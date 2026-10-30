@@ -3,8 +3,8 @@
 `hack/ci-eval-pr.sh` exports `AGENT_TRANSPORT=inject` and the door's bearer
 token, read from the Secret the operator renders beside the door, when the
 deploy ran under the flag; unset, section 4 fetches the agent token as it
-always has and exports neither. Every pull request runs the unset path, so
-that is the half pinned first, with five spellings of "not 1". The set half
+always has and exports neither. The today lane and every non-next job run
+the unset path, so that is the half pinned first, with five spellings of "not 1". The set half
 is run against a stubbed `kubectl` and checked for the exact Secret and key
 the operator writes and the harness reads -- three sources that have to agree
 on two strings, held together here rather than in three places by hand.
@@ -79,12 +79,12 @@ def lifted_between(start: str, stop: str, what: str) -> str:
 
 def recorder_decision() -> str:
     """EVAL_IS_MAIN_RUN, decided above the fan-out: the JOB_TYPE case and the
-    overrides after it, through the flag's."""
+    overrides after it, through the today lane's."""
     lines = text(_CI_EVAL).splitlines()
     start = lines.index('case "${JOB_TYPE:-}" in')
     for end in range(start, len(lines) - 2):
         if (
-            lines[end] == 'if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then'
+            lines[end] == 'if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then'
             and lines[end + 1] == '  EVAL_IS_MAIN_RUN="false"'
             and lines[end + 2] == "fi"
         ):
@@ -97,6 +97,14 @@ def publisher_gate() -> str:
     match = re.search(r"^publish_eval_dashboard\(\) \{\n.*?^\}$", text(_CI_EVAL), re.DOTALL | re.MULTILINE)
     if match is None:
         raise AssertionError(f"publish_eval_dashboard() not found in {_CI_EVAL}")
+    return match.group(0)
+
+
+def rollback_lane_function() -> str:
+    """run_rollback_lane(), as written."""
+    match = re.search(r"^run_rollback_lane\(\) \{\n.*?^\}$", text(_CI_EVAL), re.DOTALL | re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"run_rollback_lane() not found in {_CI_EVAL}")
     return match.group(0)
 
 
@@ -137,7 +145,7 @@ def go_constant(name: str) -> str:
     return match.group(1)
 
 
-def run_section(mode_next: str | None, secret_missing: bool = False) -> subprocess.CompletedProcess:
+def run_section(mode_next: str | None, secret_missing: bool = False, rollback_lane: str | None = None) -> subprocess.CompletedProcess:
     script = "\n".join(
         [
             "set -euo pipefail",
@@ -145,11 +153,12 @@ def run_section(mode_next: str | None, secret_missing: bool = False) -> subproce
             # shell running the tests happens to export: the flag, and the two
             # variables the flag-set path exports, which a developer who drove
             # the door by hand has in their shell.
-            "unset EVAL_MODE_NEXT AGENT_TRANSPORT AGENT_INJECT_TOKEN",
+            "unset EVAL_MODE_NEXT EVAL_ROLLBACK_LANE AGENT_TRANSPORT AGENT_INJECT_TOKEN",
             f'export TARGET_NAMESPACE="{_NAMESPACE}"',
             'export AGENT_SERVICE_NAME="platform-agent"',
             "" if mode_next is None else f'export EVAL_MODE_NEXT="{mode_next}"',
             'export INJECT_SECRET_MISSING="1"' if secret_missing else "",
+            "" if rollback_lane is None else f'export EVAL_ROLLBACK_LANE="{rollback_lane}"',
             _KUBECTL_STUB,
             constants_block(),
             section(),
@@ -183,14 +192,15 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
                 self.assertEqual(len(calls), 1, calls)
                 self.assertIn("secret platform-agent-secrets", calls[0])
 
-    def test_the_flag_is_read_in_section_4_the_recorder_the_publisher_and_the_rollback_and_nowhere_else(self) -> None:
-        """The header promises four places: section 4, the baseline recorder
-        (its decision and the log line at the record step), the dashboard
-        publisher's gate and the rollback round trip. Another reader is another
-        behaviour under the flag that this test suite does not cover. The
-        publisher's gate is run in scripts/test_eval_dashboard_publish.py, the
-        rollback round trip in tests/test_rollback_roundtrip.py; the others
-        here."""
+    def test_the_flag_is_read_in_the_today_lane_section_4_and_the_rollback_and_nowhere_else(self) -> None:
+        """The header promises three places: the today lane's step
+        (run_rollback_lane, which refuses the lane without the flag), section
+        4 and the rollback round trip. The baseline recorder and the dashboard
+        publisher read EVAL_ROLLBACK_LANE instead (pinned below): a next-mode
+        run on main records under the version key's next mode. Another reader
+        is another behaviour under the flag that this test suite does not
+        cover. The rollback lane and round trip are run in
+        tests/test_rollback_roundtrip.py; the others here."""
         script = text(_CI_EVAL)
         # Any spelling of an expansion (`${EVAL_MODE_NEXT...}` or bare `$EVAL_MODE_NEXT`),
         # on a line that is not a comment; the log lines that name the flag as
@@ -199,17 +209,42 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
             m.start()
             for m in re.finditer(r"^[^#\n]*\$\{?EVAL_MODE_NEXT\b", script, re.MULTILINE)
         ]
-        self.assertEqual(len(reads), 5, "EVAL_MODE_NEXT is read at a site in hack/ci-eval-pr.sh this suite does not cover")
-        publisher = script.index(publisher_gate())
-        self.assertTrue(publisher <= reads[0] < publisher + len(publisher_gate()))
+        self.assertEqual(len(reads), 3, "EVAL_MODE_NEXT is read at a site in hack/ci-eval-pr.sh this suite does not cover")
+        lane = script.index(rollback_lane_function())
+        self.assertTrue(lane <= reads[0] < lane + len(rollback_lane_function()))
         start = script.index(section())
         self.assertTrue(start <= reads[1] < start + len(section()))
-        decision = script.index(recorder_decision())
-        self.assertTrue(decision <= reads[2] < decision + len(recorder_decision()))
-        step = script.index(recorder_step_message())
-        self.assertTrue(step <= reads[3] < step + len(recorder_step_message()))
         rollback = script.index(rollback_function())
-        self.assertTrue(rollback <= reads[4] < rollback + len(rollback_function()))
+        self.assertTrue(rollback <= reads[2] < rollback + len(rollback_function()))
+
+    def test_the_recorder_and_the_publisher_key_on_the_today_lane(self) -> None:
+        """Each of the three recorder/publisher sites reads EVAL_ROLLBACK_LANE:
+        the publisher's gate, the recorder's decision and the record step's
+        log line."""
+        script = text(_CI_EVAL)
+        for block in (publisher_gate(), recorder_decision(), recorder_step_message()):
+            self.assertRegex(block, r'"\$\{EVAL_ROLLBACK_LANE:-\}" = "1"')
+            self.assertNotRegex(block, r"\$\{?EVAL_MODE_NEXT\b")
+            self.assertIn(block, script)
+
+
+class RollbackLaneStaysOnTheApiTest(unittest.TestCase):
+    def test_the_today_lane_grades_over_the_agent_api_with_the_flag_set(self) -> None:
+        """The today lane carries EVAL_MODE_NEXT=1 for its deploy and has
+        rolled the install back before section 4 (run_rollback_lane), so the
+        door is gone: the section reads the agent token alone and exports no
+        transport. Any other value of EVAL_ROLLBACK_LANE leaves the flag's
+        inject path as it was."""
+        result = run_section("1", rollback_lane="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = exported(result)
+        self.assertEqual(out["TOKEN"], _AGENT_TOKEN)
+        self.assertEqual(out["TRANSPORT"], "<unset>")
+        self.assertEqual(out["INJECT_TOKEN"], "<unset>")
+        self.assertEqual(len(kubectl_calls(result)), 1)
+        for other in ("", "0", "true"):
+            with self.subTest(EVAL_ROLLBACK_LANE=other):
+                self.assertEqual(exported(run_section("1", rollback_lane=other))["TRANSPORT"], "inject")
 
 
 class FlagSetIsInjectTest(unittest.TestCase):
@@ -273,20 +308,21 @@ class FlagSetIsInjectTest(unittest.TestCase):
         self.assertIn('export AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"', block)
 
 
-class FlagSetNeverRecordsBaselineTest(unittest.TestCase):
-    """A flagged run never appends to the baseline store. The next lane's
-    periodic on main is JOB_TYPE=periodic with no PULL_NUMBER, exactly the
-    shape the recorder appends from, and VersionKey has no mode field, so its
-    samples would be today's once written. With the flag unset the decision
-    is what it was: main-branch job types record, a release candidate and
-    a pull request do not."""
+class NextModeRecordsUnderItsOwnKeyTest(unittest.TestCase):
+    """A next-mode run on main appends: `bench-gate` files its lines under the
+    version key's `next` mode, so they never land in today's window. The today
+    lane (EVAL_ROLLBACK_LANE=1 beside the flag) does not: it grades an install
+    rolled back from next, and its key reads today. With the flag unset the
+    decision is what it was: main-branch job types record, a release
+    candidate and a pull request do not."""
 
-    def decide(self, mode_next: str | None, job_type: str, rc: str = "") -> str:
+    def decide(self, mode_next: str | None, job_type: str, rc: str = "", rollback: str = "") -> str:
         script = "\n".join(
             [
                 "set -euo pipefail",
-                "unset EVAL_MODE_NEXT JOB_TYPE RC_COMMIT_SHA PULL_NUMBER",
+                "unset EVAL_MODE_NEXT EVAL_ROLLBACK_LANE JOB_TYPE RC_COMMIT_SHA PULL_NUMBER",
                 "" if mode_next is None else f'export EVAL_MODE_NEXT="{mode_next}"',
+                f'export EVAL_ROLLBACK_LANE="{rollback}"',
                 f'export JOB_TYPE="{job_type}"',
                 f'export RC_COMMIT_SHA="{rc}"',
                 recorder_decision(),
@@ -306,27 +342,37 @@ class FlagSetNeverRecordsBaselineTest(unittest.TestCase):
                 self.assertEqual(self.decide(value, ""), "false")
                 self.assertEqual(self.decide(value, "periodic", rc="abc1234"), "false")
 
-    def test_the_flag_set_records_from_nothing(self) -> None:
+    def test_the_flag_set_records_from_main_branch_job_types_only(self) -> None:
+        """The next-mode nightly's shape records, under the next key."""
+        self.assertEqual(self.decide("1", "periodic"), "true")
+        self.assertEqual(self.decide("1", "postsubmit"), "true")
+        self.assertEqual(self.decide("1", "presubmit"), "false")
+        self.assertEqual(self.decide("1", ""), "false")
+        self.assertEqual(self.decide("1", "periodic", rc="abc1234"), "false")
+
+    def test_the_today_lane_records_from_nothing(self) -> None:
         for job_type in ("periodic", "postsubmit", "presubmit", ""):
             with self.subTest(JOB_TYPE=job_type):
-                self.assertEqual(self.decide("1", job_type), "false")
+                self.assertEqual(self.decide("1", job_type, rollback="1"), "false")
 
-    def test_the_record_step_says_why_a_flagged_periodic_did_not_record(self) -> None:
-        """The record step's else-chain, run with the recorder stubbed: a
-        flagged periodic logs the next-mode line and never calls bench-gate;
-        without the flag the same periodic records; a flagged presubmit keeps
-        the line PULL_NUMBER already earned it."""
-        for mode_next, job_type, pull, expect_record, expect_line in (
-            ("1", "periodic", "", False, "Next-mode run (EVAL_MODE_NEXT=1, JOB_TYPE=periodic): the baseline store is read, never written"),
-            (None, "periodic", "", True, "Recording baseline evidence from main"),
-            ("1", "presubmit", "1686", False, "Not a main-branch recorder run (JOB_TYPE=presubmit)"),
+    def test_the_record_step_says_why_a_today_lane_periodic_did_not_record(self) -> None:
+        """The record step's else-chain, run with the recorder stubbed: the
+        today lane's periodic logs its line and never calls bench-gate; a
+        flagged periodic without it records, as the unflagged one does; a
+        flagged presubmit keeps the line PULL_NUMBER already earned it."""
+        for mode_next, rollback, job_type, pull, expect_record, expect_line in (
+            ("1", "1", "periodic", "", False, "Today-lane run (EVAL_ROLLBACK_LANE=1, JOB_TYPE=periodic): the baseline store is read, never written"),
+            ("1", "", "periodic", "", True, "Recording baseline evidence from main"),
+            (None, "", "periodic", "", True, "Recording baseline evidence from main"),
+            ("1", "", "presubmit", "1686", False, "Not a main-branch recorder run (JOB_TYPE=presubmit)"),
         ):
-            with self.subTest(EVAL_MODE_NEXT=mode_next, JOB_TYPE=job_type, PULL_NUMBER=pull):
+            with self.subTest(EVAL_MODE_NEXT=mode_next, EVAL_ROLLBACK_LANE=rollback, JOB_TYPE=job_type, PULL_NUMBER=pull):
                 script = "\n".join(
                     [
                         "set -euo pipefail",
-                        "unset EVAL_MODE_NEXT RC_COMMIT_SHA PULL_NUMBER",
+                        "unset EVAL_MODE_NEXT EVAL_ROLLBACK_LANE RC_COMMIT_SHA PULL_NUMBER",
                         "" if mode_next is None else f'export EVAL_MODE_NEXT="{mode_next}"',
+                        f'export EVAL_ROLLBACK_LANE="{rollback}"',
                         f'export JOB_TYPE="{job_type}"',
                         "" if not pull else f'export PULL_NUMBER="{pull}"',
                         'BENCH_DIR="." ARTIFACT_DIR="." EVAL_RECORD_COMMIT="" EVAL_RECORDED_MANIFEST="./manifest"',

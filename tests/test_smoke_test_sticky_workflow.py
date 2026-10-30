@@ -46,9 +46,12 @@ class SmokeTestStickyWorkflowTest(unittest.TestCase):
         self.condition = self.job["if"]
         self.steps = {step["name"]: step for step in self.job["steps"]}
 
-    def test_it_starts_on_status_events_and_pushes_to_main_only(self):
-        self.assertEqual(sorted(self.triggers), ["push", "status"])
+    def test_it_starts_on_status_events_pushes_to_main_and_a_manual_dispatch(self):
+        self.assertEqual(sorted(self.triggers), ["push", "status", "workflow_dispatch"])
         self.assertEqual(self.triggers["push"], {"branches": ["main"]})
+        # The job-level `if:` has to admit the dispatch too: on a dispatch
+        # github.event.context is empty, so the status clause alone skips it.
+        self.assertIn("github.event_name == 'workflow_dispatch'", self.condition)
 
     def test_the_job_carries_the_fork_guard(self):
         self.assertIn(_FORK_GUARD, self.condition)
@@ -75,13 +78,22 @@ class SmokeTestStickyWorkflowTest(unittest.TestCase):
 
     def test_a_push_sweeps_and_a_status_pins_one_commit(self):
         sweep = self.steps["Re-pin every open pull request after the merge"]
-        self.assertEqual(sweep["if"], "github.event_name == 'push'")
+        self.assertEqual(sweep["if"], "github.event_name == 'push' || github.event_name == 'workflow_dispatch'")
         self.assertEqual(sweep["run"].strip(), f"python3 {_SCRIPT} sweep")
         one = self.steps["Re-pin this commit's green if main has already moved"]
         self.assertEqual(one["if"], "github.event_name == 'status'")
         self.assertIn(f"{_SCRIPT} status --sha \"$SHA\" --status-id \"$STATUS_ID\"", one["run"])
         self.assertEqual(one["env"]["STATUS_ID"], "${{ github.event.id }}")
         self.assertEqual(one["env"]["SHA"], "${{ github.event.sha }}")
+
+    def test_both_pinning_steps_carry_the_mode_cutoff(self):
+        """A cutoff only one path honoured would let the other re-pin a green about the other mode."""
+        for step in self.steps.values():
+            if "run" in step:
+                self.assertEqual(
+                    step["env"][pin_smoke_status.NOT_BEFORE_ENV],
+                    "${{ vars." + pin_smoke_status.NOT_BEFORE_ENV + " }}",
+                )
 
     def test_each_step_s_command_line_parses_as_the_script_expects(self):
         """argparse rejects a parent option after the subcommand; the order in `run:` is the contract."""

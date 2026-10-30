@@ -50,6 +50,19 @@ resource "google_kms_crypto_key_iam_member" "gke_kms_binding" {
   member        = "serviceAccount:${google_project_service_identity.gke_service_agent[0].email}"
 }
 
+
+# The ordering gate for var.create_after. A resource rather than a bare
+# reference because only the cluster resources may carry the edge: hanging it
+# on the module instead -- `depends_on = [module.drift_pubsub]` on the call --
+# defers every data source in here, data.google_container_cluster.existing
+# included, and an unknown cluster_endpoint leaves provider "helm" without a
+# host. A helm provider that cannot reach the cluster reports every release as
+# absent, so the plan plans them as creates and the apply trips over names
+# still in use. terraform_data holds no state of its own and talks to nothing.
+resource "terraform_data" "create_after" {
+  input = var.create_after
+}
+
 resource "google_container_cluster" "autopilot" {
   #checkov:skip=CKV_GCP_12:GKE Autopilot manages Dataplane V2 network policies automatically
   #checkov:skip=CKV_GCP_13:Client certificate authentication disabled by default in Autopilot
@@ -137,7 +150,8 @@ resource "google_container_cluster" "autopilot" {
   }
 
   depends_on = [
-    google_kms_crypto_key_iam_member.gke_kms_binding
+    google_kms_crypto_key_iam_member.gke_kms_binding,
+    terraform_data.create_after
   ]
 }
 
@@ -236,7 +250,8 @@ resource "google_container_cluster" "standard" {
   }
 
   depends_on = [
-    google_kms_crypto_key_iam_member.gke_kms_binding
+    google_kms_crypto_key_iam_member.gke_kms_binding,
+    terraform_data.create_after
   ]
 }
 

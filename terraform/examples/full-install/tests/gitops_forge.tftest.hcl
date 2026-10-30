@@ -204,6 +204,9 @@ run "gitlab_inputs_need_the_gitlab_forge" {
   expect_failures = [helm_release.kube_agents]
 }
 
+# gitops_host under the default forge is a GitHub Enterprise Server host
+# (github_enterprise.tftest.hcl), which needs github_repo: a host alone is
+# still refused.
 run "a_gitlab_host_needs_the_gitlab_forge" {
   command = plan
   variables {
@@ -277,3 +280,26 @@ run "gitlab_release_values" {
     error_message = "a GitLab install enabled the GitHub minter"
   }
 }
+
+run "web_console_refuses_no_network_policy" {
+  command = plan
+  override_module {
+    target = module.gke_cluster
+    outputs = {
+      cluster_endpoint        = "10.0.0.1"
+      cluster_endpoint_is_dns = false
+      cluster_ca_certificate  = "Y2E="
+      cluster_location        = "us-central1"
+      cluster_name            = "c"
+      network_policy_enforced = false
+      workload_identity_pool  = "tftest-project.svc.id.goog"
+    }
+  }
+  variables {
+    create_cluster           = false
+    accept_no_network_policy = true
+    web_console_enabled      = true
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+

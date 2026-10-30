@@ -68,12 +68,14 @@ FINAL_ANCHOR = (
     "            chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)\n"
 )
 FINAL_PATCHED = (
-    "        # kube-agents patch: a marked failure wake's reply is drawn as one; see\n"
-    "        # gateway/slack_ux_failure.py. Unmarked, begin returns None.\n"
+    "        # kube-agents patch: a marked failure wake's reply is drawn as one, and no\n"
+    "        # chat platform posts a declared step's line; see gateway/slack_ux_failure.py.\n"
+    "        # Unmarked, begin returns None.\n"
     "        _kage_failure_token = _kage_slack_failure.begin(event)\n"
     "        try:\n"
     "            result = await delivery_adapter._send_with_retry(\n"
-    "                chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)\n"
+    "                chat_id=event.source.chat_id, content=_kage_slack_failure.visible(event, text_content),\n"
+    "                reply_to=reply_to, metadata=metadata)\n"
     "        finally:\n"
     "            _kage_slack_failure.end(_kage_failure_token)\n"
 )

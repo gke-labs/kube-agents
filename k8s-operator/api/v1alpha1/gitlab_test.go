@@ -234,8 +234,8 @@ func TestBrokerForgesListsGitHubFirstAndEachGitLabHostOnce(t *testing.T) {
 		}
 	}
 	want := `[{"provider":"github","host":"github.com"},` +
-		`{"provider":"gitlab","host":"gitlab.com","tokenPath":"/creds/gl/token","allowedPaths":["acme","docs","platform/tools"]},` +
-		`{"provider":"gitlab","host":"gitlab.example.com","tokenPath":"/creds/onprem/token","allowedPaths":["team"]}]`
+		`{"provider":"gitlab","host":"gitlab.com","tokenPath":"/creds/gl/token","readTokenPath":"/creds/gl/read-token","allowedPaths":["acme","docs","platform/tools"]},` +
+		`{"provider":"gitlab","host":"gitlab.example.com","tokenPath":"/creds/onprem/token","readTokenPath":"/creds/onprem/read-token","allowedPaths":["team"]}]`
 	if string(got) != want {
 		t.Errorf("BrokerForges =\n %s\nexpected\n %s", got, want)
 	}
@@ -513,8 +513,8 @@ func TestACABundleRefReachesThatForgesBrokerEntryOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := `[{"provider":"github","host":"github.com"},` +
-		`{"provider":"gitlab","host":"gitlab.com","tokenPath":"/creds/gl/token","allowedPaths":["acme"]},` +
-		`{"provider":"gitlab","host":"gitlab.example.com","tokenPath":"/creds/onprem/token","caSecret":"onprem-ca","caKey":"ca.crt","caFile":"/ca/onprem/ca.crt","allowedPaths":["team"]}]`
+		`{"provider":"gitlab","host":"gitlab.com","tokenPath":"/creds/gl/token","readTokenPath":"/creds/gl/read-token","allowedPaths":["acme"]},` +
+		`{"provider":"gitlab","host":"gitlab.example.com","tokenPath":"/creds/onprem/token","readTokenPath":"/creds/onprem/read-token","caSecret":"onprem-ca","caKey":"ca.crt","caFile":"/ca/onprem/ca.crt","allowedPaths":["team"]}]`
 	if string(got) != want {
 		t.Errorf("BrokerForges =\n %s\nexpected\n %s", got, want)
 	}
@@ -524,9 +524,9 @@ func TestACABundleRefReachesThatForgesBrokerEntryOnly(t *testing.T) {
 	}
 }
 
-// The github provider reads no CA bundle, so the field is refused there
-// rather than ignored: an administrator who set it would believe the
-// certificate trusted. Names the API server would refuse on the broker
+// github.com presents a certificate the public CAs sign, so the field is
+// refused on a GitHub forge there rather than ignored: a private CA must never
+// vouch for it. Names the API server would refuse on the broker
 // Deployment are refused here too, and the forge is withheld.
 func TestACABundleRefIsRefusedWhereItCannotBeUsed(t *testing.T) {
 	github := ghForge("github", "acme")

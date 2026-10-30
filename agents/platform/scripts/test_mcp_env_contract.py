@@ -23,8 +23,18 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
 sys.path.insert(0, str(REPO_ROOT / "deploy" / "docker"))
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 from merge_configs import merge  # noqa: E402
+
+# For the home-channel assertion below, which derives the variable names from the
+# same place the server derives them from rather than repeating the list. This is
+# the whole of what that assertion needs, and it is deliberately not
+# `platform_mcp_server`: that module's `from mcp.server import MCPServer` would make
+# the entire file — including the two unrelated classes above — a single load error
+# in a bare checkout, which `test_mcp_package_contract.py` records as a supported way
+# to run the suite. `chat_platforms` is dependency-free bar PyYAML by design.
+import chat_platforms  # noqa: E402
 
 BASE_CONFIG = REPO_ROOT / "deploy" / "shared" / "defaults" / "config.yaml"
 OVERLAY_CONFIG = REPO_ROOT / "agents" / "platform" / "config.yaml"
@@ -213,6 +223,21 @@ class LocalServersDeclareTheEnvTheyReadTest(unittest.TestCase):
     # declaration. Kept explicit rather than folded into each block's `env:`.
     ALLOWLIST_PASSTHROUGH = frozenset({"HERMES_HOME", "HOME", "LC_CTYPE", "PATH"})
 
+    def test_platform_control_is_handed_the_own_cluster_identity(self):
+        """gke_endpoint reads the agent's own cluster from three variables
+        (OWN_CLUSTER_ENV) to decide whether a fleet cluster is reachable over
+        its private endpoint. Hermes hands a stdio MCP server only the keys
+        named in its env block, so platform_control's switch_kube_context
+        would otherwise never know its own VPC. Read through the tuple, since
+        the server never spells the names itself."""
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import gke_endpoint
+
+        env = merged_config()["mcp_servers"]["platform_control"].get("env") or {}
+        for name in gke_endpoint.OWN_CLUSTER_ENV:
+            self.assertIn(name, env, f"platform_control's env block does not pass {name}")
+            self.assertEqual(env[name], "${%s}" % name)
+
     def test_each_local_python_server_declares_what_it_reads(self):
         merged = merged_config()
         checked = 0
@@ -235,6 +260,57 @@ class LocalServersDeclareTheEnvTheyReadTest(unittest.TestCase):
         # A guard that passes because it examined nothing is not a passing
         # guard: platform_control is a local Python server and must be seen.
         self.assertGreater(checked, 0, "no local Python MCP server was examined")
+
+    def test_the_home_channel_entries_track_the_platform_table(self):
+        """The one read the walk above cannot see, asserted from its source.
+
+        `send_notification` derives its home-channel variable from the platform
+        — `platform.upper() + HOME_CHANNEL_ENV_SUFFIX` — rather than naming
+        GOOGLE_CHAT_HOME_CHANNEL and SLACK_HOME_CHANNEL as literals. That is
+        deliberate: a per-platform table in the server was a fourth copy of
+        CHAT_PLATFORMS with nothing pinning it to the real one. But the walk
+        above collects only `os.environ.get("<literal>")`, and discards a call
+        whose first argument is a BinOp before it asks whether the call is an
+        environment read at all — so the derivation costs that walk its only
+        sight of these two entries, and the comment on them in
+        agents/platform/config.yaml says this file is what catches a missing
+        one.
+
+        Asserting them from CHAT_PLATFORMS keeps the derivation and the guard
+        moving together: a platform added there without an `env:` entry fails
+        here, which is more than the literals covered.
+        """
+        declared = set(
+            merged_config()["mcp_servers"]["platform_control"].get("env", {})
+        )
+        for platform in chat_platforms.CHAT_PLATFORMS:
+            var = platform.upper() + chat_platforms.HOME_CHANNEL_ENV_SUFFIX
+            self.assertIn(
+                var,
+                declared,
+                f"send_notification derives {var} for the {platform} home "
+                f"channel, but the platform_control mcp_servers block does not "
+                f"declare it — Hermes never hands the child the value, so the "
+                f"read yields empty and the report goes to a bare platform "
+                f"name, the silent 'No home channel set' loss",
+            )
+
+    def test_the_bus_entries_track_what_a2a_notify_needs(self):
+        """The other read the walk cannot see: `a2a notify`'s, in Go.
+
+        Under next, send_notification runs `chat_notify.command`, which execs
+        the `a2a` CLI. The CLI reads the bus URL, the identity and the CA from
+        its environment, so none of the three appears as a Python read here,
+        and a block missing one fails only at runtime. Without the CA, every
+        post fails TLS verification against a bus that requires it.
+        """
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import chat_notify
+
+        env = merged_config()["mcp_servers"]["platform_control"].get("env") or {}
+        for name in (chat_notify.BUS_URL_ENV, chat_notify.BUS_USER_ENVS[0], chat_notify.BUS_CA_ENV):
+            self.assertIn(name, env, f"platform_control's env block does not pass {name}, which `a2a notify` reads")
+            self.assertEqual(env[name], "${%s}" % name)
 
 
 if __name__ == "__main__":

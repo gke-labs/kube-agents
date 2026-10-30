@@ -1,0 +1,19 @@
+Subject: List every reservation affinity in the CRD field reference
+
+Why: The field reference listed only `Specific` and `None` while the same sync recommends `AnyThenFail` in SKILL.md, the debug guide and an asset; the CRD enum is `Specific`, `AnyBestEffort` and `None` on 1.35, and upstream gates `AnyThenFail` at 1.36.0-gke.3204000, so the list names all four with that gate.
+Local-Issue: #2692
+Upstream-Issue: none filed yet
+Retire-When: when the upstream CRD field reference lists every affinity
+
+diff --git a/references/compute-class-crd-fields.md b/references/compute-class-crd-fields.md
+--- a/references/compute-class-crd-fields.md
++++ b/references/compute-class-crd-fields.md
+@@ -78,7 +78,7 @@ Applied to pools created by the autoscaler.
+     at scale-up — *infrastructure* layer; still scales up if a zone is short).
+     Balances nodes, **not** pods — for even *pod* distribution add pod
+     `topologySpreadConstraints`/`DoNotSchedule` (*workload* layer).
+--   `reservations`: `affinity: Specific` or `None`.
++-   `reservations`: `affinity: Specific`, `AnyBestEffort` or `None`; `AnyThenFail` from GKE 1.36.0-gke.3204000.
+ -   `flexStart`: `{ enabled: true }` for DWS queued provisioning.
+ -   `gpu` / `tpu`: Accelerator requests (count, type, topology).
+ -   `nodepools`: (Standard Only) List of manual pool names to target.

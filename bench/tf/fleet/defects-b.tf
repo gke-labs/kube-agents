@@ -77,9 +77,10 @@ provider "kubernetes" {
 # this value changes and left alone when only the patch does; the comment on
 # its lifecycle block says why.
 resource "terraform_data" "no_surge_pool_minor" {
-  # `try` for the same reason `local.lagging_version` carries one: on a cycle
-  # where REGULAR offers no previous minor the list is empty, and the message
-  # the operator must see is seeded_b's precondition, not a `split` error here.
+  # `try` for the same reason `local.lagging_version` can be null: on a cycle
+  # where seeded-b is a create and REGULAR offers no previous minor, the
+  # message the operator must see is seeded_b's precondition, not a `split`
+  # error here.
   input = try(join(".", slice(split(".", local.lagging_version), 0, 2)), null)
 }
 
@@ -426,5 +427,79 @@ resource "kubernetes_pod_disruption_budget_v1" "drain_blocked" {
     selector {
       match_labels = { app = "pinned-batch-runner" }
     }
+  }
+}
+
+# Defect (upgrade readiness): a load balancer whose connection drain outlasts
+# the node's deregistration wait (catalogue entry 21). When a node pool upgrade
+# removes a node that is a backend of a load balancer, GKE deregisters the node
+# from the backend service and waits for the service's connection draining, up
+# to 600 seconds per node. A backend service whose
+# `connectionDraining.drainingTimeoutSec` is above that wait outlasts it: GKE
+# stops waiting at 600 seconds, but the instance group's delete of the old VM
+# waits out the full drain, so each node's removal takes the whole drain and,
+# past about 30 minutes, GKE fails the node step (the price below). In one
+# production fleet's support history this is one of the five causes behind
+# fourteen failed or blocked upgrade operations.
+#
+# Planted as a global external TCP backend service on the default pool's
+# instance group, draining for 720 seconds (a fifth over the wait), behind a
+# TCP health check and with no forwarding rule or proxy in front of it, so it
+# routes nothing and costs nothing. The default pool rather than
+# no-surge-pool, so the finding reads against the pool the version lag
+# already names and the no-surge-pool's budget stays the one drain blocker.
+#
+# The price: every default-pool node recreate on seeded-b waits out the whole
+# drain before the old VM goes, which is the mechanism the entry describes and
+# is what the readiness report must flag. Compute Engine holds the delete for
+# the full drainingTimeoutSec, not GKE's 600 seconds. The reconcile pays it on
+# every patch roll, because the default pool follows local.lagging_version
+# (main.tf), and so does GKE's own auto-upgrade, which a REGULAR cluster cannot
+# turn off. So the value has to stay inside what that roll survives, and 3600
+# did not: on 2026-10-27 the instance group manager flagged the old node at
+# 09:25:40 UTC, Compute Engine deleted it at 10:26:42, and GKE had already
+# ended the UPGRADE_NODES `Failed to update node pool` at 09:55:52, about 30
+# minutes after the flag. The pool sat in ERROR for an hour on every project
+# (#4043). At 720 the old node goes 12 minutes after the flag, so the roll
+# finishes in about 18 minutes: clear of GKE's 30-minute give-up and of the
+# provider's 30-minute node-pool update timeout. Above 600 is all the
+# readiness rule needs; the 30-minute give-up is the ceiling.
+#
+# `managed_instance_group_urls` is the pool's `instanceGroups` URL, the form a
+# backend's `group` takes; `instance_group_urls` is the manager's. The
+# readiness rule matches either by zone and name.
+#
+# The reconciler creates and deletes these two kinds with
+# roles/compute.loadBalancerAdmin (the grant loop in
+# scripts/provision_ci_pool_project.sh, FLEET_RECONCILER_ROLES, the repair block
+# in docs/ci-pool-projects.md section 3), granted on every registered project
+# before this merges; the role landed with the fixture.
+#
+# Addressed by the readiness-lb-drain-timeout role.
+resource "google_compute_health_check" "drain_timeout" {
+  name = "drain-timeout-${var.cluster_prefix}-b"
+
+  tcp_health_check {
+    # The kube-proxy health port every GKE node serves; nothing is routed, so
+    # the check only has to be a valid one.
+    port = 10256
+  }
+}
+
+resource "google_compute_backend_service" "drain_timeout" {
+  name                  = "drain-timeout-${var.cluster_prefix}-b"
+  protocol              = "TCP"
+  load_balancing_scheme = "EXTERNAL"
+  timeout_sec           = 10
+  # The defect: above the 600 seconds GKE waits per node during a pool
+  # upgrade, and under the 30 minutes after which GKE fails the node step (the
+  # comment above). Lower it to 600 and the fixture is healed while every probe
+  # still passes, which is why the role's fixture text names the value.
+  connection_draining_timeout_sec = 720
+  health_checks                   = [google_compute_health_check.drain_timeout.id]
+
+  backend {
+    group          = google_container_node_pool.seeded_b_default.managed_instance_group_urls[0]
+    balancing_mode = "UTILIZATION"
   }
 }

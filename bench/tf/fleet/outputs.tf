@@ -28,6 +28,11 @@ output "fleet_reader_service_account" {
 }
 
 output "lagging_version" {
-  description = "The version seeded-b is pinned to this cycle (REGULAR default minus one minor, freshest patch)."
+  description = "The version seeded-b is pinned to this cycle: the newest patch REGULAR offers one minor behind its default, or the hold when seeded-b runs a patch REGULAR does not carry (seeded_b_pin.py)."
   value       = local.lagging_version
+}
+
+output "seeded_b_pin" {
+  description = "How seeded_b_pin.py arrived at the pin: REGULAR's default, the lag target, the running master version and whether it is held."
+  value       = data.external.seeded_b_pin.result
 }

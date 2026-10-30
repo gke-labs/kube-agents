@@ -39,7 +39,7 @@ say which agent to attach to. Give both installers the same pair: a route instal
 one agent and the adapter that serves it beside another produces no error and no alert.
 
 The installer also creates the Pub/Sub topic, subscription and log sink, grants the agent's
-service account the roles it needs to read capacity and quota, and patches the
+service account the roles it needs to read capacity and quota and to read and pull the subscription, and patches the
 `PlatformAgent` with [`tuning.yaml`](tuning.yaml) — long remediation runs exhaust Hermes'
 default retry and turn limits, and the resulting failure is reported as a protocol
 violation rather than as "the limits were too low". Skip that with `APPLY_TUNING=false`

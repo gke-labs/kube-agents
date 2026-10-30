@@ -25,18 +25,22 @@ The inject is off unless `--daemon-url` is set, and off is the default. With it 
 does everything else and stops at the `DRIFT` log line, which is how it ran before T4 and is what a
 local run against a real subscription wants. With it on, each surviving record opens a session and
 posts one payload into it — except one from a cluster outside the install's scope, which is held (the
-rule is a few paragraphs below); `logDriftEvent` still runs first either way, so the `DRIFT` line is
+rule is a few paragraphs below), and most that arrived late, which go to the daemon's digest route
+with no session when the daemon advertises one ([The backlog](#the-backlog)); `logDriftEvent` still runs first either way, so the `DRIFT` line is
 emitted whether or not a daemon is configured and whether or not the inject lands.
 
 Two things about that are worth knowing before relying on it. A record whose inject fails is
 **acked anyway and never redelivered** — the handler signature returns nothing, so there is no way
-to tell the subscriber to nack, and the `INJECT FAILED` log line naming the `insert_id` is the only
-remaining trace of the change. And because Pub/Sub delivers at least once while the subscriber acks
+to tell the subscriber to nack, and the `INJECT FAILED` log line naming the `insert_id` (`BACKLOG POST FAILED` for a
+backlog record) is the only remaining trace of the change. And because Pub/Sub delivers at least once while the subscriber acks
 after the handler returns, redelivery is ordinary rather than exceptional: the detector remembers
 the last few thousand `insertId`s it has injected and suppresses a repeat before opening a second
 session, so one redelivered batch does not page a human twice for one change. That set is in memory
 and per-process, which leaves one case uncovered: a non-graceful exit leaves its batch unacked, and
-the next instance starts with an empty set and injects those records again. A climbing `duplicate=`
+the next instance starts with an empty set. Those records were published before its first pull, so
+they come back as backlog, and the daemon drops each one that already has a drift row. A late
+`kubectl` write is the exception: it is carded, not digested, so it is injected again, as every
+record is against a daemon without the digest route. A climbing `duplicate=`
 count in the shutdown tally is a sign the ack deadline is too tight, not that the cluster is busy.
 Climbing alongside `failed=` means something else — a record is marked seen before its send, so a
 failed inject is not retried on redelivery either.
@@ -51,7 +55,8 @@ chat line names no severity — but billed to a daily ceiling
 of its own rather than to the event watcher's, because one `kubectl apply` over a directory is one
 human action and several audit entries: sharing the bucket let routine use of this signal cap-drop
 the watcher's for the rest of the day. The two ceilings therefore add up, which is the cost of the
-split; what it does not fix is the fan-out itself, since the detector coalesces nothing. A record
+split; what it does not fix is the fan-out itself, since the detector coalesces nothing live. Most records
+that arrive late are the exception: they are digested instead ([The backlog](#the-backlog)). A record
 the ceiling refuses is lost rather than deferred: the daemon answers
 `suppressed`, the detector has already marked the `insertId` as seen, and the intercepted-events
 ledger row the daemon writes is the only place that change survives. `GET /v1/alert-quota` is where
@@ -59,9 +64,10 @@ a spent budget shows up.
 
 The join has two credential sources and they are additive. `--in-cluster` or `--kubeconfig` gives it
 the one directly reachable cluster; `--profiles-dir` gives it every cluster that has a Cluster
-Agent profile, whichever project it is in, reached as the pod's own Google identity through
-[`internal/clusterprofiles`](../../internal/clusterprofiles/) — one shared token source, not a
-credential per cluster. With neither set the join reaches nothing and every record naming a live
+Agent profile, whichever project it is in, reached through
+[`internal/clusterprofiles`](../../internal/clusterprofiles/) with one credential, not one per
+cluster: in the agent pod, the credential proxy's, through its watcher routes; without a broker
+configured, as on a local run, the pod's own Google identity. With neither set the join reaches nothing and every record naming a live
 object comes out `unreachable`. The subscription carries whatever the install's sinks export, so any
 cluster they cover that neither source reaches still comes out `unreachable`, and two shutdown lines name those
 clusters, split by what became of their records.
@@ -139,6 +145,12 @@ back for a run inside the agent Pod.
 each give the join one cluster's credentials, and with `--project` these two are what name the
 cluster those credentials reach. Omit either and startup refuses the flags rather than joining
 against the wrong cluster.
+
+Startup also tries to confirm that the credentials reach the cluster the flags name. With
+`--in-cluster` it asks the metadata server for the node's project and cluster attributes. Inside the
+gateway Pod that path is closed (the Pod holds no Google identity and its NetworkPolicy does not open
+the metadata server), so the probe times out, the detector logs that the cluster is taken on trust,
+and the join runs on the operator's triple. A kubeconfig run still confirms it from the context name.
 
 **The daemon is loopback-only**, and that decides where this binary can run. `docker-entrypoint.sh`
 starts it with `--host 127.0.0.1 --port 8699`, so `--daemon-url` has nothing to point at from
@@ -219,10 +231,20 @@ Two flags reach `spec.harness.driftDetector`, `subscription` and `gitopsManagers
 where the process runs. `--in-cluster` and `--profiles-dir` are always on, so a deployed detector
 joins its own cluster and every Cluster Agent profile, whichever project it names, without being asked.
 
-Application Default Credentials need `roles/pubsub.subscriber` on the subscription — inside the
-agent pod, the Workload Identity the `drift-pubsub` module grants it to. Add `roles/pubsub.viewer`
+Inside the agent pod the detector reaches Pub/Sub through the credential proxy (`WATCHER_BROKER_URL`
+and `WATCHER_BROKER_TOKEN_FILE`, set by the operator; the broker relays the four calls on the one
+configured subscription, and fleet reads the same way as the event watcher's). On a profile cluster
+the join's read goes through the same broker, which reads only the kinds in its table
+(`WATCHER_NAMED_READS` in `agents/platform/scripts/watcher_policy.py`): built-in declarative kinds and
+the six GitOps sync objects the agent can read itself, never a Secret. A record of any other kind
+comes out `failed`, with the broker's rule in the lookup error, and so without the `reconciled`
+judgement: a GitOps-managed object of an unlisted kind (a Flux HelmRelease, say) is reported without
+"since reconciled by" even when its controller has already put it back. The credential behind
+those calls is then the broker's, which needs `roles/pubsub.subscriber` on the subscription; with
+neither variable set, Application Default Credentials need it — the Workload Identity the
+`drift-pubsub` module grants it to. Add `roles/pubsub.viewer`
 for the startup ack-deadline check described under
-[Three things to know before changing it](#three-things-to-know-before-changing-it): subscriber does
+[Before changing it](#before-changing-it): subscriber does
 not carry `subscriptions.get`. The module grants both, so this is a note for a
 hand-made subscription or a local run, where the check is skipped with a log line rather than
 failing the process.
@@ -233,8 +255,9 @@ The join needs Kubernetes permissions on top of that, and they are not the same 
 groups including CRDs. A resource it cannot read comes out `failed` with the RBAC error on the
 line, not silently unenriched.
 
-`--profiles-dir` needs two more grants, and they attach to the pod's **Google** identity rather
-than to its ServiceAccount, because that is what a profile cluster is reached as. Addressing the
+`--profiles-dir` needs two more grants, and they attach to a **Google** identity rather than to
+the pod's ServiceAccount, because that is what a profile cluster is reached as: the credential
+proxy's, in the agent pod, and the pod's own only without a broker. Addressing the
 cluster at all takes `container.clusters.get` — `roles/container.viewer` is the usual shape — in
 every project a profile names, which is the scope grant that let the reconcile write the profile
 there. Without the grant every profile in that project is skipped at startup with
@@ -246,7 +269,10 @@ clusters' records still come out `unreachable` and are still injected, thin: the
 them, so they are inside the scope and the hold above does not apply, and the thin cards are how the
 missing grant shows up in chat.
 Reading the objects then takes the same cluster-wide `get` as above, bound to that Google identity
-on every cluster in the fleet. A cluster where only the second is missing still starts: its records
+on every cluster in the fleet (through the broker, for the kinds its watcher route reads). A record
+about a Secret comes out `failed` on every profile cluster whatever its RBAC: the broker's watcher
+route never reads a Secret (`kubernetes.watcher.secrets`), so that refusal is the broker's policy,
+and no grant on the cluster lifts it. A cluster where only the second is missing still starts: its records
 come out `failed` with the RBAC error, which is the difference between a cluster that was not
 addressed and one that was and refused.
 
@@ -342,6 +368,14 @@ one at all — so a dry-run write by a person would currently be reported as dri
 step on it is establishing what the payload looks like rather than writing a rule for a shape
 nobody has seen.
 
+**Coordination objects are not drift.** Tools such as `scripts/live_test_lease.py`
+([`docs/designs/live-test-lease.md`](../../../docs/designs/live-test-lease.md)) create and update the
+`live-test-lease` ConfigMap in `kubeagents-system` under a contributor's own credential during live
+testing. Even though the principal is human and the call mutates cluster state, the object is an
+ephemeral developer mutex and not part of the cluster's declared GitOps state. `isCoordinationResource`
+drops writes to the `live-test-lease` ConfigMap, counting them as `non_declarative` so they are not
+flagged as out-of-band drift or offered for reversion.
+
 **A failed call is not drift.** The audit log records attempts: writes rejected by RBAC, refused by
 admission, or aborted after losing an optimistic-concurrency race. A 24-hour query for failed
 mutating calls on one project returned its full 5000-row limit — a floor, not a total — with 4793 of
@@ -426,8 +460,9 @@ entry per Cluster Agent profile; `--in-cluster`/`--kubeconfig` contributes the c
 itself can reach. They overlap on every install, because reconcile gives the management cluster a
 profile like any other cluster, and the direct credential is kept: it reaches
 `kubernetes.default.svc` as the pod's Kubernetes service account and never leaves the cluster, where
-a profile authenticates as the pod's Google identity against the control-plane endpoint, which IAM
-without `roles/container.viewer` or a master authorized network can refuse. That profile is declined
+a profile authenticates as a Google identity against the control-plane endpoint (the broker's,
+from the broker's egress, in the agent pod; the pod's without a broker), which IAM without
+`roles/container.viewer` or a master authorized network can refuse. That profile is declined
 during the scan rather than dropped after it, because addressing it is not free: it costs a GKE
 describe for a getter that is discarded, and on an install without
 `container.clusters.get` the describe fails and the profile is reported as skipped — telling an
@@ -446,7 +481,10 @@ skipped and reported with the API's answer like any other.
 
 Profile discovery follows `internal/clusterprofiles`' failure policy, which is the watcher's: a
 `--profiles-dir` that was given and is not there is fatal, because discovery runs once and a restart
-fixes it; an unreadable one degrades to a log line; and a single bad profile is skipped so one
+fixes it, and so is a credential proxy that cannot be reached or answers with an error about itself
+(no credential yet, its hop to Google failed, or it refused this process's own token), for the same
+reason. A Google error it relays for one cluster, a 5xx included, is that cluster's and is skipped; an unreadable one degrades to a
+log line; and a single bad profile is skipped so one
 unparseable `config.yaml` cannot cost the whole fleet. A profile whose dynamic client will not build
 is skipped on the same grounds. Every skip is logged by profile name and counted, and the count is
 reported at startup — a fan-in that silently reached six of seven clusters otherwise looks exactly
@@ -487,7 +525,7 @@ flags are the only place a human states which cluster a credential reaches. The 
 the profile scan, so a run with both sources configured still refuses on a mismatch without first
 minting a token per profile.
 
-Five outcomes, all of them counted in the shutdown line. The table lists them by how a reader meets
+Six outcomes, all of them counted in the shutdown line. The table lists them by how a reader meets
 them, not in the order `join` decides them — and one of those decisions is worth knowing on its own:
 the `no_object` test runs before the cluster lookup, so a delete is `no_object` whether or not the
 join has a cluster to read. "The join is off" therefore does not mean "everything is `unreachable`".
@@ -502,15 +540,16 @@ rest collected under a label. Not every entry is a misconfiguration: a project h
 nobody intends to onboard sits on the second line every run, and the detector cannot tell that from
 one whose profile failed to write.
 
-| Outcome       | Means                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enriched`    | The object was read and `owners=` carries its field ownership.                                                                                                                                                                                                                                                                                                                                                                                    |
-| `no_object`   | Nothing to fetch: a delete, or a create whose name the API server had not assigned when audited.                                                                                                                                                                                                                                                                                                                                                  |
-| `gone`        | The cluster served the path and answered `NotFound`. The object existed when the call was audited and does not now.                                                                                                                                                                                                                                                                                                                               |
-| `unreachable` | The record names a live object this process cannot read: a cluster the join has no client for, or any cluster at all when neither source is configured. The shutdown lines name them. When no readable Cluster Agent profile names the cluster the record is outside the install's scope and is logged (`inject=held_out_of_scope`) and not escalated; when one does, or the scope is unknown, it is forwarded and injected as any other outcome. |
-| `failed`      | Any other lookup error: RBAC, a network fault, a timeout, an API group or version the cluster does not serve.                                                                                                                                                                                                                                                                                                                                     |
+| Outcome           | Means                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enriched`        | The object was read and `owners=` carries its field ownership.                                                                                                                                                                                                                                                                                                                                                                                    |
+| `no_object`       | Nothing to fetch: a delete, or a create whose name the API server had not assigned when audited.                                                                                                                                                                                                                                                                                                                                                  |
+| `gone`            | The cluster served the path and answered `NotFound`. The object existed when the call was audited and does not now.                                                                                                                                                                                                                                                                                                                               |
+| `unreachable`     | The record names a live object this process cannot read: a cluster the join has no client for, or any cluster at all when neither source is configured. The shutdown lines name them. When no readable Cluster Agent profile names the cluster the record is outside the install's scope and is logged (`inject=held_out_of_scope`) and not escalated; when one does, or the scope is unknown, it is forwarded and injected as any other outcome. |
+| `failed`          | Any other lookup error: RBAC, a network fault, a timeout, an API group or version the cluster does not serve, or a kind the credential proxy does not read for a profile cluster (`SECURITY_POLICY_BLOCKED (kubernetes.watcher.kind)`). Also a lookup not attempted because a slow one benched its cluster, counted `benched=` rather than `failed=` on the shutdown line ([Before changing it](#before-changing-it)).                            |
+| `skipped_backlog` | A backlog record the join did not look up, because the daemon takes the digest route and nothing reads its ownership ([The backlog](#the-backlog)). Decided after the delete test and the cluster lookup, so a backlog delete is still `no_object` and a backlog record from an unread cluster is still `unreachable`.                                                                                                                            |
 
-A 404 answers both of the last two, so they are told apart by what the error names rather than by
+A 404 answers both `gone` and `failed`, so they are told apart by what the error names rather than by
 its status code: a genuine absence names the group, resource and object that were looked up, while
 a refusal of the path names nothing. Without the distinction a CRD uninstalled — or a served
 version retired — between the audited write and the lookup would be reported `gone`, which says the
@@ -630,10 +669,53 @@ no `inject_kinds` at all are all refusals, because treating any of them as permi
 behaviour the check exists to prevent. A startup check rather than a per-record one because the
 answer cannot change under a running process, and a refusal rather than a fall back to log-only
 because an operator who set `--daemon-url` asked for escalation and the two modes are
-indistinguishable in every later line. The error names dropping the flag as the way to get the
+indistinguishable in every later line but the backlog marker. The error names dropping the flag as the way to get the
 degraded mode deliberately.
 
-## Three things to know before changing it
+The same reply's `features` is read too, and does not gate the start: without `drift-backlog` on it,
+backlog records are sent as cards ([The backlog](#the-backlog)).
+
+## The backlog
+
+A record that reached the detector late is backlog. The subscriber marks it (`subscriber.backlog`)
+when its message's `publishTime` is earlier than this process's first successful pull, or when it
+waited in the subscription longer than `backlogMaxWait` (30 minutes). The first rule catches
+everything that queued while no detector was pulling: an install, a pod roll. The test is the publish time, so an install write that reaches
+the topic after the first pull is live. The second catches a process that started and then could not
+pull.
+
+Against a daemon whose `/healthz` lists the `drift-backlog` feature, a backlog record skips the
+live-object join and is posted to `POST /v1/drift-backlog` with no session. The daemon records it,
+spends no alert quota, starts no triage turn, and posts one digest per burst that counts the records
+by principal. The `DRIFT` line of such a record carries `backlog=true` and the publish time, and the
+shutdown tally counts `skipped_backlog=` (join) and `backlog=` (inject). Against an older daemon, the
+startup line says so and every record is sent as a card, as before.
+
+A backlog record whose user agent starts with `kubectl/` is not sent to the digest: it is joined and
+injected as a live record is, with no `backlog=true` marker. An install's own writes come from Helm's
+Go client, so a late kubectl write is more likely a person's edit made just before a restart. The
+user agent is self-declared; the rule only routes such a record the way a live one goes.
+
+An install's own Helm apply is the burst this exists for. It runs under the installer's account,
+so the classifier sees a person, and before this route each object it wrote became a triage card
+and spent the day's drift budget.
+
+The cost: after every detector restart, records published before the new process's first pull are
+backlog. That includes records nacked at shutdown and changes made within the sink's export lag
+before the restart. Two rules keep a person's edit in that window carded: the kubectl rule above,
+and the daemon's, which cards every late row of a principal with fewer than three late rows in the
+digest. What is left without a card of its own is three or more late non-kubectl changes by one
+principal, which the digest names under that principal. On an install with no chat platform enabled
+(a `next` install whose only chat platform has no home channel counts) the digest is one card on the
+task board, unassigned and blocked, so no agent acts on it and it stays in view. The daily board
+health report names it while it stays blocked; that report reaches a person once the install
+has chat. One card per burst: the digest closes 60 seconds after its newest row or 10
+minutes after its oldest, so while the detector lags more than 30 minutes, each burst of three or
+more changes by one person, more than 60 seconds apart, files its own card. A Helm upgrade the old
+detector is still running for is not covered:
+its writes reach a running process and are triaged as live changes.
+
+## Before changing it
 
 **The join happens before the ack, inside the batch's deadline.** Synchronous pull does not extend
 the ack deadline while a handler runs, so every `GET` a batch makes has to finish inside the
@@ -649,6 +731,42 @@ other lookup error: the records that would have reached a `GET` come out `failed
 acked, while a delete or a foreign-cluster record is unaffected, since both are settled before the
 context is consulted. Adding retries, a second `GET`, or a per-record backoff means re-checking
 that arithmetic.
+
+**A slow cluster is benched so it cannot spend the other clusters' share of the budget.** The budget
+is one pool for the batch, so on a fan-in a cluster that is slow to answer, or never answers, would
+cost up to `joinRequestTimeout`, ten seconds, per record naming it: an overloaded control plane
+answering late, or a master authorized network that drops the packets so the connection itself
+hangs. Three such records exhaust a thirty-second batch for every cluster in it. On a join with more
+than one cluster, a lookup that runs at least `slowLookupThreshold` (2s) and then ends on a deadline
+benches its cluster for `slowClusterCooldown` at once. One that answers that slowly, with the object,
+a `NotFound` or any other error, is a strike instead, and the second slow answer in a row from one
+cluster (`slowAnswerStrikes`) benches it; a fast answer clears the streak, and a lookup a deadline ended before it answered leaves it alone. A slow answer keeps its
+own result, so it is still `enriched`. The cluster's later records skip the lookup and come out
+`failed` with a `lookup_error` naming the cluster and the slow lookup, counted `benched=` on the join
+tally rather than `failed=`, and one log line says when a cluster is benched. A healthy control plane
+answers in tens of milliseconds, error or not, so a two-second lookup was held up on its path: the
+cluster, or for a profile cluster the credential-proxy broker in front of it, which a slow broker
+therefore benches too — or this process's own, under a gVisor sandbox or on a cold first call, which
+is why an answer gets a second chance before a bench costs a healthy cluster five minutes of
+enrichment. Every record that was looked up carries `lookup_ms=` on its `DRIFT` line, so the latency
+the threshold judges can be read from the logs. A budget that cuts a lookup off benches its cluster
+only when that lookup had already run two seconds: a hung lookup started within two seconds of the
+budget's end is cut sooner and benches nothing, and a `--batch-join-budget` below two seconds never
+benches, which is why the threshold sits below the `4s` budget above. The cooldown is the flag's
+five-minute ceiling, so a batch starts at most one lookup against a hung cluster, which costs the
+rest of the batch at most ten seconds, and at most two against a cluster that keeps answering
+slowly. A cluster whose slow answers alternate with fast ones never benches, and each slow answer
+costs its own time; that is the price of the second chance. After the cooldown the next record probes: a hang benches again at once, a slow answer is
+the first strike of a new streak. The price is that a cluster which recovers at once stays
+unenriched for up to five minutes. The bound is per cluster, not on the sum: three hung clusters
+still take thirty seconds between them. A single-cluster join never benches, because there is no
+other cluster's budget to protect: every record keeps its lookup.
+
+The bench was chosen over the two other ways to share the budget. A per-cluster share needs the
+batch's cluster mix before the first lookup, which the joiner does not see, and splits the budget
+whether or not anyone is slow. Ordering the batch so each cluster gets one lookup before any gets
+a second only moves the slow cluster's records later: each still costs the full timeout, and the
+healthy clusters' second records wait behind them.
 
 **The inject spends that same budget, and it is the slowest thing in it.** With `--daemon-url` set,
 a surviving record makes two more calls after the join — `POST /sessions` then
@@ -669,7 +787,8 @@ exhausted batch still cuts it short.
 That bounds the blast radius rather than removing it. Six consecutive unresponsive records still
 exhaust a thirty-second budget between them, and what the operator sees when they do is a batch of
 `failed` **lookups** — every later record's `GET` returning a deadline error — which reads
-identically to a slow control plane and is not. Check the inject tally on the shutdown line before
+identically to a slow control plane and is not. Those lookups fail at once on the spent context, so
+they neither bench their clusters nor clear a slow cluster's strike, and `benched=` stays out of `failed=`. Check the inject tally on the shutdown line before
 blaming the API server, and turn the inject off with an empty `--daemon-url` to tell the two apart.
 Sizing the budget for an install with the inject on still means budgeting for the daemon's latency
 as well as the control plane's; a per-record budget covering the whole handler, rather than the

@@ -1,0 +1,141 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Hand one scheduled report to the chat relay, and clean up after it. Runs in the agent container.
+
+Usage: python3 - <mode> <home> <hermes> <base url> [<report, base64>] < relay_probe.py
+
+post: POSTs the report to the Session KV server's /v1/cron-reports on loopback, the
+call the scheduler's relay plugin makes for every `deliver: "chat"` job
+(deploy/docker/plugins/chat/adapter.py), and records the time, the report and the
+route's answer in the state file the verifier reads. The container's environment
+carries the SESSION_KV_API_KEY the route requires. Exits 0 whatever the route
+answered: the answer is the verifier's to grade.
+
+clean: archives every card filed from the probe's relay sessions (an image that runs
+an agent turn over the report can file one), deletes the probe's routing rows and the
+text stored for their threads, so the probe drops out of the 24-hour report index that
+incident_context shows beside unthreaded messages, and removes the state file. Safe to
+run with nothing posted. The post itself stays in the channel.
+"""
+
+import base64
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+mode, home, hermes, base = sys.argv[1:5]
+STATE = os.path.join(home, ".bench-relay-probe.json")
+JOB_ID = "bench-relay-probe"
+PROFILE = "platform"
+TITLE = "Bench relay probe"
+KANBAN_DB = os.path.join(home, "kanban.db")
+# session_kv_server.py: SESSION_KV_DB_PATH, which the container's environment carries.
+SESSION_KV_DB = os.environ.get("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
+# session_kv_server._cron_report_session_id, for this profile and job.
+SESSION_PREFIX = f"cron-{PROFILE}-{JOB_ID}-"
+# The relay plugin's RELAY_TIMEOUT_SECONDS, plus room for the connect.
+TIMEOUT_SECONDS = 400.0
+SQLITE_BUSY_TIMEOUT = 10
+TMP_SUFFIX = ".tmp"
+# How much of a refused route's body the state file keeps, and the apply log shows.
+DETAIL_MAX_CHARS = 2000
+LOG_ANSWER_MAX_CHARS = 300
+ARCHIVED = "archived"
+
+
+def write_state(state):
+    tmp = STATE + TMP_SUFFIX
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, STATE)
+
+
+def post(report):
+    token = (os.environ.get("SESSION_KV_API_KEY") or "").strip()
+    if not token:
+        sys.exit("SESSION_KV_API_KEY is not set in this container, so the route would refuse the report")
+    state = {"applied_at": datetime.now(timezone.utc).isoformat(), "job_id": JOB_ID, "report": report}
+    write_state(state)
+    body = json.dumps({"job_id": JOB_ID, "profile": PROFILE, "title": TITLE, "report": report}).encode()
+    req = urllib.request.Request(
+        f"{base}/v1/cron-reports",
+        data=body,
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+            state["status"], state["answer"] = resp.status, json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as exc:
+        state["status"], state["answer"] = exc.code, {"detail": exc.read().decode(errors="replace")[:DETAIL_MAX_CHARS]}
+    write_state(state)
+    print(f"posted {JOB_ID}: HTTP {state['status']} {json.dumps(state['answer'])[:LOG_ANSWER_MAX_CHARS]}")
+
+
+def live_cards():
+    """The probe's cards that are not archived, read from the board."""
+    if not os.path.exists(KANBAN_DB):
+        return []
+    con = sqlite3.connect(f"file:{KANBAN_DB}?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT)
+    try:
+        return [
+            row[0]
+            for row in con.execute(
+                "SELECT id FROM tasks WHERE session_id LIKE ? AND status != ?", (SESSION_PREFIX + "%", ARCHIVED)
+            )
+        ]
+    finally:
+        con.close()
+
+
+def clean():
+    cards = live_cards()
+    for card in cards:
+        subprocess.run([hermes, "kanban", "archive", card], capture_output=True, text=True, check=False)
+    # `hermes kanban archive` can refuse without failing, so the board says what happened.
+    refused = [card for card in live_cards() if card in cards]
+    rows = 0
+    if os.path.exists(SESSION_KV_DB):
+        with sqlite3.connect(SESSION_KV_DB, timeout=SQLITE_BUSY_TIMEOUT) as con:
+            routed = con.execute(
+                "SELECT session_id, metadata FROM session_metadata WHERE session_id LIKE ?", (SESSION_PREFIX + "%",)
+            ).fetchall()
+            for session_id, blob in routed:
+                for entry in (json.loads(blob or "{}").get("platform_threads") or {}).values():
+                    rows += con.execute(
+                        "DELETE FROM incidents WHERE chat_id = ? AND thread_id = ?",
+                        (entry.get("chat_id"), entry.get("thread_id")),
+                    ).rowcount
+                con.execute("DELETE FROM session_metadata WHERE session_id = ?", (session_id,))
+    try:
+        os.remove(STATE)
+    except FileNotFoundError:
+        pass
+    print(f"cleaned: {len(cards) - len(refused)} card(s) archived, {rows} stored post(s) removed")
+    if refused:
+        print(f"could not archive {', '.join(refused)}; the next run tries again", file=sys.stderr)
+
+
+if mode == "post":
+    post(base64.b64decode(sys.argv[5]).decode("utf-8"))
+elif mode == "clean":
+    clean()
+else:
+    sys.exit(f"unknown mode {mode!r}")

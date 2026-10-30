@@ -1,0 +1,40 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "The checkout-gateway deployment in seeded-a is restarting every few minutes.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "Because its readiness probe times out under load, which the HPA then reads as missing capacity. Raise the probe timeout to 5s.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      }
+    ],
+    "attachments": []
+  }
+]

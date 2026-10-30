@@ -69,6 +69,25 @@ streaming and tool progress are skipped and only the turn's final reply comes
 back, through ``send``. ``edit_message`` is left at the base default
 (unsupported), which tells the rolling progress line to post each note anew;
 attachments are not posted (there is no file route), and say so in the log.
+
+Chat messages
+-------------
+Under ``next`` the gateway lays a card's post out from a
+``kube-agents.chat/v1`` object and composes nothing
+(``docs/designs/spec-a2a-payloads.md``, "Card work after the task ends"). The
+``today`` presenters' gateway patches (``slack_ux_status``, ``slack_ux_moments``,
+``slack_ux_incident``, ``slack_ux_failure``, ``kanban_progress_lines``) reach a
+Slack card through this stand-in as well, and :func:`chat_route` tells them
+they can: instead of ``chat.postMessage``/``chat.update`` they compose the same
+state into a chat message (``agents/platform/scripts/chat_message.py``) and
+hand it to :meth:`ChatNotifyAdapter.send_chat`, with an ``update`` key for a
+message that is edited in place (the thread's plan, a card's question, the
+alert). :meth:`ChatNotifyAdapter.send` forwards both as ``a2a notify
+--chat-file`` and ``--update``; the text stays the fallback, and a gateway that
+does not read them posts the text. A failure wake's reply with a Try again
+offer (``slack_ux_failure.chat_for``) is laid out the same way.
+:func:`conversation_ask` reads back the kind of ask the hermes-bridge recorded
+on the conversation's route, which the plan's ``mark`` keeps while its cards run.
 """
 
 from __future__ import annotations
@@ -81,6 +100,7 @@ import math
 import os
 import sqlite3
 import subprocess
+import tempfile
 import time
 from contextlib import closing
 from typing import Any, Dict, Optional
@@ -141,7 +161,20 @@ ROUTE_PROBE_TIMEOUT_SECONDS = 5
 # the route), and its chat_id is the session that holds the route, whose
 # context id conversation_context reads back: the report is sent with
 # --conversation and --context rather than --thread.
-CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:")
+CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:", "console:")
+# The console door's platform (lib.NotifyPlatformConsole). The gateway serves
+# its chat.notify route whenever the console runs, so it counts as served
+# with no environment variable naming it. Hermes has no console platform, and
+# its notifier turns a subscription's platform string into its Platform enum
+# before anything here runs, so the name is registered with Hermes's platform
+# registry when this module loads (_register_console_platform). Kanban-era:
+# the registration goes when kanban does.
+CONSOLE_PLATFORM = "console"
+CONSOLE_PLATFORM_LABEL = "kube-agents console (chat.notify only)"
+# Splits a console card's thread_id into the conversation key and the gateway
+# task of the turn that filed it (kanban_event_routing.CONSOLE_THREAD_TASK_SEP),
+# which the report names with --reply-to.
+CONSOLE_THREAD_TASK_SEP = "#"
 # The attribute the stand-in is cached under on the runner, which outlives the
 # per-tick collector and the per-delivery notification.
 RUNNER_ATTR = "_kage_chat_notify_adapter"
@@ -163,6 +196,24 @@ API_SERVER_HOST = "127.0.0.1"
 API_SERVER_PORT = 8642
 API_SERVER_MODEL = "model-default"
 API_SERVER_KEY_ENV = "API_SERVER_KEY"
+# The keys a gateway patch puts a chat message and its update key under in
+# send()'s metadata (see "Chat messages" above), and the route record's ask.
+CHAT_METADATA_KEY = "kage_chat"
+UPDATE_METADATA_KEY = "kage_update"
+#: Metadata key marking a conversation post as an ask's answer: the delivered
+#: report of the card that settles every card of the ask's plan, its value that
+#: plan's update key. Sent as ``a2a notify --answer-to <key>``, so the gateway
+#: draws its rating controls on it, under the ask the plan is bound to.
+ANSWER_METADATA_KEY = "kage_answer"
+#: The ``a2a notify`` flags a conversation post and its answer ride on.
+CONVERSATION_FLAG = "--conversation"
+ANSWER_FLAG = "--answer-to"
+UPDATE_FLAG = "--update"
+CONVERSATION_ASK_KEY = "ask"
+# The chat message's file for `a2a notify --chat-file`: written mode 0600 by
+# tempfile, removed once the command returns.
+CHAT_FILE_PREFIX = "kage-chat-"
+CHAT_FILE_SUFFIX = ".json"
 
 # routed_since's answer, read or written once per process.
 _routed_since: Optional[float] = None
@@ -197,9 +248,42 @@ def is_conversation(sub: Optional[dict]) -> bool:
     return str((sub or {}).get("thread_id") or "").strip().startswith(CONVERSATION_KEY_PREFIXES)
 
 
+def chat_route(adapter: Any) -> bool:
+    """Whether ``adapter`` is a stand-in that carries chat messages (:meth:`ChatNotifyAdapter.send_chat`)."""
+    return callable(getattr(adapter, "send_chat", None))
+
+
+def served_platforms() -> set:
+    """The platforms whose deliveries go through the gateway's chat.notify route."""
+    return {p for p in (routed_platform(), conversation_platform(), CONSOLE_PLATFORM) if p}
+
+
 def active_platforms(names: set) -> set:
-    """``names`` plus the routed platforms, when there are any."""
-    return names | {p for p in (routed_platform(), conversation_platform()) if p}
+    """``names`` plus the platforms the gateway's route serves."""
+    return names | served_platforms()
+
+
+def _register_console_platform() -> None:
+    """Make ``Platform("console")`` resolve in Hermes, so a console card's subscription is read at all.
+
+    Process-global (source "builtin"), so every profile scope sees it. The
+    factory makes no adapter: nothing enables or connects a console platform,
+    and deliveries go through the conversation stand-in (resolve). Fails open,
+    logged: without it a console card's report is skipped, as it is today.
+    """
+    try:
+        from gateway.platform_registry import PlatformEntry, platform_registry
+
+        if not platform_registry.is_registered(CONSOLE_PLATFORM):
+            platform_registry.register(PlatformEntry(
+                name=CONSOLE_PLATFORM,
+                label=CONSOLE_PLATFORM_LABEL,
+                adapter_factory=lambda _config: None,
+                check_fn=lambda: True,
+                source="builtin",
+            ))
+    except Exception as exc:  # not inside Hermes (tests), or a registry without this shape
+        logger.warning("chat.notify: console platform not registered; console cards will not report: %s", exc)
 
 
 def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None) -> Any:
@@ -214,7 +298,7 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
     conversation = is_conversation(sub)
     name = str(getattr(platform, "value", platform) or "").lower()
     if conversation:
-        if not name or name != conversation_platform():
+        if not name or name not in (conversation_platform(), CONSOLE_PLATFORM):
             return None
     elif not routes(platform):
         return adapter
@@ -224,6 +308,12 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
         return None
     attr, cls = ((RUNNER_CONVERSATION_ATTR, ConversationNotifyAdapter) if conversation
                  else (RUNNER_ATTR, ChatNotifyAdapter))
+    # The conversation stand-ins are kept one per platform: a chat
+    # platform's and the console's are served side by side, and one shared
+    # slot would rebuild the stand-in, and re-probe the route, on every
+    # switch between them.
+    if conversation:
+        attr = f"{attr}_{name}"
     stand_in = getattr(runner, attr, None)
     if stand_in is None or stand_in.platform != platform:
         stand_in = cls(platform, runner)
@@ -470,6 +560,36 @@ def _title(conn: Any, child: str, claim: dict) -> str:
     return (row[0] if row else "") or ""
 
 
+def _folds_into_row(conn: Any, sub: dict) -> bool:
+    """Whether ``kanban_progress_lines.deliver`` folds this card's completion into its plan row.
+
+    True when ``KAGE_SLACK_UX`` is on for the subscription's platform and the
+    card's nearest fanned-out ancestor is still open on the same thread, the
+    two things that delivery reads (its ``_slack_quiet`` and
+    ``FANNED_OUT_ANCESTOR_SQL``). Delivered then, the completion settles the
+    card's row and posts nothing, so it needs no hold; held, its row would
+    stay running after the answer posts, since the drop that follows never
+    reaches the plan. Anything that goes wrong reads as no, which holds as
+    before.
+    """
+    try:
+        try:
+            from gateway import kanban_notifier, kanban_progress_lines
+        except ImportError:  # Unit tests import the patch modules flat.
+            import kanban_notifier
+            import kanban_progress_lines
+        if not kanban_notifier.slack_ux_on(sub.get("platform")):
+            return False
+        params = (
+            sub["task_id"], kanban_progress_lines.FOLD_ANCESTOR_DEPTH,
+            str(sub.get("platform") or "").lower(), sub["chat_id"], sub.get("thread_id") or "",
+        )
+        return conn.execute(kanban_progress_lines.FANNED_OUT_ANCESTOR_SQL, params).fetchone() is not None
+    except Exception as exc:  # noqa: BLE001 — fail towards the hold
+        logger.debug("kanban notifier: reading %s's plan fold failed: %s", sub.get("task_id"), exc)
+        return False
+
+
 def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -> Optional[dict]:
     """``claim`` with a fanned-out child's answer folded into its parent's.
 
@@ -487,6 +607,9 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
     - the parent's own ``completed`` (a later event) has been delivered on that
       thread: the child's event is dropped, and its cursor moved past it, so
       neither its post nor its wake runs;
+    - the parent is still working and the child's completion folds into its
+      plan row (:func:`_folds_into_row`): it delivers, so its row settles, and
+      ``kanban_progress_lines`` posts nothing for it;
     - the parent is still working, or has completed but its answer has not
       posted yet, for under FOLD_HOLD_SECONDS: the child's event is held.
       Events before it deliver, and the claim stops just before it, so the
@@ -510,7 +633,7 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
     if not claim:
         return claim
     sub = claim.get("sub") or {}
-    if (sub.get("platform") or "").lower() not in {p for p in (routed_platform(), conversation_platform()) if p}:
+    if (sub.get("platform") or "").lower() not in served_platforms():
         return claim
     child = sub.get("task_id") or ""
     events = list(claim.get("events") or [])
@@ -533,6 +656,9 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
             dropped = True
             continue
         waiting = status in FOLD_WAITING_STATUSES or (status in FOLD_DONE_STATUSES and later)
+        if status in FOLD_WAITING_STATUSES and _folds_into_row(conn, sub):
+            kept.append(ev)
+            continue
         if waiting and now - (getattr(ev, "created_at", 0) or 0) < FOLD_HOLD_SECONDS:
             committed = _durable_cursor(conn, child, sub) == int(claim.get("cursor") or 0) != int(claim.get("old_cursor") or 0)
             if committed:
@@ -672,6 +798,43 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         logger.info("chat.notify: %s not posted (no file route): %s", kind, file_name or "attachment")
         return SendResult(success=False, error="attachments are not posted over chat.notify")
 
+    async def send_chat(self, chat_id: str, content: str, chat: Optional[dict], update: str = "",
+                        metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """:meth:`send` laid out by ``chat``, a ``kube-agents.chat/v1`` object, with ``content`` its fallback.
+
+        ``update`` names the message: a later send with the same key, in the
+        same conversation, edits it in place.
+        """
+        extra = {CHAT_METADATA_KEY: chat, UPDATE_METADATA_KEY: update}
+        return await self.send(chat_id, content, metadata={**(metadata or {}), **extra})
+
+    def _chat_args(self, content: str, metadata: Optional[Dict[str, Any]]) -> tuple:
+        """``(argv, chat file)`` for the metadata's chat message and update key; the file is the caller's to remove.
+
+        The chat message rides only with a text fallback. A failure wake's reply
+        that carries none of its own is laid out by ``slack_ux_failure.chat_for``.
+        """
+        meta = metadata or {}
+        chat = meta.get(CHAT_METADATA_KEY)
+        update = str(meta.get(UPDATE_METADATA_KEY) or "").strip()
+        if chat is None and self.platform.value == SLACK_PLATFORM:
+            chat = _failure_chat(content)
+        argv, path = [], ""
+        if isinstance(chat, dict) and str(content or "").strip():
+            # Serialized before the file exists, so a value JSON cannot hold leaves no file behind.
+            body = json.dumps(chat, ensure_ascii=False)
+            fd, path = tempfile.mkstemp(prefix=CHAT_FILE_PREFIX, suffix=CHAT_FILE_SUFFIX)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(body)
+            except OSError:
+                os.unlink(path)
+                raise
+            argv += ["--chat-file", path]
+        if update:
+            argv += [UPDATE_FLAG, update]
+        return argv, path
+
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         thread = str((metadata or {}).get("thread_id") or "").strip()
@@ -681,7 +844,30 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         except LookupError as exc:
             logger.warning("chat.notify: %s; the card's report is not posted", exc)
             return SendResult(success=False, error=str(exc))
-        argv += ["--", content]
+        try:
+            chat_argv, chat_file = self._chat_args(content, metadata)
+        except (OSError, TypeError, ValueError) as exc:
+            # The text is the deliverable: a chat message that cannot be written posts without it.
+            logger.warning("chat.notify: the chat message is not sent (%s); posting the text", exc)
+            chat_argv, chat_file = [], ""
+        argv += chat_argv
+        # Only a conversation post answers an ask; the CLI refuses the flag on
+        # a home channel post, which would lose the report.
+        answer_to = str((metadata or {}).get(ANSWER_METADATA_KEY) or "").strip()
+        if answer_to and CONVERSATION_FLAG in argv and UPDATE_FLAG not in argv:
+            argv += [ANSWER_FLAG, answer_to]
+        # The chat message above was laid out from the text as written; what a person reads has no step line.
+        argv += ["--", _visible(content)]
+        try:
+            return await self._notify(argv, chat_id)
+        finally:
+            if chat_file:
+                try:
+                    os.unlink(chat_file)
+                except OSError as exc:
+                    logger.debug("chat.notify: removing %s failed: %s", chat_file, exc)
+
+    async def _notify(self, argv: list, chat_id: str) -> SendResult:
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -715,19 +901,55 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=answer.get("message_id") or None, raw_response=answer)
 
 
-def conversation_context(session_id: str) -> str:
-    """The context id of the gateway conversation ``session_id`` holds the route for, or ""."""
+def _visible(content: str) -> str:
+    """``slack_moments.visible_text``: ``content`` without the declared step's line, which no
+    surface shows as text; ``content`` as written when nothing else is left or the module is absent."""
+    try:
+        import slack_moments
+    except ImportError:  # the scripts directory is not on PYTHONPATH
+        return content
+    return slack_moments.visible_text(content) or content
+
+
+def _failure_chat(content: str) -> Optional[dict]:
+    """``slack_ux_failure.chat_for``'s chat message for a marked failure reply, or None."""
+    try:
+        from gateway import slack_ux_failure
+    except ImportError:
+        try:  # Unit tests import the patch modules flat.
+            import slack_ux_failure
+        except ImportError:
+            return None
+    try:
+        return slack_ux_failure.chat_for(content)
+    except Exception as exc:  # noqa: BLE001 - the reply still posts as text
+        logger.warning("chat.notify: laying out the failure reply failed: %s", exc)
+        return None
+
+
+def _route(session_id: str) -> dict:
+    """The conversation route ``session_id`` holds, as the bridge recorded it, or {}."""
     path = os.environ.get(SESSION_KV_DB_ENV) or SESSION_KV_DEFAULT_DB
     if not session_id or not os.path.exists(path):
-        return ""
+        return {}
     try:
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=SESSION_KV_TIMEOUT_SECONDS)) as conn:
             row = conn.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)).fetchone()
         route = (json.loads(row[0]) if row and row[0] else {}).get(CONVERSATION_ROUTE_KEY)
     except Exception as exc:  # noqa: BLE001 - an unreadable route is a failed send, said in the log
         logger.warning("chat.notify: route for %s unreadable: %s", session_id, exc)
-        return ""
-    return str(route.get("context_id") or "") if isinstance(route, dict) else ""
+        return {}
+    return route if isinstance(route, dict) else {}
+
+
+def conversation_context(session_id: str) -> str:
+    """The context id of the gateway conversation ``session_id`` holds the route for, or ""."""
+    return str(_route(session_id).get("context_id") or "")
+
+
+def conversation_ask(session_id: str) -> str:
+    """The kind of ask the conversation ``session_id`` routes was last asked (a ``mark.ask`` token), or ""."""
+    return str(_route(session_id).get(CONVERSATION_ASK_KEY) or "")
 
 
 class ConversationNotifyAdapter(ChatNotifyAdapter):
@@ -753,7 +975,17 @@ class ConversationNotifyAdapter(ChatNotifyAdapter):
         context = conversation_context(chat_id)
         if not context:
             raise LookupError(f"no conversation route recorded for {chat_id}")
-        return ["--conversation", thread, "--context", context]
+        if not thread.startswith(CONSOLE_PLATFORM + ":"):
+            return ["--conversation", thread, "--context", context]
+        conversation, _, task = thread.partition(CONSOLE_THREAD_TASK_SEP)
+        target = ["--conversation", conversation, "--context", context]
+        if task:
+            target += ["--reply-to", task]
+        return target
+
+    def ask(self, chat_id: str) -> str:
+        """The kind of ask the conversation was last asked, which the plan's mark keeps while cards run."""
+        return conversation_ask(chat_id)
 
     async def handle_message(self, event: Any) -> None:
         if not getattr(event, "internal", False):
@@ -765,3 +997,8 @@ class ConversationNotifyAdapter(ChatNotifyAdapter):
         session = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
         await _self_post_chat_completion(self, text=event.text, session_id=session)
         event._gateway_accepted = True
+
+
+# Registered at import, which the notifier's trailer triggers before it reads
+# any subscription (apply_kanban_chat_notify.TRAILER).
+_register_console_platform()

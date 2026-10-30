@@ -131,9 +131,19 @@ def project_answers(**overrides):
     return answers
 
 
+class Warned:
+    """A `project_answers` answer for a read that exits 0 and writes `stderr`,
+    as a gcloud list does when some regions or zones did not respond."""
+
+    def __init__(self, answer, stderr):
+        self.answer = answer
+        self.stderr = stderr
+
+
 def fake_run_cmd(per_project, calls=None):
     """A `run_cmd` answering each project's reads from `project_answers`. An
-    answer that is a `(rc, stderr)` tuple is a failed read."""
+    answer that is a `(rc, stderr)` tuple is a failed read; a `Warned` answer
+    is a read that passed and wrote its `stderr` too."""
 
     def run(cmd, *args, **kwargs):
         if calls is not None:
@@ -142,6 +152,8 @@ def fake_run_cmd(per_project, calls=None):
         answers = per_project.get(networking_audit.project_flag_value(cmd) or "", {})
         for phrase, answer in answers.items():
             if phrase in joined:
+                if isinstance(answer, Warned):
+                    return (0, json.dumps(answer.answer), answer.stderr)
                 if isinstance(answer, tuple):
                     return (answer[0], "", answer[1])
                 return (0, json.dumps(answer), "")
@@ -2393,6 +2405,85 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
 
 
 
+class IncompleteListingTest(unittest.TestCase):
+    """A gcloud list that exits 0 but warns that it may be incomplete is a
+    partial read for the subnet sweep.
+
+    gcloud exits 0 when some regions or zones do not respond and names them on
+    stderr. A subnet that the listing did not return, or a VM, address or
+    forwarding rule in a measured subnet, can be in the part it did not read.
+    """
+
+    AUDIT = "gcp-networking-fabric-audit"
+    INCOMPLETE = "WARNING: The following regions did not respond: us-east1. List results may be incomplete."
+    USAGE_READS = ("instances list", "addresses list", "forwarding-rules list")
+
+    def setUp(self):
+        sys.path.insert(0, FLEET_AUDIT_SCRIPTS)
+        self.addCleanup(sys.path.remove, FLEET_AUDIT_SCRIPTS)
+        networking_audit.PROJECT_NUMBERS.clear()
+        self.addCleanup(networking_audit.PROJECT_NUMBERS.clear)
+
+    def fleet(self, per_project):
+        with patch.object(networking_audit, "get_target_projects", return_value=list(per_project)), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            manifest = networking_audit.collect_fleet()
+        return manifest, {e["name"]: e for e in manifest["clusters"]}
+
+    def gaps(self, manifest):
+        import audit_report
+
+        doc = audit_report.draft_findings(manifest, self.AUDIT)
+        audit_report.validate_findings(doc, self.AUDIT)
+        audit_report.cross_check_manifest(doc, manifest)
+        return audit_report.coverage_gaps(doc)
+
+    def test_a_partial_subnet_list_names_the_warning_on_the_subnets_it_listed(self):
+        answers = project_answers(**{"subnets list": Warned([subnet("small", "10.0.0.0/24")], self.INCOMPLETE)})
+        manifest, by_name = self.fleet({"p1": answers})
+        limitations = by_name["p1/us-central1/small"]["limitations"]
+        self.assertIn("subnets partially read: `gcloud compute networks subnets list --project=p1", limitations)
+        self.assertIn("did not respond: us-east1", limitations)
+        self.assertTrue(any("did not respond: us-east1" in gap for gap in self.gaps(manifest)))
+
+    def test_a_partial_subnet_list_with_no_countable_subnet_is_skipped(self):
+        # Another project has a measured subnet, so the run has subnet
+        # targets and only the skipped row says that p1 was not read in full.
+        manifest, by_name = self.fleet({
+            "p1": project_answers(**{"subnets list": Warned([], self.INCOMPLETE)}),
+            "p2": project_answers(**{"subnets list": [subnet("small", "10.0.0.0/24", project="p2")]}),
+        })
+        row = by_name["p1/UNENUMERATED_SUBNETS"]
+        self.assertEqual(row["outcome"], networking_audit.OUTCOME_GATE_FAILED)
+        self.assertIn("did not respond: us-east1", row["error"])
+        gaps = self.gaps(manifest)
+        self.assertTrue(any("p1/UNENUMERATED_SUBNETS" in gap for gap in gaps), gaps)
+
+    def test_a_partial_usage_read_names_the_warning_on_the_projects_subnets(self):
+        for phrase in self.USAGE_READS:
+            with self.subTest(read=phrase):
+                networking_audit.PROJECT_NUMBERS.clear()
+                answers = project_answers(**{"subnets list": [subnet("small", "10.0.0.0/24")],
+                                             phrase: Warned([], self.INCOMPLETE)})
+                manifest, by_name = self.fleet({"p1": answers})
+                limitations = by_name["p1/us-central1/small"]["limitations"]
+                self.assertIn("partially read", limitations)
+                self.assertIn("primary-range use can be undercounted", limitations)
+                gaps = self.gaps(manifest)
+                self.assertTrue(any("did not respond: us-east1" in gap for gap in gaps), gaps)
+
+    def test_a_read_with_an_unrelated_warning_is_a_full_read(self):
+        for phrase in ("subnets list", *self.USAGE_READS):
+            with self.subTest(read=phrase):
+                networking_audit.PROJECT_NUMBERS.clear()
+                listing = [subnet("small", "10.0.0.0/24")]
+                answers = project_answers(**{"subnets list": listing})
+                answers[phrase] = Warned(listing if phrase == "subnets list" else [], "WARNING: some unrelated notice")
+                manifest, by_name = self.fleet({"p1": answers})
+                self.assertNotIn("limitations", by_name["p1/us-central1/small"])
+                self.assertEqual(self.gaps(manifest), [])
+
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
     """The declared scope the agent carries from the platform_control fleet_scope
@@ -2511,11 +2602,11 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertFalse(any("could not resolve" in n for n in notes), notes)
 
     def test_main_hands_the_flags_to_the_resolver(self):
-        # The wiring the SOP relies on: the two flags main parses reach the
+        # The wiring the SOP relies on: the three flags main parses reach the
         # holder the resolver reads, before anything else runs.
         with mock.patch.object(networking_audit.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
-            networking_audit.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
-        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+            networking_audit.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied", "--scope-exclude-clusters", "ops-mgmt/us-central1/lane-b"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied", "ops-mgmt/us-central1/lane-b")
 
     def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
         # `--scope-unread` alone (what collector_args carries when no declared

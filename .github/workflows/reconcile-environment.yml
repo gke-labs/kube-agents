@@ -36,6 +36,11 @@ on:
         required: false
         default: "defer"
         type: string
+      allow_breaking_downgrade:
+        description: "Let a move to an older image_tag continue across a commit marked as a breaking change"
+        required: false
+        default: false
+        type: boolean
       # For an environment that may not be provisioned yet: when the GitHub
       # environment does not exist, or exists without GCP_PROJECT_ID, the run
       # posts a notice and reports `skipped` instead of failing on the strict
@@ -89,6 +94,11 @@ on:
           - "fail"
           - "defer"
           - "ignore"
+      allow_breaking_downgrade:
+        description: "Let a move to an older image_tag continue across a commit marked as a breaking change"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   # Asks whether the GitHub environment exists before any job binds it, because
@@ -275,6 +285,7 @@ jobs:
           GITHUB_ENVIRONMENT: ${{ inputs.github_environment }}
           IMAGE_TAG: ${{ inputs.image_tag }}
           LEASE_POLICY: ${{ inputs.lease_policy }}
+          ALLOW_BREAKING_DOWNGRADE: ${{ inputs.allow_breaking_downgrade }}
           GH_TOKEN: ${{ github.token }}
           # Every install setting, under the names render_install_env.sh maps.
           # An environment missing one of the required ones fails there, naming
@@ -329,6 +340,7 @@ jobs:
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
           HERMES_DASHBOARD_ENABLED: ${{ vars.HERMES_DASHBOARD_ENABLED }}
+          WEB_CONSOLE_ENABLED: ${{ vars.WEB_CONSOLE_ENABLED }}
           KMS_KEYRING: ${{ vars.KMS_KEYRING }}
           KMS_KEY: ${{ vars.KMS_KEY }}
           # GITOPS_, not GH_ORG/GH_REPO: that pair names the RELEASE repository,
@@ -355,7 +367,7 @@ jobs:
       # always(), because a failed plan is the artifact worth having.
       - name: Upload the plan
         if: always() && steps.reconcile.outputs.plan_log != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: reconcile-${{ inputs.github_environment }}-${{ inputs.mode }}
           path: ${{ steps.reconcile.outputs.plan_log }}

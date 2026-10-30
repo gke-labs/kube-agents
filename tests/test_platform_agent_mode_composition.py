@@ -54,6 +54,82 @@ def _crd_enum() -> list:
     return version["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["mode"]["enum"]
 
 
+_OPERATOR_CRD = _REPO_ROOT / "k8s-operator" / "config" / "crd" / "bases" / "kubeagents.x-k8s.io_platformagents.yaml"
+_MODE_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "mode.go"
+
+
+class ExistingInstallsKeepTodayTest(unittest.TestCase):
+    """A new install defaults to next through install.sh alone. The CRD carries
+    no default for spec.mode, and the operator reads an absent one as today.
+
+    The API server applies a structural-schema default every time it reads an
+    object from etcd, not only when the object is created. The composition and
+    the chart render no mode field for today, so every existing today install
+    has none. A CRD default of next would move all of them to next on their
+    next reconcile, with no upgrade step to stop it.
+    """
+
+    def test_neither_crd_copy_defaults_the_mode(self):
+        for path in (_CRD, _OPERATOR_CRD):
+            with self.subTest(crd=path.relative_to(_REPO_ROOT).as_posix()):
+                crd = yaml.safe_load(path.read_text())
+                version = next(v for v in crd["spec"]["versions"] if v["name"] == "v1alpha1")
+                mode = version["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["mode"]
+                self.assertNotIn("default", mode)
+
+    def test_the_example_leaves_the_mode_to_the_cluster(self):
+        # INSTALL.md copies install.env.example onto running installs too. A
+        # live key there would switch a today install to next; commented, the
+        # cluster decides (adopt_live_platform_agent_mode).
+        example = (_REPO_ROOT / "install.env.example").read_text()
+        self.assertNotRegex(example, r"(?m)^\s*PLATFORM_AGENT_MODE=")
+        self.assertIn("\n# PLATFORM_AGENT_MODE=next\n", example)
+
+    def test_only_install_shs_first_install_resolver_reads_the_first_install_default(self):
+        # A front door that falls back to the first-install default for a mode
+        # install.env did not record treats an existing today install as next.
+        reads = {
+            "install.sh": [
+                '  PLATFORM_AGENT_MODE_FALLBACK="${DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}"'
+            ],
+        }
+        for path in sorted(_REPO_ROOT.glob("*.sh")) + sorted((_REPO_ROOT / "scripts").rglob("*.sh")):
+            rel = path.relative_to(_REPO_ROOT).as_posix()
+            with self.subTest(path=rel):
+                lines = [
+                    line
+                    for line in path.read_text().splitlines()
+                    if "$DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE" in line
+                    or "${DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE" in line
+                ]
+                self.assertEqual(lines, reads.get(rel, []))
+
+    def test_released_scripts_still_read_today_as_an_existing_installs_mode(self):
+        # install.sh and upgrade.sh source the target tree's
+        # install.defaults.env, so a released script installing this tree reads
+        # DEFAULT_PLATFORM_AGENT_MODE as it always has: the mode of an install
+        # whose install.env records none. Sourced, under a strict shell, with
+        # the expression those scripts use.
+        script = (
+            "set -euo pipefail\n"
+            f". {_DEFAULTS}\n"
+            "unset PLATFORM_AGENT_MODE PARAM_PLATFORM_AGENT_MODE\n"
+            'echo "INSTALL=[${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}] '
+            'UPGRADE=[${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}]"\n'
+        )
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("INSTALL=[today] UPGRADE=[today]", proc.stdout)
+        # And upgrade.sh in this tree is such a reader.
+        self.assertIn(
+            '"${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"', (_REPO_ROOT / "upgrade.sh").read_text()
+        )
+
+    def test_the_operator_reads_an_absent_mode_as_today(self):
+        text = _MODE_GO.read_text()
+        self.assertIn("if agent == nil || agent.Spec.Mode == nil {\n\t\treturn ModeToday, nil", text)
+
+
 class CompositionTextTest(unittest.TestCase):
     def setUp(self):
         self.variable = _variable_block()

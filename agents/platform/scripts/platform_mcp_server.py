@@ -11,14 +11,13 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import subprocess
-import ipaddress
-import tempfile
 from typing import Any
 from pathlib import Path
-from datetime import datetime
 from mcp.server import MCPServer
 import sandbox_exec
-from agent_common_server import _run_env, CONFIG_PATH
+from agent_common_server import _run_env
+from untrusted_text import strip_unsafe
+from chat_platforms import HOME_CHANNEL_ENV_SUFFIX, enabled_chat_platforms
 import chat_notify
 
 # send_notification gives `hermes send` no kill timeout, as before; a routed
@@ -42,10 +41,26 @@ DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 # platform profile's own home and would show a roster with no Cluster Agents in it.
 DEFAULT_AGENT_HOME = "/opt/data"
 
+# Session origins that name no chat platform. `POST /sessions` stamps
+# `k8s-watcher` on an event session at creation, and
+# `session_kv_server._register_session_routing` overwrites it with the platform
+# the alert actually reached. A row still carrying one of these holds a
+# `chat_id`/`thread_id` whose platform is unrecorded — the pair still identifies
+# the thread a reply will arrive in, but it cannot be *addressed*, because a
+# `hermes send` target needs the platform and the row does not say.
+#
+# The same call about the same rows as `NON_CHAT_ORIGINS` in
+# `deploy/docker/patches/kanban_event_routing.py`, which already declines to
+# substitute a route it reads one of these from. `api_server` is carried here
+# for that symmetry rather than because this endpoint returns it: that value is
+# stamped on the kanban subscription row, and no writer of `session_metadata`
+# produces it. Keep the two sets in step.
+NON_CHAT_SESSION_ORIGINS = frozenset({"api_server", "k8s-watcher"})
+
 # How long `report_to_chat` waits on /v1/cron-reports. That route relays
-# synchronously — it creates the session, runs a whole Chat Agent turn (its own
-# 300s ceiling) and blocks on `hermes send` before answering — so this has to
-# outlast the work, not just a connect stall. Deliberately the same 360s the
+# synchronously — it blocks on `hermes send` to every enabled platform, and on a
+# Slack audit headline's ledger read, before answering — so this has to outlast
+# the work, not just a connect stall. Deliberately the same 360s the
 # delivery plugin uses (`RELAY_TIMEOUT_SECONDS`,
 # deploy/docker/plugins/chat/adapter.py), for the same reason and with the same
 # ordering: the server's verdict must be what the caller records.
@@ -122,51 +137,9 @@ def _pod_summary(pod: dict) -> dict | None:
 # Input Sanitization Helpers for Pod & Audit Logs (Task 537148227)
 # =============================================================================
 
-def _is_safe_char(ch: str) -> bool:
-    """Check whether a character is safe from control/zero-width/bidi smuggling."""
-    code = ord(ch)
-    # Preserve newline (\n, 10) and tab (\t, 9)
-    if code in (9, 10):
-        return True
-    # Strip C0 control characters (< 32), DEL (127), and C1 control characters (128-159)
-    if code < 32 or 127 <= code <= 159:
-        return False
-    # Strip zero-width, bidi, and format control characters
-    # U+200B-U+200F (Zero-width space, non-joiner, joiner, LRM, RLM)
-    # U+202A-U+202E (Bidi embedding/override controls: LRE, RLE, PDF, LRO, RLO)
-    # U+2060-U+206F (Word joiner, invisible operators, bidi isolates)
-    # U+FEFF (Zero-width no-break space / BOM)
-    # U+00AD (Soft hyphen), U+034F (Combining grapheme joiner), U+061C (Arabic letter mark), U+180E (Mongolian vowel separator)
-    if (
-        0x200B <= code <= 0x200F
-        or 0x202A <= code <= 0x202E
-        or 0x2060 <= code <= 0x206F
-        or code in (0xFEFF, 0x00AD, 0x034F, 0x061C, 0x180E)
-    ):
-        return False
-    # Strip Unicode tag block and non-printable supplementary blocks (U+E0000 and above)
-    if code >= 0xE0000:
-        return False
-    return True
-
-
 def _strip_unsafe_chars(text: str) -> str:
-    """
-    Strip ANSI escape codes (7-bit and 8-bit CSI), carriage returns, C0/C1
-    control characters, DEL, zero-width characters, bidi control characters,
-    and Unicode tag blocks.
-    """
-    if not text:
-        return ""
-    # Strip ANSI escape codes (7-bit ESC sequences and 8-bit CSI sequences) and carriage returns
-    text = re.sub(r"\r", "", text)
-    text = re.sub(
-        r"(?:\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\x9B[0-?]*[ -/]*[@-~])",
-        "",
-        text,
-    )
-    # Strip C0/C1 control characters, DEL, zero-width/bidi characters, and Unicode tag block
-    return "".join(ch for ch in text if _is_safe_char(ch))
+    """ANSI escape sequences, carriage returns, control, zero-width and bidi characters out; see untrusted_text."""
+    return strip_unsafe(text)
 
 
 def _neutralize_tokens(text: str) -> str:
@@ -416,7 +389,7 @@ def _cluster_agent_roster() -> list[dict]:
         return []
     roster = []
     for home in sorted(base.iterdir()):
-        if home.name in RESERVED_PROFILES or not is_ready_profile(home):
+        if home.name in RESERVED_PROFILES or home.name.startswith(".") or not is_ready_profile(home):
             continue
         entry = {"name": home.name}
         try:
@@ -438,8 +411,9 @@ def fleet_scope() -> str:
     Reads the reconcile's snapshot (fleet_scope.json at the data volume's
     root). Returns JSON:
       {"declared": true, "resolved_at": "...", "projects": [...],
-       "unread": [{"project": ..., "outcome": ...}], "collector_args": "...",
-       "source": "<the snapshot's path>"}
+       "unread": [{"project": ..., "outcome": ...}],
+       "excluded_clusters": [{"project": ..., "location": ..., "cluster": ...}],
+       "collector_args": "...", "source": "<the snapshot's path>"}
     `projects` is the sweep: every project the scope resolved to that this
     install could read (its Kubernetes Engine API off included; the collectors
     count such a project empty), plus the management project whatever the
@@ -449,8 +423,12 @@ def fleet_scope() -> str:
     One entry, `declared-scope=unresolved`, is not a project: it rides when
     the reconcile has not resolved the declaration (before its first tick, or
     on a tick that could not read the render while a folder, organisation or
-    selector is declared), and the collectors render it as its own sentence. `collector_args` is the string to append to
-    a collector command verbatim (`--scope-projects ... --scope-unread ...`);
+    selector is declared), and the collectors render it as its own sentence.
+    `excluded_clusters` names each cluster spec.scope.exclude.clusters leaves
+    out: leave it out of fleet answers and audits, so do not list, describe, audit or report
+    on it, even though its project is in `projects`. `collector_args` is the string to append to
+    a collector command verbatim (`--scope-projects ... --scope-unread ...
+    --scope-exclude-clusters ...`);
     when nothing is readable it carries `--scope-unread` alone, and the
     collector then reports that and sweeps nothing. When no snapshot answers
     that a boundary is in force (before the reconcile's first tick, or when
@@ -473,13 +451,15 @@ def fleet_scope() -> str:
     except Exception as e:  # noqa: BLE001 - a tool answers, it does not raise
         return f"ERROR: Could not read the scope snapshot: {e}"
     if targets is None:
-        return json.dumps({"declared": False, "projects": [], "unread": [], "collector_args": "",
+        return json.dumps({"declared": False, "projects": [], "unread": [], "excluded_clusters": [], "collector_args": "",
                            "note": "no declared scope: the collectors enumerate every project the identity can list"}, indent=2)
     return json.dumps({
         "declared": True,
         "resolved_at": targets.resolved_at,
         "projects": list(targets.projects),
         "unread": [{"project": project, "outcome": outcome} for project, outcome in targets.unread],
+        "excluded_clusters": [{"project": project, "location": location, "cluster": cluster}
+                              for project, location, cluster in targets.excluded_clusters],
         "collector_args": targets.collector_args(),
         **({"note": targets.note} if targets.note else {}),
         "source": targets.path,
@@ -778,8 +758,8 @@ def get_cc_pod_diagnostics(
         results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\n{_sanitize_log_text(res.stdout)}\n")
     except subprocess.TimeoutExpired:
         results.append("=== POD LOGS (PREVIOUS TAIL=100) TIMEOUT ===\nCommand timed out after 30 seconds.\n")
-    except subprocess.CalledProcessError as e:
-        results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\nNo previous container logs available (container has not restarted or previous logs expired).\n")
+    except subprocess.CalledProcessError:
+        results.append("=== POD LOGS (PREVIOUS TAIL=100) ===\nNo previous container logs available (container has not restarted or previous logs expired).\n")
     except sandbox_exec.SandboxUnavailable as e:
         # Not folded into the clause above: "no previous logs" is a statement
         # about the pod, and the sandbox being gone is not evidence for it.
@@ -887,81 +867,36 @@ def send_notification(message: str, session_id: str = "") -> str:
     import urllib.request
     import json
     import os
-    
-    def get_enabled_platforms() -> list[str]:
-        platforms_found = []
-        try:
-            import yaml
-            if os.path.exists(CONFIG_PATH):
-                with open(CONFIG_PATH, "r") as f:
-                    cfg = yaml.safe_load(f) or {}
-                platforms = cfg.get("platforms", {})
-                if platforms.get("slack", {}).get("enabled"):
-                    platforms_found.append("slack")
-                if platforms.get("google_chat", {}).get("enabled"):
-                    platforms_found.append("google_chat")
-        except Exception:
-            pass
 
-        if not platforms_found:
-            if os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_HOME_CHANNEL"):
-                platforms_found.append("slack")
-            if os.environ.get("GOOGLE_CHAT_PROJECT_ID") or os.environ.get("GOOGLE_CHAT_HOME_CHANNEL"):
-                platforms_found.append("google_chat")
-
-        # Under next the Hermes platform is off and the gateway posts for it
-        # (chat_notify.py); it is still where this install's posts go.
-        routed = chat_notify.routed_platform()
-        if routed and routed not in platforms_found:
-            platforms_found.append(routed)
-
-        if not platforms_found:
-            platforms_found.append("google_chat")
-
-        return platforms_found
-
-    enabled_platforms = get_enabled_platforms()
-    targets = []
+    # `chat_platforms` rather than another local answer to the same question.
+    # The copy this replaces read CONFIG_PATH and then
+    # `SLACK_BOT_TOKEN or SLACK_HOME_CHANNEL`, and never the managed scope — so
+    # on an operator-managed pod, where `renderConfigYAML` writes the CR's answer
+    # to /etc/hermes/config.yaml and CONFIG_PATH carries no `enabled` key at all,
+    # it resolved off the environment. A credential-proxy install has no bot
+    # token by design and a home channel rendered regardless, which is why it
+    # could name Slack on a pod whose CR had turned Slack off (#743). Every other
+    # reader of this question already reads the managed scope first. That copy
+    # also appended `chat_notify.routed_platform()` after its environment
+    # fallback; `enabled_chat_platforms` covers the routed platform itself, per
+    # platform rather than as an append, so nothing is lost with the copy.
+    enabled_platforms = enabled_chat_platforms()
+    threaded_targets = []
     chat_id = None
     thread_id = None
 
-    if session_id:
-        try:
-            # Query the local metadata server for thread info
-            url = f"http://127.0.0.1:8699/v1/sessions/{session_id}/metadata"
-            req = urllib.request.Request(url, headers=_session_kv_headers(), method="GET")
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
-                if resp.status == 200:
-                    meta = json.loads(resp.read().decode("utf-8"))
-                    thread_id = meta.get("thread_id")
-                    chat_id = meta.get("chat_id")
-                    session_platform = meta.get("platform")
-                    if not session_platform or session_platform == "k8s-watcher":
-                        session_platform = "slack" if "slack" in enabled_platforms else "google_chat"
-                    if thread_id and chat_id:
-                        # Construct explicit target for send_message_tool
-                        targets.append(f"{session_platform}:{chat_id}:{thread_id}")
-        except Exception as exc:
-            # Fail-open: log error but fall back to broadcast targets.
-            # stderr, never a bare print: this server speaks JSON-RPC on
-            # stdout, and one stray line of prose there corrupts the stream
-            # for the MCP client mid-session. Pinned by the stdio seam test
-            # (tests/integration/test_seam_mcp_stdio.py).
-            print(f"Failed to resolve session metadata for threading: {exc}", file=sys.stderr)
+    def home_channel_targets() -> list[str]:
+        """Every enabled platform, at its home channel where one is rendered."""
+        composed = []
+        for platform in enabled_platforms:
+            home_channel = os.environ.get(
+                platform.upper() + HOME_CHANNEL_ENV_SUFFIX, ""
+            ).strip()
+            composed.append(f"{platform}:{home_channel}" if home_channel else platform)
+        return composed
 
-    if not targets:
-        for p in enabled_platforms:
-            if p == "slack":
-                home_channel = os.environ.get("SLACK_HOME_CHANNEL", "").strip()
-                targets.append(f"slack:{home_channel}" if home_channel else "slack")
-            elif p == "google_chat":
-                home_channel = os.environ.get("GOOGLE_CHAT_HOME_CHANNEL", "").strip()
-                targets.append(f"google_chat:{home_channel}" if home_channel else "google_chat")
-            else:
-                targets.append(p)
-
-    results = []
-    for target in targets:
+    def attempt(target: str) -> tuple[bool, str]:
+        """Post to one target; report whether it landed and what to say about it."""
         platform_name = target.split(":", 1)[0]
         try:
             # Stays in the agent pod. `hermes` is not cluster tooling: it needs
@@ -975,17 +910,90 @@ def send_notification(message: str, session_id: str = "") -> str:
                 # read it would swallow protocol frames.
                 stdin=subprocess.DEVNULL,
             )
-            results.append(f"SUCCESS: Notification posted to {platform_name}. Output: {res.stdout.strip()}")
+            return True, f"SUCCESS: Notification posted to {platform_name}. Output: {res.stdout.strip()}"
         except subprocess.CalledProcessError as e:
             if chat_notify.outcome_unknown(e.returncode):
-                results.append(f"SUCCESS: Notification to {platform_name} may have posted "
-                               f"(the gateway did not answer in time); do not resend it.")
-                continue
-            results.append(f"ERROR: Failed to send notification to {platform_name}: {e.stderr.strip()}")
+                # The gateway did not answer in time, so the post may have
+                # landed. It counts as delivered: the home-channel fallback
+                # below must not turn a report that did post into a duplicate.
+                return True, (f"SUCCESS: Notification to {platform_name} may have posted "
+                              f"(the gateway did not answer in time); do not resend it.")
+            return False, f"ERROR: Failed to send notification to {platform_name}: {e.stderr.strip()}"
         except Exception as e:
-            results.append(f"ERROR: {platform_name}: {e}")
+            return False, f"ERROR: {platform_name}: {e}"
 
-    # after a successful hermes send, persist the report for two-way reply context if threaded
+    if session_id:
+        try:
+            # Query the local metadata server for thread info
+            url = f"http://127.0.0.1:8699/v1/sessions/{session_id}/metadata"
+            req = urllib.request.Request(url, headers=_session_kv_headers(), method="GET")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    meta = json.loads(resp.read().decode("utf-8"))
+                    thread_id = meta.get("thread_id")
+                    chat_id = meta.get("chat_id")
+                    session_platform = meta.get("platform")
+                    # Coordinates first, platform second. A row with no thread at
+                    # all — what `POST /sessions` leaves when the alert path's own
+                    # `hermes send` failed before `_register_session_routing` —
+                    # goes to the home channel for the ordinary reason, and saying
+                    # a thread was declined there would point an operator reading
+                    # stderr at #743's guess when none was available to make.
+                    if thread_id and chat_id:
+                        if not session_platform or session_platform in NON_CHAT_SESSION_ORIGINS:
+                            # The row carries coordinates but not who they belong
+                            # to. Guessing pairs one platform's name with
+                            # another's ids, and `hermes send` rejects that pair
+                            # outright rather than degrading to the home channel —
+                            # so the guess does not risk a misdelivery, it
+                            # guarantees a non-delivery (#743). Leave
+                            # `threaded_targets` empty and let the home-channel
+                            # broadcast below carry the report.
+                            log(
+                                f"session {session_id} records no chat platform "
+                                f"({session_platform or 'unset'!r}); posting to the "
+                                "home channel rather than guessing a thread"
+                            )
+                        else:
+                            # Construct explicit target for send_message_tool
+                            threaded_targets.append(f"{session_platform}:{chat_id}:{thread_id}")
+        except Exception as exc:
+            # Fail-open: log error but fall back to broadcast targets.
+            # stderr, never a bare print: this server speaks JSON-RPC on
+            # stdout, and one stray line of prose there corrupts the stream
+            # for the MCP client mid-session. Pinned by the stdio seam test
+            # (tests/integration/test_seam_mcp_stdio.py).
+            print(f"Failed to resolve session metadata for threading: {exc}", file=sys.stderr)
+
+    results = []
+    delivered = False
+    for target in threaded_targets or home_channel_targets():
+        landed, line = attempt(target)
+        delivered = delivered or landed
+        results.append(line)
+
+    if threaded_targets and not delivered:
+        # Every thread target failed, so the report has reached nobody. The
+        # broadcast used to be gated on whether a target was *composed* rather
+        # than on whether one *landed*, which let a single unsendable address
+        # suppress the fallback that would have delivered the report anyway
+        # (#743). A duplicate is not a risk here: this runs only where nothing
+        # was delivered at all.
+        results.append("NOTE: thread delivery failed; falling back to the home channel.")
+        for target in home_channel_targets():
+            _, line = attempt(target)
+            results.append(line)
+
+    # Persist the report for two-way reply context whenever the row gave us a
+    # thread, which is not the same as having posted into it. Both new paths
+    # above reach here with the coordinates set: the unattributable-platform
+    # case, where the report went to the home channel, and the fallback, where
+    # the thread send failed. Writing the row anyway is deliberate — a reply
+    # still arrives in *this* thread, and `incident_context` keys on the
+    # chat_id/thread_id pair without the platform, so the row is the only thing
+    # that makes such a reply mean anything. What neither path can do is key a
+    # row on the home channel the report actually reached: a bare `hermes send`
+    # returns no thread id to key one on.
     if chat_id and thread_id:
         try:
             req = urllib.request.Request(
@@ -1007,13 +1015,17 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     Send a report from a SCHEDULED (cron) job to the user's chat channel mid-run.
 
     You usually do NOT need this. A job created with deliver='chat' has its final
-    response relayed to the Chat Agent automatically, with nothing to call and
-    nothing to remember. Use this tool only when that is not enough: to report
+    response relayed to chat automatically, with nothing to call and nothing to
+    remember. Use this tool only when that is not enough: to report
     partway through a long run, or to send something other than your final answer.
 
     Having called it, return exactly `[SILENT]` so the same finding is not also
-    delivered as the run's result. The Chat Agent presents what you pass, so write
-    `report` as the finished message for a human reader, not as notes to yourself.
+    delivered as the run's result, unless the job is one of the shipped
+    fleet-audit streams: for those the report `finish` rendered is posted at the
+    end of the run in place of your final response, and `[SILENT]` would stop
+    it. What you pass is posted as written (on Slack a fleet-audit report is
+    shown as a headline linking its ledger issue), so write `report` as the
+    finished message for a human reader, not as notes to yourself.
 
     Prefer this over send_notification for scheduled work: send_notification posts
     with no conversational context, so a user replying to it reaches an agent that
@@ -1060,15 +1072,15 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     # fan-out that reached some platforms and not others, and says which in
     # `relay` and `undelivered`. Reading both here is the difference between the
     # agent knowing what actually happened to its report and it believing the
-    # Chat Agent framed it for everyone. The relay adapter — the other caller of
+    # report reached everyone. The relay adapter — the other caller of
     # this route — reads the same two fields; a sibling that reads only one
     # reports a half-delivered report as a clean one.
     #
     # `relay_detail` is the route's own wording for the degradation, so this
-    # end stops hard-coding it: `degraded` has one cause today (the Chat Agent
-    # turn did not compose the report; a leg that never landed keeps `relay:
-    # ok` and shows up in `undelivered` instead). Older routes do not send it;
-    # the sentence they used to get is the fallback.
+    # end does not hard-code it. A current route never sends `degraded`; an
+    # older one did when its Chat Agent turn over the report failed, and its
+    # sentence is the fallback for a route too old to send a detail. A leg that
+    # never landed keeps `relay: ok` and shows up in `undelivered` instead.
     session = payload.get("session_id", "?")
     labels, caveats = [], []
     if payload.get("relay") == "degraded":
@@ -1102,7 +1114,7 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
         )
     return (
         f"SUCCESS: Report accepted for delivery to chat (session {session}). "
-        "The Chat Agent posts it; do not also call send_notification for this report."
+        "It is posted to chat; do not also call send_notification for this report."
     )
 
 
@@ -1151,7 +1163,8 @@ def register_findings(findings: list, scope: dict | None = None) -> str:
     cluster name alone is ambiguous across projects. A finding the user
     dismissed stays dismissed and is reported back as 'suppressed'.
 
-    Each finding needs: source ('inventory' | 'event-watcher' | 'audit'), check
+    Each finding needs: source ('inventory' | 'event-watcher' | 'audit' |
+    'upgrade-readiness'), check
     (the audit stream's own slug), project, cluster, namespace (omit for
     cluster-scoped), object, title, rubric, recommendation {action, rationale,
     risk}, remediation {kind, path, note} and verification {kind, command,
@@ -1168,7 +1181,15 @@ def register_findings(findings: list, scope: dict | None = None) -> str:
         scope: Pass {'project': '<id>', 'cluster': '<name>', 'complete': true}
             only when this run covered that cluster in full. It lowers the
             confidence of queued rows the run did not re-report. Omit it for a
-            partial or failed run.
+            partial or failed run. The claim reaches the rows whose check
+            starts with 'check_prefix' when the scope names one (a run that
+            reads one family of checks, such as 'upgrade-'; a family ends with
+            '-', and a batch with findings must belong to it), whatever wrote
+            them, or, with 'source' beside it, that source's rows in the family;
+            else the rows of the batch's own sources, or of 'source',
+            which must be a known source and one the batch wrote. An empty
+            findings list with a complete scope is a complete run that found
+            nothing; it must name 'check_prefix' or 'source', or it is refused.
     """
     return _findings_call("POST", "/v1/findings", {"findings": findings, "scope": scope})
 
@@ -1258,9 +1279,17 @@ def update_finding(
     through. A decision covers the finding's whole item: every other open,
     undecided finding with the same check, project and cluster (one line in
     the nudge's message) takes it too, and their ids come back in
-    `item_rows_decided`. So one call per item the user decided is enough. A
-    finding that no longer reproduces is not set here: that is a verification
-    outcome.
+    `item_rows_decided`. So one call per item the user decided is enough.
+    Covering the rest of the item is the decision's design, not a side effect
+    to confirm: the nudge prints one id per item and tells the user that a
+    decision on it covers every undecided finding of the item. So apply the
+    decision the user gave, and say in the reply which other findings it
+    covered. The call itself decides any 'queued' finding of the item too, and
+    no message has named a 'queued' finding yet, so the user has not seen it.
+    So before the call, look for one: get_findings(project=..., cluster=...,
+    state='queued') and the same check. If there is one, ask the user instead
+    of calling. A finding that no longer reproduces is not set here: that is a
+    verification outcome.
 
     Args:
         finding_id: The finding's id.

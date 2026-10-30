@@ -44,6 +44,9 @@ sys.path.insert(
 import vcs  # noqa: E402
 import vcs_client  # noqa: E402
 
+#: The real `call`, which the setUp replaces with the stub broker; the record tests put it back.
+REAL_CALL = vcs_client.call
+
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "Test",
     "GIT_AUTHOR_EMAIL": "test@example.com",
@@ -733,6 +736,35 @@ class CollaborationTest(VcsTestCase):
         self.assertEqual(payload["source"], "fix/replicas")
         self.assertEqual(payload["target"], "main")
         self.assertEqual(payload["title"], "Raise replicas")
+
+    def test_proposal_create_records_the_proposal_on_stderr_and_keeps_stdout_json(self):
+        # `vcs_client.call` itself, with only the broker under it stubbed: the record
+        # goes to stderr for the agent pod's pr_opened plugin, and stdout stays the
+        # one JSON document the model reads.
+        url = "https://github.com/acme/infra/pull/12"
+        self.broker.answers["proposal-create"] = {
+            "proposal": {"number": 12, "title": "Raise replicas", "url": url, "state": "open"},
+        }
+        self.run_vcs("branch", "fix/replicas")
+        stderr = io.StringIO()
+        with mock.patch.object(vcs_client, "call", REAL_CALL), \
+                mock.patch.object(vcs_client, "_call", self.broker), \
+                redirect_stderr(stderr):
+            code, out = self.run_vcs("proposal", "create", "--title", "Raise replicas")
+        self.assertEqual(code, 0)
+        self.assertEqual(out["proposal"]["url"], url)
+        self.assertEqual(
+            [json.loads(line) for line in stderr.getvalue().splitlines()],
+            [{"kube-agents.event": "proposal-opened", "proposal": {"url": url, "number": 12, "title": "Raise replicas"}}],
+        )
+
+    def test_a_proposal_read_records_nothing(self):
+        stderr = io.StringIO()
+        with mock.patch.object(vcs_client, "call", REAL_CALL), \
+                mock.patch.object(vcs_client, "_call", self.broker), \
+                redirect_stderr(stderr):
+            self.run_vcs("proposal", "list")
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_pr_and_mr_reach_the_same_verb(self):
         # The neutral noun is the command; a caller who knows one forge's word

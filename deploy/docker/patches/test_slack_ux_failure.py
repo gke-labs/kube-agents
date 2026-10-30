@@ -28,6 +28,8 @@ import verify_slack_ux_failure as verifier
 REPLY = (
     "I couldn't find seeded-z. The fleet has seeded-a, -b and -c. checkout-gateway runs on seeded-a. Check it there?"
 )
+#: Mock 06's reply with its next step declared on a last line of its own.
+DECLARED_REPLY = REPLY + "\n\n[next: check seeded-a]"
 SUB = {"task_id": "t_f1", "platform": "slack", "chat_id": "C0KAGE", "thread_id": "1700000000.000100"}
 WAKE = "Task t_f1 gave up."
 FLAG_ENV = "KAGE_SLACK_UX"
@@ -289,6 +291,103 @@ class MarkTest(FlagOn):
         self.assertIn("Check it there?", blocks[0]["text"]["text"])
         self.assertRegex(button["action_id"], slack_presenter.CHOICE_ACTION_ID_PATTERN)
 
+    def test_under_next_a_marked_reply_is_laid_out_as_a_chat_message(self):
+        # The chat.notify stand-in asks chat_for under the same mark, and gets
+        # the reply's first sentence as the headline and Try again as a choice.
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        token = runtime.begin(_turn())
+        try:
+            chat = runtime.chat_for(REPLY)
+        finally:
+            runtime.end(token)
+        self.assertEqual(chat["headline"], "I couldn't find seeded-z.")
+        self.assertEqual(chat["choices"], [{"text": "Try again"}])
+        self.assertIn("Check it there?", chat["detail"])
+        self.assertIsNone(runtime.chat_for(REPLY), "an unmarked reply is not laid out")
+
+    def test_a_declared_next_step_is_the_button_and_its_line_is_not_shown(self):
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        blocks = self.draw(_turn(), content=DECLARED_REPLY)
+        (button,) = _buttons(blocks)
+        self.assertEqual((button["text"]["text"], button["value"]), ("check seeded-a", "check seeded-a"))
+        self.assertTrue(blocks[0]["text"]["text"].endswith("Check it there?"))
+        self.assertNotIn("[next:", blocks[0]["text"]["text"])
+
+    def test_a_declared_next_step_needs_no_yes_no_question(self):
+        # An open question gets no Try again, but a declared step is still the button.
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        reply = "I couldn't find seeded-z. Which cluster did you mean?\n[next: check seeded-a]"
+        (button,) = _buttons(self.draw(_turn(), content=reply))
+        self.assertEqual(button["value"], "check seeded-a")
+
+    def test_visible_takes_the_line_off_every_chat_final_and_holds_the_step(self):
+        self.addCleanup(runtime._held.set, "")
+        for platform in ("slack", "google_chat", "discord"):
+            with self.subTest(platform):
+                self.assertEqual(runtime.visible(_event(platform=platform), DECLARED_REPLY), REPLY)
+        # A program reads the API server's answer: the eval sees what the agent wrote.
+        self.assertEqual(runtime.visible(_event(platform="api_server"), DECLARED_REPLY), DECLARED_REPLY)
+
+    def test_a_reply_whose_line_visible_took_off_still_draws_the_held_step(self):
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        event = _turn()
+        token = runtime.begin(event)
+        try:
+            posted = runtime.visible(event, DECLARED_REPLY)
+            blocks = runtime.maybe_blocks(posted, _render)
+        finally:
+            runtime.end(token)
+        (button,) = _buttons(blocks)
+        self.assertEqual(button["value"], "check seeded-a")
+        self.assertNotIn("[next:", blocks[0]["text"]["text"])
+        self.assertEqual(runtime._held.get(), "", "end drops the held step")
+
+    def test_under_next_a_reply_whose_line_visible_took_off_still_offers_the_held_step(self):
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        event = _turn()
+        token = runtime.begin(event)
+        try:
+            chat = runtime.chat_for(runtime.visible(event, DECLARED_REPLY))
+        finally:
+            runtime.end(token)
+        self.assertEqual(chat["choices"], [{"text": "check seeded-a", "next": True}])
+
+    def test_under_next_a_command_word_step_leaves_the_try_again(self):
+        chat = runtime.layout(REPLY + "\n\n[next: stop]", True)
+        self.assertEqual(chat["choices"], [{"text": runtime.OFFER_LABEL}])
+        self.assertNotIn("[next:", chat["detail"])
+
+    def test_an_unmarked_reply_keeps_its_declared_line(self):
+        # Only a failure wake's reply is drawn here; any other is upstream's, line and all.
+        self.assertEqual(self.draw(_event(), content=DECLARED_REPLY), _render(DECLARED_REPLY))
+
+    def test_under_next_a_declared_next_step_is_the_choice(self):
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        token = runtime.begin(_turn())
+        try:
+            chat = runtime.chat_for(DECLARED_REPLY)
+        finally:
+            runtime.end(token)
+        self.assertEqual(chat["choices"], [{"text": "check seeded-a", "next": True}])
+        self.assertTrue(chat["detail"].endswith("Check it there?"))
+        outside = runtime.layout(DECLARED_REPLY, False)
+        self.assertIsNone(outside.get("choices"), "no button outside a thread")
+        self.assertTrue(outside["detail"].endswith("Check it there?"), "and its line is no text either")
+
+    def test_a_declared_step_with_no_room_for_its_button_is_not_shown_as_text(self):
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        full = lambda content: _render(content) * runtime.MESSAGE_BLOCKS_MAX  # noqa: E731
+        blocks = self.draw(_turn(), content=DECLARED_REPLY, render=full)
+        self.assertEqual(_buttons(blocks), [])
+        self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
+        self.assertTrue(blocks[0]["text"]["text"].endswith("Check it there?"))
+
+    def test_outside_a_thread_a_declared_step_is_neither_button_nor_text(self):
+        runtime.note_wake({**SUB, "thread_id": None}, {"blocked"}, WAKE)
+        blocks = self.draw(_turn(thread_id=None), content=DECLARED_REPLY)
+        self.assertEqual(_buttons(blocks), [])
+        self.assertTrue(blocks[0]["text"]["text"].endswith("Check it there?"), "nothing takes the step's place")
+
     def test_a_reply_needs_its_turn_to_have_claimed_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
         self.assertEqual(self.draw(_event()), _render(REPLY))
@@ -521,7 +620,8 @@ class ApplyTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         files = {
             applier.NOTIFIER: "class N:\n    def build_wake_text(self):\n" + applier.WAKE_ANCHOR,
-            applier.BASE: "class B:\n    async def send_final_ledgered(self, event):\n"
+            applier.BASE: "class B:\n    async def send_final_ledgered(self, event, text_content, metadata, *, reply_to):\n"
+            + "        delivery_adapter = self\n"
             + applier.FINAL_ANCHOR
             + "        return result\n\n"
             + "    async def _process_message_background(self, event, session_key):\n"

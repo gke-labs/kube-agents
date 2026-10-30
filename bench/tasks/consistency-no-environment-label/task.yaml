@@ -1,8 +1,8 @@
 # NIGHTLY-TIER, registered on landing in hack/eval/nightly-cases.txt: the
 # default home for a new case (that file's header says why), and a full
 # audit besides -- the same shape and cost band as consistency-drift-outlier,
-# which is why the consistency domain's presubmit seat stays with
-# consistency-authorized-networks-probe.
+# which is why the consistency domain's presubmit seat stayed with
+# consistency-authorized-networks-probe (nightly since 2026-10-21, #3598).
 #
 # The check this case grades is `no-environment-label`, SOP §4.14: the one
 # check in the drift stream that fires outside a cohort. The stream's other
@@ -68,9 +68,6 @@ validated: false
 
 # Slug per docs/designs/domains.yaml.
 domain: consistency
-
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
 
 # The seeded-fleet defects this scenario asserts on, named by ROLE rather than
 # by cluster; roles are defined in bench/tf/fleet/fixtures.json and the rule

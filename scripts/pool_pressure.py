@@ -43,6 +43,7 @@ Usage:
 import argparse
 import concurrent.futures
 import json
+import ssl
 import os
 import re
 import shutil
@@ -52,6 +53,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -75,6 +77,27 @@ BUILD_INDEX_SUFFIX = ".txt"
 # can 404 mid-copy and turn the hour into "could not measure" for a file the
 # check never reads (2 of 716 runs by 2026-10-08).
 GCS_BUILD_INDEX_GLOB = f"{GCS_BUILD_INDEX}/[0-9]*{BUILD_INDEX_SUFFIX}"
+# Prow rewrites a build's pointer while the build runs and when it finishes,
+# so one can vanish between the copy's listing and its fetch. gcloud copies
+# the rest and exits 1 with this line, the object name percent-encoded, among
+# the Copying lines (2 of 30 runs on 2026-10-14). That build is reported
+# unreadable and the hour is still measured; any other error still fails it.
+GCS_CP_ERROR_PREFIX = "ERROR: "
+GCS_CP_PROGRESS_DOT = "."
+GCS_OBJECT_NOT_FOUND = re.compile(r"^ERROR: (gs://\S+) not found: 404\.?$")
+INDEX_POINTER_VANISHED = "index pointer rewritten during the copy (404)"
+# gcloud's exit status when some operations failed and the rest completed;
+# a signal or a crash exits otherwise and may print no error line, so only
+# this status is read as a partial copy.
+GCLOUD_PARTIAL_FAILURE_EXIT = 1
+# Prow's rewrite touches one or two pointers an hour. More vanishing in one
+# copy is something removing index objects in bulk, and the hour is not
+# measured over whatever subset landed.
+VANISHED_POINTER_LIMIT = 10
+# How many of gcloud's error lines a refusal quotes; over the ceiling there
+# is one per vanished object, and the message lands in the JSON, the report
+# and four JUnit cells.
+REFUSAL_ERROR_LINES = 3
 
 # The three artifacts setup time is read from, in the order the run writes
 # them. Only prowjob.json is required: initupload writes it when the pod starts,
@@ -188,6 +211,10 @@ TOO_FEW_RUNS = "(too few runs to judge)"
 # the end of the wait and NOT for its start. SNOWFLAKE_SLACK covers both that
 # jitter and a wait that straddles the window edge.
 SNOWFLAKE_EPOCH_MS = 1288834974657
+# Every Prow build ID is a 19-digit snowflake, as BUILD_ID_IN_OWNER reads
+# them; a longer decimal stem is not one and would take snowflake_time past
+# the datetime range, so the index grammar stops at this length.
+BUILD_ID_DIGITS = 19
 SNOWFLAKE_TIMESTAMP_SHIFT = 22
 SNOWFLAKE_SLACK = timedelta(hours=6)
 
@@ -207,6 +234,27 @@ BOSKOS_SERVICE = "svc/boskos"
 BOSKOS_SERVICE_PORT = 80
 BOSKOS_RESOURCE_TYPE = "kube-agents-evals-project"
 BOSKOS_METRIC_PATH = "/metric?type=" + BOSKOS_RESOURCE_TYPE
+# Which project each lease holder has: Boskos keeps one `resources.boskos.k8s.io`
+# object per project in its namespace (name, status.state, status.owner,
+# status.lastUpdate), which /metric aggregates away. Read from inside the
+# cluster through the API server with the pod's own token (--boskos-via
+# http), through kubectl for a hand run, or from `boskos-resources.json`
+# under --from-dir. The job's service account needs the namespace's
+# `boskos-crd-reader` role bound to it (docs/ci-health.md, "A backed-up
+# pool"); until then the read fails and the artifact says so.
+BOSKOS_RESOURCES_API_PATH = "/apis/boskos.k8s.io/v1/namespaces/boskos/resources"
+BOSKOS_RESOURCES_KIND = "resources.boskos.k8s.io"
+BOSKOS_RESOURCES_FILE = "boskos-resources.json"
+IN_CLUSTER_HOST_ENV = "KUBERNETES_SERVICE_HOST"
+IN_CLUSTER_PORT_ENV = "KUBERNETES_SERVICE_PORT"
+IN_CLUSTER_TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+IN_CLUSTER_CA_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+# The summary keys the health bot reads them under (health.POOL_HELD_KEY).
+HELD_KEY = "held"
+HELD_ERROR_KEY = "held_error"
+HELD_KEY_OWNER = "owner"
+HELD_KEY_STATE = "state"
+HELD_KEY_SINCE = "since"
 BOSKOS_IN_CLUSTER_URL = (
     f"http://boskos.{BOSKOS_NAMESPACE}.svc.cluster.local{BOSKOS_METRIC_PATH}"
 )
@@ -221,16 +269,31 @@ BOSKOS_STATE_FREE = "free"
 # nobody, not a real lease, and including it would make every idle pool look
 # like it had one mystery holder.
 BOSKOS_NO_OWNER = ""
-# A job names its lease `<job name>-<build ID>`, and a Prow build ID is a
+# The one invariant the owner classification rests on: a lease taken by a
+# Prow run, of any job and any lane, carries that run's build ID somewhere in
+# its owner (`<job>-<build>`, `<job>-<build>-gitlab`, ...). A Prow build ID is a
 # snowflake (SNOWFLAKE_* below): 19 digits since 2018 and until the epoch runs
-# out. An owner that does not end in one was taken by a person, for a repair.
-BUILD_ID_SUFFIX = re.compile(r"-(\d{19})$")
-# Jobs that lease under a fixed owner rather than `<job name>-<build ID>`: the
-# defaults of the hack/ scripts that lease through boskos_pool.py, which their
-# Prow jobs do not override (test_integration_contracts.py pins the list to
-# those scripts). Deck cannot vouch for a lease with no build ID in it, so
-# these are reported as a job's, apart from the hand holds, and are never
-# compared against it.
+# out, so the first run of exactly 19 digits after a dash is the build: a
+# run's owner joins the build to the job name with one, and anything after
+# it is the lane's. Nothing here knows job names or lane suffixes; a new job
+# needs nothing from this file. A hand hold must not name a build: the check
+# cannot tell a quoted build from a run's own, and the runbook says so.
+BUILD_ID_IN_OWNER = re.compile(r"(?<=-)([0-9]{19})(?![0-9])")
+# How long after Deck's completionTime a lease may still be held while the
+# pod tears down and the wrapper releases the project; in between the lease
+# is releasing, not leaked. On an abort Deck sets the stamp at the abort but
+# to startTime + 30:00 (see fetch_live_queue), so an early-aborted run reads
+# as releasing for up to 45 minutes after the abort, and a run aborted later
+# than that is already outside the grace and reads as leaked for its teardown
+# minutes: the stamp is the only clock Deck offers, and this is the price of
+# not naming every abort.
+RELEASE_GRACE = timedelta(minutes=15)
+# The fixed owners the hack/ scripts that lease through boskos_pool.py fall
+# back to when nothing names the build (test_integration_contracts.py pins
+# the list to those scripts). In Prow only the fleet reconcile leases this
+# way today; the pull sweep's job passes `<job>-<build>` and `-gitlab` to its
+# two passes. Deck cannot vouch for a lease with no build ID in it, so these
+# are reported as a job's, apart from the rest, and never compared against it.
 BOSKOS_JOB_OWNERS = (
     "fleet-reconcile",
     "ci-kube-agents-compute-sweep",
@@ -365,7 +428,9 @@ JUNIT_ROW_FREE = "free pool projects"
 # percentiles do not move: runs refused a project in the recent window, and
 # the projects that are leased without a run behind them.
 JUNIT_ROW_LEASE_FAILURES = "recent lease failures"
-JUNIT_ROW_HELD_BY_HAND = "projects held by hand"
+# Renamed from "projects held by hand" in #2929, which starts a new TestGrid
+# row: the old name claimed a person behind every owner without a build ID.
+JUNIT_ROW_NO_BUILD_ID = "leases with no build ID in the owner"
 JUNIT_ROW_OUT_OF_ROTATION = "projects out of rotation"
 JUNIT_ROW_NAMES = (
     JUNIT_ROW_VERDICT,
@@ -374,7 +439,7 @@ JUNIT_ROW_NAMES = (
     JUNIT_ROW_QUEUE,
     JUNIT_ROW_FREE,
     JUNIT_ROW_LEASE_FAILURES,
-    JUNIT_ROW_HELD_BY_HAND,
+    JUNIT_ROW_NO_BUILD_ID,
     JUNIT_ROW_OUT_OF_ROTATION,
 )
 # The setup rows are also skipped, not graphed, when the number does not cover
@@ -546,6 +611,8 @@ class LiveQueue:
     tenant's running job, and is what the holders are compared against: the
     nightlies and the next lane lease from the same pool, and against the
     smoke runs alone each of theirs read as leaked (#2747).
+    `releasing_build_ids` is every tenant's job that completed within
+    RELEASE_GRACE: its lease is on its way back, not leaked (#2929).
     """
 
     def __init__(
@@ -553,12 +620,18 @@ class LiveQueue:
         waiting: List[LiveWait],
         running_build_ids: set,
         all_running_build_ids: Optional[set] = None,
+        releasing_build_ids: Optional[set] = None,
+        read_at: Optional[datetime] = None,
     ):
         self.waiting = waiting
         self.running_build_ids = running_build_ids
         self.all_running_build_ids = (
             set(running_build_ids) if all_running_build_ids is None else all_running_build_ids
         )
+        self.releasing_build_ids = set() if releasing_build_ids is None else releasing_build_ids
+        # The clock the waits and the release grace were measured against, so
+        # a reader dating a backlog from a wait subtracts from the right stamp.
+        self.read_at = read_at
 
     @property
     def running(self) -> int:
@@ -605,18 +678,19 @@ class PoolState:
             if owner in BOSKOS_JOB_OWNERS
         }
 
-    def held_by_hand(self) -> Dict[str, int]:
-        """Owners that are neither a Prow run nor a known job, with how many
-        projects each holds.
+    def no_build_id(self) -> Dict[str, int]:
+        """Owners that name no build and are not a known job's fixed owner,
+        with how many projects each holds.
 
         A person leasing a project for a repair names the lease however they
-        like, and Deck has never heard of them, so these are reported as held
-        rather than compared against it and called leaked.
+        like, and so does a job that forgot the convention; Deck can vouch for
+        neither, so they are reported by name rather than compared against it
+        and called leaked. Which of the two it is, the name says.
         """
         return {
             owner: self.owners[owner]
             for owner in self.lease_holders()
-            if not BUILD_ID_SUFFIX.search(owner) and owner not in BOSKOS_JOB_OWNERS
+            if build_of(owner) is None and owner not in BOSKOS_JOB_OWNERS
         }
 
 
@@ -696,6 +770,12 @@ def percentile(values: Sequence[float], pct: int) -> float:
     low = int(rank)
     high = min(low + 1, len(ordered) - 1)
     return ordered[low] + (ordered[high] - ordered[low]) * (rank - low)
+
+
+def build_of(owner: str) -> Optional[str]:
+    """The build ID a lease owner names, or None when it names none."""
+    match = BUILD_ID_IN_OWNER.search(owner)
+    return match.group(1) if match else None
 
 
 def _pull_of(prowjob: dict) -> str:
@@ -820,8 +900,11 @@ def wait_from_prowjob(
     )
 
 
-def _index_entries_from_gcs(tmpdir: str) -> Tuple[Dict[int, str], Optional[str]]:
-    """Every build ID in the flat index, mapped to its artifact directory.
+def _index_entries_from_gcs(
+    tmpdir: str,
+) -> Tuple[Dict[int, str], Optional[str], List[Dict[str, str]]]:
+    """Every build ID in the flat index, mapped to its artifact directory,
+    with the builds whose pointer vanished mid-copy as unreadable entries.
 
     Copied in bulk rather than listed and read one at a time: one `gcloud
     storage cp` of the whole prefix is a few seconds, where a thousand
@@ -830,24 +913,82 @@ def _index_entries_from_gcs(tmpdir: str) -> Tuple[Dict[int, str], Optional[str]]
     dest = os.path.join(tmpdir, "index")
     os.makedirs(dest, exist_ok=True)
     # A wildcard, not `cp -r` on the directory, which exits 0 having copied
-    # nothing; and the build files only, for the reason beside the constant.
+    # nothing; the build files only, for the reason beside the constant; and
+    # the rest of the index after one failed object even when gcloud copies
+    # sequentially (a parallel copy, the default, carries on regardless).
     rc, _, err = run_cmd(
-        ["gcloud", "storage", "cp", GCS_BUILD_INDEX_GLOB, dest],
+        ["gcloud", "storage", "cp", GCS_BUILD_INDEX_GLOB, dest, "--continue-on-error"],
         timeout=GCS_INDEX_TIMEOUT_SECONDS,
     )
-    if rc != 0:
-        return {}, f"could not read the build index: {err.strip() or f'exit {rc}'}"
-    return _index_entries_from_dir(dest), None
+    if rc == 0:
+        return _index_entries_from_dir(dest), None, []
+    vanished, others, errors = _gcloud_errors(err)
+    partial = (
+        rc == GCLOUD_PARTIAL_FAILURE_EXIT and 0 < len(vanished) <= VANISHED_POINTER_LIMIT and not others
+    )
+    entries = _index_entries_from_dir(dest) if partial else {}
+    if not entries:
+        # What decided the refusal, then the error lines with the ones that
+        # are not a vanished pointer first, or the last line when there is
+        # none: the stderr is thousands of Copying lines, and a 404 line
+        # alone would read as the case the hour survives.
+        facts = [f"exit {rc}"]
+        if others:
+            facts.append(f"{len(others)} error(s) other than a vanished pointer")
+        if len(vanished) > VANISHED_POINTER_LIMIT:
+            facts.append(f"{len(vanished)} vanished pointers, over the ceiling of {VANISHED_POINTER_LIMIT}")
+        if partial:
+            facts.append("nothing landed")
+        tail = err.strip().splitlines()
+        quoted = others + [line for line in errors if line not in others]
+        detail = "; ".join(quoted[:REFUSAL_ERROR_LINES]) or (tail[-1] if tail else "")
+        if len(quoted) > REFUSAL_ERROR_LINES:
+            detail += f" and {len(quoted) - REFUSAL_ERROR_LINES} more"
+        reason = ", ".join(facts) + (f": {detail}" if detail else "")
+        return {}, f"could not read the build index: {reason}", []
+    return entries, None, [
+        {"build_id": str(build), "error": INDEX_POINTER_VANISHED} for build in vanished
+    ]
+
+
+def _gcloud_errors(stderr: str) -> Tuple[List[int], List[str], List[str]]:
+    """The build IDs whose index pointer gcloud reported missing, the error
+    lines that say anything else, and every error line in stderr order."""
+    vanished: List[int] = []
+    others: List[str] = []
+    errors: List[str] = []
+    prefix = f"{GCS_BUILD_INDEX}/"
+    for raw in stderr.splitlines():
+        # Progress dots land at the start of about one line in eighty.
+        line = raw.lstrip(GCS_CP_PROGRESS_DOT)
+        if not line.startswith(GCS_CP_ERROR_PREFIX):
+            continue
+        errors.append(line)
+        match = GCS_OBJECT_NOT_FOUND.match(line)
+        name = urllib.parse.unquote(match.group(1)) if match else ""
+        build_id = _build_id_of(name[len(prefix) :]) if name.startswith(prefix) else None
+        if build_id is not None:
+            vanished.append(build_id)
+        else:
+            others.append(line)
+    return vanished, others, errors
+
+
+def _build_id_of(name: str) -> Optional[int]:
+    """The build ID an index file name carries, or None: the one grammar for
+    the names the copy lands and the names gcloud reports missing."""
+    if not name.endswith(BUILD_INDEX_SUFFIX):
+        return None
+    stem = name[: -len(BUILD_INDEX_SUFFIX)]
+    # isdecimal, not isdigit: int() refuses the superscripts isdigit admits.
+    return int(stem) if stem.isdecimal() and len(stem) == BUILD_ID_DIGITS else None
 
 
 def _index_entries_from_dir(dest: str) -> Dict[int, str]:
     entries: Dict[int, str] = {}
     for name in os.listdir(dest):
-        if not name.endswith(BUILD_INDEX_SUFFIX):
-            continue
-        try:
-            build_id = int(name[: -len(BUILD_INDEX_SUFFIX)])
-        except ValueError:
+        build_id = _build_id_of(name)
+        if build_id is None:
             continue
         try:
             path = Path(dest, name).read_text(encoding="utf-8").strip()
@@ -976,8 +1117,9 @@ class Sweep:
         self.elapsed_seconds = elapsed_seconds
         self.window_start = window_start
         self.truncated = truncated
-        # Builds whose read raised, each as {"build_id", "error"}; counted in
-        # builds_read, left out of waits.
+        # Builds whose read raised (counted in builds_read) or whose index
+        # pointer vanished mid-copy (never read, so not counted), each as
+        # {"build_id", "error"}; left out of waits.
         self.unreadable = unreadable or []
 
 
@@ -1010,11 +1152,24 @@ def collect_waits(
 
     began = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="pool-pressure-") as tmpdir:
-        entries, err = _index_entries_from_gcs(tmpdir)
+        entries, err, vanished = _index_entries_from_gcs(tmpdir)
         if err:
             return Source(error=err)
         if not entries:
             return Source(error=f"the build index at {GCS_BUILD_INDEX} is empty")
+        # A vanished pointer is a build the sweep never saw: named with the
+        # unreadable builds when its ID falls in the window, left out of the
+        # numbers, and not counted against the newest-builds share below,
+        # which judges the reader, not Prow. Slack on the high side only (a
+        # replay of a past day does not report today's); the ID encodes the
+        # end of the wait, so one below window_start was created below it.
+        vanished_in_window = [
+            gone
+            for gone in vanished
+            if window_start
+            <= snowflake_time(int(gone["build_id"]))
+            <= window_end + SNOWFLAKE_SLACK
+        ]
 
         candidates: Dict[str, List[int]] = {}
         for build_id in entries:
@@ -1027,7 +1182,9 @@ def collect_waits(
                 candidates.setdefault(moment.strftime(DATE_FORMAT), []).append(build_id)
         if not candidates:
             return Source(
-                value=Sweep([], 0, time.monotonic() - began, window_start)
+                value=Sweep(
+                    [], 0, time.monotonic() - began, window_start, False, vanished_in_window
+                )
             )
 
         collected: List[Wait] = []
@@ -1063,6 +1220,15 @@ def collect_waits(
         )
 
     waits = [w for w in collected if measured_start <= w.created <= window_end]
+    # A vanished pointer below the window the sweep covered is not named
+    # beside the days that were read, as the report says those days are
+    # missing. No slack on this side: the ID encodes the end of the wait, so
+    # one below measured_start was created below it too.
+    unreadable = [
+        gone
+        for gone in vanished_in_window
+        if snowflake_time(int(gone["build_id"])) >= measured_start
+    ] + unreadable
     sweep = Sweep(
         waits, read, time.monotonic() - began, measured_start, truncated, unreadable
     )
@@ -1133,13 +1299,20 @@ def _collect_waits_from_dir(
     return Source(value=Sweep(waits, read, 0.0, window_start))
 
 
-def fetch_live_queue(now: datetime, from_dir: Optional[str] = None) -> Source:
+def fetch_live_queue(now: Optional[datetime], from_dir: Optional[str] = None) -> Source:
     """Runs that are queued right now and have not been given a pod.
 
     This is the half GCS structurally cannot see. A run waiting in `triggered`
     has written no artifacts, so during a stall the bucket stops gaining samples
     and the trend gets *quieter* as the queue gets longer.
+
+    `now` is the clock the waits and the release grace are measured against:
+    None on a live read, which takes the moment Deck is read, because the GCS
+    sweep before it can run for minutes and a clock from the run's start would
+    make every wait that much shorter and the grace that much longer.
     """
+    if now is None:
+        now = datetime.now(timezone.utc)
     if from_dir is not None:
         payload = Path(from_dir, "deck.json")
         if not payload.is_file():
@@ -1160,6 +1333,7 @@ def fetch_live_queue(now: datetime, from_dir: Optional[str] = None) -> Source:
     waiting: List[LiveWait] = []
     running: set = set()
     all_running: set = set()
+    releasing: set = set()
     for item in document.get("items") or []:
         spec = item.get("spec") or {}
         status = item.get("status") or {}
@@ -1174,7 +1348,14 @@ def fetch_live_queue(now: datetime, from_dir: Optional[str] = None) -> Source:
         # 24.1 minutes all read 30.0 here. Aborts are the largest single state
         # in this job's history, so any duration derived from this field is
         # wrong for most of the runs it covers. Durations come from artifacts.
+        # The one thing it is read for: a job whose stamp is inside
+        # RELEASE_GRACE may still hold its lease while the pod tears down. A
+        # stamp in the future (that start + 30:00) counts as inside it.
         if status.get("completionTime"):
+            completed = parse_rfc3339(status["completionTime"])
+            build_id = str(status.get("build_id") or "")
+            if build_id and completed is not None and completed >= now - RELEASE_GRACE:
+                releasing.add(build_id)
             continue
         ours = spec.get("job") == JOB_NAME
         if status.get("pendingTime"):
@@ -1193,7 +1374,7 @@ def fetch_live_queue(now: datetime, from_dir: Optional[str] = None) -> Source:
             continue
         waiting.append(LiveWait(_pull_of(item), created, now))
     waiting.sort(key=lambda w: w.seconds, reverse=True)
-    return Source(value=LiveQueue(waiting, running, all_running))
+    return Source(value=LiveQueue(waiting, running, all_running, releasing, read_at=now))
 
 
 def _free_port() -> int:
@@ -1289,6 +1470,87 @@ def fetch_pool_state(
     if err:
         return Source(error=f"could not read the Boskos metric: {err}")
     return Source(value=_pool_state_from(document))
+
+
+def _held_from(document: dict) -> Dict[str, dict]:
+    """{project: {owner, state, since}} for every Boskos resource object
+    with a holder, from a `kubectl get -o json`-shaped list."""
+    held: Dict[str, dict] = {}
+    for item in document.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("metadata") or {}).get("name")
+        status = item.get("status") if isinstance(item.get("status"), dict) else {}
+        owner = status.get("owner")
+        if not name or not owner:
+            continue
+        held[str(name)] = {
+            HELD_KEY_OWNER: str(owner),
+            HELD_KEY_STATE: str(status.get("state") or ""),
+            HELD_KEY_SINCE: str(status.get("lastUpdate") or ""),
+        }
+    return held
+
+
+def _read_in_cluster(path: str) -> Tuple[Optional[dict], Optional[str]]:
+    """One GET against the API server the pod runs under, as the pod."""
+    host, port = os.environ.get(IN_CLUSTER_HOST_ENV), os.environ.get(IN_CLUSTER_PORT_ENV)
+    if not host or not port:
+        return None, "not running in a cluster (no API server in the environment)"
+    try:
+        token = Path(IN_CLUSTER_TOKEN_FILE).read_text(encoding="utf-8").strip()
+        context = ssl.create_default_context(cafile=IN_CLUSTER_CA_FILE)
+    except (OSError, ssl.SSLError) as exc:
+        return None, f"no service-account token or CA: {exc}"
+    request = urllib.request.Request(f"https://{host}:{port}{path}", headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=BOSKOS_TIMEOUT_SECONDS, context=context) as response:
+            return json.loads(response.read().decode("utf-8")), None
+    except urllib.error.HTTPError as exc:
+        return None, f"HTTP {exc.code} from the API server (the pod's service account may lack the boskos-crd-reader role)"
+    except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
+        return None, str(exc)
+
+
+def fetch_held(via: str, context: str, from_dir: Optional[str] = None) -> Source:
+    """Which project each Boskos lease holder has right now.
+
+    Separate from fetch_pool_state because /metric cannot answer it: the
+    health bot needs the names to read a project the fleet reconcile holds as
+    being applied rather than drifted. Missing is reported, never defaulted.
+    """
+    if from_dir is not None:
+        payload = Path(from_dir, BOSKOS_RESOURCES_FILE)
+        if not payload.is_file():
+            return Source(error=f"no {BOSKOS_RESOURCES_FILE} under {from_dir}")
+        try:
+            document = json.loads(payload.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return Source(error=f"could not parse {payload}: {exc}")
+        if not isinstance(document, dict):
+            return Source(error=f"{payload} is not a JSON object")
+        return Source(value=_held_from(document))
+    if via == BOSKOS_VIA_NONE:
+        return Source(error="Boskos was not queried (--boskos-via none)")
+    if via == BOSKOS_VIA_HTTP:
+        document, err = _read_in_cluster(BOSKOS_RESOURCES_API_PATH)
+        if err:
+            return Source(error=f"could not list Boskos resources in-cluster: {err}")
+        if not isinstance(document, dict):
+            return Source(error="could not list Boskos resources in-cluster: the API server's answer is not a JSON object")
+        return Source(value=_held_from(document))
+    if shutil.which(KUBECTL_BINARY) is None:
+        return Source(error="kubectl is not on PATH, so Boskos resources cannot be listed")
+    code, out, err = run_cmd([KUBECTL_BINARY, "--context", context, "-n", BOSKOS_NAMESPACE, "get", BOSKOS_RESOURCES_KIND, "-o", "json"], timeout=BOSKOS_TIMEOUT_SECONDS)
+    if code != 0:
+        return Source(error=f"kubectl get {BOSKOS_RESOURCES_KIND}: {(err or '').strip() or f'exit {code}'}")
+    try:
+        document = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return Source(error=f"kubectl get {BOSKOS_RESOURCES_KIND}: not JSON ({exc})")
+    if not isinstance(document, dict):
+        return Source(error=f"kubectl get {BOSKOS_RESOURCES_KIND}: not a JSON object")
+    return Source(value=_held_from(document))
 
 
 def _pool_state_from(document: dict) -> PoolState:
@@ -1431,8 +1693,10 @@ def leaked_leases(pool: Optional[PoolState], queue: Optional[LiveQueue]) -> List
 
     Compared against every tenant's running job, not this job's alone: the
     nightlies and the next lane lease from the same pool. A holder with no
-    build ID is a known job's fixed owner or a hand hold, and is reported as
-    held, never as leaked: nothing in Deck can vouch for it either way.
+    build ID anywhere in its name is a known job's fixed owner, a hand hold or
+    a job that forgot the convention, and is reported by name, never as
+    leaked: nothing in Deck can vouch for it either way. A holder whose run
+    completed within RELEASE_GRACE is releasing (below), not leaked.
 
     Needs both sources: with no list of running jobs to compare against, every
     holder looks orphaned.
@@ -1441,10 +1705,23 @@ def leaked_leases(pool: Optional[PoolState], queue: Optional[LiveQueue]) -> List
         return []
     orphaned = []
     for holder in pool.lease_holders():
-        match = BUILD_ID_SUFFIX.search(holder)
-        if match and match.group(1) not in queue.all_running_build_ids:
+        build = build_of(holder)
+        if (
+            build
+            and build not in queue.all_running_build_ids
+            and build not in queue.releasing_build_ids
+        ):
             orphaned.append(holder)
     return orphaned
+
+
+def releasing_leases(pool: Optional[PoolState], queue: Optional[LiveQueue]) -> List[str]:
+    """Lease holders whose run's Deck completion stamp is inside RELEASE_GRACE:
+    the wrapper releases the project after the pod's teardown, so these free
+    themselves."""
+    if pool is None or queue is None:
+        return []
+    return [h for h in pool.lease_holders() if build_of(h) in queue.releasing_build_ids]
 
 
 def latest_max_concurrency(waits: List[Wait]) -> Optional[int]:
@@ -1533,8 +1810,9 @@ def summarise(
     # anything filtering on the label. What the cap and the pool size are is
     # still reported, under `max_concurrency` and `pool.stranded`.
     leaked = leaked_leases(pool_state, queue)
+    releasing = releasing_leases(pool_state, queue)
     cause_label, cause_text = (
-        cause(pool_state, queue, concurrency, len(recent_failed), leaked, live_backlog)
+        cause(pool_state, queue, concurrency, len(recent_failed), leaked, live_backlog, releasing)
         if breached
         else (None, [])
     )
@@ -1614,6 +1892,11 @@ def summarise(
         "queue": {
             "read": live.ok,
             "error": live.error,
+            # When Deck was read: the clock `waiting_runs[].minutes` counts
+            # from, which on a live run is after the sweep, not window_end.
+            "read_at": (
+                queue.read_at.strftime(TIMESTAMP_FORMAT) if queue and queue.read_at else None
+            ),
             "waiting": len(queue.waiting) if queue else None,
             "running": queue.running if queue else None,
             "over_threshold": len(live_breach),
@@ -1636,8 +1919,9 @@ def summarise(
         # each with its count; None when the pool was not read.
         "states": dict(pool_state.counts) if pool_state else None,
         "held_by_job": pool_state.held_by_job() if pool_state else None,
-        "held_by_hand": pool_state.held_by_hand() if pool_state else None,
+        "no_build_id": pool_state.no_build_id() if pool_state else None,
         "leaked_leases": leaked,
+        "releasing_leases": releasing,
         "cause": cause_label,
         "cause_text": cause_text,
         "breached": breached,
@@ -1795,10 +2079,11 @@ def render(summary: dict) -> str:
                 f"  {sum(by_job.values())} project(s) held by a job without a run ID:"
                 f" {_holders_text(by_job)}"
             )
-        held = summary["held_by_hand"]
-        if held:
+        unnamed = summary["no_build_id"]
+        if unnamed:
             out.append(
-                f"  {sum(held.values())} project(s) held by hand: {_holders_text(held)}"
+                f"  {sum(unnamed.values())} project(s) leased with no build ID in the owner:"
+                f" {_holders_text(unnamed)}"
             )
     concurrency = summary["max_concurrency"]
     out.append(
@@ -1813,11 +2098,21 @@ def render(summary: dict) -> str:
             f"{pool['stranded']} project(s) can never be leased."
         )
 
+    releasing = summary["releasing_leases"]
+    if releasing:
+        out.append(
+            f"\n{len(releasing)} lease(s) held by runs whose Deck completion stamp is inside the"
+            f" last {int(RELEASE_GRACE.total_seconds() // SECONDS_PER_MINUTE)} min, so still tearing"
+            " down (an abort's stamp is start + 30:00, see docs/ci-pool-projects.md):"
+        )
+        for holder in releasing:
+            out.append(f"      {holder}")
     orphans = summary["leaked_leases"]
     if orphans:
-        out.append(f"\n[!] {len(orphans)} lease(s) held by runs Deck does not know about.")
+        out.append(f"\n[!] {len(orphans)} lease(s) held by runs Deck does not show running.")
         out.append("    A leaked lease occupies a project exactly as a running test does,")
-        out.append("    so the pool reads as full without the demand to justify it.")
+        out.append("    so the pool reads as full without the demand to justify it. A hand")
+        out.append("    hold named after a run reads the same: rename it rather than release it.")
         for holder in orphans:
             out.append(f"      {holder}")
 
@@ -1882,7 +2177,9 @@ def _holders_text(held: Dict[str, int]) -> str:
     return ", ".join(f"{owner} ({count})" for owner, count in sorted(held.items()))
 
 
-def _pool_now_lines(pool_state: PoolState, leaked: Sequence[str]) -> List[str]:
+def _pool_now_lines(
+    pool_state: PoolState, leaked: Sequence[str], releasing: Sequence[str] = ()
+) -> List[str]:
     """What the projects are doing, for a cause that turns on it."""
     lines = [
         f"Pool now: {pool_state.busy} leased, {pool_state.free} free,"
@@ -1894,11 +2191,13 @@ def _pool_now_lines(pool_state: PoolState, leaked: Sequence[str]) -> List[str]:
     by_job = pool_state.held_by_job()
     if by_job:
         lines.append(f"  held by a job without a run ID: {_holders_text(by_job)}")
-    held = pool_state.held_by_hand()
-    if held:
-        lines.append(f"  held by hand: {_holders_text(held)}")
+    unnamed = pool_state.no_build_id()
+    if unnamed:
+        lines.append(f"  no build ID in the owner: {_holders_text(unnamed)}")
     if leaked:
         lines.append(f"  {len(leaked)} lease(s) leaked, named under leaked_leases")
+    if releasing:
+        lines.append(f"  {len(releasing)} lease(s) releasing, their run's Deck stamp inside the grace")
     return lines
 
 
@@ -1941,6 +2240,7 @@ def cause(
     lease_failures: int = 0,
     leaked: Sequence[str] = (),
     live_backlog: bool = False,
+    releasing: Sequence[str] = (),
 ) -> Tuple[str, List[str]]:
     """Why runs are waiting, and therefore what to do about it.
 
@@ -1986,7 +2286,7 @@ def cause(
             "What the projects are doing decides the remedy: a repair ends, a leak is",
             "released, and demand needs the next project, per the pool runbook:",
             "docs/ci-pool-projects.md",
-        ] + _pool_now_lines(pool_state, leaked)
+        ] + _pool_now_lines(pool_state, leaked, releasing)
 
     label, lines = _wait_cause(pool_state, queue, concurrency)
     return label, (refused + [""] + lines) if lease_failures else lines
@@ -2165,9 +2465,9 @@ def junit_report(summary: dict) -> str:
         )
     else:
         add(JUNIT_ROW_LEASE_FAILURES, "properties", _junit_value(recent["lease_failures"]))
-    held = sum((summary["held_by_hand"] or {}).values())
+    unnamed = sum((summary["no_build_id"] or {}).values())
     for name, value in (
-        (JUNIT_ROW_HELD_BY_HAND, held),
+        (JUNIT_ROW_NO_BUILD_ID, unnamed),
         (JUNIT_ROW_OUT_OF_ROTATION, pool["in_transition"]),
     ):
         if pool["read"]:
@@ -2232,8 +2532,11 @@ def measure(
         replay = Source(error="not read: --as-of replays a past window, and this is live")
         live, pool = replay, replay
     else:
-        live = fetch_live_queue(window_end, from_dir)
+        # A fixture replay keeps the instant it was captured at; a live read
+        # takes its own clock after the sweep (fetch_live_queue says why).
+        live = fetch_live_queue(window_end if from_dir is not None else None, from_dir)
         pool = fetch_pool_state(boskos_via, context, from_dir)
+    held = fetch_held(boskos_via, context, from_dir) if from_dir is not None or as_of is None else Source(error="not read: --as-of replays a past window")
 
     summary = summarise(
         window_start,
@@ -2245,6 +2548,10 @@ def measure(
         live,
         pool,
     )
+    # Which project each holder has, for the health bot's fixture rule;
+    # None with the reason when the list could not be read.
+    summary[HELD_KEY] = held.value if held.ok else None
+    summary[HELD_ERROR_KEY] = held.error
 
     # Written before the report is printed, and a write that fails is reported
     # rather than raised: the exit code is the verdict, and the tab still shows

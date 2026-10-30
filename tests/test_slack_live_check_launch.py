@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import subprocess
 import unittest
 from unittest import mock
@@ -878,6 +879,20 @@ class ModesAndArgsTest(unittest.TestCase):
         jobs = [pod_spec(yaml.safe_load(doc))["containers"][0]["args"] for doc in cluster.applied[2::2]]
         self.assertEqual([a[a.index("--checks") + 1] for a in jobs], ["dm,mention", "restart"])
 
+    def test_no_status_line_plans_no_job_around_thread(self):
+        # The harness leaves thread out under the flag; the launcher neither names it in a
+        # Job nor records it as unanswered, and a dm/thread/restart split leaves no
+        # thread-only Job.
+        cluster = FakeCluster()
+        cluster.job_log = "PASS dm: answer\nPASS restart: answer\n"
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm,thread,restart", "--after-restart",
+                               "--", "--no-status-line")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertIn("NOTE thread not run", out)
+        self.assertNotIn("FAIL thread", out)
+        jobs = [pod_spec(yaml.safe_load(doc))["containers"][0]["args"] for doc in cluster.applied[2::2]]
+        self.assertEqual([a[a.index("--checks") + 1] for a in jobs], ["dm", "restart"])
+
     def test_cleanup_validates_no_harness_flags(self):
         cluster = FakeCluster()
         cluster.namespaces["slack-test"] = {"app.kubernetes.io/name": "slack-live-check"}
@@ -1052,7 +1067,10 @@ class ModesAndArgsTest(unittest.TestCase):
         self.assertIn(f'return agent.Name + "{launch.CREDENTIAL_PROXY_SUFFIX}"', cp)
         a2a = (REPO / "k8s-operator/internal/controller/platformagent_a2a_manifests.go").read_text()
         self.assertIn(f'return agent.Name + "{launch.GATEWAY_SUFFIX}"', a2a)
-        self.assertIn(f'Name:  "{launch.GATEWAY_CONTAINER}",', a2a)
+        # The container name is a constant since the usage poller reads the
+        # gateway by it; pin the constant's value, and that the pod uses it.
+        self.assertRegex(a2a, rf'(?m)^\s*a2aGatewayContainerName\s*=\s*"{re.escape(launch.GATEWAY_CONTAINER)}"$')
+        self.assertIn("Name:  a2aGatewayContainerName,", a2a)
         sandbox = (REPO / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text()
         self.assertIn(f'return agent.Name + "{launch.SHELL_SANDBOX_SUFFIX}"', sandbox)
         proxy = (REPO / "agents/platform/scripts/credential_proxy.py").read_text()

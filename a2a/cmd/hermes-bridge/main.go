@@ -67,6 +67,9 @@ const (
 	// defaultProgressIntervalSeconds is hermesbridge.DefaultProgressInterval
 	// in the environment's unit.
 	defaultProgressIntervalSeconds = 60
+	// defaultCardStopTimeoutSeconds is hermesbridge.DefaultCardStopTimeout
+	// in the environment's unit.
+	defaultCardStopTimeoutSeconds = 35
 	// activityListenOff is the value that closes the activity door. The
 	// Config zero value means "off" but an empty environment variable reads
 	// as unset, so the daemon needs a word for it.
@@ -248,6 +251,9 @@ func configFromEnv(log *slog.Logger) (hermesbridge.Config, error) {
 		RouteKey:       os.Getenv(hermesbridge.RouteKeyEnv),
 		ActivitySecret: os.Getenv(hermesbridge.ActivitySecretEnv),
 		Logger:         log,
+		// The card stop's request to the same session-kv server
+		// (a2a/hermes-bridge/cardstop.go).
+		CardStopTimeout: time.Duration(envInt(log, "BRIDGE_CARD_STOP_TIMEOUT_SECONDS", defaultCardStopTimeoutSeconds)) * time.Second,
 		// Unset means required: a submission with no capability is
 		// refused. "false" is the mixed-version window only — a gateway
 		// that predates the mint. It does not switch enforcement off; a

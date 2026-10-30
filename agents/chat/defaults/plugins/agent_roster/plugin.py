@@ -3,7 +3,7 @@ import logging
 import os
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -21,15 +21,28 @@ _HEADER = "[SPECIALIST AGENTS AVAILABLE NOW]"
 _FOOTER = (
     "Use one of the names above verbatim as the `assignee` of `kanban_create`. "
     "This list is current as of this turn; call `list_agents` only if an agent "
-    "you expect is missing."
+    "you expect is missing. The GCP projects in scope, if listed above, are "
+    "answered directly in this turn without calling `kanban_create`; which "
+    "clusters are running, how many, or what versions is live state and goes to "
+    "a specialist."
+)
+# Appended only when the host cluster identity is present, so it never points
+# at a section that was not rendered (agent_roster.read_host_identity).
+_HOST_FOOTER = (
+    "The host cluster's name, project and location, when listed above, are "
+    "answered directly too. For live Kubernetes state on \"this cluster\" or "
+    "\"this host cluster\", route `kanban_create` to the Host Cluster "
+    "`assignee` above without asking which cluster the user means; if that "
+    "line carries no `assignee`, route to `platform`."
 )
 
-# Cached across turns in one process. Not a TTL cache: the module is a few
-# hundred lines of stdlib and re-executing it per turn buys nothing, whereas
-# the roster it produces IS re-read every turn — a cluster agent created a
-# moment ago has to show up on the next message, which is the whole reason the
-# front door was calling the tool in the first place.
+# Cached across turns in one process, keyed by (path, st_mtime_ns) so an in-place
+# script update on the shared volume is picked up automatically while normal turns
+# pay only a stat() call. The roster it produces is always re-read every turn —
+# a cluster agent created a moment ago has to show up on the next message, which
+# is the whole reason the front door was calling the tool in the first place.
 _roster_module: Optional[ModuleType] = None
+_roster_module_source: Optional[Tuple[Path, int]] = None
 
 
 def _scripts_dirs() -> list[Path]:
@@ -38,9 +51,7 @@ def _scripts_dirs() -> list[Path]:
 
 
 def _load_roster_module() -> Optional[ModuleType]:
-    global _roster_module
-    if _roster_module is not None:
-        return _roster_module
+    global _roster_module, _roster_module_source
     for base in _scripts_dirs():
         path = base / _SCRIPT_NAME
         try:
@@ -50,6 +61,12 @@ def _load_roster_module() -> Optional[ModuleType]:
             # runs ahead of every turn on the front door.
             if not path.is_file():
                 continue
+            mtime_ns = path.stat().st_mtime_ns
+            if (
+                _roster_module is not None
+                and _roster_module_source == (path, mtime_ns)
+            ):
+                return _roster_module
             spec = importlib.util.spec_from_file_location(_MODULE_NAME, path)
             if spec is None or spec.loader is None:
                 continue
@@ -59,6 +76,7 @@ def _load_roster_module() -> Optional[ModuleType]:
             logger.warning("Could not load the agent roster from %s: %s", path, e)
             continue
         _roster_module = module
+        _roster_module_source = (path, mtime_ns)
         return module
     logger.warning("No %s found under %s; roster injection disabled.",
                    _SCRIPT_NAME, [str(b) for b in _scripts_dirs()])
@@ -87,6 +105,8 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     try:
         data_dir = Path(os.environ.get("HERMES_HOME", "/opt/data"))
         roster = module.render(data_dir / "profiles")
+        read_host = getattr(module, "read_host_identity", None)
+        has_host = bool(read_host(None)) if callable(read_host) else False
     except Exception as e:
         logger.warning("Could not render the agent roster: %s", e)
         return None
@@ -101,9 +121,13 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # in it, on a persona forbidden from doing the work itself, invites an
     # invented assignee. getattr rather than a direct read, because every other
     # module access in this hook is already defensive.
-    if roster == getattr(module, "EMPTY_ROSTER", None):
+    # render() appends the host and scope sections after the empty-fleet
+    # sentence too, so compare the start: with no agent there is no name to copy.
+    empty = getattr(module, "EMPTY_ROSTER", None)
+    if empty and roster.startswith(empty):
         return {"context": f"\n\n{_HEADER}\n{roster}\n"}
-    return {"context": f"\n\n{_HEADER}\n{roster}\n\n{_FOOTER}\n"}
+    footer = f"{_FOOTER} {_HOST_FOOTER}" if has_host else _FOOTER
+    return {"context": f"\n\n{_HEADER}\n{roster}\n\n{footer}\n"}
 
 
 def register(ctx: Any) -> None:

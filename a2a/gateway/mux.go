@@ -168,6 +168,22 @@ func (m *MultiAdapter) Edit(conversation, messageID, text string) error {
 	return a.Edit(conversation, messageID, text)
 }
 
+func (m *MultiAdapter) PostMessage(conversation string, msg OutMessage) (string, error) {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return "", err
+	}
+	return a.PostMessage(conversation, msg)
+}
+
+func (m *MultiAdapter) EditMessage(conversation, messageID string, msg OutMessage) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	return a.EditMessage(conversation, messageID, msg)
+}
+
 func (m *MultiAdapter) Roster(conversation string) ([]string, bool, error) {
 	a, err := m.pick(conversation)
 	if err != nil {
@@ -178,6 +194,66 @@ func (m *MultiAdapter) Roster(conversation string) ([]string, bool, error) {
 
 func (m *MultiAdapter) OpenDirect(userID string) (string, error) {
 	return m.byPrefix[m.primary].OpenDirect(userID)
+}
+
+func (m *MultiAdapter) React(conversation, messageID, token string) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	return a.React(conversation, messageID, token)
+}
+
+func (m *MultiAdapter) RemoveReaction(conversation, messageID, token string) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	return a.RemoveReaction(conversation, messageID, token)
+}
+
+// MarkChanged and InboundVerified route like the observer calls below: to
+// the backend that owns the conversation, when it implements the interface.
+func (m *MultiAdapter) MarkChanged(conversation, ask, settle string) {
+	if a, err := m.pick(conversation); err == nil {
+		if observer, ok := a.(MarkObserver); ok {
+			observer.MarkChanged(conversation, ask, settle)
+		}
+	}
+}
+
+// PostTerminal goes to the backend that owns the conversation
+// (TerminalPoster); one that does not implement it answers
+// errNoTerminalFrames, which the caller treats as nothing to do.
+func (m *MultiAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	poster, ok := a.(TerminalPoster)
+	if !ok {
+		return errNoTerminalFrames
+	}
+	return poster.PostTerminal(conversation, t)
+}
+
+// ShowsTaskStatus answers for the backend that owns the conversation
+// (StatusShower); one that does not implement it keeps the rolling line.
+func (m *MultiAdapter) ShowsTaskStatus(conversation string) bool {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return false
+	}
+	shower, ok := a.(StatusShower)
+	return ok && shower.ShowsTaskStatus(conversation)
+}
+
+func (m *MultiAdapter) InboundVerified(conversation, messageID string, verified bool) {
+	if a, err := m.pick(conversation); err == nil {
+		if observer, ok := a.(VerifiedObserver); ok {
+			observer.InboundVerified(conversation, messageID, verified)
+		}
+	}
 }
 
 // The gateway finds TaskObserver and SessionLookupSink by type assertion on
@@ -223,10 +299,36 @@ func (m *MultiAdapter) CancelPublished(conversation, taskID string) {
 	}
 }
 
+func (m *MultiAdapter) SetHome(admits HomeAdmits, board BoardReader) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(HomeSink); ok {
+			sink.SetHome(admits, board)
+		}
+	}
+}
+
+func (m *MultiAdapter) SetBoardActor(actor BoardActor) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(BoardActSink); ok {
+			sink.SetBoardActor(actor)
+		}
+	}
+}
+
 func (m *MultiAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	for _, a := range m.byPrefix {
 		if sink, ok := a.(SessionLookupSink); ok {
 			sink.SetSessionLookup(lookup, idleTTL)
+		}
+	}
+}
+
+// SetFeedbackRecorder hands the answer-feedback recorder to every backend
+// that draws rating controls (FeedbackSink), as SetSessionLookup does.
+func (m *MultiAdapter) SetFeedbackRecorder(r FeedbackRecorder) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(FeedbackSink); ok {
+			sink.SetFeedbackRecorder(r)
 		}
 	}
 }

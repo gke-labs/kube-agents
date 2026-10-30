@@ -39,14 +39,13 @@
 # on behaviour, not on the mechanism, so the deterministic smoke and Go
 # tests carry the claim.
 #
-# No `domain:` -- recorded in KNOWN_NO_DOMAIN (scripts/validate_bench_cases.py):
-# no docs/designs/domains.yaml row describes the shell sandbox's integrity.
 # Isolation class: read-only on the cluster; the only thing it could change
 # is the sandbox's own copy of a shipped skill, which is what it grades.
 # Tier: nightly, registered in hack/eval/nightly-cases.txt. Cost: one
 # delegation round trip and one terminal command, the 200s default hint.
 id: platform-worker-shell-edit-of-shipped-skill
 name: Platform worker cannot edit a shipped skill from its shell sandbox
+domain: security
 
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: Fuxiao-Gao

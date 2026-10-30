@@ -1,0 +1,46 @@
+{
+  "name": "plan-one-card-step-count",
+  "source": "agents/platform/scripts/test_slack_status.py::RowTitleTest.test_a_step_count_once_there_is_more_than_one",
+  "notes": "Steps are the card's notes, unmarked: the renderer draws today's ✓ and ◌ from the item's status (the last step of an in_progress item is the open one).",
+  "input": {
+    "title": null,
+    "rows": [
+      {
+        "task_id": "t_a",
+        "title": "check payments",
+        "lines": [
+          "found it on seeded-a",
+          "reading pod state in seeded-a"
+        ],
+        "status": "in_progress",
+        "note": "reading pod state in seeded-a",
+        "steps": 2
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "plan": {
+          "title": "check payments",
+          "items": [
+            {
+              "id": "t_a",
+              "title": "reading pod state in seeded-a · step 2 ▸",
+              "status": "in_progress",
+              "steps": [
+                "found it on seeded-a",
+                "reading pod state in seeded-a"
+              ],
+              "stepCount": 2,
+              "note": "reading pod state in seeded-a"
+            }
+          ]
+        }
+      },
+      "update": "plan"
+    }
+  ]
+}

@@ -59,6 +59,7 @@ grant it needs.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import math
@@ -66,7 +67,7 @@ import os
 import random
 import re
 import shlex
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -94,11 +95,10 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 ]
 
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
+# The rc a refused kubeconfig directory stands for in the credentials
+# result: gcloud was not run through it, and the note is the error.
+KUBECONFIG_REFUSED_RC = 1
 DEFAULT_TIMEOUT_S = 60
-# The exit status a `Run` reports for a command `subprocess.run` killed on
-# its timeout -- coreutils `timeout`'s, and the one collect.py, fleet_drift.py
-# and patch_readiness.py report, so a timeout reads the same in every manifest.
-TIMEOUT_RC = 124
 # Was 64, sized so every cluster's ten-minute sampling window ran
 # concurrently rather than queuing behind an earlier one. Nothing sleeps any
 # more -- per-cluster work is a handful of subprocess reads and a few HTTP
@@ -111,8 +111,8 @@ MAX_WORKERS = 4
 # What the manifest calls a target. A GKE name is unique only inside one
 # project and location, so every cluster is `<project>/<location>/<name>`, and
 # a failed or narrowed project discovery is one `project/UNENUMERATED_PROJECTS`
-# target. Copied from `collect.py` under the standalone-collector rule below;
-# `audit_report.py` reads both shapes, so keep them in step with it.
+# target. A copy of `collect.py`'s; `audit_report.py` reads both shapes, so
+# keep them in step with it.
 QUALIFIED_TARGET_SEPARATOR = "/"
 PROJECT_TARGET_PREFIX = "project/"
 # A cluster the collector never read: not running, or its credentials failed.
@@ -150,8 +150,10 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+from collect import declaration_for, indexed_workspace, release_declaration_for, release_declarations, workload_declarations  # noqa: E402
 
-# The scope this collector was handed, set by main from the two flags.
+# The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
 SCOPED_RUN_NOTE = (
@@ -169,25 +171,11 @@ DETAIL_EXCERPT_CHARS = 200
 # rather than a read that failed; otherwise every non-GKE project a credential
 # can see is a permanent `gate-failed` target. Copied from `collect.py`.
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
-# The project an API refusal names, which gcloud gives by number ("has not been
-# used in project 123456789", "consumer: projects/123456789"). The refusal is
-# the consumer project's, and with a quota project set (`billing/quota_project`)
-# that is not the project being listed.
-REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
-# The project *id* a refusal names, when it names one rather than a number,
-# in gcloud's phrasings: `project <id> before`, `Project <id> is not found`,
-# `projects/<id>`, then punctuation, a quote or the end. A project id is 6-30
-# lowercase letters, digits and hyphens, starting with a letter and not ending
-# in a hyphen. Used only to say which project a refusal was about.
-REFUSED_PROJECT_ID_RE = re.compile(
-    r"\b(?i:projects?)[ /]['\"\[]?([a-z][a-z0-9-]{4,28}[a-z0-9])"
-    r"(?=\s+(?:before|is|was|has|does)\b|['\"\],.;:)]|\s*$)"
-)
-# English words of id shape that gcloud's prose puts where an id could sit
-# ("... on this project either."): never read as the project a refusal names.
-REFUSED_PROJECT_ID_STOPWORDS = frozenset({"before", "either", "itself", "number", "should", "settings"})
-# The read `refusal_names_project` makes to turn a project id into the number
-# a refusal names. `collect_fleet` answers a repeat of it from the first answer.
+# Which project a refusal names, and whether it is the listed project's own:
+# `collect.refusal_owner`, the one rule the collectors share (the regexes and
+# the reasoning live beside it); `refusal_owner` below reads it from there.
+# The read it makes to turn a project id into the number a refusal names;
+# `collect_fleet` answers a repeat of it from the first answer.
 PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
 # The zone or region and name in a PV's disk handle
 # (`projects/p/zones/us-central1-a/disks/data-1`, `.../regions/r/disks/n`).
@@ -259,71 +247,11 @@ NO_TARGET_REASON = (
     "no project in scope recorded an error, so each holds no cluster and has neither the Compute Engine nor the Artifact Registry API on"
 )
 
-# Where a GitOps clone keeps the manifests applied to one cluster:
-# `clusters/<cluster>/...`, so a path shorter than two parts names no cluster.
-# Copied from `collect.py` rather than imported: every collector in this
-# directory runs standalone under `python3 <file>` (`main` imports `collect`
-# for a workspace that is not a clone, and only then), and each one that has
-# needed a constant a sibling also declares has duplicated it (`SYSTEM_NAMESPACES`
-# is the same value in three of them). Keep these three in step with
-# `collect.py`'s if the repository layout moves.
-GITOPS_CLUSTER_TREE_ROOT = "clusters"
-GITOPS_CLUSTER_TREE_DEPTH = 2
+# Whether `--workspace` is a clone: `main` reads it to tell one from a
+# content-mode scratch directory, as `collect.indexed_workspace` does. The
+# GitOps layout, and the declaration index that walks it, are `collect.py`'s
+# (imported above).
 GIT_DIR_NAME = ".git"
-# Config Connector's API group. Its objects name a GCP resource, which
-# `spec.resourceID` can override, not a workload, so `workload_declarations`
-# skips them rather than resolving a `Cluster/<name>` finding against one.
-KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
-# `release_declarations` indexes the objects that render a workload a GitOps
-# repo holds no manifest for -- an Argo CD `Application`, from either a chart
-# or a Kustomize overlay, and a Flux `HelmRelease` -- plus the two it needs to
-# resolve them: Argo CD's cluster registration Secret (which is how
-# `spec.destination.server` becomes a cluster name) and Flux's `HelmRepository`
-# (which is how a `HelmRelease`'s chart reference becomes a URL `helm show
-# values` can read). Copied from `collect.py` under the same
-# standalone-collector rule as the three above.
-ARGOCD_APPLICATION_KIND = "Application"
-ARGOCD_CLUSTER_SECRET_LABEL = "argocd.argoproj.io/secret-type"
-ARGOCD_CLUSTER_SECRET_VALUE = "cluster"
-ARGOCD_IN_CLUSTER_SERVER = "https://kubernetes.default.svc"
-FLUX_HELM_RELEASE_KIND = "HelmRelease"
-FLUX_HELM_REPOSITORY_KIND = "HelmRepository"
-# The two shapes a key in that index takes. An Argo CD chart Application is
-# found by the Application name its tracking id carries; a Helm release proper
-# -- `helm install`, or Flux driving it -- by release namespace and name.
-RELEASE_KEY_APPLICATION = "application"
-RELEASE_KEY_RELEASE = "release"
-# A third key on that same index, answering a different question: not "where
-# is this object declared" but "where would a *new* object for this namespace
-# go". Only a local Kustomize root can answer it, because only a local root is
-# a directory in this repository that renders into the namespace. No check here
-# creates an object, so nothing in this file reads the key; it is built anyway
-# because `release_declarations` is a copy of `collect.py`'s and the copy is
-# kept identical, not trimmed to what one stream happens to use.
-RELEASE_KEY_NAMESPACE = "namespace"
-# What `collect.broker_mirror` leaves in a content-mode mirror a file that could
-# hold a release was withheld from; `release_declarations` then answers nothing
-# rather than part.
-MIRROR_RELEASES_WITHHELD_MARKER = ".git/collect-releases-withheld"
-# Where a values override goes, per reconciler. Argo CD accepts both a YAML
-# string (`values`) and a structured block (`valuesObject`); this names the one
-# already in the file, and `valuesObject` when neither is, because a structured
-# block is what a programmatic edit can extend without reindenting a string.
-ARGOCD_VALUES_OBJECT_FIELD = "valuesObject"
-ARGOCD_VALUES_STRING_FIELD = "values"
-FLUX_VALUES_FIELD = "values"
-ARGOCD_KUSTOMIZE_PATCHES_FIELD = "patches"
-# Which of those two overrides a declaration takes, since they are written
-# differently: a values mapping the chart reads by key, or a list of patches
-# Kustomize applies to a matched object. Carried on the entry so the SOP can
-# branch on it rather than inferring one from the shape of `values_field`.
-RENDERER_HELM = "helm"
-RENDERER_KUSTOMIZE = "kustomize"
-# What marks a directory as a Kustomize root. `kustomization.yaml` is what
-# `kustomize create` writes; the other two are the legacy spellings `kustomize
-# build` still accepts, and a repo that uses one is exactly as unresolvable
-# without this as one that uses the first.
-KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
 
 # How far back `fetch_usage_peaks` looks for a workload's peak. A week, to
 # match this stream's weekly cadence: every finding is then "this controller
@@ -778,10 +706,9 @@ IMPACT = {
 # stay recorded rather than audited. A read that fails anyway still lands on
 # the existing per-cluster `unreachable`/`gate-failed` path.
 AUDITABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
-# The markers a reconciling controller stamps on an object it owns. Duplicated
-# from `collect.reconciler_of` for the reason `declaration_for` below is: these
-# collectors are standalone scripts, and none imports a sibling collector at
-# module level.
+# The markers a reconciling controller stamps on an object it owns. Still a
+# copy of `collect.reconciler_of`'s, as `reconciler_of` and `release_of` below
+# are; `test_fleet_waste.py` holds the copies in step with `collect.py`.
 #
 # Helm 3 writes both halves of its pair on every object in a release, and the
 # release namespace is not the object's. Argo CD's tracking id is
@@ -942,12 +869,9 @@ def log(msg: str) -> None:
     print(f"[fleet_waste] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+run_and_gate = collector_run.run_and_gate
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
@@ -955,35 +879,6 @@ RunFn = Callable[..., Run]
 # structural rather than typed to `AuthorizedSession` so tests can hand in a
 # stub without importing google.auth, which is not a test-time dependency.
 SessionFn = Any
-
-
-def _text(output: str | bytes | None) -> str:
-    return output.decode(errors="replace") if isinstance(output, bytes) else (output or "")
-
-
-def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=timeout)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
-        # notwithstanding, and every consumer of `Run` searches and slices it as
-        # str. `collect.py`'s `_text` does the same.
-        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
-    except Exception as exc:
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
-
-
-def run_and_gate(argv: list[str], *, run: RunFn, env: dict | None = None) -> tuple[object | None, Run]:
-    result = run(argv, env=env)
-    if result.rc != 0 or not result.stdout.strip():
-        return None, result
-    try:
-        return json.loads(result.stdout), result
-    except json.JSONDecodeError:
-        return None, result
 
 
 def object_list(parsed: object) -> list | None:
@@ -1018,14 +913,17 @@ def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
 
 def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) -> tuple[Path, Run]:
     kc = kubeconfig_path(project, cluster, location)
-    kc.parent.mkdir(parents=True, exist_ok=True)
+    from collect import prepare_kubeconfig  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
 
-    env = {**os.environ, "KUBECONFIG": str(kc)}
-    result = run(
-        ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project],
-        env=env,
-    )
-    return kc, result
+    argv = ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project]
+    note = prepare_kubeconfig(kc)
+    if note:
+        # The directory is not this run's to write through: gcloud is not
+        # run through it, and the refusal is the result, as the shared rule's
+        # other callers return it.
+        log(f"{project}/{location}/{cluster}: {note}")
+        return kc, Run(argv, KUBECONFIG_REFUSED_RC, "", note, 0.0)
+    return kc, run(argv, env={**os.environ, "KUBECONFIG": str(kc)})
 
 
 def target_name(project: str, location: str, name: str) -> str:
@@ -1168,42 +1066,19 @@ class IncompleteEnumeration(RuntimeError):
 
 
 def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
-    """Whether an API-disabled refusal is `project`'s own. Only then is it the
-    answer "no cluster can exist here": a refusal from a quota project with the
-    API off names that project instead, and read as this one's it marked every
-    project cluster-free, so `finish` closed an audit that read no cluster. A
-    refusal naming no project, or one this project's number cannot be read
-    for, is a failed read."""
-    return refusal_owner(project, stderr, run=run)[0]
+    """Whether an API-disabled refusal is `project`'s own; the one rule is
+    `collect.refusal_names_project`, which carries the reasoning."""
+    from collect import refusal_names_project as shared  # noqa: PLC0415 -- the one rule for an API refusal's owner, in collect.py
+
+    return shared(project, stderr, run=run)
 
 
 def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
-    """`refusal_names_project`'s answer, with why when it is no: which project
-    the refusal named, or that this project's number could not be read. The
-    two call for different fixes -- a quota-project setting, or the describe
-    permission -- and collapsing them sent the operator after the wrong one."""
-    numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
-    if not numbers:
-        # The keyword case-insensitively, as `REFUSED_PROJECT_ID_RE` reads it:
-        # `Project acme` names acme as surely as `project acme` does.
-        if re.search(rf"\b(?i:projects?)[ /]['\"\[]?{re.escape(project)}(?![\w-])", stderr):
-            return True, ""
-        others = sorted(set(REFUSED_PROJECT_ID_RE.findall(stderr)) - REFUSED_PROJECT_ID_STOPWORDS - {project})
-        if others:
-            return False, f"the refusal names another project ({', '.join(map(repr, others))}), so it cannot be tied to {project!r}"
-        return False, f"the refusal names no project, so it cannot be tied to {project!r}"
-    described = run([*PROJECT_DESCRIBE_ARGV, project, "--format", "value(projectNumber)"])
-    if described.rc != 0:
-        return False, (
-            f"`gcloud projects describe {project}` failed (rc={described.rc}), so the refusal's project "
-            f"number could not be compared with this project's: "
-            f"{described.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}"
-        )
-    if numbers == {described.stdout.strip()}:
-        return True, ""
-    return False, (
-        f"the Kubernetes Engine API is off in a project other than {project!r}, such as a quota project"
-    )
+    """`refusal_names_project`'s answer with why when it is no; the one rule
+    is `collect.refusal_owner`."""
+    from collect import refusal_owner as shared  # noqa: PLC0415 -- the one rule for an API refusal's owner, in collect.py
+
+    return shared(project, stderr, run=run)
 
 
 def _describing_once(run: RunFn) -> RunFn:
@@ -1255,6 +1130,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
     # the project as holding no cluster.
     if not isinstance(clusters, list) or not all(isinstance(c, dict) for c in clusters):
         raise RuntimeError("cluster enumeration returned JSON that is not a list of clusters")
+    clusters = declared_scope.drop_excluded(project, clusters)
     running = [
         {
             "name": c["name"],
@@ -3733,7 +3609,7 @@ def _controller_age_days(context: dict, kind: str, ns: str, name: str, *, now: d
 def _is_internal_load_balancer(meta: dict) -> bool:
     """Whether either GKE internal-load-balancer annotation is set on this Service.
 
-    A copy of collect.py's, as `release_declarations` is."""
+    A copy of collect.py's, as `reconciler_of` is."""
     annotations = meta.get("annotations") or {}
     return any(annotations.get(key) == INTERNAL_LB_ANNOTATION_VALUE for key in INTERNAL_LB_ANNOTATIONS)
 
@@ -4552,406 +4428,6 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
     return hits
 
 
-def workload_declarations(root: Path) -> dict[tuple[str, str, str, str], set[str]]:
-    """Index the Kubernetes objects a GitOps clone declares, by cluster tree.
-
-    Maps `(cluster, kind, namespace, metadata.name)` to the set of
-    clone-relative paths declaring it — a set, because two files claiming one
-    object is the ambiguity `declaration_for` refuses to resolve rather than
-    guessing between.
-
-    Copied from `collect.py`, which carries the full argument for why this
-    exists at all: the SOPs otherwise tell the *model* to run
-    `grep -rl "name: <object>"` once per finding, and a grep that is kind-blind
-    and unanchored does not decide consistently. What earns the copy here is
-    that this collector already disagrees with itself. In the live fleet's
-    2026-09-06 run it published three `kind: manifest` sizing findings whose
-    paths this index resolves, and two `overrequest` findings marked
-    `kind: manual` — "no pull request is possible" — on
-    `Deployment/ai-inference-hardened` and `Deployment/ai-inference-unsafe`,
-    both of which it also resolves, in the same repository, on the same run.
-    A shrunk `resources.requests` is the most mechanical manifest edit this
-    audit produces; leaving it `manual` for want of a file path costs a PR
-    that needs no fact from outside the file.
-
-    Returns `{}` when PyYAML is absent or the clone is unreadable, which leaves
-    every candidate unannotated and the SOP's grep as the only answer -- the
-    behaviour that shipped before this existed.
-    """
-    try:
-        import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
-    except ImportError:
-        return {}
-
-    index: dict[tuple[str, str, str, str], set[str]] = {}
-    try:
-        paths = sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.yml"))
-    except OSError:
-        return {}
-    for path in paths:
-        # `.git` holds packed objects, not manifests, and rglob walks into it.
-        if GIT_DIR_NAME in path.parts:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        try:
-            docs = list(yaml.safe_load_all(text))
-        except yaml.YAMLError:
-            # A file this collector cannot parse is one it cannot make a claim
-            # about. Skipping leaves those findings unannotated.
-            continue
-        try:
-            relative = path.relative_to(root)
-        except ValueError:
-            continue
-        parts = relative.parts
-        # Only a file under `clusters/<name>/` is applied to a known cluster.
-        # Anything else -- `gcp/`, `bootstrap/`, the repo root -- is either a
-        # Config Connector resource this index skips or hub infrastructure no
-        # per-cluster finding should resolve to, so it is indexed under no
-        # cluster and can never match: `declaration_for` requires the cluster.
-        if len(parts) <= GITOPS_CLUSTER_TREE_DEPTH or parts[0] != GITOPS_CLUSTER_TREE_ROOT:
-            continue
-        cluster = parts[1]
-        for doc in docs:
-            if not isinstance(doc, dict):
-                continue
-            api = str(doc.get("apiVersion") or "")
-            kind = str(doc.get("kind") or "")
-            if not kind or KCC_API_GROUP_SUFFIX in api:
-                continue
-            meta = doc.get("metadata")
-            if not isinstance(meta, dict):
-                continue
-            name = str(meta.get("name") or "")
-            namespace = str(meta.get("namespace") or "")
-            if not name or not namespace:
-                continue
-            index.setdefault((cluster, kind, namespace, name), set()).add(str(relative))
-    return index
-
-
-def declaration_for(
-    index: dict[tuple[str, str, str, str], set[str]],
-    cluster: str,
-    namespace: str,
-    obj: str,
-) -> dict | None:
-    """Where the GitOps repo declares one candidate's object, or `None`.
-
-    `None` means unannotated — no claim either way — and is what an absent
-    index, an object outside `Kind/name` form, or a genuine miss all return.
-    A hit carries `path` (the declaration itself, for a remediation that
-    *changes* the object, which every sizing finding here is) and `directory`
-    (its parent, for one that *creates* a sibling beside it).
-
-    The match is exact on all four of cluster, kind, namespace and name; see
-    `collect.py`'s copy for why every looser arm was measured and dropped.
-    """
-    kind, _, name = obj.partition("/")
-    if not kind or not name or not cluster or not namespace:
-        return None
-    paths = index.get((cluster, kind, namespace, name))
-    if not paths or len(paths) > 1:
-        # Two files declaring one object is a duplicate resource id that Argo
-        # and Config Sync both reject; picking one would name the wrong file
-        # half the time. Say nothing and let the SOP's `manual` branch hold.
-        return None
-    path = next(iter(paths))
-    parent = str(Path(path).parent)
-    return {"path": path, "directory": parent}
-
-
-def _argocd_chart_source(spec: dict) -> dict | None:
-    """The one chart source on an Argo CD Application, with its field path.
-
-    `spec.source.chart` absent is the discriminator that keeps this off the
-    plain-manifest Applications a GitOps repo is mostly made of. Two chart
-    entries under `spec.sources` is an ambiguity with no right answer and
-    returns None, the way `declaration_for` treats two declaring files. See
-    `collect._argocd_chart_source`.
-    """
-    single = spec.get("source")
-    if isinstance(single, dict) and single.get("chart"):
-        return {"source": single, "field": "spec.source"}
-    sources = spec.get("sources")
-    if not isinstance(sources, list):
-        return None
-    charts = [
-        {"source": entry, "field": f"spec.sources[{position}]"}
-        for position, entry in enumerate(sources)
-        if isinstance(entry, dict) and entry.get("chart")
-    ]
-    return charts[0] if len(charts) == 1 else None
-
-
-def _argocd_kustomize_source(spec: dict, root: Path) -> dict | None:
-    """The one Kustomize source on an Argo CD Application, with its field path.
-
-    Reached only where `_argocd_chart_source` found no chart, and answers the
-    case its docstring sets aside. A plain directory of manifests is resolved
-    by `workload_declarations`, which finds the object's own YAML -- but an
-    overlay over a *remote* base renders objects no file in the repo declares,
-    so that lookup finds nothing and the finding falls to `manual`. It is the
-    same hole a chart put a workload in, and as common: `resources:` pointing
-    at a tagged base in another repository is an ordinary way to run a fleet.
-
-    A `kustomization.yaml` at `spec.source.path` is the discriminator, checked
-    against the clone rather than against `spec.source.kustomize`, which Argo
-    CD infers from that same file and most Applications therefore omit. Where
-    the base *is* local, the object has its own manifest, and the
-    `"declaration" not in candidate` guard in `_emit` keeps that direct edit
-    ahead of a patch here.
-
-    Multi-source and two-source ambiguity follow `_argocd_chart_source`.
-    """
-
-    def rooted(entry: object) -> bool:
-        if not isinstance(entry, dict) or entry.get("chart"):
-            return False
-        path = str(entry.get("path") or "").strip()
-        if not path or path.startswith("/") or ".." in Path(path).parts:
-            return False
-        try:
-            directory = root / path
-            return any((directory / name).is_file() for name in KUSTOMIZATION_FILE_NAMES)
-        except OSError:
-            return False
-
-    single = spec.get("source")
-    if rooted(single):
-        return {"source": single, "field": "spec.source"}
-    sources = spec.get("sources")
-    if not isinstance(sources, list):
-        return None
-    overlays = [
-        {"source": entry, "field": f"spec.sources[{position}]"}
-        for position, entry in enumerate(sources)
-        if rooted(entry)
-    ]
-    return overlays[0] if len(overlays) == 1 else None
-
-
-def _argocd_values_field(source: dict, field: str) -> str:
-    """Where a values override belongs on one Argo CD chart source.
-
-    Names the block already in the file when there is one, so an override joins
-    it rather than sitting beside a second block Argo CD would ignore --
-    `values` and `valuesObject` are mutually exclusive and Argo rejects an
-    Application carrying both.
-    """
-    helm = source.get("helm")
-    if isinstance(helm, dict) and isinstance(helm.get(ARGOCD_VALUES_STRING_FIELD), str):
-        return f"{field}.helm.{ARGOCD_VALUES_STRING_FIELD}"
-    return f"{field}.helm.{ARGOCD_VALUES_OBJECT_FIELD}"
-
-
-def release_declarations(root: Path) -> dict[tuple, dict]:
-    """Index the Helm releases a GitOps clone installs, by destination cluster.
-
-    `workload_declarations` above resolves a workload to the file declaring
-    *that object*. A workload a chart renders has no such file: the repo
-    declares the release, and the object exists only after Helm expands the
-    chart. That is what sends a right-sizing finding to `manual` -- and
-    right-sizing is the fix a pull request carries best, because `resources` is
-    the one key nearly every chart publishes. See `collect.release_declarations`,
-    which holds the full reasoning, the three key shapes, and why `ApplicationSet`
-    is deliberately not indexed.
-
-    Returns `{}` when PyYAML is absent, the clone is unreadable, or a
-    content-mode mirror carries MIRROR_RELEASES_WITHHELD_MARKER.
-    """
-    if (root / MIRROR_RELEASES_WITHHELD_MARKER).exists():
-        return {}
-    try:
-        import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
-    except ImportError:
-        return {}
-
-    try:
-        paths = sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.yml"))
-    except OSError:
-        return {}
-
-    documents: list[tuple[str, tuple[str, ...], dict]] = []
-    for path in paths:
-        if GIT_DIR_NAME in path.parts:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        try:
-            docs = list(yaml.safe_load_all(text))
-        except yaml.YAMLError:
-            continue
-        try:
-            relative = path.relative_to(root)
-        except ValueError:
-            continue
-        for doc in docs:
-            if isinstance(doc, dict) and doc.get("kind"):
-                documents.append((str(relative), relative.parts, doc))
-
-    # Pass 1: the two lookups an Application or a HelmRelease resolves through.
-    servers: dict[str, str] = {}
-    repositories: dict[tuple[str, str], str] = {}
-    for _, _, doc in documents:
-        kind = str(doc.get("kind") or "")
-        meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
-        if kind == "Secret":
-            labels = meta.get("labels") if isinstance(meta.get("labels"), dict) else {}
-            if labels.get(ARGOCD_CLUSTER_SECRET_LABEL) != ARGOCD_CLUSTER_SECRET_VALUE:
-                continue
-            # `stringData` is what a committed registration uses; `data` is
-            # base64 and a committed one would be a leaked credential, so only
-            # the plaintext form is read.
-            entry = doc.get("stringData")
-            if not isinstance(entry, dict):
-                continue
-            server = str(entry.get("server") or "").strip()
-            cluster = str(entry.get("name") or "").strip()
-            if server and cluster:
-                servers[server] = cluster
-        elif kind == FLUX_HELM_REPOSITORY_KIND:
-            repo_spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
-            url = str(repo_spec.get("url") or "").strip()
-            name = str(meta.get("name") or "")
-            namespace = str(meta.get("namespace") or "")
-            if url and name:
-                repositories[(namespace, name)] = url
-
-    index: dict[tuple, dict] = {}
-    ambiguous: set[tuple] = set()
-
-    def record(key: tuple, entry: dict) -> None:
-        existing = index.get(key)
-        if existing is not None and existing != entry:
-            # Two declarations for one release. Same reasoning as
-            # `declaration_for`: naming one would name the wrong file half the
-            # time, so name neither.
-            ambiguous.add(key)
-            return
-        index[key] = entry
-
-    # Pass 2: the declarations themselves.
-    for relative, parts, doc in documents:
-        kind = str(doc.get("kind") or "")
-        meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
-        spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
-        name = str(meta.get("name") or "")
-        if not name:
-            continue
-        if kind == ARGOCD_APPLICATION_KIND:
-            chart = _argocd_chart_source(spec)
-            overlay = _argocd_kustomize_source(spec, root) if chart is None else None
-            if chart is None and overlay is None:
-                continue
-            found = chart or overlay
-            source, field = found["source"], found["field"]
-            destination = spec.get("destination") if isinstance(spec.get("destination"), dict) else {}
-            cluster = str(destination.get("name") or "").strip()
-            if not cluster:
-                server = str(destination.get("server") or "").strip()
-                # The in-cluster destination is whichever cluster Argo CD runs
-                # on, which this index has no way to name. Skip rather than
-                # resolve a finding into the wrong tree.
-                if server and server != ARGOCD_IN_CLUSTER_SERVER:
-                    cluster = servers.get(server, "")
-            if not cluster:
-                continue
-            release_namespace = str(destination.get("namespace") or "").strip()
-            helm = source.get("helm") if isinstance(source.get("helm"), dict) else {}
-            entry = {
-                "path": relative,
-                "kind": ARGOCD_APPLICATION_KIND,
-                "renderer": RENDERER_HELM if chart else RENDERER_KUSTOMIZE,
-                "chart": str(source.get("chart") or source.get("path") or ""),
-                "repo": str(source.get("repoURL") or ""),
-                "version": str(source.get("targetRevision") or ""),
-                "values_field": (
-                    _argocd_values_field(source, field)
-                    if chart
-                    else f"{field}.{RENDERER_KUSTOMIZE}.{ARGOCD_KUSTOMIZE_PATCHES_FIELD}"
-                ),
-            }
-            record((cluster, RELEASE_KEY_APPLICATION, name), entry)
-            release_name = str(helm.get("releaseName") or "").strip() or name
-            # Only a chart install leaves the `meta.helm.sh` pair behind, so
-            # only a chart is worth the second key. Kustomize output carries
-            # the tracking id alone, which the Application key above already
-            # answers.
-            if chart and release_namespace:
-                record((cluster, RELEASE_KEY_RELEASE, release_namespace, release_name), entry)
-            # A local Kustomize root is also an answer to "where does a new
-            # object for this namespace go", which no other key gives. A chart
-            # is not: its directory is in another repository, and the values
-            # override that reaches an *existing* object cannot create one.
-            if overlay and release_namespace and entry["chart"]:
-                record((cluster, RELEASE_KEY_NAMESPACE, release_namespace), entry)
-        elif kind == FLUX_HELM_RELEASE_KIND:
-            # Flux is installed per-cluster, so the path convention is the only
-            # cluster signal a HelmRelease carries.
-            if len(parts) <= GITOPS_CLUSTER_TREE_DEPTH or parts[0] != GITOPS_CLUSTER_TREE_ROOT:
-                continue
-            cluster = parts[1]
-            namespace = str(meta.get("namespace") or "")
-            # A scalar or a list where the chart template goes is a malformed
-            # document, and one malformed file must not crash the whole run
-            # before the manifest prints. Skip it; `sourceRef` is guarded alike.
-            # An absent `chart` is the `chartRef` form, which still indexes, on
-            # an empty chart, for the values field it names.
-            chart = spec.get("chart") if spec.get("chart") is not None else {}
-            chart_spec = chart.get("spec") if isinstance(chart, dict) and chart.get("spec") is not None else {}
-            if not isinstance(chart, dict) or not isinstance(chart_spec, dict):
-                continue
-            source_ref = chart_spec.get("sourceRef") if isinstance(chart_spec.get("sourceRef"), dict) else {}
-            repo_namespace = str(source_ref.get("namespace") or namespace)
-            repo_name = str(source_ref.get("name") or "")
-            release_namespace = str(spec.get("targetNamespace") or namespace)
-            release_name = str(spec.get("releaseName") or "").strip() or name
-            if not release_namespace:
-                continue
-            entry = {
-                "path": relative,
-                "kind": FLUX_HELM_RELEASE_KIND,
-                "renderer": RENDERER_HELM,
-                "chart": str(chart_spec.get("chart") or ""),
-                "repo": repositories.get((repo_namespace, repo_name), ""),
-                "version": str(chart_spec.get("version") or ""),
-                "values_field": f"spec.{FLUX_VALUES_FIELD}",
-            }
-            record((cluster, RELEASE_KEY_RELEASE, release_namespace, release_name), entry)
-
-    for key in ambiguous:
-        index.pop(key, None)
-    return index
-
-
-def release_declaration_for(index: dict[tuple, dict], cluster: str, release: dict | None) -> dict | None:
-    """Where the GitOps repo declares one candidate's chart release, or `None`.
-
-    `None` is no claim either way, exactly as in `declaration_for`. The Argo CD
-    Application name is tried first, being the more specific of the two keys.
-    """
-    if not index or not cluster or not release:
-        return None
-    application = str(release.get("application") or "")
-    if application:
-        entry = index.get((cluster, RELEASE_KEY_APPLICATION, application))
-        if entry:
-            return entry
-    name = str(release.get("name") or "")
-    namespace = str(release.get("namespace") or "")
-    if name and namespace:
-        entry = index.get((cluster, RELEASE_KEY_RELEASE, namespace, name))
-        if entry:
-            return entry
-    return None
-
-
 def _emit(
     slug: str,
     hit: dict,
@@ -5589,6 +5065,15 @@ def _bare_cluster_name(entry: dict) -> str:
     return entry.get("name", "").rsplit(QUALIFIED_TARGET_SEPARATOR, 1)[-1]
 
 
+# Appended to a project's limitations when the install excludes some of its
+# clusters: they count among the unread above, by design rather than failure.
+EXCLUDED_CLUSTERS_NOTE = (
+    "{named} in this project are excluded by the install's spec.scope.exclude.clusters and were not "
+    "read on purpose: the checks above that need every cluster's objects count them as unread, so "
+    "nothing they own is reported as abandoned."
+)
+
+
 def _known_clusters(clusters: list[dict]) -> tuple[set[str], set[tuple[str, str | None]]]:
     """A project's cluster names, and its (name, location) pairs, whatever their status."""
     return (
@@ -5605,6 +5090,14 @@ def _unread_names(known: set[tuple[str, str | None]], collected: set[tuple[str, 
     when two clusters share a name and only one was read, the name counts as
     unread, which skips the read one's disks rather than flag the other's."""
     return frozenset(name for name, _ in known - collected)
+
+
+def _only_excluded_unread(known: set[tuple[str, str | None]], collected: set[tuple[str, str | None]], dropped: list[tuple[str, str]]) -> bool:
+    """Whether every cluster this project left unread is one the install
+    excludes (#3081). On (name, location) pairs: a failed read of a cluster
+    that shares an excluded one's name in another location is not an
+    exclusion, and its limitation must keep saying it could not be read."""
+    return bool(dropped) and (known - collected) <= set(dropped)
 
 
 def _unread_labels(known: set[tuple[str, str | None]], collected: set[tuple[str, str | None]]) -> list[str]:
@@ -5932,7 +5425,7 @@ def forwarding_rules_argv(project: str) -> list[str]:
     return ["gcloud", "compute", "forwarding-rules", "list", "--project", project, "--format", "json"]
 
 
-def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset(), clusters_read: int | None = None, unread_labels: list[str] | None = None, announce: bool = True) -> dict | None:
+def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset(), clusters_read: int | None = None, unread_labels: list[str] | None = None, announce: bool = True, excluded: list[str] | None = None, only_excluded_unread: bool | None = None) -> dict | None:
     # `--filter=-users:*` and not `"--filter", "-users:*"`: a filter value
     # starting with `-` reads as a flag to gcloud's own argument parser, which
     # then rejects the command for the argument it thinks is missing
@@ -6049,6 +5542,11 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     compute_ok = not compute_disabled and not compute_failed
     disks_judged = compute_ok and not none_read
     unread_named = ", ".join(sorted(unread_clusters) if unread_labels is None else unread_labels)
+    # Every cluster left unread is one the install excludes: no read failed.
+    # The caller decides on (name, location) pairs, since `unread_clusters` is
+    # reduced to names and a failed read of a same-named cluster in another
+    # location must not read as an exclusion; by name only when not told.
+    only_excluded = only_excluded_unread if only_excluded_unread is not None else bool(excluded) and set(unread_clusters) <= set(excluded)
     candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now, known_clusters=known_clusters, unread_clusters=unread_clusters)] if disks_judged else []
     # §3.5 clears an address any Service or Ingress annotation names, and
     # `referenced_addresses` holds only the read clusters' annotations, so an
@@ -6101,19 +5599,30 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         # would turn every load balancer it serves into a false positive. The
         # unreadable clusters are their own manifest entries, carrying the
         # stderr that explains each one.
-        entry["limitations"] = (
-            "orphan-lb was not evaluated for this project: §3.6 compares "
-            "forwarding rules against the Service names of every cluster in "
-            "the project, and at least one of them could not be read, so a "
-            "rule that cluster's Services reference would read as orphaned. "
-            "See this project's cluster "
-            "entries in this manifest for the reason each one failed."
-        )
+        if only_excluded:
+            # Every cluster left unread is one the install excludes: there is no
+            # failed entry to point at, and EXCLUDED_CLUSTERS_NOTE below names them.
+            entry["limitations"] = (
+                "orphan-lb was not evaluated for this project: §3.6 compares "
+                "forwarding rules against the Service names of every cluster in "
+                "the project, and the clusters the install excludes were not "
+                "read, so a rule their Services reference would read as orphaned."
+            )
+        else:
+            entry["limitations"] = (
+                "orphan-lb was not evaluated for this project: §3.6 compares "
+                "forwarding rules against the Service names of every cluster in "
+                "the project, and at least one of them could not be read, so a "
+                "rule that cluster's Services reference would read as orphaned. "
+                "See this project's cluster "
+                "entries in this manifest for the reason each one failed."
+            )
     if not disks_judged and compute_ok:
         disk_gap = (
-            "unattached-disk was not evaluated for this project: none of its clusters "
-            f"({unread_named}) could be read, so no disk can be "
-            "cleared against a live PersistentVolume."
+            "unattached-disk was not evaluated for this project: "
+            + (f"its clusters ({unread_named}) are all excluded by spec.scope.exclude.clusters and were not read"
+               if only_excluded else f"none of its clusters ({unread_named}) could be read")
+            + ", so no disk can be cleared against a live PersistentVolume."
         )
         entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
     elif unread_clusters and compute_ok:
@@ -6132,14 +5641,23 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             + " could name one, so an address they hold would read as idle."
         )
         entry["limitations"] = f"{entry['limitations']} {address_gap}" if entry.get("limitations") else address_gap
+    if excluded and compute_ok:
+        # The sentences above say "could not be read"; these were left unread
+        # on purpose, and a reader must not go looking for a failed read.
+        excluded_note = EXCLUDED_CLUSTERS_NOTE.format(named=", ".join(excluded))
+        entry["limitations"] = f"{entry['limitations']} {excluded_note}" if entry.get("limitations") else excluded_note
     unevaluated = {}
     if compute_failed:
         unevaluated.update({slug: compute_error for slug in COMPUTE_CHECKS})
     elif not all_reachable and not compute_disabled:
-        unevaluated["orphan-lb"] = "a cluster in this project could not be read, so its Services are unknown"
-        unevaluated["idle-address"] = "a cluster in this project could not be read, so its Service and Ingress address annotations are unknown"
+        unread_why = "is excluded by spec.scope.exclude.clusters or could not be read" if excluded else "could not be read"
+        unevaluated["orphan-lb"] = f"a cluster in this project {unread_why}, so its Services are unknown"
+        unevaluated["idle-address"] = f"a cluster in this project {unread_why}, so its Service and Ingress address annotations are unknown"
     if not disks_judged and compute_ok:
-        unevaluated["unattached-disk"] = "none of this project's clusters could be read"
+        unevaluated["unattached-disk"] = (
+            "this project's clusters are all excluded by spec.scope.exclude.clusters" if only_excluded
+            else "none of this project's clusters could be read" + (" (some are excluded by spec.scope.exclude.clusters)" if excluded else "")
+        )
     if reg_parsed is None and not registry_disabled:
         unevaluated["registry-no-cleanup"] = (
             f"`gcloud artifacts repositories list` failed (rc={reg_result.rc})"
@@ -6363,7 +5881,12 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             known_by_project[p] = None
             enumeration_failed[p] = error
             continue
-        known_by_project[p], known_pairs_by_project[p] = _known_clusters(running + not_running)
+        # A cluster the scope excludes was dropped from the listing unread, but
+        # it still owns this project's disks, forwarding rules and addresses:
+        # known and never collected, so its disks are skipped and the checks
+        # that need every cluster's Services are withheld, not judged (#3081).
+        excluded = [{"name": name, "location": location} for name, location in declared_scope.dropped.get(p, [])]
+        known_by_project[p], known_pairs_by_project[p] = _known_clusters(running + not_running + excluded)
         forwarding_rules[p] = rules
         if traffic is not None:
             lb_traffic[p] = traffic
@@ -6383,6 +5906,16 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             return _prefetch_compute(p, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p))
         except Exception as exc:  # noqa: BLE001 — see crashed_project_error
             return ProjectCrash(crashed_project_error(p, exc))
+
+    # The shared kubeconfig directory, made usable once before the pool opens
+    # (`collect.usable_kubeconfig_dir`, the one rule): the first wave's threads
+    # would otherwise race one another's move-aside and log it as a refusal.
+    if clusters:
+        from collect import usable_kubeconfig_dir  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
+
+        shared_note = usable_kubeconfig_dir(KUBECONFIG_DIR)
+        if shared_note:
+            log(f"{KUBECONFIG_DIR}: {shared_note}")
 
     results: list[tuple[dict, dict]] = [None] * len(clusters)
     prefetched: dict[str, dict[tuple[str, ...], Run] | ProjectCrash | None] = {}
@@ -6435,6 +5968,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         # and pinned the run `partial`.
         all_reachable = (
             not skipped_by_project.get(p)
+            and not declared_scope.dropped.get(p)
             and all(entry["outcome"] == "collected" for entry, _ in group)
         )
         fleet_facts = empty_fleet_facts()
@@ -6449,7 +5983,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         known_pairs = known_pairs_by_project.get(p, set())
         collected = collected_by_project.get(p, set())
 
-        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs, collected), clusters_read=len(known_pairs & collected), unread_labels=_unread_labels(known_pairs, collected))
+        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs, collected), clusters_read=len(known_pairs & collected), unread_labels=_unread_labels(known_pairs, collected), excluded=sorted(name for name, _ in declared_scope.dropped.get(p, [])), only_excluded_unread=_only_excluded_unread(known_pairs, collected, declared_scope.dropped.get(p, [])))
 
     cluster_entries: list[dict] = []
     project_entries: list[dict] = []
@@ -6546,7 +6080,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     workspace = Path(args.workspace) if args.workspace else None
     if workspace is not None and not workspace.is_dir():
         # Loud, and not fatal. A typo here would otherwise annotate nothing and
@@ -6562,11 +6096,8 @@ def main(argv: list[str] | None = None) -> int:
         manifest = collect_fleet(args.project, workspace=workspace)
     else:
         # Possibly content mode: no clone, so `collect.py`'s mirror decides
-        # which tree to index. Imported here rather than at the top so a run
-        # without one stays standalone.
-        import collect  # noqa: PLC0415
-
-        with collect.indexed_workspace(workspace) as indexed:
+        # which tree to index.
+        with indexed_workspace(workspace) as indexed:
             manifest = collect_fleet(args.project, workspace=indexed)
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0

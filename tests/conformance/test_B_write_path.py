@@ -35,32 +35,19 @@ _WORKFLOWS = sorted(
 # The hosted GKE MCP server. Matched by host anywhere in the mcp-remote argv or
 # in a native `url:` transport, rather than by the `gke` key or the exact URL,
 # so a copy under another name, with a trailing slash, another scheme or a
-# `--url=` spelling is still found.
+# `--url=` spelling is still found. The shipped entries reach it through the
+# credential proxy's relay, so the relay's gke route counts too; a direct
+# entry still matches the host, and the relay test below refuses it.
 _GKE_MCP_HOST = "container.googleapis.com"
+_GKE_MCP_TARGETS = (_GKE_MCP_HOST, "${KUBE_AGENTS_MCP_RELAY_URL}/gke")
 
 # The server's tools that it annotates `readOnlyHint: true`, from its
 # `tools/list` on 2026-10-13: 15 of 23. The other eight are create_cluster,
 # create_node_pool, update_cluster, update_node_pool, apply_k8s_manifest,
-# patch_k8s_resource, delete_k8s_resource and cancel_operation.
-_GKE_MCP_READ_TOOLS = frozenset(
-    {
-        "check_k8s_auth",
-        "describe_k8s_resource",
-        "get_cluster",
-        "get_k8s_cluster_info",
-        "get_k8s_logs",
-        "get_k8s_resource",
-        "get_k8s_rollout_status",
-        "get_k8s_version",
-        "get_node_pool",
-        "get_operation",
-        "list_clusters",
-        "list_k8s_api_resources",
-        "list_k8s_events",
-        "list_node_pools",
-        "list_operations",
-    }
-)
+# patch_k8s_resource, delete_k8s_resource and cancel_operation. One source:
+# the set the credential proxy enforces, so the offer and the refusal cannot
+# drift apart.
+_GKE_MCP_READ_TOOLS = h.mcp_policy.GKE_READ_TOOLS
 
 # A registered MCP tool name whose verb changes something. Hermes registers a
 # server's tool as `mcp__<server>__<tool>` (tools/mcp_tool_schema.py
@@ -88,11 +75,12 @@ def _profile_configs():
     return {
         "platform": merge(shared, platform),
         "cluster": yaml.safe_load(h.text("cluster_config")),
+        "tse": yaml.safe_load(h.text("tse_config")),
     }
 
 
-def _servers_reaching(config, host):
-    """The `mcp_servers` entries in one parsed config that name `host`.
+def _servers_reaching(config, targets):
+    """The `mcp_servers` entries in one parsed config that name any of `targets`.
 
     Either through mcp-remote, where the URL is an argv entry, or through
     Hermes' native HTTP transport, where it is the `url` key
@@ -103,7 +91,10 @@ def _servers_reaching(config, host):
         name: server
         for name, server in (config.get("mcp_servers") or {}).items()
         if isinstance(server, dict)
-        and any(isinstance(value, str) and host in value for value in [*(server.get("args") or []), server.get("url")])
+        and any(
+            isinstance(value, str) and any(target in value for target in targets)
+            for value in [*(server.get("args") or []), server.get("url")]
+        )
     }
 
 
@@ -249,17 +240,14 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
                 self.assertFalse(decision.allowed, f"{argv} reached the project")
 
     def test_B1_the_gke_mcp_server_offers_no_write_tool(self) -> None:
-        """The one cloud write path the broker never sees.
+        """The offer half of the gke MCP server's read-only posture.
 
-        The `gke` MCP server runs in the agent container on the pod's Workload
-        Identity credential, so the gcloud allowlist above does not apply to
-        it. With a `custom` permission set that grants a write role, an
-        unfiltered server hands the model create_cluster and
-        patch_k8s_resource, and both have been used.
-
-        The filter is a declaration rather than enforcement: the credential is
-        unchanged, and only the tool list stands between the model and the
-        write. So this reads the list from the config each profile actually
+        With a `custom` permission set that grants a write role, an unfiltered
+        server hands the model create_cluster and patch_k8s_resource, and both
+        have been used. The refusal half is the credential proxy's relay
+        (`test_B1_the_broker_refuses_every_gke_mcp_write_tool`); this is the
+        declaration that keeps the write tools out of the model's offer, so a
+        refused call is never attempted in the first place. So this reads the list from the config each profile actually
         runs with, not from the source files. It requires a `tools.include`
         allowlist, since `exclude` offers a tool the day the server ships it,
         and requires every name on it to be one the server marks read-only.
@@ -270,9 +258,12 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         declaring = {
             path.relative_to(h.REPO_ROOT).as_posix()
             for path in (h.path_of("shared_defaults_config"), *sorted((h.REPO_ROOT / "agents").glob("*/config.yaml")))
-            if _servers_reaching(yaml.safe_load(path.read_text()) or {}, _GKE_MCP_HOST)
+            if _servers_reaching(yaml.safe_load(path.read_text()) or {}, _GKE_MCP_TARGETS)
         }
-        modelled = {h.SOURCES[name].path for name in ("shared_defaults_config", "platform_config", "cluster_config")}
+        modelled = {
+            h.SOURCES[name].path
+            for name in ("shared_defaults_config", "platform_config", "cluster_config", "tse_config")
+        }
         self.assertEqual(
             set(),
             declaring - modelled,
@@ -280,7 +271,7 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         )
 
         for profile, config in _profile_configs().items():
-            servers = _servers_reaching(config, _GKE_MCP_HOST)
+            servers = _servers_reaching(config, _GKE_MCP_TARGETS)
             with self.subTest(profile=profile):
                 self.assertTrue(servers, f"the {profile} profile declares no {_GKE_MCP_HOST} server")
             for name, server in servers.items():
@@ -505,6 +496,98 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
             "a second Slack remove or delete method reaches the bot token",
         )
 
+    # The gke MCP server's own write tools: the eight of its 23 that it does
+    # not annotate `readOnlyHint`, from a live `tools/list` on 2026-10-13.
+    # Literal here and not read from mcp_policy, so a widened table cannot
+    # also widen what this test expects.
+    _GKE_MCP_WRITE_TOOLS = (
+        "apply_k8s_manifest",
+        "cancel_operation",
+        "create_cluster",
+        "create_node_pool",
+        "delete_k8s_resource",
+        "patch_k8s_resource",
+        "update_cluster",
+        "update_node_pool",
+    )
+    # A name with one of these prefixes mutates. The server's eight are above;
+    # this is what a tool added upstream would most likely be called.
+    _WRITE_SHAPED_PREFIXES = ("apply_", "cancel_", "create_", "delete_", "patch_", "scale_", "update_")
+
+    def test_B1_the_broker_refuses_every_gke_mcp_write_tool(self) -> None:
+        """`mcp__gke__patch_k8s_resource` is refused by the broker, not just not offered.
+
+        The gke MCP server runs on the broker's credential, which can create
+        clusters. What the model is offered can drift (a warm schema cache, a
+        config edit); this is the check that refuses the call regardless.
+        """
+        policy = h.mcp_policy
+        for name in self._GKE_MCP_WRITE_TOOLS + ("a_tool_added_upstream_tomorrow",):
+            message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name}}
+            decision = policy.evaluate("gke", message)
+            self.assertFalse(decision.allowed, f"the broker relays gke {name}")
+            self.assertEqual(decision.rule_id, "gcp.mcp.read-only")
+        for name in sorted(policy.GKE_READ_TOOLS):
+            self.assertFalse(
+                name.startswith(self._WRITE_SHAPED_PREFIXES),
+                f"gke {name} is in the broker's read set but is named like a write",
+            )
+            self.assertNotIn(name, self._GKE_MCP_WRITE_TOOLS)
+
+    def test_B1_no_remote_mcp_server_is_reached_on_the_agents_own_credential(self) -> None:
+        """Every remote MCP server in every profile goes through the broker's relay.
+
+        A server pointed straight at `*.googleapis.com` runs on whatever Google
+        credential the agent container can get, and no policy sees its calls.
+        So each mcp-remote entry, and any native `url:` entry, must target the
+        relay, and name a server the relay has a table for.
+        """
+        relay = "${KUBE_AGENTS_MCP_RELAY_URL}/"
+        checked = 0
+        for source in ("shared_defaults_config", "platform_config", "cluster_config", "tse_config"):
+            servers = (yaml.safe_load(h.text(source)) or {}).get("mcp_servers") or {}
+            for alias, spec in servers.items():
+                spec = spec or {}
+                strings = [spec.get("url") or ""] + [str(arg) for arg in spec.get("args") or []]
+                remote = [value for value in strings if "://" in value or value.startswith(relay)]
+                if not remote:
+                    continue  # a local stdio server, like platform_control
+                where = f"{alias} in {h.SOURCES[source].path}"
+                for value in remote:
+                    self.assertTrue(
+                        value.startswith(relay),
+                        f"{where} reaches {value!r} directly, outside the broker",
+                    )
+                    self.assertIsNotNone(
+                        h.mcp_policy.server(value[len(relay):]),
+                        f"{where} targets a relay server the broker has no table for",
+                    )
+                self.assertEqual(
+                    (spec.get("env") or {}).get("MCP_REMOTE_BEARER_FILE"),
+                    "${CREDENTIAL_PROXY_TOKEN_FILE}",
+                    f"{where} does not present the broker token",
+                )
+                checked += 1
+        self.assertGreaterEqual(checked, 5, "the scan matched fewer remote servers than ship")
+
+    def test_B1_only_the_gateway_reaches_the_mcp_relay(self) -> None:
+        """The relay is the gateway's: the sandbox and session pods get no new read path."""
+        prefix = h.mcp_policy.MCP_RELAY_PREFIX
+        self.assertEqual(
+            h.credential_proxy.required_roles(prefix + "gke"),
+            (h.credential_proxy.CALLER_ROLE_CHAT,),
+        )
+
+    def test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route(self) -> None:
+        """The URL the configs interpolate is the route mcp_policy guards."""
+        split = h.text("broker_split_go")
+        match = re.search(r'mcpRelayPath = "([^"]+)"', split)
+        self.assertIsNotNone(match, "mcpRelayPath is no longer a string constant")
+        self.assertEqual(match.group(1) + "/", h.mcp_policy.MCP_RELAY_PREFIX)
+        self.assertIn('mcpRelayURLEnvVar = "KUBE_AGENTS_MCP_RELAY_URL"', split)
+        body = h.go_function_body(h.text("manifests_go"), "buildPodTemplateSpec")
+        self.assertIn("Name:  mcpRelayURLEnvVar", body)
+
 
 class B2AssentIsHumanOrPolicy(unittest.TestCase):
     """B2: gatekeepers may block and may never approve."""
@@ -514,9 +597,11 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
 
         A veto is monotone in the safe direction -- successful injection
         against one produces a false block, a nuisance on one pull request
-        rather than a breach. That property only holds while nothing in CI can
-        assent, so this refuses the mechanisms rather than the intent: the
-        merge and approve calls, and GitHub's auto-merge.
+        rather than a breach. That property only holds while nothing in CI
+        assents on its own verdict, so this refuses the mechanisms rather than
+        the intent: the merge and approve calls, and GitHub's auto-merge, in
+        workflow text. One script enacts the human `lgtm` and `approved` labels
+        through auto-merge; the two tests after the next pin it.
         """
         assenting = (
             r"gh\s+pr\s+merge",
@@ -543,18 +628,24 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
     def test_B2_no_workflow_grants_a_bot_the_ability_to_approve(self) -> None:
         """`pull-requests: write` is the permission an approval needs.
 
-        Six workflows hold it, and none can give an approval:
+        Seven workflows hold it, and none can give an approval:
 
+        - auto-enqueue: `schedule`, `workflow_dispatch` and
+          `pull_request_target: labeled, unlabeled`, `permissions: {}` at the
+          top, job-gated on `github.repository`, the grant job-scoped, checkout
+          pinned to the default branch with `persist-credentials: false`. Its
+          `GITHUB_TOKEN` pull-request write is one comment on a pull request
+          removed from the merge queue, saying why and how to put it back. Its
+          auto-merge calls run on a GitHub App token, which the tests below
+          pin; the comment explains a removal and cannot approve or merge.
         - auto_request_review, which requests reviewers and does not give them.
-        - auto-assign-milestone: triggers on `pull_request_target: closed`
-          gated on `merged == true`, so it runs only after the merge decision
-          has been taken, and its one call is `gh pr edit --milestone`.
         - coverage-comment: `workflow_run`-triggered in the base repository,
           job-gated on `github.repository`, and its one write is posting the
           coverage comment.
         - risk_classify: `pull_request_target` with `permissions: {}` at the
-          top, the grant job-scoped, checkout pinned to the default branch,
-          and its one write is swapping the `risk:*` label.
+          top, job-gated on `github.repository`, the grant job-scoped, checkout
+          pinned to the default branch, and its one write is swapping the
+          `risk:*` label.
         - hold-unresolved-threads: `schedule` plus `pull_request_target:
           labeled`, `permissions: {}` at the top, the grant job-scoped,
           checkout pinned to the default branch, and its writes are the
@@ -567,11 +658,22 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           write is one comment on a pull request whose smoke run went red,
           edited in place on later runs. It explains a red; it cannot approve,
           label, or merge anything.
+        - retest-actions: `issue_comment` on a `/retest` that opens the
+          comment, from an owner, member or collaborator; `permissions: {}`
+          at the top, the grant job-scoped, checkout of the default branch
+          with `persist-credentials: false`, the two event fields passed as
+          integers through the environment. Its one pull-request write is a
+          reaction on the comment that asked; its other writes are re-runs of
+          the pull request's own failed workflow runs, under `actions: write`,
+          which execute with their original actor's privileges. It re-runs a
+          check; it cannot approve, label, or merge anything.
 
         The list is an allowlist of holders, not of intents: the permission is
-        a capability, and this asserts membership rather than absence so a
-        seventh holder is a red test and a conversation rather than a silent
-        addition. Adding a name here means someone read the workflow.
+        a capability, and this asserts membership rather than absence so an
+        eighth holder is a red test and a conversation rather than a silent
+        addition. Adding a name here means someone read the workflow. A GitHub
+        App token minted with Pull requests write is not a `permissions:`
+        grant; `test_B2_app_token_write_grants_are_pinned` holds those.
         """
         holders = []
         for path, document in _workflow_documents():
@@ -586,16 +688,148 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
                     break
         self.assertEqual(
             [
-                "auto-assign-milestone.yml",
+                "auto-enqueue.yml",
                 "auto_request_review.yml",
                 "ci-health.yml",
                 "coverage-comment.yml",
                 "hold-unresolved-threads.yml",
+                "retest-actions.yml",
                 "risk_classify.yml",
             ],
             sorted(set(holders)),
             "an unexpected workflow can write to pull requests",
         )
+
+
+    def test_B2_no_script_merges_except_the_enqueue_sweep(self) -> None:
+        """The workflow-text scan above cannot see a merge call made from a script.
+
+        A workflow that runs `python3 scripts/x.py` carries none of the
+        patterns itself, so this reads the scripts too, for the calls that
+        merge, enqueue or approve. One is allowed on purpose: the sweep in
+        `scripts/merge_gate.py`, run by `auto-enqueue.yml`, turns on GitHub
+        auto-merge, which with a merge queue on `main` means "enqueue once the
+        required checks pass". That is assent by policy: it fires only on
+        `lgtm` and `approved` with no `do-not-merge` label, the predicate Tide
+        merges on today, and Prow sets those two labels only for accounts the
+        `OWNERS` files name. No model verdict is an input. The call runs on a
+        GitHub App token, not on a `pull-requests: write` grant: the holder
+        list above shows `auto-enqueue.yml` only for its left-out comment, and
+        the App-token test below pins who mints one. The next test pins the predicate; any other script under
+        `scripts/` making one of these calls is a red.
+        """
+        merging = (
+            r"enablePullRequestAutoMerge",
+            r"enqueuePullRequest",
+            r"mergePullRequest",
+            r"addPullRequestReview",
+            r"gh\s+pr\s+merge",
+            r"gh\s+pr\s+review[^\n]*--approve",
+            r"/pulls/[^\n]*/merge\b",
+        )
+        allowed = {("scripts/merge_gate.py", "enablePullRequestAutoMerge")}
+        found = set()
+        offences = []
+        for path in sorted((h.REPO_ROOT / "scripts").rglob("*")):
+            if path.suffix not in (".py", ".sh") or path.name.startswith("test_"):
+                continue
+            text = path.read_text()
+            for pattern in merging:
+                for match in re.finditer(pattern, text):
+                    key = (str(path.relative_to(h.REPO_ROOT)), match.group(0))
+                    if key in allowed:
+                        found.add(key)
+                        continue
+                    line = text[: match.start()].count("\n") + 1
+                    offences.append(f"{path.relative_to(h.REPO_ROOT)}:{line} {match.group(0)!r}")
+        self.assertEqual([], offences, "a script can assent to its own repository's changes")
+        self.assertEqual(allowed, found, "the allowed call is gone; drop it from the allowlist")
+
+    def test_B2_the_enqueue_sweep_assents_only_on_both_human_labels(self) -> None:
+        """The predicate behind the one allowed call, driven over the label space.
+
+        Auto-merge goes on only for a pull request that is not a draft, carries
+        both `lgtm` and `approved`, and carries none of the `do-not-merge`
+        labels Tide's query excludes. Every other combination must leave it
+        off. That holds on each removal path too: never removed, removed with
+        the one retry after a `failed_checks` removal due, and removed with it
+        spent, which stays out.
+        """
+        scripts = h.REPO_ROOT / "scripts"
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        import merge_gate
+
+        holds = (
+            "do-not-merge",
+            "do-not-merge/hold",
+            "do-not-merge/invalid-owners-file",
+            "do-not-merge/work-in-progress",
+        )
+        for lgtm in (False, True):
+            for approved in (False, True):
+                for hold in (None,) + holds:
+                    for draft in (False, True):
+                        labels = {"size/S"} | ({"lgtm"} if lgtm else set()) | ({"approved"} if approved else set())
+                        if hold:
+                            labels.add(hold)
+                        for removed, retry in ((False, False), (True, True), (True, False)):
+                            pull = {
+                                "draft": draft,
+                                "labels": labels,
+                                "auto_merge": False,
+                                "queue_entry": None,
+                                "removed_since_push": removed,
+                                "retry": retry,
+                            }
+                            expected = lgtm and approved and not hold and not draft and (retry or not removed)
+                            with self.subTest(labels=sorted(labels), draft=draft, removed=removed, retry=retry):
+                                self.assertEqual(
+                                    expected,
+                                    merge_gate.enqueue_action(pull) == merge_gate.ENABLE,
+                                )
+
+
+    def test_B2_app_token_write_grants_are_pinned(self) -> None:
+        """The write scopes a workflow mints for a GitHub App token, which `permissions:` does not show.
+
+        The release path mints Contents and Workflows write to push its tags.
+        `auto-enqueue.yml` alone also mints Pull requests write, for the
+        enqueue sweep above: it turns auto-merge on and off and dequeues, and
+        the script scan holds it to that. Its key is read nowhere else, so no
+        other workflow can mint the same token. A new grant is a red test and
+        a conversation, as for the holder list above, and so is a minting step
+        that names no scope, which gets every permission the App holds.
+        """
+        grants = set()
+        key_readers = set()
+        for path, document in _workflow_documents():
+            if "MERGE_QUEUE_APP_PRIVATE_KEY" in path.read_text():
+                key_readers.add(path.name)
+            for job in (document.get("jobs") or {}).values():
+                for step in (job or {}).get("steps") or []:
+                    if "create-github-app-token" not in str(step.get("uses", "")):
+                        continue
+                    scopes = {
+                        str(name): value
+                        for name, value in (step.get("with") or {}).items()
+                        if str(name).startswith("permission-")
+                    }
+                    # No `permission-*` input mints every permission the App holds.
+                    self.assertTrue(scopes, f"{path.name} mints an App token with the App's full permission set")
+                    for name, value in scopes.items():
+                        if value != "read":
+                            grants.add((path.name, name))
+        release = {"permission-contents", "permission-workflows"}
+        expected = {(name, scope) for name in (
+            "rc-create-tag.yml",
+            "rc-tag-validated.yml",
+            "release-publish.yml",
+            "staging-promotion-pipeline.yml",
+        ) for scope in release}
+        expected |= {("auto-enqueue.yml", scope) for scope in release | {"permission-pull-requests"}}
+        self.assertEqual(expected, grants)
+        self.assertEqual({"auto-enqueue.yml"}, key_readers)
 
 
 class B3TheSubstrateIsNotAgentAuthorable(unittest.TestCase):
@@ -742,8 +976,8 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         `workflow_run` gate asserts its own: this test says nothing at all
         about a repository with no `pull_request_target` workflows, or one
         where none of them checks anything out, so it cannot tell "the trigger
-        is gone" from "the parse stopped seeing it". Three workflows carry the
-        trigger today and two of them run a checkout. If either reaches zero
+        is gone" from "the parse stopped seeing it". Several workflows carry
+        the trigger today and most of them run a checkout. If either reaches zero
         the test should be read again, not passed by default.
         """
         consumers = [

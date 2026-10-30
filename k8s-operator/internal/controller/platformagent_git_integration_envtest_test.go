@@ -90,12 +90,33 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme",
 				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "Bad_Name"}}},
 		}, "credentialsRef.name"},
-		// caBundleRef is for a gitlab forge, and its names are the
-		// API server's own, held with the webhook off.
+		// caBundleRef is for a self-managed host, and its names are the
+		// API server's own, held with the webhook off. github.com, in any
+		// spelling, takes no private CA.
 		"github-ca-bundle": {agentv1alpha1.IntegrationSpec{
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs",
 				CABundleRef: &agentv1alpha1.ForgeCABundleRef{Name: "gh-ca"}}},
-		}, "caBundleRef is for a gitlab forge"},
+		}, "caBundleRef is for a self-managed host"},
+		// A forge at another host names its provider, so a forge written for
+		// a GitLab instance is never read as a GitHub Enterprise Server.
+		"unnamed-provider-at-a-host": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "f", Host: "git.example.com", Namespace: "acme"}},
+		}, "names its provider"},
+		"github-com-named-ca": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Host: "SSH.GitHub.com", Namespace: "gke-labs",
+				CABundleRef: &agentv1alpha1.ForgeCABundleRef{Name: "gh-ca"}}},
+		}, "caBundleRef is for a self-managed host"},
+		"gitea-http-external": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gitea", Provider: "gitea", Host: "gitea.example.com",
+				Scheme:         "http",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitea-token"}}},
+		}, "scheme http sends the forge token unencrypted"},
+		"gitea-http-ca": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gitea", Provider: "gitea", Host: "gitea.gitea.svc.cluster.local",
+				Scheme:         "http",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitea-token"},
+				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gitea-ca"}}},
+		}, "caBundleRef cannot be set when scheme is http"},
 		"gitlab-com-ca": {agentv1alpha1.IntegrationSpec{
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme",
 				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},
@@ -185,6 +206,13 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 			Namespace:      "acme",
 			CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitlab-token"},
 			CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gitlab-forge-ca"}}}},
+		// A GitHub Enterprise Server forge, with and without its private CA.
+		"ghes": {Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Host: "ghe.example.com",
+			Namespace: "acme"}}, Repositories: []agentv1alpha1.RepositorySpec{
+			{Forge: "github", Repository: "infra", Role: "gitops"}}},
+		"ghes-ca": {Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Host: "ghe.example.com",
+			Namespace:   "acme",
+			CABundleRef: &agentv1alpha1.ForgeCABundleRef{Name: "ghe-ca"}}}},
 		"alias":    {GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"}},
 		"base":     {Forges: gh, Repositories: gitops("release/2026")},
 		"base-max": {Forges: gh, Repositories: gitops(strings.Repeat("a", 200))},

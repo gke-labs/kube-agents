@@ -47,6 +47,25 @@ const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
 // route posts to; the operator renders it from slack.homeChannel.
 const envSlackHomeChannel = "A2A_SLACK_HOME_CHANNEL"
 
+// The learned-home contract (slack_home_channel.go): the operator renders the
+// policy from slack.homeChannelPolicy, the record ConfigMap's name, the
+// gateway's own image for the record's writer and reader keys, and the one
+// switch that arms the learn, which only an operator that also admits the
+// record renders.
+const (
+	envSlackHomePolicy    = "A2A_SLACK_HOME_POLICY"
+	envHomeChannelRecord  = "A2A_HOME_CHANNEL_RECORD"
+	envSelfImage          = "A2A_SELF_IMAGE"
+	envHomeChannelLearn   = "A2A_HOME_CHANNEL_LEARN"
+	slackHomePolicyManual = "manual"
+	envTrue               = "true"
+)
+
+// envSlackAnswerFeedback turns answer feedback off when "false"
+// (feedback.go); the operator renders it only from
+// slack.answerFeedback=false.
+const envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
+
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
 // lines rather than a directory of one file per id, because every key carries
@@ -80,6 +99,10 @@ const (
 // busyNoticeAtEnv names the busy notice's threshold (Config.BusyNoticeAt).
 const busyNoticeAtEnv = "A2A_BUSY_NOTICE_AT"
 
+// EnvNATSCAConfigMap names the ConfigMap the gateway's CA bundle comes from
+// (Config.NATSCAConfigMap), which the operator renders beside NATS_CA_FILE.
+const EnvNATSCAConfigMap = "NATS_CA_CONFIGMAP"
+
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
 	displayModeDefault = "default"
@@ -90,6 +113,10 @@ const (
 // adapter's own default (a2a/cmd/worker-adapter: A2A_TASK_DEADLINE_SECONDS,
 // 1800s), restated here because the two halves of one contract must agree.
 const defaultTaskDeadline = 30 * time.Minute
+
+// defaultSessionMaxLifetime is what SessionMaxLifetime means when unset; the
+// field's comment carries the rationale.
+const defaultSessionMaxLifetime = 4 * time.Hour
 
 // defaultAskTTL is what AskTTL means when unset; the field's comment carries
 // the horizon rationale.
@@ -103,6 +130,17 @@ const defaultSessionTTL = 7 * 24 * time.Hour
 // field's comment carries the sizing rationale.
 const defaultFirstEventGrace = 10 * time.Minute
 
+// defaultCardStopTimeout is what CardStopTimeout means when unset: above the
+// bridge's worst case for a card-stop control, about 60 s (its capability
+// check's 5 s, its 20 s wait for the session's turn and its 35 s POST to
+// session-kv; a2a/hermes-bridge/cardstop.go), with room for the bus.
+const defaultCardStopTimeout = 75 * time.Second
+
+// cardStopTimeoutFloor is the least A2A_CARD_STOP_TIMEOUT FromEnv takes: a
+// wait shorter than the bridge's own turn wait gives up on every stop that
+// has to wait for the turn it just cancelled.
+const cardStopTimeoutFloor = 30 * time.Second
+
 // Config is the gateway's runtime configuration. The env contract matches
 // what the W6 operator renders onto the a2a-gateway Deployment; everything
 // else has playground defaults.
@@ -111,6 +149,13 @@ type Config struct {
 	NATSUser     string
 	NATSPassword string
 	DiscordToken string
+
+	// NATSCAFile is the CA bundle this gateway trusts the bus by
+	// (lib.EnvNATSCAFile), and NATSCAConfigMap the ConfigMap it was mounted
+	// from. The spawner hands both to every session pod: the pod mounts the
+	// same ConfigMap at the same path, so it trusts what the gateway trusts.
+	NATSCAFile      string
+	NATSCAConfigMap string
 
 	// SlackBotToken and SlackAppToken arm the Slack backend: Socket Mode
 	// needs both (xoxb- drives the Web API, xapp- the outbound websocket —
@@ -148,6 +193,20 @@ type Config struct {
 	// the one place a Slack chat.notify home post may land (notify.go). Empty
 	// leaves the route serving conversation requests only.
 	SlackHomeChannel string
+	// SlackHomePolicy is slack.homeChannelPolicy as the operator renders it:
+	// "manual" keeps the home channel the CR's alone; anything else is auto.
+	SlackHomePolicy string
+	// HomeChannelRecord names the ConfigMap a learned home channel is
+	// recorded in, and SelfImage the gateway's own image reference, which it
+	// stamps into that record. HomeChannelLearn is the switch that arms the
+	// learn at all (HomeLearnArmed).
+	HomeChannelRecord string
+	SelfImage         string
+	HomeChannelLearn  bool
+	// AnswerFeedbackOff is the install's slack.answerFeedback=false: no
+	// rating controls are drawn and nothing is kept, whatever the feedback
+	// bucket holds.
+	AnswerFeedbackOff bool
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
@@ -209,6 +268,16 @@ type Config struct {
 	// is not counted by the one-real-backend guard because it consumes
 	// nothing and competes for nothing. See a2a/gateway/a2adoor.go.
 	A2ADoorListen string
+
+	// ConsoleDoor (A2A_CONSOLE_DOOR=true) says the console door is wanted
+	// on its own: a gateway with no chat backend and no other door starts
+	// for it rather than refusing. The console adapter runs whenever the
+	// gateway runs; this only lets it be the gateway's whole ingress. The
+	// operator sets it on every next gateway, so an install with no chat
+	// backend still runs one for the console page and the MCP server. Like
+	// the doors it is not a backend in the one-real-backend sense: it
+	// consumes nothing and competes for nothing.
+	ConsoleDoor bool
 
 	// A2ADoorToken is the bearer token the door requires on every RPC
 	// request (A2A_DOOR_TOKEN); the agent card is the one unauthenticated
@@ -274,10 +343,32 @@ type Config struct {
 	// lazily so that an install with it off never depends on the RBAC.
 	SpawnSessions bool
 
-	// IdleTTL is the reap threshold since the session's last activity: a
-	// verified turn, or an executor ending a live task (decided 8/24: 30
-	// minutes, config-backed; the task's end counts since 2026-09-30).
+	// IdleTTL is the reap threshold since the session's last user message
+	// (decided 8/24: 30 minutes, config-backed; spec-chatops-gateway.md,
+	// Session lifecycle). The answer to that message does not move it: with
+	// one pod serving every turn, the pod is the conversation's, and a
+	// conversation nobody has spoken in for the TTL is idle however recently
+	// its last answer landed. A running task still exempts its pod.
 	IdleTTL time.Duration
+
+	// SessionReuse keeps one pod per conversation across turns
+	// (A2A_SESSION_REUSE, on unless "false"): a turn whose pod is live and
+	// idle goes to it, and only a conversation with no live pod gets a new
+	// one. Off, every turn is a fresh pod, as before 10/9, and the pods
+	// spawned are never handed a second task. Either way the gateway only
+	// reuses pods spawned with the flag, so turning it on never reaches a
+	// pod an older gateway spawned.
+	SessionReuse bool
+
+	// SessionMaxLifetime bounds a reused session pod's whole life
+	// (A2A_SESSION_MAX_LIFETIME, 4h by default), as its activeDeadlineSeconds.
+	// A one-task pod's deadline is TaskDeadline plus a grace, which a pod
+	// serving many turns cannot have; this is the backstop in its place, and
+	// a per-task overdue check in the reap scan bounds a wedged task inside
+	// it (Gateway.taskOverdue). A pod near the end of its lifetime is not
+	// handed another task. Never below TaskDeadline plus twice the grace, so
+	// the pod deadline and the overdue check cannot fire together.
+	SessionMaxLifetime time.Duration
 
 	// AttributionSalt keys the HMAC pseudonyms in authority blocks. The
 	// salt is SESSION_KV_SALT, the one the install already provisions into
@@ -302,9 +393,11 @@ type Config struct {
 	// pod-level activeDeadlineSeconds it sizes above it, and two knobs for
 	// one contract would drift. Unset means 1800s, the adapter's own
 	// default. The adapter kills the harness and publishes the terminal at
-	// this deadline; the pod deadline (this plus a fixed grace) is the
-	// backstop that hands a wedged ADAPTER to Sweep instead of letting it
-	// hold its bus credential indefinitely. Raising it buys longer tasks at
+	// this deadline; for a pod that serves one task, the pod deadline (this
+	// plus a fixed grace) is the backstop that hands a wedged ADAPTER to
+	// Sweep instead of letting it hold its bus credential indefinitely. A
+	// reused pod's backstop is SessionMaxLifetime plus the reap scan's
+	// overdue check at the same bound (Gateway.taskOverdue). Raising it buys longer tasks at
 	// the price of how long a wedged worker can hold a cap slot; lowering
 	// it turns long-running asks into failed tasks sooner.
 	TaskDeadline time.Duration
@@ -363,6 +456,27 @@ type Config struct {
 	// raising it is how long a user waits before the conversation answers
 	// again. Values under 1m are refused at boot.
 	FirstEventGrace time.Duration
+
+	// CardStop arms the card stop (A2A_CARD_STOP, off unless "true";
+	// gke-labs#3263): a `stop` in a conversation on the default addressee
+	// also sends that addressee a card-stop control, a task whose message is
+	// the cardStop data part alone, and the reply names the kanban cards the
+	// executor stopped (cardstop.go). Off, a stop cancels the active task
+	// only and says a card keeps working, as before. A rollout switch: the
+	// control needs a hermes-bridge and an agent image that answer it, and an
+	// older bridge rejects it, which answers cardStopUnconfirmedNotice.
+	CardStop bool
+
+	// CardStopTimeout bounds the wait for a card-stop control's terminal
+	// (A2A_CARD_STOP_TIMEOUT, a Go duration, 75s by default and at least
+	// 30s). Past it the gateway cancels the control and answers that it
+	// could not confirm the stop: the cards may have stopped, and the
+	// executor's answer is what was lost. The operator renders it at the
+	// 75s default and offers no override, as the bridge's own bound
+	// (BRIDGE_CARD_STOP_TIMEOUT_SECONDS, 35s by default) has none; the env
+	// is read so a hand-built Deployment can set it. A change to either
+	// bound is a code change made to both together.
+	CardStopTimeout time.Duration
 
 	// OwnerDeployment names the gateway's own Deployment
 	// (A2A_OWNER_DEPLOYMENT; the operator renders its own render's name).
@@ -437,9 +551,10 @@ type Config struct {
 	// (A2A_MAX_SESSIONS). "Delegate:" makes pod creation user-triggerable and
 	// threads are free, so the principal map bounds WHO can spawn and this
 	// bounds HOW MANY - without it, one mapped user's afternoon can fill the
-	// namespace. At the cap a new delegation (or a session-routed first ask)
-	// is refused with a chat reply naming the numbers; nothing queues,
-	// nothing drops silently.
+	// namespace. At the cap the session pod idle longest is evicted to make
+	// room, and its conversation told; only with none idle is the new
+	// delegation (or session-routed turn) refused, with a chat reply naming
+	// the numbers. Nothing queues, nothing drops silently.
 	//
 	// Zero means 10, the harness spike's "busy day": at the worker shape's
 	// requests (250m/512Mi) ten concurrent sessions hold 2.5 CPU / 5Gi, which
@@ -458,7 +573,10 @@ type Config struct {
 	// parent's depth plus one, and a turn already at the bound may not
 	// delegate again. One child at a time means the chain is a line, and
 	// this bounds its length: a harness that delegates in a loop stops at
-	// the bound instead of walking the session cap.
+	// the bound instead of walking the session cap. Since a wake's pod has
+	// no delegate tool (delegateToolFor), a chain from a stock worker is a
+	// human turn and its child, so the bound is the backstop for a worker
+	// that delegates without the tool, not the everyday limit.
 	//
 	// Zero means 3. FromEnv refuses a value under 1 rather than clamping
 	// it: 0 would be "delegation off", which is a different switch
@@ -483,8 +601,8 @@ type Config struct {
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
-// "discord", or "" when a side door (inject, A2A, or both) is the only way
-// in. FromEnv
+// "discord", or "" when a side door (inject, A2A, or both) or the console
+// door alone is the only way in. FromEnv
 // refuses more than one real backend, so the order here only decides what a
 // hand-built Config means.
 //
@@ -500,7 +618,7 @@ func (c *Config) Backend() string {
 		return slackBackend
 	case c.DiscordToken != "":
 		return discordBackend
-	case c.InjectListen != "" || c.A2ADoorListen != "":
+	case c.InjectListen != "" || c.A2ADoorListen != "" || c.ConsoleDoor:
 		// No real backend: a door is the whole of the ingress, and the
 		// attribution on a message that comes through it is the door's own.
 		return ""
@@ -516,6 +634,16 @@ func (c *Config) Backend() string {
 // InjectArmed reports whether the side door is open.
 func (c *Config) InjectArmed() bool { return c.InjectListen != "" }
 
+// HomeLearnArmed reports whether the gateway may learn the Slack home channel
+// from the first admitted channel mention and record it: the backend is
+// Slack, the CR names no home channel (a set one is the CR's, malformed or
+// not), the policy is auto, a record is named, and the operator has armed the
+// learn. Every gate holds, or nothing is read, written or posted.
+func (c *Config) HomeLearnArmed() bool {
+	return c.Backend() == slackBackend && c.SlackHomeChannel == "" &&
+		c.SlackHomePolicy != slackHomePolicyManual && c.HomeChannelRecord != "" && c.HomeChannelLearn
+}
+
 // A2ADoorArmed reports whether the A2A door is open.
 func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
 
@@ -523,6 +651,8 @@ func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
 func FromEnv() (*Config, error) {
 	cfg := &Config{
 		NATSURL:          os.Getenv("NATS_URL"),
+		NATSCAFile:       os.Getenv(lib.EnvNATSCAFile),
+		NATSCAConfigMap:  os.Getenv(EnvNATSCAConfigMap),
 		NATSUser:         os.Getenv("NATS_USER"),
 		NATSPassword:     os.Getenv("NATS_PASSWORD"),
 		DiscordToken:     os.Getenv("DISCORD_TOKEN"),
@@ -552,6 +682,11 @@ func FromEnv() (*Config, error) {
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
 	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
 	cfg.SlackHomeChannel = strings.TrimSpace(os.Getenv(envSlackHomeChannel))
+	cfg.SlackHomePolicy = strings.TrimSpace(os.Getenv(envSlackHomePolicy))
+	cfg.HomeChannelRecord = strings.TrimSpace(os.Getenv(envHomeChannelRecord))
+	cfg.SelfImage = strings.TrimSpace(os.Getenv(envSelfImage))
+	cfg.HomeChannelLearn = os.Getenv(envHomeChannelLearn) == envTrue
+	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false)
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
 	// Set is a list, even set empty: the operator renders the var empty for
@@ -575,6 +710,7 @@ func FromEnv() (*Config, error) {
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)
 	cfg.A2ADoorListen = strings.TrimSpace(os.Getenv("A2A_DOOR_LISTEN"))
+	cfg.ConsoleDoor = os.Getenv("A2A_CONSOLE_DOOR") == "true"
 	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))
 	cfg.A2ADoorPrincipalMapPath = envOr("A2A_DOOR_PRINCIPAL_MAP", defaultA2ADoorPrincipalMapPath)
 	cfg.A2ADoorPublicURL = strings.TrimSpace(os.Getenv("A2A_DOOR_PUBLIC_URL"))
@@ -595,6 +731,13 @@ func FromEnv() (*Config, error) {
 	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
+	}
+	// The CA and the ConfigMap it came from arm the session pods' trust
+	// together. With the file alone the gateway itself connects, while every
+	// session pod it spawns gets the tls:// URL and no CA, and fails
+	// verification on its first connect.
+	if (cfg.NATSCAFile != "") != (cfg.NATSCAConfigMap != "") {
+		return nil, fmt.Errorf("%s and %s arm the session pods' bus trust together; only one is set", lib.EnvNATSCAFile, EnvNATSCAConfigMap)
 	}
 	// Socket Mode needs the whole Slack pair; half a pair is a typo, not a
 	// choice, so it refuses rather than silently running another backend.
@@ -640,11 +783,14 @@ func FromEnv() (*Config, error) {
 		// inject-only when it does, and says so on the door's read route,
 		// because a next install whose relay URL failed to render looks the
 		// same. The spec's test-backend section states the same decision.
-		if cfg.InjectListen == "" && cfg.A2ADoorListen == "" {
-			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), or A2A_DOOR_LISTEN (the A2A door for agent callers)")
+		// The console door alone is enough too (A2A_CONSOLE_DOOR), for the
+		// same reason: a console client such as the MCP server needs a
+		// gateway on an install that configured no chat backend.
+		if cfg.InjectListen == "" && cfg.A2ADoorListen == "" && !cfg.ConsoleDoor {
+			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), A2A_DOOR_LISTEN (the A2A door for agent callers), or A2A_CONSOLE_DOOR=true (the console door alone)")
 		}
 	default:
-		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The side doors (A2A_INJECT_LISTEN, A2A_DOOR_LISTEN) are not backends in this sense and may sit beside any one of them", strings.Join(armed, ", "))
+		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The side doors (A2A_INJECT_LISTEN, A2A_DOOR_LISTEN, A2A_CONSOLE_DOOR) are not backends in this sense and may sit beside any one of them", strings.Join(armed, ", "))
 	}
 	// Fail closed: a door with no token would be reachable by anything that
 	// reaches the listener, and the port-forward path the runner uses is
@@ -721,6 +867,17 @@ func FromEnv() (*Config, error) {
 	}
 	cfg.TaskDeadline = time.Duration(secs) * time.Second
 
+	cfg.SessionReuse = os.Getenv("A2A_SESSION_REUSE") != "false"
+	lifetime := envOr("A2A_SESSION_MAX_LIFETIME", defaultSessionMaxLifetime.String())
+	lt, err := time.ParseDuration(lifetime)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_SESSION_MAX_LIFETIME %q: %w", lifetime, err)
+	}
+	if floor := cfg.TaskDeadline + 2*podDeadlineGrace; lt < floor {
+		return nil, fmt.Errorf("A2A_SESSION_MAX_LIFETIME %q is under %v, A2A_TASK_DEADLINE_SECONDS plus twice the pod deadline grace; a pod that cannot outlive one task cannot serve a conversation", lifetime, floor)
+	}
+	cfg.SessionMaxLifetime = lt
+
 	askTTL := envOr("A2A_ASK_TTL", defaultAskTTL.String())
 	at, err := time.ParseDuration(askTTL)
 	if err != nil {
@@ -753,6 +910,17 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_FIRST_EVENT_GRACE %q is under the 1m floor; it would release a task still cold-starting", grace)
 	}
 	cfg.FirstEventGrace = fg
+
+	cfg.CardStop = os.Getenv("A2A_CARD_STOP") == "true"
+	cardStopTimeout := envOr("A2A_CARD_STOP_TIMEOUT", defaultCardStopTimeout.String())
+	cst, err := time.ParseDuration(cardStopTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_CARD_STOP_TIMEOUT %q: %w", cardStopTimeout, err)
+	}
+	if cst < cardStopTimeoutFloor {
+		return nil, fmt.Errorf("A2A_CARD_STOP_TIMEOUT %q is under the %v floor; the bridge alone may wait 20s for the turn the stop cancelled", cardStopTimeout, cardStopTimeoutFloor)
+	}
+	cfg.CardStopTimeout = cst
 
 	cfg.OwnerDeployment = os.Getenv("A2A_OWNER_DEPLOYMENT")
 

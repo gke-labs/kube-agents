@@ -13,7 +13,7 @@
 ### 0. Open the audit run
 
 ```bash
-python3 ./skills/fleet-audit/scripts/audit_report.py start --audit gce-compute-fleet-audit
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit gce-compute-fleet-audit
 ```
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/gce-compute-fleet-audit/org__repo", "findings_path":"/opt/data/scratch/findings_gce-compute-fleet-audit.json", "pending_remediation_requests": [<finding_id>, ...]}`.
@@ -35,7 +35,7 @@ If `pending_remediation_requests` is non-empty, inspect each requested finding i
 **Run the collector before evaluating any check below by hand.**
 
 ```bash
-python3 ./skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_gce-compute-fleet-audit.json
+python3 /opt/data/profiles/platform/skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_gce-compute-fleet-audit.json
 ```
 
 This stream's targets are GCP projects, not GKE clusters, so its collector is its own script rather than `fleet-audit`'s `collect.py` — see the script's own module docstring for the field contracts it assumes of each `gcloud` command's JSON. Pass `--project-id <id>` only to scope a run to one project the tool lists, with the `collector_args` beside it. Left alone it resolves the scope §1 describes — the `--scope-projects` you pass from `fleet_scope`, else `MONITORED_PROJECT_IDS` when set, which narrows the run on purpose, and otherwise the configured project plus every project `gcloud projects list` returns — so without a declared scope an identity that can list the organisation sweeps every project it can see rather than the one it is configured for. On this install's sandbox the collector knows whether a scope is declared and, if it is, refuses a run without the `collector_args`, so the fall-through cannot cross the boundary. Read the manifest before doing anything else:
@@ -99,7 +99,7 @@ A project holding no snapshots at all gets the same plain `checks_not_applicable
 For promoted findings requiring `kind: manifest` remediation, write the updated Terraform or manifest file to `remediation.path` resolved within the `workspace` GitOps repository:
 
 - Discover the target configuration from existing repository paths (e.g., `terraform/modules/compute/vm.tf`).
-- **The fleet-audit skill's rule that "a `path` is discovered, never invented" decides where the file goes** — for an object the repo already declares and for one it does not yet. That rule anchors a sibling on the cluster and namespace; every target this audit reports on is project-scoped, so here the sibling that proves a directory is reconciled is another declaration governing that same project: a Config Connector `Compute*` resource, or the Terraform file that already describes the instances, MIGs, or node groups you are fixing. Find no sibling for the project and the finding is `kind: manual`.
+- **The fleet-audit skill's rule that "a `path` is discovered, never invented" (`/opt/data/profiles/platform/skills/fleet-audit/references/findings-document.md`) decides where the file goes** — for an object the repo already declares and for one it does not yet. That rule anchors a sibling on the cluster and namespace; every target this audit reports on is project-scoped, so here the sibling that proves a directory is reconciled is another declaration governing that same project: a Config Connector `Compute*` resource, or the Terraform file that already describes the instances, MIGs, or node groups you are fixing. Find no sibling for the project and the finding is `kind: manual`.
 - Never write to a directory outside the reconciled GitOps hierarchy. Creating an object the repo does not yet declare is permitted and is what makes a finding resolvable by a pull request; inventing the _directory_ to put it in is not, because the repository is reconciled over a fixed set of paths and a file outside them is applied by nothing.
 
 ### 4. Emit findings.json
@@ -160,16 +160,18 @@ Every finding must conform to the full findings schema:
 ### 5. Close the audit run
 
 ```bash
-python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit gce-compute-fleet-audit \
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit gce-compute-fleet-audit \
   --findings-file /opt/data/scratch/findings_gce-compute-fleet-audit.json \
   --manifest-file /opt/data/scratch/manifest_gce-compute-fleet-audit.json
-# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
+# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED"|"NO_FORGE"|"STORE_LEDGER","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true}
 ```
 
 - On a **scheduled** run, `silent_ok: true` -> your final response is exactly `[SILENT]`.
-- **An on-demand run is never silent.** If a person dispatched this job, report the outcome and the ledger URL whatever `silent_ok` says.
+- **An on-demand run is never silent.** `finish` returns `silent_ok: true` only for a scheduled run. On a run that a person asked for, `silent_ok` is always `false`, so report the outcome and the ledger URL.
+- `status == "NO_FORGE"` → no forge is configured, or the broker cannot reach the repository, so nothing was published and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
+- `status == "STORE_LEDGER"` → the forge has no issue tracker, or no labels, so the ledger is in the report store and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim, which names the remediation pull requests (the skill's "A forge with no issue tracker" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
 - Repo writers can trigger remediation by commenting `/remediate <finding-id>` or `/remediate all` on the ledger issue.
 
 ---

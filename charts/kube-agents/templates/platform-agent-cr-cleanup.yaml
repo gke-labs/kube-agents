@@ -39,7 +39,7 @@ metadata:
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
 rules:
   - apiGroups: ["kubeagents.x-k8s.io"]
-    resources: ["platformagents"]
+    resources: ["platformagents", "agentprofiles"]
     verbs: ["get", "list", "watch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -75,7 +75,7 @@ metadata:
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
 spec:
   backoffLimit: 0
-  {{- /* Bounds the hook even if the pod never becomes ready; comfortably above the wait. */}}
+  {{- /* Bounds the hook even if the pod never becomes ready; must cover scheduling, pull, and both waits (agentProfileTimeout + timeout). */}}
   activeDeadlineSeconds: {{ .Values.platformAgent.cleanupHook.activeDeadlineSeconds }}
   template:
     metadata:
@@ -120,6 +120,12 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - >-
+              kubectl delete agentprofile --all
+              --namespace={{ .Release.Namespace }}
+              --ignore-not-found
+              --wait
+              --timeout={{ .Values.platformAgent.cleanupHook.agentProfileTimeout }}
+              || true;
               kubectl delete platformagent {{ .Values.platformAgent.name | quote }}
               --namespace={{ .Release.Namespace }}
               --ignore-not-found
@@ -137,10 +143,16 @@ spec:
             requests:
               cpu: 50m
               memory: 64Mi
+              {{- /* The cache emptyDir's sizeLimit plus 64Mi for logs; the quota preflight
+                     in _helpers.tpl sums the same figure. */}}
+              ephemeral-storage: 1088Mi
             limits:
               cpu: 200m
               memory: 128Mi
+              ephemeral-storage: 1088Mi
       volumes:
+        {{- /* 1Gi: kubectl's discovery cache, which grows with the cluster's CRDs. */}}
         - name: cache
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 1Gi
 {{- end }}

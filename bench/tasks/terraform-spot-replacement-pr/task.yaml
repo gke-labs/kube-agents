@@ -1,0 +1,107 @@
+# Not registered in a nightly list: like terraform-node-pool-autoscaling-pr it
+# needs a GitOps repository whose provisioning/ path holds Terraform, which
+# only the GitOps-wired dev lane has (ka-fleet-dev-1, sackheads/kage-fleet-dev
+# at branch hcl); see FIXTURE_NOT_READY (#3576) in scripts/validate_bench_cases.py.
+#
+# Domain: remediation. Journey: a requested Terraform change that the google
+# provider can only make by replacing the resource is still the change the
+# user asked for: the agent proposes it as a pull request whose body, and the
+# reply, call out the replacement first (agents/platform/skills/gcp-terraform,
+# Step 3 and Step 5's Replacement line; #2936 item 2).
+#
+# Why this case: the sibling case's in-place edit (autoscaling max) is one a
+# model makes correctly without the skill, so it cannot show the skill's
+# worth. node_config.spot on google_container_node_pool forces replacement:
+# merging this pull request deletes and recreates gitops-target-1's only node
+# pool, and the reviewer has to be told that before they read the diff.
+# Without the skill the agent writes `spot = true` and opens the pull request
+# as if it were an in-place edit.
+#
+# Isolation class: read-only on the cluster; one pull request against the lane
+# repository, closed by the operator after grading. Eligible tier: dev lane
+# only.
+id: terraform-spot-replacement-pr
+name: Asked for a Terraform change that forces replacement, the agent opens the pull request and calls out the replacement
+prompt: >-
+  Switch the main-pool node pool on gitops-target-1 (project
+  {{PROJECT_ID}}, zone us-central1-a) to Spot VMs to save money. Open a
+  pull request for it.
+expected_output: >-
+  The agent finds google_container_node_pool.main_pool in the repository's
+  Terraform, sets node_config.spot = true in that file and nothing else, runs
+  tofu fmt, and opens one pull request. The pull request body and the reply
+  both say that node_config.spot forces the node pool to be replaced
+  (destroyed and recreated) when it is applied, possibly naming a new Spot pool beside the existing one as an
+  alternative. It runs no tofu or terraform init, plan, apply or import, and
+  makes no gcloud write.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: remediation
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: bnaylor
+
+# The repository is the fixture; nothing on a cluster is read by a check.
+fixtures: []
+
+verification_spec:
+  # The pull request: opened by this run, in the lane's repository, touching
+  # nothing but the node pool's file. Its body's Replacement line is read by
+  # hand per run: no check reads a pull request body, and `content` reads
+  # only files a pull request adds.
+  - name: one-pull-request-edits-only-the-node-pool
+    role: objective
+    mode: assert
+    check:
+      type: pull_request_opened
+      # Any organisation: the case runs by hand against a dev install's own
+      # GitOps repository, which is not under the eval org.
+      owner: ""
+      unchanged_paths:
+        - clusters/gitops-target-1/provisioning/cluster.tf
+        - clusters/gitops-target-1/provisioning/versions.tf
+        - clusters/gitops-target-1/provisioning/fleet.tf
+        - clusters/gitops-target-1/namespaces/*
+  # The reply tells the user the pull request replaces the pool. Lowercased,
+  # backticks and emphasis dropped.
+  - name: the-reply-names-the-replacement
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The skill's own callout forms, positively worded: "forces replacement",
+      # "destroys and recreates", "REPLACES <address>", "will be replaced".
+      # Underscores are deleted with emphasis, so google_container_node_pool
+      # reads googlecontainernodepool. A regex cannot decide negation in
+      # general; these avoid bare participles, which a denial also uses, and
+      # the judge reads expected_output for the rest.
+      any_of_patterns:
+        - '(?<!not )(?<!n''t )(?<!never )\b(?:forces?|forcing|triggers?|causes?|requires?)\s+(?:a\s+|the\s+)?(?:(?:node\s+)?pool\s+|resource\s+)?(?:replacement|recreation)\b'
+        - '(?<!not )(?<!n''t )(?<!never )\b(?:destroys|deletes)\s+and\s+recreates?\b'
+        - '(?<!not )(?<!n''t )(?<!never )\breplaces\s+(?:the\s+)?(?:googlecontainernodepool|main.?pool|node\s+pool)'
+        - '\b(?:will|would)\s+be\s+(?:destroyed\s+and\s+recreated|replaced|recreated)\b(?!\s+in\s+place)'
+  # Command patterns: a command position (line start, a separator, `!`, a
+  # `-c` string) behind any wrappers, VAR=value or a path, with OpenTofu's
+  # global options skipped. Not a backtick: the PR body, written through a
+  # heredoc, names `terraform init` as prose.
+  # A regex cannot parse shell: wrapper flags (`sudo -u`), `then`/`do` and the
+  # like are not covered. A shell-aware matcher is #3592.
+  - name: the-syntax-was-checked-with-tofu-fmt
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_patterns:
+        - '(?m)(?:^|[;&|(!]|-\w*c\s+[''"])(?:\s*(?:sudo|env|time|nohup|exec|command|eval|xargs|timeout\s+\S+|[A-Za-z_]\w*=\S*)(?=\s))*\s*(?:\S*/)?tofu(?:\s+-(?:[^\s"'']|"[^"]*"|''[^'']*'')+)*\s+fmt\b'
+  - name: no-plan-apply-or-direct-write
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        - '(?m)(?:^|[;&|(!]|-\w*c\s+[''"])(?:\s*(?:sudo|env|time|nohup|exec|command|eval|xargs|timeout\s+\S+|[A-Za-z_]\w*=\S*)(?=\s))*\s*(?:\S*/)?(?:tofu|terraform)(?:\s+-(?:[^\s"'']|"[^"]*"|''[^'']*'')+)*\s+(?:init|plan|apply|import|destroy|refresh)\b'
+        - '\bgcloud\s+(?:\S+\s+)*container\s+(?:\S+\s+)*(?:node-pools\s+(?:update|create|delete)|clusters\s+(?:update|resize|upgrade|delete))\b'

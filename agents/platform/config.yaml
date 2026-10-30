@@ -42,6 +42,14 @@ mcp_servers:
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       GOOGLE_CLOUD_PROJECT: "${GOOGLE_CLOUD_PROJECT}"
       GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
+      # The agent's own cluster, which gke_endpoint reads to decide whether a
+      # fleet cluster is reachable over its private endpoint
+      # (docs/designs/private-endpoint-selection.md). Without these three the
+      # server's switch_kube_context never knows its own VPC and leaves that
+      # decision to the credential proxy's splice, one describe later.
+      GKE_PROJECT_ID: "${GKE_PROJECT_ID}"
+      GKE_LOCATION: "${GKE_LOCATION}"
+      GKE_CLUSTER_NAME: "${GKE_CLUSTER_NAME}"
       # Hermes hands a stdio MCP server only a safe baseline (PATH, HOME, …) plus the
       # keys named here (`_build_safe_env` in hermes `tools/mcp_tool.py`), so without
       # this line the `hermes send` behind send_notification has no home channel and
@@ -70,10 +78,14 @@ mcp_servers:
       SLACK_HOME_CHANNEL: "${SLACK_HOME_CHANNEL}"
       # Under next send_notification posts through the A2A gateway with
       # `a2a notify` (chat_notify.py) instead of `hermes send`: the platform it
-      # routes, and the bus address and identity the CLI connects with. The
-      # bus token is a file mount, not environment, so nothing else is needed.
+      # routes, and the bus address and identity the CLI connects with, and
+      # the CA it trusts the bus by: the bus requires TLS, and without
+      # NATS_CA_FILE the CLI checks the bus against the system roots and every
+      # post fails verification. The bus token is a file mount, not
+      # environment, so nothing else is needed.
       A2A_NOTIFY_PLATFORM: "${A2A_NOTIFY_PLATFORM}"
       NATS_URL: "${NATS_URL}"
+      NATS_CA_FILE: "${NATS_CA_FILE}"
       A2A_BUS_USER: "${A2A_BUS_USER}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
       # The bearer token for the loopback Session KV server on 8699. The
@@ -107,6 +119,10 @@ mcp_servers:
   # time and carries the full analysis; this bounds the damage if it ever stops
   # applying. Healthy calls to this endpoint measure 0.47-0.48s.
   #
+  # The server is reached through the credential proxy's MCP relay, which
+  # enforces the tool allowlist; deploy/shared/defaults/config.yaml explains
+  # the URL, the flags and the `env` block.
+  #
   # The whole entry is redundant with the shared defaults — the build-time merge
   # unions the two — but repeating it here keeps this file from reading as if
   # gke were the one server without these settings.
@@ -129,13 +145,17 @@ mcp_servers:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://container.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/gke"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60
-    # Read tools only, as an allowlist: this server bypasses the credential
-    # broker, so the list is what keeps its write tools out of the model's
-    # reach. deploy/shared/defaults/config.yaml carries the full rationale; the
+    # Read tools only, as an allowlist: the credential proxy's relay refuses
+    # the write tools, and this list keeps them out of the model's offer. deploy/shared/defaults/config.yaml carries the full rationale; the
     # list is the same one, name for name.
     tools:
       include:
@@ -154,6 +174,36 @@ mcp_servers:
         - list_k8s_events
         - list_node_pools
         - list_operations
+
+# Model-call deadlines for the gateway. This overrides the 600s stale bound in
+# deploy/shared/defaults/config.yaml, which this file is merged onto at image
+# build (deploy/docker/merge_configs.py merges maps leaf by leaf, so
+# request_timeout_seconds keeps the base value). stale_timeout_seconds is how
+# long Hermes waits for the first chunk, or for the next one, before it drops
+# the stream and retries (hermes_cli/timeouts.py).
+#
+# The Platform Agent runs as a kanban worker, so it uses 120s, not the front
+# door's 600s. The front door needs 600s because Gemini thinks in silence on
+# this path and a hard front-door prompt took 140-210s before its first chunk.
+# A worker hardly thinks: in the five-run latency benchmark
+# (gke-labs/kube-agents#3140) worker calls used about 100 reasoning tokens
+# each, and 99% of 6,059 worker calls sent their first chunk within 60s. The
+# slow ones were stalls, not thinks: most returned fewer than 120 tokens, three
+# in four missed the prompt cache, and each 600s stale kill matched a Vertex
+# 504. A 120s bound retries such a call up to 480s sooner. Hermes raises the
+# bound for a large prompt (to at least 240s above 50k context tokens and 300s
+# above 100k), so the gain is smaller there. agents/cluster/config.yaml sets the
+# same value for the Cluster Agents.
+#
+# A person can also chat with this profile directly (`hermes -p platform`), and
+# under the unsupported `experimental.platformFrontDoor` chat reaches it as the
+# front door. A hard question there can think in silence for more than 120s,
+# and Hermes then retries the call. Under platformFrontDoor the entrypoint only
+# fills keys this profile lacks, so an install that upgrades keeps the bound it
+# already has, and only a new install gets 120s.
+providers:
+  custom:
+    stale_timeout_seconds: 120
 
 # Explicitly list platform_toolsets
 # platform_toolsets is a reserved framework key in Hermes.
@@ -203,27 +253,47 @@ platform_toolsets:
 toolsets:
   - kanban
 
-# Per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet
-# audits outgrew when each ran its checks cluster by cluster: three separate runs
-# died on `Iteration budget exhausted (90/90)` — reported as a `timed_out` kanban
-# event, though the run was actively heartbeating and no clock ran out. Most
-# streams, cost and drift among them, now run one collector script that reads
-# the whole fleet in a single call, so a clean run costs the SOP read, the
-# collector, the recommendations and the publish harness. What still scales
-# with the fleet is the Compute Engine and networking audits, which have no
-# collector yet, and the by-hand fallback the SOPs prescribe for every cluster
-# or project a collector marks `unreachable` or `gate-failed` — a bad day on a
-# large fleet is the old per-cluster loop over part of it. 250, roughly triple
-# the observed near-miss, is kept as headroom for those paths.
+# Per-turn tool-calling iteration budget for the kanban workers: every
+# delegated chat request and issue-resolver card is spawned with HERMES_HOME
+# pinned to this profile and reads this value. Pinned rather than unset: a
+# worker is a `hermes chat` process, and the chat CLI's own defaults cap an
+# unset key at 500 (cli.py `_cli_config_defaults`), while the gateway's config
+# loader reads an unset key as no cap at all (hermes_cli/config_defaults.py).
+# 150 is 1.4 times the largest worker seen across a full presubmit run and a
+# full nightly run (2026-10-20: 156 and 132 cards, max 43 and 105 tool calls,
+# p90 22 and 36; the 105 was an upgrades audit requested through chat, which
+# runs inside a card and has no budget of its own).
 #
-# This belongs here rather than in the operator's generated root config because
-# both ways an audit can start read *this* file and not the root one: a cron run
-# on this profile's own roster (agents/platform/cron/jobs.json) is executed with
-# the profile active, and a kanban worker is spawned with HERMES_HOME pinned to
-# the profile. Scoping it here leaves the Chat Agent and the per-cluster Cluster
-# Agents on the default 90, where nothing has ever approached the ceiling.
+# The fleet audits need more: three runs died on `Iteration budget exhausted
+# (90/90)` when each ran its checks cluster by cluster, and the Compute Engine
+# and networking audits plus every SOP's by-hand fallback for an `unreachable`
+# or `gate-failed` cluster still take that path. Their roster entries carry
+# `max_turns: 250` (agents/platform/cron/jobs.json), which the image's scheduler
+# reads ahead of this value (deploy/docker/patches/apply_cron_job_max_turns.py);
+# before that patch this value was 250 and every worker ran with it (#1947).
+#
+# The operator's `spec.harness.tuning.platform.maxTurns` overlays this value; a
+# roster entry's own `max_turns` raises its job above whichever is in force and
+# never lowers it. The Chat Agent and the Cluster Agents leave the key unset,
+# so their gateway turns run uncapped and their workers at the CLI's 500.
 agent:
-  max_turns: 250
+  max_turns: 150
+  # Toolsets this profile's turns never need, kept out of every model call. Gemini
+  # on Vertex intermittently waits tens of seconds to minutes before its first
+  # token when a request declares the full hermes-cli set (36 tools here), and
+  # not when these are dropped: replaying a captured worker request straight to
+  # Vertex, the first token took p90 13.7s and up to 57s with all 36 declared,
+  # and p90 2.8s, max 5.9s, with browser, tts and vision removed. A fleet
+  # question that took 28 minutes answered in about 2.6 once they were gone.
+  # disabled_toolsets is applied last, on every platform key, so it narrows the
+  # hermes-cli bundle above and the toolsets a kanban worker is spawned with
+  # (_resolve_worker_cli_toolsets reads the same resolution).
+  disabled_toolsets:
+    - browser
+    - computer_use
+    - image_gen
+    - tts
+    - vision
 
 # Per-file character cap Hermes puts on a context file (SOUL.md, AGENTS.md) when it
 # builds the system prompt. Unset, the cap is 6% of the model window, and a flat
@@ -260,6 +330,19 @@ context_file_max_chars: 100000
 tool_loop_guardrails:
   loop_caps:
     max_web_searches: 200
+  # Definitive permission refusals (the command policy's kubernetes.read-only
+  # rule refusing a mutating kubectl verb, as the credential-proxy shim's
+  # `policy verb:` line reports it) in one run before the runtime halts it
+  # (deploy/docker/patches/permission_refusal_stop.py).
+  # The policy's notice says the change is refused however it is attempted, so
+  # the first one ends the run with the refusal on the board instead of the
+  # workaround hunt #1943 describes; live runs showed the model reading the
+  # guidance a lower tier appends and going on investigating. A higher value
+  # restores that guidance tier. API 403s are not counted: an audit meets
+  # them on projects it may not read and continues; nor are gcp.read-only
+  # refusals or kubernetes.read-only refusals of a read spelling, since both
+  # allowlists refuse an unlisted read with the same notice.
+  permission_refusal_halt_after: 1
 
 # Shared memory, read-only.
 #
@@ -309,9 +392,12 @@ memory:
 # The Platform Agent is no longer the chat ingress (the Chat Agent / `default`
 # profile owns that), so the session_store / session_otel_bridge ingress plugins
 # move to the Chat Agent. Keep otel for observability parity and tool_call_audit
-# to audit this privileged specialist's tool calls.
+# to audit this privileged specialist's tool calls. pr_opened records each pull
+# request this profile's kanban workers open on their card, which is what posts
+# the thread's PR message (plugins/pr_opened/__init__.py).
 plugins:
   enabled:
     - hermes_otel
     - tool_call_audit
     - incident_context
+    - pr_opened

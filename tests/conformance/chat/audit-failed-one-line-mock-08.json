@@ -1,0 +1,21 @@
+{
+  "name": "audit-failed-one-line-mock-08",
+  "source": "agents/platform/scripts/test_slack_audit_report.py::FailedLineTest.test_the_chat_message_is_the_line_with_the_report_folded",
+  "notes": "slack_audit_report.failed_chat: a fleet-audit report that could not write its ledger posts the first sentence of its What's wrong section, the agent's own words, with the whole report folded under 'why'. Under today the same line posts as text and the incident row keeps the report for a reply.",
+  "input": {
+    "failed_audit_report": "Here is the latest scheduled GCP networking fabric and VPC IPAM audit report from the platform agent.\n\n## What's wrong\nThe GCP networking fabric and VPC IPAM audit ran and identified 2 critical firewall issues in project `my-project`, but could not publish its findings because no GitOps repository is registered in the `platform-agent-gitops-state` ConfigMap.\n\n## Why\n- **FirewallRule/default-allow-rdp** — `sourceRanges 0.0.0.0/0` allows `tcp:3389` (RDP) with no target restriction.\n- **FirewallRule/default-allow-ssh** — `sourceRanges 0.0.0.0/0` allows `tcp:22` (SSH) with no target restriction.\n\n## What to do\n- **Register a GitOps repository** — add one to the `platform-agent-gitops-state` ConfigMap so future audits can open a ledger issue.\n"
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "detail": "The GCP networking fabric and VPC IPAM audit ran and identified 2 critical firewall issues in project `my-project`, but could not publish its findings because no GitOps repository is registered in the `platform-agent-gitops-state` ConfigMap.",
+        "fold": {
+          "title": "why",
+          "text": "Here is the latest scheduled GCP networking fabric and VPC IPAM audit report from the platform agent.\n\n## What's wrong\nThe GCP networking fabric and VPC IPAM audit ran and identified 2 critical firewall issues in project `my-project`, but could not publish its findings because no GitOps repository is registered in the `platform-agent-gitops-state` ConfigMap.\n\n## Why\n- **FirewallRule/default-allow-rdp** — `sourceRanges 0.0.0.0/0` allows `tcp:3389` (RDP) with no target restriction.\n- **FirewallRule/default-allow-ssh** — `sourceRanges 0.0.0.0/0` allows `tcp:22` (SSH) with no target restriction.\n\n## What to do\n- **Register a GitOps repository** — add one to the `platform-agent-gitops-state` ConfigMap so future audits can open a ledger issue."
+        }
+      }
+    }
+  ]
+}

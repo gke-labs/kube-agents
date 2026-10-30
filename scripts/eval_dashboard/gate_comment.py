@@ -363,13 +363,15 @@ def also_text(count) -> str:
 
 def result_cell(case: dict) -> str:
     reps = case.get("reps") or {}
-    total = reps.get("pass", 0) + reps.get("fail", 0) + reps.get("infra", 0) + reps.get("ceiling", 0)
+    total = reps.get("pass", 0) + reps.get("fail", 0) + reps.get("infra", 0) + reps.get("ceiling", 0) + reps.get("fixture", 0)
     cell = f"{reps.get('pass', 0)} / {total} reps"
     notes = []
     if reps.get("infra"):
         notes.append(f"{reps['infra']} infra")
     if reps.get("ceiling"):
         notes.append(f"{reps['ceiling']} at the delegation ceiling")
+    if reps.get("fixture"):
+        notes.append(f"{reps['fixture']} not run, fixture drifted")
     if notes:
         cell += f" ({', '.join(notes)})"
     return cell

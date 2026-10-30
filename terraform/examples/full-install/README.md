@@ -60,10 +60,24 @@ install without the interview.
   provider, and `install.sh` sets it from the `LITELLM_REDACTION_*` keys in
   `install.env`; `platform_agent_mode` (default `"today"`, which passes the
   chart nothing, so the CR carries no `mode` field) sets the `PlatformAgent`'s
-  `spec.mode`, and `"next"` also renders the NATS bus and the A2A gateway, a
-  development stack. `install.sh` sets it from `PLATFORM_AGENT_MODE` in
-  `install.env`. Changing it on a running install is a mode switch
+  `spec.mode`, and `"next"` puts the NATS bus and the A2A gateway in front of
+  the agent. `install.sh` sets it from `PLATFORM_AGENT_MODE` in `install.env`,
+  which a first install records as `"next"`. Changing it on a running install is a mode switch
   ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
+  `platform_agent_storage_size` (default `"50Gi"`, which passes the chart nothing,
+  so the CR carries no `storage` field) sets the `PlatformAgent`'s
+  `spec.storage.size`, the size of the agent's data volume and the shell
+  sandbox's. A raise grows both claims where the StorageClass allows it, and a
+  lower value is refused. `install.sh` sets it from `PLATFORM_AGENT_STORAGE_SIZE`
+  in `install.env`.
+  `alert_daily_limits` (default `{}`) sets the daily alert ceilings, and
+  `install.sh` sets it from the `ALERT_DAILY_LIMIT_*` keys in `install.env`.
+  A key that is not set keeps the default in the agent image. Each apply that
+  changes the env list that the chart renders replaces the `PlatformAgent`'s
+  `spec.deployment.env`, and entries added to the CR by hand are lost. Set
+  those through `platformAgent.deployment.env` in `extra_helm_values`. The
+  [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
+  gives the buckets, the defaults and a sizing method.
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.
@@ -88,6 +102,26 @@ install without the interview.
   `enable_drift_detector = true` alongside it, the
   `spec.harness.driftDetector.enabled` field that starts the consumer. See
   [Drift audit-log ingress](#drift-audit-log-ingress).
+- Optionally (`model_provider = "openai_compatible"`) a server speaking the OpenAI
+  chat-completions API (vLLM, TGI, an internal gateway), reached through the
+  gateway. No GCP resource: the composition passes the chart
+  `litellm.openaiCompatible` from `openai_compatible_api_base` (the base URL
+  including `/v1`), `openai_compatible_target_port` (the server pod's port, for
+  an in-cluster Service), `openai_compatible_egress_cidrs` (the private ranges
+  any other host is reached at; none for a public endpoint on 443) and
+  `openai_compatible_ca_secret_name` (a Secret you create holding the CA under
+  `ca.crt`), and puts `openai_compatible_api_key`, when set, in the credentials
+  Secret as `OPENAI_COMPATIBLE_API_KEY`. `model_default_name` has no default for
+  it; the plan fails without it or the base URL.
+- Optionally (`litellm_env_secret_name`) a Secret you create in the agent's
+  namespace that the gateway reads whole as environment variables. No GCP
+  resource and nothing in state: the composition passes the name as the chart's
+  `litellm.envFromSecret`. It is how `model_provider = "sap"` (SAP AI Core,
+  `AICORE_SERVICE_KEY` and `AICORE_RESOURCE_GROUP`), any other LiteLLM provider
+  slug (its driver's variables; `model_default_name` is then required and the
+  plan fails without it) and an `openai_compatible` gateway behind OAuth2
+  client credentials (`OPENAI_COMPATIBLE_OAUTH_TOKEN_URL`, `_CLIENT_ID`,
+  `_CLIENT_SECRET`) get their credentials.
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on
@@ -153,14 +187,20 @@ install without the interview.
 ```bash
 cd terraform/examples/full-install
 cp terraform.tfvars.example terraform.tfvars   # then edit it
-terraform init
-terraform apply
+./lifecycle.sh apply -auto-approve             # not bare `terraform apply`; the paragraph below says why
 ```
 
-A first apply into an empty project needs nothing else. Once the project has
-been destroyed and re-applied even once, use `make tf-apply` instead — it
-adopts the Cloud KMS resources GCP refuses to delete, which a bare
-`terraform apply` fails on. See [Teardown and re-apply](#teardown-and-re-apply).
+Even a first apply into an empty project is better driven through
+`make tf-apply`: Cloud KMS rejects some requests for a few minutes after the
+enablement that apply performs, and bare Terraform has nothing for it. An
+approved apply (`make tf-apply ARGS=-auto-approve`, which the front doors and
+CI pass) retries past it. An unapproved apply at a terminal stops once on the 403;
+run it again after a few minutes and it untaints the key ring or key the first
+run created, where a bare `terraform apply` would plan their replacement and 409.
+Once the project has been destroyed and re-applied even once, `make tf-apply`
+is required — it adopts the Cloud KMS resources GCP refuses to delete, which a
+bare `terraform apply` fails on. The table under
+[Teardown and re-apply](#teardown-and-re-apply) has both.
 
 ### Remote state
 
@@ -483,13 +523,15 @@ For production, always pin a validated numeric SemVer release tag or full commit
 For a cluster that may only pull from an approved registry, copy the images
 there first — `make mirror-images MIRROR_PREFIX=<prefix> IMAGE_TAG=<tag>` from
 the repository root, driven by `images.json` — then set `image_registry` to the
-same prefix. It reaches the two images the chart never renders as well (the
-agent Deployment and the fluent-bit sidecar the operator resolves at reconcile
-time); the [chart README](../../../charts/kube-agents/README.md) explains how.
-Add `third_party_image_registry` only if the mirror keeps LiteLLM and
-fluent-bit under a different path.
+same prefix. It reaches the runtime images the chart never renders as well (the
+agent Deployment and shell sandbox StatefulSet the operator resolves at reconcile
+time; the fluent-bit logging sidecar follows `third_party_image_registry`); the
+[chart README](../../../charts/kube-agents/README.md) explains how.
+Add `third_party_image_registry` to mirror third-party images (cert-manager,
+LiteLLM, fluent-bit, the GitHub token minter, Hindsight); empty leaves them on
+their upstream registries.
 
-`IMAGE_TAG` is not optional here. The four first-party images take whatever tag
+`IMAGE_TAG` is not optional here. The first-party images take whatever tag
 the mirror step was given (`latest` if it was given none), while Terraform asks
 for `image_tag` — so a mirror populated at `latest` against an `image_tag` of
 `v1.2.3` holds no reference the install will ever request. `terraform apply`
@@ -517,15 +559,15 @@ chart renders and, through `IMAGE_PULL_SECRETS` on the operator and
 `spec.deployment.imagePullSecrets` on the `PlatformAgent`, the agent pods the
 operator renders too.
 
-**cert-manager images follow the same prefix, but not the same credentials.**
+**cert-manager images follow `third_party_image_registry`, not `image_registry`.**
 `helm_release.cert_manager` is a separate release of an upstream chart and
 never sees the `helm_release.kube_agents` values, but the composition passes
-it the same registry through its own image overrides
-(`local.cert_manager_mirror_values`), so its five images
+`var.third_party_image_registry` through its own image overrides
+(`local.cert_manager_mirror_values`), so when set, its five images
 (`cert-manager-controller`, `-cainjector`, `-webhook`, `-acmesolver`,
 `-startupapicheck`) are pulled as `<prefix>/<name>:<tag>` — the layout
 `make mirror-images` writes from `images.json`, which carries all five
-entries. `image_pull_secrets` does **not** reach it, so a mirror that needs
+entries. Empty leaves them on `quay.io`. `image_pull_secrets` does **not** reach it, so a mirror that needs
 credentials means installing cert-manager yourself (below). Also not covered
 is the chart itself: it is fetched over the network from
 `https://charts.jetstack.io`, which an air-gapped runner cannot
@@ -751,6 +793,8 @@ with the created topic/subscription — restrict access with
 
 With `enable_github_minter = true`, set `github_repo` to your primary GitOps repository (in `owner/repo` or GitHub URL format). Additional GitOps repositories within the same organization can also be registered in the ConfigMap by cluster administrators.
 
+For a GitOps repository on a GitHub Enterprise Server, set `gitops_host` to the instance's hostname and `github_repo` to `owner/name` on the instance (not a URL: the composition reads a github.com URL only). The composition then declares the `github` forge at that host in `spec.integration.forges`, with the owner as its namespace, and the repository as its `gitops` repository, with no `github` alias; the chart points the token minter at `https://<host>/api/v3`. A host where GitHub runs its own services (`github.com`, `githubusercontent.com`, `ghe.com` and the like) or `gitlab.com` is refused. When a private CA signed the instance's certificate, set `github_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`: the broker trusts it for that host only, and the minter trusts it for all of its calls and reads it when it starts, so restart the minter after the Secret changes (`install.sh --gitops-ca-file` creates the Secret and restarts the minter). The minter's Cloud KMS key ring and key are created and the App key imported before the apply, so apply with `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply`, which adopts them, not a bare `terraform apply`. A new cluster goes into the project's `default` VPC network, because the composition has no network or subnetwork variable: an instance reachable only from another VPC or a Shared VPC needs a cluster created in that VPC and `create_cluster = false`. See [GitHub Enterprise Server in INSTALL.md](../../../INSTALL.md#github-enterprise-server).
+
 With `gitops_forge = "gitlab"`, set `gitlab_repo` to the GitLab project's full path (`group/project`, nested groups allowed) and, for a self-managed instance, `gitops_host` to its hostname. The CR then declares one `gitlab` forge and the project as its `gitops` repository, with `credentialsRef` naming `gitlab_token_secret_name` (default `gitlab-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A self-managed instance whose certificate a private CA signed also sets `gitlab_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`; the broker trusts it for that host only (`install.sh --gitops-ca-file` creates it). A Secret, not a ConfigMap, so changing the CA needs the same rights as changing the token. A GitLab install has no GitHub App, so `github_repo` and `enable_github_minter` must stay unset; the plan refuses otherwise. See [GitLab as the GitOps forge](../../../docs/site/src/content/docs/install/gitlab.md).
 
 `enable_slack = true` writes `slack_bot_token` / `slack_app_token` into the
@@ -786,6 +830,19 @@ subscription (`drift_pubsub_subscription`, default
 the sink's writer identity, and `roles/pubsub.subscriber` plus
 `roles/pubsub.viewer` on the subscription for the agent's GSA. It also adds
 `pubsub.googleapis.com` to the enabled APIs.
+
+The module creates the sink after its publish grant, and `gke_cluster` takes
+the ingress's `teardown_gate` output as its `create_after` input, which makes
+Terraform destroy the cluster before the drain, the publish grant and the
+topic. Without that ordering the topic goes while the control plane is still
+emitting matching audit records, and each one mails every project owner. An
+input rather than a `depends_on` on the module call, because a module-level
+`depends_on` would also defer `gke-cluster`'s data sources — including the one
+a `create_cluster = false` install reads the endpoint from, which the Helm
+provider needs at plan time; and an indexed output rather than a splat, which
+would reach `source_projects` and close a cycle. The module README's
+[ordering section](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
+is canonical.
 
 `drift_pubsub_topic_publishers` (default `[]`) grants `roles/pubsub.publisher`
 on the topic to each member it lists, on top of the sink's writer identity.
@@ -846,8 +903,11 @@ parallelism window and, on a first install, the IAM module and the chart
 release behind the cluster — waits for a second apply. The identity applying
 needs `logging.sinks.create`, the
 project's number and the Service Usage call that mints its Logging agent in
-each listed project (`roles/owner` carries them), and nothing probes for that
-before the apply: a number it cannot read fails the plan, or the apply at
+each listed project (`roles/owner` carries them). The installer's front doors
+probe the first in each `SCOPE_PROJECTS` entry the sinks will cover before an apply
+and refuse naming
+the project ([`scripts/installer/README.md`](../../../scripts/installer/README.md));
+a hand-driven apply, and a selector's members on any route, have no probe: a number it cannot read fails the plan, or the apply at
 that read when the plan deferred it (a first install, or any apply that
 enables an API), and an agent or grant it cannot make stops the apply with
 the host's trio untouched and every source sink held back until the next
@@ -884,7 +944,8 @@ wait already paid — the wait is keyed on this value, so a change re-creates it
 and pays the new, lower figure once — it only shortens any later one.
 
 [The module's README](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
-is canonical for all three orderings.
+is canonical for all four orderings — the three inside the module, and the
+cluster-before-ingress edge this composition adds on top of them.
 
 Four outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 `drift_pubsub_subscription`, `drift_pubsub_subscription_id`, the
@@ -1024,16 +1085,17 @@ make tf-apply       # or: ./terraform/examples/full-install/lifecycle.sh apply
 
 What each one does that raw Terraform cannot:
 
-| Asymmetry                                                                                                | Handled by                                                                                                                                                                                                                                                                         |
-| -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| KMS key rings and keys can never be deleted, so the next apply 409s                                      | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                                                                                                                                                        |
-| The `PlatformAgent` finalizer strands the CR and hangs the namespace                                     | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                                                                                                                                                      |
-| A `BackupPlan` cannot be deleted while it owns backups                                                   | `tf-destroy` purges the plan's backups first                                                                                                                                                                                                                                       |
-| `deletion_protection = true` cannot be overridden by a destroy alone                                     | `tf-destroy` applies it as `false`, then destroys                                                                                                                                                                                                                                  |
-| The helm provider reports a release destroyed when it cannot reach the cluster                           | On a cluster this composition did not create, `tf-destroy` uninstalls the releases this state installed with the `helm` CLI first, and stops if `helm` cannot list or uninstall them; skipped with a warning when `helm` is missing or the cluster's credentials cannot be fetched |
-| A Pub/Sub topic or subscription that already exists makes the create 409                                 | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install                                                                                                                                       |
-| The stockout topic, subscription and sink survive a partial teardown and 409 the same way                | `tf-apply` imports whichever of them exist by name when the flag is on (`adopt_kms`, alongside the KMS resources)                                                                                                                                                                  |
-| The drift trio does too, but the detector is on by default, so every second install in a project hits it | `tf-apply` refuses instead of importing (`guard_drift_adoption`): an import cannot tell a leftover from another live install's trio; the source sinks a scoped install owns in the listed projects are not probed, and the refusal prints the import for them                      |
+| Asymmetry                                                                                                                                          | Handled by                                                                                                                                                                                                                                                                                                                                                                                     |
+| -------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| KMS key rings and keys can never be deleted, so the next apply 409s                                                                                | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                                                                                                                                                                                                                                                                    |
+| Cloud KMS 403s some requests for a few minutes after a project's first enablement, which the same apply (or the installer just before it) performs | `tf-apply` retries an approved apply (`ARGS=-auto-approve`, which the front doors and CI pass) on that message after a wait, untainting a key ring or key the failed attempt created first (`run_apply`, `adopt_kms`); an unapproved apply at a terminal runs once, and its re-run untaints the same way; `KMS_API_PROPAGATION_ATTEMPTS` and `KMS_API_PROPAGATION_WAIT_SECONDS` size the retry |
+| The `PlatformAgent` finalizer strands the CR and hangs the namespace                                                                               | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                                                                                                                                                                                                                                                                  |
+| A `BackupPlan` cannot be deleted while it owns backups                                                                                             | `tf-destroy` purges the plan's backups first                                                                                                                                                                                                                                                                                                                                                   |
+| `deletion_protection = true` cannot be overridden by a destroy alone                                                                               | `tf-destroy` applies it as `false`, then destroys                                                                                                                                                                                                                                                                                                                                              |
+| The helm provider reports a release destroyed when it cannot reach the cluster                                                                     | On a cluster this composition did not create, `tf-destroy` uninstalls the releases this state installed with the `helm` CLI first, and stops if `helm` cannot list or uninstall them; skipped with a warning when `helm` is missing or the cluster's credentials cannot be fetched                                                                                                             |
+| A Pub/Sub topic or subscription that already exists makes the create 409                                                                           | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install                                                                                                                                                                                                                                                   |
+| The stockout topic, subscription and sink survive a partial teardown and 409 the same way                                                          | `tf-apply` imports whichever of them exist by name when the flag is on (`adopt_kms`, alongside the KMS resources)                                                                                                                                                                                                                                                                              |
+| The drift trio does too, but the detector is on by default, so every second install in a project hits it                                           | `tf-apply` refuses instead of importing (`guard_drift_adoption`): an import cannot tell a leftover from another live install's trio; the source sinks a scoped install owns in the listed projects are not probed, and the refusal prints the import for them                                                                                                                                  |
 
 The chart also carries a `pre-delete` hook that removes the CR and waits for
 its finalizer, so a plain `helm uninstall` is safe on its own; `tf-destroy`

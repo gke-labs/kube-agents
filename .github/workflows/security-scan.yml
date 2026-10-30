@@ -45,6 +45,14 @@ jobs:
         # argument is an int, is the analyzer being imprecise. G304 stays
         # enabled and still catches a file path that does come from outside.
         run: go run github.com/securego/gosec/v2/cmd/gosec -exclude=G703,G706 ./...
+      # The same gosec, built from k8s-operator/go.mod's pin, over the
+      # k8s-api-proxy module, which declares no gosec of its own. No
+      # exclusions: the G703/G706 reasoning above is about the operator's argv.
+      - name: Run gosec on k8s-api-proxy
+        run: |
+          go -C k8s-operator build -o "$RUNNER_TEMP/gosec" github.com/securego/gosec/v2/cmd/gosec
+          cd k8s-api-proxy
+          "$RUNNER_TEMP/gosec" ./...
 
   trivy-scan:
     name: Container & Manifest Scan (trivy)
@@ -63,8 +71,12 @@ jobs:
   semgrep-scan:
     name: SAST Scan (semgrep)
     runs-on: ubuntu-latest
+    # Pulled through mirror.gcr.io rather than from Docker Hub: the runner's daemon
+    # pulls a job container anonymously, and Docker Hub's per-IP anonymous limit
+    # failed this job 25 times on 2026-10-09 (#2870; docker-build.yml has the
+    # account). The digest pins the same bytes on either host.
     container:
-      image: semgrep/semgrep:1.155.0@sha256:cc869c685dcc0fe497c86258da9f205397d8108e56d21a86082ea4886e52784d
+      image: mirror.gcr.io/semgrep/semgrep:1.155.0@sha256:cc869c685dcc0fe497c86258da9f205397d8108e56d21a86082ea4886e52784d
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -78,7 +90,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run Checkov
-        uses: bridgecrewio/checkov-action@cc0e17d456ef1713bbfd963ebac19dc776775cb2 # v12.3128.0
+        uses: bridgecrewio/checkov-action@c3e106d5f8f4253a6de5110efb41a080f83db294 # v12.3135.0
         with:
           framework: terraform,github_actions
           output_format: cli

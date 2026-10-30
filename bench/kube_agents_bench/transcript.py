@@ -109,6 +109,15 @@ class TranscriptSnapshot:
     # empty when it read everything. ``worker_agents`` reads it to tell a
     # profile that never worked the run from one whose calls went unread.
     worker_capture_gaps: list[str] | None = None
+    # Child card to parent card from the same read (``worker_trajectory.
+    # parents``), so a check can treat a card and the cards its worker fanned
+    # out as one lineage. ``None`` when the read did not run.
+    worker_card_parents: dict[str, str] | None = None
+    # How each delegated card's attempts ended (``worker_trajectory.runs``):
+    # ``task`` / ``profile`` / ``status`` / ``outcome`` / ``error`` per run row,
+    # so a check can read the turn budget a worker ran out of. ``None`` when
+    # the read did not run.
+    worker_runs: list[dict[str, Any]] | None = None
 
 
 _current: TranscriptSnapshot | None = None
@@ -123,6 +132,8 @@ def set(  # noqa: A001 - deliberate, matches get/clear
     started_at: float = 0.0,
     worker_commands: list[dict[str, str]] | None = None,
     worker_capture_gaps: list[str] | None = None,
+    worker_card_parents: dict[str, str] | None = None,
+    worker_runs: list[dict[str, Any]] | None = None,
 ) -> None:
     """Stash the just-finished run's transcript for the verifiers.
 
@@ -141,6 +152,8 @@ def set(  # noqa: A001 - deliberate, matches get/clear
         started_at=started_at,
         worker_commands=None if worker_commands is None else list(worker_commands),
         worker_capture_gaps=None if worker_capture_gaps is None else list(worker_capture_gaps),
+        worker_card_parents=None if worker_card_parents is None else dict(worker_card_parents),
+        worker_runs=None if worker_runs is None else [dict(r) for r in worker_runs],
     )
 
 

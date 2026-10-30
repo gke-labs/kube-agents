@@ -12,7 +12,9 @@ owns both ends of that lifecycle.
 ## The store
 
 `/opt/data/fleet-audit/reports/<audit-id>/<owner>/<name>/`, one directory per stream and GitOps
-repository — a stream publishes one ledger per managed repository:
+repository. A run publishes to the `role: gitops` repository, or to the repository a person gave
+with `--repo`, so a stream can have more than one directory. A run with no repository to publish
+to uses `no_forge/local`:
 
 - `latest.json` — the newest run's envelope.
 - `runs/<YYYYMMDDThhmmss.ffffffZ>.json` — one envelope per run, newest 14 kept. The only
@@ -21,12 +23,25 @@ repository — a stream publishes one ledger per managed repository:
 An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
 `wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_still_open`, `prs_closed`, `silent_ok`,
-`ledger_held_open`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
-`document`, and sometimes `ledger_document`, `inspect_s`, `publish_s` and `collect_s`.
+`ledger_held_open`, `scheduled`, `scheduled_coverage_gaps`, `scheduled_published_ids`, `scheduled_reported_under_gap`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
+`document`, and sometimes `ledger_document`, `reported_under_gap`, `silent_floor`, `inspect_s`, `publish_s` and `collect_s`.
+The `scheduled_*` keys record the last scheduled run, not this run: an on-demand run copies them
+forward.
 
 - `document` is this run's whole validated findings document — un-clipped, so it holds findings the
   issue body had no room to print.
-- `status` is `OPENED`, `UPDATED`, `CLEAN`, or `HELD`. `ledger_held_open` true means a `CLEAN` or
+- `status` is `OPENED`, `UPDATED`, `CLEAN`, `HELD`, `NO_FORGE`, or `STORE_LEDGER`. `NO_FORGE` means the run had no
+  repository to publish to: it wrote no ledger issue, `issue_number` and `issue_url` are null, and
+  the envelope is the only record of what it found. A `NO_FORGE` envelope in a repository's
+  directory carries `unreachable_repo` (`repo`, `reason`): the run could not reach that repository.
+  One under `no_forge/local` can carry `no_repository_chosen` (`reason`): several repositories are
+  managed and none is the one `role: gitops` repository. For both, the new and resolved counts are
+  unknown; say so. An envelope with neither key is from an install with no forge.
+  `STORE_LEDGER` means the repository is on a forge with no issue tracker, or no labels: the
+  envelope is the ledger (`issue_number` and `issue_url` are null, `ledger` is `store`), and the
+  remediation pull requests opened on the forge are in `prs_opened`, `prs_still_open` and
+  `prs_closed`. Give those links where you would give the ledger link.
+  `ledger_held_open` true means a `CLEAN` or
   `HELD` run left the issue open (partial, or over findings it did not account for) without
   rewriting it: the issue still lists the previous run's findings, `current` counts those, and this
   run's `findings: 0` and `critical: 0` do **not** mean the ledger is clear. `streams`, `show` and
@@ -37,8 +52,12 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
   delta: `new_ids` and `resolved_ids` are empty, and `new`/`resolved` 0, because nothing was claimed,
   not because nothing changed. Say the delta is unknown for that run. Envelopes written before the
   key existed lack it; read their counts as they are. `streams` and `show` carry it.
-- `current_ids` is exactly what the body's hidden block published: the findings the body rendered
-  plus the ids the collector held. Derive this run's full set from `document`.
+- `silent_floor` true means an earlier `finish` in the same run reported news or opened a pull
+  request, so this run's
+  `silent_ok` was kept `false` and its counts may be measured against that `finish`.
+- `current_ids` is exactly what the body's hidden block published: the findings the body named, in
+  full or on one line, the ids the collector held, and the ids under _Not re-checked this run_
+  (previous findings on a target the run did not check). Derive this run's full set from `document`.
 - `inspect_s`, `publish_s` and `collect_s` are seconds: from `start` to `finish`, for `finish` to
   publish, and for the collector to run. An envelope has only the ones `finish` could measure.
   `show` gives them, with null for the others; `streams` does not carry them.
@@ -60,7 +79,7 @@ Answering "how many criticals are open?" that way spends tens of thousands of to
 When `report_query.py` says a stream has no record, that is the answer: do not search the directory
 for a file it did not find.
 
-`python3 ./skills/fleet-audit-reports/scripts/report_query.py <subcommand>` prints one small JSON
+`python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py <subcommand>` prints one small JSON
 object per call.
 
 | Subcommand                          | Answers                                                               |
@@ -79,8 +98,8 @@ object per call.
   empty. Every answer carries an `error` key, null on success. `streams` exits 2 when any one stream is
   unreadable; its other rows still stand — report them and name the unreadable ones.
 - Every subcommand but `streams` takes `--repo`, the repository as the managed list or the `repos`
-  list names it: `owner/name` (or `github.com/owner/name`) on GitHub, `<host>/<path>` for a
-  repository on another forge. Leave it off when the stream has
+  list names it: `owner/name` (or `github.com/owner/name`) on github.com, `<host>/owner/name` on a
+  GitHub Enterprise Server, and `<host>/<path>` for a repository on another forge. Leave it off when the stream has
   published to one repository; when it has published to several, the answer is exit 2 with the
   `repos` to choose from — ask which, or run once per repository, never pick one silently.
 - `--run` takes a stamp from `runs`, with or without the `.json`. Default is the newest run:
@@ -103,20 +122,21 @@ object per call.
 **"What did last night's compliance audit find?"**
 
 ```bash
-python3 ./skills/fleet-audit-reports/scripts/report_query.py show compliance-audit
-python3 ./skills/fleet-audit-reports/scripts/report_query.py findings compliance-audit --severity critical
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py show compliance-audit
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py findings compliance-audit --severity critical
 ```
 
 `show` gives, under `envelope`, `status`, `findings`, `critical`, `partial`, `ledger_held_open`, the
 delta counts and `issue_url`; name the criticals from `findings`. When `ledger_held_open` is true,
 this run found nothing but the issue still carries the previous run's findings — say both, and point
 at the issue. Always hand back the issue URL — the store is where you read, the ledger is where a
-human acts.
+human acts — except on a `NO_FORGE` run, which has no issue: the store is the only record. A
+`STORE_LEDGER` run has no issue either: hand back its pull request links instead.
 
 **"What changed since the last run?"**
 
 ```bash
-python3 ./skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit
 ```
 
 Defaults to the newest two runs and returns ids and titles under `added` and `resolved`. When
@@ -128,14 +148,14 @@ be findings the ledger already carried — say "found again", not "new". For a w
 ring first and name two stamps, older as `--from` — a reversed pair is refused:
 
 ```bash
-python3 ./skills/fleet-audit-reports/scripts/report_query.py runs compliance-audit
-python3 ./skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit --from <stamp> --to <stamp>
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py runs compliance-audit
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit --from <stamp> --to <stamp>
 ```
 
 **"Tell me about that finding."**
 
 ```bash
-python3 ./skills/fleet-audit-reports/scripts/report_query.py finding compliance-audit <finding-id>
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py finding compliance-audit <finding-id>
 ```
 
 The evidence command and excerpt, the impact, and all three `recommendation` fields. This is the
@@ -144,11 +164,12 @@ expensive call: make it for the finding that was asked about, not for the list.
 **"The issue says findings or commands were omitted — what were they?"**
 
 ```bash
-python3 ./skills/fleet-audit-reports/scripts/report_query.py findings obtainability-audit
-python3 ./skills/fleet-audit-reports/scripts/report_query.py checks obtainability-audit --cluster prod-us-east
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py findings obtainability-audit
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py checks obtainability-audit --cluster prod-us-east
 ```
 
-The ledger drops its least-severe findings, then its evidence table whole, to stay inside GitHub's
+The ledger names findings it has no room to show in full on one line each, as far as the room left
+after the criticals' full blocks allows, then drops the least-severe ones and its evidence table whole, to stay inside GitHub's
 body limit, and says so in a notice that points here. `findings` lists every finding the run
 carried. `checks` is one row per check the run says it performed, with the command that performed
 it, plus each `checks_not_applicable` exclusion and its reason; filter by cluster or check — a
@@ -173,7 +194,7 @@ last run" and "is anything stuck" come back in one call. Coverage questions read
   hand: either way it is not the open ledger. Check the issue's state, or say
   the findings are as of that run.
   **No stored run means unknown, not clean** — say the store has no record, and read the ledger
-  issue.
+  issue if the install has a forge.
 
 ## Red lines
 
@@ -183,7 +204,7 @@ last run" and "is anything stuck" come back in one call. Coverage questions read
 - **Never read `document` or `ledger_body` whole** to answer a question a subcommand answers.
 - **Never run, publish, or remediate from here.** Dispatching a stream, rewriting a ledger and
   opening remediation pull requests belong to `fleet-audit`
-  ([Running a stream on demand](../fleet-audit/SKILL.md#running-a-stream-on-demand)).
+  ([Running a stream on demand](../fleet-audit/references/on-demand.md#running-a-stream-on-demand)).
 - **Never act on a `running` or `died` stream's lease.** It is `fleet-audit`'s; report the state.
 - **Never quote a count the store did not give you.** The counts are keys; re-deriving one by hand
   from prose is how a stale number reaches a user with the authority of a file read.

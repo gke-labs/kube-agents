@@ -1,0 +1,129 @@
+# Upgrade-failure catalogue entry 5 (maintenance window too short, or an
+# exclusion ends mid-roll), in the shape the seeded fleet plants it:
+# seeded-b carries the NO_MINOR_UPGRADES exclusion hold-the-minor-lag, with
+# an end time the apply stamps a fixed number of hours ahead. An operator
+# scheduling the upgrade needs its scope and its end, not only its existence.
+#
+# upgrades-fleet-readiness-exclusion already grades that the exclusion is
+# reported as what holds the automatic upgrade. This case asks the
+# scheduling question: does anything get in the way next week, and until
+# when. It asks for the answer to end in one declared line per cluster, in a
+# fixed form, and the deterministic objectives read those lines and nothing
+# else; a report that only says "an exclusion exists" cannot fill the line.
+#
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# No deterministic mutation safeguard, documented: the exclusion is on the
+# GKE API, not in a cluster, so fleet_resource_property has nothing to read;
+# the fleet's scheduled reconcile re-stamps it on every apply and owns its
+# integrity, and the prompt forbids the change.
+# The end objective grades the form of the date (a day first, then anything
+# but a hedge mark), not its value: the fleet re-stamps the exclusion's window at every
+# apply, so no fixed pattern can hold the day, and whether the day the agent
+# names is the real end is the judge's to check against the policy.
+id: upgrades-exclusion-end-date-named
+name: The maintenance exclusion in the way of next week's upgrade is named with its scope and end time
+
+prompt: >-
+  If we put the seeded clusters' control-plane upgrades on the calendar for
+  next week, does any maintenance exclusion or maintenance window get in the
+  way, on which cluster, what exactly does it exclude, and until when? Read
+  only; change nothing. End your answer with one line per seeded cluster in
+  exactly this form, no other words on the line: "<cluster>: exclusion
+  <name or none>; scope <scope or none>; ends <YYYY-MM-DD or none>; holds
+  the automatic minor upgrade: <yes|no>".
+
+expected_output: >-
+  It reads each seeded cluster's maintenance policy and names
+  hold-the-minor-lag on seeded-b: scope NO_MINOR_UPGRADES, so GKE's automatic
+  minor upgrade is held while it is in effect, with its end time stated as a
+  date, and says whether that end falls before or after next week. It says
+  the exclusion holds the automatic upgrade and does not stop an operator
+  starting one, and that the other seeded clusters carry no exclusion that
+  blocks upgrades. It recommends either waiting for the end time or
+  shortening the exclusion, and performs no change. It ends with the
+  declared line for every seeded cluster, seeded-b's reading "exclusion
+  hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends <date>; holds the
+  automatic minor upgrade: yes" and the others "exclusion none". It cites no
+  CVE identifiers.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+fixtures:
+  - version-laggard
+
+verification_spec:
+  # The declared lines are what the deterministic objectives read; each
+  # pattern matches a whole line that starts with seeded-b. A label the
+  # template writes without a colon may carry one; a value then starts at
+  # its first non-blank character, so a negated slot cannot be sidestepped
+  # by the colon.
+  - name: seeded-b-has-a-declared-line-naming-the-exclusion
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - version-laggard
+      any_of_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+
+  - name: the-declared-line-states-the-scope
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - version-laggard
+      # Under the fold an underscore between two word characters becomes a
+      # hyphen before `_normalize` runs, so NO_MINOR_UPGRADES and
+      # no_minor_upgrades both arrive as "no-minor-upgrades"; the optional
+      # separator also admits a spaced spelling.
+      any_of_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?no[-_ ]?minor[-_ ]?upgrades(?: ?\([^)\n;]*\))?; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?(?!no[-_ ]?minor[-_ ]?upgrades(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+
+  - name: the-declared-line-states-the-end-date
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - version-laggard
+      any_of_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?20\d\d-\d\d-\d\d[^;\n?!]*; holds the automatic minor upgrade: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?(?!20\d\d-\d\d-\d\d[^;\n?!]*;)[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+
+  - name: the-declared-line-says-it-holds-the-automatic-upgrade
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - version-laggard
+      any_of_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: yes$'
+      forbidden_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?!yes$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]

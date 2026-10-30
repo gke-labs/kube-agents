@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
 """Unit tests for fleet_upgrade_report.py, with gcloud replaced by canned JSON."""
 
+import errno
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
 import unittest
 import subprocess
 from unittest import mock
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 import fleet_upgrade_report as report  # noqa: E402
+import credential_proxy_client  # noqa: E402 -- on sys.path through the reporter's SHARED_SCRIPT_DIRS
+import readiness_rules  # noqa: E402
+import upgrade_readiness as readiness  # noqa: E402
+from readiness_rules import audit_log, zonal_control_plane  # noqa: E402
+
+PAGE_BOUND_CLAUSE = audit_log.PAGE_CLAUSE[: audit_log.PAGE_CLAUSE.index("{")]  # the bound the window and every later page carry
+
+ZONAL = zonal_control_plane.RULE_ID
 
 # Every resolver asks the operator's answer when a run passes neither scope flag:
 # the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
@@ -28,6 +38,9 @@ _fleet_scope_args = report.fleet_scope_args  # the collector's own import; one m
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
 
+POD_RANGE = "10.0.0.0/14"
+
+
 def cluster(name, location, master, pools, channel="REGULAR", status="RUNNING"):
     record = {
         "name": name,
@@ -35,6 +48,7 @@ def cluster(name, location, master, pools, channel="REGULAR", status="RUNNING"):
         "status": status,
         "currentMasterVersion": master,
         "nodePools": [{"name": p, "version": v, "status": "RUNNING"} for p, v in pools],
+        "clusterIpv4Cidr": POD_RANGE,  # every GKE record carries one; the surge-capacity rule counts its free blocks
     }
     if channel is not None:
         record["releaseChannel"] = {"channel": channel}
@@ -46,14 +60,38 @@ def server_config(**defaults):
 
 
 class FakeGcloud:
-    """Answers `clusters list` per project and `get-server-config` per location."""
+    """Answers `clusters list` per project, `get-server-config` per location, and the three
+    project reads the per-entry rules take (`backend-services list`, `instances list`,
+    `operations list`), each empty unless the test hands a list per project.
 
-    def __init__(self, clusters_by_project, config_by_location, failing_projects=(), failing_locations=()):
+    A location missing from `config_by_location` answers with a config that lists every
+    version the fake's clusters run as valid on every channel they are on, the way GKE lists
+    the versions it is serving: a readiness test that pins an explicit `--target-version`
+    never asked for the server config before the rules did, and the rules that read it must
+    find the fleet's own versions valid there unless a test says otherwise.
+    """
+
+    def __init__(self, clusters_by_project, config_by_location, failing_projects=(), failing_locations=(), backend_services_by_project=None, instances_by_project=None, operations_by_project=None, failing_project_reads=()):
         self.clusters_by_project = clusters_by_project
         self.config_by_location = config_by_location
         self.failing_projects = set(failing_projects)
         self.failing_locations = set(failing_locations)
+        self.backend_services_by_project = backend_services_by_project or {}
+        self.instances_by_project = instances_by_project or {}
+        self.operations_by_project = operations_by_project or {}
+        self.failing_project_reads = set(failing_project_reads)  # the read names (`backend-services`, `instances`, `operations`) whose list fails
         self.calls = []
+
+    def default_instances(self, project):
+        """The instances a project has when the test names none: none."""
+        return []
+
+    def _default_server_config(self):
+        clusters = [c for clusters in self.clusters_by_project.values() for c in clusters]
+        versions = sorted({v for c in clusters for v in [c.get("currentMasterVersion"), *[p.get("version") for p in c.get("nodePools") or []]] if v}, key=report.parse_version)
+        channels = sorted({(c.get("releaseChannel") or {}).get("channel") for c in clusters} - {None, ""})
+        newest = versions[-1] if versions else None
+        return {"channels": [{"channel": ch, "defaultVersion": newest, "validVersions": versions} for ch in channels], "validMasterVersions": versions, "validNodeVersions": versions}
 
     def __call__(self, cmd):
         self.calls.append(cmd)
@@ -66,7 +104,17 @@ class FakeGcloud:
             location = cmd[3].split("=", 1)[1]
             if location in self.failing_locations:
                 return 1, "", f"ERROR: location {location} unavailable"
+            if location not in self.config_by_location:
+                return 0, json.dumps(self._default_server_config()), ""
             return 0, json.dumps(self.config_by_location[location]), ""
+        for name, prefix, lists in (("backend-services", ["gcloud", "compute", "backend-services", "list"], self.backend_services_by_project), ("instances", ["gcloud", "compute", "instances", "list"], self.instances_by_project), ("operations", ["gcloud", "container", "operations", "list"], self.operations_by_project)):
+            if cmd[: len(prefix)] == prefix:
+                project = cmd[len(prefix)].split("=", 1)[1]
+                if name in self.failing_project_reads:
+                    return 1, "", f"ERROR: (gcloud.{name}.list) permission denied on {project}"
+                if name == "instances" and project not in lists:
+                    return 0, json.dumps(self.default_instances(project)), ""
+                return 0, json.dumps(lists.get(project, [])), ""
         raise AssertionError(f"unexpected command {cmd}")
 
 
@@ -104,6 +152,41 @@ class ExplicitTargetTest(unittest.TestCase):
         result = self._run(clusters)
         self.assertEqual(len(result["members"]), 1)
         return result["members"][0]
+
+
+    def test_a_cluster_the_scope_excludes_is_not_a_member(self):
+        # #3081: an agent-run report (collector_args carry the exclusion) leaves
+        # an excluded cluster out; live run 2026-10-15 answered a fleet question
+        # through this script and listed every excluded cluster.
+        report.declared_scope.set("p1", None, "p1/us-central1/lane-b")
+        self.addCleanup(report.declared_scope.set, None, None)
+        pools = [("default-pool", "1.30.5-gke.100")]
+        with patch("sys.stderr"):
+            result = self._run([cluster("ka-today", "us-central1", "1.30.5-gke.100", pools),
+                                cluster("lane-b", "us-central1", "1.30.5-gke.100", pools)])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["ka-today"])
+
+    def test_a_cluster_spec_naming_an_excluded_cluster_says_excluded_not_unmatched(self):
+        report.declared_scope.set("p1", None, "p1/us-central1/lane-b")
+        self.addCleanup(report.declared_scope.set, None, None)
+        pools = [("default-pool", "1.30.5-gke.100")]
+        fake = FakeGcloud({"p1": [cluster("ka-today", "us-central1", "1.30.5-gke.100", pools),
+                                  cluster("lane-b", "us-central1", "1.30.5-gke.100", pools)]}, {})
+        with patch.object(report, "run_cmd", fake), patch("sys.stderr"):
+            result = report.build_report(["p1"], self.TARGET, clusters=["lane-b"])
+        self.assertEqual(result["members"], [])
+        self.assertEqual([e["message"] for e in result["errors"]],
+                         [report.EXCLUDED_CLUSTER_SPEC.format(spec="lane-b", clusters="p1/us-central1/lane-b")])
+
+    def test_without_the_exclusion_flag_every_cluster_is_a_member(self):
+        # The readiness watch passes --project flags and no exclusion: its
+        # report covers excluded clusters, the documented exception (#3026).
+        report.declared_scope.set("p1", None)
+        self.addCleanup(report.declared_scope.set, None, None)
+        pools = [("default-pool", "1.30.5-gke.100")]
+        result = self._run([cluster("ka-today", "us-central1", "1.30.5-gke.100", pools),
+                            cluster("lane-b", "us-central1", "1.30.5-gke.100", pools)])
+        self.assertEqual(sorted(m["cluster"] for m in result["members"]), ["ka-today", "lane-b"])
 
     def test_lagging_control_plane(self):
         m = self._member([cluster("a", "us-central1", "1.30.5-gke.1355000", [("default-pool", "1.30.5-gke.1355000")])])
@@ -312,6 +395,160 @@ class RunCmdTest(unittest.TestCase):
 
 
 class ProjectFailureTest(unittest.TestCase):
+    def test_a_cluster_filter_skips_the_other_members(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["b"])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["b"])
+        with patch.object(report, "run_cmd", fake):
+            everything = report.build_report(["p"], target)
+        self.assertEqual([m["cluster"] for m in everything["members"]], ["a", "b"])
+
+    def test_a_location_qualified_filter_leaves_a_same_named_twin_alone(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)]), cluster("prod", "europe-west1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["us-central1/prod"])
+        self.assertEqual([(m["location"], m["cluster"]) for m in result["members"]], [("us-central1", "prod")])
+        with patch.object(report, "run_cmd", fake):
+            both = report.build_report(["p"], target, clusters=["prod"])
+        self.assertEqual(len(both["members"]), 2)
+
+    def test_an_unmatched_cluster_spec_is_an_error_and_exit_one_not_an_empty_report(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["prd", "europe-west1/prod", "prod"])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["prod"])
+        self.assertEqual(
+            [(e["location"], e["cluster"], e["message"]) for e in result["errors"]],
+            [
+                (None, "prd", "no cluster matched --cluster 'prd' in p"),
+                ("europe-west1", "prod", "no cluster matched --cluster 'europe-west1/prod' in p"),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as out:
+            rc = report.main(["--project", "p", "--cluster", "prd", "--target-version", target, "--state-dir", state_dir])
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        self.assertIn("no cluster matched --cluster 'prd' in p", out.getvalue())
+
+    def test_an_unmatched_spec_over_a_failed_listing_says_the_listing_failed_not_no_match(self):
+        """A project the run could not list may hold the cluster: the line says
+        which projects were listed and which were not, never "no match" over
+        a project it never read."""
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"other": [cluster("a", "us-central1", target, [("p", target)])]}, {}, failing_projects=["acme"])
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["acme", "other"], target, clusters=["us-central1/prod"])
+        messages = [e["message"] for e in result["errors"]]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("permission denied on acme", messages[0])
+        self.assertEqual(messages[1], "no cluster matched --cluster 'us-central1/prod' in other; acme could not be listed, so whether it is there is unknown")
+        with patch.object(report, "run_cmd", fake):
+            alone = report.build_report(["acme"], target, clusters=["us-central1/prod"])
+        self.assertEqual([e["message"] for e in alone["errors"]][1], "--cluster 'us-central1/prod' could not be matched: acme could not be listed")
+        self.assertNotIn("no cluster matched", " ".join(e["message"] for e in alone["errors"]))
+
+    def test_a_qualified_and_a_bare_spec_naming_one_cluster_are_both_matched(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["prod", "us-central1/prod"])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["prod"])
+        self.assertEqual(result["errors"], [])
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as out:
+            rc = report.main(["--project", "p", "--cluster", "prod", "--cluster", "us-central1/prod", "--target-version", target, "--state-dir", state_dir])
+        self.assertEqual(rc, report.EXIT_OK)
+        self.assertNotIn("no cluster matched", out.getvalue())
+
+    def test_a_cluster_spec_outside_the_gke_name_grammar_is_a_usage_error_before_any_read(self):
+        """Each half is a GKE name, lowercase letters, digits and hyphens, never
+        a hyphen first: an empty half, a second slash, whitespace from a pasted
+        line, an uppercase letter or a leading hyphen can match nothing, and is
+        refused with the spec as typed rather than reported as a miss."""
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        for spec in ("/prod", "prod/", "", "us-central1/prod/extra", "us-central1/prod ", " prod", "us-central1/Prod", "us central1/prod", "us-central1/-a", "-us-central1/prod", "-prod"):
+            with self.subTest(spec=spec):
+                err = io.StringIO()
+                with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    # One token, `--cluster=<spec>`: argparse reads a separate
+                    # `-prod` as an option and never hands it to the parser.
+                    rc = report.main(["--project", "p", f"--cluster={spec}", "--target-version", target])
+                self.assertEqual(rc, report.EXIT_USAGE)
+                # The line names the spec as typed, slash and all.
+                self.assertIn(f"--cluster {spec!r} is neither", err.getvalue())
+                self.assertEqual(fake.calls, [])
+        # `/prod` is not the bare form: a direct caller is refused too, rather
+        # than handed `prod` in every location.
+        with patch.object(report, "run_cmd", fake), self.assertRaises(ValueError):
+            report.build_report(["p"], target, clusters=["/prod"])
+        self.assertEqual(fake.calls, [])
+
+    def test_the_spec_half_grammar_is_the_brokers_gke_name_component(self):
+        """One GKE name grammar in the tree: the broker's context component,
+        the scoped pool's copy of it, and this file's spec half. Held equal
+        character for character, anchors aside (every use here is
+        `fullmatch`), and driven with the same inputs, so an edit to one fails
+        here rather than admitting a half the broker refuses."""
+        broker = credential_proxy_client._GKE_CONTEXT_COMPONENT
+        self.assertEqual(report.CLUSTER_SPEC_HALF_RE.pattern, broker.pattern.removeprefix("^").removesuffix(r"\Z"))
+        for candidate in ("abc", "a", "a-b-c", "us-east4", "0abc", "abc-", "-abc", "ABC", "a_b", "a.b", "a/b", "", "a b", "abc\n", "\nabc", "abc\r\n"):
+            with self.subTest(candidate=candidate):
+                self.assertEqual(
+                    bool(broker.fullmatch(candidate)),
+                    bool(report.CLUSTER_SPEC_HALF_RE.fullmatch(candidate)),
+                    f"the broker and the reporter disagree about {candidate!r}",
+                )
+        self.assertIsNone(report.parse_cluster_spec("us-central1/-a"))
+        self.assertIsNone(report.parse_cluster_spec("-prod"))
+        self.assertEqual(report.parse_cluster_spec("us-central1/a-1"), ("us-central1", "a-1"))
+
+    def test_rollout_in_progress_beside_cluster_is_a_usage_error_before_any_read(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        err = io.StringIO()
+        with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = report.main(["--project", "p", "--cluster", "prod", "--rollout-in-progress", "--target-version", target])
+        self.assertEqual(rc, report.EXIT_USAGE)
+        self.assertIn(report.ROLLOUT_FLAG_NEEDS_FULL_READ, err.getvalue())
+        self.assertEqual(fake.calls, [])
+
+    def test_a_narrowed_run_leaves_the_rollout_record_alone(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as out:
+            rc = report.main(["--project", "p", "--target-version", target, "--state-dir", state_dir])
+            self.assertEqual(rc, report.EXIT_OK)
+            path = report.state_path(state_dir, target)
+            before = open(path, encoding="utf-8").read()
+            rc = report.main(["--project", "p", "--cluster", "us-central1/b", "--target-version", target, "--state-dir", state_dir])
+            self.assertEqual(rc, report.EXIT_OK)
+            self.assertEqual(open(path, encoding="utf-8").read(), before)
+            self.assertIn(report.NARROWED_RUN_NOTE, out.getvalue())
+
+    def test_a_narrowed_run_marks_its_report_and_a_full_run_does_not(self):
+        """A reader of the JSON (the deprecation scan's floor, the collector's
+        join) has to tell a narrowed `members[]` from a full run whose project
+        held one cluster; `narrowed_to` is that mark."""
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()):
+            output = os.path.join(tmp, "r.json")
+            rc = report.main(["--project", "p", "--cluster", "us-central1/b", "--cluster", "b", "--target-version", target, "--state-dir", tmp, "--output", output])
+            self.assertEqual(rc, report.EXIT_OK)
+            with open(output, encoding="utf-8") as handle:
+                narrowed = json.load(handle)
+            self.assertEqual(narrowed["narrowed_to"], ["b", "us-central1/b"])
+            self.assertEqual([m["cluster"] for m in narrowed["members"]], ["b"])
+            rc = report.main(["--project", "p", "--target-version", target, "--state-dir", tmp, "--output", output])
+            self.assertEqual(rc, report.EXIT_OK)
+            with open(output, encoding="utf-8") as handle:
+                full = json.load(handle)
+            self.assertIsNone(full["narrowed_to"])
+            self.assertEqual([m["cluster"] for m in full["members"]], ["a", "b"])
+
     def test_one_failed_project_does_not_abort_the_others(self):
         target = "1.31.0-gke.1"
         fake = FakeGcloud(
@@ -525,9 +762,45 @@ class OutputShapeTest(unittest.TestCase):
         self.assertIn(f"read failed for {report.PROJECTS_LIST_ERROR_SCOPE}", stdout.getvalue())
         self.assertIn("PERMISSION_DENIED", stdout.getvalue())
 
+    def test_write_json_atomically_leaves_the_previous_file_on_failure(self):
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "out.json")
+        report.write_json_atomically(path, {"run": 1}, report.OUTPUT_TMP_PREFIX)
+        with self.assertRaises(TypeError):
+            report.write_json_atomically(path, {"run": object()}, report.OUTPUT_TMP_PREFIX)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"run": 1})
+        self.assertEqual(os.listdir(directory), ["out.json"])
+        report.write_json_atomically(path, {"run": 2}, report.OUTPUT_TMP_PREFIX)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"run": 2})
+
+    def test_main_refuses_an_abbreviated_flag(self):
+        # The bench credits a run by the flag's full word; argparse's prefix matching would run
+        # the report on `--readi` and leave the run uncredited.
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as exc:
+            report.main(["--project", "p1", "--target-version", self.target, "--readi"])
+        self.assertEqual(exc.exception.code, report.EXIT_USAGE)
+        self.assertIn("--readi", err.getvalue())
+
+    def test_a_webhook_read_failure_row_is_tagged_and_a_first_read_failure_row_is_not(self):
+        # The readiness watch tells the two apart: a webhook-side row leaves the member graded
+        # `unknown`; a first-read row is a member the server never answered.
+        read_first_failed = {"error": "kubectl get pdb failed", "webhook_error": None, "webhook_skipped": True}
+        read_second_failed = {"error": None, "webhook_error": "kubectl output cut at the cap", "webhook_skipped": False}
+        for read, expect_tag in ((read_first_failed, False), (read_second_failed, True)):
+            with self.subTest(expect_tag=expect_tag):
+                with patch.object(report, "run_cmd", self.fake), patch.object(report, "read_cluster_objects", return_value=read), patch.object(report, "assess_readiness", return_value={"status": "unknown"}):
+                    data = report.build_report(["p1"], self.target, {"at": report.utc_now(), "kubeconfig_dir": tempfile.mkdtemp()})
+                rows = [e for e in data["errors"] if e.get("cluster")]
+                self.assertTrue(rows)
+                self.assertEqual(all(e.get(report.ERROR_READ_KEY) == report.WEBHOOK_READ for e in rows), expect_tag)
+
     def test_main_returns_partial_when_output_cannot_be_written(self):
         out_dir = tempfile.mkdtemp()
-        # A directory where the file should go: open() fails with IsADirectoryError, an OSError.
+        # A directory where the file should go: the temp file is written beside it and the rename
+        # onto it fails with an OSError (IsADirectoryError), which the whole-file write reports.
         with patch.object(report, "run_cmd", self.fake), redirect_stdout(io.StringIO()):
             rc = report.main(["--project", "p1", "--target-version", self.target, "--output", out_dir])
         self.assertEqual(rc, report.EXIT_PARTIAL)
@@ -804,6 +1077,23 @@ class RolloutTrackingTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.state_dir, other + ".json")))
         self.assertEqual(self._state()["recorded_at"], "2026-09-11T10:00:00Z", "the first target's record is untouched")
 
+    def test_a_failed_project_read_does_not_carry_a_deleted_cluster_forward(self):
+        # The carry-forward is for a project whose `clusters list` failed. A failed `compute
+        # instances list` (one of the rules' project reads) in a project that listed cleanly
+        # leaves a deleted cluster dropped from the record, as a clean read does.
+        previous = {"recorded_at": "2026-09-11T10:00:00Z", "members": {"p2/europe-west1/far": {"status": "lagging", "control_plane_version": self.OLD, "unchanged_since": "2026-09-11T10:00:00Z"}}}
+        now = self.T0 + timedelta(hours=1)
+
+        def missing(errors):
+            run = {"projects": ["p2"], "members": [], "errors": errors, "target_version": self.TARGET}
+            report.compute_progress(run, previous, now, False, os.path.join(self.state_dir, self.TARGET + ".json"))
+            return run["rollout"]["missing_members"]
+
+        instances_failed = [{"project": "p2", "location": None, report.ERROR_READ_KEY: readiness_rules.PROJECT_READ_INSTANCES, "message": "gcloud compute instances list --project=p2 --format=json(name,zone,status) failed (1): forbidden"}]
+        self.assertEqual(missing(instances_failed), [{"member": "p2/europe-west1/far", "reason": report.GONE_REASON_ABSENT, "carried_forward": False}])
+        listing_failed = [{"project": "p2", "location": None, report.ERROR_READ_KEY: report.CLUSTERS_LIST_READ, "message": "gcloud container clusters list --project=p2 --format=json failed (1): forbidden"}]
+        self.assertEqual(missing(listing_failed), [{"member": "p2/europe-west1/far", "reason": report.GONE_REASON_NOT_READ.format(why=report.NOT_READ_FAILED.format(project="p2")), "carried_forward": True}])
+
     def test_member_missing_after_a_failed_read_is_carried_forward_then_dropped(self):
         fleet = self._fleet()
         fleet["p2"] = [cluster("far", "europe-west1", self.OLD, [("p", self.OLD)])]
@@ -885,6 +1175,236 @@ class RolloutTrackingTest(unittest.TestCase):
         self.assertFalse(data["rollout"]["active"])
         self.assertEqual(data["rollout"]["summary"]["new"], 4)
 
+@contextmanager
+def owned_by(path, uid):
+    """`os.stat` and `os.fstat` reporting `uid` as `path`'s owner -- on the path, and on a descriptor
+    opened on it (matched by device and inode) -- the test's own fact rather than the runner's uid, real
+    for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real_stat, real_fstat = os.stat, os.fstat
+    try:
+        identity = os.lstat(path)
+        same = (identity.st_dev, identity.st_ino)
+    except FileNotFoundError:
+        same = None
+
+    def rewrite(result):
+        return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
+
+    def fake(target, *args, **kwargs):
+        result = real_stat(target, *args, **kwargs)
+        return rewrite(result) if isinstance(target, (str, bytes, os.PathLike)) and os.fspath(target) == os.fspath(path) else result
+
+    def fake_fstat(fd):
+        result = real_fstat(fd)
+        return rewrite(result) if same is not None and (result.st_dev, result.st_ino) == same else result
+
+    with patch.object(os, "stat", fake), patch.object(os, "fstat", fake_fstat):
+        yield
+
+
+class PrepareKubeconfigTest(unittest.TestCase):
+    def test_the_default_directory_is_shared_and_a_named_one_keeps_the_umask(self):
+        # The default `$HERMES_HOME/.kubeconfigs` follows the fleet-audit collectors' rule: sticky and
+        # world-writable whatever the umask, widened when this uid made it at another mode, moved aside
+        # and remade when another uid's, a stale kubeconfig this uid cannot write removed (root keeps
+        # it). A directory `--kubeconfig-dir` names is the caller's and keeps the caller's umask.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            os.mkdir(shared, 0o755)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("stale")
+            os.chmod(path, 0o400)
+            # The keep follows `os.access`, which root alone answers true for a 0400 file: stated as
+            # that answer rather than as the runner's uid, so a mocked euid does not decide it.
+            kept = os.access(path, os.W_OK)
+            mask = os.umask(0o077)
+            try:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            finally:
+                os.umask(mask)
+            self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, report.KUBECONFIG_DIR_MODE)
+            self.assertEqual(os.path.exists(path), kept)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("root's")
+            with patch.object(os, "geteuid", return_value=os.stat(shared).st_uid + 1), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            # The move-aside is said, as the shared rule says it.
+            self.assertIn("moved aside to .kubeconfigs.unusable-", err.getvalue())
+            self.assertFalse(os.path.exists(path))
+            self.assertEqual(len([n for n in os.listdir(root) if n.startswith(".kubeconfigs.unusable-")]), 1)
+            self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, report.KUBECONFIG_DIR_MODE)
+            named = os.path.join(root, "nested", "kubeconfigs")
+            mask = os.umask(0o077)
+            try:
+                self.assertIsNone(report.prepare_kubeconfig(named, report.kubeconfig_path(named, "p1", "seeded-a", "us-central1-a")))
+            finally:
+                os.umask(mask)
+            self.assertEqual(os.stat(named).st_mode & report.KUBECONFIG_DIR_MODE_MASK, 0o700)
+            # The shared rule's note contract: a directory another uid owns in a parent this uid
+            # cannot rename in is a note naming the owner, which the member's read error carries,
+            # not an OSError reported as a directory creation.
+            other = os.stat(shared).st_uid + 1
+            with patch.object(os, "geteuid", return_value=other), patch.object(os, "rename", side_effect=PermissionError(13, "Permission denied")):
+                note = report.prepare_kubeconfig(shared, path)
+            self.assertIn(f"this run is uid {other}; it could not be moved aside", note)
+            with patch.object(report, "prepare_kubeconfig", return_value=note):
+                read = report.read_cluster_objects({"name": "seeded-a", "location": "us-central1-a"}, "p1", shared)
+            # The rule's refusal is the directory's: both reads fail with it, as a directory that could not be made.
+            self.assertEqual((read["items"], read["error"], read["webhook_error"], read["directory_error"], read["credentials_error"], read["kubeconfig"]), (None, report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note), report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note), report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note), None, path))
+            # A stat the old guard would have caught: a parent this uid cannot search is a note too,
+            # not a traceback out of the run.
+            real_stat = os.stat
+
+            def refusing(target, *args, **kwargs):
+                if str(target) == shared:
+                    raise PermissionError(13, "Permission denied")
+                return real_stat(target, *args, **kwargs)
+
+            with patch.object(os, "stat", side_effect=refusing):
+                note = report.prepare_kubeconfig(shared, path)
+            self.assertEqual(note, report.KUBECONFIG_NOT_READ_FORMAT.format(directory=shared, error="[Errno 13] Permission denied"))
+
+    def test_a_root_run_keeps_the_ticks_directory_and_a_lost_rename_race_is_no_refusal(self):
+        # From root's side the tick's directory is another uid's, and root keeps it rather than moving
+        # it aside; the tick's stale file in it is replaced rather than written through (mocked root
+        # shows both branches). A rename that finds the directory already moved, another run's tick in
+        # the same second having won, reads what stands there now and is no refusal.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            os.mkdir(shared, 0o755)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("the tick's")
+            # The file's owner is the test's own fact as the directory's is, so the replace branch is the
+            # one exercised whoever runs the suite, root included.
+            with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1), owned_by(path, report.ROOT_UID + 1), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertNotIn("moved aside", err.getvalue())
+            self.assertEqual((os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.exists(path), sorted(os.listdir(root))), (report.KUBECONFIG_DIR_MODE, False, [".kubeconfigs"]))
+            # A link planted at the file's name is removed, never written through, the target untouched.
+            target = os.path.join(root, "target")
+            with open(target, "w", encoding="utf-8") as f:
+                f.write("root's secret")
+            os.chmod(target, 0o600)
+            os.symlink(target, path)
+            with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1):
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            with open(target, encoding="utf-8") as f:
+                kept = f.read()
+            self.assertEqual((os.path.lexists(path), kept, os.stat(target).st_mode & 0o7777), (False, "root's secret", 0o600))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("the tick's")
+            other = os.stat(shared).st_uid + 1
+            real_rename = os.rename
+
+            def winner_first(src, dst, *args, **kwargs):
+                # The winner moved the directory and remade it between this run's stat and rename.
+                real_rename(src, dst, *args, **kwargs)
+                os.mkdir(src, 0o755)
+                raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+
+            with patch.object(os, "geteuid", return_value=other), patch.object(os, "rename", winner_first), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertNotIn("could not be moved aside", err.getvalue())
+            [aside] = [n for n in os.listdir(root) if n.startswith(".kubeconfigs.unusable-")]
+            self.assertEqual((os.path.exists(os.path.join(root, aside, os.path.basename(path))), os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.exists(path)), (True, report.KUBECONFIG_DIR_MODE, False))
+
+    def test_a_symlink_at_the_shared_directory_is_refused_not_followed(self):
+        # As the shared rule: a symlink planted at the default directory's name is refused with a
+        # note and never followed, so a root run neither chmods nor writes into its target.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        elsewhere = os.path.join(root, "elsewhere")
+        os.mkdir(elsewhere, 0o700)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            os.symlink(elsewhere, shared)
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            for euid in (os.geteuid(), report.ROOT_UID):
+                with self.subTest(euid=euid), patch.object(os, "geteuid", return_value=euid):
+                    note = report.prepare_kubeconfig(shared, path)
+                self.assertEqual(note, report.KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=shared))
+                self.assertEqual((os.stat(elsewhere).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.islink(shared)), (0o700, True))
+
+
+    def test_this_uids_private_directory_whose_mode_cannot_change_is_kept(self):
+        # As the shared rule: a chmod the filesystem refuses keeps a directory this uid owns alone
+        # (owner write and search, no other uid's write) at its mode, said on stderr; any other mode,
+        # and another uid's directory from root's side, stay the note.
+        refused = OSError(errno.EPERM, "Operation not permitted")
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            os.mkdir(shared)
+            os.chmod(shared, 0o700)
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            # The owner is the test's own fact, this run's euid on the path and on the descriptor.
+            with owned_by(shared, os.geteuid()), patch.object(os, "fchmod", side_effect=refused), redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, 0o700)
+            self.assertIn(report.KUBECONFIG_MODE_KEPT_FORMAT.format(directory=shared, mode="0o700", wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused), err.getvalue())
+            for mode in (0o777, 0o555):
+                with self.subTest(mode=oct(mode)):
+                    os.chmod(shared, mode)
+                    with owned_by(shared, os.geteuid()), patch.object(os, "fchmod", side_effect=refused):
+                        note = report.prepare_kubeconfig(shared, path)
+                    self.assertEqual(note, report.KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=shared, mode=oct(mode), wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused))
+            os.chmod(shared, 0o700)
+            with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1), patch.object(os, "fchmod", side_effect=refused):
+                note = report.prepare_kubeconfig(shared, path)
+            self.assertEqual(note, report.KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=shared, mode="0o700", wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused))
+
+    def test_an_entry_planted_at_the_kubeconfig_name_is_never_used(self):
+        # As the shared rule: a directory planted at the public name is moved aside and said, the note
+        # when it cannot be; another uid's file is removed; this uid's own writable file is kept; a link
+        # to a directory is removed with its target untouched.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            os.mkdir(path, 0o777)
+            with open(os.path.join(path, "inside"), "w", encoding="utf-8") as f:
+                f.write("planted")
+            with redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            [aside] = [n for n in os.listdir(shared) if n.startswith(os.path.basename(path) + ".unusable-")]
+            with open(os.path.join(shared, aside, "inside"), encoding="utf-8") as f:
+                self.assertEqual((os.path.lexists(path), f.read()), (False, "planted"))
+            self.assertIn(report.KUBECONFIG_NOT_A_FILE_MOVED_FORMAT.format(path=path, aside=aside), err.getvalue())
+            os.mkdir(path, 0o777)
+            with patch.object(os, "rename", side_effect=PermissionError(13, "Permission denied")):
+                note = report.prepare_kubeconfig(shared, path)
+            self.assertEqual(note, report.KUBECONFIG_NOT_A_FILE_FORMAT.format(path=path, error="[Errno 13] Permission denied"))
+            with patch.object(report, "prepare_kubeconfig", return_value=note):
+                read = report.read_cluster_objects({"name": "seeded-a", "location": "us-central1-a"}, "p1", shared)
+            self.assertEqual((read["items"], read["error"], read["directory_error"]), (None, report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note), report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note)))
+            os.rmdir(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("another's")
+            os.chmod(path, 0o666)
+            with owned_by(path, os.geteuid() + 1):
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertFalse(os.path.exists(path))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("mine")
+            with owned_by(path, os.geteuid()):
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "mine")
+            elsewhere = os.path.join(root, "elsewhere")
+            os.mkdir(elsewhere, 0o700)
+            os.unlink(path)
+            os.symlink(elsewhere, path)
+            self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertEqual((os.path.lexists(path), os.path.isdir(elsewhere), os.stat(elsewhere).st_mode & report.KUBECONFIG_DIR_MODE_MASK), (False, True, 0o700))
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
@@ -947,6 +1467,19 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
             self.assertEqual(report.get_target_projects(["acme-only"], errors), [])
         self.assertTrue(any("declared scope does not list" in e for e in errors))
 
+    def test_the_one_project_the_audit_collector_hands_on_is_the_whole_scope_the_override_needs(self):
+        """The upgrade audit's collector runs this reporter per behind cluster
+        as `--project <p> --scope-projects <p> --cluster ...`, the one project
+        and never the sweep or the unread rows, so its recorded command does
+        not grow with the fleet. That is enough here: with `--project` the
+        scope is read only to pass the project through `override_error`, so
+        the run proceeds on a scoped sandbox with no error and no note."""
+        errors: list[str] = []
+        report.declared_scope.set("payments-prod", None)
+        with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing may be read"))):
+            self.assertEqual(report.get_target_projects(["payments-prod"], errors), ["payments-prod"])
+        self.assertEqual(errors, [])
+
     def test_a_project_without_the_flags_on_a_scoped_sandbox_is_refused_before_any_read(self):
         errors: list[str] = []
         with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing may be read"))):
@@ -986,11 +1519,11 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(errors, [])
 
     def test_main_hands_the_flags_to_the_resolver(self):
-        # The wiring the SOP relies on: the two flags main parses reach the
+        # The wiring the SOP relies on: the three flags main parses reach the
         # holder the resolver reads, before anything else runs.
         with mock.patch.object(report.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
-            report.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
-        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+            report.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied", "--scope-exclude-clusters", "ops-mgmt/us-central1/lane-b"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied", "ops-mgmt/us-central1/lane-b")
 
     def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
         # `--scope-unread` alone (what collector_args carries when no declared
@@ -1014,17 +1547,86 @@ if __name__ == "__main__":
 
 
 class FakeReadinessCommands(FakeGcloud):
-    """FakeGcloud plus `get-credentials` and `kubectl get`, recording the KUBECONFIG each ran with."""
+    """FakeGcloud plus `get-credentials`, the six `kubectl get` reads and `logging read`,
+    recording the KUBECONFIG each kubectl ran with.
 
-    def __init__(self, clusters_by_project, config_by_location, objects_by_cluster, failing_kubectl=(), failing_credentials=()):
-        super().__init__(clusters_by_project, config_by_location)
+    `objects_by_cluster` answers the PDB read and the webhook read, each filtered to the kinds
+    it asks for (`KINDS`), `namespaced_objects_by_cluster` the namespaced
+    read, `pods_by_cluster` the pod read, `cluster_objects_by_cluster` the StorageClass and
+    PersistentVolume read and `nodes_by_cluster` (Node dicts) the projected node read,
+    rendered the way kubectl's jsonpath renders it; `node_output_by_cluster` replaces that
+    rendering verbatim. `failing_reads` maps a cluster to the resource arguments whose reads
+    fail; `cut_reads` to those the credential proxy cuts at its output cap (rc 0, the output
+    cut after the first line, the proxy's marker on stderr); `audit_by_cluster` holds one
+    page of audit entries per cluster and `failing_logging` the clusters whose `logging
+    read` times out.
+    """
+
+    # What each resource name in a `kubectl get` list returns, so a read that stops asking for
+    # a kind stops receiving it, as a real API server would.
+    KINDS = {
+        "pdb": "PodDisruptionBudget",
+        "deploy": "Deployment",
+        "statefulset": "StatefulSet",
+        "validatingwebhookconfigurations": "ValidatingWebhookConfiguration",
+        "mutatingwebhookconfigurations": "MutatingWebhookConfiguration",
+        "services": "Service",
+        "endpointslices": "EndpointSlice",
+        "namespaces": "Namespace",
+    }
+
+    def __init__(self, clusters_by_project, config_by_location, objects_by_cluster, failing_kubectl=(), failing_credentials=(), failing_webhook_read=(), namespaced_objects_by_cluster=None, pods_by_cluster=None, cluster_objects_by_cluster=None, nodes_by_cluster=None, node_output_by_cluster=None, failing_reads=None, cut_reads=None, audit_by_cluster=None, failing_logging=(), described_status_by_cluster=None, **project_reads):
+        super().__init__(clusters_by_project, config_by_location, **project_reads)
+        self.described_status_by_cluster = described_status_by_cluster or {}  # what `clusters describe` says now; RUNNING unless a test says otherwise
         self.objects_by_cluster = objects_by_cluster
+        self.namespaced_objects_by_cluster = namespaced_objects_by_cluster or {}
+        self.pods_by_cluster = pods_by_cluster or {}
+        self.cluster_objects_by_cluster = cluster_objects_by_cluster or {}
+        self.nodes_by_cluster = nodes_by_cluster or {}
+        self.node_output_by_cluster = node_output_by_cluster or {}
         self.failing_kubectl = set(failing_kubectl)
+        self.failing_webhook_read = set(failing_webhook_read)
+        self.failing_reads = failing_reads or {}
+        self.cut_reads = cut_reads or {}
         self.failing_credentials = set(failing_credentials)
+        self.audit_by_cluster = audit_by_cluster or {}
+        self.failing_logging = set(failing_logging)
         self.kubeconfigs = []
+        self.timeouts = []
         self.current_cluster = None
 
+    def default_instances(self, project):
+        """One instance per node the fake knows, in the zone its label names or the project's
+        first cluster location: a node a test adds is a live one unless the test says otherwise."""
+        location = next((c.get("location") for clusters in self.clusters_by_project.values() for c in clusters), "")
+        instances = []
+        for nodes in self.nodes_by_cluster.values():
+            for node in nodes:
+                zone = ((node.get("metadata") or {}).get("labels") or {}).get("topology.kubernetes.io/zone") or location
+                instances.append({"name": node["metadata"]["name"], "zone": f"https://www.googleapis.com/compute/v1/projects/{project}/zones/{zone}", "status": "RUNNING"})
+        return instances
+
     def __call__(self, cmd, timeout=None, env=None):
+        if cmd[:4] == ["gcloud", "container", "clusters", "describe"]:
+            self.calls.append(cmd)
+            described = self.described_status_by_cluster.get(cmd[4], "RUNNING")
+            if described is None:
+                return 1, "", "ERROR: (gcloud.container.clusters.describe) forbidden"
+            return 0, json.dumps({"status": described} if isinstance(described, str) else described), ""
+        if cmd[:3] == ["gcloud", "logging", "read"]:
+            self.calls.append(cmd)
+            self.timeouts.append(timeout)
+            filter_text = cmd[3]
+            match = re.search(r'cluster_name="([^"]+)"', filter_text)
+            name = match.group(1) if match else None
+            if name in self.failing_logging:
+                return -1, "", "timed out after 60 seconds"
+            if filter_text.count(PAGE_BOUND_CLAUSE) > 1:
+                return 0, "[]", ""  # a later page (the window's bound and the page's): the canned lists are one page
+            entries = self.audit_by_cluster.get(name, [])
+            removed = [e for e in entries if "k8s.io/removed-release" in (e.get("labels") or {})]
+            page = [e for e in entries if e not in removed] if 'k8s.io/deprecated"="true"' in filter_text else removed
+            return 0, json.dumps(page), ""
         if cmd[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
             self.calls.append(cmd)
             self.current_cluster = cmd[4]
@@ -1035,10 +1637,101 @@ class FakeReadinessCommands(FakeGcloud):
         if cmd[:2] == ["kubectl", "get"]:
             self.calls.append(cmd)
             self.kubeconfigs.append(env.get("KUBECONFIG") if env else None)
-            if self.current_cluster in self.failing_kubectl:
-                return 1, "", "Unable to connect to the server: dial tcp: i/o timeout"
-            return 0, json.dumps({"kind": "List", "items": self.objects_by_cluster.get(self.current_cluster, [])}), ""
+            resource = cmd[2]
+            if resource in (report.KUBECTL_RESOURCES, report.KUBECTL_WEBHOOK_RESOURCES):
+                if self.current_cluster in self.failing_kubectl:
+                    return 1, "", "Unable to connect to the server: dial tcp: i/o timeout"
+                wanted = {self.KINDS[name] for name in resource.split(",")}
+                if "EndpointSlice" in wanted and self.current_cluster in self.failing_webhook_read:
+                    return 1, "", "Error from server (Timeout): the server was unable to return a response in the time allotted"
+                items = [o for o in self.objects_by_cluster.get(self.current_cluster, []) if o.get("kind") in wanted]
+                return 0, json.dumps({"kind": "List", "items": items}), ""
+            if resource in self.failing_reads.get(self.current_cluster, ()):
+                return 1, "", f'Error from server (Forbidden): {resource} is forbidden: User "agent" cannot list resource "{resource}"'
+            if resource == report.KUBECTL_NAMESPACED_RESOURCES:
+                stdout = json.dumps({"kind": "List", "items": self.namespaced_objects_by_cluster.get(self.current_cluster, [])})
+            elif resource == report.KUBECTL_POD_RESOURCE:
+                stdout = json.dumps({"kind": "List", "items": self.pods_by_cluster.get(self.current_cluster, [])}, indent=1)
+            elif resource == report.KUBECTL_CLUSTER_RESOURCES:
+                stdout = json.dumps({"kind": "List", "items": self.cluster_objects_by_cluster.get(self.current_cluster, [])})
+            elif resource == report.KUBECTL_NODE_RESOURCE:
+                stdout = self.node_output_by_cluster.get(self.current_cluster)
+                if stdout is None:
+                    stdout = "".join(node_line(n) for n in self.nodes_by_cluster.get(self.current_cluster, []))
+            else:
+                raise AssertionError(f"unexpected kubectl resource {resource}")
+            if resource in self.cut_reads.get(self.current_cluster, ()):
+                return 0, stdout.split("\n", 1)[0] + "\n", "credential proxy output truncated\n"
+            return 0, stdout, ""
         return super().__call__(cmd)
+
+
+# The node fields in the order the report's template asks for them, parsed out of the template
+# itself (`{.a.b}` expressions; the range, the separators and the end are not fields), so the
+# fake renders whatever order the template declares and the parser is held against the template
+# through the round trip, not against a copy of the order kept here.
+NODE_TEMPLATE_PATHS = [path.split(".") for path in re.findall(r"\{\.([A-Za-z0-9_.]+)\}", report.KUBECTL_NODE_JSONPATH)]
+
+
+def node_line(node):
+    """One node as kubectl's jsonpath renders the report's template, field by field in the template's own order: a string raw, maps, lists and booleans as JSON, an absent field empty."""
+    values = []
+    for path in NODE_TEMPLATE_PATHS:
+        value = node
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
+        values.append("" if value is None else value if isinstance(value, str) else json.dumps(value))
+    return "\t".join(values) + "\n"
+
+
+# Literal resource lists and the literal node template, not the constants: a list that drops a
+# kind, or a template that moves, drops or renames a field, must fail here.
+PDB_READ_CMD = ["kubectl", "get", "pdb,deploy,statefulset", "-A", "-o", "json"]
+WEBHOOK_READ_CMD = ["kubectl", "get", "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces", "-A", "-o", "json"]
+NAMESPACED_READ_CMD = ["kubectl", "get", "daemonset,cronjob,pvc,networkpolicy,namespace", "-A", "-o", "json"]
+POD_READ_CMD = ["kubectl", "get", "pods", "-A", "-o", "json"]
+NODE_READ_CMD = ["kubectl", "get", "node", "-o", 'jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.spec.providerID}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.spec.podCIDR}{"\\t"}{.metadata.labels}{"\\t"}{.spec.taints}{"\\t"}{.spec.unschedulable}{"\\t"}{.status.nodeInfo}{"\\t"}{.status.allocatable}{"\\t"}{.status.conditions}{"\\n"}{end}']
+CLUSTER_READ_CMD = ["kubectl", "get", "storageclass,pv", "-o", "json"]
+MEMBER_READS = [PDB_READ_CMD, WEBHOOK_READ_CMD, NAMESPACED_READ_CMD, POD_READ_CMD, NODE_READ_CMD, CLUSTER_READ_CMD]
+CUT_AT_CAP = "output was cut at the credential proxy's output cap"
+
+
+def fake_rule(rule_id, entry=0, can_block=True, evaluate=None, describe=None):
+    """A rule module stand-in for the registry: a class with the contract's attributes."""
+
+    class Rule:
+        RULE_ID = rule_id
+        ENTRY = entry
+        CAN_BLOCK = can_block
+
+    Rule.evaluate = staticmethod(evaluate or (lambda cluster, member, read, target, context: readiness_rules.new_result()))
+    Rule.describe = staticmethod(describe or (lambda finding: finding.get("detail", "")))
+    return Rule
+
+
+# The reads' kind names against the `kind` the objects carry, for the fake rules below.
+OBJECT_KIND = {"pods": "Pod", "node": "Node", "pv": "PersistentVolume", "networkpolicy": "NetworkPolicy"}
+
+
+def kind_rule(rule_id, kind, can_block=True):
+    """A rule that needs one kind of the reads after the PDB read: `unknown` when it was
+    not read, a note naming how many objects of the kind it saw otherwise."""
+
+    def evaluate(cluster, member, read, target, context):
+        out = readiness_rules.new_result()
+        error = readiness_rules.read_error(read, kind)
+        if error:
+            out["unknown"].append(f"the {kind} read failed ({error})")
+        else:
+            out["notes"].append(f"saw {len(readiness_rules.items_of_kind(readiness_rules.read_items(read), OBJECT_KIND[kind]))} {kind}(s)")
+        return out
+
+    return fake_rule(rule_id, can_block=can_block, evaluate=evaluate)
+
+
+def node_record(name, zone, project, ready="True", unschedulable=False):
+    """A Node as the jsonpath read projects it, with the providerID GKE sets."""
+    return {"kind": "Node", "metadata": {"name": name, "labels": {"cloud.google.com/gke-nodepool": "default-pool", "topology.kubernetes.io/zone": zone}}, "spec": {"taints": [], "unschedulable": unschedulable, "providerID": f"gce://{project}/{zone}/{name}"}, "status": {"nodeInfo": {"kubeletVersion": "v1.35.1-gke.1000"}, "allocatable": {"cpu": "940m"}, "conditions": [{"type": "Ready", "status": ready}]}}
 
 
 def k8s_workload(kind, namespace, name, replicas, labels):
@@ -1047,6 +1740,23 @@ def k8s_workload(kind, namespace, name, replicas, labels):
 
 def k8s_pdb(namespace, name, spec, expected):
     return {"kind": "PodDisruptionBudget", "metadata": {"namespace": namespace, "name": name}, "spec": spec, "status": {"expectedPods": expected, "disruptionsAllowed": 0}}
+
+
+def k8s_webhook(kind, config, webhook, policy, service, resources, operations=("CREATE",)):
+    rule = {"apiGroups": [""], "apiVersions": ["v1"], "operations": list(operations), "resources": list(resources)}
+    return {"kind": kind, "metadata": {"name": config}, "webhooks": [{"name": webhook, "failurePolicy": policy, "rules": [rule], "clientConfig": {"service": {"namespace": service[0], "name": service[1]}}}]}
+
+
+def k8s_service(namespace, name, port=443, port_name="https"):
+    return {"kind": "Service", "metadata": {"namespace": namespace, "name": name}, "spec": {"ports": [{"name": port_name, "port": port, "targetPort": 8443}]}}
+
+
+def k8s_endpointslice(namespace, service, ready, port_name="https"):
+    return {"kind": "EndpointSlice", "metadata": {"namespace": namespace, "name": f"{service}-x", "labels": {"kubernetes.io/service-name": service}}, "ports": [{"name": port_name, "port": 8443}], "endpoints": [{"conditions": {"ready": ready}}]}
+
+
+def k8s_namespace(name, labels=None):
+    return {"kind": "Namespace", "metadata": {"name": name, "labels": {"kubernetes.io/metadata.name": name, **(labels or {})}}}
 
 
 class ReadinessTest(unittest.TestCase):
@@ -1088,6 +1798,25 @@ class ReadinessTest(unittest.TestCase):
             ],
         }
 
+        # seeded-b: the seeded fleet's fixture shape, a gate on ConfigMaps only, whose Service does
+        # not exist, scoped to its own namespace as bench/tf/fleet/defects-b.tf scopes it. It is an
+        # outage because ConfigMaps are on neither graded list; the scope confines the gate.
+        seeded_gate = k8s_webhook("ValidatingWebhookConfiguration", "seeded-fail-closed-gate", "gate.seeded.invalid", "Fail", ("seeded-upgrade", "nonexistent-admission-gate"), ["configmaps"])
+        seeded_gate["webhooks"][0]["namespaceSelector"] = {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}}
+        self.objects["seeded-b"] = self.objects.get("seeded-b", []) + [seeded_gate]
+        # robot-host: a gate on pod creation whose Service exists but has no endpoints; the drain's replacements need it.
+        self.objects["robot-host"] = self.objects.get("robot-host", []) + [
+            k8s_webhook("ValidatingWebhookConfiguration", "pod-gate", "pods.example.com", "Fail", ("gate", "pod-hook"), ["pods"]),
+            k8s_service("gate", "pod-hook"),
+        ]
+        # seeded-a: a pod gate with a ready backend, and a fail-open one.
+        self.objects["seeded-a"] = self.objects.get("seeded-a", []) + [
+            k8s_webhook("ValidatingWebhookConfiguration", "healthy-gate", "ok.example.com", "Fail", ("kube-system", "live-hook"), ["pods"]),
+            k8s_service("kube-system", "live-hook"),
+            k8s_endpointslice("kube-system", "live-hook", ready=True),
+            k8s_webhook("MutatingWebhookConfiguration", "advisor", "advise.example.com", "Ignore", ("kube-system", "live-hook"), ["pods"]),
+        ]
+
     def _args(self, *extra):
         return ["--state-dir", self.state_dir, "--project", "p1", "--target-version", self.TARGET, *extra]
 
@@ -1128,16 +1857,26 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(host["pdbs"]["orphan"], 1)
         self.assertFalse(host["skew"]["applicable"])
         self.assertIn("1 orphan PDB(s)", host["note"])
+        self.assertEqual([f["webhook"] for f in host["webhooks"]["blocking"]], ["pod-gate/pods.example.com"])
+        self.assertEqual(host["webhooks"]["blocking"][0]["upgrade_path"], ["CREATE pods"])
+        self.assertEqual(host["webhooks"]["blocking"][0]["reason"], "Service gate/pod-hook has no ready endpoints on port 443")
 
         b = by_name["seeded-b"]
         self.assertEqual(b["status"], "blocked")
         self.assertEqual(b["pdbs"]["blocking"], [])
+        # The fixture's gate matches ConfigMaps only: an outage for what it matches, not an upgrade blocker.
+        self.assertEqual(b["webhooks"]["blocking"], [])
+        self.assertEqual([f["webhook"] for f in b["webhooks"]["outage"]], ["seeded-fail-closed-gate/gate.seeded.invalid"])
+        self.assertEqual(b["webhooks"]["outage"][0]["reason"], "Service seeded-upgrade/nonexistent-admission-gate does not exist")
         self.assertEqual(b["maintenance"]["blocking_exclusions"], ["hold-the-minor-lag"])
         self.assertEqual(b["maintenance"]["window"]["state"], "closed")
         self.assertEqual(b["maintenance"]["window"]["next_opening"], "2026-09-15T03:00Z")
 
         a = by_name["seeded-a"]
         self.assertEqual(a["status"], "ready")
+        self.assertEqual(a["webhooks"]["blocking"], [])
+        self.assertEqual(a["webhooks"]["evaluated"], 1)
+        self.assertEqual(a["webhooks"]["fail_open"], 1)
         self.assertEqual(a["skew"]["pools"][0]["verdict"], "ok")
         self.assertEqual(data["readiness"]["summary"], {"blocked": 2, "ready": 1, "unknown": 0})
         self.assertEqual(data["readiness"]["evaluated_at"], "2026-09-14T15:00:00Z")
@@ -1149,6 +1888,8 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("no exclusion in effect; no maintenance window", host_row)
         self.assertIn("n/a (Autopilot", host_row)
         b_row = next(l for l in lines if l.startswith("| p1 | seeded-b |") and "| blocked |" in l)
+        self.assertIn("seeded-fail-closed-gate/gate.seeded.invalid (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/nonexistent-admission-gate does not exist; matches none of the operations this rule reads as the upgrade's path (its rules: CREATE configmaps at v1); it fails now every request the server sends it; reported, not graded", b_row)
+        self.assertIn("pod-gate/pods.example.com (ValidatingWebhookConfiguration): failurePolicy Fail and Service gate/pod-hook has no ready endpoints on port 443; matches CREATE pods", host_row)
         self.assertIn("exclusion hold-the-minor-lag (NO_MINOR_UPGRADES) blocks auto-upgrade to 1.35.1-gke.1000 until 2026-12-11T14:35Z", b_row)
         self.assertIn("window daily at 03:00Z for 4h: closed, next opening 2026-09-15T03:00Z", b_row)
         self.assertIn("Readiness at 2026-09-14T15:00:00Z: 2 blocked, 1 ready, 0 unknown", text)
@@ -1171,7 +1912,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(all(k and k.startswith(self.kubeconfig_dir + os.sep) for k in fake.kubeconfigs))
         self.assertTrue(os.path.isdir(self.kubeconfig_dir))
         kubectl = [c for c in fake.calls if c[:1] == ["kubectl"]]
-        self.assertEqual(kubectl, [["kubectl", "get", "pdb,deploy,statefulset", "-A", "-o", "json"]] * 3)
+        self.assertEqual(kubectl, MEMBER_READS * 3)
         self.assertEqual(data["readiness"]["kubeconfig_dir"], self.kubeconfig_dir)
         self.assertEqual({m["cluster"]: m["readiness"]["kubeconfig"] for m in data["members"]}["seeded-b"], expected)
 
@@ -1194,9 +1935,27 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("i/o timeout", by_name["seeded-a"]["read_error"])
         self.assertEqual(by_name["robot-host"]["status"], "blocked")
         self.assertEqual(by_name["seeded-b"]["status"], "blocked")
+        self.assertIsNone(by_name["seeded-a"]["webhooks"])
+        # An API server the first read could not reach is not asked a second time: one
+        # kubectl call for seeded-a, every read for each of the other members.
+        self.assertEqual(len([c for c in fake.calls if c[:2] == ["kubectl", "get"]]), 1 + 2 * report.KUBECTL_READS_PER_MEMBER)
+        self.assertTrue(by_name["seeded-a"]["webhook_read_error"].startswith(report.WEBHOOK_READ_SKIPPED))
+        # The skipped read is reported as skipped, not failed: one error row, and a note that says why the webhooks are unread.
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
         self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
-        self.assertIn("| read failed |", text)
+        self.assertEqual([l for l in text.splitlines() if l.startswith("- read failed") and "skipped" in l], [])
+        self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the credential proxy unreachable); webhooks not graded", by_name["seeded-a"]["note"])
+        self.assertNotIn("webhook read failed", by_name["seeded-a"]["note"])
+        self.assertTrue(by_name["seeded-a"]["webhook_read_skipped"])
+        self.assertIn("| read failed | read skipped |", text)
+        self.assertNotIn("| read failed | read failed |", text)
+        # The PDB cell says the read failed; the rules' cells answer for the rules, which ran
+        # on the cluster record: `none` under `other blockers`, the zonal risk under `risks`.
+        row = [line for line in text.splitlines() if "| seeded-a |" in line][1]  # the readiness table's row, between the version table's and the add-ons table's
+        self.assertEqual(row.count("| read failed |"), 1, row)  # the PDB cell alone; the note names the read in prose
+        # `other blockers` is `none`; the risks cell carries the zonal risk first, then the known-issues rows the page lists for the fake fleet's version (the registry's entry order).
+        self.assertIn("| none | zonal-control-plane: ", row)
+        self.assertIn("; known-issues-matrix: known issue ", row)
         # The version row is unaffected, and the rollout record does not treat the project as unread.
         self.assertEqual({m["cluster"]: m["status"] for m in data["members"]}["seeded-a"], report.STATUS_CURRENT)
         self.assertEqual(data["rollout"]["missing_members"], [])
@@ -1210,7 +1969,617 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(b["status"], "blocked")
         self.assertIsNone(b["pdbs"])
         self.assertIn("forbidden", b["read_error"])
-        self.assertEqual(len([c for c in fake.calls if c[:1] == ["kubectl"]]), 2)
+        self.assertIsNone(b["webhooks"])
+        # Every read for each of the two members whose credentials came; none for seeded-b.
+        self.assertEqual(len([c for c in fake.calls if c[:1] == ["kubectl"]]), 2 * report.KUBECTL_READS_PER_MEMBER)
+        self.assertEqual(report.KUBECTL_READS_PER_MEMBER, len(MEMBER_READS))
+        # One credentials failure is one error row, not one per read, and the note names credentials, not the PDB read.
+        self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-b"])
+        self.assertIn("credentials for the cluster could not be fetched", b["note"])
+        self.assertNotIn("PDB read failed", b["note"])
+        # The skipped reads are recorded per kind, so the JSON cannot be read as nine
+        # successful reads, and the note names them from that record.
+        self.assertIn(readiness_rules.NO_READ_RAN_REASON, b["note"])
+        self.assertNotIn(readiness_rules.LATER_READS_SKIPPED_REASON, b["note"])
+        # The zonal rule reads the cluster record alone, so the risk is still filed.
+        self.assertEqual([f["location"] for f in b["risks"] if f["rule"] == ZONAL], ["us-central1-a"])
+        self.assertEqual({kind: readiness_rules.NO_READ_RAN_REASON for kind in readiness_rules.READ_KINDS}, b["read_errors"])
+
+    def test_an_unwritable_kubeconfig_dir_is_a_directory_error_not_a_credentials_error(self):
+        # `--kubeconfig-dir` is operator-chosen, so an unwritable path is ordinary input and
+        # the note has to send the operator to the path, not to IAM.
+        directory = os.path.join(os.devnull, "kubeconfigs")
+        read = report.read_cluster_objects({"name": "c", "location": "l"}, "p", directory)
+        self.assertIsNotNone(read["directory_error"])
+        self.assertIsNone(read["credentials_error"])
+        # The kubeconfig rule's note names the path that could not be made, under the reporter's prefix.
+        self.assertTrue(read["error"].startswith(report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note="")), read["error"])
+        self.assertIn(report.KUBECONFIG_NOT_MADE_FORMAT.format(directory=directory, error="").split("(")[0], read["error"])
+        self.assertEqual(read["error"], read["webhook_error"])
+
+    def test_a_first_read_killed_by_the_deadline_does_not_skip_the_webhook_read(self):
+        # In the sandbox the deadline measures the credential proxy's admission queue as often as
+        # the server, and a second read enters that queue afresh.
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            if cmd[2] == report.KUBECTL_RESOURCES:
+                return -1, "", f"timed out after {report.KUBECTL_TIMEOUT_SECONDS} seconds"
+            return 0, '{"items": []}', ""
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertIn("timed out after", read["error"])
+        self.assertFalse(read["webhook_skipped"])
+        self.assertEqual((read["webhook_items"], read["webhook_error"]), ([], None))
+        self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES, report.KUBECTL_WEBHOOK_RESOURCES])
+
+    def test_a_server_answered_error_quoting_a_dial_failure_does_not_skip_the_webhook_read(self):
+        # kubectl prefixes an error the API server returned with `Error from server (...)`; its
+        # body can quote the server's own dial failure (apiserver to etcd during a control-plane
+        # event), which is an answer, so the second read is made and may be answered.
+        calls = []
+        answered = 'Error from server (InternalError): an error on the server ("rpc error: code = Unavailable desc = dial tcp 10.0.0.2:2379: connect: connection refused") has prevented the request from succeeding'
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            if cmd[2] == report.KUBECTL_RESOURCES:
+                return 1, "", answered
+            return 0, '{"items": []}', ""
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertIn("connection refused", read["error"])
+        self.assertFalse(read["webhook_skipped"])
+        self.assertEqual((read["webhook_items"], read["webhook_error"]), ([], None))
+        self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES, report.KUBECTL_WEBHOOK_RESOURCES])
+        self.assertTrue(report.first_read_failed_before_the_server_answered("Unable to connect to the server: dial tcp 10.0.0.1:443: connect: connection refused"))
+        self.assertFalse(report.first_read_failed_before_the_server_answered(answered))
+        # The webhook read ran and is graded beside the kinds the PDB failure skipped, so the
+        # per-kind record and the note say the later reads were skipped, not that nothing was read.
+        self.assertEqual(set(read["read_errors"].values()), {readiness_rules.LATER_READS_SKIPPED_REASON})
+        self.assertEqual(report._read_error_notes(read["read_errors"]), [report.NOTE_READ_FAILED.format(kinds=readiness.LIST_SEPARATOR.join(readiness_rules.READ_KINDS), error=readiness_rules.LATER_READS_SKIPPED_REASON)])
+        self.assertNotIn("nothing was read", report._read_error_notes(read["read_errors"])[0])
+
+    def test_the_shims_broker_down_line_skips_the_webhook_read(self):
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            return 1, "", "credential proxy unavailable: [Errno 111] Connection refused\n"
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertTrue(read["webhook_skipped"])
+        self.assertTrue(read["webhook_error"].startswith(report.WEBHOOK_READ_SKIPPED))
+        self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES])
+        self.assertEqual(set(read["read_errors"].values()), {readiness_rules.LATER_READS_SKIPPED_REASON})
+
+    def test_a_list_cut_at_the_proxy_cap_is_named_as_such(self):
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            if cmd[2] == report.KUBECTL_RESOURCES:
+                return 0, '{"items": []}', ""
+            return 0, '{"items": [{"kind": "Service", "metadata": {"na', f"{report.PROXY_TRUNCATION_MARKER}\n"
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertEqual((read["items"], read["error"]), ([], None))
+        self.assertIsNone(read["webhook_items"])
+        self.assertIn("cut at the credential proxy's output cap", read["webhook_error"])
+        self.assertNotIn("unparsable", read["webhook_error"])
+
+    def test_webhook_read_failure_leaves_the_pdb_rule_graded(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_webhook_read=["robot-host"])
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        host = next(m for m in data["members"] if m["cluster"] == "robot-host")["readiness"]
+        self.assertIsNone(host["webhooks"])
+        self.assertIsNotNone(host["pdbs"])
+        self.assertEqual(host["pdbs"]["blocking"][0]["pdb"], "readiness-1411/block-drain")
+        self.assertEqual(host["status"], "blocked")  # the PDB still blocks; the webhook rule alone is unread
+        self.assertIn("webhook read failed; webhooks not graded", host["note"])
+        row = next(l for l in text.splitlines() if l.startswith("| p1 | robot-host |") and "| blocked |" in l)
+        self.assertIn("(2 replicas)) | read failed |", row)
+        self.assertIn("kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A -o json failed (1)", text)
+
+    def test_the_namespace_read_feeds_the_selector(self):
+        # A dead Role gate that exempts kube-system and kube-public by a label the installer
+        # put on them is an outage on the cluster whose Namespace read shows the label, and a
+        # blocker on the cluster whose namespaces do not carry it.
+        gate = k8s_webhook("ValidatingWebhookConfiguration", "policy-gate", "roles.example.com", "Fail", ("policy", "absent"), ["roles"])
+        gate["webhooks"][0]["rules"][0]["apiGroups"] = ["rbac.authorization.k8s.io"]
+        gate["webhooks"][0]["namespaceSelector"] = {"matchExpressions": [{"key": "admission.policy.example/ignore", "operator": "DoesNotExist"}]}
+        exempt = [k8s_namespace("kube-system", {"admission.policy.example/ignore": "true"}), k8s_namespace("kube-public", {"admission.policy.example/ignore": "true"})]
+        plain = [k8s_namespace("kube-system"), k8s_namespace("kube-public")]
+        objects = {**self.objects, "seeded-a": self.objects["seeded-a"] + [gate] + exempt, "robot-host": self.objects["robot-host"] + [gate] + plain}
+        _, _, data = self._run(FakeReadinessCommands(self.clusters, {}, objects))
+        webhooks = {m["cluster"]: m["readiness"]["webhooks"] for m in data["members"]}
+        self.assertEqual(([f["webhook"] for f in webhooks["seeded-a"]["outage"]], webhooks["seeded-a"]["blocking"]), (["policy-gate/roles.example.com"], []))
+        blocking = {f["webhook"]: f["upgrade_path"] for f in webhooks["robot-host"]["blocking"]}
+        self.assertEqual(blocking["policy-gate/roles.example.com"], ["CREATE roles in kube-system,kube-public"])
+
+    def test_url_backend_is_counted_in_the_json_and_not_noted(self):
+        url_hook = {"kind": "ValidatingWebhookConfiguration", "metadata": {"name": "warden"}, "webhooks": [{"name": "warden.example.com", "failurePolicy": "Fail", "rules": [{"apiGroups": [""], "operations": ["CREATE"], "resources": ["pods"]}], "clientConfig": {"url": "https://localhost:5443/validate"}}]}
+        objects = {**self.objects, "seeded-a": self.objects["seeded-a"] + [url_hook]}
+        fake = FakeReadinessCommands(self.clusters, {}, objects)
+        _, _, data = self._run(fake)
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual(a["webhooks"]["url_backends"], 1)
+        self.assertEqual(a["status"], "ready")
+        self.assertNotIn("URL", a["note"])
+
+    def test_zonal_risk_fills_the_risks_column_and_the_json_shape(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        by_name = {m["cluster"]: m["readiness"] for m in data["members"]}
+        a = by_name["seeded-a"]
+        self.assertEqual(a["status"], "ready")  # a risk never moves the verdict
+        zonal = [f for f in a["risks"] if f["rule"] == ZONAL]
+        self.assertEqual([(f["entry"], f["location"]) for f in zonal], [(11, "us-central1-a")])
+        self.assertTrue(zonal[0]["text"].startswith("control plane is zonal (us-central1-a)"))
+        self.assertEqual([f for f in a["rule_blocking"] if f["rule"] == ZONAL], [])
+        self.assertEqual([u for u in a["unknown"] if u["rule"] == ZONAL], [])
+        self.assertEqual(set(a) >= {"rules", "rule_blocking", "risks", "unknown", "notes", "read_errors", "audit_log", "read_error"}, True)
+        self.assertTrue(all(isinstance(a[key], list) for key in ("rule_blocking", "risks", "unknown", "notes")))
+        self.assertEqual(a["rules"][ZONAL], {"entry": 11, "can_block": False, "blocking": 0, "risks": 1, "unknown": 0, "notes": 0})
+        self.assertEqual(set(a["rules"]), {m.RULE_ID for m in readiness.EXTRA_RULES})
+        self.assertEqual(a["read_errors"], {kind: None for kind in readiness_rules.READ_KINDS})
+        self.assertIsInstance(a["audit_log"], dict)  # one entry per read a registered rule performed
+        self.assertIsNone(a["read_error"])
+        host = by_name["robot-host"]
+        self.assertEqual([f for f in host["risks"] if f["rule"] == ZONAL], [])  # regional
+        with_risks = sum(1 for m in data["members"] if m["readiness"]["risks"])
+        self.assertGreaterEqual(with_risks, 2)  # the two zonal members at least
+        self.assertEqual(data["readiness"]["members_with_risks"], with_risks)
+        self.assertEqual(data["readiness"]["summary"], {"blocked": 2, "ready": 1, "unknown": 0})
+
+        lines = text.splitlines()
+        header = "| " + " | ".join(report.READINESS_COLUMNS) + " |"
+        self.assertTrue(header.endswith("| node-pool skew | other blockers | risks | note |"))
+        self.assertIn(header, lines)
+        a_row = next(l for l in lines if l.startswith("| p1 | seeded-a |") and "| ready |" in l)
+        cells = [c.strip() for c in a_row.strip("|").split(" | ")]
+        blockers, risks = report.READINESS_COLUMNS.index("other blockers"), report.READINESS_COLUMNS.index("risks")
+        self.assertEqual(cells[blockers], "none")
+        # The cell names the rule, so a reader of the table alone can quote its id.
+        self.assertIn("zonal-control-plane: control plane is zonal (us-central1-a)", cells[risks])
+        self.assertIn("retry with backoff", cells[risks])
+        host_row = next(l for l in lines if l.startswith("| p1 | robot-host |") and "| blocked |" in l)
+        self.assertNotIn("control plane is zonal", host_row)
+        self.assertIn(f"Readiness at 2026-09-14T15:00:00Z: 2 blocked, 1 ready, 0 unknown; {with_risks} with risks; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB, a fail-closed webhook with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), skew or an other blocker any upgrade; a risk does not block.", text)
+
+    def test_an_unknown_from_a_rule_that_cannot_block_stays_in_the_note(self):
+        odd = cluster("odd", "everywhere", self.TARGET, [("p", self.TARGET)])
+        fake = FakeReadinessCommands({"p1": [odd]}, {}, {"odd": self.objects["seeded-a"]})
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        r = data["members"][0]["readiness"]
+        self.assertEqual(r["status"], "ready")
+        zonal = [u for u in r["unknown"] if u["rule"] == ZONAL]
+        self.assertEqual([u["can_block"] for u in zonal], [False])
+        self.assertIn("neither a zone nor a region", zonal[0]["reason"])
+        self.assertIn("zonal-control-plane: location 'everywhere' is neither a zone nor a region", r["note"])
+        self.assertEqual(r["rules"][ZONAL]["unknown"], 1)
+        self.assertIn("| ready | none |", text)
+
+    def test_a_narrowed_run_hands_a_peer_rule_the_whole_listing(self):
+        # `--cluster` (the weekly collector's per-cluster form) selects whom to grade; a rule
+        # that compares a member with its peers still sees every cluster the projects
+        # listed, as the contract promises, not a fleet of one.
+        def evaluate(cluster, member, read, target, context):
+            out = readiness_rules.new_result()
+            peers = sorted(c["name"] for c in context[readiness_rules.CONTEXT_CLUSTERS])
+            out["notes"].append(f"{cluster['name']} sees {len(peers)} peer(s): {', '.join(peers)}")
+            return out
+
+        peer_rule = fake_rule("peers", entry=2, evaluate=evaluate)
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        with patch.object(readiness, "EXTRA_RULES", [peer_rule]):
+            rc, text, data = self._run(fake, "--cluster", "seeded-a")
+        self.assertEqual(rc, report.EXIT_OK)
+        self.assertEqual([m["cluster"] for m in data["members"]], ["seeded-a"])
+        self.assertEqual(data["narrowed_to"], ["seeded-a"])
+        self.assertEqual(data["members"][0]["readiness"]["notes"], ["peers: seeded-a sees 3 peer(s): robot-host, seeded-a, seeded-b"])
+        # Only the narrowed member paid for its reads.
+        self.assertEqual(len([c for c in fake.calls if c[:1] == ["kubectl"]]), report.KUBECTL_READS_PER_MEMBER)
+
+    def test_a_rule_that_breaks_the_audit_log_cache_is_one_unknown_and_the_report_still_writes(self):
+        # `assess_readiness` builds the JSON's `audit_log` from the cache the rules fill; a
+        # rule that writes another shape there is its own `unknown`, named inside the fold's
+        # guard, and the report carries only what `audit_log.read` stored.
+        def evaluate(cluster, member, read, target, context):
+            context[readiness_rules.CONTEXT_CACHE][report.audit_log.CACHE_KEY] = [{"error": "x"}]
+            return readiness_rules.new_result()
+
+        spoiler = fake_rule("spoiler", entry=6, evaluate=evaluate)
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        with patch.object(readiness, "EXTRA_RULES", [spoiler, zonal_control_plane]):
+            rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual([(u["rule"], u["can_block"]) for u in a["unknown"]], [("spoiler", True)])
+        self.assertIn("the rule left the audit-log cache unreadable: cache['audit_log'] is list, not a dict of read results", a["unknown"][0]["reason"])
+        self.assertEqual(a["audit_log"], {})
+        self.assertEqual([f["rule"] for f in a["risks"]], ["zonal-control-plane"])
+        self.assertFalse(any("audit log" in e["message"] for e in data["errors"]))
+        self.assertEqual(a["status"], "unknown")
+
+    def test_a_blocking_rule_moves_the_verdict_and_fills_the_other_blockers_column(self):
+        def evaluate(cluster, member, read, target, context):
+            out = readiness_rules.new_result()
+            if cluster["name"] == "seeded-a":
+                out["blocking"].append({"detail": "pool p removes a node first", "pool": "p"})
+            return out
+
+        blocker = fake_rule("test-blocker", entry=2, evaluate=evaluate)
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        with patch.object(readiness, "EXTRA_RULES", [blocker, zonal_control_plane]):
+            rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual(a["status"], "blocked")
+        self.assertEqual([(f["rule"], f["entry"], f["text"]) for f in a["rule_blocking"]], [("test-blocker", 2, "pool p removes a node first")])
+        self.assertEqual([f["rule"] for f in a["risks"]], ["zonal-control-plane"])
+        self.assertEqual(list(a["rules"]), ["test-blocker", "zonal-control-plane"])
+        row = next(l for l in text.splitlines() if l.startswith("| p1 | seeded-a |") and "| blocked |" in l)
+        self.assertIn("| test-blocker: pool p removes a node first | zonal-control-plane: control plane is zonal", row)
+        self.assertEqual(data["readiness"]["summary"], {"blocked": 3, "ready": 0, "unknown": 0})
+
+    def test_a_failed_read_after_the_pdb_read_costs_the_rules_that_need_it_and_no_exit_code(self):
+        needs_pods = kind_rule("needs-pods", "pods")
+        needs_netpol = kind_rule("needs-netpol", "networkpolicy")
+        needs_nodes = kind_rule("needs-nodes", "node")
+        needs_pv = kind_rule("needs-pv", "pv", can_block=False)
+        member_only = {"p1": [self.clusters["p1"][1]]}
+        objects = {"seeded-a": self.objects["seeded-a"]}
+        pods = [{"kind": "Pod", "metadata": {"namespace": "shop", "name": "web-1"}, "spec": {}, "status": {"phase": "Running"}}]
+        policies = [{"kind": "NetworkPolicy", "metadata": {"namespace": "shop", "name": "deny"}, "spec": {}}]
+        nodes = [{"kind": "Node", "metadata": {"name": "n1", "labels": {"cloud.google.com/gke-nodepool": "default-pool"}}, "status": {"allocatable": {"cpu": "940m"}}}]
+        with patch.object(readiness, "EXTRA_RULES", [needs_pods, needs_netpol, needs_nodes, needs_pv]):
+            # Every read answers: four notes, nothing unknown.
+            fake = FakeReadinessCommands(member_only, {}, objects, namespaced_objects_by_cluster={"seeded-a": policies}, pods_by_cluster={"seeded-a": pods}, nodes_by_cluster={"seeded-a": nodes})
+            rc, text, data = self._run(fake)
+            self.assertEqual(rc, report.EXIT_OK)
+            a = data["members"][0]["readiness"]
+            self.assertEqual(a["status"], "ready")
+            self.assertEqual(a["notes"], ["needs-pods: saw 1 pods(s)", "needs-netpol: saw 1 networkpolicy(s)", "needs-nodes: saw 1 node(s)", "needs-pv: saw 0 pv(s)"])
+            self.assertEqual(a["read_errors"], {kind: None for kind in readiness_rules.READ_KINDS})
+            # The namespaced read refused: the five kinds it carried are unread, the policy rule
+            # is unknown and moves the verdict; the pods rule, read on its own, and the node and
+            # pv rules are untouched; exit 0.
+            fake = FakeReadinessCommands(member_only, {}, objects, pods_by_cluster={"seeded-a": pods}, nodes_by_cluster={"seeded-a": nodes}, failing_reads={"seeded-a": {report.KUBECTL_NAMESPACED_RESOURCES}})
+            rc, text, data = self._run(fake)
+            self.assertEqual(rc, report.EXIT_OK)
+            a = data["members"][0]["readiness"]
+            self.assertEqual(a["status"], "unknown")
+            self.assertEqual(a["pdbs"]["blocking"], [])
+            self.assertIsNone(a["read_error"])
+            for kind in readiness_rules.NAMESPACED_READ_KINDS:
+                self.assertIn("daemonset,cronjob,pvc,networkpolicy,namespace is forbidden", a["read_errors"][kind])
+            self.assertIsNone(a["read_errors"]["pods"])
+            self.assertIsNone(a["read_errors"]["node"])
+            self.assertIsNone(a["read_errors"]["pv"])
+            self.assertEqual([(u["rule"], u["can_block"]) for u in a["unknown"]], [("needs-netpol", True)])
+            self.assertIn("the networkpolicy read failed (kubectl get daemonset,cronjob,pvc,networkpolicy,namespace -A -o json failed (1)", a["unknown"][0]["reason"])
+            self.assertEqual(a["rules"]["needs-netpol"], {"entry": 0, "can_block": True, "blocking": 0, "risks": 0, "unknown": 1, "notes": 0})
+            self.assertEqual(a["rules"]["needs-pods"]["notes"], 1)
+            self.assertIn("daemonset, cronjob, pvc, networkpolicy, namespace not read (kubectl get daemonset,cronjob,pvc,networkpolicy,namespace -A -o json failed (1)", a["note"])
+            self.assertIn("; the per-entry rules that need them say so", a["note"])
+            self.assertEqual(data["errors"], [])
+            self.assertNotIn("read failed for", text)
+            # The pod read refused: only the pods rule is unknown.
+            fake = FakeReadinessCommands(member_only, {}, objects, namespaced_objects_by_cluster={"seeded-a": policies}, nodes_by_cluster={"seeded-a": nodes}, failing_reads={"seeded-a": {report.KUBECTL_POD_RESOURCE}})
+            rc, _, data = self._run(fake)
+            self.assertEqual(rc, report.EXIT_OK)
+            a = data["members"][0]["readiness"]
+            self.assertEqual([u["rule"] for u in a["unknown"]], ["needs-pods"])
+            self.assertIn("kubectl get pods -A -o json failed (1)", a["read_errors"]["pods"])
+            self.assertIsNone(a["read_errors"]["networkpolicy"])
+            # The node and cluster-scoped reads refused: the pv rule cannot block, so its unknown
+            # is reported and the node rule's is what makes the member unknown.
+            fake = FakeReadinessCommands(member_only, {}, objects, namespaced_objects_by_cluster={"seeded-a": policies}, pods_by_cluster={"seeded-a": pods}, failing_reads={"seeded-a": {report.KUBECTL_NODE_RESOURCE, report.KUBECTL_CLUSTER_RESOURCES}})
+            rc, _, data = self._run(fake)
+            self.assertEqual(rc, report.EXIT_OK)
+            a = data["members"][0]["readiness"]
+            self.assertEqual(a["status"], "unknown")
+            self.assertEqual([(u["rule"], u["can_block"]) for u in a["unknown"]], [("needs-nodes", True), ("needs-pv", False)])
+            self.assertIn("kubectl get node failed (1)", a["read_errors"]["node"])
+            self.assertIn("storageclass,pv is forbidden", a["read_errors"]["storageclass"])
+            self.assertEqual(a["read_errors"]["storageclass"], a["read_errors"]["pv"])
+            self.assertIsNone(a["read_errors"]["pods"])
+            # Only the cluster-scoped read refused: the one rule that cannot block leaves the verdict ready.
+            fake = FakeReadinessCommands(member_only, {}, objects, namespaced_objects_by_cluster={"seeded-a": policies}, pods_by_cluster={"seeded-a": pods}, nodes_by_cluster={"seeded-a": nodes}, failing_reads={"seeded-a": {report.KUBECTL_CLUSTER_RESOURCES}})
+            rc, _, data = self._run(fake)
+            a = data["members"][0]["readiness"]
+            self.assertEqual(a["status"], "ready")
+            self.assertEqual([u["rule"] for u in a["unknown"]], ["needs-pv"])
+            self.assertIn("needs-pv: the pv read failed", a["note"])
+
+    def test_a_read_the_proxy_cut_at_its_cap_is_that_kinds_error_naming_the_cap(self):
+        needs_pods = kind_rule("needs-pods", "pods")
+        needs_netpol = kind_rule("needs-netpol", "networkpolicy")
+        needs_nodes = kind_rule("needs-nodes", "node")
+        member_only = {"p1": [self.clusters["p1"][1]]}
+        objects = {"seeded-a": self.objects["seeded-a"]}
+        pods = [{"kind": "Pod", "metadata": {"namespace": "shop", "name": f"web-{i}"}, "spec": {}, "status": {"phase": "Running"}} for i in range(3)]
+        nodes = [{"kind": "Node", "metadata": {"name": f"n{i}", "labels": {}}, "status": {}} for i in range(3)]
+        with patch.object(readiness, "EXTRA_RULES", [needs_pods, needs_netpol, needs_nodes]):
+            # The pod list cut: rc 0, unparsable stdout, the marker on stderr. Pods alone are
+            # unread, named for the cap rather than as unparsable JSON; the five small kinds
+            # and the nodes reach their rules; no exit code.
+            fake = FakeReadinessCommands(member_only, {}, objects, pods_by_cluster={"seeded-a": pods}, nodes_by_cluster={"seeded-a": nodes}, cut_reads={"seeded-a": {report.KUBECTL_POD_RESOURCE}})
+            rc, text, data = self._run(fake)
+            self.assertEqual(rc, report.EXIT_OK)
+            a = data["members"][0]["readiness"]
+            self.assertEqual(a["read_errors"]["pods"], f"kubectl get pods -A -o json {CUT_AT_CAP}, so the list did not fit in one read")
+            self.assertNotIn("unparsable", a["read_errors"]["pods"])
+            self.assertEqual({k: v for k, v in a["read_errors"].items() if k != "pods"}, {kind: None for kind in readiness_rules.READ_KINDS if kind != "pods"})
+            self.assertEqual([u["rule"] for u in a["unknown"]], ["needs-pods"])
+            self.assertEqual(a["notes"], ["needs-netpol: saw 0 networkpolicy(s)", "needs-nodes: saw 3 node(s)"])
+            self.assertIn(f"pods not read (kubectl get pods -A -o json {CUT_AT_CAP}", a["note"])
+            self.assertEqual(data["errors"], [])
+            # The node read cut on a line boundary: the lines before the cut parse, and the read is
+            # still recorded as cut rather than as a short list.
+            fake = FakeReadinessCommands(member_only, {}, objects, pods_by_cluster={"seeded-a": pods}, nodes_by_cluster={"seeded-a": nodes}, cut_reads={"seeded-a": {report.KUBECTL_NODE_RESOURCE}})
+            rc, _, data = self._run(fake)
+            self.assertEqual(rc, report.EXIT_OK)
+            a = data["members"][0]["readiness"]
+            self.assertEqual(a["read_errors"]["node"], f"kubectl get node {CUT_AT_CAP}, so the list did not fit in one read")
+            self.assertEqual([u["rule"] for u in a["unknown"]], ["needs-nodes"])
+            self.assertEqual(a["notes"], ["needs-pods: saw 3 pods(s)", "needs-netpol: saw 0 networkpolicy(s)"])
+
+    def test_projected_nodes_are_parsed_and_a_malformed_line_fails_the_node_read_only(self):
+        nodes, error = report.parse_node_lines('n1\tgce://p1/us-central1-a/n1\t2026-10-20T11:50:00Z\t10.4.0.0/24\t{"cloud.google.com/gke-nodepool":"default-pool"}\t\t\t{"kubeletVersion":"v1.33.4-gke.1000"}\t{"cpu":"940m"}\t[{"type":"Ready","status":"True"}]\n\n')
+        self.assertIsNone(error)
+        self.assertEqual(nodes[0]["spec"]["providerID"], "gce://p1/us-central1-a/n1")
+        self.assertEqual(nodes, [{"kind": "Node", "metadata": {"name": "n1", "labels": {"cloud.google.com/gke-nodepool": "default-pool"}, "creationTimestamp": "2026-10-20T11:50:00Z"}, "spec": {"taints": [], "unschedulable": False, "providerID": "gce://p1/us-central1-a/n1", "podCIDR": "10.4.0.0/24"}, "status": {"nodeInfo": {"kubeletVersion": "v1.33.4-gke.1000"}, "allocatable": {"cpu": "940m"}, "conditions": [{"type": "Ready", "status": "True"}]}}])
+        # A node with no block yet carries no podCIDR key, as the API's object does not.
+        nodes, error = report.parse_node_lines('n1\t\t\t\t{}\t\t\t{}\t{}\t[]\n')
+        self.assertEqual((error, nodes[0]["spec"]), (None, {"taints": [], "unschedulable": False}))
+        self.assertEqual(report.parse_node_lines(""), ([], None))
+        nodes, error = report.parse_node_lines("n1\t\t\t\tnot-json\t\t\t\t\t\n")
+        self.assertIsNone(nodes)
+        self.assertIn("node line unparsable", error)
+        nodes, error = report.parse_node_lines("n1\tonly two\n")
+        self.assertIn("field(s), not 10", error)
+        # Only the template's newline ends a node: a NEL (U+0085) inside a free-text field,
+        # which Go's JSON encoder leaves raw, is part of the line; a node with no providerID and no
+        # creation timestamp (the second to fourth fields empty) parses without the keys, as the API serves them.
+        nodes, error = report.parse_node_lines('n1\t\t\t\t{"note":"a\u0085b"}\t\t\t{}\t{}\t[]\n')
+        self.assertIsNone(error)
+        self.assertEqual(nodes[0]["metadata"]["labels"], {"note": "a\u0085b"})
+        self.assertEqual(report.KUBECTL_NODE_JSONPATH.count('{"\\t"}'), report.NODE_FIELD_COUNT - 1)
+        self.assertIn("{.spec.unschedulable}", report.KUBECTL_NODE_JSONPATH)
+        self.assertIn("{.spec.podCIDR}", report.KUBECTL_NODE_JSONPATH)
+        # The template declares as many fields as the parser reads, name first; the fake renders
+        # a node in the template's own field order and the report reads it back whole, so a
+        # template or parser that moved a field fails here on a node whose every field differs;
+        # a cordoned node's `spec.unschedulable` survives the projection, so the helper that
+        # reads it answers from the report's own data.
+        self.assertEqual(len(NODE_TEMPLATE_PATHS), report.NODE_FIELD_COUNT)
+        self.assertEqual(NODE_TEMPLATE_PATHS[0], ["metadata", "name"])
+        node = {"kind": "Node", "metadata": {"name": "n1", "labels": {"cloud.google.com/gke-nodepool": "default-pool"}}, "spec": {"taints": [{"key": "k", "effect": "NoSchedule"}], "unschedulable": False, "podCIDR": "10.4.0.0/24"}, "status": {"nodeInfo": {"containerRuntimeVersion": "containerd://2.0.10"}, "allocatable": {"cpu": "940m", "memory": "2Gi"}, "conditions": [{"type": "Ready", "status": "True"}]}}
+        self.assertEqual(report.parse_node_lines(node_line(node)), ([node], None))
+        self.assertTrue(readiness_rules.node_schedulable(report.parse_node_lines(node_line(node))[0][0]))
+        cordoned = {**node, "spec": {"taints": [{"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}], "unschedulable": True, "podCIDR": "10.4.1.0/24"}}
+        self.assertEqual(report.parse_node_lines(node_line(cordoned)), ([cordoned], None))
+        self.assertFalse(readiness_rules.node_schedulable(report.parse_node_lines(node_line(cordoned))[0][0]))
+        # A malformed node line is the node read's failure alone: the other kinds reach the rules.
+        needs_nodes = kind_rule("needs-nodes", "node")
+        needs_pods = kind_rule("needs-pods", "pods")
+        with patch.object(readiness, "EXTRA_RULES", [needs_nodes, needs_pods]):
+            fake = FakeReadinessCommands({"p1": [self.clusters["p1"][1]]}, {}, {"seeded-a": self.objects["seeded-a"]}, node_output_by_cluster={"seeded-a": "n1\tonly two\n"})
+            rc, _, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        a = data["members"][0]["readiness"]
+        self.assertIn("field(s), not 10", a["read_errors"]["node"])
+        self.assertIsNone(a["read_errors"]["pods"])
+        self.assertEqual([u["rule"] for u in a["unknown"]], ["needs-nodes"])
+        self.assertEqual(a["notes"], ["needs-pods: saw 0 pods(s)"])
+
+    def test_the_project_reads_are_made_once_per_project_and_reach_the_rules(self):
+        # Three members in one project: one backend-services, one instances and one operations
+        # list between them, and the server config once for the one location each needs.
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        listed = [tuple(c[:4]) for c in fake.calls if c[:2] == ["gcloud", "compute"] or c[:3] == ["gcloud", "container", "operations"]]
+        self.assertEqual(sorted(listed), [("gcloud", "compute", "backend-services", "list"), ("gcloud", "compute", "instances", "list"), ("gcloud", "container", "operations", "list")])
+        self.assertEqual([c[4:] for c in fake.calls if c[:4] == ["gcloud", "compute", "instances", "list"]], [["--project=p1", "--format=json(name,zone,status)"]])
+        self.assertEqual(sorted(c[3] for c in fake.calls if c[:3] == ["gcloud", "container", "get-server-config"]), ["--location=us-central1", "--location=us-central1-a"])
+        by_name = {m["cluster"]: m["readiness"] for m in data["members"]}
+        a = by_name["seeded-a"]
+        self.assertEqual(a["status"], "ready")
+        self.assertEqual(set(a["rules"]), {m.RULE_ID for m in readiness.EXTRA_RULES})
+        self.assertEqual(a["unknown"], [])
+        # Each rule's note on a clean member, prefixed with its id, so the table says the rule ran.
+        self.assertIn("orphan-node-objects: 0 orphan Node(s) (0 nodes, 0 instances in the project)", a["note"])
+        self.assertIn("cluster-status-age: status RUNNING; no operation of this cluster or its node pools is listed", a["note"])
+        self.assertIn("target-patch-valid: channel REGULAR; target 1.35.1-gke.1000 valid; control plane 1.35.1-gke.1000 listed in validVersions at us-central1-a", a["note"])
+        self.assertIn("control-plane-upgrade-history: 0 capacity failure(s) among 0 upgrade or repair operation(s) in the last 90 days; maintenance window none", a["note"])
+        self.assertIn("lb-connection-draining: no backend service on this cluster's pools or NEGs drains for more than 600 s (0 matched of 0 in the project)", a["note"])
+        self.assertRegex(a["note"], r"known-issues-matrix: 0 add-on\(s\) inventoried in kube-system, gmp-system; \d+ known issue\(s\) match")  # the page lists rows for every current minor, add-on-less ones included
+        self.assertEqual(a["addons"], [])
+        self.assertEqual(data["errors"], [])
+
+    def test_a_failed_project_read_is_an_error_row_exit_1_and_the_rules_that_need_it_say_unknown(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_project_reads=["instances"])
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        rows = [e for e in data["errors"] if e["project"] == "p1" and e.get("cluster") is None]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("gcloud compute instances list --project=p1 --format=json(name,zone,status) failed (1)", rows[0]["message"])
+        self.assertIn("- read failed for p1: gcloud compute instances list", text)
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual([(u["rule"], u["can_block"], u["holds"]) for u in a["unknown"]], [("orphan-node-objects", True, ["node-pool"])])  # the audit's join reads `holds` on an unknown too
+        self.assertIn("permission denied on p1", a["unknown"][0]["reason"])
+        self.assertEqual(a["status"], "unknown")  # a rule that can block could not read: the verdict says so
+        self.assertEqual(a["rules"]["orphan-node-objects"], {"entry": 22, "can_block": True, "blocking": 0, "risks": 0, "unknown": 1, "notes": 0})
+        self.assertEqual(a["rules"]["lb-connection-draining"]["unknown"], 0)  # the other reads answered
+        # One list per project even when it failed: the failure is not retried per member.
+        self.assertEqual(len([c for c in fake.calls if c[:4] == ["gcloud", "compute", "instances", "list"]]), 1)
+
+    def test_a_project_list_cut_at_the_proxy_cap_is_an_error_naming_the_cap(self):
+        cmd = ["gcloud", "compute", "instances", "list", "--project=p1", "--format=json(name,zone,status)"]
+        with patch.object(report, "run_cmd", return_value=(0, "[{\"name\": \"n", "credential proxy output truncated\n")):
+            data, error = report.run_gcloud_json(cmd)
+        self.assertIsNone(data)
+        self.assertEqual(error, report.GCLOUD_OUTPUT_CUT.format(cmd=" ".join(cmd)))
+
+    def test_the_addon_inventory_is_in_the_json_and_the_table_and_a_ghost_node_blocks(self):
+        fluentbit = {"kind": "DaemonSet", "metadata": {"namespace": "kube-system", "name": "fluentbit-gke"}, "spec": {"template": {"spec": {"containers": [{"name": "fluentbit", "image": "gke.gcr.io/fluent-bit:v0.0.422-gke.21@sha256:abc"}, {"name": "exporter", "image": "gke.gcr.io/fluent-bit-gke-exporter:v0.27.17-gke.36"}]}}}}
+        app = {"kind": "DaemonSet", "metadata": {"namespace": "shop", "name": "agent"}, "spec": {"template": {"spec": {"containers": [{"name": "a", "image": "shop/agent:1"}]}}}}
+        kube_dns = k8s_workload("Deployment", "kube-system", "kube-dns", 2, {"k8s-app": "kube-dns"})
+        kube_dns["spec"]["template"]["spec"] = {"containers": [{"name": "kubedns", "image": "gke.gcr.io/k8s-dns-kube-dns:1.26.7-gke.21"}]}
+        live = node_record("gke-seeded-a-default-pool-aaaa-live", "us-central1-a", "p1")
+        ghost = node_record("gke-seeded-a-default-pool-aaaa-ghost", "us-central1-a", "p1", ready="Unknown", unschedulable=True)
+        objects = {**self.objects, "seeded-a": self.objects["seeded-a"] + [kube_dns]}
+        instances = [{"name": "gke-seeded-a-default-pool-aaaa-live", "zone": "https://www.googleapis.com/compute/v1/projects/p1/zones/us-central1-a", "status": "RUNNING"}]
+        fake = FakeReadinessCommands(self.clusters, {}, objects, namespaced_objects_by_cluster={"seeded-a": [fluentbit, app]}, nodes_by_cluster={"seeded-a": [live, ghost]}, instances_by_project={"p1": instances})
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        # The inventory: the add-on namespaces only, one row per container, image name and tag.
+        self.assertEqual([(r["kind"], r["name"], r["container"], r["image"], r["tag"]) for r in a["addons"]], [("DaemonSet", "fluentbit-gke", "exporter", "fluent-bit-gke-exporter", "v0.27.17-gke.36"), ("DaemonSet", "fluentbit-gke", "fluentbit", "fluent-bit", "v0.0.422-gke.21"), ("Deployment", "kube-dns", "kubedns", "k8s-dns-kube-dns", "1.26.7-gke.21")])
+        addons_row = next(l for l in text.splitlines() if l.startswith("| p1 | seeded-a |") and "fluent-bit v0.0.422-gke.21" in l)
+        self.assertIn("| fluent-bit v0.0.422-gke.21, fluent-bit-gke-exporter v0.27.17-gke.36, k8s-dns-kube-dns 1.26.7-gke.21 |", addons_row)
+        self.assertIn(report.ADDONS_HEADING.format(namespaces="kube-system, gmp-system"), text)
+        self.assertIn("| p1 | seeded-b | us-central1-a | none |", text)
+        # The ghost node, read through the jsonpath template with its providerID, blocks the member.
+        self.assertEqual(a["status"], "blocked")
+        self.assertEqual([(f["rule"], f["node"], f["ready"], f["unschedulable"], f["holds"]) for f in a["rule_blocking"]], [("orphan-node-objects", "gke-seeded-a-default-pool-aaaa-ghost", "Unknown", True, ["node-pool"])])
+        self.assertIn("| orphan-node-objects: Node gke-seeded-a-default-pool-aaaa-ghost names no instance in the project (providerID gce://p1/us-central1-a/gke-seeded-a-default-pool-aaaa-ghost; Ready=Unknown; unschedulable=true)", text)
+        self.assertIn("orphan-node-objects: 1 orphan Node(s) (2 nodes, 1 instances in the project)", a["note"])
+
+    def test_a_member_listed_not_running_with_nothing_running_is_described_before_it_blocks(self):
+        # seeded-a listed RECONCILING with no RUNNING operation in the project's list: the status-age rule describes
+        # the cluster once through the report's runner, with the member's location and project, and grades what it
+        # says now. RUNNING now is a note; a status still not RUNNING blocks; a failed describe is unknown.
+        for record in self.clusters["p1"]:
+            if record["name"] == "seeded-a":
+                record["status"] = "RECONCILING"
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        describes = [c for c in fake.calls if c[:4] == ["gcloud", "container", "clusters", "describe"]]
+        self.assertEqual(describes, [["gcloud", "container", "clusters", "describe", "seeded-a", "--location", "us-central1-a", "--project", "p1", "--format=json(status,statusMessage)"]])
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual(a["status"], "ready")
+        self.assertIn("cluster-status-age: status RUNNING now (RECONCILING at list time; newest operation none listed)", a["note"])
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, described_status_by_cluster={"seeded-a": {"status": "DEGRADED", "statusMessage": "Node pool default-pool needs repair"}})
+        rc, text, data = self._run(fake)
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual(a["status"], "blocked")
+        self.assertEqual([(f["rule"], f["status"], f["listed_status"], f["status_message"]) for f in a["rule_blocking"]], [("cluster-status-age", "DEGRADED", "RECONCILING", "Node pool default-pool needs repair")])
+        # The status confirmed, the rule re-listed this cluster's operations through the report's runner before it blocked.
+        self.assertIn(["gcloud", "container", "operations", "list", "--project=p1", "--location=us-central1-a", "--filter=targetLink~/clusters/seeded-a($|/nodePools/)", "--format=json(name,operationType,status,startTime,endTime,targetLink)"], fake.calls)
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, described_status_by_cluster={"seeded-a": None})
+        rc, text, data = self._run(fake)
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual((a["status"], [u["rule"] for u in a["unknown"]]), ("unknown", ["cluster-status-age"]))
+
+    def test_the_whole_run_is_listed_before_any_member_is_graded(self):
+        seen = {}
+
+        def evaluate(cluster, member, read, target, context):
+            seen[cluster["name"]] = sorted(c["name"] for c in context["clusters"])
+            return readiness_rules.new_result()
+
+        peers = fake_rule("peers", evaluate=evaluate)
+        legacy = cluster("legacy", "us-central1-a", self.TARGET, [("p", self.TARGET)])
+        v2 = cluster("v2-host", "us-central1", self.TARGET, [("p", self.TARGET)])
+        fake = FakeReadinessCommands({"p1": [legacy], "p2": [v2]}, {}, {"legacy": [], "v2-host": []})
+        out_path = os.path.join(tempfile.mkdtemp(), "report.json")
+        with patch.object(readiness, "EXTRA_RULES", [peers]), patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()):
+            rc = report.main(["--state-dir", self.state_dir, "--project", "p1", "--project", "p2", "--target-version", self.TARGET, "--readiness", "--at", self.AT, "--kubeconfig-dir", self.kubeconfig_dir, "--output", out_path])
+        self.assertEqual(rc, report.EXIT_OK)
+        # A peer in a project listed later still counts, so the listing has to finish first.
+        self.assertEqual(seen, {"legacy": ["legacy", "v2-host"], "v2-host": ["legacy", "v2-host"]})
+        kinds = []
+        for c in fake.calls:
+            if c[:4] == ["gcloud", "container", "clusters", "list"]:
+                kinds.append("list")
+            elif c[3:4] == ["get-credentials"]:
+                kinds.append("get-credentials")
+        self.assertEqual(kinds, ["list", "list", "get-credentials", "get-credentials"])
+
+    def test_readiness_context_carries_the_contract_keys(self):
+        record = self.clusters["p1"][0]
+        record["nodePools"][0]["config"] = {"imageType": "COS_CONTAINERD"}
+        record["nodePools"][0]["autoscaling"] = {"enabled": True, "minNodeCount": 0, "maxNodeCount": 3}
+        member = report.grade_member(record, "p1", self.TARGET, report.ServerConfigCache())
+        at = datetime(2026, 9, 14, 15, 0, tzinfo=timezone.utc)
+        pools = report._pool_records(record, member)
+        context = report.readiness_context(member, at, [record], pools, (1, 34, 11, 1000), False)
+        self.assertEqual(set(context), set(readiness_rules.CONTEXT_KEYS))
+        self.assertEqual((context["project"], context["location"], context["cluster_name"]), ("p1", "us-central1-a", "seeded-b"))
+        self.assertIs(context["run_cmd"], report.run_cmd)
+        self.assertEqual(context["timeout_seconds"], report.GCLOUD_TIMEOUT_SECONDS)
+        self.assertIs(context["at"], at)
+        self.assertEqual(context["cache"], {})
+        self.assertEqual([c["name"] for c in context["clusters"]], ["seeded-b"])
+        self.assertEqual(context["pools"], [{"name": "default-pool", "version": "1.34.11-gke.1000", "parsed": (1, 34, 11, 1000), "config": {"imageType": "COS_CONTAINERD"}, "autoscaling": {"enabled": True, "minNodeCount": 0, "maxNodeCount": 3}}])
+        self.assertEqual((context["target_text"], context["master"], context["autopilot"]), (self.TARGET, (1, 34, 11, 1000), False))
+        # Without the optional pieces the keys are still all present.
+        bare = report.readiness_context({"project": "p", "location": "l", "cluster": "c", "target_version": None}, at)
+        self.assertEqual(set(bare), set(readiness_rules.CONTEXT_KEYS))
+        self.assertEqual((bare["clusters"], bare["pools"], bare["master"], bare["autopilot"]), ([], [], None, False))
+
+    def test_an_audit_log_read_runs_through_the_context_and_a_failure_is_the_rules_unknown_not_an_error_row(self):
+        def evaluate(cluster, member, read, target, context):
+            out = readiness_rules.new_result()
+            log = audit_log.read_removed(context)
+            if log["error"]:
+                out["unknown"].append(f"removed-release read failed: {log['error']}")
+            else:
+                out["notes"].append(f"{log['entries']} removed-release entries")
+            return out
+
+        reader = fake_rule("reads-audit-log", entry=6, evaluate=evaluate)
+        with open(os.path.join(os.path.dirname(__file__), "testdata", "audit_log_sample.json"), encoding="utf-8") as f:
+            sample = json.load(f)
+        with patch.object(readiness, "EXTRA_RULES", [reader]):
+            fake = FakeReadinessCommands(self.clusters, {}, self.objects, audit_by_cluster={"seeded-a": sample}, failing_logging=["seeded-b"])
+            rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        reads = [c for c in fake.calls if c[:3] == ["gcloud", "logging", "read"]]
+        self.assertEqual(len(reads), 3)  # one read per member, through the shared cache
+        self.assertEqual(set(fake.timeouts), {report.GCLOUD_TIMEOUT_SECONDS})
+        a_read = next(c for c in reads if 'cluster_name="seeded-a"' in c[3])
+        self.assertIn('resource.type="k8s_cluster"', a_read[3])
+        self.assertIn('resource.labels.location="us-central1-a"', a_read[3])
+        self.assertIn('timestamp>="2026-09-07T15:00:00Z" AND timestamp<="2026-09-14T15:00:00Z"', a_read[3])
+        self.assertEqual(a_read[4:], ["--project=p1", "--limit=1000", audit_log.JSON_FORMAT_FLAG])
+        by_name = {m["cluster"]: m["readiness"] for m in data["members"]}
+        a = by_name["seeded-a"]
+        self.assertEqual(set(a["audit_log"]), {"removed"})
+        self.assertEqual({k: a["audit_log"]["removed"][k] for k in ("entries", "pages", "sampled", "error")}, {"entries": 2, "pages": 1, "sampled": False, "error": None})
+        self.assertEqual((a["audit_log"]["removed"]["window_start"], a["audit_log"]["removed"]["window_end"]), ("2026-09-07T15:00:00Z", "2026-09-14T15:00:00Z"))
+        self.assertEqual(len(a["audit_log"]["removed"]["commands"]), 1)
+        self.assertEqual(a["notes"], ["reads-audit-log: 2 removed-release entries"])
+        self.assertEqual(a["status"], "ready")
+        b = by_name["seeded-b"]
+        self.assertIn("timed out after 60 seconds", b["audit_log"]["removed"]["error"])
+        self.assertEqual([u["rule"] for u in b["unknown"]], ["reads-audit-log"])
+        self.assertIn("reads-audit-log: removed-release read failed: `gcloud logging read` (removed read, page 1) failed (rc=-1): timed out after 60 seconds", b["note"])
+        # Apart from `errors`, which the daily watch reads as a kubectl read that failed and the
+        # cluster as not graded: the member stays graded, listed in its own block, exit 1.
+        self.assertEqual(data["errors"], [])
+        self.assertEqual([(f["cluster"], f["read"]) for f in data["readiness"]["audit_log_failures"]], [("seeded-b", "removed")])
+        self.assertIn("timed out after 60 seconds", data["readiness"]["audit_log_failures"][0]["message"])
+        self.assertIn("- audit log not read for p1 (us-central1-a) cluster seeded-b (removed read): `gcloud logging read` (removed read, page 1) failed (rc=-1): timed out after 60 seconds; the member stays graded, and the rule that needed the read says unknown", text)
+        self.assertNotIn("- read failed for p1 (us-central1-a) cluster seeded-b", text)
+        self.assertEqual(by_name["robot-host"]["status"], "blocked")
 
     def test_unknown_target_grades_the_pdb_rule_and_marks_the_rest_unknown(self):
         record = cluster("nochannel", "us-central1", "1.34.0-gke.1", [("p", "1.34.0-gke.1")], channel=None)
@@ -1221,6 +2590,31 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(rc, report.EXIT_OK)
         self.assertIn("| unknown | none |", stdout.getvalue())
         self.assertIn("no target; exclusion scope and skew not graded", stdout.getvalue())
+
+    def test_a_report_json_cannot_carry_leaves_no_half_written_output(self):
+        # The fold refuses such a finding, so this reaches the writer only through a defect
+        # outside the rules; the writer serialises first and opens the file after.
+        original = report.assess_readiness
+
+        def poisoned(*args, **kwargs):
+            out = original(*args, **kwargs)
+            out["poison"] = {"when": datetime(2026, 9, 14, tzinfo=timezone.utc)}
+            return out
+
+        out_path = os.path.join(tempfile.mkdtemp(), "nested", "report.json")
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(report, "assess_readiness", poisoned), patch.object(report, "run_cmd", fake), redirect_stdout(stdout), patch("sys.stderr", stderr):
+            rc = report.main(self._args("--readiness", "--at", self.AT, "--kubeconfig-dir", self.kubeconfig_dir, "--output", out_path))
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        self.assertFalse(os.path.exists(out_path))
+        self.assertIn(f"failed to serialise the report for {out_path}", stderr.getvalue())
+        self.assertIn("| " + " | ".join(report.READINESS_COLUMNS) + " |", stdout.getvalue())  # the tables still printed
+
+    def test_a_cell_is_one_line(self):
+        self.assertEqual(report._cell("first line\nsecond  line | pipe"), "first line second line \\| pipe")
+        self.assertEqual(report._cell("\n  \n"), report.EMPTY_CELL)
+        self.assertEqual(report._cell(0), "0")
 
     def test_default_kubeconfig_dir_follows_hermes_home(self):
         with patch.dict(os.environ, {"HERMES_HOME": "/home/hermes"}):

@@ -1,0 +1,108 @@
+# Upgrade-failure catalogue entry 22: a Node object outlives its virtual machine.
+#
+# The rule reads a condition that cannot be planted on a healthy seeded cluster
+# (the cloud controller deletes a fresh ghost Node within seconds, and GKE's admission policy ties a Node's providerID to its name), so this case does not grade a detection: it grades the
+# rule's declared report line for every seeded cluster in its "no finding" form,
+# which is red on `main` (no rule prints such a line, and an agent cannot
+# invent the numbers it carries) and green once the rule prints it; the rule's
+# unit tests (scripts/test_readiness_rules.py) carry the positive detection on
+# recorded inputs. The prompt asks for one declared line per seeded cluster in
+# a fixed vocabulary copied from the rule's note in the report's note column
+# (`<rule id>: <the rule's text>`) and its JSON (`readiness.notes`); the
+# deterministic objectives read those lines and nothing else, the prose is the
+# judge's.
+#
+# The patterns name the slots through `{cluster:<slot>}`, which the verifier
+# expands to the cluster the runner recorded for the slot, so a fleet applied
+# with another prefix is graded on its own names.
+#
+# Isolation class: read-only (chat prompt; the script reads with gcloud
+# container, gcloud compute and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+#
+# No deterministic mutation safeguard, documented: nothing is planted for this
+# case; the four roles below stand for their slots, so the declared-line
+# objectives can tell a cluster the agent missed from a cluster the project
+# does not have. No `worker_commands` objective either: it reads delegated
+# workers' terminals only and errors on a run the router answered itself, so
+# the report's own output is graded through the declared lines instead.
+id: upgrades-readiness-orphan-node
+name: Upgrade readiness counts the Nodes without an instance behind them on every cluster
+
+prompt: >-
+  For every cluster in this project, run the upgrade readiness check against each cluster's release channel default and include, per cluster, how many Node objects name no compute instance in the project (the orphan-node-objects rule: a Node whose providerID's instance is gone blocks the next pool upgrade until it is deleted), how many Nodes the report read, and how many instances the project has, as the rule's note in the report's note column or its JSON states them. Read only; change and upgrade nothing. A member may be blocked or carry
+  risks from other rules on the same report; the slots are about this rule
+  only. End your answer with one line per seeded cluster in exactly this
+  form, no other words on the line: "<cluster>: orphan-node-objects: <n> orphan Node(s) (<n> nodes, <n> instances in the project)".
+
+expected_output: >-
+  The version table and the readiness table read during this run, with every seeded cluster's Nodes matched to a compute instance: zero orphan Node objects per cluster, and the report's own counts of nodes and of the project's instances. The answer says what an orphan Node would mean (a pool upgrade waits on it; `kubectl delete node <name>` is the fix) and that none was found. It ends with the declared lines, each reading "orphan-node-objects: 0 orphan Node(s) (<nodes> nodes, <instances> instances in the project)" with the numbers copied from the report. It cites no CVE identifiers and performs no upgrade.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# No planted defect is read: the four roles are one per slot, and they are how the
+# declared-line objectives tell a cluster the agent missed from a cluster the
+# project does not have.
+fixtures:
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame, anchored
+  # at both ends, with the line's decoration folded first.
+  # The frame every cluster must satisfy, all three counts included.
+  # The verifier's decoration fold strips a closing parenthesis at the end of a line (a
+  # trailing closer), so the rule's `(<n> nodes, <n> instances in the project)` tail is
+  # matched with its `)` optional: the two green runs of 2026-10-21 wrote the line exactly
+  # as the rule prints it and failed only on that character.
+  # The fold spaces a separator only before a letter, so a count written right
+  # after `:` or `;` stays unspaced; the patterns admit the missing space there.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: orphan-node-objects: ?\d+ orphan node\(s\) \(\d+ nodes, \d+ instances in the project\)?$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: orphan-node-objects: ?\d+ orphan node\(s\) \(\d+ nodes, \d+ instances in the project\)?$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: orphan-node-objects: ?\d+ orphan node\(s\) \(\d+ nodes, \d+ instances in the project\)?$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: orphan-node-objects: ?\d+ orphan node\(s\) \(\d+ nodes, \d+ instances in the project\)?$)'
+  # Zero orphans, and at least one node and one instance: a zero node count is a node read
+  # that failed, which the rule reports as unknown rather than as a count.
+  - name: the-declared-lines-count-zero-orphans-against-the-nodes-and-instances-read
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: orphan-node-objects: ?0 orphan node\(s\) \([1-9]\d* nodes, [1-9]\d* instances in the project\)?$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: orphan-node-objects:(?! ?0 orphan node\(s\) \([1-9]\d* nodes, [1-9]\d* instances in the project\)?$)[^\n]*$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

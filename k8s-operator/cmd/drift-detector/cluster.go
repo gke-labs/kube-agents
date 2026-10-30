@@ -97,10 +97,10 @@ const (
 //
 // Its credentials are also not equivalent to a profile's. This reaches
 // kubernetes.default.svc as the pod's Kubernetes service account and never
-// leaves the cluster; a profile authenticates as the pod's Google identity
-// against the control-plane endpoint, which an IAM set without
-// roles/container.viewer or a master authorized network excluding the pod's
-// egress can refuse. So when both name the same cluster, this one wins.
+// leaves the cluster; a profile authenticates as a Google identity (the
+// broker's, through the credential proxy, or the pod's without one) against
+// the control-plane endpoint, which an IAM set without roles/container.viewer
+// or a master authorized network excluding that identity's egress can refuse. So when both name the same cluster, this one wins.
 //
 // Returns nil with no error when neither flag is set. A detector without
 // cluster credentials is a supported mode: it is how the binary has run since
@@ -167,7 +167,8 @@ func applyJoinThrottle(cfg *rest.Config) {
 }
 
 // profilesDiscovery is the profile scan discoverProfileClusters runs. Its zero
-// value reaches the real GKE API with this process's own Google credentials;
+// value reaches the real GKE API with this process's own Google credentials, or
+// through the credential proxy when clusterprofiles.BrokerFromEnv names one;
 // the tests replace its Describe and TokenSource fields so the scan needs
 // neither. OnSkip is set per call instead, because the message it writes is
 // this binary's rather than the package's.
@@ -265,14 +266,16 @@ func identityFromProfile(id clusterprofiles.Identity) clusterIdentity {
 // naming a cluster in another project -- which the Platform Agent writes a
 // profile for, since an install's scope can span projects -- can be joined
 // only through that profile. Addressing it costs a GKE describe in that
-// project, and the pod's Google identity holds container.clusters.get there by
-// the same scope grant that let the reconcile write the profile, so a describe
+// project, and the identity making it (the broker's, or the pod's without
+// one) holds container.clusters.get there by the same scope grant that let the
+// reconcile write the profile, so a describe
 // that fails names a real gap: the profile is skipped and reported with the
 // API's answer like any other.
 //
 // Failure policy is internal/clusterprofiles's, and it is the watcher's: a
-// missing directory is fatal because discovery runs once and a restart fixes
-// it, an unreadable one degrades, and a single bad profile is skipped so that
+// missing directory, or a credential proxy that cannot be reached or answers
+// with an error about itself, is fatal because discovery runs once and a restart
+// fixes it, an unreadable directory degrades, and a single bad profile is skipped so that
 // one unparseable config.yaml cannot cost the whole fleet. What this adds is
 // the second half of that last rule -- a cluster whose dynamic client will not
 // build is skipped too, for the same reason.
@@ -344,6 +347,16 @@ func discoverProfileClusters(ctx context.Context, dir string, directlyReached *c
 	d := profilesDiscovery
 	d.OnSkip = skip
 	d.Want = want
+	// The credential proxy, as in k8s-event-watcher: when the operator names
+	// one it replaces the pod's Workload Identity for the describe and for
+	// every profile cluster's reads. A Broker already on the seam is a test's.
+	if d.Broker == nil {
+		broker, err := clusterprofiles.BrokerFromEnv()
+		if err != nil {
+			return scan, err
+		}
+		d.Broker = broker
+	}
 	discovered, err := d.Discover(ctx, dir)
 	if err != nil {
 		return scan, err

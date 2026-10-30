@@ -94,6 +94,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 def serve_tls(cert: Path, key: Path) -> tuple[http.server.HTTPServer, int]:
     server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(str(cert), str(key))
     server.socket = context.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -362,11 +363,11 @@ class GitTrustTest(unittest.TestCase):
     )
 
     def test_a_github_entry_with_a_ca_is_refused_and_pins_nothing(self):
-        # The GitHub forge reads no CA bundle. Git alone trusting one for
-        # github.com would leave the two clients disagreeing about the host.
+        # github.com presents a certificate the public CAs sign: a private CA
+        # must never vouch for it, in the API client or in git.
         entry = {"provider": "github", "host": "github.com", "token_path": "", "allowed_paths": None,
                  "ca_file": "/ca/private.crt"}
-        with self.assertRaisesRegex(ValueError, "caFile is not supported for github"):
+        with self.assertRaisesRegex(ValueError, "names a caFile; only a GitHub Enterprise Server host may"):
             providers.build_forges({"forges": [entry]})
         self.assertEqual((), credential_proxy._ca_reading_entries([entry, *self.BUILT[1:]]))
         tmp = tempfile.TemporaryDirectory()
@@ -376,6 +377,19 @@ class GitTrustTest(unittest.TestCase):
                 timeout_seconds=5, max_output_bytes=1024, state_dir=tmp.name, scoped_pool=None
             )
         self.assertEqual((), executor.forge_ca_config)
+
+    def test_a_github_enterprise_server_entry_pins_its_ca_on_its_host_only(self):
+        entry = {"provider": "github", "host": "ghe.example.com", "token_path": "", "allowed_paths": None,
+                 "ca_file": "/ca/ghe.crt", "ca_source": "the Secret ghe-ca or its key ca.crt"}
+        reading = credential_proxy._ca_reading_entries([entry, *self.BUILT[1:]])
+        self.assertEqual(
+            {"host": "ghe.example.com", "ca_file": "/ca/ghe.crt", "ca_source": "the Secret ghe-ca or its key ca.crt"},
+            reading[0],
+        )
+        config = dict(credential_proxy.forge_ca_git_config(reading))
+        self.assertEqual("/ca/ghe.crt", config["http.https://ghe.example.com/.sslCAInfo"])
+        self.assertEqual("false", config["http.https://ghe.example.com/.followRedirects"])
+        self.assertNotIn("http.https://github.com/.sslCAInfo", config)
 
     def test_every_git_the_executor_runs_carries_the_pin(self):
         tmp = tempfile.TemporaryDirectory()
@@ -396,6 +410,64 @@ class GitTrustTest(unittest.TestCase):
     def test_an_unreadable_configuration_adds_no_pin(self):
         with mock.patch.object(providers, "load_forge_entries", side_effect=ValueError("bad")):
             self.assertEqual((), credential_proxy._configured_forge_entries())
+
+    @unittest.skipUnless(shutil.which("git"), "git is needed to read the layer back")
+    def test_a_ported_gitea_forge_pins_its_ca_and_source_by_host_and_port(self):
+        ported = (
+            {
+                "provider": "gitea",
+                "name": "gitea-corp",
+                "host": "gitea.corp",
+                "port": 8443,
+                "token_path": "/t",
+                "allowed_paths": ("acme",),
+                "ca_file": "/ca/gitea.crt",
+                "ca_source": "the Secret gitea-ca or its key ca.crt",
+            },
+        )
+        entries = credential_proxy._ca_reading_entries(ported)
+        self.assertEqual(
+            (
+                {
+                    "host": "gitea.corp:8443",
+                    "ca_file": "/ca/gitea.crt",
+                    "ca_source": "the Secret gitea-ca or its key ca.crt",
+                },
+            ),
+            entries,
+        )
+        config = credential_proxy.forge_ca_git_config(entries)
+        self.assertEqual(
+            (
+                ("http.https://gitea.corp:8443/.sslCAInfo", "/ca/gitea.crt"),
+                ("http.https://gitea.corp:8443/.followRedirects", "false"),
+            ),
+            config,
+        )
+        sources = credential_proxy.forge_ca_sources(entries)
+        self.assertEqual({"gitea.corp:8443": "the Secret gitea-ca or its key ca.crt"}, sources)
+
+        environment = {
+            **os.environ,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            **credential_proxy._git_forced_config_environment(config),
+        }
+        result = subprocess.run(
+            ["git", "config", "--get-urlmatch", "http.sslCAInfo", "https://gitea.corp:8443/acme/infra.git"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual("/ca/gitea.crt", result.stdout.strip())
+
+        refusal = providers.tls_refusal(
+            "fatal: unable to access 'https://gitea.corp:8443/acme/infra.git/': "
+            "Problem with the SSL CA cert (path? access rights?)",
+            sources,
+        )
+        self.assertIn("the Secret gitea-ca or its key ca.crt is missing", refusal.fields["detail"])
 
 
 @unittest.skipUnless(OPENSSL and shutil.which("git"), "openssl and git are needed")

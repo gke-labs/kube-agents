@@ -74,9 +74,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: upgrades
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # No planted defect is read: the case depends on the seeded clusters existing
 # and being zonal, which is the slots' shape (bench/tf/fleet/variables.tf's
 # `zone`), not a role. The four roles below are one per slot, and they are

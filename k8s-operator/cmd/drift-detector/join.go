@@ -44,6 +44,45 @@ const (
 	// batch size.
 	joinRequestTimeout = 10 * time.Second
 
+	// slowLookupThreshold is how long a lookup has to have run to count
+	// against its cluster. One that then ends on a deadline benches the
+	// cluster for slowClusterCooldown at once; one that answers -- an object,
+	// a NotFound, any other error -- is a strike, and slowAnswerStrikes in a
+	// row bench it. A healthy control plane answers a GET in tens of
+	// milliseconds, so a lookup that took two seconds was held up on its
+	// path: the cluster itself, or for a profile cluster the credential-proxy
+	// broker in front of it, or the detector's own process -- a gVisor
+	// sandbox, a cold token -- which is why an answer gets a second chance.
+	// Below joinRequestTimeout so the per-request timeout always trips it, and
+	// below the 4s --batch-join-budget the README names for a ten-second ack
+	// deadline, so a lookup that budget cuts off trips it too -- but only one
+	// that had already run this long: a lookup started within this much of
+	// the budget's end is cut sooner and benches nothing, and a budget below
+	// this never benches.
+	slowLookupThreshold = 2 * time.Second
+
+	// slowAnswerStrikes is how many slow answers in a row from one cluster
+	// bench it. Two rather than one, so a single slow answer -- a cold path
+	// after start-up or idle, a token refresh -- does not cost a healthy
+	// cluster a cooldown of lost enrichment; a fast answer clears the streak.
+	// A persistently slow cluster then costs at most this many slow lookups
+	// per cooldown.
+	slowAnswerStrikes = 2
+
+	// lookupDurationField names the DRIFT line field carrying how long a
+	// record's lookup took, so the latency the bench judges is readable from
+	// the logs. Present only on a record that was looked up.
+	lookupDurationField = "lookup_ms"
+
+	// slowClusterCooldown is how long a benched cluster's lookups are skipped.
+	// At least the longest batch budget the flag accepts, so a batch can start
+	// at most one lookup against a cluster that keeps hanging: one hung
+	// cluster then costs the rest of a batch at most joinRequestTimeout, not
+	// joinRequestTimeout per record naming it, and one slow but answering
+	// cluster at most slowAnswerStrikes slow lookups. The price is a cluster
+	// that recovers at once stays unenriched for up to this long.
+	slowClusterCooldown = batchJoinBudgetCeiling
+
 	// managedFieldsTimeGranularity is the precision a managedFields timestamp
 	// survives at. metav1.Time marshals with time.RFC3339, which has no
 	// fractional part, so every entry the API server returns is floored to the
@@ -94,7 +133,42 @@ const (
 	// as such from that line alone, or every unreachable DRIFT line in a run
 	// reads as a card that was sent.
 	injectHeldOutOfScopeMarker = "inject=held_out_of_scope"
+
+	// backlogMarker is appended to the DRIFT line of a backlog record, for the
+	// same reason as injectHeldOutOfScopeMarker: the line an operator greps
+	// for has to say that this record is not getting a card of its own.
+	backlogMarker = "backlog=true"
+
+	// kubectlUserAgentPrefix starts the user agent kubectl sends. A backlog
+	// record from kubectl is carded rather than digested: an install's own
+	// writes come from Helm's Go client, so a late kubectl write is far more
+	// likely a person's edit made just before a restart. The user agent is
+	// self-declared; the rule only routes such a record the way a live one
+	// goes.
+	kubectlUserAgentPrefix = "kubectl/"
+
+	// slowAnswer stands in for the cause of a bench whose lookup answered, so
+	// the skip error and the log line still say what happened.
+	slowAnswer = "it answered, slowly"
 )
+
+// errSlowClusterSkipped is the LookupError behind a joinFailed record whose
+// lookup was not attempted because its cluster is benched (joiner.slow).
+var errSlowClusterSkipped = errors.New("lookup skipped: cluster benched after a slow lookup")
+
+// slowCluster records why and until when a cluster's lookups are skipped.
+type slowCluster struct {
+	until   time.Time
+	elapsed time.Duration
+	cause   string
+}
+
+// digestible reports whether a record goes to the daemon's digest rather than
+// a card, when the daemon takes the digest route: a backlog record not sent by
+// kubectl. See kubectlUserAgentPrefix.
+func digestible(record AuditRecord) bool {
+	return record.Backlog && !strings.HasPrefix(record.UserAgent, kubectlUserAgentPrefix)
+}
 
 // joinOutcome says what happened when the detector tried to enrich a record
 // with the live object's field ownership. Every outcome except joinEnriched is
@@ -143,8 +217,18 @@ const (
 	joinUnreachable joinOutcome = "unreachable"
 
 	// joinFailed is any other lookup error: RBAC, a network fault, a timeout,
-	// an API group the cluster does not serve.
+	// an API group the cluster does not serve -- or a lookup not attempted
+	// because a slow earlier one benched its cluster (errSlowClusterSkipped),
+	// which the tally counts as Benched rather than Failed.
 	joinFailed joinOutcome = "failed"
+
+	// joinSkippedBacklog is a backlog record (AuditRecord.Backlog) the join
+	// did not look up, because it goes to the daemon's digest rather than to
+	// a triage card and nothing reads its ownership. Skipped so a large
+	// backlog does not spend the batch's join budget on lookups and leave its
+	// tail to fail open. Only when the daemon takes the digest route: against
+	// one that does not, the record is injected as a card and keeps its join.
+	joinSkippedBacklog joinOutcome = "skipped_backlog"
 )
 
 // joinCounts tallies outcomes for the shutdown report, so a run that enriched
@@ -156,20 +240,29 @@ type joinCounts struct {
 	Unreachable int
 	Failed      int
 
+	// Benched is records carried as joinFailed whose lookup was skipped
+	// because their cluster was benched (errSlowClusterSkipped). Counted apart
+	// from Failed so a failed= that climbs alongside the inject's failures
+	// still means lookups that were tried.
+	Benched int
+
 	// OutOfScope is the subset of Unreachable that was marked for the inject
 	// to hold -- see DriftEvent.OutOfScope. Not a sixth outcome: the record's
 	// Outcome stays joinUnreachable, and this count exists because a run that
 	// held every unreachable record and one that forwarded them all print the
 	// same Unreachable.
 	OutOfScope int
+
+	// SkippedBacklog is records not looked up because they are backlog.
+	SkippedBacklog int
 }
 
 // String renders the tally for the shutdown line, always printing every
 // outcome. A zero that is absent reads as a category that did not apply; a zero
 // that is printed reads as one that did not happen, and those differ.
 func (c joinCounts) String() string {
-	return fmt.Sprintf("enriched=%d no_object=%d gone=%d unreachable=%d out_of_scope=%d failed=%d",
-		c.Enriched, c.NoObject, c.Gone, c.Unreachable, c.OutOfScope, c.Failed)
+	return fmt.Sprintf("enriched=%d no_object=%d gone=%d unreachable=%d out_of_scope=%d failed=%d benched=%d skipped_backlog=%d",
+		c.Enriched, c.NoObject, c.Gone, c.Unreachable, c.OutOfScope, c.Failed, c.Benched, c.SkippedBacklog)
 }
 
 // DriftEvent is an audit record plus what the live object says about it. It is
@@ -203,6 +296,10 @@ type DriftEvent struct {
 	// LookupError is the error behind a joinFailed outcome, nil otherwise.
 	LookupError error
 
+	// LookupDuration is how long the live-object lookup took, zero when none
+	// was attempted. Logged as lookupDurationField.
+	LookupDuration time.Duration
+
 	// OutOfScope is set by the joiner on a joinUnreachable record whose
 	// cluster the install's scope does not name: the profiles directory was
 	// read and no readable Cluster Agent profile in it carries this identity
@@ -234,6 +331,13 @@ type DriftEvent struct {
 	// joins its own cluster and so always has one; what separates a scope
 	// boundary from a misconfiguration is whether a profile names the cluster.
 	OutOfScope bool
+
+	// Digest is set by the joiner on a backlog record that goes to the daemon's
+	// digest route rather than a card: the daemon advertises the route and the
+	// record is not held out of scope. It is what the DRIFT line's backlog
+	// marker reports, so a backlog record that is still carded (an older
+	// daemon) is not logged as one that is not.
+	Digest bool
 }
 
 // driftEventHandler consumes an enriched record. logDriftEvent is one; with
@@ -351,6 +455,19 @@ type joiner struct {
 	// timeout bounds one lookup.
 	timeout time.Duration
 
+	// slow benches a cluster whose lookup ran at least slowLookup and then
+	// hit a deadline, or answered that slowly slowAnswerStrikes times in a
+	// row (strikes counts the run), skipping its lookups for cooldown so it
+	// cannot spend the batch budget that the other clusters' records share. Each skipped record
+	// is still forwarded, joinFailed with errSlowClusterSkipped. Consulted only
+	// when the join has more than one cluster: with one, there is nobody else's
+	// budget to protect, and every record keeps its lookup as before. Keys are
+	// registered clusters only, so the map is bounded by the routing table.
+	slow       map[clusterIdentity]slowCluster
+	strikes    map[clusterIdentity]int
+	slowLookup time.Duration
+	cooldown   time.Duration
+
 	next   driftEventHandler
 	counts joinCounts
 
@@ -375,6 +492,11 @@ type joiner struct {
 	// counted under unreachableOverflowLabel.
 	unreachable map[string]int
 	held        map[string]int
+
+	// skipBacklog turns on joinSkippedBacklog. Set by realMain when the daemon
+	// advertises the digest route, because that is when a backlog record is
+	// not going to a card.
+	skipBacklog bool
 }
 
 // newJoiner builds the handler. An empty or nil cluster set is legal and
@@ -387,6 +509,10 @@ func newJoiner(clusters map[clusterIdentity]objectGetter, gitopsManagers map[str
 		scope:          scope,
 		injected:       injected,
 		timeout:        joinRequestTimeout,
+		slow:           map[clusterIdentity]slowCluster{},
+		strikes:        map[clusterIdentity]int{},
+		slowLookup:     slowLookupThreshold,
+		cooldown:       slowClusterCooldown,
 		next:           next,
 		unreachable:    map[string]int{},
 		held:           map[string]int{},
@@ -443,8 +569,15 @@ func (j *joiner) Handle(ctx context.Context, record AuditRecord) {
 			j.noteCluster(j.unreachable, identity)
 		}
 	case joinFailed:
-		j.counts.Failed++
+		if errors.Is(event.LookupError, errSlowClusterSkipped) {
+			j.counts.Benched++
+		} else {
+			j.counts.Failed++
+		}
+	case joinSkippedBacklog:
+		j.counts.SkippedBacklog++
 	}
+	event.Digest = j.skipBacklog && digestible(record) && !event.OutOfScope
 
 	j.next(ctx, event)
 }
@@ -531,7 +664,9 @@ func renderClusterCounts(counts map[string]int) []string {
 }
 
 // join performs the lookup and classifies the result. Split from Handle so the
-// outcome logic is testable without going through the counters.
+// outcome logic is testable without going through the counters. It does keep
+// one piece of state, the slow-cluster bench, because whether to attempt a
+// lookup depends on how the last one against the same cluster went.
 func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 	event := DriftEvent{Record: record}
 
@@ -562,10 +697,41 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 		return event
 	}
 
+	// After the routing check, so a backlog record from a cluster this process
+	// cannot read is still unreachable, and still held when it is out of scope.
+	if j.skipBacklog && digestible(record) {
+		event.Outcome = joinSkippedBacklog
+		return event
+	}
+
+	// After the backlog test, so a record that would not have been looked up
+	// anyway keeps its skipped_backlog outcome.
+	fleet := len(j.clusters) > 1
+	if fleet {
+		if benched, ok := j.slow[identity]; ok {
+			if time.Now().Before(benched.until) {
+				event.Outcome = joinFailed
+				event.LookupError = fmt.Errorf("%w: a lookup on %s took %s (%s); next attempt after %s",
+					errSlowClusterSkipped, identity, benched.elapsed.Round(time.Millisecond), benched.cause,
+					benched.until.Format(time.RFC3339))
+				return event
+			}
+			// Cooldown over: this lookup is the probe. A hang benches the
+			// cluster again at once, a slow answer is its first strike.
+			delete(j.slow, identity)
+		}
+	}
+
 	lookupCtx, cancel := context.WithTimeout(ctx, j.timeout)
 	defer cancel()
 
+	started := time.Now()
 	obj, err := getter.Get(lookupCtx, record.Resource)
+	elapsed := time.Since(started)
+	event.LookupDuration = elapsed
+	if fleet {
+		j.charge(identity, elapsed, err, lookupCtx.Err(), ctx.Err())
+	}
 	switch {
 	case apierrors.IsNotFound(err) && !pathNotServed(err):
 		event.Outcome = joinGone
@@ -580,6 +746,56 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 	event.Owners = ownership(obj)
 	event.Reconciled, event.ReconciledBy = j.reconciledBy(event.Owners, record.Timestamp)
 	return event
+}
+
+// charge judges one lookup against its cluster's record.
+//
+// A lookup that ran slowLookup and ended on a deadline -- the request
+// timeout's or the batch budget's, provided it had already run this long --
+// benches at once: the cluster sat on the request, and the next record would
+// pay the same. One that answered that slowly is a strike, because a slow
+// answer can be this process's own cold path as well as the cluster's, and
+// the bench costs a cooldown of lost enrichment; slowAnswerStrikes in a row
+// bench. The answering record keeps its result either way. A fast lookup
+// clears the streak. A SIGTERM counts for nothing: the process is going away
+// and the cluster has not shown anything.
+func (j *joiner) charge(identity clusterIdentity, elapsed time.Duration, err, lookupErr, parentErr error) {
+	if errors.Is(parentErr, context.Canceled) {
+		return
+	}
+	if elapsed < j.slowLookup {
+		// Only an answer clears the streak. A lookup a deadline ended before it
+		// answered -- the batch budget already spent, or cut within this long of
+		// starting -- says nothing about the cluster, any more than a SIGTERM
+		// does, so the streak stays where it was.
+		if !errors.Is(lookupErr, context.DeadlineExceeded) {
+			delete(j.strikes, identity)
+		}
+		return
+	}
+	if err != nil && errors.Is(lookupErr, context.DeadlineExceeded) {
+		j.bench(identity, elapsed, err)
+		return
+	}
+	j.strikes[identity]++
+	if j.strikes[identity] >= slowAnswerStrikes {
+		j.bench(identity, elapsed, err)
+	}
+}
+
+// bench skips a cluster's lookups for j.cooldown, and says so once rather than
+// leaving the run of failed lookups that follows to read as a dead cluster.
+func (j *joiner) bench(identity clusterIdentity, elapsed time.Duration, err error) {
+	until := time.Now().Add(j.cooldown)
+	cause := slowAnswer
+	if err != nil {
+		cause = err.Error()
+	}
+	j.slow[identity] = slowCluster{until: until, elapsed: elapsed, cause: cause}
+	delete(j.strikes, identity)
+	log.Printf("%s: a lookup on cluster %q took %s; skipping its lookups until %s so it cannot spend "+
+		"the batch join budget the other clusters share (records still forwarded, join=failed): %s",
+		commandName, identity.String(), elapsed.Round(time.Millisecond), until.Format(time.RFC3339), cause)
 }
 
 // pathNotServed reports whether a NotFound says the cluster does not serve the
@@ -802,12 +1018,19 @@ func logDriftEvent(_ context.Context, event DriftEvent) {
 	if event.LookupError != nil {
 		line += fmt.Sprintf(" lookup_error=%q", event.LookupError)
 	}
+	if event.LookupDuration > 0 {
+		line += fmt.Sprintf(" %s=%d", lookupDurationField, event.LookupDuration.Milliseconds())
+	}
 	// Appended here, where the DRIFT line is built, rather than by the inject
-	// handler that acts on the flag: the line is identical with the inject on
-	// and off, and the marker says what the handler will do with the record,
-	// which is the fact an operator reading only DRIFT lines needs.
+	// handler that acts on the flag: the marker says what the handler will do
+	// with the record, which is the fact an operator reading only DRIFT lines
+	// needs. The out-of-scope marker reads the same with the inject on and off;
+	// the backlog marker appears only with a daemon that takes the digest.
 	if event.OutOfScope {
 		line += " " + injectHeldOutOfScopeMarker
+	}
+	if event.Digest {
+		line += fmt.Sprintf(" %s publish_time=%s", backlogMarker, record.PublishTime.Format(time.RFC3339))
 	}
 
 	log.Print(line)

@@ -328,3 +328,95 @@ func TestNotifyAimsAtAConversation(t *testing.T) {
 		}
 	}
 }
+
+// --chat-file and --update ride the request as chat and update, the chat
+// object as written; a chat file that is not a JSON object, one beside
+// --blocks-file, or an update key with surrounding space is refused before
+// anything is sent.
+func TestNotifyCarriesAChatMessageAndAnUpdateKey(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	got, _ := answerNotify(t, s.ClientURL(), lib.NotifyReply{MessageID: "m"})
+	dir := t.TempDir()
+	chat := filepath.Join(dir, "chat.json")
+	body := `{"schema":"kube-agents.chat/v1","headline":"3 nodes"}`
+	if err := os.WriteFile(chat, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"notify", "--platform", "google_chat", "--chat-file", chat, "--update", "plan-t_1", "--", "3 nodes"}); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	req := <-got
+	if string(req.Chat) != body || req.Update != "plan-t_1" || req.Text != "3 nodes" {
+		t.Fatalf("request = %+v", req)
+	}
+	array := filepath.Join(dir, "array.json")
+	if err := os.WriteFile(array, []byte(`[1]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, args := range map[string][]string{
+		"not an object": {"--chat-file", array},
+		"missing":       {"--chat-file", filepath.Join(dir, "none.json")},
+		"both layouts":  {"--chat-file", chat, "--blocks-file", chat},
+		"spaced key":    {"--update", " plan"},
+		"long key":      {"--update", strings.Repeat("k", notifyUpdateMax+1)},
+	} {
+		// A request that is not refused goes out and, unanswered here, times out as
+		// outcome-unknown; the short timeout keeps that a quick failure.
+		argv := append([]string{"notify", "--platform", "google_chat", "--timeout", "200ms"}, append(args, "--", "x")...)
+		if err := run(argv); err == nil || errors.Is(err, errNotifyRouteUnavailable) || errors.Is(err, errNotifyOutcomeUnknown) {
+			t.Errorf("%s: err = %v, want a usage refusal", name, err)
+		}
+	}
+	// --answer-to rides a conversation post only, and is held to an update key's shape.
+	for name, args := range map[string][]string{
+		"answer without conversation": {"--answer-to", "plan-1"},
+		"spaced answer key":           {"--answer-to", " plan-1", "--conversation", "slack:C1/1.0", "--context", "x"},
+		"long answer key":             {"--answer-to", strings.Repeat("k", notifyUpdateMax+1), "--conversation", "slack:C1/1.0", "--context", "x"},
+	} {
+		argv := append([]string{"notify", "--platform", "slack", "--timeout", "200ms"}, append(args, "--", "x")...)
+		if err := run(argv); err == nil || !strings.Contains(err.Error(), "--answer-to") {
+			t.Errorf("%s: err = %v, want a refusal naming --answer-to", name, err)
+		}
+	}
+}
+
+// --reply-to rides a conversation request to the console's subject; it is
+// refused without --conversation, or when it is no task id.
+func TestNotifyCarriesReplyToOnAConsoleConversation(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+	got := make(chan lib.NotifyRequest, 1)
+	if _, err := nc.Subscribe(lib.NotifySubjectConsole, func(m *nats.Msg) {
+		var req lib.NotifyRequest
+		_ = json.Unmarshal(m.Data, &req)
+		got <- req
+		body, _ := json.Marshal(lib.NotifyReply{MessageID: "n-1", ThreadID: req.Conversation})
+		_ = m.Respond(body)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"notify", "--platform", "console", "--conversation", "console:tab-1", "--context", "ctx-1",
+		"--reply-to", "task-7", "the report"}); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	if req := <-got; req.ReplyTo != "task-7" || req.Conversation != "console:tab-1" {
+		t.Errorf("request = %+v, want reply_to task-7 into console:tab-1", req)
+	}
+	for _, args := range [][]string{
+		{"notify", "--platform", "console", "--reply-to", "task-7", "x"},
+		{"notify", "--platform", "console", "--conversation", "console:tab-1", "--context", "ctx-1", "--reply-to", "task 7", "x"},
+	} {
+		if err := run(args); err == nil || !strings.Contains(err.Error(), "--reply-to") {
+			t.Errorf("%v: err = %v, want a --reply-to refusal", args, err)
+		}
+	}
+}

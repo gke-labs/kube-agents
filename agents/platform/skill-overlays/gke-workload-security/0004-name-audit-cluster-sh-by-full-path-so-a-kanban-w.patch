@@ -1,0 +1,19 @@
+Subject: Name audit_cluster.sh by full path so a kanban worker can run it
+
+Why: the command names the script relative to the skill folder. A kanban worker starts in its card's workspace, where `scripts/audit_cluster.sh` names nothing and the shell exits 127. The full path under the platform profile home resolves from any working directory.
+Local-Issue: #3219
+Upstream-Issue: none (specific to this repository)
+Retire-When: upstream names the script by a path that resolves outside the skill folder
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -47,7 +47,7 @@ script.
+ **Command:**
+ 
+ ```bash
+-scripts/audit_cluster.sh <cluster-name> <region> <project-id>
++/opt/data/profiles/platform/skills/gke-workload-security/scripts/audit_cluster.sh <cluster-name> <region> <project-id>
+ ```
+ 
+ ### 2. Configure Workload Identity (legacy GSA impersonation)

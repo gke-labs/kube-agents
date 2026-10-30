@@ -273,11 +273,20 @@ class SyntheticProfileTests(unittest.TestCase):
         self.fixture.write(
             "agents/platform/cron/jobs.json",
             '{"jobs": [{"id": "audit", "prompt": '
-            "\"Read the SOP at 'governance/moved_sop.md' in your profile home.\"}]}",
+            "\"Read the SOP at '/opt/data/profiles/platform/governance/moved_sop.md'.\"}]}",
         )
         findings = self.fixture.run()
         self.assertEqual(["cron-asset"], [f.rule for f in findings])
         self.assertIn("governance/moved_sop.md", findings[0].message)
+
+    def test_cron_prompt_naming_an_absolute_platform_path_that_exists_passes(self):
+        self.fixture.write("agents/platform/governance/real_sop.md", "# sop\n")
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": '
+            "\"Read the SOP at '/opt/data/profiles/platform/governance/real_sop.md'.\"}]}",
+        )
+        self.assertEqual([], self.fixture.run())
 
     def test_frontmatter_name_must_match_the_directory(self):
         """The agent loads by directory; prose cites the frontmatter name."""
@@ -515,6 +524,48 @@ class SyntheticProfileTests(unittest.TestCase):
                     findings = cpa.check_cron_risk()
                 self.assertEqual([], findings)
 
+
+    def test_model_run_cron_job_without_max_turns_is_reported(self):
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": "run it", "risk": "low"}]}',
+        )
+        with mock.patch.object(cpa, "REPO", self.fixture.root):
+            findings = cpa.check_cron_max_turns()
+        self.assertEqual(["cron-max-turns"], [f.rule for f in findings])
+        self.assertIn("has max_turns=None", findings[0].message)
+
+    def test_cron_job_max_turns_hermes_would_read_as_unlimited_is_reported(self):
+        for value in ("0", "-1", "true", '"250"', "null"):
+            with self.subTest(value=value):
+                self.fixture.write(
+                    "agents/platform/cron/jobs.json",
+                    '{"jobs": [{"id": "audit", "prompt": "run it", "risk": "low", '
+                    f'"max_turns": {value}}}]}}',
+                )
+                with mock.patch.object(cpa, "REPO", self.fixture.root):
+                    findings = cpa.check_cron_max_turns()
+                self.assertEqual(["cron-max-turns"], [f.rule for f in findings])
+
+    def test_no_agent_cron_job_with_max_turns_is_reported(self):
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "sweep", "prompt": "", "risk": "low", "no_agent": true, '
+            '"script": "sweep.py", "max_turns": 90}]}',
+        )
+        with mock.patch.object(cpa, "REPO", self.fixture.root):
+            findings = cpa.check_cron_max_turns()
+        self.assertEqual(["cron-max-turns"], [f.rule for f in findings])
+        self.assertIn("is no_agent", findings[0].message)
+
+    def test_cron_jobs_with_a_declared_budget_pass(self):
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": "run it", "risk": "low", "max_turns": 250}, '
+            '{"id": "sweep", "prompt": "", "risk": "low", "no_agent": true, "script": "s.py"}]}',
+        )
+        with mock.patch.object(cpa, "REPO", self.fixture.root):
+            self.assertEqual([], cpa.check_cron_max_turns())
     def test_cron_job_with_medium_risk_is_reported(self):
         self.fixture.write(
             "agents/platform/cron/jobs.json",
@@ -850,6 +901,18 @@ class ResolutionModelTests(unittest.TestCase):
             "cluster home model has drifted from cluster_agent_profile.py",
         )
 
+        optional_items = re.search(r'OPTIONAL_SYNC_ITEMS="([^"]+)"', entrypoint)
+        self.assertIsNotNone(optional_items, "OPTIONAL_SYNC_ITEMS moved or changed shape")
+        self.assertEqual(
+            set(optional_items.group(1).split()) | {"skills", "scripts"},
+            set(cpa.PROFILE_HOME_ITEMS["tse"]),
+            "tse home model has drifted from docker-entrypoint.sh OPTIONAL_SYNC_ITEMS",
+        )
+        self.assertIn(
+            'ln -sfn "$TARGET_DIR/scripts" "$_opt_home/scripts"',
+            entrypoint,
+        )
+
 
 class CheckoutPathTests(unittest.TestCase):
     """A path that addresses the checkout is the one spelling always wrong.
@@ -882,6 +945,52 @@ class CheckoutPathTests(unittest.TestCase):
         self.fixture.write(
             "agents/platform/governance/sop.md",
             "Read `skills/thing/references/how.md` first.\n",
+        )
+        self.assertEqual([], self._findings())
+
+    def test_the_profile_home_spelling_of_a_file_it_ships_passes(self):
+        self.fixture.write("agents/platform/skills/thing/scripts/run.py", "")
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Run `/opt/data/profiles/platform/skills/thing/scripts/run.py` first.\n",
+        )
+        self.assertEqual([], self._findings())
+
+    def test_the_profile_home_spelling_of_a_missing_file_is_reported(self):
+        """Named in full for a kanban worker, it is still a file the image ships."""
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Run `/opt/data/profiles/platform/skills/thing/scripts/gone.py` first.\n",
+        )
+        self.assertEqual(len(self._findings()), 1)
+
+    def test_a_template_under_the_profile_home_is_not_reported(self):
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Read `/opt/data/profiles/platform/governance/<stream>_sop.md` first.\n",
+        )
+        self.assertEqual([], self._findings())
+
+    def test_the_profile_home_spelling_of_a_checkout_only_file_is_reported(self):
+        self.fixture.write("agents/platform/docs/glossary.md", "# glossary\n")
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Read `/opt/data/profiles/platform/docs/glossary.md` first.\n",
+        )
+        self.assertEqual(len(self._findings()), 1)
+
+    def test_a_misspelt_full_path_under_a_checkout_only_directory_is_reported(self):
+        self.fixture.write("agents/platform/docs/glossary.md", "# glossary\n")
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Read `/opt/data/profiles/platform/docs/glosary.md` first.\n",
+        )
+        self.assertEqual(len(self._findings()), 1)
+
+    def test_runtime_state_under_the_profile_home_is_not_reported(self):
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Read `/opt/data/profiles/platform/SETTINGS.md` first.\n",
         )
         self.assertEqual([], self._findings())
 

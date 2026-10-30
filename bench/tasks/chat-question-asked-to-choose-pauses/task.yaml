@@ -1,0 +1,117 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. A user who asks for options and to pick one
+# themselves is asking a question back, and the card has to stop and ask it:
+# kanban_block(kind="needs_input") with a reason that ends on the options. On
+# Slack that block is the needs-you message, ⏸️ on the ask, a yellow side-bar
+# and a button per option (deploy/docker/patches/slack_ux_moments.py,
+# needs_you, reading the options with agents/platform/scripts/slack_moments.py
+# _trailing_options). A card that completes with the options as text instead
+# posts an answer the user cannot click, and nothing waits on their pick.
+# agents/chat/SOUL.md §2 step 3 carries the choice into the card body;
+# agents/platform/SOUL.md §0 step 3 and agents/cluster/SOUL.md §6 step 4 say
+# whoever owns the user's card blocks with the question.
+#
+# The objectives read the question the user's card paused on, as the inject
+# lane folds it into the reply ("Question from delegated task <id>:", the
+# block's reason, which the conversation shows as the needs-you message).
+# The pattern approximates what the Slack parser turns into buttons: a line
+# ending in "?" and right below it two to five option lines, each at most 75
+# characters (slack_presenter BUTTON_TEXT_MAX), and nothing after them. It
+# differs from the parser at the edges, none of which the SOULs' "Which one?"
+# shape reaches: it reads the report's normalized text (lowercased, `*`, `_`
+# and backticks dropped), so it refuses a `*` bullet list, and it accepts a
+# list after a "Shall I proceed?" that the parser leaves as text. Only the
+# inject lane's board read produces the question section, so the case is on
+# hack/eval/api-lane-exclusions.txt.
+#
+# What it does not grade: the click, or the work after the answer. The block
+# ends the run (blocked is terminal to the harness's wait), so the case grades
+# the pause and the question, not what the agent does with the pick.
+#
+# The prompt names no cluster: fixtures.json is the only thing allowed to
+# address a seeded cluster (cluster-agent-crashloop-debug's header).
+#
+# Planted defect required: crashloop-workload, the payments-api Deployment in
+# seeded-debug on slot a, OOMKilled on every start. Isolation class: read-only.
+#
+# ON SPEC.MODE NEXT (#4004). The case grades what the user sees: the work
+# pauses on a question that names the OOM and ends on two to five options, and
+# nothing is fixed. It does not grade how the agent got there (which profile
+# called kanban_block, read from the workers' trajectory, which the scorer set
+# aside on this lane).
+id: chat-question-asked-to-choose-pauses
+name: Asked for options to choose from, the card pauses with the question and its options
+prompt: >-
+  payments-api in the seeded-debug namespace keeps restarting somewhere in the
+  fleet. Look into why, then give me two or three ways to fix it and ask me
+  which one to go with.
+expected_output: >-
+  The front door files one card and acks it. The worker that owns the
+  user's card finds payments-api OOMKilled on every start against its 64Mi
+  memory limit, then pauses on a question for the user: it opens with the
+  question, gives the finding in a few lines, and ends with
+  "Which one?" and two or three short options such as raising the limit,
+  setting a request to match, or reducing the app's memory use. It does not
+  complete with the options as an answer, and nothing is changed.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the conversation around a routed ask.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: jayantid
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - crashloop-workload
+
+verification_spec:
+  # The pause, as the conversation shows it: the user's card stopped on a
+  # needs_input block, whose reason the harness folds in under "Question
+  # from delegated task <id>:" (harness._append_delivered); a card that
+  # completed with the options as text delivers a result instead, and fails.
+  # Grounded in what the fleet plants: the OOM's evidence, not "memory",
+  # which "Increase the memory limit" in an option would supply on its own.
+  - name: the-work-paused-on-a-question-that-names-the-oom
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      required_patterns:
+        - 'question from delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?payments-api)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?(?:oomkilled|oom[- ]?kill|exit code 137|64mi|out of memory))'
+  # The options the Slack parser makes buttons of: a line ending in "?"
+  # that is not itself an option line, then two to five option lines (`-`,
+  # `•`, `1.`, `1)`, `a.` or `a)`, the SOULs' shape), blank lines allowed
+  # between them, each at most 75 characters (slack_presenter
+  # BUTTON_TEXT_MAX), and nothing after them in the question. A `*` bullet is
+  # not accepted: the report's normalization strips the `*`, which leaves it
+  # looking like a wrapped line, and a wrapped line is no option to the parser. The grounding is repeated here so
+  # one question carries both, not one card's question the OOM and another's
+  # the options.
+  - name: the-question-ends-on-two-to-five-options
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_patterns:
+        - 'question from delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?payments-api)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?(?:oomkilled|oom[- ]?kill|exit code 137|64mi|out of memory))(?:(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?\n)?(?!(?:[ ]?(?:[-•]|\d+[.)]|[a-z][.)])[ ]+))[^\n]*\?[ ]*\n(?:[ ]*\n)*(?:(?:[ ]?(?:[-•]|\d+[.)]|[a-z][.)])[ ]+)[^\n]{1,75}\n(?:[ ]*\n)*){1,4}(?:[ ]?(?:[-•]|\d+[.)]|[a-z][.)])[ ]+)[^\n]{1,75}(?:\n[ ]*)*?(?:\Z|\n(?=result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))'
+  # Diagnosed and asked, not fixed: the limit the fixture plants is unchanged.
+  - name: the-crashloop-was-not-fixed-before-asking
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: crashloop-workload
+      kind: deployment
+      resource_name: payments-api
+      namespace: seeded-debug
+      path: spec.template.spec.containers[?(@.name=='api')].resources.limits.memory
+      op: eq
+      value: 64Mi

@@ -1,0 +1,7 @@
+# make-certs.sh refuses to write inside the repository. These lines are a
+# second guard, so that no key or certificate is committed from here.
+*.key
+*.crt
+*.pem
+*.csr
+/ghes-proxy

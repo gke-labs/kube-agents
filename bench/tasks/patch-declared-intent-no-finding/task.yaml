@@ -48,9 +48,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: upgrades
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 verification_spec:
   - name: the-posture-is-not-a-finding
     role: objective

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // setBaseEnv pins the required env plus empty values for every optional
@@ -23,6 +25,8 @@ import (
 func setBaseEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("NATS_URL", "nats://127.0.0.1:4222")
+	t.Setenv(lib.EnvNATSCAFile, "")
+	t.Setenv(EnvNATSCAConfigMap, "")
 	t.Setenv("NATS_PASSWORD", "pw")
 	t.Setenv("DISCORD_TOKEN", "x")
 	t.Setenv("SLACK_BOT_TOKEN", "")
@@ -33,6 +37,8 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_ASK_TTL", "")
 	t.Setenv("A2A_SESSION_TTL", "")
 	t.Setenv("A2A_FIRST_EVENT_GRACE", "")
+	t.Setenv("A2A_CARD_STOP", "")
+	t.Setenv("A2A_CARD_STOP_TIMEOUT", "")
 	t.Setenv("A2A_OWNER_DEPLOYMENT", "")
 	t.Setenv("A2A_MAX_SESSIONS", "")
 	t.Setenv("A2A_DELEGATION_DEPTH_MAX", "")
@@ -52,6 +58,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_DOOR_TOKEN", "")
 	t.Setenv("A2A_DOOR_PRINCIPAL_MAP", "")
 	t.Setenv("A2A_DOOR_PUBLIC_URL", "")
+	t.Setenv("A2A_CONSOLE_DOOR", "")
 }
 
 // TestFromEnvSaltPrecedence: the salt is SESSION_KV_SALT, the one the
@@ -495,6 +502,36 @@ func TestFromEnvFirstEventGrace(t *testing.T) {
 		t.Setenv("A2A_FIRST_EVENT_GRACE", bad)
 		if _, err := FromEnv(); err == nil {
 			t.Fatalf("A2A_FIRST_EVENT_GRACE=%q accepted", bad)
+		}
+	}
+}
+
+// TestFromEnvCardStop: the card stop is off unless exactly "true" (a rollout
+// switch, so a typo leaves the old reply), and its bound is 75s by default,
+// a Go duration, and never under the floor the bridge's own turn wait sets.
+func TestFromEnvCardStop(t *testing.T) {
+	setBaseEnv(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CardStop || cfg.CardStopTimeout != 75*time.Second {
+		t.Fatalf("defaults: CardStop %v, CardStopTimeout %v; want off and 75s", cfg.CardStop, cfg.CardStopTimeout)
+	}
+	for value, want := range map[string]bool{"true": true, "TRUE": false, "1": false, "false": false} {
+		t.Setenv("A2A_CARD_STOP", value)
+		if cfg, err = FromEnv(); err != nil || cfg.CardStop != want {
+			t.Errorf("A2A_CARD_STOP=%q: CardStop %v (err %v), want %v", value, cfg.CardStop, err, want)
+		}
+	}
+	t.Setenv("A2A_CARD_STOP_TIMEOUT", "2m")
+	if cfg, err = FromEnv(); err != nil || cfg.CardStopTimeout != 2*time.Minute {
+		t.Fatalf("A2A_CARD_STOP_TIMEOUT=2m: %v (err %v)", cfg.CardStopTimeout, err)
+	}
+	for _, bad := range []string{"29s", "75", "junk"} {
+		t.Setenv("A2A_CARD_STOP_TIMEOUT", bad)
+		if _, err := FromEnv(); err == nil {
+			t.Errorf("A2A_CARD_STOP_TIMEOUT=%q accepted", bad)
 		}
 	}
 }
@@ -953,6 +990,26 @@ func TestAMalformedPodNamespaceIsAGatewayBootFailure(t *testing.T) {
 	}
 }
 
+// TestAProfileTierIsNotAGatewayCeiling: read and unattended are tiers a grant
+// carries only with its profile, and the gateway's install-wide mint sets no
+// profile. Entry.Validate refuses a profile tier with no profile, so a gateway
+// configured with A2A_AUTHORITY_TIER=read or unattended fails boot instead of
+// minting profile-less roots whose first hop could pick any profile (#3659).
+func TestAProfileTierIsNotAGatewayCeiling(t *testing.T) {
+	for _, tier := range []capability.Tier{capability.TierRead, capability.TierUnattended} {
+		c := &Config{Namespace: "kubeagents-system", AuthorityTier: tier}
+		c.defaultCapabilityCeiling()
+		if err := c.validateCapabilityCeiling(); err == nil || !strings.Contains(err.Error(), "names no profile") {
+			t.Errorf("A2A_AUTHORITY_TIER=%s: validateCapabilityCeiling = %v, want a boot failure naming the missing profile", tier, err)
+		}
+	}
+	c := &Config{Namespace: "kubeagents-system", AuthorityTier: capability.TierDeveloperTeam}
+	c.defaultCapabilityCeiling()
+	if err := c.validateCapabilityCeiling(); err != nil {
+		t.Fatalf("the default tier should still boot: %v", err)
+	}
+}
+
 // TestDelegationDepthMaxFromEnv: unset means 3; a value below 1 or a
 // non-integer refuses the boot, the way A2A_MAX_SESSIONS does, rather than
 // quietly clamping a typo into a different bound.
@@ -982,5 +1039,123 @@ func TestDelegationDepthMaxFromEnv(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "A2A_DELEGATION_DEPTH_MAX") {
 			t.Fatalf("A2A_DELEGATION_DEPTH_MAX=%q: error %q does not name the variable", bad, err)
 		}
+	}
+}
+
+// The CA file and its ConfigMap come as a pair: the gateway would connect on
+// the file alone while every session pod it spawned got no CA.
+func TestFromEnvRefusesHalfTheBusTrust(t *testing.T) {
+	for _, tc := range []struct{ file, cm string }{{"/etc/a2a-nats-ca/ca.crt", ""}, {"", "agent-a2a-nats-ca-bundle"}} {
+		setBaseEnv(t)
+		t.Setenv(lib.EnvNATSCAFile, tc.file)
+		t.Setenv(EnvNATSCAConfigMap, tc.cm)
+		if _, err := FromEnv(); err == nil {
+			t.Errorf("FromEnv accepted %s=%q with %s=%q", lib.EnvNATSCAFile, tc.file, EnvNATSCAConfigMap, tc.cm)
+		}
+	}
+	setBaseEnv(t)
+	t.Setenv(lib.EnvNATSCAFile, "/etc/a2a-nats-ca/ca.crt")
+	t.Setenv(EnvNATSCAConfigMap, "agent-a2a-nats-ca-bundle")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("FromEnv refused the pair: %v", err)
+	}
+	if cfg.NATSCAFile != "/etc/a2a-nats-ca/ca.crt" || cfg.NATSCAConfigMap != "agent-a2a-nats-ca-bundle" {
+		t.Errorf("cfg = %q / %q", cfg.NATSCAFile, cfg.NATSCAConfigMap)
+	}
+}
+
+// The console door alone starts a gateway (A2A_CONSOLE_DOOR=true), as a door
+// does: no backend name, and never in place of a real backend. Anything but
+// "true" leaves the no-backend refusal as it was.
+func TestFromEnvConsoleDoor(t *testing.T) {
+	for value, wantErr := range map[string]bool{"true": false, "": true, "1": true, "TRUE": true} {
+		t.Run("alone/"+value, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("DISCORD_TOKEN", "")
+			t.Setenv("A2A_CONSOLE_DOOR", value)
+			cfg, err := FromEnv()
+			if wantErr {
+				if err == nil || !strings.Contains(err.Error(), "A2A_CONSOLE_DOOR") {
+					t.Fatalf("A2A_CONSOLE_DOOR=%q: err = %v, want the no-backend refusal naming it", value, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !cfg.ConsoleDoor || cfg.Backend() != "" {
+				t.Errorf("console door = %v, backend = %q; want the door and no backend", cfg.ConsoleDoor, cfg.Backend())
+			}
+		})
+	}
+	t.Run("beside a backend", func(t *testing.T) {
+		setBaseEnv(t)
+		t.Setenv("A2A_CONSOLE_DOOR", "true")
+		t.Setenv("DISCORD_TOKEN", "x")
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Backend() != discordBackend {
+			t.Errorf("Backend() = %q; the console door must not displace a real backend", cfg.Backend())
+		}
+	})
+}
+
+// A gateway whose only ingress is the console door attributes to the console,
+// never "": New's default must say what the backend is.
+func TestNewDefaultsAConsoleOnlyGatewayToTheConsole(t *testing.T) {
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Close)
+	cfg := &Config{
+		NATSURL:          url,
+		DefaultAddressee: "platform",
+		IdleTTL:          30 * time.Minute,
+		AttributionSalt:  []byte("test-salt"),
+		ConsoleDoor:      true,
+	}
+	g, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.backend != consoleBackend {
+		t.Fatalf("a console-only gateway attributes to %q, want %q", g.backend, consoleBackend)
+	}
+}
+
+func TestConfigHomeLearnArmed(t *testing.T) {
+	armed := Config{SlackBotToken: "xoxb-x", HomeChannelRecord: "platform-agent-home-channel", HomeChannelLearn: true}
+	cases := []struct {
+		name string
+		mut  func(*Config)
+		want bool
+	}{
+		{"all gates hold", func(*Config) {}, true},
+		{"policy absent is auto", func(c *Config) { c.SlackHomePolicy = "" }, true},
+		{"CR home set", func(c *Config) { c.SlackHomeChannel = "C0HOME" }, false},
+		{"CR home set but malformed", func(c *Config) { c.SlackHomeChannel = "general" }, false},
+		{"policy manual", func(c *Config) { c.SlackHomePolicy = slackHomePolicyManual }, false},
+		{"no record named", func(c *Config) { c.HomeChannelRecord = "" }, false},
+		{"learn not armed by the operator", func(c *Config) { c.HomeChannelLearn = false }, false},
+		{"Chat holds the gateway", func(c *Config) { c.GchatRelayURL = "https://relay" }, false},
+		{"no backend", func(c *Config) { c.SlackBotToken = "" }, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := armed
+			tc.mut(&c)
+			if got := c.HomeLearnArmed(); got != tc.want {
+				t.Errorf("HomeLearnArmed = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

@@ -26,7 +26,7 @@ variable "create_cluster" {
 }
 
 variable "accept_no_network_policy" {
-  description = "With create_cluster = false, install onto a cluster that enforces no NetworkPolicy instead of refusing the plan. The cluster is left as it is; every NetworkPolicy the install ships — the agent's ingress and egress confinement, the shell sandbox's deny-all, LiteLLM's, the minter's, Hindsight's — is accepted by the API server and enforced by nothing. The choice is stamped onto the PlatformAgent as the kubeagents.x-k8s.io/network-policy-enforcement annotation so it outlives the run. install.sh sets this from --accept-no-network-policy. No effect on a created cluster or one that already enforces."
+  description = "With create_cluster = false, install onto a cluster that enforces no NetworkPolicy instead of refusing the plan. The cluster is left as it is; every NetworkPolicy the install ships — the agent's ingress and egress confinement, the shell sandbox's deny-all, LiteLLM's, the minter's, Hindsight's, the web console's — is accepted by the API server and enforced by nothing (and web_console_enabled = true is refused when NetworkPolicy is not enforced). The choice is stamped onto the PlatformAgent as the kubeagents.x-k8s.io/network-policy-enforcement annotation so it outlives the run. install.sh sets this from --accept-no-network-policy. No effect on a created cluster or one that already enforces."
   type        = bool
   default     = false
 }
@@ -254,7 +254,7 @@ variable "agent_service_account_id" {
 }
 
 variable "agent_ksa_name" {
-  description = "Kubernetes ServiceAccount the agent pod runs as, and the KSA half of its Workload Identity binding. The Workload Identity principal is project/namespace/KSA with no cluster in it, so two installs in one project that share the namespace and this name bind one principal and each agent can mint the other's GSA tokens however differently the GSAs are named; give a second install its own name here. One variable feeds both consumers — the composition passes it to the kube-agents-iam module's ksa_name and to the chart's platformAgent.security.serviceAccountName — so the binding and the pod cannot name different KSAs. The default is the name both consumers defaulted to before this variable existed, so an install that never sets it does not move. Through the installer front doors, set it as a TF_VAR_agent_ksa_name=... line in install.env: unlike agent_service_account_id, which the front doors now name with PLATFORM_AGENT_GSA_NAME, this has no install.env key of its own yet, and the generator writes no agent_ksa_name into terraform.tfvars, so the TF_VAR_ passthrough is what Terraform reads."
+  description = "Kubernetes ServiceAccount the credential broker pod runs as, and the KSA half of its Workload Identity binding (the agent gateway pod runs as its own unannotated <name>-gateway-agent). The Workload Identity principal is project/namespace/KSA with no cluster in it, so two installs in one project that share the namespace and this name bind one principal and each agent can mint the other's GSA tokens however differently the GSAs are named; give a second install its own name here. One variable feeds both consumers — the composition passes it to the kube-agents-iam module's ksa_name and to the chart's platformAgent.security.serviceAccountName — so the binding and the pod cannot name different KSAs. The default is the name both consumers defaulted to before this variable existed, so an install that never sets it does not move. Through the installer front doors, set it as a TF_VAR_agent_ksa_name=... line in install.env: unlike agent_service_account_id, which the front doors now name with PLATFORM_AGENT_GSA_NAME, this has no install.env key of its own yet, and the generator writes no agent_ksa_name into terraform.tfvars, so the TF_VAR_ passthrough is what Terraform reads."
   type        = string
   nullable    = false
   default     = "kubeagents-platform-agent"
@@ -329,19 +329,32 @@ variable "image_pull_secrets" {
 }
 
 variable "third_party_image_registry" {
-  description = "Registry prefix for the images this project does not build (LiteLLM, fluent-bit). Defaults to image_registry; set it only when the mirror keeps third-party images under a different path."
+  description = "Registry prefix for the images this project does not build (cert-manager, LiteLLM, fluent-bit, the GitHub token minter, Hindsight). Empty leaves them on their upstream registries; set it to mirror third-party images."
   type        = string
   default     = ""
 }
 
 variable "model_provider" {
-  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, or vertex_ai). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead."
+  description = "Model provider the LiteLLM gateway routes model-default to: gemini, anthropic, openai, vertex_ai, openai_compatible, sap, or any other LiteLLM provider slug. Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead; openai_compatible is any server speaking the OpenAI chat-completions API (vLLM, TGI, an internal gateway), set with model_default_name and the openai_compatible_* variables; sap (SAP AI Core) and any other slug read their credentials from the Secret litellm_env_secret_name names, and a slug outside that list needs model_default_name."
   type        = string
   default     = "gemini"
 
   validation {
-    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai"], var.model_provider)
-    error_message = "model_provider must be one of gemini, anthropic, openai, or vertex_ai."
+    # One shape admits every provider the chart knows and every other LiteLLM
+    # slug; chatgpt is the slug the chart refuses by name (a subscription needs
+    # an OAuth token store it does not ship), so the plan refuses it here.
+    condition     = can(regex("^[a-z][a-z0-9_]*$", var.model_provider)) && var.model_provider != "chatgpt"
+    error_message = "model_provider must be gemini, anthropic, openai, vertex_ai, openai_compatible, sap, or another LiteLLM provider slug (lowercase letters, digits and underscores); chatgpt is not supported, use openai with an API key."
+  }
+}
+
+variable "litellm_env_secret_name" {
+  description = "Name of a Secret, in the agent's namespace, that the LiteLLM gateway reads whole as environment variables (envFrom, optional). It carries whatever the provider reads from the environment: AICORE_SERVICE_KEY and AICORE_RESOURCE_GROUP for sap, the driver's variables for another slug, and for openai_compatible the OAuth2 client-credentials trio OPENAI_COMPATIBLE_OAUTH_TOKEN_URL, _CLIENT_ID and _CLIENT_SECRET. Empty: nothing is mounted. Terraform only names it; create the Secret yourself, and it stays out of state."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.litellm_env_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.litellm_env_secret_name)) && length(var.litellm_env_secret_name) <= 253)
+    error_message = "litellm_env_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
   }
 }
 
@@ -364,7 +377,7 @@ variable "vertex_manage_serving_project" {
 }
 
 variable "model_default_name" {
-  description = "Model name behind model-default. Empty selects the chart's per-provider default (which mirrors the provisioning scripts)."
+  description = "Model name behind model-default. Empty selects the chart's per-provider default (which mirrors the provisioning scripts); openai_compatible has no default and requires it."
   type        = string
   default     = ""
 }
@@ -377,6 +390,62 @@ variable "model_max_tokens" {
   validation {
     condition     = var.model_max_tokens >= 0 && floor(var.model_max_tokens) == var.model_max_tokens
     error_message = "model_max_tokens must be a whole number of tokens, 0 or more."
+  }
+}
+
+variable "alert_daily_limits" {
+  description = "Daily alert ceilings for the Platform Agent, one per bucket: critical, warning, info and drift. The chart renders each key that is set as ALERT_DAILY_LIMIT_<KEY> in the PlatformAgent's spec.deployment.env. A key that is not set keeps the default in the agent image, and 0 removes the cap for that bucket. Each apply that changes the env list that the chart renders replaces the full env list on the CR, and entries added to the CR by hand are lost; set those through platformAgent.deployment.env in extra_helm_values. Buckets, defaults and a sizing method: the site's chatops page, \"Daily alert ceiling\"."
+  # A map, not an object type: Terraform drops an unknown attribute of an
+  # object without an error, so a misspelt key would set nothing.
+  type    = map(number)
+  default = {}
+
+  validation {
+    condition     = alltrue([for bucket in keys(var.alert_daily_limits) : contains(["critical", "warning", "info", "drift"], bucket)])
+    error_message = "Each alert_daily_limits key must be critical, warning, info or drift."
+  }
+
+  validation {
+    condition     = alltrue([for limit in values(var.alert_daily_limits) : limit >= 0 && limit <= 2147483647 && floor(limit) == limit if limit != null])
+    error_message = "Each alert_daily_limits value must be a whole number of alerts, from 0 to 2147483647."
+  }
+}
+
+variable "openai_compatible_api_base" {
+  description = "The server's OpenAI-compatible base URL, including /v1, when model_provider = \"openai_compatible\" (required with it). An in-cluster Service (<svc>, <svc>.<namespace>.svc, <svc>.<namespace>.svc.cluster.local) needs openai_compatible_target_port; any other host needs openai_compatible_egress_cidrs, unless it is a public endpoint on port 443."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.openai_compatible_api_base == "" || can(regex("^https?://", var.openai_compatible_api_base))
+    error_message = "openai_compatible_api_base must be an http:// or https:// URL."
+  }
+}
+
+variable "openai_compatible_target_port" {
+  description = "The server pod's port when openai_compatible_api_base names an in-cluster Service: the gateway's NetworkPolicy matches the pod's port, not the Service's. 0 leaves it unset."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.openai_compatible_target_port == 0 || (floor(var.openai_compatible_target_port) == var.openai_compatible_target_port && var.openai_compatible_target_port >= 1 && var.openai_compatible_target_port <= 65535)
+    error_message = "openai_compatible_target_port must be 0 (unset) or a port from 1 to 65535."
+  }
+}
+
+variable "openai_compatible_egress_cidrs" {
+  description = "Private ranges, in CIDR form, the gateway may reach the server at when openai_compatible_api_base is not an in-cluster Service (an internal load balancer, an on-prem address). NetworkPolicy cannot match a DNS name, so a hostname needs the ranges it resolves to. None for a public endpoint on 443, which the gateway's existing egress rule reaches. Ignored for an in-cluster Service."
+  type        = list(string)
+  default     = []
+}
+
+variable "openai_compatible_ca_secret_name" {
+  description = "Name of the Secret, in the agent's namespace, holding the PEM CA that signed the server's TLS certificate, under the key `ca.crt`. The gateway trusts it for this server only. Empty: the gateway's default CAs. Terraform only names it; create the Secret yourself."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.openai_compatible_ca_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.openai_compatible_ca_secret_name)) && length(var.openai_compatible_ca_secret_name) <= 253)
+    error_message = "openai_compatible_ca_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
   }
 }
 
@@ -464,6 +533,13 @@ variable "openai_api_key" {
   default     = ""
 }
 
+variable "openai_compatible_api_key" {
+  description = "The openai_compatible server's API key, stored as OPENAI_COMPATIBLE_API_KEY (optional; omitted from the Secret when empty). The gateway sends it to that server only."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "enable_google_chat" {
   description = "Provision the Google Chat backend (Pub/Sub topic and subscription, Chat APIs) and enable the CR's googleChat integration with the created topic/subscription."
   type        = bool
@@ -545,6 +621,16 @@ variable "slack_home_channel_name" {
   default     = ""
 }
 
+variable "slack_home_channel_policy" {
+  description = "\"auto\" (also empty) or \"manual\". Accepted and recorded in this release but with no effect yet: the A2A gateway does not learn a home channel, so slack_home_channel alone decides. Only used when enable_slack is true."
+  type        = string
+  default     = ""
+  validation {
+    condition     = contains(["", "auto", "manual"], var.slack_home_channel_policy)
+    error_message = "slack_home_channel_policy must be \"\", \"auto\" or \"manual\"."
+  }
+}
+
 variable "chat_topic_name" {
   description = "Pub/Sub topic for Google Chat events. The default matches the chat-pubsub module and the chart."
   type        = string
@@ -561,6 +647,12 @@ variable "hermes_dashboard_enabled" {
   description = "Whether the Hermes Web UI dashboard is enabled on the agent. null leaves the field out of the CR so the CRD default (true) applies."
   type        = bool
   default     = null
+}
+
+variable "web_console_enabled" {
+  description = "Whether to deploy the in-cluster web console, a browser chat page for the Platform Agent reached by kubectl port-forward. Maps to the chart's webConsole.enabled."
+  type        = bool
+  default     = false
 }
 
 variable "memory_enabled" {
@@ -582,13 +674,13 @@ variable "user_profile_enabled" {
 }
 
 variable "github_repo" {
-  description = "Target GitOps repository for the agent's GitHub integration (owner/repo or URL). Empty leaves the GitHub integration unconfigured. Independent of enable_github_minter, which only provisions the minter's GCP identity."
+  description = "Target GitOps repository for the agent's GitHub integration (owner/repo or a github.com URL). On a GitHub Enterprise Server (gitops_host set), owner/repo on the instance, not a URL. Empty leaves the GitHub integration unconfigured. Independent of enable_github_minter, which only provisions the minter's GCP identity."
   type        = string
   default     = ""
 }
 
 variable "gitops_forge" {
-  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter) or gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names). A gitlab install declares one gitlab forge and its gitops repository through spec.integration.forges/repositories; github_repo and enable_github_minter must be left unset."
+  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter, on github.com or, with gitops_host, on a GitHub Enterprise Server) or gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names). A gitlab install, and a github install with gitops_host, declare one forge and its gitops repository through spec.integration.forges/repositories. A gitlab install must leave github_repo and enable_github_minter unset."
   type        = string
   default     = "github"
   validation {
@@ -598,7 +690,7 @@ variable "gitops_forge" {
 }
 
 variable "gitops_host" {
-  description = "Hostname of the forge holding the GitOps repository, for a self-managed GitLab instance (e.g. gitlab.example.com). Empty is the forge's own host (gitlab.com). A bare hostname: no scheme, path or port. Read only when gitops_forge is gitlab."
+  description = "Hostname of the forge holding the GitOps repository: with gitops_forge = github, a GitHub Enterprise Server (e.g. github.example.com); with gitops_forge = gitlab, a self-managed GitLab instance (e.g. gitlab.example.com). Empty is the forge's own host (github.com or gitlab.com). A bare hostname: no scheme, path or port. For github, a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) is refused. On a GitHub Enterprise Server the composition declares the github forge at this host in spec.integration.forges, with github_repo's owner as its namespace, and the chart points the token minter at https://<host>/api/v3."
   type        = string
   default     = ""
   validation {
@@ -633,8 +725,18 @@ variable "gitlab_ca_secret_name" {
   }
 }
 
+variable "github_ca_secret_name" {
+  description = "Name of the Secret, in the agent's namespace, holding the PEM CA that signed a GitHub Enterprise Server's TLS certificate, under the key `ca.crt`. The credential broker trusts it for the instance's host only. The chart's token minter trusts it for all of its outbound calls, and reads it when it starts, so restart the minter after the Secret changes. Empty: the system CAs only. The installer creates it from --gitops-ca-file and restarts the minter; Terraform only names it. Read only when gitops_forge is github and gitops_host is set."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.github_ca_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.github_ca_secret_name)) && length(var.github_ca_secret_name) <= 253)
+    error_message = "github_ca_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
+  }
+}
+
 variable "enable_github_minter" {
-  description = "Provision the GitHub token minter: its GCP resources (service account, KMS key ring and signing key) and, through the chart, its Kubernetes workload. Requires github_repo in owner/repo (or github.com URL) form. The App private key must be imported into the KMS key before the minter goes Ready."
+  description = "Provision the GitHub token minter: its GCP resources (service account, KMS key ring and signing key) and, through the chart, its Kubernetes workload. Requires github_repo in owner/repo (or github.com URL) form. The App private key must be imported into the KMS key before the minter goes Ready. On a GitHub Enterprise Server (gitops_host set) the App is created on the instance, and the chart points the minter at the instance, with the CA that github_ca_secret_name names."
   type        = bool
   default     = false
 }
@@ -814,7 +916,7 @@ variable "enable_drift_detector" {
 }
 
 variable "platform_agent_mode" {
-  description = "The PlatformAgent's spec.mode: \"today\", the current architecture, or \"next\", which also renders the NATS bus and the A2A gateway, a development stack (docs/designs/spec-mode-switch.md). \"today\" passes nothing to the chart, so the CR carries no mode field, which the operator reads as today, and an install that never sets this renders what it did before the variable existed. Changing it on a running install is a mode switch: the operator rolls the agent and renders or retires the A2A stack. A mode set on the CR by hand with kubectl is left alone while this stays \"today\", because Helm patches only the fields its renders differ in. Mirrors PLATFORM_AGENT_MODE, which install.sh sets from --mode."
+  description = "The PlatformAgent's spec.mode: \"today\", the previous stack kept as a rollback, or \"next\", which puts the NATS bus and the A2A gateway in front of the agent and is what install.sh records on a first install (docs/designs/spec-mode-switch.md). \"today\" passes nothing to the chart, so the CR carries no mode field, which the operator reads as today, and an install that never sets this renders what it did before the variable existed. Changing it on a running install is a mode switch: the operator rolls the agent and renders or retires the A2A stack. A mode set on the CR by hand with kubectl is left alone while this stays \"today\", because Helm patches only the fields its renders differ in. Mirrors PLATFORM_AGENT_MODE, which install.sh sets from --mode."
   type        = string
   default     = "today"
   nullable    = false
@@ -822,6 +924,26 @@ variable "platform_agent_mode" {
   validation {
     condition     = contains(["today", "next"], var.platform_agent_mode)
     error_message = "platform_agent_mode must be \"today\" or \"next\", the PlatformAgent CRD's spec.mode enum."
+  }
+}
+
+variable "platform_agent_storage_size" {
+  description = "The PlatformAgent's spec.storage.size: the request of the agent's <name>-data claim and of the shell sandbox's data claim, which the operator gives the same size. The default is the operator's own default, and passes the chart nothing, so the CR carries no storage field. Raising it expands both existing claims online where their StorageClass sets allowVolumeExpansion; elsewhere the claims keep their size and the CR's DataVolumeNotExpanded condition says so. A claim cannot shrink, so the operator's admission webhook refuses a lower value, and returning to the default never shrinks a claim. Each GiB added counts twice against the project's disk quota, once for each claim. At most 64Ti, the largest persistent disk. Mirrors PLATFORM_AGENT_STORAGE_SIZE in install.env, and its default is DEFAULT_PLATFORM_AGENT_STORAGE_SIZE in install.defaults.env."
+  type        = string
+  default     = "50Gi"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[1-9][0-9]*(Mi|Gi|Ti)$", var.platform_agent_storage_size))
+    error_message = "platform_agent_storage_size must be a whole number of Mi, Gi or Ti above zero, for example \"80Gi\". It sets the PlatformAgent CRD's spec.storage.size."
+  }
+
+  # 67108864 Mi is 64Ti, the largest persistent disk, the limit the admission
+  # webhook, the chart and the installer also take. A value the grammar above
+  # refuses passes here, so it is refused once.
+  validation {
+    condition     = try(tonumber(regex("^[0-9]+", var.platform_agent_storage_size)) * lookup({ Mi = 1, Gi = 1024, Ti = 1048576 }, regex("[MGT]i$", var.platform_agent_storage_size)) <= 67108864, true)
+    error_message = "platform_agent_storage_size must be at most 64Ti, the largest persistent disk size."
   }
 }
 

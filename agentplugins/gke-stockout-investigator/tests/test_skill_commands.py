@@ -6,7 +6,7 @@ A worker runs as `hermes chat -q`, where the command scanner refuses a command
 whose program is a shell variable (`$G add`) and the refusal is final. The
 platform image's skill check does not read this skill, which ships in the
 plugin's own image, and its `git` steps sit in inline code, which that check
-skips.
+skips. tests/test_skill_inline_commands.py also reads this skill's inline code.
 """
 
 import re

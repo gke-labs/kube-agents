@@ -1,0 +1,50 @@
+{
+  "name": "card-question-then-settled",
+  "source": "deploy/docker/patches/test_slack_ux_moments.py::QUESTION",
+  "notes": "A choice's reply starts with its label and names the card, as the click turn does today. The answered question is the same update key with no choices; the renderer writes the '✓ name: choice' line.",
+  "input": {
+    "card": "t_e0c1",
+    "events": [
+      {
+        "kind": "blocked",
+        "payload": {
+          "kind": "needs_input",
+          "reason": "Which cluster?\n- seeded-a\n- seeded-b"
+        }
+      },
+      {
+        "kind": "unblocked"
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Which cluster?",
+        "tone": "attention",
+        "choices": [
+          {
+            "text": "seeded-a",
+            "reply": "seeded-a\n\n(Clicked on the question from card t_e0c1.)"
+          },
+          {
+            "text": "seeded-b",
+            "reply": "seeded-b\n\n(Clicked on the question from card t_e0c1.)"
+          }
+        ]
+      },
+      "update": "question-t_e0c1"
+    },
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Which cluster?",
+        "tone": "attention"
+      },
+      "update": "question-t_e0c1"
+    }
+  ]
+}

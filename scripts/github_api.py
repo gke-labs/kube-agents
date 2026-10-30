@@ -4,7 +4,10 @@ Combines bounded retries on transient errors (5xx, 429, secondary rate limit 403
 with automatic list endpoint pagination (`get_all`), so callers neither drop
 writes on transient blips nor silently truncate multi-page lists. `graphql()`
 goes through the same retries and raises on an `errors` body, so a partial
-answer is never mistaken for a whole one.
+answer is never mistaken for a whole one. `get_object_pages()` pages the
+Actions list endpoints that wrap their page in an object (`workflows()` is
+one caller), and `is_refusal()` is the 4xx test
+the scheduled sweeps share for "ours to fix" against "wait for the next one".
 """
 
 from __future__ import annotations
@@ -25,6 +28,9 @@ REQUEST_ATTEMPTS = 3
 REQUEST_RETRY_SECONDS = 5
 REQUEST_RETRY_CEILING = 60
 PER_PAGE = 100
+# The status that separates GitHub refusing a request from GitHub failing.
+SERVER_ERROR_FLOOR = 500
+TOO_MANY_REQUESTS = 429
 
 
 def log(message: str) -> None:
@@ -50,6 +56,18 @@ def _retry_delay(error: urllib.error.HTTPError) -> int:
     if requested and str(requested).strip().isdigit():
         return min(int(str(requested).strip()), REQUEST_RETRY_CEILING)
     return REQUEST_RETRY_SECONDS
+
+
+def is_refusal(error) -> bool:
+    """A 4xx other than a rate limit: a permission or a request GitHub rejects,
+    which retrying will not change and a person has to fix. A scheduled sweep
+    reds on one of these and leaves anything else to its next run."""
+    return (
+        isinstance(error, urllib.error.HTTPError)
+        and error.code < SERVER_ERROR_FLOOR
+        and error.code != TOO_MANY_REQUESTS
+        and not _rate_limited(error)
+    )
 
 
 class GitHubAPI:
@@ -132,6 +150,28 @@ class GitHubAPI:
             if len(batch) < per_page:
                 return items
             page += 1
+
+    def get_object_pages(self, path: str, key: str, query=None):
+        """Every page of an endpoint that wraps its list as `{"total_count": n, <key>: [...]}`.
+
+        The Actions list endpoints (workflows, workflow runs, a commit's check
+        runs) answer that way, so `get_all`, which pages a bare list, cannot
+        read them. An empty page ends the loop as well as reaching the total,
+        so a total that overstates the list cannot spin this.
+        """
+        found = []
+        page = 1
+        while True:
+            encoded = urllib.parse.urlencode({**(query or {}), "per_page": PER_PAGE, "page": page})
+            batch = self.get(f"{path}?{encoded}")
+            found.extend(batch[key])
+            if not batch[key] or len(found) >= batch["total_count"]:
+                return found
+            page += 1
+
+    def workflows(self):
+        """Every workflow the repository has, paged to the endpoint's own total."""
+        return self.get_object_pages(f"/repos/{self.repo}/actions/workflows", "workflows")
 
     def post(self, path: str, payload=None, tolerate=()):
         return self.request("POST", path, payload, tolerate=tolerate)

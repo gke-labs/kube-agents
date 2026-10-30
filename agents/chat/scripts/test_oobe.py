@@ -2,15 +2,15 @@
 
 Run: python3 -m unittest agents/chat/scripts/test_oobe.py
 
-oobe imports gitops_workspace from agents/platform/scripts, which the image copies
-beside the chat scripts; the tests stand in for its repository list rather than
-reading this machine's /etc/gitops.
+The stage reads no repository list; the no-repository test stands in an empty one so a
+check that came back would be seen.
 """
 
 import contextlib
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -35,7 +35,6 @@ NOW_SETTLED = FILED_AT + 600
 FALLBACK_SECONDS = oobe.bootstrap_handoff.DEADLINE_SECONDS + oobe.RANKING_ALLOWANCE_SECONDS
 NOW_PAST_FALLBACK = FILED_AT + FALLBACK_SECONDS
 RANKING_ID = "t_rank"
-REPOS = ["acme/gitops"]
 FIRST = [oobe.FIRST_RUN_AUDITS[0]]
 MINUTE = 60
 
@@ -68,7 +67,6 @@ class StageTest(unittest.TestCase):
         self.board = self.d / "kanban.db"
         self.started: list[tuple[list[str], dict]] = []
         self.failing: set[str] = set()
-        self.repos: list[str] | Exception = list(REPOS)
         self._roster([{"id": job_id, "enabled": True, "state": "scheduled"} for job_id in oobe.FIRST_RUN_AUDITS])
         # The scan and delivery stages are their own modules, tested beside them; here they are stubs.
         self.scan = mock.Mock(return_value=0)
@@ -76,7 +74,6 @@ class StageTest(unittest.TestCase):
         patches = [
             mock.patch.object(oobe, "board_path", lambda _d: self.board),
             mock.patch.object(oobe.subprocess, "run", self._run),
-            mock.patch.object(oobe, "managed_repositories", self._repos),
             mock.patch.object(oobe.bootstrap_scan_gate, "main", self.scan),
             mock.patch.object(oobe.bootstrap_delivery, "main", self.deliver),
         ]
@@ -91,11 +88,6 @@ class StageTest(unittest.TestCase):
         self.started.append((argv, env))
         code = 1 if argv[-1] in self.failing else 0
         return subprocess.CompletedProcess(argv, code, stdout="", stderr="no such job" if code else "")
-
-    def _repos(self):
-        if isinstance(self.repos, Exception):
-            raise self.repos
-        return self.repos
 
     def _roster(self, jobs: list[dict]) -> None:
         cron = self.d / "profiles" / "platform" / "cron"
@@ -326,6 +318,39 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_PAST_FALLBACK + 10 * oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS)
         self.assertEqual(self._started_ids(), FIRST)
 
+    def test_a_fleet_past_the_first_run_cap_waits_for_its_uncarded_clusters(self):
+        # #3702: the marker's uncarded= agents have no card but are still in the hand-off's deadline.
+        per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
+        clusters = [(f"t_c{i}", "running", f"bootstrap-inventory-cluster-c{i}", SWEEP_CREATED_AT + 1) for i in range(6)]
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(
+            f"task_id={SWEEP_ID}\nfiled_at={FILED_AT}\nuncarded=4\n", encoding="utf-8"
+        )
+        _board(self.board, clusters)
+        self._main(now=NOW_PAST_FALLBACK + 6 * per_card)
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK + 10 * per_card - 1)
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK + 10 * per_card)
+        self.assertEqual(self._started_ids(), FIRST)
+
+    def test_an_unpinned_sweep_waits_for_the_live_roster_past_the_cap(self):
+        # #3702: the marker pinned nothing (an empty or failed listing at filing), so the
+        # stage budgets the live roster's agents past the cap, as the hand-off does.
+        per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
+        clusters = [(f"t_c{i}", "running", f"bootstrap-inventory-cluster-c{i}", SWEEP_CREATED_AT + 1) for i in range(6)]
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(
+            f"task_id={SWEEP_ID}\nfiled_at={FILED_AT}\ncap=6\n", encoding="utf-8"
+        )
+        _board(self.board, clusters)
+        with mock.patch.object(oobe.bootstrap_scan_gate, "cluster_agents", return_value=[{}] * 10) as listing:
+            self._main(now=NOW_PAST_FALLBACK + 6 * per_card)
+            self.assertEqual(self.started, [])
+            self._main(now=NOW_PAST_FALLBACK + 10 * per_card - 1)
+            self.assertEqual(self.started, [])
+            self._main(now=NOW_PAST_FALLBACK + 10 * per_card)
+        self.assertEqual(self._started_ids(), FIRST)
+        listing.assert_called_with(capped=False)
+
     def test_the_fallback_is_the_hand_offs_deadline_for_the_cards_it_counts(self):
         # An archived cluster card is not one the hand-off waits for, so the stage does not either.
         per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
@@ -387,9 +412,10 @@ class StageTest(unittest.TestCase):
             self.assertEqual(env["HERMES_HOME"], str(self.d / "profiles" / "platform"))
 
     def test_the_chain_follows_1866s_order(self):
+        # #1866's four in its order, then the upgrade retrospective.
         self.assertEqual(
             oobe.FIRST_RUN_AUDITS,
-            ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention"),
+            ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention", "upgrade-retrospective"),
         )
 
     def test_the_trigger_marks_the_job_due_and_does_not_run_it(self):
@@ -799,11 +825,12 @@ class StageTest(unittest.TestCase):
             {"id": "obtainability-audit", "enabled": False, "state": "paused", "paused_at": "2026-10-06T00:00:00"},
             {"id": "stockout-prevention", "enabled": True, "paused_at": "2026-10-06T00:00:00"},
             {"id": "fleet-wide-cost-analysis", "enabled": True},
+            {"id": "upgrade-retrospective", "enabled": True},
         ])
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self._drive()
-        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis"])
+        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis", "upgrade-retrospective"])
         state = oobe.read_state(self.d)
         self.assertEqual(state[oobe.STATE_HELD], {
             "compliance-audit": "disabled",
@@ -861,26 +888,20 @@ class StageTest(unittest.TestCase):
 
     # --- no GitOps repository -------------------------------------------------
 
-    def test_no_repository_skips_and_finishes(self):
+    def test_the_audits_start_on_an_install_with_no_repository(self):
+        """With no repository the audits run without a forge, so the chain starts as it would with one."""
         self._file_scan()
         _board(self.board, [_ranking("done")])
-        self.repos = []
-        self._main()
-        self.assertEqual(self.started, [])
-        state = oobe.read_state(self.d)
-        self.assertTrue(state[oobe.STATE_DONE])
-        self.assertEqual(state[oobe.STATE_REASON], oobe.SKIP_NO_REPOSITORY)
-
-    def test_an_unreadable_repository_list_is_retried(self):
-        self._file_scan()
-        _board(self.board, [_ranking("done")])
-        self.repos = RuntimeError("kubectl binary not found in PATH")
-        self._main()
-        self.assertEqual(self.started, [])
-        self.assertFalse((self.d / oobe.AUDITS_MARKER).exists())
-        self.repos = list(REPOS)
-        self._main()
+        # Every reader the stage has used answers empty, so a repository check that came back
+        # would take its skip branch here rather than fail on a missing name.
+        empty = types.ModuleType("gitops_workspace")
+        for reader in ("get_managed_github_repo_names", "get_managed_github_repos", "get_managed_repos"):
+            setattr(empty, reader, lambda: [])
+        empty.managed_repos_registered = lambda: False
+        with mock.patch.dict(sys.modules, {"gitops_workspace": empty}):
+            self._main()
         self.assertEqual(self._started_ids(), FIRST)
+        self.assertFalse(oobe.read_state(self.d).get(oobe.STATE_SKIPPED))
 
     # --- once only ------------------------------------------------------------
 
@@ -1101,6 +1122,30 @@ class RosterTest(unittest.TestCase):
         self.assertEqual(job["script"], "oobe.py")
         self.assertTrue(job["no_agent"])
         self.assertEqual(job["deliver"], "local")
+
+    def test_the_retired_first_run_jobs_ship_disabled(self):
+        # oobe is the only job that may start the first-run audits; the image's
+        # `enabled` is what turns off a copy already on the volume.
+        roster = Path(__file__).resolve().parent.parent / "defaults" / "cron" / "jobs.json"
+        jobs = {job["id"]: job for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
+        entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
+        seeded = next(line for line in entrypoint.splitlines() if line.strip().startswith('ASSUME_RETIRED="bootstrap'))
+        for job_id in ("bootstrap-inventory-scan", "bootstrap-inventory-delivery"):
+            if job_id in jobs:
+                self.assertIs(jobs[job_id].get("enabled"), False, job_id)
+                self.assertIn(job_id, seeded.split('"')[1].split(","), job_id)
+
+    def test_the_retired_first_run_gate_is_deleted_from_volumes(self):
+        # oobe runs the first-run audits. A volume can still hold the gate
+        # enabled, and only the default profile's --cron-retire removes it.
+        roster = Path(__file__).resolve().parent.parent / "defaults" / "cron" / "jobs.json"
+        ids = {job["id"] for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
+        self.assertNotIn("first-run-quick-value-audit", ids)
+        entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
+        # The default profile's call is the one that also forces profile-cron-tick.
+        block = re.search(r'--cron-jobs "profile-cron-tick".*?--cron-retire "([^"]*)"', entrypoint, re.S)
+        self.assertIsNotNone(block, "the default profile's --cron-retire call was not found")
+        self.assertIn("first-run-quick-value-audit", block.group(1).split())
 
 
 if __name__ == "__main__":

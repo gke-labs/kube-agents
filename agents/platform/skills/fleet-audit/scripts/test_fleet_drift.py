@@ -259,6 +259,18 @@ class EnumerateProjectClustersTest(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertIsNone(error)
 
+
+    def test_a_cluster_the_scope_excludes_is_dropped_from_the_listing(self):
+        # #3081: spec.scope.exclude.clusters bounds every fleet read, so an
+        # excluded cluster in a swept project is neither audited nor recorded.
+        fd.declared_scope.set("acme", None, "acme/us-central1/lane-b")
+        self.addCleanup(fd.declared_scope.set, None, None)
+        clusters_json = json.dumps([{"name": "ka-today", "location": "us-central1"}, {"name": "lane-b", "location": "us-central1"}])
+        with mock.patch("sys.stderr"):
+            clusters, _, error = fd.enumerate_project_clusters("acme", run=lambda a: run_of(0, clusters_json))
+        self.assertEqual([c["name"] for c in clusters], ["ka-today"])
+        self.assertIsNone(error)
+
     def test_failed_list_returns_empty_with_no_record_and_says_why(self):
         clusters, record, error = fd.enumerate_project_clusters("acme", run=lambda a: run_of(1, "", "denied"))
         self.assertEqual(clusters, [])
@@ -2699,11 +2711,11 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(fd.discover_fleet("acme-only", run=lambda *a, **k: run_of(1)).projects, ["acme-only"])
 
     def test_main_hands_the_flags_to_the_resolver(self):
-        # The wiring the SOP relies on: the two flags main parses reach the
+        # The wiring the SOP relies on: the three flags main parses reach the
         # holder the resolver reads, before anything else runs.
         with mock.patch.object(fd.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
-            fd.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
-        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+            fd.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied", "--scope-exclude-clusters", "ops-mgmt/us-central1/lane-b"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied", "ops-mgmt/us-central1/lane-b")
 
     def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
         # `--scope-unread` alone (what collector_args carries when no declared
@@ -2719,6 +2731,57 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
+
+class DefaultRunTimeoutTest(unittest.TestCase):
+    """`TimeoutExpired` carries the child's output as bytes even under `text=True`;
+    every reader of `Run` matches markers against a str, so the timeout arm
+    must hand back text, as the other collectors' `default_run` copies do."""
+
+    TIMED_OUT = subprocess.TimeoutExpired(["gcloud"], 1, output=b"partial", stderr=b"WARNING: zone did not respond")
+
+    def test_a_timeout_that_wrote_output_returns_text(self):
+        with mock.patch.object(fd.subprocess, "run", side_effect=self.TIMED_OUT):
+            result = fd.default_run(["gcloud"])
+        self.assertEqual(result.rc, fd.TIMEOUT_RC)
+        self.assertEqual((result.stdout, result.stderr), ("partial", "WARNING: zone did not respond"))
+
+    def test_a_timeout_that_wrote_nothing_returns_empty_text(self):
+        with mock.patch.object(fd.subprocess, "run", side_effect=subprocess.TimeoutExpired(["gcloud"], 1)):
+            result = fd.default_run(["gcloud"])
+        self.assertEqual((result.rc, result.stdout, result.stderr), (fd.TIMEOUT_RC, "", ""))
+
+    def test_a_completed_run_passes_its_text_through(self):
+        done = subprocess.CompletedProcess(["gcloud"], 0, stdout="[]", stderr="")
+        with mock.patch.object(fd.subprocess, "run", return_value=done):
+            result = fd.default_run(["gcloud"])
+        self.assertEqual((result.rc, result.stdout, result.stderr), (0, "[]", ""))
+
+    def test_a_timed_out_clusters_list_reads_as_a_gate_failure_in_gclouds_words(self):
+        with mock.patch.object(fd.subprocess, "run", side_effect=self.TIMED_OUT):
+            timed_out = fd.default_run(["gcloud"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            clusters, record, error = fd.enumerate_project_clusters("proj-a", run=lambda argv, **kw: timed_out)
+        self.assertEqual((clusters, record), ([], None))
+        self.assertEqual(error, f"clusters list rc={fd.TIMEOUT_RC}: WARNING: zone did not respond")
+
+    def test_a_timed_out_projects_list_is_quoted_as_text_not_as_a_bytes_repr(self):
+        """`discover_fleet` formats the listing's stderr into the manifest's
+        partial note with an f-string, which renders bytes as `b'...'` without
+        raising; the note must carry gcloud's words."""
+        with mock.patch.object(fd.subprocess, "run", side_effect=self.TIMED_OUT):
+            timed_out = fd.default_run(["gcloud"])
+
+        def run(argv, **_):
+            if argv[:3] == ["gcloud", "config", "get-value"]:
+                return fd.Run(argv, 0, "acme\n", "", 0.0)
+            return timed_out
+
+        fd.declared_scope.set(None, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            discovery = fd.discover_fleet(None, run=run)
+        self.assertEqual(discovery.projects, ["acme"])
+        self.assertIn(f"`gcloud projects list` rc={fd.TIMEOUT_RC}: WARNING: zone did not respond. The scope", discovery.partial)
+
 
 if __name__ == "__main__":
     unittest.main()

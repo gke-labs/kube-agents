@@ -177,14 +177,46 @@ func TestResolveDeploymentReplicasAndStrategy(t *testing.T) {
 			expectedStrategy: appsv1.RecreateDeploymentStrategyType,
 		},
 		{
-			name: "high availability enabled",
+			// Capped at supportedGatewayReplicas: a multi-replica gateway does
+			// not start (#2995), so two renders as one, under Recreate.
+			name: "two replicas are capped at one",
 			deployment: &agentv1alpha1.DeploymentSpec{
 				Availability: &agentv1alpha1.AvailabilitySpec{
 					Replicas: ptr.To(int32(2)),
 				},
 			},
-			expectedReplicas: 2,
-			expectedStrategy: appsv1.RollingUpdateDeploymentStrategyType,
+			expectedReplicas: 1,
+			expectedStrategy: appsv1.RecreateDeploymentStrategyType,
+		},
+		{
+			name: "three replicas are capped at one",
+			deployment: &agentv1alpha1.DeploymentSpec{
+				Availability: &agentv1alpha1.AvailabilitySpec{
+					Replicas: ptr.To(int32(3)),
+				},
+			},
+			expectedReplicas: 1,
+			expectedStrategy: appsv1.RecreateDeploymentStrategyType,
+		},
+		{
+			name: "one replica is unchanged",
+			deployment: &agentv1alpha1.DeploymentSpec{
+				Availability: &agentv1alpha1.AvailabilitySpec{
+					Replicas: ptr.To(int32(1)),
+				},
+			},
+			expectedReplicas: 1,
+			expectedStrategy: appsv1.RecreateDeploymentStrategyType,
+		},
+		{
+			name: "zero replicas are unchanged",
+			deployment: &agentv1alpha1.DeploymentSpec{
+				Availability: &agentv1alpha1.AvailabilitySpec{
+					Replicas: ptr.To(int32(0)),
+				},
+			},
+			expectedReplicas: 0,
+			expectedStrategy: appsv1.RecreateDeploymentStrategyType,
 		},
 		{
 			name: "scale to zero enabled",
@@ -203,7 +235,7 @@ func TestResolveDeploymentReplicasAndStrategy(t *testing.T) {
 				ScaleToZero: ptr.To(true),
 			},
 			expectedReplicas: 0,
-			expectedStrategy: appsv1.RollingUpdateDeploymentStrategyType,
+			expectedStrategy: appsv1.RecreateDeploymentStrategyType,
 		},
 	}
 
@@ -248,9 +280,10 @@ func TestRollingUpdateAlwaysAllowsProgressUnderAQuota(t *testing.T) {
 		{replicas: 8, expectedMaxUnavailable: 2, expectedMaxSurge: 2},
 	} {
 		t.Run(fmt.Sprintf("replicas=%d", tc.replicas), func(t *testing.T) {
-			_, strategy := resolveDeploymentReplicasAndStrategy(&agentv1alpha1.DeploymentSpec{
-				Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(tc.replicas)},
-			})
+			// replicasAndStrategyFor directly: the spec path caps the count at
+			// supportedGatewayReplicas, and this invariant is about the
+			// multi-replica strategy that cap keeps out of the render.
+			_, strategy := replicasAndStrategyFor(tc.replicas, false)
 
 			if strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
 				t.Fatalf("expected RollingUpdate at %d replicas, got %s", tc.replicas, strategy.Type)

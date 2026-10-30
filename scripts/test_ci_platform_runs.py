@@ -57,6 +57,8 @@ RUNNER_CONSTANTS = (
     "EVAL_GATEWAY_HOME",
     "EVAL_PLATFORM_RUN_WAIT_SECONDS",
     "EVAL_PLATFORM_RUN_POLL_SECONDS",
+    "EVAL_GATEWAY_NOT_FOUND_RE",
+    "EVAL_GATEWAY_GONE_RC",
 )
 
 
@@ -340,6 +342,44 @@ class PlatformRunsTest(unittest.TestCase):
         )
         self.assertIn("returned 0", done.stdout, done.stderr)
         self.assertIn("stopped waiting on compliance-audit after 2s", done.stderr)
+
+    def test_a_gateway_that_is_not_found_ends_the_wait_at_once(self):
+        # #3129: another run's teardown had uninstalled the install, and the
+        # exec failed this way every 30 s for two hours per repetition. A
+        # missing Deployment is not a rolling pod; no retry mends it.
+        fn = re.search(r"^wait_platform_runs\(\) \{.*?^\}$", RUNNER.read_text(), re.S | re.M).group(0)
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir()
+        count = self.home / "count"
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text(
+            f'#!/bin/sh\ncat > /dev/null\nn=$(($(cat "{count}" 2>/dev/null || echo 0) + 1))\necho "$n" > "{count}"\n'
+            'echo \'Error from server (NotFound): deployments.apps "platform-agent-gateway" not found\'; exit 1\n'
+        )
+        kubectl.chmod(0o755)
+        body = "\n".join(
+            [
+                "set -euo pipefail",
+                f'SCRIPT_DIR="{REPO / "hack"}"',
+                *runner_constants(),
+                # A short bound, so a regression to retrying reads as a clean
+                # assertion failure rather than the subprocess timing out.
+                "EVAL_PLATFORM_RUN_WAIT_SECONDS=3 EVAL_PLATFORM_RUN_POLL_SECONDS=0",
+                "PROJECT_ID=proj AGENT_CLUSTER_CONTEXT=gke_proj_us_c TARGET_NAMESPACE=ns AGENT_SERVICE_NAME=platform-agent",
+                fn,
+                'rc=0; wait_platform_runs "case rep 1" "compliance-audit" || rc=$?',
+                'echo "returned ${rc} gone=${EVAL_GATEWAY_GONE_RC}"',
+            ]
+        )
+        done = subprocess.run(
+            ["bash", "-c", body], capture_output=True, text=True, check=False, timeout=60,
+            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        self.assertRegex(done.stdout, r"returned (\d+) gone=\1\b", done.stdout + done.stderr)
+        self.assertNotIn("returned 0 ", done.stdout)
+        self.assertEqual(count.read_text().strip(), "1", "one exec, no retry")
+        self.assertNotIn("trying again", done.stderr)
+        self.assertIn("is gone", done.stderr)
 
 
 if __name__ == "__main__":

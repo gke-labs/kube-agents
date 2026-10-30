@@ -407,6 +407,13 @@ class HelmEnforcesSchemaTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("/operator/replicaCount", proc.stderr)
 
+    def test_a_stall_watch_bound_fails_with_its_path(self) -> None:
+        # The schema carries the CRD's bounds, so the render fails before the
+        # API server refuses the CR.
+        proc = self._template("--set", "platformAgent.harness.stallWatch.minStallAgeMinutes=1441")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("/platformAgent/harness/stallWatch/minStallAgeMinutes", proc.stderr)
+
     def test_a_numeric_image_tag_renders(self) -> None:
         # Helm's --set reads an all-digit value as an integer; a date-stamped
         # tag must not be refused on type.

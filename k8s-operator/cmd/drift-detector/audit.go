@@ -153,6 +153,15 @@ type AuditRecord struct {
 	// StatusMessage is the human-readable half of that status, empty on
 	// success. Carried so a dropped record can say why it was dropped.
 	StatusMessage string
+
+	// PublishTime is when the entry reached the subscription's topic, read
+	// from the Pub/Sub message rather than the entry. Zero when the message
+	// carried none.
+	PublishTime time.Time
+
+	// Backlog is set by the subscriber on a record that reached this process
+	// late. subscriber.backlog has the rule and the reason for it.
+	Backlog bool
 }
 
 // Succeeded reports whether the call changed the cluster. An audit entry

@@ -531,6 +531,105 @@ func TestDriftFilterDropsNonDeclarativeSubresources(t *testing.T) {
 	}
 }
 
+// TestDriftFilterDropsCoordinationResources pins issue #3353: scripts/live_test_lease.py
+// creates and updates the "live-test-lease" ConfigMap under contributor credentials
+// during live testing. Even though the principal is human, coordination objects are
+// ephemeral developer synchronization and not GitOps drift. They must be dropped as
+// non-declarative rather than forwarded to join or inject.
+//
+// Crucially, coordination Leases (such as leader-election locks in kubeagents-system
+// or kube-system) are NOT dropped by this rule: human writes to Leases must reach
+// the detector to catch control plane lock tampering (the Pub/Sub sink carve-out).
+func TestDriftFilterDropsCoordinationResources(t *testing.T) {
+	human := "jayantid@google.com"
+
+	dropped := []AuditRecord{
+		// The live-test lease ConfigMap in kubeagents-system.
+		{
+			Principal: human,
+			Resource: ResourceRef{
+				Version:   "v1",
+				Namespace: "kubeagents-system",
+				Resource:  "configmaps",
+				Name:      "live-test-lease",
+			},
+		},
+		// The live-test lease in another namespace (custom install namespace).
+		{
+			Principal: human,
+			Resource: ResourceRef{
+				Version:   "v1",
+				Namespace: "custom-system",
+				Resource:  "configmaps",
+				Name:      "live-test-lease",
+			},
+		},
+	}
+
+	forwardedRecords := []AuditRecord{
+		// Normal declarative write by the same human to show the filter keys on the
+		// coordination object rather than the namespace or configmaps in general.
+		{
+			Principal: human,
+			Resource: ResourceRef{
+				Version:   "v1",
+				Namespace: "kubeagents-system",
+				Resource:  "configmaps",
+				Name:      "platform-agent-config",
+			},
+		},
+		// Coordination lease in kubeagents-system: human write must reach the detector
+		// to catch control plane lock tampering (sink carve-out).
+		{
+			Principal: human,
+			Resource: ResourceRef{
+				Group:     "coordination.k8s.io",
+				Version:   "v1",
+				Namespace: "kubeagents-system",
+				Resource:  "leases",
+				Name:      "c5a0294c.kubeagents.x-k8s.io",
+			},
+		},
+		// Coordination lease in another namespace (e.g. kube-system): must also reach detector.
+		{
+			Principal: human,
+			Resource: ResourceRef{
+				Group:     "coordination.k8s.io",
+				Version:   "v1",
+				Namespace: "kube-system",
+				Resource:  "leases",
+				Name:      "kube-controller-manager",
+			},
+		},
+	}
+
+	var forwarded []AuditRecord
+	filter := newDriftFilter(NewClassifier("", ""), func(_ context.Context, r AuditRecord) { forwarded = append(forwarded, r) }, false)
+
+	for _, r := range dropped {
+		filter.Handle(context.Background(), r)
+	}
+	for _, r := range forwardedRecords {
+		filter.Handle(context.Background(), r)
+	}
+
+	counts := filter.Counts()
+	if counts.NonDeclarative != 2 {
+		t.Errorf("NonDeclarative = %d, want 2", counts.NonDeclarative)
+	}
+	if counts.Actionable != 3 {
+		t.Errorf("Actionable = %d, want 3", counts.Actionable)
+	}
+	if len(forwarded) != 3 {
+		t.Fatalf("forwarded len = %d, want 3", len(forwarded))
+	}
+	for i, want := range forwardedRecords {
+		if forwarded[i].Resource != want.Resource {
+			t.Errorf("forwarded[%d] = %+v, want %+v", i, forwarded[i].Resource, want.Resource)
+		}
+	}
+}
+
 // TestClassifierHumanDomainsAreCaseInsensitive pins the normalisation in
 // NewClassifier. DNS is case-insensitive and GCP lower-cases principalEmail, so
 // a miscased --human-domains value must still match. Unnormalised, this sends
@@ -592,6 +691,7 @@ func TestDriftFilterLogDroppedDoesNotPanic(t *testing.T) {
 		{Principal: "system:kube-scheduler"},
 		{Principal: "bob@example.com", StatusCode: 7, StatusMessage: "PERMISSION_DENIED"},
 		{Principal: "ada@example.com", Resource: ResourceRef{Version: "v1", Resource: "pods", Name: "api-0", Subresource: "exec"}},
+		{Principal: "ada@example.com", Resource: ResourceRef{Version: "v1", Namespace: "kubeagents-system", Resource: "configmaps", Name: "live-test-lease"}},
 		{Principal: "ada@example.com", Resource: ResourceRef{Version: "v1", Resource: "pods", Name: "api-0"}},
 	}
 	for _, r := range records {
@@ -599,8 +699,8 @@ func TestDriftFilterLogDroppedDoesNotPanic(t *testing.T) {
 	}
 
 	counts := filter.Counts()
-	if counts.Failed != 1 || counts.NonDeclarative != 1 || counts.Actionable != 1 {
-		t.Errorf("failed=%d non_declarative=%d actionable=%d, want 1/1/1",
+	if counts.Failed != 1 || counts.NonDeclarative != 2 || counts.Actionable != 1 {
+		t.Errorf("failed=%d non_declarative=%d actionable=%d, want 1/2/1",
 			counts.Failed, counts.NonDeclarative, counts.Actionable)
 	}
 }

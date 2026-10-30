@@ -11,6 +11,10 @@ const (
 	NotifySubjectGchat = "chat.notify.gchat"
 	// NotifySubjectSlack is the subject a Slack notify is published on.
 	NotifySubjectSlack = "chat.notify.slack"
+	// NotifySubjectConsole is the subject a console notify is published on.
+	// The console has no home channel, so it serves conversation requests
+	// only.
+	NotifySubjectConsole = "chat.notify.console"
 	// NotifyReplyPrefix is the namespace a notify's reply subject must sit
 	// under: the gateway answers there and nowhere else, and the agent
 	// principal is the one reader of it.
@@ -21,17 +25,24 @@ const (
 	NotifyPlatformGchat = "google_chat"
 	// NotifyPlatformSlack is Slack's, as Hermes spells it (`--to slack`).
 	NotifyPlatformSlack = "slack"
+	// NotifyPlatformConsole is the console door's. Hermes has no console
+	// platform of its own; this is the name the agent side records on a
+	// console conversation's route.
+	NotifyPlatformConsole = "console"
 )
 
 // NotifySubjects maps a caller's platform name to its notify subject.
 var NotifySubjects = map[string]string{
-	NotifyPlatformGchat: NotifySubjectGchat,
-	NotifyPlatformSlack: NotifySubjectSlack,
+	NotifyPlatformGchat:   NotifySubjectGchat,
+	NotifyPlatformSlack:   NotifySubjectSlack,
+	NotifyPlatformConsole: NotifySubjectConsole,
 }
 
 // NotifyRequest is the body of a chat.notify request.
 type NotifyRequest struct {
-	// Text is the message, chunked under the backend cap on the way out.
+	// Text is the message, chunked under the backend cap on the way out,
+	// except on a conversation request with an Update key, which is one
+	// message (an edit reaches one) and is cut to one chunk.
 	Text string `json:"text"`
 	// Thread, when set, is the thread to reply on. It must be a thread of
 	// the home channel; empty starts a new thread there. On Google Chat it
@@ -57,13 +68,28 @@ type NotifyRequest struct {
 	// conversation's own tasks brought to the agent. Thread must be empty.
 	Conversation string `json:"conversation,omitempty"`
 	ContextID    string `json:"context_id,omitempty"`
-	// Chat and Update are reserved for a card's work after its task ends:
-	// Chat a kube-agents.chat/v1 object, with Text its fallback, and Update
-	// a sender-chosen key whose later request edits the message the first
-	// posted in the same conversation. This gateway does not read them yet;
-	// a request carrying them is posted as its Text.
+	// Chat and Update carry a card's work after its task ends, on a request
+	// aimed at a conversation: Chat a kube-agents.chat/v1 object, with Text
+	// its fallback, laid out by a backend that renders it (Slack) and posted
+	// as Text by any other; Update a sender-chosen key whose later request
+	// edits the message the first posted in the same conversation. A home
+	// channel request may carry Chat too (the fleet-audit or first-inventory card), laid
+	// out the same way; it ignores Update.
 	Chat   json.RawMessage `json:"chat,omitempty"`
 	Update string          `json:"update,omitempty"`
+	// AnswerTo, on a conversation request, says the post answers an ask:
+	// it is the delivered report of the card whose completion settled every
+	// card of the ask's plan, and its value is that plan's Update key, which
+	// names the ask (the chain the key's first mark bound). A backend that
+	// draws rating controls draws them on it (answer feedback). The CLI
+	// refuses it on a home channel request, and the gateway ignores it with
+	// Update, which names a message edited in place rather than an answer.
+	AnswerTo string `json:"answer_to,omitempty"`
+	// ReplyTo, on a request aimed at a conversation, is the id of the
+	// gateway task whose turn filed the work this reports on, when the
+	// sender knows it. Only the console passes it on (its frame's replyTo),
+	// so a console client can join a report to the turn it answers.
+	ReplyTo string `json:"reply_to,omitempty"`
 }
 
 // NotifyReply is the answer: the first message posted and the thread it

@@ -72,19 +72,20 @@ is not independently verifiable from this repository alone.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
 import random
 import re
 import shlex
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Callable
 
 MANIFEST_VERSION = 1
 # The stream this collector serves, as `audit_report.py finish --audit` names it.
@@ -105,6 +106,9 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 ]
 
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
+# The rc a refused kubeconfig directory stands for in the credentials
+# result: gcloud was not run through it, and the note is the error.
+KUBECONFIG_REFUSED_RC = 1
 DEFAULT_TIMEOUT_S = 60
 # The credential proxy's admitted count at the operator's default limit;
 # collect.py's MAX_WORKERS comment has the reasoning.
@@ -253,8 +257,9 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
 
-# The scope this collector was handed, set by main from the two flags.
+# The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
 SCOPED_RUN_NOTE = (
@@ -262,23 +267,10 @@ SCOPED_RUN_NOTE = (
     "project in this fleet was named or read, and this run cannot speak for their clusters."
 )
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
-# The project an API refusal names; `fleet_waste.REFUSED_PROJECT_NUMBER_RE`
-# carries the reasoning.
-REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
-# The project *id* a refusal names, when it names one rather than a number,
-# in gcloud's phrasings: `project <id> before`, `Project <id> is not found`,
-# `projects/<id>`, then punctuation, a quote or the end. A project id is 6-30
-# lowercase letters, digits and hyphens, starting with a letter and not ending
-# in a hyphen. Used only to say which project a refusal was about.
-REFUSED_PROJECT_ID_RE = re.compile(
-    r"\b(?i:projects?)[ /]['\"\[]?([a-z][a-z0-9-]{4,28}[a-z0-9])"
-    r"(?=\s+(?:before|is|was|has|does)\b|['\"\],.;:)]|\s*$)"
-)
-# English words of id shape that gcloud's prose puts where an id could sit
-# ("... on this project either."): never read as the project a refusal names.
-REFUSED_PROJECT_ID_STOPWORDS = frozenset({"before", "either", "itself", "number", "should", "settings"})
-# The read `refusal_names_project` makes; `collect_fleet` answers a repeat of
-# it from the first answer.
+# Which project a refusal names, and whether it is the listed project's own:
+# `collect.refusal_owner`, the one rule the collectors share; `refusal_owner`
+# below reads it from there. The read it makes; `collect_fleet` answers a
+# repeat of it from the first answer.
 PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
 # §3.8's read. Its answer depends on region and machine type only, so
 # `_advising_once` answers a repeat from the first success.
@@ -523,43 +515,12 @@ def is_non_production(name: str, labels: dict | None = None, namespace: str = ""
     )
 
 
-class Run(NamedTuple):
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+run_and_gate = collector_run.run_and_gate
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
-
-
-def _text(output: str | bytes | None) -> str:
-    return output.decode(errors="replace") if isinstance(output, bytes) else (output or "")
-
-
-def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=timeout)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
-        # notwithstanding, and every consumer of `Run` searches and slices it as
-        # str. `collect.py`'s `_text` does the same.
-        return Run(argv, 124, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
-    except Exception as exc:
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
-
-
-def run_and_gate(argv: list[str], *, run: RunFn, env: dict | None = None) -> tuple[object | None, Run]:
-    result = run(argv, env=env)
-    if result.rc != 0 or not result.stdout.strip():
-        return None, result
-    try:
-        return json.loads(result.stdout), result
-    except json.JSONDecodeError:
-        return None, result
 
 
 def object_list(parsed: object) -> list | None:
@@ -590,13 +551,17 @@ def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
 
 def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) -> tuple[Path, Run]:
     kc = kubeconfig_path(project, cluster, location)
-    kc.parent.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, "KUBECONFIG": str(kc)}
-    result = run(
-        ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project],
-        env=env,
-    )
-    return kc, result
+    from collect import prepare_kubeconfig  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
+
+    argv = ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project]
+    note = prepare_kubeconfig(kc)
+    if note:
+        # The directory is not this run's to write through: gcloud is not
+        # run through it, and the refusal is the result, as the shared rule's
+        # other callers return it.
+        log(f"{project}/{location}/{cluster}: {note}")
+        return kc, Run(argv, KUBECONFIG_REFUSED_RC, "", note, 0.0)
+    return kc, run(argv, env={**os.environ, "KUBECONFIG": str(kc)})
 
 
 def not_running_entry(c: dict, project: str) -> dict:
@@ -709,34 +674,19 @@ class IncompleteEnumeration(RuntimeError):
 
 
 def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
-    """Whether an API-disabled refusal is `project`'s own; a copy of
-    `fleet_waste.refusal_names_project`, which carries the reasoning."""
-    return refusal_owner(project, stderr, run=run)[0]
+    """Whether an API-disabled refusal is `project`'s own; the one rule is
+    `collect.refusal_names_project`, which carries the reasoning."""
+    from collect import refusal_names_project as shared  # noqa: PLC0415 -- the one rule for an API refusal's owner, in collect.py
+
+    return shared(project, stderr, run=run)
 
 
 def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
-    """`refusal_names_project`'s answer with why when it is no; a copy of
-    `fleet_waste.refusal_owner`, which carries the reasoning."""
-    numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
-    if not numbers:
-        if re.search(rf"\b(?i:projects?)[ /]['\"\[]?{re.escape(project)}(?![\w-])", stderr):
-            return True, ""
-        others = sorted(set(REFUSED_PROJECT_ID_RE.findall(stderr)) - REFUSED_PROJECT_ID_STOPWORDS - {project})
-        if others:
-            return False, f"the refusal names another project ({', '.join(map(repr, others))}), so it cannot be tied to {project!r}"
-        return False, f"the refusal names no project, so it cannot be tied to {project!r}"
-    described = run([*PROJECT_DESCRIBE_ARGV, project, "--format", "value(projectNumber)"])
-    if described.rc != 0:
-        return False, (
-            f"`gcloud projects describe {project}` failed (rc={described.rc}), so the refusal's project "
-            f"number could not be compared with this project's: "
-            f"{described.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}"
-        )
-    if numbers == {described.stdout.strip()}:
-        return True, ""
-    return False, (
-        f"the Kubernetes Engine API is off in a project other than {project!r}, such as a quota project"
-    )
+    """`refusal_names_project`'s answer with why when it is no; the one rule
+    is `collect.refusal_owner`."""
+    from collect import refusal_owner as shared  # noqa: PLC0415 -- the one rule for an API refusal's owner, in collect.py
+
+    return shared(project, stderr, run=run)
 
 
 def _describing_once(run: RunFn) -> RunFn:
@@ -834,6 +784,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
     # the project as holding no cluster.
     if not isinstance(clusters, list) or not all(isinstance(c, dict) for c in clusters):
         raise RuntimeError("cluster enumeration returned JSON that is not a list of clusters")
+    clusters = declared_scope.drop_excluded(project, clusters)
     running = [
         {
             "name": c["name"],
@@ -2606,6 +2557,16 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         except Exception as exc:  # noqa: BLE001 — see crashed_project_error
             return crashed_project_error(p, exc)
 
+    # The shared kubeconfig directory, made usable once before the pool opens
+    # (`collect.usable_kubeconfig_dir`, the one rule): the first wave's threads
+    # would otherwise race one another's move-aside and log it as a refusal.
+    if clusters:
+        from collect import usable_kubeconfig_dir  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
+
+        shared_note = usable_kubeconfig_dir(KUBECONFIG_DIR)
+        if shared_note:
+            log(f"{KUBECONFIG_DIR}: {shared_note}")
+
     cluster_entries = [None] * len(clusters)
     project_reads: dict[str, tuple[dict | None] | str | None] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -2674,7 +2635,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", help="audit only this project (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else every project the credential can see")
     fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     manifest = collect_fleet(args.project)
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0

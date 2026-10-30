@@ -27,7 +27,9 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
@@ -163,22 +165,18 @@ func TestAnUnarmedGatewayCarriesNoSlackPair(t *testing.T) {
 	}
 }
 
-// TestTheSlackIntegrationRendersTheGateway: Slack enabled under next is a
-// backend on the CR alone, so the gate renders the gateway with no Secret
-// in the namespace - the same no-read answer Chat gets. A missing token
-// Secret is the kubelet's to report on the pod (the refs are required).
+// TestTheSlackIntegrationRendersTheGateway: Slack enabled under next renders
+// the gateway with the Slack pair and no other Secret in the namespace. A
+// missing token Secret is the kubelet's to report on the pod (the refs are
+// required).
 func TestTheSlackIntegrationRendersTheGateway(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := slackTestAgent("next", true)
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	state, err := r.reconcileA2A(ctx, agent)
-	if err != nil {
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
-	}
-	if state.gatewayDark {
-		t.Fatalf("Slack is enabled under next and the gateway is reported dark: %q", state.gatewayDarkReason)
 	}
 	dep := &appsv1.Deployment{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, dep); err != nil {
@@ -186,26 +184,6 @@ func TestTheSlackIntegrationRendersTheGateway(t *testing.T) {
 	}
 	if _, ok := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)[a2aSlackAppTokenEnvVar]; !ok {
 		t.Errorf("the rendered gateway carries no %s", a2aSlackAppTokenEnvVar)
-	}
-}
-
-// TestTheDarkReasonNamesSlack: the remedy an admin reads off the A2AGateway
-// condition names the Slack integration beside the Chat field, the Discord
-// Secret and the door.
-func TestTheDarkReasonNamesSlack(t *testing.T) {
-	t.Setenv(a2aInjectBackendEnvVar, "")
-	agent := a2aTestAgent()
-	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
-	ctx := context.Background()
-	theCalloutIsServing(t, ctx, cl, r, agent)
-	state, err := r.reconcileA2A(ctx, agent)
-	if err != nil || !state.gatewayDark {
-		t.Fatalf("precondition: want a dark gateway (state=%+v err=%v)", state, err)
-	}
-	for _, want := range []string{"spec.integration.slack", "spec.integration.googleChat", a2aDiscordBotSecretName, a2aInjectBackendEnvVar} {
-		if !strings.Contains(state.gatewayDarkReason, want) {
-			t.Errorf("the reason does not name %q: %q", want, state.gatewayDarkReason)
-		}
 	}
 }
 
@@ -264,7 +242,9 @@ func TestTheLegacySlackConsumerIsNotRenderedUnderNext(t *testing.T) {
 // which is what opens a Socket Mode connection (the broker's SlackRelay, the
 // gateway's Slack adapter). Slack spreads one app's events across every open
 // connection, so two would split the workspace's messages; none would drop
-// them. Exactly one, in every mode and beside Chat.
+// them. Exactly one in every mode rendered by a single operator, and beside
+// Chat. (Under version skew across operator versions, a frozen gateway and
+// the re-rendered legacy relay both consume; see spec-chatops-gateway.md).
 func TestNoRenderCarriesTwoSlackSocketModeConsumers(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
@@ -438,9 +418,10 @@ func TestChatArmedDropsTheSlackReferences(t *testing.T) {
 // verb on Secrets - the a2a-slack-principal-map Secret is reachable by the
 // kubelet's mount alone. Every Role builder, next stack
 // and legacy, is rendered and read; a wildcard resource counts as reaching
-// them. What this does not bound is the gateway's `create` on pods, which can
-// mount a Secret into a pod it builds; buildA2AGatewayRole's comment records
-// that as the admission policy it owes.
+// them. What this does not bound is the gateway's `create` on pods, which RBAC
+// cannot keep from mounting a Secret into a pod it builds; the admission policy
+// kube-agents-a2a-gateway-pod does, where the chart installs it
+// (buildA2AGatewayRole's comment).
 func TestNoRenderedRoleReachesASecret(t *testing.T) {
 	agent := a2aTestAgent()
 	roles := map[string][]rbacv1.PolicyRule{
@@ -467,11 +448,13 @@ func TestNoRenderedRoleReachesASecret(t *testing.T) {
 
 // TestNoEgressPolicySelectsTheGatewayPod: Slack is reached outbound (the
 // Socket Mode websocket and the Web API), and the gateway pod carries no
-// egress fence - its one policy is the ingress-only inject fence - so no
-// rule has to admit those hosts, and none could name them: the repository's
-// policies are selector and CIDR based. Pinned here so the day a deny-default
-// egress fence is put on the gateway, this test is what says Slack's egress
-// must come with it.
+// egress fence - any policy that selects it (the inject door fence, the
+// A2A door fence, and the gateway's own fence) is ingress-only - so no rule has to admit those hosts, and
+// none could name them: the repository's standard policies are selector and CIDR
+// based (with the exception of buildFQDNNetworkPolicy, which fences the legacy
+// gateway pod rather than the A2A gateway pod).
+// Pinned here so the day a deny-default egress fence is put on the gateway, this
+// test is what says Slack's egress must come with it.
 func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 	agent := a2aTestAgent()
 	dns := []string{"10.96.0.10"}
@@ -479,13 +462,37 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 	agentEgress, _ := buildAgentEgressNetworkPolicy(agent, dns, "")
 	policies := []*networkingv1.NetworkPolicy{
 		buildA2AGatewayNetworkPolicy(agent),
+		buildA2ADoorNetworkPolicy(agent),
+		buildA2AGatewayFencePolicy(agent),
 		buildA2ASessionNetworkPolicy(agent, dns),
 		buildA2ANATSNetworkPolicy(agent),
 		buildA2AVerifierNetworkPolicy(agent, dns),
+		buildA2AConsoleNetworkPolicy(agent),
 		buildCredentialProxyNetworkPolicy(agent),
 		buildShellSandboxNetworkPolicy(agent, dns),
 		agentEgress,
+		buildNetworkPolicy(agent, []string{"10.0.0.0/8"}, netpolProfile{DNSClusterIPs: dns}, false, "", false),
+		buildLiteLLMNetworkPolicy(agent, netpolProfile{DNSClusterIPs: dns}),
 	}
+	fqdnPolicy := buildFQDNNetworkPolicy(agent)
+	rawSel, _, err := unstructured.NestedMap(fqdnPolicy.Object, "spec", "podSelector")
+	if err != nil {
+		t.Fatalf("buildFQDNNetworkPolicy podSelector: %v", err)
+	}
+	var sel metav1.LabelSelector
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(rawSel, &sel); err != nil {
+		t.Fatalf("buildFQDNNetworkPolicy FromUnstructured: %v", err)
+	}
+	policies = append(policies, &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fqdnPolicy.GetName(),
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: sel,
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+		},
+	})
+	matched := 0
 	for _, pol := range policies {
 		if pol == nil {
 			continue
@@ -497,11 +504,19 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 		if !sel.Matches(gatewayPod) {
 			continue
 		}
+		matched++
 		for _, pt := range pol.Spec.PolicyTypes {
 			if pt == networkingv1.PolicyTypeEgress {
-				t.Errorf("%s fences the gateway pod's egress; Slack's websocket and Web API need admitting in it", pol.Name)
+				if pol.Name == fqdnPolicy.GetName() {
+					t.Errorf("%s fences the gateway pod's egress; the FQDN policy must not select the A2A gateway pod without this test being rewritten to read its patterns", pol.Name)
+				} else {
+					t.Errorf("%s fences the gateway pod's egress; Slack's websocket and Web API need admitting in it", pol.Name)
+				}
 			}
 		}
+	}
+	if matched == 0 {
+		t.Fatal("no policy matched the gateway pod; expected the gateway ingress fences to match")
 	}
 }
 
@@ -542,6 +557,34 @@ func TestAnArmedGatewayCarriesTheSlackAllowlist(t *testing.T) {
 			}
 			if got := env[a2aSlackAllowAllUsersEnvVar].Value; got != tc.wantAll {
 				t.Errorf("%s = %q, want %q", a2aSlackAllowAllUsersEnvVar, got, tc.wantAll)
+			}
+		})
+	}
+}
+
+// TestAnswerFeedbackOffIsTheOnlyRenderedState: slack.answerFeedback=false
+// reaches the gateway as its off switch, and unset or true renders nothing,
+// so an install that never set the field keeps its gateway pod as it was.
+func TestAnswerFeedbackOffIsTheOnlyRenderedState(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	off, on := false, true
+	for _, tc := range []struct {
+		name    string
+		setting *bool
+		want    string
+		present bool
+	}{
+		{"unset", nil, "", false},
+		{"true", &on, "", false},
+		{"false", &off, "false", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := slackTestAgent("next", true)
+			agent.Spec.Integration.Slack.AnswerFeedback = tc.setting
+			env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+			got, ok := env[a2aSlackAnswerFeedbackEnvVar]
+			if ok != tc.present || got.Value != tc.want {
+				t.Errorf("%s = %q (rendered %v), want %q (rendered %v)", a2aSlackAnswerFeedbackEnvVar, got.Value, ok, tc.want, tc.present)
 			}
 		})
 	}
@@ -760,18 +803,12 @@ func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 	}
 }
 
-// TestDisablingSlackScalesTheArmedGatewayToZero: Slack is the only backend
-// of a running gateway, and the admin disables it on the CR. The gateway
-// takes the dark path every other last-backend loss takes (#2481): the same
-// Deployment, by UID, at zero replicas, the remedy naming Slack, and one
-// replica again on the same object when Slack comes back.
-//
-// And the zero apply carries no secret-env digest. The stamp (#2401) sits
-// after the dark branch returns, so a gateway at zero replicas is never
-// digested against Secrets that may be gone with the backend; the armed
-// pass shows the digest is there to lose, so its absence on the dark
-// Deployment is the ordering and not a render that never stamps.
-func TestDisablingSlackScalesTheArmedGatewayToZero(t *testing.T) {
+// TestDisablingSlackLeavesTheGatewayRunning: Slack is the only backend of a
+// running gateway, and the admin disables it on the CR. Older operators
+// scaled the gateway to zero here (#2481); now it stays on the same
+// Deployment, by UID, at one replica, without the Slack pair, on the console
+// door alone. Slack back brings the pair back on the same object.
+func TestDisablingSlackLeavesTheGatewayRunning(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	t.Setenv(a2aAgentDoorEnvVar, "")
 	agent := slackTestAgent("next", true)
@@ -786,54 +823,53 @@ func TestDisablingSlackScalesTheArmedGatewayToZero(t *testing.T) {
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
 
-	if state, err := r.reconcileA2A(ctx, agent); err != nil || state.gatewayDark {
-		t.Fatalf("precondition: a Slack-armed gateway renders (state=%+v err=%v)", state, err)
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatalf("precondition: a Slack-armed gateway renders: %v", err)
 	}
 	armed := &appsv1.Deployment{}
 	if err := cl.Get(ctx, key, armed); err != nil {
 		t.Fatalf("precondition: the Slack-armed gateway Deployment exists: %v", err)
 	}
-	if armed.Spec.Template.Annotations[secretEnvHashAnnotation] == "" {
-		t.Fatalf("precondition: the armed pass stamped no %s", secretEnvHashAnnotation)
-	}
 
 	agent.Spec.Integration.Slack.Enabled = ptr.To(false)
-	state, err := r.reconcileA2A(ctx, agent)
-	if err != nil {
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatalf("reconcileA2A with Slack disabled: %v", err)
 	}
-	if !state.gatewayDark || !strings.Contains(state.gatewayDarkReason, "spec.integration.slack") {
-		t.Errorf("a gateway whose last backend was Slack is not dark with a remedy naming Slack (dark=%v reason=%q)",
-			state.gatewayDark, state.gatewayDarkReason)
-	}
-	dark := &appsv1.Deployment{}
-	if err := cl.Get(ctx, key, dark); err != nil {
+	off := &appsv1.Deployment{}
+	if err := cl.Get(ctx, key, off); err != nil {
 		t.Fatalf("the gateway Deployment is gone after Slack was disabled: %v", err)
 	}
-	if dark.UID != armed.UID {
-		t.Errorf("the gateway was replaced (UID %s, was %s), which hands its session pods to the garbage collector", dark.UID, armed.UID)
+	if off.UID != armed.UID {
+		t.Errorf("the gateway was replaced (UID %s, was %s), which hands its session pods to the garbage collector", off.UID, armed.UID)
 	}
-	if got := ptr.Deref(dark.Spec.Replicas, -1); got != 0 {
-		t.Errorf("the gateway asks for %d replicas with no backend, want 0", got)
+	if got := ptr.Deref(off.Spec.Replicas, -1); got != 1 {
+		t.Errorf("the gateway asks for %d replicas with no backend, want 1", got)
 	}
-	if got := dark.Spec.Template.Annotations[secretEnvHashAnnotation]; got != "" {
-		t.Errorf("the zero-replica apply carries %s=%q: the digest was stamped on a dark gateway", secretEnvHashAnnotation, got)
+	offEnv := envMapOf(off.Spec.Template.Spec.Containers[0].Env)
+	if _, ok := offEnv[a2aSlackAppTokenEnvVar]; ok {
+		t.Errorf("the gateway still carries %s with Slack disabled", a2aSlackAppTokenEnvVar)
+	}
+	if offEnv["A2A_CONSOLE_DOOR"].Value != "true" {
+		t.Errorf("A2A_CONSOLE_DOOR = %q with no backend, want \"true\"", offEnv["A2A_CONSOLE_DOOR"].Value)
 	}
 
 	agent.Spec.Integration.Slack.Enabled = ptr.To(true)
-	if state, err := r.reconcileA2A(ctx, agent); err != nil || state.gatewayDark {
-		t.Fatalf("re-enabling Slack did not bring the gateway back (state=%+v err=%v)", state, err)
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatalf("re-enabling Slack: %v", err)
 	}
-	woken := &appsv1.Deployment{}
-	if err := cl.Get(ctx, key, woken); err != nil {
+	back := &appsv1.Deployment{}
+	if err := cl.Get(ctx, key, back); err != nil {
 		t.Fatal(err)
 	}
-	if woken.UID != armed.UID || ptr.Deref(woken.Spec.Replicas, -1) != 1 {
+	if back.UID != armed.UID || ptr.Deref(back.Spec.Replicas, -1) != 1 {
 		t.Errorf("re-enabling Slack left the gateway at UID %s replicas %d, want UID %s replicas 1",
-			woken.UID, ptr.Deref(woken.Spec.Replicas, -1), armed.UID)
+			back.UID, ptr.Deref(back.Spec.Replicas, -1), armed.UID)
 	}
-	if woken.Spec.Template.Annotations[secretEnvHashAnnotation] == "" {
-		t.Errorf("the woken gateway carries no %s; a rotated Slack token would not roll it", secretEnvHashAnnotation)
+	if _, ok := envMapOf(back.Spec.Template.Spec.Containers[0].Env)[a2aSlackAppTokenEnvVar]; !ok {
+		t.Errorf("re-enabling Slack did not bring %s back", a2aSlackAppTokenEnvVar)
+	}
+	if back.Spec.Template.Annotations[secretEnvHashAnnotation] == "" {
+		t.Errorf("the gateway carries no %s; a rotated Slack token would not roll it", secretEnvHashAnnotation)
 	}
 }
 

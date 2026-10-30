@@ -14,9 +14,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -32,9 +35,40 @@ const sessionKindDM = "dm"
 // in a message the adapter marked TopLevel: one that roots a conversation of
 // its own (a top-level Slack DM), so nothing is running in it and the task
 // the user means is in another thread. The notice says where to send it. A
-// thread with nothing running, a question refused at the session cap among
-// them, gets the plain reply: the user is already in the right place.
+// thread with nothing running gets one of the in-thread replies below
+// (nothingRunningNotice or nothingRunningCardNotice): the user is already in
+// the right place.
 const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
+
+// feedbackCommandNotice answers a bare "/feedback", the gateway's second slash
+// command (docs/designs/chat-feedback-command.md): where a report about
+// kube-agents itself goes, what one needs, and how to have the agent write
+// one up. Deterministic and model-free, like every gateway affordance; the
+// two links are chattext's, shared with the personas. "/feedback <text>" is
+// not answered here: it is the agent's turn, passed through as typed.
+var feedbackCommandNotice = fmt.Sprintf(`📝 To report a problem with kube-agents itself:
+• Open an issue: %s
+• Or use the feedback form, which needs no account: %s
+A report needs a one-line summary, the kind (Bug, Feature request, Question or Other) and what happened. A submission becomes a public issue, so keep cluster names, project ids and anything read from a Secret out of it.
+To have it written up and filed for you, send `+"`/feedback <what happened>`"+` — I'll show you the exact text and ask before anything is filed.
+For a usage summary of this install you can paste into a report, send `+"`/feedback summary`"+`.`,
+	chattext.FeedbackTrackerURL, chattext.FeedbackFormURL)
+
+// nothingRunningNotice answers a "stop" in a conversation with no active
+// task. nothingRunningCardNotice is the same answer for a conversation that
+// has run a task before: its turn may have filed a kanban card (the gateway
+// cannot tell whether it did, so the reply says "if"; nor where the card's
+// answer lands, which a console conversation never receives), which ends the
+// turn within seconds but is not a task the gateway holds or can cancel. The
+// card keeps working, so the reply must not read as "nothing is happening"
+// (gke-labs#3263); stopping the card is the follow-up there. A
+// conversation that never ran a task (a first message, or one refused at the
+// session cap) has no card of its own to mention. Both start with the same
+// text, so readers matching "nothing is running" still do.
+const (
+	nothingRunningNotice     = "🤷 nothing is running"
+	nothingRunningCardNotice = "🤷 nothing is running in this conversation. If the agent filed a card for it, that card keeps working until it finishes; stopping a card from chat isn't supported yet."
+)
 
 // What retireIncarnation posts when the previous task cannot be closed on
 // the bus, by what the caller was about to do: three callers start a task,
@@ -43,6 +77,10 @@ const (
 	retireRefusalNotStarted = "⚠️ not started: could not close the previous task on the bus; try again in a moment"
 	retireRefusalStillOn    = "⚠️ could not close the previous task on the bus; the session route is still on and its pod still there — try `/session off` again in a moment"
 )
+
+// noticeBusUnreachable says a task's publish failed: on its rolling line, or
+// posted when the backend keeps none (StatusShower).
+const noticeBusUnreachable = "❌ could not reach the bus; try again"
 
 // turnTimeout bounds one handler turn — an inbound message or a relay
 // batch — so a stuck bus or backend call frees the conversation's queue
@@ -136,8 +174,23 @@ type Gateway struct {
 	ps      *Pseudonymizer
 	log     *slog.Logger
 	spawner spawner // nil until SpawnSessions arms (W4)
+	// usage reads what "/feedback summary" prints (feedback_summary.go);
+	// nil where the gateway has no cluster credentials, and the command then
+	// answers that the summary is unavailable.
+	usage usageSource
 	// metrics is the gateway's counters (metrics.go); never nil after New.
 	metrics *Metrics
+	// feedback is the answer-feedback recorder, set by Run once the
+	// feedback bucket is found (startFeedback); nil leaves answers unmarked.
+	feedback atomic.Pointer[feedbackDesk]
+	// consoleResults holds a console chain end's deliverable from
+	// observeTaskDelivered to the observeTaskTerminal that follows it
+	// (consoleFrame).
+	consoleResults consoleResultStash
+	// consoleCardsPending marks a console chain end whose task handed work
+	// to kanban cards (lib.ArtifactHandoff), from the relay's terminal to
+	// the frame (consoleFrame); the value is unused.
+	consoleCardsPending consoleResultStash
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -179,6 +232,11 @@ type Gateway struct {
 	taskSessions map[string]string
 	// relays holds per-task render state for the rolling progress line.
 	relays map[string]*relayState
+	// cardStopTimers holds each in-flight card-stop control's timeout, by
+	// task id, under mu (cardstop.go). Memory only: a restart loses them,
+	// and the next turn on the conversation expires a control past its
+	// bound instead (expireCardStop).
+	cardStopTimers map[string]*time.Timer
 	// steerNoticesFrom is each addressee this gateway has heard a steer
 	// notice from since it started, under mu: the relay's evidence that the
 	// executor answers follow-ups at all (postSteerShortfall).
@@ -187,7 +245,7 @@ type Gateway struct {
 	// gateway was a no-resume refusal - an executor that cannot continue a
 	// session, the bridge's cli executor - under mu, and cleared by a
 	// queued notice from it. routeTurn gives such an addressee the wide
-	// status matcher (isStatusQuery says why). The gateway cannot see the
+	// status matcher (chattext.IsStatusQuery says why). The gateway cannot see the
 	// executor, so the first follow-up to one is acknowledged and refused
 	// before this is learned.
 	steersRefusedBy map[string]bool
@@ -296,6 +354,10 @@ func New(o Options) (*Gateway, error) {
 		// backend the inject door wins the default, and every message
 		// through either stamps its own.
 		backend = a2aBackend
+	} else if backend == "" && o.Config.ConsoleDoor {
+		// The console door alone (A2A_CONSOLE_DOOR): every message through
+		// it stamps console itself, and the default says the same.
+		backend = consoleBackend
 	}
 	if backend == injectBackend {
 		// Said out loud, and repeated on the door's read route
@@ -413,6 +475,9 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.FirstEventGrace <= 0 {
 		o.Config.FirstEventGrace = defaultFirstEventGrace
 	}
+	if o.Config.CardStopTimeout <= 0 {
+		o.Config.CardStopTimeout = defaultCardStopTimeout
+	}
 	if o.Config.SessionTTL <= 0 {
 		o.Config.SessionTTL = defaultSessionTTL
 	}
@@ -433,6 +498,7 @@ func New(o Options) (*Gateway, error) {
 		sessionLocks:     map[string]*sessionLockEntry{},
 		taskSessions:     map[string]string{},
 		relays:           map[string]*relayState{},
+		cardStopTimers:   map[string]*time.Timer{},
 		steerNoticesFrom: map[string]bool{},
 		steersRefusedBy:  map[string]bool{},
 		backend:          backend,
@@ -469,6 +535,18 @@ func New(o Options) (*Gateway, error) {
 	if sink, ok := o.Adapter.(SessionLookupSink); ok {
 		sink.SetSessionLookup(g.hasSession, o.Config.IdleTTL)
 	}
+	// The Home tab: the allowlist an inbound message is admitted by, and the
+	// agent pod's board read over the bus (slack_home.go, board.go).
+	if sink, ok := o.Adapter.(HomeSink); ok {
+		sink.SetHome(func(member string) (bool, bool) {
+			return g.slackRosterPrincipal(member) != "", g.slackAllowAll && !g.slackAllowed[member]
+		}, busBoardReader(o.Client))
+	}
+	// The board-health card's Retry and Drop, over the same route
+	// (slack_board.go); the adapter admits the presser by the Home tab's rule.
+	if sink, ok := o.Adapter.(BoardActSink); ok {
+		sink.SetBoardActor(busBoardActor(o.Client))
+	}
 	g.events = newKeyedQueue(g.relayBatch)
 	if o.Spawner != nil {
 		g.spawner = o.Spawner
@@ -478,6 +556,12 @@ func New(o Options) (*Gateway, error) {
 			return nil, fmt.Errorf("session-pod spawning is enabled but the k8s client failed: %w", err)
 		}
 		g.spawner = s
+	}
+	// Tests set g.usage directly; there is no option for it.
+	if src, err := newK8sUsageSource(o.Config); err == nil {
+		g.usage = src
+	} else {
+		log.Info("feedback summary: no in-cluster reader; /feedback summary will answer unavailable", "reason", err)
 	}
 	if o.Config.DefaultAddressee == RouteSession && g.spawner == nil {
 		return nil, fmt.Errorf("A2A_DEFAULT_ADDRESSEE=%s requires A2A_SPAWN_SESSIONS=true: without a spawner the sentinel would publish tasks to a literal %q addressee no executor owns", RouteSession, RouteSession)
@@ -499,6 +583,9 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // the adapter until ctx is done.
 func (g *Gateway) Run(ctx context.Context) error {
 	g.runCtx = ctx
+	// Its first try before the relay starts, so on an install with the
+	// bucket every answer the relay posts is marked alike.
+	g.startFeedback(ctx)
 	// Both task-event subjects, one durable: the executors' events and the
 	// terminals this gateway synthesizes as supervisor, which it relays to
 	// the requester and retires the task on exactly like an executor's own.
@@ -571,12 +658,29 @@ func (h *sessionLockHandle) Lock() {
 	h.entry.mu.Lock()
 }
 
+// TryLock takes the lock only if it is free. On false the handle is spent:
+// its reference is released and a later Unlock is a no-op, so a caller can
+// defer Unlock either way.
+func (h *sessionLockHandle) TryLock() bool {
+	if h.entry.mu.TryLock() {
+		return true
+	}
+	h.unlocked = true
+	h.release()
+	return false
+}
+
 func (h *sessionLockHandle) Unlock() {
 	if h.unlocked {
 		return
 	}
 	h.unlocked = true
 	h.entry.mu.Unlock()
+	h.release()
+}
+
+// release drops the handle's reference, pruning the entry with the last one.
+func (h *sessionLockHandle) release() {
 	h.g.mu.Lock()
 	h.entry.refcount--
 	if h.entry.refcount <= 0 {
@@ -611,7 +715,16 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// rather than as a guess about timing.
 	defer g.observeTurnFinished(msg.Conversation)
 
+	// Counted before the sender is verified, as the chat_metrics plugin
+	// counts the Hermes-side ingress before its allowlist, so the two halves
+	// of chatMessagesInboundTotal mean the same thing: a message a person
+	// sent, whether or not the gateway went on to answer it.
+	if platform, ok := metricsPlatformLabel(g.backendFor(msg)); ok {
+		g.metrics.messageInbound(platform)
+	}
+
 	backend, principal, ok := g.verifySender(msg)
+	g.observeInboundVerified(msg, ok)
 	if !ok {
 		return
 	}
@@ -692,26 +805,48 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 	backend = g.backendFor(msg)
 	principal = g.resolvePrincipal(backend, msg.AuthorID)
 	if principal == "" {
-		g.log.Warn("dropping message from unverified sender",
-			"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation)
+		if msg.Unaddressed {
+			// Someone off the list talking under one of the bot's posts, to a
+			// colleague as often as not: routine, so Info rather than a Warn per
+			// message. Not Debug: the gateway's handler drops Debug, and this
+			// line is the only trace the drop leaves.
+			g.log.Info("dropping unaddressed message from unverified sender",
+				"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation, "unaddressed", true)
+		} else {
+			g.log.Warn("dropping message from unverified sender",
+				"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation)
+		}
 		// Keyed by backend and case-folded author: one gateway has several
 		// ingresses, and the same id on two of them is not the same sender,
 		// so a notice on one must not silence the other. Case-folded because
 		// an asserted address that varies in case is one person. Bounded the
 		// way the adapters bound their own maps: wholesale eviction at the
 		// cap, which at worst repeats a notice.
-		key := droppedNoticeKey(backend, msg.AuthorID)
-		g.mu.Lock()
-		if len(g.droppedNotices) >= droppedNoticesCap {
-			g.droppedNotices = map[string]bool{}
-		}
-		notified := g.droppedNotices[key]
-		g.droppedNotices[key] = true
-		g.mu.Unlock()
+		//
+		// Not for a message that addressed nobody (Unaddressed): a member off
+		// the list talking to a colleague under an alert would otherwise get
+		// a public refusal in a thread the channel is reading. Nor is it
+		// counted as notified, so their first real ask still gets the notice.
+		//
+		// Nor for a shortcut: the conversation is a thread under someone
+		// else's message, and the adapter tells the clicker privately
+		// (InboundMessage.Shortcut).
+		//
+		// Nor for a press of Slack's Stop button: it asked the bot for
+		// nothing, and the notice would land in a thread the channel reads.
+		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend)
 		if !notified {
-			g.post(msg.Conversation, "⛔ I can't verify who you are on "+backend+
-				" (id "+msg.AuthorID+"), so I can't take asks from you yet — an admin has to add you to "+
-				unverifiedRemedyFor(backend)+".")
+			key := droppedNoticeKey(backend, msg.AuthorID)
+			g.mu.Lock()
+			if len(g.droppedNotices) >= droppedNoticesCap {
+				g.droppedNotices = map[string]bool{}
+			}
+			notified = g.droppedNotices[key]
+			g.droppedNotices[key] = true
+			g.mu.Unlock()
+		}
+		if !notified {
+			g.post(msg.Conversation, unverifiedNotice(backend, msg.AuthorID))
 		}
 		// After the notice, and whether or not one was posted: an adapter
 		// whose caller is a program has to learn about the drop it is not
@@ -747,6 +882,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		}
 	}
 	rec.LastActivity = time.Now().UTC()
+	rec.LastUserMessage = rec.LastActivity
 
 	rosterIDs, rosterComplete, err := g.adapter.Roster(msg.Conversation)
 	if err != nil {
@@ -776,6 +912,8 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// card rather than clearing silently — the same deterministic template
 	// the status ask uses. In the relay-lag case this duplicates the
 	// rolling-line edit that follows; redundant beats swallowed.
+	// MarkTerminalObserved on the record dedupes the relay's observeTaskTerminal
+	// call so metrics are not double-counted.
 	//
 	// The other stale shape has no terminal to find: a task with NO events
 	// at all (TasksGet answers TaskNotFound) because its executor never
@@ -800,6 +938,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// heal writes the record under this conversation's lock, and a read
 	// that also wrote would be a second writer racing the next turn.
 	g.healActiveTask(ctx, rec)
+	// A card-stop control past its bound whose timer this process never
+	// held (it started before a restart) is given up here, before the stop
+	// switch reads it as in flight.
+	g.expireCardStop(ctx, rec, authority)
 
 	active := rec.ActiveTask
 	// The status matcher's wide rule only where a stolen steer costs
@@ -812,19 +954,26 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// "Chat entrypoints"): it is not a status ask, not a stop, and never a
 	// steer. Text only - a programmatic cancel keeps its intent whatever
 	// its text says.
-	sessionRest, sessionCmd := isSessionCommand(msg.Text)
+	sessionRest, sessionCmd := chattext.IsSessionCommand(msg.Text)
 	if sessionCmd && g.spawner != nil && g.cfg.DefaultAddressee == RouteSession &&
-		sessionRest != "" && !isSessionOff(sessionRest) {
+		sessionRest != "" && !chattext.IsSessionOff(sessionRest) {
 		// Post-flip, every conversation is a session already, so
 		// "/session <text>" is <text>: the ordinary turn it would have been
 		// without the prefix, not a confirmation that drops the ask.
 		msg.Text, sessionCmd = sessionRest, false
 	}
+	// The bare "/feedback" and "/feedback summary" are answered in place
+	// whatever the conversation's route or task state; any other text after
+	// the word makes the message the agent's and nothing here changes
+	// (chattext.IsFeedbackCommand, IsFeedbackSummaryCommand).
+	feedbackRest, feedbackCmd := chattext.IsFeedbackCommand(msg.Text)
+	bareFeedback := feedbackCmd && feedbackRest == ""
+	summaryFeedback := feedbackCmd && chattext.IsFeedbackSummaryCommand(msg.Text)
 	// An explicit cancel from a backend that can express one is read before
 	// the text is read at all: it is not an ask, and a program must never
 	// have to spell "stop" to reach a control path. Read after the strip
 	// above, so a post-flip "/session stop" is the stop it unwraps to.
-	stopping := msg.Intent == IntentCancel || isStop(msg.Text)
+	stopping := msg.Intent == IntentCancel || chattext.IsStop(msg.Text)
 	// A program holds a delegation chain's root id only (observedAs), so a
 	// cancel naming the root while the chain runs is a cancel of the task
 	// that is running: the child, or the wake. Published at the root's own
@@ -847,36 +996,83 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		}
 	}
 	switch {
+	case msg.Intent == "" && bareFeedback:
+		// Answered without touching the record's task state: not a steer,
+		// not a stop, not a new task.
+		g.log.Info("feedback notice", "conversation", rec.Key)
+		g.post(rec.Key, feedbackCommandNotice)
+	case msg.Intent == "" && summaryFeedback:
+		// The same contract as the bare form: the gateway's own answer, the
+		// usage summary block (feedback_summary.go), and no task.
+		g.feedbackSummary(ctx, rec)
 	case msg.Intent == "" && sessionCmd:
 		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
 			return
 		}
-	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
+	case msg.Intent == "" && active != nil && chattext.IsStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
-	case msg.Intent == "" && msg.TopLevel && active == nil && isStatusQuery(msg.Text, false):
+	case msg.Intent == "" && msg.TopLevel && active == nil && chattext.IsStatusQuery(msg.Text, false):
 		// A status question that roots its own conversation has no task to
 		// report on and must not become one that reads "any update?".
-		// isStatusQuery is a phrase set (text.go), so a real question such
+		// chattext.IsStatusQuery is a phrase set, so a real question such
 		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
+	case stopping && isSlackStop(msg, backend) &&
+		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
+		// Only the people who asked for work in a Slack thread may press
+		// its Stop button (stopgate.go). Anyone else's press cancels
+		// nothing and posts nothing. A typed `stop` keeps the rule below.
+		g.log.Info("slack stop refused: not a requester in this conversation", "conversation", rec.Key)
+	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
+		g.slackStop(ctx, rec, authority, backend)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
 		// active -- the heal a few lines up may just have released it.
 		g.cancelNamedTask(ctx, rec, msg.TaskID, authority)
 	case active != nil && !active.Detached && stopping:
-		g.cancelTask(ctx, rec, authority)
+		// The turn may already have filed a card, so an armed stop that
+		// names no task stops the conversation's cards too, after the
+		// cancel: the control waits for the turn it cancels to end
+		// (cardStopWanted says which stops send one).
+		// A control already in flight may have passed this turn's cards
+		// by, so it is marked for one follow-up (markCardStopAgain).
+		if g.cancelTask(ctx, rec, authority) && g.cardStopWanted(rec, msg) {
+			if rec.CardStop == nil {
+				g.stopCards(ctx, rec, authority, backend, false)
+			} else {
+				markCardStopAgain(rec, authority)
+			}
+		}
 	case stopping:
 		// A stop with nothing to stop must not fall through and become a
 		// task that literally reads "stop": the impatient second "stop"
 		// (cancel sent, terminal pending) and a bare "stop" with nothing
-		// running both land here, answered deterministically.
+		// running both land here, answered deterministically. Armed, the
+		// card stop answers both instead: the cards are what may still be
+		// running (gke-labs#3263), and one control at a time.
+		cardStop := g.cardStopWanted(rec, msg)
 		switch {
+		case cardStop && rec.CardStop != nil:
+			// The control in flight is the stop on the bus: the inject
+			// door's cancel reports it, rather than a cancel never sent.
+			// The notice promises an answer, which a quiet follow-up would
+			// otherwise keep to itself when it finds nothing (Promised).
+			markCardStopAgain(rec, authority)
+			rec.CardStop.Promised = true
+			g.observeCancelPublished(rec.Key, rec.CardStop.TaskID)
+			g.post(rec.Key, cardStopAlreadyNotice)
+		case active != nil && cardStop:
+			g.stopCards(ctx, rec, authority, backend, false)
 		case active != nil:
 			g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
 		case msg.TopLevel:
 			g.post(rec.Key, topLevelNothingRunningNotice)
+		case len(rec.Tasks) > 0 && cardStop:
+			g.stopCards(ctx, rec, authority, backend, false)
+		case len(rec.Tasks) > 0:
+			g.post(rec.Key, nothingRunningCardNotice)
 		default:
-			g.post(rec.Key, "🤷 nothing is running")
+			g.post(rec.Key, nothingRunningNotice)
 		}
 	case active != nil && !active.Detached:
 		// The one routing decision with no other log line: a new task logs
@@ -887,7 +1083,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			"addressee", rec.Addressee, "taskAge", time.Since(active.SubmittedAt).Round(time.Second))
 		g.steerTask(ctx, rec, msg, backend, authority)
 	default:
-		if rest, ok := isDelegate(msg.Text); ok && g.spawner != nil {
+		if rest, ok := chattext.IsDelegate(msg.Text); ok && g.spawner != nil {
 			// The Delegate flow (W4 amendment): this ONE task goes to a
 			// freshly spawned session worker - the addressee is the new
 			// session name, the rest of the text is the task. On a
@@ -907,9 +1103,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			// A lingering previous incarnation is not this task's executor,
 			// and its task is already closed (healed or detached). Delete
 			// the pod rather than just untrack it: once PodName clears,
-			// reap can never find it again, and sweep only sees terminal
-			// phases - a wedged Running pod would hold its bus credential
-			// forever. If the task is detached, the gateway is its
+			// reap can never find it again, and the sweep takes a live pod
+			// only when it is a reused one its record no longer names
+			// (sweepUntracked) - a wedged Running one-task pod would hold
+			// its bus credential until its deadline. If the task is detached, the gateway is its
 			// supervisor and owes its terminal `canceled` BEFORE the delete
 			// (the one deletion rule in Session lifecycle); a refusal here
 			// precedes every route mutation, so the record is untouched.
@@ -923,9 +1120,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			rec.Addressee = rec.BusSession
 			msg.Text = rest
 		} else if rec.SessionRouted {
-			// Every new task on the session route gets a fresh incarnation;
-			// freshIncarnation says why and holds the cap.
-			if !g.freshIncarnation(ctx, rec) {
+			// A new task on the session route goes to the conversation's
+			// live pod when it can take it, and to a fresh incarnation
+			// otherwise; nextIncarnation says when, and the fresh path
+			// holds the cap.
+			if !g.nextIncarnation(ctx, rec) {
 				return
 			}
 		} else {
@@ -1033,6 +1232,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	healed := false
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only
+	var healedTerminal chatmsg.Reading
 	switch {
 	case err == nil && task.Final && task.Artifact(lib.ArtifactDelegate) != nil && !rec.delegationHandled(active.TaskID):
 		// A turn that asked to delegate, whose request the relay has not
@@ -1103,12 +1303,26 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			}
 		}
 		g.logTaskTerminal(rec, addressee, active.TaskID, task.State, source, finalMessageText(task))
+		// A console client is told the task handed work to cards, as the
+		// relay tells it (relayTerminal): the fold read here carries the
+		// handoff too, so a heal-found end is not the one path without it.
+		if isConsoleConversation(rec.Key) && handedOff(task.State, foldHandedOff(task)) {
+			root, _ := rec.observedAs(active.TaskID)
+			g.consoleCardsPending.put(root, "")
+		}
 		// Under the chain's root, and not at all for a child: its result
 		// is the wake's to digest, not the root's deliverable, and the
 		// root's end comes from the wake below or, with no wake, from
 		// observeChildEnd.
 		g.observeEnded(rec, active.TaskID, task.State, source, finalMessageText(task))
-		healed, healedSource, healedTask = true, source, task
+		rec.MarkTerminalObserved(active.TaskID)
+		// The terminal's mark, or the default, as relayTerminal draws it.
+		var terminal chatmsg.Reading
+		if task.FinalMessage != nil {
+			terminal = g.readChat(rec.Key, active.TaskID, chatmsg.Terminal, task.FinalMessage.Parts)
+		}
+		g.terminalMark(rec, active.TaskID, task.State, terminal)
+		healed, healedSource, healedTask, healedTerminal = true, source, task, terminal
 	case noFirstEventPastGrace(active, isTaskNotFound(err), g.cfg.FirstEventGrace, time.Now()):
 		g.log.Info("healing an active task with no first event inside the grace",
 			"conversation", rec.Key, "taskId", active.TaskID, "addressee", addressee,
@@ -1123,7 +1337,15 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// says, age is not evidence.
 		g.logTaskTerminal(rec, addressee, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		g.observeEnded(rec, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
+		g.applyTerminalMark(rec, active.TaskID, lib.StateFailed)
 		healed, healedSource = true, TerminalNeverStarted
+		// A pod that never started this task is not handed the next one:
+		// it may yet run the abandoned task first, after the person has
+		// moved on, or never run anything. Unmarked, the next turn retires
+		// it and spawns fresh, as before reuse (reuseLivePod).
+		if addressee == rec.BusSession && rec.PodName == rec.BusSession {
+			rec.PodReuse = false
+		}
 	}
 	if healed {
 		// Notices held for the task's terminal (a delegation refusal)
@@ -1143,16 +1365,19 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// terminal the heal found finds no route and is dropped, so it
 		// neither posts nor wakes. A never-started child's late events are
 		// dropped the same way. A human turn keeps its index, so its late
-		// result still posts.
+		// result still posts; MarkTerminalObserved on the record prevents
+		// double-counting in metrics when the relay arrives.
 		ref, known := rec.TaskRefFor(active.TaskID)
 		child := known && ref.Role == taskRoleChild
 		if child {
 			g.retireTaskRoute(ctx, active.TaskID)
 		}
+		unmarkOnSupervisorTerminal(rec, active.TaskID, healedSource)
 		rec.ActiveTask = nil
 		// The same rule as relayTerminal's, for the same terminal reaching
 		// the record by the other route: an executor's end of the task is
-		// activity, and the idle window opens at the answer. Without this a
+		// activity, and the session-thread window opens at the answer (the
+		// reap's opens at the last user message). Without this a
 		// healed thread went quiet the moment its lost answer was posted.
 		if healedSource == TerminalFromExecutor {
 			now := time.Now().UTC()
@@ -1165,10 +1390,19 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// child that never started does not: the room has the never-started
 		// notice, and there is no outcome to hand the session. The turn
 		// that ran the heal then routes against the wake as its active task.
+		// As the relay does: a task, a human turn or a child, that handed
+		// the ask to cards leaves the answer, and its rating, to the card's
+		// report (AnswerFeedbackTarget rates only such a chain).
+		toCards := healedTask != nil &&
+			(cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask)))
+		if toCards {
+			rec.markCardsAnswer(active.TaskID)
+		}
 		switch {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason); !woken {
+			// false: the heal's status card above carries no result text.
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, toCards); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:
@@ -1484,6 +1718,13 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		// never that nothing is there.
 		return state, fmt.Errorf("reading task %s on %s: %w", read, addressee, terr)
 	}
+	if chainUsageAsked(ctx) {
+		readTask := task
+		if terr != nil {
+			readTask = nil
+		}
+		state.Usage, state.ChildUsage, state.UsagePartial = g.chainUsage(ctx, rec, taskID, read, readTask)
+	}
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a
@@ -1509,11 +1750,75 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 	return state, nil
 }
 
+// chainUsage is what taskID's turns cost, from the usage artifact's parts
+// summed (lib.UsageTotal) per tier. front is the front door's own turns:
+// taskID's stream and, when taskID is a delegation chain's root, every wake
+// that continued it. children is the chain's child tasks, the addressees the
+// front door delegated to (the platform router that files the cards among
+// them). Either is nil when none of its turns published usage. partial
+// reports that a link's stream could not be read, so the sums leave out
+// whatever that link cost. The stream the probe already folded (read,
+// readTask; nil when it found no events) is not read twice.
+func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, read string, readTask *lib.Task) (front, children *lib.Usage, partial bool) {
+	links := []TaskRef{{ID: taskID}}
+	if ref, ok := rec.TaskRefFor(taskID); ok {
+		links[0] = ref
+		if ref.Role != taskRoleChild && ref.rootID() == taskID {
+			for _, other := range rec.Tasks {
+				if other.ID != taskID && other.rootID() == taskID {
+					links = append(links, other)
+				}
+			}
+		}
+	}
+	var frontTurns, childTurns []lib.Usage
+	for i, link := range links {
+		folded := readTask
+		if link.ID != read {
+			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID)
+			switch {
+			case err == nil:
+				folded = t
+			case isTaskNotFound(err):
+				folded = nil
+			default:
+				partial = true
+				continue
+			}
+		}
+		if folded == nil {
+			continue
+		}
+		for _, p := range artifactParts(folded, lib.ArtifactUsage) {
+			u, ok := lib.UsageOf(p)
+			if !ok {
+				continue
+			}
+			if i > 0 && link.Role == taskRoleChild {
+				childTurns = append(childTurns, u)
+			} else {
+				frontTurns = append(frontTurns, u)
+			}
+		}
+	}
+	return usageSum(frontTurns), usageSum(childTurns), partial
+}
+
+// usageSum is turns folded by lib.UsageTotal, or nil when there are none.
+func usageSum(turns []lib.Usage) *lib.Usage {
+	if len(turns) == 0 {
+		return nil
+	}
+	total := lib.UsageTotal(turns)
+	return &total
+}
+
 // retireIncarnation deletes the record's lingering session pod before a
 // successor is minted or the route is left. Delete rather than just untrack:
-// once PodName clears, reap can never find the pod again, and sweep only
-// sees terminal phases - a wedged Running pod would hold its bus credential
-// forever. A detached task's supervisor terminal is owed BEFORE the delete
+// once PodName clears, reap can never find the pod again, and the sweep takes
+// a live pod only when it is a reused one its record no longer names
+// (sweepUntracked) - a wedged Running one-task pod would hold its bus
+// credential until its deadline. A detached task's supervisor terminal is owed BEFORE the delete
 // (the one deletion rule in Session lifecycle); false means that terminal
 // could not be published, a post has said so, and nothing was touched.
 // Spawner-nil is the W4-rollback shape: the record names a pod nothing can
@@ -1536,13 +1841,14 @@ func (g *Gateway) retireIncarnation(ctx context.Context, rec *SessionRecord, why
 }
 
 // freshIncarnation retires the previous session pod, if any, and mints the
-// next incarnation's name as the record's addressee. The worker adapter is
-// one task per process, so a lingering PodName names an executor that can
-// never serve the next task; publishing toward it wedges the conversation
-// (S9 review finding). Retire it the way Delegate does: supervisor terminal
-// for a detached task first, then the delete, then the successor. The cap
-// holds here too, or Delegate refusals just push the flood one affordance
-// over.
+// next incarnation's name as the record's addressee. It is the path for a
+// conversation whose pod cannot take the next task (reuseLivePod): none is
+// live, it was spawned to serve one task only, or a stopped task is still
+// finishing on it. Publishing toward such a pod wedges the conversation (S9
+// review finding), so it is retired the way Delegate does: supervisor
+// terminal for a detached task first, then the delete, then the successor.
+// The cap holds here too, or Delegate refusals just push the flood one
+// affordance over.
 //
 // False means the turn was refused - at the cap, or because the previous
 // task could not be closed on the bus - and a post has already said so.
@@ -1560,7 +1866,8 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 	return true
 }
 
-// sessionCommand resolves the one slash command the gateway owns:
+// sessionCommand resolves the first of the two slash commands the gateway
+// owns (the other, a bare /feedback, is answered inline in routeTurn):
 // "/session" marks the conversation session-routed, "/session <text>" marks
 // it and runs <text> as the first turn, "/session off" releases the
 // incarnation and re-homes to the default addressee. Deterministic, like
@@ -1572,7 +1879,7 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 // when the turn was refused part-way (the cap, or a previous task that could
 // not be closed) and the in-memory route change must not persist.
 func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, rest, principal string, authority Authority) bool {
-	off := isSessionOff(rest)
+	off := chattext.IsSessionOff(rest)
 	// The way back is answered even with no spawner: a record left
 	// session-routed after A2A_SPAWN_SESSIONS was disarmed (the W4-rollback
 	// shape) would otherwise publish every ask to an addressee nothing
@@ -1627,7 +1934,7 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		g.post(rec.Key, "ℹ️ already on the session route")
 		return true
 	}
-	if isStop(rest) {
+	if chattext.IsStop(rest) {
 		// "/session stop" is almost certainly the way back misspelled. It
 		// must never become a task whose text reads "stop" - the same rule
 		// the stopping case below enforces for a bare "stop".
@@ -1660,7 +1967,7 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		return true
 	}
 	msg.Text = rest
-	if !g.freshIncarnation(ctx, rec) {
+	if !g.nextIncarnation(ctx, rec) {
 		return false
 	}
 	g.startTask(ctx, rec, msg, backend, principal, authority)
@@ -1770,6 +2077,13 @@ func artifactParts(task *lib.Task, name string) []lib.Part {
 	return parts
 }
 
+// showsTaskStatus reports whether the backend that owns conversation shows
+// a task's status itself (StatusShower), and so wants no rolling line.
+func (g *Gateway) showsTaskStatus(conversation string) bool {
+	shower, ok := g.adapter.(StatusShower)
+	return ok && shower.ShowsTaskStatus(conversation)
+}
+
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements
 // TaskObserver about a task's two ends. Both are no-ops for an adapter that
 // does not implement the interface -- Discord and gchat, for which a human
@@ -1786,13 +2100,66 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 // observeTaskTerminal is also where the task-terminal counter counts
 // (metrics.go), whatever the adapter: it is the funnel every terminal path
 // ends in, once per path -- relayTerminal, the heal (stale terminal or never
-// started) and the publish that never reached the bus -- so the failures the
-// gateway itself declares are counted beside the executor's, and a terminal
-// is counted as often as an adapter is told of it.
-func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
+// started), observeChildEnd, and the publish that never reached the bus -- so
+// the failures the gateway itself declares are counted beside the executor's,
+// and a terminal is counted as often as an adapter is told of it.
+// A delegation chain is counted once under its root: observedAs keeps both
+// the turn that delegated and its child from reaching observeTaskTerminal
+// separately, and a session turn that asked to delegate but started no child
+// is counted as failed (handOffEnd) even when the executor reported completed.
+//
+// A console conversation is told the same end as a terminal frame on .out
+// (consoleFrame), so a console client learns each chain's end once, under
+// the task its turn started, without reading TASKS.
+func (g *Gateway) observeTaskTerminal(rec *SessionRecord, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	g.metrics.taskTerminal(state, source)
 	if observer, ok := g.adapter.(TaskObserver); ok {
-		observer.TaskTerminal(conversation, taskID, state, source, reason)
+		observer.TaskTerminal(rec.Key, taskID, state, source, reason)
+	}
+	g.consoleFrame(rec, taskID, state, source, reason)
+}
+
+// consoleFrame publishes a console conversation's terminal frame for the end
+// observeTaskTerminal was just told. A completed task's text is the
+// deliverable observeTaskDelivered held for it, or the non-text stand-in;
+// any other end's is the relay's notice. The relay posts its notices as it
+// always has, so a frame that cannot go out costs the console client the end
+// and costs the page nothing.
+func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.TaskState, source TerminalSource, reason string) {
+	if !isConsoleConversation(rec.Key) {
+		return
+	}
+	delivered, ok := g.consoleResults.take(taskID)
+	_, cardsPending := g.consoleCardsPending.take(taskID)
+	text := terminalNotice(state, reason)
+	// An end the gateway declared itself carries no executor reason; its
+	// frame says what the page's notice says rather than the bare line.
+	if state == lib.StateFailed && reason == "" {
+		switch source {
+		case TerminalFromGateway:
+			text = noticeBusUnreachable
+		case TerminalNeverStarted:
+			text = consoleNeverStartedText
+		}
+	}
+	if state == lib.StateCompleted {
+		text = completedNonTextResult
+		if ok {
+			text = delivered
+		}
+	}
+	poster, isPoster := g.adapter.(TerminalPoster)
+	if !isPoster {
+		return
+	}
+	// A backend that takes no frames (errNoTerminalFrames, the test rig's
+	// default) is told nothing, as MarkChanged is told nothing by one
+	// without a mark; only a frame that failed to go out is logged.
+	if err := poster.PostTerminal(rec.Key, ConsoleTerminal{
+		TaskID: taskID, Addressee: rec.AddresseeFor(taskID), State: state, Text: text,
+		CardsPending: cardsPending && state == lib.StateCompleted,
+	}); err != nil && !errors.Is(err, errNoTerminalFrames) {
+		g.log.Error("console terminal frame failed", "conversation", rec.Key, "taskId", taskID, "err", err)
 	}
 }
 
@@ -1842,7 +2209,12 @@ func (g *Gateway) observeDelivered(rec *SessionRecord, taskID, result string) {
 		return
 	}
 	if id, ends := rec.observedAs(taskID); ends {
-		g.observeTaskDelivered(rec.Key, id, result)
+		// The console's stash is taken by the observeTaskTerminal that
+		// follows; a task whose terminal was already observed (the heal got
+		// there first, and the relay's terminal arrives after) gets no
+		// second one, so nothing is put that nothing would take.
+		ref, known := rec.TaskRefFor(taskID)
+		g.observeTaskDelivered(rec, id, result, !known || !ref.TerminalObserved)
 	}
 }
 
@@ -1853,7 +2225,7 @@ func (g *Gateway) observeEnded(rec *SessionRecord, taskID string, state lib.Task
 		if replaced, why, handOff := rec.handOffEnd(taskID, state); handOff {
 			state, reason = replaced, why
 		}
-		g.observeTaskTerminal(rec.Key, id, state, source, reason)
+		g.observeTaskTerminal(rec, id, state, source, reason)
 	}
 }
 
@@ -1864,9 +2236,12 @@ func (g *Gateway) observeCancel(rec *SessionRecord, taskID string) {
 
 // observeTaskDelivered hands a DeliverableObserver the completed task's
 // result whole, before the relay posts it in chunks. See the interface.
-func (g *Gateway) observeTaskDelivered(conversation, taskID, result string) {
+func (g *Gateway) observeTaskDelivered(rec *SessionRecord, taskID, result string, stash bool) {
 	if observer, ok := g.adapter.(DeliverableObserver); ok {
-		observer.TaskDelivered(conversation, taskID, result)
+		observer.TaskDelivered(rec.Key, taskID, result)
+	}
+	if stash && isConsoleConversation(rec.Key) {
+		g.consoleResults.put(taskID, result)
 	}
 }
 
@@ -1907,6 +2282,14 @@ func (g *Gateway) observeMessageDropped(conversation, authorID string) {
 	}
 }
 
+// observeInboundVerified tells a VerifiedObserver whether a message passed
+// sender verification. See VerifiedObserver.
+func (g *Gateway) observeInboundVerified(msg InboundMessage, verified bool) {
+	if observer, ok := g.adapter.(VerifiedObserver); ok {
+		observer.InboundVerified(msg.Conversation, msg.MessageID, verified)
+	}
+}
+
 // observeTurnFinished tells an InboundObserver that a turn on a conversation
 // has ended. Deferred in handleInbound, so an early return announces it too.
 func (g *Gateway) observeTurnFinished(conversation string) {
@@ -1940,6 +2323,13 @@ func (g *Gateway) mintSession(ctx context.Context, msg InboundMessage) (*Session
 	}
 	err := g.reg.Create(ctx, rec)
 	if err == nil {
+		// One session per conversation, counted on the create that won,
+		// under the platform of the message that opened it; a door's
+		// conversations are not chat and are not counted, as handleInbound
+		// does not count their messages.
+		if platform, ok := metricsPlatformLabel(g.backendFor(msg)); ok {
+			g.metrics.sessionMinted(platform)
+		}
 		return rec, nil
 	}
 	if !errors.Is(err, ErrSessionExists) {
@@ -2000,6 +2390,11 @@ type taskStart struct {
 	// gateway starts on its own (a child, a wake) has no backend message.
 	MessageID string
 	Principal string
+	// Click and Answer are InboundMessage's: the turn continues the
+	// conversation's previous ask, whose message its chain marks. A click
+	// names no message of its own; an answer with no earlier chain marks
+	// itself.
+	Click, Answer bool
 	// Requester is stored on the history entry as given — backend and the
 	// already-pseudonymized subject. startTask hashes a human's author id;
 	// a child copies its parent turn's entry.
@@ -2044,6 +2439,8 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	taskID, _ := g.startTaskWith(ctx, rec, taskStart{
 		Text:      msg.Text,
 		MessageID: msg.MessageID,
+		Click:     msg.Click,
+		Answer:    msg.Answer,
 		Principal: principal,
 		Requester: TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
 		Authority: authority,
@@ -2129,9 +2526,14 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 
 	// Placeholder first, so the rolling line exists before the first event
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
-	statusMsgID, err := g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
-	if err != nil {
-		g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
+	// None on a backend that shows the task's status itself (StatusShower).
+	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
+	if !lineless {
+		var err error
+		statusMsgID, err = g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
+		if err != nil {
+			g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
+		}
 	}
 
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
@@ -2156,6 +2558,15 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	}
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))
+		// The message the chain's mark is drawn on (mark.go).
+		ref.AskMessageID = ts.MessageID
+		if ts.Click || ts.Answer {
+			if ask, mark := rec.continuedAskMessage(); ask != "" {
+				ref.AskMessageID, ref.Mark = ask, mark
+			} else if ts.Click {
+				ref.AskMessageID = ""
+			}
+		}
 	}
 	ref.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
 	rec.Tasks = append(rec.Tasks, ref)
@@ -2196,7 +2607,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if err != nil {
 		g.log.Error("task publish failed", "taskId", taskID, "err", err)
 		if statusMsgID != "" {
-			_ = g.adapter.Edit(rec.Key, statusMsgID, "❌ could not reach the bus; try again")
+			_ = g.adapter.Edit(rec.Key, statusMsgID, noticeBusUnreachable)
+		} else if lineless {
+			// No line to put it on, and nothing else would say the ask
+			// went nowhere.
+			g.post(rec.Key, noticeBusUnreachable)
 		}
 		rec.ActiveTask = nil
 		g.mu.Lock()
@@ -2216,7 +2631,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		// is logged, though: each wrote its ingress line above.
 		g.logTaskTerminal(rec, rec.Addressee, taskID, lib.StateFailed, TerminalFromGateway, "")
 		if ts.Role == "" {
-			g.observeTaskTerminal(rec.Key, taskID, lib.StateFailed, TerminalFromGateway, "")
+			g.observeTaskTerminal(rec, taskID, lib.StateFailed, TerminalFromGateway, "")
 		}
 		return "", false
 	}
@@ -2383,20 +2798,30 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 // no janitor yet (the dispatcher arrives at stage 3), so a dead executor
 // would otherwise wedge the conversation forever. The gateway never forges a
 // terminal event for a task it doesn't supervise; it just stops letting that
-// task serialize new ones.
-func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority Authority) {
+// task serialize new ones. It reports whether the cancel reached the bus.
+func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority Authority) bool {
+	return g.cancelTaskVoiced(ctx, rec, authority, false)
+}
+
+// cancelTaskVoiced is cancelTask, and quiet posts neither of its lines: the
+// Slack Stop button's path (slack_stop.go) answers with one reply of its own,
+// and marks the task so the relay posts no "canceled" for it either
+// (TaskRef.QuietCancel).
+func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, authority Authority, quiet bool) bool {
 	active := rec.ActiveTask
 	env, err := lib.NewCancelEnvelope(gatewayParty, active.TaskID, rec.ContextID, active.CorrelationID,
 		lib.WithTo(lib.Party{Session: rec.Addressee}),
 		lib.WithAuthority(authority.Render(active.Capability)))
 	if err != nil {
 		g.log.Error("cancel envelope build failed", "err", err)
-		return
+		return false
 	}
 	if err := g.client.Publish(ctx, lib.TaskInSubject(rec.Addressee, active.TaskID), env); err != nil {
 		g.log.Error("cancel publish failed", "taskId", active.TaskID, "err", err)
-		g.post(rec.Key, "⚠️ could not send the stop; the task is still running — try again")
-		return
+		if !quiet {
+			g.post(rec.Key, "⚠️ could not send the stop; the task is still running — try again")
+		}
+		return false
 	}
 	active.Detached = true
 	// Detached outlives ActiveTask (a new turn overwrites it), so the
@@ -2408,11 +2833,16 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 	// residue; replaying the in subject for the cancel envelope is the
 	// close if it ever bites.
 	rec.MarkCanceled(active.TaskID)
-	// The post before the signal: a waiter woken by the signal snapshots the
-	// conversation's entries, and the line saying the cancel went belongs in
-	// what it reads.
-	g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
+	if quiet {
+		rec.markQuietCancel(active.TaskID)
+	} else {
+		// The post before the signal: a waiter woken by the signal snapshots
+		// the conversation's entries, and the line saying the cancel went
+		// belongs in what it reads.
+		g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
+	}
 	g.observeCancel(rec, active.TaskID)
+	return true
 }
 
 // cancelNamedTask publishes kind:cancel for a task this conversation has
@@ -2489,9 +2919,17 @@ func (g *Gateway) answerStatusByReplay(ctx context.Context, rec *SessionRecord) 
 
 // messagePayload builds the A2A Message for one chat turn.
 func messagePayload(text, taskID, contextID string) ([]byte, error) {
+	return messagePayloadParts([]lib.Part{{Kind: "text", Text: text}}, taskID, contextID)
+}
+
+// messagePayloadParts builds the A2A Message for one submission or steer
+// from its parts. Every chat turn's are its text alone (messagePayload); the
+// card-stop control's are the cardStop data part alone (cardStopPayload),
+// which no text a person types can produce.
+func messagePayloadParts(parts []lib.Part, taskID, contextID string) ([]byte, error) {
 	return marshalMessage(lib.Message{
 		Role:      "user",
-		Parts:     []lib.Part{{Kind: "text", Text: text}},
+		Parts:     parts,
 		MessageID: "msg-" + randHex(messageIDHexWidth),
 		TaskID:    taskID,
 		ContextID: contextID,

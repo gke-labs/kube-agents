@@ -1,0 +1,127 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "addressType": "IPv4",
+   "apiVersion": "discovery.k8s.io/v1",
+   "endpoints": [],
+   "kind": "EndpointSlice",
+   "metadata": {
+    "annotations": {
+     "endpoints.kubernetes.io/last-change-trigger-time": "2026-09-24T17:38:07Z"
+    },
+    "creationTimestamp": "2026-09-24T17:38:07Z",
+    "generateName": "alertmanager-",
+    "generation": 1,
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile",
+     "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io",
+     "kubernetes.io/service-name": "alertmanager",
+     "service.kubernetes.io/headless": ""
+    },
+    "name": "alertmanager-qxg8t",
+    "namespace": "gmp-system",
+    "ownerReferences": [
+     {
+      "apiVersion": "v1",
+      "blockOwnerDeletion": true,
+      "controller": true,
+      "kind": "Service",
+      "name": "alertmanager",
+      "uid": "138c8c64-7eee-478f-8fe5-b724b9835582"
+     }
+    ],
+    "resourceVersion": "1790271487915023020",
+    "uid": "88e213f6-5df6-40c1-ba10-a2f4810c9295"
+   },
+   "ports": null
+  },
+  {
+   "addressType": "IPv4",
+   "apiVersion": "discovery.k8s.io/v1",
+   "endpoints": [
+    {
+     "conditions": {
+      "ready": true,
+      "serving": true,
+      "terminating": false
+     },
+     "targetRef": {
+      "kind": "Pod",
+      "name": "gmp-operator-85c5bb49c6-9bqdv"
+     }
+    }
+   ],
+   "kind": "EndpointSlice",
+   "metadata": {
+    "annotations": {
+     "endpoints.kubernetes.io/last-change-trigger-time": "2026-09-30T21:30:39Z"
+    },
+    "creationTimestamp": "2026-09-24T17:38:08Z",
+    "generateName": "gmp-operator-",
+    "generation": 10,
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile",
+     "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io",
+     "kubernetes.io/service-name": "gmp-operator"
+    },
+    "name": "gmp-operator-hr5ht",
+    "namespace": "gmp-system",
+    "ownerReferences": [
+     {
+      "apiVersion": "v1",
+      "blockOwnerDeletion": true,
+      "controller": true,
+      "kind": "Service",
+      "name": "gmp-operator",
+      "uid": "5aa88606-5e22-4571-8b97-c3028a49f184"
+     }
+    ],
+    "resourceVersion": "1790803839340783000",
+    "uid": "473a888e-35d8-4757-b875-64464c1e523a"
+   },
+   "ports": [
+    {
+     "name": "webhook",
+     "port": 10250,
+     "protocol": "TCP"
+    }
+   ]
+  },
+  {
+   "addressType": "IPv4",
+   "apiVersion": "discovery.k8s.io/v1",
+   "endpoints": [],
+   "kind": "EndpointSlice",
+   "metadata": {
+    "annotations": {
+     "endpoints.kubernetes.io/last-change-trigger-time": "2026-09-24T18:04:24Z"
+    },
+    "creationTimestamp": "2026-09-24T18:04:24Z",
+    "generateName": "rule-evaluator-",
+    "generation": 1,
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "Reconcile",
+     "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io",
+     "kubernetes.io/service-name": "rule-evaluator"
+    },
+    "name": "rule-evaluator-ncgms",
+    "namespace": "gmp-system",
+    "ownerReferences": [
+     {
+      "apiVersion": "v1",
+      "blockOwnerDeletion": true,
+      "controller": true,
+      "kind": "Service",
+      "name": "rule-evaluator",
+      "uid": "60157b34-d086-4963-96c6-78dc3125ce64"
+     }
+    ],
+    "resourceVersion": "1790273064113871001",
+    "uid": "5f71b06d-1171-4f70-95c8-45cb374cf745"
+   },
+   "ports": null
+  }
+ ],
+ "kind": "List"
+}

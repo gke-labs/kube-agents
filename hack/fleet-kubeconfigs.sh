@@ -29,8 +29,9 @@
 #   resourceLabels.environment=seeded AND
 #   resourceLabels.managed-by=kube-agents-seeded-fleet
 #
-# which is exactly `local.cluster_labels` in bench/tf/fleet/main.tf and is
-# carried by the seeded clusters and by nothing else in an eval project (neither
+# which are two of the keys of `local.cluster_labels` in bench/tf/fleet/main.tf
+# (the upgrade-family key beside them is not in the filter) and are carried by
+# the seeded clusters and by nothing else in an eval project (neither
 # platform-agent-host nor the per-run eval-pr-* clusters have either label).
 # Composing "${prefix}-${slot}" from catalog constants instead would silently
 # address the wrong thing the first time someone applies the stack with a

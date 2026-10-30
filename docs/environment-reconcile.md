@@ -57,7 +57,7 @@ Long-lived environments are reconciled and deployed atomically using `./upgrade.
 
 - **staging** is deployed by `Staging: Deploy` (`staging-deploy.yml`), which triggers when the staging promotion pipeline pushes a `staging_*` tag. It pushes that tag only after two gates: its full E2E test matrix passes on a fresh nightly cluster, and the release-candidate eval returns GREEN on the `evalcand_*` tag it pushes first. The workflow reconciles the Terraform composition, Helm release, and container images together atomically from that validated candidate commit.
 - **autopush** is deployed by `Autopush: Deploy` (`autopush-deploy.yml`), which triggers whenever candidate container images are successfully published to GHCR from `main`.
-- **autopush-next** is deployed by `Autopush-Next: Deploy` (`autopush-next-deploy.yml`), on the same trigger and resolving the same commit, from its own GitHub environment and GCP project, which set `PLATFORM_AGENT_MODE=next`. It is a separate workflow so that each lane holds its own workflow-level concurrency group: a run holds the group from creation, so resolve and deploy are serialized together and an older publish never lands after a newer one, and a failure or a held lease on one environment does not hold up the other. Its `REGISTRY_PREFIX` has to match `autopush`'s, because its resolve job checks the candidate images bound to `autopush`, so that it never binds, and so creates, an unprovisioned `autopush-next`. Until its GitHub environment exists with a `GCP_PROJECT_ID`, its deploy posts a notice and reports `skipped`. The installer reads that variable, so the reconcile renders `spec.mode: next` and the environment runs `next`; what a rebuild does with it is under [`PLATFORM_AGENT_MODE`](#what-each-environment-has-to-be-configured-with) below.
+- **autopush-next** is deployed by `Autopush-Next: Deploy` (`autopush-next-deploy.yml`), on the same trigger and resolving the same commit, from its own GitHub environment and GCP project, which set `PLATFORM_AGENT_MODE=next`. It is a separate workflow so that each lane holds its own workflow-level concurrency group: a run holds the group from creation, so resolve and deploy are serialized together and an older publish never lands after a newer one, and a failure or a held lease on one environment does not hold up the other. Its `REGISTRY_PREFIX` has to match `autopush`'s, because its resolve job checks the candidate images bound to `autopush`, so that it never binds, and so creates, an unprovisioned `autopush-next`. Until its GitHub environment exists with a `GCP_PROJECT_ID`, its deploy posts a notice and reports `skipped`. The installer reads that variable, so the reconcile renders `spec.mode: next` and the environment runs `next`; what a rebuild does with it is under [`PLATFORM_AGENT_MODE`](#what-each-environment-has-to-be-configured-with) below. `Autopush-Next: Google Chat E2E` (`autopush-next-e2e-gchat.yml`) reads `E2E_GCP_SERVICE_ACCOUNT`, `E2E_GCP_WORKLOAD_IDENTITY_PROVIDER` and `E2E_CHAT_SPACE_ID` from the same environment and skips until all three are set ([`tests/e2e/README.md`](../tests/e2e/README.md#against-autopush-next)).
 
 A deploy takes the live-test lease before it applies anything (see
 [`designs/live-test-lease.md`](designs/live-test-lease.md)).
@@ -65,7 +65,11 @@ Because automated release deploys must not silently drop candidate releases or r
 success on an unapplied commit, lease contention fails loudly (`lease_policy: fail`)
 rather than deferring silently.
 
-Run one by hand with `Shared: Reconcile Environment` (`mode: apply`). Locally,
+Run one by hand with `Shared: Reconcile Environment` (`mode: apply`). An apply to an older
+`image_tag` stops when the move leaves behind a commit marked as a breaking change, and names each
+one; set `allow_breaking_downgrade` on that dispatch, or on the `image_tag` dispatch of
+`Autopush: Deploy`, `Autopush-Next: Deploy` or `Staging: Deploy`, to roll the environment back
+anyway. Locally,
 `./upgrade.sh --plan` against any install shows what a reconcile would change;
 [`terraform/examples/full-install/README.md`](../terraform/examples/full-install/README.md#asking-what-an-apply-would-change)
 documents it.
@@ -189,8 +193,8 @@ the `secrets: inherit` gap
 [`scripts/release/README.md`](../scripts/release/README.md) describes for
 `GH_APP_ID`, which drops every secret the same way.
 
-`ENABLE_GKE_BACKUP_PLAN`, `ENABLE_GVISOR`, and `HERMES_DASHBOARD_ENABLED` are checked
-there too, for spelling rather than presence. All three reach `install.sh` as
+`ENABLE_GKE_BACKUP_PLAN`, `ENABLE_GVISOR`, `HERMES_DASHBOARD_ENABLED`, and `WEB_CONSOLE_ENABLED` are checked
+there too, for spelling rather than presence. All four reach `install.sh` as
 `--enable-*` flags, whose validator takes `true` or `false` and nothing else, while
 the same values travelling through `install.env` reach `is_truthy`, which also takes
 `True`/`yes`/`y`/`1`/`on`. `provision_environment.sh` folds the second list into

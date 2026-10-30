@@ -58,14 +58,18 @@ variable "agent_deployment" {
   default     = "platform-agent-gateway"
 }
 
-# A variable rather than a literal for the same reason as the two above: the
-# watcher is a peer process inside this container, not a container of its own,
-# so a rename in deploy/ would otherwise surface here as a 300s timeout blaming
-# the watcher rather than as an error naming the container.
 variable "agent_container" {
-  type        = string
-  description = "Container inside agent_deployment that k8s-event-watcher runs alongside"
-  default     = "envoy-credential-proxy"
+  type = string
+  # k8s-event-watcher is not a container of its own: it runs inside the
+  # agent-api-auth sidecar of the gateway pod (buildAgentAPIAuthSidecar in
+  # k8s-operator/internal/controller/platformagent_manifests.go). It used to
+  # sit beside envoy-credential-proxy, which #913 moved to its own pod on
+  # 2026-09-05, and a default still naming it timed out the watcher wait on
+  # every apply (#3681). Step 0a of main.tf refuses a container the pod does
+  # not have, before anything is planted; tests/test_autoops_incident_plant.py
+  # pins this default to the operator's agentAPIAuthContainerName.
+  description = "Container inside agent_deployment that k8s-event-watcher runs inside"
+  default     = "agent-api-auth"
 }
 
 # ---------------------------------------------------------------------------
@@ -119,6 +123,91 @@ variable "allocate_mib" {
   type        = number
   description = "Single bounded allocation the container makes, in MiB. Must exceed memory_limit_mib."
   default     = 96
+}
+
+# More than one is incident-triage-workload-fold's scenario: every replica
+# crash-loops the same way at once, so the watcher opens one incident per pod
+# and the daemon has to fold them into one.
+variable "replicas" {
+  type        = number
+  description = "Replicas of the OOM-killed Deployment"
+  default     = 1
+}
+
+# incident-triage-workload-fold's repetitions run a few minutes apart, inside
+# the daemon's fold window, so a later repetition's replicas fold into the
+# first one's incident and the watcher logs `folded` rather than `fire`. That
+# case grades the fold and sets this; the others wait on their own card and
+# leave it off.
+variable "accept_folded" {
+  type        = bool
+  description = "Count the watcher's `folded` log line, as well as `fire`, as the incident being handled"
+  default     = false
+}
+
+
+# The second shape the stack can plant: a container that exits non-zero until
+# crash_seconds have passed since its pod started, then runs. kubelet backs it
+# off (Reason=BackOff), the back-off climbs 10s, 20s, 40s, 80s, 160s, so the
+# restarts fall at about 10s, 30s, 70s, 150s and 310s, and kubelet re-emits
+# the BackOff event on every sync while a back-off is pending, so the event's
+# sightings span the whole time until a restart succeeds. 45 runs on the 70s
+# restart, inside the watcher's 2m settle period, and must raise no card; 240
+# outlasts it and must. 0 (the default) plants the OOM shape above instead.
+variable "crash_seconds" {
+  type        = number
+  description = "Seconds the planted container keeps crashing before it starts; 0 plants the OOM-killed shape."
+  default     = 0
+}
+# What the apply waits for before returning: `incident`, the watcher's log
+# line that it opened an incident for the namespace (the OOM shape's only
+# sensible wait); `followup`, the watcher's log line that it sent the quiet
+# follow-up for the namespace, which arrives WATCHER_QUIET_AFTER (15m) after
+# the pod's last event, and which the apply stops waiting for at its bound
+# without failing, so a case can grade the follow-up's absence; `recurrence`,
+# the incident, then an open agent pull request that changes
+# gitops_manifest_path in the run's GitOps repository, then a replaced pod's
+# event handed to the daemon: the same fault on a new pod, after the fold
+# window, while its fix waits for review.
+variable "wait_for" {
+  type        = string
+  description = "What the apply waits for: incident, followup or recurrence."
+  default     = "incident"
+  validation {
+    condition     = contains(["incident", "followup", "recurrence"], var.wait_for)
+    error_message = "wait_for must be incident, followup or recurrence."
+  }
+}
+
+# The workload's manifest in the run's GitOps repository (BENCH_GITOPS_REPO),
+# which wait_for = "recurrence" waits for an open agent pull request to change.
+# Matched as the end of a changed file's path, so a case need not know the
+# repository's layout above it.
+# The repository has to declare the workload there, or no fix can be opened.
+variable "gitops_manifest_path" {
+  type        = string
+  description = "Path of the planted workload's manifest in the GitOps repository; read only by wait_for = recurrence."
+  default     = ""
+}
+
+# Seconds to sleep after the watcher poll before handing control to the agent
+# turn (same settle pattern as bench/tf/prebuilt/triage-start-burst). The
+# front-door reader (`default` profile) has no `sleep` tool and is not held in
+# `_await_delegated_work` when it files no cards of its own, so a fast burst of
+# `kanban_list`/`kanban_show` reads can exhaust its turn while sequential cards
+# (such as `INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true`'s triage card followed by
+# its parented Pull Request card) are still running. Defaults to 0 so
+# single-card cases keep their existing timing; multi-card cases size this as a
+# wall-clock head start for card execution before the board read starts.
+variable "start_settle_seconds" {
+  type        = number
+  description = "Seconds to wait after the watcher poll before the agent turn so filed incident cards have a head start toward completion before the board read starts."
+  default     = 0
+
+  validation {
+    condition     = var.start_settle_seconds >= 0 && var.start_settle_seconds <= 86400 && floor(var.start_settle_seconds) == var.start_settle_seconds
+    error_message = "start_settle_seconds must be a whole number of seconds between 0 and 86400."
+  }
 }
 
 # Identify the CI run that planted this, so a janitor can find what a run killed

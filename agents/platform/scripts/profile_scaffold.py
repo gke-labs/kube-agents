@@ -14,18 +14,119 @@
 # by every profile.
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
+from typing import Callable
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 # Paths inside the template that hold runtime state as well as image-owned
 # configuration, and so must be merged rather than replaced. Relative to the
 # profile home, POSIX-separated; each one needs a merge rule below.
 MERGE_PATHS: tuple[str, ...] = ("cron/jobs.json",)
 DEFAULT_LEGACY_CRON_RISK: str = "low"
+DEFAULT_JOBS_LOCK_TIMEOUT_SECONDS: float = 15.0
+DEFAULT_HERMES_HOME = "/opt/data"
+
+# npm keeps its cache in ~/.npm, and a profile's processes run with HOME at
+# <profile>/home (Hermes' _PROFILE_DIRS), so each profile kept its own ~100 MiB
+# copy (gke-labs#3376). A ~/.npm symlink to one directory on the data volume gives
+# them one cache. It is a symlink and not a cache line in .npmrc or the environment:
+# Hermes starts MCP stdio servers with a filtered environment, and it looks for an
+# installed npx package only at $npm_config_cache or ~/.npm (_npx_cached_bin in
+# tools/mcp_tool_config.py). The link is relative, so it resolves after agentHome moves.
+PROCESS_HOME = "home"
+NPM_HOME_CACHE = ".npm"
+NPM_SHARED_CACHE = Path(".cache", "npm")
+# Where the start-up sweep moves an old per-profile cache before it deletes it.
+NPM_RECLAIM_NAME = ".npm.reclaim"
+
+_jobs_lock_state = threading.local()
+
+
+@contextlib.contextmanager
+def cron_jobs_lock(cron_dir: Path, timeout: float | None = None, *, warn: Callable[[str], None] | None = None):
+    """Serialize reads and writes to jobs.json against Hermes' own cron calls.
+
+    Hermes (cron/jobs.py) protects load_jobs -> modify -> save_jobs with a
+    cross-process advisory lock on <cron_dir>/.jobs.lock. Taking the same
+    flock around the startup merge prevents racing with an in-pod `hermes cron`
+    command (such as `hermes cron pause` on restart). `warn` is where the
+    fail-open messages go; a caller in another script passes its own logger.
+    """
+    if timeout is None:
+        timeout = DEFAULT_JOBS_LOCK_TIMEOUT_SECONDS
+    emit = warn or log
+    held = getattr(_jobs_lock_state, "held", None)
+    if held is None:
+        held = {}
+        _jobs_lock_state.held = held
+
+    lock_dir = cron_dir.resolve()
+    if lock_dir in held:
+        held[lock_dir] += 1
+        try:
+            yield
+        finally:
+            held[lock_dir] -= 1
+            if held[lock_dir] == 0:
+                del held[lock_dir]
+        return
+
+    cron_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = cron_dir / ".jobs.lock"
+    try:
+        lock_fd = open(lock_path, "a+", encoding="utf-8-sig")
+    except OSError as exc:
+        emit(f"WARN: could not open cron jobs lock {lock_path} ({exc}); proceeding without lock")
+        yield
+        return
+
+    acquired = False
+    try:
+        if fcntl is not None:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        emit(f"WARN: timed out after {timeout}s waiting for {lock_path}; proceeding without lock")
+                        break
+                    time.sleep(0.05)
+                except OSError as exc:
+                    emit(f"WARN: could not acquire cron jobs lock {lock_path} ({exc}); proceeding without lock")
+                    break
+        else:
+            acquired = True
+
+        held[lock_dir] = 1
+        try:
+            yield
+        finally:
+            del held[lock_dir]
+    finally:
+        if acquired and fcntl is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except (OSError, IOError):
+                pass
+        try:
+            lock_fd.close()
+        except (OSError, IOError):
+            pass
 
 
 
@@ -133,7 +234,68 @@ def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
             raise SystemExit(f"ERROR: could not execute 'hermes' to create profile {name}: {e}")
     if not home.is_dir():
         raise SystemExit(f"ERROR: expected profile home not found after create: {home}")
+    share_npm_cache(home / PROCESS_HOME, hermes_home)
     return home
+
+
+def share_npm_cache(process_home: Path, hermes_home: Path, reclaim: bool = False) -> None:
+    """Make `process_home`/.npm a symlink to the one npm cache under `hermes_home`.
+
+    Never creates `process_home`: Hermes gives a subprocess that HOME only when the
+    directory exists, so creating it would move where the profile keeps its gcloud
+    and kube state. An existing ~/.npm symlink stays, and a cache line in .npmrc wins
+    over ~/.npm. A real ~/.npm directory is the old per-profile cache. With `reclaim`,
+    it is moved aside, the link takes its place, and then the moved copy is deleted,
+    so a delete that fails leaves an orphan directory, never a home with no link.
+    The next run with `reclaim` deletes an orphan that an earlier run left, before
+    anything else. Only the start-up sweep sets `reclaim`, because a process of the
+    profile can be using the directory at any other time. On an install with more
+    than one replica, a pod that has not restarted yet can still be using it during
+    the sweep; no shipped agent runs an npx MCP server, and such a server starts
+    again through npx. npx runs an installed package without a new integrity check,
+    so a package changed in the shared cache stays for every profile: after a
+    suspected compromise, clear `<agentHome>/.cache/npm`, not only the profile.
+    """
+    if not process_home.is_dir():
+        return
+    link = process_home / NPM_HOME_CACHE
+    aside = process_home / NPM_RECLAIM_NAME
+    shared = hermes_home / NPM_SHARED_CACHE
+    try:
+        # Also when the link exists: npm fails on every command when its cache is a dangling link.
+        shared.mkdir(parents=True, exist_ok=True)
+        if reclaim and aside.is_dir() and not aside.is_symlink():
+            # Left by an earlier start-up whose delete failed or that stopped
+            # before the link; it would also block the rename below.
+            _delete_reclaimed_npm_cache(aside)
+        if link.is_symlink():
+            return
+        if link.exists():
+            if not (reclaim and link.is_dir()):
+                return
+            link.rename(aside)
+            link.symlink_to(os.path.relpath(shared.resolve(), process_home.resolve()), target_is_directory=True)
+            log(f"pointed npm in {process_home} at the shared cache {shared}")
+            _delete_reclaimed_npm_cache(aside)
+            return
+        link.symlink_to(os.path.relpath(shared.resolve(), process_home.resolve()), target_is_directory=True)
+        log(f"pointed npm in {process_home} at the shared cache {shared}")
+    except OSError as exc:
+        log(f"WARN: could not point npm in {process_home} at the shared cache {shared} ({exc})")
+
+
+def _delete_reclaimed_npm_cache(aside: Path) -> None:
+    """Delete an old per-profile npm cache that share_npm_cache moved to `aside`.
+
+    A failure is logged with the directory and left for the next start-up sweep.
+    """
+    try:
+        size = sum((Path(root) / name).lstat().st_size for root, _, names in os.walk(aside) for name in names)
+        shutil.rmtree(aside)
+    except OSError as exc:
+        log(f"WARN: could not delete the old per-profile npm cache {aside} ({exc}); the next start-up tries again")
+        return
+    log(f"reclaimed the per-profile npm cache {aside} ({size} bytes)")
 
 
 def read_json(path: Path) -> object | None:
@@ -265,20 +427,21 @@ def backfill_cron_file(path: Path) -> bool:
     Atomic rewrite using a .tmp sibling and os.replace, matching _merge_after_overlay.
     Returns True if the file was modified, False otherwise.
     """
-    data = read_json(path)
-    if data is None:
-        return False
-    backfilled = backfill_cron_store(data)
-    if backfilled == data:
-        return False
-    try:
-        scratch = path.with_name(path.name + ".tmp")
-        scratch.write_text(json.dumps(backfilled, indent=2) + "\n", encoding="utf-8")
-        os.replace(scratch, path)
-        return True
-    except OSError as exc:
-        log(f"WARN: could not backfill cron store {path}: {exc}")
-        return False
+    with cron_jobs_lock(path.parent):
+        data = read_json(path)
+        if data is None:
+            return False
+        backfilled = backfill_cron_store(data)
+        if backfilled == data:
+            return False
+        try:
+            scratch = path.with_name(path.name + ".tmp")
+            scratch.write_text(json.dumps(backfilled, indent=2) + "\n", encoding="utf-8")
+            os.replace(scratch, path)
+            return True
+        except OSError as exc:
+            log(f"WARN: could not backfill cron store {path}: {exc}")
+            return False
 
 
 def retire_cron_jobs(store: object, retire_ids: tuple[str, ...]) -> object:
@@ -343,23 +506,24 @@ def _merge_after_overlay(
         source = template_dir.joinpath(*parts)
         if not source.is_file():
             continue
-        merged = retire_cron_jobs(
-            merge_cron_store(read_json(source), previous, cron_job_ids),
-            cron_retire_ids,
-        )
         destination = home.joinpath(*parts)
-        try:
-            # Temp file and os.replace, not a plain write: a torn jobs.json is
-            # a profile with no cron roster at all, and this runs during
-            # start-up on a volume that may be mid-restart.
-            scratch = destination.with_name(destination.name + ".tmp")
-            scratch.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
-            os.replace(scratch, destination)
-        except OSError as exc:
-            # The image's copy is already in place, so the profile still runs;
-            # what is lost is the run history. Say so rather than fail the
-            # whole start-up over it.
-            log(f"WARN: could not merge {relative}; image copy stands ({exc})")
+        with cron_jobs_lock(destination.parent) if parts[0] == "cron" else contextlib.nullcontext():
+            merged = retire_cron_jobs(
+                merge_cron_store(read_json(source), previous, cron_job_ids),
+                cron_retire_ids,
+            )
+            try:
+                # Temp file and os.replace, not a plain write: a torn jobs.json is
+                # a profile with no cron roster at all, and this runs during
+                # start-up on a volume that may be mid-restart.
+                scratch = destination.with_name(destination.name + ".tmp")
+                scratch.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+                os.replace(scratch, destination)
+            except OSError as exc:
+                # The image's copy is already in place, so the profile still runs;
+                # what is lost is the run history. Say so rather than fail the
+                # whole start-up over it.
+                log(f"WARN: could not merge {relative}; image copy stands ({exc})")
 
 
 def overlay_template(
@@ -385,12 +549,9 @@ def overlay_template(
     if not template_dir.is_dir():
         raise SystemExit(f"ERROR: template dir not found: {template_dir}")
     names = tuple(items) if items is not None else tuple(p.name for p in template_dir.iterdir())
-    prior = {
-        relative: contents
-        for relative in MERGE_PATHS
-        if (contents := read_json(home.joinpath(*relative.split("/")))) is not None
-    }
     for item_name in names:
+        if item_name == "cron":
+            continue
         src = template_dir / item_name
         if not src.exists():
             continue
@@ -399,7 +560,22 @@ def overlay_template(
             shutil.copytree(src, dest, dirs_exist_ok=True)
         else:
             shutil.copy2(src, dest)
-    _merge_after_overlay(home, template_dir, names, prior, cron_job_ids, cron_retire_ids)
+
+    if "cron" in names:
+        with cron_jobs_lock(home / "cron"):
+            prior = {
+                relative: contents
+                for relative in MERGE_PATHS
+                if (contents := read_json(home.joinpath(*relative.split("/")))) is not None
+            }
+            src = template_dir / "cron"
+            if src.exists():
+                dest = home / "cron"
+                if src.is_dir():
+                    shutil.copytree(src, dest, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src, dest)
+            _merge_after_overlay(home, template_dir, names, prior, cron_job_ids, cron_retire_ids)
     if plugins_dir and plugins_dir.is_dir():
         try:
             shutil.copytree(plugins_dir, home / "plugins", dirs_exist_ok=True)
@@ -435,6 +611,14 @@ def main() -> None:
         "--backfill-cron",
         help="Backfill default risk tier onto a cron/jobs.json file directly without overlaying.",
     )
+    group.add_argument(
+        "--share-npm-cache",
+        action="store_true",
+        help=(
+            "Point npm in $HERMES_HOME/home and every profile's home at one shared cache, "
+            "and remove each old per-profile cache (see share_npm_cache)."
+        ),
+    )
     ap.add_argument("--template", default="", help="Baked template dir to overlay onto the profile home.")
     ap.add_argument("--description", default="", help="Profile description (surfaced in discovery).")
     ap.add_argument("--plugins", default="", help="Optional shared plugins dir to overlay for observability.")
@@ -460,6 +644,12 @@ def main() -> None:
         ),
     )
     args = ap.parse_args()
+    hermes_home = Path(os.environ.get("HERMES_HOME", DEFAULT_HERMES_HOME))
+
+    if args.share_npm_cache:
+        for process_home in (hermes_home / PROCESS_HOME, *profiles_base(hermes_home).glob(f"*/{PROCESS_HOME}")):
+            share_npm_cache(process_home, hermes_home, reclaim=True)
+        return
 
     if args.backfill_cron:
         target = Path(args.backfill_cron)
@@ -476,7 +666,6 @@ def main() -> None:
         if not home.is_dir():
             raise SystemExit(f"ERROR: --home is not a directory: {home}")
     else:
-        hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
         home = ensure_profile(args.name, args.description, hermes_home)
     overlay_template(
         home,

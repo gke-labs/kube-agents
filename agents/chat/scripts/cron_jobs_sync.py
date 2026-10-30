@@ -65,17 +65,21 @@ on an install with no ``oobe`` job, where both scripts check
 
 Concurrency
 -----------
-Within one pod there is one writer, and it takes two separate facts to say so.
-This runs from the entrypoint ahead of ``exec "$@"``, so the scheduler in that
-container has not started; and step 1.5 of the entrypoint hands the shared tree to
-a single owning container, so the dashboard — which runs the same image over the
-same PVC, and has no scheduler of its own — never reaches the step that calls this.
+Hermes serializes its own cron store mutations (``hermes cron pause|resume|add|remove``)
+under an exclusive advisory flock on ``<cron_dir>/.jobs.lock`` (see ``cron/jobs.py``).
+This script acquires that same lock via ``cron_jobs_lock`` around the entire
+read-reconcile-write-ledger sequence, preventing an in-pod cron command issued during
+gateway restart from racing the startup merge and having its mutation clobbered (#3179).
+Both the ``jobs.json`` write and the ledger write sit inside the critical section, so a
+concurrent mutation under ``.jobs.lock`` cannot land between them.
 
-**Both facts are scoped to one pod, and that is the limit of the guarantee.** Step
-1.5 elects an owner per pod, not per volume: the operator sets
+**This lock coordinates writers that honour .jobs.lock, but cross-pod limits remain.**
+Step 1.5 of the entrypoint elects an owner per pod, not per volume: the operator sets
 ``AGENT_SHARED_STATE_SETUP=owner`` on the gateway container of the pod *template*
-(``platformagent_manifests.go``), so every replica's gateway is an owner. At
-``availability.replicas > 1`` the operator gives those replicas one shared volume —
+(``platformagent_manifests.go``), so every replica's gateway is an owner. The
+operator now caps the gateway at one replica, so what follows describes the
+multi-replica render this code still guards against. At
+``availability.replicas > 1`` the operator gave those replicas one shared volume —
 ``getDefaultStorageConfig`` switches the data PVC to ReadWriteMany on
 ``standard-rwx``, and ``useStatefulSet`` stays false without custom ReadWriteOnce
 storage, so it is several pods against one PVC rather than one volume each. A
@@ -84,31 +88,23 @@ rolling update then runs this in a new pod while an old pod is still up
 before the last old one is gone; ``maxUnavailable`` is an absolute 1, so one
 old pod also stays while it starts).
 
-What that costs is bounded but real, and stating it precisely matters more than
-naming a mechanism:
+What that costs across pods on a shared volume:
 
-* Concurrent runs of this script cannot tear ``jobs.json`` — ``write_json`` names
-  its temp file per *pod* (see ``writer_tag``; the pid alone is not distinct
-  across replicas), so every ``os.replace`` publishes a whole file — but two of
-  them can still lose one merge to the other. The loser retries next boot.
-* A merge racing a live scheduler's own write is the case that does not
-  self-correct. If a tick's write lands between this script's ``jobs.json`` write
-  and its ledger write, the job is absent from the volume with its id recorded as
-  installed, which ``reconcile`` reads as "removed on purpose" on that boot and
-  every boot after it.
+* On filesystems supporting advisory locking, ``.jobs.lock`` serializes concurrent runs
+  across pods. If the filesystem does not support ``flock`` or lock manager fails,
+  ``cron_jobs_lock`` fails open immediately, and ``write_json`` names its temp file
+  per *pod* (see ``writer_tag``) so ``os.replace`` publishes a whole file, though
+  one merge could overwrite another until the next boot.
+* If lock acquisition blocks for longer than 15s (contention timeout), ``cron_jobs_lock``
+  also logs a warning and proceeds without the lock.
+* Cross-pod races on multi-replica shared storage remain possible during fail-open windows
+  or if concurrent processes modify the store outside advisory locks.
 
-How wide that second window is depends on whether Hermes' ``mark_job_run``
-re-reads the store or writes back a list cached at tick time. This module does not
-know, and neither did the comment that used to assert the latter here. It is
-recorded as unverified because nobody has read ``/opt/hermes/cron/jobs.py`` to
-settle it, and an unverified premise stated as fact is what put the wrong claim
-here in the first place.
-
-Neither is fixable from inside this script: the competing writer is a scheduler in
-another pod that takes no lock this one could hold. Running the reconcile once per
+Eliminating the cross-pod race entirely requires running the reconcile once per
 volume — behind leader election, or from an init container or per-rollout Job —
-is the fix, and it is a change to the deployment topology rather than to this file.
-Single-replica installs, which are the default, are unaffected.
+which is a change to the deployment topology. Single-replica installs, which are
+the default, are protected whenever the lock is acquired; the two fail-open paths
+above are the residual.
 """
 
 import argparse
@@ -118,6 +114,10 @@ import re
 import socket
 import sys
 from pathlib import Path
+
+# Beside this script in /opt/defaults/scripts (deploy/docker/Dockerfile copies
+# both directories there); the lock and its timeout have one owner.
+from profile_scaffold import cron_jobs_lock
 
 # The one key the image ships whose value the *deployment* nevertheless owns.
 #
@@ -142,7 +142,6 @@ ORIGIN_KEY = "origin"
 
 DEFAULT_LEDGER_NAME = ".cron_jobs_installed"
 DEFAULT_LEGACY_CRON_RISK = "low"
-
 
 def log(msg: str) -> None:
     print(f"[CRON-JOBS-SYNC] {msg}", file=sys.stderr)
@@ -367,52 +366,53 @@ def sync(
         log(f"no runtime job file at {runtime_path}; leaving it to the defaults copy")
         return 0
 
-    try:
-        _, image_jobs = load_jobs(image_path)
-    except (OSError, ValueError) as e:
-        log(f"WARN: cannot read image job file: {e}")
-        return 1
-    try:
-        runtime_container, runtime_jobs = load_jobs(runtime_path)
-    except (OSError, ValueError) as e:
-        log(f"WARN: cannot read runtime job file: {e}")
-        return 1
+    with cron_jobs_lock(runtime_path.parent, warn=log):
+        try:
+            _, image_jobs = load_jobs(image_path)
+        except (OSError, ValueError) as e:
+            log(f"WARN: cannot read image job file: {e}")
+            return 1
+        try:
+            runtime_container, runtime_jobs = load_jobs(runtime_path)
+        except (OSError, ValueError) as e:
+            log(f"WARN: cannot read runtime job file: {e}")
+            return 1
 
-    ledger = load_ledger(ledger_path) | (assume_retired or set())
-    merged, new_ledger, summary = reconcile(image_jobs, runtime_jobs, ledger)
+        ledger = load_ledger(ledger_path) | (assume_retired or set())
+        merged, new_ledger, summary = reconcile(image_jobs, runtime_jobs, ledger)
 
-    for label, ids in summary.items():
-        if ids:
-            log(f"{label}: {', '.join(sorted(ids))}")
-    if not any(summary.values()) and ledger == new_ledger:
+        for label, ids in summary.items():
+            if ids:
+                log(f"{label}: {', '.join(sorted(ids))}")
+        if not any(summary.values()) and ledger == new_ledger:
+            return 0
+
+        if dry_run:
+            log("dry run; not writing")
+            return 0
+
+        if isinstance(runtime_container, dict):
+            runtime_container["jobs"] = merged
+            payload: object = runtime_container
+        else:
+            payload = merged
+
+        try:
+            write_json(runtime_path, payload)
+        except OSError as e:
+            log(f"WARN: could not write {runtime_path}: {e}")
+            return 1
+
+        # The ledger is written only after the jobs file lands. The other order
+        # would record an id as installed that never made it to disk, and the
+        # never-resurrect rule would then keep it out for good.
+        try:
+            write_json(ledger_path, sorted(new_ledger))
+        except OSError as e:
+            log(f"WARN: could not write ledger {ledger_path}: {e}")
+            return 1
+
         return 0
-
-    if dry_run:
-        log("dry run; not writing")
-        return 0
-
-    if isinstance(runtime_container, dict):
-        runtime_container["jobs"] = merged
-        payload: object = runtime_container
-    else:
-        payload = merged
-
-    try:
-        write_json(runtime_path, payload)
-    except OSError as e:
-        log(f"WARN: could not write {runtime_path}: {e}")
-        return 1
-
-    # The ledger is written only after the jobs file lands. The other order
-    # would record an id as installed that never made it to disk, and the
-    # never-resurrect rule would then keep it out for good.
-    try:
-        write_json(ledger_path, sorted(new_ledger))
-    except OSError as e:
-        log(f"WARN: could not write ledger {ledger_path}: {e}")
-        return 1
-
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -11,7 +11,7 @@ content back. What lands locally is source without a repository around it: files
 you can open, grep and reason about, and no `.git/config` for anything to
 execute out of.
 
-The script is `./skills/inspect-repository/scripts/inspect_repository.py`. Every subcommand prints one JSON
+The script is `/opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py`. Every subcommand prints one JSON
 object on stdout.
 
 ## When to Use
@@ -36,7 +36,7 @@ object on stdout.
 **Copy the tree** when the repository is small enough to read on disk:
 
 ```bash
-python3 ./skills/inspect-repository/scripts/inspect_repository.py clone --repo kubernetes-sigs/kustomize --depth 1
+python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py clone --repo kubernetes-sigs/kustomize --depth 1
 ```
 
 Copies into `/opt/data/scratch/repos/<owner>__<name>` unless `--into` names
@@ -48,10 +48,10 @@ Narrow with `--prefix api` when only part of it matters.
 most of them:
 
 ```bash
-H=$(python3 ./skills/inspect-repository/scripts/inspect_repository.py open --repo kubernetes-sigs/kustomize --depth 1 | jq -r .handle)
-python3 ./skills/inspect-repository/scripts/inspect_repository.py grep --handle "$H" --pattern 'func NewCmdBuild'
-python3 ./skills/inspect-repository/scripts/inspect_repository.py fetch --handle "$H" --into ./src kustomize/commands/build/build.go
-python3 ./skills/inspect-repository/scripts/inspect_repository.py close --handle "$H"
+H=$(python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py open --repo kubernetes-sigs/kustomize --depth 1 | jq -r .handle)
+python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py grep --handle "$H" --pattern 'func NewCmdBuild'
+python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py fetch --handle "$H" --into ./src kustomize/commands/build/build.go
+python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py close --handle "$H"
 ```
 
 The handle survives between turns; the shell does not. Keep it, and **close it

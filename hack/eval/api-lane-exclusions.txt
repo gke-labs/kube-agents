@@ -1,0 +1,33 @@
+# The api lane's exclusions: registered cases that do not run when the matrix
+# goes to the agent's API server (the harness's AGENT_TRANSPORT=api: every lane
+# but the inject one, the today lane included, which deploys under
+# EVAL_MODE_NEXT=1 and grades over api), because the case's premise needs something only the
+# inject door carries: a second message on the same chat conversation through
+# the A2A gateway, such as the `stop` bench/kube_agents_bench/stop_hook.py
+# sends. The mirror of inject-lane-exclusions.txt.
+#
+# One case id per line; `#` starts a comment, blank lines are skipped. The
+# reason is the comment block directly above the id, and it names the issue
+# that decides when the entry goes: scripts/test_eval_rosters.py fails an entry
+# with no reason, with no issue number, or that names no registered case, and
+# fails a registered case whose prompt opens with the stop directive and is not
+# listed here. hack/ci-eval-pr.sh reads this file when it builds the matrix
+# and, only on a transport other than inject, drops the named cases from TASKS
+# before the fan-out and says so in the log; on the inject lane the file
+# changes nothing. An entry here is not a demotion: the rosters are untouched.
+#
+# WHO APPROVES. The normal approvers: hack/OWNERS matches no filter on this file.
+
+# #3263: the harness types `stop` on the conversation after the opening turn
+# filed a card (stop_hook.py), which only the inject door can carry, and grades
+# the card stop that the next lane arms. Leaves this list when the api lane can
+# send a second message on the same conversation.
+chat-stop-halts-delegated-remediation
+
+# #4004: grades the question a delegated card paused on, which only the inject
+# lane's board read folds into the reply ("Question from delegated task
+# <id>:", bench/kube_agents_bench/harness.py); the api transport's status-turn
+# wait reads the card's run summary as its result instead. No api-transport
+# job runs a nightly case today; the entry keeps one from grading it on that
+# wait. Leaves this list when the api lane's wait reads a paused card's block.
+chat-question-asked-to-choose-pauses

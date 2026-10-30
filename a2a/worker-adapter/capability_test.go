@@ -1,9 +1,12 @@
 package workeradapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -281,8 +284,8 @@ func TestAVerifierThatCannotBeReachedRefusesTheTask(t *testing.T) {
 	submit(t, c, session, taskID, "do the thing")
 
 	cfg := adapterConfig(url, taskID, session, noHarness)
-	// The default is five seconds; the task is refused either way, but the
-	// suite should not wait for it.
+	// Refused once the client's reach window (capability.DefaultReachWindow)
+	// is spent with nothing answering.
 	out := waitOutcome(t, runAdapter(context.Background(), cfg), 30*time.Second)
 	if out.res.State != lib.StateRejected {
 		t.Fatalf("state %q err %v; an unreachable verifier did not fail closed", out.res.State, out.err)
@@ -292,10 +295,11 @@ func TestAVerifierThatCannotBeReachedRefusesTheTask(t *testing.T) {
 	}
 }
 
-// silentVerifier subscribes to the verify subject and never answers. Without
-// it there is no window to cancel inside: core NATS answers a request with no
-// responder immediately, so "the verifier is absent" and "the verifier is
-// wedged" are different fixtures and only the second one holds the check open.
+// silentVerifier subscribes to the verify subject and never answers, so one
+// ask stays open for its whole timeout. "The verifier is absent" and "the
+// verifier is wedged" are different fixtures: core NATS answers a request with
+// no responder immediately, and the client asks again inside its reach window,
+// whereas a silent subscriber holds a single ask open.
 func silentVerifier(t *testing.T, url string) {
 	t.Helper()
 	nc, err := nats.Connect(url, nats.Name("cap-verifier-silent"))
@@ -329,7 +333,10 @@ func TestASIGTERMInsideTheVerifyWindowIsAnEvictionNotARefusal(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runAdapter(ctx, adapterConfig(url, taskID, session, noHarness))
+	cfg := adapterConfig(url, taskID, session, noHarness)
+	var logged lockedBuffer
+	cfg.Logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	done := runAdapter(ctx, cfg)
 
 	// Cancel on the state, not on a clock: `submitted` on the stream means
 	// the adapter is past every step before the check and into the window
@@ -352,5 +359,56 @@ func TestASIGTERMInsideTheVerifyWindowIsAnEvictionNotARefusal(t *testing.T) {
 	}
 	if strings.Contains(text, "capability-refused") {
 		t.Fatalf("the eviction was published as a capability refusal: %q", text)
+	}
+	if log := logged.String(); strings.Contains(log, "capability refused this task") ||
+		!strings.Contains(log, "capability check stopped before the verifier answered") {
+		t.Errorf("the stopped check was logged as a refusal, or not at all:\n%s", log)
+	}
+}
+
+// lockedBuffer is a bytes.Buffer safe for the adapter's goroutines to write
+// while the test reads.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// verifierGap is how long the verifier is absent in the reconnect-gap test:
+// about what gke-labs/kube-agents#3270 saw between an executor and the
+// verifiers coming back after a bus restart, inside the reach window.
+const verifierGap = 3 * time.Second
+
+// The #3270 gap, through the session executor: the bus is up and the adapter
+// is on it, but no verifier is yet. The check waits for the verifier rather
+// than refusing on the first no-responders reply. noHarness makes the task
+// fail once it passes the check, which is how this tells "waited and was
+// permitted" from "refused".
+func TestTheExecutorWaitsOutAVerifierReconnectGap(t *testing.T) {
+	url := startServerNoVerifier(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-ibex-cap16", "task-cap-reconnect-gap"
+	submit(t, c, session, taskID, "do the thing")
+
+	done := runAdapter(context.Background(), adapterConfig(url, taskID, session, noHarness))
+	time.Sleep(verifierGap)
+	startVerifier(t, url)
+
+	out := waitOutcome(t, done, 30*time.Second)
+	text := terminalText(t, url, session, taskID)
+	if out.res.State == lib.StateRejected || strings.Contains(text, "capability-refused") {
+		t.Fatalf("state %q (%q): the task was refused in the gap instead of waiting for the verifier",
+			out.res.State, text)
 	}
 }

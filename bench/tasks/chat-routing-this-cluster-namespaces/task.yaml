@@ -1,0 +1,60 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. "this cluster" is the cluster the agent runs on.
+# The roster block's Host Cluster Identity section names it
+# (agents/chat/scripts/agent_roster.py), and agents/chat/SOUL.md §1.4 tells the
+# front door to route the question to that line's assignee, or to `platform`
+# when the line has none, without asking which cluster the user means (#3286).
+# Before the section existed the front door stalled on a question back to the
+# user on a multi-cluster fleet.
+#
+# chat-routing-own-cluster-namespaces asks the same thing in words that name
+# the cluster ("the Kubernetes cluster you are running in"); this case uses
+# the short form a person types.
+#
+# What it grades: a successful kanban_create, the namespaces in the answer, and
+# no "which cluster" question. It does not pin the card's assignee to the host
+# Cluster Agent: the nightly install is not guaranteed to have one, and the
+# platform fallback is also correct. agent_roster's unit tests pin the host
+# line the routing reads.
+#
+# Depends on the front door delegating live reads. If a change lets the front
+# door answer read-only lookups itself (open PR #3339), the first check below
+# has to be revisited with it.
+#
+# Planted defect required: none. Isolation class: read-only. deployer: noop,
+# one front-door turn plus the card round trip.
+id: chat-routing-this-cluster-namespaces
+name: The front door routes "this cluster" without asking which cluster
+prompt: >-
+  Which namespaces exist in this cluster?
+expected_output: >-
+  The front door files a card for the host cluster's agent (or platform when
+  there is none) without asking which cluster is meant, and the answer lists
+  the cluster's namespaces, including kubeagents-system and kube-system.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the front door's routing journey.
+domain: chat-and-routing
+
+verification_spec:
+  # assert, not the converge default: the transcript is immutable once the
+  # run ends, so polling a failed check would only wait out the timeout.
+  - name: work-was-delegated-through-kanban
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  - name: the-answer-names-the-hosts-namespaces-without-asking
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["kubeagents-system", "kube-system"]
+      forbidden_patterns:
+        - '(?i)\bwhich cluster\b'

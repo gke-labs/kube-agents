@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -44,10 +45,10 @@ import (
 //
 // spec.security.workloadIdentityFederation is optional hardening on top. It
 // moves this pod's cloud identity off the metadata server and onto a projected
-// token file: the pod's ServiceAccount carries no iam.gke.io/gcp-service-account
-// annotation, so the metadata server answers with an unbound
-// <project>.svc.id.goog principal that IAM grants nothing, and the provider's
-// attribute conditions bound what the exchange can mint. It narrows what this
+// token file the provider's attribute conditions bound. Without it this pod
+// takes its Google identity from the Workload Identity annotation on its
+// ServiceAccount (agentServiceAccountName), which the gateway Pod no longer
+// shares. It narrows what this
 // pod may mint; it does not decide where the pod runs.
 //
 // The split is by role rather than by copy: the same image runs here and in the
@@ -111,7 +112,9 @@ const (
 	// hold the limit to at least two. An install raises the limit through
 	// spec.deployment.credentialProxy.resources (resolveCredentialProxyResources
 	// merges it over these defaults per key), which raises the admitted count;
-	// the caps stay here.
+	// the caps stay here. Concurrency is bought vertically, not with
+	// replicas: the broker is one pod by design
+	// (docs/designs/credential-proxy-single-pod.md).
 	//
 	// Autopilot enforces a CPU:memory ratio between 1:1 and 1:6.5 GiB per vCPU
 	// and raises the smaller request to meet it, so a 500m pod is admitted at
@@ -342,16 +345,33 @@ func buildCredentialProxyService(agent *agentv1alpha1.PlatformAgent) *corev1.Ser
 	return svc
 }
 
-// buildCredentialProxyDeployment renders the standalone proxy pod.
+// buildCredentialProxyDeployment is buildCredentialProxyDeploymentForPlugins
+// with no plugins.
+func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHash string) *appsv1.Deployment {
+	return buildCredentialProxyDeploymentForPlugins(agent, policyHash, nil, true, credentialProxyProfileConfig{})
+}
+
+// buildCredentialProxyDeploymentForPlugins renders the standalone proxy pod.
 //
 // Recreate, not RollingUpdate. The Google Chat relay pulls from a Pub/Sub
-// subscription and buffers what it pulled until the gateway fetches it over this
-// Service; two pods pulling the same subscription during a rollout means
-// messages land in the buffer of the pod that is going away, and the Service
-// then load-balances the gateway's fetch to the other one. A few seconds of
-// unavailability is the cheaper failure — the gateway retries its long poll,
-// while a dropped chat message is silent.
-func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHash string) *appsv1.Deployment {
+// subscription when the gateway fetches over this Service and keeps each
+// message's ack id in this process; with two pods during a rollout, an ack the
+// Service sends to the other pod fails, and a message that misses its ack
+// deadline is delivered again and its turn runs twice. A few seconds of
+// unavailability is the cheaper failure: the gateway retries its long poll.
+//
+// One replica, by design. The Chat relay's ack ids, the Slack relay's
+// event queue and receipts, and the content workspace live in this process or its
+// emptyDir, so a second pod behind the Service breaks them; only the exec route
+// scales as it is. docs/designs/credential-proxy-single-pod.md records the
+// decision, the load it was sized against, and the split exec tier to build if
+// it reopens.
+//
+// The AgentPlugins resolved for the agent reach the container's environment
+// (buildCredentialProxyEnvForPlugins); buildCredentialProxyDeployment is this
+// with none. So does the profile role's configuration (credential_proxy_profiles.go):
+// the AgentProfile identities and the task-signing public key.
+func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool, profiles credentialProxyProfileConfig) *appsv1.Deployment {
 	saName := agent.Name
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
 		saName = agent.Spec.Security.ServiceAccountName
@@ -410,7 +430,7 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 					Affinity:         affinity,
 					NodeSelector:     nodeSelector,
 					Tolerations:      tolerations,
-					Containers:       []corev1.Container{buildCredentialProxyContainer(agent)},
+					Containers:       []corev1.Container{buildCredentialProxyContainerForPlugins(agent, agentPlugins, mcpIdentityOwned, profiles)},
 					Volumes:          buildCredentialProxyRuntimeVolumes(agent),
 				},
 			},
@@ -421,7 +441,13 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 	return dep
 }
 
-// buildCredentialProxyContainer is the credential half of the old sidecar: Envoy
+// buildCredentialProxyContainer is buildCredentialProxyContainerForPlugins with
+// no plugins.
+func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
+	return buildCredentialProxyContainerForPlugins(agent, nil, true, credentialProxyProfileConfig{})
+}
+
+// buildCredentialProxyContainerForPlugins is the credential half of the old sidecar: Envoy
 // and the credential runtime, with the chat relays the runtime hosts. The event
 // watcher and the agent API authenticator stay in the gateway pod, because both
 // talk to processes on that pod's loopback — see buildAgentAPIAuthSidecar.
@@ -429,7 +455,7 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 // One variant, because the broker has one placement: a Deployment of its own.
 // It shares no pod with the agent, which holds the credentials it mints from,
 // and no pod with the sandbox, which runs model-authored code.
-func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
+func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool, profiles credentialProxyProfileConfig) corev1.Container {
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
@@ -438,7 +464,7 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 	// buildCredentialProxyEnv. 0.0.0.0 because both callers arrive over the
 	// Service — the sandbox's wrapped CLIs and the gateway's chat relays, which
 	// are hosted in this same process, and one listener serves both.
-	envVars := buildCredentialProxyEnv(agent)
+	envVars := buildCredentialProxyEnvForPlugins(agent, agentPlugins, mcpIdentityOwned, profiles)
 	volumeMounts := buildCredentialProxyVolumeMounts(agent)
 	securityContext := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -656,6 +682,9 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 		// that lets it connect.
 		callers = append(callers, networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()}})
 	}
+	// The MCP server's pod, under its flag, on the same condition as its
+	// place on allowedBrokerCallers (a2aMCPBrokerPeers).
+	callers = append(callers, a2aMCPBrokerPeers(agent)...)
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
@@ -711,6 +740,11 @@ var (
 		"credential-proxy-policy":    true,
 		"credential-proxy-runtime":   true,
 		"credential-proxy-ksa-token": true,
+		// The watcher-audience token confers the broker's `watcher` role: every
+		// fleet cluster's events and named objects, and the drift subscription.
+		// It is projected into agent-api-auth alone, and that geometry is the
+		// whole of what keeps it from the model's container.
+		watcherTokenVolume: true,
 	}
 	credentialProxyRuntimeVolumeNames = map[string]bool{
 		"credential-proxy-policy":    true,
@@ -803,24 +837,135 @@ func filterVolumes(volumes []corev1.Volume, keep map[string]bool) []corev1.Volum
 // whose author believes it took effect, and the failure this guards against is
 // one nobody looks for: the manifest applies cleanly and the agent quietly gains
 // read access to the credentials the proxy exists to keep from it.
-func validateExtraVolumeMounts(agent *agentv1alpha1.PlatformAgent) string {
-	if agent.Spec.Deployment == nil {
-		return ""
+func validateExtraVolumeMounts(agent *agentv1alpha1.PlatformAgent, agentPlugins ...*agentv1alpha1.AgentPlugin) string {
+	var extraMounts []string
+	var containerMounts []string
+	var reservedVolumes []string
+	var forgeVolumeSources []string
+	var forgeEnvRefs []string
+	var forgeSecrets []string
+	if agent.Spec.Integration != nil {
+		forgeSecrets = agent.Spec.Integration.ForgeCredentialSecretNames()
 	}
-	var forbidden []string
-	for _, mount := range agent.Spec.Deployment.ExtraVolumeMounts {
-		if agentForbiddenVolumeNames[mount.Name] {
-			forbidden = append(forbidden, fmt.Sprintf("%s (at %s)", mount.Name, mount.MountPath))
+
+	if agent.Spec.Deployment != nil {
+		for _, mount := range agent.Spec.Deployment.ExtraVolumeMounts {
+			if agentForbiddenVolumeNames[mount.Name] || agentv1alpha1.IsForgeCredentialVolumeName(mount.Name) {
+				extraMounts = append(extraMounts, fmt.Sprintf("%s (at %s)", mount.Name, mount.MountPath))
+			}
+		}
+		for i, c := range agent.Spec.Deployment.InitContainers {
+			for _, mount := range c.VolumeMounts {
+				if agentForbiddenVolumeNames[mount.Name] || agentv1alpha1.IsForgeCredentialVolumeName(mount.Name) {
+					containerMounts = append(containerMounts, fmt.Sprintf("spec.deployment.initContainers[%d].volumeMounts (%s: %s at %s)", i, c.Name, mount.Name, mount.MountPath))
+				}
+			}
+		}
+		for i, c := range agent.Spec.Deployment.Sidecars {
+			for _, mount := range c.VolumeMounts {
+				if agentForbiddenVolumeNames[mount.Name] || agentv1alpha1.IsForgeCredentialVolumeName(mount.Name) {
+					containerMounts = append(containerMounts, fmt.Sprintf("spec.deployment.sidecars[%d].volumeMounts (%s: %s at %s)", i, c.Name, mount.Name, mount.MountPath))
+				}
+			}
+		}
+
+		for _, volList := range []struct {
+			field   string
+			volumes []corev1.Volume
+		}{
+			{"spec.deployment.extraVolumes", agent.Spec.Deployment.ExtraVolumes},
+			{"spec.deployment.sidecarVolumes", agent.Spec.Deployment.SidecarVolumes},
+		} {
+			for i, vol := range volList.volumes {
+				if agentForbiddenVolumeNames[vol.Name] || agentv1alpha1.IsForgeCredentialVolumeName(vol.Name) {
+					reservedVolumes = append(reservedVolumes, fmt.Sprintf("%s[%d].name (%s)", volList.field, i, vol.Name))
+					continue
+				}
+				if agent.Spec.Integration != nil {
+					for _, route := range agent.Spec.Integration.ForgeCredentialRoutes(vol) {
+						forgeVolumeSources = append(forgeVolumeSources, fmt.Sprintf("%s[%d] (%s -> Secret %s)", volList.field, i, vol.Name, route.Secret))
+					}
+				}
+			}
+		}
+
+		for i, e := range agent.Spec.Deployment.Env {
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+				forgeEnvRefs = append(forgeEnvRefs, fmt.Sprintf("spec.deployment.env[%d] (%s -> Secret %s)", i, e.Name, e.ValueFrom.SecretKeyRef.Name))
+			}
+		}
+		for _, cList := range []struct {
+			field      string
+			containers []corev1.Container
+		}{
+			{"spec.deployment.initContainers", agent.Spec.Deployment.InitContainers},
+			{"spec.deployment.sidecars", agent.Spec.Deployment.Sidecars},
+		} {
+			for ci, c := range cList.containers {
+				for ei, e := range c.Env {
+					if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+						forgeEnvRefs = append(forgeEnvRefs, fmt.Sprintf("%s[%d].env[%d] (%s.%s -> Secret %s)", cList.field, ci, ei, c.Name, e.Name, e.ValueFrom.SecretKeyRef.Name))
+					}
+				}
+				for efi, ef := range c.EnvFrom {
+					if ef.SecretRef != nil && slices.Contains(forgeSecrets, ef.SecretRef.Name) {
+						forgeEnvRefs = append(forgeEnvRefs, fmt.Sprintf("%s[%d].envFrom[%d] (%s -> Secret %s)", cList.field, ci, efi, c.Name, ef.SecretRef.Name))
+					}
+				}
+			}
 		}
 	}
-	if len(forbidden) == 0 {
-		return ""
+
+	for _, plugin := range agentPlugins {
+		if plugin == nil {
+			continue
+		}
+		for ei, e := range plugin.Spec.Env {
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+				forgeEnvRefs = append(forgeEnvRefs, fmt.Sprintf("AgentPlugin %s spec.env[%d] (%s -> Secret %s)", plugin.Name, ei, e.Name, e.ValueFrom.SecretKeyRef.Name))
+			}
+		}
 	}
-	return fmt.Sprintf(
-		"spec.deployment.extraVolumeMounts names volumes owned by the credential proxy: %s. "+
-			"Those hold the broker's home directory, its generated kubeconfigs and its git "+
-			"workspaces, and mounting them into the agent container defeats the credential "+
-			"isolation the proxy provides. Remove them, or use a volume of your own.",
-		strings.Join(forbidden, ", "),
-	)
+	var messages []string
+	if len(extraMounts) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"spec.deployment.extraVolumeMounts names volumes owned by the credential proxy: %s. "+
+				"Those hold the broker's home directory, its generated kubeconfigs, its git "+
+				"workspaces, and its forge credentials or CA bundles, and mounting them into the agent container "+
+				"defeats the credential isolation the proxy provides. Remove them, or use a volume of your own.",
+			strings.Join(extraMounts, ", "),
+		))
+	}
+	if len(containerMounts) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"User-authored container volumeMounts name volumes owned by the credential proxy: %s. "+
+				"Those volumes belong to the credential proxy alone and may not be mounted into initContainers or sidecars. "+
+				"Remove those volumeMounts, or use a volume of your own.",
+			strings.Join(containerMounts, ", "),
+		))
+	}
+	if len(reservedVolumes) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"Volume declarations use names reserved by the operator for the credential proxy: %s. "+
+				"Choose a different volume name.",
+			strings.Join(reservedVolumes, ", "),
+		))
+	}
+	if len(forgeVolumeSources) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"Volume declarations reference forge credential Secrets owned by the credential proxy: %s. "+
+				"Forge credentialsRef Secrets are mounted into the credential proxy alone so "+
+				"forge credentials never reach the agent Pod. Remove those volume declarations from spec.deployment.",
+			strings.Join(forgeVolumeSources, ", "),
+		))
+	}
+	if len(forgeEnvRefs) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"Environment variable declarations reference forge credential Secrets owned by the credential proxy: %s. "+
+				"Forge credentialsRef Secrets are mounted into the credential proxy alone so "+
+				"forge credentials never reach the agent Pod. Remove those Secret references from spec.deployment or the offending AgentPlugin.",
+			strings.Join(forgeEnvRefs, ", "),
+		))
+	}
+	return strings.Join(messages, " ")
 }

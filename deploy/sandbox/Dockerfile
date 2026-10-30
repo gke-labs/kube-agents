@@ -28,6 +28,17 @@ ARG PYTHON_IMAGE=python
 ARG PYTHON_VERSION=3.14-slim
 FROM ${PYTHON_IMAGE}:${PYTHON_VERSION}
 
+# No bytecode caches from any process the container's own environment reaches,
+# which is every `kubectl exec`, and those run as root (#3047). The image trees
+# under /opt/defaults are root-owned so the model can't change them, but root
+# can still write there, so a root-run script that imports from
+# /opt/defaults/scripts would leave a __pycache__ in the reference tree. That
+# tree is what `sandbox_tree_matches_image` compares the read-only copies
+# against, so the stray cache reads as an edit. The model's own sessions come in
+# through sshd and don't inherit this; they could never write a cache into those
+# trees anyway, so nothing they run loses one.
+ENV PYTHONDONTWRITEBYTECODE=1
+
 # openssh-server is baked rather than installed by the startup command. The
 # prototype this image replaces ran `apt-get install openssh-server` in the
 # Sandbox pod's args on every cold start: slow, and a hard dependency on
@@ -65,19 +76,73 @@ RUN apt-get update && \
       wget && \
     rm -rf /var/lib/apt/lists/*
 
-# The credential-free utility CLIs, at the versions the agent image carried
-# before #737 moved them here. This is now their only home — deploy/docker's
-# step 2 says so and its guard enforces it — so a version bump has one place to
-# happen. k9s did not come across: it is a full-screen terminal UI, and every
-# command here arrives over a non-interactive `ssh host -- cmd` with no tty, so
-# it could not run even if a skill asked for it. Nothing in agents/ does.
+# The credential-free utility CLIs: yq and helm (at the versions the agent
+# image carried before #737 moved them here) plus leeway, below. This is their
+# only home — deploy/docker's step 2 says so and its guard enforces it — so a
+# version bump has one place to happen.
+# k9s did not come across: it is a full-screen terminal UI, and every command
+# here arrives over a non-interactive `ssh host -- cmd` with no tty, so it
+# could not run even if a skill asked for it. Nothing in agents/ does.
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
     curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
-    tar -xzf /tmp/helm.tar.gz -C /tmp && \
+    tar -xzf /tmp/helm.tar.gz --no-same-owner -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
     rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
+
+# leeway, for GKE capacity, spot, and zonal topology-skew diagnostics. It holds
+# no credentials of its own; inside the sandbox session `CREDENTIAL_PROXY_URL`
+# is set (`pkg/clusters/broker.go`: `BrokerFromEnv` sets `ShellMode: true`), so
+# `leeway report` (`v0.1.3+`) leaves `Cluster.Config = nil` and
+# `fetchViaKubectl` (`pkg/report/collector.go`) shells out to the sandbox's
+# `kubectl` credential-proxy shim on `PATH` (`/opt/credential-proxy/bin/kubectl`,
+# governed by `KUBECTL_READ_VERBS`) rather than dialing the Kubernetes API
+# server directly through `client-go`. Pinned and checked against the
+# release's SHA256SUMS, per architecture; a version bump moves the hashes and
+# the `leeway version` check in deploy/sandbox/smoke-test.sh with it.
+ARG LEEWAY_VERSION=0.1.3
+ARG LEEWAY_SHA256_AMD64=26380a054ae1e5291f915f3965705c5d4198aeec611c42db843fd0ddbea06854
+ARG LEEWAY_SHA256_ARM64=850d8b9cd8d745898f41d139c1284db0aa88c6b9a42a5a95e758f59b58a8bb5b
+RUN ARCH=$(dpkg --print-architecture) && \
+    case "${ARCH}" in \
+      amd64) LEEWAY_SHA256="${LEEWAY_SHA256_AMD64}" ;; \
+      arm64) LEEWAY_SHA256="${LEEWAY_SHA256_ARM64}" ;; \
+      *) echo "no leeway checksum pinned for ${ARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -sSLf --retry 5 --retry-all-errors -o /tmp/leeway.tar.gz \
+      "https://github.com/go-steer/leeway/releases/download/v${LEEWAY_VERSION}/leeway_v${LEEWAY_VERSION}_linux_${ARCH}.tar.gz" && \
+    echo "${LEEWAY_SHA256}  /tmp/leeway.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/leeway.tar.gz --no-same-owner -C /usr/local/bin leeway && \
+    rm -f /tmp/leeway.tar.gz && \
+    leeway version
+
+# OpenTofu, for one command: `tofu fmt -check -diff`, the gcp-terraform skill's
+# syntax check on the HCL it writes before a pull request. It is the only check
+# that needs no provider plugins, state or credentials: `init`, `validate`,
+# `plan`, `apply` and `import` all need plugins from a registry this pod cannot
+# reach where its NetworkPolicy is enforced (DNS and the credential proxy out,
+# nothing else) and a cloud credential it never holds, so they fail here, and
+# the skill never runs them (agents/platform/scripts/test_command_policy.py). Like
+# helm, tofu is not one of the tools the command policy governs, because there
+# is nothing here for it to reach. OpenTofu rather than Terraform for its MPL
+# licence. Pinned and checked against the release's SHA256SUMS, per
+# architecture.
+ARG OPENTOFU_VERSION=1.13.1
+ARG OPENTOFU_SHA256_AMD64=378ada19d4bc70c43732004e8159be771b23b9a5afdf059e5f8a2b3fa2c70a69
+ARG OPENTOFU_SHA256_ARM64=9c1ef375aa1852db0b2888aa921b640c71f8140d4682aa4fec99378a64fa7dc3
+RUN ARCH=$(dpkg --print-architecture) && \
+    case "${ARCH}" in \
+      amd64) TOFU_SHA256="${OPENTOFU_SHA256_AMD64}" ;; \
+      arm64) TOFU_SHA256="${OPENTOFU_SHA256_ARM64}" ;; \
+      *) echo "no OpenTofu checksum pinned for ${ARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -sSLf --retry 5 --retry-all-errors -o /tmp/tofu.tar.gz \
+      "https://github.com/opentofu/opentofu/releases/download/v${OPENTOFU_VERSION}/tofu_${OPENTOFU_VERSION}_linux_${ARCH}.tar.gz" && \
+    echo "${TOFU_SHA256}  /tmp/tofu.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/tofu.tar.gz --no-same-owner -C /usr/local/bin tofu && \
+    rm -f /tmp/tofu.tar.gz && \
+    tofu version
 
 # In the agent container `python3` resolves through PATH into the Hermes venv,
 # so a shell command there gets these for free; here python3 is the bare base
@@ -95,6 +160,24 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # Cloud API relay (`credential_proxy_client.ApiSession`, over `requests`)
 # for the REST reads no CLI exposes, which is the whole arrangement.
 RUN pip install --no-cache-dir pyyaml requests
+
+# Precompile the standard library to bytecode at build time (#4027).
+# python:3.14-slim ships no precompiled .pyc files in the standard library, and
+# PYTHONDONTWRITEBYTECODE=1 (needed so root runs do not write caches into /opt/defaults)
+# prevents Python from caching bytecode at runtime. Without this, every invocation of
+# python3 or credential-proxy-exec re-compiles the standard library from source,
+# costing ~0.85s of CPU per command in the shell.
+# Precompiled bytecode is baked into /usr/local/lib/python3.14/ and never touches
+# /opt/defaults, so PYTHONDONTWRITEBYTECODE=1 can safely stay.
+#
+# No `-o`: the runtime sets neither PYTHONOPTIMIZE nor -O, so it looks for the
+# plain `.cpython-NNN.pyc` that a bare compileall writes, not an `.opt-N` one.
+# An `-o` or `-oN` would write `.opt-N.pyc` files that nothing loads, quietly
+# putting the runtime back to compiling from source.
+RUN STDLIB="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')" && \
+    [ -d "$STDLIB" ] && \
+    { python3 -m compileall -q -j 0 "$STDLIB" || true; } && \
+    [ "$(find "$STDLIB" -name '*.pyc' ! -name '*.opt-*.pyc' | head -500 | wc -l)" -ge 500 ]
 
 # A real git with no credential and no way to reach a host.
 #
@@ -398,9 +481,9 @@ COPY --chmod=0755 deploy/sandbox/session-command.sh /usr/local/bin/sandbox-sessi
 #                 happens in the agent pod, which reads SKILL.md from the platform
 #                 profile and puts it in the prompt; what arrives here is only the
 #                 part the resulting shell command touches.
-#   governance/ — the SOPs. `fleet-audit` cites them by relative path
-#                 (`governance/compliance_audit_sop.md`) and the model reads them
-#                 with a file tool, which is also over SSH now.
+#   governance/ — the SOPs. `fleet-audit` sends the model to them by full path
+#                 (`/opt/data/profiles/platform/governance/compliance_audit_sop.md`)
+#                 and the model reads them with a file tool, which is also over SSH now.
 #   scripts/    — the shared modules, as an allowlist rather than the directory.
 #
 # Hermes' own ssh backend separately syncs a skills tree to /home/agent/.hermes/skills.
@@ -448,6 +531,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          reaches for it; the content mode it runs in does not.
 #                          Every working copy that *proposes* a change goes
 #                          through `vcs_client`
+#   gitops_preflight.py    the one-line answer a PR-writing skill or SOUL.md is to run
+#                          first: is a GitOps repository registered and readable.
+#                          It reads the registry through gitops_workspace
+#                          and, with --repo, probes it through vcs.py; stdlib only
 #   credential_proxy_client.py  how anything here reaches the broker at all, and
 #                          the only way out of this container that carries a
 #                          credential. Imported by vcs_client, and through it by
@@ -455,7 +542,15 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          /usr/local/bin/credential-proxy-exec above, as the
 #                          kubectl/gcloud shim; that copy is not importable by
 #                          module name, so it is staged here as well
-#   fleet_scope_args.py    the two flags (`--scope-projects`, `--scope-unread`) the
+#   credential_shapes.py   the token shapes the feedback gate refuses and the broker
+#                          redacts before logging: one list, imported by
+#                          feedback_broker here and by credential_proxy off-pod
+#   feedback_broker.py     the constants the kube-agents-feedback client reads (the
+#                          route, the statuses, the fallback links, the payload's
+#                          normalisation); the same module's broker half files the
+#                          form from the broker pod, which is the side with egress
+#   fleet_scope_args.py    the flags (`--scope-projects`, `--scope-unread`,
+#                          `--scope-exclude-clusters`) the
 #                          fleet-audit collectors take the install's declared scope
 #                          by. The scope's snapshot sits on the agent pod's data
 #                          volume, which this container does not share, so the agent
@@ -485,6 +580,16 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          skill trees are not staged in this image (see
 #                          deploy/sandbox/entrypoint.sh: everything agents/cluster
 #                          names is under /opt/data/scripts)
+#   audit_cluster.sh       the Cluster Agent's gke-workload-security audit; its
+#                          gcloud read goes through the same wrapper. Here for the
+#                          reason stall_report.py is, and copied from the Platform
+#                          Agent's synced skill so both agents run one file
+#   audit_storage.py       single-pass storage collector (PVCs, PVs, StorageClasses,
+#                          VolumeAttachments) for Cluster Agent domain audits (#3285)
+#   audit_networking.py    single-pass ingress, Gateway API, and LoadBalancer collector
+#                          for Cluster Agent domain audits (#3285)
+#   audit_certificates.py  single-pass cert-manager CRD, Certificate, Issuer, and GKE
+#                          ManagedCertificate collector (#3285)
 #   inventory_findings.py  the onboarding ranking card's bridge from
 #                          INVENTORY.raw.md to the findings queue
 #                          (governance/inventory_prioritize_sop.md). `extract`
@@ -518,15 +623,24 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/github_token_refresh.py \
      agents/platform/scripts/wif_credentials.py \
      agents/platform/scripts/gitops_workspace.py \
+     agents/platform/scripts/gitops_preflight.py \
      agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/credential_shapes.py \
+     agents/platform/scripts/feedback_broker.py \
      agents/platform/scripts/fleet_scope_args.py \
+     agents/platform/scripts/collector_run.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/workspace_paths.py \
      agents/platform/scripts/gke_endpoint.py \
      agents/platform/scripts/cluster_preflight.sh \
      agents/platform/scripts/stall_report.py \
+     agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh \
+     agents/platform/scripts/audit_storage.py \
+     agents/platform/scripts/audit_networking.py \
+     agents/platform/scripts/audit_certificates.py \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
+     agents/platform/scripts/untrusted_text.py \
      /opt/defaults/scripts/
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_profile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_reconcile.py
@@ -627,6 +741,7 @@ COPY agents/platform/scripts/forge.py \
      agents/platform/scripts/credential_proxy_client.py \
      agents/platform/scripts/github_token_refresh.py \
      agents/platform/scripts/wif_credentials.py \
+     agents/platform/scripts/untrusted_text.py \
      /opt/vcs/libexec/platform/
 COPY deploy/sandbox/trusted-closure-guard.py /opt/vcs/libexec/trusted-closure-guard.py
 RUN set -e; \

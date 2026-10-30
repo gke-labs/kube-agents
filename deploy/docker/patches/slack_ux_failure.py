@@ -22,13 +22,17 @@ only when it ends on a yes/no question.
 With the flag on, the Slack reply to such a wake is drawn with its first
 sentence in bold and, when it ends on one short yes/no question, a choice button
 reading :data:`OFFER_LABEL` ("Try again"), whatever the question's words; the
-question stays in the reply above it. An open question ("Which namespace
+question stays in the reply above it, and a declared step's line never posts. An open question ("Which namespace
 should it use?"), a request ("Could you share the namespace?") or an either/or
-stays text, since it needs a word, not a click. A click is the clicker answering in the thread with the button's text
+stays text, since it needs a word, not a click. A reply that declares its next step on a
+last line of its own (``slack_moments.next_step``: ``[next: check seeded-a]``) gets that
+step as the button instead, whatever its question says, and the line is left out of the
+blocks. The line itself is plumbing and is never posted as text, on any chat platform
+(:func:`visible`, in the final's send); outside a thread nothing takes its place. A click is the clicker answering in the thread with the button's text
 (``gateway/slack_ux_clicks.py``), so the Planning Agent reads it as the user
 saying yes. The words are the agent's; only how they are drawn changes. The
-``text`` Slack keeps for notifications and for a later read of the thread is
-unchanged, question included.
+``text`` Slack keeps for notifications and for a later read of the thread keeps
+the question, and, like every chat final, has no step line.
 
 Which reply is the wake's: :func:`note_wake` marks the subscription's thread
 when a Slack wake carries ``blocked``, ``crashed``, ``timed_out`` or
@@ -55,6 +59,13 @@ A reply that arrives as edits to a streamed message, rather than through
 ``send_final_ledgered``, is drawn as upstream draws it, and its claim is
 dropped as an unsent one is.
 
+Under ``spec.mode: next`` a wake's reply in an alert's thread is sent by the
+kanban notifier's chat.notify stand-in (``kanban_chat_notify``), which has no
+blocks to hand :func:`maybe_blocks`. It asks :func:`chat_for` instead, under
+the same mark: the reply's first sentence as the headline, the rest as the
+detail, and the declared step, else Try again when :func:`present` finds the
+offer, as a choice (:func:`layout`, ``agents/platform/scripts/chat_message.py``).
+
 Fail-soft: anything that raises is logged and the reply goes out as upstream
 renders it.
 """
@@ -75,6 +86,14 @@ try:
     import slack_presenter as _presenter
 except ImportError:  # the scripts directory is not on PYTHONPATH
     _presenter = None
+try:
+    import chat_message as _chat
+except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
+    _chat = None
+try:
+    import slack_moments as _moments
+except ImportError:  # the scripts directory is not on PYTHONPATH
+    _moments = None
 
 SLACK_PLATFORM = "slack"
 
@@ -132,6 +151,12 @@ _marks: "OrderedDict[tuple[str, str], tuple[float, datetime, str]]" = OrderedDic
 #: Marks a queued wake carried to its follow-up's reply, ``(chat_id, thread_id) ->
 #: (mark time, when carried)``: taken under any event that arrived before the carry.
 _carried: "OrderedDict[tuple[str, str], tuple[float, datetime]]" = OrderedDict()
+
+#: The step the final being sent declared, held while its line is kept off the posted text.
+_held: contextvars.ContextVar[str] = contextvars.ContextVar("kage_declared_step", default="")
+#: Platforms whose finals are no chat post: the API server's reader is a program (the eval
+#: among them), which gets the agent's text as written, and the local CLI.
+NOT_CHAT_PLATFORMS = frozenset({"api_server", "local"})
 
 #: The marked thread's id ("" outside a thread) for the length of one marked final's send.
 _marked: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("kage_failure_reply", default=None)
@@ -286,9 +311,30 @@ def _noted_by(event: Any, moment: datetime) -> bool:
 
 
 def end(token: Optional[contextvars.Token]) -> None:
-    """Undo :func:`begin`."""
+    """Undo :func:`begin`, and drop any step :func:`visible` held."""
+    _held.set("")
     if token is not None:
         _marked.reset(token)
+
+
+def visible(event: Any, text: Any) -> Any:
+    """The final ``text`` as a chat platform posts it: without a declared step's line.
+
+    The ``[next: ...]`` line is plumbing, so no chat surface shows it, on any
+    platform and with the flag on or off. The step it declares is held for
+    :func:`maybe_blocks`, which draws it as the reply's button in a thread. A
+    program's platform (:data:`NOT_CHAT_PLATFORMS`) gets the text as written.
+    """
+    try:
+        source = getattr(event, "source", None)
+        platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+        if not isinstance(text, str) or _moments is None or str(platform or "").lower() in NOT_CHAT_PLATFORMS:
+            return text
+        _held.set(_moments.next_step(text)[1])
+        return _moments.visible_text(text) or text
+    except Exception:
+        logger.warning("slack_ux_failure: taking the step line off the final failed", exc_info=True)
+        return text
 
 
 def present(content: str) -> tuple[str, str]:
@@ -414,20 +460,63 @@ def _continues(line: str) -> bool:
     )
 
 
+def _next_step(content: str) -> tuple[str, str]:
+    """``slack_moments.next_step``: the reply without its declared step's line, and the step's label."""
+    return _moments.next_step(content) if _moments is not None else (content, "")
+
+
+def layout(content: str, in_thread: bool) -> Optional[dict]:
+    """A failure reply as a ``kube-agents.chat/v1`` message: :func:`present`'s offer, or the
+    declared next step in its place, as its button, only ``in_thread``. The step's line is
+    never part of the layout, in a thread or out of one."""
+    # The send's visible() has usually taken the line off already and held the step.
+    content, step = _next_step(content)
+    step = (step or _held.get()) if in_thread else ""
+    content = _moments.visible_text(content) or content if _moments is not None else content
+    _bolded, offer = present(content)
+    if step and _chat.command_word(step):
+        # A step the gateway would act on as a command is no choice; the question's Try again stands.
+        step = ""
+    return _chat.failure_message(content, bool((step or offer) and in_thread), step)
+
+
+def chat_for(content: str) -> Optional[dict]:
+    """The ``kube-agents.chat/v1`` layout of a marked failure reply, or None for any other.
+
+    :func:`maybe_blocks` for the chat.notify stand-in: the offer only in a thread,
+    since a click answers in the thread it was clicked in.
+    """
+    thread = _marked.get()
+    if thread is None or _chat is None:
+        return None
+    try:
+        return layout(content, bool(thread))
+    except Exception:
+        logger.warning("slack_ux_failure: laying out the failure reply failed", exc_info=True)
+        return None
+
+
 def maybe_blocks(content: str, render: Callable[[str], Optional[list]]) -> Optional[list]:
-    """``render(content)``, or for a marked reply its :func:`present` form plus the Try again offer."""
+    """``render(content)``, or for a marked reply its :func:`present` form plus its offer: the
+    declared next step, else Try again."""
     thread = _marked.get()
     if thread is None:
         return render(content)
     try:
-        bolded, offer = present(content)
+        # visible() has usually taken the step's line off already and held the step.
+        shown, step = _next_step(content)
+        step = step or _held.get()
+        shown = _moments.visible_text(shown) or shown if _moments is not None else shown
+        bolded, offer = present(shown)
         blocks = render(bolded)
         if blocks is None:
-            return render(content)
-        if offer and thread and len(blocks) < MESSAGE_BLOCKS_MAX:
-            blocks = list(blocks) + _presenter.blocks_answer(
-                "", choices=[OFFER_LABEL], action_id_prefix=ACTION_ID_PREFIX,
+            return render(shown)
+        label = step or (OFFER_LABEL if offer else "")
+        if label and thread and len(blocks) < MESSAGE_BLOCKS_MAX:
+            return list(blocks) + _presenter.blocks_answer(
+                "", choices=[label], action_id_prefix=ACTION_ID_PREFIX,
             )
+        # No button can carry the step (outside a thread, or no room): nothing takes its place.
         return blocks
     except Exception:
         logger.warning("slack_ux_failure: drawing the failure reply failed", exc_info=True)

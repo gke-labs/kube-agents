@@ -38,6 +38,10 @@ domain: chat-and-routing
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: haoxuw
 
+# Naming /new needs no tool call, so rung 3 takes the reply, not the
+# trajectory, as the evidence the agent ran (docs/designs/bench-case-format.md).
+tool_calls_optional: true
+
 verification_spec:
   - name: the-reply-names-the-session-command
     role: objective

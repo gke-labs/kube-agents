@@ -1,0 +1,19 @@
+{
+  "name": "needs-you-long-question-with-link-shown-once",
+  "source": "agents/platform/scripts/test_slack_moments.py::NeedsYouTest.test_a_long_question_with_a_link_shows_its_words_once",
+  "notes": "The headline shows a link's label only, so the link opens the detail on a line of its own to keep its url, followed on the next line by the rest of the question after the ellipsis; no sentence is drawn twice.",
+  "input": {
+    "reason": "Should I merge [PR #412](https://github.com/acme/gitops/pull/412), which raises the memory limit of checkout-gateway in seeded-reliability to 512Mi, or close it and open one that rolls back the image instead?"
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Should I merge PR #412, which raises the memory limit of checkout-gateway in seeded-reliability to 512Mi, or close it and open one that rolls back…",
+        "detail": "[PR #412](https://github.com/acme/gitops/pull/412)\n…the image instead?",
+        "tone": "attention"
+      }
+    }
+  ]
+}

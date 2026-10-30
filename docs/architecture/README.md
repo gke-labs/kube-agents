@@ -57,7 +57,7 @@ Two tiers, meant to be read in order **01 → 09**:
 
 09 sits in the first tier rather than the second because it presumes agents are separate workloads.
 **Amended 9/9:** one hop of that topology now exists — the a2a chat gateway (C20) spawns a session pod per
-task — and 09's mechanism is built and enforcing across it. The multi-hop fan-out 09 draws still
+conversation — and 09's mechanism is built and enforcing across it. The multi-hop fan-out 09 draws still
 does not exist, so attenuation ships with no production caller. 09 §0 states the boundary; read it
 before taking any section of 09 as either a plan or a fact.
 

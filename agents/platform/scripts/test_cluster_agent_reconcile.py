@@ -556,22 +556,6 @@ class ExclusiveRunTest(unittest.TestCase):
             self.assertIsNone(rec.main())
 
 
-class MetadataTest(unittest.TestCase):
-    def test_response_is_closed(self):
-        # urlopen's response holds a socket; on a cron tick, leaking one per call
-        # leaks one per tick. It must be context-managed.
-        resp = mock.MagicMock()
-        resp.read.return_value = b"  my-project\n"
-        resp.__enter__.return_value = resp
-        with mock.patch.object(rec.urllib.request, "urlopen", return_value=resp):
-            self.assertEqual(rec._metadata("project/project-id"), "my-project")
-        resp.__exit__.assert_called_once()
-
-    def test_unreachable_metadata_returns_none(self):
-        with mock.patch.object(rec.urllib.request, "urlopen", side_effect=OSError("no route")):
-            self.assertIsNone(rec._metadata("project/project-id"))
-
-
 class ListProfilesReservedTest(unittest.TestCase):
     def test_reserved_profiles_excluded(self):
         base = Path(tempfile.mkdtemp()) / "profiles"
@@ -1132,11 +1116,9 @@ class ScopeTest(HomesMixin):
 
     def test_an_empty_reconcile_project_reads_as_unset(self):
         # The operator pins RECONCILE_PROJECT empty; the empty value must not become the project.
-        with mock.patch.dict(os.environ, {"RECONCILE_PROJECT": ""}), \
-             mock.patch.object(rec, "_metadata", return_value="from-metadata"):
-            self.assertEqual(rec._project_source(), ("from-metadata", True))
-        with mock.patch.dict(os.environ, {"RECONCILE_PROJECT": "override"}), \
-             mock.patch.object(rec, "_metadata", return_value="from-metadata"):
+        with mock.patch.dict(os.environ, {"RECONCILE_PROJECT": "", "GKE_PROJECT_ID": "from-harness"}):
+            self.assertEqual(rec._project_source(), ("from-harness", True))
+        with mock.patch.dict(os.environ, {"RECONCILE_PROJECT": "override", "GKE_PROJECT_ID": "from-harness"}):
             self.assertEqual(rec._project_source(), ("override", True))
 
     def test_an_unreadable_declaration_with_no_previous_snapshot_excludes_nothing(self):
@@ -1437,7 +1419,9 @@ class ScopeTest(HomesMixin):
                 stall.hold()
             return True if cluster != "c" else False
 
-        listings = {self.MGMT: [(self.MGMT, "b", "us-central1")]}
+        # No cluster on the list, so all three are described: a listed one would skip its
+        # describe (#3703) and leave only one completing describe beside the stall.
+        listings = {self.MGMT: []}
         with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 0.2), mock.patch.object(rec, "PRUNE_SECONDS_PER_DESCRIBE", 0.05), \
                 mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, deleted = self._run({}, listings, profiles=list(ids), identities=ids, exists=exists)
@@ -3072,5 +3056,115 @@ class ScopeTest(HomesMixin):
         self.assertIn(f"`{self.SCOPE}` (denied, 1 project(s))", text)
 
 
+
+    # #3703: a cluster its project's own list named this run is not described again. The
+    # list is proof of existence and never proof of absence: a cluster missing from it is
+    # still described, and only that describe's NotFound deletes its profile.
+
+    def _describes(self, answers):
+        """An `_cluster_exists` stub that records which profiles it was asked about."""
+        asked: list[str] = []
+
+        def exists(project, cluster, location, timeout=None):
+            asked.append(cluster)
+            return answers[cluster]
+        return asked, exists
+
+    def _profiles(self, *clusters, project=None):
+        project = project or self.MGMT
+        names = [f"cluster-{c}" for c in clusters]
+        return names, {f"cluster-{c}": _identity(project=project, cluster=c) for c in clusters}
+
+    def test_a_cluster_on_its_projects_list_is_kept_without_a_describe(self):
+        profiles, identities = self._profiles("a", "b")
+        asked, exists = self._describes({})
+        report, _, deleted = self._run(None, {self.MGMT: [(self.MGMT, "a", "us-central1"),
+                                                          (self.MGMT, "b", "us-central1")]},
+                                       profiles=profiles, identities=identities, exists=exists)
+        self.assertEqual(asked, [])
+        self.assertEqual(deleted, [])
+        self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-b"])
+
+    def test_a_cluster_missing_from_the_list_is_described_and_pruned_only_on_notfound(self):
+        profiles, identities = self._profiles("a", "gone", "unsure")
+        asked, exists = self._describes({"gone": False, "unsure": None})
+        report, _, deleted = self._run(None, {self.MGMT: [(self.MGMT, "a", "us-central1")]},
+                                       profiles=profiles, identities=identities, exists=exists)
+        self.assertEqual(sorted(asked), ["gone", "unsure"])
+        self.assertEqual(deleted, ["cluster-gone"])
+        self.assertEqual(report["skipped_error"], ["cluster-unsure"])
+        self.assertEqual(report["kept"], ["cluster-a"])
+
+    def test_a_partial_list_cannot_delete_a_live_cluster(self):
+        # The safety property: the list leaves out a cluster that exists (filtered, cut short,
+        # or simply wrong). Absence from it is not a NotFound, so the describe decides, and a
+        # live answer keeps the profile.
+        profiles, identities = self._profiles("a", "omitted")
+        asked, exists = self._describes({"omitted": True})
+        report, _, deleted = self._run(None, {self.MGMT: [(self.MGMT, "a", "us-central1")]},
+                                       profiles=profiles, identities=identities, exists=exists)
+        self.assertEqual(asked, ["omitted"])
+        self.assertEqual(deleted, [])
+        self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-omitted"])
+
+    def test_a_failed_list_describes_every_profile_in_the_project(self):
+        profiles, identities = self._profiles("a", "b")
+        asked, exists = self._describes({"a": True, "b": None})
+        report, _, deleted = self._run(None, {self.MGMT: (None, rec.OUTCOME_UNREACHABLE)},
+                                       profiles=profiles, identities=identities, exists=exists)
+        self.assertEqual(sorted(asked), ["a", "b"])
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["kept"], ["cluster-a"])
+        self.assertEqual(report["skipped_error"], ["cluster-b"])
+
+    def test_an_asset_inventory_member_is_still_described(self):
+        # The index lags, and a member's describe is the one call that sees an IAM deny on
+        # its project, so index rows are not evidence here.
+        members = {"team-a": [("team-a", "prod", "us-central1")]}
+        profiles, identities = self._profiles("prod", project="team-a")
+        asked, exists = self._describes({"prod": True})
+        report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []},
+                                       profiles=profiles, identities=identities, exists=exists,
+                                       searches={self.FOLDER: (members, rec.OUTCOME_OK)})
+        self.assertEqual(asked, ["prod"])
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["kept"], ["cluster-prod"])
+
+
+class ProjectSourceTest(unittest.TestCase):
+    """The management project comes from the operator before the metadata server.
+
+    The gateway pod reaches no metadata server once its Workload Identity is gone,
+    so the operator's GKE_PROJECT_ID has to answer first, and authoritatively.
+    """
+
+    def test_the_operators_project_answers_and_the_metadata_server_is_gone(self):
+        # The gateway reaches no metadata server, and the script no longer asks one.
+        self.assertFalse(hasattr(rec, "_metadata"))
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "mgmt-project", "RECONCILE_PROJECT": ""}):
+            self.assertEqual(rec._project_source(), ("mgmt-project", True))
+
+    def test_a_numeric_operator_project_is_resolved_to_its_id(self):
+        # In the gateway the metadata server is closed, so the number is
+        # resolved through the broker; the metadata answer is never reached.
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "123456789012", "RECONCILE_PROJECT": ""}), \
+                mock.patch.object(rec, "_project_id_of", return_value=("mgmt-project", rec.OUTCOME_OK)) as resolve:
+            self.assertEqual(rec._project_source(), ("mgmt-project", True))
+        resolve.assert_called_once_with("123456789012")
+
+    def test_a_numeric_operator_project_that_will_not_resolve_is_not_an_answer(self):
+        # Not even through the gcloud config fallback, which the broker was
+        # bootstrapped with from this same number: on a tick with no snapshot
+        # the number would stand as the management project and key every
+        # profile on it. The run is unresolved instead, and the next tick asks.
+        for outcome in (rec.OUTCOME_DENIED, rec.OUTCOME_UNREACHABLE):
+            with self.subTest(outcome=outcome), \
+                    mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "123456789012", "RECONCILE_PROJECT": ""}), \
+                    mock.patch.object(rec, "_project_id_of", return_value=(None, outcome)), \
+                    mock.patch.object(rec.sandbox_exec, "run", side_effect=AssertionError("gcloud config asked")):
+                self.assertEqual(rec._project_source(), (None, False))
+
+
 if __name__ == "__main__":
     unittest.main()
+

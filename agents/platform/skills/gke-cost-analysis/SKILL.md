@@ -75,6 +75,8 @@ When handling a cost-related question:
 
 ## Live Cluster & Cost Monitoring
 
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+
 Use read-only CLI commands to inspect current cluster budgets, node utilization,
 and pod resource consumption vs. requests:
 
@@ -82,10 +84,9 @@ and pod resource consumption vs. requests:
 # View billing budgets for an account (requires Cost Management API)
 gcloud billing budgets list --billing-account={billing_account} --quiet
 
-# Verify/Enable GKE cost allocation on a cluster for namespace-level billing tracking
-gcloud container clusters update {cluster_name} \
-    --enable-cost-allocation \
-    --region {region}
+# Verify GKE cost allocation on a cluster for namespace-level billing tracking
+gcloud container clusters describe {cluster_name} \
+    --region {region} --format="value(costManagementConfig.enabled)"
 
 # View live node resource utilization across the cluster
 kubectl top nodes
@@ -93,6 +94,10 @@ kubectl top nodes
 # View pod resource usage across namespaces (compare against requested limits to diagnose waste)
 kubectl top pods --all-namespaces --containers
 ```
+
+If cost allocation is off, it is enabled with `spec.costManagementConfig.enabled: true`
+on the cluster's `ContainerCluster`, as Config Connector YAML through
+`gcp-config-connector`.
 
 ## Applying Cost Optimizations
 
@@ -169,3 +174,21 @@ LIMIT 10
 
 Note: Checking that the `goog-k8s-cluster-name` label exists scopes the total
 billing data specifically to GKE costs.
+
+<!-- kube-agents: local addition -->
+
+## On a kube-agents install
+
+- **No dollar figure without billing data.** Quote a cost, a dollar saving or a monthly total only
+  from the billing export queries above, and say which query it came from. When the export is not
+  configured or cannot be read, report waste in resource units (vCPU, GiB, nodes, disks) and say
+  that a price needs billing data. Never multiply list prices, or the $0.10/hour cluster fee above,
+  into a fleet total. A published discount range (Spot, committed use) may be quoted as Google's
+  range, never as this fleet's saving. A fleet-wide waste question belongs to the `fleet-audit`
+  skill's cost SOP (`fleet_wide_cost_analysis_sop.md`), which reports in resource units by design.
+- **A cluster running kube-agents is not empty.** System pods (`kube-system`, `gke-*`, `gmp-*`) are
+  not workload. The kube-agents operator, the agents and their sidecars are workload, wherever they
+  run. Never call a cluster idle or empty, or recommend stopping or deleting it, without naming the
+  workloads you counted on it.
+- **Stay inside the install's scope.** Read `fleet_scope()` first, and leave out every cluster it
+  lists in `excluded_clusters` (#3081).

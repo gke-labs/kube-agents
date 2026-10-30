@@ -1,0 +1,19 @@
+Subject: Stop listing `gvnic` as a field the CRD lacks
+
+Why: Upstream took `gvnic` off the CRD field reference's never-use list but left it on SKILL.md's STRICT SCHEMA RULE, so the skill forbade and allowed the same field; `spec.nodePoolConfig.gvnic` exists in the ComputeClass CRD (checked with `kubectl explain` on 1.35.8), so the reference is right and SKILL.md follows it.
+Local-Issue: #2692
+Upstream-Issue: none filed yet
+Retire-When: when upstream SKILL.md drops `gvnic` from the STRICT SCHEMA RULE
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -54,7 +54,7 @@ not block the user's initial request.** If asked for YAML/recommendations:
+         your existing CUDs/Reservations`.
+     *   **MUST label initial YAML as `EXAMPLE TEMPLATE - DO NOT DEPLOY`.**
+     *   **STRICT SCHEMA RULE:** NEVER hallucinate fields. Do NOT use
+-        `spec.description`, `gvnic`, `transparentHugepageEnabled`, or
++        `spec.description`, `transparentHugepageEnabled`, or
+         `shutdownGracePeriodSeconds`. Use `bootDiskSize` (NOT `bootDiskSizeGb`).
+     *   **YAML FORMATTING RULE:** NEVER quote integer or boolean values (e.g.,
+         use `bootDiskSize: 50`, not `bootDiskSize: "50"`). `imageType` MUST be

@@ -95,6 +95,13 @@ readonly KV_DAEMON_HOST=127.0.0.1
 readonly KV_DAEMON_PORT=8699
 readonly KV_DAEMON_URL="http://${KV_DAEMON_HOST}:${KV_DAEMON_PORT}"
 
+# The agent gateway the daemon starts each triage turn on, on the same loopback
+# (session_kv_server.py's PLATFORM_API_URL default). The watcher waits for it to
+# answer before it watches events: the daemon accepts an inject before it starts
+# the turn, so an event offered while the gateway boots would rest on the
+# daemon's retries, which give up after a bounded wait.
+readonly AGENT_GATEWAY_URL="http://127.0.0.1:8642"
+
 # How long to wait for that daemon to start listening before launching the
 # detector anyway. This container is a native sidecar, so it starts before the
 # platform-agent container the daemon runs in, and the detector's startup check
@@ -241,10 +248,26 @@ clamp_at_least DRIFT_SHORT_EXIT_ALERT_COUNT
 # delivers the signal and not the shutdown.
 #
 # Fifteen seconds because the detector budgets ten to settle its in-flight
-# records (settleGracePeriod, k8s-operator/cmd/drift-detector/subscriber.go) and
-# the pod takes Kubernetes' default thirty-second grace period, so this leaves
-# half of it unspent for the credential runtime and Envoy. The poll is whole
-# seconds: the drain is bounded by the settle, not by how often it is checked.
+# records (settleGracePeriod, k8s-operator/cmd/drift-detector/subscriber.go).
+# A cut drain loses those settles: unsettled records go to the next instance,
+# which can post one duplicate drift record to Session KV per non-graceful
+# restart. The credential runtime is not waited on; it is killed once the
+# supervisors are gone.
+#
+# With the current operator, the only pod that runs this drain is the gateway
+# pod, where this script runs in the agent-api-auth native sidecar. That pod's
+# grace period is gatewayTerminationGracePeriodSeconds (60s,
+# k8s-operator/internal/controller/platformagent_manifests.go), not the 30s
+# default. Native sidecars are signalled after the app containers exit and share
+# that budget. Today the operator runs the gateway at one replica
+# (supportedGatewayReplicas), where Hermes' stop path may spend 40s, so this
+# drain gets about 20s. If multi-replica gateways return (#3016), leader_elect.py
+# may spend up to 56s (50s drain plus lease release calls), leaving this drain
+# about 4s; resizing it is tracked in #3407. An older operator's `combined`
+# sidecar keeps the 30s default, which 15s fits. The standalone broker pod
+# (CREDENTIAL_PROXY_ROLE=broker) starts no watcher or detector, so terminate()
+# has nothing to drain there. The poll is whole seconds: the drain is bounded by
+# the settle, not by how often it is checked.
 readonly SHUTDOWN_DRAIN_SECONDS=15
 readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
 
@@ -306,15 +329,27 @@ WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-3}"
 WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-3}"
 
 # The backstop for FailedScheduling when cluster-autoscaler has recorded no
-# verdict on the pod: five failed scheduling attempts, a count rather than a
-# time, since the scheduler retries on every cluster change and at least
-# every five minutes. The autoscaler's own events take precedence over it: a
+# verdict on the pod: five failed scheduling attempts, with
+# WATCHER_FAILEDSCHEDULING_MIN_SPAN below on top, because the scheduler
+# retries on every cluster change and the count alone climbs in seconds.
+# The autoscaler's own events take precedence over it: a
 # NotTriggerScaleUp on the pod fires at any count, a TriggeredScaleUp holds at
 # any count for WATCHER_SCALEUP_HOLD, and on a cluster with an autoscaler one
 # or the other arrives seconds after the pod's first attempt. Both are in the
 # --reason list below so the watcher reads them; neither is forwarded. Set to
-# 1 to fire on the first event when no verdict is on record.
+# 1, with WATCHER_FAILEDSCHEDULING_MIN_SPAN=0, to fire on the first event when
+# no verdict is on record.
 WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-5}"
+
+# How long such a FailedScheduling has to have lasted, by the event's own first
+# and last sighting, before the count backstop passes it. The count alone
+# climbs in seconds while a node scale-down drains a node: no verdict is
+# recorded, the scheduler retries the evicted pod's replacement on every
+# change, and it is placed seconds later. A pod still stuck is sighted again
+# within the scheduler's five-minute flush and fires then. A Go duration
+# (2m, 90s); a bare number stops the watcher from starting. Set to 0 to
+# switch it off.
+WATCHER_FAILEDSCHEDULING_MIN_SPAN="${WATCHER_FAILEDSCHEDULING_MIN_SPAN:-2m}"
 
 # How long a TriggeredScaleUp on a pod holds its FailedScheduling events,
 # measured from the autoscaler's event to the FailedScheduling's own last
@@ -323,6 +358,28 @@ WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-5}"
 # a pod still pending past it is reported on the count whatever the autoscaler
 # last said. Raise it on a cluster whose node pools take longer to provision.
 WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-15m}"
+
+# The settle period: how long a failure in the settle family (the crash-loop
+# family, FailedMount, Unhealthy; the reasons kubelet re-emits while they
+# last) has to have lasted, by the
+# event's own first and last sighting, before the watcher forwards it. It
+# runs after the count debounces above: a failure has to have repeated AND
+# lasted. A BackOff that clears inside it, kubelet warming its object cache on
+# a fresh Autopilot node, is not forwarded; a real crash loop crosses it on
+# its fourth or fifth back-off and is forwarded with its first sighting kept.
+# Never applied to OOMKilled, the image-pull family or FailedScheduling, which
+# have gates of their own. Set to 0 to switch it off.
+WATCHER_SETTLE="${WATCHER_SETTLE:-2m}"
+
+# How long after its last sighting an incident whose alert went out is reported
+# quiet: the watcher sends the Session KV server one k8s-event-followup inject
+# for it, which lands in the alert's thread saying the object has emitted
+# nothing since, so a card read hours later says what was true when. Silence,
+# not recovery: the watcher reads events only and reads no object back, and a
+# deleted pod goes as quiet as a recovered one. Past kubelet's 5m back-off
+# ceiling with margin, so a crash loop still going is never reported quiet
+# between two of its back-offs. Set to 0 to send none.
+WATCHER_QUIET_AFTER="${WATCHER_QUIET_AFTER:-15m}"
 
 # Whether to hold the FailedScheduling an Autopilot cluster emits for GKE's own
 # system pods once it has scaled itself to zero nodes — kube-dns, metrics-server,
@@ -606,13 +663,17 @@ start_event_watcher() {
         --metrics-addr="${metrics_addr}" \
         --in-cluster \
         --daemon-url="${KV_DAEMON_URL}" \
+        --gateway-url="${AGENT_GATEWAY_URL}" \
         --token-env=SESSION_KV_API_KEY \
         --owner=platform \
         --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled,FailedScheduling,TriggeredScaleUp,NotTriggerScaleUp \
         --backoff-min-count="${WATCHER_BACKOFF_MIN_COUNT}" \
         --imagepull-transient-min-count="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT}" \
         --failedscheduling-min-count="${WATCHER_FAILEDSCHEDULING_MIN_COUNT}" \
+        --failedscheduling-min-span="${WATCHER_FAILEDSCHEDULING_MIN_SPAN}" \
         --scaleup-hold="${WATCHER_SCALEUP_HOLD}" \
+        --settle="${WATCHER_SETTLE}" \
+        --quiet-after="${WATCHER_QUIET_AFTER}" \
         --autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}" || true
       ran=$(( SECONDS - started ))
 

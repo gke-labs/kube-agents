@@ -5,8 +5,9 @@ name: Conformance
 # cannot be tested yet.
 #
 # **No paths filter, on purpose.** The filtered jobs here, k8s-operator-test.yml
-# and a2a-test.yml on the Go side, gate on dorny/paths-filter, and for them that
-# is the right trade: each asserts properties of one directory. (python-tests.yml is already
+# and a2a-test.yml on the Go side and docs-build.yml for the site, gate on
+# dorny/paths-filter, and for them that is the right trade: each asserts
+# properties of one directory. (python-tests.yml is already
 # unfiltered, and says so.) This suite asserts properties of the repository — the Dockerfile's
 # build gate, the rendered operator manifests, the workflows in this directory,
 # the chart's RBAC, the upstream skill sync — so the filter

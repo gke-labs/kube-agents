@@ -58,6 +58,7 @@ jobs:
   test:
     name: Run Controller Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
       - name: Checkout code
@@ -67,6 +68,14 @@ jobs:
         id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
+          # No token: on a pull request the action then diffs the checked-out
+          # merge commit against the base SHA with git, the path it already
+          # takes on push and merge-queue runs, instead of paging the file list
+          # through the GitHub API with no retry. The rule, the day it comes
+          # from, and why the checkout stays at depth one:
+          # .agents/rules/github_actions.md, "Detect changed files with git,
+          # not the API"; tests/test_paths_filter_uses_git_diff.py holds it.
+          token: ""
           filters: |
             operator:
               - "k8s-operator/**"

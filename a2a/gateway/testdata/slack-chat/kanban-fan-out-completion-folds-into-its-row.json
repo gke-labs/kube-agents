@@ -1,0 +1,35 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "details": {
+          "elements": [
+            {
+              "elements": [
+                {
+                  "elements": [
+                    {
+                      "text": "✓ reading version",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                }
+              ],
+              "style": "bullet",
+              "type": "rich_text_list"
+            }
+          ],
+          "type": "rich_text"
+        },
+        "status": "complete",
+        "task_id": "t_e0c1",
+        "title": "seeded-a: 1.33.4 = default.",
+        "type": "task_card"
+      }
+    ],
+    "attachments": []
+  }
+]

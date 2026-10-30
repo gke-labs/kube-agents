@@ -417,6 +417,9 @@ class TestNestedStores(ReportStatusTestCase):
             ("acme/fleet", "acme/fleet"),
             ("GitHub.com/Acme/Fleet", "acme/fleet"),
             ("gitlab.com/acme/platform/infra", "gitlab.com/acme/platform/infra"),
+            # A GitHub Enterprise Server repository keeps its host: it is not
+            # the github.com repository of the same name.
+            ("GHE.example.com/Acme/Fleet", "ghe.example.com/acme/fleet"),
         ):
             with self.subTest(typed=typed):
                 self.assertEqual(key, report_status.store_key("/r", "compliance-audit", typed))

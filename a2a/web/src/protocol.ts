@@ -59,6 +59,75 @@ export const ARTIFACT_TURN = "turn";
 export const ARTIFACT_THINKING = "thinking";
 export const ARTIFACT_ACTIVITY = "activity";
 export const ARTIFACT_PROGRESS = "progress";
+/** What a task's turns cost: one data part per finished turn, a `Usage` object (spec "Reserved artifact names"). */
+export const ARTIFACT_USAGE = "usage";
+
+/**
+ * One finished turn's cost, as the `usage` artifact carries it. Every field is
+ * optional, and an absent figure is unknown, never zero: the producer omits
+ * what it did not measure (the bridge's CLI executor reports duration alone;
+ * Hermes behind the gateway never prices a turn, so `costUsd` is the harness's
+ * own estimate when present).
+ */
+export interface Usage {
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+  durationMs?: number;
+}
+
+/** Whether `v` is a usage object a reader can fold: an object with at least one non-negative figure. */
+export function usageOf(v: unknown): Usage | undefined {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
+  const o = v as Record<string, unknown>;
+  // A negative figure is one no producer measured; the whole part is not
+  // usage then, as the library's reader says.
+  const figureKeys = ["inputTokens", "outputTokens", "costUsd", "durationMs"];
+  if (figureKeys.some((k) => typeof o[k] === "number" && (o[k] as number) < 0)) return undefined;
+  // A zero is "not known" on the wire (the producer omits it), so an explicit
+  // zero reads as absent too rather than as a known nothing.
+  const num = (k: string): number | undefined =>
+    typeof o[k] === "number" && Number.isFinite(o[k]) && (o[k] as number) > 0 ? (o[k] as number) : undefined;
+  const u: Usage = {
+    model: typeof o.model === "string" && o.model !== "" ? o.model : undefined,
+    inputTokens: num("inputTokens"),
+    outputTokens: num("outputTokens"),
+    costUsd: num("costUsd"),
+    durationMs: num("durationMs"),
+  };
+  const figures = [u.inputTokens, u.outputTokens, u.costUsd, u.durationMs].filter((n) => n !== undefined && n > 0);
+  return figures.length > 0 ? u : undefined;
+}
+
+/** The usage objects among `parts`: one per data part that reads as usage; anything else is skipped. */
+export function usageParts(parts: Part[] | undefined): Usage[] {
+  if (!Array.isArray(parts)) return [];
+  const out: Usage[] = [];
+  for (const p of parts) {
+    if (!p || p.kind !== "data") continue;
+    const u = usageOf(p.data);
+    if (u !== undefined) out.push(u);
+  }
+  return out;
+}
+
+/** Sum turns into one usage: figures add, the model is the last one named, an absent figure stays absent. */
+export function usageTotal(turns: Usage[]): Usage | undefined {
+  if (turns.length === 0) return undefined;
+  const add = (a: number | undefined, b: number | undefined): number | undefined =>
+    a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
+  return turns.reduce<Usage>(
+    (acc, u) => ({
+      model: u.model ?? acc.model,
+      inputTokens: add(acc.inputTokens, u.inputTokens),
+      outputTokens: add(acc.outputTokens, u.outputTokens),
+      costUsd: add(acc.costUsd, u.costUsd),
+      durationMs: add(acc.durationMs, u.durationMs),
+    }),
+    {},
+  );
+}
 
 export interface Party {
   session: string;

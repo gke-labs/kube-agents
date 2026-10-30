@@ -101,6 +101,33 @@ def _doc(path: pathlib.Path) -> dict:
     return yaml.safe_load(path.read_text())
 
 
+def _evaluate_teardown_condition(
+    condition: str, *, deploy: str, matrix: str,
+    run_cancelled: bool = False, upstream_repository: bool = True, skipped: bool = False,
+) -> bool:
+    """The teardown's `if:` as GitHub would read it for one set of facts.
+
+    The two job results are the usual variables; the run-level facts
+    (`!cancelled()`, the repository guard, the skip-pipeline output) are
+    parameters too, so a table can check that the deploy arms sit inside
+    those guards rather than beside them. The expression is rewritten into
+    Python operators and evaluated with no names available, so anything but
+    these substitutions fails loudly.
+    """
+    text = condition
+    for name, value in {
+        "needs.step-2-deploy-env.result": deploy,
+        "needs.step-3-run-e2e-matrix.result": matrix,
+    }.items():
+        text = text.replace(name, repr(value))
+    text = text.replace("!cancelled()", repr(not run_cancelled))
+    text = text.replace("github.repository == 'gke-labs/kube-agents'", repr(upstream_repository))
+    text = text.replace("needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true'", repr(not skipped))
+    text = text.replace("&&", " and ").replace("||", " or ")
+    text = " ".join(text.split())  # the block scalar's newlines and indentation
+    return bool(eval(text, {"__builtins__": {}}, {}))  # noqa: S307 - a six-token expression under test
+
+
 class PromotionPipelineWiringTest(unittest.TestCase):
     def setUp(self):
         self.doc = _doc(_PROMOTION)
@@ -289,13 +316,14 @@ class PromotionPipelineWiringTest(unittest.TestCase):
             "GitHub caps a job at six hours whatever this says",
         )
 
-    def test_the_eval_wait_activates_its_credential_for_gsutil(self):
-        """gsutil ignores GOOGLE_GHA_CREDS_PATH; the poller would see an empty bucket.
-
-        Without the explicit `gcloud auth login --cred-file`, every listing the
-        poller makes fails on anonymous credentials, no build is ever found, and
-        the job reports `never_ran` — which reads as a broken eval lane rather
-        than a missing login. ci-health.yml paid forty failed ticks to learn this.
+    def test_the_eval_wait_makes_its_credential_the_active_account(self):
+        """The poller's `gcloud storage` reads run as the active account, which
+        the explicit `gcloud auth login --cred-file` makes the auth step's
+        credential. (The reads were gsutil's until 2026-10, and gsutil ignored
+        GOOGLE_GHA_CREDS_PATH outright: every listing failed on anonymous
+        credentials, no build was ever found, and the job reported `never_ran`,
+        which reads as a broken eval lane rather than a missing login.
+        ci-health.yml paid forty failed ticks to learn this.)
 
         Order is half of it: a login after the poller is a login that changes
         nothing, and the run still reports the same empty bucket.
@@ -392,8 +420,8 @@ class PromotionPipelineWiringTest(unittest.TestCase):
         waiting on a verdict about container images already in GHCR that the
         cluster plays no part in producing. The RC pipeline can afford a
         dependency like this because its next scheduled run reclaims the
-        environment within three hours; this pipeline has no schedule, so nothing
-        would remove it at all.
+        environment within three hours; this pipeline's next daily run is the
+        only thing that would remove it.
         """
         teardown = self.jobs[_TEARDOWN_JOB]
         self.assertEqual(
@@ -416,6 +444,49 @@ class PromotionPipelineWiringTest(unittest.TestCase):
             "a failed run leaves standing for diagnosis",
         )
         self.assertIn("step-3-run-e2e-matrix", teardown["needs"])
+
+    def test_teardown_runs_after_a_failed_provision(self):
+        """A provision that failed leaves nothing to examine beyond the apply log,
+        and the half-built environment it leaves (a GKE cluster in ERROR after a
+        regional stockout, the rest of the composition around it) costs money
+        and starts the next night dirty. The matrix hold above stays: only the
+        deploy's own failure opens this path, and the matrix result is still
+        required for the success path."""
+        condition = self.jobs[_TEARDOWN_JOB].get("if", "")
+        # Substrings alone cannot tell the deploy arms apart from the same
+        # words nested under the matrix clause, so the expression is evaluated
+        # against the results it has to answer for. A deploy job stopped on
+        # its timeout-minutes reports cancelled while the run is not.
+        cases = {
+            ("success", "success"): True,
+            ("failure", "skipped"): True,
+            ("cancelled", "skipped"): True,
+            ("success", "failure"): False,
+            ("success", "cancelled"): False,
+            ("skipped", "skipped"): False,
+        }
+        for (deploy, matrix), expected in cases.items():
+            with self.subTest(deploy=deploy, matrix=matrix):
+                self.assertEqual(
+                    _evaluate_teardown_condition(condition, deploy=deploy, matrix=matrix),
+                    expected,
+                    f"deploy={deploy} matrix={matrix}: {condition}",
+                )
+        # The deploy arms must sit inside the run-level guards: a run the
+        # operator cancelled, a fork, or a skipped pipeline tears nothing down
+        # whatever the deploy reported. A flattened expression (the parentheses
+        # dropped) passes the table above and fails here.
+        for deploy, matrix in cases:
+            for guard in ("run_cancelled", "skipped"):
+                with self.subTest(deploy=deploy, matrix=matrix, guard=guard):
+                    self.assertFalse(
+                        _evaluate_teardown_condition(condition, deploy=deploy, matrix=matrix, **{guard: True}),
+                        f"{guard} must veto the teardown for deploy={deploy} matrix={matrix}",
+                    )
+            with self.subTest(deploy=deploy, matrix=matrix, guard="fork"):
+                self.assertFalse(
+                    _evaluate_teardown_condition(condition, deploy=deploy, matrix=matrix, upstream_repository=False)
+                )
 
     def test_the_rollback_leg_runs_on_the_nightly_cluster_after_the_matrix(self):
         """It moves the install twice, so it has to come after what the matrix graded.

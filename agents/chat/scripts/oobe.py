@@ -8,9 +8,11 @@ The design is ``docs/designs/oobe.md``. Each tick runs three stages in order:
    because the scheduler snapshots this job's destination when the run starts.
 2. The inventory scan, ``bootstrap_scan_gate.main``: file the sweep card, then the
    hand-off's cluster and ranking cards.
-3. The first-run audits, below: once the scan has settled, the four fleet audits that
+3. The first-run audits, below: once the scan has settled, the four fleet audits and the upgrade retrospective that
    would otherwise wait for their schedules (the next 06:20 UTC, the next Monday for
-   cost), one after another.
+   cost), one after another, and then the upgrade retrospective, whose schedule is
+   Sunday evening and whose first run is the baseline of every cluster the install
+   manages.
 
 Delivery's stdout is the report, and the scheduler posts whatever this job prints to
 that chat, and a failed run with its stderr. So the other two stages write to
@@ -34,9 +36,9 @@ run``: that CLI runs the whole job synchronously in the calling process.
 ``.oobe_audits_fired`` records each one before it is marked, and the mark awaiting
 its run, so a run killed partway marks nothing twice: marking an audit due again after it has run
 starts a second full run. An audit that has completed a run since the sweep was filed (a
-scheduled one) is recorded as adopted and not marked: the install already has that run. With no
-GitHub repository for the audits to publish to every audit fails before it reads anything, so the
-stage records the skip and marks none.
+scheduled one) is recorded as adopted and not marked: the install already has that run. The stage
+reads no repository list: with no GitOps repository each audit runs without a forge
+(docs/designs/oobe.md §4.4).
 
 ``trigger_job`` also sets a job's ``enabled`` back to true, so an audit an operator
 has disabled or paused is left alone rather than started.
@@ -78,13 +80,16 @@ MARKER_TASK_ID = "task_id"
 # The hand-off's marker (bootstrap_handoff._record): `sweep=`, and `task_id=` its ranking card.
 HANDOFF_SWEEP = "sweep"
 
-# The four audits #1866 names, by their ids in agents/platform/cron/jobs.json, in the
-# order it chains them: cost, security, reliability, capacity.
+# The four audits #1866 names and the upgrade retrospective, by their ids in agents/platform/cron/jobs.json, in the
+# order it chains them: cost, security, reliability, capacity; then the upgrade
+# retrospective, last so the four keep #1866's order and the review of every cluster's
+# last upgrade follows the audits whose findings it cites.
 FIRST_RUN_AUDITS = (
     "fleet-wide-cost-analysis",
     "compliance-audit",
     "obtainability-audit",
     "stockout-prevention",
+    "upgrade-retrospective",
 )
 EXECUTIONS_DB = "executions.db"
 # A run row in either is still going; any other status has ended.
@@ -147,9 +152,6 @@ CURRENT_MARKED_AT = "marked_at"
 STATE_SKIPPED = "skipped"
 STATE_REASON = "reason"
 STATE_AT = "at"
-# What the audits publish to is the GitHub entries of managed_repos (gitops_workspace); a repository
-# on another forge is not one they can use.
-SKIP_NO_REPOSITORY = "no GitHub repository in managed_repos for the audits to publish to"
 # Past NEW_INSTALL_SECONDS the stage cannot tell an install that onboarded before this job existed
 # from a new one whose start checks failed all day, so the reason says only what it knows.
 SKIP_NOT_NEW = "the onboarding sweep was filed more than a day before the stage could start"
@@ -274,6 +276,14 @@ def scan_settled(data_dir: Path, now: float) -> bool:
     state = bootstrap_handoff.read_board(board, sweep_id)
     if state is None:
         return False
+    # The hand-off's own budget for the clusters past the cap, the live roster included when the
+    # marker pinned nothing (a failed listing at filing still sent the worker to audit them).
+    marker = data_dir / SCAN_FILED_MARKER
+    state["uncarded"] = bootstrap_handoff.uncarded_budget(
+        marker,
+        bootstrap_handoff.sweep_cluster_cards(data_dir, marker),
+        lambda: bootstrap_scan_gate.cluster_agents(capped=False),
+    )
     wait = bootstrap_handoff.deadline(state) + RANKING_ALLOWANCE_SECONDS
     if now - filed_at >= wait:
         _log(
@@ -282,13 +292,6 @@ def scan_settled(data_dir: Path, now: float) -> bool:
         )
         return True
     return False
-
-
-def managed_repositories() -> list[str]:
-    """The GitOps repositories audits publish to. Raises when the list cannot be read."""
-    import gitops_workspace  # beside this script in the pod
-
-    return gitops_workspace.get_managed_github_repos()
 
 
 def trigger(job_id: str, data_dir: Path) -> bool:
@@ -490,7 +493,7 @@ def advance_chain(data_dir: Path, state: dict, now: float, since: float | None =
 
     busy = audits_in_flight(runs, now)
     if busy:
-        # One of the four has a run going, whatever started it, including the run a mark found
+        # One of the chain's audits has a run going, whatever started it, including the run a mark found
         # already going; the chain waits its turn, as the schedule does.
         return save()
     holds = audit_holds(data_dir)
@@ -603,25 +606,24 @@ def first_run_audits(data_dir: Path, now: float) -> None:
         if filed is not None and now - filed[1] >= NEW_INSTALL_SECONDS:
             skip(data_dir, SKIP_NOT_NEW if scan_finished(data_dir, filed[0]) else SKIP_UNSETTLED, now)
             return
+        # No repository check: with none registered each audit keeps its report in the report store
+        # (the fleet-audit skill's "No forge configured").
         if not scan_settled(data_dir, now):
-            return
-        try:
-            repositories = managed_repositories()
-        except Exception as e:  # noqa: BLE001 - an unreadable list is retried, not taken as empty
-            _log(f"cannot read the managed repositories: {e}")
-            return
-        if not repositories:
-            skip(data_dir, SKIP_NO_REPOSITORY, now)
             return
     advance_chain(data_dir, state, now, since=filed[1] if filed is not None else None)
 
 
 def finished(data_dir: Path, now: float) -> bool:
-    """Every stage is done, and the report was claimed long enough ago that no run still posts it."""
+    """Every stage is done, and the report was claimed long enough ago that no run still posts it,
+    and on the conversation path its post recorded an outcome."""
     if not read_state(data_dir).get(STATE_DONE):
         return False
     claimed = bootstrap_delivery._completed_at(data_dir)
-    return claimed is not None and now - claimed >= bootstrap_delivery.RETIRE_AFTER_SECONDS
+    return (
+        claimed is not None
+        and now - claimed >= bootstrap_delivery.RETIRE_AFTER_SECONDS
+        and bootstrap_delivery.delivery_settled(data_dir)
+    )
 
 
 def main(data_dir: Path | None = None, now: float | None = None) -> int:

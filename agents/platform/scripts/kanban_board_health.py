@@ -92,8 +92,7 @@ Scheduled since #656, as ``kanban-board-health`` on the Platform Agent's roster
 unscheduled because the roster it belonged on could not carry its output to a
 human: the Chat Agent's jobs deliver ``local``, which the scheduler resolves to
 no target, and the Platform Agent's profile had no board of its own. Two things
-changed. ``deliver: "chat"`` now relays a job's stdout through a Chat Agent turn
-into the home channel (``docs/designs/cron-report-relay.md``), and the board
+changed. ``deliver: "chat"`` now relays a job's stdout into the home channel (``docs/designs/cron-report-relay.md``), and the board
 was never per-profile: it is the agent home's ``kanban.db``, which a
 platform-roster job reaches through ``PLATFORM_AGENT_HOME``
 (``gitops_workspace.agent_home``), not ``$HERMES_HOME``, which under that roster
@@ -103,28 +102,53 @@ nothing periodically asked (#656).
 
 ``stuck_in_blocked`` is therefore reported whatever the severity floor says: a
 worker or operator block is sticky, nothing retries it until a human acts, and
-a card nobody is looking at is the one finding this check exists for. The rule
-is stateless and a card still blocked is named once a day until someone
-unblocks, comments on, or archives it, which is the intended nag. Each such
-line carries the card's kind, reason and age, read here from the board, and the
-two operator commands, because the CLI's JSON has neither the kind nor the
-reason and a line that names a stuck card without saying how to move it is a
-line the room learns to skip.
+a card nobody is looking at is the one finding this check exists for.
+
+The stuck cards are said in plain words, for whoever is in the channel: a
+headline counting them ("2 tasks are stuck and need someone to decide."), then
+one row per task, newest first, with the task's own title in bold and how long
+it has waited ("Stopped 3 days ago before finishing.", or "Paused 6 days ago."
+for a block waiting on a person's answer). No task ids, block reasons or
+commands: those stay behind ``hermes kanban list`` and ``hermes kanban show``.
+Tasks sharing a title and whether they wait on a person are one row with
+their count, and past ``MAX_STUCK_ROWS`` rows the rest are counted.
+
+They are said when a task first gets stuck, then once a week while any stays
+stuck (``stuck_due``); a run in between says nothing about them. The record of
+the ids last said, and when, is ``profiles/platform/cron/kanban_board_health.json``
+under the agent home (``STATE_ENV`` overrides). A record that cannot be read
+says every stuck task again, which is the loud side to fail on. The other
+findings (invariant violations, the engine's other rules) are rare and stay
+stateless, under ``REPORT_HEADER``.
+
+A run whose stuck tasks are all it says also leaves the card file
+(``CARD_SUFFIX``, beside the record): the rows as said, each with the ids of
+the cards it stands for, and the text. The relay lays it out in Slack with
+Retry and Drop on each row (``board_health_card.py``); every other run removes
+it, and a card whose text is not the report is not used.
 
 Run on demand:  PLATFORM_AGENT_HOME=/opt/data python3 kanban_board_health.py
+(a hand run updates the record; point ``KANBAN_HEALTH_STATE`` elsewhere to keep it)
 """
 
+import collections
 import json
+import math
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # A sibling in the shared scripts directory: the agent home is `PLATFORM_AGENT_HOME`,
 # never `HERMES_HOME`, which under the platform roster names the profile home.
 import gitops_workspace
+# Grades `last_delivery_error` the way the delivery ledger does, so a note on a
+# post that landed is not read as a lost post.
+from chat_delivery_watch import GRADE_HARD, grade_error, is_delivered_note
 
 # Severity floor applied to what `hermes kanban diagnostics` returns. "error" on
 # purpose: the engine's warning-tier rules are useful to pull on demand but too
@@ -147,14 +171,98 @@ HOME_ENV = "KANBAN_HEALTH_HOME"
 # Rendering. The engine's `detail` runs to several paragraphs; chat gets its
 # first line, clipped, and the rest stays behind `hermes kanban diagnostics`.
 DETAIL_MAX_CHARS = 200
-REASON_MAX_CHARS = 200
+MAX_DIAGNOSTIC_ITEMS = 20
+MAX_DIAGNOSTIC_CHARS = 3500
+MAX_INVARIANT_ITEMS = 20
+MAX_REPORT_CHARS = 8500
+# The other findings' header, under the stuck tasks when both are present.
+REPORT_HEADER = "kanban board health: attention required"
+# What the header and its newline take of the other findings' budget.
+REPORT_HEADER_RESERVE = len(REPORT_HEADER) + 1
+# The room an omission line ("... and N other ... omitted") needs; below it
+# the line is left off rather than pushing the report past its budget.
+OMISSION_LINE_RESERVE = 120
+
+# The stuck tasks, in plain words: the task's own title and how long it has
+# waited, no ids, reasons or commands. Standard markdown, which the relay's
+# chat adapters (and the gateway under `spec.mode: next`) turn into each
+# platform's bold.
+STUCK_HEADLINE = (
+    "{count} task is stuck and needs someone to decide.",
+    "{count} tasks are stuck and need someone to decide.",
+)
+STUCK_BOLD = "**{text}**"
+STUCK_ROW_TITLE = "**{title}**"
+STUCK_GROUP_SUFFIX = " ({count} tasks)"
+UNTITLED_TASK = "Untitled task"
+# A block that waits on a person reads "Paused"; every other kind is a task
+# that stopped before it finished.
+PERSON_BLOCK_KINDS = frozenset({"needs_input"})
+PAUSED_LINE = "Paused {age} ago."
+PAUSED_LINE_NO_AGE = "Paused."
+STOPPED_LINE = "Stopped {age} ago before finishing."
+STOPPED_LINE_NO_AGE = "Stopped before finishing."
+# The todo cards a stuck task holds back (a child waits until every parent is
+# done), by title: the first, cut shorter than a row's title, then a count of
+# the rest.
+HELD_LINE = "Holding back: {titles}."
+HELD_MORE = " and {count} more"
+HELD_TITLES_MAX = 1
+HELD_TITLE_MAX_CHARS = 80
+HELD_SEPARATOR = ", "
+AGE_UNITS = (("day", "days"), ("hour", "hours"))
 HOURS_PER_DAY = 24
-AGE_IN_HOURS_BELOW_H = 48
-NO_KIND = "no kind"
-# Pinned to the board file this run read, the way `diagnostics_lines` pins the
-# engine: `kanban_db_path()` would otherwise honour `kanban/current` first.
-UNBLOCK_COMMAND = 'HERMES_HOME={home} HERMES_KANBAN_DB={home}/kanban.db hermes kanban unblock --reason "<why>" {task_id}'
-ARCHIVE_COMMAND = "HERMES_HOME={home} HERMES_KANBAN_DB={home}/kanban.db hermes kanban archive {task_id}"
+STUCK_MORE_LINE = "And {count} more."
+# Rows past this are counted, not listed; a title is cut at a word boundary.
+MAX_STUCK_ROWS = 15
+STUCK_TITLE_MAX_CHARS = 120
+# What the stuck tasks can take of `MAX_REPORT_CHARS`: the headline, the
+# rows' bold titles with a group count, their status lines, and the count of
+# the rest, with room to spare.
+STUCK_CARD_RESERVE = 5000
+ELLIPSIS = "…"
+# A word cut keeping less than 1/CLIP_MIN_SHARE of the budget falls back to the
+# hard cut: a long unbroken token would otherwise take the rest of the title with
+# it (slack_status._clip carries the same guard).
+CLIP_MIN_SHARE = 2
+# Markdown emphasis inside a title would close the row's bold early.
+TITLE_EMPHASIS = "*"
+
+# Stuck tasks are said when one first gets stuck and then once a week while
+# any stays stuck; a run in between prints nothing about them. The record of
+# what was said lives beside the other platform watches' ledgers.
+REMIND_AFTER_DAYS = 7
+SECONDS_PER_HOUR = 3600
+# The run that posted may have been a catch-up hours after 12:35 UTC (the
+# scheduler fires a missed daily job once, whenever the gateway is back), so a
+# week measured from it would slip the reminder to the eighth day. Half a day
+# early still counts: a once-a-day job cannot fire twice inside that.
+REMIND_SLACK_SECONDS = 12 * SECONDS_PER_HOUR
+STATE_ENV = "KANBAN_HEALTH_STATE"
+PROFILES_DIR = "profiles"
+PLATFORM_PROFILE = "platform"
+CRON_DIR = "cron"
+STATE_FILE_NAME = "kanban_board_health.json"
+# The platform store the scheduler stamps after delivery, and this job's entry
+# in it (agents/platform/cron/jobs.json).
+JOBS_FILE = "jobs.json"
+JOB_ID = "kanban-board-health"
+STATE_TMP_SUFFIX = ".tmp"
+STATE_SCHEMA_VERSION = 1
+STATE_VERSION_KEY = "version"
+STATE_SAID_KEY = "said"
+STATE_SAID_AT_KEY = "said_at"
+# The card the relay lays out with Retry and Drop on each row
+# (board_health_card.py): the stuck rows as said, each with the ids it stands
+# for, written beside the record when the stuck tasks are said alone and
+# removed on every other run. It carries the text it was said with, so the
+# relay lays it out only for the post it describes.
+CARD_SUFFIX = ".card.json"
+CARD_SCHEMA_VERSION = 1
+
+# The line a run where the engine did not answer returns, and how `report`
+# tells that run from a clean one: its stuck cards are unknown, not absent.
+DIAGNOSTICS_UNAVAILABLE = "  diagnostics unavailable"
 
 # The CLI opens the board through Hermes' own connection and may run an
 # idempotent migration; 60s is generous for a board of this size and still well
@@ -186,11 +294,11 @@ GHOST_CLAIMS_SQL = """
      ORDER BY id
 """
 
-# What the engine's JSON does not carry about a blocked card: its kind, and
-# the reason the last `blocked` event recorded (`kanban_db.block_task` writes
-# `{"reason": ..., "kind": ...}` as the event payload).
+# What the engine's JSON does not carry about a blocked card: its title, and
+# its kind as the last `blocked` event recorded it (`kanban_db.block_task`
+# writes `{"reason": ..., "kind": ...}` as the event payload).
 BLOCKED_TASKS_SQL = """
-    SELECT id, title, assignee, block_kind
+    SELECT id, title, block_kind
       FROM tasks
      WHERE status = 'blocked'
 """
@@ -199,6 +307,34 @@ BLOCKED_EVENTS_SQL = """
       FROM task_events
      WHERE kind = 'blocked'
      ORDER BY created_at, id
+"""
+BLOCKED_CHILDREN_SQL = """
+    SELECT l.parent_id, c.id, c.title, c.assignee
+      FROM task_links l
+      JOIN tasks c ON c.id = l.child_id
+     WHERE c.status = 'todo'
+     ORDER BY c.id
+"""
+# The words `session_kv_server._triage_authorize_clauses(True)` puts in a
+# triage report's `To authorize:` bullet when the install opens the Pull
+# Request itself (`TRIAGE_OPEN_PR_MARKER` there). The Slack notifier
+# (`slack_ux_incident.OPENING_PULL_REQUEST`) and the bench case key on the same
+# words, so all three readers agree on which reports made the promise.
+TRIAGE_OPEN_PR_MARKER = "is being opened automatically"
+# A completed triage card whose report made that promise must have its linked
+# child card in `task_links`. If the front-door turn ended between Call 1 and
+# Call 2, the reader sees a report telling them not to reply `apply` while no
+# follow-up card exists to open the Pull Request.
+MISSING_PR_CHILD_SQL = f"""
+    SELECT t.id, t.title
+      FROM tasks t
+     WHERE t.status = 'done'
+       AND t.title LIKE 'Triage %'
+       AND t.result LIKE '%{TRIAGE_OPEN_PR_MARKER}%'
+       AND NOT EXISTS (
+           SELECT 1 FROM task_links l WHERE l.parent_id = t.id
+       )
+     ORDER BY t.id
 """
 
 
@@ -256,10 +392,10 @@ def read_only_connection(db: Path) -> sqlite3.Connection:
 
 
 def blocked_context(conn: sqlite3.Connection) -> dict:
-    """kind, reason, title and assignee per blocked card, or {} on an unmigrated board."""
+    """Title, kind and the todo children it holds back, per blocked card, or {} on an unmigrated board."""
     try:
         tasks = {
-            row["id"]: {"title": row["title"] or "", "assignee": row["assignee"] or "", "kind": row["block_kind"], "reason": ""}
+            row["id"]: {"title": row["title"] or "", "kind": row["block_kind"]}
             for row in conn.execute(BLOCKED_TASKS_SQL)
         }
         for row in conn.execute(BLOCKED_EVENTS_SQL):
@@ -270,10 +406,20 @@ def blocked_context(conn: sqlite3.Connection) -> dict:
             except ValueError:
                 payload = {}
             if isinstance(payload, dict):
-                # Events arrive oldest first, so the last one wins for both fields.
-                tasks[row["task_id"]]["reason"] = str(payload.get("reason") or tasks[row["task_id"]]["reason"])
+                # Events arrive oldest first, so the last kind wins.
                 if payload.get("kind"):
                     tasks[row["task_id"]]["kind"] = payload["kind"]
+        try:
+            for row in conn.execute(BLOCKED_CHILDREN_SQL):
+                if row["parent_id"] not in tasks:
+                    continue
+                tasks[row["parent_id"]].setdefault("waiting_children", []).append({
+                    "id": row["id"],
+                    "title": row["title"] or "",
+                    "assignee": row["assignee"] or "?",
+                })
+        except sqlite3.OperationalError:
+            pass
     except sqlite3.OperationalError:
         return {}
     return tasks
@@ -286,34 +432,272 @@ def first_line(text: str, limit: int) -> str:
     return ""
 
 
-def render_age(age_hours) -> str:
+def _card_age_hours(diag: dict) -> float:
     try:
-        hours = float(age_hours)
-    except (TypeError, ValueError):
-        return "?"
-    if hours < AGE_IN_HOURS_BELOW_H:
-        return f"{int(hours)}h"
-    return f"{int(hours // HOURS_PER_DAY)}d"
+        val = (diag.get("data") or {}).get("age_hours")
+        if val is not None:
+            return float(val)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return float("inf")
 
 
-def stuck_card_lines(task_id: str, diag: dict, context: dict, entry: dict, home: Path) -> list:
-    """One stuck card: the board's kind and reason, the CLI's title and assignee as fallback."""
-    info = context.get(task_id) or {}
-    kind = info.get("kind") or NO_KIND
-    assignee = info.get("assignee") or entry.get("assignee") or "?"
-    title = info.get("title") or entry.get("title") or ""
-    reason = " ".join((info.get("reason") or "").split())[:REASON_MAX_CHARS]
-    age = render_age((diag.get("data") or {}).get("age_hours"))
-    head = f"  - {task_id} ({assignee}, {kind}, blocked {age})"
-    if title:
-        head += f": {title}"
-    if reason:
-        head += f' — "{reason}"'
-    return [
-        head,
-        f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=task_id)}",
-        f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=task_id)}",
+def _take_within_budget(items: list, max_items: int, max_chars: int, line_fn=None) -> list:
+    """Take items up to max_items and max_chars (including newlines)."""
+    taken = []
+    total_chars = 0
+    for item in items:
+        if len(taken) >= max_items:
+            break
+        lines = line_fn(item) if line_fn else item
+        if isinstance(lines, str):
+            lines = [lines]
+        item_chars = sum(len(ln) + 1 for ln in lines)
+        if total_chars + item_chars > max_chars:
+            continue
+        taken.append(item)
+        total_chars += item_chars
+    return taken
+
+
+def stuck_tasks(stuck_items: list, context: dict) -> list:
+    """One dict per stuck card: id, title, whether it waits on a person, and its age.
+
+    The board's title and kind first (``blocked_context``), the CLI's title as
+    the fallback, and the titles of the todo cards it holds back; the reason is
+    not carried, since chat never shows it.
+    """
+    tasks = []
+    for task_id, diag, entry in stuck_items:
+        task_id = str(task_id)
+        info = (context or {}).get(task_id) or {}
+        raw_title = info.get("title") or (entry or {}).get("title") or ""
+        tasks.append({
+            "task_id": task_id,
+            "title": " ".join(str(raw_title).split()),
+            "person": info.get("kind") in PERSON_BLOCK_KINDS,
+            "age_hours": _card_age_hours(diag),
+            "held": [str(child.get("title") or "") for child in info.get("waiting_children") or ()],
+        })
+    return tasks
+
+
+def plain_age(age_hours: float) -> str | None:
+    """"3 days" or "5 hours"; None when the engine gave no age, or one that is not a number."""
+    if not math.isfinite(age_hours):
+        return None
+    hours = max(0, int(age_hours))
+    days = hours // HOURS_PER_DAY
+    count, units = (days, AGE_UNITS[0]) if days else (hours, AGE_UNITS[1])
+    return f"{count} {units[0] if count == 1 else units[1]}"
+
+
+def plain_title(title: str, limit: int = STUCK_TITLE_MAX_CHARS) -> str:
+    """The task's title without emphasis markers, cut at a word boundary within ``limit``."""
+    text = " ".join(title.replace(TITLE_EMPHASIS, "").split()) or UNTITLED_TASK
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - len(ELLIPSIS)]
+    head, space, _rest = cut.rpartition(" ")
+    if not space or len(head) * CLIP_MIN_SHARE < len(cut):
+        head = cut
+    return head.rstrip() + ELLIPSIS
+
+
+def held_line(group: list) -> str | None:
+    """"Holding back: <title> and N more." for the todo cards a row's tasks hold back, or None."""
+    titles = list(dict.fromkeys(plain_title(title, HELD_TITLE_MAX_CHARS) for task in group for title in task.get("held") or ()))
+    if not titles:
+        return None
+    shown = HELD_SEPARATOR.join(titles[:HELD_TITLES_MAX])
+    rest = len(titles) - HELD_TITLES_MAX
+    return HELD_LINE.format(titles=shown + (HELD_MORE.format(count=rest) if rest > 0 else ""))
+
+
+def status_line(person: bool, age_hours: float) -> str:
+    age = plain_age(age_hours)
+    if person:
+        return PAUSED_LINE.format(age=age) if age else PAUSED_LINE_NO_AGE
+    return STOPPED_LINE.format(age=age) if age else STOPPED_LINE_NO_AGE
+
+
+def stuck_rows(tasks: list) -> tuple[str, list, int]:
+    """The stuck tasks as a headline counting every task, a row per title, and how many tasks no row shows.
+
+    Rows are newest first. Tasks sharing a title as shown (``plain_title``)
+    and whether they wait on a person are one row with their count, aged by the
+    one that has waited longest, so two rows never read the same. Past
+    ``MAX_STUCK_ROWS`` the rest are counted. Each row is ``title``, ``count``,
+    ``status`` (its status line), ``held`` (its holding-back line, or "") and
+    ``tasks``, the ids it stands for, which Retry and Drop act on.
+    """
+    groups = collections.OrderedDict()
+    for task in tasks:
+        groups.setdefault((plain_title(task["title"]), task["person"]), []).append(task)
+    ordered = sorted(
+        groups.values(),
+        key=lambda group: (min(t["age_hours"] for t in group), group[0]["title"]),
+    )
+    rows = [
+        {
+            "title": plain_title(group[0]["title"]),
+            "count": len(group),
+            "status": status_line(group[0]["person"], max(t["age_hours"] for t in group)),
+            "held": held_line(group) or "",
+            "tasks": [t["task_id"] for t in group],
+        }
+        for group in ordered[:MAX_STUCK_ROWS]
     ]
+    noun = STUCK_HEADLINE[0] if len(tasks) == 1 else STUCK_HEADLINE[1]
+    return noun.format(count=len(tasks)), rows, sum(len(group) for group in ordered[MAX_STUCK_ROWS:])
+
+
+def render_stuck_tasks(tasks: list) -> list:
+    """The stuck tasks as chat lines (``stuck_rows``): the headline, then each row. Empty for no tasks."""
+    if not tasks:
+        return []
+    headline, rows, hidden = stuck_rows(tasks)
+    lines = [STUCK_BOLD.format(text=headline)]
+    for row in rows:
+        title = STUCK_ROW_TITLE.format(title=row["title"])
+        if row["count"] > 1:
+            title += STUCK_GROUP_SUFFIX.format(count=row["count"])
+        lines.extend(["", title, row["status"]])
+        if row["held"]:
+            lines.append(row["held"])
+    if hidden:
+        lines.extend(["", STUCK_MORE_LINE.format(count=hidden)])
+    return lines
+
+
+def stuck_card(tasks: list, text: str) -> dict:
+    """The card file's contents for stuck tasks said as ``text`` (``CARD_SUFFIX``)."""
+    headline, rows, hidden = stuck_rows(tasks)
+    return {
+        STATE_VERSION_KEY: CARD_SCHEMA_VERSION,
+        "text": text,
+        "headline": headline,
+        "rows": rows,
+        "more": STUCK_MORE_LINE.format(count=hidden) if hidden else "",
+    }
+
+
+def card_path(home: Path, env=None) -> Path:
+    """The card file, beside the record (``state_path``)."""
+    return state_path(home, env).with_suffix(CARD_SUFFIX)
+
+
+def save_card(path: Path, card: dict | None) -> None:
+    """Write the card atomically, or remove it for None. A card that cannot be
+    written leaves the post as text: the relay finds no card for it."""
+    try:
+        if card is None:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + STATE_TMP_SUFFIX)
+        tmp.write_text(json.dumps(card, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def state_path(home: Path, env=None) -> Path:
+    """Where the record of what was said lives: `STATE_ENV`, else beside the platform watches' ledgers."""
+    override = (env if env is not None else os.environ).get(STATE_ENV)
+    return Path(override) if override else home / PROFILES_DIR / PLATFORM_PROFILE / CRON_DIR / STATE_FILE_NAME
+
+
+def load_state(path: Path) -> dict:
+    """The ids last said and when; empty (so the next stuck task is said) when missing or unreadable.
+
+    Empty is the same record ``stuck_due`` keeps for a board with nothing
+    stuck, so a healthy run writes nothing.
+    """
+    empty = {STATE_SAID_KEY: [], STATE_SAID_AT_KEY: None}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return empty
+    if not isinstance(data, dict) or data.get(STATE_VERSION_KEY) != STATE_SCHEMA_VERSION:
+        return empty
+    said = data.get(STATE_SAID_KEY)
+    said_at = data.get(STATE_SAID_AT_KEY)
+    return {
+        STATE_SAID_KEY: [str(tid) for tid in said] if isinstance(said, list) else [],
+        STATE_SAID_AT_KEY: said_at if isinstance(said_at, (int, float)) and math.isfinite(said_at) else None,
+    }
+
+
+def last_post_undelivered(home: Path, said_at, env=None) -> bool:
+    """Whether the run that last said the stuck tasks failed to deliver them.
+
+    The record is saved before the relay delivers, so it cannot know. The
+    scheduler can: after delivery it stamps this job's entry in the platform
+    store with ``last_run_at`` and, on a failure, ``last_delivery_error``. An
+    error stamped at or after ``said_at`` belongs to that run (or a later one),
+    so the tasks are said again rather than left unreported for a week. Under
+    ``STATE_ENV`` (tests and hand runs) the store is not read. Only a hard
+    failure (``chat_delivery_watch.grade_error``) counts: a partial or
+    degraded relay, or a scheduler note on a delivered report, landed
+    somewhere and is not said again. A hard grade can also mark a post that
+    landed (``feedback_prompt.py`` says why), which costs a repeat card the
+    next day, not a silent week.
+    """
+    if said_at is None or (env if env is not None else os.environ).get(STATE_ENV):
+        return False
+    try:
+        data = json.loads((home / PROFILES_DIR / PLATFORM_PROFILE / CRON_DIR / JOBS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    jobs = data.get("jobs", []) if isinstance(data, dict) else data
+    job = next((j for j in jobs if isinstance(j, dict) and j.get("id") == JOB_ID), None) if isinstance(jobs, list) else None
+    error = str(job.get("last_delivery_error") or "") if job else ""
+    if not error or is_delivered_note(error) or grade_error(error) != GRADE_HARD:
+        return False
+    try:
+        run_at = datetime.fromisoformat(str(job.get("last_run_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if run_at.tzinfo is None:
+        run_at = run_at.replace(tzinfo=timezone.utc)
+    return run_at.timestamp() >= said_at
+
+
+def save_state(path: Path, state: dict) -> None:
+    """Write the record atomically. A record that cannot be written leaves the
+    tasks said again on the next run, since nothing can remember them."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + STATE_TMP_SUFFIX)
+        tmp.write_text(json.dumps({STATE_VERSION_KEY: STATE_SCHEMA_VERSION, **state}, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def stuck_due(tasks: list, state: dict, now: float) -> tuple[bool, dict]:
+    """Whether to say the stuck tasks this run, and the record to keep.
+
+    Said when a task is stuck that the last post did not name, or when
+    ``REMIND_AFTER_DAYS`` have passed since the last post (less
+    ``REMIND_SLACK_SECONDS``) and any task is still stuck. A task that comes
+    unstuck drops out of the record, so if it sticks again it is new. A
+    ``said_at`` ahead of ``now`` (a clock step, a hand-edited record) is treated
+    as no post at all, so it cannot silence the tasks until it ages a week.
+    ``now`` is epoch seconds.
+    """
+    current = sorted({task["task_id"] for task in tasks})
+    said = set(state.get(STATE_SAID_KEY) or [])
+    said_at = state.get(STATE_SAID_AT_KEY)
+    if said_at is not None and said_at > now:
+        said_at = None
+    if not current:
+        return False, {STATE_SAID_KEY: [], STATE_SAID_AT_KEY: None}
+    remind_after = REMIND_AFTER_DAYS * HOURS_PER_DAY * SECONDS_PER_HOUR - REMIND_SLACK_SECONDS
+    if set(current) - said or said_at is None or now - said_at >= remind_after:
+        return True, {STATE_SAID_KEY: current, STATE_SAID_AT_KEY: now}
+    return False, {STATE_SAID_KEY: sorted(said & set(current)), STATE_SAID_AT_KEY: said_at}
 
 
 def invariant_violations(conn: sqlite3.Connection) -> list:
@@ -329,6 +713,14 @@ def invariant_violations(conn: sqlite3.Connection) -> list:
             f"  ghost claim: task {row['id']} is '{row['status']}' but still holds "
             f"claim_lock={row['claim_lock']!r}"
         )
+    try:
+        for row in conn.execute(MISSING_PR_CHILD_SQL):
+            lines.append(
+                f"  missing follow-up child: task {row['id']} ({row['title']!r}) promised "
+                "an automatic Pull Request but has no linked child in task_links"
+            )
+    except sqlite3.OperationalError:
+        pass
     return lines
 
 
@@ -371,7 +763,8 @@ def _parse_diagnostics_json(out: str):
 
 
 def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
-                      binary=None, env=None, context=None, always=ALWAYS_REPORT_KINDS) -> list:
+                      binary=None, env=None, always=ALWAYS_REPORT_KINDS,
+                      *, stuck: list | None = None, max_chars: int | None = None) -> list:
     """Ask the shipped rule engine. Returns rendered lines; empty when clean.
 
     ``--json`` returns before the human-table branch of ``_cmd_diagnostics``, so
@@ -380,14 +773,16 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
 
     The engine is asked for every severity and the floor is applied here, so a
     kind in ``always`` (``stuck_in_blocked`` by default) is reported however low
-    the engine grades it. Stuck cards are rendered from ``context`` (see
-    ``blocked_context``) under their own heading; everything else keeps the
-    engine's own title and detail.
+    the engine grades it. Stuck cards are not rendered here: each is appended
+    to ``stuck`` as ``(task_id, diag, entry)`` for ``stuck_tasks``, and a call
+    without the list drops them. Everything else keeps the engine's own title
+    and detail, within max_chars. A run where the engine did not answer
+    returns one line starting ``DIAGNOSTICS_UNAVAILABLE``.
     """
     try:
         exe = str(binary) if binary else str(hermes_bin())
     except FileNotFoundError as exc:
-        return [f"  diagnostics unavailable: {exc}"]
+        return [f"{DIAGNOSTICS_UNAVAILABLE}: {exc}"]
     child_env = dict(env if env is not None else os.environ)
     child_env["HERMES_HOME"] = str(home)
     # Pin the engine to the file the invariant queries just read. Left alone,
@@ -402,35 +797,38 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     try:
         code, out, err = runner(argv, child_env, DIAGNOSTICS_TIMEOUT_SECONDS)
     except Exception as exc:  # timeout, OSError, anything the runner raises
-        return [f"  diagnostics unavailable: {type(exc).__name__}: {exc}"]
+        return [f"{DIAGNOSTICS_UNAVAILABLE}: {type(exc).__name__}: {exc}"]
     if code != 0:
         detail = [ln for ln in ((err or out or "").strip().splitlines()) if ln.strip()]
         tail = detail[-1] if detail else f"exit {code}"
-        return [f"  diagnostics unavailable: `hermes kanban diagnostics` exit {code}: {tail}"]
+        return [f"{DIAGNOSTICS_UNAVAILABLE}: `hermes kanban diagnostics` exit {code}: {tail}"]
     try:
         entries = _parse_diagnostics_json(out)
     except json.JSONDecodeError as exc:
-        return [f"  diagnostics unavailable: unparseable JSON from the CLI ({exc})"]
+        return [f"{DIAGNOSTICS_UNAVAILABLE}: unparseable JSON from the CLI ({exc})"]
     # The `--json` branch of `_cmd_diagnostics` always emits a list, so this is
     # belt-and-braces — but the contract of this whole function is that it
     # returns lines and never raises, and a dict or a bare int would otherwise
     # escape as a traceback that the scheduler reports as a failed watchdog.
     if entries is not None and not isinstance(entries, list):
-        return [f"  diagnostics unavailable: CLI returned "
+        return [f"{DIAGNOSTICS_UNAVAILABLE}: CLI returned "
                 f"{type(entries).__name__}, expected a JSON list"]
-    lines = []
-    stuck = []
+    if max_chars is None:
+        max_chars = MAX_REPORT_CHARS
+
+    diag_lines = []
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
-        task_id = entry.get("task_id", "?")
-        status = entry.get("status", "?")
+        task_id = str(entry.get("task_id") or "?")
+        status = str(entry.get("status") or "?")
         for diag in entry.get("diagnostics") or []:
             if not isinstance(diag, dict):
                 continue
             kind = diag.get("kind")
             if kind == STUCK_IN_BLOCKED and kind in always:
-                stuck.extend(stuck_card_lines(task_id, diag, context or {}, entry, home))
+                if stuck is not None:
+                    stuck.append((task_id, diag, entry))
                 continue
             if not clears_floor(str(diag.get("severity", "")), severity) and kind not in always:
                 continue
@@ -439,23 +837,37 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
             detail = first_line((diag.get("detail") or ""), DETAIL_MAX_CHARS)
             if detail:
                 parts.append(f" - {detail}")
-            lines.append("".join(parts))
-    if stuck:
+            diag_lines.append("".join(parts))
+
+    diag_budget = max(0, min(MAX_DIAGNOSTIC_CHARS, max_chars) - OMISSION_LINE_RESERVE)
+    shown_diag_lines = _take_within_budget(diag_lines, MAX_DIAGNOSTIC_ITEMS, diag_budget)
+    lines = list(shown_diag_lines)
+    omitted_diags = len(diag_lines) - len(shown_diag_lines)
+    if omitted_diags > 0 and max_chars >= OMISSION_LINE_RESERVE:
         lines.append(
-            "Cards blocked with no one looking (a worker or operator block is sticky: "
-            "nothing retries it until a human acts):"
+            f"  ... and {omitted_diags} other diagnostic{'s' if omitted_diags != 1 else ''} omitted "
+            f"(run hermes kanban diagnostics on the agent pod to view all)"
         )
-        lines.extend(stuck)
     return lines
 
 
-def report(home: Path, *, env=None, **kwargs) -> list:
-    """The whole check. Empty list means healthy, which means silent."""
+def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> tuple[list | None, list]:
+    """The whole check: ``(stuck tasks, other lines)``. Both empty means healthy, which means silent.
+
+    The stuck tasks are ``stuck_tasks`` dicts, which ``main`` renders when
+    ``stuck_due`` says so, or None when the engine did not answer (its line is
+    among the other lines), since then which cards are stuck is unknown. The other lines (invariant violations and the
+    engine's other findings) stay <= max_chars (including
+    ``REPORT_HEADER_RESERVE``); the default leaves ``STUCK_CARD_RESERVE`` of the
+    report's budget to the stuck tasks.
+    """
+    if max_chars is None:
+        max_chars = MAX_REPORT_CHARS - STUCK_CARD_RESERVE
     db = board_path(home)
     if not db.exists():
         # No board on this profile: not a failure, nothing to say. Skipping the
         # shell-out here is deliberate — the CLI would create one.
-        return []
+        return [], []
     lines = []
     conn = read_only_connection(db)
     try:
@@ -463,31 +875,81 @@ def report(home: Path, *, env=None, **kwargs) -> list:
         context = blocked_context(conn)
     finally:
         conn.close()
+
+    used_chars = REPORT_HEADER_RESERVE
     if violations:
-        lines.append(
-            "Board invariant violations (a direct write to kanban.db is the usual cause):"
-        )
-        lines.extend(violations)
+        header = "Board invariant violations (a direct write to kanban.db is the usual cause):"
+        lines.append(header)
+        header_len = len(header) + 1
+        used_chars += header_len
+        viol_allowance = max(0, max_chars - used_chars)
+        viol_budget = max(0, min(MAX_DIAGNOSTIC_CHARS, viol_allowance) - 120)
+        shown_violations = _take_within_budget(violations, MAX_INVARIANT_ITEMS, viol_budget)
+        lines.extend(shown_violations)
+        omitted_violations = len(violations) - len(shown_violations)
+        if omitted_violations > 0 and viol_allowance >= 120:
+            lines.append(
+                f"  ... and {omitted_violations} other invariant violation{'s' if omitted_violations != 1 else ''} omitted"
+            )
+        used_chars = REPORT_HEADER_RESERVE + sum(len(ln) + 1 for ln in lines)
+
+    diag_header_reserve = len("Active kanban diagnostics:\n")
+    remaining_chars = max(0, max_chars - used_chars - diag_header_reserve)
+    stuck = []
     diags = diagnostics_lines(
-        home, severity_floor(env), env=env, context=context, always=always_report_kinds(env), **kwargs
+        home, severity_floor(env), env=env, always=always_report_kinds(env),
+        stuck=stuck, max_chars=remaining_chars, **kwargs
     )
     if diags:
         lines.append("Active kanban diagnostics:")
         lines.extend(diags)
-    return lines
+    if any(line.startswith(DIAGNOSTICS_UNAVAILABLE) for line in diags):
+        return None, lines
+    return stuck_tasks(stuck, context), lines
 
 
-def main(argv=None) -> int:
+def main(argv=None, *, env=None, now=None) -> int:
     home = agent_home()
+    path = state_path(home, env)
+    recorded = load_state(path)
+    # The scheduler's stamp of a failed delivery lasts one run, so it is read
+    # on every run, whatever the engine says: a run that could not read the
+    # board still forgets the undelivered post, and the next answer says it.
+    state = recorded
+    if last_post_undelivered(home, recorded[STATE_SAID_AT_KEY], env):
+        state = {STATE_SAID_KEY: [], STATE_SAID_AT_KEY: None}
     try:
-        lines = report(home)
+        tasks, lines = report(home, env=env)
     except sqlite3.Error as exc:
+        if state != recorded:
+            save_state(path, state)
+        save_card(card_path(home, env), None)
         print(f"kanban board health: cannot read {board_path(home)}: {exc}")
         return 0
+    out = []
+    said = []
+    # An engine that did not answer leaves the ids as they were: saving would
+    # forget every task said, and the next answer would say them all again.
+    if tasks is not None:
+        due, state = stuck_due(tasks, state, time.time() if now is None else now)
+        # Rendered before the record is saved, so a card that fails to render
+        # is not remembered as said.
+        out = render_stuck_tasks(tasks) if due else []
+        said = tasks if due else []
+    # Compared with what is on disk, so a forgotten post is written down even
+    # on a day the new record matches the empty one.
+    if state != recorded:
+        save_state(path, state)
+    # The card is the stuck tasks alone: a report that also carries the other
+    # findings posts as text.
+    card = stuck_card(said, "\n".join(out)) if said and not lines else None
     if lines:
-        print("\n".join(["kanban board health: attention required", *lines]))
+        out.extend([""] if out else [])
+        out.extend([REPORT_HEADER, *lines])
+    save_card(card_path(home, env), card)
+    if out:
+        print("\n".join(out))
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

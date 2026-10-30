@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
@@ -29,12 +31,106 @@ type fakeSlackAPI struct {
 	// gateway workers; single-goroutine tests read the slices directly.
 	mu sync.Mutex
 	// team is the team id auth.test answers with.
-	team     string
-	posted   []struct{ channel, thread, text string }
-	updated  []struct{ channel, ts, text string }
-	members  []string
-	cursor   string
-	openedIM string
+	team   string
+	posted []struct{ channel, thread, text string }
+	// postValues is every chat.postMessage's full form, for the fields
+	// posted does not name.
+	postValues []url.Values
+	// postOptions is every chat.postMessage's options as given, for the
+	// blocks (sentUpdateForm reads them off the wire).
+	postOptions [][]slack.MsgOption
+	updated     []struct{ channel, ts, text string }
+	members     []string
+	cursor      string
+	openedIM    string
+	// updatedBlocks and updatedAttachments are each update's blocks and
+	// attachments fields as sent, beside updated.
+	updatedBlocks      []string
+	updatedAttachments []string
+	// reactions records reactions.add and .remove as "+name channel/ts" and
+	// "-name channel/ts"; reactErr, when set, is every reaction call's error.
+	reactions []string
+	reactErr  error
+	// users answers users.info; userInfoCalls counts the calls.
+	users         map[string]*slack.User
+	userInfoCalls int
+	// prompts records setSuggestedPrompts calls.
+	prompts []slack.AssistantThreadsSetSuggestedPromptsParameters
+	// onPost, when set, runs at the start of every chat.postMessage, so a
+	// test can look at the adapter's state while a post is in flight.
+	onPost func()
+	// conversations and conversationErr answer conversations.info;
+	// conversationInfoCalls counts the calls.
+	conversations         map[string]*slack.Channel
+	conversationErr       error
+	conversationInfoCalls int
+	// views records views.publish calls by member.
+	views []publishedView
+}
+
+type publishedView struct {
+	member string
+	view   slack.HomeTabViewRequest
+}
+
+func (f *fakeSlackAPI) PublishView(member string, view slack.HomeTabViewRequest, _ string) (*slack.ViewResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.views = append(f.views, publishedView{member, view})
+	return &slack.ViewResponse{}, nil
+}
+
+func (f *fakeSlackAPI) AddReaction(name string, item slack.ItemRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reactions = append(f.reactions, "+"+name+" "+item.Channel+"/"+item.Timestamp)
+	return f.reactErr
+}
+
+func (f *fakeSlackAPI) RemoveReaction(name string, item slack.ItemRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reactions = append(f.reactions, "-"+name+" "+item.Channel+"/"+item.Timestamp)
+	return f.reactErr
+}
+
+func (f *fakeSlackAPI) GetUserInfo(user string, _ ...slack.GetUserInfoOption) (*slack.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.userInfoCalls++
+	if u, ok := f.users[user]; ok {
+		return u, nil
+	}
+	return nil, errors.New("user_not_found")
+}
+
+func (f *fakeSlackAPI) GetUserInfoContext(_ context.Context, user string, options ...slack.GetUserInfoOption) (*slack.User, error) {
+	return f.GetUserInfo(user, options...)
+}
+
+// GetConversationInfoContext answers conversations.info from conversations:
+// a conversation it names, conversationErr for one it does not, or a channel
+// the bot is a member of when neither is set.
+func (f *fakeSlackAPI) GetConversationInfoContext(_ context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.conversationInfoCalls++
+	if ch, ok := f.conversations[input.ChannelID]; ok {
+		return ch, nil
+	}
+	if f.conversationErr != nil {
+		return nil, f.conversationErr
+	}
+	ch := &slack.Channel{}
+	ch.ID, ch.IsMember = input.ChannelID, true
+	return ch, nil
+}
+
+func (f *fakeSlackAPI) SetAssistantThreadsSuggestedPrompts(p slack.AssistantThreadsSetSuggestedPromptsParameters) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.prompts = append(f.prompts, p)
+	return nil
 }
 
 func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse, error) {
@@ -42,6 +138,9 @@ func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse
 }
 
 func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption) (string, string, error) {
+	if f.onPost != nil {
+		f.onPost()
+	}
 	_, values, err := slack.UnsafeApplyMsgOptions("tok", channelID, "https://slack.example/api/", options...)
 	if err != nil {
 		return "", "", err
@@ -51,6 +150,8 @@ func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption)
 	f.posted = append(f.posted, struct{ channel, thread, text string }{
 		values.Get("channel"), values.Get("thread_ts"), values.Get("text"),
 	})
+	f.postValues = append(f.postValues, values)
+	f.postOptions = append(f.postOptions, options)
 	return channelID, "999.001", nil
 }
 
@@ -64,6 +165,11 @@ func (f *fakeSlackAPI) UpdateMessage(channelID, timestamp string, options ...sla
 	f.updated = append(f.updated, struct{ channel, ts, text string }{
 		values.Get("channel"), timestamp, values.Get("text"),
 	})
+	// Blocks and attachments live outside the values UnsafeApplyMsgOptions
+	// returns, so they are read off the wire form a real client sends.
+	sent := sentUpdateForm(channelID, timestamp, options...)
+	f.updatedBlocks = append(f.updatedBlocks, sent.Get("blocks"))
+	f.updatedAttachments = append(f.updatedAttachments, sent.Get("attachments"))
 	return channelID, timestamp, "", nil
 }
 
@@ -757,6 +863,7 @@ func slackMsg(channelType, channel, user, text, ts, threadTS string) *slackevent
 func TestSlackRefusesAnotherWorkspacesMember(t *testing.T) {
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 	a.teamID = "T0URS"
+	a.syncSessions = true // refusal notices are sent inline, so the post count below is settled
 	ctx := context.Background()
 	foreign := slackMsg("im", "D1", "UGUEST", "drain node 4", "1.0", "")
 	foreign.UserTeam = "T0THER"
@@ -806,10 +913,143 @@ func TestSlackRefusesAnotherWorkspacesMember(t *testing.T) {
 	// No team id from auth.test: a message that names a sender workspace
 	// cannot be shown to be ours, so it is refused.
 	a.teamID = ""
+	posted := len(a.api.(*fakeSlackAPI).posted)
 	unknown := slackMsg("im", "D3", "U3", "hello", "5.0", "")
 	unknown.UserTeam = "T0URS"
 	if _, ok := a.inbound(ctx, unknown); ok {
 		t.Error("with no team id known, a message naming a sender workspace was delivered")
+	}
+	// Refused, but not told it is in another workspace: it may well be ours.
+	if got := a.api.(*fakeSlackAPI).posted[posted:]; len(got) != 0 {
+		t.Errorf("with no team id known, the sender was told it is in another workspace: %+v", got)
+	}
+}
+
+// TestSlackTellsAnotherWorkspacesMemberWhyOnce: a refused member of another
+// workspace who addressed the bot gets one reply in the thread of that message,
+// naming their member id, and the refusal's log line names them too. A second
+// ask from them gets no second notice, a message that addressed nobody gets
+// none, and the same member id in another workspace is another sender.
+func TestSlackTellsAnotherWorkspacesMemberWhyOnce(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a := newTestSlackAdapter(api)
+	a.teamID = "T0URS"
+	a.syncSessions = true // the notice is sent off the pump; inline here
+	logs := &recordingHandler{}
+	a.log = slog.New(logs)
+	ctx := context.Background()
+
+	mention := slackMsg("channel", "C1", "UGUEST", "<@UBOT> drain node 4", "2.0", "")
+	mention.UserTeam = "T0THER"
+	if _, ok := a.inbound(ctx, mention); ok {
+		t.Fatal("a mention from another workspace's member was delivered as a turn")
+	}
+	if len(api.posted) != 1 {
+		t.Fatalf("posts = %+v, want one notice", api.posted)
+	}
+	notice := api.posted[0]
+	if notice.channel != "C1" || notice.thread != "2.0" || !strings.Contains(notice.text, "UGUEST") ||
+		!strings.Contains(notice.text, "another workspace") {
+		t.Errorf("notice = %+v, want a reply in the mention's thread naming the member id", notice)
+	}
+	if !logs.has("user", "UGUEST") {
+		t.Error("the refusal's log line does not name the refused member")
+	}
+
+	again := slackMsg("im", "D1", "UGUEST", "drain node 4", "3.0", "")
+	again.UserTeam = "T0THER"
+	a.inbound(ctx, again)
+	if len(api.posted) != 1 {
+		t.Errorf("posts = %+v, want no second notice for the same sender", api.posted)
+	}
+
+	unaddressed := slackMsg("channel", "C1", "UOTHER", "anyone seen node 4?", "4.0", "")
+	unaddressed.UserTeam = "T0THER"
+	a.inbound(ctx, unaddressed)
+	if len(api.posted) != 1 {
+		t.Errorf("posts = %+v, want no notice for a message that addressed nobody", api.posted)
+	}
+
+	elsewhere := slackMsg("im", "D2", "UGUEST", "hello", "5.0", "")
+	elsewhere.UserTeam = "T0THIRD"
+	a.inbound(ctx, elsewhere)
+	if len(api.posted) != 2 || api.posted[1].thread != "5.0" {
+		t.Errorf("posts = %+v, want a notice for the same member id in another workspace", api.posted)
+	}
+
+	// A mention inside a thread gets its notice in that thread, on its root.
+	inThread := slackMsg("channel", "C1", "UGUEST2", "<@UBOT> and node 5", "8.0", "100.1")
+	inThread.UserTeam = "T0THER"
+	a.inbound(ctx, inThread)
+	if len(api.posted) != 3 || api.posted[2].thread != "100.1" {
+		t.Errorf("posts = %+v, want the notice in the mention's thread", api.posted)
+	}
+
+	// A sender whose workspace is named only in the message's own team field is
+	// keyed by that workspace, so is a sender of their own.
+	teamOnly := slackMsg("im", "D6", "UGUEST3", "hello", "9.0", "")
+	teamOnly.Message = &slack.Msg{Team: "T0THER"}
+	a.inbound(ctx, teamOnly)
+	if len(api.posted) != 4 || !strings.Contains(api.posted[3].text, "UGUEST3") {
+		t.Errorf("posts = %+v, want a notice for a sender named only in the team field", api.posted)
+	}
+	teamOnlyElsewhere := slackMsg("im", "D7", "UGUEST3", "hello", "10.0", "")
+	teamOnlyElsewhere.Message = &slack.Msg{Team: "T0FIFTH"}
+	a.inbound(ctx, teamOnlyElsewhere)
+	if len(api.posted) != 5 {
+		t.Errorf("posts = %+v, want the same member id in another team-field workspace told too", api.posted)
+	}
+}
+
+// TestSlackForeignNoticeIsSharedByMessagesAndClicks: a member of another
+// workspace told once through a message is not told again when they click a
+// question's button, and the other way round: one memory, one notice.
+func TestSlackForeignNoticeIsSharedByMessagesAndClicks(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	ctx := context.Background()
+	mention := slackMsg("channel", "C1", "UGUEST", "<@UBOT> drain node 4", "2.0", "")
+	mention.UserTeam = "T2"
+	a.inbound(ctx, mention)
+	a.interactive(clickPayload(t, "UGUEST", "T2", "C1", "40.0", "kage.choice.0", "Option A", "x", "65.0"))
+	if len(api.posted) != 1 {
+		t.Errorf("posts = %+v, want one notice across a message and a click", api.posted)
+	}
+	a.interactive(clickPayload(t, "UOTHER", "T2", "C1", "40.0", "kage.choice.0", "Option A", "x", "66.0"))
+	other := slackMsg("im", "D1", "UOTHER", "hello", "3.0", "")
+	other.UserTeam = "T2"
+	a.inbound(ctx, other)
+	if len(api.posted) != 2 || api.posted[1].thread != "40.0" {
+		t.Errorf("posts = %+v, want the clicker's one notice in the question's thread, none for the later DM", api.posted)
+	}
+}
+
+// TestSlackForeignNoticeMemoryIsBounded: the once-per-sender memory never holds
+// more than slackForeignNoticesCap senders, and at the cap it is wiped whole, so
+// at worst a sender is told twice.
+func TestSlackForeignNoticeMemoryIsBounded(t *testing.T) {
+	saved := slackForeignNoticesCap
+	slackForeignNoticesCap = 2
+	t.Cleanup(func() { slackForeignNoticesCap = saved })
+	api := &fakeSlackAPI{}
+	a := newTestSlackAdapter(api)
+	a.teamID = "T0URS"
+	a.syncSessions = true
+	ctx := context.Background()
+	dm := func(user, ts string) {
+		m := slackMsg("im", "D"+user, user, "hello", ts, "")
+		m.UserTeam = "T0THER"
+		a.inbound(ctx, m)
+	}
+	dm("U1", "1.0")
+	dm("U2", "2.0")
+	dm("U3", "3.0") // the cap is reached: the memory is wiped, then U3 recorded
+	if n := len(a.foreignNoticed); n > slackForeignNoticesCap {
+		t.Fatalf("notice memory holds %d senders, over the cap of %d", n, slackForeignNoticesCap)
+	}
+	dm("U1", "4.0")
+	if len(api.posted) != 4 {
+		t.Errorf("posts = %d, want U1 told again after the wholesale eviction", len(api.posted))
 	}
 }
 
@@ -858,6 +1098,11 @@ func TestSlackPostThreadsAndTranslates(t *testing.T) {
 	}
 	if api.posted[2].channel != "D1" || api.posted[2].thread != "100.1" {
 		t.Errorf("a post to a DM thread's conversation must land in that thread: %+v", api.posted[2])
+	}
+	for i, v := range api.postValues {
+		if v.Get("unfurl_links") != "false" || v.Get("unfurl_media") != "false" {
+			t.Errorf("post %d: unfurl_links=%q unfurl_media=%q, want both false", i, v.Get("unfurl_links"), v.Get("unfurl_media"))
+		}
 	}
 	if _, err := a.Post("discord:1/2", "x"); err == nil {
 		t.Error("malformed conversation must error")
@@ -1073,6 +1318,44 @@ func TestToMrkdwn(t *testing.T) {
 	}
 }
 
+// TestToMrkdwnKeepsAnExecutorsSlackLink mirrors
+// TestToGchatTextKeepsAnExecutorsChatLink: <url|text> is Slack's link form
+// too, and escaping turned every one the executor wrote into literal text
+// with a bare URL beside it (#3015 on Chat). A closed one in prose, with an
+// http(s) URL in the markdown destination class and text that names no
+// other host, is kept with its URL and text escaped as the rest of the text
+// is; everything else is escaped as before, Slack's other sequences
+// included.
+func TestToMrkdwnKeepsAnExecutorsSlackLink(t *testing.T) {
+	cases := map[string]string{
+		issue3015Reply:                                              issue3015Reply,
+		"<https://x.example/a?b=1&c=2|R&D>":                         "<https://x.example/a?b=1&amp;c=2|R&amp;D>",
+		"<https://x.example/a|a> and [b](https://x.example/b)":      "<https://x.example/a|a> and <https://x.example/b|b>",
+		"<https://evil.example/login|https://github.com/x>":         "&lt;https://evil.example/login|https://github.com/x&gt;",
+		"<https://evil.example|x](https://good.example) [y>":        "&lt;https://evil.example|x](https://good.example) [y&gt;",
+		"<https://a.example|<https://b.example|c>>":                 "&lt;https://a.example|<https://b.example|c>&gt;",
+		"<https://x.example/a|b|c>":                                 "&lt;https://x.example/a|b|c&gt;",
+		"see <https://evil.example|docs: <https://x.example/p|doc>": "see &lt;https://evil.example|docs: <https://x.example/p|doc>",
+		"<!channel|everyone>":                                       "&lt;!channel|everyone&gt;",
+		"<@U999|bob> and <#C1|chan>":                                "&lt;@U999|bob&gt; and &lt;#C1|chan&gt;",
+		"<mailto:a@x.example|mail>":                                 "&lt;mailto:a@x.example|mail&gt;",
+		"`<https://x.example|doc>`":                                 "`&lt;https://x.example|doc&gt;`",
+		"see ``` <https://x.example|doc>":                           "see ``` &lt;https://x.example|doc&gt;",
+		// The markdown rules read a kept link as the link it is: the bold
+		// a heading becomes wraps it, and a markdown link around it or
+		// inside it is refused rather than nested.
+		"# Opened <https://x.example/p|PR 3>":                "*Opened <https://x.example/p|PR 3>*",
+		"<https://x.example/p|**doc**>":                      "<https://x.example/p|*doc*>",
+		"[t](https://evil.example/<https://good.example|x>)": "[t](https://evil.example/<https://good.example|x>)",
+		"<https://x.example/a|[doc](https://x.example/b)>":   "<https://x.example/a|[doc](https://x.example/b)>",
+	}
+	for in, want := range cases {
+		if got := toMrkdwn(in); got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestToMrkdwnConvertsProseAfterAChunkedFence: Gateway.post splits a result
 // with chatChunks(text, discordChunk) and the adapter translates each chunk
 // on its own, so the chunker closes a fenced block it cuts and reopens it in
@@ -1111,10 +1394,12 @@ func TestToMrkdwnConvertsProseAfterAChunkedFence(t *testing.T) {
 func TestToMrkdwnRewritesBoldOnlyOnClosedPairs(t *testing.T) {
 	cases := map[string]string{
 		// The issue's rows: none of these is a bold pair.
-		"**kwargs":                "**kwargs",
-		"**/*.yaml":               "**/*.yaml",
-		"a ** b":                  "a ** b",
-		"***":                     "***",
+		"**kwargs":  "**kwargs",
+		"**/*.yaml": "**/*.yaml",
+		"a ** b":    "a ** b",
+		// Inline, since a line of only *** is a thematic break, which
+		// rewriteSlackBlocks drops (TestRewriteSlackBlocks).
+		"a *** b":                 "a *** b",
 		"def f(*args, **kwargs):": "def f(*args, **kwargs):",
 		// Bold-italic is the one triple that is a pair, and a single star
 		// inside a pair is emphasis inside it, not a second pair.
@@ -1992,7 +2277,7 @@ func TestSlackSessionLookupLogLevels(t *testing.T) {
 }
 
 // TestSlackDecodedTextDrivesTheAffordances pins a consequence of decoding the
-// inbound entities that nothing else in the suite notices. normalize() drops
+// inbound entities that nothing else in the suite notices. chattext.Normalize() drops
 // every non-alphanumeric, so the entity escaping used to survive it as
 // letters: "&lt;stop&gt;" normalized to "ltstopgt" and matched nothing.
 // Decoded first, the same wire text normalizes to "stop" — a hard task cancel.
@@ -2003,8 +2288,8 @@ func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
 
 	// What Slack puts on the wire when a user types "<stop>".
 	const stopWire = "&lt;stop&gt;"
-	if got := normalize(stopWire); got != "ltstopgt" || isStop(stopWire) {
-		t.Fatalf("premise: normalize(%q) = %q, isStop = %v", stopWire, got, isStop(stopWire))
+	if got := chattext.Normalize(stopWire); got != "ltstopgt" || chattext.IsStop(stopWire) {
+		t.Fatalf("premise: chattext.Normalize(%q) = %q, chattext.IsStop = %v", stopWire, got, chattext.IsStop(stopWire))
 	}
 	msg, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", stopWire, "800.0", ""))
 	if !ok {
@@ -2013,7 +2298,7 @@ func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
 	if msg.Text != "<stop>" {
 		t.Fatalf("inbound text = %q, want the decoded form", msg.Text)
 	}
-	if !isStop(msg.Text) {
+	if !chattext.IsStop(msg.Text) {
 		t.Error("a typed <stop> must cancel: the decode is what lets normalize see \"stop\"")
 	}
 }
@@ -2630,6 +2915,21 @@ func TestSlackMappedButDisallowedSenderDropsVisiblyOnce(t *testing.T) {
 	}
 }
 
+// TestSlackVerificationIsToldToTheAdapter: the adapter learns the gateway's
+// word on every sender (VerifiedObserver), so a click from a sender the
+// gateway drops rewrites nothing, and an admitted one's does. A click is a
+// message like any other here: same path, same allowlist.
+func TestSlackVerificationIsToldToTheAdapter(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1"}, false)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U2", MessageID: "60.1", Text: "Option A: restart"}
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U1", MessageID: "60.2", Text: "Option A: restart"}
+	waitFor(t, "both verdicts", func() bool { return len(r.adapter.verifiedCalls()) == 2 })
+	if got, want := r.adapter.verifiedCalls(), []string{"60.1:false", "60.2:true"}; !slices.Equal(got, want) {
+		t.Errorf("verdicts = %v, want %v", got, want)
+	}
+	slackAuthorityOf(t, r)
+}
+
 // TestSlackListedUnmappedSenderIsAttributedByMemberID: the map is an
 // override, not a gate. A listed sender it does not name is admitted and
 // attributed slack:<member id>, with the verifiedBy that says no map was
@@ -2742,6 +3042,20 @@ func TestSlackAllowAllAdmitsEverySender(t *testing.T) {
 	}
 }
 
+// TestSlackGuestEntryResolvesOnlyTheQualifiedAuthor: a "T…:U…" entry is matched
+// by the qualified author id the adapter gives an admitted guest, through the
+// same exact match as a plain entry, and attributes that guest by it. The
+// member id alone does not reach it.
+func TestSlackGuestEntryResolvesOnlyTheQualifiedAuthor(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1", "T2:U9"}, false)
+	if p := r.g.resolvePrincipal(slackBackend, "T2:U9"); p != slackMemberPrincipalPrefix+"T2:U9" {
+		t.Errorf("a listed guest resolved to %q, want %q", p, slackMemberPrincipalPrefix+"T2:U9")
+	}
+	if p := r.g.resolvePrincipal(slackBackend, "U9"); p != "" {
+		t.Errorf("the bare member id of a listed guest resolved to %q, want no principal", p)
+	}
+}
+
 // TestSlackEmptyAllowlistWithoutAllowAllDropsEveryone: Chat's posture for
 // the shape the operator renders from a degenerate CR list.
 func TestSlackEmptyAllowlistWithoutAllowAllDropsEveryone(t *testing.T) {
@@ -2817,4 +3131,233 @@ func teamOf(m *slackevents.MessageEvent) string {
 		return "<nil Message>"
 	}
 	return m.Message.Team
+}
+
+// TestSlackReplyUnderTheBotsOwnPostIsAddressed: a chat.notify post (an alert,
+// a card's report) roots a thread no task started, so it is never a session
+// thread. A reply there with no mention used to drop without a log line
+// (gke-labs/kube-agents#3246). The root's author, which Slack sends on every
+// reply, now decides it, without asking the registry.
+func TestSlackReplyUnderTheBotsOwnPostIsAddressed(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	reg := &countingLookup{}
+	a.sessions = reg.lookup
+
+	reply := slackMsg("channel", "C1", "U1", "why is it OOMing?", "1792100300.000100", "1792100240.299609")
+	got, ok := a.inboundEvent(context.Background(), reply, "UBOT")
+	if !ok || got.Conversation != "slack:C1/1792100240.299609" || got.Text != "why is it OOMing?" {
+		t.Fatalf("reply under the bot's post: delivered=%v conv=%q text=%q", ok, got.Conversation, got.Text)
+	}
+	if len(reg.asked) != 0 {
+		t.Errorf("the registry was asked %v; the root's author is the answer", reg.asked)
+	}
+	if !got.Unaddressed {
+		t.Error("an unmentioned reply under the bot's post is not marked Unaddressed")
+	}
+	mentioned := slackMsg("channel", "C1", "U1", "<@UBOT> why?", "1792100300.000200", "1792100240.299609")
+	if got, ok := a.inboundEvent(context.Background(), mentioned, "UBOT"); !ok || got.Unaddressed {
+		t.Errorf("a mentioned reply there: delivered=%v unaddressed=%v, want delivered and addressed", ok, got.Unaddressed)
+	}
+}
+
+func TestSlackReplyUnderSomeoneElsesPostStillNeedsAMention(t *testing.T) {
+	for _, parent := range []string{"", "UALICE"} {
+		a := newTestSlackAdapter(&fakeSlackAPI{})
+		a.sessions = noSessions
+		reply := slackMsg("channel", "C1", "U1", "do option 2", "5.0", "200.1")
+		if _, ok := a.inboundEvent(context.Background(), reply, parent); ok {
+			t.Errorf("parent %q: an unmentioned reply in a thread the bot did not root must not deliver", parent)
+		}
+	}
+}
+
+func TestSlackParentUserIDFromTheEventsAPIPayload(t *testing.T) {
+	payload := json.RawMessage(`{"token":"x","team_id":"T1","type":"event_callback","event":` +
+		`{"type":"message","channel":"C1","user":"U1","text":"do option 2","ts":"1792100300.000100",` +
+		`"thread_ts":"1792100240.299609","parent_user_id":"UBOT","channel_type":"channel"}}`)
+	if got := slackParentUserID(payload); got != "UBOT" {
+		t.Errorf("parent_user_id = %q, want UBOT", got)
+	}
+	for _, p := range []json.RawMessage{nil, json.RawMessage(`{`), json.RawMessage(`{"event":{"type":"message"}}`)} {
+		if got := slackParentUserID(p); got != "" {
+			t.Errorf("payload %s: parent = %q, want empty", p, got)
+		}
+	}
+}
+
+// TestSlackPumpPassesTheRootAuthorThrough: the pump reads parent_user_id from
+// the envelope's raw payload and hands it to inboundEvent. Without that
+// wiring the reply-under-our-post rule never fires on a real delivery, and
+// the unit tests above would still pass. A reply with no payload behind it
+// stays dropped; a DM after both is the sentinel that the pump got that far.
+func TestSlackPumpPassesTheRootAuthorThrough(t *testing.T) {
+	srv, unblock := stalledSlackStub(t)
+	defer unblock()
+
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.sessions = noSessions
+	a.sm = socketmode.New(slack.New("xoxb-stub", slack.OptionAPIURL(srv.URL+"/")))
+
+	withRoot := slackEnvelope("Env-root", slackMsg("channel", "C1", "U1", "why is it OOMing?", "700.1", "650.0"))
+	withRoot.Request.Payload = json.RawMessage(`{"type":"event_callback","event":{"type":"message",` +
+		`"channel":"C1","user":"U1","text":"why is it OOMing?","ts":"700.1","thread_ts":"650.0","parent_user_id":"UBOT"}}`)
+	a.sm.Events <- withRoot
+	a.sm.Events <- slackEnvelope("Env-bare", slackMsg("channel", "C1", "U1", "and now?", "700.2", "660.0"))
+	a.sm.Events <- slackEnvelope("Env-dm", slackMsg("im", "D1", "U1", "sentinel", "700.3", ""))
+
+	delivered := make(chan InboundMessage, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx, func(m InboundMessage) { delivered <- m }) }()
+
+	var got []string
+	for len(got) < 2 {
+		select {
+		case m := <-delivered:
+			got = append(got, m.MessageID)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("delivered %v, want the reply under our post and the sentinel", got)
+		}
+	}
+	if got[0] != "700.1" || got[1] != "700.3" {
+		t.Errorf("delivered %v, want [700.1 700.3]: the reply under our post, not the reply with no root author", got)
+	}
+}
+
+func TestSlackAdmitsOnlyTheGuestsTheAllowlistNamesByWorkspace(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a := newTestSlackAdapter(api)
+	a.teamID = "T0URS"
+	a.syncSessions = true
+	logs := &recordingHandler{}
+	a.log = slog.New(logs)
+	a.SetAllowedGuests([]string{"UPLAIN", "T0THER:UGUEST", " T0THER:UTRIM ", "T0THER:not-an-id", "T0URS:UME"})
+	ctx := context.Background()
+
+	// Named by user_team: admitted, and the turn carries the qualified id the
+	// gateway's allowlist and principal map match.
+	byUserTeam := slackMsg("channel", "C1", "UGUEST", "<@UBOT> drain node 4", "2.0", "")
+	byUserTeam.UserTeam = "T0THER"
+	msg, ok := a.inbound(ctx, byUserTeam)
+	if !ok || msg.AuthorID != "T0THER:UGUEST" {
+		t.Fatalf("a listed guest = (%+v, %v), want a turn authored T0THER:UGUEST", msg, ok)
+	}
+	// Named only by the message's team field, the bug bash's shape.
+	byMessageTeam := slackMsg("im", "D1", "UTRIM", "hello", "3.0", "")
+	byMessageTeam.Message = &slack.Msg{Team: "T0THER"}
+	if msg, ok := a.inbound(ctx, byMessageTeam); !ok || msg.AuthorID != "T0THER:UTRIM" {
+		t.Errorf("a listed guest named by the team field = (%+v, %v), want T0THER:UTRIM", msg, ok)
+	}
+	if len(api.posted) != 0 {
+		t.Errorf("posts = %+v, want no notice for an admitted guest", api.posted)
+	}
+
+	// The same member id from a workspace the entry does not name: refused,
+	// and told which entry would admit them.
+	elsewhere := slackMsg("im", "D2", "UGUEST", "hello", "4.0", "")
+	elsewhere.UserTeam = "T0THIRD"
+	if _, ok := a.inbound(ctx, elsewhere); ok {
+		t.Error("an entry for one workspace admitted the member id from another")
+	}
+	if len(api.posted) != 1 || !strings.Contains(api.posted[0].text, "`T0THIRD:UGUEST`") {
+		t.Errorf("posts = %+v, want a notice naming the entry T0THIRD:UGUEST", api.posted)
+	}
+	// Two fields that disagree name no workspace that can be trusted.
+	disagree := slackMsg("im", "D3", "UGUEST", "hello", "5.0", "")
+	disagree.UserTeam = "T0THER"
+	disagree.Message = &slack.Msg{Team: "T0THIRD"}
+	if _, ok := a.inbound(ctx, disagree); ok {
+		t.Error("a sender whose two workspace fields disagree was admitted")
+	}
+	// A plain member id names a member of our own workspace, never a guest.
+	plain := slackMsg("im", "D4", "UPLAIN", "hello", "6.0", "")
+	plain.UserTeam = "T0THER"
+	if _, ok := a.inbound(ctx, plain); ok {
+		t.Error("a plain member id admitted another workspace's member")
+	}
+	// Our own member keeps the plain id.
+	own := slackMsg("im", "D5", "UOWN", "hello", "7.0", "")
+	own.UserTeam = "T0URS"
+	if msg, ok := a.inbound(ctx, own); !ok || msg.AuthorID != "UOWN" {
+		t.Errorf("our own member = (%+v, %v), want a turn authored UOWN", msg, ok)
+	}
+	if !logs.has("entry", "T0THER:not-an-id") {
+		t.Error("a malformed guest entry was not logged")
+	}
+
+	a.connected(&slack.AuthTestResponse{UserID: "UBOT", TeamID: "T0URS"})
+	if !logs.has("entry", "T0URS:UME") {
+		t.Error("an entry naming the install's own workspace was not logged")
+	}
+}
+
+func TestSlackAdmitsNoGuestWithoutAnEntry(t *testing.T) {
+	// Allow-all is an empty list, so it names no guest: another workspace's
+	// member stays refused, the bug bash's install included.
+	api := &fakeSlackAPI{}
+	a := newTestSlackAdapter(api)
+	a.teamID = "T0URS"
+	a.syncSessions = true
+	a.SetAllowedGuests(nil)
+	guest := slackMsg("channel", "C1", "UGUEST", "<@UBOT> hi", "2.0", "")
+	guest.Message = &slack.Msg{Team: "T0GUESTORG"}
+	if _, ok := a.inbound(context.Background(), guest); ok {
+		t.Fatal("another workspace's member was admitted with no entry naming them")
+	}
+	if len(api.posted) != 1 || !strings.Contains(api.posted[0].text, "`T0GUESTORG:UGUEST`") {
+		t.Errorf("posts = %+v, want the notice to name the entry an admin would add", api.posted)
+	}
+}
+
+func TestSlackGuestRuleEdges(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a := newTestSlackAdapter(api)
+	a.teamID = "T0URS"
+	a.syncSessions = true
+	a.SetAllowedGuests([]string{"T0THER:UGUEST"})
+	ctx := context.Background()
+
+	// Two workspace fields that disagree admit nobody, so the notice does not
+	// offer an entry that would not work.
+	disagree := slackMsg("im", "D1", "UGUEST", "hello", "2.0", "")
+	disagree.UserTeam = "T0THER"
+	disagree.Message = &slack.Msg{Team: "T0THIRD"}
+	if _, ok := a.inbound(ctx, disagree); ok {
+		t.Fatal("a sender whose two workspace fields disagree was admitted")
+	}
+	if len(api.posted) != 1 || strings.Contains(api.posted[0].text, "To be admitted") ||
+		!strings.Contains(api.posted[0].text, "UGUEST") {
+		t.Errorf("posts = %+v, want a notice naming the member id and no entry", api.posted)
+	}
+
+	// Without a team id of our own every named workspace is foreign, and a
+	// listed guest is still admitted by their entry.
+	a.teamID = ""
+	listed := slackMsg("im", "D2", "UGUEST", "hello", "3.0", "")
+	listed.UserTeam = "T0THER"
+	if msg, ok := a.inbound(ctx, listed); !ok || msg.AuthorID != "T0THER:UGUEST" {
+		t.Errorf("a listed guest with no team id of our own = (%+v, %v), want T0THER:UGUEST", msg, ok)
+	}
+}
+
+func TestSlackMemberOfKeepsTheRawMemberId(t *testing.T) {
+	for author, want := range map[string]string{"U1": "U1", "T2:U9": "U9", "": ""} {
+		if got := slackMemberOf(author); got != want {
+			t.Errorf("slackMemberOf(%q) = %q, want %q", author, got, want)
+		}
+	}
+}
+
+func TestSlackTargetAllowlistMatchesAGuestEntry(t *testing.T) {
+	ps := NewPseudonymizer([]byte("test-salt"))
+	cfg := &Config{TargetAllowedUsers: map[string]map[string][]string{
+		targetPlatform: {slackBackend: {"U1", "T2:U9"}},
+	}}
+	g := &Gateway{targetAllowed: buildTargetAllowed(cfg, ps)}
+	if !g.targetAllows(targetPlatform, slackBackend, requesterSubject(ps, slackBackend, "T2:U9")) {
+		t.Error("a listed guest's qualified author is not on the target allowlist")
+	}
+	if g.targetAllows(targetPlatform, slackBackend, requesterSubject(ps, slackBackend, "U9")) {
+		t.Error("a listed guest's bare member id reached the target allowlist")
+	}
 }

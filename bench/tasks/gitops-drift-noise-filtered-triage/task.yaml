@@ -29,8 +29,10 @@
 # project.sh sets enable_drift_pubsub, so a pool project carries the sink, the
 # drift-audit topic and the pull subscription, and hack/ci-deploy.sh turns the
 # detector on per lease and fails the deploy if it never reaches its pull loop.
-# A project onboarded before that has no ingress and fails this case as broken
-# rather than red; docs/ci-pool-projects.md section 3 states the limitation.
+# Not every mapped project carries it. Section 3 of docs/ci-pool-projects.md
+# is the one home for which do and which do not, dated, and nothing re-checks
+# the state between leases. A lease of a project without the ingress fails
+# this case as broken rather than red.
 #
 # The sink is the one part of the trio this case does not use, and that matters
 # because the sibling stack's header gives the export lag as a reason the audit
@@ -75,14 +77,15 @@
 # THE ALERT CEILING, AND WHY IT IS NOT A BLOCKER HERE
 #
 # The daemon allows ALERT_DAILY_LIMIT_DRIFT drift injects a day per install
-# from a bucket keyed DRIFT_QUOTA_KEY (5 by default,
+# from a bucket keyed DRIFT_QUOTA_KEY (the default is in
 # agents/platform/scripts/session_kv_server.py), and a suppressed record files
 # no card at all. This case spends one inject per repetition — eleven of its
-# twelve records are meant to be dropped — and so does the sibling, so two
-# nightly drift cases at three repetitions each would be six injects against a
-# default ceiling of five.
+# twelve records are meant to be dropped — and so does the sibling. Two nightly
+# drift cases at three repetitions each spend six injects, which is below the
+# default ceiling. Other runs against the same install on the same UTC day
+# spend from the same bucket.
 #
-# That does not bite on an eval install, because the ceiling is off there:
+# The ceiling does not bite on an eval install, because it is off there:
 # hack/ci-deploy.sh sets EVAL_ALERT_DAILY_LIMIT_DRIFT="0", _alert_daily_limit
 # clamps at zero and _claim_alert_quota returns early for limit <= 0, so zero
 # means uncapped rather than "no injects". The comment on that constant
@@ -91,14 +94,15 @@
 # first record and is refused the rest, which is indistinguishable from a
 # working filter.
 #
-# It does bite on a dev install carrying the default, and the stack names it
-# directly: a ceiling refusal is a ledger row with notified=0 and an empty
-# delivery_error, which it writes as card-quota-refused. Raise the limit or
-# use a fresh install rather than reading that as a finding. card-turn-failed
-# is the other shape -- a row the daemon accepted whose card never reached a
-# terminal status, whether because the turn filed none or because it was still
-# running when the timeout elapsed -- so on that token the ceiling is precisely
-# what the explanation is not.
+# It can bite on a dev install carrying the default, when other runs spend the
+# bucket first, and the stack names it directly: a ceiling refusal is a ledger
+# row with notified=0 and an empty delivery_error, which it writes as
+# card-quota-refused. Raise the limit or use a fresh install rather than
+# reading that as a finding. card-turn-failed is the other shape -- a row the
+# daemon accepted whose card never reached a terminal status, whether because
+# the turn filed none or because it was still running when the timeout
+# elapsed -- so on that token the ceiling is precisely what the explanation is
+# not.
 #
 # WHY THE WORKLOAD NAMES CARRY A PREFIX
 #
@@ -225,7 +229,7 @@
 # case's finding; the sibling stack already treats the first that way,
 # exiting 1 on
 # an inject_status of `suppressed` and saying why in the message
-# (bench/tf/prebuilt/gitops-drift/main.tf).
+# (bench/tf/modules/drift-inject/drift_inject.sh).
 #
 # The cut is not between the churn check and everything about the card. Two
 # observations are this case's finding, and they are the same regression in
@@ -320,9 +324,10 @@
 #   argocd-controller and kubectl-edit from, the third thing expected_output
 #   requires. The detector's own testdata captures all say
 #   example-project/us-central1/prod-1, so they cannot be copied as they
-#   stand. And every insertId is minted per apply, in the
-#   sibling's eval-drift-$(date -u +%s)-$RANDOM form
-#   (bench/tf/prebuilt/gitops-drift/main.tf). Distinct within the run is not
+#   stand. And every insertId is minted per apply, in the sibling stacks'
+#   <prefix>-$(date -u +%s)-$RANDOM form — the prefix is the stack's own
+#   argument, the tail is drift_mint_insert_id's
+#   (bench/tf/modules/drift-inject/drift_inject.sh). Distinct within the run is not
 #   enough, and fixed-but-distinct churn ids — the shape of the
 #   detector's own testdata — is the reading to rule out. driftInjectHandler
 #   .Handle calls seen.Add(record.InsertID) before the send (inject.go), on a
@@ -363,7 +368,7 @@
 #   (`insertId=<id>`, session_kv_server.py), so a bounded poll for that
 #   literal is run-scoped without needing a per-run object name — which is how
 #   the sibling stack scopes its own poll
-#   (bench/tf/prebuilt/gitops-drift/main.tf).
+#   (bench/tf/modules/drift-inject/drift_inject.sh).
 # - When that poll times out the stack says which failure it was, and the
 #   ledger is where it looks. Publishing to Pub/Sub gets no reply, so unlike
 #   the sibling's direct inject there is no `suppressed` status to read — but
@@ -542,9 +547,6 @@ validated: false
 
 # Slug per docs/designs/domains.yaml.
 domain: incident-triage
-
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
 
 # The case plants its own namespaces rather than reading the seeded fleet, as
 # the sibling drift case does, which is why this list is empty.

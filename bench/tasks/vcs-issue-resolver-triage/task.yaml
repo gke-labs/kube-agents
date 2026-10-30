@@ -60,11 +60,9 @@
 # one transition. The first of those overlapped a Vertex capacity incident that
 # had the conversation loop retrying on HTTP 503 throughout, so take the second
 # as the figure. Budget it as a long nightly, not a presubmit.
-#
-# No `domain:`, for the reason vcs-history-only-fact gives: this grades a
-# route, not a journey in docs/designs/domains.yaml.
 id: vcs-issue-resolver-triage
 name: The issue resolver claims a real ticket and transitions it
+domain: source-control
 prompt: >-
   Two steps, in order.
 

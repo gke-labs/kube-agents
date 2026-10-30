@@ -103,6 +103,9 @@ def run_image_source(
             # candidate branch overwrites them and the presubmit path must not.
             f'export IMG="{_AR_REPO}/kube-agents-operator:{_PRESUBMIT_TAG}"',
             f'export AGENT_IMAGE="{_AR_REPO}/platform-agent"',
+            # The section names the two AgentPlugin images by the file-head
+            # constants, as section 4 names its poll's bounds.
+            head_constants(),
             lifted(*_IMAGE_SOURCE_SECTION),
             'echo "TAG=${TAG}"',
             'echo "IMG=${IMG}"',
@@ -116,8 +119,18 @@ def run_image_source(
     )
 
 
+def head_constants() -> str:
+    """The file-head `readonly` lines section 4 reads (its poll's bounds)."""
+    return "\n".join(line for line in _CI_DEPLOY.read_text(encoding="utf-8").splitlines() if line.startswith("readonly "))
+
+
 def run_build_section(rc_commit_sha: str) -> subprocess.CompletedProcess:
-    """Run section 4 with `gcloud` stubbed, so a build announces itself."""
+    """Run section 4 with `gcloud` stubbed, so a build announces itself on
+    stderr; the stub answers `builds submit` with an id and a log URL on
+    stdout, as --format=value(id,logUrl) does, and `builds describe` with
+    SUCCESS, so the section's poll (#3129) ends on its first turn. The real
+    `timeout` cannot exec a shell function, so it is shimmed to run its
+    command."""
     script = "\n".join(
         [
             "set -euo pipefail",
@@ -127,7 +140,9 @@ def run_build_section(rc_commit_sha: str) -> subprocess.CompletedProcess:
             'export PROJECT_ID="kube-agents-evals"',
             'export HERMES_AGENT_TAG="v0"',
             "BUILD_WORKER_ARGS=(--machine-type=e2-highcpu-8)",
-            'gcloud() { echo "BUILD SUBMITTED"; }',
+            'gcloud() { case "$1 $2" in "builds submit") echo "BUILD SUBMITTED" >&2; printf "b-1\\tu\\n" ;; "builds describe") echo SUCCESS ;; esac; }',
+            'timeout() { shift 2; "$@"; }',
+            head_constants(),
             lifted(*_BUILD_SECTION),
         ]
     )
@@ -176,6 +191,14 @@ class PresubmitPathUnchangedTest(unittest.TestCase):
                 f"agentSandbox.image.repository={_AR_REPO}/agent-sandbox",
                 "--set-string",
                 f"agentSandbox.image.tag={_PRESUBMIT_TAG}",
+                "--set-string",
+                f"plugins.pubsubPlatform.image.repository={_AR_REPO}/pubsub-platform",
+                "--set-string",
+                f"plugins.pubsubPlatform.image.tag={_PRESUBMIT_TAG}",
+                "--set-string",
+                f"plugins.stockoutInvestigator.image.repository={_AR_REPO}/gke-stockout-investigator",
+                "--set-string",
+                f"plugins.stockoutInvestigator.image.tag={_PRESUBMIT_TAG}",
             ],
             "the presubmit's Helm image flags must name every image the run "
             "built: every pull request runs this path, and an image left off "
@@ -196,7 +219,7 @@ class PresubmitPathUnchangedTest(unittest.TestCase):
     def test_the_images_are_still_built(self) -> None:
         result = run_build_section(rc_commit_sha="")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("BUILD SUBMITTED", result.stdout)
+        self.assertIn("BUILD SUBMITTED", result.stderr)
 
 
 class ReleaseCandidatePathTest(unittest.TestCase):
@@ -204,7 +227,9 @@ class ReleaseCandidatePathTest(unittest.TestCase):
         """The published operator image is `k8s-operator` and the Artifact
         Registry one is `kube-agents-operator`, so an override copied from the
         presubmit path would 404. The chart already defaults every image to the
-        published path; only the tag has to be said."""
+        published path; only the tag has to be said. The two AgentPlugin images
+        are published under the same tag (scripts/release/common.sh,
+        REQUIRED_RELEASE_IMAGES), so they get a tag and no repository too."""
         with tempfile.TemporaryDirectory() as tmp:
             fake_hack, rc_sha = fake_candidate_tree(tmp, images_exist=True)
             result = run_image_source(fake_hack, rc_commit_sha=rc_sha)
@@ -218,6 +243,10 @@ class ReleaseCandidatePathTest(unittest.TestCase):
                 f"platformAgent.deployment.image.tag={rc_sha}",
                 "--set-string",
                 f"agentSandbox.image.tag={rc_sha}",
+                "--set-string",
+                f"plugins.pubsubPlatform.image.tag={rc_sha}",
+                "--set-string",
+                f"plugins.stockoutInvestigator.image.tag={rc_sha}",
             ],
         )
 

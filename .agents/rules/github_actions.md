@@ -2,8 +2,9 @@
 # Claude Code loads this rule only beside files matching `paths`; Antigravity uses `trigger` and `description`.
 paths:
   - ".github/workflows/**"
+  - ".github/buildkitd.toml"
 trigger: model_decision
-description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs, guarding credentialed workflows against forks, and collapsing superseded pull-request runs with a concurrency group."
+description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs, guarding credentialed workflows against forks, hardening pull_request_target workflows, collapsing superseded pull-request runs with a concurrency group, detecting changed files with git rather than the API, and pulling Docker Hub images through mirror.gcr.io."
 ---
 
 # GitHub Actions rules
@@ -32,7 +33,9 @@ Two classes need no guard: a workflow reachable only through `workflow_call` is 
 (`reconcile-environment.yml`, `teardown-environment.yml`), and a `workflow_dispatch`-only one runs only when someone deliberately
 starts it (`rc-create-tag.yml`, `deploy-environment.yml`, `rc-tag-validated.yml`,
 `e2e-gchat-test.yml`). `docs-deploy.yml` is push-triggered and deliberately unguarded, so a fork
-can publish its own Pages site.
+can publish its own Pages site. `merge-gate.yml`'s `gate` job is unguarded too: it runs only on
+`merge_group`, which a fork never gets, and a skipped job reports success to a required check, so
+a guard that evaluated false on a queue commit would pass every group.
 
 ## Collapse superseded pull-request runs with a concurrency group
 
@@ -64,3 +67,81 @@ next push or edit. Keyed by head, a run can only supersede runs for its own head
 
 `smoke-test-sticky.yml` has no group on purpose and says why in its header: it starts on `status`
 and `push`, never on `pull_request`, and a dropped pending run there would drop a re-pin.
+
+## Detect changed files with git, not the API
+
+A `dorny/paths-filter` step on a workflow that starts on `pull_request` sets `token: ""`. With a
+token the action lists a pull request's files through the GitHub API, a page at a time, with no
+retry around any page, and one failed page reds the check: on 2026-10-14 between 01:33 and 01:42
+UTC that call failed in four runs across `a2a-test.yml` and `k8s-operator-test.yml`, two of them
+re-run by hand, and in the five thousand pull-request runs of those workflows around them it failed
+in none; the flaky-check tracker opened #2984 and #2983 for the two checks. With no token the action
+diffs the checked-out merge commit against the base SHA with git, the path it already takes on push
+and merge-queue runs, after one depth-one fetch of the base SHA from the server the checkout just
+used. `tests/test_paths_filter_uses_git_diff.py` holds the input on every such step.
+
+The checkout before the step stays at its default depth of one. A depth of two would make the base
+tip local and spare that fetch, but it changes what a `workflow_dispatch` run on `main` tests: at
+depth one the shallow root makes the action see every file as changed and the whole suite runs, at
+depth two it sees the tip commit's files alone and a dispatch after a commit outside the filter's
+paths tests nothing.
+
+A `pull_request_target` workflow is the exemption: there the action runs in the base branch's
+context and refuses an empty token, so it keeps the API path. None uses the action today.
+
+## Pull Docker Hub images through mirror.gcr.io
+
+Docker Hub limits anonymous pulls per source IP, and GitHub-hosted runners share egress IPs, so a
+burst of pull requests fails every job that pulls from Docker Hub at once: on 2026-10-09 every
+failed image build and every failed GHCR publish that day died on it, most within seconds of
+starting. A workflow on a GitHub-hosted runner therefore pulls Docker Hub images through
+`mirror.gcr.io`, which serves public Docker Hub images without that limit and takes no credential,
+so a fork keeps the same path.
+
+- Every `docker/setup-buildx-action` step takes `buildkitd-config: .github/buildkitd.toml`, which
+  mirrors `docker.io` for the builder (a reference the mirror does not hold falls through to
+  Docker Hub), and `driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1`, because the
+  action pulls the builder image on the runner's own daemon before the builder exists, so the
+  config cannot cover it. Both on every step, whether or not the job builds today: a job's build
+  can be a `run:` line, which no check can tell from one that does not.
+- A job `container:`, a `services:` image, a `docker://` action, or a `docker run` or
+  `docker pull` of a Docker Hub image, names it as `mirror.gcr.io/<repository>` with the same tag
+  and digest.
+
+`tests/test_workflow_pins_and_fork_guards.py` checks the buildx steps, job containers, service
+images and `docker://` actions of every workflow against this rule, and that the config file holds
+the mirror.
+
+A floating tag resolves to the manifest the mirror last refreshed, which can trail Docker Hub by
+days; pin a digest where that matters. The kind node image the installer matrix starts is the one
+exception: kind pairs that image with its own release, so naming one on the mirror would also pin
+the Kubernetes version the matrix tests, and that is a separate decision. Cloud Build pulls from
+Google's egress and is out of scope.
+
+## Harden `pull_request_target` workflows
+
+`pull_request_target` runs in the base repository's context with repository secrets and writable
+`GITHUB_TOKEN` scopes, and GitHub's repository Actions event rules allow it only on explicitly
+allowlisted workflow paths (`auto-enqueue.yml`, `hold-unresolved-threads.yml`, `merge-gate.yml`,
+`risk_classify.yml`). Prefer `pull_request` (or `pull_request` + `workflow_run` when only an
+artifact hand-off needs write access); adding a new `pull_request_target` workflow requires adding
+both a per-workflow repository Actions event rule on GitHub and an allowlist entry in
+`tests/test_pull_request_target_workflows.py`.
+
+Every `pull_request_target` workflow must:
+
+- Set `permissions: {}` at the top level and grant minimal scopes per job (`contents: write` and
+  `id-token: write` are forbidden).
+- Carry `if: github.repository == 'gke-labs/kube-agents'` on every job (even `GITHUB_TOKEN`-only
+  jobs), except `merge-gate.yml`'s `merge_group`-only `gate` job.
+- Set an explicit `timeout-minutes` (`<= 60`) on every job.
+- Check out an explicit `ref: ${{ github.event.repository.default_branch }}` with
+  `persist-credentials: false` and never check out or execute pull-request head code; pass event
+  payload fields into `run:` steps through `env:`.
+
+`tests/conformance/test_B_write_path.py` (`test_B4_no_pull_request_target_workflow_checks_out_the_pull_request`)
+holds the `contents`/`id-token` write ceiling and non-PR checkout `ref:`, and
+`tests/test_pull_request_target_workflows.py` holds the workflow allowlist, `permissions: {}`, the
+repository guard, `timeout-minutes`, `ref: ${{ github.event.repository.default_branch }}` with
+`persist-credentials: false`, and the absence of event/input `${{ ... }}` interpolation in `run:`
+steps.

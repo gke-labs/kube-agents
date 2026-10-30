@@ -30,8 +30,9 @@ const (
 // so the line hedges on a start that is merely late.
 const noFirstEventNotice = "⚠️ task `%s` has produced nothing on its event stream in %s; unless it starts first, your next message here starts a new task instead of going to it"
 
-// reapLoop enforces the idle TTL — a session silent past the TTL loses its
-// pod — and the ask bound (boundAskCopy), which runs on every record the
+// reapLoop enforces the idle TTL — a session nobody has written to for the
+// TTL loses its pod — the overdue bound on a reused pod's running task
+// (taskOverdue), and the ask bound (boundAskCopy), which runs on every record the
 // scan visits, pod or no pod. It also enforces SessionTTL, deleting session
 // records that have been idle past the retention horizon, and posts the
 // no-first-event notice (noticeNoFirstEvent) on the same visit.
@@ -107,10 +108,20 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 	if rec.PodName == "" {
 		return // nothing incarnated (the Hermes-first world, or already reaped)
 	}
+	// A reused pod's running task past its bound is the one exception to
+	// the rule below: the task is closed as its supervisor and the pod goes
+	// (retireOverdue), so a wedged adapter cannot hold a conversation for
+	// the hours its pod deadline allows.
+	if g.taskOverdue(rec, time.Now()) {
+		g.retireOverdue(ctx, rec.Key)
+		return
+	}
 	if rec.ActiveTask != nil && !rec.ActiveTask.Detached {
 		return // never delete a pod out from under a running task
 	}
-	if time.Since(rec.LastActivity) < g.cfg.IdleTTL {
+	// The idle clock is the last user message, not the last activity: the
+	// answer to a message does not keep the pod (idleSince).
+	if time.Since(rec.idleSince()) < g.cfg.IdleTTL {
 		return
 	}
 	l := g.lockSession(rec.Key)
@@ -122,7 +133,7 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 	fresh, err := g.reg.Get(ctx, rec.Key)
 	if err != nil || fresh == nil || fresh.PodName == "" ||
 		(fresh.ActiveTask != nil && !fresh.ActiveTask.Detached) ||
-		time.Since(fresh.LastActivity) < g.cfg.IdleTTL {
+		time.Since(fresh.idleSince()) < g.cfg.IdleTTL {
 		l.Unlock()
 		return
 	}
@@ -268,8 +279,11 @@ func (g *Gateway) requesterExpired(rec *SessionRecord, now time.Time) bool {
 // buildRehydrationPrimer folds the conversation's earlier turns into a
 // transcript primer for a fresh pod, the next incarnation's first input
 // (the worker reads it as lib.EnvPrimerFile and puts it ahead of the new
-// message). Every turn is a fresh pod, so this is all a session knows of the
-// conversation before it. Each human turn contributes what the user asked
+// message). A pod spawned for a conversation that already has turns (after a
+// reap, an eviction, or when the live pod could not take the turn) starts
+// with no harness session to resume, so this is all it knows of the
+// conversation before it; a reused pod's later turns resume the session this
+// fed instead. Each human turn contributes what the user asked
 // (TaskRef.Request, the copy session-state keeps until AskTTL) and each task
 // its result from JetStream, labelled by who answered. current is the task
 // the pod is being started for, left out so the new message is not

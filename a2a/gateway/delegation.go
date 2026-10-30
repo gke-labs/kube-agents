@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // The rules a delegation is refused or ignored under, as the audit line
@@ -416,7 +417,7 @@ func capAsk(text string) string {
 // and then ended otherwise wakes with those answers, then its reason under
 // wakeEndMarker. With none the body is the result or the reason alone, as
 // before.
-func wakeText(state lib.TaskState, childID, ask string, turns []string, result, reason string) string {
+func wakeText(state lib.TaskState, childID, ask string, turns []string, result, reason string, fullAnswer, cardsPending bool) string {
 	outcome, completed, body := "completed", true, result
 	switch state {
 	case lib.StateFailed, lib.StateCanceled: // a canceled the gateway did not publish
@@ -436,14 +437,66 @@ func wakeText(state lib.TaskState, childID, ask string, turns []string, result, 
 	} else {
 		text = fmt.Sprintf("The task you delegated to %s (task %s) %s.", targetPlatform, childID, outcome)
 	}
+	extraReserve := 0
+	if cardsPending {
+		text += "\n" + wakeCardsPendingNote
+		extraReserve = len("\n") + len(wakeCardsPendingNote)
+	}
 	if earlier != "" {
 		// wakeAnswers trimmed each answer; last opens with its separator.
-		text += "\n" + fenceWakeBody(earlier, body)
+		text += "\n" + fenceWakeBody(earlier, body, extraReserve)
 	} else if body = strings.TrimSpace(body); body != "" {
-		text += "\n" + fenceWakeBody("", body)
+		text += "\n" + fenceWakeBody("", body, extraReserve)
 	}
-	return text
+	if fullAnswer {
+		return text + "\n" + wakeReplyGuideFull
+	}
+	return text + "\n" + wakeReplyGuide
 }
+
+// wakeCardsPendingNote is added to a completed wake when the delegated child
+// handed work to kanban cards whose report posts to the conversation.
+const wakeCardsPendingNote = "The delegated turn handed work to a Cluster Agent card. That card's report posts into this conversation on its own; if it is not above yet, it is still to come."
+
+// handedOff is cardsPending's other signal: the task published
+// lib.ArtifactHandoff, which the hermes-bridge does on every chat route,
+// where the mark is Slack-with-KAGE_SLACK_UX only (#3258).
+func handedOff(state lib.TaskState, handoff bool) bool {
+	return state == lib.StateCompleted && handoff
+}
+
+// foldHandedOff reports whether a folded task carries lib.ArtifactHandoff,
+// for a terminal a heal or a replay found on the stream.
+func foldHandedOff(task *lib.Task) bool {
+	art := task.Artifact(lib.ArtifactHandoff)
+	return art != nil && lastTextPart(art.Parts) == lib.HandoffCards
+}
+
+// cardsPending reports whether a completed task's terminal mark signals that
+// asynchronous kanban cards are still running.
+func cardsPending(state lib.TaskState, terminal chatmsg.Reading) bool {
+	return state == lib.StateCompleted && terminal.Mark != nil && terminal.Mark.Ask != "" && terminal.Mark.Settle == ""
+}
+
+// wakeReplyGuide and wakeReplyGuideFull close every wake's text, chosen by
+// whether the person asking has seen the child's result (wakeNeedsFullAnswer).
+// In a chat the relay has already posted the child's whole result, so the
+// wake adds what it means rather than repeating it. A program behind a door
+// receives only the wake's reply as the root's deliverable (spec-chatops-
+// gateway, "To a program behind a door"), and a chat whose child terminal
+// was found by a heal saw only a status card, so there the wake gives the
+// whole answer. Either way the wake's pod has no delegate
+// tool (delegateToolFor): an interim answer such as "still checking, the
+// results will post here" is reported as that, not asked again, which is how
+// a wake used to loop to the depth bound with nothing answered.
+const (
+	wakeReplyGuide     = "The user has already seen what came back above. Reply in a few sentences with what it means for their question, without repeating it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
+	wakeReplyGuideFull = "The person asking hasn't seen what came back above; they see only your reply. Give them the complete answer to their question from it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
+)
+
+// wakeReplyGuideMax is the longer of the two guides, which the result
+// body's budget reserves room for.
+var wakeReplyGuideMax = max(len(wakeReplyGuide), len(wakeReplyGuideFull))
 
 // wakeFollowUpMarker opens each follow-up's answer in a wake body that
 // carries a child's turns, numbered from the first follow-up.
@@ -505,14 +558,16 @@ func wakeAnswers(turns []string, outcome string, completed bool, body string) (e
 // body is earlier then last. Over the cap, earlier is cut first, so the
 // newest answer arrives whole when it fits the cap alone; when it does not,
 // the joined body is cut from its end as a lone result is. Either cut is
-// marked.
-func fenceWakeBody(earlier, last string) string {
+// marked. When cards are pending, extraReserve reserves room for the note.
+func fenceWakeBody(earlier, last string, extraReserve int) string {
 	earlier = breakBacktickRuns(earlier, wakeFenceMax-1)
 	last = breakBacktickRuns(last, wakeFenceMax-1)
 	body := earlier + last
 	fence := wakeFence(body)
-	// label \n fence \n body \n fence
-	budget := lib.DelegateTextCap - len(wakeResultLabel) - 2*len(fence) - 3
+	// label \n fence \n body \n fence, then \n and the closing guide
+	// (wakeReplyGuide or wakeReplyGuideFull), which wakeText appends after
+	// this block.
+	budget := lib.DelegateTextCap - len(wakeResultLabel) - 2*len(fence) - 3 - 1 - wakeReplyGuideMax - extraReserve
 	if len(body) > budget {
 		if keep := budget - len(last) - len("…") - len(wakeTruncatedNote); earlier != "" && keep >= 0 {
 			body = truncateRunes(earlier, keep) + wakeTruncatedNote + last
@@ -659,8 +714,8 @@ func (g *Gateway) flushNotices(conversation string, rs *relayState) {
 }
 
 // wakeSession starts the session's next turn on a delegated child's terminal
-// (spec-chatops-gateway.md, "Sessions by default"): a fresh incarnation and
-// the ordinary spawn, as a human turn gets, with gateway-authored text
+// (spec-chatops-gateway.md, "Sessions by default"): the live pod or a fresh
+// incarnation, as a human turn gets, with gateway-authored text
 // carrying the outcome and the delegating
 // turn's stored attribution, so the wake runs under the requester who asked.
 // Called under the session lock, after the child's result or failure is
@@ -671,7 +726,7 @@ func (g *Gateway) flushNotices(conversation string, rs *relayState) {
 // It reports whether the wake reached the bus, and when it did not, why, in
 // a phrase for the chain root's terminal reason (observeChildEnd). A stop
 // the requester asked for reports false and no reason.
-func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, turns []string, result, reason string) (bool, string) {
+func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, turns []string, result, reason string, resultPosted, cardsPending bool) (bool, string) {
 	log := g.log.With("child", child.ID, "conversation", rec.Key, "state", string(state))
 	// The gateway published a cancel for the child: the human said stop,
 	// and whatever the executor answered with, waking the session would act
@@ -705,24 +760,31 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 
 	// The delegating turn's request, carried down a longer chain: the
 	// human's question, not an intermediate wake's gateway-authored text.
-	text := wakeText(state, child.ID, parent.Request, turns, result, reason)
+	text := wakeText(state, child.ID, parent.Request, turns, result, reason, wakeNeedsFullAnswer(&parent, resultPosted), cardsPending)
 
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile
 	}
-	// The wake's pod is a fresh incarnation (one task per pod). It reads
-	// the transcript primer like any other, and its text also carries
-	// the child's result, and the child's ask was written by the parent's
-	// incarnation. So the wake's incarnation starts from the parent's set,
-	// taken before freshIncarnation rotates it away.
-	inherited, inheritedUnknown, inheritedSince := rec.sessionAuthorsOf()
-	// The cap holds and the previous pod is retired here; a refusal has
-	// posted the standard notice, and the child's result stands as relayed.
-	if !g.freshIncarnation(ctx, rec) {
-		log.Info("no wake: the session could not be started")
-		return false, "the session could not be started"
+	// The wake goes to the parent's pod when it is live and can take it
+	// (reuseLivePod): the same incarnation, so its author set is the
+	// parent's already and nothing is re-seeded. Its adapter runs the wake
+	// with the delegate tool off, from the via above.
+	if !g.reuseLivePod(ctx, rec) {
+		// Otherwise the wake's pod is a fresh incarnation. It reads the
+		// transcript primer like any other, and its text also carries the
+		// child's result, and the child's ask was written by the parent's
+		// incarnation. So the wake's incarnation starts from the parent's
+		// set, taken before freshIncarnation rotates it away.
+		inherited, inheritedUnknown, inheritedSince := rec.sessionAuthorsOf()
+		// The cap holds and the previous pod is retired here; a refusal
+		// has posted the standard notice, and the child's result stands
+		// as relayed.
+		if !g.freshIncarnation(ctx, rec) {
+			log.Info("no wake: the session could not be started")
+			return false, "the session could not be started"
+		}
+		rec.seedSessionAuthors(inherited, inheritedUnknown, inheritedSince)
 	}
-	rec.seedSessionAuthors(inherited, inheritedUnknown, inheritedSince)
 	// The wake is the delegating turn's successor: the chain's correlation
 	// id (a task spawned in service of another inherits it) and the child's
 	// depth, so depth counts delegations rather than turns.
@@ -778,5 +840,31 @@ func (g *Gateway) observeChildEnd(rec *SessionRecord, child TaskRef, state lib.T
 			rec.Tasks[i].ChainEnd = &end
 		}
 	}
-	g.observeTaskTerminal(rec.Key, child.rootID(), end.State, end.Source, end.Reason)
+	g.observeTaskTerminal(rec, child.rootID(), end.State, end.Source, end.Reason)
+	// The chain ends at the child, so its mark settles here, as the chain's
+	// end the observers were just told (terminalMark leaves a child's
+	// terminal to this or to the wake).
+	g.applyTerminalMark(rec, child.ID, end.State)
+}
+
+// wakeNeedsFullAnswer reports whether the wake has to give the whole answer
+// rather than explain one already shown: when the chain's answer goes to a
+// program behind a door, or when the child's result wasn't posted to the
+// conversation (a heal found the terminal and posted only a status card).
+func wakeNeedsFullAnswer(parent *TaskRef, resultPosted bool) bool {
+	return !resultPosted || wakeToDoor(parent)
+}
+
+// wakeToDoor reports whether the chain's answer goes to a program behind a
+// door (the inject door or the A2A door, by the requester's backend) rather
+// than into a chat, where the child's result has already been posted.
+func wakeToDoor(parent *TaskRef) bool {
+	if parent == nil || parent.Requester == nil {
+		return false
+	}
+	switch parent.Requester.Backend {
+	case injectBackend, a2aBackend, a2aGoogleBackend:
+		return true
+	}
+	return false
 }

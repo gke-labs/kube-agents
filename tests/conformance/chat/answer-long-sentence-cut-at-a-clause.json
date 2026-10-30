@@ -1,0 +1,18 @@
+{
+  "name": "answer-long-sentence-cut-at-a-clause",
+  "source": "agents/platform/scripts/test_slack_presenter.py::ClauseCutTest.test_cut_before_because_not_before_which",
+  "notes": "A first sentence past the headline cap is cut before 'because' (a comma before 'which' would leave a fragment), and the rest of it leads the detail.",
+  "input": {
+    "markdown": "The `checkout-gateway` deployment in seeded-a is restarting every few minutes because its readiness probe times out under load, which the HPA then reads as missing capacity. Raise the probe timeout to 5s."
+  },
+  "expected": [
+    {
+      "carrier": "result",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "The checkout-gateway deployment in seeded-a is restarting every few minutes.",
+        "detail": "Because its readiness probe times out under load, which the HPA then reads as missing capacity. Raise the probe timeout to 5s."
+      }
+    }
+  ]
+}

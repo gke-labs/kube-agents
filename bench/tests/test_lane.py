@@ -22,20 +22,23 @@ from pathlib import Path
 import pytest
 import yaml
 from devops_bench.verification.spec import parse_entries
-from kube_agents_bench import lane
+from kube_agents_bench import lane, stop_hook
 from kube_agents_bench.cases import load_case
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LANE_FILE = REPO_ROOT / "hack" / "eval" / "inject-lane-safeguards.yaml"
 TASKS = REPO_ROOT / "bench" / "tasks"
 # A presubmit case that requests no pull request, neither through its own
-# checks nor through the file's `requesting:` list, and a nightly case that
-# requests one (its objective is a pull_request_opened check). Not
+# checks nor through the file's `requesting:` list, and a case that requests
+# one (its objective is a pull_request_opened check). Not
 # obtainability-remediation-proposal: it asks for a proposal, the lane file
 # no longer lists it among the requesting, and it is the case the
 # zero-allowance safeguard exists to watch.
 READ_ONLY_CASE = "reliability-pdb-probe"
 REQUESTING_CASE = "pdb-remediation-pr"
+# A stopped ask (stop_hook.py): it requests no pull request, and runs alone
+# in the second phase on the inject lane, the only lane that carries it.
+STOPPED_ASK_CASE = "chat-stop-halts-delegated-remediation"
 # The count a scratch lane file's `requesting:` entry gives READ_ONLY_CASE,
 # so the listed path is tested without pinning the real file's entries,
 # whose contents scripts/test_eval_rosters.py owns.
@@ -76,9 +79,10 @@ def test_the_copy_is_the_task_plus_the_lane_entries(tmp_path):
     parsed, errors = parse_entries(written["verification_spec"])
     assert errors == []
     assert len(parsed) == len(original["verification_spec"]) + 1
-    # A case that requests nothing gets no allowance.
+    # A case that requests nothing gets no allowance, and shares its window.
     leaf = lane._leaves(appended[0]["check"])[0]
     assert lane.REQUESTED_FIELD not in leaf
+    assert lane.EXCLUSIVE_WINDOW_FIELD not in leaf
 
 
 def test_a_case_that_requests_a_pull_request_gets_that_allowance(tmp_path):
@@ -88,9 +92,28 @@ def test_a_case_that_requests_a_pull_request_gets_that_allowance(tmp_path):
     appended = load(copy)["verification_spec"][-1]
     leaf = lane._leaves(appended["check"])[0]
     assert leaf[lane.REQUESTED_FIELD] == 1
+    # It runs alone in the second phase, so its window is its own.
+    assert leaf[lane.EXCLUSIVE_WINDOW_FIELD] is True
     # The lane file itself is not mutated between tasks.
     again = lane.append_lane_safeguards(TASKS / READ_ONLY_CASE / "task.yaml", lane.load_lane_safeguards(LANE_FILE), tmp_path)
-    assert lane.REQUESTED_FIELD not in lane._leaves(load(again)["verification_spec"][-1]["check"])[0]
+    again_leaf = lane._leaves(load(again)["verification_spec"][-1]["check"])[0]
+    assert lane.REQUESTED_FIELD not in again_leaf
+    assert lane.EXCLUSIVE_WINDOW_FIELD not in again_leaf
+
+
+def test_a_stopped_ask_gets_an_exclusive_window_and_no_allowance(tmp_path):
+    # It runs alone in the second phase with the requesting cases, so a write
+    # its failed stop lets the card make reds it whether named or not.
+    source = TASKS / STOPPED_ASK_CASE / "task.yaml"
+    assert stop_hook.is_stopped_ask(load(source)["prompt"])
+    assert lane.requested_pull_requests(load(source)["verification_spec"]) == 0
+    copy, requested = lane.copy_task(source, lane.load_lane_safeguards(LANE_FILE), tmp_path)
+    assert requested == 0
+    leaf = lane._leaves(load(copy)["verification_spec"][-1]["check"])[0]
+    assert leaf[lane.EXCLUSIVE_WINDOW_FIELD] is True
+    assert lane.REQUESTED_FIELD not in leaf
+    _parsed, errors = parse_entries(load(copy)["verification_spec"])
+    assert errors == []
 
 
 def test_requested_counts_nested_leaves_of_both_requesting_types():
@@ -220,13 +243,8 @@ def test_the_cli_prints_case_and_path_per_task_and_fails_loudly(tmp_path, capsys
     assert capsys.readouterr().out.splitlines() == [f"{LISTED_COUNT} {READ_ONLY_CASE} {tmp_path / 'listed' / READ_ONLY_CASE / 'task.yaml'}"]
 
 
-def test_list_requesting_prints_the_counts_and_writes_nothing(tmp_path, capsys):
-    """The api lane orders its second phase by this, with no copies made."""
-    listed_file = scratch_lane_file(tmp_path, {READ_ONLY_CASE: LISTED_COUNT})
-    rc = lane.main(["--safeguards", str(listed_file), "--list-requesting", str(TASKS / READ_ONLY_CASE / "task.yaml"), str(TASKS / REQUESTING_CASE / "task.yaml")])
-    assert rc == 0
-    assert capsys.readouterr().out.splitlines() == [f"{LISTED_COUNT} {READ_ONLY_CASE}", f"1 {REQUESTING_CASE}"]
-    assert not any(tmp_path.rglob("task.yaml"))
+def test_the_copies_have_somewhere_to_go():
+    """Both lanes take the copies, so there is no mode that writes none."""
     with pytest.raises(SystemExit):
         lane.main(["--safeguards", str(LANE_FILE), str(TASKS / READ_ONLY_CASE / "task.yaml")])
 

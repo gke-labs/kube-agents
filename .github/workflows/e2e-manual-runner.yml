@@ -7,16 +7,16 @@ name: "E2E: Manual Runner"
 #
 # Only against `rc` or `nightly`, and only while one of them has a cluster up.
 # Both are ephemeral: a pipeline that passes destroys its own cluster in its last
-# step, so what leaves one standing is a FAILED run — every pipeline's teardown
-# job hangs off the implicit success() of the ones before it, and a red run keeps
-# its cluster for diagnosis. That is the case this workflow exists for.
+# step, so what leaves one standing is a FAILED run. On the RC every failure
+# keeps the cluster: its teardown job hangs off the implicit success() of the
+# ones before it. On the nightly only a failed E2E matrix keeps it; a deploy
+# that did not succeed is torn down in the same run, since a half-built
+# environment has nothing to examine. That is the case this workflow exists for.
 #
 # So the window is narrow, and it closes on its own. On the RC the next scheduled
 # run is three hours away and tears the environment down before it reinstalls, so
-# a surviving cluster lasts until then at most. The nightly pipeline has no cron
-# yet, so nothing reclaims a nightly cluster at all today — it stands and bills
-# until someone dispatches the pipeline again or runs uninstall.sh by hand. Once
-# the nightly cron lands the window there becomes a day.
+# a surviving cluster lasts until then at most. On the nightly the next daily
+# promotion run does the same, so the window there is a day.
 #
 # What the window buys: a fix has just merged and you want to know whether it
 # clears the failure, without waiting out a fresh provision. Point this at the

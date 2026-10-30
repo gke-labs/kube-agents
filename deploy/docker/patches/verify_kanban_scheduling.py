@@ -182,9 +182,12 @@ def last_event(conn, tid, kind):
     return json.loads(row["payload"]) if row and row["payload"] else {}
 
 
-def new_card(conn, title, parents=(), priority=0):
+CLUSTER_ASSIGNEE = "cluster-kube-agents-evals-13-seeded-a-us-central1-a"
+
+
+def new_card(conn, title, parents=(), priority=0, assignee="platform"):
     task = K.create_task(
-        conn, title=title, assignee="platform", parents=tuple(parents),
+        conn, title=title, assignee=assignee, parents=tuple(parents),
         priority=priority,
     )
     return task.id if hasattr(task, "id") else str(task)
@@ -199,7 +202,15 @@ K.recompute_ready(conn)
 claimed = K.claim_task(conn, parent)
 check("the orchestrator card claims normally", claimed is not None)
 
-kids = [new_card(conn, f"Audit cluster {n}", parents=[parent]) for n in (1, 2, 3)]
+# Per-cluster cards, as on 2026-08-07: the repair never releases a platform
+# card queued after a platform card (#3164), so these name Cluster Agents.
+# The negative cases below use one too, so each still fails on its own
+# condition rather than on that skip.
+kids = [
+    new_card(conn, f"Audit cluster {n}", parents=[parent],
+             assignee=f"cluster-kube-agents-evals-13-seeded-{n}-us-central1-a")
+    for n in (1, 2, 3)
+]
 K.recompute_ready(conn)
 check(
     "children parented to a running card start unclaimable",
@@ -243,7 +254,7 @@ check(
 conn = fresh()
 a = new_card(conn, "researcher a")
 b = new_card(conn, "researcher b")
-sink = new_card(conn, "synthesizer", parents=[a, b])
+sink = new_card(conn, "synthesizer", parents=[a, b], assignee=CLUSTER_ASSIGNEE)
 K.recompute_ready(conn)
 K.claim_task(conn, a)
 K.block_task(conn, a, reason="waiting on an external approval", kind="dependency")
@@ -271,8 +282,8 @@ check(
 # raw UPDATE precisely because that is what makes the parents settled.
 conn = fresh()
 upstream = new_card(conn, "prerequisite")
-mid = new_card(conn, "middle stage", parents=[upstream])
-tail = new_card(conn, "final stage", parents=[mid])
+mid = new_card(conn, "middle stage", parents=[upstream], assignee=CLUSTER_ASSIGNEE)
+tail = new_card(conn, "final stage", parents=[mid], assignee=CLUSTER_ASSIGNEE)
 conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (upstream,))
 conn.commit()
 K.recompute_ready(conn)

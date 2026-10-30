@@ -21,7 +21,7 @@
 # k8s-event-watcher is guaranteed to be watching while the case runs.
 #
 # It is not a single-cluster watcher. It runs as a peer process inside that
-# pod's envoy-credential-proxy container, started by
+# pod's agent-api-auth sidecar, started by
 # deploy/shared/start-services.sh with BOTH --in-cluster and --profiles-dir,
 # and those sources are additive: the host cluster, plus every Cluster Agent
 # profile on the PVC naming a cluster the direct entry does not already cover
@@ -82,6 +82,13 @@ locals {
   ns       = var.incident_namespace
   workload = var.workload_name
 
+  # What the watcher logs once it has handed a pod's event to the daemon:
+  # `fire` when the daemon opened an incident, `folded` when it recorded the
+  # event against an incident already open for the workload. Only a case that
+  # grades the fold accepts the second (var.accept_folded); for one that waits
+  # on its own card, a folded event means no card is coming.
+  watcher_handled = var.accept_folded ? "(fire|folded)" : "fire"
+
   ci_labels = {
     "managed-by"  = "kube-agents-bench"
     "build-id"    = var.prow_build_id != "" ? var.prow_build_id : "local"
@@ -126,6 +133,11 @@ resource "null_resource" "incident" {
       local.workload,
       tostring(var.memory_limit_mib),
       tostring(var.allocate_mib),
+      tostring(var.replicas),
+      tostring(var.crash_seconds),
+      var.wait_for,
+      var.gitops_manifest_path,
+      tostring(var.start_settle_seconds),
       var.host_cluster_name,
     ]))
   }
@@ -232,6 +244,25 @@ resource "null_resource" "incident" {
       gcloud container clusters get-credentials "${var.host_cluster_name}" \
         --location "${var.host_cluster_location}" --project "$project" --quiet
 
+      # ---- 0a. Check the pod has the watcher's container --------------------
+      # Step 3 polls the watcher's log with kubectl's stderr discarded, so a
+      # container the pod no longer carries reads as "the watcher logged no
+      # fire" 300s later, not as kubectl's own error. That is how #913's move
+      # of the watcher out of envoy-credential-proxy hid in the nightly (#3681).
+      # Checked before anything is touched, so a wrong name costs seconds and
+      # plants nothing. agent-api-auth is a native sidecar, listed under
+      # initContainers, so both lists are read.
+      pod_containers="$(kubectl get deployment "${var.agent_deployment}" \
+        -n "${var.agent_namespace}" \
+        -o jsonpath='{.spec.template.spec.initContainers[*].name} {.spec.template.spec.containers[*].name}')"
+      case " $pod_containers " in
+        *" ${var.agent_container} "*) ;;
+        *)
+          echo "ERROR: deployment/${var.agent_deployment} in ${var.agent_namespace} has no container '${var.agent_container}', which is where this stack reads k8s-event-watcher's log (agent_container). Its containers: $pod_containers" >&2
+          exit 1
+          ;;
+      esac
+
       # ---- 0b. Clear what an earlier run left behind ------------------------
       # A leftover ${local.ns} does not just sit there, it silently defeats the
       # whole scenario, and it does so through the plant appearing to succeed.
@@ -297,7 +328,12 @@ resource "null_resource" "incident" {
         build-id="${local.ci_labels["build-id"]}" \
         pull-number="${local.ci_labels["pull-number"]}"
 
-      kubectl apply -f - <<'MANIFEST'
+      if [ "${var.crash_seconds}" -gt 0 ]; then
+        # The transient shape: exit 1 until crash_seconds after the pod's
+        # first start, kept in an emptyDir that outlives the container's
+        # restarts, then run. kubelet's BackOff events are the ones a crash
+        # loop emits; only their span differs.
+        kubectl apply -f - <<'MANIFEST'
       apiVersion: apps/v1
       kind: Deployment
       metadata:
@@ -307,6 +343,43 @@ resource "null_resource" "incident" {
           app: ${local.workload}
       spec:
         replicas: 1
+        selector:
+          matchLabels:
+            app: ${local.workload}
+        template:
+          metadata:
+            labels:
+              app: ${local.workload}
+          spec:
+            automountServiceAccountToken: false
+            volumes:
+              - name: state
+                emptyDir: {}
+            containers:
+              - name: allocator
+                image: busybox:1.36
+                command: ["sh", "-c", "[ -f /state/t0 ] || date +%s > /state/t0; t0=$(cat /state/t0); now=$(date +%s); if [ $((now - t0)) -lt ${var.crash_seconds} ]; then echo \"still failing: $((now - t0))s of ${var.crash_seconds}s\"; exit 1; fi; echo recovered; sleep 3600"]
+                volumeMounts:
+                  - name: state
+                    mountPath: /state
+                resources:
+                  requests:
+                    cpu: 10m
+                    memory: ${var.memory_limit_mib}Mi
+                  limits:
+                    memory: ${var.memory_limit_mib}Mi
+      MANIFEST
+      else
+      kubectl apply -f - <<'MANIFEST'
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ${local.workload}
+        namespace: ${local.ns}
+        labels:
+          app: ${local.workload}
+      spec:
+        replicas: ${var.replicas}
         selector:
           matchLabels:
             app: ${local.workload}
@@ -327,6 +400,7 @@ resource "null_resource" "incident" {
                   limits:
                     memory: ${var.memory_limit_mib}Mi
       MANIFEST
+      fi
 
       # ---- 2. Wait for the debounce to clear --------------------------------
       # The watcher holds the crash-loop family until Event.Count reaches
@@ -360,7 +434,16 @@ resource "null_resource" "incident" {
       done
       echo "BackOff reached the debounce threshold after $${elapsed}s."
 
-      # ---- 3. Wait for the watcher to open the incident ---------------------
+      # watcher_logged: has k8s-event-watcher logged a line matching the
+      # given regex since the plant? The same read as step 3's poll, for the
+      # follow-up wait in 3b; the regex names this namespace's pods.
+      watcher_logged() {
+        kubectl logs "deployment/${var.agent_deployment}" \
+            -n "${var.agent_namespace}" -c "${var.agent_container}" \
+            --since-time="$started_at" --tail=-1 2>/dev/null \
+          | grep -qE "$1"
+      }
+      # ---- 3. Wait for the watcher to hand the event to the daemon ----------
       # Read from the watcher's own log rather than from the gateway's
       # /api/sessions, which the design note in #901 suggested: that route needs
       # a bearer token and a port-forward, and the harness does not establish
@@ -368,14 +451,16 @@ resource "null_resource" "incident" {
       # log line is the same seam observed one layer earlier, and `kubectl logs`
       # is all it costs.
       #
-      # k8s-event-watcher is a peer process inside the credential proxy
-      # container, not a container of its own, which is why -c names that one.
+      # k8s-event-watcher is a peer process inside the agent-api-auth sidecar,
+      # not a container of its own, which is why -c names that one. Step 0a
+      # has already proved the pod has it, so the 2>/dev/null below cannot
+      # hide a missing container behind this timeout again.
       #
       # --since-time, not --since: the namespace name is static, so a wall-clock
-      # window would also match the `fire` line from an earlier run against a
+      # window would also match the line from an earlier run against a
       # recycled Boskos lease and return before this run's incident exists.
       #
-      # The fire line carries no cluster (k8s-event-watcher/main.go), and the
+      # The watcher's line carries no cluster (k8s-event-watcher/main.go), and the
       # watcher fans in over several, so in principle this matches a pod of
       # that name on any watched cluster. Nothing reaches it today: only this
       # stack plants ${local.ns}, step 0b clears any leftover of it on this
@@ -386,9 +471,9 @@ resource "null_resource" "incident" {
       until kubectl logs "deployment/${var.agent_deployment}" \
               -n "${var.agent_namespace}" -c "${var.agent_container}" \
               --since-time="$started_at" --tail=-1 2>/dev/null \
-            | grep -q "fire .*pod=${local.ns}/"; do
+            | grep -qE "${local.watcher_handled} .*pod=${local.ns}/"; do
         if [ "$elapsed" -ge 300 ]; then
-          echo "ERROR: the workload is crash-looping past the debounce, but k8s-event-watcher logged no 'fire' for a pod in ${local.ns} within $${elapsed}s. The incident was detected by Kubernetes and not by the watcher, so nothing downstream will run. Its recent log follows." >&2
+          echo "ERROR: the workload is crash-looping past the debounce, but k8s-event-watcher logged no '${local.watcher_handled}' for a pod in ${local.ns} within $${elapsed}s. The incident was detected by Kubernetes and not by the watcher, so nothing downstream will run. Its recent log follows." >&2
           kubectl logs "deployment/${var.agent_deployment}" -n "${var.agent_namespace}" \
             -c "${var.agent_container}" --since-time="$started_at" --tail=200 >&2 || true
           exit 1
@@ -396,13 +481,106 @@ resource "null_resource" "incident" {
         sleep 10
         elapsed=$((elapsed + 10))
       done
-      echo "k8s-event-watcher opened an incident for ${local.ns} after $${elapsed}s."
+      echo "k8s-event-watcher handled a pod of ${local.ns} (matched '${local.watcher_handled}') after $${elapsed}s."
+      if [ "${var.wait_for}" = "followup" ]; then
+        # ---- 3b. Wait for the quiet follow-up ---------------------------------
+        # The pod recovers crash_seconds after its first start and its last
+        # BackOff is then WATCHER_QUIET_AFTER (15m) from the watcher's
+        # follow-up line; the card's own triage runs meanwhile. Bounded past
+        # that, and NOT fatal at the bound: a watcher that sends no follow-up
+        # is the behaviour the case grades, so the apply returns and the
+        # agent turn reads a card with no follow-up on it, which is the red.
+        elapsed=0
+        until watcher_logged "followup .*pod=${local.ns}/.* sent "; do
+          if [ "$elapsed" -ge 1500 ]; then
+            echo "k8s-event-watcher logged no 'followup' for a pod in ${local.ns} within $${elapsed}s (due WATCHER_QUIET_AFTER, 15m, after the pod's last event); returning so the case can grade its absence." >&2
+            break
+          fi
+          sleep 15
+          elapsed=$((elapsed + 15))
+        done
+        if [ "$elapsed" -lt 1500 ]; then
+          echo "k8s-event-watcher sent the quiet follow-up for ${local.ns} after $${elapsed}s."
+        fi
+      fi
+      if [ "${var.wait_for}" = "recurrence" ]; then
+        # ---- 3c. The same fault again, while its fix waits for review ---------
+        # First the fix: an open pull request in the run's GitOps repository
+        # that changes the workload's manifest. Asked of GitHub with the
+        # runner's read token, not of the install, so it reads the same on a
+        # build with or without the change under test. The incident's
+        # triage, and on an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true
+        # the card that opens its pull request, run meanwhile.
+        repo="$${BENCH_GITOPS_REPO:-}"
+        token="$${BENCH_GITHUB_TOKEN:-$${GITHUB_TOKEN:-}}"
+        api="$${BENCH_GITHUB_API_ROOT:-https://api.github.com}"
+        if [ -z "$repo" ] || [ -z "$token" ] || [ -z "${var.gitops_manifest_path}" ]; then
+          echo "ERROR: wait_for = recurrence needs BENCH_GITOPS_REPO, BENCH_GITHUB_TOKEN (or GITHUB_TOKEN) and gitops_manifest_path to find the incident's pull request." >&2
+          exit 1
+        fi
+        open_fix() {
+          curl -fsS -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
+            "$api/repos/$repo/pulls?state=open&per_page=50" \
+          | python3 -c '
+      import json, subprocess, sys
+      since, path, api, repo, token = sys.argv[1:6]
+      for pull in json.load(sys.stdin):
+          if pull.get("created_at", "") < since:
+              continue
+          files = subprocess.run(
+              ["curl", "-fsS", "-H", "Authorization: Bearer " + token,
+               api + "/repos/" + repo + "/pulls/" + str(pull["number"]) + "/files?per_page=100"],
+              capture_output=True, text=True).stdout
+          names = [f.get("filename", "") for f in json.loads(files or "[]")]
+          if any(n == path or n.endswith("/" + path) for n in names):
+              print(pull["html_url"]); break
+      ' "$started_at" "${var.gitops_manifest_path}" "$api" "$repo" "$token"
+        }
+        elapsed=0
+        fix=""
+        until fix="$(open_fix)" && [ -n "$fix" ]; do
+          if [ "$elapsed" -ge 2400 ]; then
+            echo "ERROR: no open pull request changing ${var.gitops_manifest_path} appeared in $repo within $${elapsed}s, so the recurrence would not be graded against an open fix. Check that the install opens the triage's pull request (INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true) and that the repository declares the workload there." >&2
+            exit 1
+          fi
+          sleep 30
+          elapsed=$((elapsed + 30))
+        done
+        echo "The incident's fix is open after $${elapsed}s: $fix"
 
-      # The card is filed within seconds of that line and then takes minutes to
-      # run. Waiting for it HERE would mean reading the Platform Agent pod's
-      # SQLite board over `kubectl exec`, coupling a bench fixture to an
-      # internal file path; the task's prompt polls the board with kanban_show
-      # instead, which is the read path the product actually offers.
+        # Then the fault again: a replaced pod is a new object to the watcher,
+        # whose dedup key is the object's UID, so its BackOff is a new event
+        # rather than a repeat it already holds. The pod's controller recreates
+        # it; nothing outside this namespace is touched.
+        recur_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        ${local.kubectl} delete pod -l app=${local.workload} --wait=false
+        elapsed=0
+        until kubectl logs "deployment/${var.agent_deployment}" \
+                -n "${var.agent_namespace}" -c "${var.agent_container}" \
+                --since-time="$recur_at" --tail=-1 2>/dev/null \
+              | grep -qE "(fire|folded) .*pod=${local.ns}/"; do
+          if [ "$elapsed" -ge 600 ]; then
+            echo "ERROR: the replaced pod crash-looped, but k8s-event-watcher logged no 'fire' or 'folded' for it within $${elapsed}s, so the recurrence never reached the daemon." >&2
+            exit 1
+          fi
+          sleep 10
+          elapsed=$((elapsed + 10))
+        done
+        echo "k8s-event-watcher handled the replaced pod of ${local.ns} after $${elapsed}s."
+      fi
+      if [ "${var.start_settle_seconds}" != "0" ]; then
+        echo "Waiting ${var.start_settle_seconds}s for the incident cards to settle before the board read."
+        sleep "${var.start_settle_seconds}"
+      fi
+
+      # After a `fire` line the incident turn files its card(s) within seconds
+      # and each card then takes minutes to run (sequentially when a follow-up
+      # card is parented on the triage card); after a `folded` line no card is
+      # filed for this run. `start_settle_seconds` is an optional wall-clock
+      # head start before the reader turn begins; polling for completion HERE
+      # would mean reading the Platform Agent pod's SQLite board over
+      # `kubectl exec`, coupling a bench fixture to an internal file path, so a
+      # task's prompt reads and re-checks the board through the kanban tools.
     EOT
   }
 

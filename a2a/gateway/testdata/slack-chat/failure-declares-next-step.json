@@ -1,0 +1,55 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "I couldn't find seeded-z.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "The fleet has seeded-a, -b and -c. checkout-gateway runs on seeded-a. Check it there?",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "text": {
+              "emoji": true,
+              "text": "check seeded-a",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "check seeded-a"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]

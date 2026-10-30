@@ -109,6 +109,79 @@ func runFoldSteps(t *testing.T, doc *usageDocument, counter string, steps []fold
 	return doc
 }
 
+// humanMovedAt reports whether res stamped LastHumanMoved with at.
+func humanMovedAt(res usageFoldResult, at time.Time) bool {
+	return res.Document.LastHumanMoved != nil && res.Document.LastHumanMoved.Time.Equal(at)
+}
+
+// Only the counter a person moves stamps LastHumanMoved: a chat message
+// does; a brokered command (the stall watch runs some every half hour), a
+// proposal (the fleet audits open them on their own) and a merge (a forge
+// rule can) do not, and LastMoved follows every advance as before.
+func TestFoldUsage_HumanCountersAloneStampLastHumanMoved(t *testing.T) {
+	t0 := foldClock(0)
+	created := t0.Add(-time.Hour)
+	doc := foldDoc(t0,
+		&usagePodEntry{Name: "broker", PodUID: foldPodBroker, Counter: usageCounterToolExecutions, Sample: 10, Marker: metav1.NewTime(t0)},
+		&usagePodEntry{Name: "broker", PodUID: foldPodBroker, Counter: usageCounterRemediationsProposed, Sample: 0, Marker: metav1.NewTime(t0)},
+		&usagePodEntry{Name: "broker", PodUID: foldPodBroker, Counter: usageCounterRemediationsMerged, Sample: 0, Marker: metav1.NewTime(t0)},
+		&usagePodEntry{Name: "gateway", PodUID: foldPodA, Counter: usageCounterChatMessagesInbound, Sample: 1, Marker: metav1.NewTime(t0), StartTime: ptr.To(1.0)},
+	)
+	// A command alone: lastMoved, not lastHumanMoved.
+	res := foldUsage(doc, foldTestAgentUID, usageSeed{}, foldLive(doc), []usageScrapedPod{
+		scrapedPod(foldPodBroker, usageCounterToolExecutions, created, 12, nil),
+		scrapedPod(foldPodBroker, usageCounterRemediationsProposed, created, 0, nil),
+		scrapedPod(foldPodA, usageCounterChatMessagesInbound, created, 1, ptr.To(1.0)),
+	}, foldClock(5))
+	doc = res.Document
+	if !movedAt(res, foldClock(5)) || doc.LastHumanMoved != nil {
+		t.Fatalf("a command alone: lastMoved=%v lastHumanMoved=%v, want moved and no human move", doc.LastMoved, doc.LastHumanMoved)
+	}
+	// A chat message: both.
+	res = foldUsage(doc, foldTestAgentUID, usageSeed{}, foldLive(doc), []usageScrapedPod{
+		scrapedPod(foldPodBroker, usageCounterToolExecutions, created, 12, nil),
+		scrapedPod(foldPodBroker, usageCounterRemediationsProposed, created, 0, nil),
+		scrapedPod(foldPodA, usageCounterChatMessagesInbound, created, 3, ptr.To(1.0)),
+	}, foldClock(10))
+	doc = res.Document
+	if !movedAt(res, foldClock(10)) || !humanMovedAt(res, foldClock(10)) {
+		t.Fatalf("a chat message: lastMoved=%v lastHumanMoved=%v, want both at minute 10", doc.LastMoved, doc.LastHumanMoved)
+	}
+	// A command again: lastHumanMoved stays at the message's poll.
+	res = foldUsage(doc, foldTestAgentUID, usageSeed{}, foldLive(doc), []usageScrapedPod{
+		scrapedPod(foldPodBroker, usageCounterToolExecutions, created, 20, nil),
+		scrapedPod(foldPodBroker, usageCounterRemediationsProposed, created, 0, nil),
+		scrapedPod(foldPodA, usageCounterChatMessagesInbound, created, 3, ptr.To(1.0)),
+	}, foldClock(15))
+	doc = res.Document
+	if !movedAt(res, foldClock(15)) || !humanMovedAt(res, foldClock(10)) || !res.Changed {
+		t.Fatalf("a later command: lastMoved=%v lastHumanMoved=%v, want 15 and 10", doc.LastMoved, doc.LastHumanMoved)
+	}
+	// A proposal and a merge: the audits open proposals and a forge rule can
+	// merge, so neither is a person; lastMoved moves, lastHumanMoved stays.
+	res = foldUsage(doc, foldTestAgentUID, usageSeed{}, foldLive(doc), []usageScrapedPod{
+		scrapedPod(foldPodBroker, usageCounterToolExecutions, created, 20, nil),
+		scrapedPod(foldPodBroker, usageCounterRemediationsProposed, created, 1, nil),
+		scrapedPod(foldPodBroker, usageCounterRemediationsMerged, created, 1, nil),
+		scrapedPod(foldPodA, usageCounterChatMessagesInbound, created, 3, ptr.To(1.0)),
+	}, foldClock(20))
+	if !movedAt(res, foldClock(20)) || !humanMovedAt(res, foldClock(10)) {
+		t.Fatalf("a proposal and a merge: lastMoved=%v lastHumanMoved=%v, want 20 and 10", res.Document.LastMoved, res.Document.LastHumanMoved)
+	}
+}
+
+// The seed carries the status's lastHumanActiveTime into a fresh document as
+// it carries lastActiveTime, so a re-seed does not forget when a person last
+// used the agent.
+func TestFoldUsage_SeedCarriesLastHumanMoved(t *testing.T) {
+	t0 := foldClock(0)
+	earlier := metav1.NewTime(t0.Add(-time.Hour))
+	res := foldUsage(nil, foldTestAgentUID, usageSeed{LastMoved: &earlier, LastHumanMoved: &earlier}, map[string]bool{}, nil, t0)
+	if res.Document.LastHumanMoved == nil || !res.Document.LastHumanMoved.Equal(&earlier) {
+		t.Fatalf("lastHumanMoved = %v, want the status's %v", res.Document.LastHumanMoved, earlier)
+	}
+}
+
 func TestFoldUsage_FirstPollRecordsEveryPodAndAddsNothing(t *testing.T) {
 	t0 := foldClock(0)
 	res := foldUsage(nil, foldTestAgentUID, usageSeed{}, map[string]bool{foldPodA: true, foldPodBroker: true}, []usageScrapedPod{
@@ -631,6 +704,107 @@ func TestFoldUsage_TheLargestDeltaAcrossGatewayPods(t *testing.T) {
 	})
 }
 
+// sessionsTotal is two document counters because its halves aggregate
+// differently: the watcher's triage sessions, read on every gateway replica
+// over the same event stream, take the largest delta like the injected events;
+// the chat sessions, from the leader's chat listener and the A2A gateway's
+// listener, each counting conversations of its own, sum.
+func TestFoldUsage_TriageSessionsTakeTheLargestDeltaAndChatSessionsTheSum(t *testing.T) {
+	first := foldClock(0)
+	created := first.Add(-time.Hour)
+	triage := foldDoc(first,
+		foldEntry(foldPodA, usageCounterSessionsTriage, 10, ptr.To(1.0), first),
+		foldEntry(foldPodB, usageCounterSessionsTriage, 10, ptr.To(1.0), first))
+	runFoldSteps(t, triage, usageCounterSessionsTriage, []foldStep{
+		{minute: 5, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterSessionsTriage, created, 13, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterSessionsTriage, created, 12, ptr.To(1.0)),
+		}, want: 3, moved: true},
+	})
+	chat := foldDoc(first,
+		foldEntry(foldPodA, usageCounterSessionsChat, 4, ptr.To(1.0), first),
+		foldEntry("a2a-gateway", usageCounterSessionsChat, 20, ptr.To(1.0), first))
+	runFoldSteps(t, chat, usageCounterSessionsChat, []foldStep{
+		{minute: 5, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterSessionsChat, created, 5, ptr.To(1.0)),
+			scrapedPod("a2a-gateway", usageCounterSessionsChat, created, 22, ptr.To(1.0)),
+		}, want: 3, moved: true},
+	})
+	if usageAggregationFor(usageCounterSessionsTriage) != usageAggregateMax || usageAggregationFor(usageCounterSessionsChat) != usageAggregateSum {
+		t.Fatal("the triage half is not Max or the chat half is not Sum")
+	}
+}
+
+// The triage half is the first Max counter a migration adds to a document
+// that predates it. On an HA install both gateway replicas are first read for
+// it in the same poll: each is a whole-sample candidate, the larger adds once,
+// not once per replica, and the next poll's deltas fold as the injected
+// events' do.
+func TestFoldUsage_AnUnfoldedMaxCounterFirstReadOnTwoReplicasAddsTheLargerOnce(t *testing.T) {
+	first := foldClock(0)
+	created := first.Add(-time.Hour)
+	doc := foldDoc(first, foldEntry(foldPodA, usageCounterEventsIngested, 100, ptr.To(1.0), first))
+	doc.Unfolded = []string{usageCounterSessionsTriage}
+	doc = runFoldSteps(t, doc, usageCounterSessionsTriage, []foldStep{
+		{minute: 5, live: []string{foldPodB}, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+			scrapedPod(foldPodA, usageCounterSessionsTriage, created, 30, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterSessionsTriage, created, 20, ptr.To(1.0)),
+		}, want: 30, moved: true},
+		{minute: 10, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+			scrapedPod(foldPodA, usageCounterSessionsTriage, created, 32, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterSessionsTriage, created, 22, ptr.To(1.0)),
+		}, want: 32, moved: true},
+	})
+	if len(doc.Unfolded) != 0 {
+		t.Fatalf("the unfolded mark outlived the first read: %v", doc.Unfolded)
+	}
+	if doc.Totals[usageCounterEventsIngested] != 0 {
+		t.Fatalf("a level injected counter moved: %v", doc.Totals)
+	}
+}
+
+// A document that predates the sessions halves gains both at migration. With
+// no sessions in the status both are unfolded and the first samples add whole;
+// with a status that carries sessions, from an operator that wrote the field
+// before a rollback, neither is: the triage half's share is in the chat
+// half's floor, so its first sample is a baseline, not an add.
+func TestMigrateUsageDocument_TheSessionsHalvesAreUnfoldedOnlyWithoutASessionsStatus(t *testing.T) {
+	first := foldClock(0)
+	created := first.Add(-time.Hour)
+	predating := func() *usageDocument {
+		doc := foldDoc(first, foldEntry(foldPodA, usageCounterEventsIngested, 100, ptr.To(1.0), first))
+		delete(doc.Totals, usageCounterSessionsTriage)
+		delete(doc.Totals, usageCounterSessionsChat)
+		return doc
+	}
+	floors := usageZeroTotals()
+	doc := predating()
+	migrateUsageDocument(doc, floors)
+	if !usageUnfolded(doc, usageCounterSessionsTriage) || !usageUnfolded(doc, usageCounterSessionsChat) {
+		t.Fatalf("with no sessions in the status both halves are unfolded: %v", doc.Unfolded)
+	}
+	floors[usageCounterSessionsChat] = 500
+	doc = predating()
+	migrateUsageDocument(doc, floors)
+	if usageUnfolded(doc, usageCounterSessionsTriage) || usageUnfolded(doc, usageCounterSessionsChat) {
+		t.Fatalf("with sessions in the status neither half is unfolded: %v", doc.Unfolded)
+	}
+	if doc.Totals[usageCounterSessionsChat] != 500 || doc.Totals[usageCounterSessionsTriage] != 0 {
+		t.Fatalf("totals after migration: %v", doc.Totals)
+	}
+	// The first read of the watcher for the triage half baselines it: the
+	// field stays at the status it was returned to, and the next delta adds.
+	doc = runFoldSteps(t, doc, usageCounterSessionsTriage, []foldStep{
+		{minute: 5, scraped: []usageScrapedPod{scrapedPod(foldPodA, usageCounterSessionsTriage, created, 450, ptr.To(1.0))}, want: 0, moved: false},
+		{minute: 10, scraped: []usageScrapedPod{scrapedPod(foldPodA, usageCounterSessionsTriage, created, 452, ptr.To(1.0))}, want: 2, moved: true},
+	})
+	if got := usageSessionsTotal(doc.Totals); got != 502 {
+		t.Fatalf("sessionsTotal after the return = %d, want 502", got)
+	}
+}
+
 // A partial straddle: both replicas move by different amounts, the total takes
 // the larger once, and the lagger's catch-up alone the poll after is reset
 // rather than counted on top.
@@ -838,6 +1012,22 @@ func TestFoldUsage_TwoNewReplicasInOnePollDoNotDoubleCount(t *testing.T) {
 	})
 	if b := podEntry(doc, foldPodB); b.Sample != 100 || !b.Marker.Time.Equal(foldClock(5)) {
 		t.Fatalf("the reset advances the new replica's baseline and takes the live sibling's marker: %+v", b)
+	}
+}
+
+// A reader that decodes the CR untyped gets a float64, so the ceiling is the
+// largest integer that representation keeps exact: it survives the round trip
+// itself, and the next integer does not.
+func TestUsageTotalCeiling_IsExactAsAFloat64(t *testing.T) {
+	const exact = int64(1) << 53
+	if usageTotalCeiling != exact {
+		t.Fatalf("usageTotalCeiling = %d, want %d", usageTotalCeiling, exact)
+	}
+	if back := int64(float64(usageTotalCeiling)); back != usageTotalCeiling {
+		t.Fatalf("the ceiling does not survive a float64 round trip: %d", back)
+	}
+	if float64(usageTotalCeiling+1) != float64(usageTotalCeiling) {
+		t.Fatalf("the ceiling is not the largest exact integer: %d is exact too", usageTotalCeiling+1)
 	}
 }
 

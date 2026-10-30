@@ -1259,7 +1259,7 @@ WAKE_LINE = (
 
 
 def notifier_source(widened_by_progress_lines=True):
-    kinds = TERMINAL_UPSTREAM + (' + ("heartbeat",)' if widened_by_progress_lines else "")
+    kinds = TERMINAL_UPSTREAM + (' + ("heartbeat", "pr_opened")' if widened_by_progress_lines else "")
     return (
         "from typing import Any, Callable\n\n"
         + kinds + "\n" + WAKE_LINE + "\n\n\n"
@@ -1378,7 +1378,7 @@ class ApplierTest(unittest.TestCase):
         self.assertIn("if _kanban_saturation_tick(", watchers)
         self.assertIn("kanban dispatcher stuck", watchers)
         notifier = out[applier.NOTIFIER_RELATIVE]
-        self.assertIn('+ ("heartbeat",) + ("queued",)', notifier)
+        self.assertIn('+ ("heartbeat", "pr_opened") + ("queued",)', notifier)
         self.assertIn('_EVENT_FORMATTERS["queued"] = _kanban_format_queued', notifier)
         self.assertIn(WAKE_LINE, notifier, "_WAKE_KINDS is untouched")
         for relative, text in out.items():
@@ -1546,7 +1546,7 @@ class DockerfileTest(unittest.TestCase):
         for marker in (
             applier.PRIORITY_PATCHED,
             '**_kanban_queue_fields(conn, new_tid, args.get("board")),',
-            '+ ("heartbeat",) + ("queued",)',
+            '+ ("heartbeat", "pr_opened") + ("queued",)',
             '_EVENT_FORMATTERS["queued"] = _kanban_format_queued',
             "_kanban_saturation_tick(",
         ):

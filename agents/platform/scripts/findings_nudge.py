@@ -32,8 +32,9 @@ formatting and bookkeeping. Each run:
    records it against the day. An announced item counts against the day from
    the state file alone while its marks have not landed.
 
-Nothing is added before the first inventory report's delivery is claimed, so
-that report is the first thing onboarding says about the fleet. The hold ends
+Nothing is added before the first inventory report is out (its delivery
+claimed, or under ``spec.mode: next`` its post's outcome recorded), so that
+report is the first thing onboarding says about the fleet. The hold ends
 ``FIRST_REPORT_HOLD_HOURS`` (24) after onboarding filed its sweep, delivered or
 not: an undelivered report by then means onboarding stalled, and holding on
 would keep the queue silent for good. Each run that is held, or would be but
@@ -71,8 +72,7 @@ TIMEOUT_SECONDS = 30
 
 PUBLISHER = "nudge"
 
-# `deliver: "chat"` relays this through a Chat Agent turn. Without a heading a
-# short message reads as conversation rather than as a report to reproduce.
+# The first line names the message in the channel.
 HEADING = "Findings queue"
 
 # A gathered item lists this many of its other objects by name, then counts
@@ -101,6 +101,12 @@ RUN_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # Filed and not yet delivered means a first report is on its way.
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 DELIVERED_MARKER = ".bootstrap_completed"
+# Under spec.mode next a claim on the conversation path is one attempt and can
+# be released; the report is out only once this outcome marker exists
+# (bootstrap_delivery.py, CONVERSATION_FILE, CONVERSATION_ALIGNED_MARKER and
+# CONVERSATION_DONE_FILE).
+CONVERSATION_MARKERS = ("onboarding_conversation.json", ".user_aligned_conversation")
+CONVERSATION_DONE_MARKER = ".bootstrap_conversation_done"
 # The line of the filed marker holding when it was filed, in Unix seconds.
 # The marker's mtime stands in when the line is missing or unreadable.
 FILED_AT_PREFIX = "filed_at="
@@ -154,6 +160,20 @@ def _filed_at(marker: Path) -> tuple[datetime, str] | None:
     return datetime.fromtimestamp(mtime, timezone.utc), "its mtime"
 
 
+def first_report_markers(gateway_home: Path) -> tuple[Path, Path]:
+    """The sweep marker, and the marker that says the first report is out.
+
+    Out is the delivery claim, or on the conversation path (``spec.mode: next``)
+    the recorded outcome, because a claim there can be released and taken
+    again. The board snapshot reads the same pair for the Home tab, and ends
+    its state early once delivery has registered the sweep's findings.
+    """
+    filed, delivered = gateway_home / SCAN_FILED_MARKER, gateway_home / DELIVERED_MARKER
+    if any((gateway_home / name).exists() for name in CONVERSATION_MARKERS):
+        delivered = gateway_home / CONVERSATION_DONE_MARKER
+    return filed, delivered
+
+
 def first_report_hold(gateway_home: Path, now: datetime) -> tuple[bool, str]:
     """Whether to add nothing yet, and the line to log about it ("" for none).
 
@@ -162,7 +182,7 @@ def first_report_hold(gateway_home: Path, now: datetime) -> tuple[bool, str]:
     onboarding never started (the experimental front door does not run it)
     has neither marker and is not held.
     """
-    filed, delivered = gateway_home / SCAN_FILED_MARKER, gateway_home / DELIVERED_MARKER
+    filed, delivered = first_report_markers(gateway_home)
     if not filed.exists() or delivered.exists():
         return False, ""
     found = _filed_at(filed)
@@ -177,7 +197,8 @@ def first_report_hold(gateway_home: Path, now: datetime) -> tuple[bool, str]:
             f"held for it ({markers})"
         )
     return True, (
-        f"{LOG_PREFIX}: adding nothing until the first inventory report's delivery is claimed, or until "
+        f"{LOG_PREFIX}: adding nothing until the first inventory report is out (its delivery claimed, or "
+        f"its conversation post's outcome recorded), or until "
         f"{(filed_at + FIRST_REPORT_HOLD).strftime(TIME_FORMAT)} ({markers})"
     )
 

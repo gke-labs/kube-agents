@@ -1,0 +1,261 @@
+[
+  {
+    "insertId": "1a2b3c-removed-1",
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "resource": {
+      "type": "k8s_cluster",
+      "labels": {
+        "cluster_name": "upg-06",
+        "location": "us-central1-a",
+        "project_id": "example-project"
+      }
+    },
+    "timestamp": "2026-09-29T13:54:19.378013Z",
+    "receiveTimestamp": "2026-09-29T13:54:20.101Z",
+    "severity": "NOTICE",
+    "labels": {
+      "authorization.k8s.io/decision": "allow",
+      "authorization.k8s.io/reason": "RBAC: allowed by ClusterRoleBinding \"legacy-flowcontrol-tuner\"",
+      "k8s.io/deprecated": "true",
+      "k8s.io/removed-release": "1.32"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "serviceName": "k8s.io",
+      "methodName": "io.k8s.apiserver.flowcontrol.v1beta3.flowschemas.create",
+      "resourceName": "flowcontrol.apiserver.k8s.io/v1beta3/flowschemas/legacy-batch-lane",
+      "authenticationInfo": {
+        "principalEmail": "system:serviceaccount:kubeagents-system:legacy-flowcontrol-tuner"
+      },
+      "requestMetadata": {
+        "callerIp": "198.51.100.7",
+        "callerSuppliedUserAgent": "legacy-flowcontrol-tuner/0.3"
+      },
+      "status": { "code": 0 }
+    }
+  },
+  {
+    "insertId": "1a2b3c-removed-2",
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "resource": {
+      "type": "k8s_cluster",
+      "labels": {
+        "cluster_name": "upg-06",
+        "location": "us-central1-a",
+        "project_id": "example-project"
+      }
+    },
+    "timestamp": "2026-09-29T14:04:19.112Z",
+    "receiveTimestamp": "2026-09-29T14:04:20.004Z",
+    "severity": "NOTICE",
+    "labels": {
+      "authorization.k8s.io/decision": "allow",
+      "k8s.io/deprecated": "true",
+      "k8s.io/removed-release": "1.32"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "serviceName": "k8s.io",
+      "methodName": "io.k8s.apiserver.flowcontrol.v1beta3.flowschemas.update",
+      "resourceName": "flowcontrol.apiserver.k8s.io/v1beta3/flowschemas/legacy-batch-lane",
+      "authenticationInfo": {
+        "principalEmail": "system:serviceaccount:kubeagents-system:legacy-flowcontrol-tuner"
+      },
+      "requestMetadata": {
+        "callerIp": "198.51.100.7",
+        "callerSuppliedUserAgent": "legacy-flowcontrol-tuner/0.3"
+      },
+      "status": { "code": 0 }
+    }
+  },
+  {
+    "insertId": "1a2b3c-deprecated-1",
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "resource": {
+      "type": "k8s_cluster",
+      "labels": {
+        "cluster_name": "upg-06",
+        "location": "us-central1-a",
+        "project_id": "example-project"
+      }
+    },
+    "timestamp": "2026-09-29T14:00:03.201Z",
+    "receiveTimestamp": "2026-09-29T14:00:04.000Z",
+    "severity": "NOTICE",
+    "labels": {
+      "authorization.k8s.io/decision": "allow",
+      "k8s.io/deprecated": "true"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "serviceName": "k8s.io",
+      "methodName": "io.k8s.core.v1.endpoints.patch",
+      "resourceName": "core/v1/namespaces/seeded-deprecation/endpoints/legacy-endpoints-lane",
+      "authenticationInfo": {
+        "principalEmail": "system:serviceaccount:seeded-deprecation:legacy-endpoints-writer"
+      },
+      "requestMetadata": {
+        "callerIp": "198.51.100.12",
+        "callerSuppliedUserAgent": "Python-urllib/3.12"
+      },
+      "status": { "code": 0 }
+    }
+  },
+  {
+    "insertId": "1a2b3c-deprecated-2",
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "resource": {
+      "type": "k8s_cluster",
+      "labels": {
+        "cluster_name": "upg-06",
+        "location": "us-central1-a",
+        "project_id": "example-project"
+      }
+    },
+    "timestamp": "2026-09-29T14:10:02.950Z",
+    "receiveTimestamp": "2026-09-29T14:10:03.500Z",
+    "severity": "NOTICE",
+    "labels": {
+      "authorization.k8s.io/decision": "allow",
+      "k8s.io/deprecated": "true"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "serviceName": "k8s.io",
+      "methodName": "io.k8s.core.v1.endpoints.patch",
+      "resourceName": "core/v1/namespaces/seeded-deprecation/endpoints/legacy-endpoints-lane",
+      "authenticationInfo": {
+        "principalEmail": "system:serviceaccount:seeded-deprecation:legacy-endpoints-writer"
+      },
+      "requestMetadata": {
+        "callerIp": "198.51.100.12",
+        "callerSuppliedUserAgent": "Python-urllib/3.12"
+      },
+      "status": { "code": 0 }
+    }
+  },
+  {
+    "insertId": "1a2b3c-platform-1",
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "resource": {
+      "type": "k8s_cluster",
+      "labels": {
+        "cluster_name": "upg-06",
+        "location": "us-central1-a",
+        "project_id": "example-project"
+      }
+    },
+    "timestamp": "2026-09-29T14:01:11.000Z",
+    "receiveTimestamp": "2026-09-29T14:01:11.400Z",
+    "severity": "NOTICE",
+    "labels": {
+      "authorization.k8s.io/decision": "allow",
+      "k8s.io/deprecated": "true"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "serviceName": "k8s.io",
+      "methodName": "io.k8s.core.v1.endpoints.update",
+      "resourceName": "core/v1/namespaces/default/endpoints/kubernetes",
+      "authenticationInfo": {
+        "principalEmail": "system:serviceaccount:kube-system:endpoint-controller"
+      },
+      "requestMetadata": {
+        "callerIp": "198.51.100.1",
+        "callerSuppliedUserAgent": "kube-controller-manager/v1.34.4 (linux/amd64) kubernetes/0a1b2c3/system:serviceaccount:kube-system:endpoint-controller"
+      },
+      "status": { "code": 0 }
+    }
+  },
+  {
+    "insertId": "1a2b3c-kubectl-stale",
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "resource": {
+      "type": "k8s_cluster",
+      "labels": {
+        "cluster_name": "upg-06",
+        "location": "us-central1-a",
+        "project_id": "example-project"
+      }
+    },
+    "timestamp": "2026-09-29T14:12:40.000Z",
+    "receiveTimestamp": "2026-09-29T14:12:40.800Z",
+    "severity": "NOTICE",
+    "labels": { "authorization.k8s.io/decision": "allow" },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "serviceName": "k8s.io",
+      "methodName": "io.k8s.core.v1.configmaps.patch",
+      "resourceName": "core/v1/namespaces/seeded-shapes/configmaps/stale-client-heartbeat",
+      "authenticationInfo": {
+        "principalEmail": "system:serviceaccount:seeded-shapes:stale-kubectl-client"
+      },
+      "requestMetadata": {
+        "callerIp": "198.51.100.20",
+        "callerSuppliedUserAgent": "kubectl/v1.29.0 (linux/amd64) kubernetes/3f7a50f"
+      },
+      "status": { "code": 0 }
+    }
+  },
+  {
+    "insertId": "1a2b3c-kubectl-current",
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "resource": {
+      "type": "k8s_cluster",
+      "labels": {
+        "cluster_name": "upg-06",
+        "location": "us-central1-a",
+        "project_id": "example-project"
+      }
+    },
+    "timestamp": "2026-09-29T15:30:00.000Z",
+    "receiveTimestamp": "2026-09-29T15:30:00.900Z",
+    "severity": "NOTICE",
+    "labels": { "authorization.k8s.io/decision": "allow" },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "serviceName": "k8s.io",
+      "methodName": "io.k8s.apps.v1.deployments.patch",
+      "resourceName": "apps/v1/namespaces/shop/deployments/web",
+      "authenticationInfo": { "principalEmail": "operator@example.com" },
+      "requestMetadata": {
+        "callerIp": "198.51.100.30",
+        "callerSuppliedUserAgent": "kubectl/v1.35.1 (darwin/arm64) kubernetes/9e8d7c6"
+      },
+      "status": { "code": 0 }
+    }
+  },
+  {
+    "insertId": "1a2b3c-client-go",
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "resource": {
+      "type": "k8s_cluster",
+      "labels": {
+        "cluster_name": "upg-06",
+        "location": "us-central1-a",
+        "project_id": "example-project"
+      }
+    },
+    "timestamp": "2026-09-29T15:31:00.000Z",
+    "receiveTimestamp": "2026-09-29T15:31:00.300Z",
+    "severity": "NOTICE",
+    "labels": {
+      "authorization.k8s.io/decision": "allow",
+      "k8s.io/deprecated": "true"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "serviceName": "k8s.io",
+      "methodName": "io.k8s.core.v1.endpoints.update",
+      "resourceName": "core/v1/namespaces/mesh/endpoints/legacy-gateway",
+      "authenticationInfo": {
+        "principalEmail": "system:serviceaccount:mesh:gateway-operator"
+      },
+      "requestMetadata": {
+        "callerIp": "198.51.100.40",
+        "callerSuppliedUserAgent": "gateway-operator/v0.9.2 (linux/amd64) kubernetes/$Format"
+      },
+      "status": { "code": 0 }
+    }
+  }
+]

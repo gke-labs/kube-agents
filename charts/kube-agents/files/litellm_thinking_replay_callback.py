@@ -3,11 +3,11 @@
 A client that enables thinking replays each earlier assistant turn's thinking
 in the next request: Claude Code sends Anthropic ``thinking`` blocks, and an
 OpenAI-format client may send ``thinking_blocks`` on the assistant message.
-LiteLLM's Gemini transformation turns each one into a part carrying the
-thinking text and its ``thoughtSignature`` but not ``thought: true``, so Gemini
-reads its own earlier thought summaries ("**Formulating the Report** / I will
-now draft...") as text it said aloud, and keeps saying them at the top of its
-answers. No prompt reaches that text.
+LiteLLM's Gemini transformation before v1.106.0 turned each one into a part
+carrying the thinking text and its ``thoughtSignature`` but not
+``thought: true``, so Gemini read its own earlier thought summaries
+("**Formulating the Report** / I will now draft...") as text it said aloud, and
+kept saying them at the top of its answers. No prompt reached that text.
 
 This pre-call hook drops those blocks from assistant messages before LiteLLM
 converts the request, for an alias whose every deployment is a Gemini model.
@@ -21,9 +21,13 @@ thinking replayed and is not touched. The gate reads the alias's own
 deployments only; a router fallback to a Claude group from a Gemini alias
 would receive the stripped history, and neither shipped config has one.
 
-Fixed upstream in BerriAI/litellm#44661 (the Gemini request no longer builds a
-part from ``thinking_blocks``). Delete this hook, its mounts and its callback
-entry once images.json pins a LiteLLM release that carries that fix.
+Fixed upstream in BerriAI/litellm#44661, which LiteLLM v1.106.0 carries and
+images.json pins: the Gemini request no longer builds a part from
+``thinking_blocks``. The hook stays for now because it removes more than that
+fix does (the ``/v1/messages`` case above), and no thinking-enabled multi-turn
+session has been measured on the pinned release without it.
+gke-labs/kube-agents#2836 tracks deleting this hook, its mounts and its
+callback entry once that measurement is on record.
 
 The chart renders this file into the litellm-config ConfigMap; the kustomize
 base carries a copy (k8s-operator/config/integrations/litellm/base), and

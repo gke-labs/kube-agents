@@ -805,6 +805,17 @@ class TheDaemonAddressIsDeclaredOnceAndUsedByBoth(_ScriptCase):
                     "so changing the port takes two edits and the second is silent",
                 )
 
+    def test_the_watcher_waits_for_the_agent_gateway(self) -> None:
+        # Without the flag the watcher offers events while the gateway boots,
+        # and the daemon accepts them with no triage turn behind them.
+        url = _run_bash(
+            "set -u\n"
+            + lift_constant("AGENT_GATEWAY_URL", self.text, _SCRIPT)
+            + 'printf "%s" "${AGENT_GATEWAY_URL}"'
+        ).stdout
+        self.assertEqual(url, "http://127.0.0.1:8642")
+        self.assertIn('--gateway-url="${AGENT_GATEWAY_URL}"', self.lift("start_event_watcher"))
+
 
 class NormalizeBooleanResolvesWhatTheWatcherIsHandedAsAFlag(_ScriptCase):
     """The boolean normaliser, exercised as bash rather than read as text.

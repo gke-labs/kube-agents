@@ -26,6 +26,8 @@ Produce clear, actionable documents — upgrade plans, runbooks, or checklists �
 
 Always frame guidance around the auto-upgrade model: auto-upgrade with maintenance windows and exclusions is the preferred control mechanism.
 
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes. A control-plane upgrade reaches the cluster as a pull request changing the version floor or release-channel field (`spec.minMasterVersion` or `spec.releaseChannel.channel` on the `ContainerCluster`). A node-pool version change (an upgrade, a downgrade or rollback, or resuming a stopped upgrade) is an operation, not desired state: write the exact `gcloud container clusters upgrade CLUSTER_NAME --node-pool NODE_POOL_NAME --cluster-version VERSION --location LOCATION` command as a step for the platform operator to run, not one to run from here, and never propose `spec.version` on a `ContainerNodePool`. A pool on a release channel cannot turn auto-upgrade off, so a version pinned in the repository fights it: Config Connector moves the pool back to the pin after each automatic upgrade, re-rolling its nodes, and a rollback pin holds the pool at the old version indefinitely. The pool's upgrade strategy (`spec.upgradeSettings`) is desired state and stays a pull request.
+
 ## Context Gathering
 
 Before producing any upgrade artifact, establish:
@@ -93,8 +95,8 @@ Configure maintenance windows to control auto-upgrade timing. GKE also supports 
 2. **Warn against "No channel"**: You MUST explicitly warn that disabling release channels ("No channel" / static versioning) is deprecated and must not be used as a replacement for exclusions.
 3. **Compare Scopes**: You MUST explain the difference between 'No upgrades' (limitations, blocks patches) and 'No minor or node upgrades' (allows patches, longer duration). Recommend 'No minor or node upgrades' when the user wants to allow security patches/fixes while blocking minor version jumps.
 4. **Handle periods > 90 days**: If the user needs to block upgrades for more than 90 days, you MUST explain that 'No upgrades' is limited to 90 days per exclusion (max 3 per cluster, and 48 hours of maintenance availability must remain in any rolling 92-day window, preventing chaining into longer continuous freezes) and advise using scoped exclusions ('No minor or node upgrades' / 'No minor upgrades'), which have no fixed day cap and can run until the minor version's End of Support.
-5. **Version skew**: Be mindful of version skew (between control plane and node pools) when using exclusions. Ensure skew does not exceed the supported 2 minor versions. Use `--add-maintenance-exclusion-until-end-of-support` for persistent exclusions.
-6. **Correct gcloud syntax**: When providing `gcloud` commands for exclusions, you MUST use the separate flag syntax: `--add-maintenance-exclusion-name`, `--add-maintenance-exclusion-start`, `--add-maintenance-exclusion-end` (or `--add-maintenance-exclusion-until-end-of-support`), and `--add-maintenance-exclusion-scope` (do NOT use a single comma-separated `--add-maintenance-exclusion` flag).
+5. **Version skew**: Be mindful of version skew (between control plane and node pools) when using exclusions. Ensure skew does not exceed the supported 2 minor versions.
+6. **Correct exclusion fields**: When proposing exclusions, you MUST write each one as its own entry in `spec.maintenancePolicy.maintenanceExclusion` on the cluster's `ContainerCluster`, with `exclusionName`, `startTime`, `endTime`, and `exclusionOptions.scope` (`NO_UPGRADES`, `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`, as the GKE API spells them, not gcloud's lowercase forms). For an exclusion that runs until End of Support, set `endTime` to the minor version's End of Support date (from the GKE release schedule) with scope `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`. The `ContainerCluster` schema carries a fixed `endTime` and no field for gcloud's form that follows the End of Support date if it moves (confirm with `kubectl explain` against the customer's CRD), so a later End of Support date is a new pull request moving `endTime`.
 
 ## Mandatory Upgrade Overrides
 
@@ -171,9 +173,9 @@ Produce checklists as copyable markdown with checkboxes. See [`references/checkl
 
 ## Maintenance runbooks
 
-Produce step-by-step runbooks with actual `gcloud` and `kubectl` commands. See `references/runbook-template.md` for the standard command sequences.
+Produce step-by-step runbooks in which each change is a pull request editing the field in the GitOps repository's format, a node pool's version change is the exact `gcloud container clusters upgrade --node-pool` command as a step for the platform operator, and each check is an actual `gcloud` or `kubectl` read command. See `references/runbook-template.md` for the standard sequences.
 
-**Any runbook that relaxes a safety control must restore it in the same runbook.** This applies above all to PDBs during a node-pool migration or rollback: back the PDBs up before draining, and make restoring them by patch a numbered step with its own verification, not a closing remark. A runbook that patches `maxUnavailable: 100%` to unblock a drain and never reverts it leaves the cluster without disruption protection, and the gap is invisible until the next voluntary eviction. The same rule covers maintenance exclusions, cordons, and autoscaler `minNodes` overrides added to get through the procedure.
+**Any runbook that relaxes a safety control must restore it in the same runbook.** This applies above all to PDBs during a node-pool migration or rollback: back the PDBs up before draining, and make restoring them by pull request a numbered step with its own verification, not a closing remark. A runbook that sets `maxUnavailable: 100%` to unblock a drain and never reverts it leaves the cluster without disruption protection, and the gap is invisible until the next voluntary eviction. The same rule covers maintenance exclusions, cordons, and autoscaler `minNodes` overrides added to get through the procedure.
 
 ## Maintenance Window Pauses
 
@@ -182,7 +184,7 @@ When diagnosing a \"stuck\" upgrade, consider if it was paused by a maintenance 
 - **Silent Pause Behavior:** If a maintenance window closes before a surge upgrade (auto or manual) completes, GKE intentionally pauses the rollout to prevent disruption outside allowed times. A blue-green node-pool upgrade does not pause: it continues past the window to completion (`references/troubleshooting.md` §11), so for a blue-green pool the window is not the cause and the rest of this section does not apply.
 - **Mixed-Version State:** The cluster is left in a stable mixed-version state (some nodes upgraded, some not). You MUST explicitly state that this is a supported and safe intended outcome.
 - **Resumption:** The upgrade will automatically resume when the next maintenance window opens.
-- **Mitigation for immediate completion:** If the user wants to complete the upgrade immediately, you MUST suggest **temporarily widening the maintenance window** to include the current time (e.g., using `gcloud container clusters update ... --maintenance-window-start ... --maintenance-window-duration ...`). Do not suggest re-triggering the manual upgrade or bypassing the window.
+- **Mitigation for immediate completion:** If the user wants to complete the upgrade immediately, you MUST suggest **temporarily widening the maintenance window** to include the current time (a pull request changing `spec.maintenancePolicy.recurringWindow` on the cluster's `ContainerCluster`). Do not suggest re-triggering the manual upgrade or bypassing the window.
 
 ## Troubleshooting
 
@@ -225,8 +227,8 @@ control plane or a node pool is the laggard, run the
 table rather than reasoning from memory:
 
 ```bash
-./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \
-  --output /opt/data/scratch/fleet_versions.json
+/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \
+  --output /opt/data/scratch/fleet_versions_$(date +%s)_$$.json
 ```
 
 Without `--target-version` it measures each cluster against its own release channel's default and
@@ -240,13 +242,63 @@ The same script's `--readiness` flag executes three items of this skill's pre-up
 per member, against the same target: PodDisruptionBudgets that would block a node drain
 (`maxUnavailable: 0`, or `minAvailable` demanding every expected pod), maintenance exclusions and
 the maintenance window at a given instant (`--at`, default now), and node-pool version skew
-against the target control plane. Run it before writing the plan and carry its `blocked` rows into
-the checklist rather than asking the operator to check those three by hand. The PDB read costs one
-`get-credentials` and one `kubectl get` per member and leaves a per-member kubeconfig under
-`${HERMES_HOME:-/opt/data}/.kubeconfigs/`; an exclusion is reported as holding back automatic
-upgrades only.
+against the target control plane. It also grades a fourth thing the checklist's admission-webhook
+item points at: a fail-closed webhook whose backend is unreachable and whose rules reach the
+upgrade's path (the writes a node drain and a node join make, as `UPGRADE_PATH_TARGETS` in
+`/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py` lists them), which is a cause of
+a drain that will not finish, or whose rules reach the bootstrap RBAC writes a new master reconciles
+(ClusterRoles and ClusterRoleBindings always; Roles and RoleBindings in `kube-system` or
+`kube-public` when its namespace selector admits that namespace), which is a cause of a master that
+will not start. It then runs the per-entry rules the fleet-upgrade-verification skill lists for the
+upgrade-failure catalogue, each a blocker the report lists under `other blockers` or a risk it lists
+under `risks` (a zonal control plane is one). Run it before writing the plan; carry its `blocked`
+rows and `other blockers` into the checklist rather than asking the operator to check those items
+by hand, and its risks as what to watch. The cluster reads cost one `get-credentials` and the
+`kubectl get`s that skill's "Check upgrade readiness" section lists per member, and leave a
+per-member kubeconfig under `${HERMES_HOME:-/opt/data}/.kubeconfigs/`; an exclusion is reported as
+holding back automatic upgrades only.
 
 When the checklist's deprecated-API item comes up, the same skill's `api_deprecation_scan.py` scans
 the linked GitOps repositories' manifests for apiVersions the target removes and reports each with
 its replacement and the commit it read; run it with `--target-version` and the version report's
-`--output`. It reads Git only: point at GKE Deprecation Insights for live client usage.
+`--output` from a full run, since it refuses a `--cluster` run's file as one cluster's floor. It
+reads Git only; live client usage of removed and deprecated APIs is what `--readiness` reads from
+the audit log, with GKE Deprecation Insights as the thirty-day cross-check.
+
+## Stuck operation
+
+A cluster whose `status` is not `RUNNING` (`RECONCILING`, `DEGRADED`, `ERROR`) accepts no cluster
+or node pool change, and only the provider can end an operation that has wedged inside it. The
+fleet-upgrade-verification report's `cluster-status-age` rule files such a cluster as a blocker
+once an operation on it or on one of its node pools has been `RUNNING` for more than four hours,
+naming that operation; when the project's operations list shows nothing `RUNNING`, it describes
+the cluster and re-lists its operations first, and blocks at once only when the status still
+stands with nothing running, quoting the cluster's `statusMessage`. What to do with it, in order:
+
+1. **Read the operation, not only the status.** List the newest operations on the cluster and
+   on its node pools (a node pool upgrade, resize or repair names the pool and holds the cluster as
+   a cluster operation does):
+   `gcloud container operations list --project <project> --filter="targetLink~/clusters/<cluster>($|/nodePools/)" --sort-by=~startTime --limit=5 --format=json`,
+   then `gcloud container operations describe <operation id> --location <location> --project <project>`
+   for the newest one whose `status` is `RUNNING`: its `operationType`, `status`, `startTime`,
+   `statusMessage` and `error`. The age is now minus `startTime`; quote both. When none is
+   `RUNNING`, what holds the cluster is in its own `statusMessage`
+   (`gcloud container clusters describe <cluster> --location <location> --project <project> --format="value(status,statusMessage)"`);
+   quote it with the newest finished operation.
+2. **Freeze changes on the cluster.** No node pool upgrade, resize, rollback or cluster update
+   until the operation ends, and say so in the answer and on any card about the cluster. A pull
+   request that changes the cluster's spec waits too: Config Connector would retry against a
+   cluster that refuses the change.
+3. **Past a few hours, draft the support-case text** (the rule's threshold is four): the project,
+   the cluster and its location, the operation id, its type, its start time and age (or, with no
+   operation `RUNNING`, the status and its `statusMessage`), the `statusMessage` and `error` text
+   verbatim, what was being changed when it started, and that the operation needs the provider to
+   abort it. P2 while the workloads run; P1 when the API or the
+   nodes are affected.
+4. **File a kanban card for a person to open the case the same day**, titled
+   `Support case: <cluster> held by <operation id>`, carrying the drafted text, and block it as
+   needing input: the agent cannot open a support case, and in one production fleet a cluster
+   sat in `RECONCILING` for six days before anyone did.
+5. **After the operation ends**, re-run the readiness report: `RUNNING` with the operation listed
+   as `DONE` closes the finding; a status that returns is the same card, reopened with the new
+   operation id.

@@ -69,7 +69,7 @@ candidate that was judged from one whose lane broke and which may be retried.
 Usage:
   poll_rc_eval_verdict.py --commit <sha> [--evalcand-tag <tag>]
 
-Requires `gsutil`, authenticated against the archive bucket.
+Requires `gcloud` (its `storage` group), authenticated against the archive bucket.
 """
 
 import argparse
@@ -106,7 +106,7 @@ DEFAULT_DEADLINE_MINUTES = 330
 # is the difference between a fixable morning and a lost day.
 DEFAULT_APPEAR_DEADLINE_MINUTES = 45
 # Between polls. The eval runs for hours, so a tighter interval buys nothing and
-# a `gsutil ls` every two minutes over five hours is ~165 calls.
+# a `gcloud storage ls` every two minutes over five hours is ~165 calls.
 DEFAULT_INTERVAL_SECONDS = 120
 # How many build directories to read per poll, newest first. The job fires at
 # most once a day, so the build we want is almost always the newest; this bounds
@@ -114,9 +114,12 @@ DEFAULT_INTERVAL_SECONDS = 120
 # cap is reported rather than silently truncating the scan.
 DEFAULT_SCAN_LIMIT = 20
 
-# Per-call ceiling on gsutil, matching scripts/eval_dashboard/collect.py.
-GSUTIL_TIMEOUT_S = 300
-DEFAULT_GSUTIL = "gsutil"
+# Per-call ceiling on gcloud storage, matching scripts/eval_dashboard/collect.py.
+GCLOUD_TIMEOUT_S = 300
+# Every archive read is `gcloud storage ls` or `gcloud storage cat` through
+# this binary (--gcloud overrides it).
+DEFAULT_GCLOUD = "gcloud"
+STORAGE_GROUP = "storage"
 
 SECONDS_PER_MINUTE = 60
 
@@ -203,28 +206,29 @@ class _Unreadable:
 
 UNREADABLE = _Unreadable()
 
-# gsutil's stderr when the object genuinely is not there, as opposed to a 403,
-# a 429, a timeout or a broken credential. Anything not matching is treated as
-# UNREADABLE, which is the safe direction: the cost of calling a real absence
-# unreadable is one more poll, while the reverse mistakes an outage for an
-# answer.
+# gcloud storage's stderr when the object genuinely is not there, as opposed
+# to a 403, a 429, a timeout or a broken credential: an absent object is
+# "matched no objects" on every verb, an absent bucket "<gs://bucket> not
+# found: 404". Anything not matching is treated as UNREADABLE, which is the
+# safe direction: the cost of calling a real absence unreadable is one more
+# poll, while the reverse mistakes an outage for an answer.
 #
-# Anchored on gsutil's phrasings rather than on the bare status number, because
-# gsutil echoes the failing URL in its error text and a Prow build id is 19
-# digits: a 503 on `.../2097891568546404123/started.json` contains "404", and
-# treating that as an absence would let the build be skipped as "not ours" and
-# an older build answer in its place. scripts/eval_dashboard/collect.py sets the
-# precedent with a compiled `matched no objects`.
+# Anchored on gcloud's phrasings rather than on the bare status number,
+# because gcloud echoes the failing URL in its error text and a Prow build id
+# is 19 digits: a 503 on `.../2097891568546404123/started.json` contains
+# "404", and treating that as an absence would let the build be skipped as
+# "not ours" and an older build answer in its place; "not found: 404" is
+# anchored on the words before the number. scripts/eval_dashboard/collect.py
+# sets the precedent with a compiled `matched no objects`.
 _NOT_FOUND_PATTERNS = (
     "matched no objects",
-    "no urls matched",
-    "notfoundexception: 404",
+    "not found: 404",
 )
 
 
-def _gsutil(args, gsutil=DEFAULT_GSUTIL):
-    """stdout of one gsutil call; None if the object is absent, UNREADABLE if
-    the call failed.
+def _gcloud_storage(args, gcloud=DEFAULT_GCLOUD):
+    """stdout of one `gcloud storage` call; None if the object is absent,
+    UNREADABLE if the call failed.
 
     A failed call is a warning rather than a fatal error: the poll has hours of
     retries ahead of it, and a transient GCS error must not be the thing that
@@ -232,18 +236,18 @@ def _gsutil(args, gsutil=DEFAULT_GSUTIL):
     """
     try:
         proc = subprocess.run(
-            [gsutil, *args],
+            [gcloud, STORAGE_GROUP, *args],
             capture_output=True,
             text=True,
-            timeout=GSUTIL_TIMEOUT_S,
+            timeout=GCLOUD_TIMEOUT_S,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"warning: {gsutil} {' '.join(args)}: {exc}", file=sys.stderr)
+        print(f"warning: {gcloud} {STORAGE_GROUP} {' '.join(args)}: {exc}", file=sys.stderr)
         return UNREADABLE
     if proc.returncode != 0:
         stderr = proc.stderr.strip()
-        print(f"warning: {gsutil} {' '.join(args)}: {stderr}", file=sys.stderr)
+        print(f"warning: {gcloud} {STORAGE_GROUP} {' '.join(args)}: {stderr}", file=sys.stderr)
         lowered = stderr.lower()
         if any(pattern in lowered for pattern in _NOT_FOUND_PATTERNS):
             return None
@@ -252,9 +256,9 @@ def _gsutil(args, gsutil=DEFAULT_GSUTIL):
 
 
 def build_dirs(listing):
-    """(build_id, directory URL) pairs from one `gsutil ls` listing, newest first.
+    """(build_id, directory URL) pairs from one `gcloud storage ls` listing, newest first.
 
-    `gsutil ls a/` prints plain `gs://.../<id>/` lines and `gsutil ls a/*`
+    `gcloud storage ls a/` prints plain `gs://.../<id>/` lines and `gcloud storage ls a/*`
     prints each matched directory as a `gs://.../<id>/:` header over its
     contents; accept both. Everything that is not a numerically-named directory
     is dropped -- latest-build.txt, and the per-object lines the second form
@@ -757,7 +761,7 @@ def main(argv=None):
             " belong to a previous attempt at the same commit and are ignored."
         ),
     )
-    parser.add_argument("--gsutil", default=DEFAULT_GSUTIL)
+    parser.add_argument("--gcloud", default=DEFAULT_GCLOUD, help="gcloud binary to invoke; the archive reads are `gcloud storage ls|cat` through it")
     args = parser.parse_args(argv)
 
     commit = args.commit.strip().lower()
@@ -788,8 +792,8 @@ def main(argv=None):
         )
     verdict, build_id, base = poll(
         commit,
-        read_listing=lambda: _gsutil(["ls", prefix], args.gsutil),
-        read_file=lambda url: _gsutil(["cat", url], args.gsutil),
+        read_listing=lambda: _gcloud_storage(["ls", prefix], args.gcloud),
+        read_file=lambda url: _gcloud_storage(["cat", url], args.gcloud),
         deadline_minutes=args.deadline_minutes,
         appear_deadline_minutes=args.appear_deadline_minutes,
         interval_seconds=args.interval_seconds,

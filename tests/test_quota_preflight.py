@@ -71,10 +71,14 @@ _DEFAULT_LIMITS_CPU_MILLIS = 10200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 8832 * 1024**2
-_DEFAULT_LIMITS_MEMORY_BYTES = 23040 * 1024**2
-_DEFAULT_REQUESTS_EPHEMERAL_BYTES = 5 * 1024**3
-_DEFAULT_LIMITS_EPHEMERAL_BYTES = 5 * 1024**3
+_DEFAULT_REQUESTS_MEMORY_BYTES = 8896 * 1024**2
+_DEFAULT_LIMITS_MEMORY_BYTES = 23424 * 1024**2
+# Ephemeral-storage requests: the footprint's 5Gi, LiteLLM's 1280Mi per replica (its tmp
+# emptyDir's sizeLimit plus logs) on two replicas, and the cleanup hook's 1088Mi.
+_LITELLM_EPHEMERAL_REQUEST_BYTES = 1280 * 1024**2
+_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (5 * 1024 + 2 * 1280 + 1088) * 1024**2
+# The same three additions, because each sets its limit equal to its request.
+_DEFAULT_LIMITS_EPHEMERAL_BYTES = _DEFAULT_REQUESTS_EPHEMERAL_BYTES
 # Cleanup hook Job: 50m requested / 200m limit, 64Mi requested / 128Mi limit, 1 pod.
 _CLEANUP_HOOK_REQUEST_MILLIS = 50
 _CLEANUP_HOOK_LIMIT_MILLIS = 200
@@ -100,7 +104,11 @@ _LARGEST_SURGING_REQUEST_MILLIS = 100
 _OPERATOR_REQUEST_MILLIS = 10
 # Two operator-rendered claims plus two from the shell StatefulSet's volumeClaimTemplates.
 _OPERATOR_PVC_COUNT = 4
-_OPERATOR_STORAGE_BYTES = 22 * 1024**3
+_OPERATOR_STORAGE_BYTES = 102 * 1024**3
+# The two claims platformAgent.storage.size sizes (the agent's data claim and the shell
+# sandbox's), at the operator default each.
+_DATA_CLAIMS = 2
+_DATA_CLAIM_DEFAULT_BYTES = 50 * 1024**3
 # hindsight.postgresql.storage, the volumeClaimTemplate the StatefulSet renders.
 _HINDSIGHT_STORAGE_BYTES = 8 * 1024**3
 # A memory quota written in decimal SI. 1G is 1,000,000,000 bytes, which is a whole number
@@ -111,14 +119,14 @@ _DECIMAL_SI_HARD_BYTES = 1000000000
 _LITELLM_REPLICAS = 2
 _LITELLM_CPU_LIMIT_MILLIS = 500 * _LITELLM_REPLICAS
 _LITELLM_CPU_REQUEST_MILLIS = 100 * _LITELLM_REPLICAS
-# An ephemeral-storage request no chart workload sets by default, so the totals move by
-# exactly this much when one does.
+# An ephemeral-storage request set on LiteLLM in place of its 1280Mi default, so the
+# totals move by the difference, per replica.
 _EPHEMERAL_SET_GIB = 3
 # What the shell StatefulSet leaves behind: persistentVolumeClaimRetentionPolicy is
 # Retain/Retain, so these two claims survive `helm uninstall` and are in `used` on the
 # next install, to be reused by name rather than created again.
 _RETAINED_PVC_COUNT = 2
-_RETAINED_STORAGE_GIB = 11
+_RETAINED_STORAGE_GIB = 51
 _MILLICORES_PER_CORE = 1000
 # The credential proxy's footprint.yaml entry (the operator's defaults), and an override
 # of the one key an install raises (#2324). The preflight merges the override over the
@@ -232,6 +240,57 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(req["limitsMemory"], _DEFAULT_LIMITS_MEMORY_BYTES)
         self.assertEqual(req["requestsEphemeral"], _DEFAULT_REQUESTS_EPHEMERAL_BYTES)
         self.assertEqual(req["limitsEphemeral"], _DEFAULT_LIMITS_EPHEMERAL_BYTES)
+
+    def test_a_data_volume_size_moves_both_data_claims(self) -> None:
+        """platformAgent.storage.size resizes two claims, so each GiB counts twice.
+
+        80Gi is 30Gi over the default on each claim: 102Gi + 2 x 30Gi = 162Gi. A size
+        below the default lowers the total the same way, and no claim is added.
+        """
+        base = self._requirements()
+        self.assertEqual(base["requestsStorage"], _OPERATOR_STORAGE_BYTES)
+        totals = {}
+        for size, size_bytes in (("80Gi", 80 * 1024**3), ("20Gi", 20 * 1024**3),
+                                 ("50Gi", _DATA_CLAIM_DEFAULT_BYTES), ("1Ti", 1024**4)):
+            with self.subTest(size=size):
+                req = self._requirements([f"platformAgent.storage.size={size}"])
+                totals[size] = req["requestsStorage"]
+                self.assertEqual(
+                    req["requestsStorage"],
+                    _OPERATOR_STORAGE_BYTES + _DATA_CLAIMS * (size_bytes - _DATA_CLAIM_DEFAULT_BYTES),
+                )
+                self.assertEqual(req["persistentVolumeClaims"], base["persistentVolumeClaims"])
+        self.assertEqual(totals["80Gi"], 162 * 1024**3)
+
+    def test_a_data_volume_size_that_does_not_fit_the_quota_fails_the_render(self) -> None:
+        # The default fits a 102Gi requests.storage quota exactly; 80Gi does not.
+        quota = [{
+            "metadata": {"name": "storage-quota"},
+            "spec": {"hard": {"requests.storage": "102Gi"}},
+            "status": {"hard": {"requests.storage": "102Gi"}, "used": {"requests.storage": "0"}},
+        }]
+        fits = self._render({"probe": {"quotas": quota}})
+        self.assertEqual(fits.returncode, 0, fits.stderr)
+        refused = self._render({"probe": {"quotas": quota}}, ["platformAgent.storage.size=80Gi"])
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("requests.storage", refused.stderr)
+
+    def test_an_oversized_data_volume_size_saturates_rather_than_wraps(self) -> None:
+        """`9Ei` parses to MaxInt64, and two claims of it wrapped the total negative.
+
+        The CR template refuses a size above 64Ti first, so this renders a copy
+        without it, to reach the preflight's own arithmetic.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = pathlib.Path(tmp) / "kube-agents"
+            shutil.copytree(self.chart, chart)
+            (chart / "templates" / "platform-agent-cr.yaml").unlink()
+            original, self.chart = self.chart, chart
+            try:
+                req = self._requirements(["platformAgent.storage.size=9Ei"])
+            finally:
+                self.chart = original
+        self.assertEqual(req["requestsStorage"], 2**63 - 1)
 
     def test_credential_proxy_memory_limit_override_moves_only_that_total(self) -> None:
         """The one key an install raises moves limits.memory by its difference and nothing else.
@@ -835,6 +894,14 @@ class PreflightDecisionTest(unittest.TestCase):
             base["requestsStorage"] + _HINDSIGHT_STORAGE_BYTES,
         )
 
+    def test_web_console_adds_its_pod_and_resources_to_the_totals(self) -> None:
+        """Enabling webConsole adds its one replica and resource requests."""
+        base = self._requirements()
+        with_console = self._requirements(["webConsole.enabled=true"])
+        self.assertEqual(with_console["pods"], base["pods"] + 1)
+        self.assertEqual(with_console["requestsCpu"], base["requestsCpu"] + 50)
+        self.assertEqual(with_console["requestsMemory"], base["requestsMemory"] + 32 * 1024**2)
+
     def test_a_workload_scaled_to_zero_is_not_charged(self) -> None:
         """`replicas | default 1` read a falsy 0 as absent and charged a full replica.
 
@@ -876,7 +943,7 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(without_requests["requestsCpu"], base["requestsCpu"] + diff_millis)
 
     def test_chart_workload_ephemeral_storage_is_counted(self) -> None:
-        """Only the footprint contributed ephemeral storage, so a chart-set value was free."""
+        """A chart-set value replaces LiteLLM's default request, per replica, in the sum."""
         base = self._requirements()
         with_ephemeral = self._requirements(
             [f"litellm.resources.requests.ephemeral-storage={_EPHEMERAL_SET_GIB}Gi"]
@@ -884,7 +951,7 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(
             with_ephemeral["requestsEphemeral"],
             base["requestsEphemeral"]
-            + _EPHEMERAL_SET_GIB * 1024**3 * _LITELLM_REPLICAS,
+            + (_EPHEMERAL_SET_GIB * 1024**3 - _LITELLM_EPHEMERAL_REQUEST_BYTES) * _LITELLM_REPLICAS,
         )
 
     def test_an_empty_hindsight_storage_key_fails_loudly(self) -> None:
@@ -1108,7 +1175,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"26112Mi"', res.stderr)
+        self.assertIn('"limits.memory":"26496Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -1119,7 +1186,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small limits.ephemeral-storage quota must fail"
         )
         self.assertIn("  - limits.ephemeral-storage:", res.stderr)
-        self.assertIn('"limits.ephemeral-storage":"5Gi"', res.stderr)
+        # The release's 8768Mi plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"limits.ephemeral-storage":"10048Mi"', res.stderr)
 
     def test_shorthand_cpu_spelling_is_enforced(self) -> None:
         """`cpu` is the shorthand spelling for `requests.cpu` and must be checked."""
@@ -1137,7 +1205,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        self.assertIn('"memory":"10880Mi"', res.stderr)
+        self.assertIn('"memory":"10944Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -1148,7 +1216,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small ephemeral-storage shorthand quota must fail"
         )
         self.assertIn("  - ephemeral-storage:", res.stderr)
-        self.assertIn('"ephemeral-storage":"5Gi"', res.stderr)
+        # The release's 8768Mi plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"ephemeral-storage":"10048Mi"', res.stderr)
 
     def test_shorthand_storage_spelling_is_enforced(self) -> None:
         """`storage` is the shorthand spelling for `requests.storage`."""
@@ -1157,7 +1226,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small storage shorthand quota must fail")
         self.assertIn("  - storage:", res.stderr)
-        self.assertIn('"storage":"22Gi"', res.stderr)
+        self.assertIn('"storage":"102Gi"', res.stderr)
 
     def test_the_install_patch_for_claims_does_not_double_count_retained_used(self) -> None:
         """Retained claims sitting in `used` on install must not double the suggested patch."""
@@ -1447,7 +1516,7 @@ class DocumentedFootprintTest(unittest.TestCase):
         gib = 1024**3
         # Check that the quota summary sentence quotes the exact current totals without stale figures.
         m_sentence = re.search(
-            r"(\d+)\s+pods,\s+(\d+)\s+persistent volume claims totalling\s+(\d+)\s+GiB of `requests\.storage`,\s+and\s+(\d+)\s+GiB of ephemeral-storage requests against\s+(\d+)\s+GiB of limits\.",
+            r"(\d+)\s+pods,\s+(\d+)\s+persistent volume claims totalling\s+(\d+)\s+GiB of `requests\.storage`,\s+and\s+([\d,]+)\s+MiB of ephemeral-storage requests against\s+([\d,]+)\s+MiB of limits\.",
             page,
         )
         self.assertIsNotNone(
@@ -1464,14 +1533,16 @@ class DocumentedFootprintTest(unittest.TestCase):
             required["requestsStorage"] // gib,
             "stale claim storage",
         )
+        # In MiB: the chart workloads' requests are not whole GiB, and a floor to
+        # GiB would understate what a quota has to hold.
         self.assertEqual(
-            int(m_sentence.group(4)),
-            required["requestsEphemeral"] // gib,
+            int(m_sentence.group(4).replace(",", "")),
+            required["requestsEphemeral"] // 1024**2,
             "stale ephemeral-storage requests",
         )
         self.assertEqual(
-            int(m_sentence.group(5)),
-            required["limitsEphemeral"] // gib,
+            int(m_sentence.group(5).replace(",", "")),
+            required["limitsEphemeral"] // 1024**2,
             "stale ephemeral-storage limits",
         )
 
@@ -1544,6 +1615,9 @@ class DocumentedFootprintTest(unittest.TestCase):
         )
         worker_cpu_limit = self._extract_match(
             r'workerCPULimit\s*=\s*"([^"]+)"', spawn_src, "workerCPULimit"
+        )
+        worker_ephemeral = self._extract_match(
+            r'workerEphemeralStorageRequest\s*=\s*"([^"]+)"', spawn_src, "workerEphemeralStorageRequest"
         )
         worker_mem_limit = self._extract_match(
             r'workerMemoryLimit\s*=\s*"([^"]+)"', spawn_src, "workerMemoryLimit"
@@ -1721,13 +1795,18 @@ class DocumentedFootprintTest(unittest.TestCase):
         )
         self.assertRegex(page, standing_delta_pattern)
 
-        # Assert a2a-worker session pod requests, limits, and delegate-triggered spawn bound:
+        # Assert a2a-worker session pod requests, limits, and what spawns one (a delegate:,
+        # or a /session conversation, which keeps its pod across turns):
         worker_mem_limit_prose = worker_mem_limit.replace("Gi", " GiB")
         worker_clause = (
-            rf"each `delegate:` from chat \(and nothing else, by default\) spawns an "
-            rf"`a2a-worker` session pod requesting {re.escape(worker_cpu)} CPU "
-            rf"and {re.escape(worker_mem)} memory \(limits {re.escape(worker_cpu_limit)} CPU, "
-            rf"(?:{re.escape(worker_mem_limit)}|{re.escape(worker_mem_limit_prose)})\), "
+            rf"each `delegate:` from chat, and each conversation moved to `/session` "
+            rf"\(one pod for the whole conversation, kept until it has been idle 30 minutes "
+            rf"or for 4 hours at most\), spawns an "
+            rf"`a2a-worker` session pod requesting {re.escape(worker_cpu)} CPU, "
+            rf"{re.escape(worker_mem)} memory and {re.escape(worker_ephemeral)} ephemeral storage "
+            rf"\(limits {re.escape(worker_cpu_limit)} CPU, "
+            rf"(?:{re.escape(worker_mem_limit)}|{re.escape(worker_mem_limit_prose)}), "
+            rf"{re.escape(worker_ephemeral)}\), "
             rf"up to `maxSessions` at once"
         )
         self.assertRegex(page, worker_clause)

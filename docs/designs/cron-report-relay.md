@@ -1,4 +1,4 @@
-# Scheduled-report relay: the specialist reasons, the Chat Agent speaks
+# Scheduled-report relay: the specialist's report, in a thread the Chat Agent answers
 
 **Status:** implemented and validated end to end on a live GKE cluster; every
 report-producing job on
@@ -11,7 +11,7 @@ path is broken; see [Detecting a broken leg](#detecting-a-broken-leg).
 A watchdog on a named profile runs with the right brain and no voice.
 
 `profile-cron-tick` fires the specialist's job under its own `HERMES_HOME`, so it
-keeps that profile's persona, skills, model and turn budget — which is the whole
+keeps that profile's persona and the entry's skills, model and turn budget — which is the whole
 reason the watchdogs live on the Platform Agent's roster rather than as kanban
 cards. What it does not get is a way to say anything useful to the person who
 cares.
@@ -30,12 +30,11 @@ follow-up unanswerable.
 
 ## The shape of the fix
 
-Separating who reasons (the specialist) from who speaks (the Chat Agent).
-
 The specialist keeps the work: it runs on its own schedule, in its own profile,
 with its own tools, and produces a finished report. It does not deliver that
-report. It hands it to the Chat Agent, which presents it in the channel and
-therefore owns the conversation that follows.
+report. It hands it to the Session KV server, which posts it into a thread and
+stores it against that thread, so a reply there reaches the Chat Agent with the
+report attached and the Chat Agent owns the conversation that follows.
 
 The trigger is the job's own delivery setting: `deliver: "chat"`.
 
@@ -51,12 +50,10 @@ chat roster: profile-cron-tick  (no_agent, * * * * *)
                           ▼
                  POST /v1/cron-reports        (Session KV server, loopback 8699)
                           │
-                          ├── POST /api/sessions/{sid}/chat   → the Chat Agent's turn
-                          │        message = the report, system_message = relay instructions
-                          │
-                          ├── hermes send                     → what the Chat Agent composed
+                          ├── hermes send                     → the report, as written
                           │   or slack_blocks_post            → a fleet-audit headline as Block Kit
                           │                                     (Slack, KAGE_SLACK_UX on; below)
+                          │   or a2a notify --chat-file       → the same card under spec.mode: next
                           │
                           └── INSERT INTO incidents (chat_id, thread_id, report)
                                        │
@@ -67,9 +64,10 @@ chat roster: profile-cron-tick  (no_agent, * * * * *)
 
 This is the event watcher's delivery path with the reasoning step removed. There,
 an out-of-band signal starts an agent turn that investigates and reports; here
-the investigation already happened and the turn only presents. The three pieces
-that make an alert answerable — a thread, a session bound to it, and the report
-stored against that thread — are reused unchanged.
+the investigation already happened, and no agent turn runs at all (see
+[Why no agent turn runs over the report](#why-no-agent-turn-runs-over-the-report)).
+The pieces that make an alert answerable — a thread, a routing row bound to it,
+and the report stored against that thread — are reused unchanged.
 
 Under `spec.mode: next` the post leg is `a2a notify` through the A2A gateway rather
 than `hermes send`, for the platform the gateway holds (spec-chatops-gateway.md,
@@ -78,8 +76,8 @@ reply typed into it reaches the gateway, which has no binding to the report, so 
 `incident_context` step above does not apply there.
 
 With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report sends a
-headline in place of the composed message (`slack_audit_report.py`, called from
-`relay_cron_report`), provided the Chat Agent composed it, a chat id or a Slack
+headline in place of the report (`slack_audit_report.py`, called from
+`relay_cron_report`), provided a chat id or a Slack
 home channel is known, the job's `skills` (a list or one string, or the legacy `skill`) include
 `fleet-audit`, the message ends
 with a link to an issue in a managed repository, and enough of the posts' budget is
@@ -104,26 +102,42 @@ words for what was not scanned, since a silent gap reads as clean; then the
 ledger link. The relayed line itself, which carries the resolved count and any
 remediation pull requests, is left off the headline and is not posted under it either: every headline links the ledger issue, whose delta comment lists the resolved findings and which the remediation pull requests link back to. The relayed line is the report's last line; when that line is only the ledger link,
 the last unindented, non-list line above it that reads as the audit line (its coverage, a
-findings total or a change count) stands in for it, else the last such line with any count. A closed issue is a clean run, which closes the ledger without rewriting its
-title, so the headline is "<Name>: clean. Ledger closed." and the link, unless the
-relayed line counts a finding. When the issue cannot be read or does not parse,
+findings total or a change count) stands in for it, else the last such line with any count. A closed issue is a clean run, which closes the ledger and then retitles it to
+0 findings above its old body, so the headline is "<Name>: clean. Ledger closed."
+and the link, unless the relayed line counts a finding. When the issue cannot be read or does not parse,
 the leg posts the relayed line in bold with the link. Not parsing includes a title
 of 0 findings, a body listing no finding, a "<n> new" above the
 title's count, a title whose count disagrees with the finding total the relayed
-line states, and a relayed line with no total that counts no non-zero new,
+line states, an issue that disagrees with the count the line leads with (fleet-audit's own
+line states no total and leads with the count of its most severe findings, "2 critical
+findings", which must be the issue's count at that severity, with none more severe), and a relayed line with no total that counts no non-zero new,
 resolved or severity count or calls the run clean, held, carried or nothing
 reproduced (a zero-finding partial or held run leaves the ledger open over its old
-title). A report whose last line is only the link and with no line carrying a
+title, or over a refreshed coverage title when a gap opened the ledger). A run that speaks only
+because findings are no longer reported under a standing gap (`unreported_under_gap`) gets the
+card only when its line's finding total matches the title's count, or the line states a non-zero
+new, resolved or severity count; otherwise it gets the bold line. A report whose last line is only the link and with no line carrying a
 count has no headline and goes out unchanged. A truncation notice leads the leg's
 message but is never read as the relayed line. Nothing is posted into the headline's
 thread, but the incident row stores the full report, so a reply in the thread is
 answered with the whole report. Under a fallback headline, that reply is the only
 way to what the report said beyond its line, such as lines above it or the link
 targets the bold line drops.
-Every other report (Google Chat, an unrelayed report, one that does not end with
-a managed-repository issue link, a job the scheduler already delivered to Slack
+
+`_failed_audit_line` posts the first sentence of a report's "What's wrong" section
+(`slack_audit_report.failed_line`, or `failed_chat` under `spec.mode: next`) for a report
+that ends with no ledger link, and only for a job that runs the fleet-audit skill. The
+scheduled delivery of a job the image ships posts what its `finish` rendered or a notice
+that it did not finish
+([A fleet-audit report comes from `finish`](#a-fleet-audit-report-comes-from-finish-not-the-final-message)),
+and neither has that section, so the line is not posted for it. A fleet-audit job created
+at runtime, and a mid-run `report_to_chat`, still post the model's text, and the line
+still applies to them.
+
+Every other report (Google Chat, one that does not end with
+a managed-repository issue link and is not such a failed run, a job the scheduler already delivered to Slack
 itself when it also left another platform to the relay, or any report with the
-flag off) gets the composed message unchanged. A job whose `deliver` value claims
+flag off) is posted unchanged. A job whose `deliver` value claims
 every platform is relayed to all of them anyway, so its Slack leg gets the
 headline beside the scheduler's raw copy.
 
@@ -146,33 +160,191 @@ when it is the only leg, and answers 200 with Slack in `undelivered` beside anot
 so declining to post the text would trade a possible second headline for a missing
 report. A post Slack accepted without returning a message ts counts as delivered,
 with nothing threaded under it. The caller gives up after the relay plugin's
-`RELAY_TIMEOUT_SECONDS` (360 s), its clock starting first, and the relay turn alone
-can take most of that. So the ledger read and the Block Kit post share a budget of
-half that timeout from the route's start: the Block Kit post stops short of it with
-room left for the text send, and when too little is left to read the ledger the
-composed message goes out as text in one send.
+`RELAY_TIMEOUT_SECONDS` (360 s), its clock starting first. So the ledger read and
+the Block Kit post share a budget of half that timeout from the route's start,
+which leaves the other half for the sends to every platform: the Block Kit post
+stops short of it with room left for the text send, and when too little is left to
+read the ledger the report goes out as text in one send.
 
-## Why the Chat Agent composes but does not send
+Under `spec.mode: next` the gateway holds Slack and the broker's relay is gone, so the
+same card goes to the gateway as a `kube-agents.chat/v1` message instead
+(`slack_audit_report.chat_from_issue`, posted with `a2a notify --chat-file`), and the
+gateway lays it out, buttons included, as it lays out a card's post in a conversation.
+The text headline rides beside it as the fallback the gateway posts when the message
+breaks a rule or Slack refuses it; the leg's own fallbacks above are unchanged.
 
-The Chat Agent cannot post to a chat platform out of band. Its toolset is
-`mcp-router`, `kanban` and `memory`; `terminal` is on its denylist, and
-`agents/chat/config.yaml` calls that denylist "the authoritative guarantee that
-the front door cannot touch the system."
+A fleet-audit report with no ledger link that is fleet-audit's own summary of a run with
+no GitOps repository (`slack_audit_report.summary_card`) gets the same card, built from
+the summary instead of an issue. `_post_summary_card` posts `blocks_from_summary` through
+the relay, or `chat_from_summary` through the gateway under `spec.mode: next`: the
+summary's headline, its finding rows, its other lines under them, and "Look at the first
+one" with no link button. Where the card does not post, `headline_from_summary` goes out
+as text, and the fallbacks are those of the ledger card.
 
-So the relay reads the turn's response body — `POST /api/sessions/{id}/chat`
-returns `{"message": {"role": "assistant", "content": …}}` — and sends that text
-itself. The alternative, giving the Chat Agent a send tool, would widen exactly
-the boundary that file exists to hold, and buy nothing: the voice and the context
-are the Chat Agent's either way.
+`kanban-board-health`'s report gets a card of its own when the stuck tasks are all it
+says: the script leaves its rows, each with the ids of the cards it stands for, in a file
+beside its record, and `_board_health_card` reads that file (`board_health_card.load`)
+only when its text is the report being relayed, with the flag on and a channel known.
+`_post_board_health_card` posts it as Block Kit through the relay (`blocks_from_card`), or
+under `spec.mode: next` as a chat message whose rows carry `tasks` and `actions`
+(`chat_from_card`), with Retry and Drop under each row; its outcomes, and the report going
+out as text where the card does not post, are the audit card's. A tap on either is no turn:
+it unblocks or archives the row's cards through session-kv's `POST /v1/board/actions` and
+edits the row
+([the job's section](../../agents/platform/cron/README.md#kanban-board-health-asks-whether-the-board-is-wedged)).
 
-The relay instruction goes in `system_message`, which the gateway applies as an
-`ephemeral_system_prompt`. It steers this turn without being replayed into every
-later turn of the thread, so a follow-up reaches a Chat Agent that remembers the
-report and not the order to repeat it.
+## Why no agent turn runs over the report
 
-### Which key the loopback call presents
+The relay first ran one Chat Agent turn over each report, told to reproduce it
+verbatim with at most one orienting sentence on top, and posted what the turn
+returned. The aim was that the Chat Agent should present the report and so own
+the conversation that followed. The turn was taken out (#2742) for what it did
+in practice and for what it did not provide:
 
-Not `os.environ["API_SERVER_KEY"]`, which is what every other in-pod caller of
+- **It replaced reports.** On toshiowang-gkedemos3 on 2026-10-08 the turn over
+  `fleet-wide-cost-analysis` filed a kanban card and replied "investigating the
+  connectivity issues in project `toshiowang-gkedemos3`."; stall-watch's
+  all-clear came back as "noted."; on 2026-10-11 a networking audit's report was
+  answered with a question. Each reply was posted as the report and the run was
+  recorded as delivered, because the transport had succeeded.
+- **Its work went nowhere.** A card filed from the turn is subscribed to the
+  turn's own API session. `kanban_event_routing` re-addresses a subscription to a
+  chat thread only when the session's routing row names one, and the turn ran
+  before the post that registers it, so the results of the three cards the
+  2026-10-08 cost report's turns filed were delivered back into a session no one
+  reads.
+- **The report was its input.** The report quotes third-party text (see
+  [The report is untrusted input](#the-report-is-untrusted-input)), and the turn
+  read it with the `kanban` toolset in reach. The gateway API has no per-request
+  way to run a turn without the profile's tools.
+- **It did not provide the context.** A reply in the thread runs in the thread's
+  own session, not in the turn's, and reaches the report through the stored row
+  ([Why context works without an append-only endpoint](#why-context-works-without-an-append-only-endpoint)).
+  What the turn added was the one sentence its instructions allowed.
+
+Platform formatting was never the turn's either: the instructions told it to keep
+the report's markdown, and the adapters render it for each platform on the send.
+
+## A fleet-audit report comes from `finish`, not the final message
+
+Posting the final message as written leaves one gap the turn used to close by
+accident: the final message is the model's whole last turn. On 2026-10-15 a
+`compliance-audit` report arrived after several paragraphs of the model
+reasoning over `finish`'s line and quoting its own instructions (#3217). The turn
+had rewritten that away; posting as written does not.
+
+So for a job that runs the fleet-audit skill, the relay does not post the final
+message at all. The run keeps a record in `chat_report_<audit>.json` in its
+scratch directory, with one entry per repository it starts. `start` adds the
+repository's entry, and `audit_report.py finish` fills it with the chat report
+it renders from its own line and the findings document (`render_chat_report`;
+`summary` on a no-forge run). An SOP that walks several repositories runs
+`start` and `finish` once for each, so a record whose last step is within two
+hours (the stream lease, which covers one step) and that holds no finished
+report for this repository is the same run; any other `start` opens a new
+record, and so does a `start` that finds no finished part, which a run that
+never reached `finish` left. A `start` after a `finish` that died after saving its verdict keeps the record and the verdict, so the next `finish` of that repository is not silent. A `finish` applies the
+age and repository rule, with one exception: a later `finish` of a repository whose entry
+`start` opened and an earlier `finish` filled, while the record's last step is within the
+two hours, is the same run. It adds its report under the earlier one's, below a label line,
+and gives the record a new `run` stamp; when the earlier `finish` died before it wrote its
+report, the later one fills the entry in its place. The first `finish` of the repository in the
+run saves the previous run's finding ids on the entry before it touches the ledger, with every id
+that run filed, rendered or not, so a finding a body over budget cut is not the run's new; a later
+`finish` counts its chat report against them (`run_baseline`): its label says the counts cover the
+whole run, and its line states the run's new and resolved findings, or says the change is unknown
+when the first `finish` had no trusted memory of the previous run. With the ids, the first
+`finish` saves what it read about the last scheduled run, so the line on that chat report that
+says the change since the last scheduled run also covers the whole run (`run_since_scheduled`).
+The JSON line of the later `finish` still counts against the earlier `finish`. Only an entry no `finish` has filled takes the ids, so a later
+`finish` does not save the mid-run memory it reads after an earlier one filled the entry without
+them. A no-forge or HELD report, or an entry without those
+ids, keeps a label that says its counts are against the earlier `finish`: the report above, or
+what it published. The earlier `finish` saves its
+`silent_ok` on the entry as each pull request its sweep opens is created, and again before
+it writes the report store. With it, it saves `news`: true when it reported news or opened a pull
+request. When `news` was true the later one is not silent either and its automatic
+sweep opens no pull request (`earlier_finish`, `silent_floor`). The floor does not read `silent_ok`,
+because an on-demand `finish` always gets `silent_ok: false`, also when it reported nothing new. A `finish` with no `start` fills no entry,
+but while a current record holds this repository's entry with a saved verdict it is taken for a
+later `finish` of that run, and the
+relay posts that run's report again with its own under it. The relay
+reads the record, over the gateway's sandbox login where the shell runs in the
+shell sandbox (`sandbox_exec.read_bytes`).
+
+The relay posts the finished repositories' reports as one message, followed by
+a line naming each repository the run started and did not finish. It posts each
+run once: the run it last posted per job is kept in `audit_report_runs`. The
+onboarding report's audits note reads that table's `posted_at` too: a post at or
+after a run's claim is that run's, a summary or a failure notice. Once a failure notice
+has replaced the row, nothing in it says whether an earlier run posted, so the note
+names that audit (`bootstrap_delivery._relay_posts`). A run
+that failed is delivered as the scheduler's failure line, which the relay
+plugin recognises by its exact opening and the job's name
+(`adapter.SCHEDULER_FAILURE_PREFIXES`, pinned against the scheduler at image
+build) and flags; the relay posts that line in plain words (below) and marks
+the record on disk posted, so a later run cannot post an earlier run's report
+as its own. The flag is read off the text, which the model can also write, so
+when the record's last step is at or after the delivering run's start (its
+`running` row in the profile's `cron/executions.db`, read-only) and it holds a
+finished part, the run reached `finish` and its report is posted instead. Otherwise a record with no finished repository, one already posted,
+or one whose last step is older than two hours means the run did not reach
+`finish`, and the relay posts a one-line notice that the job did not finish in
+place of the final message. A read of the file
+that fails, rather than finding none, posts a second notice naming the failure,
+and leaves the run unposted. `[SILENT]` is unchanged: the scheduler drops a
+silent run before delivery. Only the scheduler's delivery leg is replaced: the relay plugin sends
+`also_delivered_to` on every delivery and `report_to_chat` never does, so a
+mid-run `report_to_chat` is posted as written.
+
+The scheduler's failure line names a CLI and a config file nobody in the
+channel can reach, so for any job, audit or not, the relay posts it as one plain
+line instead (`scheduler_failure_line`): "**The Workload Reliability Audit didn't
+run.** The AI model's usage limit was reached. It will try again tomorrow."
+The reason is the scheduler's own, in plain words, or "It hit an error" for one
+the relay does not name, and the scheduler's line goes to the server's log
+(`logs/session_kv_server.log`, which fluent-bit ships). "tomorrow" is for a job
+whose roster schedule fires once a day, every day (`cron_schedule.is_daily`);
+any other says "It will try again at its next scheduled run." A failure no
+retry clears says so instead of promising one: rejected credentials, and the
+scheduler's blocked-configuration line (which it sends once, running the job no
+more until the configuration is fixed), end with "An admin needs to fix this
+before it can run; the details are in the agent's log." There is no clock time: under `spec.mode: next`, the default
+for a first install, the gateway escapes Slack's `<!date^…>` token, and a time
+in one zone is wrong for most readers. A failure posts once: `scheduler_failure_posts` keeps the reason each
+job last posted, and the same reason is withheld until the job's `completed` row
+in the run ledger starts after that post, or until any delivery from the job
+that is not a failure line, whose own report is the sign it runs again. A
+different reason posts at once, and a ledger the relay cannot read posts rather
+than withholds.
+
+Each report ends with a `Ledger: <url>` line, which the Slack headline reads,
+so a run over one repository gets its card. A message that carries the line
+naming unfinished repositories, or several reports followed by a closing line
+that counts them, does not end with a ledger link, and Slack posts it whole with
+no card, because a card shows one repository's ledger and drops the rest.
+
+The substitution applies only to a job the image's Platform Agent roster ships
+with the fleet-audit skill (`/opt/platform-template/cron/jobs.json`), because
+only such a job runs under the stream id that names the record; a job created at
+runtime keeps posting its final message. A record over 1 MiB posts the
+unreadable notice.
+
+The match is by job id, because Hermes hands the relay no run id, and three
+cases fall outside it. A repository whose `start` was refused, or never run,
+has no entry, so nothing names it. A run that neither fails nor calls `start`
+(the model skips the SOP, or an on-demand run holds the stream) within two hours
+of the last step of a run whose report was never posted, an on-demand run or a
+silent one the scheduler dropped, posts that run's report. And an on-demand run
+of one later repository, followed within two hours by a scheduled run, leaves
+its part in the record the scheduled run joins; the scheduled report then leaves
+out its own first repository, whose ledger issue is still published.
+
+## Which key the loopback call presents
+
+The relay no longer calls the gateway; the event-triage path
+(`trigger_agent_troubleshooter`) still does, and this is why it presents the key
+it does. Not `os.environ["API_SERVER_KEY"]`, which is what every other in-pod caller of
 the gateway uses and what this one used until the first live run. Three things
 disagree about that name, and the environment loses:
 
@@ -243,10 +415,9 @@ background task would only add a way to fail.
 
 ## The report is untrusted input
 
-Before this change a scheduled report was inert text posted into a channel: it
-entered no agent's context. Now it is the message of a real Chat Agent turn, and
-the stored copy is spliced into every later threaded reply — so what a report says
-matters in a way it did not before.
+Before this design a scheduled report was inert text posted into a channel: it
+entered no agent's context. Now the stored copy is spliced into every later
+threaded reply — so what a report says matters in a way it did not before.
 
 The text is not the specialist's own words alone. Every audit on the roster is
 required to back each finding with an `evidence.excerpt` — literal
@@ -258,21 +429,14 @@ And the receiving profile is the delegation surface rather than a bystander: its
 `kanban` toolset, with `dispatch_in_gateway: true`, can file work for specialists
 that hold `terminal`, `gcloud` and `kubectl`.
 
-Both hops are framed, and deliberately not the same way, because only one of them
-is reproduced for a human to read:
-
-- **The relay turn.** The framing goes in the ephemeral system prompt — the
-  trusted channel, read before the report — which names the user message as
-  untrusted data, says to relay it and never act on it, and enumerates the asks
-  to ignore. The body itself is touched as little as possible: only chat-template
-  control tokens (`<|im_start|>` and friends) are blunted, because the Chat Agent
-  reproduces this text essentially verbatim into the user's channel and a report
-  about system components can legitimately contain a `### System:` heading.
-- **The replay into a later reply.** `incident_context` never shows its output to
-  a human, so it can be blunt: the stored report is wrapped in an
-  `<untrusted_report>` fence under a `[SECURITY NOTICE: …]` header, stripped of the
-  tokens that could close the fence or forge a second notice, and followed by the
-  user's own words under a label saying that line alone is theirs.
+The post itself reaches no agent: it is the report, sent as written, and a report
+about system components can legitimately contain a `### System:` heading the reader
+should see. The one hop where an agent reads it is the replay into a later reply,
+and that hop is framed. `incident_context` never shows its output to a human, so it
+can be blunt: the stored report is wrapped in an `<untrusted_report>` fence under a
+`[SECURITY NOTICE: …]` header, stripped of the tokens that could close the fence or
+forge a second notice, and followed by the user's own words under a label saying
+that line alone is theirs.
 
 The pattern is not new here —
 [`platform_mcp_server.py`](../../agents/platform/scripts/platform_mcp_server.py)'s
@@ -282,27 +446,15 @@ loaded by file path and cannot reach the platform agent's scripts.
 
 ### Under `platformFrontDoor`
 
-The separation this design rests on — the specialist reasons, the Chat Agent
-speaks — is a property of _which profile the gateway runs as_, not of the relay.
-`_run_relay_turn` POSTs to whatever `PLATFORM_API_URL` answers, and the
-experimental
+The experimental
 [`platformFrontDoor`](../site/src/content/docs/operator/platformagent-crd.md)
-flag re-homes the gateway onto the platform profile.
+flag re-homes the gateway onto the platform profile, so the agent that answers a
+reply in a report's thread is the Platform Agent rather than the Chat Agent.
+The relay route itself is unaffected: `hermes send` still does the posting, apart
+from a Slack fleet-audit headline posted as Block Kit (above). What changes is
+whether anything reaches the route at all. Two things, both worth stating rather
+than discovering.
 
-Mechanically the relay route is unaffected: it is one more turn on one more
-gateway, the session is created the same way, and `hermes send` still does the
-posting, apart from a Slack fleet-audit headline posted as Block Kit (above). What changes is whether anything reaches the route at all, and who is
-composing when it does. Three things, all worth stating rather than discovering.
-
-- **The composer is no longer the locked-down one.** The Chat Agent's
-  `platform_toolsets.api_server` is `mcp-router`, `kanban` and `memory`; the
-  platform profile's is `mcp-platform_control`, `mcp-gke` and
-  `mcp-developer_knowledge`, and the flag's own documentation says the lockdown
-  is deliberately not copied across. So the agent reading the untrusted report
-  holds fleet tools directly, where by default the worst an injected instruction
-  could reach for was a kanban card. Nothing above stops working, but the
-  framing is carrying more weight, and "who reasons" and "who speaks" become the
-  same agent.
 - **The ticker moves, and the relay loses its supply.** The `--profile` flag
   re-points `HERMES_HOME` before anything imports, and Hermes' cron ticker binds
   to whatever home its own process has. So the gateway starts
@@ -349,9 +501,9 @@ the whole of the goal; retrieving the named report is not part of it.
 Two properties are load-bearing:
 
 - **Labels only, never report text.** `_store_incident_report` persists the
-  relay's composed output rather than the specialist's finding, and this block is
-  prepended to every unthreaded message in the space. A preview line would carry
-  model-written text into all of them. `job_id`, `title` and `profile` are fields
+  report as posted, which quotes third-party text, and this block is prepended to
+  every unthreaded message in the space. A preview line would carry that text
+  into all of them. `job_id`, `title` and `profile` are fields
   the Session KV server wrote itself.
 - **Bounded on both axes.** A window shorter than `CLEANUP_TTL_DAYS`
   (`SESSION_KV_RECENT_REPORTS_HOURS`, default 24) and a row cap
@@ -420,20 +572,16 @@ store rewrites the whole dict from memory and would otherwise erase a peer
 process's write. Until then the cost is one message in the wrong place per report
 thread, carrying a correct answer.
 
-## Session lifetime: one per job, per UTC day
+## Thread lifetime: one per job, per UTC day
 
-One session per _report_ — what the watcher's `per-incident` mode does — gives a
-daily watchdog a new thread every tick, so a follow-up lands in a session that
-has seen one message. One session per _job_, kept forever, is the opposite
-failure: every turn replays the whole history, so a job on a five-minute
-schedule grows an unbounded prompt and relaying report N costs proportionally to
-N.
-
-`cron-<profile>-<job_id>-<YYYYMMDD>` sits between them. Consecutive reports from
-one job share a thread, so the Chat Agent can see it is the third time today;
-the history resets before it can grow without bound. Yesterday's thread does not
-go dark at the rollover, because `incident_context` resolves a reply by thread
-rather than by session id, and those rows live for `CLEANUP_TTL_DAYS`.
+One thread per _report_ — what the watcher's `per-incident` mode does — gives a
+daily watchdog a new thread every tick. One thread per _job_, kept forever, piles
+weeks of reports under one message. The routing row is keyed
+`cron-<profile>-<job_id>-<YYYYMMDD>`, between the two: consecutive reports from
+one job share a thread for the day. No gateway session is created under that id.
+Yesterday's thread does not go dark at the rollover, because `incident_context`
+resolves a reply by thread rather than by routing id, and those rows live for
+`CLEANUP_TTL_DAYS`.
 
 ## Why not a flag on `/sessions/{id}/inject`
 
@@ -454,15 +602,13 @@ finding then existed only in the job's saved output with a line in
 [Detecting a broken leg](#detecting-a-broken-leg)); #1094 records three runs lost that way
 over 30 and 31 August 2026, across `stockout-prevention` and `compliance-audit`,
 whose fleet-wide output runs to several times this cap. The head survives, and
-the message opens with a `[truncated]` line naming `cron/output/<job_id>/`,
-where the whole report is.
+the message opens with a `[truncated]` line naming where the whole report is:
+`cron/output/<job_id>/`, or for a fleet-audit job's record its
+`chat_report_<audit>.json` and the ledger issue.
 
-That line is prepended to the **composed message, after the relay turn** — not
-appended to the report before it. Appended, it is model input, and the relay
-instructions tell the Chat Agent to reproduce the report while adding "nothing
-at the bottom": the one sentence telling a reader the report is incomplete would
-be the sentence the instructions invite it to drop. Prepending it afterwards is
-how `[unrelayed]` already makes the same kind of admission unconditional.
+That line leads the posted message rather than ending it: a reader has to know
+the report is incomplete before reading it, and the Slack audit headline reads
+the report's last line, which the notice must not be.
 
 ## Which platforms a report is posted to
 
@@ -475,6 +621,15 @@ booleans and therefore settles it outright on a deployed pod), then `CONFIG_PATH
 — `/opt/data/config.yaml`, the front door's own writable file rather than a named
 profile's — then per-platform environment signals for an install neither file
 describes.
+
+An install with no chat route gets no send at all: when the managed scope turns
+every platform off and nothing routes one through the gateway — a `next` install
+whose only chat platform is held by the gateway with no home channel, or an
+install with neither Google Chat nor Slack — the relay answers 502 without posting. The detail names the gateway's
+platform from `A2A_NOTIFY_CONVERSATIONS` and the CR field that sets its home
+channel (`composed but not delivered to slack (no home channel: set
+spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`), or says that no route
+exists when no platform can be named.
 
 The one narrowing is `also_delivered_to`: a platform the cron child already
 posted the raw report to is skipped, and where that would empty the set the
@@ -498,20 +653,20 @@ audience and the operator cannot tell which; a report going somewhere unintended
 is visible and correctable, and a report going nowhere was not. An install that
 wants one destination should enable one platform.
 
-Each leg keeps its own thread. A thread id is platform-local, so the session row
+Each leg keeps its own thread. A thread id is platform-local, so the routing row
 carries `platform_threads` — one `(chat_id, thread_id)` per platform — and every
 leg replays only its own. Keeping a single address instead is how a leg that
 failed once stayed unthreaded for the rest of the day: the next report found the
 row naming another platform, posted a fresh top-level message, and did it again
 on every run. The top-level `platform`/`chat_id`/`thread_id` triple still holds
 one address, because the event-triage card has one destination; it goes to the
-leg the session was already routed to, or to the first that landed.
+leg the row was already routed to, or to the first that landed.
 
 An incident row is stored for every leg that landed **on that run**, so a reply
 in any channel the report reached replays it. Storing only one left a reply in
 the other channel answered by an agent that had never seen the report. The
 qualifier is load-bearing in the other direction: `platform_threads` is additive
-and never pruned, and the session id is per job per UTC day, so the map also
+and never pruned, and the routing id is per job per UTC day, so the map also
 holds legs that landed earlier today and failed just now. Writing a row for one
 of those would overwrite that channel's stored context with a report it never
 received, and the store is `INSERT OR REPLACE` on `(chat_id, thread_id)`, so the
@@ -559,13 +714,19 @@ time delivery is reached. `run_one_job` applies the `[SILENT]` check and, on a
 failed run, substitutes `_summarize_cron_failure_for_delivery(job, error)` —
 both _before_ calling `_deliver_result`. So a `deliver: "chat"` job inherits
 silence-on-nothing-to-report and audible failures without asking the model for
-either. One case the scheduler's check misses: it matches the bare marker only,
+either. The relay posts that failure summary in plain words, once until the job
+runs again, and for a fleet-audit job it posts the rendered report in place of
+any other final message. One case the scheduler's check misses: it matches the bare marker only,
 and a run that emphasised it (`**[SILENT]**`, where the SOP asked for the bare
 marker as the whole response) reached both senders. The adapter therefore
 carries its own `is_silent_report`, which undresses the marker before testing,
 and the Slack sender imports the same predicate so the two ends agree. The
-scheduler's direct Google Chat leg, which the two roster jobs on `"all"` still
-use, is upstream's sender and carries no such guard.
+scheduler's direct Google Chat leg, which a job on `"all"` uses, is upstream's
+sender and carries no such guard; no roster job uses `"all"`.
+
+The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`.
+That sentence controls silence, not delivery: a prompt without it only makes the job noisier
+([ledger design §7.5](fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening)).
 
 ## How the switch is wired: `chat` is a platform
 
@@ -618,23 +779,23 @@ every one of them is visible to a job author:
 - **`deliver: "all"` includes the relay**, because `_expand_routing_tokens`
   expands to every platform with a configured home channel and the relay now has
   one. A job left on `all` therefore reports twice on a platform the scheduler
-  can address — once flat into the channel and once through the Chat Agent. The
+  can address — once from the scheduler and once through the relay. The
   relay leg subtracts what it can: `adapter.sibling_delivery_targets` resolves
   the job's `deliver` in the cron child, where alone `all` is known to have
   expanded, and sends the set as `also_delivered_to`; `relay_cron_report` skips
   those platforms. An explicit `platform:chat_id` part counts only when its id
   is that platform's home channel, the one place the relay's leg goes; a DM the
   relay never addresses cannot get a duplicate from it, and claiming it would
-  cost the home channel its only composed copy. The subtraction is one-sided by design — where it would empty
+  cost the home channel its only relayed copy. The subtraction is one-sided by design — where it would empty
   the list it fans out to every platform anyway, because `also_delivered_to`
   says what the scheduler _intended_ to send and a channel that resolved can
   still fail on the send. Two copies is a nuisance; none is a missed audit. So
   on an install where the child can address every enabled platform, a job on
   `all` still posts twice; the subtraction bites only where the child could
   address a strict subset. That is why every report-producing job on the
-  Platform Agent roster names `"chat"` except the two the roster README names:
+  Platform Agent roster names `"chat"`:
   the `deliver` token itself remains additive, and `"chat"` is the only way to
-  ask for one composed copy without depending on a subtraction that is designed
+  ask for one relayed copy without depending on a subtraction that is designed
   to give up rather than risk silence.
   No migration was needed to get there: `deliver` is
   an image-owned key on a named profile, so the entrypoint's existing cron merge
@@ -647,16 +808,11 @@ every one of them is visible to a job author:
   every leg — `hermes send` and the message id it has to parse back — reaches the
   scheduler as an error it records in `last_delivery_error`, naming the leg that
   broke; the report itself is still in the job's saved output.
-  A failed **Chat Agent turn** is the one leg that is not an error, because the
-  finding still belongs in the channel — but it is not a clean run either, and
-  saying so only in a log is how the seven consecutive failures above went
-  unnoticed. So the degradation is stated twice: the posted message is prefixed
-  `[unrelayed]`, naming the profile and job, and the response body carries
-  `"relay": "degraded"` next to `"status": "delivered"`.
-  Both callers had hard-coded the sentence for that cause, so the body also
-  carries `relay_detail`: the route's own wording, which
-  names the cause and never a platform, and which lets another cause land in
-  the route without a client change.
+  The response body also carries `"relay"` and `relay_detail`, which the relay
+  plugin and `platform_mcp_server` read. They reported a failed Chat Agent turn
+  posted as a raw report marked `[unrelayed]`; with no turn, the route answers
+  `"relay": "ok"` and an empty `relay_detail`, and the fields stay so a later
+  cause can land in the route without a client change.
   A send that lands on one platform and not another is a different case, and not
   a degradation — the report reached a channel, so `relay` stays `ok` — but one
   audience has nothing, so the body carries `undelivered`: the platforms that
@@ -715,8 +871,9 @@ and a silent run, recognised from the job's newest file under `cron/output/`,
 moves the high-water mark and changes nothing else. Failures are graded from the
 strings this design produces: `hard` when the report reached no platform (a 502,
 an unreachable relay, no key), `partial` when it landed somewhere but not on the
-platforms the `undelivered` field names, `degraded` when it posted but the Chat
-Agent's turn failed. The scheduler's own two failures, a platform named in
+platforms the `undelivered` field names, `degraded` when it posted but the relay
+said the delivery degraded (only a route that still ran a Chat Agent turn over
+the report did; the grade stays for a cause the route may name later). The scheduler's own two failures, a platform named in
 `deliver` that is not enabled and a `deliver` that resolved to no target, also
 grade `hard`: nothing was delivered either way. A run the scheduler recorded as
 anything but `ok` and that saved no document (interrupted by a gateway shutdown,
@@ -751,7 +908,8 @@ privilege the pod does not already hold.
   token already holds `issues: write`.
   The issue resolver's search excludes the label, so the agent never triages its
   own ledger. With no repository to use, the job falls back to the log line
-  alone. Two installs that manage one repository would share one issue; the
+  alone. A forge with no issue verbs, or no labels, keeps no ledger either: the
+  ALERT line says `ledger=log-only`, and that is not a fault. Two installs that manage one repository would share one issue; the
   fleet-audit ledgers have the same property, and an install-specific ledger
   repository is the answer for both.
 - An **`ALERT chat_delivery_watch` line** appended to
@@ -779,10 +937,12 @@ pod-to-operator path and a new grant first. One such path exists now: the
 operator reads the event watcher's and the credential broker's metrics
 listeners for the usage counters ([design](usage-counters-producer.md)), and it
 carries integer totals and nothing about a report, so the grant is still the
-missing piece. The operator binds no metrics endpoint of its own in the shipped
-deploy; the ones the agent's pods expose are the event watcher's and the
-credential broker's, scraped through the chart's `PodMonitoring`s beside
-LiteLLM's and Hindsight's, and neither carries anything about a report. Those are the next step, with this
+missing piece. The operator's own metrics endpoint, bound since the usage
+gauges landed, serves copies of that status and controller-runtime's series
+([the status as gauges](usage-counters-producer.md#the-status-as-gauges)); the
+ones the agent's pods expose are the event watcher's and the credential
+broker's, scraped through the chart's `PodMonitoring`s beside LiteLLM's and
+Hindsight's, and none of them carries anything about a report. Those are the next step, with this
 section as the record of why the first step took the channels it did.
 
 ## Related

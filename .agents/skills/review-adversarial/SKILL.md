@@ -1,6 +1,6 @@
 ---
 name: review-adversarial
-description: Reviews a change adversarially — establishes what it claims to do, hunts candidates from ten angles, then re-derives every candidate from source as a hostile second reader and reports only what survives.
+description: Reviews a change adversarially — establishes what it claims to do, hunts candidates from eleven angles, then re-derives every candidate from source as a hostile second reader and reports only what survives.
 ---
 
 # Task
@@ -95,7 +95,8 @@ you what moved; the enclosing function tells you whether it still works.
 
 Write down, in one sentence, **what this change claims to do**. Take it from the issue it closes,
 the pull request body, or — for a branch with neither — the change itself. Keep that sentence: it
-is the yardstick for Angle I, and it is what tells you whether a given hunk belongs here at all.
+is the yardstick for Angles F and I, and it is what tells you whether a given hunk belongs here at
+all.
 
 Two failure modes. Do not let the stated intent talk you out of a defect — "known limitation,
 follow-up" does not make a dropped guard correct, though it does change how you phrase the
@@ -103,9 +104,9 @@ finding. And do not treat the stated intent as a description of the diff: where 
 the diff is what merges. A description promising a behaviour the diff does not implement, or
 silent about one it does, is itself a finding.
 
-## 4. Find candidates (ten angles)
+## 4. Find candidates (eleven angles)
 
-Work all ten angles yourself, in sequence. Do not skip an angle because an earlier one found
+Work all eleven angles yourself, in sequence. Do not skip an angle because an earlier one found
 nothing there, and do not let one angle's conclusion suppress another's — if two angles flag the
 same line for different reasons, record both.
 
@@ -183,7 +184,10 @@ shared and adjacent modules, and name the existing helper to call instead.
 **Angle F — simplification and efficiency.** Flag unnecessary complexity the diff adds: redundant
 or derivable state, copy-paste with slight variation, deep nesting, dead code left behind. And
 wasted work: repeated I/O, independent operations run sequentially, blocking work added to startup
-or a hot path. Name the simpler or cheaper form that does the same job.
+or a hot path. Name the simpler or cheaper form that does the same job. A new abstraction, flag,
+config key or option that serves the intent sentence from step 3, but that a smaller change would
+meet without it, is a finding too, and the candidate names that change; Angle I owns what does not
+serve the intent.
 
 **Angle G — altitude.** Check that each change sits at the right depth rather than being a fragile
 bandaid. Special cases layered onto shared infrastructure are a sign the fix isn't deep enough —
@@ -293,10 +297,20 @@ reaches `main` in neither. A hand-off points backwards as often as forwards, so 
 sibling that has already merged rather than concluding from the listing that there is none, and
 check that what it carries exercises this diff rather than only the sibling's own.
 
-For the cleanup, altitude, conventions, scope, and sibling candidates the `failure_scenario` states
-the concrete cost — what is duplicated, wasted, harder to maintain, out of scope, or which rule or
-untested behaviour is at risk — instead of a crash. Correctness bugs always outrank them when
-something has to be cut.
+**Angle K — maintainability and brittleness.** Back on this change alone, ask what it costs to keep
+right. Flag what the team must now keep in sync by hand, a list or value copied from a project this
+repository does not own unless a sync script, generator or pin file owns the copy, a private name of
+another project its owner may rename, a change a future upstream edit must repeat in several places,
+and temporary code beyond the minimum. Flag the brittle forms: a check on a tool's display line
+instead of the value it stands for, a constant copied across files instead of imported, a test that
+passes only in one order, and a test that pins incidental wording. Name the sturdier form or the
+smaller design that drops no behaviour; a candidate with no named alternative is a remark, not a
+finding.
+
+For the cleanup, altitude, maintainability, conventions, scope, and sibling candidates the
+`failure_scenario` states the concrete cost — what is duplicated, wasted, harder to maintain, out
+of scope, or which rule or untested behaviour is at risk — instead of a crash. Correctness bugs
+always outrank them when something has to be cut.
 
 Prefer running things over reasoning about them: execute the test suites the change touches and
 reproduce the failures you claim.
@@ -313,7 +327,9 @@ Confirm the mechanism, not just the conclusion: a real defect reached by an imag
 still a wrong finding. Assign each one a verdict:
 
 - **CONFIRMED** — you can name the inputs or state that trigger it and the resulting wrong output,
-  crash, or misconfiguration. Quote the line.
+  crash, or misconfiguration. Quote the line. For an Angle K candidate, quote both sides of the
+  dependency it names: the two copies, the display text and the value behind it, or the test and
+  the order or wording it relies on.
 - **PLAUSIBLE** — the mechanism is real but the trigger is uncertain (timing, environment, cluster
   state). State what would confirm it. Realistic-but-unproven is PLAUSIBLE, not REFUTED:
   concurrency races, nil on a rare-but-reachable path (error handler, cold cache, absent optional

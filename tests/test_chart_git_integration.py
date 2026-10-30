@@ -19,9 +19,11 @@ it.
 See docs/designs/version-control-support.md §6.
 """
 
+import os
 import pathlib
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 import yaml
@@ -184,7 +186,7 @@ class ChartGitIntegrationTest(unittest.TestCase):
         the rewrite the provider rules exist to refuse."""
         result = _render(
             _CR_TEMPLATE,
-            *_forge(0, name="github", host="gitlab.com"),
+            *_forge(0, name="github", provider="github", host="gitlab.com"),
             *_repo(0, forge="github", repository="group/project", role="gitops"),
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -619,10 +621,12 @@ class ChartGitIntegrationTest(unittest.TestCase):
 
     def test_a_ca_bundle_the_operator_refuses_fails_the_render(self):
         """The same refusals the CRD and the operator make, naming the values
-        key: a github forge reads no CA, and the names are Kubernetes names."""
+        key: github.com takes no private CA, and the names are Kubernetes names."""
         for fields, expected in (
             ({"provider": "github", "namespace": "gke-labs", "caBundleRef.name": "gh-ca"},
-             "caBundleRef is for a gitlab forge"),
+             "caBundleRef is for a self-managed host"),
+            ({"provider": "github", "host": "WWW.GitHub.com", "namespace": "gke-labs", "caBundleRef.name": "gh-ca"},
+             "caBundleRef is for a self-managed host"),
             ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
               "caBundleRef.name": "Bad_Name"}, "caBundleRef.name"),
             ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
@@ -649,6 +653,68 @@ class ChartGitIntegrationTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(f"{_P}forges[0].{expected.split()[0]}", result.stderr)
                 self.assertIn(expected, result.stderr)
+
+    def test_a_github_enterprise_server_forge_renders_as_the_lists(self):
+        """The alias has no host field, so a GitHub forge at a GitHub
+        Enterprise Server host renders as the lists, with its host and CA
+        bundle, even when the alias could carry everything else."""
+        integration = _integration(
+            *_forge(0, name="ghe", provider="github", host="ghe.example.com", namespace="acme"),
+            *_repo(0, forge="ghe", repository="infra", role="gitops"),
+        )
+        self.assertNotIn("github", integration)
+        self.assertEqual("ghe.example.com", integration["forges"][0]["host"])
+        integration = _integration(
+            *_forge(0, name="ghe", provider="github", host="ghe.example.com", namespace="acme"),
+            f"{_P}forges[0].caBundleRef.name=ghe-ca",
+        )
+        self.assertEqual({"name": "ghe-ca"}, integration["forges"][0]["caBundleRef"])
+
+    def test_github_hosts_the_operator_refuses_fail_the_render(self):
+        """Chart parity with the operator: a host under a domain GitHub
+        operates is not a GitHub Enterprise Server, an install serves one
+        GitHub host, and one host is one forge's."""
+        secret = f"{_P}forges[1].credentialsRef.name=gitlab-token"
+        for label, sets, expected in (
+            ("api host", _forge(0, name="gh", provider="github", host="api.github.com", namespace="acme"), "forges[0].host"),
+            ("ghe.com", _forge(0, name="gh", provider="github", host="acme.ghe.com", namespace="acme"), "forges[0].host"),
+            ("content host", _forge(0, name="gh", provider="github", host="raw.githubusercontent.com", namespace="acme"), "forges[0].host"),
+            ("gitlab host", _forge(0, name="gh", provider="github", host="gitlab.com", namespace="acme"), "forges[0].host"),
+            # A forge with no provider at another host is told to name it first,
+            # as the CRD's rule does, not to change a host it did not mean for GitHub.
+            ("gitlab host, no provider", _forge(0, name="gl", host="gitlab.com", namespace="acme"),
+             "forges[0].provider is required"),
+            ("GitHub-operated host, no provider", _forge(0, name="gh", host="acme.ghe.com", namespace="acme"),
+             "forges[0].provider is required"),
+            ("not a hostname", _forge(0, name="gh", provider="github", host="ghe..example.com", namespace="acme"), "forges[0].host"),
+            ("two GitHub hosts", (*_forge(0, name="gh", namespace="acme"),
+                                  *_forge(1, name="ghe", provider="github", host="ghe.example.com", namespace="acme")),
+             "forges[1].host: this install's GitHub host is already github.com"),
+            ("two GHES hosts", (*_forge(0, name="gh", provider="github", host="ghe.example.com", namespace="acme"),
+                                *_forge(1, name="ghe", provider="github", host="ghe.other.example", namespace="acme")),
+             "forges[1].host: this install's GitHub host is already ghe.example.com"),
+            ("unnamed provider", _forge(0, name="gh", host="ghe.example.com", namespace="acme"),
+             "forges[0].provider is required"),
+            ("one host, two providers", (*_forge(0, name="gh", provider="github", host="git.example.com", namespace="acme"),
+                                         *_forge(1, name="gl", provider="gitlab", host="GIT.example.com", namespace="acme"),
+                                         secret),
+             "forges[1].host: git.example.com is already the host of a github forge"),
+            ("two CA bundles", (*_forge(0, name="a", provider="github", host="ghe.example.com", namespace="acme"),
+                                f"{_P}forges[0].caBundleRef.name=ca-one",
+                                *_forge(1, name="b", provider="github", host="ghe.example.com", namespace="beta"),
+                                f"{_P}forges[1].caBundleRef.name=ca-two"),
+             "forges[1].host: ghe.example.com already has a CA bundle"),
+        ):
+            with self.subTest(case=label):
+                result = _render(_CR_TEMPLATE, *sets)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}{expected}", result.stderr)
+        # Two forges on one GitHub host, in two spellings, are one host.
+        integration = _integration(
+            *_forge(0, name="a", namespace="acme"),
+            *_forge(1, name="b", host="www.github.com", namespace="beta"),
+        )
+        self.assertEqual(2, len(integration["forges"]))
 
     def test_a_gitlab_forge_without_a_secret_fails_naming_it(self):
         """The broker would have no token to call GitLab with; the operator
@@ -764,6 +830,193 @@ class ChartGitIntegrationTest(unittest.TestCase):
                 result = _render(_MINTER_TEMPLATE, *_MINTER, *extra)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("name: github-token-minter", result.stdout)
+
+
+# A self-managed Gitea inside the cluster, declared the way an install with
+# no external forge declares it: plain http on the Service's own port.
+_GITEA_FORGE = {
+    "name": "in-cluster-gitea",
+    "provider": "gitea",
+    "host": "gitea-http.gitea.svc.cluster.local",
+    "scheme": "http",
+    "port": 3000,
+    "namespace": "demo",
+    "credentialsRef": {"name": "gitea-token"},
+}
+_GITEA_REPO = {"forge": "in-cluster-gitea", "repository": "gke-fleet-iac", "role": "gitops"}
+
+
+def _render_values(template: str, values: dict) -> subprocess.CompletedProcess:
+    """Renders from a values file, not --set: a number in a values file reaches
+    the template as a float, which is the path a real install takes."""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
+        yaml.safe_dump(values, handle)
+        path = handle.name
+    try:
+        args = ["helm", "template", "t", str(_CHART), "--show-only", template, "-f", path]
+        for value in _HARNESS:
+            args += ["--set", value]
+        return subprocess.run(args, capture_output=True, text=True)
+    finally:
+        os.unlink(path)
+
+
+def _gitea_values(**overrides) -> dict:
+    forge = {**_GITEA_FORGE, **overrides}
+    forge = {k: v for k, v in forge.items() if v is not None}
+    return {"platformAgent": {"integration": {"forges": [forge], "repositories": [_GITEA_REPO]}}}
+
+
+@unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+class ChartGiteaForgeTest(unittest.TestCase):
+    """The schema and the forge helper both have to admit what the CRD admits
+    for gitea, or `helm install` installs nothing and names a key the
+    administrator wrote correctly."""
+
+    def test_a_gitea_forge_over_http_with_a_port_reaches_the_cr(self):
+        result = _render_values(_CR_TEMPLATE, _gitea_values())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        integration = yaml.safe_load(result.stdout)["spec"]["integration"]
+        self.assertNotIn("github", integration)
+        self.assertEqual(
+            integration["forges"],
+            [
+                {
+                    "name": "in-cluster-gitea",
+                    "provider": "gitea",
+                    "host": "gitea-http.gitea.svc.cluster.local",
+                    "scheme": "http",
+                    "port": 3000,
+                    "namespace": "demo",
+                    "credentialsRef": {"name": "gitea-token"},
+                }
+            ],
+        )
+        self.assertEqual(integration["repositories"], [_GITEA_REPO])
+
+    def test_the_minter_refuses_a_gitea_only_install(self):
+        values = _gitea_values()
+        values["githubMinter"] = {
+            "enabled": True, "org": "gke-labs", "repo": "gke-labs/kube-agents",
+        }
+        result = _render_values(_MINTER_TEMPLATE, values)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("declares no github forge", result.stderr)
+
+    def test_a_gitea_forge_without_a_host_fails_naming_it(self):
+        result = _render_values(_CR_TEMPLATE, _gitea_values(host=None))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"{_P}forges[0].host is required", result.stderr)
+
+    def test_a_gitea_forge_without_credentials_ref_fails_naming_it(self):
+        result = _render_values(_CR_TEMPLATE, _gitea_values(credentialsRef=None))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"{_P}forges[0].credentialsRef.name is required", result.stderr)
+
+    def test_a_gitea_forge_with_reserved_saas_host_fails_naming_it(self):
+        for host in (
+            "github.com",
+            "api.github.com",
+            "raw.githubusercontent.com",
+            "gitlab.com",
+            "sub.gitlab.com",
+            "acme.ghe.com",
+        ):
+            with self.subTest(host=host):
+                result = _render_values(_CR_TEMPLATE, _gitea_values(host=host))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f'{_P}forges[0].host is "{host}"', result.stderr)
+
+    def test_a_gitea_forge_refuses_invalid_host_and_namespace(self):
+        for label, overrides, key in (
+            ("single label host", {"host": "gitea"}, "host"),
+            ("empty label host", {"host": "gitea..local"}, "host"),
+            ("http external host", {"host": "gitea.example.com", "scheme": "http"}, "scheme"),
+            ("http with caBundleRef", {"caBundleRef": {"name": "gitea-ca"}}, "caBundleRef"),
+            ("leading dash namespace", {"namespace": "-demo"}, "namespace"),
+            ("long namespace", {"namespace": "a" * 41}, "namespace"),
+            ("host as namespace", {"namespace": "gitea-http.gitea.svc.cluster.local"}, "namespace"),
+        ):
+            with self.subTest(case=label):
+                result = _render_values(_CR_TEMPLATE, _gitea_values(**overrides))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}forges[0].{key}", result.stderr)
+
+    def test_duplicate_gitea_forge_hosts_fail_naming_it(self):
+        for port in (3000, 3001):
+            with self.subTest(port=port):
+                values = _gitea_values()
+                second = {**_GITEA_FORGE, "name": "second-gitea", "port": port}
+                values["platformAgent"]["integration"]["forges"].append(second)
+                result = _render_values(_CR_TEMPLATE, values)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}forges[1].host", result.stderr)
+        with self.subTest(case="gitlab and gitea at same host"):
+            values = {
+                "platformAgent": {
+                    "integration": {
+                        "forges": [
+                            {
+                                "name": "gl",
+                                "provider": "gitlab",
+                                "host": "forge.corp",
+                                "namespace": "acme",
+                                "credentialsRef": {"name": "gl-token"},
+                            },
+                            {
+                                "name": "gt",
+                                "provider": "gitea",
+                                "host": "FORGE.corp",
+                                "namespace": "acme",
+                                "credentialsRef": {"name": "gt-token"},
+                            },
+                        ],
+                        "repositories": [{"forge": "gl", "repository": "infra", "role": "gitops"}],
+                    }
+                }
+            }
+            result = _render_values(_CR_TEMPLATE, values)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn(f"{_P}forges[1].host", result.stderr)
+
+    def test_a_repository_naming_only_the_gitea_host_is_not_a_bare_name(self):
+        """The host-only test reads the forge's own host. Read against
+        GitHub's spellings, `<gitea-host>/` would be called a bare name."""
+        values = _gitea_values(namespace=None)
+        values["platformAgent"]["integration"]["repositories"] = [
+            {"forge": "in-cluster-gitea",
+             "repository": "gitea-http.gitea.svc.cluster.local/", "role": "gitops"},
+        ]
+        result = _render_values(_CR_TEMPLATE, values)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("a bare name", result.stderr)
+
+    def test_scheme_and_port_outside_the_crd_fail_the_schema(self):
+        for label, overrides in (
+            ("scheme", {"scheme": "ftp"}),
+            ("port zero", {"port": 0}),
+            ("port too high", {"port": 65536}),
+        ):
+            with self.subTest(case=label):
+                result = _render_values(_CR_TEMPLATE, _gitea_values(**overrides))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertRegex(result.stderr, r"forges[./]0")
+
+    def test_github_refuses_a_port_and_plain_http(self):
+        for field, value in (("port", "3000"), ("scheme", "http")):
+            with self.subTest(field=field):
+                result = _render(
+                    _CR_TEMPLATE,
+                    *_forge(0, name="github", namespace="gke-labs", **{field: value}),
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}forges[0].{field}", result.stderr)
+
+    def test_an_unknown_provider_names_every_registered_one(self):
+        result = _render(_CR_TEMPLATE, *_forge(0, name="bitbucket", provider="bitbucket"))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f'{_P}forges[0].provider is "bitbucket"; must be one of github, gitlab, gitea',
+                      result.stderr)
 
 
 if __name__ == "__main__":

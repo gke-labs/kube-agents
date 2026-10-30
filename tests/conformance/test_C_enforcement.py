@@ -109,6 +109,337 @@ class C1IsolationIsStructural(unittest.TestCase):
         # ServiceAccount the sandbox pod actually names.
         self.assertIn("shellSandboxServiceAccountName(agent)", body)
 
+    _WATCHER_AUDIENCE = "kubeagents-credential-proxy-watcher"
+
+    def _gateway(self, documents):
+        gateways = [
+            d for d in documents
+            if d.get("kind") == "Deployment" and d["metadata"]["name"].endswith("-gateway")
+        ]
+        self.assertEqual(len(gateways), 1)
+        return gateways[0]
+
+    def test_C1_the_gateway_identity_carries_no_cloud_annotation(self) -> None:
+        """The gateway Pod runs as a ServiceAccount with no Workload Identity binding.
+
+        GKE resolves Workload Identity by the Pod's ServiceAccount, so this is the
+        whole of what keeps a Google token off the model's Pod; the closed
+        metadata route is the second wall. The WI-bound ServiceAccount is the
+        broker's alone. Checked on every golden.
+        """
+        for fixture, documents in h.golden_documents().items():
+            gateway = self._gateway(documents)
+            name = gateway["spec"]["template"]["spec"]["serviceAccountName"]
+            self.assertTrue(name.endswith("-gateway-agent"), f"{fixture}: the gateway runs as {name}")
+            accounts = [
+                d for d in documents
+                if d.get("kind") == "ServiceAccount" and d["metadata"]["name"] == name
+            ]
+            self.assertEqual(len(accounts), 1, f"{fixture}: the operator renders no {name}")
+            annotations = accounts[0]["metadata"].get("annotations") or {}
+            self.assertNotIn(
+                "iam.gke.io/gcp-service-account", annotations,
+                f"{fixture}: the gateway's ServiceAccount is bound to a Google service account",
+            )
+
+    def test_C1_the_gateway_identity_holds_only_the_audited_bindings(self) -> None:
+        """The gateway ServiceAccount holds the minimal, local and leader grants, nothing else.
+
+        Each is a grant it held before the split, under the shared name, and an
+        audit of its own token use found a user for each: the event watcher and
+        drift detector read the management cluster (minimal), the drift join
+        reads the PlatformAgent an audit record names (local), and leader
+        election takes a Lease (leader). The broker, which runs no leader
+        election, no longer holds leader.
+        """
+        for fixture, documents in h.golden_documents().items():
+            name = self._gateway(documents)["spec"]["template"]["spec"]["serviceAccountName"]
+            held = sorted(
+                d["roleRef"]["name"].split(":")[1]
+                for d in documents
+                if d.get("kind") in ("ClusterRoleBinding", "RoleBinding")
+                and any(
+                    s.get("kind") == "ServiceAccount" and s.get("name") == name
+                    for s in d.get("subjects") or []
+                )
+            )
+            self.assertEqual(held, ["leader", "local", "minimal"], f"{fixture}: the gateway holds {held}")
+            leader_subjects = [
+                s.get("name")
+                for d in documents
+                if d.get("kind") == "RoleBinding" and d["roleRef"]["name"].split(":")[1] == "leader"
+                for s in d.get("subjects") or []
+            ]
+            self.assertEqual(leader_subjects, [name], f"{fixture}: the leader Role is bound to {leader_subjects}")
+
+    def test_C1_only_agent_api_auth_holds_a_kubernetes_api_token_in_the_gateway(self) -> None:
+        """No container the model runs in holds a token the API server accepts.
+
+        A default-audience projected token is a Kubernetes API credential. In the
+        gateway Pod only agent-api-auth mounts one (the watchers' in-cluster
+        reads); the platform-agent container holds the chat-audience broker
+        token, which the API server does not accept.
+        """
+        for fixture, documents in h.golden_documents().items():
+            spec = self._gateway(documents)["spec"]["template"]["spec"]
+            self.assertIs(spec.get("automountServiceAccountToken"), False, fixture)
+            volumes = {v["name"]: v for v in spec.get("volumes", [])}
+            holders = sorted(
+                c["name"]
+                for c in spec.get("containers", []) + spec.get("initContainers", [])
+                for m in c.get("volumeMounts", [])
+                for source in (volumes.get(m["name"], {}).get("projected", {}).get("sources") or [])
+                if "serviceAccountToken" in source and not source["serviceAccountToken"].get("audience")
+            )
+            self.assertEqual(holders, ["agent-api-auth"], f"{fixture}: default-audience tokens in {holders}")
+
+    def test_C1_the_watcher_token_is_mounted_only_in_agent_api_auth(self) -> None:
+        """The watcher role reaches fleet API servers and Pub/Sub through the broker.
+
+        The broker confers the role by audience alone, so the question is where a
+        token for the watcher audience is mounted, under any volume name, in any
+        workload: exactly the gateway's agent-api-auth container. Not the Hermes
+        container beside it, which runs model-chosen tools and holds only the
+        chat token; not the sandbox, where model-authored shell runs; not the
+        broker. Checked on every golden.
+        """
+        for fixture, documents in h.golden_documents().items():
+            mounts = set()
+            gateways = []
+            for workload in h.objects_of_kind(documents, "Deployment") + h.objects_of_kind(documents, "StatefulSet"):
+                name = workload["metadata"]["name"]
+                if workload["kind"] == "Deployment" and name.endswith("-gateway"):
+                    gateways.append(name)
+                spec = workload["spec"]["template"]["spec"]
+                watcher_volumes = {
+                    v["name"]
+                    for v in spec.get("volumes", [])
+                    for source in (v.get("projected") or {}).get("sources", [])
+                    if (source.get("serviceAccountToken") or {}).get("audience") == self._WATCHER_AUDIENCE
+                }
+                for container in h.containers_of(workload):
+                    if any(m["name"] in watcher_volumes for m in container.get("volumeMounts", [])):
+                        mounts.add((name, container["name"]))
+            self.assertEqual(len(gateways), 1, f"{fixture}: expected one gateway Deployment")
+            self.assertEqual(
+                mounts,
+                {(gateways[0], "agent-api-auth")},
+                f"{fixture}: a watcher-audience token is mounted in {sorted(mounts)}",
+            )
+
+    def test_C1_the_watcher_cluster_read_never_relays_a_client_credential(self) -> None:
+        """A GKE clusters.get answer carries masterAuth's client certificate and key
+        on a cluster with issuance on: a credential for that API server, wider
+        than anything the watcher role may do. The broker relays the CA only."""
+        import json
+
+        answer = json.dumps({
+            "name": "c",
+            "masterAuth": {"clusterCaCertificate": "CA", "clientCertificate": "CERT", "clientKey": "KEY",
+                           "username": "admin", "password": "pw"},
+        }).encode()
+        relayed = json.loads(h.watcher_policy.project_cluster(answer))
+        self.assertEqual(relayed["masterAuth"], {"clusterCaCertificate": "CA"})
+
+    def test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads(self) -> None:
+        policy = h.watcher_policy
+        target = "kagents-dev/us-east4/fleet-a/"
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            for path in ("api/v1/events", "api/v1/namespaces/default/configmaps/x"):
+                decision = policy.evaluate_k8s(method, target + path, {})
+                self.assertFalse(decision.allowed, f"{method} {path} reaches a fleet API server")
+        for path in (
+            "api/v1/pods",
+            "api/v1/namespaces/default/pods",
+            "api/v1/namespaces/default/pods/x/exec",
+            "api/v1/namespaces/default/serviceaccounts/x/token",
+            "api/v1/namespaces/default/secrets/db",
+            "apis/apps/v1/deployments",
+        ):
+            self.assertFalse(policy.evaluate_k8s("GET", target + path, {}).allowed, f"GET {path} is relayed")
+        # The deprecated watch/<resource> paths the API server still serves: a
+        # watch of anything, Secrets included. Refused by their own rule, not
+        # only because the kind table has no kind called `watch`.
+        for path in ("api/v1/watch/secrets", "apis/apps/v1/watch/deployments"):
+            decision = policy.evaluate_k8s("GET", target + path, {})
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_LEGACY, f"GET {path} is not refused as a legacy path")
+        self.assertTrue(policy.evaluate_k8s("GET", target + "api/v1/events", {"watch": ["1"]}).allowed)
+        # The named read is a kind table, not "anything but Secrets" (#2990):
+        # a listed kind is read, an unlisted one is not, and a listed plural
+        # under another API group is not either.
+        self.assertTrue(
+            policy.evaluate_k8s("GET", target + "apis/apps/v1/namespaces/default/deployments/web", {}).allowed
+        )
+        for path in (
+            "api/v1/nodes/node-1",
+            "apis/cert-manager.io/v1/namespaces/default/certificates/tls",
+            "apis/example.com/v1/namespaces/default/deployments/web",
+        ):
+            decision = policy.evaluate_k8s("GET", target + path, {})
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_KIND, f"GET {path} is relayed")
+        # A Secret is refused by its own rule under any group, not merely by
+        # being absent from a table that a later edit could widen.
+        for path in ("api/v1/namespaces/default/secrets/db", "apis/example.com/v1/namespaces/default/secrets/db"):
+            decision = policy.evaluate_k8s("GET", target + path, {})
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_SECRETS, f"GET {path} is not refused as a Secret")
+
+    def test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription(self) -> None:
+        policy = h.watcher_policy
+        configured = "projects/kagents-dev/subscriptions/platform-agent-drift-audit-sub"
+        for other in (
+            "projects/kagents-dev/subscriptions/another-sub",
+            "projects/elsewhere-1/subscriptions/platform-agent-drift-audit-sub",
+        ):
+            decision = policy.evaluate_gcp("POST", policy.PUBSUB_HOST, f"v1/{other}:pull", b"{}", configured)
+            self.assertFalse(decision.allowed, f"the watcher relay pulls {other}")
+        self.assertFalse(
+            policy.evaluate_gcp("POST", policy.PUBSUB_HOST, f"v1/{configured}:pull", b"{}", "").allowed,
+            "with the detector off the relay still reaches Pub/Sub",
+        )
+        self.assertTrue(
+            policy.evaluate_gcp("POST", policy.PUBSUB_HOST, f"v1/{configured}:pull", b'{"maxMessages":1}', configured).allowed
+        )
+
+    def test_C1_only_the_watcher_role_reaches_the_watcher_routes(self) -> None:
+        proxy = h.credential_proxy
+        for prefix in (h.watcher_policy.WATCHER_GCP_PREFIX, h.watcher_policy.WATCHER_K8S_PREFIX):
+            self.assertEqual(proxy.required_roles(prefix + "x"), (proxy.CALLER_ROLE_WATCHER,), prefix)
+
+    def test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read(self) -> None:
+        """The drift join's custom-resource kinds are the agent's own grant.
+
+        The broker lets the drift detector's join read a GitOps reconciler's
+        sync object by name (watcher_policy.RECONCILER_NAMED_READS), and the
+        operator grants the agent's minimal ClusterRole get/list/watch on the
+        same kinds (#2987). Two modules, so no single test compiles both: a
+        kind added to either side alone either relays an object the agent was
+        never granted or leaves a granted kind unenriched. Every custom-resource
+        kind (a group not on the built-in list below) in the rendered minimal
+        role, on every fixture, is a reconciler kind the join may read, and the
+        reverse, each with get.
+        """
+        expected = set(h.watcher_policy.RECONCILER_NAMED_READS)
+        self.assertTrue(expected, "the reconciler table is empty")
+
+        # Built-in groups by name, not by suffix: a CRD can live under
+        # *.k8s.io too (gateway.networking.k8s.io, snapshot.storage.k8s.io),
+        # and a suffix rule would wave it through on both sides. A built-in
+        # group new to the role or the table fails loudly here, and the fix
+        # is to add it to this list.
+        builtin = frozenset({
+            "", "admissionregistration.k8s.io", "apiextensions.k8s.io", "apps", "autoscaling",
+            "batch", "metrics.k8s.io", "networking.k8s.io", "policy", "rbac.authorization.k8s.io",
+        })
+
+        def custom(group: str) -> bool:
+            return group not in builtin
+
+        # The broker enforces WATCHER_NAMED_READS; the reconciler table is the
+        # only custom-resource part of it, and that is what keeps the two in
+        # step rather than a kind added to the wider table directly.
+        relayed = {kind for kind in h.watcher_policy.WATCHER_NAMED_READS if custom(kind[0])}
+        self.assertEqual(expected, relayed, "a custom-resource kind is relayed outside RECONCILER_NAMED_READS")
+
+        fixtures = h.golden_documents()
+        self.assertTrue(fixtures, "no golden fixtures to read")
+        for fixture, documents in fixtures.items():
+            roles = [
+                d for d in h.objects_of_kind(documents, "ClusterRole")
+                if d["metadata"]["name"].startswith("kubeagents:minimal:")
+            ]
+            with self.subTest(fixture=fixture):
+                self.assertEqual(len(roles), 1, "no single minimal ClusterRole rendered")
+                rules = roles[0].get("rules") or []
+                for rule in rules:
+                    self.assertNotIn("*", rule.get("apiGroups") or [], "a wildcard API group in the minimal role")
+                granted = {
+                    (group, resource)
+                    for rule in rules
+                    if {"get", "*"} & set(rule.get("verbs") or [])
+                    for group in rule.get("apiGroups") or []
+                    if custom(group)
+                    for resource in rule.get("resources") or []
+                }
+                self.assertEqual(
+                    expected,
+                    granted,
+                    "the agent's custom-resource reads and the drift join's reconciler kinds differ. "
+                    "If the role gained a built-in group, add it to builtin here; otherwise, unless the kind is a GitOps sync object, "
+                    "do not widen RECONCILER_NAMED_READS, which widens what the broker relays",
+                )
+
+    def test_C1_the_platform_pubsub_relay_reaches_only_the_configured_subscriptions(self) -> None:
+        """The gateway's Pub/Sub platform adapter pulls through the broker, and only its own subscriptions.
+
+        The gateway pod holds no Google credential (the identity tests above), so
+        the adapter's one path to a subscription is `/v1/pubsub/gcp/`, confined to
+        the set the operator rendered from the AgentPlugin configs. An empty set
+        refuses everything: an install with no Pub/Sub platform relays nothing.
+        """
+        policy = h.watcher_policy
+        configured = frozenset({"projects/kagents-dev/subscriptions/gke-stockout-alerts-sub"})
+        pull = "v1/projects/kagents-dev/subscriptions/gke-stockout-alerts-sub:pull"
+        self.assertTrue(policy.evaluate_pubsub("POST", policy.PUBSUB_HOST, pull, b'{"maxMessages":1}', configured).allowed)
+        for other in (
+            "projects/kagents-dev/subscriptions/platform-agent-drift-audit-sub",
+            "projects/elsewhere-1/subscriptions/gke-stockout-alerts-sub",
+        ):
+            decision = policy.evaluate_pubsub("POST", policy.PUBSUB_HOST, f"v1/{other}:pull", b"{}", configured)
+            self.assertFalse(decision.allowed, f"the platform relay pulls {other}")
+        self.assertFalse(policy.evaluate_pubsub("POST", policy.PUBSUB_HOST, pull, b"{}", frozenset()).allowed)
+        self.assertFalse(
+            policy.evaluate_pubsub("GET", policy.GKE_HOST, "v1/projects/p/locations/l/clusters/c", b"", configured).allowed,
+            "the platform relay reaches the GKE API",
+        )
+
+    def test_C1_only_the_chat_role_reaches_the_platform_pubsub_relay(self) -> None:
+        proxy = h.credential_proxy
+        prefix = h.watcher_policy.PLATFORM_PUBSUB_PREFIX
+        self.assertEqual(proxy.required_roles(prefix + "x"), (proxy.CALLER_ROLE_CHAT,), prefix)
+        self.assertNotIn(proxy.CALLER_ROLE_WATCHER, proxy.required_roles(prefix + "x"))
+
+    def test_C1_no_shipped_platform_adapter_holds_a_google_credential_path(self) -> None:
+        """A platform adapter runs in the gateway pod, which has no Google identity.
+
+        An adapter that imports a Google client library or reads a service
+        account key file is one that will call Google on a credential the pod
+        does not hold, and fail the way the Pub/Sub adapter failed when the
+        gateway lost Workload Identity. Every Google call goes through the broker.
+        """
+        forbidden_roots = {"google", "googleapiclient", "google_auth_httplib2"}
+        key_env = "GOOGLE_APPLICATION_CREDENTIALS"
+        adapters = sorted(h.REPO_ROOT.glob("agentplugins/*/files/platforms/*/*.py"))
+        self.assertTrue(adapters, "no shipped platform adapter found; the glob is stale")
+        for path in adapters:
+            source = path.read_text()
+            tree = ast.parse(source, filename=str(path))
+            for node in ast.walk(tree):
+                names: list[str] = []
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    names = [node.module]
+                for name in names:
+                    self.assertNotIn(
+                        name.split(".")[0], forbidden_roots,
+                        f"{path.relative_to(h.REPO_ROOT)} imports {name}: a platform adapter calls Google through the broker",
+                    )
+            self.assertNotIn(key_env, source, f"{path.relative_to(h.REPO_ROOT)} reads {key_env}")
+        for manifest in sorted(h.REPO_ROOT.glob("agentplugins/*/files/platforms/*/plugin.yaml")):
+            self.assertNotIn(key_env, manifest.read_text(), f"{manifest.relative_to(h.REPO_ROOT)} asks for {key_env}")
+
+    def test_C1_the_operator_pins_the_drift_detectors_own_default_subscription(self) -> None:
+        """The broker refuses every subscription but the one the operator names.
+
+        When the CR names none, the operator names the detector's default; the
+        two constants drifting apart would refuse the detector's every pull.
+        """
+        operator = re.search(r'driftDetectorDefaultSubscription = "([^"]+)"', h.text("broker_split_go"))
+        detector = re.search(r'defaultSubscriptionName = "([^"]+)"', h.text("drift_detector_main_go"))
+        self.assertIsNotNone(operator)
+        self.assertIsNotNone(detector)
+        self.assertEqual(operator.group(1), detector.group(1))
+
     def test_C1_the_credential_broker_is_its_own_deployment(self) -> None:
         """Topology, not configuration -- which is the upgrade #913 delivered.
 
@@ -482,20 +813,25 @@ class C1IsolationIsStructural(unittest.TestCase):
             "fences no pod: fence requires %r, spawner stamps %r" % (required, stamped),
         )
 
-    def test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else(self) -> None:
-        """The gateway's fences admit one peer, to one port: the collector, to metrics.
+    def test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else(self) -> None:
+        """The gateway's fences admit two peers, to one port: the collector and the
+        operator's pods, to metrics.
 
         The A2A gateway's doors listen on loopback, and its fences deny every
         pod on their ports; a door reached from the pod network is a task
         submission endpoint guarded by a bearer token alone. The metrics
         listener is the one port on that pod the pod network is meant to
         reach, and only from the managed-Prometheus collector's namespace --
-        the credential broker's second rule, copied. A rule that admits any
-        other peer, or admits the collector to any other port, widens the
-        gateway past what the metrics listener needed.
+        the credential broker's second rule, copied -- and from the operator's
+        pods in the operator's namespace, which read the gateway's chat counter
+        into status.usage: the rule the broker's and the Hermes gateway's
+        policies carry on their metrics ports. A rule that admits any other
+        peer, or admits either to any other port, widens the gateway past what
+        the metrics listener needed.
 
         Read from the operator's real render (the fixture its Go test keeps
-        equal to the builder), with both doors armed so all three fences
+        equal to the fences as the reconciler applies them, with the operator
+        in its default namespace), with both doors armed so all three fences
         exist: each door's, and the gateway's own, which renders on every next
         gateway door or no door because the metrics listener binds every
         interface (#2473).
@@ -518,6 +854,18 @@ class C1IsolationIsStructural(unittest.TestCase):
         self.assertTrue(doors, "the fixture renders no door port, so nothing here is fenced")
         self.assertNotIn(metrics[0], doors, "the metrics port is also a door's port")
         collector = {"matchLabels": {"kubernetes.io/metadata.name": "gke-gmp-system"}}
+        # The operator peer, pinned to the operator's own label constants.
+        labels = h.text("operator_metrics_peer")
+
+        def go_const(name: str) -> str:
+            match = re.search(rf"^\s*(?:const\s+)?{name}\s*=\s*\"([^\"]+)\"", labels, re.MULTILINE)
+            self.assertIsNotNone(match, f"{name} is no longer a string constant")
+            return match.group(1)
+
+        operator = [{
+            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kubeagents-system"}},
+            "podSelector": {"matchLabels": {go_const("operatorPodNameLabel"): go_const("operatorPodNameValue")}},
+        }]
         # The labels the gateway pod carries, not the Deployment's name: a
         # fence requiring a label the pod lacks selects nothing, and the API
         # server reports that as success.
@@ -539,16 +887,20 @@ class C1IsolationIsStructural(unittest.TestCase):
                 )
                 self.assertIn("Ingress", spec.get("policyTypes") or [], "the fence governs no ingress")
                 rules = spec.get("ingress") or []
-                self.assertEqual(len(rules), 1, "the fence admits more than the collector's rule")
-                rule = rules[0]
+                self.assertEqual(len(rules), 2, "the fence admits more than the collector's rule and the operator's")
                 self.assertEqual(
-                    rule.get("from"), [{"namespaceSelector": collector}],
-                    "the fence admits a peer other than the collector's namespace, alone",
+                    rules[0].get("from"), [{"namespaceSelector": collector}],
+                    "the first rule admits a peer other than the collector's namespace, alone",
                 )
                 self.assertEqual(
-                    rule.get("ports"), [{"port": metrics[0], "protocol": "TCP"}],
-                    "the collector is admitted to a port other than the metrics listener's",
+                    rules[1].get("from"), operator,
+                    "the second rule admits a peer other than the operator's pods in the operator's namespace",
                 )
+                for rule in rules:
+                    self.assertEqual(
+                        rule.get("ports"), [{"port": metrics[0], "protocol": "TCP"}],
+                        "a peer is admitted to a port other than the metrics listener's",
+                    )
 
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.
@@ -684,29 +1036,17 @@ class C1IsolationIsStructural(unittest.TestCase):
             "binding scan above may be reading the wrong file",
         )
 
-    @h.known_violation("C1", "slice-2b/findings.md 1.4 (see gke-labs/kube-agents#676)")
     def test_C1_the_rendered_egress_policy_reaches_no_metadata_address(self) -> None:
-        """KNOWN VIOLATION. The sandbox reaches the metadata server anyway.
+        """No rendered egress rule reaches a metadata address on a credential port.
 
-        This is the invariant `spec.security.egressPolicy: Allowlist` exists to
-        establish, and on this tree it does not hold: the operator-rendered
-        platformagent-gateway-netpol allows 169.254.169.254/32 on TCP 80 -- the
-        metadata server's own ports -- and 169.254.169.252/32 on 988, selecting
-        the same `app: platformagent-gateway` pods that
-        platformagent-sandbox-metadata-deny selects.
+        Closed by the gateway's Workload Identity removal (#2940): the gateway
+        pod holds no Google identity, so its policy carries no metadata rule.
+        The history below is kept because it explains what the assertion guards.
 
-        Two policies over one Pod union their allow-sets, so opting into the
-        allowlist does not subtract what the gateway policy adds.
-
-        The failure is real and the feature does not currently do what its name
-        says. Recorded here rather than repaired because #676 was deliberate:
-        Workload Identity needs the metadata path, and the sidecar layout puts
-        the credential proxy in the Pod that would lose it. Scoping those rules
-        to the broker Pod under splitCredentialBrokerPod is the shape of the
-        fix, and it is a design change to a live-tested slice, not a test edit.
-
-        Deleting this decorator is the signal that the control works: unittest
-        reports the pass as an unexpected success.
+        Until then it was a known violation (#676): platformagent-gateway-netpol
+        allowed 169.254.169.254/32 on TCP 80 and 169.254.169.252/32 on 988 for the
+        gateway's Workload Identity, selecting the same pods the sandbox
+        metadata-deny policy selects, and NetworkPolicies union their allow-sets.
 
         All three metadata addresses, not just the famous one.
 
@@ -745,17 +1085,33 @@ class C1IsolationIsStructural(unittest.TestCase):
             for rule in policy["spec"].get("egress") or []:
                 ports = rule.get("ports") or []
                 # A rule naming no ports opens every port, so it is never the
-                # DNS exemption however it is spelled.
+                # DNS exemption however it is spelled; nor is a port carrying
+                # endPort, which opens a range ({port: 53, endPort: 988} admits
+                # the post-NAT token port) while `port` still reads 53.
                 dns_only = bool(ports) and all(
-                    str(port.get("port")) == "53" for port in ports
+                    str(port.get("port")) == "53" and "endPort" not in port for port in ports
                 )
                 for peer in rule.get("to") or []:
                     block = peer.get("ipBlock")
                     if not block:
                         continue
                     network = ipaddress.ip_network(block["cidr"], strict=False)
+                    # An `except` block is subtracted from the peer, as
+                    # NetworkPolicy subtracts it: the internet rule's
+                    # `0.0.0.0/0 except 169.254.0.0/16` does not reach the
+                    # metadata address, and reading it as if it did kept this
+                    # test red after the real violation was gone.
+                    excepted = [
+                        ipaddress.ip_network(cidr, strict=False)
+                        for cidr in block.get("except") or []
+                    ]
                     for address in addresses:
                         if address.version != network.version:
+                            continue
+                        if any(
+                            address.version == hole.version and address in hole
+                            for hole in excepted
+                        ):
                             continue
                         if dns_only:
                             # The exemption is one address in one role, not a
@@ -1275,7 +1631,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
 
     def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
-        """The MCP tool schema and `lib.DelegateRequest` spell the same two fields.
+        """The MCP tool schema and `lib.DelegateRequest` spell the same fields, bar `parameters`.
 
         The session's harness speaks MCP to the worker-adapter's own server,
         which answers `tools/list` with `delegateToolSchema` -- a
@@ -1292,12 +1648,23 @@ class C1IsolationIsStructural(unittest.TestCase):
         """
         payload = h.text("a2a_payload")
         struct = payload.split("type DelegateRequest struct {")[1].split("\n}")[0]
-        tags = sorted(re.findall(r'`json:"(\w+)"`', struct))
+        # A tag's name runs to its first comma or quote: `json:"parameters,omitempty"`.
+        all_tags = sorted(re.findall(r'`json:"(\w+)[,"]', struct))
         self.assertEqual(
-            ["addressee", "text"],
-            tags,
+            ["addressee", "parameters", "text"],
+            all_tags,
             "lib.DelegateRequest's wire shape changed; this test compared nothing",
         )
+        # `parameters` is on the wire struct but not the tool: the worker
+        # adapter refuses a request carrying any until a gateway reads them
+        # (validateDelegate), so the model is not offered the field. The
+        # exemption holds only while that refusal does.
+        self.assertIn(
+            "if len(req.Parameters) > 0 {",
+            h.text("a2a_worker_adapter_delegate"),
+            "the adapter no longer refuses delegate parameters; declare them in delegateToolSchema",
+        )
+        tags = [t for t in all_tags if t != "parameters"]
 
         mcp = h.text("a2a_worker_adapter_mcp")
         schema = mcp.split("var delegateToolSchema")[1].split("\n}\n")[0]
@@ -1855,6 +2222,53 @@ class C2FailClosed(unittest.TestCase):
 class C3UntrustedByDefault(unittest.TestCase):
     """C3: no privileged decision may be derived from content the agent controls."""
 
+    def test_C3_the_management_project_cannot_come_from_the_agents_env_file(self) -> None:
+        """The reconcile's management project is pinned where the agent cannot outrank it.
+
+        cluster_agent_reconcile.py takes RECONCILE_PROJECT, then GKE_PROJECT_ID, as
+        the management project, and a changed management project retires the old
+        one's profiles. The agent can write $HERMES_HOME/.env, which beats the
+        container env; only the managed .env beats it. So both keys are pinned
+        there on every golden: RECONCILE_PROJECT empty, GKE_PROJECT_ID to the
+        harness's own value.
+        """
+        checked = 0
+        for fixture, documents in h.golden_documents().items():
+            for document in documents:
+                managed = (document.get("data") or {}).get("managed.env") if document.get("kind") == "ConfigMap" else None
+                if managed is None:
+                    continue
+                checked += 1
+                lines = managed.splitlines()
+                self.assertIn("RECONCILE_PROJECT=", lines, fixture)
+                pinned = [line for line in lines if line.startswith("GKE_PROJECT_ID=")]
+                self.assertEqual(len(pinned), 1, f"{fixture}: GKE_PROJECT_ID is not pinned in managed.env")
+                self.assertNotEqual(pinned[0], "GKE_PROJECT_ID=", f"{fixture}: pinned empty, which reads as unset")
+        self.assertGreater(checked, 0, "no golden renders a managed.env; this test would be vacuous")
+
+    def test_C3_the_stall_watch_knobs_cannot_come_from_the_agents_env_file(self) -> None:
+        """The stall watch's knobs are pinned where the agent cannot outrank them.
+
+        stall_watch.py reads STALL_WATCH_EXCLUDE_NAMESPACES, STALL_WATCH_MIN_AGE_MINUTES
+        and STALL_WATCH_KINDS from the environment it inherits after the agent-writable
+        PVC .env is applied, and each one changes what the watch reads or when it alerts.
+        Only the managed .env beats the PVC .env, so all three are pinned there on every
+        golden, empty when the CR's spec.harness.stallWatch does not set them.
+        """
+        keys = ("STALL_WATCH_EXCLUDE_NAMESPACES", "STALL_WATCH_MIN_AGE_MINUTES", "STALL_WATCH_KINDS")
+        checked = 0
+        for fixture, documents in h.golden_documents().items():
+            for document in documents:
+                managed = (document.get("data") or {}).get("managed.env") if document.get("kind") == "ConfigMap" else None
+                if managed is None:
+                    continue
+                checked += 1
+                lines = managed.splitlines()
+                for key in keys:
+                    pinned = [line for line in lines if line.startswith(f"{key}=")]
+                    self.assertEqual(len(pinned), 1, f"{fixture}: {key} is not pinned in managed.env")
+        self.assertGreater(checked, 0, "no golden renders a managed.env; this test would be vacuous")
+
     def test_C3_the_policy_decision_reads_nothing_but_its_argv(self) -> None:
         """The strongest form of "untrusted content cannot reach the decision".
 
@@ -2408,6 +2822,35 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         chart = h.text("chart_admission_policy")
         self.assertIn("failurePolicy: Fail", chart)
         self.assertNotIn("failurePolicy: Ignore", chart)
+
+    def test_C5_the_gateway_pod_policy_holds_its_pods_to_the_session_account(self) -> None:
+        """The A2A gateway's `create` on pods is confined by admission, not by RBAC.
+
+        RBAC cannot see a PodSpec, so buildA2AGatewayRole's grant would let a
+        compromised gateway run a pod as any ServiceAccount in its namespace.
+        kube-agents-a2a-gateway-pod holds those pods to `<name>-a2a-session`
+        and the session token audiences. This is the static half: the policy
+        fails closed, denies, keeps the identity rule, and is tied to the
+        chart copy. k8s-operator's a2a_gateway_pod_policy_envtest_test.go runs
+        it in an API server.
+        """
+        documents = h.yaml_documents("gateway_pod_policy")
+        policy = next(d for d in documents if d.get("kind") == "ValidatingAdmissionPolicy")
+        binding = next(d for d in documents if d.get("kind") == "ValidatingAdmissionPolicyBinding")
+        self.assertEqual("Fail", policy["spec"].get("failurePolicy"))
+        self.assertEqual(["Deny"], binding["spec"].get("validationActions"))
+        self.assertEqual(policy["metadata"]["name"], binding["spec"]["policyName"])
+        self.assertTrue(
+            any(
+                "object.spec.serviceAccountName == variables.sessionAccount" in v["expression"]
+                for v in policy["spec"]["validations"]
+            ),
+            "the policy no longer holds the gateway's pods to the session account",
+        )
+        sync = (h.REPO_ROOT / "hack/sync-chart-manifests.sh").read_text()
+        for tied in (h.SOURCES["gateway_pod_policy"].path, h.SOURCES["chart_gateway_pod_policy"].path):
+            self.assertIn(tied, sync, "the sync script no longer ties the chart copy to the source")
+        self.assertNotIn("failurePolicy: Ignore", h.text("chart_gateway_pod_policy"))
 
 
 def _executor():

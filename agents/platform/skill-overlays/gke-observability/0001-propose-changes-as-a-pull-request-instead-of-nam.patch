@@ -1,0 +1,69 @@
+Subject: Propose changes as a pull request instead of naming write tools
+
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; the gke MCP server offers read tools only (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
+Local-Issue: #3185
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; kube-agents proposes every change as a pull request
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -17,7 +17,9 @@ metrics.
+ 
+ > **MCP Tools:** `gke:get_cluster`, `gke:list_k8s_events`, `gke:get_k8s_logs`,
+ > `gke:get_k8s_cluster_info`, `gke:describe_k8s_resource`. **CLI-only:** `gcloud
+-> container clusters update --monitoring=...`, `gcloud logging read`
++> logging read`
++>
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+ 
+ ## Golden Path Observability Defaults
+ 
+@@ -47,22 +49,14 @@ scheduling delays, stuck controllers).
+ 
+ ## Enabling Full Monitoring
+ 
+-```bash
+-# Enable golden path monitoring suite
+-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
+-  --monitoring=SYSTEM,API_SERVER,SCHEDULER,CONTROLLER_MANAGER,STORAGE,POD,DEPLOYMENT,STATEFULSET,DAEMONSET,HPA,CADVISOR,KUBELET,DCGM \
+-  --quiet
++Each of these is a cluster setting, changed as Config Connector YAML on the cluster's
++`ContainerCluster` through `gcp-config-connector`:
+ 
+-# Enable Managed Prometheus
+-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
+-  --enable-managed-prometheus \
+-  --quiet
+-
+-# Enable Dataplane V2 observability metrics
+-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
+-  --enable-dataplane-v2-flow-observability \
+-  --quiet
+-```
++-   **Golden path monitoring suite**: `spec.monitoringConfig.enableComponents` with the
++    components in the table above.
++-   **Managed Prometheus**: `spec.monitoringConfig.managedPrometheus.enabled: true`.
++-   **Dataplane V2 observability metrics**:
++    `spec.monitoringConfig.advancedDatapathObservabilityConfig` with `enableMetrics: true`.
+ 
+ ## Managed Prometheus
+ 
+@@ -177,14 +171,9 @@ Monitoring and logging have associated costs:
+     per time series
+ -   **Managed Prometheus**: Charged per samples ingested
+ 
+-To reduce costs in non-production:
+-
+-```bash
+-# Reduce to system-only monitoring
+-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
+-  --monitoring=SYSTEM \
+-  --quiet
+-```
++To reduce costs in non-production, reduce to system-only monitoring:
++`spec.monitoringConfig.enableComponents: [SYSTEM_COMPONENTS]` on the cluster's
++`ContainerCluster`, through `gcp-config-connector`.
+ 
+ ## Distributed Tracing & Continuous Profiling (Recommended)
+ 

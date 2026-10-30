@@ -28,7 +28,8 @@ The trailer makes two rebindings:
   loses its events older than the module's stale cutoff (the cursor still
   advances past them), and a fanned-out child's answer folds into its
   parent's (``fold_fanout``: held while the parent works, dropped once the
-  parent's answer is in, posted if the parent's never comes).
+  parent's answer is in, posted if the parent's never comes; on Slack with
+  ``KAGE_SLACK_UX`` on, delivered while the parent works, so its plan row settles).
 
 Ordering. Runs after ``apply_kanban_notify_delivery.py``, which rewrites the
 claim in ``_claim_for_sub`` but leaves the ``active_platforms`` assignment and

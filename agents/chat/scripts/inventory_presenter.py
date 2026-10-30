@@ -10,8 +10,9 @@ the counts the posture states in a sentence saying what was scanned ("3 of 5
 clusters" is 3), then a lead
 ("Two are worth fixing first:") when the total is more than the rows
 shown. The part of the posture naming what was not scanned ("2 clusters could
-not be scanned (permission denied)") is kept, as written, on its own line under
-the headline, since a silent gap reads as clean; a sentence it shares with the
+not be scanned (permission denied)") is kept, as written, on the line under
+the headline (after the posture line in the text layout), since a silent gap
+reads as clean; a sentence it shares with the
 scan counts is split at its clauses, so the counts stay in the headline. A gap
 named after the list joins it from the roll-up, which both layouts leave out,
 and on the card from the closing lines too, which only the text keeps. A
@@ -46,18 +47,24 @@ and 1 low") summed. With no
 roll-up, the total is a closing line's "all <n> findings", then the
 posture's "<n> findings" after a scan verb, then the largest of the closing
 lines' "<n> findings in total" (one may count one cluster), then any other
-"<n> findings" in the posture, then the listed items. The rest of the
+"<n> findings" in the posture, then the listed items. The posture line
+``inventory_findings.py select`` printed, counting the scan's checks and naming
+the audits' areas, is kept whole, first on the line under the headline. The rest of the
 findings, the rest of the posture and any other roll-up paragraph are left out;
 every other closing line is kept as written, counts and all, since they are
 how a text reader asks for the rest. When the roll-up was the last of them,
 "Ask me to see all <n>." takes its place.
 
-``blocks`` is the same card as Block Kit, which ``bootstrap_delivery``
-posts itself when it can: the headline, lead and top rows with no count
-above them, a kept roll-up as a line under them, then a primary "Fix the first one" button and, when the total is
-more than the rows shown, a "See all N" button, both answered as the
+``blocks`` is the same card as Block Kit: the headline, lead and the first
+:data:`CARD_ROWS` findings as rows with no count above them, the lead counting only those, a
+kept roll-up and then the posture line, a sentence a line, under them, the other listed findings folded under
+"<n> more worth a look", then a primary "Fix the first one" button and, when the total is
+more than the findings the report lists, a "See all N" button, both answered as the
 clicker's turn: a click posts the button's label in the card's thread.
-The closing lines are left out too: "See all N" asks for the rest.
+The closing lines are left out too: "See all N" asks for the rest. ``chat``
+is the same card as a ``kube-agents.chat/v1`` message. Neither is the first
+report any more: ``bootstrap_delivery`` posts the card ``inventory_card`` builds
+from the stored findings, and takes ``present`` here when that card cannot be built.
 
 The report is model-written to the format in
 ``agents/platform/governance/inventory_prioritize_sop.md`` (Step 6). A report
@@ -65,7 +72,9 @@ that does not parse to that shape is returned unchanged.
 """
 
 import re
+from typing import NamedTuple
 
+from inventory_findings import SCAN_SCOPE_LINE, SCAN_SCOPE_SENTENCES
 from slack_presenter import as_line, blocks_report, fallback_text, gap_parts, severity_row
 
 BOLD_MARK = "**"
@@ -109,6 +118,9 @@ CARD_NEUTRAL_LEAD_ONE = "Start with this one:"
 FIX_FIRST = "Fix the first one"
 FIX_ONLY = "Fix it"
 SEE_ALL = "See all {count}"
+#: The card shows this many of the listed findings as rows; the rest fold under FOLD_TITLE.
+CARD_ROWS = 2
+FOLD_TITLE = "{count} more worth a look"
 #: Counts written as words in a lead; past the last, the digits.
 COUNT_WORDS = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten"}
 #: Number words a posture may use for a count.
@@ -638,6 +650,16 @@ class _Shape:
         # Otherwise only the roll-up goes: the headline carries its count, and a
         # closing line with a count in it is still how a text reader asks.
         self.closing = [p for p in tail if p is not rollup]
+        # The posture line select prints counts the scan's checks; it is kept whole, since without
+        # it the total reads as the whole fleet's: under the headline as text, under the rows on the
+        # card, whose one line under the headline already carries the gap and the lead and is
+        # clipped at ROW_TEXT_MAX. Step 6 puts it before the list; one written after the list is
+        # lifted out of the closing lines.
+        posture = " ".join(posture.split())
+        after = next((p for p in self.closing if " ".join(p.split()) == SCAN_SCOPE_LINE), None)
+        self.closing = [p for p in self.closing if p is not after]
+        self.scope = SCAN_SCOPE_LINE if SCAN_SCOPE_LINE in posture or after is not None else ""
+        posture = posture.replace(SCAN_SCOPE_LINE, " ")
         clauses = [c.strip() for c in CLAUSE_END.split(posture.replace(BOLD_MARK, "")) if c.strip()]
         split = [_split_gap(c) for c in clauses]
         # A roll-up left out of both layouts has its gap join the posture's.
@@ -713,14 +735,18 @@ def _counted(count: int, nouns: tuple[str, str]) -> str:
     return f"{count} {nouns[count != 1]}"
 
 
-def card_headline(shape: _Shape, closing_gaps: bool = False) -> tuple[str, str, str]:
+def card_headline(
+    shape: _Shape, closing_gaps: bool = False, shown: int | None = None, scope: bool = True
+) -> tuple[str, str, str]:
     """The card's ``(headline, note, detail)``.
 
     The headline says what was scanned and the total. The lead saying what to
     fix first is the note on the headline's line, or, when the report names a
     gap, follows the gap on the line under it, so it still runs into the rows.
     ``closing_gaps`` adds the gaps the closing lines name, for a layout that
-    leaves them out.
+    leaves them out. ``shown`` is how many rows the layout shows, every listed
+    finding when None; the lead counts those. ``scope`` puts the scan's posture
+    line first in the detail, for a layout that does not show it elsewhere.
     """
     scanned = [
         _counted(count, nouns)
@@ -735,18 +761,19 @@ def card_headline(shape: _Shape, closing_gaps: bool = False) -> tuple[str, str, 
         headline = SCANNED_TEMPLATE.format(scanned=SCANNED_JOIN.join(scanned), found=found)
     else:
         headline = FOUND_TEMPLATE.format(found=found)
-    shown = len(shape.top)
+    shown = len(shape.top) if shown is None else shown
     lead = ""
     if shape.total > shown:
-        if any(item[0] in URGENT_SEVERITIES for item in shape.top):
+        if any(item[0] in URGENT_SEVERITIES for item in shape.top[:shown]):
             one, template = CARD_LEAD_ONE, CARD_LEAD_TEMPLATE
         else:
             one, template = CARD_NEUTRAL_LEAD_ONE, CARD_NEUTRAL_LEAD_TEMPLATE
         lead = one if shown == 1 else template.format(count=COUNT_WORDS.get(shown, str(shown)))
         lead = lead[:1].upper() + lead[1:]
     gap = _gap_line(shape.gaps + (shape.closing_gaps if closing_gaps else []))
-    if gap:
-        return headline + LEADS_ON, "", " ".join(part for part in (gap, lead) if part)
+    scope_line = shape.scope if scope else ""
+    if gap or scope_line:
+        return headline + LEADS_ON, "", " ".join(part for part in (scope_line, gap, lead) if part)
     return headline + (LEADS_ON if lead else ROWS_FOLLOW), lead, ""
 
 
@@ -756,24 +783,80 @@ def blocks(report: str) -> tuple[list[dict], str] | None:
     ``text`` is the message's mrkdwn ``text`` field: the headline, the gap and
     lead, then the top rows.
     """
+    card = _card(report)
+    if card is None:
+        return None
+    built = blocks_report(
+        card.headline,
+        note=card.note,
+        detail=card.detail,
+        rows=card.rows,
+        choices=card.choices,
+        action_id_prefix=ACTION_ID_PREFIX,
+        after_rows=card.after,
+        fold_title=card.fold_title,
+        fold_rows=card.folded,
+    )
+    lead = " ".join(part for part in (card.headline, card.note, card.detail) if part)
+    return built, fallback_text(lead, rows=card.rows + card.folded)
+
+
+def chat(report: str) -> tuple[dict, str] | None:
+    """The card as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
+
+    The same headline, rows, fold and buttons as :func:`blocks`, composed by
+    ``chat_message.report_message``; ``text`` is :func:`present`'s markdown,
+    the fallback the gateway posts when it does not lay the message out.
+    """
+    import chat_message
+
+    card = _card(report)
+    if card is None:
+        return None
+    message = chat_message.report_message(
+        card.headline,
+        note=card.note,
+        detail=card.detail,
+        rows=card.rows,
+        choices=card.choices,
+        after_rows=card.after,
+        fold_title=card.fold_title,
+        fold_rows=card.folded,
+    )
+    return message, present(report)
+
+
+class _Card(NamedTuple):
+    headline: str
+    note: str
+    detail: str
+    rows: list[dict]
+    #: The listed findings past :data:`CARD_ROWS`, folded under ``fold_title``.
+    folded: list[dict]
+    fold_title: str
+    choices: list[str]
+    after: str
+
+
+def _card(report: str) -> _Card | None:
+    """The card both layouts draw: the top :data:`CARD_ROWS` rows, the rest folded; None when the report does not parse."""
     # A NUL inside a gap ("could not\0 be scanned") hides it from _split_gap.
     report = report.replace("\0", "")
     shape = _shape(report)
     if shape is None:
         return None
-    headline, note, detail = card_headline(shape, closing_gaps=True)
-    top = _rows(shape.top)
-    label = FIX_FIRST if len(shape.top) > 1 else FIX_ONLY
-    choices: list = [label]
+    shown, folded = shape.top[:CARD_ROWS], shape.top[CARD_ROWS:]
+    headline, note, detail = card_headline(shape, closing_gaps=True, shown=len(shown), scope=False)
+    choices = [FIX_FIRST if len(shape.top) > 1 else FIX_ONLY]
     if shape.total > len(shape.top):
         choices.append(SEE_ALL.format(count=shape.total))
-    built = blocks_report(
+    return _Card(
         headline,
-        note=note,
-        detail=detail,
-        rows=top,
-        choices=choices,
-        action_id_prefix=ACTION_ID_PREFIX,
-        after_rows=" ".join(shape.deferred.split()),
+        note,
+        detail,
+        _rows(shown),
+        _rows(folded),
+        FOLD_TITLE.format(count=len(folded)) if folded else "",
+        choices,
+        "\n".join(filter(None, [" ".join(shape.deferred.split()), *(SCAN_SCOPE_SENTENCES if shape.scope else ())])),
     )
-    return built, fallback_text(" ".join(part for part in (headline, note, detail) if part), rows=top)

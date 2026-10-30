@@ -6,9 +6,11 @@ package hermesbridge
 // Under -Q hermes writes nothing to stdout until the final response, so the
 // bridge cannot learn about tool calls from the pipe it already holds. What
 // hermes does offer is its outbound webhooks (agent/outbound_webhooks.py): a
-// `hooks.outbound` config entry POSTs every pre_tool_call and post_tool_call
-// to a URL, fire-and-forget through a bounded queue, signed with HMAC-SHA256
-// when the variable named by `secret_env` is set. The bridge listens on a
+// `hooks.outbound` config entry POSTs every pre_tool_call, post_tool_call and
+// post_api_request to a URL, fire-and-forget through a bounded queue, signed
+// with HMAC-SHA256 when the variable named by `secret_env` is set. The tool
+// calls become the activity trace and its plan steps; a model request marks
+// where one request ends, and may be the synthesis step (activity_steps.go). The bridge listens on a
 // loopback address (the sidecar shares the pod's network namespace), and
 // hands each child the entry through hermes's managed scope: a per-task
 // directory holding the operator's managed config.yaml and .env with a
@@ -63,6 +65,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
 const (
@@ -190,6 +193,7 @@ const (
 
 	hookPreToolCall     = "pre_tool_call"
 	hookPostToolCall    = "post_tool_call"
+	hookPostAPIRequest  = "post_api_request"
 	hookSignatureHeader = "X-Hermes-Signature-256"
 	hookSignaturePrefix = "sha256="
 	hookStatusOK        = "ok"
@@ -386,6 +390,13 @@ type hookDelivery struct {
 		DurationMs json.Number `json:"duration_ms"`
 		Status     string      `json:"status"`
 		ErrorType  string      `json:"error_type"`
+		// A post_api_request's: how the request ended, its ordinal in the
+		// turn, and hermes's sanitized response, of which the door reads
+		// the finish reason and whether any call was planned, and nothing
+		// else (synthesisLocked).
+		FinishReason string          `json:"finish_reason"`
+		APICallCount json.Number     `json:"api_call_count"`
+		Response     json.RawMessage `json:"response"`
 	} `json:"extra"`
 }
 
@@ -414,6 +425,9 @@ func (d *hookDelivery) UnmarshalJSON(b []byte) error {
 	d.Extra.DurationMs = lenientNumber(extra["duration_ms"])
 	d.Extra.Status = lenientString(extra["status"])
 	d.Extra.ErrorType = lenientString(extra["error_type"])
+	d.Extra.FinishReason = lenientString(extra["finish_reason"])
+	d.Extra.APICallCount = lenientNumber(extra["api_call_count"])
+	d.Extra.Response = extra["response"]
 	return nil
 }
 
@@ -462,6 +476,11 @@ type activityState struct {
 	sessionID string
 	inTurn    atomic.Bool
 
+	// cardsFiled says a kanban_create call of this task's ended without an
+	// error: the turn handed work to cards, so its terminal keeps the ask
+	// marked (cardsMark in bridge.go).
+	cardsFiled atomic.Bool
+
 	// traced says a delivery can reach this task at all: the door is open
 	// and the task has a key, or, on the API executor, the shared secret
 	// to check a session's delivery against.
@@ -480,6 +499,22 @@ type activityState struct {
 	lastTool   string
 	startedAt  time.Time
 	appended   map[string]bool // artifact name -> a first part went out
+
+	// openStep is the plan step the current run of one tool's calls is
+	// building, published when it closes (activity_steps.go); turnSession
+	// is the turn's own hermes session, which a synthesis step must come
+	// from; steps counts the steps published, against activityStepBudget.
+	openStep    *stepmsg.Step
+	turnSession string
+	steps       int
+	// turnCalls is calls for the current turn only, which the synthesis
+	// rule reads: the API route keeps one activityState across a task's
+	// turns, and a follow-up that answers outright did no work however
+	// many calls an earlier turn made (beginTurn). calls stays task-wide.
+	turnCalls int
+	// stepRefused says a step record was refused at encoding and the log
+	// has said so; one line per task (publishSteps).
+	stepRefused atomic.Bool
 
 	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
 	// publishes each one on the delivering request, under run.mu, so no
@@ -543,6 +578,7 @@ func (b *Bridge) apiTraced() bool {
 func newSessionActivityState(sessionID string, traced bool) *activityState {
 	a := newActivityState(false)
 	a.sessionID = sessionID
+	a.turnSession = sessionID
 	a.traced = traced
 	return a
 }
@@ -586,7 +622,7 @@ func hookSigned(key, sig string, body []byte) bool {
 // observe records one delivery. A start opens a call; an end closes it and
 // yields the entry to publish. Ends are the entries (one per invocation, the
 // spec's rule); starts exist so an interrupted call can still be reported.
-func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
+func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool, []stepmsg.Step) {
 	id := d.Extra.ToolCallID
 	if id == "" {
 		// Inline executors carry no call id; the tool name pairs start to
@@ -598,7 +634,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 	defer a.mu.Unlock()
 	if d.DeliveryID != "" {
 		if _, dup := a.seen[d.DeliveryID]; dup {
-			return ActivityEntry{}, false
+			return ActivityEntry{}, false, nil
 		}
 		// The most recent activitySeenCap ids: a retry follows its first
 		// delivery closely, so the oldest id is the one safe to forget.
@@ -611,9 +647,10 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		}
 		a.seen[d.DeliveryID] = struct{}{}
 	}
-	a.lastTool = capRunes(d.ToolName, activityToolNameCap)
+	steps := a.observeStepsLocked(d)
 	switch d.Event {
 	case hookPreToolCall:
+		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 		if _, seen := a.open[id]; !seen {
 			a.openOrder = append(a.openOrder, id)
 		}
@@ -623,14 +660,19 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 			CallID: capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			At:     capRunes(d.Timestamp, activityWordCap),
 		}
-		return ActivityEntry{}, false
+		return ActivityEntry{}, false, steps
 	case hookPostToolCall:
+		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 		if _, seen := a.open[id]; seen {
 			delete(a.open, id)
 			a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == id })
 		}
 		a.calls++
+		a.turnCalls++
 		status := activityStatus(d)
+		if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
+			a.cardsFiled.Store(true)
+		}
 		e := ActivityEntry{
 			Tool:       capRunes(d.ToolName, activityToolNameCap),
 			Input:      redactInput(d.ToolName, d.ToolInput),
@@ -642,9 +684,9 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		if status == ActivityStatusError {
 			e.ErrorType = capRunes(activityErrorType(d), activityWordCap)
 		}
-		return e, true
+		return e, true, steps
 	}
-	return ActivityEntry{}, false
+	return ActivityEntry{}, false, steps
 }
 
 // interrupted returns the calls still open, in start order, as entries, and
@@ -1049,7 +1091,7 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	outbound = append(outbound, map[string]any{
 		"name":       hookEntryName,
 		"url":        b.ActivityURL(),
-		"events":     []any{hookPreToolCall, hookPostToolCall},
+		"events":     []any{hookPreToolCall, hookPostToolCall, hookPostAPIRequest},
 		"secret_env": ActivitySecretEnv,
 		"timeout":    hookTimeoutSeconds,
 	})
@@ -1252,7 +1294,9 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// trace neither as completed nor as interrupted.
 	act := run.act.Load()
 	run.mu.Lock()
-	if entry, ok := act.observe(d); ok {
+	entry, ok, steps := act.observe(d)
+	b.publishSteps(run, act, steps)
+	if ok {
 		if run.state == stateRunning {
 			if act.underBudget() {
 				if !b.publishActivityEntry(run, entry) {
@@ -1340,6 +1384,9 @@ func (b *Bridge) drainActivity(run *taskRun) {
 		return
 	}
 	a.signalStop()
+	// The step the last calls were building closes with the turn, ahead of
+	// the interrupted calls it may hold.
+	b.publishSteps(run, a, a.closeStep())
 	deadline := time.Now().Add(activityDrainBudget)
 	open := a.interrupted()
 	for i, e := range open {
@@ -1389,10 +1436,11 @@ func (b *Bridge) publishActivityEntry(run *taskRun, e ActivityEntry) bool {
 	return b.publishArtifactPart(run, lib.ArtifactActivity, lib.Part{Kind: "data", Data: data})
 }
 
-// publishProgress publishes one text part onto the progress artifact.
-// Caller holds run.mu.
+// publishProgress publishes one text part onto the progress artifact, with a
+// chat message beside it that marks the kind of the task's ask (chat.go), so
+// the ask's reaction stands while the turn runs. Caller holds run.mu.
 func (b *Bridge) publishProgress(run *taskRun, text string) {
-	b.publishArtifactPart(run, lib.ArtifactProgress, lib.Part{Kind: "text", Text: text})
+	b.publishArtifactParts(run, lib.ArtifactProgress, progressParts(text, run.askKind())...)
 }
 
 // publishArtifactPart is the worker adapter's publishArtifactChunk: one part
@@ -1401,6 +1449,21 @@ func (b *Bridge) publishProgress(run *taskRun, text string) {
 // the part went out. The result artifact keeps its own publisher because it
 // is chunked and load-bearing.
 func (b *Bridge) publishArtifactPart(run *taskRun, name string, part lib.Part) bool {
+	return b.publishArtifactParts(run, name, part)
+}
+
+// publishArtifactParts is publishArtifactPart for one chunk of several parts:
+// a heartbeat's text and the chat message beside it.
+func (b *Bridge) publishArtifactParts(run *taskRun, name string, parts ...lib.Part) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), activityPublishTimeout)
+	defer cancel()
+	return b.publishArtifactPartsCtx(ctx, run, name, parts...)
+}
+
+// publishArtifactPartsCtx is publishArtifactParts on the caller's context,
+// for a publish that has to share a budget (publishHandoff, inside
+// finalizeResult's result+terminal budget).
+func (b *Bridge) publishArtifactPartsCtx(ctx context.Context, run *taskRun, name string, parts ...lib.Part) bool {
 	a := run.act.Load()
 	payload, err := json.Marshal(lib.ArtifactUpdate{
 		TaskID:    run.origin.TaskID,
@@ -1408,7 +1471,7 @@ func (b *Bridge) publishArtifactPart(run *taskRun, name string, part lib.Part) b
 		Artifact: lib.Artifact{
 			ArtifactID: "artifact-" + run.origin.TaskID + "-" + name,
 			Name:       name,
-			Parts:      []lib.Part{part},
+			Parts:      parts,
 		},
 		Append: a.appended[name],
 	})
@@ -1426,8 +1489,6 @@ func (b *Bridge) publishArtifactPart(run *taskRun, name string, part lib.Part) b
 	// the next part a non-append that replaces the artifact in every fold.
 	// A lost first part costs one entry; a reset costs the whole trace.
 	a.appended[name] = true
-	ctx, cancel := context.WithTimeout(context.Background(), activityPublishTimeout)
-	defer cancel()
 	if err := b.c.Publish(ctx, lib.TaskEventsSubject(b.cfg.Profile, run.origin.TaskID), env); err != nil {
 		b.cfg.Logger.Warn("artifact publish failed", "task", run.origin.TaskID, "name", name, "err", err)
 		return false

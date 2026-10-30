@@ -21,7 +21,7 @@ spec:
     GitOps repo, never touches another tenant's namespace.
 
   persona:
-    # SOUL.md, AGENTS.md, the chat skills, persona config.
+    # Under /files: persona.yaml, instructions.md, the chat skills, mcp.yaml.
     image: <registry>/kube-agents/persona-chat:2026.08
 
   harness:

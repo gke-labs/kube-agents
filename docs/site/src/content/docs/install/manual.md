@@ -5,6 +5,8 @@ description: Install the Platform Agent workspace into an existing Hermes-compat
 
 If you're not using GKE or the shipping automated installation flow, you can install the Platform Agent workspace into an existing Hermes-compatible harness by hand. This page covers the harness-side setup only; you still need to arrange cluster access, chat ingress, an inference gateway, and (for GitOps flows) a token minter separately.
 
+For a token minter on a GitHub Enterprise Server, see [GitHub Enterprise Server](/kube-agents/deploy/token-minter/#github-enterprise-server) in the token minter guide, and the install steps in [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
+
 ## Prerequisites
 
 - A harness or platform that runs the Hermes agent runtime (`nousresearch/hermes-agent`) with workspace file access and tool execution.
@@ -30,7 +32,7 @@ platform/
 ├── skills/                  # SKILL.md bundles
 ├── governance/              # SOPs the scheduled governance jobs point at
 ├── cron/jobs.json           # the governance watchdog roster (see below)
-├── plugins/                 # in-tree Hermes plugins (incident_context, memory)
+├── plugins/                 # in-tree Hermes plugins (incident_context, pr_opened, memory)
 ├── docs/                    # workspace docs (glossary, console-link templates)
 └── scripts/                 # in-pod Python MCP servers + kanban helpers
 ```
@@ -60,10 +62,10 @@ See [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) and [Ref
 
 The manual install covers only the agent workspace. To reach parity with an automated `install.sh` installation, you still need:
 
-- **Cluster access**: a Kubernetes context the agent can call. The shipping config expects the [GKE MCP server](https://container.googleapis.com/mcp) proxied via `mcp-remote`; for other clusters, substitute your own Kubernetes MCP server or add `kubectl` to the toolset.
+- **Cluster access**: a Kubernetes context the agent can call. The shipping config reaches the [GKE MCP server](https://container.googleapis.com/mcp) through the credential proxy's MCP relay, which the operator wires up (`KUBE_AGENTS_MCP_RELAY_URL`). A manual install has no relay, so point the `gke` entry at your own Kubernetes MCP server or add `kubectl` to the toolset.
 - **Chat ingress**: Google Chat Pub/Sub or Slack Socket Mode. See [ChatOps](/kube-agents/concepts/chatops/).
 - **Inference gateway**: any Completions-API-compatible endpoint (LiteLLM is the default recommendation). See [Inference gateway](/kube-agents/concepts/inference-gateway/).
-- **GitHub token minter**: for the `submit-suggestion` and `github-issue-resolver` skills. See [Deploy → Token minter](/kube-agents/deploy/token-minter/).
+- **GitHub token minter**: for the `submit-suggestion` and `github-issue-resolver` skills. See [Deploy → Token minter](/kube-agents/deploy/token-minter/). A GitOps repository on GitLab needs no minter: the credential broker holds a GitLab access token. See [GitLab as the GitOps forge](/kube-agents/install/gitlab/).
 
 ## Verify
 

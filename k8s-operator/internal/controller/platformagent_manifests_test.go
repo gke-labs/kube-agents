@@ -305,8 +305,8 @@ func TestBuildPVC(t *testing.T) {
 		t.Errorf("expected PVC name test-agent-data, got %s", pvc.Name)
 	}
 	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	if storageReq.String() != "10Gi" {
-		t.Errorf("expected storage request 10Gi, got %s", storageReq.String())
+	if storageReq.String() != "50Gi" {
+		t.Errorf("expected storage request 50Gi, got %s", storageReq.String())
 	}
 }
 
@@ -477,8 +477,11 @@ func TestBuildDeployment(t *testing.T) {
 	if dep.Spec.Template.Spec.RuntimeClassName == nil || *dep.Spec.Template.Spec.RuntimeClassName != "gvisor" {
 		t.Errorf("expected RuntimeClassName gvisor, got %v", dep.Spec.Template.Spec.RuntimeClassName)
 	}
-	if dep.Spec.Template.Spec.ServiceAccountName != "custom-sa" {
-		t.Errorf("expected shared pod service account custom-sa, got %s", dep.Spec.Template.Spec.ServiceAccountName)
+	// The gateway runs as its own operator-minted ServiceAccount whatever
+	// spec.security.serviceAccountName says: that name, and its cloud binding,
+	// are the broker's.
+	if dep.Spec.Template.Spec.ServiceAccountName != gatewayServiceAccountName(agent) {
+		t.Errorf("expected the gateway's own service account %s, got %s", gatewayServiceAccountName(agent), dep.Spec.Template.Spec.ServiceAccountName)
 	}
 	if dep.Spec.Template.Spec.AutomountServiceAccountToken == nil || *dep.Spec.Template.Spec.AutomountServiceAccountToken {
 		t.Errorf("expected sandbox service account token automount to be disabled")
@@ -1297,8 +1300,8 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	}
 	// Drift bills a bucket of its own rather than the Warning one it displays
 	// as, so its ceiling is a fourth variable and has to be overridable by the
-	// same route. Off the allowlist, one multi-object `kubectl apply` spends
-	// the default of 5 and every later drift record that day is lost for good
+	// same route. Off the allowlist, one large `kubectl apply` can spend
+	// the default and every later drift record that day is lost for good
 	// — the detector cannot re-offer one — with no way to raise the cap short
 	// of a new image.
 	if values["ALERT_DAILY_LIMIT_DRIFT"] != "50" {
@@ -1463,6 +1466,15 @@ func TestSafeSandboxEnvOverridesPassesFindingsPacingLimits(t *testing.T) {
 	// A neighbour sharing the prefix is not on the list.
 	if _, ok := values["FINDINGS_QUEUE_DB_PATH"]; ok {
 		t.Errorf("FINDINGS_QUEUE_DB_PATH must not pass, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesWorkloadDedupWindow(t *testing.T) {
+	// session_kv_server.py reads the window from its own environment; off the
+	// allowlist, the documented spec.deployment.env entry never reaches it.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "INCIDENT_WORKLOAD_DEDUP_SECONDS", Value: "900"}})
+	if len(got) != 1 || got[0].Name != "INCIDENT_WORKLOAD_DEDUP_SECONDS" || got[0].Value != "900" {
+		t.Errorf("expected INCIDENT_WORKLOAD_DEDUP_SECONDS=900 to pass, got %#v", got)
 	}
 }
 
@@ -3088,8 +3100,8 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 		t.Errorf("expected ClusterRole name %s, got %s", expectedName, role.Name)
 	}
 
-	if len(role.Rules) != 8 {
-		t.Fatalf("expected 8 PolicyRules, got %d", len(role.Rules))
+	if len(role.Rules) != 12 {
+		t.Fatalf("expected 12 PolicyRules, got %d", len(role.Rules))
 	}
 
 	// Core group rule
@@ -3120,6 +3132,68 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 	expectedMetricsVerbs := []string{"get", "list"}
 	if !slices.Equal(ruleMetrics.Verbs, expectedMetricsVerbs) {
 		t.Errorf("expected Metrics Verbs %v, got %v", expectedMetricsVerbs, ruleMetrics.Verbs)
+	}
+}
+
+// The agent reads the GitOps reconcilers' sync objects to learn which repository
+// and directory syncs a cluster. Nothing in that grant may write or reach a Secret
+// (Argo CD keeps cluster and repository credentials in Secrets), and the kinds the
+// sync lookup does not need stay out, so the readable inline values are bounded
+// to what Applications and Kustomizations carry.
+func TestMinimalPlatformRoleReadsTheGitOpsReconcilers(t *testing.T) {
+	role := buildMinimalPlatformRole(&agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	})
+	want := map[string][]string{
+		"argoproj.io":                 {"applications"},
+		"kustomize.toolkit.fluxcd.io": {"kustomizations"},
+		"source.toolkit.fluxcd.io":    {"gitrepositories", "ocirepositories"},
+		"configsync.gke.io":           {"rootsyncs", "reposyncs"},
+	}
+	excluded := map[string]string{
+		"helmreleases":     "helm.toolkit.fluxcd.io",
+		"applicationsets":  "argoproj.io",
+		"appprojects":      "argoproj.io",
+		"helmrepositories": "source.toolkit.fluxcd.io",
+	}
+	readOnly := []string{"get", "list", "watch"}
+	seen := map[string]bool{}
+	for _, rule := range role.Rules {
+		if slices.Contains(rule.Resources, "secrets") {
+			t.Errorf("minimal role grants secrets in %v", rule.APIGroups)
+		}
+		if slices.Contains(rule.Resources, "*") || slices.Contains(rule.APIGroups, "*") || slices.Contains(rule.Verbs, "*") {
+			t.Errorf("minimal role carries a wildcard: %+v", rule)
+		}
+		for _, resource := range rule.Resources {
+			if group, ok := excluded[resource]; ok && slices.Contains(rule.APIGroups, group) {
+				t.Errorf("minimal role grants %s.%s, which carries inline values or templates", resource, group)
+			}
+		}
+		for _, group := range rule.APIGroups {
+			resources, ok := want[group]
+			if !ok {
+				continue
+			}
+			// Every rule on a pinned group is checked, not only the first: a
+			// second rule on the same group must not widen it unseen.
+			if seen[group] {
+				t.Errorf("%s: more than one rule; the grant must be exactly %v", group, resources)
+				continue
+			}
+			seen[group] = true
+			if !slices.Equal(rule.Resources, resources) {
+				t.Errorf("%s: resources %v, want %v", group, rule.Resources, resources)
+			}
+			if !slices.Equal(rule.Verbs, readOnly) {
+				t.Errorf("%s: verbs %v, want %v", group, rule.Verbs, readOnly)
+			}
+		}
+	}
+	for group := range want {
+		if !seen[group] {
+			t.Errorf("minimal role has no rule for %s", group)
+		}
 	}
 }
 
@@ -3282,6 +3356,9 @@ func TestGetConfigMapHash(t *testing.T) {
 	}
 }
 
+// TestBuildDeploymentHA renders replicas: 2, which the operator caps at one
+// replica (supportedGatewayReplicas) because a multi-replica gateway does not
+// start.
 func TestBuildDeploymentHA(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3300,8 +3377,11 @@ func TestBuildDeploymentHA(t *testing.T) {
 	}
 
 	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	if *dep.Spec.Replicas != 2 {
-		t.Errorf("expected 2 replicas for HA deployment, got %d", *dep.Spec.Replicas)
+	if *dep.Spec.Replicas != 1 {
+		t.Errorf("expected replicas: 2 to be capped at 1, got %d", *dep.Spec.Replicas)
+	}
+	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("expected the single-replica Recreate strategy, got %s", dep.Spec.Strategy.Type)
 	}
 
 	if dep.Spec.Template.Spec.Affinity != nil {
@@ -3399,9 +3479,11 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 		},
 	}
 
+	// Capped at one replica (supportedGatewayReplicas): three renders the
+	// single-replica gateway, with none of the leader-election wiring.
 	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	if *dep.Spec.Replicas != 3 {
-		t.Errorf("expected 3 replicas when explicitly set, got %d", *dep.Spec.Replicas)
+	if *dep.Spec.Replicas != 1 {
+		t.Errorf("expected replicas: 3 to be capped at 1, got %d", *dep.Spec.Replicas)
 	}
 
 	// Leadership is the Lease that leader_elect.py holds, not a config key: nothing in
@@ -3419,11 +3501,10 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 	for _, env := range container.Env {
 		envMap[env.Name] = env
 	}
-	if envMap["ENABLE_LEADER_ELECTION"].Value != "true" {
-		t.Errorf("expected ENABLE_LEADER_ELECTION true, got %s", envMap["ENABLE_LEADER_ELECTION"].Value)
-	}
-	if envMap["LEADER_ELECTION_LEASE_NAME"].Value != "custom-replicas-agent-leader" {
-		t.Errorf("expected LEADER_ELECTION_LEASE_NAME custom-replicas-agent-leader, got %s", envMap["LEADER_ELECTION_LEASE_NAME"].Value)
+	for _, name := range []string{"ENABLE_LEADER_ELECTION", "LEADER_ELECTION_LEASE_NAME", "LEADER_ELECTION_NAMESPACE"} {
+		if env, found := envMap[name]; found {
+			t.Errorf("expected no %s on a capped gateway, got %q", name, env.Value)
+		}
 	}
 }
 
@@ -3464,36 +3545,20 @@ func envValue(c corev1.Container, name string) (string, bool) {
 	return value, found
 }
 
-// TestLeaderElectionKeepsTheImageEntrypoint guards the HA path against the regression
-// where nothing built the shared tree.
-//
-// Setting Command on this container replaces the image ENTRYPOINT
-// (/usr/local/bin/agent-entrypoint), so the setup that seeds $HERMES_HOME from
-// /opt/defaults, scaffolds the platform profile, links plugin volumes, merges the config
-// overlays and starts the Session KV server on 8699 never ran at all — leader_elect.py
-// went straight to Hermes. The dashboard was quietly covering for it by running the setup
-// itself; once the dashboard was correctly gated out, an HA pod had no container doing it.
-func TestLeaderElectionKeepsTheImageEntrypoint(t *testing.T) {
-	dep := buildDeployment(haAgent("ha-agent", 2), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	gateway := containerNamed(t, dep, "platform-agent")
-
-	if len(gateway.Command) != 0 {
-		t.Errorf("Command must stay unset so the image ENTRYPOINT runs the shared-state "+
-			"setup before leader_elect.py; got %v", gateway.Command)
-	}
-	want := []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}
-	if !reflect.DeepEqual(gateway.Args, want) {
-		t.Errorf("expected the leader-election wrapper as the entrypoint's exec target %v, got %v", want, gateway.Args)
-	}
-}
-
+// TestSingleReplicaGatewayUsesTheImageCMD covers the counts above one too: the
+// operator caps them at one replica, so none of them runs leader_elect.py,
+// which exits at startup in a container with no in-cluster token (#2995).
 func TestSingleReplicaGatewayUsesTheImageCMD(t *testing.T) {
-	dep := buildDeployment(haAgent("solo-agent", 1), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	gateway := containerNamed(t, dep, "platform-agent")
+	for _, replicas := range []int32{1, 2, 3} {
+		t.Run(fmt.Sprintf("replicas=%d", replicas), func(t *testing.T) {
+			dep := buildDeployment(haAgent("solo-agent", replicas), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+			gateway := containerNamed(t, dep, "platform-agent")
 
-	if len(gateway.Command) != 0 || len(gateway.Args) != 0 {
-		t.Errorf("expected the image CMD (`hermes gateway run`) to stand, got command=%v args=%v",
-			gateway.Command, gateway.Args)
+			if len(gateway.Command) != 0 || len(gateway.Args) != 0 {
+				t.Errorf("expected the image CMD (`hermes gateway run`) to stand, got command=%v args=%v",
+					gateway.Command, gateway.Args)
+			}
+		})
 	}
 }
 
@@ -3726,15 +3791,21 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// five unconditional pins, none of which is about chat: the loopback bearer (see
-	// the next test), the PVC's directory mode, the mode switch, the scope path, and
-	// the empty management-project override.
+	// ten unconditional pins, none of which is about chat: the loopback bearer (see
+	// the next test), the PVC's directory mode, the mode switch, the scope path, the
+	// empty management-project override, the stall watch's three knobs, empty, the
+	// Pub/Sub platform relay URL, empty, and the project that qualifies its routes.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
 		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
 		kubeagentsModeEnvKey + "=today\n" +
 		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
-		reconcileProjectEnvKey + "=\n"
+		reconcileProjectEnvKey + "=\n" +
+		stallWatchExcludeNamespacesEnvKey + "=\n" +
+		stallWatchMinAgeEnvKey + "=\n" +
+		stallWatchKindsEnvKey + "=\n" +
+		pubsubRelayURLEnvVar + "=\n" +
+		pubsubRelayProjectEnvVar + "=" + pubsubRelayProject(newTestPlatformAgent()) + "\n"
 	if bare != want {
 		t.Errorf("renderManagedEnv with no integration = %q, want %q", bare, want)
 	}
@@ -3801,11 +3872,15 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 	// container env is not a disagreement — only a different answer is.
 	// The mode key is pinned-only by design: the managed .env is the one path the
 	// mode takes into the runtime (spec-mode-switch.md), so a container-env copy
-	// would be a second answer to a question that must have exactly one.
+	// would be a second answer to a question that must have exactly one. The stall
+	// watch's knobs take the same single path to stall_watch.py.
 	pinnedOnly := map[string]bool{
-		"GATEWAY_ALLOWED_USERS":   true,
-		"GATEWAY_ALLOW_ALL_USERS": true,
-		kubeagentsModeEnvKey:      true,
+		"GATEWAY_ALLOWED_USERS":           true,
+		"GATEWAY_ALLOW_ALL_USERS":         true,
+		kubeagentsModeEnvKey:              true,
+		stallWatchExcludeNamespacesEnvKey: true,
+		stallWatchMinAgeEnvKey:            true,
+		stallWatchKindsEnvKey:             true,
 	}
 
 	for _, line := range strings.Split(strings.TrimSpace(renderManagedEnv(agent)), "\n") {
@@ -3986,26 +4061,33 @@ func TestRWOStoragePerReplica(t *testing.T) {
 		},
 	}
 
-	if !useStatefulSet(agent) {
-		t.Fatalf("expected useStatefulSet to be true for multi-replica agent with RWO storage")
+	// replicas > 1 over RWO storage used to select the StatefulSet gateway.
+	// The replica cap renders it as the single-replica Deployment, with the
+	// claim as a standalone PVC mounted from the pod spec.
+	if useStatefulSet(agent) {
+		t.Fatalf("expected the replica cap to keep a multi-replica agent with RWO storage on the Deployment")
 	}
 
 	pvcs, err := buildCustomPVCs(agent)
 	if err != nil {
 		t.Fatalf("unexpected error from buildCustomPVCs: %v", err)
 	}
-	if len(pvcs) != 0 {
-		t.Errorf("expected 0 standalone PVCs when using StatefulSet, got %d", len(pvcs))
+	if len(pvcs) != 1 {
+		t.Errorf("expected 1 standalone PVC on the capped Deployment, got %d", len(pvcs))
 	}
 
 	vols := buildCustomStorageVolumes(agent)
-	if len(vols) != 0 {
-		t.Errorf("expected 0 custom storage volumes in pod spec when using StatefulSet RWO, got %d", len(vols))
+	if len(vols) != 1 {
+		t.Errorf("expected 1 custom storage volume in the capped pod spec, got %d", len(vols))
 	}
 
+	// buildStatefulSet itself is unreachable from the spec under the cap and
+	// is called directly here so its claim-template shape stays pinned. Its
+	// replica count comes through the same capped resolver.
+
 	sts := buildStatefulSet(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	if *sts.Spec.Replicas != 2 {
-		t.Errorf("expected 2 replicas in StatefulSet, got %d", *sts.Spec.Replicas)
+	if *sts.Spec.Replicas != 1 {
+		t.Errorf("expected the capped 1 replica in StatefulSet, got %d", *sts.Spec.Replicas)
 	}
 	if len(sts.Spec.VolumeClaimTemplates) != 1 {
 		t.Fatalf("expected 1 VolumeClaimTemplate in StatefulSet, got %d", len(sts.Spec.VolumeClaimTemplates))
@@ -4146,6 +4228,11 @@ func TestBuildDeployment_AgentPlugins_ImageVolumeUnsupported(t *testing.T) {
 	}
 	if pluginVol.EmptyDir == nil {
 		t.Errorf("expected plugin-myplugin volume source to be EmptyDir, got %+v", pluginVol)
+	} else if sl := pluginVol.EmptyDir.SizeLimit; sl == nil || sl.Cmp(resource.MustParse(pluginStagingSizeLimit)) != 0 {
+		// The staging emptyDir is bounded at the figure emptydir_limits.go
+		// gives; this is the only render of it, since no golden fixture
+		// carries an AgentPlugin.
+		t.Errorf("plugin-myplugin staging emptyDir sizeLimit = %v, want %s", sl, pluginStagingSizeLimit)
 	}
 
 	// 2. InitContainer must stage the plugin
@@ -4438,6 +4525,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 			Env: []corev1.EnvVar{
 				{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
 				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
+				{Name: "KUBE_AGENTS_MCP_RELAY_URL", Value: "http://attacker.invalid/v1/mcp"},
 				{Name: "PATH", Value: "/tmp/hijacked/bin:/usr/bin"},
 				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
 				{Name: "HERMES_MANAGED_DIR", Value: "/opt/data/managed"},
@@ -4465,6 +4553,13 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	// leave the plugin as the only writer.
 	if value, ok := env["CREDENTIAL_PROXY_URL"]; !ok || value != "" {
 		t.Errorf("plugin must not be able to set CREDENTIAL_PROXY_URL, got %q (present=%v)", value, ok)
+	}
+
+	// KUBE_AGENTS_MCP_RELAY_URL is appended after the merge too. A plugin that
+	// could set it would point every mcp-remote child at a listener of its own,
+	// which would then receive the projected token mcp-remote presents.
+	if value := env["KUBE_AGENTS_MCP_RELAY_URL"]; value != mcpRelayURL(agent) {
+		t.Errorf("plugin must not be able to set KUBE_AGENTS_MCP_RELAY_URL, got %q", value)
 	}
 
 	// PATH is appended by the same mechanism and for the same reason, and it is
@@ -6296,8 +6391,9 @@ func TestPlatformFrontDoorArgsSelectTheProfile(t *testing.T) {
 	}{
 		{"off at one replica keeps the image CMD", 1, false, nil},
 		{"on at one replica names the profile", 1, true, []string{"hermes", "--profile", "platform", "gateway", "run"}},
-		{"off above one replica keeps the wrapper", 2, false, []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}},
-		{"on above one replica keeps the wrapper", 2, true, []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}},
+		// Two is capped at one replica, so the argv is the single-replica one.
+		{"off above one replica is capped to the image CMD", 2, false, nil},
+		{"on above one replica is capped and names the profile", 2, true, []string{"hermes", "--profile", "platform", "gateway", "run"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dep := buildDeployment(frontDoorAgent("fd-agent", tc.replicas, tc.on), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
@@ -6462,6 +6558,23 @@ func TestPlatformFrontDoorOverlayKeepsTargetedPlugins(t *testing.T) {
 	}
 }
 
+// TestPlatformFrontDoorOverlayEnablesBackfillPlugins: an existing front-door volume never
+// gains a list entry from the image's config.yaml, so the overlay is what turns these on.
+func TestPlatformFrontDoorOverlayEnablesBackfillPlugins(t *testing.T) {
+	agent := frontDoorAgent("fd-backfill", 1, true)
+	overlay := map[string]any{}
+	raw := buildConfigMapData(agent, nil)[profileOverlayKey(platformProfileName)]
+	if err := yaml.Unmarshal([]byte(raw), &overlay); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v\n%s", err, raw)
+	}
+	enabled := sortedStrings(t, listAt(t, overlay, []string{"plugins", "enabled"}))
+	for _, want := range append(slices.Clone(frontDoorPlugins), "pr_opened") {
+		if !slices.Contains(enabled, want) {
+			t.Errorf("plugins.enabled = %v, missing %q", enabled, want)
+		}
+	}
+}
+
 // TestPlatformFrontDoorOverlayMergesTargetedPluginToolsets guards the second half of the
 // clobber TestPlatformFrontDoorOverlayKeepsTargetedPlugins covers for plugins.enabled.
 //
@@ -6577,7 +6690,7 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 // TestFrontDoorPluginsMatchChatConfig is the drift guard frontDoorPlugins names.
 //
 // The list is derived, not chosen: every ingress plugin the chat profile enables, less the
-// two named below, less the three agents/platform/config.yaml already enables. Adding an
+// two named below, less the ones agents/platform/config.yaml already enables. Adding an
 // ingress plugin to the chat profile and not here is the drift that matters — it hooks a
 // message the front door is the one receiving, so the behaviour is simply lost, with
 // nothing logged.
@@ -7242,6 +7355,11 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 // carries namespace-wide pods:patch on the identity that also holds the agent's
 // Workload Identity annotation. Nothing breaks, nothing logs, and the grant is
 // only found by someone auditing RBAC.
+//
+// Under the replica cap (supportedGatewayReplicas) every row renders one replica,
+// so the pods rule and the arming are both off on every row; the agreement still
+// holds and is still checked. TestLeaderRolePodsRuleVerbsAboveOneReplica keeps
+// the verbs of the multi-replica rule pinned meanwhile.
 func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -7552,5 +7670,34 @@ func TestDeploymentEnvCannotMoveTheWatcherMetricsPort(t *testing.T) {
 	}
 	if found[0] != "9095" {
 		t.Errorf("spec.deployment.env moved the watcher's metrics port to %q", found[0])
+	}
+}
+
+// TestLeaderRolePodsRuleVerbsAboveOneReplica pins the verbs of the leader Role's
+// pods rule at a multi-replica count, read from leaderRoleRules directly because
+// the replica cap keeps every spec-driven render at one replica and so renders
+// the rule nowhere. It is the agent identity's only write grant on workloads, so
+// a verb added to it is worth a red test before the cap lifts (#3016).
+func TestLeaderRolePodsRuleVerbsAboveOneReplica(t *testing.T) {
+	var found bool
+	for _, r := range leaderRoleRules(3) {
+		if !slices.Contains(r.Resources, "pods") {
+			continue
+		}
+		found = true
+		if !slices.Equal(r.Verbs, []string{"get", "patch"}) {
+			t.Errorf("leader Role pods rule grants %v, want [get patch]", r.Verbs)
+		}
+		if !slices.Equal(r.Resources, []string{"pods"}) {
+			t.Errorf("leader Role pods rule reaches %v, want [pods]", r.Resources)
+		}
+	}
+	if !found {
+		t.Error("no pods rule at three replicas")
+	}
+	for _, r := range leaderRoleRules(1) {
+		if slices.Contains(r.Resources, "pods") {
+			t.Errorf("a pods rule at one replica: %v", r)
+		}
 	}
 }

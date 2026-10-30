@@ -7,17 +7,15 @@ description: Specific workflows for scaling GKE workloads using HPA and VPA, as 
 
 This skill provides workflows and best practices for scaling applications on Google Kubernetes Engine (GKE). It covers manual scaling, Horizontal Pod Autoscaling (HPA), and Vertical Pod Autoscaling (VPA).
 
+> You are read-only: each change below is a proposal you report with your findings, never a command you run.
+
 ## Workflows
 
 ### 1. Manual Scaling
 
-Quickly scale a deployment to a fixed number of replicas. Useful for immediate manual intervention or testing.
+Set a deployment to a fixed number of replicas. Useful for immediate manual intervention or testing.
 
-**Command:**
-
-```bash
-kubectl scale deployment <deployment-name> --replicas=<number> -n <namespace>
-```
+Propose the new `spec.replicas` value as a patch to the Deployment.
 
 ### 2. Horizontal Pod Autoscaling (HPA)
 
@@ -28,19 +26,8 @@ Automatically scale the number of pods based on observed CPU utilization, memory
 - Metrics Server must be running (enabled by default on GKE).
 - Containers clearly define resource requests/limits.
 
-**Quick Command:**
-
-```bash
-kubectl autoscale deployment <deployment-name> --cpu-percent=50 --min=1 --max=10
-```
-
-**Manifest Approach (Recommended):**
-Use a YAML manifest for version-controlled configuration.
-See [assets/hpa-example.yaml](assets/hpa-example.yaml) for a template.
-
-```bash
-kubectl apply -f assets/hpa-example.yaml
-```
+**Manifest:**
+Propose an `autoscaling/v2` `HorizontalPodAutoscaler` whose `scaleTargetRef` names the Deployment, with `minReplicas`, `maxReplicas` and a `Resource` metric target (for example, CPU at 50% average utilization). A complete example is in [assets/hpa-example.yaml](assets/hpa-example.yaml).
 
 **Custom Metrics & External Metrics:**
 For GKE, the modern and recommended approach for scaling based on Cloud Monitoring metrics (e.g., Pub/Sub queue length) is to use the **External** metric type, which is natively supported by the GKE control plane without requiring the Custom Metrics Adapter. For application-specific metrics exposed via Prometheus, you can use **Google Cloud Managed Service for Prometheus** or the Prometheus Adapter.
@@ -55,11 +42,8 @@ Automatically adjust the CPU and memory reservations for your pods to match actu
   - **Autopilot:** Enabled by default.
   - **Standard:** Must be enabled manually.
 
-**Enable VPA on Standard Cluster:**
-
-```bash
-gcloud container clusters update <cluster-name> --enable-vertical-pod-autoscaling --zone <zone>
-```
+**VPA on a Standard Cluster:**
+Propose turning on vertical Pod autoscaling for the cluster (Config Connector `ContainerCluster` field `spec.verticalPodAutoscaling.enabled: true`).
 
 **Update Modes:**
 
@@ -69,22 +53,14 @@ gcloud container clusters update <cluster-name> --enable-vertical-pod-autoscalin
 - `InPlaceOrRecreate`: Attempts to update Pod resources without recreating the Pod. If in-place update is not possible, it reverts to `Auto` mode (requires GKE 1.34+).
 
 **Example:**
-See [assets/vpa-example.yaml](assets/vpa-example.yaml) for a configuration template.
+Propose an `autoscaling.k8s.io/v1` `VerticalPodAutoscaler` whose `targetRef` names the Deployment, with an `updatePolicy.updateMode` from the list above and, if needed, `minAllowed`/`maxAllowed` bounds per container. A complete example is in [assets/vpa-example.yaml](assets/vpa-example.yaml).
 
 ### 4. Cluster Autoscaler
 
 While not a workload-level scaler, the Cluster Autoscaler is essential for ensuring your cluster has enough nodes to run the scaled pods.
 
-**Enable on a Node Pool:**
-
-```bash
-gcloud container clusters update <cluster-name> \
-    --enable-autoscaling \
-    --node-pool <node-pool-name> \
-    --min-nodes <min> \
-    --max-nodes <max> \
-    --zone <zone>
-```
+**On a Node Pool:**
+Propose node-pool autoscaling with a minimum and maximum node count (Config Connector `ContainerNodePool` fields `spec.autoscaling.minNodeCount` and `spec.autoscaling.maxNodeCount`).
 
 ## Best Practices
 

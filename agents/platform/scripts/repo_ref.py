@@ -88,8 +88,9 @@ FLAG_PREFIX = "-"
 
 #: Every spelling of GitHub that can appear in a remote this install produces.
 #: `ssh.github.com` is GitHub's SSH-over-443 endpoint, which shows up in a clone
-#: URL. An enterprise host is deliberately absent: Minty issues tokens for
-#: github.com installations only.
+#: URL. A GitHub Enterprise Server host is not a spelling of github.com, so it
+#: is absent: it is the install's declared GitHub host, which the broker's
+#: registry and `gitops_workspace.github_host` know and this module does not.
 GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
 
 #: The one spelling that appears in a repository *registration*, as opposed to a

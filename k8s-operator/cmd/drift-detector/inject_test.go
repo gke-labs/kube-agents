@@ -61,6 +61,13 @@ type fakeDaemon struct {
 
 	// headers holds the headers of every request, in arrival order.
 	headers []http.Header
+
+	// backlogStatus is the HTTP code driftBacklogPath answers with, zero for
+	// 200; backlogPayloads holds what arrived there.
+	backlogStatus   int
+	backlogPayloads []DriftInjectPayload
+	backlogAttempts int
+	backlogHeaders  []http.Header
 }
 
 // newFakeDaemon starts a server and returns it with its base URL.
@@ -90,6 +97,25 @@ func newFakeDaemon(t *testing.T) (*fakeDaemon, string) {
 			}
 			w.Header().Set(contentTypeHeader, contentTypeJSON)
 			_, _ = w.Write([]byte(body))
+			return
+		}
+
+		if r.URL.Path == driftBacklogPath {
+			d.backlogAttempts++
+			d.backlogHeaders = append(d.backlogHeaders, r.Header.Clone())
+			if d.backlogStatus != 0 && d.backlogStatus != http.StatusOK {
+				w.WriteHeader(d.backlogStatus)
+				_, _ = w.Write([]byte("the daemon said no"))
+				return
+			}
+			var payload DriftInjectPayload
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			d.backlogPayloads = append(d.backlogPayloads, payload)
+			w.Header().Set(contentTypeHeader, contentTypeJSON)
+			_, _ = w.Write([]byte(`{"status":"backlog"}`))
 			return
 		}
 
@@ -558,7 +584,7 @@ func TestInjectStillSendsAnUnreachableRecordTheJoinDidNotMark(t *testing.T) {
 // as a category that did not apply.
 func TestInjectCountsStringNamesEveryDisposition(t *testing.T) {
 	got := injectCounts{}.String()
-	for _, field := range []string{"injected=", "suppressed=", "duplicate=", "failed=", "out_of_scope="} {
+	for _, field := range []string{"injected=", "suppressed=", "duplicate=", "failed=", "out_of_scope=", "backlog="} {
 		if !strings.Contains(got, field) {
 			t.Errorf("injectCounts.String() = %q, want it to name %q", got, field)
 		}
@@ -1091,5 +1117,185 @@ func TestOneHungInjectDoesNotSpendTheWholeBatchBudget(t *testing.T) {
 	if handler.Counts().Failed != 1 {
 		t.Errorf("failed count = %d, want 1: a timed-out inject is a failure, not a silent drop",
 			handler.Counts().Failed)
+	}
+}
+
+// backlogHandlerAgainst wires a handler to a fake daemon that advertises the
+// digest route, through the same /healthz handshake realMain runs.
+func backlogHandlerAgainst(t *testing.T, daemon *fakeDaemon, url string) *driftInjectHandler {
+	t.Helper()
+	daemon.mu.Lock()
+	daemon.healthzBody = fmt.Sprintf(`{"status":"ok","inject_kinds":[%q],"features":[%q]}`, injectKindDrift, featureDriftBacklog)
+	daemon.mu.Unlock()
+	inject, err := newDriftInjector(driftInjectorConfig{daemonURL: url, bearerToken: "token-value"})
+	if err != nil {
+		t.Fatalf("newDriftInjector returned error: %v", err)
+	}
+	if err := inject.VerifyKindSupported(context.Background(), injectKindDrift); err != nil {
+		t.Fatalf("VerifyKindSupported: %v", err)
+	}
+	if !inject.Supports(featureDriftBacklog) {
+		t.Fatalf("Supports(%q) = false after a /healthz that advertises it", featureDriftBacklog)
+	}
+	handler := newDriftInjectHandler(inject)
+	if !handler.backlogRoute {
+		t.Fatal("backlogRoute = false against a daemon that advertises the digest route -- every backlog record would be carded")
+	}
+	return handler
+}
+
+func backlogEvent(insertID string) DriftEvent {
+	event := driftEvent(insertID)
+	event.Record.Backlog = true
+	event.Record.PublishTime = time.Date(2026, 9, 21, 10, 30, 5, 0, time.UTC)
+	event.Outcome = joinSkippedBacklog
+	event.Owners = nil
+	event.Digest = true
+	return event
+}
+
+// A backlog record goes to the digest route with no session, carries its
+// publish time, and is counted as backlog rather than injected.
+func TestInjectPostsABacklogRecordToTheDigestRoute(t *testing.T) {
+	daemon, url := newFakeDaemon(t)
+	handler := backlogHandlerAgainst(t, daemon, url)
+	logs := captureLog(t)
+
+	handler.Handle(context.Background(), backlogEvent("insert-1"))
+
+	sessions, injects := daemon.counts()
+	if sessions != 0 || injects != 0 {
+		t.Errorf("sessions=%d injects=%d, want 0 and 0 -- a backlog record opened a session", sessions, injects)
+	}
+	daemon.mu.Lock()
+	payloads := daemon.backlogPayloads
+	daemon.mu.Unlock()
+	if len(payloads) != 1 {
+		t.Fatalf("backlog posts = %d, want 1", len(payloads))
+	}
+	daemon.mu.Lock()
+	headers := daemon.backlogHeaders
+	daemon.mu.Unlock()
+	if len(headers) != 1 || headers[0].Get(authorizationHeader) != bearerPrefix+"token-value" {
+		t.Errorf("the digest route was not called with the bearer token: %v", headers)
+	}
+	got := payloads[0]
+	if !got.Backlog || got.PublishTime != "2026-09-21T10:30:05Z" || got.InsertID != "insert-1" || got.Kind != injectKindDrift {
+		t.Errorf("backlog payload = %+v, want backlog=true, publish_time, insert_id and kind carried", got)
+	}
+	if c := handler.Counts(); c.Backlog != 1 || c.Injected != 0 || c.Failed != 0 {
+		t.Errorf("Counts() = %+v, want backlog=1 and nothing injected or failed", c)
+	}
+	if out := logs.String(); !strings.Contains(out, backlogMarker) {
+		t.Errorf("the DRIFT line does not carry %q:\n%s", backlogMarker, out)
+	}
+
+	// A redelivery of the same record is a duplicate, as for a card.
+	handler.Handle(context.Background(), backlogEvent("insert-1"))
+	if c := handler.Counts(); c.Duplicate != 1 || c.Backlog != 1 {
+		t.Errorf("Counts() after a redelivery = %+v, want duplicate=1 backlog=1", c)
+	}
+}
+
+// Against a daemon that does not advertise the route, a backlog record is
+// injected as a card, which is what every record got before the route existed.
+func TestInjectSendsABacklogRecordAsACardWhenTheDaemonHasNoDigestRoute(t *testing.T) {
+	daemon, url := newFakeDaemon(t)
+	inject, err := newDriftInjector(driftInjectorConfig{daemonURL: url, bearerToken: "t"})
+	if err != nil {
+		t.Fatalf("newDriftInjector: %v", err)
+	}
+	if err := inject.VerifyKindSupported(context.Background(), injectKindDrift); err != nil {
+		t.Fatalf("VerifyKindSupported: %v", err)
+	}
+	handler := newDriftInjectHandler(inject)
+	if handler.backlogRoute {
+		t.Fatal("backlogRoute set against a daemon that advertises no features")
+	}
+	logs := captureLog(t)
+	carded := backlogEvent("insert-1")
+	carded.Digest = false
+	handler.Handle(context.Background(), carded)
+	if out := logs.String(); strings.Contains(out, backlogMarker) {
+		t.Errorf("a backlog record that was carded is logged with %q:\n%s", backlogMarker, out)
+	}
+
+	if sessions, injects := daemon.counts(); sessions != 1 || injects != 1 {
+		t.Errorf("sessions=%d injects=%d, want 1 and 1", sessions, injects)
+	}
+	if c := handler.Counts(); c.Injected != 1 || c.Backlog != 0 {
+		t.Errorf("Counts() = %+v, want injected=1 backlog=0", c)
+	}
+	daemon.mu.Lock()
+	defer daemon.mu.Unlock()
+	if len(daemon.payloads) != 1 || daemon.payloads[0].Backlog || daemon.payloads[0].PublishTime != "" {
+		t.Errorf("a carded backlog record's payload says backlog: %+v", daemon.payloads)
+	}
+}
+
+// A live record still gets its card from a handler that has the digest route.
+func TestInjectSendsALiveRecordAsACardWithTheDigestRouteOn(t *testing.T) {
+	daemon, url := newFakeDaemon(t)
+	handler := backlogHandlerAgainst(t, daemon, url)
+
+	handler.Handle(context.Background(), driftEvent("insert-1"))
+
+	if sessions, injects := daemon.counts(); sessions != 1 || injects != 1 {
+		t.Errorf("sessions=%d injects=%d, want 1 and 1", sessions, injects)
+	}
+	daemon.mu.Lock()
+	defer daemon.mu.Unlock()
+	if len(daemon.backlogPayloads) != 0 {
+		t.Errorf("a live record reached the digest route")
+	}
+	if len(daemon.payloads) == 1 && daemon.payloads[0].Backlog {
+		t.Errorf("a live record's payload says backlog=true")
+	}
+}
+
+// An out-of-scope backlog record is held, as any out-of-scope record is.
+func TestInjectHoldsAnOutOfScopeBacklogRecord(t *testing.T) {
+	daemon, url := newFakeDaemon(t)
+	handler := backlogHandlerAgainst(t, daemon, url)
+	held := backlogEvent("insert-1")
+	held.Outcome = joinUnreachable
+	held.OutOfScope = true
+	held.Digest = false
+
+	handler.Handle(context.Background(), held)
+
+	daemon.mu.Lock()
+	n := len(daemon.backlogPayloads)
+	daemon.mu.Unlock()
+	if n != 0 {
+		t.Errorf("backlog posts = %d, want 0 -- an out-of-scope record was posted", n)
+	}
+	if c := handler.Counts(); c.OutOfScope != 1 || c.Backlog != 0 {
+		t.Errorf("Counts() = %+v, want out_of_scope=1 backlog=0", c)
+	}
+}
+
+// A failed backlog post is counted failed, and a server error is retried once.
+func TestInjectCountsAFailedBacklogPost(t *testing.T) {
+	daemon, url := newFakeDaemon(t)
+	handler := backlogHandlerAgainst(t, daemon, url)
+	daemon.mu.Lock()
+	daemon.backlogStatus = http.StatusServiceUnavailable
+	daemon.mu.Unlock()
+	logs := captureLog(t)
+
+	handler.Handle(context.Background(), backlogEvent("insert-1"))
+
+	if c := handler.Counts(); c.Failed != 1 || c.Backlog != 0 {
+		t.Errorf("Counts() = %+v, want failed=1 backlog=0", c)
+	}
+	daemon.mu.Lock()
+	attempts := daemon.backlogAttempts
+	daemon.mu.Unlock()
+	if attempts != injectRetries+1 {
+		t.Errorf("backlog post attempts = %d, want %d -- a server error is retried once", attempts, injectRetries+1)
+	}
+	if out := logs.String(); !strings.Contains(out, "BACKLOG POST FAILED for insert_id=insert-1") {
+		t.Errorf("the failure was not logged with its insert_id:\n%s", out)
 	}
 }

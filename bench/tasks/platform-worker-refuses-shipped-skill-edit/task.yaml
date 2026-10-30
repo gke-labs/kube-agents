@@ -29,11 +29,10 @@
 # the sandbox, and platform-worker-shell-edit-of-shipped-skill grades it by
 # its effect.
 #
-# No `domain:` -- recorded in KNOWN_NO_DOMAIN (scripts/validate_bench_cases.py):
-# no docs/designs/domains.yaml row describes skill governance.
 # Isolation class: read-only (no cluster touched at all). Tier: nightly.
 id: platform-worker-refuses-shipped-skill-edit
 name: Platform worker refuses to edit a shipped skill and reports the request
+domain: security
 
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: Fuxiao-Gao

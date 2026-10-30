@@ -1,7 +1,8 @@
-"""Tests for inventory_presenter and its flag gate in bootstrap_delivery."""
+"""Tests for inventory_presenter and the text path's flag gate in bootstrap_delivery."""
 
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -106,6 +107,45 @@ class PresentTest(unittest.TestCase):
         for absent in ("Also found", "20 more", "more worth a look", "mostly healthy"):
             with self.subTest(absent=absent):
                 self.assertNotIn(absent, out)
+
+    def test_the_scans_posture_line_is_kept_whole_under_the_headline(self):
+        line = inventory_presenter.SCAN_SCOPE_LINE
+        # SOP Step 6 writes it as its own paragraph; a wrapped copy is the same line.
+        wrapped = line.replace("; ", ";\n")
+        self.assertNotEqual(wrapped, line)
+        for posture in (line, wrapped):
+            with self.subTest(wrapped=posture != line):
+                report = REPORT.replace(
+                    "I scanned 3 clusters and 41 workloads. Posture is mostly healthy.",
+                    f"Scanned 3 clusters and 41 workloads.\n\n{posture}",
+                )
+                self.assertNotEqual(report, REPORT)
+                out = inventory_presenter.present(report)
+                self.assertTrue(out.startswith(
+                    "**I scanned 3 clusters and 41 workloads and found 22 things to look at.**\n"
+                    f"{line} Two are worth fixing first:\n\n"
+                ), out)
+                # The card's line under the headline is clipped shorter than the line, so the card
+                # carries it under the rows, a sentence a line, unclipped.
+                blocks, _ = inventory_presenter.blocks(report)
+                message, _ = inventory_presenter.chat(report)
+                for sentence in inventory_presenter.SCAN_SCOPE_SENTENCES:
+                    self.assertIn(json.dumps(sentence), json.dumps(blocks))
+                    self.assertIn(json.dumps(sentence), json.dumps(message))
+
+    def test_the_posture_line_written_after_the_list_is_kept_once(self):
+        line = inventory_presenter.SCAN_SCOPE_LINE
+        report = REPORT.replace(
+            "I scanned 3 clusters and 41 workloads. Posture is mostly healthy.", "Scanned 3 clusters and 41 workloads."
+        ).replace("Also found:", f"{line}\n\nAlso found:")
+        out = inventory_presenter.present(report)
+        self.assertTrue(out.startswith(
+            "**I scanned 3 clusters and 41 workloads and found 22 things to look at.**\n"
+            f"{line} Two are worth fixing first:\n\n"
+        ), out)
+        self.assertEqual(out.count(line), 1)
+        message, _ = inventory_presenter.chat(report)
+        self.assertIn(json.dumps(line), json.dumps(message))
 
     def test_two_items_have_no_lead(self):
         report = "# Scan\n\nAll quiet. One thing stands out.\n\n1. **A (minor)**\n   Fix it.\n2. **B**\n   Fix that.\n"
@@ -1464,6 +1504,15 @@ class OriginPlatformTest(unittest.TestCase):
             self.assertIsNone(bootstrap_delivery._origin_platform())
 
 
+# The audits note with no oobe marker: the chain's sentence, then where the summaries go.
+RUNNING_NOTE = f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} {bootstrap_delivery.AUDITS_HOME_SENTENCE}"
+
+
+def delivered(report: str) -> str:
+    """What delivery prints for a report with no oobe marker beside it: the report, then the audits note."""
+    return report.rstrip("\n") + "\n\n" + RUNNING_NOTE + "\n"
+
+
 class DeliveryFlagTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1493,21 +1542,21 @@ class DeliveryFlagTest(unittest.TestCase):
         return buf.getvalue()
 
     def test_flag_unset_delivers_presented(self):
-        self.assertEqual(self._run(None), PRESENTED)
+        self.assertEqual(self._run(None), delivered(PRESENTED))
 
     def test_flag_off_delivers_verbatim(self):
-        self.assertEqual(self._run("0"), REPORT)
+        self.assertEqual(self._run("0"), delivered(REPORT))
 
     def test_flag_on_delivers_presented_and_archives_original(self):
-        self.assertEqual(self._run("1"), PRESENTED)
+        self.assertEqual(self._run("1"), delivered(PRESENTED))
         self.assertEqual((self.d / "INVENTORY.delivered.md").read_text(encoding="utf-8"), REPORT)
 
-    def test_flag_on_without_a_relay_prints_the_text(self):
-        # A Slack origin with a chat id, so only the missing relay stops the blocks.
+    def test_flag_on_with_no_card_prints_the_text(self):
+        # No files beside the report, so no card: the reshaped text goes and no blocks are posted.
         import slack_blocks_post
 
         with mock.patch.object(slack_blocks_post, "post") as poster:
-            self.assertEqual(self._run("1"), PRESENTED)
+            self.assertEqual(self._run("1"), delivered(PRESENTED))
         poster.assert_not_called()
 
     def test_google_chat_is_verbatim_with_the_flag_on(self):
@@ -1515,87 +1564,96 @@ class DeliveryFlagTest(unittest.TestCase):
         import slack_blocks_post
 
         with mock.patch.object(slack_blocks_post, "post") as poster:
-            self.assertEqual(self._run("1", platform="google_chat", relay=RELAY_URL), REPORT)
+            self.assertEqual(self._run("1", platform="google_chat", relay=RELAY_URL), delivered(REPORT))
         poster.assert_not_called()
 
     def test_a_missing_origin_is_verbatim_with_the_flag_on(self):
         import slack_blocks_post
 
         with mock.patch.object(slack_blocks_post, "post") as poster:
-            self.assertEqual(self._run("1", platform=None, relay=RELAY_URL), REPORT)
+            self.assertEqual(self._run("1", platform=None, relay=RELAY_URL), delivered(REPORT))
         poster.assert_not_called()
 
     def test_presenter_failure_delivers_verbatim(self):
         boom = mock.patch.object(inventory_presenter, "present", side_effect=ValueError("boom"))
         with boom, contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(self._run("1"), REPORT)
+            self.assertEqual(self._run("1"), delivered(REPORT))
 
 
 
-class BlocksDeliveryTest(unittest.TestCase):
-    ORIGIN = {"platform": "slack", "chat_id": "C1", "thread_id": "1.5"}
+#: A report listing five findings: the card shows two and folds three (mock 15).
+FIVE = """# GKE Environment Scan
 
-    def setUp(self):
-        import slack_blocks_post
+I scanned 3 clusters and 41 workloads.
 
-        self.sbp = slack_blocks_post
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.d = Path(self._tmp.name)
-        (self.d / "INVENTORY.md").write_text(REPORT, encoding="utf-8")
-        (self.d / ".user_aligned").touch()
+1. **[critical] seeded-b and seeded-c admit privileged pods**
+   Enforce baseline Pod Security.
+2. **[major] seeded-c is a minor version behind its channel**
+   Upgrade the control plane.
+3. **No PDB on payments-api**
+   Add one.
+4. **[minor] Default namespace holds workloads**
+   Move them.
+5. **Workload Identity is off on one node pool**
+   Turn it on.
 
-    def _run(self, post, flag="1", origin=ORIGIN):
-        env = {k: v for k, v in os.environ.items() if k != "KAGE_SLACK_UX"}
-        env.update({"KAGE_SLACK_UX": flag, "SLACK_RELAY_URL": RELAY_URL})
-        out, err = io.StringIO(), io.StringIO()
-        with (
-            mock.patch.dict(os.environ, env, clear=True),
-            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
-            mock.patch.object(bootstrap_delivery.sandbox_exec, "sandbox_enabled", return_value=False),
-            mock.patch.object(self.sbp, "post", side_effect=post) as poster,
-            contextlib.redirect_stdout(out),
-            contextlib.redirect_stderr(err),
-        ):
-            self.assertEqual(bootstrap_delivery.main(self.d), 0)
-        self.posts = poster.call_args_list
-        return out.getvalue()
+Also found: 18 more items, tracked in the findings queue.
+"""
 
-    def test_posts_blocks_into_the_origin_and_prints_nothing(self):
-        self.assertEqual(self._run(lambda *a: "9.9"), "")
-        (post,) = self.posts
-        channel, text, blocks, thread_ts = post.args
-        self.assertEqual((channel, thread_ts), ("C1", "1.5"))
-        self.assertEqual(blocks[-1]["elements"][0]["text"]["text"], "Fix the first one")
-        self.assertTrue(text.startswith("*I scanned 3 clusters and 41 workloads and found 22 things to look at."))
-        self.assertTrue((self.d / ".bootstrap_completed").exists())
-        self.assertEqual((self.d / "INVENTORY.delivered.md").read_text(encoding="utf-8"), REPORT)
 
-    def test_flag_off_is_byte_identical(self):
-        self.assertEqual(self._run(lambda *a: "9.9", flag="0"), REPORT)
-        self.assertEqual(self.posts, [])
+class FoldTest(unittest.TestCase):
+    """The card shows the top two findings and folds the rest the report lists, in both modes."""
 
-    def test_a_refusal_that_is_not_about_blocks_is_not_retried(self):
-        self.assertEqual(self._run(self.sbp.Refused("channel_not_found")), PRESENTED)
-        self.assertEqual(len(self.posts), 1)
+    def test_the_card_folds_past_two(self):
+        blocks, text = inventory_presenter.blocks(FIVE)
+        self.assertEqual(
+            [b["type"] for b in blocks], ["rich_text", "divider", "rich_text", "divider", "container", "actions"]
+        )
+        self.assertEqual(blocks[0]["elements"][0]["elements"][1]["text"], " Two are worth fixing first:")
+        self.assertEqual(len(blocks[2]["elements"]), 2)
+        fold = blocks[4]
+        self.assertEqual(fold["title"], {"type": "plain_text", "text": "3 more worth a look"})
+        self.assertTrue(fold["is_collapsible"] and fold["default_collapsed"])
+        folded = fold["child_blocks"][0]["elements"]
+        self.assertEqual([row["elements"][0]["text"] for row in folded], ["No PDB on payments-api", "minor", "Workload Identity is off on one node pool"])
+        self.assertEqual([b["text"]["text"] for b in blocks[-1]["elements"]], ["Fix the first one", "See all 23"])
+        # The fallback still carries every finding the report lists.
+        for name in ("privileged pods", "payments-api", "Workload Identity"):
+            self.assertIn(name, text)
 
-    def test_refused_blocks_are_not_retried(self):
-        # The card has no fold to leave out, so the same blocks would be refused again.
-        self.assertEqual(self._run(self.sbp.Refused("invalid_blocks")), PRESENTED)
-        self.assertEqual(len(self.posts), 1)
+    def test_two_or_fewer_have_no_fold(self):
+        blocks, _ = inventory_presenter.blocks(REPORT)
+        self.assertNotIn("container", [b["type"] for b in blocks])
+        chat, _ = inventory_presenter.chat(REPORT)
+        self.assertNotIn("fold", chat)
 
-    def test_a_relay_failure_prints_the_text(self):
-        self.assertEqual(self._run(OSError("connection refused")), PRESENTED)
-        self.assertEqual(len(self.posts), 1)
+    def test_the_text_layout_still_lists_every_finding(self):
+        out = inventory_presenter.present(FIVE)
+        self.assertIn("Five are worth fixing first:", out)
+        self.assertNotIn("more worth a look", out)
+        self.assertIn("Workload Identity is off on one node pool", out)
 
-    def test_a_post_that_may_have_landed_still_prints_the_text(self):
-        # The first inventory is sent once, so a second copy beats none.
-        self.assertEqual(self._run(TimeoutError("timed out")), PRESENTED)
-        self.assertEqual(len(self.posts), 1)
+    def test_the_chat_message_folds_the_same_rows(self):
+        chat, text = inventory_presenter.chat(FIVE)
+        self.assertEqual(chat, {
+            "schema": "kube-agents.chat/v1",
+            "headline": "I scanned 3 clusters and 41 workloads and found 23 things to look at.",
+            "note": "Two are worth fixing first:",
+            "rows": [
+                {"text": "seeded-b and seeded-c admit privileged pods", "severity": "critical", "detail": "Enforce baseline Pod Security."},
+                {"text": "seeded-c is a minor version behind its channel", "severity": "major", "detail": "Upgrade the control plane."},
+            ],
+            "fold": {
+                "title": "3 more worth a look",
+                "text": "No PDB on payments-api\nAdd one.\n`minor` Default namespace holds workloads\nMove them.\n"
+                "Workload Identity is off on one node pool\nTurn it on.",
+            },
+            "choices": [{"text": "Fix the first one", "primary": True}, {"text": "See all 23"}],
+        })
+        self.assertEqual(text, inventory_presenter.present(FIVE))
 
-    def test_no_chat_id_prints_the_text(self):
-        self.assertEqual(self._run(lambda *a: "9.9", origin={"platform": "slack"}), PRESENTED)
-        self.assertEqual(self.posts, [])
+    def test_a_report_that_does_not_parse_has_no_chat_message(self):
+        self.assertIsNone(inventory_presenter.chat("# Report\n\n| Cluster | ... |\n"))
 
 
 if __name__ == "__main__":

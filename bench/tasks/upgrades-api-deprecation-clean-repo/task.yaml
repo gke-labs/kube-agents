@@ -2,19 +2,20 @@
 # commented out of the presubmit's TASKS array before that. Held out of the
 # presubmit by the same maintainer's call that holds the skill's Phase-1 and
 # Phase-2 cases: no presubmit seat pending #1254.
-# Its eval loop was not run (`validated: false`): the only install its author
-# could reach (the robot's) links no GitOps repository, so the scan there has
-# nothing to read, and no fleet-linked install was available to that account.
-# The eval projects do link gke-agentic/kube-agents-evals*-infra as
-# managed_repos, so once #1254 closes a maintainer can activate it after one
-# observed run on that fleet.
+# Still `validated: false`: its nightly record (0 of 15 through 2026-10-17)
+# predates the scan route of #1680; it is validated once that record shows it
+# both pass and fail. A dev-install loop for that route ran on a
+# gemini-3.8-flash install whose managed repository carries manifests.
 #
 # The Phase-4 case for the fleet-upgrade-verification skill (#1343, #1412):
 # not "which clusters lag" (upgrades-fleet-version-table asks that) but "is the
 # linked GitOps repository ready for the next minor", which the skill's
 # api_deprecation_scan.py answers per repository with the commit it read. The
-# report is graded, not the tool path: an agent that reads the manifests any
-# other way and states the same source and verdict passes.
+# report is graded, and so is one step of the tool path: the scan must have run.
+# The platform persona puts the "repo manifests as of <sha>" wording in every
+# worker's context, so a worker that greps a clone by hand can copy that
+# wording; a hand read reports neither the files it read nor the ones it
+# skipped, so its "clean" cannot be checked.
 #
 # The clean variant. The eval repositories carry no manifest on an apiVersion
 # the next minor removes, so the correct answer is a clean section that names
@@ -56,12 +57,11 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: upgrades
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # report_contains: a chat prompt, so the sections are the reply. Three
 # objectives, one for each thing the report must do: name its source, give a
-# verdict, invent nothing. Split rather than one check so a red says which.
+# verdict, invent nothing; and three for the route it must take: delegate, run
+# the scan, and keep its files to this run. Split rather than one check so a
+# red says which.
 verification_spec:
   - name: the-section-names-its-source
     role: objective
@@ -76,6 +76,52 @@ verification_spec:
       # so that phrase cannot fail. A report that read the repository another
       # way still has to say which commit its manifests were read at.
       required_phrases: ["manifests as of"]
+  # The request reached a specialist: without a card the worker check below
+  # would error, not fail.
+  - name: the-request-was-delegated
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  # The routing check. required_runs reads each shell segment of a worker
+  # command as an argv: a run counts when api_deprecation_scan.py is the
+  # command word or follows python3, and not when the segment has -h or
+  # --help, follows python3 -c, or only mentions the script (echo, grep, cat).
+  # It reads words, not the exit status: the word pattern refuses only a run
+  # with no floor flag, so a run that names one and still exits 2 (a missing
+  # file, a target the parser refuses) counts (#3404).
+  - name: the-deprecation-scan-ran
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: api_deprecation_scan.py
+          word_patterns: ["^--(versions|current-version)(=.*)?$"]
+  # The scratch-name check. /opt/data/scratch is shared by every card, so a
+  # fleet_versions*.json or api_deprecations*.json path without the run's
+  # mark names a file another card can write or has written. The mark is the
+  # pair the skill dictates, $(date +%s) then $$, or a run of 9+ digits (the
+  # expanded timestamp). Any other spelling is forbidden, a unique one such as
+  # $RANDOM included. Forbidden: a run of either script with such a path as a
+  # word. It reads names only: it does not see a read of another run's file
+  # (cat, search_files, read_file), whether --versions names a file this run
+  # wrote, or where the reply's section came from (#3404).
+  - name: the-scan-files-have-per-run-names
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_runs:
+        - script: api_deprecation_scan.py
+          word_patterns:
+            &unsuffixed_scratch_name [
+              '^(?!.*(\$\(date \+%s\)\S*\$\$|\d{9,}))(?:--[a-z-]+=)?(?:\S*/)?(api_deprecations|fleet_versions)[^/]*\.json$',
+            ]
+        - script: fleet_upgrade_report.py
+          word_patterns: *unsuffixed_scratch_name
   - name: the-section-gives-a-verdict
     role: objective
     mode: assert

@@ -6,7 +6,7 @@
 | `balanced` (default) | Keeps spare capacity; conservative scale-down. | Latency-sensitive serving. |
 | `optimize-utilization` | Aggressive packing; faster removal. | Cost-driven; Batch; **Golden Path**. |
 
-- **Command:** `gcloud container clusters update <C> --autoscaling-profile=optimize-utilization`.
+- **Setting:** `spec.clusterAutoscaling.autoscalingProfile: OPTIMIZE_UTILIZATION` on the cluster's `ContainerCluster`, proposed as Config Connector YAML through `gcp-config-connector`.
 
 ## Spot Best Practices
 - **Mandatory Fallback:** Any time you recommend or debug the use of Spot instances (whether via manual pools or node pool auto-creation), suggest including other Spot or On-Demand fallback priorities via ComputeClasses. Spot capacity is highly variable, and without a fallback, workloads will become stuck during GCE stockouts (`scale.up.error.out.of.resources`).

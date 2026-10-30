@@ -247,7 +247,8 @@ fi
 
 # --- fleet-audit finding id pattern ---------------------------------------
 # Ground truth: FINDING_ID_RE in the fleet-audit harness. Two documents quote
-# this pattern back to the model — SKILL.md and the ledger design doc — and an
+# this pattern back to the model — the skill's findings-document reference and
+# the ledger design doc — and an
 # id that does not match is rejected before anything is published. When the
 # pattern was last relaxed, every copy silently went stale, so the docs told
 # the model to generate ids the validator refused.
@@ -293,7 +294,7 @@ fi
 
 # --- fleet-audit rendering caps -------------------------------------------
 # Ground truth: the module constants in the fleet-audit harness. Every one is
-# hand-copied into SKILL.md, the governance SOPs, the design doc, and the site
+# hand-copied into the skill's reference files, the governance SOPs, the design doc, and the site
 # so the model knows what the renderer will do to its output, and until now
 # nothing checked a single copy. A stale cap is not cosmetic: it teaches the
 # model to pad an excerpt the clipper then truncates mid-object, or to withhold

@@ -25,6 +25,14 @@ CONTAINER_TOOL ?= docker
 # running the manifests gate (see .github/workflows/k8s-operator-test.yml).
 PRETTIER := $(shell command -v prettier 2>/dev/null || echo npx prettier)
 
+# The CRD field reference pages on the docs site are generated from the API
+# types in api/v1alpha1, so `manifests` refreshes them beside the CRD YAML and
+# one command leaves both current. scripts/generate_docs.py registers one
+# block per kind under this prefix, so a kind added there is covered here
+# without an edit; `make docs-check-generated` at the repository root fails
+# when a page is stale.
+CRD_FIELD_DOC_BLOCK_PREFIX := crd-fields-
+
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
 SHELL = /usr/bin/env bash -o pipefail
@@ -42,8 +50,9 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: manifests
-manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects, and the CRD field pages on the docs site.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	python3 ../scripts/generate_docs.py --block-prefix $(CRD_FIELD_DOC_BLOCK_PREFIX)
 	@$(PRETTIER) --write "config/crd/bases/*.yaml" "config/rbac/*.yaml" "config/webhook/*.yaml" \
 		|| echo "WARNING: prettier did not run (not installed, or npm registry unreachable?). The regenerated YAML is left unformatted, which CI's prettier check will reject. Re-run prettier --write over config/ once prettier is available." >&2
 
@@ -65,8 +74,10 @@ test: manifests generate fmt vet test-python ## Run tests.
 # they are absent, so every envtest-asset fetch in this file goes through the
 # retrying macro and this target needs no setup-envtest prerequisite of its
 # own. Dropping it costs the "Setting up envtest binaries..." line and saves a
-# second `use`. (go-install-tool's `go install` of setup-envtest itself is a
-# separate fetch and still has no retry; the module cache usually serves it.)
+# second `use`. go-install-tool's `go install` of setup-envtest itself is a
+# separate fetch with the same retry: the module cache usually serves it, but
+# `release-0.24` is a branch, so a miss asks the proxy and the checksum
+# database, and one stream error there failed this target (#3029).
 #
 # Resolved on a line of its own and then checked, not written as a prefix
 # assignment on the `go test` line: a command substitution in a prefix
@@ -235,6 +246,8 @@ deploy-litellm: kustomize ## Deploy LiteLLM integration.
 	$(call require-var,LITELLM_IMAGE,images.json)
 	@if [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
 		$(KUSTOMIZE) build config/integrations/litellm/overlays/vertex_ai | envsubst '$(LITELLM_VERTEX_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
+	elif [ "$$MODEL_PROVIDER" = "anthropic" ]; then \
+		$(KUSTOMIZE) build config/integrations/litellm/overlays/anthropic | envsubst '$(LITELLM_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
 	else \
 		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$(LITELLM_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
 	fi
@@ -243,6 +256,8 @@ deploy-litellm: kustomize ## Deploy LiteLLM integration.
 undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
 	@if [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
 		$(KUSTOMIZE) build config/integrations/litellm/overlays/vertex_ai | envsubst '$(LITELLM_VERTEX_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
+	elif [ "$$MODEL_PROVIDER" = "anthropic" ]; then \
+		$(KUSTOMIZE) build config/integrations/litellm/overlays/anthropic | envsubst '$(LITELLM_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 	else \
 		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$(LITELLM_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 	fi
@@ -303,7 +318,9 @@ ENVTEST_K8S_VERSION ?= 1.36.0
 # single failed transfer rather than one long outage, which is what a retry
 # absorbs. Four attempts with a doubling delay (5s, 10s, 20s) spends at most 35
 # seconds on that before giving up, so an asset that is genuinely unreachable
-# does not hold a runner.
+# does not hold a runner. The same two bound go-install-tool's `go install` of
+# setup-envtest, controller-gen and kustomize (#3029), so lowering the ceiling
+# to shorten the asset retry shortens those too.
 ENVTEST_DOWNLOAD_ATTEMPTS ?= 4
 ENVTEST_RETRY_DELAY_SECONDS ?= 5
 
@@ -335,17 +352,63 @@ envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
 $(ENVTEST): $(LOCALBIN)
 	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
 
+# The two retry tunables, read into $$attempts and $$delay and checked before
+# either loop below reads them. One copy, called from go-install-tool and
+# envtest-use, so the two cannot drift. An empty one gets past `?=` -- an
+# exported empty variable, or `make ... ENVTEST_DOWNLOAD_ATTEMPTS=` -- and
+# `[ "$$attempt" -ge "" ]` then errors, which `if` reads as false: the ceiling
+# never fires and the loop retries forever. Digits only, as the root
+# Makefile's test-bench-deps checks: `test`'s integer grammar admits a sign or
+# trailing whitespace ("5 ", "-0") that `sleep` rejects, and under this file's
+# `-e` a rejected sleep ends the recipe after the first failed attempt, so the
+# retry would not retry. The delay is then read as decimal (`10#`): a leading
+# zero passes the digits check and `sleep`, but the doubling `$$(( ))` in both
+# loops would read `08` as a bad octal literal and end the recipe after the
+# first sleep, and `010` as 8, the shape deploy/shared/start-services.sh
+# normalises for the same reason.
+define retry-tunables
+attempts="$(ENVTEST_DOWNLOAD_ATTEMPTS)"; \
+delay="$(ENVTEST_RETRY_DELAY_SECONDS)"; \
+bad=0; \
+case "$$attempts" in ''|*[!0-9]*) bad=1;; *) [ "$$attempts" -ge 1 ] || bad=1;; esac; \
+case "$$delay" in ''|*[!0-9]*) bad=1;; *) delay=$$((10#$$delay));; esac; \
+if [ "$$bad" -ne 0 ]; then \
+echo "Error: ENVTEST_DOWNLOAD_ATTEMPTS must be a whole number of at least 1 and ENVTEST_RETRY_DELAY_SECONDS one of at least 0, digits only; got '$$attempts' and '$$delay'." >&2; \
+exit 1; \
+fi;
+endef
+
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary
 # $2 - package url which can be installed
 # $3 - specific version of package
+#
+# The `go install` is retried on the envtest-use schedule below, with the same
+# two tunables, because it is the same kind of fetch: the module proxy and the
+# checksum database answer it, and on 2026-10-14 one HTTP/2 stream error from
+# sum.golang.org while verifying a dependency of setup-envtest failed the
+# operator's Run Tests job on a change with no Go in it (#3029). The envtest
+# binary download beside it had carried this retry since #1603; this fetch had
+# not. The notices go to stderr for the reason envtest-use gives: a caller
+# captures `make -s envtest-path` into a variable.
 define go-install-tool
 @[ -f "$(1)-$(3)" ] && [ "$$(readlink -- "$(1)" 2>/dev/null)" = "$(1)-$(3)" ] || { \
 set -e; \
 package=$(2)@$(3) ;\
+$(retry-tunables) \
 echo "Downloading $${package}" >&2 ;\
 rm -f "$(1)" ;\
-GOBIN="$(LOCALBIN)" go install $${package} ;\
+attempt=1; \
+while ! GOBIN="$(LOCALBIN)" go install $${package}; do \
+if [ "$$attempt" -ge "$$attempts" ]; then \
+echo "Error: Failed to install $${package} after $$attempts attempts." >&2; \
+exit 1; \
+fi; \
+echo "go install of $${package}: attempt $$attempt of $$attempts failed; retrying in $${delay}s" >&2; \
+sleep "$$delay"; \
+attempt=$$((attempt + 1)); \
+delay=$$((delay * 2)); \
+done; \
 mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
 } ;\
 ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"
@@ -360,17 +423,9 @@ endef
 # captured holds a kube-apiserver, so a retry notice on stdout would break that
 # caller rather than inform it.
 #
-# The two tunables are checked before the loop reads them. An empty one gets
-# past `?=` -- an exported empty variable, or `make ... ENVTEST_DOWNLOAD_ATTEMPTS=`
-# -- and `[ "$$attempt" -ge "" ]` then errors, which `if` reads as false: the
-# ceiling never fires and the loop retries forever.
+# The two tunables are checked by retry-tunables above before the loop reads them.
 define envtest-use
-@attempts="$(ENVTEST_DOWNLOAD_ATTEMPTS)"; \
-delay="$(ENVTEST_RETRY_DELAY_SECONDS)"; \
-if ! [ "$$attempts" -ge 1 ] 2>/dev/null || ! [ "$$delay" -ge 0 ] 2>/dev/null; then \
-echo "Error: ENVTEST_DOWNLOAD_ATTEMPTS must be a whole number of at least 1 and ENVTEST_RETRY_DELAY_SECONDS one of at least 0; got '$$attempts' and '$$delay'." >&2; \
-exit 1; \
-fi; \
+@$(retry-tunables) \
 attempt=1; \
 while :; do \
 if $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path; then \

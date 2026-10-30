@@ -126,7 +126,7 @@ against the smoke runs alone), a smoke lease no running job accounts for (the
 one leak), `fleet-reconcile`, the reconcile's fixed owner with no build ID
 (held by a job, never a hand hold or a leak), and `hangdng-rebuild`, an owner
 with no build ID, holding two projects in Boskos's custom `rebuilding` state
-(held by hand, never leaked). `current` has no `free` key, so the pool reads
+(reported as a lease with no build ID in its owner, never as a leak). `current` has no `free` key, so the pool reads
 full.
 
 ## Re-capturing

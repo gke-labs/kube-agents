@@ -9,7 +9,7 @@
 > section as either aspirational or done.
 
 > **Written as a north star; the a2a plane arrived under it.** This presumes agents are separate
-> workloads. That is now true of one hop - the a2a chat gateway (C20) spawns a session pod per task, and
+> workloads. That is now true of one hop - the a2a chat gateway (C20) spawns a session pod per conversation, and
 > the session pod is a separate workload with its own principal - and still false of the
 > multi-agent fan-out the worked example in §3 draws. So the design got a first hop to be real
 > about and no second one. Core invariant #3 used to ban agent-to-agent calls outright and would
@@ -60,9 +60,10 @@ spec flipped for `authority.grants` on the strength of it.
 
 **The per-request principal §4 and §5 both demand exists, and it was not new work.** The a2a chat
 gateway (C20) allocates a session pod name and a taskId in the same breath at spawn; one incarnation
-serves exactly one task; and the bus derives a pod's identity from the API server's attested
+served exactly one task until 10/9, and now serves every turn of its conversation while its pod is
+live (a coarser partition, below); and the bus derives a pod's identity from the API server's attested
 `authentication.kubernetes.io/pod-name` claim rather than from anything the pod says. So the
-per-incarnation principal _is_ the per-request principal, the parent can predict its name because
+per-incarnation principal _was_ the per-request principal, the parent can predict its name because
 the parent allocates it, and §5's "read the last five words of the claim as the target" is
 discharged. That is a happier answer than §5 expected: it asked for a new credential-issuing
 mechanism and the runtime already had one.
@@ -237,6 +238,26 @@ or cyclic, whether the refusal was the delegate rule or the walk. Verb and scope
 other way and keep their reasons, because those reach a legitimate caller holding a legitimate
 capability who needs to know what it lacks. The split is deliberate: chain shape is not the
 caller's business, and what a capability permits is.
+
+**Profile tasks** (#3659). A tier permits an explicit set of verbs, not a rank, and narrowing means
+a child's set is inside its parent's. Two tiers exist for profile tasks: `read` (`task.execute` and
+`profile.run`) and `unattended` (`profile.run` only). Neither nests with `platform` ⊃
+`cluster-admin` ⊃ `developer-team`. A profile task's root carries one more field, `profile`, the
+AgentProfile it is minted for, and only a profile tier carries one. The gateway's per-profile mint
+is not built yet; until it is, every root is the install-wide one described in §5. A profile tier
+narrows only to itself, and a hop (a child entry a broker writes) carries its parent's profile
+unchanged, so no hop can relabel a human's `read` grant as `unattended` or choose which profile its
+chain may run. A profile task's child task does not hop: the gateway mints it a fresh root, naming
+the child's profile at the parent's tier, with a target inside the parent's, which is how fan-out
+crosses profiles. The dispatcher asks the verb `profile.run` with two request fields of its own,
+`profile` and `tier`, and a target scope (`project/P/location/L/cluster/C`, or the install's
+`namespace/N` for a task with no target, never empty). The verifier allows it only when the verb is
+in the grant's tier set, the target is inside the grant's scope, `tier` is the grant's own tier and
+`profile` is the grant's profile. It still answers yes or no, and the dispatcher never reads a tier
+out of the grant. Any other verb carrying `profile` or `tier` is refused rather than having the
+fields ignored. These refusals are verb refusals, so they keep their reasons. That tells the asker
+which tier and profile the grant carries, which the split above allows: the asker is the leaf
+delegate, already holding the capability.
 
 The caller identity in the first check **must be request-scoped**. An identity shared across
 concurrent requests cannot separate them, and the guarantee this design exists to make is void
@@ -458,8 +479,13 @@ the shape this section asked for:
 - The a2a chat gateway (C20) allocates the session pod's name and the taskId **in the same breath at
   spawn**, so the parent can predict the delegate's name -- which is precisely the derivability
   this section identified as the real obstacle, rather than the credential existing yet.
-- **One incarnation serves exactly one task.** A session pod is spawned per task and reaped with
-  it, so per-incarnation and per-request are the same partition, not an approximation of it.
+- **One incarnation served exactly one task**, so per-incarnation and per-request were the same
+  partition. **Amended 10/9 (#2825):** a session pod now serves every turn of its conversation
+  while it is live, up to `A2A_SESSION_MAX_LIFETIME` (4 hours), so the principal is per
+  conversation, a coarser partition than per request. Every turn's root names the same pod as its
+  `delegate`, so the delegate check no longer tells one turn's capability from another's inside a
+  conversation. What bounds that today is that a session presents a capability only to verify the
+  task the gateway handed it, and holds no grant to mint or attenuate one.
 - The bus derives a pod's principal from the API server's attested
   `authentication.kubernetes.io/pod-name` claim on its ServiceAccount token, so the identity is
   not something the pod asserts about itself.
@@ -640,7 +666,9 @@ sweeps it, so every capability ever minted is still resolvable. What limits the 
 is only that the delegate is a session pod name and session pods are reaped: a stale root names a
 principal that is usually not running, so usually nothing presents it. That is an accident of the
 topology rather than a property of the design, and it stops being true the moment a delegate
-outlives the request. Do not read it as expiry.
+outlives the request. Do not read it as expiry. **Amended 10/9:** that moment has come. A session
+pod serves every turn of its conversation (#2825), so an earlier turn's root names a principal that
+stays live for the rest of the conversation, up to `A2A_SESSION_MAX_LIFETIME`.
 
 **And "nothing can present it" is the wrong strength** (10/2). The entry's `delegate` is the pod
 name alone. The API server attests the pod UID too, and `a2a/authcallout` requires it to be
@@ -675,7 +703,8 @@ the party being revoked from. **Shipped in that state**: no component deletes a 
 revocation -- the property this design prefers over TTLs, and the reason it can tolerate "nothing
 expires" -- is the one advertised feature with no implementation behind it.
 
-**The envelope has no requester field.** It carries a tier and a scope. [03](03-security-model.md)
+**The envelope has no requester field.** It carries a tier and a scope (and, for a profile task, the
+profile it was minted for). [03](03-security-model.md)
 §4a stays canonical for the requirement and that requirement is authorization against the
 requester's own identity, which a hop cannot perform from a resolved capability because it does not
 know who the human is. The goal below is written as "agent ceiling ∩ requester" while the mechanism
@@ -767,7 +796,8 @@ layer down.
 - **Not a defence against a compromised gateway.** The gateway is the root of trust for the whole
   chain; if it lies about who asked, everything below inherits the lie.
 - **Not per-user granularity.** Capabilities carry the same `tier` the `Agent` CR does
-  ([02](02-agent-personas.md) §6.1), so this is as fine-grained as that field and no finer.
+  ([02](02-agent-personas.md) §6.1), or one of the two profile tiers, which add only a profile name,
+  so this is as fine-grained as that field plus the profile and no finer.
 
 ## 9. Verification
 
@@ -798,6 +828,9 @@ server, and against the shipped render rather than a hand-written config.**
   a reviewer will ask for. Build the attacker before the verifier. A design that has only ever seen
   well-formed capabilities has not been tested, and the tell is a suite where every capability was
   minted by the code under test.
+- **A profile grant cannot be relabelled or repointed:** a child that changes `read` to
+  `unattended`, or changes or drops `profile`, fails resolution; `profile.run` naming another tier or
+  profile is refused; `profile` or `tier` on any other verb is refused.
 - **Widening is refused:** a child granting a tier or scope its parent does not hold fails
   resolution, whether it widens by one field or replaces the payload wholesale.
 - **A concurrent capability belonging to another request is refused:** one agent is handed two

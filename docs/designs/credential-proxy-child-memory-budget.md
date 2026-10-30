@@ -15,7 +15,8 @@ variable that carries the limit.
 **Does not own:** the per-request slot cap and output cap, which
 [`docs/credential-isolation-design.md`](../credential-isolation-design.md) describes and which
 this budget sits beside; the size of a single `kubectl` child (#2045); the Controller Stall
-Watch's own schedule and sweep budget (#2325).
+Watch's own schedule and sweep budget (#2325); whether the broker runs wider than one pod
+([`credential-proxy-single-pod.md`](credential-proxy-single-pod.md)).
 
 ## 1. What was true on `main` before this change
 

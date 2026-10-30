@@ -1,0 +1,722 @@
+{
+  "generated": "2026-10-20",
+  "source": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues",
+  "source_note": "Read from the page's table (Category, Identified version(s), Fixed version(s), details) on 2026-10-20. Inclusion rule: every row whose identified versions name a minor from 1.32 to the newest minor the page lists (1.37), add-on-less rows included; rows naming earlier minors only, and rows with no versions, are left out. `identified` and `fixed_in` are the page's cells with their bullets joined by '; ' (`none listed` where the cell is empty). `gke_versions` is the machine reading of the identified cell, bounded above by the fixed cell: an exact version; {from, to[, to_exclusive]} a range; {minor} a whole minor, with {from} and {to, to_exclusive} inside it where the page names a first affected or a fixed build; {through_minor} 'X and earlier'; {from_minor} 'X and later'; {all_versions} 'All versions'. `addon` names the kube-system or gmp-system image the issue is in only where the page names a managed component whose image name the inventory carries; every other row matches by version alone. The grade is derived per matched spec: a match through a spec with no upper bound (`all_versions`, `from_minor`, or `from` with no `to`), which stands on every later version until the page changes, is a note on the member and no risk; a match through a bounded spec (an exact version, a closed range, a minor, or a range the fixed build ends) is a risk. `newest_gke_version` is the newest version the included rows name; it is shown in the rule's note and not graded.",
+  "newest_gke_version": "1.37.1-gke.1187000",
+  "issues": [
+    {
+      "id": "workload-identity-post-token-bad-request",
+      "category": "Operation",
+      "summary": "HTTP POST requests for tokens from the metadata server fail with a 400 Bad Request error",
+      "identified": "1.35; 1.36; 1.37",
+      "fixed_in": "1.35.6-gke.1250001 and later; 1.36.4-gke.1391002 and later; 1.37.1-gke.1187000 and later",
+      "gke_versions": [
+        {
+          "minor": "1.35",
+          "to": "1.35.6-gke.1250001",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.36",
+          "to": "1.36.4-gke.1391002",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.37",
+          "to": "1.37.1-gke.1187000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": "gke-metadata-server",
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#workload-identity-post-token-bad-request"
+    },
+    {
+      "id": "unscheduled-pods-and-exhausted-quota-during-two-step-minor-upgrades-for-the-control-plane",
+      "category": "Upgrades and updates",
+      "summary": "Unscheduled Pods and exhausted quota during two-step minor upgrades for the control plane.",
+      "identified": "1.33 and later",
+      "fixed_in": "TBD",
+      "gke_versions": [
+        {
+          "from_minor": "1.33"
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#unscheduled-pods-and-exhausted-quota-during-two-step-minor-upgrades-for-the-control-plane.",
+      "note": "Autopilot clusters with extended-duration Pods, per the page's text; the row names no add-on, so it matches by version alone."
+    },
+    {
+      "id": "nfs-mount-table-exhaustion",
+      "category": "Operation",
+      "summary": "Nodes that mount NFS volumes accumulate mount entries and stop creating containers",
+      "identified": "1.37.0-gke.2941000 and later",
+      "fixed_in": "1.37.1-gke.1131000",
+      "gke_versions": [
+        {
+          "from": "1.37.0-gke.2941000",
+          "to": "1.37.1-gke.1131000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#nfs-mount-table-exhaustion"
+    },
+    {
+      "id": "gb300-bare-metal-workload-failures",
+      "category": "Upgrades",
+      "summary": "A4X Max (GB300) GPU workload failures",
+      "identified": "1.34.9-gke.1065000 and later, 1.35.6-gke.1049000 and later, and all 1.36 patch versions",
+      "fixed_in": "1.34.10-gke.1328000 and later, 1.35.8-gke.1026000 and later, 1.36.4-gke.1058000 and later (no fix is available yet for 1.37)",
+      "gke_versions": [
+        {
+          "minor": "1.34",
+          "from": "1.34.9-gke.1065000",
+          "to": "1.34.10-gke.1328000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.35",
+          "from": "1.35.6-gke.1049000",
+          "to": "1.35.8-gke.1026000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.36",
+          "to": "1.36.4-gke.1058000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.37"
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#gb300-bare-metal-workload-failures",
+      "note": "The fixed cell says no fix is available yet for 1.37, read as the whole minor affected."
+    },
+    {
+      "id": "gpu-tpu-nodes-stuck-impending-node-termination-taints",
+      "category": "Operation",
+      "summary": "GPU or TPU nodes stuck with impending-node-termination taints after host maintenance",
+      "identified": "1.33 versions earlier than 1.33.5-gke.2469000, 1.34 versions earlier than 1.34.1-gke.2037001",
+      "fixed_in": "1.33.5-gke.2469000 and later, 1.34.1-gke.2037001 and later, 1.35 and later",
+      "gke_versions": [
+        {
+          "minor": "1.33",
+          "to": "1.33.5-gke.2469000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.34",
+          "to": "1.34.1-gke.2037001",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#gpu-tpu-nodes-stuck-impending-node-termination-taints"
+    },
+    {
+      "id": "pod-admission-failures-for-tpu-v7-workloads-due-to-reporting-an-incorrect-chip-count",
+      "category": "Operation",
+      "summary": "Pod admission failures for TPU v7 workloads due to reporting an incorrect chip count.",
+      "identified": "1.33; 1.34",
+      "fixed_in": "1.34.1-gke.1829001 and later",
+      "gke_versions": [
+        {
+          "minor": "1.33"
+        },
+        {
+          "minor": "1.34",
+          "to": "1.34.1-gke.1829001",
+          "to_exclusive": true
+        }
+      ],
+      "addon": "tpu-device-plugin",
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#pod-admission-failures-for-tpu-v7-workloads-due-to-reporting-an-incorrect-chip-count."
+    },
+    {
+      "id": "lustre-multinic-throughput",
+      "category": "Operation",
+      "summary": "Lustre client does not utilize secondary NICs on multi-NIC nodes",
+      "identified": "1.35.3-gke.1234000 and later",
+      "fixed_in": "TBD",
+      "gke_versions": [
+        {
+          "from": "1.35.3-gke.1234000"
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#lustre-multinic-throughput"
+    },
+    {
+      "id": "metadata-server-connection-timeouts",
+      "category": "Operation",
+      "summary": "Connection timeout or connection refused for flows redirected to GKE metadata server",
+      "identified": "1.35 and later",
+      "fixed_in": "TBD",
+      "gke_versions": [
+        {
+          "from_minor": "1.35"
+        }
+      ],
+      "addon": "gke-metadata-server",
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#metadata-server-connection-timeouts"
+    },
+    {
+      "id": "gvisor-shim-cleanup-failure",
+      "category": "Operation",
+      "summary": "gVisor shim fails to clean up, logs \"runsc: executable file not found in $PATH\" error",
+      "identified": "1.33.8-gke.1026000 and later",
+      "fixed_in": "1.35.1 and later",
+      "gke_versions": [
+        {
+          "from": "1.33.8-gke.1026000",
+          "to": "1.35.1",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#gvisor-shim-cleanup-failure",
+      "note": "The fixed cell's `1.35.1` carries no build; read as every build of 1.35.1 and later fixed."
+    },
+    {
+      "id": "dynamic-volumes-fallback",
+      "category": "Operation",
+      "summary": "Dynamic volumes fallback to default disk type",
+      "identified": "1.35.0-gke.2232000 and later",
+      "fixed_in": "1.35.3-gke.1.35.3-gke.1290000 and later",
+      "gke_versions": [
+        {
+          "from": "1.35.0-gke.2232000",
+          "to": "1.35.3-gke.1290000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": "gcp-compute-persistent-disk-csi-driver",
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#dynamic-volumes-fallback",
+      "note": "The fixed cell reads `1.35.3-gke.1.35.3-gke.1290000` on the page; taken as 1.35.3-gke.1290000."
+    },
+    {
+      "id": "pod-startup-issues-1.35-dpv2",
+      "category": "Upgrades and updates",
+      "summary": "Pod startup issues during upgrades to GKE 1.35 for GKE Dataplane V2 clusters",
+      "identified": "All patch versions earlier than 1.34.3-gke.1208000 for GKE 1.34; All patch versions earlier than 1.35.0-gke.2232000 for GKE 1.35",
+      "fixed_in": "1.34.3-gke.1208000 for GKE 1.34; 1.35.0-gke.2232000 for GKE 1.35",
+      "gke_versions": [
+        {
+          "minor": "1.34",
+          "to": "1.34.3-gke.1208000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.35",
+          "to": "1.35.0-gke.2232000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#pod-startup-issues-1.35-dpv2"
+    },
+    {
+      "id": "pod-scheduling-delays-on-new-nodes-with-calico-network-policy-enabled",
+      "category": "Upgrades and updates",
+      "summary": "Pod scheduling delays on new nodes with Calico network policy enabled",
+      "identified": "1.32; 1.33; 1.34; 1.35",
+      "fixed_in": "1.32.11-gke.1153001 and later; 1.33.5-gke.2326000 and later; 1.34.3-gke.1214000 and later; 1.35.0-gke.2180000 and later",
+      "gke_versions": [
+        {
+          "minor": "1.32",
+          "to": "1.32.11-gke.1153001",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.33",
+          "to": "1.33.5-gke.2326000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.34",
+          "to": "1.34.3-gke.1214000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.35",
+          "to": "1.35.0-gke.2180000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#pod-scheduling-delays-on-new-nodes-with-calico-network-policy-enabled"
+    },
+    {
+      "id": "ns-perf",
+      "category": "Performance",
+      "summary": "General purpose networking's performance drops on A series and G4 GPU machine types",
+      "identified": "1.32.8-gke.1134000 and later for GKE 1.32; 1.33.3-gke.1392000 and later for GKE 1.33; All patch versions for GKE 1.34 and 1.35",
+      "fixed_in": "1.32.11-gke.1075000 and later for GKE 1.32; 1.33.5-gke.2392000 and later for GKE 1.33; 1.34.3-gke.1318000 and later for GKE 1.34; 1.35.0-gke.2398000 and later for GKE 1.35",
+      "gke_versions": [
+        {
+          "minor": "1.32",
+          "from": "1.32.8-gke.1134000",
+          "to": "1.32.11-gke.1075000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.33",
+          "from": "1.33.3-gke.1392000",
+          "to": "1.33.5-gke.2392000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.34",
+          "to": "1.34.3-gke.1318000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.35",
+          "to": "1.35.0-gke.2398000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#ns-perf"
+    },
+    {
+      "id": "tcpx-perf",
+      "category": "Performance",
+      "summary": "GPUDirect-TCPX's performance drops on A3 High",
+      "identified": "1.32.8-gke.1134000 and later for GKE 1.32; 1.33.3-gke.1392000 and later for GKE 1.33 and later",
+      "fixed_in": "1.32.11-gke.1075000 and later for GKE 1.32; 1.33.5-gke.2392000 and later for GKE 1.33",
+      "gke_versions": [
+        {
+          "minor": "1.32",
+          "from": "1.32.8-gke.1134000",
+          "to": "1.32.11-gke.1075000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.33",
+          "from": "1.33.3-gke.1392000",
+          "to": "1.33.5-gke.2392000",
+          "to_exclusive": true
+        },
+        {
+          "from_minor": "1.34"
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#tcpx-perf",
+      "note": "The identified cell says `1.33.3-gke.1392000 and later for GKE 1.33 and later` and the fixed cell names 1.32 and 1.33 only; 1.34 and later read as affected with no fix named."
+    },
+    {
+      "id": "cilium-duplicated-identities",
+      "category": "Upgrades",
+      "summary": "Cilium identity duplication in GKE Dataplane V2 clusters",
+      "identified": "1.35",
+      "fixed_in": "1.35.0-gke.2232000 and later.",
+      "gke_versions": [
+        {
+          "minor": "1.35",
+          "to": "1.35.0-gke.2232000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#cilium-duplicated-identities"
+    },
+    {
+      "id": "tcpx-cos125",
+      "category": "Upgrades",
+      "summary": "GPUDirect-TCPX is unavailable with A3 High for specific GKE versions",
+      "identified": "1.34 patch versions before 1.34.5-gke.1153000; 1.35 patch versions before 1.35.2-gke.1485000",
+      "fixed_in": "1.34.5-gke.1153000 and later; 1.35.2-gke.1485000 and later; 1.36 and later; You must also use GPUDirect-TCPX installer version 3.1.9 or later and; sidecar version 2.0.12 or later. The installer and sidecar versions have a; one-to-one mapping and must correspond. For example, the GPUDirect-TCPX installer version; 3.1.12 corresponds to sidecar version 2.0.15. For more information about; installer and sidecar versions, see the; GPUDirect-TCPX Release Notes.",
+      "gke_versions": [
+        {
+          "minor": "1.34",
+          "to": "1.34.5-gke.1153000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.35",
+          "to": "1.35.2-gke.1485000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#tcpx-cos125"
+    },
+    {
+      "id": "updated-lustre-min-capacity",
+      "category": "Operation",
+      "summary": "Updated minimum instance capacity",
+      "identified": "All versions before 1.34.0-gke.2285000",
+      "fixed_in": "1.34.0-gke.2285000 and later",
+      "gke_versions": [
+        {
+          "to": "1.34.0-gke.2285000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#updated-lustre-min-capacity"
+    },
+    {
+      "id": "gke-ui-blocked-autorepair",
+      "category": "Operation",
+      "summary": "Google Cloud console UI becomes uneditable during node auto-repair",
+      "identified": "All versions",
+      "fixed_in": "TBD",
+      "gke_versions": [
+        {
+          "all_versions": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#gke-ui-blocked-autorepair"
+    },
+    {
+      "id": "lustre-incorrect-perf-tier",
+      "category": "Operation",
+      "summary": "Incorrect performance tier for dynamically provisioned Lustre instances",
+      "identified": "1.33 versions before 1.33.4-gke.1036000",
+      "fixed_in": "1.33.4-gke.1036000 and later",
+      "gke_versions": [
+        {
+          "minor": "1.33",
+          "to": "1.33.4-gke.1036000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#lustre-incorrect-perf-tier"
+    },
+    {
+      "id": "gcsfusecsi-io-error",
+      "category": "Operation",
+      "summary": "Input/output error when renaming or moving files using Cloud Storage FUSE CSI driver",
+      "identified": "1.32.3-gke.1099000 and later; 1.33",
+      "fixed_in": "1.33.3-gke.1266000 and later",
+      "gke_versions": [
+        {
+          "from": "1.32.3-gke.1099000",
+          "to": "1.33.3-gke.1266000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#gcsfusecsi-io-error"
+    },
+    {
+      "id": "gke-metrics-agent-ds-race-condition",
+      "category": "Logging and monitoring",
+      "summary": "Race condition in gke-metrics-agent DaemonSets",
+      "identified": "All versions",
+      "fixed_in": "TBD",
+      "gke_versions": [
+        {
+          "all_versions": true
+        }
+      ],
+      "addon": "gke-metrics-agent",
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#gke-metrics-agent-ds-race-condition"
+    },
+    {
+      "id": "containerd-ulimit-reduced",
+      "category": "Upgrades",
+      "summary": "Lowered open files limit with containerd 2.0",
+      "identified": "1.33",
+      "fixed_in": "1.33.2-gke.1043000",
+      "gke_versions": [
+        {
+          "minor": "1.33",
+          "to": "1.33.2-gke.1043000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#containerd-ulimit-reduced"
+    },
+    {
+      "id": "crd-status-invalid",
+      "category": "Upgrades",
+      "summary": "Invalid CRD status.storedVersions for managed CRDs",
+      "identified": "1.31.5-gke.1169000, 1.32.1-gke.1376000",
+      "fixed_in": "1.31.7-gke.1164000, 1.32.3-gke.1512000",
+      "gke_versions": ["1.31.5-gke.1169000", "1.32.1-gke.1376000"],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#crd-status-invalid"
+    },
+    {
+      "id": "missing-metrics-autoscaler",
+      "category": "Operation, logging and monitoring",
+      "summary": "Missing metrics or workload autoscaler not scaling",
+      "identified": "1.32.2-gke.1652000, 1.31.6-gke.1221000, 1.30.10-gke.1227000",
+      "fixed_in": "1.32.2-gke.1652003 or later; 1.31.6-gke.1221001 or later; 1.30.10-gke.1227001 or later",
+      "gke_versions": [
+        "1.32.2-gke.1652000",
+        "1.31.6-gke.1221000",
+        "1.30.10-gke.1227000"
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#missing-metrics-autoscaler"
+    },
+    {
+      "id": "gke-metadata-server-oomkilled",
+      "category": "Operation",
+      "summary": "gke-metadata-server is OOMKilled on TPU/GPU nodes",
+      "identified": "1.32.3-gke.1927000, 1.32.3-gke.1785000, 1.32.3-gke.1717000, 1.32.3-gke.1440000, 1.32.3-gke.1170000, 1.32.3-gke.1250000, 1.32.3-gke.1671000, 1.32.3-gke.1596000, 1.32.3-gke.1298000",
+      "fixed_in": "none listed",
+      "gke_versions": [
+        "1.32.3-gke.1927000",
+        "1.32.3-gke.1785000",
+        "1.32.3-gke.1717000",
+        "1.32.3-gke.1440000",
+        "1.32.3-gke.1170000",
+        "1.32.3-gke.1250000",
+        "1.32.3-gke.1671000",
+        "1.32.3-gke.1596000",
+        "1.32.3-gke.1298000"
+      ],
+      "addon": "gke-metadata-server",
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#gke-metadata-server-oomkilled",
+      "note": "The page lists no fixed version."
+    },
+    {
+      "id": "dangling-status-nodependingresize-1-32",
+      "category": "Operation",
+      "summary": "Volume resizes might be stuck due to dangling NodePendingResize status on PVCs.",
+      "identified": "1.32.0-gke.1358000 to 1.32.4-gke.1106006, 1.32.4-gke.1236007, 1.32.4-gke.1353001, 1.32.4-gke.1415001, 1.32.4-gke.1533000; 1.33.0-gke.0 to 1.33.0-gke.1552000",
+      "fixed_in": "1.32.4-gke.1353003 and later; 1.33.0-gke.1552000 and later",
+      "gke_versions": [
+        {
+          "from": "1.32.0-gke.1358000",
+          "to": "1.32.4-gke.1106006"
+        },
+        "1.32.4-gke.1236007",
+        "1.32.4-gke.1353001",
+        "1.32.4-gke.1415001",
+        "1.32.4-gke.1533000",
+        {
+          "from": "1.33.0-gke.0",
+          "to": "1.33.0-gke.1552000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#dangling-status-nodependingresize-1-32",
+      "note": "The page lists 1.33.0-gke.1552000 both as the last identified version and as the first fixed one; the fixed reading is taken, so the range stops short of it."
+    },
+    {
+      "id": "excessive-volume-group-logging",
+      "category": "Operation",
+      "summary": "The PDCSI driver might log excessively",
+      "identified": "1.32.4-gke.1236007, 1.32.4-gke.1353001",
+      "fixed_in": "1.32.4-gke.1353003 and later",
+      "gke_versions": ["1.32.4-gke.1236007", "1.32.4-gke.1353001"],
+      "addon": "gcp-compute-persistent-disk-csi-driver",
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#excessive-volume-group-logging"
+    },
+    {
+      "id": "ro-mount-on-nfs-volumes-on-cos",
+      "category": "Operations",
+      "summary": "Pods that attempt to mount NFS persistent volumes on COS nodes which previously had a Read-Only (RO) mount will only be mounted in RO mode",
+      "identified": "1.27.16-gke.2440000 and later; 1.28.15-gke.1673000 and later; 1.29.13-gke.1038000 and later; 1.30.9 and later; 1.31.7 and later; 1.32.1-gke.1357001 and later",
+      "fixed_in": "1.27.16-gke.2691000 and later; 1.28.15-gke.2152000 and later; 1.29.15-gke.1218000 and later; 1.30.11-gke.1190000 and later; 1.31.7-gke.1363000 and later; 1.32.4-gke.1106000 and later; 1.33.0-gke.1552000 and later",
+      "gke_versions": [
+        {
+          "minor": "1.27",
+          "from": "1.27.16-gke.2440000",
+          "to": "1.27.16-gke.2691000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.28",
+          "from": "1.28.15-gke.1673000",
+          "to": "1.28.15-gke.2152000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.29",
+          "from": "1.29.13-gke.1038000",
+          "to": "1.29.15-gke.1218000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.30",
+          "from": "1.30.9",
+          "to": "1.30.11-gke.1190000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.31",
+          "from": "1.31.7",
+          "to": "1.31.7-gke.1363000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.32",
+          "from": "1.32.1-gke.1357001",
+          "to": "1.32.4-gke.1106000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#ro-mount-on-nfs-volumes-on-cos",
+      "note": "The fixed cell also names 1.33.0-gke.1552000 and later; the identified cell names no 1.33 version, so none is read as affected."
+    },
+    {
+      "id": "pods-using-io-uring-related-syscalls-stuck-in-terminating",
+      "category": "Operation",
+      "summary": "Pods using io_uring-related syscalls might be stuck in Terminating",
+      "identified": ">= 1.28.15-gke.1436000, < 1.28.15-gke.1668000, >= 1.29.12-gke.1040000, < 1.29.13-gke.1028000, >= 1.30.8-gke.1053000, < 1.30.8-gke.1287000, >= 1.31.4-gke.1057000, < 1.31.6-gke.1020000, >= 1.32.0-gke.1281000, < 1.32.1-gke.1369000",
+      "fixed_in": "1.28.15-gke.1668000 or later; 1.29.13-gke.1028000 or later; 1.30.8-gke.1287000 or later; 1.31.6-gke.1020000 or later; 1.32.1-gke.1369000 or later",
+      "gke_versions": [
+        {
+          "from": "1.28.15-gke.1436000",
+          "to": "1.28.15-gke.1668000",
+          "to_exclusive": true
+        },
+        {
+          "from": "1.29.12-gke.1040000",
+          "to": "1.29.13-gke.1028000",
+          "to_exclusive": true
+        },
+        {
+          "from": "1.30.8-gke.1053000",
+          "to": "1.30.8-gke.1287000",
+          "to_exclusive": true
+        },
+        {
+          "from": "1.31.4-gke.1057000",
+          "to": "1.31.6-gke.1020000",
+          "to_exclusive": true
+        },
+        {
+          "from": "1.32.0-gke.1281000",
+          "to": "1.32.1-gke.1369000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#pods-using-io-uring-related-syscalls-stuck-in-terminating"
+    },
+    {
+      "id": "image-screaming-too-many-links",
+      "category": "Operation",
+      "summary": "Image streaming fails because of symbolic links",
+      "identified": "1.34 and earlier; 1.35 versions earlier than 1.35.6-gke.1005000; 1.36 versions earlier than 1.36.0-gke.2459000",
+      "fixed_in": "1.35.6-gke.1005000 and later; 1.36.0-gke.2459000 and later",
+      "gke_versions": [
+        {
+          "through_minor": "1.34"
+        },
+        {
+          "minor": "1.35",
+          "to": "1.35.6-gke.1005000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.36",
+          "to": "1.36.0-gke.2459000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#image-screaming-too-many-links"
+    },
+    {
+      "id": "omg-82383",
+      "category": "Networking",
+      "summary": "Broken UDP traffic between Pods that run on the same node",
+      "identified": "1.31, 1.32",
+      "fixed_in": "1.32.1-gke.1729000 or later; 1.31.6-gke.1020000 or later",
+      "gke_versions": [
+        {
+          "minor": "1.31",
+          "to": "1.31.6-gke.1020000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.32",
+          "to": "1.32.1-gke.1729000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#omg-82383"
+    },
+    {
+      "id": "image-streaming-pod-bootstrap-fails-deadlock",
+      "category": "Operation",
+      "summary": "Pods fail to start on nodes with Image streaming enabled",
+      "identified": "1.33.1-gke.1522000 and later",
+      "fixed_in": "1.33.4-gke.1142000 and later",
+      "gke_versions": [
+        {
+          "from": "1.33.1-gke.1522000",
+          "to": "1.33.4-gke.1142000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#image-streaming-pod-bootstrap-fails-deadlock"
+    },
+    {
+      "id": "ccc-image-type-matching-issue",
+      "category": "Operation",
+      "summary": "Custom ComputeClasses with ImageType not using existing GKE node pools.",
+      "identified": "1.32.4-gke.1198000 and later; 1.33 versions before 1.33.5-gke.1862000; 1.34 versions before 1.34.1-gke.2541000",
+      "fixed_in": "1.33.5-gke.1862000 and later; 1.34.1-gke.2541000 and later",
+      "gke_versions": [
+        {
+          "minor": "1.32",
+          "from": "1.32.4-gke.1198000"
+        },
+        {
+          "minor": "1.33",
+          "to": "1.33.5-gke.1862000",
+          "to_exclusive": true
+        },
+        {
+          "minor": "1.34",
+          "to": "1.34.1-gke.2541000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": null,
+      "addon_versions": [],
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues#ccc-image-type-matching-issue"
+    }
+  ]
+}

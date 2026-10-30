@@ -12,8 +12,9 @@ install.env key in test_render_install_env.py. This file holds the rest:
 - The workflows that carry the mode: deploy-environment.yml and e2e-run.yml
   take it as a `mode` input defaulting to `today`, hand it to the scripts as
   PLATFORM_AGENT_MODE, and run their extra steps only when it is not `today`.
-  The two pipelines that call them pass no mode, so they install and test
-  `today`, as they did.
+  The two pipelines that call them pass `next` to their gating jobs, the mode
+  a new install gets; the RC pipeline's today leg runs after them, passes
+  `today`, and gates nothing.
 """
 
 import pathlib
@@ -58,7 +59,6 @@ _NEXT_GATE = [
     f"kubectl rollout status deployment/platform-agent-a2a-callout -n {_NAMESPACE} --timeout=GATE",
     f"kubectl rollout status deployment/platform-agent-a2a-verifier -n {_NAMESPACE} --timeout=GATE",
     f"kubectl rollout status deployment/platform-agent-gateway -n {_NAMESPACE} --timeout=GATE",
-    f"kubectl get platformagent platform-agent -n {_NAMESPACE} -o jsonpath=GATEWAY",
     f"kubectl rollout status deployment/platform-agent-a2a-gateway -n {_NAMESPACE} --timeout=GATE",
 ]
 
@@ -69,9 +69,9 @@ def _normalise(lines):
     for line in lines:
         if "-o jsonpath=" in line:
             tag = next(
-                (c for c in ("A2AGateway", "BusProvisioned", "BusCredentialsReady", ".spec.mode") if c in line),
+                (c for c in ("BusProvisioned", "BusCredentialsReady", ".spec.mode") if c in line),
                 "READ",
-            ).replace("A2AGateway", "GATEWAY").replace(".spec.mode", "MODE")
+            ).replace(".spec.mode", "MODE")
             line = line.split("-o jsonpath=", 1)[0] + "-o jsonpath=" + tag
         match = re.search(r"--timeout=(\d+)s$", line)
         if match:
@@ -262,6 +262,12 @@ def _workflow(name):
     return yaml.safe_load((_WORKFLOWS / name).read_text())
 
 
+def _needs(job):
+    """A job's `needs:` as a list: it may be a scalar, and set() of a str is its characters."""
+    needs = job.get("needs") or []
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
 def _step(doc, job, name):
     for step in doc["jobs"][job]["steps"]:
         if step.get("name") == name:
@@ -393,9 +399,11 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
             steps.index("Provision Environment in GCP"),
         )
 
-    def test_today_keeps_the_deploy_jobs_sixty_minutes(self):
+    def test_today_gives_the_deploy_job_the_stockout_retry_budget(self):
+        """150 for three provision attempts with teardowns and waits between
+        them (deploy-environment.yml says the sum); `next` adds the gate."""
         job = _workflow("deploy-environment.yml")["jobs"]["deploy-environment"]
-        self.assertEqual(job["timeout-minutes"], "${{ inputs.mode == 'next' && 90 || 60 }}")
+        self.assertEqual(job["timeout-minutes"], "${{ inputs.mode == 'next' && 180 || 150 }}")
 
     def test_next_buys_the_deploy_job_the_whole_gate(self):
         """The 30 extra minutes are the gate's single budget, which runs after the install."""
@@ -405,8 +413,18 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
         budget = int(re.search(r"PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS:-(\d+)\}", helper).group(1))
         self.assertGreaterEqual((next_minutes - today_minutes) * 60, budget)
 
-    def test_the_pipelines_still_install_and_test_today(self):
-        """No caller passes a mode yet; the input's default is what they run."""
+    def test_the_pipelines_gate_on_next(self):
+        """Every gating deploy and E2E job passes `next`, the mode a new install gets.
+
+        The RC pipeline's today leg is the one exception, and it is listed by
+        name so a job that drops the mode, or passes `today`, anywhere else
+        still fails here. Every job names its mode, so none of them moves with
+        the inputs' default.
+        """
+        today_leg = {
+            ("rc-release-pipeline.yml", "step-6-deploy-today-env"),
+            ("rc-release-pipeline.yml", "step-7-run-e2e-today"),
+        }
         for workflow in ("rc-release-pipeline.yml", "staging-promotion-pipeline.yml"):
             doc = _workflow(workflow)
             for job_id, job in doc["jobs"].items():
@@ -415,7 +433,88 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
                     "./.github/workflows/e2e-run.yml",
                 ):
                     with self.subTest(workflow=workflow, job=job_id):
-                        self.assertNotIn("mode", job.get("with") or {})
+                        expected = "today" if (workflow, job_id) in today_leg else "next"
+                        self.assertEqual((job.get("with") or {}).get("mode"), expected)
+
+    def test_the_rc_today_leg_gates_nothing_and_follows_the_next_leg(self):
+        """The today leg must not hold back a release, and must not share the cluster.
+
+        Nothing the tag step or the gating teardown waits on may belong to the leg,
+        and the leg starts only after that teardown, whose own success()
+        gate keeps a failed next install standing for diagnosis.
+        """
+        jobs = _workflow("rc-release-pipeline.yml")["jobs"]
+        leg = {"step-6-deploy-today-env", "step-7-run-e2e-today", "step-8-teardown-today-env"}
+        for job_id in ("step-2-deploy-env", "step-3-run-e2e-tests", "step-4-tag-validated", "step-5-teardown-env"):
+            with self.subTest(job=job_id):
+                self.assertFalse(leg & set(_needs(jobs[job_id])))
+        self.assertIn("step-5-teardown-env", _needs(jobs["step-6-deploy-today-env"]))
+        self.assertIn("step-6-deploy-today-env", _needs(jobs["step-7-run-e2e-today"]))
+        self.assertIn("step-7-run-e2e-today", _needs(jobs["step-8-teardown-today-env"]))
+        # The validated tag waits on the next leg's E2E: that is the gate.
+        self.assertIn("step-3-run-e2e-tests", _needs(jobs["step-4-tag-validated"]))
+        for job_id in leg:
+            with self.subTest(job=job_id):
+                job = jobs[job_id]
+                self.assertEqual(job["with"]["github_environment"], "rc")
+                self.assertIn("github.repository == 'gke-labs/kube-agents'", job["if"])
+                # Any status function replaces the implicit success() gate.
+                self.assertIsNone(re.search(r"\b(always|cancelled|failure|success)\s*\(", job["if"]))
+        # The tag step fails closed on a red next E2E, and the gating teardown keeps a
+        # failed next install standing, only through the same implicit success().
+        for job_id in ("step-4-tag-validated", "step-5-teardown-env"):
+            with self.subTest(job=job_id):
+                self.assertIsNone(re.search(r"\b(always|cancelled|failure|success)\s*\(", jobs[job_id]["if"]))
+        # The same suites as the today leg, so the two results read side by side.
+        for key in ("blocking_suite", "optional_suites"):
+            self.assertEqual(jobs["step-7-run-e2e-today"]["with"][key], jobs["step-3-run-e2e-tests"]["with"][key])
+
+    def test_needs_reads_the_scalar_form_as_one_job(self):
+        """Step 2 writes `needs:` as a scalar; the pin above must see it as a job name."""
+        self.assertEqual(_needs({"needs": "step-7-run-e2e-next"}), ["step-7-run-e2e-next"])
+        self.assertEqual(_needs({"needs": ["a", "b"]}), ["a", "b"])
+        self.assertEqual(_needs({}), [])
+        leg = {"step-7-run-e2e-next"}
+        self.assertTrue(leg & set(_needs({"needs": "step-7-run-e2e-next"})))
+
+    _SUITE_STEPS = (
+        ("Execute Blocking E2E Gate", "execute_e2e_tests.sh"),
+        ("Execute Optional E2E Suites", "run_optional_e2e_suites.sh"),
+    )
+    _NEXT_EXPRESSION = "${{ steps.mode.outputs.next == 'true' }}"
+
+    def _run_suite_step(self, name, script, next_value):
+        """Runs the step's `run:` with the mode expression rendered, against a stub script."""
+        step = _step(_workflow("e2e-run.yml"), "run-e2e", name)
+        self.assertEqual(step["run"].count(self._NEXT_EXPRESSION), 1)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        record = root / "env"
+        stub = root / "scripts" / "release" / script
+        stub.parent.mkdir(parents=True)
+        stub.write_text(f'#!/usr/bin/env bash\nprintf "%s" "${{TEST_TIMEOUT_SEC-unset}}" > "{record}"\n')
+        stub.chmod(0o755)
+        proc = subprocess.run(
+            ["bash", "-e", "-c", step["run"].replace(self._NEXT_EXPRESSION, next_value)],
+            capture_output=True, text=True, cwd=root, env={"PATH": "/usr/bin:/bin"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return step, record.read_text()
+
+    def test_today_hands_the_suites_no_test_timeout(self):
+        """The test is the candidate's, and one older than the next leg reads '' as int('')."""
+        for name, script in self._SUITE_STEPS:
+            with self.subTest(step=name):
+                step, value = self._run_suite_step(name, script, "false")
+                self.assertNotIn("TEST_TIMEOUT_SEC", step.get("env") or {})
+                self.assertEqual(value, "unset")
+
+    def test_next_gives_the_suites_300_seconds(self):
+        for name, script in self._SUITE_STEPS:
+            with self.subTest(step=name):
+                _, value = self._run_suite_step(name, script, "true")
+                self.assertEqual(value, "300")
 
 
 if __name__ == "__main__":

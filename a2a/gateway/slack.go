@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/slack-go/slack"
@@ -39,6 +40,39 @@ const slackSeenCap = 2048
 // accrues per distinct thread replied to, and a busy workspace should not
 // grow the gateway forever.
 const slackThreadsCap = 2048
+
+// slackForeignNoticesCap bounds the once-per-sender memory of the notice a
+// refused member of another workspace gets (foreignSender); one entry per
+// such sender, evicted wholesale at the cap, which at worst repeats a notice.
+// A var so a test can lower it.
+var slackForeignNoticesCap = 2048
+
+// slackForeignNoticeKeySep joins the sender's workspace and member id in the
+// notice memory's key.
+const slackForeignNoticeKeySep = "/"
+
+// slackForeignNoticeText is what a refused member of another workspace is told,
+// with their member id, the one thing an admin needs to find the refusal in the log.
+const slackForeignNoticeText = "⛔ I only take asks from members of this Slack workspace, and you are " +
+	"posting from another workspace, so I can't answer you here. Your member id is %s."
+
+// slackForeignNoticeEntryText follows it when the sender's workspace is clear
+// (senderWorkspace): the allowlist entry that would admit them
+// (slackGuestEntry), so they can hand it to an admin. Both ids are ones they
+// already hold. Left out when their two workspace fields disagree, since then
+// no entry admits them.
+const slackForeignNoticeEntryText = " To be admitted, ask an admin of this install to add `%s` to its allowed Slack users."
+
+// slackGuestSep joins a Slack Connect guest's workspace id and member id in an
+// allowlist entry (integration.slack.allowedUsers: "T…:U…") and in the author
+// id the adapter gives an admitted guest's turns, so the gateway's exact-match
+// allowlist and the target allowlist read one string. The principal map cannot
+// name a guest: its keys are Secret keys, which cannot hold this separator.
+const slackGuestSep = ":"
+
+// slackGuestEntryPattern is a well-formed guest entry: a workspace id (T…, or
+// E… for an Enterprise Grid org), the separator, and a member id (U… or W…).
+var slackGuestEntryPattern = regexp.MustCompile(`^[TE][A-Z0-9]+:[UW][A-Z0-9]+$`)
 
 // slackTurnSubtypes are the message subtypes that are genuine user turns.
 // Plain messages have no subtype; thread_broadcast is a thread reply with
@@ -122,6 +156,9 @@ const (
 	slackMemberPrincipalPrefix = "slack:"
 	// slackChannelTypeIM is a direct message's channel_type.
 	slackChannelTypeIM = "im"
+	// slackChannelTypeChannel is a public channel's channel_type; a home
+	// channel is never a DM.
+	slackChannelTypeChannel = "channel"
 	// slackMinChannelIDLen is the shortest id slackIsHomeChannelID takes:
 	// the prefix letter and at least two characters after it.
 	slackMinChannelIDLen = 3
@@ -142,6 +179,13 @@ type slackAPI interface {
 	UpdateMessage(channelID, timestamp string, options ...slack.MsgOption) (string, string, string, error)
 	GetUsersInConversation(params *slack.GetUsersInConversationParameters) ([]string, string, error)
 	OpenConversation(params *slack.OpenConversationParameters) (*slack.Channel, bool, bool, error)
+	AddReaction(name string, item slack.ItemRef) error
+	RemoveReaction(name string, item slack.ItemRef) error
+	GetUserInfo(user string, options ...slack.GetUserInfoOption) (*slack.User, error)
+	GetUserInfoContext(ctx context.Context, user string, options ...slack.GetUserInfoOption) (*slack.User, error)
+	GetConversationInfoContext(ctx context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error)
+	SetAssistantThreadsSuggestedPrompts(params slack.AssistantThreadsSetSuggestedPromptsParameters) error
+	PublishView(userID string, view slack.HomeTabViewRequest, hash string) (*slack.ViewResponse, error)
 }
 
 // SlackAdapter is the first real mapped-identity backend. Transport is
@@ -207,6 +251,66 @@ type SlackAdapter struct {
 	// seen and seenOrder are the at-least-once dedupe ring over (channel, ts).
 	seen      map[string]bool
 	seenOrder []string
+	// foreignNoticed records which members of other workspaces have been told
+	// they are refused, so the notice is once per sender, not once per
+	// message. Created on first use; bounded by slackForeignNoticesCap.
+	foreignNoticed map[string]bool
+	// guests is the set of other workspaces' members the allowlist names,
+	// as "T…:U…" entries (SetAllowedGuests). foreignSender admits exactly
+	// these; set before Run, read-only after.
+	guests map[string]bool
+
+	// sessionsAPI drives Agent Sessions (slack_sessions.go); nil in a test
+	// that does not fake it, which then sends no status. sessionStates holds
+	// each thread's session state, made on first use, sessionOrder its
+	// eviction ring. syncSessions runs the session and prompt sends inline,
+	// for tests.
+	sessionsAPI   slackSessionsAPI
+	sessionStates map[string]*slackSession
+	sessionOrder  []string
+	syncSessions  bool
+	// sessionErrorsSeen is the setStatus error texts already logged at Warn
+	// (firstSessionError), under s.mu.
+	sessionErrorsSeen map[string]bool
+	// pressers caches each Stop presser's workspace answer (slack_stop.go,
+	// presserInWorkspace), so a press costs at most one users.info call.
+	pressers map[string]slackPresser
+	// boardActor acts on a board-health row's Retry or Drop, and boardTaps
+	// holds each row whose tap is running or landed, under s.mu
+	// (slack_board.go).
+	boardActor     BoardActor
+	boardTaps      map[string]bool
+	boardTapsOrder []string
+	// boardSent is the blocks each board card's last edit sent, by
+	// channel/ts, under s.mu, bounded oldest first like boardTaps
+	// (remember); boardEditMu runs one board edit at a time.
+	boardSent      map[string]json.RawMessage
+	boardSentOrder []string
+	boardEditMu    sync.Mutex
+
+	// ux is the click and question state (slack_interactive.go), made on
+	// first use.
+	ux *slackUX
+
+	// postWebhook posts to a shortcut's response_url (slack_shortcut.go);
+	// nil is slack-go's, through the bounded client. Tests fake it.
+	postWebhook func(ctx context.Context, url string, msg *slack.WebhookMessage) error
+
+	// homeLearn is the learned home channel's state (slack_home_channel.go).
+	homeLearn slackHomeLearn
+
+	// workspaceURL is the bot's workspace as auth.test names it
+	// ("https://acme.slack.com/"), the root of a message's permalink; home is
+	// the Home tab's state (slack_home.go).
+	workspaceURL string
+	home         slackHome
+
+	// feedback is the gateway's answer-feedback recorder, under s.mu; until
+	// it is handed over, no rating controls are drawn.
+	// feedbackAPI is the Web API answer feedback calls
+	// (slack_feedback.go); nil in a test that does not fake it.
+	feedback    FeedbackRecorder
+	feedbackAPI slackFeedbackAPI
 }
 
 // slackLinkRE matches the markdown links the relay emits, for rewriteLinks
@@ -268,25 +372,40 @@ func slackChannelThread(conversation string) (channel, threadTS string, ok bool)
 	return channel, threadTS, true
 }
 
-// toMrkdwn escapes Slack's control characters, then translates the two
-// markdown forms the relay emits (bold pairs, links) into mrkdwn. Escaping
-// first, over the whole text, so the only < and > on the wire are the ones
-// our own deterministic link translation writes, and so a prompt-injected
-// <!channel> inside a code span is as inert as one in prose; the two
-// translations then leave code spans as written, since the task's result is
-// executor output of arbitrary shape and a `**kwargs` or a `**/*.yaml` in
-// it is the answer, not bold. The rules are the ones markdown.go holds for
-// both chat surfaces. Narrow on purpose: full markdown fidelity is
-// presentation polish, and the legacy Hermes path's converter is not this
-// code path's to reuse.
+// toMrkdwn rewrites the line-level markdown Slack cannot show (headings,
+// rules, list markers, tables: rewriteSlackBlocks), escapes Slack's control
+// characters, then translates the two inline markdown forms the relay emits
+// (bold pairs, links) into mrkdwn. Escaping first, over the whole text, so
+// the only < and > on the wire are the ones our own deterministic link
+// translation writes or keeps (below), and so a prompt-injected <!channel>
+// inside a code span is as inert as one in prose; the two translations then
+// leave code spans as written, since the task's result is executor output of
+// arbitrary shape and a `**kwargs` or a `**/*.yaml` in it is the answer, not
+// bold. The rules are the ones markdown.go holds for both chat surfaces.
+// Narrow on purpose: full markdown fidelity is presentation polish, and the
+// legacy Hermes path's converter is not this code path's to reuse.
+//
+// One <url|text> the executor wrote is not escaped: a closed one, in prose,
+// whose URL is http(s) with no whitespace, angle bracket or pipe and whose
+// text does not name another host (keepChatLinks), which is the link
+// rewriteLinks would have written from [text](url), refused on the same
+// label-host ground. Its URL and text are escaped as the rest of the text is,
+// and only its own angle brackets stay live. Its URL must start with
+// http(s)://, so a <!channel>, <@U…> or <#C…> is never one, and its text
+// admits no angle bracket, so none rides out inside it.
 func toMrkdwn(text string) string {
-	return rewriteMarkdown(slackEscaper.Replace(text), slackLinkRE)
+	return rewriteMarkdown(keepChatLinks(rewriteSlackBlocks(text), slackEscaper.Replace, func(dest, label string) string {
+		return chatLinkOpen + slackEscaper.Replace(dest) + chatLinkSep + slackEscaper.Replace(label) + chatLinkClose
+	}), slackLinkRE)
 }
 
 var (
 	_ Adapter           = (*SlackAdapter)(nil)
 	_ TaskObserver      = (*SlackAdapter)(nil)
 	_ SessionLookupSink = (*SlackAdapter)(nil)
+	_ MarkObserver      = (*SlackAdapter)(nil)
+	_ StatusShower      = (*SlackAdapter)(nil)
+	_ VerifiedObserver  = (*SlackAdapter)(nil)
 )
 
 // SetSessionLookup receives the gateway's session registry as a read, and
@@ -313,7 +432,19 @@ func (s *SlackAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Durat
 // record, threaded or not: a DM carries every message, so its threads never
 // consult the cache. Called on the conversation's inbox worker under the
 // session lock (TaskObserver): record and return.
+//
+// It also opens the thread's Agent Session, a DM thread's included:
+// processing from here until the chain ends and its card work settles
+// (slack_sessions.go). And when the task is a verified shortcut's, it posts
+// the line naming who asked, before anything of the task's can post
+// (creditShortcut): the one post this observer makes, under the session lock
+// like the placeholder startTask posts right after it on a backend without
+// Agent Sessions.
 func (s *SlackAdapter) TaskStarted(conversation, _ string) {
+	s.updateSession(conversation, func(st *slackSession) { st.running = true })
+	// After the mark below: the credit is a Slack round trip, and a reply
+	// typed in the thread meanwhile must find the thread a session thread.
+	defer s.creditShortcut(conversation)
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
@@ -332,8 +463,12 @@ func (s *SlackAdapter) startedExpiry() time.Time {
 	return s.now().Add(s.sessionTTL)
 }
 
-// TaskTerminal, TaskAccepted and CancelPublished are not the Slack adapter's
-// business: a human reads the thread. A thread stays a session thread past
+// TaskTerminal ends the running half of the thread's Agent Session: it is
+// called for the chain's end only (observedAs), and the session then holds
+// processing while the chain's mark says card work is still open, suspended
+// while it waits on the user, and closes otherwise (slackSession.wanted).
+// TaskAccepted holds processing like TaskStarted; CancelPublished is not the
+// Slack adapter's business: a human reads the thread. A thread stays a session thread past
 // its task's end for as long as the session has been active within the idle
 // TTL, and the relay stamps the task's end as activity, so that window
 // starts at the answer. What TaskTerminal does here is expire the cached
@@ -345,6 +480,7 @@ func (s *SlackAdapter) startedExpiry() time.Time {
 // re-ask decides. Called on the relay queue under the session lock: record
 // and return.
 func (s *SlackAdapter) TaskTerminal(conversation, _ string, _ lib.TaskState, _ TerminalSource, _ string) {
+	s.updateSession(conversation, func(st *slackSession) { st.running = false })
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
@@ -370,7 +506,21 @@ func (s *SlackAdapter) expireMark(key string) {
 	}
 }
 
-func (s *SlackAdapter) TaskAccepted(string, string)    {}
+// ShowsTaskStatus is the StatusShower answer: with Agent Sessions wired the
+// thread's Working… status, the ask's reaction and the plan rows are the
+// task's status, so the relay posts no rolling line. An adapter built
+// without them (a test that fakes no sessions API) keeps the line, and so
+// does a conversation with no thread (a legacy top-level DM key), which
+// gets no Agent Session.
+func (s *SlackAdapter) ShowsTaskStatus(conversation string) bool {
+	_, thread, ok := slackChannelThread(conversation)
+	return s.sessionsAPI != nil && ok && thread != ""
+}
+
+func (s *SlackAdapter) TaskAccepted(conversation, _ string) {
+	s.updateSession(conversation, func(st *slackSession) { st.running = true })
+}
+
 func (s *SlackAdapter) CancelPublished(string, string) {}
 
 // NewSlackAdapter builds the Socket Mode client pair. The bot token drives
@@ -401,6 +551,8 @@ func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack
 		sessionExpiresAt: map[string]time.Time{},
 		seen:             map[string]bool{},
 		now:              time.Now,
+		sessionsAPI:      slackSessionsClient{token: botToken, apiURL: slack.APIURL, http: slackHTTPClient()},
+		feedbackAPI:      api,
 	}
 }
 
@@ -433,6 +585,9 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	// blocks with it, which is the honest reading of "the pump is finished".
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	// A home-channel learn or adopt in flight finishes its write before Run
+	// returns, and none starts after (slack_home_channel.go).
+	defer s.closeHomeLearn()
 
 	// The pump below exits only on ctx, so derive our own: any return from
 	// Run — a failed auth.test, or RunContext giving up on an invalid token
@@ -472,26 +627,29 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			if ctx.Err() != nil {
 				return
 			}
-			if evt.Type != socketmode.EventTypeEventsAPI {
-				// Everything that is not an EventsAPI envelope is dropped
-				// here, unacked. socketmode's parseEvent attaches a Request
-				// to all five request types it knows
+			if evt.Type != socketmode.EventTypeEventsAPI && evt.Type != socketmode.EventTypeInteractive {
+				// Everything that is neither an EventsAPI nor an interactive
+				// envelope is dropped here, unacked. socketmode's parseEvent
+				// attaches a Request to all five request types it knows
 				// (socketmode/socket_mode_managed_conn.go): hello and
 				// disconnect carry one whose EnvelopeID is empty — acking
 				// those would write a junk frame back up the socket — while
-				// slash_commands and interactive carry a real, non-empty one
-				// that this continue throws away.
+				// slash_commands carry a real, non-empty one that this
+				// continue throws away: the gateway answers no slash command.
 				//
-				// The same app serves the legacy consumer under today, which
-				// does answer interactions, so an install may well have
-				// interactivity on and these envelopes do arrive. Nothing the
-				// gateway posts carries an interactive element - the agent
-				// sends the audit card through the notify route with its
-				// buttons removed - so the only clicks that land here are on
-				// messages posted under today. Answering interactions means
-				// acking them here first: Slack wants the envelope acked
-				// inside three seconds, and an unacked one redelivers and
-				// shows the user a timeout.
+				// Interactive envelopes are acked below like an event, inside
+				// the three seconds Slack allows before it redelivers and
+				// shows the clicker a timeout, and a click on one of the
+				// choice buttons a chat message's layout carries
+				// (renderSlackChat), the home-channel cards the notify route
+				// lays out (the fleet audit's, the first inventory's) among
+				// them, becomes a turn (slack_interactive.go). A tap on an answer's
+				// feedback buttons, and the note its 👎 opens, are ratings, never
+				// turns (slack_feedback.go). A click on any
+				// other button (one on a message posted under today, a link)
+				// is acked and changes nothing. The route's raw blocks still
+				// carry none. The "ask about this" message shortcut arrives
+				// the same way and becomes a turn too (slack_shortcut.go).
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in
@@ -579,6 +737,24 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 					return
 				}
 			}
+			if evt.Type == socketmode.EventTypeInteractive {
+				if evt.Request == nil {
+					continue
+				}
+				if payload := evt.Request.Payload; slackIsShortcut(payload) {
+					// The message shortcut reads from Slack before it has a
+					// turn to hand over, so it runs off the pump; wg holds Run
+					// until it is done, and every read it makes is under ctx.
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						s.shortcut(ctx, payload, handler)
+					}()
+				} else if msg, ok := s.interactive(payload); ok {
+					handler(msg)
+				}
+				continue
+			}
 			e, ok := evt.Data.(slackevents.EventsAPIEvent)
 			if !ok {
 				continue
@@ -586,12 +762,31 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			if e.Type != slackevents.CallbackEvent {
 				continue
 			}
-			m, ok := e.InnerEvent.Data.(*slackevents.MessageEvent)
-			if !ok {
-				continue
-			}
-			if msg, ok := s.inbound(ctx, m); ok {
-				handler(msg)
+			switch inner := e.InnerEvent.Data.(type) {
+			case *slackevents.MessageEvent:
+				var parent string
+				if evt.Request != nil {
+					parent = slackParentUserID(evt.Request.Payload)
+				}
+				if msg, ok := s.inboundEvent(ctx, inner, parent); ok {
+					// Recorded before the handoff, so the gateway's word on
+					// the sender always finds it (InboundVerified).
+					s.notePending(msg)
+					s.noteHomeCandidate(msg, inner)
+					msg.Answer = s.answersOpenQuestion(msg)
+					handler(msg)
+				}
+			case *slackevents.AgentSessionStoppedEvent:
+				// Not notePending: a Stop is no message, so there is
+				// nothing to draw a mark or a refusal on.
+				if msg, ok := s.inboundStop(inner); ok {
+					handler(msg)
+				}
+			case *slackevents.AssistantThreadStartedEvent:
+				s.suggestPrompts(inner)
+			case *slackevents.AppHomeOpenedEvent:
+				s.suggestPrompts(inner)
+				s.homeOpened(inner)
 			}
 		}
 	}()
@@ -606,7 +801,14 @@ func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("malformed conversation id %q", conversation)
 	}
-	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false)}
+	// No unfurls: an answer cites console and documentation links, and each
+	// unfurled into a preview card (a console link previews as the Google
+	// sign-in page), three or four under every answer.
+	opts := []slack.MsgOption{
+		slack.MsgOptionText(toMrkdwn(text), false),
+		slack.MsgOptionDisableLinkUnfurl(),
+		slack.MsgOptionDisableMediaUnfurl(),
+	}
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
@@ -668,6 +870,37 @@ func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.R
 	return ts, thread, nil
 }
 
+// PostNotifyMessage is PostNotify for a message value: a chat message laid
+// out as Block Kit (renderSlackChat), its text as the notification and
+// fallback, link and media previews off. A layout the renderer will not send,
+// or that Slack refuses, is an error wrapped in ErrLayoutRefused and nothing
+// is posted; the Notifier posts the text instead.
+func (s *SlackAdapter) PostNotifyMessage(channel, thread string, m OutMessage) (message, landed string, err error) {
+	if !slackIsHomeChannelID(channel) {
+		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	opts, err := slackMessageOptions(m)
+	if err != nil {
+		return "", "", err
+	}
+	opts = append(opts, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err != nil {
+		return "", "", slackLayoutError(err)
+	}
+	if thread == "" {
+		thread = ts
+	}
+	// A home card with choices is its thread's open question, as a
+	// conversation's is, so a typed answer in the thread settles it and a
+	// later click on it is dropped.
+	s.trackQuestion(slackConversationID(slackChannelTypeChannel, channel, thread), ts, m)
+	return ts, thread, nil
+}
+
 // slackIsHomeChannelID reports a public ("C...") or private ("G...")
 // channel id: a prefix letter and upper-case letters or digits after it. A
 // DM ("D...") is not a home channel.
@@ -707,8 +940,122 @@ func (s *SlackAdapter) Edit(conversation, messageID, text string) error {
 	if !ok {
 		return fmt.Errorf("malformed conversation id %q", conversation)
 	}
-	_, _, _, err := s.api.UpdateMessage(channel, messageID, slack.MsgOptionText(toMrkdwn(text), false))
+	// The whole message, blocks and side bar cleared: the rolling line may
+	// have been laid out by EditMessage before, in this process or one a
+	// restart replaced, and chat.update keeps whatever it is not sent.
+	opts, _ := slackMessageOptions(OutMessage{Text: text})
+	_, _, _, err := s.api.UpdateMessage(channel, messageID, opts...)
 	return err
+}
+
+// PostMessage posts a message value: a chat message laid out as Block Kit
+// (renderSlackChat) with the text, as mrkdwn, as its notification and
+// fallback, into the conversation's thread as Post does, link and media
+// previews off (its links are buttons). Without a chat message it is Post,
+// unless it is an answer drawn with rating controls (slack_feedback.go).
+// A chat message the renderer will not send, or that Slack refuses, is an
+// error and nothing is posted; the gateway posts the text instead.
+func (s *SlackAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	rated := s.rates(m)
+	if m.Chat == nil && !rated {
+		return s.Post(conversation, m.Text)
+	}
+	channel, threadTS, ok := slackChannelThread(conversation)
+	if !ok {
+		return "", fmt.Errorf("malformed conversation id %q", conversation)
+	}
+	var opts []slack.MsgOption
+	var err error
+	if rated {
+		opts, err = slackRatedOptions(m)
+	} else {
+		opts, err = slackMessageOptions(m)
+	}
+	if err != nil {
+		return "", err
+	}
+	opts = append(opts, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err == nil {
+		s.trackQuestion(conversation, ts, m)
+	}
+	return ts, slackLayoutError(err)
+}
+
+// slackLayoutRefusals are the chat.postMessage and chat.update errors that
+// refuse what a message carries rather than the call itself.
+var slackLayoutRefusals = map[string]bool{
+	"invalid_blocks": true, "invalid_blocks_format": true, "invalid_attachments": true,
+	"msg_too_long": true, "too_many_attachments": true, "no_text": true,
+}
+
+// slackGoneErrors are the chat.update errors that say the message cannot be
+// edited at all.
+var slackGoneErrors = map[string]bool{
+	"message_not_found": true, "cant_update_message": true, "edit_window_closed": true, "channel_not_found": true,
+}
+
+// slackLayoutError wraps Slack's refusal of a layout in ErrLayoutRefused, and
+// its answer that the message cannot be edited in ErrMessageGone, and leaves
+// any other error (a rate limit, an outage) as it is.
+func slackLayoutError(err error) error {
+	var resp slack.SlackErrorResponse
+	switch {
+	case !errors.As(err, &resp):
+		return err
+	case slackLayoutRefusals[resp.Err]:
+		return fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	case slackGoneErrors[resp.Err]:
+		return fmt.Errorf("%w: %w", ErrMessageGone, err)
+	}
+	return err
+}
+
+// EditMessage replaces a posted message with a message value. Without a chat
+// message the text replaces the layout too: the blocks and the side bar are
+// sent empty, since chat.update keeps whatever it is not sent.
+func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	channel, _, ok := slackChannelThread(conversation)
+	if !ok {
+		return fmt.Errorf("malformed conversation id %q", conversation)
+	}
+	opts, err := slackMessageOptions(m)
+	if line := s.answeredLine(channel, messageID); line != "" && (m.Chat == nil || !asksQuestion(m.Chat.Choices)) {
+		// An answered question edited again without its choices (the card
+		// settling it on the notify route, laid out or as text) keeps the
+		// line that names who answered.
+		opts, err = slackAnsweredOptions(m, line)
+	}
+	if err != nil {
+		return err
+	}
+	_, _, _, err = s.api.UpdateMessage(channel, messageID, opts...)
+	if err == nil {
+		s.trackQuestion(conversation, messageID, m)
+	}
+	return slackLayoutError(err)
+}
+
+// slackMessageOptions is a message value as chat.postMessage and
+// chat.update options: the text as mrkdwn, and the chat message's layout, or
+// no blocks and no side bar when there is none.
+func slackMessageOptions(m OutMessage) ([]slack.MsgOption, error) {
+	text := toMrkdwn(m.Text)
+	if m.Chat == nil {
+		return []slack.MsgOption{slack.MsgOptionText(text, false), slack.MsgOptionBlocks(),
+			slack.MsgOptionAttachments([]slack.Attachment{}...)}, nil
+	}
+	if utf8.RuneCountInString(text) > slackChatTextMax {
+		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, errSlackChatTooLarge)
+	}
+	layout, err := renderSlackChat(m.Chat, text)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	}
+	return slackChatOptions(layout, text)
 }
 
 // Roster is the channel's membership. Slack has no per-thread membership,
@@ -824,7 +1171,10 @@ func (s *SlackAdapter) alreadySeen(key string) bool {
 // @mention), and the next reply asks again. With no lookup wired (an
 // embedder that offers none) a miss is a false; there is nothing to ask.
 //
-// Nothing is derived from the root message, and that is deliberate. The
+// Nothing about a session thread is derived from the root message, and that
+// is deliberate. (A reply under the bot's own post is a separate rule,
+// decided in inboundEvent from the root's author, and it makes no session
+// thread either.) The
 // root can say that someone mentioned the bot; it cannot say that the
 // gateway verified them and started a task, and only the latter makes a
 // session thread. So a channel ask's own thread becomes a session thread
@@ -989,6 +1339,7 @@ func (s *SlackAdapter) setMark(key string, isSession, force bool, until time.Tim
 func (s *SlackAdapter) connected(auth *slack.AuthTestResponse) {
 	s.botUserID = auth.UserID
 	s.teamID = auth.TeamID
+	s.workspaceURL = auth.URL
 	s.log.Info("slack connected", "user", auth.User, "botUserID", auth.UserID, "team", auth.TeamID)
 	if auth.TeamID == "" {
 		// foreignSender fails closed without it, so a message that names any
@@ -996,36 +1347,164 @@ func (s *SlackAdapter) connected(auth *slack.AuthTestResponse) {
 		// a bot that has gone quiet.
 		s.log.Warn("slack auth.test returned no team id; every message that names a workspace will be refused as another workspace's")
 	}
+	for entry := range s.guests {
+		if team, _, _ := strings.Cut(entry, slackGuestSep); auth.TeamID != "" && team == auth.TeamID {
+			// A member of our own workspace is matched by the plain id, so this
+			// entry admits nobody; said once, so the admin is not left guessing.
+			s.log.Warn("slack allowedUsers entry names this install's own workspace; list the plain member id instead",
+				"entry", entry)
+		}
+	}
+}
+
+// SetAllowedGuests takes the Slack allowlist (integration.slack.allowedUsers)
+// and keeps its team-qualified entries, "T…:U…": the members of other
+// workspaces this install serves in a Slack Connect channel. A plain "U…"
+// entry is a member of the install's own workspace, matched by the gateway,
+// and is not a guest. An entry that has the separator but is not well formed
+// (slackGuestEntryPattern) is logged and admits nobody. Call before Run.
+func (s *SlackAdapter) SetAllowedGuests(entries []string) {
+	s.guests = map[string]bool{}
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if !strings.Contains(entry, slackGuestSep) {
+			continue
+		}
+		if !slackGuestEntryPattern.MatchString(entry) {
+			s.log.Warn("slack allowedUsers entry is not a member of another workspace in the form T…:U…; ignoring it",
+				"entry", entry)
+			continue
+		}
+		s.guests[entry] = true
+	}
+	if len(s.guests) > 0 {
+		s.log.Info("slack guests from other workspaces loaded", "entries", len(s.guests))
+	}
+}
+
+// senderWorkspace names the workspace a sender belongs to, from the two fields
+// Slack may carry: the sender's own team (user_team, or a click's user.team_id)
+// first, then the team the message or click names. ok is false when both are
+// set and disagree: then which workspace the sender is in cannot be told, and
+// no guest entry is matched. Both empty is "" and ok: the sender names no
+// workspace, which is our own member's shape.
+func senderWorkspace(userTeam, otherTeam string) (team string, ok bool) {
+	if userTeam != "" && otherTeam != "" && userTeam != otherTeam {
+		return "", false
+	}
+	if userTeam != "" {
+		return userTeam, true
+	}
+	return otherTeam, true
+}
+
+// slackGuestEntry is the allowlist entry that names member user of workspace team.
+func slackGuestEntry(team, user string) string {
+	return team + slackGuestSep + user
+}
+
+// admitGuest reports whether the allowlist names this member of another
+// workspace, and the author id their turns carry: "T…:U…", so the gateway's
+// allowlist and target allowlist match the same entry. A
+// workspace that cannot be told (senderWorkspace) or is unnamed admits nobody.
+func (s *SlackAdapter) admitGuest(userTeam, otherTeam, user string) (string, bool) {
+	team, ok := senderWorkspace(userTeam, otherTeam)
+	if !ok || team == "" || user == "" {
+		return "", false
+	}
+	entry := slackGuestEntry(team, user)
+	return entry, s.guests[entry]
 }
 
 // foreignSender reports a message whose sender belongs to a workspace other
-// than the bot's. Slack names the sender's workspace as user_team on a
-// message in a channel shared between workspaces, and a message's own team
-// field names the workspace it was posted from; both are read, so a shape
-// that carries only one is still checked. A message that names a workspace
-// other than ours in either is a Slack Connect guest's, and is refused
-// before the allowlist is consulted: the member id is the principal for an unmapped
-// sender, so admission must not reach past the install's own workspace, and
-// under allow-all nothing else would stop it. Fail-closed when auth.test
-// gave no team id. Silent to the sender, as a bot's or an edit's drop is;
-// logged at Info when it addressed the bot, so an admin can see why a guest
-// got no answer. Under Enterprise Grid a member of a sister workspace in a
-// shared channel is refused too, since the event does not carry the
-// sender's enterprise.
-func (s *SlackAdapter) foreignSender(m *slackevents.MessageEvent) bool {
-	if !s.otherWorkspace(m.UserTeam) && (m.Message == nil || !s.otherWorkspace(m.Message.Team)) {
-		return false
+// than the bot's and is not admitted, and gives the author id a turn carries:
+// the member id for our own member, "T…:U…" for an admitted guest. Slack names
+// the sender's workspace as user_team on a message in a channel shared between
+// workspaces, and a message's own team field names the workspace it was posted
+// from; both are read, so a shape that carries only one is still checked. A
+// message that names a workspace other than ours in either is a Slack Connect
+// guest's, and is refused before the allowlist is consulted unless the
+// allowlist names that member of that workspace (admitGuest): the member id is
+// the principal for an unmapped sender, so admission must not reach past the
+// install's own workspace without an entry that says so, and under allow-all
+// nothing else would stop it. Allow-all admits no guest; a plain member id
+// does not either. Fail-closed when auth.test gave no team id, for every
+// sender the allowlist does not name by workspace. When the refused message
+// addressed the bot (a DM, or a mention), the refusal is logged at Info with
+// the sender's member id, and the sender is told once (noticeForeignSender),
+// so a guest in a shared channel does not meet a bot that seems broken. A
+// message that addressed nobody is dropped without a word, as a bot's or an
+// edit's drop is. Under Enterprise Grid a member of a sister workspace in a
+// shared channel is refused too unless named, since the event does not carry
+// the sender's enterprise.
+func (s *SlackAdapter) foreignSender(m *slackevents.MessageEvent) (refused bool, author string) {
+	messageTeam := ""
+	if m.Message != nil {
+		messageTeam = m.Message.Team
+	}
+	if !s.otherWorkspace(m.UserTeam) && !s.otherWorkspace(messageTeam) {
+		return false, m.User
+	}
+	if guest, ok := s.admitGuest(m.UserTeam, messageTeam, m.User); ok {
+		return false, guest
 	}
 	if m.ChannelType == slackChannelTypeIM || slackMentionsBot(m.Text, s.botUserID) {
-		messageTeam := ""
-		if m.Message != nil {
-			messageTeam = m.Message.Team
-		}
 		// Both fields: either can be the one that named the other workspace.
 		s.log.Info("slack: ignoring a message from another workspace's member",
-			"userTeam", m.UserTeam, "messageTeam", messageTeam, "team", s.teamID, "channel", m.Channel)
+			"user", m.User, "userTeam", m.UserTeam, "messageTeam", messageTeam, "team", s.teamID, "channel", m.Channel)
+		thread := m.ThreadTimeStamp
+		if thread == "" {
+			thread = m.TimeStamp
+		}
+		s.noticeForeignSender(m.Channel, thread, m.UserTeam, messageTeam, m.User)
 	}
-	return true
+	return true, ""
+}
+
+// noticeForeignSender tells a refused member of another workspace why the bot
+// will not answer, once per sender: a reply in thread, the thread of the
+// message they addressed the bot with or of the question whose button they
+// clicked. Keyed by their workspace (userTeam, else otherTeam) and member id,
+// so the same id in two workspaces is two senders. The notice names their own
+// member id and, when their workspace is clear, the "T…:U…" entry that would
+// admit them: ids they already hold, and nothing about this workspace. Not posted
+// when auth.test gave no team id: then every message that names a workspace is
+// refused, our own members' included, and telling them they are in another
+// workspace would be false; connected has already warned the admin. Sent off
+// the event pump, as suggestPrompts is, so a slow Slack API does not hold the
+// acks behind it. A failed post is logged and not retried; the sender stays
+// counted as told, as the gateway's own drop notice does.
+func (s *SlackAdapter) noticeForeignSender(channel, thread, userTeam, otherTeam, user string) {
+	if s.teamID == "" {
+		return
+	}
+	team := userTeam
+	if team == "" {
+		team = otherTeam
+	}
+	text := fmt.Sprintf(slackForeignNoticeText, user)
+	if clear, ok := senderWorkspace(userTeam, otherTeam); ok && clear != "" {
+		text += fmt.Sprintf(slackForeignNoticeEntryText, slackGuestEntry(clear, user))
+	}
+	key := team + slackForeignNoticeKeySep + user
+	s.mu.Lock()
+	if s.foreignNoticed == nil || len(s.foreignNoticed) >= slackForeignNoticesCap {
+		s.foreignNoticed = map[string]bool{}
+	}
+	told := s.foreignNoticed[key]
+	s.foreignNoticed[key] = true
+	s.mu.Unlock()
+	if told {
+		return
+	}
+	s.goSession(func() {
+		if _, _, err := s.api.PostMessage(channel,
+			slack.MsgOptionText(text, false),
+			slack.MsgOptionTS(thread)); err != nil {
+			s.log.Warn("slack: could not tell another workspace's member why they are refused",
+				"user", user, "channel", channel, "err", err)
+		}
+	})
 }
 
 // otherWorkspace reports a workspace id that is named and is not the bot's.
@@ -1040,19 +1519,44 @@ func (s *SlackAdapter) otherWorkspace(team string) bool {
 // conversation; a channel
 // message must mention the bot, and the ask's own ts becomes the session
 // thread's root (Slack threads are implicit); a thread reply is a turn when
-// it mentions the bot or the thread is already a session thread — one the
-// gateway has started a task in, which a mention alone does not make it,
+// it mentions the bot, the thread's root is the bot's own post (an alert or
+// another home-channel post; read from the event, see inboundEvent), or the thread is
+// already a session thread — one the gateway has started a task in, which a
+// mention alone does not make it,
 // the channel ask's own thread included: the gateway starting the task
 // there does (TaskStarted), the same as for any other thread, and a channel
 // mention from an unverified sender roots nothing. Everything else — bots,
 // our own posts, edits and other subtypes, redeliveries, and a sender from
 // another workspace — is not a turn.
 func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent) (InboundMessage, bool) {
+	return s.inboundEvent(ctx, m, "")
+}
+
+// slackParentUserID is the thread root's author on a thread reply, from the
+// raw Events API payload: Slack sends it as event.parent_user_id, and
+// slackevents.MessageEvent has no field for it. Empty on anything else, and
+// on a payload that does not parse, which reads as "not known".
+func slackParentUserID(payload json.RawMessage) string {
+	var envelope struct {
+		Event struct {
+			ParentUserID string `json:"parent_user_id"`
+		} `json:"event"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &envelope) != nil {
+		return ""
+	}
+	return envelope.Event.ParentUserID
+}
+
+// inboundEvent is inbound with the thread root's author, when the event
+// carried one (slackParentUserID).
+func (s *SlackAdapter) inboundEvent(ctx context.Context, m *slackevents.MessageEvent, parentUserID string) (InboundMessage, bool) {
 	if !slackTurnSubtypes[m.SubType] || m.BotID != "" || m.User == "" || m.User == s.botUserID ||
 		m.Channel == "" || m.TimeStamp == "" {
 		return InboundMessage{}, false
 	}
-	if s.foreignSender(m) {
+	refused, author := s.foreignSender(m)
+	if refused {
 		return InboundMessage{}, false
 	}
 	if s.alreadySeen(m.Channel + "/" + m.TimeStamp) {
@@ -1086,11 +1590,11 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 		return InboundMessage{
 			Conversation: slackConversationID(m.ChannelType, m.Channel, threadTS),
 			Kind:         "dm",
-			AuthorID:     m.User,
+			AuthorID:     author,
 			MessageID:    m.TimeStamp,
 			TopLevel:     m.ThreadTimeStamp == "",
 			// Decoding also changes what the affordance matchers see. That is
-			// intended, and it is not obvious: normalize (text.go) strips
+			// intended, and it is not obvious: chattext.Normalize strips
 			// every non-alphanumeric, so a typed "<stop>" — on the wire as
 			// "&lt;stop&gt;" — used to normalize to "ltstopgt" and match
 			// nothing, and decoded first it normalizes to "stop" and is a
@@ -1126,13 +1630,23 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 		// bare mention as a reply.
 		return InboundMessage{}, false
 	}
-	if isReply && !mentioned && !s.isSessionThread(ctx, m.Channel, threadTS) {
+	// A reply under one of the bot's own posts is addressed to it, mention or
+	// not: an alert, or any other chat.notify post the bot roots in the home
+	// channel, starts a thread no task started, so it is never a session
+	// thread, and its
+	// replies used to vanish without a log line (gke-labs/kube-agents#3246).
+	// Same rule as the today path's Slack adapter (_bot_authored_thread_root,
+	// upstream #63530), and like it, durable: Slack says who rooted the
+	// thread on every reply, so a restart or an expired mark changes nothing.
+	botRooted := isReply && parentUserID != "" && parentUserID == s.botUserID
+	if isReply && !mentioned && !botRooted && !s.isSessionThread(ctx, m.Channel, threadTS) {
 		return InboundMessage{}, false
 	}
 	return InboundMessage{
 		Conversation: slackConversationID(m.ChannelType, m.Channel, threadTS),
 		Kind:         "group",
-		AuthorID:     m.User,
+		Unaddressed:  botRooted && !mentioned,
+		AuthorID:     author,
 		MessageID:    m.TimeStamp,
 		// Decoded last, after the mention match and strip above: both key on
 		// Slack's raw "<@U…>" form, which decoding would have turned into

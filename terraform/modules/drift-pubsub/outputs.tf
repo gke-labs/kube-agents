@@ -37,3 +37,37 @@ output "source_sink_writer_identities" {
   description = "Service account each source project's sink publishes as, by project ID. Exported for debugging, as sink_writer_identity is: a source project whose records never arrive almost always means this identity lost its roles/pubsub.publisher grant on the topic."
   value       = { for project, sink in google_logging_project_sink.source_drift_audit : project => sink.writer_identity }
 }
+
+output "teardown_gate" {
+  description = <<-EOT
+    An opaque value a caller passes to whatever creates the clusters this
+    ingress exports, so that Terraform destroys those clusters first. The
+    value is never read; only the dependency matters.
+
+    It names the three resources that have to outlive the clusters -- the
+    drain, the publish grant and the topic -- rather than the module as a
+    whole, and that is deliberate on both sides.
+
+    Not less: ordering only the topic leaves the grant free to be revoked
+    while a control plane is still emitting, which trades topic_not_found for
+    topic_permission_denied and mails the same owners. The drain is the first
+    of the three destroyed, so naming it carries the other two.
+
+    Not more: the sink is left out because its filter reads source_projects,
+    and in full-install that value comes from kube-agents-iam, which depends
+    on the cluster. A gate that reached the sink would close a cycle. Leaving
+    it out costs nothing -- a sink deleted while a cluster still emits is the
+    case the drain already covers, with the topic and the grant both still in
+    place behind this gate.
+
+    `.id` on the grant, never `.etag`: the provider refreshes etag to the
+    topic policy's, so any other IAM change on that topic would show this
+    value updating in place and upgrade.sh's preview would call it
+    PLAN_DRIFT. The dependency is the same either way.
+  EOT
+  value = join(",", [
+    time_sleep.sink_drain.id,
+    google_pubsub_topic_iam_member.sink_writer.id,
+    google_pubsub_topic.drift_audit.id,
+  ])
+}

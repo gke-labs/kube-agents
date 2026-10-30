@@ -478,10 +478,47 @@ func TestAssertion18_ReservedArtifacts(t *testing.T) {
 			{ArtifactID: "r", Name: ArtifactResult, Parts: textPart},
 			{ArtifactID: "p", Name: ArtifactProgress, Parts: dataPart},
 		}, StateCompleted, true},
+		// A chat message beside a heartbeat's text: the live message's
+		// state, the one data part progress may carry.
+		{"progress_with_a_chat_message", []Artifact{
+			{ArtifactID: "r", Name: ArtifactResult, Parts: textPart},
+			{ArtifactID: "p", Name: ArtifactProgress, Parts: append(append([]Part{}, textPart...),
+				Part{Kind: "data", Data: json.RawMessage(`{"schema": "kube-agents.chat/v1", "mark": {"ask": "fleet"}}`)})},
+		}, StateCompleted, false},
+		// A key spelled otherwise is not the schema, as chatmsg reads it.
+		{"progress_with_a_misspelled_schema_key", []Artifact{
+			{ArtifactID: "r", Name: ArtifactResult, Parts: textPart},
+			{ArtifactID: "p", Name: ArtifactProgress, Parts: append(append([]Part{}, textPart...),
+				Part{Kind: "data", Data: json.RawMessage(`{"Schema": "kube-agents.chat/v1"}`)})},
+		}, StateCompleted, true},
 		{"non_reserved_name_unconstrained", []Artifact{
 			{ArtifactID: "r", Name: ArtifactResult, Parts: textPart},
 			{ArtifactID: "x", Name: "custom-diagnostics", Parts: dataPart},
 		}, StateCompleted, false},
+		// usage is one data part per finished turn, each a usage object
+		// (added 10/20); a text part, or data that is not one, misuses the
+		// name. A failed task may carry it too: the turn that failed still
+		// cost tokens.
+		{"usage_with_usage_parts", []Artifact{
+			{ArtifactID: "r", Name: ArtifactResult, Parts: textPart},
+			{ArtifactID: "u", Name: ArtifactUsage, Parts: []Part{
+				{Kind: "data", Data: json.RawMessage(`{"model":"m","inputTokens":10,"outputTokens":2,"durationMs":300}`)},
+				{Kind: "data", Data: json.RawMessage(`{"costUsd":0.01}`)},
+			}},
+		}, StateCompleted, false},
+		{"usage_on_a_failed_task", []Artifact{
+			{ArtifactID: "u", Name: ArtifactUsage, Parts: []Part{
+				{Kind: "data", Data: json.RawMessage(`{"durationMs":300}`)},
+			}},
+		}, StateFailed, false},
+		{"usage_with_text_part", []Artifact{
+			{ArtifactID: "r", Name: ArtifactResult, Parts: textPart},
+			{ArtifactID: "u", Name: ArtifactUsage, Parts: textPart},
+		}, StateCompleted, true},
+		{"usage_with_a_part_that_is_not_usage", []Artifact{
+			{ArtifactID: "r", Name: ArtifactResult, Parts: textPart},
+			{ArtifactID: "u", Name: ArtifactUsage, Parts: dataPart},
+		}, StateCompleted, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

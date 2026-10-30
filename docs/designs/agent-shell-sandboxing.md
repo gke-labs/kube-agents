@@ -37,6 +37,8 @@ smallest thing that has an identity, so the pod is the boundary a credential get
 taking the identity away from the pod the model's shell lands in is what this design is
 for.
 
+**Since closed:** the gateway now runs as its own unannotated ServiceAccount (`<agent>-gateway-agent`) and its NetworkPolicy opens no metadata path; the annotated one is the broker's alone. The text below is the record of the gap as it stood.
+
 The gateway and the broker still share the annotated ServiceAccount, so the gateway pod
 retains an ambient cloud identity. That is the remaining gap, and it is what
 `spec.security.workloadIdentityFederation` closes: with it configured the broker reads an
@@ -1380,17 +1382,22 @@ none of them: the profile list, the SSH key, and the files themselves. It runs f
 agent entrypoint (step 5.7, in the foreground, gated on the bootstrap primary so
 two replicas do not both push) and again from `cluster_agent_profile.py` when a profile is
 scaffolded later, so a cluster onboarded at 3am does not wait for a pod restart to get its
-directories. Nothing about it is ordered against the sandbox starting: the Deployment and
+directories. The scaffold passes `--profile <name>` and pushes that home plus the machine
+home and `profiles/platform`, the two roots the sandbox creates bare; the start pushes
+every home. Re-sending every home on every scaffold made onboarding N clusters
+cost O(N²) (#3701). Nothing about it is ordered against the sandbox starting: the Deployment and
 the StatefulSet come up independently, so the script waits for sshd and, failing that,
 leaves the agent pod's files untouched and lets the next start retry.
 
-**One of its failures holds the agent pod down and the rest do not**, which is a distinction
-the exit codes carry rather than a judgement the entrypoint makes. A copy that ran and
-failed can have moved the model's files off the agent pod's volume without landing them on
-the sandbox's, and coming up healthy in that state is the outcome the mirror exists to
-prevent — so it exits `EXIT_FATAL`, the container refuses to start, and
-`getDeploymentStatusDetails` surfaces a Degraded CR naming this container. Everything else
-exits `EXIT_RETRY`: the entrypoint warns and the agent starts.
+**Almost none of its failures hold the agent pod down**, which is a distinction the exit
+codes carry rather than a judgement the entrypoint makes. A copy that ran and failed exits
+`EXIT_RETRY` like everything else: the copy reads the agent pod's volume and never removes
+from it, so a transfer that dies halfway leaves every file where it was and the migration
+marker unwritten, and the next start copies again, keeping whatever already landed. The
+entrypoint warns and the agent starts. `EXIT_FATAL` is left for what running the script
+again cannot fix, no `tar` on `PATH` and an unhandled exception (the reasoning is at the
+exit codes in `deploy/shared/sandbox_mirror.py`): the container refuses to start, and
+`getDeploymentStatusDetails` surfaces a Degraded CR naming this container.
 
 The dividing line is who can provoke the failure, not how bad it looks. Everything under
 the sandbox's `/opt/data` except the image's trees is owned by uid 1000 and the volume
@@ -1452,8 +1459,9 @@ Sizing the two volumes together has an upgrade cost, because `volumeClaimTemplat
 immutable and the template sizes only the claims it creates. An install that predates it
 therefore needs both halves done to it: the operator widens the existing claim in place
 (online, with the volume still mounted) and recreates the StatefulSet with Orphan
-propagation so the pod and its disk survive the swap. Both are in `reconcileShellSandbox`,
-and both are best-effort in the direction that matters — a StorageClass without
+propagation so the pod and its disk survive the swap. The recreate is in
+`reconcileShellSandbox`; the widening is `growShellSandboxDataClaim`, which `reconcilePVC` runs
+through `growDataClaim` before it grows the agent's own claim, and both are best-effort in the direction that matters — a StorageClass without
 `allowVolumeExpansion` leaves a smaller volume and a bounded migration rather than a failed
 reconcile that would take the agent down with it.
 
@@ -1791,8 +1799,9 @@ wholesale would put a file named `credential_proxy.py` inside the sandbox, which
 wrong thing for a reviewer to find even though it is inert there. So the image gets an
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
 `github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
-`stall_report.py` and `inventory_findings.py` — the entry points an agent is told to run,
-plus the transitive closure of what they import, and the shared modules the skill-tree collectors import from `/opt/defaults/scripts` (`credential_proxy_client.py`, `fleet_scope_args.py`). `inventory_findings.py extract` and `select`
+`stall_report.py`, `audit_cluster.sh`, the three Cluster Agent domain collectors (`audit_storage.py`, `audit_networking.py`,
+`audit_certificates.py`) and `inventory_findings.py` — the entry points an agent is told to run,
+plus the transitive closure of what they import, and the shared modules the skill-tree collectors import from `/opt/defaults/scripts` (`credential_proxy_client.py`, `fleet_scope_args.py`, `collector_run.py`). `inventory_findings.py extract` and `select`
 work there, and `select` chooses the report's items from the scores file alone. `register` calls
 the Session KV server on the agent pod's loopback and exits 13 from the sandbox, and the
 prioritization SOP answers that exit by going on to `select` and writing the report.
@@ -1988,8 +1997,8 @@ build fails if anything under it is not owned by root or is writable by group or
 
 #### Cron scripts stay in the agent pod and reach into the sandbox from there
 
-A `no_agent` cron job — one carrying a `script` rather than a `prompt` — is unaffected
-by the terminal backend. The scheduler's `_run_job_script` resolves the script against
+A cron job's `script` — the whole of a `no_agent` job, or a prompt job's pre-run step — is
+unaffected by the terminal backend. The scheduler's `_run_job_script` resolves the script against
 `HERMES_HOME/scripts`, rejects anything resolving outside it, picks `/bin/bash` or
 `sys.executable` by extension, and calls `subprocess.run` with an environment from
 `build_subprocess_env` — imported from `tools.environments.local`, hardcoded. There is
@@ -2073,10 +2082,11 @@ the PVC from the moment the card is filed, so the report files it also checks ad
 nothing. Its sweep card still calls `/opt/data/INVENTORY.md` the Chat Agent's home,
 which is wrong about the pod and right about the path the worker must write.
 
-The one agent-pod reader whose behaviour the move changes is the onboarding plugin. It
-picks its first greeting by checking `INVENTORY.md` on the PVC, so with the sandbox on it always greets
-as though the scan were still running. The report still arrives on the next delivery
-tick.
+The one agent-pod reader whose behaviour the move changes is the onboarding plugin, which
+picks its first greeting by whether `INVENTORY.md` is written. It reads the report across with
+`sandbox_exec.read_bytes`, as delivery does, and greets as though the scan were still running
+when the report is not there yet, or when that read fails or takes longer than
+`REPORT_CHECK_TIMEOUT_SECONDS`. The report still arrives on the next delivery tick either way.
 
 #### Nothing collects the sandbox's finished workspaces, so a cron job does
 
@@ -2131,6 +2141,41 @@ as a fact about the cluster, and a `.bashrc` that hijacked its `rm` would be doi
 uid 1000's own files what uid 1000 can already do. The commands are `/bin/ls` and
 `/bin/rm` by absolute path, which that file cannot shadow — a bash function name cannot
 contain a slash, and a non-interactive shell does not expand aliases.
+
+The same job takes an inventory of each sandbox profile home (#2989). Hermes cron runs
+started in the sandbox's unwritable login home, so a run's scratch went wherever it could
+write, often the profile home, beside the skills and config on a volume nothing sweeps, and a later session that lists the home cannot tell them
+from what the product put there. Every top-level entry the product doesn't create in that
+kind of home (the mirror's skeleton everywhere; the image-staged trees and database
+placeholders in the platform home; the identity and kubeconfig in a cluster home), checked
+by name and type, goes to `logs/kanban_workspace_gc.log` on the
+agent pod with its mtime and size, as does any sandbox profile home the agent pod has no
+profile for: the volume has no owner, so a cluster dropped from scope keeps its home and
+kubeconfig there. The inventory moves nothing: whether to move loose files waits for data
+from the test fleet now that cron runs have a working directory of their own. A stale
+`cluster-*` home itself is removed, as `delete_profile` removes the agent pod's: the sandbox
+is listed before the pod's profile list is read, so a profile scaffolded between the two
+reads is never taken for stale; only cluster-prefixed names go, only when the pod lists the
+platform profile, and only under a profiles root that `find -P` reports as a real directory,
+by one `rm` per home as the model's account, which owns the homes; a home whose `rm` fails
+is named in one chat bullet each night until it goes. The listing runs as
+`hermes`, the default principal, because its output is believed, under the sandbox's own
+`workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
+name cannot forge a row.
+
+Two shapes are removed rather than inventoried. A cron run's working directory
+(`<home>/cron/runs/<run>`) is pruned after seven days. An override tree, a top-level
+directory named `<something>_override`, is removed the first night (#3551): it is a
+worker's copy of a shipped skill or script, patched to run in place of the original
+(#3444). No product code writes one, and `scripts/test_shipped_import_paths.py` keeps
+the literal paths it reads in shipped import-path calls, shell `PYTHONPATH` and configs
+off them. That test is a guard on the obvious forms, not a proof; the prune is the
+enforcement. Both
+prunes cover the homes the agent pod has a profile for; a sandbox home the pod has no
+profile for goes to the stale-home removal above when it is a cluster home, and stays in
+the inventory otherwise. Neither follows a symlink the model planted: the home, `cron` and
+`cron/runs` must be real directories for the runs prune, a symlinked home is left alone
+by the override prune, and a symlinked override entry is unlinked rather than followed.
 
 #### The agent pod gives up cluster tooling entirely
 
@@ -2360,8 +2405,8 @@ the script deleted. An operator back-fills a card with no subscription with the 
 `hermes kanban notify-subscribe`, run in the agent pod.
 
 **Executing `hermes`.** Exactly one capability is invoked from sandbox-side prose:
-`hermes cron run <job-id>`, at `agents/platform/AGENTS.md:32` and
-`agents/platform/skills/fleet-audit/SKILL.md:53`. Both spell it
+`hermes cron run <job-id>`, at `agents/platform/AGENTS.md` and
+`agents/platform/skills/fleet-audit/references/on-demand.md`. Both spell it
 `/opt/hermes/.venv/bin/hermes`, which is absent from the sandbox twice over. The other
 matches across `agents/` are either prose mentioning the binary or agent-side processes
 that stay put; `agentplugins/gke-stockout-investigator/scenarios/lib/common.sh:617`
@@ -2552,7 +2597,7 @@ With the proxy gone, the shell in the sandbox, and `automountServiceAccountToken
 already in place, the gateway pod's credential surface is `SESSION_KV_API_KEY` and
 `SESSION_KV_SALT` — and Part A removes those too by putting the Session KV server behind
 its own interface. It keeps the `iam.gke.io/gcp-service-account` annotation on
-`kubeagents-platform-agent`, which is the remaining gap: no process in that pod uses it,
+`kubeagents-platform-agent`, which was the remaining gap (since closed by giving the gateway its own ServiceAccount): no process in that pod uses it,
 but it is still mintable from `169.254.169.254` by anything that gets execution there.
 
 ### Cron jobs that authenticate without a model turn
@@ -2597,8 +2642,9 @@ API server. Every path on the credentialed listener except `/healthz` requires i
 unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
-the same listener, when the next stack takes Google Chat, the A2A gateway's, and, under the
-operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session pods'. The operator grants
+the same listener, when the next stack takes Google Chat, the A2A gateway's, under the
+operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, under `mode: next` with
+an `AgentProfile` bound, each profile tier's ServiceAccount. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
 **The audience is per Pod, and it is what separates the callers.** The sandbox's token is
@@ -2619,12 +2665,30 @@ role, and the legacy event routes it cannot reach; [the chatops gateway
 design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
 apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
-minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits `(shell, session)`, and
+minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits `(shell, session, profile)`
+(the sixth role, `profile`, is below), and
 within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. Because a
 Pod picks the audience it projects, the role is also bound to the caller:
 `CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
 the session audience, and no other caller may present that audience
-([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
+([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). With the
+A2A MCP server on, a fifth, `mcp`, is the MCP pod's: its token is minted for
+`kubeagents-credential-proxy-mcp`, it reaches `/v1/vcs/` alone, and within it `ROLE_VCS_VERBS`
+admits `proposal-view` only, checked on the normalised verb before the body is read, with that
+verb's managed-repository check still applying. It is bound the same way:
+`CREDENTIAL_PROXY_MCP_CALLERS` names the MCP pod's own ServiceAccount, which may present only
+the mcp audience, and no other caller may present it; with the list empty, nobody holds the
+role. It names the account only while the operator controls it; an account somebody else holds under the name is never named. Under
+`mode: next` with an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
+their token is minted for `kubeagents-credential-proxy-profile`, `/v1/exec` admits it, and
+`ROLE_EXECUTABLES` holds it to `kubectl` and `gcloud` with the session's `kubectl` flag
+allowlist. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
+profile tier's ServiceAccount to its (profile, tier), and that account may present only the
+profile audience. Each call also carries the dispatcher's signed task credential in
+`X-Kube-Agents-Task-Credential`, bound to the caller's pod, and is confined to that
+credential's cluster and project. Profile calls together hold at most
+`CREDENTIAL_PROXY_PROFILE_SLOTS` of the command slots
+([spec-subagent-profiles.md](spec-subagent-profiles.md) owns the detail). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 
@@ -2802,6 +2866,8 @@ The Slack relay holds a socket-mode WebSocket. Two replicas means two connection
 duplicate event delivery, so the broker Deployment pins `replicas: 1`. The credential
 broker cannot be made highly available while it is fused with an inbound event pump, and
 splitting the two is the obvious follow-up.
+[`credential-proxy-single-pod.md`](credential-proxy-single-pod.md) owns the replica decision
+and the other state that keeps the broker at one pod.
 
 ### The proxy image is not the agent image
 
@@ -2924,6 +2990,8 @@ The broker runs in a pod of its own whether or not `workloadIdentityFederation` 
 configured, and the shell is in the sandbox either way. What federation adds is a credential
 source that is a file in the broker's pod rather than the metadata server answering a
 ServiceAccount two pods share. Without it, two things stay open:
+
+**Since closed:** the gateway now runs as its own unannotated ServiceAccount (`<agent>-gateway-agent`) and its NetworkPolicy opens no metadata path; the annotated one is the broker's alone. The text below is the record of the gap as it stood.
 
 **The gateway pod keeps a cloud identity.** The gateway and the broker both run as
 `kubeagents-platform-agent`, which carries the `iam.gke.io/gcp-service-account` annotation,

@@ -23,14 +23,13 @@
 # where the cluster serves the PodMonitoring API, and a kustomize install
 # needs it applied by hand before the run.
 # No `fixtures:`: the case reads the agent's own install, not the seeded
-# fleet. No `domains.yaml` row covers the agent's own observability, which is
-# why the case is a reviewed KNOWN_NO_DOMAIN entry in
-# scripts/validate_bench_cases.py rather than a slug.
+# fleet.
 #
 # Expected cost bracket: ~100-300s, one delegation round trip and a handful of
 # reads of the agent's own namespace.
 id: observability-watcher-scrape-state
 name: The event watcher's metrics are scraped through the PodMonitoring
+domain: observability
 prompt: >-
   Are the event watcher's Prometheus metrics being scraped on this install?
   Tell me how the scrape is configured, where the watcher's listener is, and

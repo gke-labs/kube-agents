@@ -10,6 +10,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -139,7 +141,9 @@ func TestStopWithNothingToStopStartsNoTask(t *testing.T) {
 		AuthorID: "1001", MessageID: "sg-1", Text: "stop"}
 	waitFor(t, "bare stop answered", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "nothing is running") {
+			// The plain reply: a conversation that never ran a task has
+			// no card of its own to mention (gke-labs#3263).
+			if p == nothingRunningNotice {
 				return true
 			}
 		}
@@ -448,5 +452,74 @@ func TestSpawnSetsSeccompRuntimeDefault(t *testing.T) {
 	csc := pod.Spec.Containers[0].SecurityContext
 	if csc == nil || csc.SeccompProfile == nil || csc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 		t.Fatalf("container securityContext missing seccompProfile RuntimeDefault: %+v", csc)
+	}
+}
+
+// A session pod trusts the bus the way the gateway does: the same CA bundle,
+// from the same ConfigMap, at the same path, named by NATS_CA_FILE. And it is
+// stamped with the transport it was given, the stamp reuse checks.
+func TestSpawnHandsTheSessionThePodTheBusCA(t *testing.T) {
+	caFile := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(caFile, []byte("ca-one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+		TaskDeadline: 15 * time.Minute, NATSURL: "tls://agent-a2a-nats.test-ns.svc:4222",
+		NATSCAFile: caFile, NATSCAConfigMap: "agent-a2a-nats-ca-bundle"}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1",
+		BusSession: "chat-otter-tls", Addressee: "chat-otter-tls"}
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-tls", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := pod.Spec.Containers[0]
+	var envCA string
+	for _, e := range c.Env {
+		if e.Name == lib.EnvNATSCAFile {
+			envCA = e.Value
+		}
+	}
+	if envCA != caFile {
+		t.Errorf("%s = %q, want %q", lib.EnvNATSCAFile, envCA, caFile)
+	}
+	var mounted bool
+	for _, m := range c.VolumeMounts {
+		if m.Name == natsCAVolume && m.MountPath == filepath.Dir(caFile) && m.ReadOnly {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Errorf("no read-only %s mount at %s: %+v", natsCAVolume, filepath.Dir(caFile), c.VolumeMounts)
+	}
+	var fromConfigMap bool
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == natsCAVolume && v.ConfigMap != nil && v.ConfigMap.Name == "agent-a2a-nats-ca-bundle" {
+			fromConfigMap = true
+		}
+	}
+	if !fromConfigMap {
+		t.Errorf("the %s volume does not come from the bundle ConfigMap: %+v", natsCAVolume, pod.Spec.Volumes)
+	}
+	stamp := pod.Annotations[annoBusTransport]
+	if stamp == "" || stamp != s.busTransport() {
+		t.Fatalf("bus-transport stamp = %q, want the spawner's %q", stamp, s.busTransport())
+	}
+	// A CA the kubelet rewrote in place does not move the stamp: the pod
+	// reads the bundle on each handshake and heals on its own. A pod spawned
+	// with the plaintext URL and no CA has another stamp, and is not reused.
+	if err := os.WriteFile(caFile, []byte("ca-two"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s.busTransport() != stamp {
+		t.Error("the stamp moved when only the CA bundle's bytes changed")
+	}
+	plain := &podSpawner{cfg: &Config{NATSURL: "nats://agent-a2a-nats.test-ns.svc:4222"}}
+	if plain.busTransport() == stamp {
+		t.Error("a plaintext spawner stamps its pods the same as a TLS one")
 	}
 }

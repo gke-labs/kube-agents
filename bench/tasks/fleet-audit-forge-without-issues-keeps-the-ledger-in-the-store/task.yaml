@@ -1,0 +1,125 @@
+# PARKED -- a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py, in
+# no roster file under hack/eval/, until an eval install has a forge that
+# declares no issue tracker (#1154).
+#
+# What this case grades: a fleet audit of a repository on a forge with no
+# issue tracker keeps its ledger in the report store, reports it in chat with
+# the reason, and still opens a remediation pull request for a finding the
+# sweep promotes (version-control-support.md section 8, "The ledger without
+# issues"). On main before the ledger decision, `start` looked the ledger
+# issue up by its label, the lookup refused on such a forge, and the run
+# stopped at `start`: no envelope, no summary, no pull request. That is the
+# red. The green is `finish` printing status STORE_LEDGER with the pull
+# request link in its summary, and the store holding that envelope.
+#
+# THE FIXTURES. Two, and both must be on the install:
+#
+# 1. The install: its forge's `capabilities` answer declares no issue verbs
+#    and `labels: false` (the shape a Bitbucket provider declares). The
+#    mechanism that gives an eval install such a forge is not agreed yet, so
+#    this case names no fixture role for it. When it is agreed, add that role
+#    under `fixtures:` below and replace the FIXTURE_NOT_READY entry; nothing
+#    else in this file depends on how the install is made.
+# 2. no-pdb-workload with its declaration in the GitOps repository, as
+#    obtainability-major-pdb-auto-pr needs (#2228): checkout-gateway in
+#    seeded-reliability declared under clusters/<seeded-a cluster>/, so
+#    section 3.3's fix is a manifest that the sweep opens, not `manual`.
+#
+# WHY NO pull_request_opened. That verifier reads the GitHub API. On a forge
+# with no issue tracker there is no forge-neutral check for an opened pull
+# request yet, so the case reads the link from the answer: `finish` writes it
+# into the chat summary, which the SOP says to report verbatim. A
+# forge-neutral check can replace the-answer-links-a-fix when one exists.
+#
+# Domain: fleet-audits.
+# Journey: an operator whose GitOps repository is on Bitbucket gets the daily
+# audits in chat, and the fixes as pull requests.
+#
+# Isolation class: read-only on the cluster; writes the install's report store
+# and one remediation pull request to the GitOps repository.
+# Eligible tier: nightly (a full obtainability audit, 600-1300s).
+id: fleet-audit-forge-without-issues-keeps-the-ledger-in-the-store
+name: A fleet audit on a forge with no issue tracker keeps its ledger in the store and still opens a fix
+prompt: >-
+  Run the workload reliability audit against the fleet, following the
+  obtainability-audit SOP.
+expected_output: >-
+  The audit runs every check. The forge has no issue tracker, so no ledger
+  issue is written: the findings, including checkout-gateway in
+  seeded-reliability with two replicas and no PodDisruptionBudget, are kept in
+  the report store as the ledger. The closing response is the run's summary:
+  it names the findings, says that the forge has no issue tracker so the ledger
+  is in the report store, and gives the link of the remediation pull request
+  that adds a PodDisruptionBudget for checkout-gateway. Nothing is applied to
+  the cluster.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: fleet-audits
+
+fixtures:
+  - no-pdb-workload
+
+verification_spec:
+  # The red: on main `start` stops at the ledger lookup, so this run stores
+  # no envelope, and none with status STORE_LEDGER.
+  - name: the-store-holds-the-ledger
+    role: objective
+    mode: assert
+    check:
+      type: audit_report_stored
+      audit: obtainability-audit
+      status: STORE_LEDGER
+      required_finding_phrases: ["checkout-gateway"]
+  # The worker typed a run of the audit's entry point; the store check is
+  # what fails a `start` that ran and stopped.
+  - name: the-worker-ran-start
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: audit_report.py
+          flags: [start]
+          word_patterns: ["^--audit(?:=|$)"]
+  # The summary is the only report the operator gets, so it says why there is
+  # no ledger issue.
+  - name: the-answer-says-why-the-ledger-is-in-the-store
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["checkout-gateway"]
+      any_of_patterns: ['(?i)\bno\s+issue\s+tracker\b', '(?i)\bno\s+labels\b']
+  # The fix still opens on the forge, and the summary links it: opened by
+  # this run, or found waiting from an earlier repetition on the stream.
+  - name: the-answer-links-a-fix
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        ['(?i)pull requests? (?:opened|waiting for review):\s*https?://\S+']
+  - name: the-planted-defect-survived-the-audit
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: deployment
+      resource_name: checkout-gateway
+      namespace: seeded-reliability
+      path: spec.replicas
+      op: eq
+      value: 2
+  - name: no-budget-was-created-during-the-audit
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: poddisruptionbudget
+      namespace: seeded-reliability
+      op: absent

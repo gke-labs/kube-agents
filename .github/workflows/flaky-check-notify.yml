@@ -3,7 +3,8 @@ name: Notify on Flaky Check
 # Open a `ci:flaky` issue when a re-run of a check passes on the same commit
 # the attempt before it failed on, and add a row to that issue each time the
 # same failure does it again. `scripts/notify_flaky_check.py` holds the
-# reasoning and the issue format; this file is the trigger and the guards.
+# reasoning, the watched list and the issue format; this file is the schedule
+# and the guards.
 #
 # The signal is `run_attempt > 1` with a green conclusion. Only a re-run
 # produces a later attempt, nothing in this repository re-runs anything
@@ -15,61 +16,48 @@ name: Notify on Flaky Check
 # cancelled one is skipped, and a re-run whose earlier attempts were all
 # cancelled records nothing.
 #
+# A sweep, not a `workflow_run` trigger. The event fires on every completion
+# of every watched workflow, pull-request runs included, and GitHub has no
+# filter on the attempt number, so the job gate skipped about six hundred
+# runs a day for the one or two that were a re-run -- each a queued run the
+# scheduler had to place ahead of real checks (#2943). The sweep lists each
+# watched workflow's recent successful runs and reads the few whose latest
+# attempt is not their first; the issue bodies say which it has already
+# recorded. What it gives up is a flake recorded within seconds, which was
+# never the point of the record; a re-run later than the script's window
+# after its run was created, which nothing recorded so far has been; and a
+# green re-run that is re-run again and fails, which the sweep does not see
+# while the run's latest attempt is red (the script's docstring has the rest).
+#
 # No setup: it writes with the workflow's own GITHUB_TOKEN and creates the
 # label the first time it needs one. Issues opened with GITHUB_TOKEN do not
 # trigger further workflows, so this cannot start a loop.
-#
-# `workflows:` matches on the workflow's `name:`, not its filename, and a
-# rename there silently stops this from firing.
-#
-# What may go on the list: a check whose result should not depend on the
-# attempt. That is every check that reads the tree and nothing else. Left off
-# on purpose: `Validate PR Title`, which a title edit legitimately turns green
-# without a commit; `Security Scanning`, whose advisory database moves between
-# attempts, so a green re-run there is the database changing rather than the
-# check flaking; and the `pull_request_target` automations (`Risk
-# Classification`, `Hold Unresolved Threads`, `Auto Assign Milestone on
-# Merge`), which are not checks on the tree at all.
 
 on:
-  # zizmor: ignore[dangerous-triggers] - workflow_run is only dangerous when it checks
-  # out the triggering run's code; this checks out the default branch, and passes the
-  # event nothing but a run id and an attempt number.
-  workflow_run:
-    workflows:
-      - A2A Module Tests
-      - Actionlint
-      - Conformance
-      - Docker Build
-      - Docs Build
-      - Documentation Checks
-      - Documentation Freshness Check
-      - Installer Cross-OS Validation Matrix
-      - Operator Tests
-      - Prettier Check
-      - Python Unit Tests
-      - Step 0 on bash 3.2
-      - Validate Repo Structure
-    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+  #checkov:skip=CKV_GHA_7:A boolean that decides whether the sweep writes, and a run id passed to the script through the environment; nothing is built and no input is interpolated into a shell
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print what would be filed and file nothing
+        type: boolean
+        default: true
+      run_id:
+        description: One workflow run to read instead of sweeping (its latest attempt)
+        type: string
+        default: ""
 
-# Serialised per watched workflow. Two re-runs of the same check finishing
-# together would otherwise both find no issue for their fingerprint and both
-# open one. `cancel-in-progress: false` still drops the middle of a burst --
-# GitHub holds one run pending per group -- which costs a row on the issue,
-# not a wrong state: the script reconciles from what the issue already
-# records rather than reporting transitions.
-#
-# The group is evaluated before the job's `if:`, so every completed run of a
-# watched workflow enters it -- ten first attempts a day per workflow, and
-# every re-run that failed again, all of which the job then skips. Keying on
-# the same predicate as the `if:` keeps those out of the group that matters:
-# otherwise a skipped run arriving while one green re-run's notify runs and
-# another's is pending cancels the pending one, and that occurrence is never
-# recorded, because this script reads only its own run and cannot be healed
-# by the next. A storm of re-runs after an outage is exactly when that would
-# happen.
+# One sweep at a time, and none cancelled: two sweeps reading the same
+# re-run together would both find no issue for its fingerprint and both open
+# one. A sweep that arrives while one runs waits; a third cancels the one
+# waiting, which costs nothing, since the one that runs reads the same window.
+# A dispatch with a `run_id` is the one record no sweep will redo, so it
+# gets a group of its own rather than a place in the sweeps' queue, where the
+# next sweep would cancel it. It writes through the same path, which lists
+# the issue before writing, so it needs no serialising against a sweep.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.workflow_id }}-${{ github.event.workflow_run.run_attempt > 1 && github.event.workflow_run.conclusion == 'success' && 'flake' || 'other' }}
+  group: ${{ github.workflow }}-${{ inputs.run_id || 'sweep' }}
   cancel-in-progress: false
 
 permissions: {}
@@ -78,26 +66,22 @@ jobs:
   notify:
     name: Notify on Flaky Check
     # The repository guard is required of any credentialed workflow that starts
-    # on its own (AGENTS.md, Pull Request Hygiene): a fork inherits the trigger
+    # on its own (AGENTS.md, Pull Request Hygiene): a fork inherits the schedule
     # and none of the secrets, so without it every fork sync mails its owner.
-    #
-    # `run_attempt > 1` is what keeps this from starting on every completed
-    # run of every watched workflow. It is a first filter, not the decision: the
-    # script reads both attempts back from the API and decides from those.
-    if: >-
-      github.repository == 'gke-labs/kube-agents' &&
-      github.event.workflow_run.run_attempt > 1 &&
-      github.event.workflow_run.conclusion == 'success'
+    if: github.repository == 'gke-labs/kube-agents'
     runs-on: ubuntu-latest
     # No pull-requests scope: the pull request is found by listing pulls,
     # which needs no permission on a public repository. On a private one
     # this would need `pull-requests: read`.
     permissions:
       contents: read # check out the script
-      actions: read # read every attempt, the failed attempts' jobs, and their logs
+      actions: read # list workflows and runs, read every attempt, the failed attempts' jobs, and their logs
       issues: write # open and update the tracking issue, and its label
     steps:
-      - name: Checkout the default branch
+      # The default branch on a schedule; a dispatch checks out the ref it was
+      # dispatched from, which is the way to try a branch's script with
+      # `dry_run` set until it has earned the right to write.
+      - name: Checkout the script
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -107,13 +91,36 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The run id and attempt number and nothing else. The script reads the
-      # conclusions, the commit and the failing jobs back from the API rather
-      # than trusting the event payload for them, so a stale or spoofed field
-      # cannot change what gets filed.
-      - name: Record the flake
+      # `FLAKY_CHECK_ANNOTATE` turns a read left to the next sweep into a
+      # warning annotation on this job; the script's unit tests run without it.
+      # `DRY_RUN` is the dispatch's boolean, which GitHub renders as the string
+      # "true"; the schedule has no inputs and always writes.
+      - name: Sweep the watched workflows
+        if: github.event_name == 'schedule' || inputs.run_id == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
-          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-        run: python3 scripts/notify_flaky_check.py --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT"
+          FLAKY_CHECK_ANNOTATE: "true"
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            python3 scripts/notify_flaky_check.py --sweep --dry-run
+          else
+            python3 scripts/notify_flaky_check.py --sweep
+          fi
+
+      # One run by id, for a re-run the window has passed or a record to
+      # check by hand. The id goes in through the environment, never into the
+      # script text. The script reads the conclusions, the commit and the
+      # failing jobs back from the API rather than trusting any input for them.
+      - name: Record one run
+        if: github.event_name == 'workflow_dispatch' && inputs.run_id != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            python3 scripts/notify_flaky_check.py --run-id "$RUN_ID" --dry-run
+          else
+            python3 scripts/notify_flaky_check.py --run-id "$RUN_ID"
+          fi

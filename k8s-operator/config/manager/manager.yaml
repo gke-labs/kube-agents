@@ -137,13 +137,35 @@ spec:
               port: 8081
             initialDelaySeconds: 5
             periodSeconds: 10
+          # Memory here is the manager's cache, and the cache holds one entry
+          # per object in the CLUSTER, not per install: every informer it
+          # starts is cluster-wide, Owns() included (it filters events by
+          # owner, it does not scope the watch). Pods are read live instead,
+          # because they outnumber every other kind, as Secrets and the A2A
+          # bookkeeping objects already were (podReader, #3493). What stays
+          # is what SetupWithManager names:
+          # Deployments, StatefulSets, Services, ServiceAccounts, ConfigMaps,
+          # PersistentVolumeClaims, NetworkPolicies and PodDisruptionBudgets;
+          # ClusterRoles, ClusterRoleBindings, Roles and RoleBindings; and the
+          # three custom resources themselves (PlatformAgent always,
+          # AgentPlugin and AgentProfile where their CRDs are installed and
+          # readable). Deployments, StatefulSets, Services and
+          # PersistentVolumeClaims grow with the cluster's workloads, a
+          # Deployment carrying a whole pod template, so a cluster with
+          # thousands of them is the case to raise this for; the rest grow
+          # with its namespaces.
+          #
+          # Sized from a measurement rather than the Kubebuilder scaffold it
+          # replaces: on a 3-node install the store holds 675 objects in
+          # 3.7 MiB of live heap, in a process of 22 MiB RSS. Keep in step
+          # with charts/kube-agents/values.yaml's operator.resources.
           resources:
             limits:
               cpu: 500m
-              memory: 128Mi
+              memory: 512Mi
             requests:
               cpu: 10m
-              memory: 64Mi
+              memory: 128Mi
           volumeMounts:
             - mountPath: /tmp/k8s-webhook-server/serving-certs
               name: cert

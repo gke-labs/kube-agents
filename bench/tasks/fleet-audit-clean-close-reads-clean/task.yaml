@@ -1,0 +1,103 @@
+# NIGHTLY-TIER, registered on landing in hack/eval/nightly-cases.txt: the
+# default home for a new case. A full audit, tofu-provisioned, the same shape
+# and cost band as ai-security-planted-model-audit.
+#
+# WHAT THIS GRADES. A clean run closes the stream's ledger. After the close,
+# `finish` changes the title to `0 findings` and puts a banner above the old
+# body (`close_ledger_reads_clean` in audit_report.py), so the closed issue
+# does not show its findings as open. Without it, the closed issue keeps the
+# title that counts the findings and the table that shows each one as `open`.
+#
+# THE PLANT (prebuilt/stale-audit-ledger). The stack opens one ai-security-audit
+# ledger with one finding on a cluster that does not exist, and writes the
+# stored record of that ledger, both from the shell sandbox with audit_report's
+# own functions. The stream is clean on the eval fleet: the seeded fleet has no
+# AI-classified workload (see ai-security-planted-model-audit, which plants
+# one for that reason). So the run finds nothing, the stale finding is on a
+# cluster that this run did not check (the unaccounted guard does not hold it),
+# and the run closes the ledger.
+#
+# THE GRADE. `ledger_issue_contains` reads the issue that the report cites. A
+# clean close does not rewrite the footer, so the footer stamp is the stack's,
+# written seconds before devops-bench starts the agent. `max_clock_skew_sec`
+# is wide enough for that gap and far below the time between two units on
+# this stream: the harness closes the stream's ledger before each repetition,
+# and the stack opens a new one.
+#
+# Eval-driven development (.agents/rules/eval_driven_development.md): red on
+# main, where the close leaves the body as the stack wrote it, so the banner
+# marker is absent ("required phrases absent from the body"); green once the
+# clean close adds the banner.
+#
+# Two ways the case breaks without the change being wrong, both reported as
+# failures of the stack or the run rather than as a red:
+#   -- a run that puts the invented cluster under `scope.skipped` makes a
+#      coverage gap, and the ledger stays open (no banner on main or with the
+#      change);
+#   -- an AI-classified workload on the fleet (another case's plant left
+#      behind) makes the run report findings, and the ledger is rewritten.
+#
+# Isolation class: read-only cluster sweep, GitOps-repo write (the ledger, the
+# same throwaway-repo terms as every audit case).
+id: fleet-audit-clean-close-reads-clean
+name: A clean audit closes its ledger with a title and banner that say it is clean
+prompt: >-
+  Run the AI workload security audit, following the ai-security-audit SOP.
+expected_output: >-
+  The audit finds no AI workload findings on the fleet and closes the open
+  ledger as clean. After the close, the ledger's title says 0 findings and a
+  banner at the top of its body says that none of the findings below
+  reproduce. The closing response is the SOP's one line, carrying the ledger
+  URL in full.
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/stale-audit-ledger"
+  teardown: true
+  # host_cluster_* arrive from the environment (TF_VAR_host_cluster_name /
+  # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh).
+  variables:
+    audit_id: "ai-security-audit"
+
+validated: false
+
+# Slug per docs/designs/domains.yaml: the SOP-machinery domain. The stack
+# plants the ledger; no seeded-fleet defect domain claims it.
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: dshnayder
+
+# The stack plants everything this case asserts on; no seeded-fleet role is
+# read (docs/designs/bench-case-format.md, the `fixtures: []` rule).
+fixtures: []
+
+verification_spec:
+  # The banner marker is an HTML comment that `publishable_text` escapes in
+  # every model-written field, so only audit_report.py can write it.
+  - name: the-closed-ledger-carries-the-clean-close-banner
+    role: objective
+    # assert: the ledger is written once, at `finish`.
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: ai-security-audit
+      scope: body
+      required_phrases: ["<!-- audit-clean-closed -->", "Closed as clean on"]
+      # Main opens a new ledger for a finding that comes back; it never
+      # reopens a closed one, so the banner must not say it does.
+      forbidden_phrases: ["reopens this ledger"]
+      # The stack writes the footer stamp before devops-bench starts the run;
+      # see the header.
+      max_clock_skew_sec: 900
+  # The run closed the ledger it was handed: the stale finding is still in the
+  # body below the banner, as the record.
+  - name: the-closed-ledger-keeps-the-stale-finding-as-the-record
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: ai-security-audit
+      scope: finding_ids
+      required_phrases: ["eval-retired-cluster"]
+      max_clock_skew_sec: 900

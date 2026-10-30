@@ -40,7 +40,8 @@ at import (``cron/executions.py`` binds ``EXECUTIONS_FILE`` when it loads). A
 fresh process is the only way to get all of them pointing at one profile, and
 it is the same path ``hermes cron tick`` takes for a manual tick — so a job
 fires through the identical execute → save → deliver → mark body the gateway
-ticker uses, with the profile's own persona, toolsets and ``max_turns``.
+ticker uses, with the profile's own persona and toolsets and the entry's own
+``skills``, ``model`` and ``max_turns``.
 
 Correctness comes from ``tick()`` itself, not from bookkeeping here:
 
@@ -253,7 +254,7 @@ HOME_TARGET_ENV_KEYS = {
 #
 # It is the `cron_deliver_env_var` of the bundled `chat` platform plugin
 # (`deploy/docker/plugins/chat/adapter.py`), which hands a job's finished report
-# to the Chat Agent instead of posting it. Setting it does two things at once:
+# to the Session KV server's relay instead of posting it. Setting it does two things at once:
 # it makes `load_gateway_config` enable the platform in this child, and it gives
 # `_get_home_target_chat_id("chat")` a value, without which the scheduler will
 # not resolve `deliver: "chat"` to a target.

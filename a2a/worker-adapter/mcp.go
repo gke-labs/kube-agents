@@ -25,7 +25,14 @@ const (
 	DelegateMCPServer     = "a2a"
 	EnvDelegateSocket     = "A2A_DELEGATE_SOCKET"
 	DefaultDelegateSocket = "/scratch/a2a-delegate.sock"
-	mcpProtocolVersion    = "2025-06-18"
+	// MCPConfigFlag, MCPServersKey and MCPEnvKey spell the harness's
+	// --mcp-config argument: the flag, its server map, and a server's env.
+	// cmd/worker-adapter writes the argument and withDelegateSocket edits it
+	// per turn, so both read these.
+	MCPConfigFlag      = "--mcp-config"
+	MCPServersKey      = "mcpServers"
+	MCPEnvKey          = "env"
+	mcpProtocolVersion = "2025-06-18"
 	// delegateExchangeTimeout bounds the whole socket round trip: dial,
 	// write the request, and read the reply. It is not the adapter's own
 	// dial accept time; the adapter's listener may take up to 10s to hand

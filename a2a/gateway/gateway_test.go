@@ -21,6 +21,8 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
 // ---- harness ----------------------------------------------------------
@@ -176,6 +178,18 @@ type fakeAdapter struct {
 	// failEdits makes the next N Edit calls fail (and go unrecorded), for
 	// pinning what the relay does when a Chat edit does not land.
 	failEdits int
+	// rendersChat makes the fake a backend that lays chat messages out:
+	// PostMessage and EditMessage with one record it in chatPosts and
+	// chatEdits (the text too, in posts and edits); without it they answer
+	// ErrTextOnly, as every backend but Slack does. refuseChat makes a
+	// rendering fake refuse every chat message, as an API refusal would.
+	rendersChat bool
+	refuseChat  bool
+	// failChatEdits fails the next N laid-out edits with an error that is
+	// no refusal, as a rate limit or an outage would.
+	failChatEdits int
+	chatPosts     []*chatmsg.Message
+	chatEdits     []*chatmsg.Message
 	// stopped is closed when Run returns, so a test can assert that a
 	// backend was actually told to stop rather than left running.
 	stopped  chan struct{}
@@ -183,6 +197,24 @@ type fakeAdapter struct {
 	// stopDelay is how long Run takes to return once told to stop, for
 	// pinning that a caller waits for it rather than exiting on its own.
 	stopDelay time.Duration
+	// reactions records React and RemoveReaction calls (reactionCalls).
+	reactions []string
+	// verified records InboundVerified calls (verifiedCalls).
+	verified []string
+	// feedbacks records every PostMessage's feedback mark, when it has one,
+	// and markedTexts the text each marked post carried.
+	feedbacks   []string
+	markedTexts []string
+	// takesTerminals makes PostTerminal record the terminal in terminals, as
+	// the console adapter publishes a terminal frame; without it the fake
+	// answers errNoTerminalFrames, as a chat backend would.
+	takesTerminals bool
+	terminals      []fakeTerminal
+}
+
+type fakeTerminal struct {
+	Conversation string
+	ConsoleTerminal
 }
 
 func newFakeAdapter() *fakeAdapter {
@@ -227,6 +259,58 @@ func (a *fakeAdapter) Edit(conversation, messageID, text string) error {
 	return nil
 }
 
+func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Feedback != "" {
+		a.mu.Lock()
+		a.feedbacks = append(a.feedbacks, m.Feedback)
+		a.markedTexts = append(a.markedTexts, m.Text)
+		a.mu.Unlock()
+	}
+	if m.Chat == nil {
+		return a.Post(conversation, m.Text)
+	}
+	a.mu.Lock()
+	rendersChat, refuseChat := a.rendersChat, a.refuseChat
+	a.mu.Unlock()
+	if !rendersChat {
+		return "", ErrTextOnly
+	}
+	if refuseChat {
+		return "", fmt.Errorf("%w: fake", ErrLayoutRefused)
+	}
+	id, err := a.Post(conversation, m.Text)
+	a.mu.Lock()
+	a.chatPosts = append(a.chatPosts, m.Chat)
+	a.mu.Unlock()
+	return id, err
+}
+
+func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	a.mu.Lock()
+	rendersChat, refuseChat := a.rendersChat, a.refuseChat
+	transient := m.Chat != nil && a.failChatEdits > 0
+	if transient {
+		a.failChatEdits--
+	}
+	a.mu.Unlock()
+	if transient {
+		return errors.New("fake transient failure")
+	}
+	if m.Chat != nil && !rendersChat {
+		return ErrTextOnly
+	}
+	if m.Chat != nil && refuseChat {
+		return fmt.Errorf("%w: fake", ErrLayoutRefused)
+	}
+	if err := a.Edit(conversation, messageID, m.Text); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.chatEdits = append(a.chatEdits, m.Chat)
+	a.mu.Unlock()
+	return nil
+}
+
 func (a *fakeAdapter) Roster(string) ([]string, bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -235,6 +319,64 @@ func (a *fakeAdapter) Roster(string) ([]string, bool, error) {
 
 func (a *fakeAdapter) OpenDirect(userID string) (string, error) {
 	return "discord:dm/du-" + userID, nil
+}
+
+// React and RemoveReaction record each call as "+token@messageID" or
+// "-token@messageID", per conversation, in call order.
+func (a *fakeAdapter) React(conversation, messageID, token string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reactions = append(a.reactions, conversation+" +"+token+"@"+messageID)
+	return nil
+}
+
+func (a *fakeAdapter) RemoveReaction(conversation, messageID, token string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reactions = append(a.reactions, conversation+" -"+token+"@"+messageID)
+	return nil
+}
+
+// InboundVerified records the gateway's word on each sender as
+// "messageID:true" or "messageID:false" (VerifiedObserver).
+func (a *fakeAdapter) InboundVerified(_, messageID string, verified bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.verified = append(a.verified, fmt.Sprintf("%s:%t", messageID, verified))
+}
+
+func (a *fakeAdapter) verifiedCalls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.verified...)
+}
+
+func (a *fakeAdapter) reactionCalls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.reactions...)
+}
+
+func (a *fakeAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.takesTerminals {
+		return errNoTerminalFrames
+	}
+	a.terminals = append(a.terminals, fakeTerminal{conversation, t})
+	return nil
+}
+
+func (a *fakeAdapter) setTakesTerminals() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.takesTerminals = true
+}
+
+func (a *fakeAdapter) terminalPosts() []fakeTerminal {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]fakeTerminal(nil), a.terminals...)
 }
 
 func (a *fakeAdapter) postTexts() []string {
@@ -333,16 +475,42 @@ func startRigWithLogger(t *testing.T, tweak func(*Config), logger *slog.Logger) 
 	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}
 }
 
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
+// pollUntil retries cond for up to ten seconds and reports whether it held.
+func pollUntil(cond func() bool) bool {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if cond() {
-			return
+			return true
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s", what)
+	return false
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	if !pollUntil(cond) {
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// waitForRecord polls the conversation's session record until cond holds and
+// returns that record. The gateway posts a command's acknowledgement inside
+// the command and writes the record only after it returns, so a test that
+// waited on the post and read the record once could read the old record on a
+// loaded runner. A timeout prints the last record and lookup error, so a
+// record that never changed and a KV that kept failing read differently.
+func waitForRecord(t *testing.T, r *rig, conv, what string, cond func(*SessionRecord) bool) *SessionRecord {
+	t.Helper()
+	var rec *SessionRecord
+	var err error
+	if !pollUntil(func() bool {
+		rec, err = r.g.reg.Get(context.Background(), conv)
+		return err == nil && rec != nil && cond(rec)
+	}) {
+		t.Fatalf("timed out waiting for %s: last record %+v, err %v", what, rec, err)
+	}
+	return rec
 }
 
 // inSubjectEnvelopes replays everything on a task's in subject.
@@ -784,12 +952,12 @@ func TestNormalizePhrases(t *testing.T) {
 		"do the thing":      false,
 	} {
 		// These phrases exercise normalization through the exact set.
-		if got := isStatusQuery(phrase, false); got != want {
-			t.Errorf("isStatusQuery(%q) = %v, want %v", phrase, got, want)
+		if got := chattext.IsStatusQuery(phrase, false); got != want {
+			t.Errorf("chattext.IsStatusQuery(%q) = %v, want %v", phrase, got, want)
 		}
 	}
-	if !isStop("Stop!") || !isStop("cancel") || isStop("stop the deploy") {
-		t.Error("isStop misclassifies")
+	if !chattext.IsStop("Stop!") || !chattext.IsStop("cancel") || chattext.IsStop("stop the deploy") {
+		t.Error("chattext.IsStop misclassifies")
 	}
 }
 
@@ -1080,6 +1248,69 @@ type fakeSpawner struct {
 	// tests use it to assert the terminal was already on the stream when
 	// the pod went, which "terminal exists and pod deleted" alone cannot.
 	onDelete func(podName string)
+	// reusable names the pods Reusable vouches for; reusableErr fails the
+	// read. Empty, no pod is reusable, which is every pre-#2825 test's
+	// world: each turn a fresh pod.
+	reusable    map[string]bool
+	reusableErr error
+	// sessionPods is what SessionPods lists, the cap eviction's candidates.
+	sessionPods []sessionPod
+	// orphansErr fails TerminalOrphans, the orphan sweep's list.
+	orphansErr error
+	// deleteErr fails Delete (the call is still recorded).
+	deleteErr error
+	// started is each pod's start time for PodStarted; startedErr fails it.
+	started    map[string]time.Time
+	startedErr error
+}
+
+func (s *fakeSpawner) Reusable(_ context.Context, podName string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reusableErr != nil {
+		return false, s.reusableErr
+	}
+	return s.reusable[podName], nil
+}
+
+// PodStarted answers from started; a pod not in it has no start time.
+func (s *fakeSpawner) PodStarted(_ context.Context, podName string) (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.startedErr != nil {
+		return time.Time{}, s.startedErr
+	}
+	return s.started[podName], nil
+}
+
+func (s *fakeSpawner) setStarted(pod string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started == nil {
+		s.started = map[string]time.Time{}
+	}
+	s.started[pod] = at
+}
+
+func (s *fakeSpawner) setReusable(pods ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reusable = map[string]bool{}
+	for _, p := range pods {
+		s.reusable[p] = true
+	}
+}
+
+func (s *fakeSpawner) SessionPods(context.Context) ([]sessionPod, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]sessionPod(nil), s.sessionPods...), nil
+}
+
+func (s *fakeSpawner) setSessionPods(p ...sessionPod) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionPods = p
 }
 
 type fakeSpawn struct {
@@ -1108,13 +1339,19 @@ func (s *fakeSpawner) failSpawns(err error) {
 
 func (s *fakeSpawner) Delete(_ context.Context, podName string) error {
 	s.mu.Lock()
-	hook := s.onDelete
+	hook, err := s.onDelete, s.deleteErr
 	s.deletes = append(s.deletes, podName)
 	s.mu.Unlock()
 	if hook != nil {
 		hook(podName)
 	}
-	return nil
+	return err
+}
+
+func (s *fakeSpawner) setDeleteErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteErr = err
 }
 
 func (s *fakeSpawner) deleted() []string {
@@ -1126,6 +1363,9 @@ func (s *fakeSpawner) deleted() []string {
 func (s *fakeSpawner) TerminalOrphans(context.Context) ([]orphanPod, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.orphansErr != nil {
+		return nil, s.orphansErr
+	}
 	return append([]orphanPod(nil), s.orphans...), nil
 }
 
@@ -1234,6 +1474,50 @@ func restartRig(t *testing.T, r *rig, whileDown ...func()) (*rig, *fakeSpawner) 
 	return restartRigWrapped(t, r, nil, whileDown...)
 }
 
+// relayPullClearRecheck spaces waitForRelayPullsToClear's two reads.
+const relayPullClearRecheck = 100 * time.Millisecond
+
+// waitForRelayPullsToClear waits until the server holds no pull request on
+// the relay durable: the stopped gateway's last pull outlives its client's
+// close by however long the server takes to notice, and an event delivered
+// to it is held unacked for the durable's AckWait (gke-labs/kube-agents#4169).
+// Two zero reads in a row, so a pull still in flight on the old connection
+// can't register between one read and the second gateway's start. This hides
+// the race from the restart tests and doesn't remove it: a gateway restart in
+// production still delays or loses events in this window, which is #4170's,
+// and a message already delivered to the old client but not acked keeps the
+// AckWait delay, which no pull count can see.
+func waitForRelayPullsToClear(t *testing.T, url, durable string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear := func() bool {
+		c, err := js.Consumer(context.Background(), lib.TasksStream, durable)
+		if errors.Is(err, jetstream.ErrConsumerNotFound) {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+		info, err := c.Info(context.Background())
+		return err == nil && info.NumWaiting == 0
+	}
+	waitFor(t, "the stopped gateway's relay pull to clear", func() bool {
+		if !clear() {
+			return false
+		}
+		time.Sleep(relayPullClearRecheck)
+		return clear()
+	})
+}
+
 // restartRigWrapped is restartRig with the second gateway's adapter chosen
 // by wrap, as startRigWithSpawnerAdapter chooses the first's.
 func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, whileDown ...func()) (*rig, *fakeSpawner) {
@@ -1245,6 +1529,7 @@ func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, wh
 		t.Fatal("the first gateway did not stop")
 	}
 	r.client.Close()
+	waitForRelayPullsToClear(t, r.url, r.g.relayDurable)
 	for _, f := range whileDown {
 		f()
 	}
@@ -1566,6 +1851,10 @@ func TestTaskEndCountsAsActivity(t *testing.T) {
 	if !after.LastTaskActivity.Equal(after.LastActivity) {
 		t.Fatalf("the executor's terminal must move the task's own clock with the session's: task=%v session=%v", after.LastTaskActivity, after.LastActivity)
 	}
+	// Only a user's message moves the reap's idle clock; an answer must not.
+	if !after.LastUserMessage.Equal(before.LastUserMessage) {
+		t.Fatalf("the executor's terminal moved LastUserMessage from %v to %v", before.LastUserMessage, after.LastUserMessage)
+	}
 	held, until, err := r.g.hasSession(ctx, conv)
 	if err != nil || !held || !until.Equal(after.LastTaskActivity.Add(r.g.cfg.IdleTTL)) {
 		t.Fatalf("after the terminal the session must be held until LastTaskActivity+IdleTTL: held=%v until=%v err=%v", held, until, err)
@@ -1662,13 +1951,11 @@ func TestNoTaskTurnDoesNotReadmitAThread(t *testing.T) {
 		}
 		return false
 	})
-	after, err := r.g.reg.Get(ctx, conv)
-	if err != nil || after == nil {
-		t.Fatal(err)
-	}
-	if !after.LastActivity.After(stale) {
-		t.Fatalf("a verified turn must still count for the reap: LastActivity %v not after %v", after.LastActivity, stale)
-	}
+	// The gateway writes the record after it posts the answer, so the
+	// reap's clock is polled for rather than read once (see waitForRecord).
+	after := waitForRecord(t, r, conv, "a verified turn to count for the reap", func(rec *SessionRecord) bool {
+		return rec.LastActivity.After(stale)
+	})
 	if !after.LastTaskActivity.Equal(stale) {
 		t.Fatalf("a turn that started nothing moved the task clock: %v, want %v", after.LastTaskActivity, stale)
 	}
@@ -1769,6 +2056,11 @@ func TestHealedExecutorTerminalCountsAsActivity(t *testing.T) {
 	if !after.LastTaskActivity.After(stale) {
 		t.Fatalf("the healed executor terminal did not count as activity: %v", after.LastTaskActivity)
 	}
+	// The "stop" stamped LastUserMessage before the heal ran; the heal's own
+	// stamp, later, must leave it there.
+	if !after.LastUserMessage.Before(after.LastTaskActivity) {
+		t.Fatalf("the healed executor terminal moved LastUserMessage to %v (task clock %v)", after.LastUserMessage, after.LastTaskActivity)
+	}
 	if held, _, err := r.g.hasSession(ctx, conv); err != nil || !held {
 		t.Fatalf("after the heal posted the answer the thread must still be a session thread: held=%v err=%v", held, err)
 	}
@@ -1806,11 +2098,8 @@ func TestSessionCommandMarksTheRouteAndTheNextMessageSpawns(t *testing.T) {
 	if got := len(spawn.calls()); got != 0 {
 		t.Fatalf("/session spawned %d pods; it must spawn none", got)
 	}
-	rec, err := r.g.reg.Get(context.Background(), conv)
-	if err != nil || rec == nil {
-		t.Fatalf("record: %v %v", rec, err)
-	}
-	if !rec.SessionRouted || rec.Profile != "chat" {
+	rec := waitForRecord(t, r, conv, "route on", func(rec *SessionRecord) bool { return rec.SessionRouted })
+	if rec.Profile != "chat" {
 		t.Fatalf("record not session-routed after /session: %+v", rec)
 	}
 	ctxID := rec.ContextID
@@ -1882,8 +2171,8 @@ func TestSessionOffReleasesThePodAndRehomes(t *testing.T) {
 		d := spawn.deleted()
 		return len(d) == 1 && d[0] == call.Session
 	})
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if rec.SessionRouted || rec.PodName != "" || rec.BusSession != "" || rec.Addressee != "platform" {
+	rec := waitForRecord(t, r, conv, "route cleared", func(rec *SessionRecord) bool { return !rec.SessionRouted })
+	if rec.PodName != "" || rec.BusSession != "" || rec.Addressee != "platform" {
 		t.Fatalf("record after /session off: %+v", rec)
 	}
 
@@ -2048,8 +2337,8 @@ func TestSessionCommandWhileAPlatformTaskRunsSaysSo(t *testing.T) {
 			t.Fatalf("promised the next message opens a pod while a task runs: %q", p)
 		}
 	}
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if !rec.SessionRouted || rec.ActiveTask == nil || rec.ActiveTask.Detached {
+	rec := waitForRecord(t, r, conv, "route on", func(rec *SessionRecord) bool { return rec.SessionRouted })
+	if rec.ActiveTask == nil || rec.ActiveTask.Detached {
 		t.Fatalf("record after /session during a task: %+v", rec)
 	}
 	if len(spawn.calls()) != 0 {
@@ -2077,8 +2366,8 @@ func TestSessionCommandWithTextWhileATaskRunsHoldsTheText(t *testing.T) {
 		}
 		t.Fatalf("the held text reached the platform task as %s", e.Kind)
 	}
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if !rec.SessionRouted || len(spawn.calls()) != 0 {
+	rec := waitForRecord(t, r, conv, "route on", func(rec *SessionRecord) bool { return rec.SessionRouted })
+	if len(spawn.calls()) != 0 {
 		t.Fatalf("record %+v, spawns %d", rec, len(spawn.calls()))
 	}
 }
@@ -2124,19 +2413,12 @@ func TestSessionInfoRepliesStillCountAsActivity(t *testing.T) {
 	waitFor(t, "ack", postedContaining(r, "session route on"))
 	// The ack is persisted; take its clock, then let only an informational
 	// reply move it.
-	rec, _ := r.g.reg.Get(context.Background(), conv)
-	if rec == nil || !rec.SessionRouted {
-		t.Fatalf("record after the ack: %+v", rec)
-	}
+	rec := waitForRecord(t, r, conv, "route on", func(rec *SessionRecord) bool { return rec.SessionRouted })
 	first := rec.LastActivity
 	time.Sleep(30 * time.Millisecond)
 	sessionRigTurn(r, conv, "s-232", "/session")
 	waitFor(t, "already", postedContaining(r, "already on the session route"))
-	time.Sleep(50 * time.Millisecond)
-	rec, _ = r.g.reg.Get(context.Background(), conv)
-	if !rec.LastActivity.After(first) {
-		t.Fatalf("informational reply did not move LastActivity: %s then %s", first, rec.LastActivity)
-	}
+	waitForRecord(t, r, conv, "informational reply to move LastActivity", func(rec *SessionRecord) bool { return rec.LastActivity.After(first) })
 }
 
 // TestSessionStatusIsAFirstTurn: the spec's sentence - "/session status" is
@@ -2170,8 +2452,8 @@ func TestSessionOffWorksWithoutASpawner(t *testing.T) {
 	}
 	sessionRigTurn(r, conv, "s-250", "/session off")
 	waitFor(t, "off ack", postedContaining(r, "session route off"))
-	got, _ := r.g.reg.Get(context.Background(), conv)
-	if got.SessionRouted || got.Addressee != "platform" || got.BusSession != "" {
+	got := waitForRecord(t, r, conv, "route cleared", func(rec *SessionRecord) bool { return !rec.SessionRouted })
+	if got.Addressee != "platform" || got.BusSession != "" {
 		t.Fatalf("record after /session off with no spawner: %+v", got)
 	}
 	sessionRigTurn(r, conv, "s-251", "how is the fleet?")
@@ -2241,8 +2523,8 @@ func TestSessionOffDuringAPlatformTaskRehomesWithoutStopping(t *testing.T) {
 	waitFor(t, "ack", postedContaining(r, "after it opens a session pod"))
 	sessionRigTurn(r, conv, "s-272", "/session off")
 	waitFor(t, "off ack", postedContaining(r, "session route off"))
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if rec.SessionRouted || rec.Addressee != "platform" || rec.ActiveTask == nil || rec.ActiveTask.Detached {
+	rec := waitForRecord(t, r, conv, "route cleared", func(rec *SessionRecord) bool { return !rec.SessionRouted })
+	if rec.Addressee != "platform" || rec.ActiveTask == nil || rec.ActiveTask.Detached {
 		t.Fatalf("record after /session off during a platform task: %+v", rec)
 	}
 	for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
@@ -3266,5 +3548,99 @@ func TestRelayReportsQueuedFollowUpsThatNeverRan(t *testing.T) {
 				t.Fatal("a task-ended refusal posted its own line")
 			}
 		})
+	}
+}
+
+// TestStopAfterTheTurnEndedSaysACardKeepsWorking pins gke-labs#3263's reply.
+// The front door's turn ends seconds after it files a kanban card, so by the
+// time a user says "stop" the conversation holds no active task while the
+// card is still working and will post here. The gateway cannot see or cancel
+// the card, and its reply must say so rather than a bare "nothing is running".
+// The rig models the turn, not the card: what the gateway keys on is that the
+// conversation ran a task and holds none now. A conversation that never ran
+// one gets the plain reply (TestStopWithNothingToStopStartsNoTask).
+func TestStopAfterTheTurnEndedSaysACardKeepsWorking(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-card-stop"
+	ctx := context.Background()
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "c-1", Text: "check the pods on x"}
+	origin := r.awaitTask(t, "platform")
+	completeTask(t, r.execFor(t, origin, "platform"), "checking the pods on x")
+	waitFor(t, "the turn's terminal to release the conversation", func() bool {
+		rec, err := r.g.reg.Get(ctx, conv)
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "c-2", Text: "stop"}
+	waitFor(t, "the stop to be answered with the card notice", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if p == nothingRunningCardNotice {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// TestBareFeedbackAnswersWithTheLinksAndStartsNoTask: a bare /feedback is the
+// gateway's second slash command (docs/designs/chat-feedback-command.md). It
+// posts the two reporting links and submits nothing to the bus.
+func TestBareFeedbackAnswersWithTheLinksAndStartsNoTask(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-fb1"
+	sessionRigTurn(r, conv, "fb-100", "/feedback")
+	waitFor(t, "notice", postedContaining(r, chattext.FeedbackFormURL))
+	if !postedContaining(r, chattext.FeedbackTrackerURL)() {
+		t.Fatal("the notice must carry the tracker link too")
+	}
+	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 0 {
+		t.Fatalf("a bare /feedback submitted %d envelope(s); it must submit none", n)
+	}
+	if rec, _ := r.g.reg.Get(context.Background(), conv); rec != nil && rec.ActiveTask != nil {
+		t.Fatalf("a bare /feedback left an active task: %+v", rec.ActiveTask)
+	}
+}
+
+// TestFeedbackWithTextIsAnOrdinaryTurnWithThePrefixKept: "/feedback <text>" is
+// the agent's to answer, so it becomes a task whose text is what the person
+// typed, prefix included, and no links notice is posted.
+func TestFeedbackWithTextIsAnOrdinaryTurnWithThePrefixKept(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-fb2"
+	sessionRigTurn(r, conv, "fb-110", "/feedback the status line stuck on working")
+	origin := r.awaitTask(t, "platform")
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinTextParts(m.Parts); got != "/feedback the status line stuck on working" {
+		t.Fatalf("task text = %q, want the text as typed, prefix included", got)
+	}
+	if postedContaining(r, chattext.FeedbackFormURL)() {
+		t.Fatal("the links notice was posted for a /feedback with text")
+	}
+}
+
+// TestFeedbackWithTextWhileATaskRunsIsASteer: with a task running, a
+// "/feedback <text>" is a follow-up like any other message, not swallowed by
+// the command branch.
+func TestFeedbackWithTextWhileATaskRunsIsASteer(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-fb3"
+	sessionRigTurn(r, conv, "fb-120", "start")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "fb-121", "/feedback the answer was wrong")
+	waitFor(t, "steer ack", postedContaining(r, ackSteerQueued))
+	envs := inSubjectEnvelopes(t, r.url, "platform")
+	if steer := envs[len(envs)-1]; steer.TaskID != origin.TaskID {
+		t.Fatalf("the /feedback follow-up minted a new task: %s vs %s", steer.TaskID, origin.TaskID)
+	}
+	if postedContaining(r, chattext.FeedbackFormURL)() {
+		t.Fatal("the links notice was posted for a /feedback follow-up")
 	}
 }

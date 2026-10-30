@@ -47,6 +47,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 import unittest.mock
 
 import yaml
@@ -264,15 +265,15 @@ class TestEveryTaskIsValid(unittest.TestCase):
             with self.subTest(rule=needle):
                 self._assert_none(needle, guidance)
 
-    def test_every_task_names_an_owner(self):
+    def test_every_task_owner_is_a_person(self):
         for needle, guidance in (
             (
-                "declares no 'owner:'",
-                "These cases name nobody to answer when they flake -- see "
-                "bench/CONTRIBUTING.md:",
+                "is no longer allowed",
+                "These cases still say 'owner: maintainers'; delete the line -- "
+                "see bench/CONTRIBUTING.md:",
             ),
             ("leading at sign", "These cases write the owner as a mention:"),
-            ("neither a GitHub login", "These cases carry an owner that is not a login:"),
+            ("is not a GitHub login (", "These cases carry an owner that is not a login:"),
         ):
             with self.subTest(rule=needle):
                 self._assert_none(needle, guidance)
@@ -466,7 +467,6 @@ class TestTheValidatorItself(unittest.TestCase):
             "id": "made-up-case",
             "name": "A case",
             "domain": "security",
-            "owner": "maintainers",
             "fixtures": ["rbac-overgrant"],
             "verification_spec": [
                 {
@@ -516,7 +516,6 @@ class TestTheRulesReject(unittest.TestCase):
         "id": "made-up-case",
         "name": "A case",
         "domain": "security",
-        "owner": "maintainers",
         "fixtures": ["rbac-overgrant"],
         "verification_spec": [
             {
@@ -620,8 +619,55 @@ class TestTheRulesReject(unittest.TestCase):
         # value, which would be a traceback instead of a finding.
         self._only("is not a slug string", domain=["security", "cost"])
 
-    def test_a_missing_owner_is_rejected(self):
-        self._only("declares no 'owner:'", owner=DELETE)
+    def test_a_missing_owner_passes(self):
+        # Optional: the case's bugs go to its domain's owner.
+        self.assertEqual(self._validate(owner=DELETE), [])
+
+    def _text_with(self, line):
+        spec = {k: v for k, v in self.VALID.items() if k != "owner"}
+        return yaml.safe_dump(spec) + line
+
+    def test_a_bare_owner_line_passes_like_a_missing_one(self):
+        # Both readers see a bare `owner:` as absent.
+        self.assertEqual(self._validate(text=self._text_with("owner:\n")), [])
+
+    def test_an_owner_the_filer_would_read_differently_is_rejected(self):
+        # YAML reads these as absent or as bob; case_owner's scan does not.
+        for line in ("owner: null\n", "owner: Null\n", "owner: >-\n  bob\n", "owner: &a bob\n", '"owner": bob\n'):
+            with self.subTest(line=line):
+                self._only("to scripts/case_owner.py", text=self._text_with(line))
+
+    def test_a_domain_the_filer_would_read_differently_is_rejected(self):
+        spec = {k: v for k, v in self.VALID.items() if k != "domain"}
+        text = yaml.safe_dump(spec) + "domain: >-\n  " + self.VALID["domain"] + "\n"
+        problem = self._only("'domain:' reads as", text=text)
+        self.assertNotIn("'owner:'", problem)
+
+    def test_a_domains_row_the_filer_would_read_differently_fails_the_lint(self):
+        rows = {
+            "slug not first": "domains:\n  - name: Security\n    slug: security\n    owner: alice\n",
+            "quoted slug": 'domains:\n  - slug: "security"\n    owner: alice\n',
+        }
+        for label, text in rows.items():
+            with self.subTest(row=label), tempfile.TemporaryDirectory() as tmp:
+                path = pathlib.Path(tmp) / "domains.yaml"
+                path.write_text(text)
+                with mock.patch.object(validator, "DOMAINS_FILE", path):
+                    with self.assertRaisesRegex(validator.CaseError, "security"):
+                        self._validate()
+
+    def test_an_owner_line_inside_another_field_names_the_cause(self):
+        spec = {k: v for k, v in self.VALID.items() if k != "owner"}
+        text = yaml.safe_dump(spec) + 'notes: "first\nowner: mallory"\n'
+        self.assertIn("inside another field", self._only("to scripts/case_owner.py", text=text))
+
+    def test_an_empty_string_owner_is_rejected(self):
+        self._only("is not a GitHub login string", owner="")
+
+    def test_the_retired_maintainers_owner_is_rejected(self):
+        for owner in ("maintainers", "Maintainers"):
+            with self.subTest(owner=owner):
+                self._only("is no longer allowed", owner=owner)
 
     def test_an_owner_with_a_leading_at_sign_is_rejected(self):
         self._only("leading at sign", owner="@someone")
@@ -631,13 +677,17 @@ class TestTheRulesReject(unittest.TestCase):
         # shapes a contributor is likely to write; GitHub accepts none of them.
         for owner in ("someone@example.com", "Some One", "some--one", "-someone"):
             with self.subTest(owner=owner):
-                self._only("neither a GitHub login", owner=owner)
+                self._only("is not a GitHub login (", owner=owner)
 
     def test_an_owner_that_is_not_a_string_is_rejected(self):
         self._only("is not a GitHub login string", owner=["a", "b"])
 
-    def test_a_login_owner_passes(self):
-        self.assertEqual(self._validate(owner="some-one1"), [])
+    def test_any_login_passes(self):
+        # Any GitHub login, not only people in OWNERS: whether GitHub accepts
+        # it as an assignee is checked when a bug is filed, not offline.
+        for owner in ("some-one1", "GinnyJI"):
+            with self.subTest(owner=owner):
+                self.assertEqual(self._validate(owner=owner), [])
 
     # -- audit_streams --
 
@@ -652,6 +702,22 @@ class TestTheRulesReject(unittest.TestCase):
         for value in ([], "compliance-audit", [1], [""], ["  "], ["compliance-audit\n"]):
             with self.subTest(value=value):
                 self._only("non-empty list", audit_streams=value)
+
+    # -- scope_exclude --
+
+    def test_a_declared_scope_exclusion_passes(self):
+        self.assertEqual(self._validate(scope_exclude={"slots": ["b", "d"]}), [])
+
+    def test_a_slot_the_catalogue_does_not_declare_is_rejected(self):
+        self._only("does not declare", scope_exclude={"slots": ["b", "z"]})
+
+    def test_excluding_every_slot_is_rejected(self):
+        self._only("excludes every seeded slot", scope_exclude={"slots": ["a", "b", "c", "d"]})
+
+    def test_a_scope_exclusion_the_runner_cannot_read_is_rejected(self):
+        for value in (None, ["b"], {"slots": []}, {"slots": ["b", "b"]}, {"slots": ["seeded-b"]}, {"clusters": ["b"]}):
+            with self.subTest(value=value):
+                self._only("must be {slots:", scope_exclude=value)
 
     def test_an_unreadable_platform_roster_is_a_case_error_naming_it(self):
         # A CaseError, which the lint's per-case loop reports, not a traceback that hides every case.
@@ -679,6 +745,16 @@ class TestTheRulesReject(unittest.TestCase):
         for value in (True, False):
             with self.subTest(value=value):
                 self.assertEqual(self._validate(expected_fail=value), [])
+
+    def test_a_tool_calls_optional_that_is_not_a_boolean_is_rejected(self):
+        for value in ("false", "true", 1, ["true"]):
+            with self.subTest(value=value):
+                self._only("is not a YAML boolean", tool_calls_optional=value)
+
+    def test_a_bare_boolean_tool_calls_optional_passes(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                self.assertEqual(self._validate(tool_calls_optional=value), [])
 
     def test_an_unknown_fixture_role_is_rejected(self):
         # Deliberately not a plausible-looking slug: `hpa-saturated` used to
@@ -857,7 +933,6 @@ class TestTheRulesReject(unittest.TestCase):
             text=(
                 "id: made-up-case\n"
                 "domain: security\n"
-                "owner: maintainers\n"
                 "verification_spec: [{name: n, role: objective, "
                 "check: {type: report_contains, required_phrases: [x]}}]\n"
             ),
@@ -1098,6 +1173,27 @@ class TestTheSanitizer(unittest.TestCase):
         )
         self.assertTrue(found.startswith("tf/prebuilt/stack/main.tf:1:"), found)
 
+    def test_a_module_file_is_scanned(self):
+        # Rooted the way the repository scan is, so what is under test is
+        # SANITIZED_ROOTS rather than a walk of the whole temporary tree.
+        roots = [r.relative_to(validator.REPO_ROOT) for r in validator.SANITIZED_ROOTS]
+        found = self._findings(
+            {
+                "bench/tasks/case/task.yaml": "ok: 192.0.2.1\n",
+                "bench/tf/modules/drift-inject/main.tf": 'ip = "10.0.0.1"\n',
+            },
+            roots=roots,
+        )
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("IPv4 literal 10.0.0.1", found[0])
+        self.assertTrue(found[0].startswith("bench/tf/modules/drift-inject/main.tf:1:"), found[0])
+
+    def test_sanitized_roots_includes_modules_dir(self):
+        self.assertEqual(
+            validator.SANITIZED_ROOTS,
+            (validator.TASKS_DIR, validator.PREBUILT_DIR, validator.MODULES_DIR),
+        )
+
     def test_dot_directories_and_local_tofu_artefacts_are_skipped(self):
         files = {
             "stack/.terraform/x.txt": "10.0.0.1\n",
@@ -1202,13 +1298,13 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
         # test_the_exclusion_lists_do_not_rot passes on a clean tree whether or
         # not this function does anything; this is what proves it does.
         with unittest.mock.patch.dict(
-            validator.KNOWN_NO_DOMAIN, {"deleted-case": "gone"}, clear=False
+            validator.KNOWN_UNREGISTERED, {"deleted-case": "gone"}, clear=False
         ):
             stale = validator.stale_allowlist_entries()
-        self.assertIn("KNOWN_NO_DOMAIN: deleted-case", stale)
+        self.assertIn("KNOWN_UNREGISTERED: deleted-case", stale)
 
-    def test_all_four_allowlists_are_swept(self):
-        for name in ("KNOWN_UNREGISTERED", "KNOWN_NO_DOMAIN", "KNOWN_JUDGE_ONLY", "FIXTURE_NOT_READY"):
+    def test_all_three_allowlists_are_swept(self):
+        for name in ("KNOWN_UNREGISTERED", "KNOWN_JUDGE_ONLY", "FIXTURE_NOT_READY"):
             with self.subTest(allowlist=name):
                 with unittest.mock.patch.dict(
                     getattr(validator, name), {"deleted-case": "gone"}, clear=False
@@ -1273,6 +1369,44 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
         self.assertEqual(list(found), ["cluster-provision-kanban"])
         self.assertIn("is commented out in", " ".join(results["cluster-provision-kanban"]))
         self.assertIn("That parking state is retired", " ".join(results["cluster-provision-kanban"]))
+
+    def test_a_repeated_key_is_refused_as_the_runner_refuses_it(self):
+        # devops-bench loads tasks with ruamel's safe loader, which raises on a
+        # repeated key that PyYAML would keep silently.
+        texts = {
+            "top level": "id: made-up-case\ntool_calls_optional: true\nname: A case\ntool_calls_optional: true\n",
+            "nested": "id: made-up-case\ninfrastructure:\n  stack: a\n  stack: b\n",
+            "quoted": "id: made-up-case\n\"name\": a\nname: b\n",
+        }
+        for where, text in texts.items():
+            with self.subTest(where=where), tempfile.TemporaryDirectory() as tmp:
+                path = pathlib.Path(tmp) / "task.yaml"
+                path.write_text(text)
+                with self.assertRaises(validator.CaseError) as raised:
+                    validator._load_yaml(path)
+                self.assertIn("found duplicate key", str(raised.exception))
+
+    def test_a_key_that_overrides_a_merged_one_is_not_a_repeat(self):
+        text = (
+            "base: &base\n  role: objective\n  required_phrases: [kube-agents]\n"
+            "entry:\n  <<: *base\n  required_phrases: [hi there]\n"
+            "both:\n  <<: [*base, {role: safeguard}]\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "task.yaml"
+            path.write_text(text)
+            loaded = validator._load_yaml(path)
+        self.assertEqual(loaded, yaml.safe_load(text))
+        self.assertEqual(loaded["entry"]["required_phrases"], ["hi there"])
+
+    def test_keys_the_other_loaders_accept_still_load(self):
+        # A bare `=` key (YAML 1.1's value tag) and a 1 beside a "1" are
+        # distinct keys to yaml.safe_load and to the runner's ruamel loader.
+        text = "variables:\n  =: x\n  other: y\nids:\n  1: a\n  \"1\": b\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "task.yaml"
+            path.write_text(text)
+            self.assertEqual(validator._load_yaml(path), yaml.safe_load(text))
 
     def test_one_unreadable_case_does_not_hide_the_others(self):
         broken = validator.TASKS_DIR / "zz-not-a-real-case" / "task.yaml"

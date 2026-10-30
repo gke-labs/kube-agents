@@ -1,0 +1,49 @@
+{
+  "args": [
+    "--allowedTools",
+    "Read,Glob,Grep,mcp__gke__get_cluster,mcp__gke__list_clusters,mcp__docs__search,Skill",
+    "--disallowedTools",
+    "Bash,BashOutput,KillShell,Edit,MultiEdit,Write,NotebookEdit,LS,NotebookRead,WebFetch,WebSearch,Task",
+    "--mcp-config",
+    "\u003cmcpConfig\u003e",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "user"
+  ],
+  "mcpConfig": {
+    "mcpServers": {
+      "docs": {
+        "args": [
+          "/opt/mcp-remote/dist/proxy.js",
+          "http://credential-proxy:8765/mcp/developer_knowledge",
+          "--allow-http",
+          "--transport",
+          "http-only"
+        ],
+        "command": "node",
+        "env": {
+          "MCP_REMOTE_BEARER_FILE": "/var/run/secrets/credential-proxy/token"
+        }
+      },
+      "gke": {
+        "args": [
+          "/opt/mcp-remote/dist/proxy.js",
+          "http://credential-proxy:8765/mcp/gke",
+          "--allow-http",
+          "--transport",
+          "http-only"
+        ],
+        "command": "node",
+        "env": {
+          "MCP_REMOTE_BEARER_FILE": "/var/run/secrets/credential-proxy/token"
+        }
+      }
+    }
+  },
+  "model": "model-default",
+  "warnings": [
+    "skills/triage/scripts/events.sh: dropped, the persona grants no shell tool to run it",
+    "mcp.yaml: servers.unused: dropped, no tools entry grants any of its tools",
+    "persona.yaml: harness.claude-code.maxTurns: not supported by this adapter, ignored"
+  ]
+}

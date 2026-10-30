@@ -139,11 +139,11 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
-			// The above-one-replica shape. This is the only fixture that
-			// renders the leader Role's pods get/patch rule, and it is here
-			// because that rule is the agent identity's one write grant --
-			// the shape a reviewer most needs to be able to read off a
-			// manifest, and the one every other fixture renders away.
+			// availability.replicas: 3, which the operator caps at one
+			// replica. The expected output is identical to
+			// platformagent-tagged.yaml's, so the cap is visible as the
+			// absence of every multi-replica object; see the fixture's
+			// header for why the gateway is capped.
 			name:         "PlatformAgentHighAvailability",
 			inputPath:    filepath.Join("testdata", "platform", "platformagent-ha.yaml"),
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-ha.yaml"),

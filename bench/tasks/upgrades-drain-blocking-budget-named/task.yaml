@@ -1,0 +1,146 @@
+# Upgrade-failure catalogue entry 1 (a PodDisruptionBudget forbids the
+# eviction), asked directly: list the budgets that would stop a node drain.
+# upgrades-fleet-readiness-exclusion reads the same budget through the
+# readiness report's grade; this case asks the agent the question outright
+# and grades its own reading, so the two go red for different reasons. The
+# seeded fleet plants one such budget:
+# pinned-batch-runner in seeded-upgrade on seeded-b, maxUnavailable 0 over
+# one replica, so disruptionsAllowed is 0 for good and a drain that reaches
+# its pod never completes.
+#
+# The prompt names no budget and no cluster. It asks for the answer to end
+# in one declared line per budget, in a fixed form, and the deterministic
+# objectives read those lines and nothing else: a substring check over the
+# prose cannot tell "does not block" from "blocks", and the first live run
+# of a prose-graded version of this case showed the agent's correct wording
+# ("currently blocking node drains") outside the list. Free prose is the
+# judge's to read, the recommendation included: a correct report quotes the
+# delete command only to advise against it, which a substring check cannot
+# tell from a proposal, so no objective forbids the command.
+#
+# The minAvailable slot is read, not graded: the planted budget has none, and
+# the spellings of an absent field (none, N/A, not set) are the judge's to read.
+#
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
+#
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
+# The three budget labels read as the template spells them or as kubectl
+# prints them: `max unavailable`, `min available`, `allowed disruptions`,
+# spaced or hyphenated.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the budget's maxUnavailable. Widening it to 1 is the
+# heal that passes every objective and empties the fixture.
+id: upgrades-drain-blocking-budget-named
+name: The budget that would stop a node drain is named, with its workload and the reason it blocks
+
+prompt: >-
+  Before the node upgrades on the seeded clusters in this project, list
+  every PodDisruptionBudget on them that would stop a node drain from
+  completing, with the workload it protects and why it blocks. Read only;
+  change nothing. End your answer with one line per PodDisruptionBudget you
+  examined, in exactly this form, no other words on the line:
+  "<cluster>/<namespace>/<budget>: maxUnavailable <value or none>;
+  minAvailable <value or none>; disruptionsAllowed <number>; blocks a drain:
+  <yes|no>".
+
+expected_output: >-
+  It reads the budgets on each seeded cluster and names the planted blocker:
+  pinned-batch-runner in seeded-upgrade on seeded-b, maxUnavailable 0 over a
+  single replica, so disruptionsAllowed is 0 by specification and the
+  eviction a drain performs is refused for as long as the pod is healthy. It
+  may also report budgets whose disruptionsAllowed is 0 only because their
+  pods are Pending or unhealthy (the capacity fixtures carry such budgets),
+  and if it does it separates that transient zero from the one the
+  specification guarantees. It recommends what the budget's owner would
+  change (a maxUnavailable of 1, or a second replica) and does not propose
+  deleting the budget, which would trade a stalled drain for an unprotected
+  workload. It ends with the declared line for every budget it examined, the
+  planted one reading "maxUnavailable 0; minAvailable none;
+  disruptionsAllowed 0; blocks a drain: yes". It performs no change and
+  cites no CVE identifiers.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+fixtures:
+  - readiness-drain-blocked
+  - readiness-pinned-workload
+
+verification_spec:
+  # The declared lines are what the deterministic objectives read. Each
+  # pattern matches a whole line that starts with the planted budget's
+  # cluster, namespace and name, so a line about another budget, a sentence
+  # that merely contains the words, or a value outside the vocabulary does
+  # not satisfy it. A label the template writes without a colon may carry
+  # one (`maxUnavailable: 0`); a value then starts at its first non-blank
+  # character, so a negated value slot cannot be sidestepped by the colon.
+  - name: the-planted-budget-has-a-declared-line
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-drain-blocked
+      any_of_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?\d+(?: ?\([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
+
+  - name: the-declared-line-carries-the-budgets-evidence
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-drain-blocked
+      any_of_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?0%?(?: ?\([^)\n;]*\))?; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?0(?: ?\([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?(?!0%?(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?\d+(?: ?\([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?(?!0(?: ?\([^)\n;]*\))?;)\d+(?: ?\([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-budget-blocks-a-drain
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-drain-blocked
+      any_of_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?\d+(?: ?\([^)\n;]*\))?; blocks a drain: yes$'
+      forbidden_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?\d+(?: ?\([^)\n;]*\))?; blocks a drain: (?!yes$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The budget survived the run. A run that widened maxUnavailable to 1
+  # would pass every objective above and heal the defect for every later case.
+  - name: the-planted-budget-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: readiness-drain-blocked
+      kind: poddisruptionbudget
+      resource_name: pinned-batch-runner
+      namespace: seeded-upgrade
+      path: spec.maxUnavailable
+      op: eq
+      value: 0
