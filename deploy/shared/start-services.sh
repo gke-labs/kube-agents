@@ -227,37 +227,41 @@ normalize_boolean() {
 
 # The shapes the watcher's duration and count flags are allowed to take: a
 # subset of what Go's flag package accepts, so that every value inside a
-# pattern is one the binary parses, and a value outside it only ever reaches
-# the fallback. A duration is time.ParseDuration's grammar narrowed four ways:
-# no sign (validate() rejects a negative settle, span or quiet period, and the
+# pattern (and, for a duration, inside duration_nanoseconds' range check) is
+# one the binary parses, and a value outside it only ever reaches the
+# fallback. A duration is time.ParseDuration's grammar narrowed three ways: no
+# sign (validate() rejects a negative settle, span or quiet period, and the
 # filter replaces a negative hold with its default anyway); no `µs`, `.5h` or
-# `1.h`; at most five integer and three fraction digits per component; and at
-# most four components. The last two are what keep it inside Go's int64 of
-# nanoseconds, about 2562047h, which a bare `3000000h` overflows; four
-# components of 99999.999h is under 400000h. A count is plain decimal, at most
-# eighteen digits: the flag package reads ints with a base prefix, so `08` is a
-# bad octal literal there and `0x10` is sixteen, and nineteen digits can
-# overflow an int64, which it rejects as out of range.
-readonly WATCHER_DURATION_PATTERN='^(0|([0-9]{1,5}(\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,4})$'
+# `1.h`; and at most three fraction digits per component, which is what keeps
+# the fraction arithmetic below inside bash's int64. A count is plain decimal,
+# at most eighteen digits: the flag package reads ints with a base prefix, so
+# `08` is a bad octal literal there and `0x10` is sixteen, and nineteen digits
+# can overflow an int64, which it rejects as out of range.
+readonly WATCHER_DURATION_PATTERN='^(0|([0-9]{1,18}(\.[0-9]{1,3})?(ns|us|ms|s|m|h))+)$'
 readonly WATCHER_COUNT_PATTERN='^[0-9]{1,18}$'
 
-# Nanoseconds in one of each unit WATCHER_DURATION_PATTERN admits, for the one
-# check that has to know a duration's size: whether it is above zero once Go
-# has truncated it to whole nanoseconds.
+# Nanoseconds in one of each unit WATCHER_DURATION_PATTERN admits, and the
+# largest duration Go represents, for the size checks: whether a duration fits
+# Go's int64 of nanoseconds (`3000000h` does not), and whether it is above
+# zero once Go has truncated it to whole nanoseconds (`0.5ns` is not).
 readonly NS_PER_US=1000
 readonly NS_PER_MS=1000000
 readonly NS_PER_S=1000000000
 readonly NS_PER_M=60000000000
 readonly NS_PER_H=3600000000000
+readonly NS_MAX=9223372036854775807
 readonly DECIMAL_BASE=10
 
-# The whole nanoseconds Go's time.ParseDuration reads a duration the pattern
-# already admitted as, printed to stdout. Each component's fraction is
-# truncated as Go truncates it, so `0.5ns` is 0 here as it is there. The digit
-# caps on the pattern keep every product inside bash's int64.
+# Set the *named* variable to the whole nanoseconds Go's time.ParseDuration
+# reads $2 as, $2 being a duration WATCHER_DURATION_PATTERN already admitted,
+# and fail without setting it if Go would reject the value as out of range.
+# Each component's fraction is truncated as Go truncates it, and every
+# addition is checked against NS_MAX before it is made, as Go checks it. By
+# name, like the normalisers, so a caller reads the answer without a subshell.
 duration_nanoseconds() {
-  local rest="$1"
-  local total=0 whole fraction unit per
+  local out="$1"
+  local rest="$2"
+  local total=0 whole fraction unit per part
   while [[ "${rest}" =~ ^([0-9]+)(\.([0-9]+))?(ns|us|ms|s|m|h)([0-9].*)?$ ]]; do
     whole="${BASH_REMATCH[1]}"
     fraction="${BASH_REMATCH[3]}"
@@ -271,12 +275,20 @@ duration_nanoseconds() {
       m) per="${NS_PER_M}" ;;
       h) per="${NS_PER_H}" ;;
     esac
+    # Divided before multiplied, so the test itself cannot overflow.
+    if ((10#${whole} > (NS_MAX - total) / per)); then
+      return 1
+    fi
     total=$((total + 10#${whole} * per))
     if [[ -n "${fraction}" ]]; then
-      total=$((total + 10#${fraction} * per / DECIMAL_BASE ** ${#fraction}))
+      part=$((10#${fraction} * per / DECIMAL_BASE ** ${#fraction}))
+      if ((part > NS_MAX - total)); then
+        return 1
+      fi
+      total=$((total + part))
     fi
   done
-  printf '%s' "${total}"
+  printf -v "${out}" '%s' "${total}"
 }
 
 # Rewrite the *named* variable, in place, to a duration the watcher's flag
@@ -291,18 +303,20 @@ normalize_duration() {
   local fallback="$2"
   local positive="${3:-}"
   local value="${!name}"
+  local nanoseconds=0
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
 
   # Zero is measured in nanoseconds rather than read off the digits: `0.5ns`
   # has a non-zero digit and is still zero to the watcher.
-  if [[ "${value}" =~ ${WATCHER_DURATION_PATTERN} ]] && { [[ -z "${positive}" ]] || [[ "$(duration_nanoseconds "${value}")" -gt 0 ]]; }; then
+  if [[ "${value}" =~ ${WATCHER_DURATION_PATTERN} ]] && duration_nanoseconds nanoseconds "${value}" &&
+    { [[ -z "${positive}" ]] || ((nanoseconds > 0)); }; then
     printf -v "${name}" '%s' "${value}"
     return 0
   fi
 
   printf -v "${name}" '%s' "${fallback}"
-  echo "start-services: ${name}=${value} is not a usable duration (a Go duration such as 2m or 90s${positive:+, above zero}); using ${fallback}" >&2
+  echo "start-services: ${name}=${value} is not a usable duration (a Go duration such as 2m or 90s, at most three fraction digits, within Go's range${positive:+, above zero}); using ${fallback}" >&2
 }
 
 # Rewrite the *named* variable, in place, to a decimal count the watcher's flag

@@ -1002,6 +1002,7 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
                 "NS_PER_S",
                 "NS_PER_M",
                 "NS_PER_H",
+                "NS_MAX",
                 "DECIMAL_BASE",
             )
         )
@@ -1018,7 +1019,12 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
         )
 
     def test_a_go_duration_passes_through_unchanged(self) -> None:
-        for value in ("2m", "90s", "1h30m", "1.5h", "500ms", "24h", "0", "0s"):
+        # 604800s and 2562047h: large, and inside Go's int64 of nanoseconds.
+        for value in (
+            "2m", "90s", "1h30m", "1.5h", "500ms", "24h", "0", "0s",
+            "604800s", "120000ms", "100000h", "1h1m1s1ms1us", "2562047h",
+            "2562047h47m16.854s",
+        ):
             with self.subTest(value=value):
                 result = self._resolve("normalize_duration", value, _FALLBACK_DURATION)
                 self.assertIn(f"resolved={value}", result.stdout)
@@ -1031,8 +1037,12 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
 
     def test_a_value_the_watcher_would_reject_lands_on_the_default_and_says_so(self) -> None:
         # 120: no unit. -5m: validate() refuses a negative. 00: ParseDuration
-        # only special-cases a bare 0. 3000000h: past int64 nanoseconds.
-        for value in ("120", "2", "-5m", "abc", "00", "2 m", "5min", "3000000h"):
+        # only special-cases a bare 0. The last four are past int64 nanoseconds:
+        # one unit, a second component, and a fraction over the line.
+        for value in (
+            "120", "2", "-5m", "abc", "00", "2 m", "5min",
+            "2562048h", "3000000h", "2562047h1h", "2562047h47m16.855s",
+        ):
             with self.subTest(value=value):
                 result = self._resolve("normalize_duration", value, _FALLBACK_DURATION)
                 self.assertIn(f"resolved={_FALLBACK_DURATION}", result.stdout)
@@ -1083,8 +1093,7 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
             ("normalize_duration", "+5m", _FALLBACK_DURATION),
             ("normalize_duration", ".5h", _FALLBACK_DURATION),
             ("normalize_duration", "1.h", _FALLBACK_DURATION),
-            ("normalize_duration", "1h1m1s1ms1us", _FALLBACK_DURATION),
-            ("normalize_duration", "100000h", _FALLBACK_DURATION),
+            ("normalize_duration", "0.0001s", _FALLBACK_DURATION),
         ):
             with self.subTest(value=value):
                 result = self._resolve(helper, value, fallback)
