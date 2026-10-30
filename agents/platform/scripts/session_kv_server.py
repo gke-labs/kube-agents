@@ -58,7 +58,10 @@ logger = logging.getLogger("session_kv_server")
 # `spec.deployment.env` (the operator renders them on the container). The PVC
 # `.env` is agent-writable (`save_env_value`), and `load_dotenv` adds any key the
 # container env lacks, which on an install that did not opt in is exactly these.
-_OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST",)
+# KUBE_AGENTS_CHAT_HOME_DIR is the test seam for the operator's projected
+# home-channel directory; a line in the agent-writable `.env` must not point
+# the readers at a file on the writable volume.
+_OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST", chat_notify.HOME_FILE_DIR_ENV)
 # The home channel a today-era `/sethome` or first chat mirrored into that
 # `.env` (Hermes' persist_home_channel). Under `next` with the operator's
 # projection mounted, the projected file is the channel the gateway posts

@@ -3261,12 +3261,14 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
     def test_the_pvc_dotenv_cannot_turn_the_switch_on(self):
         loaded = self._load_dotenv(
             b"INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true\n"
+            b"KUBE_AGENTS_CHAT_HOME_DIR=/opt/data/anywhere\n"
             b"export SAFE_KEY='loaded_ok'\n"
             b"COMMENTED=value # an inline comment\n"
             b"PREEXISTING_VAR=from_dotenv\n",
-            ("SAFE_KEY", "COMMENTED"),
+            ("SAFE_KEY", "COMMENTED", "KUBE_AGENTS_CHAT_HOME_DIR"),
         )
         self.assertIsNone(loaded[self.ENV])
+        self.assertIsNone(loaded["KUBE_AGENTS_CHAT_HOME_DIR"])
         self.assertEqual(loaded["SAFE_KEY"], "loaded_ok")
         self.assertEqual(loaded["COMMENTED"], "value")
         self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")

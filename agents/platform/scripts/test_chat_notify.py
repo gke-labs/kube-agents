@@ -23,8 +23,8 @@ class HomeFileTest(unittest.TestCase):
     """The home channel the operator projects into the pod as a file.
 
     A learned channel is never rendered into the pod env; ``routed_platform``
-    and ``slack_home_channel`` take it from the file after a non-empty env,
-    and read it on every call because the kubelet refreshes it in place.
+    and ``home_file_value`` take it from the file after a non-empty env, and
+    read it on every call because the kubelet refreshes it in place.
     """
 
     def setUp(self):
