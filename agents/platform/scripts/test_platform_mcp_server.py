@@ -99,8 +99,18 @@ chat_platforms.CONFIG_PATH = "/nonexistent/kube-agents-test/profile.yaml"
 # the same reason the relay URLs are. Named from `chat_notify`'s own constants.
 BLANK_CHAT_ENV = {
     var: "" for signals in chat_platforms._ENV_SIGNALS.values() for var in signals
-} | {chat_notify.NOTIFY_PLATFORM_ENV: "", chat_notify.NOTIFY_CONVERSATIONS_ENV: "",
-     chat_notify.HOME_FILE_DIR_ENV: "/nonexistent/kube-agents-chat-home"}
+} | {chat_notify.NOTIFY_PLATFORM_ENV: "", chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}
+# The projected home-channel file is absent on a test runner; say so rather
+# than rely on it.
+_HOME_DIR_PATCH = patch.object(chat_notify, "HOME_FILE_DIR", "/nonexistent/kube-agents-chat-home")
+
+
+def setUpModule():
+    _HOME_DIR_PATCH.start()
+
+
+def tearDownModule():
+    _HOME_DIR_PATCH.stop()
 
 from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics, audit_log_searcher, send_notification, report_to_chat, _sanitize_log_text, _sanitize_audit_value, _strip_audit_log_noise
 
@@ -808,7 +818,7 @@ class TestSendNotification(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with open(os.path.join(directory, 'slack_home'), 'w', encoding='utf-8') as handle:
                 handle.write('C0FILE\n')
-            with patch.dict(os.environ, {'KUBE_AGENTS_CHAT_HOME_DIR': directory}):
+            with patch.object(chat_notify, "HOME_FILE_DIR", directory):
                 result = send_notification("alert", session_id="")
         self.assertIn("SUCCESS: Notification posted to slack", result)
         argv = mock_run.call_args[0][0]

@@ -1607,7 +1607,8 @@ projected value before a post: a hand edit of the record carries the same trust 
 is not checked either, and a post Slack refuses (`channel_not_found`, `is_archived`, `not_in_channel`)
 is logged with where the value came from. With the switch set, the policy `auto` and `homeChannel`
 empty, a verified, top-level channel mention that is not a command is a candidate only while the file
-names no home: its channel is checked with `conversations.info` (a channel id, not shared through
+names no home, or while the home it names is one Slack now refuses (checked once per such mention
+outside it): its channel is checked with `conversations.info` (a channel id, not shared through
 Slack Connect, not archived, the app a member) and written once (`slack`, `slack.setBy`,
 `slack.setAt`, `writer`; `slack.refused` cleared), and one line in the learning thread names the
 channel; the gateway's own home posts follow within one kubelet sync, about a minute, during which a

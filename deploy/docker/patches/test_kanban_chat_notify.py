@@ -80,10 +80,12 @@ class RoutedPlatformFromTheFileTest(unittest.TestCase):
         env = mock.patch.dict(os.environ, {
             kanban_chat_notify.NOTIFY_PLATFORM_ENV: "",
             kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack",
-            kanban_chat_notify.HOME_FILE_DIR_ENV: self.dir,
         })
         env.start()
         self.addCleanup(env.stop)
+        directory = mock.patch.object(kanban_chat_notify, "HOME_FILE_DIR", self.dir)
+        directory.start()
+        self.addCleanup(directory.stop)
 
     def _write(self, text):
         with open(os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
@@ -109,7 +111,7 @@ class RoutedPlatformFromTheFileTest(unittest.TestCase):
             self.assertEqual(kanban_chat_notify.routed_platform(), "")
 
     def test_an_absent_directory_routes_nothing(self):
-        with mock.patch.dict(os.environ, {kanban_chat_notify.HOME_FILE_DIR_ENV: os.path.join(self.dir, "absent")}):
+        with mock.patch.object(kanban_chat_notify, "HOME_FILE_DIR", os.path.join(self.dir, "absent")):
             self.assertEqual(kanban_chat_notify.routed_platform(), "")
 
 

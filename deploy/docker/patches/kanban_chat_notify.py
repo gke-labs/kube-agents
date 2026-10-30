@@ -120,7 +120,6 @@ NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 # The operator's projection of the home channel, mounted in the agent pod
 # (agents/platform/scripts/chat_notify.py keeps the same three names).
 HOME_FILE_DIR = "/etc/kube-agents/chat-home"
-HOME_FILE_DIR_ENV = "KUBE_AGENTS_CHAT_HOME_DIR"
 HOME_FILE_KEY = "slack_home"
 HOME_FILE_PLATFORM = "slack"
 # The bus CLI in the agent image, on PATH.
@@ -247,7 +246,7 @@ def routed_platform() -> str:
     if conversation_platform() != HOME_FILE_PLATFORM:
         return ""
     try:
-        with open(os.path.join(os.environ.get(HOME_FILE_DIR_ENV, HOME_FILE_DIR), HOME_FILE_KEY), encoding="utf-8") as handle:
+        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
             return HOME_FILE_PLATFORM if handle.read().strip() else ""
     except (OSError, ValueError):
         return ""

@@ -33,11 +33,12 @@ class HomeFileTest(unittest.TestCase):
         env = mock.patch.dict(os.environ, {
             chat_notify.NOTIFY_PLATFORM_ENV: "",
             chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack",
-            chat_notify.SLACK_HOME_CHANNEL_ENV: "",
-            chat_notify.HOME_FILE_DIR_ENV: self.dir,
         })
         env.start()
         self.addCleanup(env.stop)
+        directory = mock.patch.object(chat_notify, "HOME_FILE_DIR", self.dir)
+        directory.start()
+        self.addCleanup(directory.stop)
 
     def _write(self, text):
         with open(os.path.join(self.dir, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
@@ -51,8 +52,7 @@ class HomeFileTest(unittest.TestCase):
 
     def test_a_non_empty_env_wins_over_the_file(self):
         self._write("C0FILE\n")
-        with mock.patch.dict(os.environ, {chat_notify.SLACK_HOME_CHANNEL_ENV: "C0ENV",
-                                          chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):
             self.assertEqual(chat_notify.routed_platform(), "google_chat")
 
     def test_an_empty_or_absent_file_routes_nothing(self):
@@ -88,7 +88,7 @@ class HomeFileTest(unittest.TestCase):
         self.assertEqual(chat_notify.routed_platform(), "")
 
     def test_a_missing_directory_reads_as_nothing(self):
-        with mock.patch.dict(os.environ, {chat_notify.HOME_FILE_DIR_ENV: os.path.join(self.dir, "absent")}):
+        with mock.patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(self.dir, "absent")):
             self.assertEqual(chat_notify.home_file_value(), "")
             self.assertEqual(chat_notify.routed_platform(), "")
 

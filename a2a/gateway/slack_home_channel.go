@@ -182,10 +182,11 @@ func (s *SlackAdapter) closeHomeLearn() {
 
 // learnHome reads the file, checks the candidate, writes the record and
 // posts the one line, in that order, so nothing is announced that is not
-// recorded. A mention is a candidate only while the file is empty: a file
-// that is absent (no projection mounted) learns nothing, and one that holds
-// anything, a channel or a hand edit the operator is about to rewrite, means
-// a home exists or is about to. The window between a learn and the
+// recorded. A mention is a candidate while the file is empty, or while the
+// home it names is one Slack now refuses (a mention outside the home checks
+// it once; recordHome then replaces it): a file that is absent (no
+// projection mounted) learns nothing, and one that holds a hand edit the
+// operator is about to rewrite means a home is about to. The window between a learn and the
 // file catching up (one kubelet sync) makes the next mention a candidate
 // too; recordHome then adopts the recorded channel and posts no line. A
 // refused or unchecked candidate releases the learner for the next mention.

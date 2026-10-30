@@ -2014,14 +2014,14 @@ class TestSlackHomeChannelResolution(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("C0PROJECTED\n")
             self._point("CONFIG_PATH", "platforms:\n  slack:\n    home_channel: C0FILE\n")
-            with patch.dict(os.environ, {chat_notify.HOME_FILE_DIR_ENV: directory}):
+            with patch.object(chat_notify, "HOME_FILE_DIR", directory), patch.dict(os.environ, {}):
                 self.assertEqual(session_kv_server._slack_home_channel(), "C0PROJECTED")
                 with open(path, "w", encoding="utf-8") as handle:
                     handle.write("")
                 self.assertEqual(session_kv_server._slack_home_channel(), "")
                 os.environ["SLACK_HOME_CHANNEL"] = "C0ENV"
                 self.assertEqual(session_kv_server._slack_home_channel(), "C0ENV")
-            with patch.dict(os.environ, {chat_notify.HOME_FILE_DIR_ENV: os.path.join(directory, "unmounted")}):
+            with patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(directory, "unmounted")):
                 self.assertEqual(session_kv_server._slack_home_channel(), "C0FILE")
 
     def test_a_hostile_config_shape_costs_the_lookup_and_not_the_caller(self):
@@ -3261,14 +3261,12 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
     def test_the_pvc_dotenv_cannot_turn_the_switch_on(self):
         loaded = self._load_dotenv(
             b"INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true\n"
-            b"KUBE_AGENTS_CHAT_HOME_DIR=/opt/data/anywhere\n"
             b"export SAFE_KEY='loaded_ok'\n"
             b"COMMENTED=value # an inline comment\n"
             b"PREEXISTING_VAR=from_dotenv\n",
-            ("SAFE_KEY", "COMMENTED", "KUBE_AGENTS_CHAT_HOME_DIR"),
+            ("SAFE_KEY", "COMMENTED"),
         )
         self.assertIsNone(loaded[self.ENV])
-        self.assertIsNone(loaded["KUBE_AGENTS_CHAT_HOME_DIR"])
         self.assertEqual(loaded["SAFE_KEY"], "loaded_ok")
         self.assertEqual(loaded["COMMENTED"], "value")
         self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
@@ -3280,11 +3278,11 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with open(os.path.join(directory, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
                 handle.write("")
-            with patch.dict(os.environ, {chat_notify.HOME_FILE_DIR_ENV: directory}):
+            with patch.object(chat_notify, "HOME_FILE_DIR", directory):
                 loaded = self._load_dotenv(b"SLACK_HOME_CHANNEL=C0OLD\nSAFE_KEY=1\n", ("SLACK_HOME_CHANNEL", "SAFE_KEY"))
             self.assertIsNone(loaded["SLACK_HOME_CHANNEL"])
             self.assertEqual(loaded["SAFE_KEY"], "1")
-            with patch.dict(os.environ, {chat_notify.HOME_FILE_DIR_ENV: os.path.join(directory, "unmounted")}):
+            with patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(directory, "unmounted")):
                 loaded = self._load_dotenv(b"SLACK_HOME_CHANNEL=C0OLD\n", ("SLACK_HOME_CHANNEL",))
             self.assertEqual(loaded["SLACK_HOME_CHANNEL"], "C0OLD")
 

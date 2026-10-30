@@ -47,12 +47,11 @@ NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 # channel the gateway learned) into a ConfigMap mounted as a directory in the
 # agent pod, so a learned channel reaches the pod without a restart. One file,
 # the Slack channel id or empty; the directory is absent on an operator older
-# than the projection and in today mode. The env override exists for tests.
+# than the projection and in today mode. No env override: the agent's own
+# .env is loaded into its environment, so a seam there would let a line on
+# the writable volume point the readers at a file of its own.
 HOME_FILE_DIR = "/etc/kube-agents/chat-home"
-HOME_FILE_DIR_ENV = "KUBE_AGENTS_CHAT_HOME_DIR"
 HOME_FILE_KEY = "slack_home"
-SLACK_HOME_CHANNEL_ENV = "SLACK_HOME_CHANNEL"
-SLACK_PLATFORM_NAME = "slack"
 #: The Slack platform name, whose threads go out channel-qualified (command).
 SLACK_PLATFORM = "slack"
 # What `a2a notify` needs to reach the bus (a2a/cmd/a2a/main.go, connect): the
@@ -122,9 +121,8 @@ def home_file() -> tuple[str, bool]:
     restarts for it. A directory or file that is absent reads as ("", False):
     today mode, or an operator older than the projection.
     """
-    directory = os.environ.get(HOME_FILE_DIR_ENV, HOME_FILE_DIR)
     try:
-        with open(os.path.join(directory, HOME_FILE_KEY), encoding="utf-8") as handle:
+        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
             try:
                 return handle.read().strip(), True
             except ValueError:
@@ -150,8 +148,8 @@ def routed_platform() -> str:
     routed = os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
     if routed:
         return routed
-    if gateway_platform() == SLACK_PLATFORM_NAME and home_file_value():
-        return SLACK_PLATFORM_NAME
+    if gateway_platform() == SLACK_PLATFORM and home_file_value():
+        return SLACK_PLATFORM
     return ""
 
 
