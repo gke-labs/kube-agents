@@ -436,6 +436,9 @@ md manifest-path > /var/gitlab/seed/path; md manifest-message > /var/gitlab/seed
 [ -s /var/gitlab/ca.crt ] || md ca-crt > /var/gitlab/ca.crt
 [ -s /var/gitlab/private/agent-token ] || md agent-token > /var/gitlab/private/agent-token
 [ -s /var/gitlab/private/ledger-token ] || md ledger-token > /var/gitlab/private/ledger-token
+# root's own token for the seeding calls below: minted here, never leaves the VM.
+[ -s /var/gitlab/private/root-token ] || printf 'glpat-%s\n' "$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40)" > /var/gitlab/private/root-token
+printf 'PRIVATE-TOKEN: %s\n' "$(cat /var/gitlab/private/root-token)" > /var/gitlab/private/root-header
 chmod 600 "/var/gitlab/config/ssl/${HOST}.key" /var/gitlab/private/*
 chown -R "${GIT_UID}:${GIT_UID}" /var/gitlab/private; chmod 700 /var/gitlab/private
 mark script-start
@@ -458,36 +461,50 @@ for i in $(seq 1 240); do
 done
 [ "${code:-}" = "200" ] || { echo "FORGE failed never-ready code=${code:-none}"; docker logs gitlab 2>&1 | tail -5; exit 1; }
 if [ ! -e /var/gitlab/private/seeded ]; then
-  # One rails call as root: the bot (a Developer, as on gitlab.com), its two
-  # tokens set to the values in the mounted files (never argv or the
-  # environment), the group, the project with its README, the bot's
-  # membership, and the manifest committed to the default branch, which keeps
-  # GitLab's default protection, so the bot cannot push it and opens merge
-  # requests instead. Every namespace needs the instance's organization since
-  # GitLab 17 ("Namespace organization can't be blank" without it).
-  docker exec -e BOT="$BOT" -e BOT_EMAIL="$BOT_EMAIL" -e TOKEN_DAYS="$TOKEN_DAYS" -e GROUP="$GROUP" -e PROJECT="$PROJECT" gitlab gitlab-rails runner '
+  # One rails call as root makes what only rails can: the bot (a Developer,
+  # as on gitlab.com), its two tokens and root's own token set to the values
+  # in the mounted files (never argv or the environment), and the group.
+  # Every namespace needs the instance's organization since GitLab 17
+  # ("Namespace organization can't be blank" without it). A failed model
+  # prints its errors, not its inspect.
+  docker exec -e BOT="$BOT" -e BOT_EMAIL="$BOT_EMAIL" -e TOKEN_DAYS="$TOKEN_DAYS" -e GROUP="$GROUP" gitlab gitlab-rails runner '
 admin = User.find_by_username("root")
 pw = SecureRandom.hex(24)
 org = Organizations::Organization.respond_to?(:default_organization) ? Organizations::Organization.default_organization : Organizations::Organization.first
 raise "no organization" unless org
+def why(m) = (m.respond_to?(:errors) ? m.errors.full_messages.join("; ") : m.inspect)
 res = Users::CreateService.new(admin, username: ENV["BOT"], email: ENV["BOT_EMAIL"], name: "Eval Bot", password: pw, password_confirmation: pw, skip_confirmation: true, projects_limit: 10, organization_id: org.id).execute
 u = res.respond_to?(:payload) ? (res.payload[:user] || res[:user]) : res
-raise "user create failed: #{res.inspect}" unless u && u.persisted?
+raise "user create failed: #{res.respond_to?(:message) ? res.message : why(u)}" unless u && u.persisted?
 {"agent" => ["api", "write_repository"], "ledger" => ["api"]}.each do |name, scopes|
   t = u.personal_access_tokens.build(name: name, scopes: scopes, expires_at: ENV["TOKEN_DAYS"].to_i.days.from_now)
   t.set_token(File.read("/var/gitlab/private/" + name + "-token").strip); t.save!
 end
+rt = admin.personal_access_tokens.build(name: "forge-seed", scopes: ["api"], expires_at: ENV["TOKEN_DAYS"].to_i.days.from_now)
+rt.set_token(File.read("/var/gitlab/private/root-token").strip); rt.save!
 g = Groups::CreateService.new(admin, name: ENV["GROUP"], path: ENV["GROUP"], visibility_level: Gitlab::VisibilityLevel::PRIVATE, organization_id: org.id).execute
 g = g.payload[:group] if g.respond_to?(:payload)
 g = g[:group] if g.is_a?(Hash)
-raise "group create failed: #{g.inspect}" unless g && g.persisted?
-p = Projects::CreateService.new(admin, name: ENV["PROJECT"], path: ENV["PROJECT"], namespace_id: g.id, visibility_level: Gitlab::VisibilityLevel::PRIVATE, initialize_with_readme: true, organization_id: org.id).execute
-raise "project create failed: #{p.inspect}" unless p && p.persisted?
-p.add_developer(u)
-r = Files::CreateService.new(p, admin, start_branch: p.default_branch, branch_name: p.default_branch, commit_message: File.read("/var/gitlab/seed/message").strip, file_path: File.read("/var/gitlab/seed/path").strip, file_content: File.read("/var/gitlab/seed/content")).execute
-raise "seed failed: #{r.inspect}" unless r[:status] == :success
-puts "rails-ok"' >/tmp/rails.out 2>&1 && mark seeded || { echo "FORGE failed rails"; grep -vE '^\s+from ' /tmp/rails.out | head -12; exit 1; }
-  touch /var/gitlab/private/seeded
+raise "group create failed: #{why(g)}" unless g && g.persisted?
+puts "rails-ok group_id=#{g.id} bot_id=#{u.id}"' >/tmp/rails.out 2>&1 && mark rails-done || { echo "FORGE failed rails"; grep -vE '^\s+from ' /tmp/rails.out | head -12; exit 1; }
+  GID=$(sed -n 's/^rails-ok group_id=\([0-9]*\) .*/\1/p' /tmp/rails.out); BOT_ID=$(sed -n 's/^rails-ok .*bot_id=\([0-9]*\)$/\1/p' /tmp/rails.out)
+  # The project, the bot's Developer membership and the manifest commit go
+  # through the API as root (the path the 2026-10-21 spike proved), with the
+  # token from the file above; the default branch keeps GitLab's protection,
+  # so the bot cannot push it and opens merge requests instead.
+  API="https://${HOST}/api/v4"
+  api() { curl -s --cacert /var/gitlab/ca.crt --resolve "${HOST}:443:127.0.0.1" -H @/var/gitlab/private/root-header "$@"; }
+  code=$(api -X POST "$API/projects" -d "name=${PROJECT}" -d "path=${PROJECT}" -d "namespace_id=${GID}" -d visibility=private -d initialize_with_readme=true -o /tmp/project.json -w '%{http_code}')
+  [ "$code" = "201" ] || { echo "FORGE failed project-create http=${code} $(head -c 300 /tmp/project.json)"; exit 1; }
+  PID=$(sed -n 's/^{"id":\([0-9]*\).*/\1/p' /tmp/project.json)
+  code=$(api -X POST "$API/projects/${PID}/members" -d "user_id=${BOT_ID}" -d access_level=30 -o /dev/null -w '%{http_code}')
+  [ "$code" = "201" ] || { echo "FORGE failed bot-membership http=${code}"; exit 1; }
+  BRANCH=$(sed -n 's/.*"default_branch":"\([^"]*\)".*/\1/p' /tmp/project.json); BRANCH="${BRANCH:-main}"
+  ENC_PATH=$(sed 's|/|%2F|g' /var/gitlab/seed/path)
+  code=$(api -X POST "$API/projects/${PID}/repository/files/${ENC_PATH}" --data-urlencode "branch=${BRANCH}" \
+    --data-urlencode "commit_message@/var/gitlab/seed/message" --data-urlencode "content@/var/gitlab/seed/content" -o /tmp/seed.json -w '%{http_code}')
+  [ "$code" = "201" ] || { echo "FORGE failed seed http=${code} $(head -c 300 /tmp/seed.json)"; exit 1; }
+  touch /var/gitlab/private/seeded; mark seeded
 fi
 mark ready
 echo "FORGE done total=$(( $(date +%s) - T0 ))s"

@@ -431,10 +431,12 @@ class ForgeScriptTest(unittest.TestCase):
         # The startup script the VM runs: root makes the bot (a Developer), its two tokens set to the given values, the group, the project and the file; readiness last.
         startup = (self.gstate / "startup-script").read_text()
         for marker in ("gitlab-rails runner", "Users::CreateService", "set_token", '"agent" => ["api", "write_repository"]', '"ledger" => ["api"]',
-                       "Groups::CreateService.new(admin", "Projects::CreateService.new(admin", "initialize_with_readme: true", "add_developer(u)", "organization_id: org.id",
-                       "Files::CreateService.new(p, admin", "gitlab_signup_enabled']=false", "/users/sign_in", 'chown -R "${GIT_UID}:${GIT_UID}" /var/gitlab/private'):
+                       "Groups::CreateService.new(admin", "organization_id: org.id", 'root-token', '"$API/projects"', "initialize_with_readme=true",
+                       "access_level=30", "repository/files/", "content@/var/gitlab/seed/content",
+                       "gitlab_signup_enabled']=false", "/users/sign_in", 'chown -R "${GIT_UID}:${GIT_UID}" /var/gitlab/private'):
             self.assertIn(marker, startup)
-        self.assertNotIn("api/v4", startup, "no API call with a token on the VM; rails does it all as root")
+        self.assertNotIn("python3", startup, "Container-Optimized OS has no python")
+        self.assertNotIn("agent-header", startup, "the bot's token is never used on the VM; root's own token seeds")
         self.assertLess(startup.index("mark seeded"), startup.index("mark ready"), "ready is printed only once the project and the file exist")
         # The secrets leave metadata together, then the cluster check reads the sign-in page.
         self.assertIn("--keys=tls-key,agent-token,ledger-token", self.calls_of("remove-metadata")[0])
