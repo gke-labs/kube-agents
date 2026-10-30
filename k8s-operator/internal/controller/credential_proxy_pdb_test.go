@@ -129,7 +129,7 @@ func TestTheCredentialProxyBudgetAndEveryOtherBudgetAreDisjoint(t *testing.T) {
 	}
 	proxyPods := labels.Set(dep.Spec.Template.Labels)
 
-	callout := buildA2ACalloutDeployment(agent)
+	callout := buildA2ACalloutDeployment(agent, "")
 	verifier := buildA2AVerifierDeployment(agent)
 	platformPDB := buildPlatformPDB(agent)
 	others := []struct {
