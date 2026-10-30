@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -1537,6 +1538,10 @@ func (s *Server) finishStreamingCall(key, convAlias, hostConvID, artifactsDir, r
 	}
 	extractedTaskID := extractStreamingTaskID(responseText)
 	isContinue := strings.HasPrefix(responseText, StreamingStepContinuePrefix) || strings.Contains(responseText, "STREAMING_STEP_CONTINUE")
+	// The in-cluster server reports a turn still running as its task line (a2a/mcp writeTask).
+	if ref := runningTaskRef(responseText); ref != "" {
+		extractedTaskID, isContinue = ref, true
+	}
 
 	s.mu.Lock()
 	if s.activeStreamingTasks == nil {
@@ -1583,11 +1588,38 @@ func (s *Server) taskOwnerConversation(taskID string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, st := range s.activeStreamingTasks {
-		if st != nil && st.TaskID == taskID && st.ConvAlias != "" {
+		if st != nil && sameTaskRef(st.TaskID, taskID) && st.ConvAlias != "" {
 			return st.ConvAlias
 		}
 	}
 	return ""
+}
+
+// runningTaskRefRegex matches the in-cluster server's line for a task still running
+// (a2a/mcp writeTask): "Task `<addressee>/<id>`: **<state>** (still running; ...".
+var runningTaskRefRegex = regexp.MustCompile("(?m)^Task `([^`\\s]+)`: \\*\\*[^*\\n]+\\*\\* \\(still running")
+
+// runningTaskRef is the task reference of the first task the server reports still running in
+// text, or "".
+func runningTaskRef(text string) string {
+	if m := runningTaskRefRegex.FindStringSubmatch(text); len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// sameTaskRef reports whether two task references name the same task: equal, or one is the
+// other's task id without its "<addressee>/" (task_control takes either form).
+func sameTaskRef(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	_, aID, aRef := strings.Cut(a, "/")
+	_, bID, bRef := strings.Cut(b, "/")
+	return (aRef && !bRef && aID == b) || (bRef && !aRef && bID == a)
 }
 
 func (s *Server) clearStreamingTask(taskID, convAlias string) {
@@ -1597,7 +1629,7 @@ func (s *Server) clearStreamingTask(taskID, convAlias string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for k, entry := range s.activeStreamingTasks {
-		if (taskID != "" && (k == taskID || k == "task:"+taskID || (entry != nil && entry.TaskID == taskID))) ||
+		if (taskID != "" && (k == taskID || k == "task:"+taskID || (entry != nil && sameTaskRef(entry.TaskID, taskID)))) ||
 			(taskID == "" && convAlias != "" && entry != nil && entry.ConvAlias == convAlias) {
 			if entry != nil && entry.CancelCall != nil {
 				entry.CancelCall()

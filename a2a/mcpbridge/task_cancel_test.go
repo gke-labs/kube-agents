@@ -61,3 +61,35 @@ func TestCancelledTaskGetStopsTheTasksOwnConversation(t *testing.T) {
 		t.Fatalf("the cancelled get stopped conversation %q (args %v); want the task's own c1", conv, stop)
 	}
 }
+
+func TestCancelledTaskGetStopsTheConversationAServerReplyNamedRunning(t *testing.T) {
+	gw := startBlockingGateway(t, ToolTaskControl)
+	// The in-cluster server's answer for a turn still running (a2a/mcp writeTask).
+	gw.sendReply = "Task `platform/task-1`: **working** (still running; read it again with task_control get)\n\nProgress: `reading`\n"
+	srv := newStdioTestServer(t, gw)
+	if res := srv.CallTool(context.Background(), ToolSendMessage, json.RawMessage(`{"message":"look at prod","conversation":"c1"}`)); res.IsError {
+		t.Fatalf("send_message: %+v", res)
+	}
+	stop, ok := cancelTaskGet(t, srv, gw)
+	if !ok {
+		t.Fatal("a cancelled get of the task send_message reported running sent no stop")
+	}
+	if conv, _ := stop["conversation"].(string); conv != "c1" {
+		t.Fatalf("the cancelled get stopped conversation %q (args %v); want c1", conv, stop)
+	}
+}
+
+func TestRunningTaskRef(t *testing.T) {
+	for text, want := range map[string]string{
+		"Task `platform/abc-1`: **working** (still running; read it again with task_control get)\n": "platform/abc-1",
+		"Task `platform/abc-1`: **completed**\n\nDone.\n":                                           "",
+		"some answer mentioning task-9\n":                                                           "",
+	} {
+		if got := runningTaskRef(text); got != want {
+			t.Errorf("runningTaskRef(%q) = %q; want %q", text, got, want)
+		}
+	}
+	if !sameTaskRef("platform/abc", "abc") || !sameTaskRef("abc", "platform/abc") || sameTaskRef("a/abc", "b/abc") || sameTaskRef("", "") {
+		t.Error("sameTaskRef does not match a reference to its bare task id, or matches two addressees")
+	}
+}

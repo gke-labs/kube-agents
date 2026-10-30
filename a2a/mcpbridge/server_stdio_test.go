@@ -27,6 +27,8 @@ type blockingGateway struct {
 	calls       chan map[string]any
 	startedOnce sync.Once
 	releaseOnce sync.Once
+	// sendReply, when set, is the text send_message answers with.
+	sendReply string
 }
 
 func (g *blockingGateway) Release() {
@@ -91,8 +93,12 @@ func startBlockingGateway(t *testing.T, blockTool string) *blockingGateway {
 				}))
 				return
 			}
+			reply := fmt.Sprintf("gateway ran %s", params.Name)
+			if params.Name == ToolSendMessage && g.sendReply != "" {
+				reply = g.sendReply
+			}
 			_, _ = fmt.Fprintf(w, "%s\n", marshalRPCResult(req.ID, CallToolResult{
-				Content: []TextContent{{Type: contentTypeText, Text: fmt.Sprintf("gateway ran %s", params.Name)}},
+				Content: []TextContent{{Type: contentTypeText, Text: reply}},
 			}))
 		default:
 			http.NotFound(w, r)
