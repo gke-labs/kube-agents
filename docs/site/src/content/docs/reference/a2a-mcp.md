@@ -33,7 +33,7 @@ Reading the Secret needs `get` on it, and the port-forward needs `pods/portforwa
 
 The workstation bridge (`kube-agents-mcp`) reads `KUBE_AGENTS_MCP_TOKEN` too. With one deployment saved, the token is that one's. With several, set `KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT` to the saved name of the deployment the token belongs to. A deployment the bridge saved as `<kube-context>/<name>`, because another context holds one called `<name>`, also answers to `<name>`, as long as no other saved deployment does. Unset, or naming none or several of them, the bridge sends the token nowhere and logs a warning.
 
-The bridge's token belongs to the deployment's saved target, not its name. A connection whose kube context, namespace or direct MCP URL differs from the saved deployment's does not get it, such as a `connect_deployment` call that overrides `kube_context` or `namespace`. The bridge reads that target's own token Secret instead, where there is one, and logs a warning.
+The bridge's token belongs to the deployment's saved target, not its name. A connection whose kube context, namespace or direct MCP URL differs from the saved deployment's does not get it, such as a `connect_deployment` call that overrides `kube_context` or `namespace`. The bridge reads that target's own token Secret instead, where there is one, and logs a warning. Such an override applies to that connection only: the bridge doesn't save it or make it the active deployment, and reconnects to it until the next `connect_deployment`.
 
 The bridge relays `notifications/progress` frames from an NDJSON reply as live progress, but this server sends none yet: each call gets one JSON answer, so the bridge shows a turn's result when it ends, with no progress before it.
 

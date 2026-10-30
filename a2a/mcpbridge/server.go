@@ -543,8 +543,13 @@ type Server struct {
 	connectMu sync.Mutex
 	// bgWG tracks the remote task stops issued when a streaming call is cancelled, so the
 	// stdio entry point can drain them before the process exits.
-	bgWG                 sync.WaitGroup
-	session              *gatewayBridgeSession
+	bgWG    sync.WaitGroup
+	session *gatewayBridgeSession
+	// override is the target of the last connect_deployment that overrode its deployment's
+	// kube_context or namespace, nil when the last one did not. Such a connection is never
+	// saved, so a reconnect goes back to override rather than to the store's active deployment;
+	// it lasts for the life of the process.
+	override             *DeploymentProfile
 	inFlightCancels      map[string]context.CancelFunc
 	activeStreamingTasks map[string]*activeStreamingTask
 	writeMu              sync.Mutex
@@ -1191,6 +1196,10 @@ func (s *Server) handleConnectDeployment(ctx context.Context, rawArgs json.RawMe
 	}
 	// kube_context filters discovery by case-insensitive substring; a profile whose context it
 	// already matches keeps that full context name, which is the one the kubeconfig knows.
+	// Otherwise kube_context and namespace override the saved target for this connection only:
+	// it is not saved, does not change which deployment is active, and gets no env token
+	// (EnvMCPTokenFor).
+	saved := prof
 	if kc := strings.TrimSpace(args.KubeContext); kc != "" && !strings.Contains(strings.ToLower(prof.KubeContext), strings.ToLower(kc)) {
 		prof.KubeContext = kc
 	}
@@ -1205,7 +1214,7 @@ func (s *Server) handleConnectDeployment(ctx context.Context, rawArgs json.RawMe
 	}
 	EnrichDeploymentVersionStatus(ctx, &prof)
 
-	sess, err := s.connectSession(ctx, prof)
+	sess, err := s.connectSession(ctx, prof, sameConnectionTarget(prof, saved))
 	if err != nil {
 		return "", err
 	}
@@ -1808,6 +1817,9 @@ func (s *Server) ensureConnected(ctx context.Context) (*gatewayBridgeSession, er
 		return cur, nil
 	}
 
+	if prof, ok := s.overrideTarget(); ok {
+		return s.connectSessionLocked(ctx, prof, false)
+	}
 	prof, ok := s.store.ActiveDeployment()
 	if !ok {
 		discovered, err := s.cluster.DiscoverDeployments(ctx, "")
@@ -1827,7 +1839,17 @@ func (s *Server) ensureConnected(ctx context.Context) (*gatewayBridgeSession, er
 			return nil, errNoDeploymentsSaved
 		}
 	}
-	return s.connectSessionLocked(ctx, prof)
+	return s.connectSessionLocked(ctx, prof, true)
+}
+
+// overrideTarget is the in-memory target of the last overridden connect_deployment, if any.
+func (s *Server) overrideTarget() (DeploymentProfile, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.override == nil {
+		return DeploymentProfile{}, false
+	}
+	return *s.override, true
 }
 
 func (s *Server) ensureConnectedAsync() {
@@ -1850,11 +1872,14 @@ func (s *Server) ensureConnectedAsync() {
 		if cur != nil && cur.IsHealthy() {
 			return
 		}
-		prof, ok := s.store.ActiveDeployment()
-		if !ok {
-			return
+		prof, overridden := s.overrideTarget()
+		if !overridden {
+			var ok bool
+			if prof, ok = s.store.ActiveDeployment(); !ok {
+				return
+			}
 		}
-		if _, err := s.connectSessionLocked(ctx, prof); err == nil && s.host != nil {
+		if _, err := s.connectSessionLocked(ctx, prof, !overridden); err == nil && s.host != nil {
 			s.host.OnKeepAliveTick(ctx, s)
 		}
 	}()
@@ -1903,13 +1928,17 @@ func (s *Server) keepAliveTick(ctx context.Context) {
 	}
 }
 
-func (s *Server) connectSession(ctx context.Context, prof DeploymentProfile) (*gatewayBridgeSession, error) {
+func (s *Server) connectSession(ctx context.Context, prof DeploymentProfile, persist bool) (*gatewayBridgeSession, error) {
 	s.connectMu.Lock()
 	defer s.connectMu.Unlock()
-	return s.connectSessionLocked(ctx, prof)
+	return s.connectSessionLocked(ctx, prof, persist)
 }
 
-func (s *Server) connectSessionLocked(ctx context.Context, prof DeploymentProfile) (*gatewayBridgeSession, error) {
+// connectSessionLocked connects to prof and makes it the session. With persist, prof is a saved
+// deployment's target: the store marks it connected and active, and any override is cleared.
+// Without it, prof is an overridden target: nothing is written to the store, and prof is kept
+// as the override that reconnects use.
+func (s *Server) connectSessionLocked(ctx context.Context, prof DeploymentProfile, persist bool) (*gatewayBridgeSession, error) {
 	var saved map[string]DeploymentProfile
 	if s.store != nil {
 		saved = s.store.Snapshot().Deployments
@@ -1918,7 +1947,7 @@ func (s *Server) connectSessionLocked(ctx context.Context, prof DeploymentProfil
 	if err != nil {
 		return nil, err
 	}
-	if s.store != nil {
+	if persist && s.store != nil {
 		if connectedProf, mErr := s.store.MarkDeploymentConnected(newSess.Profile()); mErr == nil {
 			newSess.UpdateProfile(connectedProf)
 		}
@@ -1926,6 +1955,12 @@ func (s *Server) connectSessionLocked(ctx context.Context, prof DeploymentProfil
 	s.mu.Lock()
 	oldSess := s.session
 	s.session = newSess
+	if persist {
+		s.override = nil
+	} else {
+		override := prof
+		s.override = &override
+	}
 	s.mu.Unlock()
 	if oldSess != nil {
 		oldSess.Close()

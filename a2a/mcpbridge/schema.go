@@ -96,11 +96,11 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 					},
 					"kube_context": map[string]any{
 						"type":        "string",
-						"description": "Optional kubeconfig context override.",
+						"description": "Optional kubeconfig context override. An override applies to this connection only: it is not saved, the active deployment does not change, and reconnects keep it until the next connect_deployment.",
 					},
 					"namespace": map[string]any{
 						"type":        "string",
-						"description": "Optional Kubernetes namespace (default: kubeagents-system).",
+						"description": "Optional Kubernetes namespace override (default: the deployment's saved namespace). An override applies to this connection only: it is not saved, the active deployment does not change, and reconnects keep it until the next connect_deployment.",
 					},
 				},
 			},
