@@ -295,16 +295,41 @@ _INJECT_STOP_SUFFIX = "/stop"
 _DEFAULT_HTTP_TIMEOUT = "600"
 _DEFAULT_DELEGATION_TIMEOUT = "1800"
 _DEFAULT_DELEGATION_POLL_INTERVAL = "30"
-# What ``tokens`` say on an inject record: the gateway reports no usage for
-# the turn it ran, and a null bucket is the truthful value rather than a zero
-# (``scoring.py`` reads the task's final ``a2a.status-update`` entry in the
-# trajectory as the liveness signal instead). The delegated workers are
-# another matter: when the delegation wait found the cards in the session
-# store, ``_settle`` reads the workers' sessions and their counts land under
-# ``tokens["workers"]``, beside the null top-level buckets.
+# What ``tokens`` say on an inject record: the top-level buckets are the
+# front door's turn as the read route's probe reported it (the task's
+# ``usage`` artifact, :func:`_inject_tokens`). Hermes reports the prompt whole
+# with no cached or reasoning split, so ``input`` counts cached reads too and
+# ``cached`` and ``reasoning`` stay null. A gateway older than the field, or a
+# turn that published no usage, leaves every bucket null, which is the
+# truthful value rather than a zero (``scoring.py`` reads the task's final
+# ``a2a.status-update`` entry in the trajectory as the liveness signal then).
+# The chain's child tasks, the addressees the front door delegated to (the
+# platform router that files the cards, which is the api transport's front
+# door), are reported apart under ``tokens["children"]`` and added into
+# ``total``. ``tokens["usage_partial"]`` is set when the gateway could not
+# read a link of the chain, so those counts are short of it.
+# The delegated workers are another matter: when the delegation wait found
+# the cards in the session store, ``_settle`` reads the workers' sessions and
+# their counts land under ``tokens["workers"]``. Their total is added into
+# the top-level ``total`` too (:func:`_fold_worker_total`), so ``total`` is
+# everything the run billed, as on the api transport, while ``input`` and
+# ``output`` stay the front door's own and ``front_door`` keeps its buckets.
+# A run whose chain reported no usage keeps a null total whatever its
+# workers billed, so the scorer's liveness rung still reads the task's
+# terminal there rather than passing on the workers' spend alone.
 _INJECT_TOKENS_NOTE = (
-    "the inject transport carries no token usage for the turn; its buckets are null, and "
-    "tokens.workers holds the delegated workers' counts when the delegation wait read them"
+    "the inject transport's input and output buckets are the front door's turns as the "
+    "gateway reported them: input counts cached reads too, and cached and reasoning are "
+    "null since Hermes reports no split; they are null when the gateway reported no usage; "
+    "tokens.children holds the chain's child tasks (the platform router), and "
+    "tokens.workers the delegated workers' counts when the delegation wait read them; "
+    "total adds both to the front door's, as on the api transport, and stays null when "
+    "the chain reported no usage"
+)
+# Appended to the note when the gateway could not read a link of the chain.
+_INJECT_TOKENS_PARTIAL_NOTE = (
+    "; partial: the gateway could not read every link of the chain, so the counts are "
+    "short of what it cost"
 )
 # The case and repetition the presubmit is running (hack/ci-eval-pr.sh exports
 # both), which with the run id become the conversation key and the backend
@@ -1363,6 +1388,36 @@ def _fold_worker_tokens(tokens: dict[str, Any]) -> None:
         tokens[bucket] = extra if current is None else current + extra
 
 
+def _fold_worker_total(tokens: dict[str, Any]) -> None:
+    """The inject transport's half of :func:`_fold_worker_tokens`: the workers'
+    total into the run's, so ``total`` is everything the run billed on both
+    transports.
+
+    Written on the api path's condition, a ``workers`` object: the front
+    door's own buckets are copied under ``front_door`` first (its ``total``
+    the front door's alone, without the chain's children). The other
+    top-level buckets stay the front door's (:func:`_inject_tokens`). A run
+    whose chain reported no usage keeps its null ``total``: folding the
+    workers in would let the scorer's liveness rung pass on the workers'
+    spend alone, where it reads the task's terminal today.
+    """
+    workers = tokens.get("workers")
+    if not isinstance(workers, dict):
+        return
+    buckets = [bucket for bucket, _ in _SESSION_TOKEN_KEYS]
+    front_door: dict[str, Any] = {bucket: tokens.get(bucket) for bucket in buckets}
+    counts = [tokens.get(bucket) for bucket in ("input", "output")]
+    front_door["total"] = (
+        None if all(c is None for c in counts) else sum(c for c in counts if c is not None)
+    )
+    tokens["front_door"] = front_door
+    extra = workers.get("total")
+    current = tokens.get("total")
+    if current is None or not isinstance(extra, int) or isinstance(extra, bool):
+        return
+    tokens["total"] = current + extra
+
+
 def _sum_tokens(base: dict[str, Any], extra: dict[str, Any]) -> None:
     """Add ``extra``'s token buckets into ``base`` in place.
 
@@ -1373,7 +1428,16 @@ def _sum_tokens(base: dict[str, Any], extra: dict[str, Any]) -> None:
         if value is None:
             continue
         current = base.get(bucket)
-        base[bucket] = value if current is None else current + value
+        if isinstance(value, bool):
+            # A flag (the inject transport's ``usage_partial``): set by any turn.
+            base[bucket] = bool(current) or value
+        elif isinstance(value, dict):
+            # A tier of buckets (the inject transport's ``children``).
+            if not isinstance(current, dict):
+                current = base[bucket] = {}
+            _sum_tokens(current, value)
+        else:
+            base[bucket] = value if current is None else current + value
 
 
 def _pending_first(task_ids: list[str], statuses: dict[str, str]) -> list[str]:
@@ -1669,6 +1733,50 @@ def _inject_identity() -> tuple[str, str, str]:
     return _mint_run_id(), case, repetition
 
 
+def _usage_buckets(usage: dict[str, int | None] | None) -> dict[str, int | None] | None:
+    """``input``, ``output`` and their ``total`` from one tier's usage, or
+    ``None`` when it carried neither count."""
+    if usage is None:
+        return None
+    counts = [usage.get(bucket) for bucket in ("input", "output")]
+    if all(count is None for count in counts):
+        return None
+    return {
+        "input": counts[0],
+        "output": counts[1],
+        "total": sum(count for count in counts if count is not None),
+    }
+
+
+def _inject_tokens(
+    usage: dict[str, int | None] | None,
+    children: dict[str, int | None] | None = None,
+    partial: bool = False,
+) -> dict[str, Any]:
+    """The record's buckets from the chain's usage (``Fold.usage``,
+    ``Fold.child_usage``, ``Fold.usage_partial``).
+
+    ``input`` and ``output`` are the front door's own; ``children`` the
+    chain's child tasks' ``input``, ``output`` and ``total``, present when
+    they reported any; ``total`` the two tiers' totals summed, null when
+    neither reported a count. ``usage_partial`` is present, and true, when
+    the gateway could not read a link of the chain.
+    """
+    tokens: dict[str, Any] = empty_tokens()
+    front = _usage_buckets(usage)
+    child = _usage_buckets(children)
+    if front is not None:
+        tokens["input"], tokens["output"] = front["input"], front["output"]
+    if child is not None:
+        tokens["children"] = child
+    totals = [tier["total"] for tier in (front, child) if tier is not None]
+    if totals:
+        tokens["total"] = sum(totals)
+    if partial:
+        tokens["usage_partial"] = True
+    return tokens
+
+
 def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> AgentResult:
     """Map a folded conversation onto the canonical result.
 
@@ -1685,8 +1793,9 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     cannot show it writes neither, and the scorer sets router-scope
     ``tool_called`` checks with no ``result`` pattern aside then, or when
     the marker reports a loss).
-    Tokens stay null -- the gateway reports no usage -- and ``metadata``
-    says so rather than inventing a number. ``identity`` is the run, case
+    Tokens are the front door's usage as the probe reported it, null when
+    it reported none (:func:`_inject_tokens`), and ``metadata`` says which
+    buckets mean what. ``identity`` is the run, case
     and repetition the key and message id were built from,
     stored beside the task id so the record joins to the gateway's ingress
     log.
@@ -1695,7 +1804,7 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     return AgentResult(
         output=fold.deliverable,
         trajectory=list(fold.trajectory),
-        tokens=empty_tokens(),
+        tokens=_inject_tokens(fold.usage, fold.child_usage, fold.usage_partial),
         errors=[],
         metadata={
             "transport": TRANSPORT_INJECT,
@@ -1720,7 +1829,8 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
             # the ``a2a.activity`` entry in the trajectory.
             "activity": fold.activity_summary,
             "progress": fold.progress or None,
-            "tokens_note": _INJECT_TOKENS_NOTE,
+            "tokens_note": _INJECT_TOKENS_NOTE
+            + (_INJECT_TOKENS_PARTIAL_NOTE if fold.usage_partial else ""),
         },
     )
 
@@ -1803,7 +1913,9 @@ class KubeAgentsHarness(AgentHarness):
                 f"AGENT_TRANSPORT must be one of {sorted(_TRANSPORTS)}, got {transport!r}"
             )
         if transport == TRANSPORT_INJECT:
-            return self._execute_inject(prompt)
+            result = self._execute_inject(prompt)
+            _fold_worker_total(result.tokens)
+            return result
         if stop_hook.is_stopped_ask(prompt):
             return AgentResult.errored(
                 f"{stop_hook.STOP_DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
@@ -2392,7 +2504,8 @@ class KubeAgentsHarness(AgentHarness):
             whose word it is and its reason -- for the record, never for the
             verdict (the supervisor completing a requester's stop for a
             worker that exited without its own terminal is still the
-            timeout). The
+            timeout), and the front door's usage as the read after that
+            terminal found it, which the deadline read could not hold. The
             deliverable stays what the task produced inside its budget --
             the cancel acknowledgement the gateway posts after it is not the
             agent's answer -- and anything else the settle says (a transient
@@ -2421,6 +2534,19 @@ class KubeAgentsHarness(AgentHarness):
                         settled.fold.terminal_source,
                         settled.fold.terminal_reason,
                     )
+                # The settle's usage read follows the terminal, so it holds
+                # every turn the chain ran, one that finished between the
+                # deadline and the cancel included -- whether the relay
+                # posted that terminal inside the settle or the settle
+                # adopted it off the stream.
+                if timed_out and settled is not None and (
+                    settled.fold.usage is not None
+                    or settled.fold.child_usage is not None
+                    or settled.fold.usage_partial
+                ):
+                    exchange.fold.usage = settled.fold.usage
+                    exchange.fold.child_usage = settled.fold.child_usage
+                    exchange.fold.usage_partial = settled.fold.usage_partial
             return timed_out, stop_pending
 
         def _stop_word(task: inject.InjectTask, stop_pending: bool) -> str:
@@ -3398,8 +3524,9 @@ class KubeAgentsHarness(AgentHarness):
         could be billed. On the api transport they are added into the run's
         top-level buckets later, in :meth:`_execute`, after the front door's
         session row is read (:func:`_fold_worker_tokens` says why the order
-        matters). On the inject transport the top-level buckets stay null (the
-        gateway reports no usage) and the counts stay under ``workers``.
+        matters). On the inject transport only their total is added, into the
+        run's ``total`` (:func:`_fold_worker_total`); the other top-level
+        buckets stay the front door's (:func:`_inject_tokens`).
         """
         _append_delivered(result, observed, awaited)
         _append_artifacts(result, awaited, _EXEC_TIMEOUT)

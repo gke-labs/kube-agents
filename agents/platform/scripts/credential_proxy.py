@@ -50,6 +50,7 @@ import mcp_policy
 import providers
 import repo_ref
 import scoped_sa_pool
+import task_confinement
 import vcs_broker
 import watcher_policy
 
@@ -321,6 +322,30 @@ CGROUP_NO_LIMIT = "max"
 # knob, and the operator's spec.deployment.env reaches it.
 DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS = 2
 ENV_SESSION_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS"
+# The profile role's share (#3889), the same mechanism as the session's: every
+# AgentProfile worker's calls together hold at most this many of the pool's
+# slots, counted before the pool is asked and refused at once past it.
+#
+# How it sits beside the global cap (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS,
+# 8 by default and shared by every caller; #4082 redesigns it):
+#   * Profile work cannot starve the shell. At serve() the share is clamped to
+#     the pool minus the session share minus one (but never below one), so
+#     given a pool larger than the session share plus one, even with every
+#     profile and session slot taken the platform agent's shell keeps at least
+#     one slot; with the defaults (8, 2, 4) it keeps two. The child-memory budget
+#     can admit fewer than the slot count, and then the guarantee is in slots,
+#     not in admissions: a budget-bound pool can still queue the shell behind
+#     running profile commands until one finishes.
+#   * The shell and sessions can starve profile work. The shell is
+#     unbounded, so a shell holding the whole pool leaves a profile call
+#     queued until the slot wait expires and then answered busy; sessions
+#     hold at most their own share. That is the intended priority: the
+#     platform agent first.
+# Operator-unset: the broker default applies, and spec.deployment.env can set
+# it, as it can the session share; on such a pool the clamp holds the shell's
+# slot whatever value arrives.
+DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS = 4
+ENV_PROFILE_SLOTS = "CREDENTIAL_PROXY_PROFILE_SLOTS"
 # How long a request waits for admission -- a slot under the slot cap and room
 # under the child memory budget alike -- before it is refused with 503. Long
 # enough to ride out a burst of one-shot reads, short enough that a queue held
@@ -584,13 +609,15 @@ ADMISSION_BOUND_SLOT = "slot"
 ADMISSION_BOUND_BUDGET = "budget"
 ADMISSION_BOUND_REFRESH_LOCK = "refresh-lock"
 ADMISSION_BOUND_SESSION = "session"
+ADMISSION_BOUND_PROFILE = "profile"
 ADMISSION_BOUND_OTHER = "other"
 #: The histogram's label for a request admitted without a wait: nothing held
 #: it, so neither bound is blamed, and the label does not flip with the memory
 #: limit. Never a refusal's bound.
 ADMISSION_BOUND_NONE = "none"
 ADMISSION_BOUNDS = frozenset(
-    {ADMISSION_BOUND_SLOT, ADMISSION_BOUND_BUDGET, ADMISSION_BOUND_REFRESH_LOCK, ADMISSION_BOUND_SESSION, ADMISSION_BOUND_NONE}
+    {ADMISSION_BOUND_SLOT, ADMISSION_BOUND_BUDGET, ADMISSION_BOUND_REFRESH_LOCK, ADMISSION_BOUND_SESSION,
+     ADMISSION_BOUND_PROFILE, ADMISSION_BOUND_NONE}
 )
 # Edges where a reader wants them: 15 s is the cap the Cluster Agent preflight
 # (cluster_preflight.sh) puts on one brokered call, the shortest caller-side
@@ -985,6 +1012,14 @@ DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 # not known", rather than with some other role's reach.
 DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE = "kubeagents-credential-proxy-mcp"
 
+# The profile workers' audience (#3889). An AgentProfile's worker pod runs
+# model output and reaches this broker the way a session pod does, over the
+# ClusterIP with a projected token, and gets a role of its own: the exec route,
+# kubectl and gcloud, each call confined to the cluster its task's credential
+# names (task_confinement). Same upgrade story as the session audience: unset
+# means the role is never conferred.
+DEFAULT_CREDENTIAL_PROXY_PROFILE_AUDIENCE = "kubeagents-credential-proxy-profile"
+
 # The roles a caller can hold, named by which Pod holds them.
 CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
@@ -1005,10 +1040,25 @@ CALLER_ROLE_WATCHER = "watcher"
 # so nothing it can be asked to do may write to a forge, clone into the broker,
 # or spend the forge credential on anything but a read of a managed repository.
 CALLER_ROLE_MCP = "mcp"
+# An AgentProfile worker pod (#3889). Exec route only, kubectl and gcloud only,
+# with the session's kubectl flag allowlist, and every call held to the target
+# cluster in the task credential the pod presents (TASK_CREDENTIAL_HEADER). The
+# credential is mandatory for anything that reaches a cluster or a project: a
+# profile caller without a valid one runs local-only commands and nothing else.
+CALLER_ROLE_PROFILE = "profile"
 
 # The TokenReview user.extra key under which the API server names the Pod a
 # projected token is bound to.
 TOKEN_REVIEW_POD_NAME_EXTRA = "authentication.kubernetes.io/pod-name"
+# And the Pod's UID, under the same binding. Read for every role; only the
+# profile role's task-credential binding compares it.
+TOKEN_REVIEW_POD_UID_EXTRA = "authentication.kubernetes.io/pod-uid"
+
+# The request header a profile worker's shim sends its task credential in
+# (credential_proxy_client.TASK_CREDENTIAL_HEADER). A header, never a body
+# field: the body is the model's argv, and the credential is not the model's to
+# compose. Never logged; a verified credential is logged by its jti.
+TASK_CREDENTIAL_HEADER = "X-Kube-Agents-Task-Credential"
 
 # Every role that exists, for the table check below. Note that two of them
 # nest: "chat" is a substring of "a2a-chat". Nothing here may compare roles in
@@ -1020,6 +1070,7 @@ CALLER_ROLES = (
     CALLER_ROLE_SESSION,
     CALLER_ROLE_WATCHER,
     CALLER_ROLE_MCP,
+    CALLER_ROLE_PROFILE,
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
@@ -1029,6 +1080,7 @@ CALLER_ROLES = (
 # refusal: widening the route never widens a session.
 ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
     CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
+    CALLER_ROLE_PROFILE: frozenset({"kubectl", "gcloud"}),
 }
 
 
@@ -1163,12 +1215,12 @@ def _session_output_permitted(value: str) -> bool:
 def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
     """The first kubectl flag a session caller may not pass, or None.
 
-    Only the session role's kubectl is narrowed; every other role and every
-    other executable keeps the executor's behaviour. Returns the flag as a
-    name (`-f`, `--output`), never the value beside it, for the refusal
-    message and the audit line.
+    Only the session and profile roles' kubectl is narrowed, both to this one
+    allowlist; every other role and every other executable keeps the
+    executor's behaviour. Returns the flag as a name (`-f`, `--output`), never
+    the value beside it, for the refusal message and the audit line.
     """
-    if role != CALLER_ROLE_SESSION or not argv or argv[0] != "kubectl":
+    if role not in (CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE) or not argv or argv[0] != "kubectl":
         return None
     tokens = argv[1:]
     index = 0
@@ -1248,7 +1300,9 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # 404s anything else under it, so the prefix admits nothing extra today.
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
-    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION)),
+    # The profile role reaches this route and no other: the Cloud API relay,
+    # the MCP relay, the watcher and Pub/Sub routes all stay closed to it.
+    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE)),
     # The feedback form verb: the sandbox's one way to file a report about
     # kube-agents itself (feedback_broker.py). The shell alone: a session pod
     # files nothing on anyone's behalf.
@@ -2071,31 +2125,75 @@ def session_slot_limit_from_env() -> int:
     return value
 
 
-class SessionSlots:
-    """The session role's bounded share of the command pool.
+def profile_slot_limit_from_env(pool: int, session_limit: int) -> int:
+    """The profile role's concurrent-command share, clamped below the pool.
 
-    Only CALLER_ROLE_SESSION is counted; every other role passes through to
-    the pool unchanged. A session at its bound is refused immediately with
+    Read like the session's (a non-positive or non-integer value is the
+    default, with a warning), then held to ``pool - session_limit - 1`` so the
+    shell keeps a slot, given a pool larger than the session share plus one
+    (DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS says why). At least one, so a pool
+    too small to share still serves profiles, and then the shell's slot is not
+    guaranteed.
+    """
+    raw = os.getenv(ENV_PROFILE_SLOTS, "").strip()
+    value = DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value <= 0:
+            LOGGER.warning(
+                "%s=%r is not a positive integer; using the default of %d",
+                ENV_PROFILE_SLOTS, raw, DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS,
+            )
+            value = DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS
+    ceiling = max(1, pool - session_limit - 1)
+    if value > ceiling:
+        LOGGER.warning(
+            "the profile share of %d is more than the pool of %d less the session share of %d and one slot "
+            "for the shell; using %d",
+            value, pool, session_limit, ceiling,
+        )
+        value = ceiling
+    return value
+
+
+class SessionSlots:
+    """A role's bounded share of the command pool: the session's by default.
+
+    Only ``role`` is counted; every other role passes through to the pool
+    unchanged. A caller at the bound is refused immediately with
     CommandSlotUnavailable, which the exec route already answers as busy, so
-    the shim prints why and the model reports it rather than retrying.
+    the shim prints why and the model reports it rather than retrying. The
+    profile role has an instance of its own (``profile_slots``).
     """
 
-    def __init__(self, limit: int) -> None:
+    def __init__(
+        self,
+        limit: int,
+        role: str = CALLER_ROLE_SESSION,
+        env_name: str = ENV_SESSION_MAX_CONCURRENT_COMMANDS,
+        bound: str = ADMISSION_BOUND_SESSION,
+    ) -> None:
         self.limit = limit
+        self.role = role
+        self.env_name = env_name
+        self.bound = bound
         self._in_flight = 0
         self._lock = threading.Lock()
 
     @contextlib.contextmanager
     def acquire(self, role: str) -> Iterator[None]:
-        if role != CALLER_ROLE_SESSION:
+        if role != self.role:
             yield
             return
         with self._lock:
             if self._in_flight >= self.limit:
                 raise CommandSlotUnavailable(
-                    f"the session role is limited to {self.limit} concurrent command(s) through the "
-                    f"credential proxy ({ENV_SESSION_MAX_CONCURRENT_COMMANDS}); try again when one finishes",
-                    bound=ADMISSION_BOUND_SESSION,
+                    f"the {self.role} role is limited to {self.limit} concurrent command(s) through the "
+                    f"credential proxy ({self.env_name}); try again when one finishes",
+                    bound=self.bound,
                 )
             self._in_flight += 1
         try:
@@ -2155,10 +2253,14 @@ class Principal:
     layer downstream reads ``principal.caller`` where it reads
     ``principal.workload`` today. Nothing about the request shape, the
     handler, or the operator's rendering has to change again.
-    ``caller`` stays None until then. What must hold in the meantime is that
-    neither field is ever derived from the request body — from ``argv``, from
-    ``cwd``, from anything a model produced. Both come from a token the API
-    server verified.
+    ``caller`` stays None until then for every role but one: a profile
+    caller's verified task credential (#3889) fills it with the task and the
+    credential's jti, and ``task`` and ``task_target`` with its claims. That
+    credential arrives in a request header (TASK_CREDENTIAL_HEADER), never the
+    body, and is bound to the pod the TokenReview attested before anything
+    reads it (ProfileTaskGate). What must hold is that none of these fields is
+    ever derived from the request body — from ``argv``, from ``cwd``, from
+    anything a model produced. Each comes from a token a verifier checked.
 
     ``role`` is the coarse version of that idea which does hold today, and it
     comes from the same place: the audience the API server validated the token
@@ -2173,7 +2275,8 @@ class Principal:
     TokenReview's ``user.extra``. It is for the audit line, not for policy: a
     session Pod is one conversation, so it is what traces a brokered command
     back to the conversation that asked for it. "" when the token is not
-    Pod-bound.
+    Pod-bound. ``pod_uid`` is that Pod's UID from the same ``user.extra``,
+    which the profile role's task-credential binding compares.
     """
 
     workload: str
@@ -2182,6 +2285,11 @@ class Principal:
     caller: str | None = None
     role: str = ""
     pod: str = ""
+    pod_uid: str = ""
+    # A profile caller's verified task credential (task_credential.TaskClaims)
+    # and its target as a cluster triple; None without one.
+    task: Any = None
+    task_target: ClusterTarget | None = None
 
     def describe(self) -> str:
         # The pod is deliberately NOT here. This string is the `principal`
@@ -2246,6 +2354,13 @@ class ServiceAccountAuthenticator:
     leave the audience deciding: the mcp role postdates its binding, so no
     operator renders the audience without the callers, and an empty set
     confers the mcp role to nobody.
+
+    ``profile_identities`` binds the profile role the way ``mcp_callers``
+    binds the mcp one, empty meaning nobody: its keys are the profile workers'
+    ServiceAccounts, each held to the profile audience and the only callers
+    that may present it. The values, each ServiceAccount's (profile, tier),
+    are what ProfileTaskGate binds a task credential to; a profile worker is
+    named here or refused.
     """
 
     authenticates = True
@@ -2262,6 +2377,7 @@ class ServiceAccountAuthenticator:
         cache_seconds: float = 60.0,
         session_callers: frozenset[str] = frozenset(),
         mcp_callers: frozenset[str] = frozenset(),
+        profile_identities: Mapping[str, Any] | None = None,
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -2273,6 +2389,8 @@ class ServiceAccountAuthenticator:
         self.allowed_callers = allowed_callers
         self.session_callers = session_callers
         self.mcp_callers = mcp_callers
+        self.profile_identities = dict(profile_identities or {})
+        self.profile_callers = frozenset(self.profile_identities)
         self.api_host = api_host
         self.api_port = api_port
         self.ca_file = ca_file
@@ -2410,17 +2528,154 @@ class ServiceAccountAuthenticator:
         # callers named the mcp audience confers nothing.
         if role == CALLER_ROLE_MCP and username not in self.mcp_callers:
             raise AuthenticationError("the mcp audience is only for mcp callers")
+        # The profile binding, as the mcp one: empty names nobody.
+        if username in self.profile_callers and role != CALLER_ROLE_PROFILE:
+            raise AuthenticationError("a profile caller may present only the profile audience")
+        if role == CALLER_ROLE_PROFILE and username not in self.profile_callers:
+            raise AuthenticationError("the profile audience is only for profile callers")
         groups = user.get("groups") or []
         extra = user.get("extra") or {}
         pod_names = (extra.get(TOKEN_REVIEW_POD_NAME_EXTRA) or []) if isinstance(extra, dict) else []
         pod = pod_names[0] if isinstance(pod_names, list) and pod_names else ""
+        pod_uids = (extra.get(TOKEN_REVIEW_POD_UID_EXTRA) or []) if isinstance(extra, dict) else []
+        pod_uid = pod_uids[0] if isinstance(pod_uids, list) and pod_uids else ""
         return Principal(
             workload=username,
             uid=str(user.get("uid") or ""),
             groups=tuple(str(group) for group in groups if isinstance(group, str)),
             role=role,
             pod=pod if isinstance(pod, str) else "",
+            pod_uid=pod_uid if isinstance(pod_uid, str) else "",
         )
+
+
+# The profile role's configuration (#3889). All four are reserved against
+# spec.deployment.env (mergeCredentialProxyEnv). The operator renders the first
+# three; it doesn't render the max lifetime yet, so the 6h default holds.
+PROFILE_AUDIENCE_ENV = "CREDENTIAL_PROXY_PROFILE_AUDIENCE"
+# JSON: {"system:serviceaccount:<ns>:<sa>": {"profile": ..., "tier": ...}}.
+PROFILE_IDENTITIES_ENV = "CREDENTIAL_PROXY_PROFILE_IDENTITIES"
+# The task-signing public keys (C..., comma separated, one or two) and the
+# lifetime ceiling, the same two variables, read the same way, as the auth
+# callout's (authcallout.ParseTaskSigningKeys, ParseTaskCredentialMaxLifetime).
+TASK_SIGNING_KEYS_ENV = "A2A_TASK_SIGNING_PUBLIC_KEYS"
+TASK_CREDENTIAL_MAX_LIFETIME_ENV = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+# The audit rule a refused task credential is recorded under. Confinement
+# refusals are task_confinement.RULE_TASK_TARGET.
+RULE_TASK_CREDENTIAL = "caller.task-credential"
+
+
+class TaskCredentialRefused(Exception):
+    """A profile caller presented a task credential that did not verify or bind.
+
+    The message is the verifier's or the binder's, which never quotes the
+    token. A missing credential is not this: it leaves the caller with
+    local-only commands (task_confinement), where a presented-and-refused one
+    refuses the request outright.
+    """
+
+
+class ProfileTaskGate:
+    """Verify a profile caller's task credential and bind it to the caller.
+
+    Built once at startup (build_profile_gate). ``admit`` runs per request, and
+    is not cached with the TokenReview: the credential changes per task on a
+    warm pod while its ServiceAccount token does not.
+    """
+
+    def __init__(
+        self,
+        trusted: tuple[str, ...],
+        identities: Mapping[str, Any],
+        max_lifetime_raw: str | None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        import task_credential
+
+        self._verifier = task_credential
+        self.trusted = trusted
+        self.identities = dict(identities)
+        self.clock = clock
+        # As the callout does: an unusable ceiling refuses every credential,
+        # naming it, rather than falling back to the default.
+        self.max_lifetime: float | None = None
+        self.lifetime_problem: str | None = None
+        try:
+            self.max_lifetime = task_credential.max_lifetime_from_env(max_lifetime_raw)
+        except task_credential.TaskCredentialError as exc:
+            self.lifetime_problem = str(exc)
+
+    def admit(self, principal: Principal, token: str | None) -> Principal:
+        """``principal`` with its task, or unchanged when no credential came.
+
+        Raises TaskCredentialRefused for a credential that is present and
+        fails: one that doesn't verify, is bound to another pod, UID, profile
+        or tier, or names a target that isn't a GKE cluster.
+        """
+        if token is None or not token.strip():
+            return principal
+        verifier = self._verifier
+        if self.lifetime_problem is not None:
+            raise TaskCredentialRefused(self.lifetime_problem)
+        try:
+            claims = verifier.verify(token.strip(), self.trusted, self.clock(), self.max_lifetime)
+        except verifier.TaskCredentialError as exc:
+            raise TaskCredentialRefused(str(exc)) from exc
+        try:
+            verifier.bind(
+                claims,
+                workload=principal.workload,
+                pod=principal.pod,
+                pod_uid=principal.pod_uid,
+                identities=self.identities,
+            )
+        except verifier.TaskCredentialError as exc:
+            raise TaskCredentialRefused(f"{exc} (jti {claims.jti})") from exc
+        target = task_confinement.target_from_claims(
+            claims.target.project, claims.target.location, claims.target.cluster
+        )
+        if target is None:
+            raise TaskCredentialRefused(f"the task credential's target is not a GKE cluster name (jti {claims.jti})")
+        return replace(
+            principal,
+            caller=f"task {claims.task} jti {claims.jti}",
+            task=claims,
+            task_target=target,
+        )
+
+
+def build_profile_gate(
+    authenticator: NullAuthenticator | ServiceAccountAuthenticator,
+) -> ProfileTaskGate | None:
+    """The task-credential gate, when the authenticator confers the profile role.
+
+    The trusted keys are validated here, at startup: an operator-rendered
+    value that isn't one or two task-signing public keys stops the broker
+    rather than leaving every profile call to fail. No keys at all is a broker
+    whose profile callers get local-only commands, said once in the log.
+    """
+    if CALLER_ROLE_PROFILE not in getattr(authenticator, "audience_roles", {}).values():
+        return None
+    import task_credential
+
+    try:
+        trusted = task_credential.parse_trusted_keys(os.getenv(TASK_SIGNING_KEYS_ENV, ""))
+    except task_credential.TaskCredentialError as exc:
+        raise RuntimeError(f"{TASK_SIGNING_KEYS_ENV} is malformed: {exc}") from exc
+    if not trusted:
+        LOGGER.warning(
+            "the profile role is conferred but %s names no task-signing key; every profile "
+            "task credential is refused, and profile callers run local-only commands only",
+            TASK_SIGNING_KEYS_ENV,
+        )
+    gate = ProfileTaskGate(
+        trusted=trusted,
+        identities=authenticator.profile_identities,
+        max_lifetime_raw=os.getenv(TASK_CREDENTIAL_MAX_LIFETIME_ENV),
+    )
+    if gate.lifetime_problem is not None:
+        LOGGER.error("%s; every profile task credential is refused", gate.lifetime_problem)
+    return gate
 
 
 def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
@@ -2478,6 +2733,9 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv("CREDENTIAL_PROXY_MCP_CALLERS", "").split(",")
         if caller.strip()
     )
+    # The profile workers' identities, read only once the profile audience is
+    # conferred below; an empty map confers the role on nobody.
+    profile_identities: dict[str, Any] = {}
     if chat_audience and chat_audience != shell_audience:
         audience_roles = {
             shell_audience: CALLER_ROLE_SHELL,
@@ -2542,6 +2800,41 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                     "is not; the mcp role is bound to the callers named there, so every "
                     "caller presenting the mcp audience is refused"
                 )
+        # The profile workers' audience (#3889), read raw for the same reason,
+        # and refused on a collision for the mcp one's. Its callers come from
+        # the identity map rather than a list of their own: one rendering
+        # names each worker ServiceAccount and its (profile, tier), so the
+        # binding and the map can't disagree.
+        profile_audience = os.getenv(PROFILE_AUDIENCE_ENV, "").strip()
+        if profile_audience and profile_audience in audience_roles:
+            LOGGER.warning(
+                "%s equals the %s audience; the profile role needs an audience of its own, "
+                "so it is not conferred",
+                PROFILE_AUDIENCE_ENV,
+                audience_roles[profile_audience] or CALLER_ROLE_SHELL,
+            )
+        elif profile_audience:
+            # Imported here: task_credential needs `cryptography`, which only a
+            # broker that confers the profile role does.
+            import task_credential
+
+            try:
+                profile_identities = dict(
+                    task_credential.parse_identity_map(os.getenv(PROFILE_IDENTITIES_ENV, ""))
+                )
+            except task_credential.TaskCredentialError as exc:
+                # Operator-rendered and reserved against spec.deployment.env,
+                # so a malformed map is a broken install, and a broker that
+                # guessed at it would be guessing who may run as a profile.
+                raise RuntimeError(f"{PROFILE_IDENTITIES_ENV} is malformed: {exc}") from exc
+            audience_roles[profile_audience] = CALLER_ROLE_PROFILE
+            if not profile_identities:
+                LOGGER.warning(
+                    "%s is set but %s names no ServiceAccount; the profile role is bound to the "
+                    "callers named there, so every caller presenting the profile audience is refused",
+                    PROFILE_AUDIENCE_ENV,
+                    PROFILE_IDENTITIES_ENV,
+                )
     else:
         audience_roles = {shell_audience: ""}
         if os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip():
@@ -2564,11 +2857,18 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                 "is not; the mcp role only exists once the chat audience split does, "
                 "so the mcp audience is ignored"
             )
+        if os.getenv(PROFILE_AUDIENCE_ENV, "").strip():
+            LOGGER.warning(
+                "%s is set but CREDENTIAL_PROXY_CHAT_AUDIENCE is not; the profile role only "
+                "exists once the chat audience split does, so the profile audience is ignored",
+                PROFILE_AUDIENCE_ENV,
+            )
     return ServiceAccountAuthenticator(
         audience_roles=audience_roles,
         allowed_callers=allowed,
         session_callers=session_callers,
         mcp_callers=mcp_callers,
+        profile_identities=profile_identities,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
         ca_file=os.getenv(
@@ -2641,6 +2941,51 @@ def drain_request_body(handler: BaseHTTPRequestHandler, max_bytes: int) -> None:
             handler.connection.settimeout(previous_timeout)
 
 
+# Top-level request-body keys the agent API reads a session id from. A value
+# here must be a string; any other type is refused.
+AGENT_API_SESSION_BODY_KEYS = ("id", "session_id", "sessionId", "gateway_session_key")
+# The longest session id the agent API accepts (Hermes' _MAX_SESSION_HEADER_LEN).
+# Longer top-level strings are message text, not ids, and aren't checked.
+AGENT_API_SESSION_ID_MAX_LEN = 256
+# More distinct short top-level strings than this in one body are refused
+# rather than checked one by one. No caller of the door sends more than a few.
+AGENT_API_MAX_CHECKED_BODY_STRINGS = 256
+# Free-text request-body keys: the agent API reads a message, a prompt, a title
+# or a name from these, never a session id, so the generic check skips them.
+AGENT_API_FREE_TEXT_BODY_KEYS = (
+    "message",
+    "input",
+    "instructions",
+    "text",
+    "title",
+    "name",
+    "prompt",
+    "system_prompt",
+    "system_message",
+)
+
+
+class _BridgeSessionDbs:
+    """The state.db connections one request's bridge-session checks share,
+    opened on first use and closed with the request."""
+
+    def __init__(self, workspace_root: str | Path | None = None) -> None:
+        self.workspace_root = workspace_root
+        self._stack = contextlib.ExitStack()
+        self._connections: list[sqlite3.Connection] | None = None
+
+    def connections(self) -> list[sqlite3.Connection]:
+        if self._connections is None:
+            self._connections = AgentAPIProxyHandler._open_bridge_session_dbs(self._stack, self.workspace_root)
+        return self._connections
+
+    def __enter__(self) -> "_BridgeSessionDbs":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._stack.close()
+
+
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     """Authenticate the external PlatformAgent API without sharing its key."""
 
@@ -2679,6 +3024,10 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         self._proxy()
 
     def _proxy(self) -> None:
+        with _BridgeSessionDbs(self.workspace_root) as dbs:
+            self._proxy_with(dbs)
+
+    def _proxy_with(self, dbs: "_BridgeSessionDbs") -> None:
         supplied = self.headers.get("Authorization", "")
         expected = f"Bearer {self.external_key}"
         if not hmac.compare_digest(supplied, expected):
@@ -2686,7 +3035,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.UNAUTHORIZED)
             return
         if self._targets_bridge_session(
-            self.path, self.headers, workspace_root=self.workspace_root
+            self.path, self.headers, workspace_root=self.workspace_root, dbs=dbs
         ):
             self._drain_request_body()
             self.send_error(HTTPStatus.FORBIDDEN)
@@ -2709,7 +3058,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             return
         body = self.rfile.read(content_length) if content_length else None
         if body and self._targets_bridge_session(
-            self.path, self.headers, body=body, workspace_root=self.workspace_root
+            self.path, self.headers, body=body, workspace_root=self.workspace_root, dbs=dbs
         ):
             self.send_error(HTTPStatus.FORBIDDEN)
             return
@@ -2777,6 +3126,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         cls,
         raw_session_id: Any,
         workspace_root: str | Path | None = None,
+        connections: list[sqlite3.Connection] | None = None,
     ) -> bool:
         val = str(raw_session_id or "").strip()
         while (unquoted := urllib.parse.unquote(val)) != val:
@@ -2786,6 +3136,16 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             return False
         if sid.lower().startswith("a2a-"):
             return True
+        if connections is not None:
+            return any(cls._descends_from_bridge_session(conn, sid) for conn in connections)
+        with contextlib.ExitStack() as stack:
+            return any(
+                cls._descends_from_bridge_session(conn, sid)
+                for conn in cls._open_bridge_session_dbs(stack, workspace_root)
+            )
+
+    @classmethod
+    def _bridge_session_dbs(cls, workspace_root: str | Path | None = None) -> list[Path]:
         root = Path(
             workspace_root
             or getattr(cls, "workspace_root", "")
@@ -2797,31 +3157,43 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         profiles_dir = root / "profiles"
         if profiles_dir.is_dir():
             db_paths.extend(sorted(profiles_dir.glob("*/state.db")))
-        for db_path in db_paths:
-            if not db_path.is_file():
-                continue
+        return [db_path for db_path in db_paths if db_path.is_file()]
+
+    @classmethod
+    def _open_bridge_session_dbs(
+        cls, stack: contextlib.ExitStack, workspace_root: str | Path | None = None
+    ) -> list[sqlite3.Connection]:
+        connections = []
+        for db_path in cls._bridge_session_dbs(workspace_root):
             try:
-                with contextlib.closing(
-                    sqlite3.connect(
-                        f"file:{db_path}?mode=ro", uri=True, timeout=2.0
+                connections.append(
+                    stack.enter_context(
+                        contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0))
                     )
-                ) as conn:
-                    cur = sid
-                    seen = {cur}
-                    for _ in range(256):
-                        row = conn.execute(
-                            "SELECT parent_session_id FROM sessions WHERE id = ?",
-                            (cur,),
-                        ).fetchone()
-                        parent = str(row[0] or "").strip() if row else ""
-                        if not parent or parent in seen:
-                            break
-                        if parent.lower().startswith("a2a-"):
-                            return True
-                        seen.add(parent)
-                        cur = parent
+                )
             except Exception as exc:
-                LOGGER.debug("could not inspect %s for session %s: %s", db_path, sid, exc)
+                LOGGER.debug("could not open %s: %s", db_path, exc)
+        return connections
+
+    @staticmethod
+    def _descends_from_bridge_session(conn: sqlite3.Connection, sid: str) -> bool:
+        cur = sid
+        seen = {cur}
+        try:
+            for _ in range(256):
+                row = conn.execute(
+                    "SELECT parent_session_id FROM sessions WHERE id = ?",
+                    (cur,),
+                ).fetchone()
+                parent = str(row[0] or "").strip() if row else ""
+                if not parent or parent in seen:
+                    return False
+                if parent.lower().startswith("a2a-"):
+                    return True
+                seen.add(parent)
+                cur = parent
+        except Exception as exc:
+            LOGGER.debug("could not inspect a state.db for session %s: %s", sid, exc)
         return False
 
     @classmethod
@@ -2831,16 +3203,20 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         headers: Any,
         body: bytes | None = None,
         workspace_root: str | Path | None = None,
+        dbs: "_BridgeSessionDbs | None" = None,
     ) -> bool:
         """Return True when an external request names an `a2a-*` bridge session or child.
 
         `hermes-bridge` talks to Hermes on loopback (`127.0.0.1:8642`), never
         through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths,
-        headers, `/v1/runs` request-body `session_id` fields, and `state.db`
+        headers, request-body session ids, and `state.db`
         child continuations on the external proxy stops a holder of
         `API_SERVER_EXTERNAL_KEY` from running a turn in a bridge-owned
         `a2a-<contextId>` session and inheriting its `session_kv` caller identity.
         """
+        if dbs is None:
+            with _BridgeSessionDbs(workspace_root) as own:
+                return cls._targets_bridge_session(path, headers, body, workspace_root, own)
         for header in ("X-Hermes-Session-Id", "X-Hermes-Session-Key"):
             raw_values = (
                 headers.get_all(header, [])
@@ -2848,7 +3224,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                 else [headers.get(header, "")]
             )
             for raw_val in raw_values:
-                if cls._is_bridge_session_id(raw_val, workspace_root):
+                if cls._is_bridge_session_id(raw_val, connections=dbs.connections()):
                     return True
         raw_path = urllib.parse.urlsplit(path).path
         while (unquoted := urllib.parse.unquote(raw_path)) != raw_path:
@@ -2861,7 +3237,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                 return True
             if seg == "sessions" and idx > 0 and segments[idx - 1] == "api":
                 if idx + 1 < len(raw_segments) and cls._is_bridge_session_id(
-                    raw_segments[idx + 1], workspace_root
+                    raw_segments[idx + 1], connections=dbs.connections()
                 ):
                     return True
         if body:
@@ -2873,12 +3249,24 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                     return True
             else:
                 if isinstance(parsed, dict):
-                    for key in ("session_id", "sessionId", "gateway_session_key"):
-                        if key in parsed and parsed[key] is not None:
-                            if not isinstance(parsed[key], str) or cls._is_bridge_session_id(
-                                parsed[key], workspace_root
-                            ):
-                                return True
+                    named = [parsed[key] for key in AGENT_API_SESSION_BODY_KEYS if parsed.get(key) is not None]
+                    if any(not isinstance(value, str) for value in named):
+                        return True
+                    # Any other top-level string short enough to be a session id is
+                    # checked too, so a field the harness reads an id from doesn't
+                    # need to be named here first.
+                    candidates = set(named) | {
+                        value
+                        for key, value in parsed.items()
+                        if key not in AGENT_API_SESSION_BODY_KEYS
+                        and key not in AGENT_API_FREE_TEXT_BODY_KEYS
+                        and isinstance(value, str)
+                        and len(value) <= AGENT_API_SESSION_ID_MAX_LEN
+                    }
+                    if len(candidates) > AGENT_API_MAX_CHECKED_BODY_STRINGS:
+                        return True
+                    if any(cls._is_bridge_session_id(value, connections=dbs.connections()) for value in candidates):
+                        return True
         return False
 
     @staticmethod
@@ -3546,6 +3934,256 @@ class SlackRelay:
         if len(content) > self.max_file_bytes:
             raise ValueError("Slack file exceeds relay size limit")
         return content
+
+
+TEAMS_EVENT_QUEUE_MAXSIZE = 500
+TEAMS_MAX_DELIVERY_ATTEMPTS = 3
+TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
+TEAMS_OAUTH_URL_TEMPLATE = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+# Case-insensitive, and percent-escapes and backslashes are refused in a
+# segment, because the Bot Connector routes case-insensitively on the decoded
+# path: `/activities/History` or `/activities/%68istory` would otherwise reach
+# Send Conversation History.
+TEAMS_ALLOWED_ACTIVITY_PATH_RE = re.compile(
+    r"^v3/conversations/[^/?#%\\]+/activities(?:/(?!history$)[^/?#%\\]+)?$",
+    re.IGNORECASE,
+)
+
+
+def is_trusted_teams_service_url(service_url: str) -> bool:
+    """Return True if service_url is HTTPS on an official Bot Framework host."""
+    if not service_url or not isinstance(service_url, str):
+        return False
+    if "?" in service_url or "#" in service_url:
+        return False
+    parsed = urllib.parse.urlparse(service_url)
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").lower()
+    return (
+        host in TEAMS_TRUSTED_SERVICE_HOSTS
+        or host == "botframework.com"
+        or host.endswith(".botframework.com")
+    )
+
+
+def extract_teams_tenant_id(activity: dict[str, Any]) -> str | None:
+    """Extract the Entra tenant ID from channelData.tenant.id or conversation.tenantId."""
+    if not isinstance(activity, dict):
+        return None
+    channel_data = activity.get("channelData")
+    if isinstance(channel_data, dict):
+        tenant = channel_data.get("tenant")
+        if isinstance(tenant, dict):
+            tid = tenant.get("id")
+            if isinstance(tid, str) and tid.strip():
+                return tid.strip()
+    conv = activity.get("conversation")
+    if isinstance(conv, dict):
+        tid = conv.get("tenantId")
+        if isinstance(tid, str) and tid.strip():
+            return tid.strip()
+    return None
+
+
+def validate_teams_activity(activity: dict[str, Any]) -> None:
+    """Validate structural types of an inbound Bot Framework activity."""
+    if not isinstance(activity, dict):
+        raise ValueError("Teams activity payload must be a JSON object")
+    for field_name in ("channelData", "from", "conversation"):
+        val = activity.get(field_name)
+        if val is not None and not isinstance(val, dict):
+            raise ValueError(f"Teams activity '{field_name}' must be an object")
+    channel_data = activity.get("channelData")
+    if isinstance(channel_data, dict):
+        tenant = channel_data.get("tenant")
+        if tenant is not None and not isinstance(tenant, dict):
+            raise ValueError("Teams activity 'channelData.tenant' must be an object")
+    text = activity.get("text")
+    if text is not None and not isinstance(text, str):
+        raise ValueError("Teams activity 'text' must be a string")
+    service_url = activity.get("serviceUrl")
+    if service_url is not None and not is_trusted_teams_service_url(service_url):
+        raise ValueError(f"invalid or untrusted Bot Framework service URL: {service_url}")
+
+
+class _TeamsNoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse 3xx redirects so the bot's Bearer token is never forwarded cross-host."""
+
+    def redirect_request(
+        self,
+        req: Any,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Any:
+        raise ValueError(f"Teams API redirect refused (HTTP {code})")
+
+
+_TEAMS_OPENER = urllib.request.build_opener(_TeamsNoRedirectHandler())
+
+
+class TeamsRelay:
+    """Credentialed Microsoft Teams / Bot Framework activity and API transport."""
+
+    def __init__(
+        self,
+        app_id: str,
+        app_password: str,
+        tenant_id: str | None = None,
+    ) -> None:
+        if not app_id or not app_password:
+            raise ValueError("Teams app ID and app password are required")
+        self.app_id = app_id.strip()
+        self.app_password = app_password.strip()
+        self.tenant_id = tenant_id.strip() if tenant_id and tenant_id.strip() else None
+        self._token: str | None = None
+        self._token_expires_at: float = 0.0
+        self._events: queue.Queue[dict[str, Any]] = queue.Queue(
+            maxsize=TEAMS_EVENT_QUEUE_MAXSIZE
+        )
+        self._receipts: dict[str, dict[str, Any]] = {}
+        self._attempts: dict[int, int] = {}
+        self._lock = threading.Lock()
+        self._token_lock = threading.Lock()
+
+    def is_tenant_authorized(self, activity: dict[str, Any]) -> bool:
+        """Verify activity tenant against configured TEAMS_TENANT_ID if set."""
+        if not self.tenant_id:
+            return True
+        activity_tenant = extract_teams_tenant_id(activity)
+        if not activity_tenant:
+            return False
+        return activity_tenant.lower() == self.tenant_id.lower()
+
+    def _get_access_token(self) -> str:
+        # Hold _token_lock rather than _lock so an identity-provider call never
+        # stalls pull() or settle() on the event receipt map.
+        with self._token_lock:
+            now = time.time()
+            if self._token and now < self._token_expires_at - 60:
+                return self._token
+
+            tenant = self.tenant_id if self.tenant_id else "botframework.com"
+            token_url = TEAMS_OAUTH_URL_TEMPLATE.format(tenant=tenant)
+            data = urllib.parse.urlencode(
+                {
+                    "grant_type": "client_credentials",
+                    "client_id": self.app_id,
+                    "client_secret": self.app_password,
+                    "scope": "https://api.botframework.com/.default",
+                }
+            ).encode("utf-8")
+
+            req = urllib.request.Request(
+                token_url,
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with self._open_url(req, timeout=20) as resp:
+                result = json.load(resp)
+
+            token = result.get("access_token")
+            if not token:
+                raise RuntimeError("no access_token returned by Microsoft identity provider")
+            expires_in = int(result.get("expires_in", 3600))
+            self._token = str(token)
+            self._token_expires_at = time.time() + expires_in
+            return self._token
+
+    @staticmethod
+    def _open_url(req: urllib.request.Request, *, timeout: float) -> Any:
+        return _TEAMS_OPENER.open(req, timeout=timeout)
+
+    def enqueue_event(self, event: dict[str, Any]) -> bool:
+        validate_teams_activity(event)
+        if not self.is_tenant_authorized(event):
+            raise PermissionError("Teams activity tenant is not authorized")
+        try:
+            self._events.put_nowait(event)
+            return True
+        except queue.Full:
+            LOGGER.warning("Teams event queue is full; dropping activity")
+            return False
+
+    def pull(self, timeout_seconds: int = 20) -> dict[str, Any] | None:
+        try:
+            event = self._events.get(timeout=max(timeout_seconds, 1))
+        except queue.Empty:
+            return None
+        receipt = str(uuid.uuid4())
+        with self._lock:
+            self._receipts[receipt] = event
+        return {"event": event, "receipt": receipt}
+
+    def settle(self, receipt: str, acknowledge: bool) -> bool:
+        with self._lock:
+            event = self._receipts.get(receipt)
+            if event is None:
+                return False
+            event_key = id(event)
+            if not acknowledge:
+                attempts = self._attempts.get(event_key, 1)
+                if attempts >= TEAMS_MAX_DELIVERY_ATTEMPTS:
+                    self._attempts.pop(event_key, None)
+                    del self._receipts[receipt]
+                    LOGGER.warning(
+                        "Teams activity exceeded %d delivery attempts; dropping",
+                        TEAMS_MAX_DELIVERY_ATTEMPTS,
+                    )
+                    return True
+                try:
+                    self._events.put_nowait(event)
+                except queue.Full:
+                    LOGGER.warning("Teams event queue is full; cannot requeue activity")
+                    return False
+                self._attempts[event_key] = attempts + 1
+            else:
+                self._attempts.pop(event_key, None)
+            del self._receipts[receipt]
+            return True
+
+    def api_call(
+        self,
+        service_url: str,
+        path: str,
+        method: str = "POST",
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not service_url or not path:
+            raise ValueError("service_url and path are required")
+        if not is_trusted_teams_service_url(service_url):
+            raise ValueError(f"invalid or untrusted Bot Framework service URL: {service_url}")
+        upper_method = (method or "").strip().upper()
+        if upper_method != "POST":
+            raise ValueError(f"Teams relay refuses HTTP method: {method}")
+        clean_path = path.lstrip("/")
+        if ".." in clean_path.split("/") or not TEAMS_ALLOWED_ACTIVITY_PATH_RE.match(clean_path):
+            raise ValueError(f"Teams relay refuses endpoint: {path}")
+
+        token = self._get_access_token()
+        url = f"{service_url.rstrip('/')}/{clean_path}"
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            method="POST",
+        )
+        with self._open_url(req, timeout=30) as resp:
+            content = resp.read()
+            if content:
+                try:
+                    return json.loads(content.decode("utf-8"))
+                except Exception:
+                    pass
+            return {"status": "ok", "statusCode": resp.status}
 
 
 @dataclass(frozen=True)
@@ -6525,8 +7163,15 @@ class CommandExecutor:
         kubeconfig_context: str | None = None,
         wants_kubeconfig: bool = False,
         caller: socket.socket | None = None,
+        confined: task_confinement.Confined | None = None,
     ) -> ExecutionResult:
         """Run an agent-selected command.
+
+        `confined` is a profile caller's call as task_confinement parsed it
+        (`_execute_confined`): when it is given, what the command reaches is
+        read from it, never from a second parse of `argv`, which must be the
+        canonical argv it carries. Every other caller passes none and takes
+        the path below unchanged.
 
         `caller` is the connection the command is being run for. While the
         command runs the connection is watched, and its closing ends the
@@ -6549,6 +7194,11 @@ class CommandExecutor:
         if not executable_path:
             raise RuntimeError(f"supported executable is unavailable: {executable}")
         command = [executable_path, *argv[1:]]
+
+        if confined is not None:
+            return self._execute_confined(
+                confined, argv, command, stdin=stdin, cwd=cwd, wants_kubeconfig=wants_kubeconfig, caller=caller,
+            )
 
         # `get-credentials` is the one command that legitimately authors a
         # kubeconfig, so it is handled separately: it writes, everything else
@@ -6652,6 +7302,69 @@ class CommandExecutor:
         ):
             return self._with_host_hint(argv, result)
         return result
+
+    def _execute_confined(
+        self,
+        confined: task_confinement.Confined,
+        argv: list[str],
+        command: list[str],
+        *,
+        stdin: str | None,
+        cwd: str | None,
+        wants_kubeconfig: bool,
+        caller: socket.socket | None,
+    ) -> ExecutionResult:
+        """Run a profile caller's confined call from its parse, not its argv.
+
+        The isolation decision, the get-credentials decision and the
+        kubeconfig are the structure's: no `_reroute_kubeconfig_flags`, no
+        `_is_get_credentials` scan, no ambient fallback. The argv must be the
+        canonical one the structure carries; anything else is refused, so a
+        later edit between the confinement and here can't run a command the
+        confinement never saw.
+        """
+        if list(argv) != confined.argv or argv[0] != confined.executable:
+            raise ValueError("the command is not the one the task confinement produced")
+        if confined.isolated:
+            # A local-only command, or no task: no get-credentials (it
+            # authors a kubeconfig for, and describes, the cluster it names),
+            # and no kubeconfig -- KUBECONFIG names an empty file, so kubectl
+            # has no cluster to reach and the pool is never asked for a token.
+            if confined.get_credentials:
+                raise ValueError("get-credentials names a cluster, and an isolated command reaches none")
+            return self._execute(
+                command,
+                stdin=stdin,
+                cwd=cwd,
+                kubeconfig_path=Path(os.devnull),
+                timeout_seconds=self.kubectl_timeout_seconds if confined.executable == "kubectl" else None,
+                caller=caller,
+            )
+        if confined.get_credentials:
+            # The confinement held the cluster, location and project to the
+            # target; the scratch-file path re-reads them from the canonical
+            # argv, so the two must agree.
+            if _get_credentials_target(argv) != confined.target:
+                raise ValueError("get-credentials does not name the task's cluster")
+            return self._execute_get_credentials(command, stdin, cwd, wants_kubeconfig, caller=caller)
+        if confined.executable == "kubectl":
+            if not confined.kubeconfig_context:
+                raise ValueError("a confined kubectl call names no cluster")
+            kubectl_deadline: int | None = None
+            if not _kubectl_runs_long(command):
+                kubectl_deadline = self.kubectl_timeout_seconds
+                command = [command[0], f"--request-timeout={DEFAULT_KUBECTL_REQUEST_TIMEOUT}", *command[1:]]
+            return self._execute(
+                command,
+                stdin=stdin,
+                cwd=cwd,
+                kubeconfig_path=self._resolve_kubeconfig(confined.kubeconfig_context, scoped=True),
+                timeout_seconds=kubectl_deadline,
+                caller=caller,
+            )
+        # gcloud names its project in argv (injected); it reads no kubeconfig
+        # but get-credentials, which is handled above.
+        return self._execute(command, stdin=stdin, cwd=cwd, kubeconfig_path=None, caller=caller)
 
     def _with_host_hint(self, argv: list[str], result: ExecutionResult) -> ExecutionResult:
         """`result`, plus a line naming the host when a context-less read found nothing.
@@ -9132,6 +9845,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # The session role's bounded share of the command pool, installed by main
     # beside the executor; None (the route tests' stand-ins) means unbounded.
     session_slots: "SessionSlots | None" = None
+    # The profile role's, the same way (profile_slot_limit_from_env).
+    profile_slots: "SessionSlots | None" = None
     max_request_bytes: int
     slack_max_request_bytes: int
     enforce_read_only: bool = True
@@ -9144,6 +9859,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # credential and an install may arm either one alone.
     a2a_chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
+    teams_relay: TeamsRelay | None = None
     # The read-only Cloud API relay's credential and transport. Armed by
     # serve() unconditionally, like the exec route: the shell role always
     # exists. None only in a test that has not set it, where the route
@@ -9184,6 +9900,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # Unix socket is the access control, behaving as it did before there was an
     # authenticator at all.
     authenticator: NullAuthenticator | ServiceAccountAuthenticator = NullAuthenticator()
+    # The profile role's task-credential gate (build_profile_gate), set by
+    # serve() when the authenticator confers that role. None leaves a profile
+    # caller with no task, so local-only commands only.
+    profile_gate: ProfileTaskGate | None = None
     # Set per request once the caller is identified; read by the policy layer.
     principal: Principal | None = None
     # What the metrics listener serves. One registry per process; a test that
@@ -9219,7 +9939,50 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return None
         if not self._role_permits(self.principal):
             return None
+        if self.principal.role == CALLER_ROLE_PROFILE and not self._admit_task(self.principal):
+            return None
         return self.principal
+
+    def _admit_task(self, principal: Principal) -> bool:
+        """Bind a profile caller's task credential, or answer 403 and return False.
+
+        Per request rather than with the cached TokenReview: a warm pod's
+        ServiceAccount token outlives its tasks. A request with no credential
+        is admitted with no task, and task_confinement gives it local-only
+        commands; one with a credential that fails is refused whole, so a
+        stale or foreign credential is loud rather than quietly downgraded.
+        The token is never logged; a bound one is, by jti, in ``caller``.
+        """
+        values = self.headers.get_all(TASK_CREDENTIAL_HEADER) or []
+        try:
+            if len(values) > 1:
+                raise TaskCredentialRefused("more than one task credential header")
+            gate = self.profile_gate
+            token = values[0] if values else None
+            if gate is None:
+                if token is not None:
+                    raise TaskCredentialRefused("this broker verifies no task credentials")
+                return True
+            self.principal = gate.admit(principal, token)
+        except TaskCredentialRefused as exc:
+            LOGGER.warning(
+                "refused a task credential path=%s principal=%s pod=%s reason=%s",
+                _sanitize_for_logging(self.path),
+                _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH),
+                _sanitize_for_logging(principal.pod),
+                _sanitize_for_logging(str(exc), max_length=256),
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": RULE_TASK_CREDENTIAL,
+                    "message": f"The task credential was refused: {exc}.",
+                },
+            )
+            return False
+        return True
 
     def _role_permits(self, principal: Principal) -> bool:
         """Answer 403 and return False if this caller's side may not use this route.
@@ -9373,6 +10136,20 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     },
                 )
             return
+        if self.path.startswith("/v1/chat/teams/events"):
+            if self.teams_relay is None:
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Teams relay disabled"}
+                )
+                return
+            try:
+                self._json(HTTPStatus.OK, {"event": self.teams_relay.pull()})
+            except Exception as exc:
+                LOGGER.warning("Teams event pull failed: %s", type(exc).__name__)
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Teams event pull failed"}
+                )
+            return
         if self.path.startswith("/v1/chat/events"):
             if self.chat_relay is None:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat relay disabled"})
@@ -9415,6 +10192,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/v1/chat/slack/"):
             self._handle_slack_post()
+            return
+        if self.path.startswith("/v1/chat/teams/"):
+            self._handle_teams_post()
             return
         if self.path.startswith("/v1/chat/"):
             self._handle_chat_post()
@@ -9596,6 +10376,33 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        # A profile caller's argv is held to its task's target before any
+        # policy reads it, so every check below judges the command that will
+        # run: the injected --project, the target's context.
+        confined: task_confinement.Confined | None = None
+        if principal.role == CALLER_ROLE_PROFILE:
+            try:
+                confined = task_confinement.confine(argv, kubeconfig_context, principal.task_target)
+            except task_confinement.ConfinementRefusal as exc:
+                LOGGER.warning(
+                    "command outside the task's target request_id=%s principal=%s reason=%s",
+                    request_id,
+                    principal_label,
+                    _sanitize_for_logging(str(exc), max_length=256),
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=task_confinement.RULE_TASK_TARGET),
+                )
+                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "code": "SECURITY_POLICY_BLOCKED",
+                        "rule": task_confinement.RULE_TASK_TARGET,
+                        "message": f"{exc}.",
+                    },
+                )
+                return
+            argv, kubeconfig_context = confined.argv, confined.kubeconfig_context
         rule = self.policy.blocked_by(argv)
         if rule is not None:
             LOGGER.warning(
@@ -9730,6 +10537,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     # The connection this command answers. Its closing
                     # mid-command kills the command; see CommandExecutor.execute.
                     caller=self.connection,
+                    # Only a profile caller's call carries its confinement,
+                    # which the executor runs from; only then is the keyword
+                    # passed, so every other call reaches the executor
+                    # exactly as before.
+                    **({"confined": confined} if confined is not None else {}),
                 )
                 if result.abandoned:
                     # The connection is gone, so there is no response to write;
@@ -11389,6 +12201,64 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             LOGGER.debug("request not answered type=%s", type(exc).__name__)
 
+    def _handle_teams_post(self) -> None:
+        if self.teams_relay is None:
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Teams relay disabled"}
+            )
+            return
+        try:
+            payload = self._read_json_body()
+            if self.path == "/v1/chat/teams/events":
+                ok = self.teams_relay.enqueue_event(payload)
+                self._json(
+                    HTTPStatus.ACCEPTED if ok else HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"status": "accepted" if ok else "queue_full"},
+                )
+                return
+            if self.path == "/v1/chat/teams/events/ack":
+                ok = self.teams_relay.settle(str(payload.get("receipt", "")), True)
+                self._json(
+                    HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok}
+                )
+                return
+            if self.path == "/v1/chat/teams/events/nack":
+                ok = self.teams_relay.settle(str(payload.get("receipt", "")), False)
+                self._json(
+                    HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok}
+                )
+                return
+            if self.path == "/v1/chat/teams/api":
+                service_url = str(payload.get("serviceUrl", ""))
+                endpoint = str(payload.get("endpoint", ""))
+                method = str(payload.get("method", "POST"))
+                body = payload.get("payload")
+                result = self.teams_relay.api_call(
+                    service_url=service_url,
+                    path=endpoint,
+                    method=method,
+                    payload=body,
+                )
+                self._json(HTTPStatus.OK, {"response": result})
+                return
+            self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+        except PermissionError as exc:
+            self._json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception as exc:
+            safe_detail = redact_credentials(str(exc))
+            LOGGER.warning(
+                "Teams relay operation failed path=%s type=%s error=%s",
+                _sanitize_for_logging(self.path),
+                type(exc).__name__,
+                _sanitize_for_logging(safe_detail, max_length=256),
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "Teams operation failed", "detail": safe_detail},
+            )
+
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
         # send_response calls this for every response this listener writes --
         # the 401 an unauthenticated caller gets, the relay's direct writes and
@@ -11446,8 +12316,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
 
     def _session_slot(self, role: str) -> contextlib.AbstractContextManager:
-        """The session role's bounded share, or nothing for every other role."""
-        slots = getattr(self, "session_slots", None)
+        """The session or profile role's bounded share, or nothing for every other role."""
+        slots = getattr(self, "profile_slots" if role == CALLER_ROLE_PROFILE else "session_slots", None)
         if slots is None:
             return contextlib.nullcontext()
         return slots.acquire(role)
@@ -11716,6 +12586,7 @@ def serve(args: argparse.Namespace) -> None:
     # Decided before anything credentialed starts, so a misconfigured
     # deployment fails at boot rather than on the first request.
     CredentialProxyHandler.authenticator = build_authenticator()
+    CredentialProxyHandler.profile_gate = build_profile_gate(CredentialProxyHandler.authenticator)
     if reachable_off_pod(args) and not CredentialProxyHandler.authenticator.authenticates:
         # A listener the cluster can reach, with no authentication, hands the
         # credentials to whoever reaches the port. The sidecar deployment gets
@@ -11752,6 +12623,12 @@ def serve(args: argparse.Namespace) -> None:
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
     CredentialProxyHandler.session_slots = SessionSlots(session_slot_limit_from_env())
+    CredentialProxyHandler.profile_slots = SessionSlots(
+        profile_slot_limit_from_env(executor.max_concurrent_commands, CredentialProxyHandler.session_slots.limit),
+        role=CALLER_ROLE_PROFILE,
+        env_name=ENV_PROFILE_SLOTS,
+        bound=ADMISSION_BOUND_PROFILE,
+    )
     CredentialProxyHandler.base_branch = (
         getattr(args, "base_branch", "")
         or os.getenv("CREDENTIAL_PROXY_BASE_BRANCH", "")
@@ -11832,6 +12709,20 @@ def serve(args: argparse.Namespace) -> None:
                     )
 
         threading.Thread(target=initialize_slack_relay, daemon=True).start()
+    teams_app_id = os.getenv("TEAMS_APP_ID", "").strip()
+    teams_app_password = os.getenv("TEAMS_APP_PASSWORD", "").strip()
+    teams_tenant_id = os.getenv("TEAMS_TENANT_ID", "").strip() or None
+    if teams_app_id and teams_app_password:
+        CredentialProxyHandler.teams_relay = TeamsRelay(
+            app_id=teams_app_id,
+            app_password=teams_app_password,
+            tenant_id=teams_tenant_id,
+        )
+        LOGGER.info(
+            "Teams relay enabled app_id=%s tenant=%s",
+            teams_app_id,
+            teams_tenant_id or "common",
+        )
     if role == "combined":
         api_server = start_agent_api_proxy()
         threading.Thread(target=api_server.serve_forever, daemon=True).start()

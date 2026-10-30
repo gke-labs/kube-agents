@@ -435,6 +435,11 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 		s.feedbackClick(p, action.Type, action.BlockID, action.Value)
 		return InboundMessage{}, false
 	}
+	if strings.HasPrefix(action.ActionID, slackBoardActionPrefix) {
+		// A board-health row's Retry or Drop: never a turn (slack_board.go).
+		s.boardClick(p, action.ActionID, action.BlockID, action.Value)
+		return InboundMessage{}, false
+	}
 	if !strings.HasPrefix(action.ActionID, slackChoiceActionPrefix) {
 		// A link button (Slack opened the url) or a button not ours.
 		return InboundMessage{}, false

@@ -3,6 +3,7 @@ package chatmsg
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -108,6 +109,35 @@ func TestEveryRule(t *testing.T) {
 		{"row severity with a space", func(m *Message) { m.Rows[0].Severity = "very bad" }, "rows[0].severity"},
 		{"row detail over cap", func(m *Message) { m.Rows[0].Detail = long(rowTextMax + 1) }, "rows[0].detail"},
 		{"row detail two lines", func(m *Message) { m.Rows[0].Detail = "a\nb" }, "rows[0].detail"},
+		{"row with tasks and both actions", func(m *Message) {
+			m.Rows[0].Tasks, m.Rows[0].Actions = []string{"t_7c2e91ab", "t-2"}, []string{RowActionRetry, RowActionDrop}
+		}, ""},
+		{"row tasks without actions", func(m *Message) { m.Rows[0].Tasks = []string{"t_1"} }, "rows[0].actions"},
+		{"row actions without tasks", func(m *Message) { m.Rows[0].Actions = []string{RowActionRetry} }, "rows[0].tasks"},
+		{"row task id with a comma", func(m *Message) {
+			m.Rows[0].Tasks, m.Rows[0].Actions = []string{"t_1,t_2"}, []string{RowActionRetry}
+		}, "rows[0].tasks[0]"},
+		{"row task id over 64", func(m *Message) {
+			m.Rows[0].Tasks, m.Rows[0].Actions = []string{long(65)}, []string{RowActionRetry}
+		}, "rows[0].tasks[0]"},
+		{"row tasks over cap", func(m *Message) {
+			m.Rows[0].Actions = []string{RowActionDrop}
+			for i := 0; i <= rowTasksMax; i++ {
+				m.Rows[0].Tasks = append(m.Rows[0].Tasks, fmt.Sprintf("t_%d", i))
+			}
+		}, "rows[0].tasks"},
+		{"row tasks past a button value joined", func(m *Message) {
+			m.Rows[0].Actions = []string{RowActionDrop}
+			for i := 0; i < rowTasksMax; i++ {
+				m.Rows[0].Tasks = append(m.Rows[0].Tasks, long(itemIDMax))
+			}
+		}, "rows[0].tasks"},
+		{"row action outside the set", func(m *Message) {
+			m.Rows[0].Tasks, m.Rows[0].Actions = []string{"t_1"}, []string{"delete"}
+		}, "rows[0].actions[0]"},
+		{"row action twice", func(m *Message) {
+			m.Rows[0].Tasks, m.Rows[0].Actions = []string{"t_1"}, []string{RowActionRetry, RowActionRetry}
+		}, "rows[0].actions[1]"},
 
 		{"after at cap", func(m *Message) { m.After = []string{"1", "2", "3", "4", "5"} }, ""},
 		{"after over cap (G1)", func(m *Message) { m.After = []string{"1", "2", "3", "4", "5", "6"} }, "after"},

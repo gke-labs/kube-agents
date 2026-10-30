@@ -13078,5 +13078,20 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
 
+class DefaultRunFailureTest(unittest.TestCase):
+    """`default_run` turns a child that could not start into a failed `Run`, so
+    project discovery records the failure instead of ending the run with a
+    traceback and no manifest."""
+
+    def test_a_missing_gcloud_is_a_recorded_discovery_error_not_a_raise(self):
+        collect.declared_scope.set(None, None)
+        missing = FileNotFoundError(2, "No such file or directory", "gcloud")
+        with mock.patch.object(collect.subprocess, "run", side_effect=missing), redirect_stderr(io.StringIO()):
+            discovery = collect.discover_fleet(None)
+        self.assertEqual(discovery.projects, [])
+        self.assertIn("rc=-1", discovery.error)
+        self.assertIn("No such file or directory", discovery.error)
+
+
 if __name__ == "__main__":
     unittest.main()

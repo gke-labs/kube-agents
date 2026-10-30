@@ -2732,5 +2732,56 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
 
+class DefaultRunTimeoutTest(unittest.TestCase):
+    """`TimeoutExpired` carries the child's output as bytes even under `text=True`;
+    every reader of `Run` matches markers against a str, so the timeout arm
+    must hand back text, as the other collectors' `default_run` copies do."""
+
+    TIMED_OUT = subprocess.TimeoutExpired(["gcloud"], 1, output=b"partial", stderr=b"WARNING: zone did not respond")
+
+    def test_a_timeout_that_wrote_output_returns_text(self):
+        with mock.patch.object(fd.subprocess, "run", side_effect=self.TIMED_OUT):
+            result = fd.default_run(["gcloud"])
+        self.assertEqual(result.rc, fd.TIMEOUT_RC)
+        self.assertEqual((result.stdout, result.stderr), ("partial", "WARNING: zone did not respond"))
+
+    def test_a_timeout_that_wrote_nothing_returns_empty_text(self):
+        with mock.patch.object(fd.subprocess, "run", side_effect=subprocess.TimeoutExpired(["gcloud"], 1)):
+            result = fd.default_run(["gcloud"])
+        self.assertEqual((result.rc, result.stdout, result.stderr), (fd.TIMEOUT_RC, "", ""))
+
+    def test_a_completed_run_passes_its_text_through(self):
+        done = subprocess.CompletedProcess(["gcloud"], 0, stdout="[]", stderr="")
+        with mock.patch.object(fd.subprocess, "run", return_value=done):
+            result = fd.default_run(["gcloud"])
+        self.assertEqual((result.rc, result.stdout, result.stderr), (0, "[]", ""))
+
+    def test_a_timed_out_clusters_list_reads_as_a_gate_failure_in_gclouds_words(self):
+        with mock.patch.object(fd.subprocess, "run", side_effect=self.TIMED_OUT):
+            timed_out = fd.default_run(["gcloud"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            clusters, record, error = fd.enumerate_project_clusters("proj-a", run=lambda argv, **kw: timed_out)
+        self.assertEqual((clusters, record), ([], None))
+        self.assertEqual(error, f"clusters list rc={fd.TIMEOUT_RC}: WARNING: zone did not respond")
+
+    def test_a_timed_out_projects_list_is_quoted_as_text_not_as_a_bytes_repr(self):
+        """`discover_fleet` formats the listing's stderr into the manifest's
+        partial note with an f-string, which renders bytes as `b'...'` without
+        raising; the note must carry gcloud's words."""
+        with mock.patch.object(fd.subprocess, "run", side_effect=self.TIMED_OUT):
+            timed_out = fd.default_run(["gcloud"])
+
+        def run(argv, **_):
+            if argv[:3] == ["gcloud", "config", "get-value"]:
+                return fd.Run(argv, 0, "acme\n", "", 0.0)
+            return timed_out
+
+        fd.declared_scope.set(None, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            discovery = fd.discover_fleet(None, run=run)
+        self.assertEqual(discovery.projects, ["acme"])
+        self.assertIn(f"`gcloud projects list` rc={fd.TIMEOUT_RC}: WARNING: zone did not respond. The scope", discovery.partial)
+
+
 if __name__ == "__main__":
     unittest.main()

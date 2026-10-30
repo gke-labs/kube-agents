@@ -910,6 +910,15 @@ func TestBuildSwarmStateInputNormalisation(t *testing.T) {
 // The one documented omission is SwarmView.KubeAgents (omitempty).
 func TestSwarmWireTypesMatchBridge(t *testing.T) {
 	allowedMissing := map[string]bool{"SwarmView.KubeAgents": true}
+	compareWireTypes(t, "SwarmSnapshot", reflect.TypeOf(SwarmSnapshot{}), reflect.TypeOf(bridgeSwarmSnapshot{}), allowedMissing)
+	compareWireTypes(t, "BoardLedger", reflect.TypeOf(BoardLedger{}), reflect.TypeOf(bridgeBoardLedger{}), allowedMissing)
+}
+
+// compareWireTypes fails t for every difference between ours and the
+// bridge's type theirs: a field on one side only (unless allowedMissing names
+// the bridge's as Type.Field), a changed tag, or a changed kind, recursively.
+func compareWireTypes(t *testing.T, root string, ours, theirs reflect.Type, allowedMissing map[string]bool) {
+	t.Helper()
 	var cmp func(path string, ours, theirs reflect.Type)
 	cmp = func(path string, ours, theirs reflect.Type) {
 		if ours.Kind() != theirs.Kind() {
@@ -952,8 +961,7 @@ func TestSwarmWireTypesMatchBridge(t *testing.T) {
 			}
 		}
 	}
-	cmp("SwarmSnapshot", reflect.TypeOf(SwarmSnapshot{}), reflect.TypeOf(bridgeSwarmSnapshot{}))
-	cmp("BoardLedger", reflect.TypeOf(BoardLedger{}), reflect.TypeOf(bridgeBoardLedger{}))
+	cmp(root, ours, theirs)
 }
 
 func TestBuildSwarmStateMemberCarriesTheClientConversationID(t *testing.T) {

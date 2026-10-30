@@ -20,7 +20,7 @@ import { CardGrid, LinkCard } from "@astrojs/starlight/components";
   />
   <LinkCard
     title="Examples"
-    description="LLM-inference example stacks in examples/."
+    description="The LLM-inference stacks and the reference GitOps repository layout in examples/."
     href="/kube-agents/reference/examples/"
   />
   <LinkCard
@@ -44,8 +44,23 @@ import { CardGrid, LinkCard } from "@astrojs/starlight/components";
     href="/kube-agents/reference/credential-isolation/"
   />
   <LinkCard
+    title="User interfaces"
+    description="The browser pages beside chat: the A2A console a next install serves, the opt-in web console and Hermes dashboard, and the local admin console, with port and switch for each."
+    href="/kube-agents/reference/user-interfaces/"
+  />
+  <LinkCard
     title="Admin console"
     description="The local Streamlit console started from a repository checkout: chat, activity, kanban, cron, and inference gateway status. Not part of the install."
     href="/kube-agents/reference/admin-console/"
+  />
+  <LinkCard
+    title="MCP server"
+    description="The opt-in A2A MCP server: how an external coding agent or IDE talks to a spec.mode next install over its bus."
+    href="/kube-agents/reference/a2a-mcp/"
+  />
+  <LinkCard
+    title="Resource labels"
+    description="The app.kubernetes.io labels on every Kubernetes object kube-agents installs, and how to select on them."
+    href="/kube-agents/reference/resource-labels/"
   />
 </CardGrid>
