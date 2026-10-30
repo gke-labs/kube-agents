@@ -219,6 +219,43 @@ func settleForPlatformMutation(spec *corev1.PodSpec, p *agentv1alpha1.AgentProfi
 	}
 }
 
+// GKE Autopilot's bounds on a general-purpose container's memory per vCPU
+// requested, in GiB, outside which it raises the smaller request.
+const (
+	autopilotMinGiBPerCPU = 1.0
+	autopilotMaxGiBPerCPU = 6.5
+)
+
+const (
+	reasonAgentProfileJobResourcesFit       = "Fits"
+	reasonAgentProfileOutsideAutopilotRatio = "OutsideAutopilotRatio"
+	// reasonProfileJobResources is the Warning Event on the PlatformAgent
+	// when a profile it renders a Job template for is outside the ratio.
+	reasonProfileJobResources = "ProfileJobResourcesOutsideAutopilotRatio"
+)
+
+// autopilotRatioProblem says why a profile that allows the unattended tier
+// would have its Jobs refused on GKE Autopilot, or "": its worker's requests
+// break Autopilot's memory-per-vCPU bounds, so Autopilot raises one of them on
+// the Job and the Job no longer equals its template (found live). Checked
+// whatever the cluster: the operator can't tell an Autopilot cluster apart,
+// and the condition says where it matters.
+func autopilotRatioProblem(p *agentv1alpha1.AgentProfile) string {
+	if !slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended) {
+		return ""
+	}
+	cpu := p.Spec.Resources.Requests.CPU.AsApproximateFloat64()
+	gib := p.Spec.Resources.Requests.Memory.AsApproximateFloat64() / (1 << 30)
+	if cpu <= 0 {
+		return ""
+	}
+	if ratio := gib / cpu; ratio < autopilotMinGiBPerCPU || ratio > autopilotMaxGiBPerCPU {
+		return fmt.Sprintf("resources.requests (cpu %s, memory %s) are %.2f GiB per vCPU, outside GKE Autopilot's %.1f to %.1f: on Autopilot the profile's unattended Jobs are refused (Autopilot raises a request, and the Job no longer equals its template)",
+			p.Spec.Resources.Requests.CPU.String(), p.Spec.Resources.Requests.Memory.String(), ratio, autopilotMinGiBPerCPU, autopilotMaxGiBPerCPU)
+	}
+	return ""
+}
+
 // a2aDispatcherJobPolicyEnvVar is the chart's signal that it rendered the
 // dispatcher Job admission policy (config/admission/a2a-dispatcher-job-policy.yaml),
 // set from the same helper as the policy. Job mode runs only where it is set:

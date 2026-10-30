@@ -15,8 +15,11 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -540,5 +543,80 @@ func TestTheJobTemplateSettlesWhatAutopilotFillsIn(t *testing.T) {
 	}
 	if n != 1 || len(tmpl.Spec.Tolerations) != 1 {
 		t.Errorf("tolerations %+v, want the architecture's alone, once", tmpl.Spec.Tolerations)
+	}
+	// An init container a builder leaves bare (the stub's declare theirs) is
+	// settled too, from the defaults.
+	bare := corev1.PodSpec{Containers: []corev1.Container{{Name: "worker"}}, InitContainers: []corev1.Container{{Name: "stage"}}}
+	settleForPlatformMutation(&bare, &p)
+	if got := bare.InitContainers[0].Resources.Requests[corev1.ResourceEphemeralStorage]; got.String() != "1Gi" {
+		t.Errorf("a bare init container's ephemeral-storage request is %q, want Autopilot's default 1Gi", got.String())
+	}
+}
+
+// A profile that allows the unattended tier and whose requests break GKE
+// Autopilot's memory-per-vCPU bounds would have its Jobs refused on Autopilot
+// (found live: Autopilot raised 250m/4Gi to 616m). The operator says so
+// before the first task: False JobResourcesFit on the profile, and a Warning
+// Event on the PlatformAgent.
+func TestAProfileOutsideAutopilotsRatioIsFlagged(t *testing.T) {
+	agent := a2aTestAgent()
+	with := func(cpu, mem string, tiers ...string) agentv1alpha1.AgentProfile {
+		p := unattendedProfile(agent, "tse")
+		p.Spec.Resources.Requests.CPU, p.Spec.Resources.Requests.Memory = resource.MustParse(cpu), resource.MustParse(mem)
+		if len(tiers) > 0 {
+			p.Spec.AllowedTiers = tiers
+		}
+		return p
+	}
+	for name, c := range map[string]struct {
+		p    agentv1alpha1.AgentProfile
+		flag bool
+	}{
+		"within (250m, 512Mi)":           {with("250m", "512Mi"), false},
+		"too much memory (250m, 4Gi)":    {with("250m", "4Gi"), true},
+		"too little memory (2, 1Gi)":     {with("2", "1Gi"), true},
+		"at the upper bound (1, 6.5Gi)":  {with("1", "6656Mi"), false},
+		"read only, no Jobs (250m, 4Gi)": {with("250m", "4Gi", agentv1alpha1.AgentProfileTierRead), false},
+	} {
+		if got := autopilotRatioProblem(&c.p) != ""; got != c.flag {
+			t.Errorf("%s: flagged %v, want %v", name, got, c.flag)
+		}
+	}
+
+	scheme := setupScheme()
+	p := with("250m", "4Gi")
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&p).WithStatusSubresource(&agentv1alpha1.AgentProfile{}).Build()
+	ar := &AgentProfileReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	if err := ar.writeStatus(ctx, &p, agent, "", reasonAgentProfileRendered, "", reasonAgentProfilePublished, "", true); err != nil {
+		t.Fatal(err)
+	}
+	cond := meta.FindStatusCondition(p.Status.Conditions, agentv1alpha1.AgentProfileConditionJobResourcesFit)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonAgentProfileOutsideAutopilotRatio {
+		t.Errorf("JobResourcesFit = %+v, want False %s", cond, reasonAgentProfileOutsideAutopilotRatio)
+	}
+	fine := p.DeepCopy()
+	fine.Spec.Resources.Requests.Memory = resource.MustParse("512Mi")
+	if err := ar.writeStatus(ctx, fine, agent, "", reasonAgentProfileRendered, "", reasonAgentProfilePublished, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if cond := meta.FindStatusCondition(fine.Status.Conditions, agentv1alpha1.AgentProfileConditionJobResourcesFit); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Errorf("JobResourcesFit for a fitting profile = %+v, want True", cond)
+	}
+
+	r, _ := jobTemplateTestReconciler(t, agent)
+	rec := record.NewFakeRecorder(10)
+	r.Recorder = rec
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, []agentv1alpha1.AgentProfile{p}, true); err != nil || profileErr != nil {
+		t.Fatalf("render: %v / %v", err, profileErr)
+	}
+	var events []string
+	for len(rec.Events) > 0 {
+		events = append(events, <-rec.Events)
+	}
+	if !slices.ContainsFunc(events, func(e string) bool {
+		return strings.Contains(e, reasonProfileJobResources) && strings.Contains(e, "tse")
+	}) {
+		t.Errorf("events %v, want a %s Warning naming tse", events, reasonProfileJobResources)
 	}
 }

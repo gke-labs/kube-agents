@@ -576,6 +576,14 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// dispatch config and into the admission policy's params, so the two
 	// never differ.
 	jobTemplates := dispatchJobTemplates(agent, profiles, r.imageVolumeSupported(agent))
+	for i := range profiles {
+		if jobTemplates[profiles[i].Name] == nil {
+			continue
+		}
+		if problem := autopilotRatioProblem(&profiles[i]); problem != "" {
+			r.recordEvent(agent, corev1.EventTypeWarning, reasonProfileJobResources, "AgentProfile "+profiles[i].Name+": "+problem)
+		}
+	}
 	// Signalled, the policy must also be in the cluster as rendered before
 	// the dispatcher gets Job mode: no templates and no Jobs Role otherwise.
 	jobMode := dispatcherJobPolicyRendered()

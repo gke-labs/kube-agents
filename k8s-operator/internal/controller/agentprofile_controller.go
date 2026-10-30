@@ -574,6 +574,17 @@ func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alph
 		Message:            cardMsg,
 		ObservedGeneration: p.Generation,
 	})
+	fitReason, fitMsg := reasonAgentProfileJobResourcesFit, "the profile's resource requests meet GKE Autopilot's cpu-to-memory ratio, or it runs no Jobs"
+	if problem := autopilotRatioProblem(p); problem != "" {
+		fitReason, fitMsg = reasonAgentProfileOutsideAutopilotRatio, problem
+	}
+	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
+		Type:               agentv1alpha1.AgentProfileConditionJobResourcesFit,
+		Status:             conditionStatus(fitReason == reasonAgentProfileJobResourcesFit),
+		Reason:             fitReason,
+		Message:            fitMsg,
+		ObservedGeneration: p.Generation,
+	})
 	if equalAgentProfileStatus(before, &p.Status) {
 		return nil
 	}
