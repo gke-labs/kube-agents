@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,9 +35,11 @@ func (s *fakeStream) Identifier() uint32   { return 0 }
 
 // fakeConnection is an httpstream.Connection whose streams' far ends arrive on remote.
 type fakeConnection struct {
-	remote    chan *fakeStream
-	closeOnce sync.Once
-	closed    chan bool
+	// failCreate makes the next CreateStream fail without closing the connection.
+	failCreate atomic.Bool
+	remote     chan *fakeStream
+	closeOnce  sync.Once
+	closed     chan bool
 }
 
 func newFakeConnection() *fakeConnection {
@@ -48,6 +51,9 @@ func (c *fakeConnection) CreateStream(headers http.Header) (httpstream.Stream, e
 	case <-c.closed:
 		return nil, errors.New("connection closed")
 	default:
+	}
+	if c.failCreate.CompareAndSwap(true, false) {
+		return nil, errors.New("stream refused")
 	}
 	toRemote, fromLocal := io.Pipe()
 	toLocal, fromRemote := io.Pipe()
@@ -230,4 +236,24 @@ func TestRedialIsBoundedAndDetachedFromTheStartingCallersContext(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	nextRemote(t, fc)
+}
+
+func TestAFailedStreamDoesNotDropAnOpenSharedConnection(t *testing.T) {
+	fc := newFakeConnection()
+	tun, calls := fakeTunnel(fc, newFakeConnection())
+	if _, err := tun.DialContext(context.Background(), "tcp", ""); err != nil {
+		t.Fatal(err)
+	}
+	fc.failCreate.Store(true)
+	if _, err := tun.DialContext(context.Background(), "tcp", ""); err == nil {
+		t.Fatal("the refused stream dialled")
+	}
+	select {
+	case <-fc.CloseChan():
+		t.Fatal("one refused stream closed the connection the other streams share")
+	default:
+	}
+	if _, err := tun.DialContext(context.Background(), "tcp", ""); err != nil || *calls != 1 {
+		t.Fatalf("next dial: %v after %d connects; want it on the same connection", err, *calls)
+	}
 }

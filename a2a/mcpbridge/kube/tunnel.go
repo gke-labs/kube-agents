@@ -121,7 +121,7 @@ func (t *PortForwardTunnel) DialContext(ctx context.Context, _, _ string) (net.C
 	headers.Set(corev1.PortForwardRequestIDHeader, strconv.Itoa(id))
 	errStream, err := conn.CreateStream(headers)
 	if err != nil {
-		t.drop(conn)
+		t.dropIfClosed(conn)
 		return nil, fmt.Errorf("creating port-forward error stream: %w", err)
 	}
 	// Nothing is written to the error stream; the server writes to it and closes it.
@@ -131,7 +131,7 @@ func (t *PortForwardTunnel) DialContext(ctx context.Context, _, _ string) (net.C
 	if err != nil {
 		_ = errStream.Reset()
 		conn.RemoveStreams(errStream)
-		t.drop(conn)
+		t.dropIfClosed(conn)
 		return nil, fmt.Errorf("creating port-forward data stream: %w", err)
 	}
 	sc := &streamConn{conn: conn, data: dataStream, errStream: errStream}
@@ -192,6 +192,17 @@ func (t *PortForwardTunnel) drop(conn httpstream.Connection) {
 		t.conn = nil
 	}
 	_ = conn.Close()
+}
+
+// dropIfClosed is drop for a connection that has closed. A stream that failed on a connection
+// still open does not tear down the other streams sharing it; a caller that sees the dial
+// error restarts the tunnel (rate-limited) if the connection is unhealthy.
+func (t *PortForwardTunnel) dropIfClosed(conn httpstream.Connection) {
+	select {
+	case <-conn.CloseChan():
+		t.drop(conn)
+	default:
+	}
 }
 
 // Restart closes the current connection, at most once per portForwardRestartMinGap, so the
