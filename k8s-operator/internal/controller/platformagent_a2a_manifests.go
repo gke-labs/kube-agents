@@ -3925,21 +3925,22 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	return defaultA2AMaxSessions
 }
 
-// a2aNATSReplicas is the bus's server count: spec.harness.tuning.busReplicas
-// when set, otherwise status.busReplicas (which resolveA2ABusReplicas derives
-// from the running bus at the start of every pass), otherwise
-// DefaultBusReplicas. Only 1 and 3 are counts: the CRD admits nothing else,
-// and anything else that reaches here (a CR written past the schema) falls
-// through rather than rendering a two-server cluster, which has no JetStream
-// quorum to lose a server from.
+// a2aNATSReplicas is the bus's server count: status.busReplicas, which
+// resolveA2ABusReplicas sets at the start of every pass to the count the pass
+// renders (the running bus's, which a set field cannot change: the
+// conversion is refused), otherwise spec.harness.tuning.busReplicas (a bus not
+// yet resolved), otherwise DefaultBusReplicas. Only 1 and 3 are counts: the
+// CRD admits nothing else, and anything else that reaches here (a CR written
+// past the schema) falls through rather than rendering a two-server cluster,
+// which has no JetStream quorum to lose a server from.
 func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
+	if r := int(agent.Status.BusReplicas); r == 1 || r == 3 {
+		return r
+	}
 	if limits := agentTuning(agent); limits != nil && limits.BusReplicas != nil {
 		if r := *limits.BusReplicas; r == 1 || r == 3 {
 			return r
 		}
-	}
-	if r := int(agent.Status.BusReplicas); r == 1 || r == 3 {
-		return r
 	}
 	return agentv1alpha1.DefaultBusReplicas
 }
@@ -4001,6 +4002,15 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		want = agentv1alpha1.DefaultBusReplicas
 	}
 	converting = running != 0 && want != running
+	if converting && !r.busConversionAllowed {
+		// The bus keeps the count it runs: converting it would empty it, and
+		// the migration that keeps the data is #4225. Said once, on the pass
+		// that first sees the ask; the condition carries it after.
+		if msg := BusConversionRefusedMessage(int32(want), int32(running)); !a2aBusConversionRefusedConditionCurrent(agent, msg) { // #nosec G115 -- 1 or 3
+			r.recordEvent(agent, corev1.EventTypeWarning, a2aBusConversionRefusedReason, msg)
+		}
+		want, converting = running, false
+	}
 	if converting && int(agent.Status.BusReplicas) != want {
 		r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusConverting,
 			fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d: converting it, which recreates every stream and bucket empty (task history, the topics journal and the KV buckets are lost once)", want, running))
@@ -4012,6 +4022,60 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 // reasonA2ABusConverting is the Warning resolveA2ABusReplicas records when a
 // set busReplicas converts a running bus.
 const reasonA2ABusConverting = "A2ABusConverting"
+
+// BusConversionRefusedMessage says why the bus keeps its count. The operator's
+// condition and Warning and the admission webhook's refusal share it, so the
+// edit refused at apply time reads the same as the one the operator holds.
+func BusConversionRefusedMessage(asked, running int32) string {
+	return fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the A2A bus runs %d. "+
+		"An existing bus's server count cannot change yet: converting it would empty the bus, and the migration "+
+		"that keeps its data is #4225. The bus keeps %d; set busReplicas to %d, or remove it, to clear this.",
+		asked, running, running, running)
+}
+
+// a2aBusConversionRefusedMessage is the A2ABusConversionRefused condition's
+// message for this pass, "" when the field asks for nothing the bus does not
+// run. Read after resolveA2ABusReplicas, whose count is the bus's.
+func a2aBusConversionRefusedMessage(agent *agentv1alpha1.PlatformAgent) string {
+	running := agent.Status.BusReplicas
+	limits := agentTuning(agent)
+	if !a2aStackRendering(agent) || limits == nil || limits.BusReplicas == nil || (running != 1 && running != 3) {
+		return ""
+	}
+	asked := *limits.BusReplicas
+	if (asked != 1 && asked != 3) || int32(asked) == running { // #nosec G115 -- 1 or 3
+		return ""
+	}
+	return BusConversionRefusedMessage(int32(asked), running) // #nosec G115 -- 1 or 3
+}
+
+// a2aBusConversionRefusedConditionCurrent reports whether the condition already
+// says msg, where "" means it is to be absent.
+func a2aBusConversionRefusedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aBusConversionRefusedConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == a2aBusConversionRefusedReason && existing.Message == msg
+}
+
+// setA2ABusConversionRefusedCondition writes the condition, or removes it when
+// msg is "". The caller does the API write.
+func setA2ABusConversionRefusedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusConversionRefusedConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               a2aBusConversionRefusedConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             a2aBusConversionRefusedReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
 
 // a2aStreamReplicas is the replica count every JetStream stream and bucket
 // is created with: one per server, up to JetStream's useful maximum of 3.

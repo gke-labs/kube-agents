@@ -42,6 +42,12 @@ an install whose bus already runs another count is a conversion, and its cost is
 bus's contents: task history, the topics journal, and the KV buckets. Converting without
 that loss is #4225 (a copy into a new cluster before the switch).
 
+**Amended 10/30 (#3274):** so the operator does not convert. An existing bus keeps the
+count it runs: a `busReplicas` that asks for another count is held to the running one,
+with an `A2ABusConversionRefused` condition and Warning, and the admission webhook
+refuses the edit with the same message. #4225 lifts that refusal in the same change that
+adds the migration, so no release can convert without it.
+
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than
 any other input.

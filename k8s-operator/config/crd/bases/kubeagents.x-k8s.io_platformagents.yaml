@@ -9650,11 +9650,12 @@ spec:
                             from before the three-server default stays on one server, and a new bus
                             gets three (status.busReplicas shows which applies).
 
-                            Setting it to a count other than the one the bus runs CONVERTS the bus,
-                            and conversion empties it: NATS cannot carry a single server's streams
-                            into a cluster or a cluster's into a single server, so every stream and
-                            bucket is recreated empty, losing task history, the topics journal and
-                            the KV buckets once (docs/designs/spec-nats-deployment.md).
+                            Set, it decides the count of a bus that does not exist yet. An existing
+                            bus keeps the count it runs: NATS cannot carry a single server's streams
+                            into a cluster or a cluster's into a single server, and the migration
+                            that would keep them is not here yet, so a count that differs is refused
+                            (the A2ABusConversionRefused condition; the admission webhook refuses the
+                            edit) rather than emptying the bus (docs/designs/spec-nats-deployment.md).
                           enum:
                             - 1
                             - 3
@@ -11492,9 +11493,10 @@ spec:
                 busReplicas:
                   description: |-
                     BusReplicas is the A2A bus's NATS server count under spec.mode: next:
-                    spec.harness.tuning.busReplicas when set; otherwise the count the bus
-                    already runs, or 3 for a new bus. Re-derived from the cluster on every
-                    reconcile, so it is a reading of the bus rather than a setting.
+                    the count the bus already runs, which spec.harness.tuning.busReplicas
+                    does not change; for a new bus, that field, or 3. Re-derived from the
+                    cluster on every reconcile, so it is a reading of the bus rather than a
+                    setting.
                   format: int32
                   type: integer
                 conditions:

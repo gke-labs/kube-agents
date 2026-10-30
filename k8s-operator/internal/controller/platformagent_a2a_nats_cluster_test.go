@@ -8,6 +8,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"net"
 	"os"
 	"path/filepath"
@@ -654,7 +658,7 @@ func TestTheBusServerCountIsStickyAndConversionIsAnnounced(t *testing.T) {
 			}
 			objs := append([]client.Object{agent}, tc.objects(agent)...)
 			rec := record.NewFakeRecorder(8)
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec}
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec, busConversionAllowed: true}
 			converting, err := r.resolveA2ABusReplicas(ctx, agent)
 			if err != nil {
 				t.Fatal(err)
@@ -781,7 +785,7 @@ func TestASingleServerBusHasNoRoutesServiceOrBudget(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16), busConversionAllowed: true}
 	ctx := context.Background()
 	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatal(err)
@@ -851,7 +855,7 @@ func TestAConversionProvisionsTheBusAgain(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32), busConversionAllowed: true}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	if _, err := r.reconcileA2A(ctx, agent); err != nil {
@@ -966,7 +970,7 @@ func TestAConversionDropsBusProvisioned(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32), busConversionAllowed: true}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
@@ -1204,7 +1208,7 @@ func TestAFailedConvertingPassStillDropsBusProvisionedOnTheRetry(t *testing.T) {
 				return base.Patch(ctx, c, obj, patch, opts...)
 			},
 		}).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32), busConversionAllowed: true}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
@@ -1233,5 +1237,226 @@ func TestAFailedConvertingPassStillDropsBusProvisionedOnTheRetry(t *testing.T) {
 	}
 	if busProvisioned(agent) {
 		t.Error("BusProvisioned survived the retry of a converting pass that failed after the StatefulSet apply; the CR reads Ready over an emptied bus")
+	}
+}
+
+// Converting an existing bus empties it, and the migration that keeps the
+// data is #4225, which lifts the gate in the same change. Until then a set
+// busReplicas that disagrees with the bus is refused in both directions,
+// whether the bus is read from its StatefulSet or from the claims a deleted
+// one left: the count stays, a Warning says so once, and the field still
+// decides for a bus that does not exist yet.
+func TestAnExistingBusRefusesAConversion(t *testing.T) {
+	ctx := context.Background()
+	claim := func(agent *agentv1alpha1.PlatformAgent, ordinal int) *corev1.PersistentVolumeClaim {
+		return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace,
+			Labels: buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels,
+		}}
+	}
+	sts := func(agent *agentv1alpha1.PlatformAgent, replicas int32) *appsv1.StatefulSet {
+		s := buildA2ANATSStatefulSet(agent, "h")
+		s.Spec.Replicas = ptr.To(replicas)
+		return s
+	}
+	for _, tc := range []struct {
+		name    string
+		spec    int
+		objects func(*agentv1alpha1.PlatformAgent) []client.Object
+		want    int32
+		refused bool
+	}{
+		{"one to three", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 1, true},
+		{"three to one", 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, true},
+		{"three to one over a deleted cluster's claims", 1, func(a *agentv1alpha1.PlatformAgent) []client.Object {
+			return []client.Object{claim(a, 0), claim(a, 1)}
+		}, 3, true},
+		{"one to three over a deleted single server's claim", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0)} }, 1, true},
+		{"the count it runs", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, false},
+		{"a new bus takes the field", 1, func(*agentv1alpha1.PlatformAgent) []client.Object { return nil }, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.spec)}}
+			rec := record.NewFakeRecorder(8)
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: rec}
+			converting, err := r.resolveA2ABusReplicas(ctx, agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if converting {
+				t.Error("resolveA2ABusReplicas reports a conversion with the gate shut")
+			}
+			if agent.Status.BusReplicas != tc.want || a2aNATSReplicas(agent) != int(tc.want) || int(*buildA2ANATSStatefulSet(agent, "h").Spec.Replicas) != int(tc.want) {
+				t.Errorf("status %d, a2aNATSReplicas %d, rendered %d; want %d throughout", agent.Status.BusReplicas, a2aNATSReplicas(agent), *buildA2ANATSStatefulSet(agent, "h").Spec.Replicas, tc.want)
+			}
+			msg := a2aBusConversionRefusedMessage(agent)
+			if tc.refused != (msg != "") {
+				t.Errorf("condition message %q, want present = %v", msg, tc.refused)
+			}
+			var events []string
+			for len(rec.Events) > 0 {
+				events = append(events, <-rec.Events)
+			}
+			if tc.refused != (len(events) == 1 && strings.Contains(events[0], a2aBusConversionRefusedReason)) {
+				t.Errorf("events %q, want one %s = %v", events, a2aBusConversionRefusedReason, tc.refused)
+			}
+			if tc.refused && !strings.Contains(msg, "#4225") {
+				t.Errorf("the refusal does not name the migration it waits for: %q", msg)
+			}
+			// Said once: with the condition standing, the next pass is quiet.
+			if tc.refused {
+				setA2ABusConversionRefusedCondition(agent, msg, metav1.Now())
+				if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+					t.Fatal(err)
+				}
+				if len(rec.Events) != 0 {
+					t.Errorf("a standing refusal is re-announced on every pass: %q", <-rec.Events)
+				}
+			}
+		})
+	}
+}
+
+// The whole pass, both directions: the StatefulSet stays at the count the
+// bus runs, including on the retry of a pass that failed after its
+// StatefulSet apply, and BusProvisioned stands, because nothing converted.
+func TestARefusedConversionRendersNothingTowardTheNewCount(t *testing.T) {
+	for _, from := range []int32{1, 3} {
+		to := 4 - int(from)
+		agent := a2aTestAgent()
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(int(from))}}
+		scheme := setupScheme()
+		failCallout := false
+		base := fakeServerSideApplyInterceptors()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+			WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+			WithInterceptorFuncs(interceptor.Funcs{Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if _, isDep := obj.(*appsv1.Deployment); failCallout && isDep && obj.GetName() == a2aCalloutName(agent) {
+					return fmt.Errorf("injected: the apply after the bus StatefulSet fails")
+				}
+				return base.Patch(ctx, c, obj, patch, opts...)
+			}}).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+		ctx := context.Background()
+		theCalloutIsServing(t, ctx, cl, r, agent)
+		setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		replicas := func() int32 {
+			t.Helper()
+			sts := &appsv1.StatefulSet{}
+			if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
+				t.Fatal(err)
+			}
+			return ptr.Deref(sts.Spec.Replicas, 0)
+		}
+		if got := replicas(); got != from {
+			t.Fatalf("precondition: the bus runs %d, want %d", got, from)
+		}
+		agent.Spec.Harness.Tuning.BusReplicas = ptr.To(to)
+		failCallout = true
+		if _, err := r.reconcileA2A(ctx, agent.DeepCopy()); err == nil {
+			t.Fatal("precondition: the injected failure did not fail the pass")
+		}
+		if got := replicas(); got != from {
+			t.Errorf("%d to %d, failed pass: the StatefulSet went to %d", from, to, got)
+		}
+		failCallout = false
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+		if got := replicas(); got != from || agent.Status.BusReplicas != from {
+			t.Errorf("%d to %d, retry: StatefulSet %d, status.busReplicas %d; want %d", from, to, got, agent.Status.BusReplicas, from)
+		}
+		if !busProvisioned(agent) {
+			t.Errorf("%d to %d: BusProvisioned dropped although nothing converted", from, to)
+		}
+	}
+}
+
+// The refusal is a condition the status write carries and clears, beside a
+// Ready that stays on the bus that runs.
+func TestARefusedConversionIsAConditionThatClears(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	running := buildA2ANATSStatefulSet(agent, "h")
+	running.Spec.Replicas = ptr.To(int32(3))
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, running).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+	read := func() *metav1.Condition {
+		t.Helper()
+		live := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+			t.Fatal(err)
+		}
+		return meta.FindStatusCondition(live.Status.Conditions, a2aBusConversionRefusedConditionType)
+	}
+	if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{done: true}); err != nil {
+		t.Fatal(err)
+	}
+	if c := read(); c == nil || c.Status != metav1.ConditionTrue || c.Message != BusConversionRefusedMessage(1, 3) {
+		t.Fatalf("condition after a refused 3 to 1 = %+v, want True with the shared message", c)
+	}
+	agent.Spec.Harness.Tuning.BusReplicas = nil
+	if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{done: true}); err != nil {
+		t.Fatal(err)
+	}
+	if c := read(); c != nil {
+		t.Errorf("condition after removing the field = %+v, want it gone", c)
+	}
+}
+
+// The gate has one way in, and it is not a production one: no non-test file
+// in this package names busConversionAllowed except where the reconciler
+// declares it, so no flag, env var or constructor can turn a conversion on
+// before #4225 brings the migration with it.
+func TestNothingButTestsAllowsABusConversion(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(token.NewFileSet(), f, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ast.Inspect(parsed, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.Field:
+				for _, name := range n.Names {
+					if name.Name == "busConversionAllowed" {
+						declared++
+					}
+				}
+				return false
+			case *ast.KeyValueExpr:
+				if id, ok := n.Key.(*ast.Ident); ok && id.Name == "busConversionAllowed" {
+					t.Errorf("%s sets busConversionAllowed in a composite literal", f)
+				}
+			case *ast.AssignStmt:
+				for _, lhs := range n.Lhs {
+					if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "busConversionAllowed" {
+						t.Errorf("%s assigns busConversionAllowed", f)
+					}
+				}
+			}
+			return true
+		})
+	}
+	if declared != 1 {
+		t.Fatalf("found the busConversionAllowed field declared %d times, want 1; this check would be vacuous", declared)
 	}
 }
