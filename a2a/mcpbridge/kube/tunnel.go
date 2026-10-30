@@ -423,7 +423,19 @@ func resolveServiceTargetPod(ctx context.Context, clientset kubernetes.Interface
 				return pod.Name, resolvePodPort(pod), nil
 			}
 		}
-		return pods.Items[0].Name, resolvePodPort(&pods.Items[0]), nil
+		// None can serve (Pending, Failed, or terminating, as in a Recreate rollout or after
+		// an eviction): refuse rather than dial one, so the next dial resolves again.
+		states := make([]string, 0, len(pods.Items))
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			state := string(pod.Status.Phase)
+			if pod.DeletionTimestamp != nil {
+				state += ", terminating"
+			}
+			states = append(states, fmt.Sprintf("%s (%s)", pod.Name, state))
+		}
+		return "", 0, fmt.Errorf("finding the pod behind service %s/%s: none of the %d pod(s) matching %s is running and not terminating: %s; retry once the replacement pod is running",
+			namespace, service, len(pods.Items), labelSelector, strings.Join(states, ", "))
 	}
 	var problems []string
 	if svcErr != nil {

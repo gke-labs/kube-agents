@@ -13,7 +13,9 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/httpstream"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 // fakeStream is one side of an in-memory port-forward stream.
@@ -255,5 +257,45 @@ func TestAFailedStreamDoesNotDropAnOpenSharedConnection(t *testing.T) {
 	}
 	if _, err := tun.DialContext(context.Background(), "tcp", ""); err != nil || *calls != 1 {
 		t.Fatalf("next dial: %v after %d connects; want it on the same connection", err, *calls)
+	}
+}
+
+// With no pod behind the Service running and not terminating (a Recreate rollout's old pod
+// terminating, its replacement Pending, an evicted pod Failed), resolveServiceTargetPod refuses
+// and names their states rather than dialling one that cannot serve.
+func TestResolveServiceTargetPodRefusesAPodThatCannotServe(t *testing.T) {
+	const ns, svc = "kubeagents-system", "pa-a2a-mcp"
+	pod := func(name string, phase corev1.PodPhase, terminating bool) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: map[string]string{"app": svc}},
+			Status:     corev1.PodStatus{Phase: phase},
+		}
+		if terminating {
+			now := metav1.Now()
+			p.DeletionTimestamp = &now
+		}
+		return p
+	}
+	for _, tc := range []struct {
+		name string
+		pods []*corev1.Pod
+		want string
+	}{
+		{"terminating", []*corev1.Pod{pod("mcp-old", corev1.PodRunning, true)}, "mcp-old (Running, terminating)"},
+		{"pending", []*corev1.Pod{pod("mcp-new", corev1.PodPending, false)}, "mcp-new (Pending)"},
+		{"evicted", []*corev1.Pod{pod("mcp-evicted", corev1.PodFailed, false), pod("mcp-new", corev1.PodPending, false)}, "mcp-evicted (Failed)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset()
+			for _, p := range tc.pods {
+				if _, err := cs.CoreV1().Pods(ns).Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			name, _, err := resolveServiceTargetPod(context.Background(), cs, ns, svc, 8089)
+			if err == nil || name != "" || !strings.Contains(err.Error(), "is running and not terminating") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("resolveServiceTargetPod = %q, %v; want a refusal naming %s", name, err, tc.want)
+			}
+		})
 	}
 }
