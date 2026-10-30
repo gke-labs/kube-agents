@@ -28,14 +28,14 @@ const (
 	// MCPTokenSecretKey is the Secret data key holding the MCP bearer token.
 	MCPTokenSecretKey = "token"
 	// EnvMCPToken is the environment variable that overrides the MCP bearer token. EnvMCPTokenFor
-	// is its only reader: with one deployment configured the token is that deployment's; with
-	// several it is the one EnvMCPTokenDeployment names. Either way it goes only to that
-	// deployment's saved target, never to a connection that overrides it.
+	// is its only reader: it is the deployment's EnvMCPTokenDeployment names when that is set;
+	// unset, it is the only deployment configured, if there is one. Either way it goes only to
+	// that deployment's saved target, never to a connection that overrides it.
 	EnvMCPToken = "KUBE_AGENTS_MCP_TOKEN"
-	// EnvMCPTokenDeployment names the saved deployment profile EnvMCPToken belongs to when more
-	// than one deployment is configured: its saved name, or its name before a cross-context
-	// rename if only one profile answers to it. Unset, or naming none or several of them, the
-	// token is sent nowhere.
+	// EnvMCPTokenDeployment names the saved deployment profile EnvMCPToken belongs to: its saved
+	// name, or its name before a cross-context rename if only one profile answers to it. Set, it
+	// decides even with one deployment configured; naming none or several, the token is sent
+	// nowhere. Unset, the token goes to the only deployment configured, or nowhere with several.
 	EnvMCPTokenDeployment = "KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT"
 
 	// DefaultUpstreamRepoURL and friends are the canonical upstream GitHub documentation links.
@@ -588,11 +588,12 @@ var (
 )
 
 // EnvMCPTokenFor returns the KUBE_AGENTS_MCP_TOKEN override when it belongs to prof, and ""
-// otherwise. saved holds the saved deployment profiles by name. With one saved, the token is
-// that profile's. With several, it is the profile's KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT names: by
-// its saved name, or by the base name it was saved under before a cross-context collision
-// renamed it to "<kubeContext>/<name>", as long as exactly one profile answers to it. With the
-// selector unset, naming none, or naming more than one, the token is sent nowhere.
+// otherwise. saved holds the saved deployment profiles by name. With
+// KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT set, the token is the profile it names, however many are
+// saved: by its saved name, or by the base name it was saved under before a cross-context
+// collision renamed it to "<kubeContext>/<name>", as long as exactly one profile answers to it;
+// naming none or more than one, the token is sent nowhere. With the selector unset, the token
+// is the only saved profile's, and is sent nowhere when several are saved.
 //
 // The token is bound to its profile's saved target, not its name: prof gets it only when it
 // still points where the saved profile does (kube context, namespace, and direct MCP URL). A
@@ -619,13 +620,15 @@ func EnvMCPTokenFor(prof DeploymentProfile, saved map[string]DeploymentProfile) 
 }
 
 // envTokenOwner names the saved profile KUBE_AGENTS_MCP_TOKEN belongs to (see EnvMCPTokenFor).
+// A set selector always decides, even with one profile saved: the token then goes only to the
+// profile it names, never to a different lone one.
 func envTokenOwner(saved map[string]DeploymentProfile) (string, bool) {
-	if len(saved) == 1 {
+	scope := strings.TrimSpace(os.Getenv(EnvMCPTokenDeployment))
+	if scope == "" && len(saved) == 1 {
 		for name := range saved {
 			return name, true
 		}
 	}
-	scope := strings.TrimSpace(os.Getenv(EnvMCPTokenDeployment))
 	var matches []string
 	if scope != "" {
 		for name, p := range saved {
@@ -636,8 +639,13 @@ func envTokenOwner(saved map[string]DeploymentProfile) (string, bool) {
 	}
 	if len(matches) != 1 {
 		envTokenNotSentWarning.Do(func() {
-			slog.Warn(EnvMCPToken+" is not sent to any deployment: more than one is configured, and "+
-				EnvMCPTokenDeployment+" does not name exactly one of them", "deployment_selector", scope)
+			if scope == "" {
+				slog.Warn(EnvMCPToken + " is not sent to any deployment: more than one is configured, and " +
+					EnvMCPTokenDeployment + " is not set to name one of them")
+				return
+			}
+			slog.Warn(EnvMCPToken+" is not sent to any deployment: "+
+				EnvMCPTokenDeployment+" does not name exactly one saved deployment", "deployment_selector", scope)
 		})
 		return "", false
 	}

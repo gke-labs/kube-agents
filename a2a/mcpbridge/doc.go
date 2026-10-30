@@ -31,12 +31,13 @@
 //	                               kube context, namespace and direct URL,
 //	                               never to a connection that overrides them
 //	KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT
-//	                               with several deployments configured, the
-//	                               saved profile name the token belongs to
-//	                               (or its name before a <context>/<name>
-//	                               rename, if only one profile has it);
-//	                               unset or ambiguous, the token is sent
-//	                               nowhere
+//	                               the saved profile name the token belongs
+//	                               to (or its name before a <context>/<name>
+//	                               rename, if only one profile has it); set,
+//	                               it decides even with one deployment saved,
+//	                               and naming none or several sends the token
+//	                               nowhere; unset, the token goes to the only
+//	                               saved deployment, or nowhere with several
 //	GH_TOKEN / GITHUB_TOKEN        GitHub token for inspect_pr; when neither is
 //	                               set the bridge falls back to the github.com
 //	                               entry in ~/.git-credentials, if present

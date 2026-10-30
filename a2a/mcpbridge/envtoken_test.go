@@ -84,6 +84,20 @@ func TestEnvMCPTokenGoesToTheOnlyDeploymentWithoutASelector(t *testing.T) {
 	}
 }
 
+func TestEnvMCPTokenSelectorDecidesEvenWithOneDeploymentSaved(t *testing.T) {
+	gw, auth := envTokenGateway(t)
+	srv := envTokenServer(t, gw.URL, "staging")
+	t.Setenv(EnvMCPToken, envTokenValue)
+	t.Setenv(EnvMCPTokenDeployment, "prod")
+	if got := connectAuth(t, srv, auth, "staging"); got != "" {
+		t.Fatalf("prod's token reached the only saved deployment, staging, as %q", got)
+	}
+	t.Setenv(EnvMCPTokenDeployment, "staging")
+	if got := connectAuth(t, srv, auth, "staging"); got != "Bearer "+envTokenValue {
+		t.Fatalf("staging, named by the selector, got Authorization %q; want the env token", got)
+	}
+}
+
 func TestEnvMCPTokenGoesNowhereWithSeveralDeploymentsAndNoSelector(t *testing.T) {
 	gw, auth := envTokenGateway(t)
 	srv := envTokenServer(t, gw.URL, "cluster-a", "cluster-b")
