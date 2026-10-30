@@ -69,8 +69,6 @@ const (
 	patchExt                    = ".patch"
 	pathSeparatorReplacement    = "__"
 	diffHeaderPrefix            = "diff --git "
-	bSidePrefix                 = " b/"
-	quotedBSidePrefix           = ` "b/`
 	fileSchemePrefix            = "file://"
 	maxDiffErrorBodyBytes       = 512
 	ghPRDiffHintFormat          = "gh pr diff %d --repo %s"
@@ -689,27 +687,11 @@ func splitUnifiedDiffByFile(diff string) map[string]string {
 		if firstLineEnd >= 0 {
 			firstLine = chunk[:firstLineEnd]
 		}
-		if filePath := diffHeaderBSidePath(firstLine); filePath != "" {
+		if filePath := mcp.DiffHeaderBSidePath(firstLine); filePath != "" {
 			out[filePath] = fullChunk
 		}
 	}
 	return out
-}
-
-// diffHeaderBSidePath extracts the post-image path from the remainder of a
-// `diff --git a/<path> b/<path>` header line, tolerating git's C-style quoting
-// (`diff --git "a/p q" "b/p q"`) used for paths with spaces or special characters.
-func diffHeaderBSidePath(firstLine string) string {
-	line := strings.TrimSpace(firstLine)
-	if idx := strings.LastIndex(line, quotedBSidePrefix); idx >= 0 {
-		if unquoted, err := strconv.Unquote(line[idx+1:]); err == nil {
-			return strings.TrimPrefix(unquoted, "b/")
-		}
-	}
-	if idx := strings.LastIndex(line, bSidePrefix); idx >= 0 {
-		return strings.TrimSpace(line[idx+len(bSidePrefix):])
-	}
-	return ""
 }
 
 // sameNameRepo returns defaultRepo when guessed is a different owner/repo with the same repository

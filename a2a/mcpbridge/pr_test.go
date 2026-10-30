@@ -206,6 +206,26 @@ func TestSplitUnifiedDiffByFileAnchorsHeadersToLineStarts(t *testing.T) {
 	}
 }
 
+func TestSplitUnifiedDiffByFileKeysAPathContainingBSlash(t *testing.T) {
+	// Git does not quote a path for a space alone, so " b/" can sit inside the path.
+	diff := "diff --git a/plan b/notes.md b/plan b/notes.md\n" +
+		"--- a/plan b/notes.md\n" +
+		"+++ b/plan b/notes.md\n" +
+		"@@ -1 +1 @@\n" +
+		"-old plan\n" +
+		"+new plan\n" +
+		"diff --git a/notes.md b/notes.md\n" +
+		"--- a/notes.md\n" +
+		"+++ b/notes.md\n" +
+		"@@ -1 +1 @@\n" +
+		"-old notes\n" +
+		"+new notes\n"
+	chunks := splitUnifiedDiffByFile(diff)
+	if !strings.Contains(chunks["plan b/notes.md"], "+new plan") || !strings.Contains(chunks["notes.md"], "+new notes") {
+		t.Fatalf("splitUnifiedDiffByFile keyed the chunks as %v; want \"plan b/notes.md\" and \"notes.md\", each with its own patch", chunkKeys(chunks))
+	}
+}
+
 func chunkKeys(chunks map[string]string) []string {
 	keys := make([]string, 0, len(chunks))
 	for k := range chunks {

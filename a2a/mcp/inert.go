@@ -19,3 +19,12 @@ func WriteInertBlock(sb *strings.Builder, s, info string, maxBytes, maxLines, li
 func InertField(s string) string {
 	return field(s)
 }
+
+// DiffHeaderBSidePath is the post-image path of the remainder of a `diff --git
+// a/<p> b/<p>` header line, as inspect_pr reads it: git's C-style quoting is
+// undone, and an unquoted path that itself contains " b/" is split where the
+// a-side matches the b-side. The workstation bridge keys its per-file patches
+// with it.
+func DiffHeaderBSidePath(header string) string {
+	return diffHeaderBSidePath(header)
+}
