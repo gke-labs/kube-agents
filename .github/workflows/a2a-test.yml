@@ -42,9 +42,14 @@ on:
       # cmd/session-persona's tests read these from outside the module: the
       # cluster skills the worker image ships a session copy of, and the
       # broker policy the session's read tables must stay a subset of. An
-      # edit to either alone has to run those tests.
+      # edit to either alone has to run those tests. lib/persona's tests read
+      # the tse persona, the skills it copies and the relay's read tools the
+      # same way.
       - "agents/cluster/skills/**"
+      - "agents/tse/persona/**"
+      - "agents/tse/skills/**"
       - "agents/platform/scripts/command_policy.py"
+      - "agents/platform/scripts/mcp_policy.py"
       - "agents/platform/scripts/credential_proxy.py"
       # lib/chatmsg validates every shared chat case, so a case-only change
       # has to run it.
@@ -92,7 +97,10 @@ jobs:
               - ".github/workflows/a2a-test.yml"
               - "k8s-operator/Makefile"
               - "agents/cluster/skills/**"
+              - "agents/tse/persona/**"
+              - "agents/tse/skills/**"
               - "agents/platform/scripts/command_policy.py"
+              - "agents/platform/scripts/mcp_policy.py"
               - "agents/platform/scripts/credential_proxy.py"
               - "tests/conformance/chat/**"
 
