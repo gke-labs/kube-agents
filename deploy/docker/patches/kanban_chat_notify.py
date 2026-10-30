@@ -82,8 +82,7 @@ they can: instead of ``chat.postMessage``/``chat.update`` they compose the same
 state into a chat message (``agents/platform/scripts/chat_message.py``) and
 hand it to :meth:`ChatNotifyAdapter.send_chat`, with an ``update`` key for a
 message that is edited in place (the thread's plan, a card's question, the
-alert; the gateway edits by key in a conversation, and posts anew in a
-home-channel thread). :meth:`ChatNotifyAdapter.send` forwards both as ``a2a notify
+alert). :meth:`ChatNotifyAdapter.send` forwards both as ``a2a notify
 --chat-file`` and ``--update``; the text stays the fallback, and a gateway that
 does not read them posts the text. A failure wake's reply with a Try again
 offer (``slack_ux_failure.chat_for``) is laid out the same way.
@@ -842,8 +841,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         """:meth:`send` laid out by ``chat``, a ``kube-agents.chat/v1`` object, with ``content`` its fallback.
 
         ``update`` names the message: a later send with the same key, in the
-        same conversation, edits it in place; in a home-channel thread the
-        gateway reads no key and posts again.
+        same conversation, edits it in place.
         """
         extra = {CHAT_METADATA_KEY: chat, UPDATE_METADATA_KEY: update}
         return await self.send(chat_id, content, metadata={**(metadata or {}), **extra})

@@ -593,6 +593,24 @@ func (a *GoogleChatAdapter) EditMessage(conversation, messageID string, m OutMes
 	if _, _, ok := gchatSpaceThread(conversation); !ok {
 		return fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
 	}
+	return a.editLaidOut(conversation, messageID, m)
+}
+
+// EditNotifyMessage is EditMessage for the chat.notify route's home posts
+// (notifyChatEditor): the message, on a thread of space, edited in place. A
+// question it carries stays bound to no conversation, as a home post's is
+// (createLaidOut), so its click reads the event's surface.
+func (a *GoogleChatAdapter) EditNotifyMessage(space, _ string, messageID string, m OutMessage) error {
+	if !gchatIsSpaceName(space) {
+		return fmt.Errorf("gchat: not a space name: %q", space)
+	}
+	return a.editLaidOut("", messageID, m)
+}
+
+// editLaidOut patches messageID to m, laid out when m carries a chat
+// message and as text otherwise, and tracks the question it opens or closes
+// under conversation.
+func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMessage) error {
 	layout := gchatChatLayout{Text: toGchatText(m.Text)}
 	if m.Chat != nil {
 		if len(m.Chat.Choices) > 0 {

@@ -840,8 +840,9 @@ id takes one too), so no plan takes another's key and edits its message, which t
 still holds: not one its first card reopens after the plan lapsed, and not one opened after
 a restart. The shared cases spell only the stem (`plan`, `question-<card>`); their runner
 matches a key that adds a `-` suffix to it. The alert is a
-home-channel post and its triage a reply in its thread, so the edit asks the gateway to
-keep `update` keys for a home-channel thread as it does for a conversation. The plan
+home-channel post and its triage a reply in its thread, and the gateway keeps `update` keys
+per home-channel thread as it does per conversation, so the triage's keyed post edits the alert
+(spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The plan
 carries the `mark` when it changes: `ask` while a card runs, `ask` with `settle: blocked`
 while one waits on the user, and `settle: done` or `failed` once all have settled. A
 completed card's report, or a hard-wall block's reason, whose settle finished the ask's plan goes

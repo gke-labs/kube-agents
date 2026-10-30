@@ -283,6 +283,49 @@ func TestGchatPostNotifyMessageLaysOut(t *testing.T) {
 	}
 }
 
+// A home post edited through the notify route is patched in place, and the
+// question it settles is closed; the one it carries stays bound to no
+// conversation, as the post's was.
+func TestGchatEditNotifyMessagePatchesAHomePost(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/S1/messages/M1", "thread": map[string]any{"name": "spaces/S1/threads/M1"}}
+	f.responses["spaces.messages/patch"] = map[string]any{"name": "spaces/S1/messages/M1"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	ask := OutMessage{Text: "which?", Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which cluster?", Choices: []chatmsg.Choice{{Text: "prod"}, {Text: "dev"}}}}
+	if _, _, err := a.PostNotifyMessage("spaces/S1", "", ask); err != nil {
+		t.Fatal(err)
+	}
+	reask := OutMessage{Text: "which, again?", Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which cluster, again?", Choices: []chatmsg.Choice{{Text: "prod"}}}}
+	if err := a.EditNotifyMessage("spaces/S1", "spaces/S1/threads/M1", "spaces/S1/messages/M1", reask); err != nil {
+		t.Fatal(err)
+	}
+	call := f.call(1)
+	if call.method != "patch" || call.arguments["name"] != "spaces/S1/messages/M1" {
+		t.Fatalf("edit = %+v, want a patch of the post", call)
+	}
+	if body := call.arguments["body"].(map[string]any); body["text"] != "*Which cluster, again?*" || len(body["accessoryWidgets"].([]any)) != 1 {
+		t.Errorf("patched body = %v", body)
+	}
+	a.mu.Lock()
+	q, open := a.uxLocked().questions["spaces/S1/messages/M1"]
+	a.mu.Unlock()
+	if !open || q.conversation != "" {
+		t.Fatalf("question = %+v, %v; want it open and bound to no conversation", q, open)
+	}
+	if err := a.EditNotifyMessage("spaces/S1", "spaces/S1/threads/M1", "spaces/S1/messages/M1", OutMessage{Text: "settled: prod"}); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	_, open = a.uxLocked().questions["spaces/S1/messages/M1"]
+	a.mu.Unlock()
+	if open {
+		t.Error("a settled home question is still open")
+	}
+	if err := a.EditNotifyMessage("not-a-space", "", "spaces/S1/messages/M1", reask); err == nil {
+		t.Error("a non-space must error")
+	}
+}
+
 // A click the gateway drops changes nothing: no rewrite, and the question
 // stays open for the next click. A click on a question posted before a
 // restart is still a turn, and its rewrite reads the message the event
