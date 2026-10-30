@@ -252,6 +252,9 @@ func (c *Config) applyDefaults() {
 type Result struct {
 	State   lib.TaskState
 	Evicted bool
+	// Abandoned is a dispatched task the dispatcher took back: no terminal
+	// was published, because the dispatcher writes it.
+	Abandoned bool
 }
 
 // resultChunkSize bounds one result artifact-update well under the bus max
@@ -365,6 +368,17 @@ type adapter struct {
 	costSeen       float64
 	costKnown      bool
 	resumedSession bool
+
+	// dispatched is a task a profile worker took from the dispatcher
+	// (profile.go). The dispatcher checked the grant at admission
+	// (CheckProfileRun), and a profile pod holds no verify subject, so the
+	// executor's own capability check is skipped for it.
+	dispatched bool
+	// abandon carries the dispatcher's abandon reason to supervise. The
+	// dispatcher writes that task's terminal itself, so supervise stops the
+	// harness and returns without one. Nil, which never fires, for every
+	// other task.
+	abandon <-chan string
 }
 
 // turnCostFrom is one result line's cost from the harness's running total,
@@ -620,7 +634,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	// for this task has to permit this executor to execute it, at this
 	// executor's own scope, and the verifier is the only thing that can say
 	// so. Refused is terminal rejected, before any model spend.
-	if reason := a.capabilityRefusal(ctx, a.nc, origin); reason != "" {
+	if reason := a.dispatchedOr(a.capabilityRefusal, ctx, origin); reason != "" {
 		// A SIGTERM that lands inside the verify window is an eviction, not
 		// a refusal. Check wraps this same ctx and turns its cancellation
 		// into "the verifier could not be reached", so without this branch
@@ -736,6 +750,15 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 
 	res, err := a.supervise(ctx, proc, steerCh, cancelCh, delegateCh)
 	return turnOutcome{res: res, err: err, launched: true, harnessSession: a.harnessSession}
+}
+
+// dispatchedOr is check's refusal for a task that came through the stream,
+// and "" for a dispatched one, whose grant the dispatcher already checked.
+func (a *adapter) dispatchedOr(check func(context.Context, *nats.Conn, *lib.Envelope) string, ctx context.Context, origin *lib.Envelope) string {
+	if a.dispatched {
+		return ""
+	}
+	return check(ctx, a.nc, origin)
 }
 
 // supervise is the main loop: harness stdout events out, steering in, cancel
@@ -911,6 +934,15 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// it before the terminal decision below.
 			proc.closeStdin()
 			proc.kill(a.cfg.KillGrace)
+
+		case reason := <-a.abandon:
+			// The dispatcher took the task back (deadline, lease expiry, a
+			// stop) and writes its terminal. Publishing one here too would
+			// put two finals on the task, so the harness is killed and
+			// nothing more goes out.
+			log.Info("the dispatcher abandoned the task; stopping the harness", "task", a.taskID, "reason", reason)
+			proc.kill(0)
+			return Result{Abandoned: true}, nil
 
 		case <-cancelCh:
 			if canceled {

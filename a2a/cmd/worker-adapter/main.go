@@ -20,6 +20,13 @@
 //
 // Exit codes: 0 completed (or nothing to do), 1 failed, 2 rejected,
 // 3 canceled, 143 evicted (SIGTERM).
+//
+// A2A_PROFILE_WORKER=true is the AgentProfile worker instead (#3655): a pool
+// or Job pod that takes its tasks from the dispatcher (workeradapter.
+// RunProfileWorker). It needs no TASK_ID, and A2A_PROFILE_TIER names its
+// pool. It answers /readyz on lib.ProfileWorkerStatusPort once it's
+// listening. It exits 0 when it stops (at SIGTERM, or after one task with
+// PROFILE_WORKER_ONE_SHOT), and 1 if it can't start.
 package main
 
 import (
@@ -173,6 +180,20 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	if os.Getenv(lib.EnvProfileWorker) == "true" {
+		oneShot := os.Getenv(lib.EnvProfileWorkerOneShot)
+		pw := workeradapter.ProfileWorkerConfig{
+			Tier:      os.Getenv(lib.EnvProfileTier),
+			OneShot:   oneShot == "1" || oneShot == "true",
+			ReadyAddr: fmt.Sprintf(":%d", lib.ProfileWorkerStatusPort),
+		}
+		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
+			log.Error("profile worker failed", "err", err)
+			return 1
+		}
+		return 0
+	}
+
 	res, err := workeradapter.Run(ctx, cfg)
 	if err != nil {
 		log.Error("adapter run failed", "task", cfg.TaskID, "state", string(res.State), "err", err)
@@ -205,8 +226,11 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	taskID := os.Getenv("TASK_ID")
 	profile := os.Getenv("PROFILE")
 	natsURL := os.Getenv("NATS_URL")
-	if taskID == "" || profile == "" || natsURL == "" {
-		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract)")
+	// A profile worker learns each task from the dispatcher's offer, so it
+	// starts with no TASK_ID.
+	profileWorker := os.Getenv(lib.EnvProfileWorker) == "true"
+	if (taskID == "" && !profileWorker) || profile == "" || natsURL == "" {
+		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract); a profile worker needs no TASK_ID")
 		return workeradapter.Config{}, false
 	}
 
