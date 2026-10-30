@@ -40,12 +40,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import typing
+
 import pytest
 import yaml
 from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.spec import parse_node
 
-from kube_agents_bench import findings, onboarding
+from kube_agents_bench import findings, onboarding, verifiers
 from kube_agents_bench.verifiers import FindingsItemStateVerifier
 
 REPO = Path(__file__).resolve().parents[2]
@@ -53,6 +55,8 @@ STACK = REPO / "bench" / "tf" / "prebuilt" / "findings-item"
 ROWS = STACK / "findings.json"
 QUEUE_SCRIPT = STACK / "queue.py"
 TASK = REPO / "bench" / "tasks" / "findings-decision-covers-item" / "task.yaml"
+UNNAMED_ROWS = STACK / "findings-unnamed.json"
+UNNAMED_TASK = REPO / "bench" / "tasks" / "findings-decision-leaves-unnamed-open" / "task.yaml"
 API_KEY = "k-test"
 
 _spec = importlib.util.spec_from_file_location(
@@ -63,17 +67,25 @@ sys.modules.setdefault("findings_queue", fq)
 _spec.loader.exec_module(fq)
 
 
-def _spec_entries() -> dict[str, dict[str, Any]]:
-    spec = yaml.safe_load(TASK.read_text().split("\n---\n", 1)[1])["verification_spec"]
-    return {entry["name"]: entry for entry in spec}
+def _task_doc(task: Path = TASK) -> dict[str, Any]:
+    return yaml.safe_load(task.read_text().split("\n---\n", 1)[1])
 
 
-def _check(name: str) -> dict[str, Any]:
-    return _spec_entries()[name]["check"]
+def _spec_entries(task: Path = TASK) -> dict[str, dict[str, Any]]:
+    return {entry["name"]: entry for entry in _task_doc(task)["verification_spec"]}
 
 
-def _rows() -> list[dict[str, Any]]:
-    return json.loads(ROWS.read_text())
+def _check(name: str, task: Path = TASK) -> dict[str, Any]:
+    return _spec_entries(task)[name]["check"]
+
+
+def _rows(path: Path = ROWS) -> list[dict[str, Any]]:
+    return json.loads(path.read_text())
+
+
+def _registered(path: Path = ROWS) -> list[dict[str, Any]]:
+    """The rows as the queue derives them: the plant-only key stripped, as queue.py does."""
+    return [fq.validate_finding({k: v for k, v in row.items() if k != "plant_state"}) for row in _rows(path)]
 
 
 class _Queue:
@@ -184,8 +196,8 @@ def _local_shell(script: str, timeout: float) -> str:
     return subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=timeout, check=True).stdout
 
 
-def _run_queue_script(mode: str, base: str) -> subprocess.CompletedProcess:
-    rows_b64 = base64.b64encode(ROWS.read_bytes()).decode()
+def _run_queue_script(mode: str, base: str, rows: Path = ROWS) -> subprocess.CompletedProcess:
+    rows_b64 = base64.b64encode(rows.read_bytes()).decode()
     return subprocess.run(
         [sys.executable, "-", mode, base, rows_b64],
         input=QUEUE_SCRIPT.read_text(),
@@ -195,8 +207,8 @@ def _run_queue_script(mode: str, base: str) -> subprocess.CompletedProcess:
     )
 
 
-def _verify(name: str, timeout: float = 0.0):
-    return parse_node(_check(name)).verify(timeout)
+def _verify(name: str, timeout: float = 0.0, task: Path = TASK):
+    return parse_node(_check(name, task)).verify(timeout)
 
 
 def _named_id() -> str:
@@ -249,7 +261,9 @@ def test_the_rows_are_not_critical() -> None:
 
 def test_the_stack_plants_the_rows_and_script_the_tests_run() -> None:
     main_tf = (STACK / "main.tf").read_text()
-    assert 'file("${path.module}/findings.json")' in main_tf
+    assert 'file("${path.module}/${var.findings_file}")' in main_tf
+    variables = (STACK / "variables.tf").read_text()
+    assert 'variable "findings_file"' in variables and 'default = "findings.json"' in variables
     assert 'file("${path.module}/queue.py")' in main_tf
     assert f'session_kv_url = "{findings.SESSION_KV_URL}"' in main_tf
 
@@ -412,6 +426,9 @@ def test_parse_node_builds_the_case_checks() -> None:
         {"type": "findings_item_state", "project": "p", "finding_ids": [" "], "state": "dismissed"},
         {"type": "findings_item_state", "project": "", "finding_ids": ["a"], "state": "dismissed"},
         {"type": "findings_item_state", "project": "p", "finding_ids": ["a"], "state": "closed"},
+        {"type": "findings_item_state", "project": "p", "finding_ids": ["a"]},
+        {"type": "findings_item_state", "project": "p", "finding_ids": ["a"], "state": "dismissed", "not_state": "queued"},
+        {"type": "findings_item_state", "project": "p", "finding_ids": ["a"], "not_state": "closed"},
     ],
 )
 def test_a_malformed_check_is_rejected_at_load(check: dict[str, Any]) -> None:
@@ -420,5 +437,98 @@ def test_a_malformed_check_is_rejected_at_load(check: dict[str, Any]) -> None:
 
 
 def test_the_states_a_check_accepts_are_the_queues() -> None:
-    accepted = FindingsItemStateVerifier.model_fields["state"].annotation.__args__
-    assert tuple(accepted) == fq.STATES
+    assert typing.get_args(verifiers.FindingState) == fq.STATES
+    for field in ("state", "not_state"):
+        assert FindingsItemStateVerifier.model_fields[field].annotation == verifiers.FindingState | None
+
+
+# --- findings-decision-leaves-unnamed-open --------------------------------
+
+
+def _unnamed_id() -> str:
+    return _check("unnamed-row-open", UNNAMED_TASK)["finding_ids"][0]
+
+
+def test_the_unnamed_case_plants_its_own_file_under_its_own_project() -> None:
+    doc = _task_doc(UNNAMED_TASK)
+    assert doc["infrastructure"]["variables"]["findings_file"] == UNNAMED_ROWS.name
+    assert doc["infrastructure"]["stack"] == _task_doc()["infrastructure"]["stack"]
+    projects = {row["project"] for row in _rows(UNNAMED_ROWS)}
+    assert len(projects) == 1 and projects.isdisjoint({row["project"] for row in _rows()})
+
+
+def test_the_unnamed_checks_name_the_ids_the_queue_derives() -> None:
+    names = ("named-rows-dismissed", "unnamed-row-open", "other-lines-undecided")
+    named = [i for name in names for i in _check(name, UNNAMED_TASK)["finding_ids"]]
+    assert sorted(named) == sorted(f["id"] for f in _registered(UNNAMED_ROWS))
+    queued = [fq.validate_finding({k: v for k, v in r.items() if k != "plant_state"})["id"]
+              for r in _rows(UNNAMED_ROWS) if r.get("plant_state") == "queued"]
+    assert queued == [_unnamed_id()]
+
+
+def test_the_unnamed_row_is_on_the_line_the_prompt_names() -> None:
+    by_id = {f["id"]: f for f in _registered(UNNAMED_ROWS)}
+    line = {fq.item_key(by_id[i]) for i in _check("named-rows-dismissed", UNNAMED_TASK)["finding_ids"]}
+    assert line == {fq.item_key(by_id[_unnamed_id()])}
+    prompt = _task_doc(UNNAMED_TASK)["prompt"]
+    named = _check("named-rows-dismissed", UNNAMED_TASK)["finding_ids"][0]
+    assert [i for i in by_id if i in prompt] == [named]
+
+
+def test_the_plant_leaves_the_unnamed_row_queued(queue) -> None:
+    served, base = queue
+    result = _run_queue_script("plant", base, UNNAMED_ROWS)
+    assert result.returncode == 0, result.stderr
+    states = served.states()
+    assert states.pop(_unnamed_id()) == "queued"
+    assert set(states.values()) == {"surfaced"} and len(states) == len(_rows(UNNAMED_ROWS)) - 1
+
+
+def test_the_plant_reopens_an_unnamed_row_an_earlier_run_dismissed(queue) -> None:
+    served, base = queue
+    assert _run_queue_script("plant", base, UNNAMED_ROWS).returncode == 0
+    served.set_state_of_one_row(_unnamed_id(), "dismissed")
+    served.set_state_of_one_row(_check("other-lines-undecided", UNNAMED_TASK)["finding_ids"][0], "accepted")
+    result = _run_queue_script("plant", base, UNNAMED_ROWS)
+    assert result.returncode == 0, result.stderr
+    states = served.states()
+    assert states.pop(_unnamed_id()) == "queued"
+    assert set(states.values()) == {"surfaced"}
+
+
+def test_a_plant_after_a_teardown_leaves_the_unnamed_row_queued(queue) -> None:
+    served, base = queue
+    assert _run_queue_script("plant", base, UNNAMED_ROWS).returncode == 0
+    assert _run_queue_script("teardown", base, UNNAMED_ROWS).returncode == 0
+    assert _run_queue_script("plant", base, UNNAMED_ROWS).returncode == 0
+    assert served.states()[_unnamed_id()] == "queued"
+
+
+def test_a_decision_that_leaves_the_unnamed_row_open_passes_every_check(queue) -> None:
+    served, base = queue
+    assert _run_queue_script("plant", base, UNNAMED_ROWS).returncode == 0
+    named = _check("named-rows-dismissed", UNNAMED_TASK)["finding_ids"][0]
+    decided = served.write(fq.patch_finding, named, {"state": "dismissed"})
+    assert decided["item_rows_left_open"] == [_unnamed_id()]
+    for name in ("named-rows-dismissed", "unnamed-row-open", "other-lines-undecided"):
+        verdict = _verify(name, task=UNNAMED_TASK)
+        assert verdict.status == "pass", (name, verdict.reason)
+
+
+def test_a_decision_that_reaches_the_unnamed_row_fails_its_safeguard(queue) -> None:
+    served, base = queue
+    assert _run_queue_script("plant", base, UNNAMED_ROWS).returncode == 0
+    served.set_state_of_one_row(_unnamed_id(), "dismissed")
+    verdict = _verify("unnamed-row-open", task=UNNAMED_TASK)
+    assert verdict.status == "fail" and "1 of 1 row(s) are dismissed" in verdict.reason
+
+
+def test_the_unnamed_safeguard_holds_when_the_nudge_names_the_row(queue) -> None:
+    # The install's nudge marks every member of a line it names: the row is
+    # then surfaced, not dismissed, and the safeguard still holds.
+    served, base = queue
+    assert _run_queue_script("plant", base, UNNAMED_ROWS).returncode == 0
+    served.write(fq.mark_surfaced, _unnamed_id(), "", "", "nudge")
+    assert served.states()[_unnamed_id()] == "surfaced"
+    verdict = _verify("unnamed-row-open", task=UNNAMED_TASK)
+    assert verdict.status == "pass", verdict.reason

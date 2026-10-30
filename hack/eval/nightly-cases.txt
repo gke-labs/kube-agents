@@ -1002,6 +1002,14 @@
 # like obtainability-remediation-proposal. Nightly from its first merge.
 ./tasks/delegated-proposal-stays-in-reply/task.yaml
 
+# The findings queue's item-wide decision when a sweep has added a finding to
+# the line since the nudge named it: the named rows are dismissed, the row no
+# message has named stays queued, and the other lines stay open.
+# prebuilt/findings-item plants findings-unnamed.json under its own project
+# through the Session KV server's findings routes and resolves the rows on
+# destroy. No fixture; the host install only.
+./tasks/findings-decision-leaves-unnamed-open/task.yaml
+
 # An on-demand audit that moved nothing still reports its ledger URL (#1929).
 # prebuilt/stale-audit-ledger with ledger_kind "gap" opens an ai-security-audit
 # ledger that a coverage gap opened; the clean run closes it with nothing new

@@ -6482,11 +6482,24 @@ class TestFindingsQueueApi(unittest.TestCase):
     def test_a_decision_on_one_id_covers_its_gathered_line(self):
         self._register(self._finding(), self._finding(object="Deployment/cart"))
         first, second = sorted(f["id"] for f in self.client.get("/v1/findings/ranked").json()["findings"])
+        for fid in (first, second):
+            self.client.post(f"/v1/findings/{fid}/surfaced", json={})
 
         dismissed = self.client.patch(f"/v1/findings/{first}", json={"state": "dismissed"}).json()
 
         self.assertEqual(dismissed["item_rows_decided"], [second])
+        self.assertEqual(dismissed["item_rows_left_open"], [])
         self.assertEqual(self.client.get("/v1/findings/ranked").json()["findings"], [])
+
+    def test_a_decision_leaves_a_never_named_row_of_the_line_open(self):
+        self._register(self._finding(), self._finding(object="Deployment/cart"))
+        first, second = sorted(f["id"] for f in self.client.get("/v1/findings/ranked").json()["findings"])
+        self.client.post(f"/v1/findings/{first}/surfaced", json={})
+
+        dismissed = self.client.patch(f"/v1/findings/{first}", json={"state": "dismissed"}).json()
+
+        self.assertEqual((dismissed["item_rows_decided"], dismissed["item_rows_left_open"]), ([], [second]))
+        self.assertEqual([f["id"] for f in self.client.get("/v1/findings/ranked").json()["findings"]], [second])
 
     def test_additions_refuse_a_day_that_is_not_a_date(self):
         for day in ("yesterday", "2026-99-99"):
