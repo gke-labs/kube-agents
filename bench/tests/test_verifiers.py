@@ -9979,6 +9979,11 @@ def test_issue_state_spec_must_bind_the_issue_to_the_run():
     # Either binding is enough on its own.
     verifiers.ForgeIssueStateVerifier(type="forge_issue_state", state="closed")
     verifiers.ForgeIssueStateVerifier(type="forge_issue_state", state="open", min_comments=1)
+    # The clock allowance is capped: a wide one would reach the previous
+    # repetition's close and void the binding.
+    verifiers.ForgeIssueStateVerifier(type="forge_issue_state", state="closed", max_clock_skew_sec=300)
+    with pytest.raises(ValidationError):
+        verifiers.ForgeIssueStateVerifier(type="forge_issue_state", state="closed", max_clock_skew_sec=301)
 
 
 def test_issue_state_gitlab_skips_system_notes(monkeypatch, github):

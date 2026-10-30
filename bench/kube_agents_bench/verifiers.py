@@ -136,8 +136,11 @@ __all__ = [
 # already drops everything older than the run.
 _ISSUE_COMMENT_PAGES = 3
 # Tolerance between a forge's stamps and the harness's run-start clock, two
-# different machines.
+# different machines. The cap keeps the window short of the previous
+# repetition: in a presubmit the next one starts minutes after the last close,
+# and a wide allowance would hand the binding rule a stale issue.
 _DEFAULT_CLOCK_SKEW_SEC = 120.0
+_MAX_CLOCK_SKEW_SEC = 300.0
 
 _NO_TRANSCRIPT_REASON = (
     "no transcript stashed for this run: the harness did not complete an "
@@ -4501,7 +4504,7 @@ class ForgeIssueStateVerifier(BaseVerifier):
     state: Literal["open", "closed"] | None = None
     labels: list[str] = Field(default_factory=list)
     min_comments: int = Field(default=0, ge=0)
-    max_clock_skew_sec: float = Field(default=_DEFAULT_CLOCK_SKEW_SEC, ge=0)
+    max_clock_skew_sec: float = Field(default=_DEFAULT_CLOCK_SKEW_SEC, ge=0, le=_MAX_CLOCK_SKEW_SEC)
 
     @model_validator(mode="after")
     def _binds_the_issue_to_the_run(self) -> ForgeIssueStateVerifier:
