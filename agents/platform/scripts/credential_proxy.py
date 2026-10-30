@@ -1257,13 +1257,13 @@ VCS_PROPOSAL_CREATE_PERMIT = "vcs:proposal-create"
 # its own initiative is refused here however the call is spelled.
 PROFILE_PERMIT_GATED_VCS_VERBS = frozenset({"publish", "proposal-create", "proposal-update"})
 
-# The profile writes that act on something that may already exist, and so are
-# further held to the install's own (VcsBroker.require_agent_proposal): an
-# update only of a proposal the install opened from its own branch here, a
-# publish only under AGENT_BRANCH_PREFIX, and an `advance` only onto a branch
-# whose open proposals are the install's. proposal-create opens a new one, from
-# a branch publish already held to the namespace.
-PROFILE_OWNERSHIP_GATED_VCS_VERBS = frozenset({"publish", "proposal-update"})
+# The profile writes further held to the install's own work
+# (VcsBroker.require_agent_proposal): an update only of a proposal the install
+# opened from its own branch here; a publish only under AGENT_BRANCH_PREFIX, and
+# onto a branch carrying open proposals only when every one is the install's; a
+# proposal-create only from the install's own branch in this repository. Every
+# profile write verb is in this set.
+PROFILE_OWNERSHIP_GATED_VCS_VERBS = frozenset({"publish", "proposal-create", "proposal-update"})
 
 
 def vcs_verb_permitted(role: str, verb: str) -> bool:

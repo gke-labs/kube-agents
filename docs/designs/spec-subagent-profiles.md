@@ -402,9 +402,13 @@ What the operator renders per profile, as built (amended 10/6):
     to the install's own work (`VcsBroker.require_agent_proposal`, profile role only, rule
     `caller.vcs-ownership`): `proposal-update` only on a proposal `forge.is_agent_pull_request`
     calls the install's (opened by the credential's login, from a branch under
-    `platform-agent/`, in this repository rather than a fork), `publish` only to a branch
-    under `platform-agent/`, and `publish` with `advance` only onto a branch whose open
-    proposals all pass that same test. A credential that cannot name its login is refused.
+    `platform-agent/`, in this repository rather than a fork); `publish` only to a branch
+    under `platform-agent/`, and, `advance` or not, onto a branch carrying open proposals only
+    when every one passes that same test (a full or truncated list is refused, and `advance`
+    still needs one open proposal); `proposal-create` only from a bare `platform-agent/` branch
+    of this repository, with no field beyond `repository`, `title`, `body`, `source`, `target`
+    and `draft`, so `owner:branch` and any source-repository field are refused. A credential
+    that cannot name its login is refused.
     The shell keeps its own, weaker `advance` bar. Every other verb is refused: `snapshot` and
     `capabilities`, which skip the managed list, and every other write, `branch-delete`
     among them. The shim sends the credential on these calls as it does on an exec. Known

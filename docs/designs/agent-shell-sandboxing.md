@@ -2695,8 +2695,10 @@ allowlist. `/v1/vcs/` admits it too, and every verb there needs a valid task cre
 submission that asked for a change. Both checks run before the body is read, and the managed
 list still bounds which repository any verb reaches. Under the permit, `proposal-update`
 reaches only a proposal the install opened from its own `platform-agent/` branch in this
-repository, and `publish` only a `platform-agent/` branch, onto an existing proposal only
-when it is the install's (rule `caller.vcs-ownership`; the shell is not held to this). No
+repository, `publish` only a `platform-agent/` branch, and onto one carrying open proposals
+only when they are all the install's, and `proposal-create` only from the install's own
+`platform-agent/` branch of this repository (rule `caller.vcs-ownership`; the shell is not
+held to this). No
 other write is the profile role's. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
 profile tier's ServiceAccount to its (profile, tier), and that account may present only the
 profile audience. Each call also carries the dispatcher's signed task credential in

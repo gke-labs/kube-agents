@@ -140,6 +140,12 @@ _INCOMING = "refs/vcs/incoming"
 # no matching ref; any other failure is a remote it could not ask.
 LS_REMOTE_NO_MATCH_EXIT_CODE = 2
 
+# The fields every adapter's proposal-create reads, plus the repository it is
+# bound to. A profile caller's proposal-create may carry no other
+# (VcsBroker.require_agent_proposal): none names a source repository today, and
+# one that did would be a fork source this check had not read.
+PROFILE_PROPOSAL_CREATE_FIELDS = frozenset({"repository", "title", "body", "source", "target", "draft"})
+
 # The namespace every branch this install publishes is named under, and the only
 # one `branch-delete` will touch. Every shipped caller derives its branch as
 # `platform-agent/<change>-<target>`; a branch outside it is a person's, or
@@ -2014,12 +2020,26 @@ class VcsBroker:
             login through `_viewer`. Without it a profile worker under the
             permit could retitle a person's proposal or strip its hold label.
           * `publish`: the branch must be under `AGENT_BRANCH_PREFIX`, the rule
-            `branch-delete` applies. With `advance`, every open proposal on the
-            branch must pass the same `is_agent_pull_request` bar, so a profile
-            worker cannot push onto a person's proposal branch. The bar
-            `_require_open_proposal` keeps for the shell -- an open proposal,
-            the author compared only when the credential can name itself -- is
-            weaker on purpose there and is left as it is.
+            `branch-delete` applies. Whenever the branch carries an open
+            proposal, every open proposal on it must pass the same
+            `is_agent_pull_request` bar, `advance` or not: a publish without it
+            still fast-forwards an existing remote branch, so keying the check
+            on the field would let a profile worker add commits to a person's
+            proposal by leaving it out. A list that came back full or truncated
+            is refused, since the proposals past it are unread. `advance` also
+            needs at least one open proposal, as it does for every caller. A
+            branch under the prefix with no open proposal stays publishable.
+            The bar `_require_open_proposal` keeps for the shell -- an open
+            proposal, the author compared only when the credential can name
+            itself -- is weaker on purpose there and is left as it is.
+          * `proposal-create`: the source must be a branch under
+            `AGENT_BRANCH_PREFIX` in this repository. The adapters open a
+            proposal from the bound repository's own branch, and
+            `validate_branch` already refuses `owner:branch`; the payload may
+            carry no field beyond the ones every adapter reads
+            (PROFILE_PROPOSAL_CREATE_FIELDS), so a field naming another
+            repository is refused rather than left for a later adapter to
+            honour.
 
         A credential that cannot name itself refuses: `is_agent_pull_request`
         answers no for an empty viewer. A lookup that failed is the forge's
@@ -2039,24 +2059,62 @@ class VcsBroker:
                     "install publishes in; a profile task publishes only a branch of "
                     "its own there."
                 )
-            if not payload.get("advance"):
-                return
-            viewer = self._viewer(bound)
+            if "proposal-list" not in getattr(bound.forge, "verbs", ()):
+                raise ProposalNotOurs(
+                    f"{bound.forge.name} cannot list proposals here, so whether {branch} "
+                    "carries somebody else's proposal cannot be established."
+                )
             answer = bound.forge.proposal_list(
                 bound.api,
                 bound.repo,
                 {"state": "open", "source": branch, "limit": OPEN_PROPOSALS_ON_A_BRANCH},
             )
             proposals = answer.get("proposals") or []
+            if answer.get("truncated") or len(proposals) >= OPEN_PROPOSALS_ON_A_BRANCH:
+                raise ProposalNotOurs(
+                    f"{branch} carries at least {len(proposals)} open proposals, a full page, "
+                    "so whether every one is this install's cannot be established."
+                )
+            if payload.get("advance") and not proposals:
+                raise ProposalNotOurs(
+                    f"`advance` says {branch} carries a proposal to add to, but no open "
+                    "proposal on this repository has it as its source."
+                )
+            if not proposals:
+                return
+            viewer = self._viewer(bound)
             strangers = [
                 item for item in proposals
                 if not agent_forge.is_agent_pull_request(_as_pull_request(agent_forge, item), bound.repo, viewer)
             ]
-            if not proposals or strangers:
-                named = (strangers[0].get("url") or "#%s" % (strangers[0].get("number"),)) if strangers else "none"
+            if strangers:
+                named = strangers[0].get("url") or "#%s" % (strangers[0].get("number"),)
                 raise ProposalNotOurs(
-                    f"`advance` onto {branch} needs every open proposal on it to be this "
-                    f"install's own, from this repository; it is not ({named})."
+                    f"{branch} carries an open proposal that is not this install's own "
+                    f"({named}), so a profile task does not publish to it."
+                )
+            return
+        if verb == "proposal-create":
+            extra = sorted(set(payload) - PROFILE_PROPOSAL_CREATE_FIELDS)
+            if extra:
+                raise ProposalNotOurs(
+                    f"proposal-create from a profile task takes only "
+                    f"{', '.join(sorted(PROFILE_PROPOSAL_CREATE_FIELDS))}; {extra[0]!r} is refused, "
+                    "since a proposal opens only from this repository's own branch."
+                )
+            try:
+                source = _short_ref(validate_branch(payload.get("source"), "source"))
+            except WorkspaceError as refused:
+                # `owner:branch`, the cross-repository head form, lands here:
+                # a colon is no branch character.
+                raise ProposalNotOurs(
+                    f"{refused} -- a profile task opens a proposal only from a branch of "
+                    "this repository, named bare."
+                ) from refused
+            if not source.startswith(AGENT_BRANCH_PREFIX):
+                raise ProposalNotOurs(
+                    f"{source} is not under {AGENT_BRANCH_PREFIX}, so a profile task does "
+                    "not open a proposal from it."
                 )
             return
         if verb == "proposal-update":

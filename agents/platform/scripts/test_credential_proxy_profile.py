@@ -1503,13 +1503,23 @@ class ProfileVcsRouteTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    # proposal-create from a profile task carries only the fields every adapter
+    # reads, so it gets a payload of its own.
+    CREATE_PAYLOAD = {
+        "repository": "https://github.com/acme/infra", "title": "t", "body": "b",
+        "source": "platform-agent/new-change", "target": "main",
+    }
+
+    def payload_for(self, verb):
+        return self.CREATE_PAYLOAD if verb == "proposal-create" else self.PAYLOAD
+
     def vcs_post(self, verb, token):
-        return self.post(self.PAYLOAD, token=token, path=f"/v1/vcs/{verb}")
+        return self.post(self.payload_for(verb), token=token, path=f"/v1/vcs/{verb}")
 
     def assert_ran(self, verb, status, body):
         self.assertEqual(200, status, body)
         self.assertEqual({"ok": verb}, body)
-        self.routes[verb].assert_called_once_with(self.PAYLOAD)
+        self.routes[verb].assert_called_once_with(self.payload_for(verb))
 
     def assert_permit_refused(self, verb, status, body):
         self.assertEqual(403, status, body)
@@ -1619,7 +1629,7 @@ class ProfileVcsRouteTest(unittest.TestCase):
         self.routes[verb].assert_not_called()
 
     def post_with(self, verb, **fields):
-        return self.post({**self.PAYLOAD, **fields}, token=PERMIT["token"], path=f"/v1/vcs/{verb}")
+        return self.post({**self.payload_for(verb), **fields}, token=PERMIT["token"], path=f"/v1/vcs/{verb}")
 
     def test_proposal_update_runs_on_the_installs_own_proposal(self):
         status, body = self.post_with("proposal-update")
@@ -1691,9 +1701,74 @@ class ProfileVcsRouteTest(unittest.TestCase):
         status, body = self.post_with("publish", branch="platform-agent/nothing-open", advance=True)
         self.assert_ownership_refused("publish", status, body)
 
-    def test_proposal_create_is_not_held_to_an_existing_proposal(self):
-        status, body = self.post_with("proposal-create", source="platform-agent/new", target="main")
+    def test_publish_without_advance_is_refused_onto_a_branch_carrying_anothers_proposal(self):
+        # A publish without `advance` still fast-forwards an existing remote
+        # branch, so the open proposals on it are checked either way.
+        cases = {
+            "a person's proposal": _proposal(9, "platform-agent/theirs", author="alice"),
+            "a fork's proposal": _proposal(9, "platform-agent/theirs", source_repo="kube-agents/infra"),
+            "another owner's same-name repository": _proposal(9, "platform-agent/theirs", source_repo="other-owner/infra"),
+        }
+        for name, proposal in cases.items():
+            with self.subTest(case=name):
+                self.reset()
+                self.forge.proposals[9] = proposal
+                status, body = self.post_with("publish", branch="platform-agent/theirs")
+                self.assert_ownership_refused("publish", status, body)
+        self.reset()
+        self.forge.proposals[9] = _proposal(9, "platform-agent/fix", author="alice")
+        status, body = self.post_with("publish")
+        self.assert_ownership_refused("publish", status, body)
+
+    def test_publish_without_advance_runs_onto_the_installs_own_proposal_branch(self):
+        status, body = self.post_with("publish")  # platform-agent/fix carries proposal 7, the install's
         self.assertEqual(200, status, body)
+        self.routes["publish"].assert_called_once()
+
+    def test_publish_is_refused_when_the_open_proposals_fill_a_page(self):
+        for number in range(20, 20 + vcs_broker.OPEN_PROPOSALS_ON_A_BRANCH):
+            self.forge.proposals[number] = _proposal(number, "platform-agent/busy")
+        for advance in (False, True):
+            with self.subTest(advance=advance):
+                self.reset()
+                status, body = self.post_with("publish", branch="platform-agent/busy", advance=advance)
+                self.assert_ownership_refused("publish", status, body)
+
+    def test_proposal_create_runs_from_the_installs_own_branch(self):
+        for source in ("platform-agent/new-change", "refs/heads/platform-agent/new-change"):
+            with self.subTest(source=source):
+                self.reset()
+                status, body = self.post_with("proposal-create", source=source)
+                self.assertEqual(200, status, body)
+                self.routes["proposal-create"].assert_called_once()
+
+    def test_proposal_create_is_refused_off_the_branch_namespace(self):
+        for source in ("fix", "main", "refs/heads/main", "release-1.2", "platform-agentx/fix"):
+            with self.subTest(source=source):
+                self.reset()
+                status, body = self.post_with("proposal-create", source=source)
+                self.assert_ownership_refused("proposal-create", status, body)
+
+    def test_proposal_create_is_refused_from_a_fork_or_another_repository(self):
+        # The cross-repository head form, and every field that could name a
+        # source repository on some adapter: none is read today, and none is
+        # left for a later adapter to honour.
+        for fields in (
+            {"source": "kube-agents:platform-agent/fix"},
+            {"source": "other-owner:platform-agent/fix"},
+            {"sourceRepo": "kube-agents/infra"},
+            {"sourceRepo": "other-owner/infra"},
+            {"head": "other-owner:platform-agent/fix"},
+            {"headRepo": "other-owner/infra"},
+            {"head_repo": "other-owner/infra"},
+            {"source_project_id": 42},
+            {"sourceProject": "other-owner/infra"},
+            {"fork": True},
+        ):
+            with self.subTest(fields=fields):
+                self.reset()
+                status, body = self.post_with("proposal-create", **fields)
+                self.assert_ownership_refused("proposal-create", status, body)
 
     # -- the platform agent is unchanged ------------------------------------------
 
@@ -1702,16 +1777,21 @@ class ProfileVcsRouteTest(unittest.TestCase):
             credential_proxy.Principal(workload="system:serviceaccount:ns:agent", uid="u", role=credential_proxy.CALLER_ROLE_SHELL)
         )
         self.forge.proposals[8] = _proposal(8, "release-1.2", author="alice")
+        self.forge.proposals[9] = _proposal(9, "platform-agent/theirs", author="alice")
         for verb, fields in (
             ("proposal-update", {"number": 8}),
             ("publish", {"branch": "feature/person"}),
             ("publish", {"branch": "release-1.2", "advance": True}),
+            ("publish", {"branch": "platform-agent/theirs"}),
+            ("proposal-create", {"source": "feature/person"}),
+            ("proposal-create", {"source": "platform-agent/x", "sourceRepo": "other-owner/infra"}),
         ):
             with self.subTest(verb=verb, fields=fields):
                 self.reset()
-                status, body = self.post({**self.PAYLOAD, **fields}, token=None, path=f"/v1/vcs/{verb}")
+                sent = {**self.payload_for(verb), **fields}
+                status, body = self.post(sent, token=None, path=f"/v1/vcs/{verb}")
                 self.assertEqual(200, status, body)
-                self.routes[verb].assert_called_once_with({**self.PAYLOAD, **fields})
+                self.routes[verb].assert_called_once_with(sent)
         CredentialProxyHandler.vcs.require_agent_proposal.assert_not_called()
 
     def test_the_shell_reaches_every_verb_with_no_task_credential(self):
