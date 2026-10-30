@@ -961,5 +961,130 @@ class NormalizeBooleanResolvesWhatTheWatcherIsHandedAsAFlag(_ScriptCase):
         )
 
 
+# The eight tunables the script hands the watcher as duration or count flags,
+# and which normaliser each goes through. The positive flag marks the one whose
+# validate() also refuses zero.
+_WATCHER_DURATION_KNOBS = {
+    "WATCHER_DEDUP_WINDOW": "--dedup-window",
+    "WATCHER_FAILEDSCHEDULING_MIN_SPAN": "--failedscheduling-min-span",
+    "WATCHER_SCALEUP_HOLD": "--scaleup-hold",
+    "WATCHER_SETTLE": "--settle",
+    "WATCHER_QUIET_AFTER": "--quiet-after",
+}
+_WATCHER_POSITIVE_DURATION_KNOBS = ("WATCHER_DEDUP_WINDOW",)
+_WATCHER_COUNT_KNOBS = {
+    "WATCHER_BACKOFF_MIN_COUNT": "--backoff-min-count",
+    "WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT": "--imagepull-transient-min-count",
+    "WATCHER_FAILEDSCHEDULING_MIN_COUNT": "--failedscheduling-min-count",
+}
+_FALLBACK_DURATION = "2m"
+_FALLBACK_COUNT = "5"
+
+
+class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
+    """The duration and count normalisers, exercised as bash.
+
+    Each value is pasted into a watcher flag, and one the flag package or
+    validate() rejects is an exit on every start: the supervisor backs off,
+    logs that no cluster events are being watched, and the container stays
+    Ready. `120` for a span (a missing unit) and `08` for a count (a bad octal
+    literal to Go) were both enough.
+    """
+
+    def _resolve(self, helper: str, value: str, *args: str) -> subprocess.CompletedProcess:
+        patterns = "\n".join(
+            lift_constant(name, self.text, _SCRIPT)
+            for name in ("WATCHER_DURATION_PATTERN", "WATCHER_COUNT_PATTERN")
+        )
+        return _run_bash(
+            f"""
+            set -u
+            {patterns}
+            {self.lift(helper)}
+            SETTING={shlex.quote(value)}
+            {helper} SETTING {" ".join(shlex.quote(a) for a in args)}
+            printf "resolved=%s" "${{SETTING}}"
+            """
+        )
+
+    def test_a_go_duration_passes_through_unchanged(self) -> None:
+        for value in ("2m", "90s", "1h30m", "1.5h", "500ms", "24h", "0", "0s"):
+            with self.subTest(value=value):
+                result = self._resolve("normalize_duration", value, _FALLBACK_DURATION)
+                self.assertIn(f"resolved={value}", result.stdout)
+                self.assertEqual("", result.stderr)
+
+    def test_surrounding_whitespace_is_dropped_not_reported(self) -> None:
+        result = self._resolve("normalize_duration", " 15m\n", _FALLBACK_DURATION)
+        self.assertIn("resolved=15m", result.stdout)
+        self.assertEqual("", result.stderr)
+
+    def test_a_value_the_watcher_would_reject_lands_on_the_default_and_says_so(self) -> None:
+        # 120: no unit. -5m: validate() refuses a negative. 00: ParseDuration
+        # only special-cases a bare 0.
+        for value in ("120", "2", "-5m", "abc", "00", "2 m", "5min"):
+            with self.subTest(value=value):
+                result = self._resolve("normalize_duration", value, _FALLBACK_DURATION)
+                self.assertIn(f"resolved={_FALLBACK_DURATION}", result.stdout)
+                self.assertIn("SETTING=", result.stderr)
+                self.assertIn("is not a usable duration", result.stderr)
+
+    def test_the_positive_form_refuses_every_spelling_of_zero(self) -> None:
+        for value in ("0", "0s", "0m0s", "0.0h"):
+            with self.subTest(value=value):
+                result = self._resolve("normalize_duration", value, "24h", "positive")
+                self.assertIn("resolved=24h", result.stdout)
+                self.assertIn("above zero", result.stderr)
+        result = self._resolve("normalize_duration", "30m", "24h", "positive")
+        self.assertIn("resolved=30m", result.stdout)
+        self.assertEqual("", result.stderr)
+
+    def test_a_count_is_rewritten_as_decimal(self) -> None:
+        for value, want in (("5", "5"), ("08", "8"), ("007", "7"), (" 3 ", "3"), ("0", "0")):
+            with self.subTest(value=repr(value)):
+                result = self._resolve("normalize_count", value, _FALLBACK_COUNT)
+                self.assertIn(f"resolved={want}", result.stdout)
+                self.assertEqual("", result.stderr)
+
+    def test_a_count_the_watcher_would_reject_lands_on_the_default_and_says_so(self) -> None:
+        # Nineteen digits can overflow the int64 the flag package parses into.
+        for value in ("abc", "-1", "1.5", "3x", "0x10", "1234567890123456789"):
+            with self.subTest(value=value):
+                result = self._resolve("normalize_count", value, _FALLBACK_COUNT)
+                self.assertIn(f"resolved={_FALLBACK_COUNT}", result.stdout)
+                self.assertIn("is not a usable count", result.stderr)
+
+    def test_every_watcher_flag_tunable_is_normalised_against_a_named_default(self) -> None:
+        """Declared from a named default, normalised, and passed to the watcher.
+
+        A tunable added to the flag list without the middle line is the bug this
+        class exists for, so each of the three is checked per knob.
+        """
+        watcher = self.lift("start_event_watcher")
+        for knobs, helper in (
+            (_WATCHER_DURATION_KNOBS, "normalize_duration"),
+            (_WATCHER_COUNT_KNOBS, "normalize_count"),
+        ):
+            for name, flag in knobs.items():
+                with self.subTest(name=name):
+                    lift_constant(f"{name}_DEFAULT", self.text, _SCRIPT)
+                    self.assertIn(f'{name}="${{{name}:-${{{name}_DEFAULT}}}}"', self.text)
+                    suffix = " positive" if name in _WATCHER_POSITIVE_DURATION_KNOBS else ""
+                    self.assertRegex(
+                        self.text,
+                        rf'(?m)^{helper} {name} "\$\{{{name}_DEFAULT\}}"{suffix}$',
+                    )
+                    self.assertIn(f'{flag}="${{{name}}}"', watcher)
+
+        # And no WATCHER_* value reaches a duration or count flag unnormalised.
+        passed = set(re.findall(r'--[a-z-]+="\$\{(WATCHER_[A-Z_]+)\}"', watcher))
+        covered = set(_WATCHER_DURATION_KNOBS) | set(_WATCHER_COUNT_KNOBS)
+        self.assertEqual(
+            set(),
+            passed - covered - {"WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD"},
+            "a WATCHER_* value reaches the watcher without a normaliser",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

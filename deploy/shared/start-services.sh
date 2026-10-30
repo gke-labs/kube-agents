@@ -225,6 +225,64 @@ normalize_boolean() {
   esac
 }
 
+# The shapes Go's flag package accepts for the watcher's duration and count
+# flags, narrowed to what a tunable here can mean. A duration is
+# time.ParseDuration's grammar without the sign (every duration the watcher
+# takes rejects a negative in validate()) and without `µs`, a spelling nobody
+# types for a span of minutes; either way a value outside the pattern only
+# reaches the fallback, never the binary. A count is plain decimal, at most
+# eighteen digits: the flag package reads ints with a base prefix, so `08` is a
+# bad octal literal there, and nineteen digits can overflow an int64, which it
+# rejects as out of range.
+readonly WATCHER_DURATION_PATTERN='^(0|([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+)$'
+readonly WATCHER_COUNT_PATTERN='^[0-9]{1,18}$'
+
+# Rewrite the *named* variable, in place, to a duration the watcher's flag
+# parser and validate() both accept, or to $2 if it is not one. The same
+# contract as normalize_boolean above, for the same reason: the value is pasted
+# into `--flag=${value}`, and one the watcher rejects is an exit on every start
+# -- the supervisor's backoff, `NO cluster events are being watched`, and a
+# container that stays Ready -- for a missing unit. $3, when set, also refuses
+# zero, for the flag whose validate() requires a value above it.
+normalize_duration() {
+  local name="$1"
+  local fallback="$2"
+  local positive="${3:-}"
+  local value="${!name}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+
+  # Zero is a value with no non-zero digit in it: `0`, `0s`, `0m0.0s`. The
+  # units carry no digits, so the test reads only the numbers.
+  if [[ "${value}" =~ ${WATCHER_DURATION_PATTERN} ]] && { [[ -z "${positive}" ]] || [[ "${value}" =~ [1-9] ]]; }; then
+    printf -v "${name}" '%s' "${value}"
+    return 0
+  fi
+
+  printf -v "${name}" '%s' "${fallback}"
+  echo "start-services: ${name}=${value} is not a usable duration (a Go duration such as 2m or 90s${positive:+, above zero}); using ${fallback}" >&2
+}
+
+# Rewrite the *named* variable, in place, to a decimal count the watcher's flag
+# parser accepts, or to $2 if it is not one. Leading zeros are dropped rather
+# than reported, as clamp_at_least drops them: `08` and `8` are the same
+# request, and only the binary would have read them differently.
+normalize_count() {
+  local name="$1"
+  local fallback="$2"
+  local value="${!name}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+
+  if [[ "${value}" =~ ${WATCHER_COUNT_PATTERN} ]]; then
+    printf -v "${name}" '%s' "$((10#${value}))"
+    return 0
+  fi
+
+  printf -v "${name}" '%s' "${fallback}"
+  echo "start-services: ${name}=${value} is not a usable count (decimal digits); using ${fallback}" >&2
+}
+
 clamp_at_least WATCHER_RETRY_MIN_SECONDS
 clamp_at_least DRIFT_RETRY_MIN_SECONDS
 # The ceilings are floored at their own minimum, not at MIN_SETTING_VALUE: a
@@ -312,7 +370,15 @@ WATCHER_DEDUP_DIR="${WATCHER_DEDUP_DIR:-${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/
 #
 # Overridable because the right value depends on the fleet's failure mix, and
 # an operator should not have to rebuild the image to find out.
-WATCHER_DEDUP_WINDOW="${WATCHER_DEDUP_WINDOW:-24h}"
+#
+# This and the seven tunables below reach the watcher as flags, so each is
+# normalised where it is declared (normalize_duration, normalize_count) against
+# a default named once, as WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD is: an unset
+# value and an unusable one resolve the same way. The window is the one that
+# also refuses zero, which the watcher's validate() rejects.
+readonly WATCHER_DEDUP_WINDOW_DEFAULT=24h
+WATCHER_DEDUP_WINDOW="${WATCHER_DEDUP_WINDOW:-${WATCHER_DEDUP_WINDOW_DEFAULT}}"
+normalize_duration WATCHER_DEDUP_WINDOW "${WATCHER_DEDUP_WINDOW_DEFAULT}" positive
 
 # Leading-edge debounce for the crash-loop family: how many times kubelet must
 # report the same BackOff before it is treated as an incident rather than a
@@ -321,7 +387,9 @@ WATCHER_DEDUP_WINDOW="${WATCHER_DEDUP_WINDOW:-24h}"
 # operator tunes per install — a cluster with slow-starting workloads wants it
 # higher — and threading it through an env var means doing so does not require
 # rebuilding the image. Set to 1 to restore firing on the first event.
-WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-3}"
+readonly WATCHER_BACKOFF_MIN_COUNT_DEFAULT=3
+WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}}"
+normalize_count WATCHER_BACKOFF_MIN_COUNT "${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}"
 
 # The same debounce for the half of the image-pull family that self-clears —
 # registry rate limits, 5xx, connection timeouts. Only failures the watcher
@@ -330,7 +398,9 @@ WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-3}"
 # separately from the crash-loop value: an install pulling from a rate-limited
 # public registry wants it higher, and one where every pull is from a private
 # mirror will rarely see it apply at all. Set to 1 to disable.
-WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-3}"
+readonly WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT=3
+WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT}}"
+normalize_count WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT "${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT}"
 
 # The backstop for FailedScheduling when cluster-autoscaler has recorded no
 # verdict on the pod: five failed scheduling attempts, with
@@ -343,7 +413,9 @@ WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-
 # --reason list below so the watcher reads them; neither is forwarded. Set to
 # 1, with WATCHER_FAILEDSCHEDULING_MIN_SPAN=0, to fire on the first event when
 # no verdict is on record.
-WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-5}"
+readonly WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT=5
+WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-${WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT}}"
+normalize_count WATCHER_FAILEDSCHEDULING_MIN_COUNT "${WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT}"
 
 # How long such a FailedScheduling has to have lasted, by the event's own first
 # and last sighting, before the count backstop passes it. The count alone
@@ -351,9 +423,11 @@ WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-5}"
 # recorded, the scheduler retries the evicted pod's replacement on every
 # change, and it is placed seconds later. A pod still stuck is sighted again
 # within the scheduler's five-minute flush and fires then. A Go duration
-# (2m, 90s); a bare number stops the watcher from starting. Set to 0 to
-# switch it off.
-WATCHER_FAILEDSCHEDULING_MIN_SPAN="${WATCHER_FAILEDSCHEDULING_MIN_SPAN:-2m}"
+# (2m, 90s); anything else falls back to the default. Set to 0 to switch it
+# off.
+readonly WATCHER_FAILEDSCHEDULING_MIN_SPAN_DEFAULT=2m
+WATCHER_FAILEDSCHEDULING_MIN_SPAN="${WATCHER_FAILEDSCHEDULING_MIN_SPAN:-${WATCHER_FAILEDSCHEDULING_MIN_SPAN_DEFAULT}}"
+normalize_duration WATCHER_FAILEDSCHEDULING_MIN_SPAN "${WATCHER_FAILEDSCHEDULING_MIN_SPAN_DEFAULT}"
 
 # How long a TriggeredScaleUp on a pod holds its FailedScheduling events,
 # measured from the autoscaler's event to the FailedScheduling's own last
@@ -361,7 +435,9 @@ WATCHER_FAILEDSCHEDULING_MIN_SPAN="${WATCHER_FAILEDSCHEDULING_MIN_SPAN:-2m}"
 # the alert: 15m is cluster-autoscaler's default node-provision timeout, and
 # a pod still pending past it is reported on the count whatever the autoscaler
 # last said. Raise it on a cluster whose node pools take longer to provision.
-WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-15m}"
+readonly WATCHER_SCALEUP_HOLD_DEFAULT=15m
+WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-${WATCHER_SCALEUP_HOLD_DEFAULT}}"
+normalize_duration WATCHER_SCALEUP_HOLD "${WATCHER_SCALEUP_HOLD_DEFAULT}"
 
 # The settle period: how long a failure in the settle family (the crash-loop
 # family, FailedMount, Unhealthy; the reasons kubelet re-emits while they
@@ -373,7 +449,9 @@ WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-15m}"
 # its fourth or fifth back-off and is forwarded with its first sighting kept.
 # Never applied to OOMKilled, the image-pull family or FailedScheduling, which
 # have gates of their own. Set to 0 to switch it off.
-WATCHER_SETTLE="${WATCHER_SETTLE:-2m}"
+readonly WATCHER_SETTLE_DEFAULT=2m
+WATCHER_SETTLE="${WATCHER_SETTLE:-${WATCHER_SETTLE_DEFAULT}}"
+normalize_duration WATCHER_SETTLE "${WATCHER_SETTLE_DEFAULT}"
 
 # How long after its last sighting an incident whose alert went out is reported
 # quiet: the watcher sends the Session KV server one k8s-event-followup inject
@@ -383,7 +461,9 @@ WATCHER_SETTLE="${WATCHER_SETTLE:-2m}"
 # deleted pod goes as quiet as a recovered one. Past kubelet's 5m back-off
 # ceiling with margin, so a crash loop still going is never reported quiet
 # between two of its back-offs. Set to 0 to send none.
-WATCHER_QUIET_AFTER="${WATCHER_QUIET_AFTER:-15m}"
+readonly WATCHER_QUIET_AFTER_DEFAULT=15m
+WATCHER_QUIET_AFTER="${WATCHER_QUIET_AFTER:-${WATCHER_QUIET_AFTER_DEFAULT}}"
+normalize_duration WATCHER_QUIET_AFTER "${WATCHER_QUIET_AFTER_DEFAULT}"
 
 # Whether to hold the FailedScheduling an Autopilot cluster emits for GKE's own
 # system pods once it has scaled itself to zero nodes — kube-dns, metrics-server,
