@@ -13,8 +13,9 @@
 # limitations under the License.
 
 # The deployer drops an injected variable this stack does not declare and
-# raises on a task.yaml variable it does not declare, so this file and
-# bench/tasks/findings-decision-covers-item/task.yaml are a matched pair.
+# raises on a task.yaml variable it does not declare, so this file,
+# bench/tasks/findings-decision-covers-item/task.yaml and
+# bench/tasks/findings-decision-leaves-unnamed-open/task.yaml are matched.
 
 variable "host_cluster_name" {
   type        = string
@@ -48,4 +49,12 @@ variable "agent_container" {
   type        = string
   description = "Container inside agent_deployment that runs the Session KV server and holds its key"
   default     = "platform-agent"
+}
+
+# Which rows to plant: findings.json for findings-decision-covers-item, and
+# findings-unnamed.json for findings-decision-leaves-unnamed-open, which adds
+# a row no message has named (`plant_state: queued`) under its own project.
+variable "findings_file" {
+  type    = string
+  default = "findings.json"
 }

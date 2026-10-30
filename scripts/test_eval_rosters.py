@@ -732,6 +732,7 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 API_LANE_EXCLUDED = [
     "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
+    "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
 ]
 
 
@@ -777,6 +778,24 @@ class ApiLaneExclusionsTest(unittest.TestCase):
             if is_stopped_ask(str(doc.get("prompt") or "")):
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} is a stopped ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
+
+    def test_every_registered_reply_under_pushed_report_is_excluded(self):
+        # The same rule for the pushed-report replay: it errors on the api
+        # transport, and its directive is read from the harness's module.
+        import yaml
+
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench.pushed_report import is_reply_under_pushed_report
+
+        excluded = eval_rosters.api_lane_exclusions()
+        found = []
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            if is_reply_under_pushed_report(str(doc.get("prompt") or "")):
+                found.append(case)
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} replays a pushed report but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
+        self.assertIn("chat-reply-under-pushed-report", found)
 
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the

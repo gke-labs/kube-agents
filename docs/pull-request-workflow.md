@@ -169,7 +169,10 @@ one shared key, restored everywhere and saved only on main — so editing the ma
 cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
 `make test-bench-deps` retries its pip install the same way, because the devops-bench pin is a git
 clone that pip does not retry, and `tests/test_bench_deps_install_retry.py` runs that loop against a
-stub pip.
+stub pip. The artifact download in `python-tests.yml`'s join gets a second attempt a minute after a
+failed first one, because the action's own retries ran out twice with every shard uploaded;
+`test_the_join_downloads_the_shards_coverage_twice` in `scripts/test_integration_contracts.py` holds
+that shape.
 
 **Operator code.** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to
 ensure compilation succeeds.

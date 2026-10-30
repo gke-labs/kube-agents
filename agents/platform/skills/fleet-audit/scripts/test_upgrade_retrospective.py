@@ -35,6 +35,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 # file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell that carries either would turn
 # this suite's --project runs into refusals; both are neutralised at import, as the sibling suites do.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URL unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import upgrade_retrospective as ur  # noqa: E402
 
 ur.fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
@@ -6493,11 +6497,10 @@ class SopQuotesTest(unittest.TestCase):
 class SweepEntryTest(unittest.TestCase):
     def test_collect_fleet_is_the_pinned_pool_entry(self):
         # The sweep-pool test across the collectors pins every module that runs a ThreadPoolExecutor
-        # to MAX_WORKERS (the credential proxy's admitted count at the default limit, four) through a
-        # `collect_fleet` entry whose `max_workers` defaults to it.
-        self.assertEqual(ur.MAX_WORKERS, 4)
+        # to a `collect_fleet` entry whose `max_workers` defaults to None and is resolved from the
+        # credential broker's admitted count (broker_admission.sweep_width()).
         self.assertIs(ur.collect, ur.collect_fleet)
-        self.assertEqual(inspect.signature(ur.collect_fleet).parameters["max_workers"].default, ur.MAX_WORKERS)
+        self.assertIsNone(inspect.signature(ur.collect_fleet).parameters["max_workers"].default)
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {ur.HERMES_HOME_ENV: tmp, ur.STORE_HOME_ENV: tmp}):
             with redirect_stderr(io.StringIO()):
                 result = ur.collect_fleet(args(), run=FakeFleet(), now=NOW, max_workers=1)

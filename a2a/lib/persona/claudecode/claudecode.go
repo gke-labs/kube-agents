@@ -46,7 +46,7 @@ const (
 
 // builtinTools maps the neutral built-in names to Claude Code's tools.
 var builtinTools = map[string][]string{
-	persona.ToolReadFile:  {"Read", "Glob", "Grep"},
+	persona.ToolReadFile:  {"Read", "Glob", "Grep", "LS", "NotebookRead"},
 	persona.ToolWebSearch: {"WebSearch"},
 	persona.ToolShell:     {"Bash", "BashOutput", "KillShell"},
 }

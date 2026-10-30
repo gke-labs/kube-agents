@@ -21,10 +21,13 @@ checking the tree out is for, and which has its own test.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import subprocess
+import tarfile
 import tempfile
+import shutil
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -35,6 +38,7 @@ import repo_ref
 import vcs_broker
 from providers import (
     BROKER_VERBS,
+    LIBRARY_VERBS,
     COLLABORATION_VERBS,
     ForgeUnsupported,
     Registry,
@@ -70,14 +74,14 @@ def git(cwd: Path | str, *args: str, check: bool = True):
     )
 
 
-def git_runner(argv, cwd, check=True, config=(), *, allow_http=False):
+def git_runner(argv, cwd, check=True, config=(), *, allow_http=False, stop=None):
     """The shape the broker's git runner presents.
 
     `config` is what the forge's credential asked for on this invocation. The
     executor turns it into a `GIT_CONFIG_COUNT` layer; here it becomes `-c`
     flags, which is the same precedence and is visible to an assertion.
     """
-    del allow_http
+    del allow_http, stop
     flags = [flag for key, value in config for flag in ("-c", f"{key}={value}")]
     return subprocess.run(
         [argv[0], *flags, *argv[1:]],
@@ -2472,7 +2476,7 @@ class CapabilitiesTest(unittest.TestCase):
         self.assertEqual(answer["forge"], self.broker.registry.default.name)
         self.assertEqual(answer["proposalNoun"], "pull request")
         self.assertEqual(
-            sorted(answer["verbs"]), sorted({*BROKER_VERBS, *COLLABORATION_VERBS})
+            sorted(answer["verbs"]), sorted({*BROKER_VERBS, *COLLABORATION_VERBS} - LIBRARY_VERBS)
         )
         self.assertEqual(answer["missing"], [])
 
@@ -3693,15 +3697,558 @@ class IdentityWithoutCurrentUserRouteTest(unittest.TestCase):
                 self.assertEqual("", forge.identity)
 
 
+class FileUrlForge(LocalForge):
+    """`LocalForge` reached by a `file://` URL.
+
+    git ignores `--depth` for a clone from a plain path ("use file://
+    instead"), so the snapshot tests use this one to see the depth hold.
+    """
+
+    def clone_url(self, repo: str) -> str:
+        return (self.root / repo).as_uri()
+
+
+class ReadOnlyCredential(RecordingCredential):
+    """What a forge's `read_credential` hands back in these tests: a recorder."""
+
+
+class ContextReadingForge(FileUrlForge):
+    """A forge with a read-only credential, so the context row has one to present."""
+
+    def __init__(self, root, minted=None, read_config=()):
+        super().__init__(root, minted)
+        self.read_ensured: list[str] = []
+        self.read_config = tuple(read_config)
+
+    def read_credential(self, repo):
+        credential = ReadOnlyCredential(self.read_ensured)
+        credential.config = self.read_config
+        return credential
+
+
+def tar_names(answer: dict) -> list[str]:
+    data = base64.b64decode(answer["archiveBase64"])
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+        return archive.getnames()
+
+
+def tar_text(answer: dict, name: str) -> str:
+    data = base64.b64decode(answer["archiveBase64"])
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+        return archive.extractfile(name).read().decode()
+
+
+class SnapshotTest(unittest.TestCase):
+    """`snapshot`: one revision's tree as a tar, by real git against a bare repository."""
+
+    commit_in = RepositoryVerbTest.commit_in
+    REPOSITORY = "local.test/acme/infra"
+    HELPER_CLEARED = ("credential.helper", "")
+
+    def setUp(self):
+        RepositoryVerbTest.setUp(self)
+        # A second revision on main, so a full clone and a depth-1 clone differ.
+        (self.seed / "manifests").mkdir()
+        self.main_tip = self.commit_in(self.seed, "manifests/app.yaml", "kind: app\n", "second")
+        git(self.seed, "tag", "-a", "v1", "-m", "release one")
+        self.commit_in(self.seed, "README.md", "after the tag\n", "third")
+        self.main_tip = git(self.seed, "rev-parse", "HEAD").stdout.strip()
+        self.tag_commit = git(self.seed, "rev-parse", "v1^{commit}").stdout.strip()
+        git(self.seed, "push", "--quiet", "origin", "main", "v1")
+        self.forge = FileUrlForge(self.forges, self.refreshed)
+        self.calls: list[tuple[list[str], tuple]] = []
+        self.broker = self.make_broker()
+
+    def make_broker(self, forge=None, **kwargs):
+        def recording(argv, cwd, check=True, config=(), *, allow_http=False, stop=None):
+            self.calls.append((list(argv), tuple(config)))
+            return git_runner(argv, cwd, check, config, allow_http=allow_http)
+
+        broker = VcsBroker(self.scratch, git_runner=recording, **kwargs)
+        broker.registry.hosts["local.test"] = forge or self.forge
+        return broker
+
+    def configs(self) -> set[tuple]:
+        return {config for _argv, config in self.calls}
+
+    def clone_argv(self) -> list[str]:
+        return next(argv for argv, _ in self.calls if argv[1] == "clone")
+
+    # -- the tar -----------------------------------------------------------
+
+    def test_the_snapshot_is_the_tree_as_a_tar_with_no_git(self):
+        answer = self.broker.snapshot({"repository": self.REPOSITORY})
+        names = tar_names(answer)
+        self.assertIn("README.md", names)
+        self.assertIn("manifests/app.yaml", names)
+        self.assertFalse(
+            [name for name in names if ".git" in name.lower().split("/")], names
+        )
+        self.assertEqual("after the tag\n", tar_text(answer, "README.md"))
+        self.assertEqual(
+            {
+                "forge": "local",
+                "repo": "acme/infra",
+                "role": "unregistered",
+                "ref": "main",
+                "revision": self.main_tip,
+                "history": "none",
+            },
+            {key: answer[key] for key in ("forge", "repo", "role", "ref", "revision", "history")},
+        )
+        self.assertEqual(len(base64.b64decode(answer["archiveBase64"])), answer["size"])
+
+    def test_the_clone_is_bare_one_revision_deep_and_one_branch_wide(self):
+        depth = []
+
+        def recording(argv, cwd, check=True, config=(), *, allow_http=False, stop=None):
+            if "archive" in argv:
+                # The clone as `archive` sees it: shallow, one revision.
+                depth.append(
+                    (
+                        (Path(cwd) / "shallow").is_file(),
+                        git(cwd, "rev-list", "--count", "--all").stdout.strip(),
+                        git(cwd, "rev-parse", "--is-bare-repository").stdout.strip(),
+                    )
+                )
+            return git_runner(argv, cwd, check, config)
+
+        broker = VcsBroker(self.scratch, git_runner=recording)
+        broker.registry.hosts["local.test"] = self.forge
+        broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual([(True, "1", "true")], depth)
+        self.broker.snapshot({"repository": self.REPOSITORY})
+        argv = self.clone_argv()
+        for flag in ("--bare", "--single-branch", "--no-recurse-submodules"):
+            self.assertIn(flag, argv)
+        self.assertEqual("1", argv[argv.index("--depth") + 1])
+
+    def test_snapshot_leaves_nothing_behind(self):
+        self.broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual([], list(self.scratch.iterdir()))
+
+    def test_the_archive_goes_to_a_file_and_not_to_stdout(self):
+        # The git runner cuts stdout at its output ceiling.
+        self.broker.snapshot({"repository": self.REPOSITORY})
+        (argv,) = [argv for argv, _ in self.calls if "archive" in argv]
+        self.assertTrue(any(arg.startswith("--output=") for arg in argv), argv)
+        self.assertEqual("--literal-pathspecs", argv[1])
+
+    # -- ref ---------------------------------------------------------------
+
+    def test_a_named_branch_is_the_tree_of_that_branch(self):
+        git(self.seed, "checkout", "--quiet", "-b", "side")
+        side_tip = self.commit_in(self.seed, "side.txt", "s\n", "side work")
+        git(self.seed, "push", "--quiet", "origin", "side")
+        answer = self.broker.snapshot({"repository": self.REPOSITORY, "ref": "side"})
+        self.assertEqual(("side", side_tip), (answer["ref"], answer["revision"]))
+        self.assertIn("side.txt", tar_names(answer))
+        self.assertEqual("side", self.clone_argv()[self.clone_argv().index("--branch") + 1])
+
+    def test_a_tag_is_the_tree_of_the_commit_it_names(self):
+        # A bare clone of a tag leaves HEAD on no branch, so the revision is
+        # looked up by the tag's own name.
+        answer = self.broker.snapshot({"repository": self.REPOSITORY, "ref": "v1"})
+        self.assertEqual(("v1", self.tag_commit), (answer["ref"], answer["revision"]))
+        self.assertEqual("origin\n", tar_text(answer, "README.md"))
+
+    def test_a_revision_or_a_bad_name_is_refused_before_anything_runs(self):
+        for ref in ("0" * 40, "a" * 64, "A" * 40, "aBc" * 13 + "D", "--upload-pack=touch /tmp/x", "main..x", "HEAD", 7):
+            with self.subTest(ref=ref), self.assertRaises(WorkspaceError) as caught:
+                self.broker.snapshot({"repository": self.REPOSITORY, "ref": ref})
+            self.assertEqual(400, caught.exception.status)
+        self.assertEqual([], self.calls)
+
+    def test_a_branch_the_remote_lacks_is_a_git_failure(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.broker.snapshot({"repository": self.REPOSITORY, "ref": "absent"})
+        self.assertEqual([], list(self.scratch.iterdir()))
+
+    def test_with_no_ref_a_pinned_base_is_used(self):
+        git(self.seed, "checkout", "--quiet", "-b", "gitops-base")
+        base_tip = self.commit_in(self.seed, "base.txt", "base\n", "on the base")
+        git(self.seed, "push", "--quiet", "origin", "gitops-base")
+        self.broker.pinned_bases = {("local.test", "acme/infra"): "gitops-base"}
+        answer = self.broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual(("gitops-base", base_tip), (answer["ref"], answer["revision"]))
+        self.assertIn("base.txt", tar_names(answer))
+        # A named ref still wins over the pin.
+        answer = self.broker.snapshot({"repository": self.REPOSITORY, "ref": "main"})
+        self.assertEqual(("main", self.main_tip), (answer["ref"], answer["revision"]))
+
+    def test_a_pinned_base_the_remote_lacks_is_refused_by_name(self):
+        self.broker.pinned_bases = {("local.test", "acme/infra"): "gitops-base"}
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual((409, "BASE_BRANCH_MISSING"), (caught.exception.status, caught.exception.fields.get("code")))
+        self.assertFalse([argv for argv, _ in self.calls if argv[1] == "clone"])
+        self.assertEqual([], list(self.scratch.iterdir()))
+
+    # -- paths -------------------------------------------------------------
+
+    def test_paths_narrow_the_tar_to_those_paths(self):
+        answer = self.broker.snapshot({"repository": self.REPOSITORY, "paths": ["manifests"]})
+        data = base64.b64decode(answer["archiveBase64"])
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            files = [member.name for member in archive.getmembers() if member.isreg()]
+        self.assertEqual(["manifests/app.yaml"], files)
+
+    def test_a_path_is_a_literal_name_and_not_a_pattern(self):
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY, "paths": ["*.md"]})
+        self.assertEqual((400, "PATH_NOT_FOUND"), (caught.exception.status, caught.exception.fields.get("code")))
+        whole = self.broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual(whole["revision"], caught.exception.fields.get("revision"))
+        self.assertEqual([], list(self.scratch.iterdir()))
+
+    def test_a_path_too_long_for_a_command_line_is_refused_before_the_clone(self):
+        for paths in (["a" * 4097], ["d/" + "b" * 1000 + str(i) for i in range(70)]):
+            with self.subTest(count=len(paths)), self.assertRaises(WorkspaceError) as caught:
+                self.broker.snapshot({"repository": self.REPOSITORY, "paths": paths})
+            self.assertEqual(400, caught.exception.status)
+        self.assertFalse([argv for argv, _ in self.calls if argv[1] == "clone"])
+
+    def test_a_path_that_is_not_repository_relative_is_refused(self):
+        for paths in (["../x"], ["/etc/passwd"], [".git/config"], ["a/./b"], [], "README.md", [3], ["x"] * 257):
+            with self.subTest(paths=paths), self.assertRaises(WorkspaceError) as caught:
+                self.broker.snapshot({"repository": self.REPOSITORY, "paths": paths})
+            self.assertEqual(400, caught.exception.status)
+        self.assertEqual([], self.calls)
+
+    # -- ceilings ----------------------------------------------------------
+
+    def test_a_tar_over_the_ceiling_is_refused_and_nothing_is_left(self):
+        self.broker.max_snapshot_bytes = 1
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual((413, "SNAPSHOT_TOO_LARGE"), (caught.exception.status, caught.exception.fields.get("code")))
+        self.assertEqual([], list(self.scratch.iterdir()))
+
+    def test_a_clone_is_stopped_at_the_ceiling_while_it_writes(self):
+        # A clone of anyone's repository could fill the scratch volume before
+        # it ends; the watch kills it once it passes the ceiling, and a killed
+        # git removes what it wrote, as this one does.
+        self.broker.max_clone_bytes = 4096
+        asked = []
+
+        def growing(argv, cwd, check=True, config=(), *, allow_http=False, stop=None):
+            if argv[1] != "clone":
+                return git_runner(argv, cwd, check, config)
+            target = Path(cwd) / argv[-1]
+            target.mkdir()
+            for chunk in range(100):
+                (target / f"pack-{chunk}").write_bytes(b"x" * 1024)
+                asked.append(chunk)
+                if stop is not None and stop():
+                    shutil.rmtree(target)
+                    return subprocess.CompletedProcess(argv, -15, "", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        self.broker._git_runner = growing
+        with mock.patch.object(vcs_broker, "CLONE_WATCH_SECONDS", 0), self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual((413, "CLONE_TOO_LARGE"), (caught.exception.status, caught.exception.fields.get("code")))
+        self.assertLess(len(asked), 10)
+        self.assertEqual([], list(self.scratch.iterdir()))
+
+    def test_a_clone_over_the_ceiling_is_refused_and_nothing_is_left(self):
+        self.broker.max_clone_bytes = 1
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual((413, "CLONE_TOO_LARGE"), (caught.exception.status, caught.exception.fields.get("code")))
+        # The verb has no `branch` field, and no field makes this clone smaller.
+        self.assertNotIn("`branch`", str(caught.exception))
+        self.assertIn("no `ref` or `paths`", str(caught.exception))
+        self.assertFalse([argv for argv, _ in self.calls if "archive" in argv])
+        self.assertEqual([], list(self.scratch.iterdir()))
+
+    def push_tree(self, files: dict[str, bytes], ref: str = "main") -> None:
+        """Commit ``files`` on top of main in the seed and push them as ``ref``."""
+        for name, data in files.items():
+            path = self.seed / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "--quiet", "-m", "more")
+        git(self.seed, "push", "--quiet", "origin", f"HEAD:refs/heads/{ref}")
+
+    def test_a_compressible_tree_over_the_ceiling_is_refused_before_the_archive_is_written(self):
+        # A small pack, a large tar: the clone ceiling cannot see this, so the
+        # tree is sized from its listing before `git archive` writes a byte.
+        self.push_tree({f"zeros/{index}.bin": b"\0" * (1 << 20) for index in range(4)})
+        self.broker.max_snapshot_bytes = 1 << 20
+        written = []
+
+        def recording(argv, cwd, check=True, config=(), *, allow_http=False, stop=None):
+            self.calls.append((list(argv), tuple(config)))
+            if "archive" in argv:
+                written.append(argv)
+            return git_runner(argv, cwd, check, config)
+
+        broker = VcsBroker(self.scratch, git_runner=recording)
+        broker.registry.hosts["local.test"] = self.forge
+        broker.max_snapshot_bytes = 1 << 20
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual((413, "SNAPSHOT_TOO_LARGE"), (caught.exception.status, caught.exception.fields.get("code")))
+        self.assertGreater(int(str(caught.exception).split(" is ")[1].split(" ")[0]), 4 << 20)
+        self.assertEqual([], written)
+        self.assertTrue([argv for argv, _ in self.calls if "ls-tree" in argv])
+        self.assertEqual([], list(self.scratch.iterdir()))
+
+    def test_the_measure_is_never_under_the_tar_and_close_to_it(self):
+        # Long names and a long link target take pax headers; a directory
+        # entry ends in `/`; a blob at two paths is in the tar twice.
+        long_dir = "d" * 120
+        self.push_tree({
+            f"{long_dir}/{'f' * 130}.txt": b"x" * 700,
+            "nested/a/b/c.txt": b"y" * 513,
+            "copy1.txt": b"same\n",
+            "copy2.txt": b"same\n",
+        })
+        os.symlink("t" * 150, self.seed / "longlink")
+        os.symlink("copy1.txt", self.seed / "shortlink")
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "--quiet", "-m", "links")
+        git(self.seed, "push", "--quiet", "origin", "HEAD:refs/heads/main")
+        listings = []
+
+        def recording(argv, cwd, check=True, config=(), *, allow_http=False, stop=None):
+            done = git_runner(argv, cwd, check, config)
+            if "ls-tree" in argv:
+                listings.append(done.stdout)
+            return done
+
+        broker = VcsBroker(self.scratch, git_runner=recording)
+        broker.registry.hosts["local.test"] = self.forge
+        answer = broker.snapshot({"repository": self.REPOSITORY})
+        (listing,) = listings
+        measured = vcs_broker._tar_bytes(listing)
+        self.assertGreaterEqual(measured, answer["size"])
+        self.assertLessEqual(measured, answer["size"] + vcs_broker.TAR_RECORD_BYTES)
+        # With `paths`, the listing is narrowed the same way the tar is.
+        listings.clear()
+        answer = broker.snapshot({"repository": self.REPOSITORY, "paths": ["nested"]})
+        self.assertGreaterEqual(vcs_broker._tar_bytes(listings[0]), answer["size"])
+        self.assertNotIn("copy1.txt", listings[0])
+
+    def test_a_listing_the_runner_cut_short_is_refused(self):
+        def cutting(argv, cwd, check=True, config=(), *, allow_http=False, stop=None):
+            self.calls.append((list(argv), tuple(config)))
+            done = git_runner(argv, cwd, check, config)
+            if "ls-tree" in argv:
+                done.truncated = True
+            return done
+
+        broker = VcsBroker(self.scratch, git_runner=cutting)
+        broker.registry.hosts["local.test"] = self.forge
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual((413, "SNAPSHOT_TOO_LARGE"), (caught.exception.status, caught.exception.fields.get("code")))
+        self.assertFalse([argv for argv, _ in self.calls if "archive" in argv])
+        self.assertEqual([], list(self.scratch.iterdir()))
+
+    def test_the_written_tar_is_still_checked_after_the_measure(self):
+        self.broker.max_snapshot_bytes = 1
+        with mock.patch.object(vcs_broker, "_tar_bytes", return_value=0), self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual((413, "SNAPSHOT_TOO_LARGE"), (caught.exception.status, caught.exception.fields.get("code")))
+        self.assertTrue([argv for argv, _ in self.calls if "archive" in argv])
+        self.assertEqual([], list(self.scratch.iterdir()))
+
+    def test_the_tar_holds_the_committed_bytes_whatever_the_tree_s_attributes_say(self):
+        # `export-subst`, `ident`, `text`/`eol` and `working-tree-encoding`
+        # all make `archive` write other bytes, some far more of them, than
+        # the listing measured.
+        committed = b"$Format:%H %B$\n$Id$\nline one\nline two\n"
+        self.push_tree({
+            ".gitattributes": b"* export-subst ident text eol=crlf\nutf.txt working-tree-encoding=UTF-16\n",
+            "subst.txt": committed,
+            # git stores it as UTF-8 and would write it back as UTF-16.
+            "utf.txt": "plain ascii\n".encode("utf-16"),
+        })
+        answer = self.broker.snapshot({"repository": self.REPOSITORY})
+        data = base64.b64decode(answer["archiveBase64"])
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            self.assertEqual(committed, archive.extractfile("subst.txt").read())
+            self.assertEqual(b"plain ascii\n", archive.extractfile("utf.txt").read())
+
+    def test_the_tar_holds_files_the_tree_marks_export_ignore(self):
+        # A repository marks files `export-ignore` for its release tarballs;
+        # a snapshot is a read of the tree, so it leaves nothing out.
+        self.push_tree({
+            ".gitattributes": b"manifests/** export-ignore\nnotes.txt export-ignore\n",
+            "manifests/app.yaml": b"kind: app\n",
+            "notes.txt": b"kept\n",
+        })
+        answer = self.broker.snapshot({"repository": self.REPOSITORY})
+        data = base64.b64decode(answer["archiveBase64"])
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            names = archive.getnames()
+        self.assertIn("manifests/app.yaml", names)
+        self.assertIn("notes.txt", names)
+
+    def test_the_tar_ceiling_comes_from_its_own_variable(self):
+        with mock.patch.dict(os.environ, {vcs_broker.MAX_SNAPSHOT_BYTES_ENV: "1234"}):
+            self.assertEqual(1234, self.make_broker().max_snapshot_bytes)
+        with mock.patch.dict(os.environ, {vcs_broker.MAX_SNAPSHOT_BYTES_ENV: ""}):
+            self.assertEqual(32 << 20, self.make_broker().max_snapshot_bytes)
+
+    # -- a crafted tree ----------------------------------------------------
+
+    def test_a_tree_carrying_a_git_entry_is_not_served(self):
+        # `git archive` refuses to write a path git would not check out, so a
+        # tree crafted with a `.GIT` directory fails here as a git error.
+        blob = subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"], cwd=self.seed, input="[core]\n",
+            capture_output=True, text=True, check=True, env={**os.environ, **GIT_ENV},
+        ).stdout.strip()
+        sub = subprocess.run(
+            ["git", "mktree"], cwd=self.seed, input=f"100644 blob {blob}\tconfig\n",
+            capture_output=True, text=True, check=True, env={**os.environ, **GIT_ENV},
+        ).stdout.strip()
+        tree = subprocess.run(
+            ["git", "mktree"], cwd=self.seed,
+            input=f"040000 tree {sub}\t.GIT\n100644 blob {blob}\tok.txt\n",
+            capture_output=True, text=True, check=True, env={**os.environ, **GIT_ENV},
+        ).stdout.strip()
+        commit = git(self.seed, "commit-tree", "-m", "crafted", "-p", "HEAD", tree).stdout.strip()
+        git(self.seed, "push", "--quiet", "origin", f"{commit}:refs/heads/crafted")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.broker.snapshot({"repository": self.REPOSITORY, "ref": "crafted"})
+        self.assertEqual([], list(self.scratch.iterdir()))
+
+    # -- the credential, by role --------------------------------------------
+
+    def test_a_managed_repository_rides_the_managed_credential(self):
+        self.forge.credential.config = (("credential.helper", "!managed"),)
+        broker = self.make_broker(repository_role=lambda forge, repo: "managed")
+        answer = broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual("managed", answer["role"])
+        self.assertEqual(["acme/infra"], self.refreshed)
+        self.assertEqual({(("credential.helper", "!managed"),)}, self.configs())
+
+    def test_a_context_repository_presents_the_read_credential_with_the_helper_cleared(self):
+        forge = ContextReadingForge(
+            self.forges, self.refreshed, read_config=(("http.extraheader", "AUTHORIZATION: basic eA=="),)
+        )
+        forge.credential.config = (("credential.helper", "!managed"),)
+        broker = self.make_broker(forge, repository_role=lambda forge, repo: "context")
+        answer = broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual("context", answer["role"])
+        # The read credential was made current; the managed one never was.
+        self.assertEqual(["acme/infra"], forge.read_ensured)
+        self.assertEqual([], self.refreshed)
+        self.assertEqual(
+            {(self.HELPER_CLEARED, ("http.extraheader", "AUTHORIZATION: basic eA=="))},
+            self.configs(),
+        )
+
+    def test_a_read_credential_that_clears_the_helper_itself_is_not_given_a_second_clear(self):
+        config = (("http.extraheader", "x"), self.HELPER_CLEARED)
+        forge = ContextReadingForge(self.forges, self.refreshed, read_config=config)
+        broker = self.make_broker(forge, repository_role=lambda forge, repo: "context")
+        broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual({config}, self.configs())
+
+    def test_a_context_repository_on_a_forge_with_no_read_credential_presents_none(self):
+        # `Forge.read_credential` is `NoCredential`, whose config is empty: the
+        # clear is added here, or the ambient helper would answer.
+        self.forge.credential.config = (("credential.helper", "!managed"),)
+        broker = self.make_broker(repository_role=lambda forge, repo: "context")
+        broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual([], self.refreshed)
+        self.assertEqual({(self.HELPER_CLEARED,)}, self.configs())
+
+    def test_an_unregistered_repository_presents_no_credential_and_clears_the_helper(self):
+        self.forge.credential.config = (("credential.helper", "!managed"),)
+        for role_of in (lambda forge, repo: "unregistered", None):
+            with self.subTest(hook=role_of):
+                self.calls.clear()
+                broker = self.make_broker(repository_role=role_of)
+                answer = broker.snapshot({"repository": self.REPOSITORY})
+                self.assertEqual("unregistered", answer["role"])
+                self.assertEqual([], self.refreshed)
+                self.assertEqual({(self.HELPER_CLEARED,)}, self.configs())
+
+    def test_lists_that_cannot_be_read_are_read_as_unregistered(self):
+        def unreadable(forge, repo):
+            raise RuntimeError("kubectl exited 1")
+
+        self.forge.credential.config = (("credential.helper", "!managed"),)
+        broker = self.make_broker(repository_role=unreadable)
+        with self.assertLogs(vcs_broker.LOGGER, level="WARNING") as logs:
+            answer = broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual("unregistered", answer["role"])
+        self.assertEqual([], self.refreshed)
+        self.assertEqual({(self.HELPER_CLEARED,)}, self.configs())
+        self.assertIn("could not be read", "\n".join(logs.output))
+
+    def test_the_role_is_asked_of_the_resolved_forge_and_repository(self):
+        asked = []
+        broker = self.make_broker(
+            repository_role=lambda forge, repo: asked.append((forge.name, repo)) or "unregistered"
+        )
+        broker.snapshot({"repository": "https://local.test/acme/infra"})
+        self.assertEqual([("local", "acme/infra")], asked)
+
+    def test_a_host_this_install_does_not_serve_is_refused_before_the_role_is_asked(self):
+        asked = []
+        broker = self.make_broker(repository_role=lambda forge, repo: asked.append(repo))
+        with self.assertRaises(ForgeUnsupported):
+            broker.snapshot({"repository": "https://git.example.invalid/acme/infra"})
+        self.assertEqual(([], []), (asked, self.calls))
+
+    # -- a name read from outside the host table ------------------------------
+
+    def test_a_fallback_name_is_cloned_from_its_url_with_no_credential(self):
+        url = (self.forges / "acme/infra").as_uri()
+        seen = []
+
+        def fallback(repository, forges):
+            seen.append((repository, forges))
+            return ("elsewhere", "acme/infra", url) if repository == "acme/infra" else None
+
+        asked = []
+        broker = self.make_broker(
+            repository_role=lambda forge, repo: asked.append(repo) or "unregistered",
+            bare_name_fallback=fallback,
+        )
+        # The registry would refuse this name: no forge is the install's one.
+        answer = broker.snapshot({"repository": "acme/infra"})
+        self.assertEqual(("elsewhere", "acme/infra", "unregistered"), (answer["forge"], answer["repo"], answer["role"]))
+        self.assertEqual(self.main_tip, answer["revision"])
+        self.assertEqual({(self.HELPER_CLEARED,)}, self.configs())
+        self.assertEqual(url, self.clone_argv()[-2])
+        self.assertEqual(broker.registry.forges, seen[0][1])
+        self.assertEqual([], asked)
+        # Any other name goes through the registry and asks the role.
+        broker.snapshot({"repository": self.REPOSITORY})
+        self.assertEqual(["acme/infra"], asked)
+
+    def test_a_name_the_fallback_lifts_is_resolved_in_its_place(self):
+        asked = []
+        broker = self.make_broker(
+            repository_role=lambda forge, repo: asked.append((forge.name, repo)) or "unregistered",
+            bare_name_fallback=lambda repository, forges: self.REPOSITORY if repository == "acme/infra" else None,
+        )
+        answer = broker.snapshot({"repository": "acme/infra"})
+        self.assertEqual(("local", "acme/infra"), (answer["forge"], answer["repo"]))
+        self.assertEqual([("local", "acme/infra")], asked)
+        self.assertEqual((self.REPOSITORY, None), broker.snapshot_source("acme/infra"))
+        self.assertEqual(("other/name", None), broker.snapshot_source("other/name"))
+
+
 class RouteTableTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.broker = VcsBroker(Path(self.tmp.name) / "scratch", git_runner=git_runner)
 
-    def test_the_table_covers_exactly_what_capabilities_advertises(self):
+    def test_the_table_covers_every_broker_and_collaboration_verb(self):
         # Two lists of verb names in one module is two lists that can disagree;
-        # this is the test that notices.
+        # this is the test that notices. `capabilities` advertises the table
+        # less `LIBRARY_VERBS`, which test_a_served_forge_lists_every_verb checks.
         self.assertEqual(
             sorted(route_table(self.broker)),
             sorted({*BROKER_VERBS, *COLLABORATION_VERBS}),

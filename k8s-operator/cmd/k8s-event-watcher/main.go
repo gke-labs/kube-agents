@@ -117,9 +117,12 @@ type flags struct {
 	// image-pull family; see filter.go.
 	imagePullTransientMinCount int
 	// failedSchedulingMinCount is the FailedScheduling backstop when
-	// cluster-autoscaler has said nothing about the pod; scaleUpHold is how
-	// long its TriggeredScaleUp holds the pod's events. See filter.go.
+	// cluster-autoscaler has said nothing about the pod, and
+	// failedSchedulingMinSpan how long such an event must have lasted on top;
+	// scaleUpHold is how long its TriggeredScaleUp holds the pod's events.
+	// See filter.go.
 	failedSchedulingMinCount int
+	failedSchedulingMinSpan  time.Duration
 	scaleUpHold              time.Duration
 	// autopilotScaleToZeroHold holds the FailedScheduling an Autopilot cluster
 	// emits for GKE's own system pods once it has scaled to zero nodes. On by
@@ -168,7 +171,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs.IntVar(&f.unhealthyMinCount, "unhealthy-min-count", 3, "Require this many consecutive Unhealthy events before firing.")
 	fs.IntVar(&f.backoffMinCount, "backoff-min-count", 3, "Require this many consecutive crash-loop (BackOff/CrashLoopBackOff) events before firing. Suppresses startup races that resolve on their own. 1 = fire on the first event.")
 	fs.IntVar(&f.imagePullTransientMinCount, "imagepull-transient-min-count", 3, "Require this many consecutive image-pull failures before firing, when the error looks self-clearing (registry 429/5xx, timeouts). Terminal causes such as a bad tag, and any cause the classifier does not recognize, always fire on the first event. 1 = fire on the first event.")
-	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1 = fire on the first event.")
+	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1, with --failedscheduling-min-span=0, = fire on the first event.")
+	fs.DurationVar(&f.failedSchedulingMinSpan, "failedscheduling-min-span", defaultFailedSchedulingMinSpan, "How long a FailedScheduling with no cluster-autoscaler verdict has to have lasted, by the event's own first and last sighting, before it fires, on top of --failedscheduling-min-count. Holds the burst a node scale-down drives the count through for a pod placed seconds later. 0 = off.")
 	fs.DurationVar(&f.scaleUpHold, "scaleup-hold", defaultScaleUpHold, "How long a TriggeredScaleUp on a pod holds its FailedScheduling events, measured from the autoscaler's event to the FailedScheduling's own last sighting. Past it the count threshold applies again. Cluster-autoscaler's default node-provision timeout.")
 	fs.DurationVar(&f.settle, "settle", defaultSettle, "How long a failure in the settle family (the crash-loop family, FailedMount, Unhealthy; the reasons kubelet re-emits while they last) has to have lasted, by the event's own first and last sighting, before it is forwarded; a failure that clears inside it is not forwarded, and a repeat blip on the same event object is measured from its own start while the in-process memo remembers the first. Applied after the count thresholds, never to OOMKilled, the image-pull family or FailedScheduling. 0 = off.")
 	fs.DurationVar(&f.quietAfter, "quiet-after", defaultQuietAfter, "How long after its last sighting an incident whose alert went out is reported quiet: the daemon gets one k8s-event-followup inject for it, which it posts into the alert's thread and onto its card (the card alone where no thread is routed). Silence is read off the events alone; no object is read back. 0 = off.")
@@ -209,9 +213,10 @@ func (f *flags) filterThresholds() filterThresholds {
 		backoffMinCount:                 f.backoffMinCount,
 		imagePullTransientMinCount:      f.imagePullTransientMinCount,
 		failedSchedulingMinCount:        f.failedSchedulingMinCount,
+		failedSchedulingMinSpan:         offThreshold(f.failedSchedulingMinSpan),
 		scaleUpHold:                     f.scaleUpHold,
 		disableAutopilotScaleToZeroHold: !f.autopilotScaleToZeroHold,
-		settle:                          settleThreshold(f.settle),
+		settle:                          offThreshold(f.settle),
 	}
 }
 
@@ -229,10 +234,11 @@ func settleClearedTTL(dedupWindow time.Duration) time.Duration {
 	return settleClearedFloor
 }
 
-// settleThreshold turns the flag's reading into the config's: on the flag 0
-// is off and the default is the flag's own; in filterThresholds 0 is the
-// default, as it is for every count, so off travels as a negative.
-func settleThreshold(flagValue time.Duration) time.Duration {
+// offThreshold turns a duration flag's reading into the config's, for
+// --settle and --failedscheduling-min-span: on the flag 0 is off and the
+// default is the flag's own; in filterThresholds 0 is the default, as it is
+// for every count, so off travels as a negative.
+func offThreshold(flagValue time.Duration) time.Duration {
 	if flagValue == 0 {
 		return -1
 	}
@@ -278,6 +284,9 @@ func (f *flags) validate() error {
 	}
 	if f.settle < 0 {
 		return errors.New("--settle must be >= 0 (0 = off)")
+	}
+	if f.failedSchedulingMinSpan < 0 {
+		return errors.New("--failedscheduling-min-span must be >= 0 (0 = off)")
 	}
 	if f.quietAfter < 0 {
 		return errors.New("--quiet-after must be >= 0 (0 = off)")
