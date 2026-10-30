@@ -270,3 +270,26 @@ func TestTaskParametersOfRefusesTwoParts(t *testing.T) {
 		t.Fatalf("ok=%v err=%v, want found and refused", ok, err)
 	}
 }
+
+// changeRequested is omitted when false, so a submission that asks for no
+// change is byte-identical to one written before the field existed, and an
+// absent field reads as false.
+func TestTaskParametersChangeRequestedRoundTrip(t *testing.T) {
+	off, err := TaskParametersPart(TaskParameters{})
+	if err != nil || string(off.Data) != `{"taskParameters":{"parameters":{}}}` {
+		t.Fatalf("no change: part = %s, %v", off.Data, err)
+	}
+	on, err := TaskParametersPart(TaskParameters{ChangeRequested: true})
+	if err != nil || string(on.Data) != `{"taskParameters":{"parameters":{},"changeRequested":true}}` {
+		t.Fatalf("change: part = %s, %v", on.Data, err)
+	}
+	for _, tc := range []struct {
+		part Part
+		want bool
+	}{{off, false}, {on, true}} {
+		got, ok, err := TaskParametersOf([]Part{tc.part})
+		if err != nil || !ok || got.ChangeRequested != tc.want {
+			t.Errorf("TaskParametersOf(%s) = %+v, %v, %v; want changeRequested %v", tc.part.Data, got, ok, err, tc.want)
+		}
+	}
+}
