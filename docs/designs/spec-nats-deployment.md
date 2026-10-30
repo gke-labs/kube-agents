@@ -629,6 +629,14 @@ Layout:
   upgrade. Same posture as `web` and stated in the same places: static, published to a
   browser by design, port-forward only.
 
+  **Amended 10/30 (#3993):** a confirm has a subject of its own, `chat.console.*.confirm`:
+  a frame there is the same ask as one on `.in`, which the gateway submits with
+  `TaskParameters.ChangeRequested`, the one way a task is granted the permit to make a
+  change. `console` is its only publisher and the gateway its only subscriber (the grants
+  arrive with the account split; see the 11/3 amendment below for `console-mcp`, which holds
+  `.in` and not `.confirm`). The gateway's console adapter subscribes it beside `.in`. A
+  frame on `.in` never carries a confirm, whatever its `kind` says.
+
   **Amended 9/24:** the page is served by an operator-rendered console server
   (`<agent>-a2a-console`), which answers the browser on its own port, hands the page the
   `console` password from the creds Secret, and proxies the page's websocket to 9222. It is

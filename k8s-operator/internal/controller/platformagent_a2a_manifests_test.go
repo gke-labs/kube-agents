@@ -708,14 +708,15 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 	}
 }
 
-// The console user is the web read surface plus one narrow publish: the
-// inbound chat subject the gateway's console adapter subscribes. Pinned
-// EXACTLY for the same reason web's list is - the reach lives in request
-// bodies and wildcards, and a blocklist cannot see either.
+// The console user is the web read surface plus two narrow publishes: the
+// inbound chat subjects the gateway's console adapter subscribes, .in for a
+// typed message and .confirm for a confirm. Pinned EXACTLY for the same
+// reason web's list is - the reach lives in request bodies and wildcards,
+// and a blocklist cannot see either.
 func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 
-	start := strings.Index(conf, "user: console")
+	start := strings.Index(conf, "user: console\n")
 	if start < 0 {
 		t.Fatal("nats.conf has no console user")
 	}
@@ -798,6 +799,107 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	}
 	if !strings.Contains(gw, `"chat.console.*.confirm"`) {
 		t.Error("gateway cannot subscribe the console confirm subject")
+	}
+}
+
+// console-mcp, the console MCP server's user, is console less the confirm
+// door: the same read surface, the frame publish on chat.console.*.in, the
+// answers on chat.console.*.out, its own inbox, and nothing on
+// chat.console.*.confirm either way. A model drives that server, and a
+// confirm is the one way a task is granted the permit to make a change.
+// Pinned EXACTLY, for console's reason.
+func TestBuildA2ANATSConfigConsoleMCPUser(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+
+	start := strings.Index(conf, "user: "+a2aConsoleMCPUser+"\n")
+	if start < 0 {
+		t.Fatal("nats.conf has no console-mcp user")
+	}
+	rest := conf[start:]
+	if next := strings.Index(rest[1:], "user: "); next >= 0 {
+		rest = rest[:next+1]
+	}
+	if !strings.Contains(rest, `password: "pw-console-mcp"`) {
+		t.Error("console-mcp's password does not come from its own creds Secret key")
+	}
+	if strings.Contains(rest, "pw-console\"") {
+		t.Error("console-mcp renders the console's password")
+	}
+
+	want := []string{
+		"$JS.API.INFO",
+		"$JS.API.STREAM.INFO.TASKS",
+		"$JS.API.STREAM.INFO.DIRECTORY",
+		"$JS.API.STREAM.INFO.TOPICS-STATE",
+		"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+		"$JS.API.CONSUMER.CREATE.TASKS.>",
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+		"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+		"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+		"$JS.API.CONSUMER.INFO.TASKS.*",
+		"$JS.API.CONSUMER.INFO.DIRECTORY.*",
+		"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+		"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+		"$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
+		"chat.console.*.in",
+		"_INBOX.console-mcp.>",
+	}
+	if got := a2aGrantSubjects(t, conf, a2aConsoleMCPUser, "publish"); !reflect.DeepEqual(got, want) {
+		t.Errorf("console-mcp publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+	wantSub := []string{"a2a.>", "chat.console.*.out", "_INBOX.console-mcp.>"}
+	if got := a2aGrantSubjects(t, conf, a2aConsoleMCPUser, "subscribe"); !reflect.DeepEqual(got, wantSub) {
+		t.Errorf("console-mcp subscribe allow-list changed.\n got: %q\nwant: %q", got, wantSub)
+	}
+	// Its deny lists are console's, so neither can be narrowed without the
+	// other.
+	for _, section := range []string{"publish", "subscribe"} {
+		want, _ := a2aGrantDenials(t, conf, "console", section)
+		if got, _ := a2aGrantDenials(t, conf, a2aConsoleMCPUser, section); !reflect.DeepEqual(got, want) {
+			t.Errorf("console-mcp %s deny-list = %q, want console's %q", section, got, want)
+		}
+	}
+
+	// Against console's own render, so the two cannot drift apart except by
+	// the confirm door and the inbox prefix.
+	strip := func(grants []string, drop ...string) []string {
+		var out []string
+		for _, g := range grants {
+			if !slices.Contains(drop, g) {
+				out = append(out, g)
+			}
+		}
+		return out
+	}
+	for _, section := range []string{"publish", "subscribe"} {
+		console := strip(a2aGrantSubjects(t, conf, "console", section), a2aConsoleConfirmSubject, "_INBOX.console.>")
+		mcp := strip(a2aGrantSubjects(t, conf, a2aConsoleMCPUser, section), "_INBOX.console-mcp.>")
+		if !reflect.DeepEqual(console, mcp) {
+			t.Errorf("console-mcp %s is not console's less the confirm door:\n console: %q\n     mcp: %q", section, console, mcp)
+		}
+	}
+	// No publish on the confirm door, the stop record or the dispatch
+	// subjects, by any pattern that reaches them, and no subscribe on the
+	// confirm door. (Its subscribe on a2a.> reads the stop and dispatch
+	// records, as console's and web's do.)
+	for _, c := range []struct {
+		section string
+		probes  []string
+	}{
+		{"publish", []string{"chat.console.*.confirm", "a2a.stop.>", "a2a.dispatch.>"}},
+		{"subscribe", []string{"chat.console.*.confirm"}},
+	} {
+		for _, g := range a2aGrantSubjects(t, conf, a2aConsoleMCPUser, c.section) {
+			for _, probe := range c.probes {
+				if subjectPatternsOverlap(g, probe) {
+					t.Errorf("console-mcp %s %q reaches %s", c.section, g, probe)
+				}
+			}
+		}
 	}
 }
 
@@ -3640,7 +3742,8 @@ func a2aGrantDenials(t *testing.T, conf, user, section string) ([]string, bool) 
 func a2aGrantList(t *testing.T, conf, user, section, list string) ([]string, bool) {
 	t.Helper()
 
-	start := strings.Index(conf, "user: "+user)
+	// Whole line: "user: console" is a prefix of "user: console-mcp".
+	start := strings.Index(conf, "user: "+user+"\n")
 	if start < 0 {
 		t.Fatalf("no %s user in the rendered config", user)
 	}
@@ -6214,7 +6317,7 @@ func TestSubjectPatternsOverlap(t *testing.T) {
 	}
 }
 
-// The console chat door, in the one spelling every check here shares. Two
+// The console chat door, in the one spelling every check here shares. Three
 // exact subjects, not a namespace: the render's other chat.* grants are the
 // notify and board routes', held by their own checks, so admitting the "chat"
 // namespace wholesale in rule 2 would be wider than the thing being held.
@@ -6245,7 +6348,7 @@ var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound,
 
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
-// chat door subjects: the console's two, the notify route's three and the
+// chat door subjects: the console's three, the notify route's three and the
 // board route's two.
 //
 // The door is deliberately not a namespace here. Admitting "chat" would stop
@@ -6292,6 +6395,7 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{"chat.discord.*.in", false},
 		{"chat.console.*.status", false},
 		{"chat.console.*.in.x", false},
+		{"chat.console.*.confirm.x", false},
 		{"chat.console.>", false},
 		// The notify route admits its subjects (one per routed backend, and
 		// the reply namespace) and nothing around them: a sibling backend not
@@ -6351,19 +6455,21 @@ func consoleDoorViolations(ids []a2aIdentity) []string {
 // TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader is the property the
 // console identity's security claim rests on (consoleIdentity's own comment):
 // the gateway takes a frame on chat.console.*.in as coming from nats:console
-// with no mapping table in between, because only console can publish there --
-// and console takes a notice on chat.console.*.out as coming from the
-// gateway for the same reason. Rule 2 above refuses everything in chat.*
-// that is not one of the two door subjects; what it cannot do is say which
-// principal may hold the door, since the door subjects are spelled the same
-// on whoever carries them. That is this test's job, and it holds them to one
-// intended writer and one intended reader: every principal's publish and
-// subscribe lists are checked for pattern overlap (subjectPatternsOverlap,
-// wildcards on either side) against chat.console.*.in and
-// chat.console.*.out. A literal chat.console.abc.in, a chat.*.*.in, or a
-// chat.> on any other principal -- bridge, seed, the callout-issued agent or
-// provision, even a widened web -- trips here; the mutation half below
-// proves the check would.
+// with no mapping table in between, because only console and console-mcp can
+// publish there; it takes a frame on chat.console.*.confirm as a confirm
+// because only console, never the model-driven console-mcp, can publish
+// there; and console and console-mcp take a notice on chat.console.*.out as
+// coming from the gateway for the same reason. Rule 2 above refuses
+// everything in chat.* that is not one of the three door subjects; what it
+// cannot do is say which principal may hold the door, since the door
+// subjects are spelled the same on whoever carries them. That is this test's
+// job, and it holds each side to its intended holders: every principal's
+// publish and subscribe lists are checked for pattern overlap
+// (subjectPatternsOverlap, wildcards on either side) against the three door
+// patterns. A literal chat.console.abc.in, a chat.*.*.in, or a chat.> on any
+// other principal -- bridge, seed, the callout-issued agent or provision,
+// even a widened web -- trips here; the mutation half below proves the check
+// would.
 func TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
 	ids := a2aIdentities(a2aTestAgent())
 	for _, v := range consoleDoorViolations(ids) {
@@ -6387,6 +6493,25 @@ func TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
 	v := consoleDoorViolations(mutated)
 	if len(v) != 1 || !strings.Contains(v[0], a2aBridgeUser+" publish \"chat.console.abc.in\"") {
 		t.Errorf("a literal chat.console.abc.in publish grant on %s was not reported exactly once; got %q", a2aBridgeUser, v)
+	}
+
+	// Mutation: console-mcp, which may publish on .in, gains the confirm
+	// door. It is the identity a model drives, so this is the widening that
+	// matters most.
+	mutated = slices.Clone(ids)
+	found = false
+	for i := range mutated {
+		if mutated[i].user == a2aConsoleMCPUser {
+			mutated[i].publish = append(slices.Clone(mutated[i].publish), consoleConfirm)
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no %s identity to mutate", a2aConsoleMCPUser)
+	}
+	v = consoleDoorViolations(mutated)
+	if len(v) != 1 || !strings.Contains(v[0], a2aConsoleMCPUser+" publish \"chat.console.*.confirm\"") {
+		t.Errorf("a chat.console.*.confirm publish grant on %s was not reported exactly once; got %q", a2aConsoleMCPUser, v)
 	}
 }
 
