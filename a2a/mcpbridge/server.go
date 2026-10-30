@@ -1409,9 +1409,13 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 		callCtx, cancelCall := context.WithCancel(ctx)
 		defer cancelCall()
 		streamKey := "task:" + taskID
-		s.registerStreamingCallStart(streamKey, taskID, conv.Alias, callerID, meta.ArtifactsDir, cancelCall)
+		// The server stops a conversation's running task, not a task by id, so a cancelled read
+		// stops the conversation that owns the task, never the caller's active one; with the
+		// owner unknown, nothing is stopped.
+		owner := s.taskOwnerConversation(taskID)
+		s.registerStreamingCallStart(streamKey, taskID, owner, callerID, meta.ArtifactsDir, cancelCall)
 		txt, title, md, callErr := sess.callRemoteTool(callCtx, ToolTaskControl, rawArgs, meta, s.store.Snapshot(), progressCallbackFromContext(ctx))
-		s.finishStreamingCall(streamKey, conv.Alias, callerID, meta.ArtifactsDir, txt, callCtx.Err(), callErr)
+		s.finishStreamingCall(streamKey, owner, callerID, meta.ArtifactsDir, txt, callCtx.Err(), callErr)
 		return txt, title, md, callErr
 	}
 
@@ -1521,6 +1525,22 @@ func (s *Server) finishStreamingCall(key, convAlias, hostConvID, artifactsDir, r
 	s.mu.Unlock()
 }
 
+// taskOwnerConversation is the conversation alias a tracked streaming task was started on (a
+// send_message that returned taskID still running), or "" when the bridge does not know it.
+func (s *Server) taskOwnerConversation(taskID string) string {
+	if s == nil || taskID == "" {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, st := range s.activeStreamingTasks {
+		if st != nil && st.TaskID == taskID && st.ConvAlias != "" {
+			return st.ConvAlias
+		}
+	}
+	return ""
+}
+
 func (s *Server) clearStreamingTask(taskID, convAlias string) {
 	if s == nil {
 		return
@@ -1538,8 +1558,10 @@ func (s *Server) clearStreamingTask(taskID, convAlias string) {
 	}
 }
 
+// stopRemoteTaskOnCancel sends stop for convAlias's running task. With convAlias unknown it
+// sends nothing: the server's stop is per conversation and would fall to its default one.
 func (s *Server) stopRemoteTaskOnCancel(convAlias, taskID string) {
-	if s == nil {
+	if s == nil || strings.TrimSpace(convAlias) == "" {
 		return
 	}
 	stopCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
