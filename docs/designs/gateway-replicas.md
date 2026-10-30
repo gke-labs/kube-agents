@@ -78,7 +78,7 @@ Then it releases the lease.
   4.4s by client-go), acquires it and starts. Events the old replica gave back are redelivered at
   once, in order. The gap is the standby's next retry plus its start-up (Slack's `auth.test` and
   socket, Discord's identify, the relay's bind): a few seconds.
-- **Crash.** The lease expires (`leaseDuration`, 15s) and the standby takes it. The dead replica's
+- **Crash.** The lease expires (`leaseDuration`, 20s) and the standby takes it. The dead replica's
   held relay events come back only when the relay durable's AckWait (30s) runs out, and a newer
   event the new leader rendered first would leave them rendering late and out of order, possibly
   after the task's terminal. So after a takeover from an expired lease, the new leader binds the
@@ -97,10 +97,13 @@ Then it releases the lease.
 
 ### Fencing
 
-A replica that can't renew the lease within `renewDeadline` (10s) steps down, and the stop has to
-fit in the 5s before the lease can expire (`leaseDuration`, 15s). Ingress and the inbound queue
-stop at once; the relay's render drain is bounded by that budget, and a batch still rendering when
-it runs out is abandoned and given back. That makes two replicas acting at once unlikely, not
+A replica that can't renew the lease steps down, and the stop has to fit before a standby can
+take the lease. In client-go the renew loop starts its `renewDeadline` (10s) window one
+`retryPeriod` (2s) after the last good renewal, so a leader that stops renewing gives up about 12s
+after it, and a standby that saw that renewal can take the lease after `leaseDuration`. With
+client-go's 15s default that leaves about 3s, so the gateway sets `leaseDuration` to 20s, leaving
+about 8s. Ingress and the inbound queue stop at once; the relay's render drain is bounded at 5s
+inside that, and a batch still rendering when it runs out is abandoned and given back. That makes two replicas acting at once unlikely, not
 impossible: a paused process, or a clock that jumps, can still overlap the next leader.
 
 So writes are fenced by a term number. The term isn't the Lease's `leaseTransitions`: the Lease
@@ -140,7 +143,7 @@ Process memory doesn't move, and the bus doesn't hold what nobody was subscribed
   console frame (including the MCP server's turns), and every `chat.notify` report-back from a
   card, published while no replica holds the subscription is lost. Discord replays nothing to a new
   session. Slack redelivers what wasn't acked, and the Google Chat pull waits in its queue. The gap
-  is a few seconds on a graceful handover and 15s or more on a crash.
+  is a few seconds on a graceful handover and 20s or more on a crash.
 - **The inbound queue at step-down:** turns taken and not started (above).
 - **Moved to KV in the build:** the console's cards-pending mark (already planned as its own
   change).
@@ -222,7 +225,11 @@ ingress gap above.
   the Lease. Readiness means "healthy", active or not, so a rollout's new pod becomes Ready as a
   standby.
 - **`RollingUpdate` with `maxSurge: 1`, `maxUnavailable: 0`,** replacing `Recreate`, so the new
-  pod comes up as a standby before an old one stops. A surge pod needs room under the agent
+  pod comes up as a standby before an old one stops. The operator renders it, and a second
+  replica, only once the Lease has had a holder: a gateway from before the election holds no
+  Lease and would act beside an elected one, and term 0 fences nothing. So an install upgrading
+  across the election in one roll keeps one replica and `Recreate` for that roll, and moves to two
+  once the elected gateway has taken the Lease. A surge pod needs room under the agent
   namespace's quota; where there's none, the rollout waits, which is the reason `Recreate` was
   chosen. The operator renders `maxSurge: 0`, `maxUnavailable: 1` instead when the CR asks for one
   replica. The ReplicaSet may stop the active pod before the standby, which costs a second, graceful
@@ -240,11 +247,13 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
   only `get` and `update` on that one Lease (`resourceNames`). Nothing else changes in its Role:
   no EndpointSlice grant and no pod patch. The project's tech lead approved this grant for phase
   one. Because the gateway can't recreate the Lease, the operator watches it: the Lease carries
-  the PlatformAgent's owner reference and the controller `Owns` it, so a deleted Lease is
-  recreated within seconds, not at the fifteen-minute requeue. The operator's ClusterRole already holds every Lease verb this needs. While it's absent, the active
-  replica fails to renew and steps down after `renewDeadline`, both replicas answer their doors
-  with a 503 saying no replica holds the lease, and the next acquisition starts a new term as
-  usual.
+  the PlatformAgent's owner reference and the controller `Owns` it. The operator's ClusterRole
+  already holds every Lease verb this needs. It recreates a deleted Lease one `leaseDuration`
+  after it saw the deletion, not at once. A Lease recreated with no holder can be taken on a
+  standby's next retry, and the old leader would keep acting until its renewal gives up, so the
+  wait lets the old leader step down first. While the Lease is absent, both replicas answer their
+  doors with a 503 saying no replica holds the lease, and the next acquisition starts a new term
+  as usual. The gap is about 20s, for an event that only a hand or a restore causes.
 
 ## Build, as follow-ups
 
@@ -266,9 +275,10 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
 3. **The standby's doors:** 503 with the holder and the exact port-forward command, the `hack/`
    helper, and the eval harness, the CI scripts and the docs resolving the holder. It lands before
    step 4, so nothing meets a standby it can't route around.
-4. **Operator:** replicas, the readiness probe, the strategy, the PDB, the spread, the Lease (with
-   its owner reference and an `Owns` watch, so a deletion is undone in seconds) and its Role. Its
-   tests pin each, including recreating a deleted Lease.
+4. **Operator:** replicas, the readiness probe, the strategy (held at one replica and `Recreate`
+   until the Lease has had a holder), the PDB, the spread, the Lease (with its owner reference and
+   an `Owns` watch, recreated one `leaseDuration` after a deletion) and its Role. Its tests pin
+   each, including the held-back recreate and the first roll across the election.
 5. **The cards-pending mark on the record** (planned separately).
 6. **Live runs** on a `next` lane: a rollout, a node drain and a force delete of the active pod
    while a task streams, measuring the gap and showing every event rendered once.
