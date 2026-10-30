@@ -124,11 +124,7 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 						"type":        "string",
 						"description": "The prompt, question, or command (/session, /session off, delegate: ..., status, stop) to send to kube-agents.",
 					},
-					"mode": map[string]any{
-						"type":        "string",
-						"enum":        []string{"auto", "platform", "session", "delegate"},
-						"description": "Routing mode: 'auto' (use current conversation mode), 'platform' (route to Hermes platform agent), 'session' (ensure /session persistent Claude worker pod is active), or 'delegate' (delegate from session worker to platform agent and wait for wake synthesis).",
-					},
+					"mode": sendModeProperty(),
 					"conversation": map[string]any{
 						"type":        "string",
 						"description": "Optional conversation alias or console token to send on (defaults to active conversation).",
@@ -216,6 +212,23 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 		defs = s.host.AugmentToolSchemas(defs)
 	}
 	return defs
+}
+
+// sendModeProperty is send_message's mode argument. Only auto is advertised until the in-cluster
+// server offers the other modes (upstreamSendModes).
+func sendModeProperty() map[string]any {
+	if upstreamSendModes {
+		return map[string]any{
+			"type":        "string",
+			"enum":        []string{sendModeAuto, "platform", "session", "delegate"},
+			"description": "Routing mode: 'auto' (use current conversation mode), 'platform' (route to Hermes platform agent), 'session' (ensure /session persistent Claude worker pod is active), or 'delegate' (delegate from session worker to platform agent and wait for wake synthesis).",
+		}
+	}
+	return map[string]any{
+		"type":        "string",
+		"enum":        []string{sendModeAuto},
+		"description": "Routing mode: 'auto' (the default) sends the turn on the conversation as it stands. Start a /session worker with manage_session session_on.",
+	}
 }
 
 // taskControlDefinition is task_control's schema. The list, status and steer actions, and the

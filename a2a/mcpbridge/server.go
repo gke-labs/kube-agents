@@ -1206,17 +1206,15 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 	if args == nil {
 		args = make(map[string]any)
 	}
+	mode, _ := args["mode"].(string)
+	if mode = strings.ToLower(strings.TrimSpace(mode)); sendModeAwaitsServer(mode) {
+		return "", "", "", errSendModeNotSupported(mode)
+	}
 	convArg, _ := args["conversation"].(string)
 	conv := s.ConversationFor(ctx, convArg, rawArgs)
 	args["conversation"] = conv.Alias
 	msgText, _ := args["message"].(string)
-	mode, _ := args["mode"].(string)
 	trimmedMsg := strings.TrimSpace(msgText)
-	if strings.EqualFold(mode, "session") || trimmedMsg == "/session" || (strings.HasPrefix(trimmedMsg, "/session ") && !strings.EqualFold(trimmedMsg, "/session off")) {
-		_, _ = s.store.SetConversationSessionMode(conv.Alias, true)
-	} else if strings.EqualFold(trimmedMsg, "/session off") {
-		_, _ = s.store.SetConversationSessionMode(conv.Alias, false)
-	}
 
 	sess, err := s.ensureConnected(ctx)
 	if err != nil {
@@ -1232,6 +1230,15 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 	updatedArgs, _ := json.Marshal(serverSendMessageArgs(args))
 	txt, title, md, callErr := sess.callRemoteTool(callCtx, ToolSendMessage, updatedArgs, meta, s.store.Snapshot(), progressCallbackFromContext(ctx))
 	s.finishStreamingCall(streamKey, conv.Alias, callerID, meta.ArtifactsDir, txt, callCtx.Err(), callErr)
+	// A /session or /session off text is a console control turn; the local session flag follows
+	// it only once the server took the turn.
+	if callErr == nil {
+		if strings.EqualFold(trimmedMsg, "/session off") {
+			_, _ = s.store.SetConversationSessionMode(conv.Alias, false)
+		} else if trimmedMsg == "/session" || strings.HasPrefix(trimmedMsg, "/session ") {
+			_, _ = s.store.SetConversationSessionMode(conv.Alias, true)
+		}
+	}
 	return txt, title, md, callErr
 }
 

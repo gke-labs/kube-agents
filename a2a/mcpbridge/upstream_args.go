@@ -23,6 +23,25 @@ const (
 	taskActionSteer  = "steer"
 )
 
+// upstreamSendModes gates send_message's routing modes other than auto (platform, session and
+// delegate). The in-cluster server's send_message has no mode: every turn goes on the
+// conversation as it stands. While false, only auto is advertised, and a call naming another
+// mode is refused with errSendModeNotSupported before the bridge connects.
+const upstreamSendModes = false
+
+const sendModeAuto = "auto"
+
+// sendModesAwaitingServer are the send_message modes upstreamSendModes gates.
+var sendModesAwaitingServer = map[string]bool{"platform": true, "session": true, "delegate": true}
+
+func sendModeAwaitsServer(mode string) bool {
+	return !upstreamSendModes && sendModesAwaitingServer[mode]
+}
+
+func errSendModeNotSupported(mode string) error {
+	return fmt.Errorf("send_message mode %q is not supported by the in-cluster server yet; omit mode (or use auto), and start a /session worker with manage_session session_on", mode)
+}
+
 func taskActionAwaitsServer(action string) bool {
 	return !upstreamTaskListAndSteer && taskActionsAwaitingServer[action]
 }
@@ -53,10 +72,11 @@ const (
 // serverSendMessageArgs translates the bridge's send_message arguments to the in-cluster
 // server's (a2a/mcp sendMessageArgs): message is text, wait_timeout_seconds is wait_seconds.
 // An omitted or non-positive wait is the bridge's default, and one above the server's ceiling
-// is that ceiling. The rest (conversation) keep their names; mode and debug have no server
-// counterpart and are ignored there.
+// is that ceiling. mode is dropped (auto is the only mode the server has). The rest
+// (conversation) keep their names; debug has no server counterpart and is ignored there.
 func serverSendMessageArgs(args map[string]any) map[string]any {
 	moveArg(args, "message", "text")
+	delete(args, "mode")
 	moveArg(args, "wait_timeout_seconds", "wait_seconds")
 	wait, _ := args["wait_seconds"].(float64)
 	switch {

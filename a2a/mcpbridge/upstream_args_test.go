@@ -203,3 +203,75 @@ func TestSendMessageForwardsTheSchemasWaitDefaultAndCeiling(t *testing.T) {
 		}
 	}
 }
+
+// sendModeEnum is the mode enum send_message advertises.
+func sendModeEnum(t *testing.T, srv *Server) []string {
+	t.Helper()
+	for _, d := range srv.toolDefinitions() {
+		if d.Name != ToolSendMessage {
+			continue
+		}
+		raw, _ := json.Marshal(d.InputSchema)
+		var schema struct {
+			Properties map[string]struct {
+				Enum []string `json:"enum"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatal(err)
+		}
+		return schema.Properties["mode"].Enum
+	}
+	t.Fatal("send_message is not advertised")
+	return nil
+}
+
+func TestSendMessageModesTheServerLacksAreHiddenAndRefused(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	if got := strings.Join(sendModeEnum(t, srv), ","); got != "auto" {
+		t.Fatalf("send_message advertises modes %q; want auto only", got)
+	}
+	for _, mode := range []string{"session", "delegate", "platform", "Session"} {
+		res := srv.CallTool(context.Background(), ToolSendMessage,
+			json.RawMessage(`{"message":"hello","conversation":"c1","mode":"`+mode+`"}`))
+		if !res.IsError || !strings.Contains(res.Content[0].Text, "not supported by the in-cluster server yet") {
+			t.Fatalf("send_message mode %s: %+v; want it refused as not supported yet", mode, res)
+		}
+		if srv.IsSessionHealthy() {
+			t.Fatalf("send_message mode %s connected before refusing", mode)
+		}
+		if c, ok := srv.Store().LookupConversation("c1"); ok && c.SessionMode {
+			t.Fatalf("send_message mode %s marked c1 as a session", mode)
+		}
+	}
+
+	res := srv.CallTool(context.Background(), ToolSendMessage, json.RawMessage(`{"message":"hello","mode":"auto"}`))
+	if res.IsError {
+		t.Fatalf("send_message mode auto: %+v", res)
+	}
+	if args := nextCallNamed(t, gw, ToolSendMessage); args["mode"] != nil {
+		t.Fatalf("forwarded send_message arguments %v carry mode; the server has none", args)
+	}
+}
+
+func TestSendMessageSessionTextMarksTheSessionOnlyWhenTheTurnIsTaken(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	gw.srv.Close()
+	if res := srv.CallTool(context.Background(), ToolSendMessage, json.RawMessage(`{"message":"/session","conversation":"c1"}`)); !res.IsError {
+		t.Fatalf("send_message to a closed gateway succeeded: %+v", res)
+	}
+	if c, ok := srv.Store().LookupConversation("c1"); ok && c.SessionMode {
+		t.Fatal("a /session turn the server never took marked c1 as a session")
+	}
+
+	gw2 := startBlockingGateway(t, "")
+	srv2 := newStdioTestServer(t, gw2)
+	if res := srv2.CallTool(context.Background(), ToolSendMessage, json.RawMessage(`{"message":"/session","conversation":"c1"}`)); res.IsError {
+		t.Fatalf("send_message /session: %+v", res)
+	}
+	if c, ok := srv2.Store().LookupConversation("c1"); !ok || !c.SessionMode {
+		t.Fatalf("a taken /session turn left c1 %+v; want SessionMode", c)
+	}
+}
