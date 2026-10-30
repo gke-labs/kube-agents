@@ -165,3 +165,69 @@ func TestTunnelURLIsNotALocalListener(t *testing.T) {
 		t.Fatalf("MCPURL %q names a local port; the kube path must open no listener", tun.MCPURL())
 	}
 }
+
+// blockingConnector is a streamConnector that holds each dial until release is closed,
+// reporting the dial's context on entered.
+func blockingConnector(fc *fakeConnection, entered chan<- context.Context, release <-chan struct{}) streamConnector {
+	return func(ctx context.Context) (httpstream.Connection, int, error) {
+		entered <- ctx
+		select {
+		case <-release:
+			return fc, 8089, nil
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		}
+	}
+}
+
+func TestDialWaitingBehindAnotherDialGivesUpOnItsOwnContext(t *testing.T) {
+	entered := make(chan context.Context, 2)
+	release := make(chan struct{})
+	defer close(release)
+	tun := newPortForwardTunnel(blockingConnector(newFakeConnection(), entered, release))
+	go func() { _, _ = tun.DialContext(context.Background(), "tcp", "") }()
+	<-entered
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := tun.DialContext(ctx, "tcp", "")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("the waiting dial returned %v; want its own context's deadline", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a dial waiting behind another's ignored its own context's deadline")
+	}
+}
+
+func TestRedialIsBoundedAndDetachedFromTheStartingCallersContext(t *testing.T) {
+	entered := make(chan context.Context, 1)
+	release := make(chan struct{})
+	fc := newFakeConnection()
+	tun := newPortForwardTunnel(blockingConnector(fc, entered, release))
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := tun.DialContext(callerCtx, "tcp", "")
+		done <- err
+	}()
+	dialCtx := <-entered
+	if dl, ok := dialCtx.Deadline(); !ok || time.Until(dl) > portForwardReadyTimeout {
+		t.Fatalf("the dial's context has deadline %v (set %v); want at most %v from now", dl, ok, portForwardReadyTimeout)
+	}
+	cancelCaller()
+	select {
+	case <-dialCtx.Done():
+		t.Fatal("cancelling the caller that started the shared dial aborted it")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	nextRemote(t, fc)
+}

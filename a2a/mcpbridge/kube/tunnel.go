@@ -49,7 +49,9 @@ type streamConnector func(ctx context.Context) (httpstream.Connection, int, erro
 type PortForwardTunnel struct {
 	connect streamConnector
 
-	dialMu      sync.Mutex // serialises (re)connecting
+	// dialSem serialises (re)connecting: a one-slot semaphore rather than a mutex, so a caller
+	// waiting behind another's dial gives up when its own context ends.
+	dialSem     chan struct{}
 	mu          sync.Mutex
 	conn        httpstream.Connection
 	port        int
@@ -80,7 +82,7 @@ func StartPortForward(ctx context.Context, prof mcpbridge.DeploymentProfile) (*P
 }
 
 func newPortForwardTunnel(connect streamConnector) *PortForwardTunnel {
-	return &PortForwardTunnel{connect: connect}
+	return &PortForwardTunnel{connect: connect, dialSem: make(chan struct{}, 1)}
 }
 
 // MCPURL returns the base URL for requests through the tunnel; see streamTunnelBaseURL.
@@ -138,10 +140,17 @@ func (t *PortForwardTunnel) DialContext(ctx context.Context, _, _ string) (net.C
 }
 
 // connection returns the open SPDY connection, opening one if there is none or the last one
-// closed.
+// closed. A caller waiting for another's dial gives up on its own ctx. The dial itself is
+// bounded by portForwardReadyTimeout and detached from the ctx of the caller that happens to
+// start it: the connection is shared, so that caller's cancellation must not abort it, and a
+// long-lived request ctx must not leave a hung dial blocking every other caller.
 func (t *PortForwardTunnel) connection(ctx context.Context) (httpstream.Connection, int, error) {
-	t.dialMu.Lock()
-	defer t.dialMu.Unlock()
+	select {
+	case t.dialSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	}
+	defer func() { <-t.dialSem }()
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -159,7 +168,9 @@ func (t *PortForwardTunnel) connection(ctx context.Context) (httpstream.Connecti
 	}
 	t.mu.Unlock()
 
-	conn, port, err := t.connect(ctx)
+	dialCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), portForwardReadyTimeout)
+	defer cancel()
+	conn, port, err := t.connect(dialCtx)
 	if err != nil {
 		return nil, 0, err
 	}
