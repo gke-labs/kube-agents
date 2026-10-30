@@ -2603,10 +2603,10 @@ CONNECTIVITY_ATTEMPTS=5
 # mid-retry, and the next attempt started another one against the same closed
 # quota. scripts/test_ci_connectivity_retry.py holds the deadline above the
 # sum at the defaults and under an override.
-AGENT_API_CALLS_PER_TURN=4          # Hermes' default api_max_retries (3) plus the first call
-AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS=60 # FLOOR_MAX_SECONDS in deploy/docker/patches/rate_limit_backoff_floor.py
-PING_MODEL_LATENCY_ALLOWANCE_SECONDS=60
-CONNECTIVITY_PING_MAX_TIME_SECONDS=$((AGENT_API_CALLS_PER_TURN * (EVAL_LITELLM_NUM_RETRIES + 1) * EVAL_LITELLM_RETRY_AFTER_SECONDS + (AGENT_API_CALLS_PER_TURN - 1) * AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS + PING_MODEL_LATENCY_ALLOWANCE_SECONDS))
+readonly AGENT_API_CALLS_PER_TURN=4          # Hermes' default api_max_retries (3) plus the first call
+readonly AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS=60 # FLOOR_MAX_SECONDS in deploy/docker/patches/rate_limit_backoff_floor.py
+readonly PING_MODEL_LATENCY_ALLOWANCE_SECONDS=60
+readonly CONNECTIVITY_PING_MAX_TIME_SECONDS=$((AGENT_API_CALLS_PER_TURN * (EVAL_LITELLM_NUM_RETRIES + 1) * EVAL_LITELLM_RETRY_AFTER_SECONDS + (AGENT_API_CALLS_PER_TURN - 1) * AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS + PING_MODEL_LATENCY_ALLOWANCE_SECONDS))
 CONNECTIVITY_OK="false"
 : >/tmp/pf-8642.log
 for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
