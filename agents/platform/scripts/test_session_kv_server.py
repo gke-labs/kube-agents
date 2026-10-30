@@ -3271,6 +3271,21 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(loaded["COMMENTED"], "value")
         self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
 
+    def test_a_mirrored_home_channel_yields_to_a_mounted_projection(self):
+        # A today-era /sethome left SLACK_HOME_CHANNEL in the PVC .env. With
+        # the operator's projection mounted the file is the home channel the
+        # gateway posts into, so the mirror is skipped; without it, it loads.
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+                handle.write("")
+            with patch.dict(os.environ, {chat_notify.HOME_FILE_DIR_ENV: directory}):
+                loaded = self._load_dotenv(b"SLACK_HOME_CHANNEL=C0OLD\nSAFE_KEY=1\n", ("SLACK_HOME_CHANNEL", "SAFE_KEY"))
+            self.assertIsNone(loaded["SLACK_HOME_CHANNEL"])
+            self.assertEqual(loaded["SAFE_KEY"], "1")
+            with patch.dict(os.environ, {chat_notify.HOME_FILE_DIR_ENV: os.path.join(directory, "unmounted")}):
+                loaded = self._load_dotenv(b"SLACK_HOME_CHANNEL=C0OLD\n", ("SLACK_HOME_CHANNEL",))
+            self.assertEqual(loaded["SLACK_HOME_CHANNEL"], "C0OLD")
+
     def test_an_undecodable_pvc_dotenv_does_not_stop_the_import(self):
         loaded = self._load_dotenv(b"# caf\xe9\nSAFE_KEY=1\n", ("SAFE_KEY",))
         self.assertIsNone(loaded["SAFE_KEY"])

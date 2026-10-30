@@ -59,6 +59,11 @@ logger = logging.getLogger("session_kv_server")
 # `.env` is agent-writable (`save_env_value`), and `load_dotenv` adds any key the
 # container env lacks, which on an install that did not opt in is exactly these.
 _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST",)
+# The home channel a today-era `/sethome` or first chat mirrored into that
+# `.env` (Hermes' persist_home_channel). Under `next` with the operator's
+# projection mounted, the projected file is the channel the gateway posts
+# into, so the mirror must not fill the key the container env lacks.
+_PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
 
 
 def _load_dotenv_ignoring_operator_switches(path: str) -> None:
@@ -79,6 +84,9 @@ def _load_dotenv_ignoring_operator_switches(path: str) -> None:
             continue
         if key in _OPERATOR_ONLY_ENV_KEYS:
             logger.info(f"Ignoring operator-only switch {key} in {path}")
+            continue
+        if key in _PROJECTED_HOME_ENV_KEYS and chat_notify.home_file()[1]:
+            logger.info(f"Ignoring {key} in {path}: the operator projects the home channel")
             continue
         if key not in os.environ:
             os.environ[key] = val
