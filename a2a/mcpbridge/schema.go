@@ -96,7 +96,7 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 					},
 					"kube_context": map[string]any{
 						"type":        "string",
-						"description": "Optional kubeconfig context override. An override applies to this connection only: it is not saved, the active deployment does not change, and reconnects keep it until the next connect_deployment.",
+						"description": "Optional kubeconfig context override: an exact context name, or a case-insensitive part of exactly one. An override applies to this connection only: it is not saved, the active deployment does not change, and reconnects keep it until the next connect_deployment.",
 					},
 					"namespace": map[string]any{
 						"type":        "string",

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"time"
 )
@@ -35,6 +36,32 @@ type ClusterAccess interface {
 	// StartGatewayPortForward opens a port-forward to the deployment's
 	// in-cluster a2a-mcp listener.
 	StartGatewayPortForward(ctx context.Context, prof DeploymentProfile) (Tunnel, error)
+}
+
+// KubeContextLister is implemented by a ClusterAccess that can name the kubeconfig's
+// contexts, as the kube package's does. connect_deployment resolves a partial kube_context
+// override against them; without it the override is used as given.
+type KubeContextLister interface {
+	KubeContexts() ([]string, error)
+}
+
+// MatchKubeContexts is the kubeconfig contexts a kube_context filter selects, sorted: every
+// name that contains it, case-insensitively, or all of them for an empty filter. Discovery's
+// filter and connect_deployment's override both select with it.
+func MatchKubeContexts(names []string, filter string) []string {
+	lowerFilter := strings.ToLower(strings.TrimSpace(filter))
+	var out []string
+	for _, name := range names {
+		c := strings.TrimSpace(name)
+		if c == "" {
+			continue
+		}
+		if lowerFilter == "" || strings.Contains(strings.ToLower(c), lowerFilter) {
+			out = append(out, c)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Tunnel is a port-forward to the in-cluster a2a-mcp listener.

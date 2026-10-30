@@ -119,18 +119,11 @@ func listKubeContextsClientGo(trimmedFilter string) ([]string, error) {
 		}
 		return nil, fmt.Errorf("loading kubeconfig contexts: %w", err)
 	}
-	lowerFilter := strings.ToLower(trimmedFilter)
-	var contexts []string
+	names := make([]string, 0, len(rawCfg.Contexts))
 	for name := range rawCfg.Contexts {
-		c := strings.TrimSpace(name)
-		if c == "" {
-			continue
-		}
-		if lowerFilter == "" || strings.Contains(strings.ToLower(c), lowerFilter) {
-			contexts = append(contexts, c)
-		}
+		names = append(names, name)
 	}
-	sort.Strings(contexts)
+	contexts := mcpbridge.MatchKubeContexts(names, trimmedFilter)
 	if len(contexts) == 0 && trimmedFilter != "" {
 		contexts = []string{trimmedFilter}
 	}

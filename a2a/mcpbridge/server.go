@@ -1225,12 +1225,16 @@ func (s *Server) handleConnectDeployment(ctx context.Context, rawArgs json.RawMe
 	}
 	// kube_context filters discovery by case-insensitive substring; a profile whose context it
 	// already matches keeps that full context name, which is the one the kubeconfig knows.
-	// Otherwise kube_context and namespace override the saved target for this connection only:
-	// it is not saved, does not change which deployment is active, and gets no env token
-	// (EnvMCPTokenFor).
+	// Otherwise it is resolved to a kubeconfig context with the same matcher, and it and
+	// namespace override the saved target for this connection only: it is not saved, does not
+	// change which deployment is active, and gets no env token (EnvMCPTokenFor).
 	saved := prof
 	if kc := strings.TrimSpace(args.KubeContext); kc != "" && !strings.Contains(strings.ToLower(prof.KubeContext), strings.ToLower(kc)) {
-		prof.KubeContext = kc
+		resolved, err := s.resolveKubeContextOverride(kc)
+		if err != nil {
+			return "", err
+		}
+		prof.KubeContext = resolved
 	}
 	if strings.TrimSpace(args.Namespace) != "" {
 		prof.Namespace = strings.TrimSpace(args.Namespace)
@@ -1253,6 +1257,35 @@ func (s *Server) handleConnectDeployment(ctx context.Context, rawArgs json.RawMe
 	}
 	return fmt.Sprintf("## 🔌 Connected to Kube-Agents Deployment `%s`\n\n- **Namespace / PlatformAgent**: `%s/%s`\n- **MCP Endpoint**: `%s`\n- **Active Conversation**: **`%s`** (token `console:%s`)\n",
 		prof.Name, prof.Namespace, prof.PlatformAgentName, sess.baseURL, conv.Alias, conv.Token), nil
+}
+
+// resolveKubeContextOverride is the kubeconfig context a connect_deployment kube_context
+// override names: an exact context name, else the one context MatchKubeContexts selects with
+// it, as discovery's filter would. Matching several or none is refused. A ClusterAccess that
+// cannot list contexts gets kc as given.
+func (s *Server) resolveKubeContextOverride(kc string) (string, error) {
+	lister, ok := s.cluster.(KubeContextLister)
+	if !ok {
+		return kc, nil
+	}
+	names, err := lister.KubeContexts()
+	if err != nil {
+		return "", fmt.Errorf("resolving kube_context %q: %w", kc, err)
+	}
+	for _, name := range names {
+		if strings.TrimSpace(name) == kc {
+			return kc, nil
+		}
+	}
+	matches := MatchKubeContexts(names, kc)
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return "", fmt.Errorf("kube_context %q matches no kubeconfig context", kc)
+	default:
+		return "", fmt.Errorf("kube_context %q matches more than one kubeconfig context: %s; name one of them", kc, strings.Join(matches, ", "))
+	}
 }
 
 func (s *Server) handleConnectionStatus(ctx context.Context) (string, error) {

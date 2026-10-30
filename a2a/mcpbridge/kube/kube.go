@@ -38,3 +38,8 @@ func (Access) StartGatewayPortForward(ctx context.Context, prof mcpbridge.Deploy
 	}
 	return tun, nil
 }
+
+// KubeContexts implements mcpbridge.KubeContextLister: every context name in the kubeconfig.
+func (Access) KubeContexts() ([]string, error) {
+	return listKubeContextsClientGo("")
+}
