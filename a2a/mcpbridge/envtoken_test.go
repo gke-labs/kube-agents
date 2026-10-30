@@ -110,3 +110,123 @@ func TestEnvMCPTokenGoesOnlyToTheSelectedDeployment(t *testing.T) {
 		t.Fatalf("cluster-a got Authorization %q; want the env token", got)
 	}
 }
+
+// secretClusterAccess serves every kube profile through gwURL and fills its token from a fake
+// Secret named after the profile's target.
+type secretClusterAccess struct {
+	noClusterAccess
+	gwURL string
+}
+
+func secretTokenFor(kubeContext, namespace string) string {
+	return "secret-" + kubeContext + "-" + namespace
+}
+
+func (c secretClusterAccess) PopulateDeploymentCredentials(_ context.Context, prof *DeploymentProfile) error {
+	prof.MCPToken = secretTokenFor(prof.KubeContext, prof.Namespace)
+	return nil
+}
+
+func (c secretClusterAccess) StartGatewayPortForward(context.Context, DeploymentProfile) (Tunnel, error) {
+	return fixedTunnel(c.gwURL), nil
+}
+
+type fixedTunnel string
+
+func (t fixedTunnel) MCPURL() string { return string(t) }
+func (fixedTunnel) Restart()         {}
+func (fixedTunnel) Close()           {}
+
+// kubeTokenServer saves profs (kube profiles, no direct URL) and serves them through gwURL.
+func kubeTokenServer(t *testing.T, gwURL string, batches ...[]DeploymentProfile) *Server {
+	t.Helper()
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range batches {
+		if err := store.UpsertDeployments(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv, err := NewServer(ServerOptions{Store: store, Cluster: secretClusterAccess{gwURL: gwURL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func connectArgsAuth(t *testing.T, srv *Server, auth <-chan string, args string) string {
+	t.Helper()
+	res := srv.CallTool(context.Background(), ToolConnectDeployment, json.RawMessage(args))
+	if res.IsError {
+		t.Fatalf("connect_deployment %s: %+v", args, res)
+	}
+	select {
+	case got := <-auth:
+		return got
+	case <-time.After(stdioTestWait):
+		t.Fatalf("connect_deployment %s made no gateway call", args)
+	}
+	return ""
+}
+
+func TestEnvMCPTokenIsNotSentWhenTheCallOverridesTheDirectTarget(t *testing.T) {
+	gw, auth := envTokenGateway(t)
+	srv := envTokenServer(t, gw.URL, "cluster-a")
+	t.Setenv(EnvMCPToken, envTokenValue)
+	t.Setenv(EnvMCPTokenDeployment, "")
+	if got := connectArgsAuth(t, srv, auth, `{"deployment":"cluster-a","namespace":"other-ns"}`); got != "" {
+		t.Fatalf("a namespace override got Authorization %q; want none", got)
+	}
+}
+
+func TestEnvMCPTokenIsNotSentWhenTheCallOverridesTheKubeTarget(t *testing.T) {
+	gw, auth := envTokenGateway(t)
+	srv := kubeTokenServer(t, gw.URL, []DeploymentProfile{{Name: "cluster-a", KubeContext: "ctx-a", Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true}})
+	t.Setenv(EnvMCPToken, envTokenValue)
+	t.Setenv(EnvMCPTokenDeployment, "")
+	if got := connectArgsAuth(t, srv, auth, `{"deployment":"cluster-a"}`); got != "Bearer "+envTokenValue {
+		t.Fatalf("the saved target got Authorization %q; want the env token", got)
+	}
+	got := connectArgsAuth(t, srv, auth, `{"deployment":"cluster-a","kube_context":"ctx-x","namespace":"ns-y"}`)
+	if want := "Bearer " + secretTokenFor("ctx-x", "ns-y"); got != want {
+		t.Fatalf("an overridden target got Authorization %q; want its own Secret's %q", got, want)
+	}
+}
+
+func TestEnvMCPTokenGoesNowhereWhenTheSelectorMatchesARenamedProfileAndAnother(t *testing.T) {
+	gw, auth := envTokenGateway(t)
+	// The second save collides with the first by name from another context, so it is saved as
+	// "ctx-2/cluster-a" while the first keeps "cluster-a".
+	srv := kubeTokenServer(t, gw.URL,
+		[]DeploymentProfile{{Name: "cluster-a", KubeContext: "ctx-1", Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true}},
+		[]DeploymentProfile{{Name: "cluster-a", KubeContext: "ctx-2", Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true}},
+	)
+	if _, ok := srv.Store().Snapshot().Deployments["ctx-2/cluster-a"]; !ok {
+		t.Fatalf("setup: want ctx-2/cluster-a saved, have %v", srv.Store().Snapshot().Deployments)
+	}
+	t.Setenv(EnvMCPToken, envTokenValue)
+	t.Setenv(EnvMCPTokenDeployment, "cluster-a")
+	for dep, ctx := range map[string]string{"cluster-a": "ctx-1", "ctx-2/cluster-a": "ctx-2"} {
+		got := connectArgsAuth(t, srv, auth, `{"deployment":"`+dep+`"}`)
+		if want := "Bearer " + secretTokenFor(ctx, testNamespace); got != want {
+			t.Fatalf("ambiguous selector: %s got Authorization %q; want its own Secret's %q", dep, got, want)
+		}
+	}
+}
+
+func TestEnvMCPTokenSelectorMatchesARenamedProfileByItsBaseName(t *testing.T) {
+	t.Setenv(EnvMCPToken, envTokenValue)
+	t.Setenv(EnvMCPTokenDeployment, "cluster-a")
+	renamed := DeploymentProfile{Name: "ctx-1/cluster-a", KubeContext: "ctx-1", Namespace: testNamespace}
+	other := DeploymentProfile{Name: "cluster-b", KubeContext: "ctx-2", Namespace: testNamespace}
+	saved := map[string]DeploymentProfile{renamed.Name: renamed, other.Name: other}
+	if got := EnvMCPTokenFor(renamed, saved); got != envTokenValue {
+		t.Fatalf("renamed profile got %q; want the env token", got)
+	}
+	if got := EnvMCPTokenFor(other, saved); got != "" {
+		t.Fatalf("the other profile got %q; want none", got)
+	}
+}

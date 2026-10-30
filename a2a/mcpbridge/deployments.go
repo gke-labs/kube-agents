@@ -29,10 +29,13 @@ const (
 	MCPTokenSecretKey = "token"
 	// EnvMCPToken is the environment variable that overrides the MCP bearer token. EnvMCPTokenFor
 	// is its only reader: with one deployment configured the token is that deployment's; with
-	// several it is the one EnvMCPTokenDeployment names.
+	// several it is the one EnvMCPTokenDeployment names. Either way it goes only to that
+	// deployment's saved target, never to a connection that overrides it.
 	EnvMCPToken = "KUBE_AGENTS_MCP_TOKEN"
 	// EnvMCPTokenDeployment names the saved deployment profile EnvMCPToken belongs to when more
-	// than one deployment is configured. Unset, or naming none of them, the token is sent nowhere.
+	// than one deployment is configured: its saved name, or its name before a cross-context
+	// rename if only one profile answers to it. Unset, or naming none or several of them, the
+	// token is sent nowhere.
 	EnvMCPTokenDeployment = "KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT"
 
 	// DefaultUpstreamRepoURL and friends are the canonical upstream GitHub documentation links.
@@ -579,35 +582,80 @@ func fetchCommitsBehindStatus(ctx context.Context, installedRef, latestTag strin
 	return res.aheadBy, res.compared
 }
 
-var envTokenNotSentWarning sync.Once
+var (
+	envTokenNotSentWarning     sync.Once
+	envTokenTargetMovedWarning sync.Once
+)
 
 // EnvMCPTokenFor returns the KUBE_AGENTS_MCP_TOKEN override when it belongs to prof, and ""
-// otherwise. configured names the saved deployment profiles. With prof the only one, the token is
-// prof's. With several, the token belongs to the one KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT names; with
-// that unset or naming none of them, it is sent nowhere and one warning says so. A token read from
-// one install's Secret is so never sent to another install.
-func EnvMCPTokenFor(prof DeploymentProfile, configured []string) string {
+// otherwise. saved holds the saved deployment profiles by name. With one saved, the token is
+// that profile's. With several, it is the profile's KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT names: by
+// its saved name, or by the base name it was saved under before a cross-context collision
+// renamed it to "<kubeContext>/<name>", as long as exactly one profile answers to it. With the
+// selector unset, naming none, or naming more than one, the token is sent nowhere.
+//
+// The token is bound to its profile's saved target, not its name: prof gets it only when it
+// still points where the saved profile does (kube context, namespace, and direct MCP URL). A
+// connection that overrides any of them gets no env token, so the target's own Secret is used
+// where there is one. Either refusal logs one warning. A token meant for one install is so
+// never sent to another.
+func EnvMCPTokenFor(prof DeploymentProfile, saved map[string]DeploymentProfile) string {
 	token := strings.TrimSpace(os.Getenv(EnvMCPToken))
 	if token == "" {
 		return ""
 	}
-	names := map[string]bool{strings.TrimSpace(prof.Name): true}
-	for _, n := range configured {
-		names[strings.TrimSpace(n)] = true
+	owner, ok := envTokenOwner(saved)
+	if !ok || owner != strings.TrimSpace(prof.Name) {
+		return ""
 	}
-	if len(names) == 1 {
-		return token
-	}
-	scope := strings.TrimSpace(os.Getenv(EnvMCPTokenDeployment))
-	if scope == "" || !names[scope] {
-		envTokenNotSentWarning.Do(func() {
-			slog.Warn(EnvMCPToken+" is not sent to any deployment: more than one is configured, and "+
-				EnvMCPTokenDeployment+" does not name one of them", "deployment_selector", scope)
+	if !sameConnectionTarget(prof, saved[owner]) {
+		envTokenTargetMovedWarning.Do(func() {
+			slog.Warn(EnvMCPToken+" is not sent: the connection overrides its deployment's saved target",
+				"deployment", owner)
 		})
 		return ""
 	}
-	if scope != strings.TrimSpace(prof.Name) {
-		return ""
-	}
 	return token
+}
+
+// envTokenOwner names the saved profile KUBE_AGENTS_MCP_TOKEN belongs to (see EnvMCPTokenFor).
+func envTokenOwner(saved map[string]DeploymentProfile) (string, bool) {
+	if len(saved) == 1 {
+		for name := range saved {
+			return name, true
+		}
+	}
+	scope := strings.TrimSpace(os.Getenv(EnvMCPTokenDeployment))
+	var matches []string
+	if scope != "" {
+		for name, p := range saved {
+			if name == scope || deploymentBaseName(name, p) == scope {
+				matches = append(matches, name)
+			}
+		}
+	}
+	if len(matches) != 1 {
+		envTokenNotSentWarning.Do(func() {
+			slog.Warn(EnvMCPToken+" is not sent to any deployment: more than one is configured, and "+
+				EnvMCPTokenDeployment+" does not name exactly one of them", "deployment_selector", scope)
+		})
+		return "", false
+	}
+	return matches[0], true
+}
+
+// deploymentBaseName is the name a profile saved as name had before a cross-context collision
+// renamed it to "<kubeContext>/<name>" (resolveDeploymentKeyLocked), or name itself.
+func deploymentBaseName(name string, p DeploymentProfile) string {
+	if ctx := strings.TrimSpace(p.KubeContext); ctx != "" {
+		return strings.TrimPrefix(name, ctx+"/")
+	}
+	return name
+}
+
+// sameConnectionTarget reports whether prof connects where the saved profile does.
+func sameConnectionTarget(prof, saved DeploymentProfile) bool {
+	return strings.TrimSpace(prof.KubeContext) == strings.TrimSpace(saved.KubeContext) &&
+		strings.TrimSpace(prof.Namespace) == strings.TrimSpace(saved.Namespace) &&
+		strings.TrimRight(strings.TrimSpace(prof.DirectMCPURL), "/") == strings.TrimRight(strings.TrimSpace(saved.DirectMCPURL), "/")
 }
