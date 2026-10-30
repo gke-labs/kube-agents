@@ -215,7 +215,7 @@ func manageSessionDefinition() ToolDefinition {
 	props := map[string]any{
 		"description": map[string]any{
 			"type":        "string",
-			"description": "Optional human-readable description when creating or switching a conversation.",
+			"description": "Optional human-readable description for the conversation manage_session new creates.",
 		},
 	}
 	if upstreamTranscriptAndClearKilled {

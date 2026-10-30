@@ -461,12 +461,15 @@ func TestFormatPRInspectionMarkdownFencesTheAuthorsContent(t *testing.T) {
 		if strings.HasPrefix(line, "#") && strings.Contains(line, "Next step") || strings.HasPrefix(line, "### injected") {
 			t.Fatalf("the PR's text renders as a heading of the bridge's own: %q\n%s", line, md)
 		}
-		if strings.HasPrefix(line, "## ") && strings.Contains(line, "](file://") {
-			t.Fatalf("the title forges a link in the heading: %q", line)
+		if title, ok := strings.CutPrefix(line, "- **Title**: "); ok && !(strings.HasPrefix(title, "`") && strings.HasSuffix(title, "`")) {
+			t.Fatalf("the title is not a code span, so it can forge a link: %q", line)
 		}
 		if strings.HasPrefix(line, "| ") && strings.Contains(line, "a|b") {
 			t.Fatalf("the filename's pipe ends its table cell: %q", line)
 		}
+	}
+	if !strings.Contains(md, "- **Title**: `") {
+		t.Fatalf("no title line to check:\n%s", md)
 	}
 	if strings.Contains(md, "‮") || !strings.Contains(md, "<U+202E>") {
 		t.Fatalf("the bidi override is not shown as <U+202E>:\n%s", md)
