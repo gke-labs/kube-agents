@@ -42,7 +42,7 @@ func shutdown(ss ...*server.Server) {
 // seedBus creates a work stream and a KV bucket at R3, the shapes the
 // provision Job makes, with messages, a durable consumer partway through,
 // and a key at revision 3.
-func seedBus(t *testing.T, url string) {
+func seedBus(t *testing.T, url string, replicas int) {
 	t.Helper()
 	var last error
 	for i := 0; i < 30; i++ {
@@ -53,7 +53,7 @@ func seedBus(t *testing.T, url string) {
 			}
 			defer nc.Close()
 			js, _ := nc.JetStream()
-			if _, err := js.AddStream(&nats.StreamConfig{Name: "TASKS", Subjects: []string{"a2a.tasks.>"}, Replicas: 3,
+			if _, err := js.AddStream(&nats.StreamConfig{Name: "TASKS", Subjects: []string{"a2a.tasks.>"}, Replicas: replicas,
 				AllowDirect: true, MaxBytes: 1 << 30, Discard: nats.DiscardOld, Duplicates: 2 * time.Minute}); err != nil {
 				return err
 			}
@@ -76,7 +76,7 @@ func seedBus(t *testing.T, url string) {
 			for _, m := range msgs {
 				m.AckSync()
 			}
-			kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "cap", Replicas: 3, History: 1, MaxBytes: 1 << 28})
+			kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "cap", Replicas: replicas, History: 1, MaxBytes: 1 << 28})
 			if err != nil {
 				return err
 			}
@@ -124,7 +124,7 @@ func TestThreeToOneKeepsTheBus(t *testing.T) {
 	s0 := startServer(t, "a2a-nats-0", d0, 16251)
 	s1 := startServer(t, "a2a-nats-1", filepath.Join(base, "1"), 16252)
 	s2 := startServer(t, "a2a-nats-2", filepath.Join(base, "2"), 16253)
-	seedBus(t, s0.ClientURL())
+	seedBus(t, s0.ClientURL(), 3)
 	streams := []string{"TASKS", "KV_cap"}
 	before := streamConfigs(t, s0.ClientURL(), streams...)
 
