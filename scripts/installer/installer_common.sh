@@ -1344,7 +1344,7 @@ next_home_channel_unset_remedy() {
   case "${1:-}" in
     SLACK_HOME_CHANNEL)
       [ "${2:-}" = "flags" ] && via="install.env or --slack-home-channel"
-      printf '%s' "Set SLACK_HOME_CHANNEL to a channel id (C... or G..., at the bottom of the channel details' About tab) in ${via} and run again, with the app invited to that channel. Slack app setup: ${SLACK_HOME_CHANNEL_DOC}"
+      printf '%s' "Set SLACK_HOME_CHANNEL to a channel id (C... or G..., at the bottom of the channel details' About tab) in ${via} and run again, with the app invited to that channel; or, under homeChannelPolicy auto (the default), mention the agent once, top-level, in the channel you want. Slack app setup: ${SLACK_HOME_CHANNEL_DOC}"
       ;;
     GOOGLE_CHAT_HOME_CHANNEL)
       [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel"

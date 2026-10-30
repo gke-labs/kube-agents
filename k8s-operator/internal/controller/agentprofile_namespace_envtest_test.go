@@ -513,7 +513,7 @@ func TestAProfileNamespaceRefusalDoesNotStopTheRender(t *testing.T) {
 		},
 	})
 	r := &PlatformAgentReconciler{Client: refusing, Scheme: scheme}
-	if _, err := r.reconcileA2A(ctx, agent); err != nil && strings.Contains(err.Error(), "refused by a policy in the profile namespace") {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil && strings.Contains(err.Error(), "refused by a policy in the profile namespace") {
 		t.Fatalf("reconcileA2A returned the profile namespace's refusal (%v); it is logged, not returned", err)
 	}
 	var q corev1.ResourceQuota
@@ -609,7 +609,7 @@ func TestTheIdentityMapRendersProfilesOnlyWithTheProfileNamespace(t *testing.T) 
 	r := &PlatformAgentReconciler{Client: c, APIReader: c, Scheme: scheme}
 	mapHas := func() bool {
 		t.Helper()
-		_, _ = r.reconcileA2A(ctx, agent)
+		_, _ = r.reconcileA2A(ctx, agent, homeChannelRecord{})
 		var cm corev1.ConfigMap
 		if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapName(agent)}, &cm); err != nil {
 			t.Fatalf("the identity map was not rendered: %v", err)
@@ -642,7 +642,7 @@ func TestTheIdentityMapRendersProfilesOnlyWithTheProfileNamespace(t *testing.T) 
 		},
 	})
 	r.APIReader = failing
-	if _, err := r.reconcileA2A(ctx, agent); err == nil || !strings.Contains(err.Error(), "timed out") {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Errorf("reconcileA2A = %v, want the namespace read's error", err)
 	}
 	var cm corev1.ConfigMap

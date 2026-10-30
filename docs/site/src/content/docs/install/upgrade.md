@@ -497,14 +497,18 @@ gateway.
    - `SLACK_ALLOWED_USERS` in `install.env` holds member IDs such as `U0123ABCD`, not emails
      ([Allowed users](/kube-agents/install/slack-app/#allowed-users)).
    - `SLACK_HOME_CHANNEL` in `install.env` is the ID of the channel for alerts and scheduled
-     reports: `C…`, or `G…` for some private channels. In Slack, the ID is at the bottom of the
-     channel's details. Under `next` the gateway posts the agent's proactive messages to this
-     channel only. A home channel set from Slack with `/sethome` is kept in the Planning Agent's
-     profile, not in `install.env`, so it does not carry over. A DM ID (`D…`) or a channel name
-     turns off the gateway's notify route, and with it the reports of board cards
+     reports: `C…`, or `G…` for some private channels. Under `next` the gateway posts the agent's
+     proactive messages to this channel, or, with it empty and `homeChannelPolicy` auto (the
+     default), to the channel of the first top-level mention of the agent. A home channel set with
+     `/sethome` lives in the Planning Agent's
+     profile and does not carry over. A DM ID (`D…`) or a channel name turns off the gateway's
+     notify route, and with it the reports of board cards
      ([Slack app setup → Home channel](/kube-agents/install/slack-app/#home-channel)). With no home
      channel those posts are dropped while conversations keep working: the run warns, and the
      `PlatformAgent` carries the `HomeChannelUnset` condition.
+   - Keep the agent image at the operator's release. A learned home channel reaches the agent through
+     a file the operator mounts; an older agent image reads env only and never sees it, while the CR
+     shows no condition.
 
 3. Check the board for cards in flight:
 
