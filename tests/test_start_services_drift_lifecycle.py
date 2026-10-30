@@ -1004,6 +1004,7 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
                 "NS_PER_H",
                 "NS_MAX",
                 "DECIMAL_BASE",
+                "WATCHER_DURATION_MAX_HOURS",
             )
         )
         return _run_bash(
@@ -1019,11 +1020,10 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
         )
 
     def test_a_go_duration_passes_through_unchanged(self) -> None:
-        # 604800s and 2562047h: large, and inside Go's int64 of nanoseconds.
+        # 1000000h is the ceiling itself (WATCHER_DURATION_MAX_HOURS).
         for value in (
             "2m", "90s", "1h30m", "1.5h", "500ms", "24h", "0", "0s",
-            "604800s", "120000ms", "100000h", "1h1m1s1ms1us", "2562047h",
-            "2562047h47m16.854s",
+            "604800s", "120000ms", "100000h", "1h1m1s1ms1us", "1000000h",
         ):
             with self.subTest(value=value):
                 result = self._resolve("normalize_duration", value, _FALLBACK_DURATION)
@@ -1038,7 +1038,8 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
     def test_a_value_the_watcher_would_reject_lands_on_the_default_and_says_so(self) -> None:
         # 120: no unit. -5m: validate() refuses a negative. 00: ParseDuration
         # only special-cases a bare 0. The last four are past int64 nanoseconds:
-        # one unit, a second component, and a fraction over the line.
+        # one unit, a second component, and a fraction over the line; without
+        # the range check each wraps negative and passes the ceiling.
         for value in (
             "120", "2", "-5m", "abc", "00", "2 m", "5min",
             "2562048h", "3000000h", "2562047h1h", "2562047h47m16.855s",
@@ -1094,6 +1095,10 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
             ("normalize_duration", ".5h", _FALLBACK_DURATION),
             ("normalize_duration", "1.h", _FALLBACK_DURATION),
             ("normalize_duration", "0.0001s", _FALLBACK_DURATION),
+            # Inside Go's range, past the ceiling the watcher's sums need.
+            ("normalize_duration", "1000000h1ns", _FALLBACK_DURATION),
+            ("normalize_duration", "2562047h", _FALLBACK_DURATION),
+            ("normalize_duration", "9223372036854775807ns", _FALLBACK_DURATION),
         ):
             with self.subTest(value=value):
                 result = self._resolve(helper, value, fallback)

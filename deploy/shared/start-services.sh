@@ -229,11 +229,12 @@ normalize_boolean() {
 # subset of what Go's flag package accepts, so that every value inside a
 # pattern (and, for a duration, inside duration_nanoseconds' range check) is
 # one the binary parses, and a value outside it only ever reaches the
-# fallback. A duration is time.ParseDuration's grammar narrowed three ways: no
+# fallback. A duration is time.ParseDuration's grammar narrowed four ways: no
 # sign (validate() rejects a negative settle, span or quiet period, and the
 # filter replaces a negative hold with its default anyway); no `µs`, `.5h` or
-# `1.h`; and at most three fraction digits per component, which is what keeps
-# the fraction arithmetic below inside bash's int64. A count is plain decimal,
+# `1.h`; at most eighteen integer and three fraction digits per component,
+# which keeps the arithmetic below inside bash's int64; and no more than
+# WATCHER_DURATION_MAX_HOURS in all. A count is plain decimal,
 # at most eighteen digits: the flag package reads ints with a base prefix, so
 # `08` is a bad octal literal there and `0x10` is sixteen, and nineteen digits
 # can overflow an int64, which it rejects as out of range.
@@ -251,6 +252,14 @@ readonly NS_PER_M=60000000000
 readonly NS_PER_H=3600000000000
 readonly NS_MAX=9223372036854775807
 readonly DECIMAL_BASE=10
+
+# The longest duration a tunable may be, far below Go's limit of about
+# 2562047h. The watcher adds its own constants to two of them (the settle
+# period plus its quiet slack, the scale-up hold plus the staleness window),
+# and either sum wraps negative within minutes of Go's limit. A million hours
+# is over a century, so no tunable meant as one is refused, and the headroom
+# does not depend on what those constants are.
+readonly WATCHER_DURATION_MAX_HOURS=1000000
 
 # Set the *named* variable to the whole nanoseconds Go's time.ParseDuration
 # reads $2 as, $2 being a duration WATCHER_DURATION_PATTERN already admitted,
@@ -310,13 +319,14 @@ normalize_duration() {
   # Zero is measured in nanoseconds rather than read off the digits: `0.5ns`
   # has a non-zero digit and is still zero to the watcher.
   if [[ "${value}" =~ ${WATCHER_DURATION_PATTERN} ]] && duration_nanoseconds nanoseconds "${value}" &&
+    ((nanoseconds <= WATCHER_DURATION_MAX_HOURS * NS_PER_H)) &&
     { [[ -z "${positive}" ]] || ((nanoseconds > 0)); }; then
     printf -v "${name}" '%s' "${value}"
     return 0
   fi
 
   printf -v "${name}" '%s' "${fallback}"
-  echo "start-services: ${name}=${value} is not a usable duration (a Go duration such as 2m or 90s, at most three fraction digits, within Go's range${positive:+, above zero}); using ${fallback}" >&2
+  echo "start-services: ${name}=${value} is not a usable duration (a Go duration such as 2m or 90s, up to eighteen digits and three decimals per number, at most ${WATCHER_DURATION_MAX_HOURS}h${positive:+, above zero}); using ${fallback}" >&2
 }
 
 # Rewrite the *named* variable, in place, to a decimal count the watcher's flag
