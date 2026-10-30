@@ -188,10 +188,11 @@ class SpecToolRegistryTest(unittest.TestCase):
     # (test_the_core_allowlist_still_has_evidence_in_the_agent_text).
     # `terminal` is the tool a worker's shell commands go through, which
     # delegated-proposal-stays-in-reply's safeguard reads (#2610).
-    HERMES_CORE_TOOLS = {"skill_view", "terminal"}
+    HERMES_CORE_TOOLS = {"skill_view", "terminal", "execute_code"}
     CORE_TOOL_EVIDENCE = (
         "agents/platform/skills/github-issue-resolver/SKILL.md",
         "agents/platform/AGENTS.md",
+        "agents/cluster/SOUL.md",
     )
 
     # Tools behind a remote MCP proxy (`/opt/mcp-remote/dist/proxy.js <url>`),
@@ -209,6 +210,9 @@ class SpecToolRegistryTest(unittest.TestCase):
         # #953: read-only workload existence inspection across clusters
         ("gke", "get_k8s_resource"),
         ("gke", "describe_k8s_resource"),
+        ("gke", "list_k8s_events"),
+        ("gke", "get_k8s_logs"),
+        ("gke", "get_k8s_rollout_status"),
     }
     REMOTE_TOOL_EVIDENCE = (
         "agents/platform/SOUL.md",
