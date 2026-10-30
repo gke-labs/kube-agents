@@ -595,6 +595,12 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 			return fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
 		}
 	}
+	// The warm pools the dispatcher hands interactive tasks to
+	// (agentprofile_pool.go). A failure there is the profile namespace's,
+	// like the quota's.
+	if err := r.reconcileProfilePools(ctx, agent, profiles, resolved); err != nil {
+		return err, nil
+	}
 	return nil, nil
 }
 
@@ -635,7 +641,8 @@ func (r *PlatformAgentReconciler) deleteDispatcherPodsRBAC(ctx context.Context, 
 			return fmt.Errorf("deleting the dispatcher's pod-read %T: %w", obj, err)
 		}
 	}
-	return nil
+	// And the warm pools, which have no work without the dispatcher.
+	return r.deleteProfilePools(ctx, agent)
 }
 
 // deleteIfControlled deletes the named object if this agent controls it.
@@ -659,7 +666,13 @@ func (r *PlatformAgentReconciler) deleteIfControlled(ctx context.Context, agent 
 // agentLabelsMark reports whether obj carries this agent's a2a labels, the
 // ownership test for objects in the profile namespace.
 func agentLabelsMark(obj client.Object, agent *agentv1alpha1.PlatformAgent) bool {
-	want := a2aLabels(agent, "dispatcher")
+	return agentLabelsMarkComponent(obj, agent, "dispatcher")
+}
+
+// agentLabelsMarkComponent is agentLabelsMark for an object of another
+// component: it carries this agent's labels with that component.
+func agentLabelsMarkComponent(obj client.Object, agent *agentv1alpha1.PlatformAgent, component string) bool {
+	want := a2aLabels(agent, component)
 	got := obj.GetLabels()
 	for k, v := range want {
 		if got[k] != v {
