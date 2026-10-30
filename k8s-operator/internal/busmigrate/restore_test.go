@@ -150,3 +150,27 @@ func TestARestoredStreamWithTheWrongConfigIsDeleted(t *testing.T) {
 		t.Fatalf("a stream with the operator's config: %v", err)
 	}
 }
+
+// The defaults cut both ways: a field the operator's config leaves zero
+// compares as the server's default, so a restored stream that set it to
+// anything else (a consumer cap, a size limit, a short duplicate window) is
+// caught, not waved through as "unset".
+func TestAZeroFieldIsNotAWildcard(t *testing.T) {
+	want := nats.StreamConfig{Name: "TASKS", Subjects: []string{"a2a.tasks.>"}, Replicas: 1}
+	stored := withServerDefaults(want)
+	if d := configDiff(want, stored); d != "" {
+		t.Fatalf("the server's own defaults read as a difference: %s", d)
+	}
+	for field, tweak := range map[string]func(*nats.StreamConfig){
+		"max_consumers": func(c *nats.StreamConfig) { c.MaxConsumers = 1 },
+		"max_bytes":     func(c *nats.StreamConfig) { c.MaxBytes = 1024 },
+		"max_msgs":      func(c *nats.StreamConfig) { c.MaxMsgs = 10 },
+		"duplicates":    func(c *nats.StreamConfig) { c.Duplicates = time.Second },
+	} {
+		got := stored
+		tweak(&got)
+		if d := configDiff(want, got); !strings.Contains(d, field) {
+			t.Errorf("a stored %s other than the default passed the read-back (diff %q)", field, d)
+		}
+	}
+}
