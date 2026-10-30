@@ -2202,6 +2202,21 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 			t.Fatalf("precondition: the dispatcher's pod-read %T in the profile namespace wasn't rendered: %v", obj, err)
 		}
 	}
+	// And Job mode's half: the Jobs Role and binding, the policy's index
+	// param, and a Job the dispatcher made (the fake runs no dispatcher).
+	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher-jobs", Namespace: "test-ns-profiles"}, obj); err != nil {
+			t.Fatalf("precondition: the dispatcher's Jobs %T in the profile namespace wasn't rendered: %v", obj, err)
+		}
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: dispatchJobIndexName, Namespace: "test-ns-profiles"}, &corev1.PodTemplate{}); err != nil {
+		t.Fatalf("precondition: the Job policy's index param wasn't rendered: %v", err)
+	}
+	if err := cl.Create(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "dispatch-1", Namespace: "test-ns-profiles", Labels: map[string]string{dispatchJobLabel: "true"},
+	}}); err != nil {
+		t.Fatalf("precondition: create a dispatcher Job: %v", err)
+	}
 
 	// The render has to have produced what the cleanup is asked to remove.
 	// Checked for the whole teardown list, not the gateway alone: every row of
@@ -2263,6 +2278,21 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher", Namespace: "test-ns-profiles"}, obj)
 		if !errors.IsNotFound(err) {
 			t.Errorf("the dispatcher's pod-read %T in the profile namespace survived the cleanup (err=%v)", obj, err)
+		}
+	}
+	// Job mode's half, likewise unowned.
+	for _, tc := range []struct {
+		obj  client.Object
+		name string
+	}{
+		{&rbacv1.Role{}, "test-agent-a2a-dispatcher-jobs"},
+		{&rbacv1.RoleBinding{}, "test-agent-a2a-dispatcher-jobs"},
+		{&corev1.PodTemplate{}, dispatchJobIndexName},
+		{&batchv1.Job{}, "dispatch-1"},
+	} {
+		err := cl.Get(ctx, types.NamespacedName{Name: tc.name, Namespace: "test-ns-profiles"}, tc.obj)
+		if !errors.IsNotFound(err) {
+			t.Errorf("Job mode's %T %s in the profile namespace survived the cleanup (err=%v)", tc.obj, tc.name, err)
 		}
 	}
 

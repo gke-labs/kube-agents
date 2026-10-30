@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -452,6 +453,10 @@ type a2aDispatchProfile struct {
 	ActiveDeadlineSeconds int                  `json:"activeDeadlineSeconds"`
 	Parameters            []a2aCardParameter   `json:"parameters,omitempty"`
 	Durables              []a2aDispatchDurable `json:"durables"`
+	// JobTemplate is the pod template the dispatcher stamps the profile's
+	// unattended Jobs from (lib.DispatchProfile.JobTemplate), set only for a
+	// profile allowing the unattended tier (agentprofile_job_template.go).
+	JobTemplate *corev1.PodTemplateSpec `json:"jobTemplate,omitempty"`
 }
 
 type a2aDispatchDurable struct {
@@ -472,6 +477,12 @@ func profileDurableName(profile, tier, kind string) string {
 // value resolved, and the profiles that have a rendered identity, each with
 // the durables the operator creates for it, one per (tier, kind).
 func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (a2aDispatchConfig, error) {
+	return desiredDispatchConfigWith(agent, profiles, nil)
+}
+
+// desiredDispatchConfigWith is desiredDispatchConfig with each unattended
+// profile's Job template, by profile name (dispatchJobTemplates).
+func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]*corev1.PodTemplateSpec) (a2aDispatchConfig, error) {
 	ceiling := resolveProfileCeiling(agent)
 	child, interactive := dispatchReserves(agent, ceiling)
 	cfg := a2aDispatchConfig{
@@ -499,6 +510,7 @@ func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 			QueueTimeoutSeconds:   int(p.QueueTimeout()),
 			ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),
 			Durables:              []a2aDispatchDurable{},
+			JobTemplate:           jobTemplates[p.Name],
 		}
 		for _, param := range p.Spec.Parameters {
 			dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
@@ -521,7 +533,13 @@ func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 }
 
 func buildA2ADispatchConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (*corev1.ConfigMap, error) {
-	cfg, err := desiredDispatchConfig(agent, profiles)
+	return buildA2ADispatchConfigMapWith(agent, profiles, nil)
+}
+
+// buildA2ADispatchConfigMapWith is buildA2ADispatchConfigMap with the
+// profiles' Job templates.
+func buildA2ADispatchConfigMapWith(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]*corev1.PodTemplateSpec) (*corev1.ConfigMap, error) {
+	cfg, err := desiredDispatchConfigWith(agent, profiles, jobTemplates)
 	if err != nil {
 		return nil, err
 	}
@@ -546,7 +564,11 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	if !a2aDispatcherEnabled() {
 		return r.removeA2ADispatcher(ctx, agent)
 	}
-	cm, err := buildA2ADispatchConfigMap(agent, profiles)
+	// One rendering of each unattended profile's Job template, into the
+	// dispatch config and into the admission policy's params, so the two
+	// never differ.
+	jobTemplates := dispatchJobTemplates(agent, profiles, r.imageVolumeSupported(agent))
+	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, jobTemplates)
 	if err != nil {
 		return nil, fmt.Errorf("failed to render the dispatch config: %w", err)
 	}
@@ -595,6 +617,16 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 			return fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
 		}
 	}
+	// Job mode: the admission policy's params before the Role that lets the
+	// dispatcher create Jobs against them.
+	if err := r.reconcileDispatchJobParams(ctx, agent, jobTemplates); err != nil {
+		return err, nil
+	}
+	for _, obj := range []client.Object{buildA2ADispatcherJobsRole(agent), buildA2ADispatcherJobsRoleBinding(agent)} {
+		if err := r.applyManaged(ctx, agent, obj); err != nil {
+			return fmt.Errorf("the dispatcher's Jobs %T: %w", obj, err), nil
+		}
+	}
 	return nil, nil
 }
 
@@ -616,10 +648,18 @@ func (r *PlatformAgentReconciler) removeA2ADispatcher(ctx context.Context, agent
 	return r.deleteDispatcherPodsRBAC(ctx, agent), nil
 }
 
-// deleteDispatcherPodsRBAC removes the dispatcher's pod-read Role and binding
-// from the profile namespace, if they carry this agent's labels. Read
-// uncached: Role is a kind this controller doesn't watch.
+// deleteDispatcherPodsRBAC removes what the dispatcher has in the profile
+// namespace: its pod-read Role and binding, and Job mode's Jobs, Job
+// templates and Jobs Role (deleteDispatcherJobResources), each if it carries
+// this agent's labels. Both run whatever the other returns.
 func (r *PlatformAgentReconciler) deleteDispatcherPodsRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	return errors.Join(r.deleteDispatcherPodReadRBAC(ctx, agent), r.deleteDispatcherJobResources(ctx, agent))
+}
+
+// deleteDispatcherPodReadRBAC removes the dispatcher's pod-read Role and
+// binding from the profile namespace, if they carry this agent's labels.
+// Read uncached: Role is a kind this controller doesn't watch.
+func (r *PlatformAgentReconciler) deleteDispatcherPodReadRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	key := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: a2aDispatcherName(agent)}
 	for _, obj := range []client.Object{&rbacv1.RoleBinding{}, &rbacv1.Role{}} {
 		if err := r.a2aReader().Get(ctx, key, obj); err != nil {
