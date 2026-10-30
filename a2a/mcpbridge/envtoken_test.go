@@ -230,3 +230,14 @@ func TestEnvMCPTokenSelectorMatchesARenamedProfileByItsBaseName(t *testing.T) {
 		t.Fatalf("the other profile got %q; want none", got)
 	}
 }
+
+func TestConnectDeploymentKeepsTheFullContextAPartialKubeContextMatched(t *testing.T) {
+	gw, auth := envTokenGateway(t)
+	const full = "gke_example-project_us-central1_prod-us-central1"
+	srv := kubeTokenServer(t, gw.URL, []DeploymentProfile{{Name: "prod-us-central1", KubeContext: full, Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true}})
+	t.Setenv(EnvMCPToken, "")
+	got := connectArgsAuth(t, srv, auth, `{"deployment":"prod-us-central1","kube_context":"PROD"}`)
+	if want := "Bearer " + secretTokenFor(full, testNamespace); got != want {
+		t.Fatalf("a partial kube_context connected with Authorization %q; want the full context's %q", got, want)
+	}
+}

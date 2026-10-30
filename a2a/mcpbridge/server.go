@@ -1170,8 +1170,10 @@ func (s *Server) handleConnectDeployment(ctx context.Context, rawArgs json.RawMe
 			return "", err
 		}
 	}
-	if strings.TrimSpace(args.KubeContext) != "" {
-		prof.KubeContext = strings.TrimSpace(args.KubeContext)
+	// kube_context filters discovery by case-insensitive substring; a profile whose context it
+	// already matches keeps that full context name, which is the one the kubeconfig knows.
+	if kc := strings.TrimSpace(args.KubeContext); kc != "" && !strings.Contains(strings.ToLower(prof.KubeContext), strings.ToLower(kc)) {
+		prof.KubeContext = kc
 	}
 	if strings.TrimSpace(args.Namespace) != "" {
 		prof.Namespace = strings.TrimSpace(args.Namespace)
