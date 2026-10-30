@@ -316,13 +316,21 @@ func (g *gatewayBridgeSession) WaitForHealthy(ctx context.Context, timeout time.
 	resp, err := g.httpClient.Do(req)
 	if err != nil {
 		// The probe's own timeout is a tunnel failure; the caller's cancel is not.
-		if g.tunnel != nil && ctx.Err() == nil {
-			g.tunnel.Restart()
+		if tun := g.currentTunnel(); tun != nil && ctx.Err() == nil {
+			tun.Restart()
 		}
 		return false
 	}
 	_ = resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
+}
+
+// currentTunnel is the session's tunnel, or nil once Close has taken it. Read it once into a
+// local: Close may nil the field between a check and a call.
+func (g *gatewayBridgeSession) currentTunnel() Tunnel {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.tunnel
 }
 
 func (g *gatewayBridgeSession) Close() {
@@ -414,8 +422,8 @@ func (g *gatewayBridgeSession) callRemoteTool(
 	if err != nil {
 		// The caller's own cancel or deadline says nothing about the tunnel, and restarting it
 		// would reset every other stream on the shared connection (a concurrent stop among them).
-		if g.tunnel != nil && ctx.Err() == nil {
-			g.tunnel.Restart()
+		if tun := g.currentTunnel(); tun != nil && ctx.Err() == nil {
+			tun.Restart()
 		}
 		return "", "", "", err
 	}

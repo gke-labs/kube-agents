@@ -3,11 +3,13 @@ package mcpbridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -177,4 +179,34 @@ func containsBlockTool(body []byte) bool {
 		} `json:"params"`
 	}
 	return json.Unmarshal(body, &req) == nil && req.Params.Name == "block_me"
+}
+
+// countingTunnel is a Tunnel that only counts restarts.
+type countingTunnel struct{ restarts atomic.Int32 }
+
+func (t *countingTunnel) MCPURL() string { return "http://127.0.0.1:1" }
+func (t *countingTunnel) Restart()       { t.restarts.Add(1) }
+func (t *countingTunnel) Close()         {}
+
+func TestAFailingCallAndCloseDoNotRaceOnTheTunnel(t *testing.T) {
+	// Requests fail at once (a transport with no shared state, so it adds no synchronisation) while another goroutine closes the
+	// session, as a reconnect closes the one it replaces. Run with -race.
+	for i := 0; i < 50; i++ {
+		g := &gatewayBridgeSession{tunnel: &countingTunnel{}, baseURL: "http://127.0.0.1:1", httpClient: &http.Client{Transport: failingRoundTripper{}}}
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			_, _, _, _ = g.callRemoteTool(context.Background(), "x", nil, CallMeta{}, PersistentConfig{}, nil)
+		}()
+		go func() { defer wg.Done(); _ = g.WaitForHealthy(context.Background(), time.Second) }()
+		go func() { defer wg.Done(); g.Close() }()
+		wg.Wait()
+	}
+}
+
+type failingRoundTripper struct{}
+
+func (failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("transport down")
 }
