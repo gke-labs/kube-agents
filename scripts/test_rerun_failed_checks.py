@@ -6,7 +6,9 @@ Run: cd scripts && python3 -m unittest test_rerun_failed_checks
 Three things here fail green if they go wrong. The per-name state is the one Tide used:
 one success clears a check name, one pending holds it, and only a name every
 check run failed is red -- read it differently and the command re-runs
-superseded runs that block nothing, or misses one that does. The plan decides
+superseded runs that block nothing, or misses one that does. A name the base
+branch requires is the exception: GitHub's merge requirement counts each red
+check run of it, so every one is re-run even beside a green. The plan decides
 how: a run that concluded `failure` by its failed jobs, any other red run
 whole, because GitHub's failed-jobs endpoint refuses a run with no failed job.
 And the ceiling is what keeps the command a flake retry rather than a way to
@@ -41,6 +43,14 @@ HEAD = "3170d0726e585fb004209d32aeb330c0dc1d6e6e"
 
 # The pull request's head as `GET /pulls/{n}` returns it: the fork branch every PR here comes from.
 PR_HEAD = {"sha": HEAD, "ref": "fix-the-thing", "repo": {"full_name": "someone/kube-agents"}}
+PR_BASE = {"ref": "main"}
+RULES_PATH = f"/repos/gke-labs/kube-agents/rules/branches/{PR_BASE['ref']}"
+
+
+def required_rule(*names):
+    """A `required_status_checks` rule as the branch-rules endpoint returns it."""
+    checks = [{"context": name, "integration_id": 15368} for name in names]
+    return {"type": rfc.RULE_REQUIRED_STATUS_CHECKS, "parameters": {"required_status_checks": checks, "strict_required_status_checks_policy": False}}
 
 
 def run(run_id, conclusion, suite, status="completed", attempt=1, name="Python Unit Tests", event="pull_request", head_branch=PR_HEAD["ref"], head_repo=PR_HEAD["repo"]["full_name"]):
@@ -76,11 +86,12 @@ class FakeAPI(rfc.GitHubAPI):
     """`GitHubAPI` with `get` and `post` faked, so the real pager runs over one pull request,
     paged lists and recorded posts."""
 
-    def __init__(self, pull=None, runs=(), checks=(), per_page=github_api.PER_PAGE, refusing=(), refusal_body=b"", failing=()):
+    def __init__(self, pull=None, runs=(), checks=(), per_page=github_api.PER_PAGE, refusing=(), refusal_body=b"", failing=(), rules=()):
         super().__init__("gke-labs/kube-agents", "x")
         self.refusal_body = refusal_body
         self.failing = set(failing)  # paths that answer 502, as the API failing rather than refusing
-        self.pull = pull or {"number": 3245, "state": "open", "head": PR_HEAD, "title": "ci: bump"}
+        self.pull = pull or {"number": 3245, "state": "open", "head": PR_HEAD, "base": PR_BASE, "title": "ci: bump"}
+        self.rules = list(rules)
         self.runs = list(runs)
         self.checks = list(checks)
         self.per_page = per_page
@@ -106,6 +117,15 @@ class FakeAPI(rfc.GitHubAPI):
             assert query["filter"] == "latest", path  # the attempt set the rollup lists; `all` would hide a red re-run behind a green first attempt
             return self._page(self.checks, "check_runs", query)
         raise AssertionError(f"unexpected call: {path}")
+
+    def get_all(self, path, per_page=github_api.PER_PAGE):
+        if path != RULES_PATH:
+            raise AssertionError(f"unexpected call: {path}")
+        if path in self.failing:
+            raise urllib.error.HTTPError(path, 502, "Bad Gateway", {}, io.BytesIO(b""))
+        if path in self.refusing:
+            raise urllib.error.HTTPError(path, 403, "Forbidden", {}, io.BytesIO(self.refusal_body))
+        return self.rules
 
     def post(self, path, payload=None, tolerate=()):
         if path in self.failing:
@@ -134,7 +154,7 @@ class StateTest(unittest.TestCase):
 
     def test_the_newest_red_check_run_of_a_red_name_is_the_one_kept(self):
         red, pending = rfc.red_check_runs([check(5, "Tests", "cancelled", 50), check(9, "Tests", "failure", 90), check(7, "Tests", "failure", 70)])
-        self.assertEqual({"Tests": 9}, {name: entry["id"] for name, entry in red.items()})
+        self.assertEqual({"Tests": [9]}, {name: [entry["id"] for entry in entries] for name, entries in red.items()})
         self.assertEqual(0, pending)
 
     def test_a_superseded_red_check_run_blocks_nothing(self):
@@ -142,6 +162,26 @@ class StateTest(unittest.TestCase):
         red, pending = rfc.red_check_runs([check(1, "Tests", "cancelled", 10), check(2, "Tests", "success", 20), check(3, "Docs", "failure", 30)])
         self.assertEqual(["Docs"], sorted(red))
         self.assertEqual(0, pending)
+
+    def test_a_superseded_red_check_run_of_a_required_name_is_still_red(self):
+        """#4256 and #4112: an `edited` run cancelled beside a green run of the same required name
+        kept both out of the merge queue."""
+        checks = [check(1, "Title", "cancelled", 10), check(2, "Title", "success", 20), check(3, "Docs", "cancelled", 30), check(4, "Docs", "success", 40)]
+        red, pending = rfc.red_check_runs(checks, required=frozenset({"Title"}))
+        self.assertEqual({"Title": [1]}, {name: [entry["id"] for entry in entries] for name, entries in red.items()})
+        self.assertEqual(0, pending)
+
+    def test_every_red_check_run_of_a_required_name_is_kept(self):
+        """Each red check suite of a required name blocks on its own, so keeping the newest would leave the rest."""
+        checks = [check(3, "Title", "failure", 30), check(1, "Title", "cancelled", 10), check(2, "Title", None, 20, status="in_progress")]
+        red, pending = rfc.red_check_runs(checks, required=frozenset({"Title"}))
+        self.assertEqual({"Title": [1, 3]}, {name: [entry["id"] for entry in entries] for name, entries in red.items()})
+        self.assertEqual(0, pending)
+
+    def test_a_required_name_with_nothing_red_reads_the_tide_way(self):
+        red, pending = rfc.red_check_runs([check(1, "Title", "success", 10), check(2, "Build", None, 20, status="queued")], required=frozenset({"Title", "Build"}))
+        self.assertEqual({}, red)
+        self.assertEqual(1, pending)
 
     def test_a_red_name_with_a_newer_run_still_going_is_pending(self):
         red, pending = rfc.red_check_runs([check(1, "Tests", "failure", 10), check(2, "Tests", None, 20, status="in_progress")])
@@ -219,6 +259,19 @@ class PlanTest(unittest.TestCase):
     def test_a_run_one_below_the_ceiling_is_still_rerun(self):
         plan = rfc.plan_reruns([check(1, "Tests", "failure", 10)], [run(100, "failure", 10, attempt=rfc.RERUN_ATTEMPT_CEILING - 1)], PR_HEAD)
         self.assertEqual(1, len(plan.rerun))
+
+    def test_a_superseded_run_of_a_required_name_reruns_whole(self):
+        plan = rfc.plan_reruns(
+            [check(1, "Title", "cancelled", 10), check(2, "Title", "success", 20)],
+            [run(100, "cancelled", 10, name="Validate PR Title"), run(200, "success", 20, name="Validate PR Title")],
+            PR_HEAD,
+            required=frozenset({"Title"}),
+        )
+        self.assertEqual([(100, rfc.RERUN_WHOLE, ["Title"])], [(e.run["id"], e.action, e.check_names) for e in plan.rerun])
+
+    def test_two_red_check_runs_of_one_name_in_one_run_name_it_once(self):
+        plan = rfc.plan_reruns([check(1, "Title", "cancelled", 10), check(2, "Title", "failure", 10)], [run(100, "cancelled", 10)], PR_HEAD, required=frozenset({"Title"}))
+        self.assertEqual([(100, ["Title"])], [(e.run["id"], e.check_names) for e in plan.rerun])
 
     def test_a_green_head_plans_nothing(self):
         plan = rfc.plan_reruns([check(1, "Tests", "success", 10), check(2, "Docs", "skipped", 20)], [run(100, "success", 10), run(200, "success", 20)], PR_HEAD)
@@ -305,6 +358,41 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rfc.REACTION_DECLINED, api.posts[-1][1]["content"])
         self.assertEqual(1, len(api.posts))
 
+    def test_a_superseded_run_of_a_required_check_is_rerun(self):
+        """#4256: the required title check's cancelled duplicate, beside a green run of it, is re-run;
+        a non-required name in the same shape is not."""
+        api = FakeAPI(
+            runs=[run(1, "cancelled", 10, name="Validate PR Title"), run(2, "success", 20, name="Validate PR Title"), run(3, "cancelled", 30, name="Risk"), run(4, "success", 40, name="Risk")],
+            checks=[check(1, "Validate Conventional Commit PR Title", "cancelled", 10), check(2, "Validate Conventional Commit PR Title", "success", 20), check(3, "classify", "cancelled", 30), check(4, "classify", "success", 40)],
+            rules=[{"type": "deletion"}, required_rule("build", "Validate Conventional Commit PR Title", "Smoke gate")],
+        )
+        code, out, err = self.run_main(api)
+        self.assertEqual(0, code, err)
+        self.assertEqual(
+            [
+                ("/repos/gke-labs/kube-agents/actions/runs/1/rerun", None),
+                ("/repos/gke-labs/kube-agents/issues/comments/77/reactions", {"content": rfc.REACTION_ACKNOWLEDGED}),
+            ],
+            api.posts,
+        )
+
+    def test_a_refused_rules_read_falls_back_to_the_tide_reading(self):
+        api = FakeAPI(
+            runs=[run(1, "cancelled", 10), run(2, "success", 20)],
+            checks=[check(1, "Title", "cancelled", 10), check(2, "Title", "success", 20)],
+            refusing={RULES_PATH},
+            refusal_body=b'{"message": "Resource not accessible by integration"}',
+        )
+        code, out, err = self.run_main(api)
+        self.assertEqual(0, code, err)
+        self.assertEqual([("/repos/gke-labs/kube-agents/issues/comments/77/reactions", {"content": rfc.REACTION_DECLINED})], api.posts)
+        self.assertIn("Could not read the rules on main (403: Resource not accessible by integration)", err)
+
+    def test_the_api_failing_on_the_rules_read_fails_the_run(self):
+        api = FakeAPI(runs=[run(1, "failure", 10)], checks=[check(1, "Tests", "failure", 10)], failing={RULES_PATH})
+        with self.assertRaises(urllib.error.HTTPError):
+            self.run_main(api)
+
     def test_only_red_checks_this_command_cannot_rerun_declines_and_names_them(self):
         api = FakeAPI(
             runs=[run(1, "failure", 10, attempt=rfc.RERUN_ATTEMPT_CEILING)],
@@ -318,7 +406,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("AI Review", out)
 
     def test_a_closed_pull_request_declines(self):
-        api = FakeAPI(pull={"number": 3245, "state": "closed", "head": PR_HEAD, "title": "t"})
+        api = FakeAPI(pull={"number": 3245, "state": "closed", "head": PR_HEAD, "base": PR_BASE, "title": "t"})
         code, out, err = self.run_main(api)
         self.assertEqual(0, code, err)
         self.assertEqual(rfc.REACTION_DECLINED, api.posts[-1][1]["content"])
