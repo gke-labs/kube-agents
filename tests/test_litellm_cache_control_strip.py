@@ -22,6 +22,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
 
@@ -264,20 +265,26 @@ class TestChartRender(unittest.TestCase):
                 self.assertIn({"name": "config-volume", "mountPath": _MOUNT, "subPath": _KEY}, mounts)
 
     def test_an_edit_to_the_hook_rolls_the_pods(self):
-        """The file feeds the Deployment's config checksum, as every subPath mount must."""
-        proc = subprocess.run(_HELM_BASE_ARGS, capture_output=True, text=True, check=False)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        before = next(d for d in yaml.safe_load_all(proc.stdout) if d and d["kind"] == "Deployment")
-        checksum = before["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
-        original = _CHART_FILE.read_text()
-        try:
-            _CHART_FILE.write_text(original + "\n# edited\n")
-            proc = subprocess.run(_HELM_BASE_ARGS, capture_output=True, text=True, check=False)
-        finally:
-            _CHART_FILE.write_text(original)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        after = next(d for d in yaml.safe_load_all(proc.stdout) if d and d["kind"] == "Deployment")
-        self.assertNotEqual(after["spec"]["template"]["metadata"]["annotations"]["checksum/config"], checksum)
+        """The file feeds the Deployment's config checksum, as every subPath mount must.
+
+        Rendered from a copy of the chart: the test sweep runs one process per
+        test file on the same checkout, so the checked-in file is never edited.
+        """
+        with tempfile.TemporaryDirectory(prefix="cache-control-strip-chart-") as tmp:
+            chart = pathlib.Path(tmp) / _CHART.name
+            shutil.copytree(_CHART, chart)
+            args = [str(chart) if a == str(_CHART) else a for a in _HELM_BASE_ARGS]
+
+            def checksum() -> str:
+                proc = subprocess.run(args, capture_output=True, text=True, check=False)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                deployment = next(d for d in yaml.safe_load_all(proc.stdout) if d and d["kind"] == "Deployment")
+                return deployment["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
+
+            before = checksum()
+            copy = chart / "files" / _KEY
+            copy.write_text(copy.read_text() + "\n# edited\n")
+            self.assertNotEqual(checksum(), before)
 
 
 if __name__ == "__main__":
