@@ -39,7 +39,7 @@ import socket
 import sqlite3
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -3018,7 +3018,8 @@ def test_inject_transport_delegated_worker_triage_does_not_deliver_result_or_dro
     """A rate-limited triage card's 429 summary is not delivered as a result and does not drop sibling ceiling marker."""
     build_session_store(tmp_path, created=[CARD_A, CARD_B])
     rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
-    set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg)
+    stashed_result = "stashed completed answer from refused turn"
+    set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg, result=stashed_result)
     set_card(tmp_path, CARD_B, "running")
 
     real_shell = local_shell(tmp_path, monkeypatch)
@@ -3047,9 +3048,40 @@ def test_inject_transport_delegated_worker_triage_does_not_deliver_result_or_dro
     assert result.has_errors()
     # Sibling CARD_B outrunning the budget must receive the ceiling marker because CARD_A delivered no answer
     assert any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
-    # The 429 failure reason must not be delivered into output as a task result
+    # Neither the 429 failure reason nor the stashed result must be delivered into output as a task result
     assert "Result of delegated task" not in result.output
     assert rate_limit_msg not in result.output
+    assert stashed_result not in result.output
+
+
+def test_inject_transport_delegated_worker_triage_initial_exhaustion_raises_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a triage card without summary exhausts all retry attempts on the initial fetch, raise transport exhausted."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "triage")
+
+    call_count = 0
+    real_read = board.read_session_cards
+
+    def failing_read(shell: Any, sid: str, to: float, want: Sequence[str] = (), max_want: int = 32) -> board.SessionCards | None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return real_read(shell, sid, to, want=want, max_want=max_want)
+        return None
+
+    monkeypatch.setattr(board, "read_session_cards", failing_read)
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert f"still waiting on: {CARD_A}" in result.errors[0]
+    # 1 initial discovery read + 3 retry attempts on triage_initial = 4 reads total (no second loop retry cycle)
+    assert call_count == 4
 
 
 def test_inject_transport_delegated_worker_blocked_to_triage_transition_marks_infra(

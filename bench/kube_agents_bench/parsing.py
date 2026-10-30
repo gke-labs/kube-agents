@@ -328,8 +328,27 @@ def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> 
         payload = _json_object(entry.get("result"))
         listed = payload.get("tasks")
         shown = payload.get("task")
+
+        shown_is_triage_infra = False
+        if isinstance(shown, dict) and str(shown.get("status") or "") == "triage":
+            shown_text = shown.get("result")
+            runs = payload.get("runs")
+            run_summary = (
+                runs[-1].get("summary")
+                if isinstance(runs, list) and runs and isinstance(runs[-1], dict)
+                else None
+            )
+            if (isinstance(shown_text, str) and extract_infra_failure_reason(shown_text)) or (
+                isinstance(run_summary, str) and extract_infra_failure_reason(run_summary)
+            ):
+                shown_is_triage_infra = True
+                if shown.get("id") is not None:
+                    delivered.pop(str(shown["id"]), None)
+
         for task in [shown, *(listed if isinstance(listed, list) else [])]:
             if not isinstance(task, dict):
+                continue
+            if task is shown and shown_is_triage_infra:
                 continue
             task_id, text = task.get("id"), task.get("result")
             if task_id in task_ids and isinstance(text, str) and text.strip():
@@ -340,7 +359,7 @@ def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> 
         # ``runs`` sits beside ``task``, not inside it, so it can only be
         # attributed to the card that payload showed, and only when the card
         # carries no explicit deliverable of its own.
-        if not isinstance(shown, dict) or shown.get("id") not in task_ids:
+        if not isinstance(shown, dict) or shown.get("id") not in task_ids or shown_is_triage_infra:
             continue
         task_id = str(shown["id"])
         if delivered.get(task_id, "").strip():

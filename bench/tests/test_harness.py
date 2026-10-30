@@ -5373,3 +5373,36 @@ def test_delivered_results_rate_limit_result_excluded_and_non_string_handled() -
     # Legitimate non-rate-limit result delivers normally
     entry_ok = {"result": json.dumps({"task": {"id": "t_1", "status": "done", "result": "completed report"}})}
     assert harness.delivered_results([entry_ok], ["t_1"]) == {"t_1": "completed report"}
+
+    # Rate-limited triage card with stashed tasks.result (e.g. refused completion) and run summary is excluded per card
+    entry_stashed = {
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "triage", "result": "stashed text from refused completion"},
+            "runs": [{"summary": rate_limit_text}],
+        })
+    }
+    assert harness.delivered_results([entry_stashed], ["t_1"]) == {}
+
+
+def test_pending_first_rate_limited_triage_sorted_after_moving_cards() -> None:
+    """_pending_first places rate-limited triage cards after moving cards so running cards are not dropped under cap."""
+    rate_limit_text = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit)"
+    task_ids = [f"t_{i}" for i in range(33)]
+    statuses = {f"t_{i}": "running" for i in range(33)}
+    statuses["t_0"] = "triage"
+    summaries = {"t_0": rate_limit_text}
+
+    def is_terminal(tid: str) -> bool:
+        st = statuses.get(tid, "")
+        if st in harness._TERMINAL_STATUSES:
+            return True
+        return harness._is_rate_limited_triage(st, tid, summaries)
+
+    ordered = harness._pending_first(task_ids, statuses, is_terminal)
+    # The 32 running cards must come first in filing order, followed by t_0
+    assert ordered[:32] == [f"t_{i}" for i in range(1, 33)]
+    assert ordered[32] == "t_0"
+
+    # Default without is_terminal treats triage as pending (backwards compatibility)
+    ordered_default = harness._pending_first(task_ids, statuses)
+    assert ordered_default == task_ids

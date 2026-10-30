@@ -1440,14 +1440,20 @@ def _sum_tokens(base: dict[str, Any], extra: dict[str, Any]) -> None:
             base[bucket] = value if current is None else current + value
 
 
-def _pending_first(task_ids: list[str], statuses: dict[str, str]) -> list[str]:
+def _pending_first(
+    task_ids: list[str],
+    statuses: dict[str, str],
+    is_terminal: Callable[[str], bool] | None = None,
+) -> list[str]:
     """Order cards still moving ahead of settled ones, keeping filing order.
 
     Only matters once :data:`_MAX_AWAITED_TASKS` bites: the cap keeps a prefix,
     so a fan-out whose first cards are already finished would otherwise be
     trimmed to nothing but those and the wait skipped.
     """
-    pending = [t for t in task_ids if statuses.get(t) not in _TERMINAL_STATUSES]
+    if is_terminal is None:
+        is_terminal = lambda t: statuses.get(t) in _TERMINAL_STATUSES
+    pending = [t for t in task_ids if not is_terminal(t)]
     return pending + [t for t in task_ids if t not in set(pending)]
 
 
@@ -3100,8 +3106,16 @@ class KubeAgentsHarness(AgentHarness):
                 {task_id: summary},
             )
 
+        # Cards the board has had no row for on consecutive reads, and the
+        # ones dropped for it: a create on another board, or a card deleted
+        # after filing, would otherwise hold the wait to the ceiling.
+        unknown: dict[str, int] = {}
+        missing: list[str] = []
+        awaited: list[str] = []
+        capped = False
+
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
-            _purge_card_state(awaited, _EXEC_TIMEOUT)
+            _purge_card_state(awaited or (read.card_ids if read is not None else []), _EXEC_TIMEOUT)
             return _DelegationTransportExhausted(
                 f"the kanban board could not be read {_MAX_TRANSPORT_FAILURES} times running; "
                 "still waiting on: " + (", ".join(still) or "nothing (reading results)")
@@ -3115,24 +3129,20 @@ class KubeAgentsHarness(AgentHarness):
         ]
         if triage_initial:
             fresh_triage = _read(triage_initial)
-            if fresh_triage is not None:
-                read.cards.update(
-                    {t: c for t, c in fresh_triage.cards.items() if t in triage_initial}
-                )
-
-        # Cards the board has had no row for on consecutive reads, and the
-        # ones dropped for it: a create on another board, or a card deleted
-        # after filing, would otherwise hold the wait to the ceiling.
-        unknown: dict[str, int] = {}
-        missing: list[str] = []
-        awaited: list[str] = []
-        capped = False
+            if fresh_triage is None:
+                raise _exhausted(triage_initial)
+            read.cards.update(
+                {t: c for t, c in fresh_triage.cards.items() if t in triage_initial}
+            )
 
         def _merge() -> list[str]:
             nonlocal awaited, capped
             merged = [t for t in dict.fromkeys(awaited + read.card_ids) if t not in missing]
             statuses = {t: _status(t) for t in merged}
-            awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
+            awaited = self._capped(
+                _pending_first(merged, statuses, _is_terminal),
+                None if capped else result,
+            )
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
             for t in awaited:
                 unknown[t] = unknown.get(t, 0) + 1 if t not in read.cards else 0
@@ -3272,10 +3282,21 @@ class KubeAgentsHarness(AgentHarness):
         # them separately let them disagree, so cards dropped from one were
         # polled to completion via the other and had their results discarded.
         capped = len(filed) > _MAX_AWAITED_TASKS
+        last_board_summaries: dict[str, str] = {}
+        last_board_errors: dict[str, str] = {}
+
+        def _is_terminal(task_id: str) -> bool:
+            st = statuses.get(task_id, "")
+            if st in _TERMINAL_STATUSES:
+                return True
+            return _is_rate_limited_triage(st, task_id, last_board_summaries)
+
         # Every card this episode waits on, including the ones that settle
         # mid-loop and leave ``outstanding``; their results are the answer.
-        awaited: list[str] = self._capped(_pending_first(filed, statuses), result)
-        outstanding = [t for t in awaited if statuses.get(t) not in _TERMINAL_STATUSES]
+        awaited: list[str] = self._capped(
+            _pending_first(filed, statuses, _is_terminal), result
+        )
+        outstanding = [t for t in awaited if not _is_terminal(t)]
         # Call ids the delegating turn already spent, so its own reads are not
         # mistaken for the first poll's.
         seen_calls: set[str] = set()
@@ -3293,8 +3314,6 @@ class KubeAgentsHarness(AgentHarness):
         transport_failures = 0
         had_answered_failure = False
         timed_out = True
-        last_board_summaries: dict[str, str] = {}
-        last_board_errors: dict[str, str] = {}
         # The freshest status seen for each card, from whichever source read
         # it last -- the board or a status turn -- for the deadline report.
         # ``statuses`` stays the agent's own readings, which are what settle a
@@ -3470,16 +3489,12 @@ class KubeAgentsHarness(AgentHarness):
             # reported only the first time, since the replayed trajectory
             # re-offers the dropped ids on every poll.
             merged = list(dict.fromkeys(awaited + delegated_task_ids(status_turn.trajectory)))
-            awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
+            awaited = self._capped(
+                _pending_first(merged, statuses, _is_terminal),
+                None if capped else result,
+            )
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
-            outstanding = [
-                t
-                for t in awaited
-                if statuses.get(t) not in _TERMINAL_STATUSES
-                and not _is_rate_limited_triage(
-                    statuses.get(t, ""), t, last_board_summaries
-                )
-            ]
+            outstanding = [t for t in awaited if not _is_terminal(t)]
 
         # Only on the deadline path: after a transport failure or a mute agent
         # the budget is untouched, and claiming it ran out would misreport why
