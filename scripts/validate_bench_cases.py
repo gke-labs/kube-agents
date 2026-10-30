@@ -651,26 +651,33 @@ COMPOUND_TYPES = frozenset({"sequence", "parallel", "all", "any", "none"})
 RESOURCE_PROPERTY_TYPES = frozenset({"resource_property", "fleet_resource_property"})
 EQUALITY_OPS = frozenset({"eq", "ne"})
 QUOTED_BOOLEANS = frozenset({"true", "false"})
-#: Fields the Kubernetes and GKE APIs serve as booleans. The rule fires only
-#: on these, by the path's last segment, so a string field a case compares to
-#: "true" (a label, an annotation, a nodeSelector, a taint value) is never
-#: blocked; a boolean field missing here is a miss, not a wrong rejection.
-BOOLEAN_FIELDS = frozenset({
-    "suspend", "automountServiceAccountToken", "hostNetwork", "hostPID", "hostIPC",
-    "privileged", "runAsNonRoot", "allowPrivilegeEscalation", "readOnlyRootFilesystem",
-    "enableServiceLinks", "shareProcessNamespace", "paused", "immutable", "optional",
-    "readOnly", "allowVolumeExpansion", "insecureSkipTLSVerify", "enabled", "autoUpgrade",
-    "autoRepair",
+#: The (parent segment, field) pairs the Kubernetes and GKE APIs serve as
+#: booleans; "" is the object root. The rule fires on a pair in this table
+#: and on nothing else, so a string field that shares a name with a boolean
+#: (`spec.selector.enabled`, a CRD's `spec.enabled` string) is never blocked;
+#: a boolean pair missing here is a miss, and a case that needs it adds the
+#: row. A kind column is held in reserve: no shipped case needs one.
+BOOLEAN_FIELD_PAIRS = frozenset({
+    ("spec", "suspend"), ("spec", "paused"), ("spec", "hostNetwork"), ("spec", "hostPID"),
+    ("spec", "hostIPC"), ("spec", "shareProcessNamespace"), ("spec", "enableServiceLinks"),
+    ("spec", "automountServiceAccountToken"), ("", "automountServiceAccountToken"),
+    ("", "immutable"), ("", "allowVolumeExpansion"),
+    ("securityContext", "runAsNonRoot"), ("securityContext", "privileged"),
+    ("securityContext", "allowPrivilegeEscalation"), ("securityContext", "readOnlyRootFilesystem"),
+    ("configMap", "optional"), ("secret", "optional"), ("configMapRef", "optional"),
+    ("secretRef", "optional"), ("configMapKeyRef", "optional"), ("secretKeyRef", "optional"),
+    ("volumeMounts", "readOnly"), ("nodePoolAutoCreation", "enabled"),
+    ("management", "autoUpgrade"), ("management", "autoRepair"), ("autoscaling", "enabled"),
 })
-#: String maps and string fields: anything under these holds strings, so a
-#: key in them that happens to be named like a boolean field (`data.enabled`,
-#: `metadata.labels.enabled`) is compared as a string, which is correct.
-STRING_MAP_SEGMENTS = frozenset({
-    "data", "stringData", "labels", "annotations", "matchLabels", "nodeSelector", "parameters",
-})
-#: Splits a JSONPath into its segments: dots, brackets and quotes are separators,
-#: so `$.spec['suspend']` and `spec.suspend` end in the same segment.
-PATH_SEGMENT_SEPARATORS = re.compile(r"""[.\[\]'"]+""")
+#: A JSONPath filter, `[?(@.name=='data')]`: removed before the path is read,
+#: so a literal inside it is never mistaken for a segment.
+PATH_FILTER = re.compile(r"\[\?\([^\]]*\)\]")
+#: One path segment: a bracket-quoted key kept whole (`['feature.enabled']`),
+#: a numeric index, or a bare name. `$.spec['suspend']` and `spec.suspend`
+#: therefore end in the same pair.
+PATH_TOKEN = re.compile(r"""\['([^']*)'\]|\["([^"]*)"\]|\[(\d+)\]|([^.\[\]'"]+)""")
+#: Tokens that name no field: the root, the current node, a wildcard.
+PATH_NON_FIELDS = frozenset({"$", "@", "*"})
 
 # The entry vocabulary devops-bench's VerificationEntry accepts
 # (verification/spec.py). Every rule below is one devops-bench enforces at
@@ -1051,27 +1058,40 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
             f"{list(fields)}, so it can only pass"
         )
 
-    # A quoted boolean against a boolean field can never match: the verifier
-    # compares the value raw and the API holds a bool, so `eq` never passes
-    # and `ne` always does. Only fields known to be booleans are judged; a
-    # string field compared to "true" is a correct case and stays untouched.
+    # A quoted boolean against a boolean field never compares equal: the
+    # verifier compares the value raw and the API holds a bool, so the check
+    # asserts nothing. Only a (parent, field) pair known to be a boolean is
+    # judged; a string field compared to "true" is a correct case and is
+    # left alone.
     op = node.get("op")
     value = node.get("value")
-    segments = [part for part in PATH_SEGMENT_SEPARATORS.split(str(node.get("path") or "")) if part]
+    segments = _path_segments(node.get("path"))
+    pair = (segments[-2] if len(segments) > 1 else "", segments[-1]) if segments else None
     if (
         node_type in RESOURCE_PROPERTY_TYPES
         and isinstance(op, str) and op in EQUALITY_OPS
         and isinstance(value, str) and value.strip().lower() in QUOTED_BOOLEANS
-        and segments and segments[-1] in BOOLEAN_FIELDS
-        and not any(segment in STRING_MAP_SEGMENTS for segment in segments[:-1])
+        and pair in BOOLEAN_FIELD_PAIRS
     ):
-        outcome = "never passes" if op == "eq" else "always passes"
         problems.append(
             f"{where}: check '{node_type}' compares the boolean field "
-            f"{node.get('path')!r} to the string {value!r}; the verifier compares "
-            f"raw, so the check {outcome}. Write the bare boolean: "
-            f"value: {value.strip().lower()}"
+            f"{node.get('path')!r} to the string {value!r}; the string never "
+            f"compares equal to the API's boolean, so the check asserts nothing. "
+            f"Write the bare boolean: value: {value.strip().lower()}. The judged "
+            f"fields are the BOOLEAN_FIELD_PAIRS table in scripts/validate_bench_cases.py."
         )
+
+
+def _path_segments(path: Any) -> list[str]:
+    """The segments of a JSONPath, filters removed, bracket-quoted keys whole,
+    indices, wildcards and roots dropped: what a parser would walk, by name."""
+    text = PATH_FILTER.sub("", str(path or ""))
+    segments = []
+    for quoted_single, quoted_double, index, bare in PATH_TOKEN.findall(text):
+        segment = quoted_single or quoted_double or bare
+        if segment and segment not in PATH_NON_FIELDS and not index:
+            segments.append(segment)
+    return segments
 
 
 def _check_types(node: Any, found: set[str]) -> None:

@@ -564,7 +564,8 @@ a check that carries no assertion and so can only pass, an `owner:` that is `mai
 written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
 that is not a bare YAML boolean, a `resource_property` or `fleet_resource_property` check that
 compares a known boolean field such as `spec.suspend` to the string `"true"` or `"false"` under
-`op: eq` or `ne` (the verifier compares raw, so `eq` never passes and `ne` always does), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
+`op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts
+nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters, names a slot
 `bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
