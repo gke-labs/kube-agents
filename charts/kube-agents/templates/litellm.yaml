@@ -229,16 +229,16 @@
   concrete model gets routed rather than a 404 from the gateway.
 */}}
 {{- $fallback := .Values.litellm.fallback | default dict }}
-{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries) $configEndpoint) }}
+{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries "retryAfterSeconds" $fallback.retryAfterSeconds) $configEndpoint) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
-  hook, the rule file, the two redaction modules, the OAuth2 hook and the
+  and cache-marker hooks, the rule file, the two redaction modules, the OAuth2 hook and the
   optional trace logger are subPath mounts too, so an edit to any of them has
   to roll the pods the same way an edit to config.yaml does. With redaction or
   trace logging off their extras are empty strings, as is the OAuth2 hook's
   source while the hook is not shipped.
 */}}
-{{- $checksumInput := printf "%s%s%s%s%s%s%s" $config $thinkingReplaySource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource }}
+{{- $checksumInput := printf "%s%s%s%s%s%s%s%s" $config $thinkingReplaySource $cacheControlStripSource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -395,6 +395,16 @@ spec:
             # transport boundary rather than via LiteLLM's user-auth layer.
             - name: LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY
               value: "true"
+            {{- $retryAfter := int ($fallback.retryAfterSeconds | default 0) }}
+            {{- if gt $retryAfter 8 }}
+            # LiteLLM applies router_settings.retry_after as the floor of its pause
+            # before a retry and then clamps the pause to MAX_RETRY_DELAY, 8s by
+            # default (litellm/constants.py reads it from the environment at
+            # import). A floor above 8s is a no-op without the ceiling raised
+            # with it; this is the one retry pause the gateway has.
+            - name: MAX_RETRY_DELAY
+              value: {{ $retryAfter | quote }}
+            {{- end }}
             {{- if eq $provider "vertex_ai" }}
             - name: VERTEXAI_PROJECT
               {{- if $vertexProjectRef.name }}

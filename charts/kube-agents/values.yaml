@@ -361,6 +361,13 @@ litellm:
     # (300s covers 99.57%, 120s covers 97.9%).
     timeoutSeconds: 0
     numRetries: 0
+    # The shortest pause, in seconds, before each of those retries. LiteLLM's
+    # own pause is an exponential backoff from 0.5s clamped to 8s, which
+    # retries a 429 from a per-minute quota inside the same closed minute; a
+    # value here is the floor of the pause and, above 8, raises the clamp to
+    # match (the MAX_RETRY_DELAY environment variable on the gateway). 0
+    # leaves LiteLLM's pause alone. Needs numRetries above 0.
+    retryAfterSeconds: 0
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload
   # Identity by default (or a service-account key Secret when

@@ -189,6 +189,17 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # the CR.
 readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
 
+# The gateway's own retries, on this install only (the chart default is none).
+# A Vertex 429 on a per-minute quota comes back with no Retry-After, and
+# LiteLLM's stock pause retries it inside the same closed minute; two retries
+# a half-minute apart let the gateway ride out a short storm before the agent
+# sees it, and the agent's own 30-60s backoff floor
+# (deploy/docker/patches/rate_limit_backoff_floor.py) covers the long ones.
+# Each gateway response says what it did in x-litellm-attempted-retries.
+# tests/test_ci_deploy_litellm_vertex.py pins the flags and the defaults.
+readonly EVAL_LITELLM_NUM_RETRIES="${EVAL_LITELLM_NUM_RETRIES:-2}"
+readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-30}"
+
 # The credential-proxy container's memory limit on the eval install. The broker
 # admits a request only while its child memory reservation fits the budget it
 # derives from this limit (agents/platform/scripts/credential_proxy.py,
@@ -1914,6 +1925,8 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
     --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
     --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
+    --set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}" \
+    --set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}" \
     --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --set "platformAgent.deployment.availability.runtimeClassName=" \
     --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
