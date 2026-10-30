@@ -33,11 +33,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL = REPO_ROOT / ".agents/skills/upgrade-kube-agents/SKILL.md"
 SECTION_HEADING = "## Report confirmed upgrade bugs"
 TRACKER = "gke-labs/kube-agents"
-# The period that ends a sentence: followed by whitespace or the end of the
-# text, after any closing punctuation -- a paren, bracket, quote or emphasis
-# marker (`... are fine.)`, `"... fine."`, `**... fine.**`) -- so the one
-# inside `install.env` or a version number does not end it.
-SENTENCE_END = r"\.[)\]\"'*_`]*(?=\s|$)"
+# What ends a sentence: a period, question mark or exclamation mark, then any
+# closing punctuation -- a paren, bracket, quote or emphasis marker
+# (`... are fine.)`, `"... fine."`, `**... fine.**`) -- then whitespace or the
+# end of the text, so the period inside `install.env` or a version number does
+# not end one.
+SENTENCE_END = r"[.?!][)\]\"'*_`]*(?=\s|$)"
 # The body of one sentence: lazily, characters that contain no sentence end.
 # An opener that recurs in the section ("Remove ..." opens a labels sentence
 # as well as the strip sentence) otherwise matches from its first occurrence
@@ -217,6 +218,12 @@ class ReaderTest(unittest.TestCase):
                     f"Remove nothing the diagnosis needs {opener}placeholders are fine.{closer} "
                     "Remove credentials and tokens and other client-specific details. Next."
                 )
+                self.assertEqual("credentials and tokens", STRIP_SENTENCE.search(text).group("classes"))
+
+    def test_a_question_or_exclamation_ends_a_sentence(self) -> None:
+        for terminator in ("?", "!"):
+            with self.subTest(terminator=terminator):
+                text = f"Remove what, exactly{terminator} Remove credentials and tokens and other client-specific details. Next."
                 self.assertEqual("credentials and tokens", STRIP_SENTENCE.search(text).group("classes"))
 
     def test_a_whole_sentence_pin_refuses_a_qualifying_tail(self) -> None:
