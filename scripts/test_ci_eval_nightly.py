@@ -1026,5 +1026,42 @@ class ApiLaneExclusionTest(unittest.TestCase):
         self.assertNotIn("runs on the inject lane only", result.stdout)
 
 
+class LiftedShellTest(unittest.TestCase):
+    """The blocks this module lifts run under `set -o pipefail`, in the job
+    and here, so none of them may feed `grep -q` through a pipeline."""
+
+    PRODUCER_INTO_GREP_Q = re.compile(r"\|\s*grep\s+-[a-zA-Z]*q")
+    COMMENT_LINE = re.compile(r"^\s*#.*$", re.MULTILINE)
+
+    def test_no_lifted_block_pipes_a_producer_into_grep_q(self):
+        """`grep -q` exits at its first match. A producer still writing on
+        the other side of the pipe then takes SIGPIPE, pipefail makes the
+        pipeline's status the producer's, and a `! ... | grep -q` reads a
+        line that is present as absent: the GitLab lane's registration
+        check did exactly that once in CI over the ~10 KB roster text
+        (kube-agents#4357). A here-string (`grep -q ... <<< "$text"`) is
+        filled by bash before grep runs, so nothing is left writing when
+        grep exits; every membership check in these blocks takes that form."""
+        for name, block in (
+            ("roster_constants", roster_constants()),
+            ("lane_constants", lane_constants()),
+            ("matrix_section", matrix_section()),
+            ("roster_block", roster_block()),
+            ("part_check", part_check()),
+            ("exclusions_block", exclusions_block()),
+            ("half_constants", half_constants()),
+            ("part_step", part_step()),
+            ("api_lane_block", api_lane_block()),
+        ):
+            with self.subTest(block=name):
+                shell = self.COMMENT_LINE.sub("", block)
+                hit = self.PRODUCER_INTO_GREP_Q.search(shell)
+                if hit is not None:
+                    self.fail(
+                        f"{name} pipes a producer into grep -q ({shell[max(hit.start() - 60, 0) : hit.end()]!r} ...); "
+                        "feed grep from a here-string instead"
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
