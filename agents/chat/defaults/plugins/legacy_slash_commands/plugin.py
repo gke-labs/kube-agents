@@ -52,8 +52,11 @@ _FRONT_DOOR_PROFILE = "platform"
 # channel lives in the record the operator projects, so Hermes' own
 # ``/sethome`` would write a file nothing reads and answer that the home is
 # set. The operator renders this variable exactly then (chat_notify.py); with
-# it set, ``sethome`` is handed to the agent as a question instead.
+# it set to ``slack``, ``sethome`` is handed to the agent as a question instead;
+# with Google Chat on the gateway, Slack stays on this listener and its
+# ``/sethome`` still applies.
 _GATEWAY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+_GATEWAY_SLACK = "slack"
 _SETHOME_SUBCOMMAND = "sethome"
 
 
@@ -111,7 +114,7 @@ def rewrite_legacy_hermes_command(text: str) -> Optional[str]:
     if target is None:
         # Not a command at all — treat it as the question the user asked.
         return rest
-    if first_word == _SETHOME_SUBCOMMAND and os.environ.get(_GATEWAY_CONVERSATIONS_ENV, "").strip():
+    if first_word == _SETHOME_SUBCOMMAND and os.environ.get(_GATEWAY_CONVERSATIONS_ENV, "").strip() == _GATEWAY_SLACK:
         # The gateway holds the home channel; the agent answers where to
         # move it (the app's Home tab) rather than Hermes claiming it is set.
         return rest

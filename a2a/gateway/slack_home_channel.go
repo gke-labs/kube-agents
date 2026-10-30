@@ -277,6 +277,10 @@ func (s *SlackAdapter) checkHomeChannel(ctx context.Context, id string) (refused
 		return "", err
 	}
 	switch {
+	case info.IsIM || info.IsMpIM:
+		// A direct or group direct message: a Home tab pick carries no
+		// channel_type, so the answer itself says what the id is.
+		return homeRefusedMalformed, nil
 	case info.IsExtShared || info.IsPendingExtShared:
 		return homeRefusedShared, nil
 	case info.IsArchived:

@@ -44,6 +44,10 @@ class RewriteLegacyHermesCommandTest(unittest.TestCase):
             self.assertEqual(plugin.rewrite_legacy_hermes_command("/hermes model gpt-5"), "/model gpt-5")
         with mock.patch.dict(os.environ, {plugin._GATEWAY_CONVERSATIONS_ENV: ""}):
             self.assertEqual(plugin.rewrite_legacy_hermes_command("/hermes sethome"), "/sethome")
+        # Google Chat on the gateway keeps Slack on this listener: Hermes' own
+        # /sethome still applies there.
+        with mock.patch.dict(os.environ, {plugin._GATEWAY_CONVERSATIONS_ENV: "google_chat"}):
+            self.assertEqual(plugin.rewrite_legacy_hermes_command("/hermes sethome"), "/sethome")
 
     def test_subcommand_arguments_are_preserved(self):
         self.assertEqual(

@@ -215,6 +215,9 @@ func TestSlackHomePickRefusals(t *testing.T) {
 			api.conversations["C0SHR1"] = homeChannelInfo("C0SHR1", func(c *slack.Channel) { c.IsExtShared = true })
 		}, slackHomePickShared, true, 1},
 		{"a direct message id", "U1", "T1", "D0DM1", nil, slackHomePickMalformed, true, 0},
+		{"a group direct message (A1)", "U1", "T1", "G0MPIM", func(a *SlackAdapter, api *fakeSlackAPI) {
+			api.conversations["G0MPIM"] = homeChannelInfo("G0MPIM", func(c *slack.Channel) { c.IsMpIM = true })
+		}, slackHomePickMalformed, true, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -282,6 +285,36 @@ func TestSlackHomePickConflictAndBusy(t *testing.T) {
 	a.homeLearn.mu.Unlock()
 	if homePatches(cs) != before || !strings.Contains(lastView(t, api, "U1"), slackHomePickBusy) {
 		t.Errorf("a pick during a change wrote or said nothing: patches %d->%d, view %s", before, homePatches(cs), lastView(t, api, "U1"))
+	}
+}
+
+// TestSlackHomePickAPIDownAndStaleRefusal (X1, Low): the API server not
+// answering moves nothing and says so; a pick of the recorded channel beside
+// a stale refusal clears the refusal and writes nothing else.
+func TestSlackHomePickAPIDownAndStaleRefusal(t *testing.T) {
+	a, api, cs, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage, homeRecordKeyRefused: homeRefusedArchived})
+	writeHomeFile(t, dir, "")
+	api.conversations["C0OLD1"] = homeChannelInfo("C0OLD1", nil)
+	api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
+	down := true
+	cs.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if down {
+			return true, nil, errors.New("the API server did not answer")
+		}
+		return false, nil, nil
+	})
+	pick(t, a, "U1", "T1", "C0NEW2", "209.1")
+	if homePatches(cs) != 0 || !strings.Contains(lastView(t, api, "U1"), slackHomePickNoAPI) || len(api.posted) != 0 {
+		t.Fatalf("API down: patches %d, posts %d, view %s", homePatches(cs), len(api.posted), lastView(t, api, "U1"))
+	}
+	down = false
+	pick(t, a, "U1", "T1", "C0OLD1", "210.1")
+	data := homeRecordData(t, cs)
+	if _, stale := data[homeRecordKeyRefused]; stale || data[homeRecordKeySlack] != "C0OLD1" || homePatches(cs) != 1 {
+		t.Errorf("same-channel pick: record %v, patches %d; want the refusal cleared in one write", data, homePatches(cs))
+	}
+	if !strings.Contains(lastView(t, api, "U1"), "already the home channel") {
+		t.Errorf("same-channel status missing: %s", lastView(t, api, "U1"))
 	}
 }
 
