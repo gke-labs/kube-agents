@@ -548,6 +548,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "every_finding_named",
     ),
+    # The issue state, its labels and its in-run comment count; the model
+    # itself refuses a spec that sets none of them.
+    "forge_issue_state": ("state", "labels", "min_comments"),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
     "answer_first": (),

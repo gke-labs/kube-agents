@@ -118,6 +118,7 @@ __all__ = [
     "BootstrapReportReadVerifier",
     "FindingsItemStateVerifier",
     "FleetResourcePropertyVerifier",
+    "ForgeIssueStateVerifier",
     "GitHubWritesVerifier",
     "LedgerIssueContainsVerifier",
     "PullRequestOpenedVerifier",
@@ -129,6 +130,11 @@ __all__ = [
     "ToolCalledVerifier",
     "WorkerCommandsVerifier",
 ]
+
+# Pages of issue comments ``forge_issue_state`` reads per issue. One run's
+# procedure posts a handful; a page holds a hundred, and the ``since`` filter
+# already drops everything older than the run.
+_ISSUE_COMMENT_PAGES = 3
 
 _NO_TRANSCRIPT_REASON = (
     "no transcript stashed for this run: the harness did not complete an "
@@ -4412,6 +4418,251 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             f"{surface}, generated at {generated_at.isoformat()} by this run, "
             "contains " + ", ".join(satisfied),
             raw=raw,
+        )
+
+
+@VERIFIERS.register("forge_issue_state")
+class ForgeIssueStateVerifier(BaseVerifier):
+    """The state of the issue the run's reply names, read from the forge.
+
+    WHY THIS EXISTS. A procedure that ends on an issue -- claim it, comment
+    on it, label it, close it -- leaves its evidence on the issue; the reply
+    only describes it. A ``report_contains`` over a list of phrasings for
+    "the report was posted" grades the description: it fails a run that did
+    every step and worded the reply another way, and it passes one that wrote
+    the words and skipped the steps. This check reads the artifact.
+
+    HOW IT FINDS THE ISSUE. Every issue web URL the final message carries in
+    full (:func:`forges.issue_refs`), as ``ledger_issue_contains`` and
+    ``pull_request_opened`` find theirs. Each URL is a POINTER, never
+    evidence: everything asserted comes from what the forge returns for it.
+    The check passes when one named issue satisfies every assertion, and the
+    reason says why each other one did not.
+
+    WHAT IS ASSERTED, all from the API response. ``state``, when set.
+    ``labels``, every one present. ``min_comments`` comments created at or
+    after the run started, less ``max_clock_skew_sec``. That window is what
+    binds the issue to THIS run: a previous repetition leaves a closed,
+    labelled issue behind, and a reply pointing at it would otherwise pass
+    forever. For the same reason a ``closed`` assertion also requires
+    ``closed_at`` inside the window. GitLab's system notes (a label or state
+    change) are not comments and are not counted.
+
+    AUTHENTICATION. The runner's read token, as ``ledger_issue_contains``
+    documents it, and never the agent's own credential. An absent token is
+    ``status="error"``, never a pass.
+    """
+
+    type: Literal["forge_issue_state"]
+    state: Literal["open", "closed"] | None = None
+    labels: list[str] = Field(default_factory=list)
+    min_comments: int = Field(default=0, ge=0)
+    # Tolerance between the forge's stamps and the harness's run-start clock,
+    # two different machines; the figure the sibling forge checks use.
+    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    @model_validator(mode="after")
+    def _asserts_something(self) -> ForgeIssueStateVerifier:
+        if self.state is None and not self.labels and not self.min_comments:
+            raise ValueError(
+                "forge_issue_state asserts nothing: set state, labels or min_comments"
+            )
+        return self
+
+    def _comments_since(
+        self,
+        api_url: str,
+        window_start: datetime,
+        token: str,
+        budget: float,
+        forge: str,
+    ) -> int | None:
+        """Comments created at or after ``window_start``; None when unreadable.
+
+        GitHub's ``since`` filters on the comment's update stamp, which is
+        never earlier than its creation, so it only narrows the pages; the
+        count is taken on ``created_at``. GitLab's notes take no ``since``
+        and are read newest first, one page.
+        """
+        since = window_start.strftime(_GITHUB_SINCE_FORMAT)
+        if forge == forges.FORGE_GITLAB:
+            urls = [f"{api_url}/notes?sort=desc&order_by=created_at&per_page={_GITHUB_PAGE_SIZE}"]
+        else:
+            urls = [
+                f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={since}&page={page}"
+                for page in range(1, _ISSUE_COMMENT_PAGES + 1)
+            ]
+        count = 0
+        for url in urls:
+            status_code, payload = _http_get_json(url, token, budget)
+            if status_code != 200 or not isinstance(payload, list):
+                return None
+            for comment in payload:
+                if not isinstance(comment, dict) or comment.get("system"):
+                    continue
+                created_at = _parse_github_time(comment.get("created_at"))
+                if created_at is not None and created_at >= window_start:
+                    count += 1
+            if len(payload) < _GITHUB_PAGE_SIZE:
+                break
+        return count
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+
+        def done(
+            success: bool,
+            reason: str,
+            *,
+            status: str | None = None,
+            raw: dict | None = None,
+        ) -> VerificationResult:
+            return VerificationResult(
+                success=success,
+                status=status,
+                elapsed_time=time.monotonic() - start,
+                reason=reason,
+                raw=raw,
+            )
+
+        snap = transcript.get()
+        if snap is None:
+            return done(False, _NO_TRANSCRIPT_REASON, status="error")
+        if not snap.started_at:
+            return done(False, _NO_RUN_CLOCK_REASON, status="error")
+        try:
+            forge = forges.forge_name()
+        except forges.UnknownForge as exc:
+            return done(False, str(exc), status="error")
+        token = forges.read_token(forge)
+        if not token:
+            return done(False, _no_token_reason(forge), status="error")
+        host = forges.web_host(forge)
+        label = _forge_label(forge)
+
+        seen = forges.issue_refs(snap.final_message, forge)
+        if not seen:
+            return done(
+                False,
+                f"the run's reply names no {host} issue URL in full, so there is "
+                "no issue to read the state of; a reply that completed the "
+                "procedure names the ticket it worked",
+            )
+        if len(seen) > _MAX_LEDGER_CANDIDATES:
+            return done(
+                False,
+                f"the run's reply names {len(seen)} distinct issue URLs; more than "
+                f"{_MAX_LEDGER_CANDIDATES} is a reply to read by hand, not a set of "
+                "candidates to resolve",
+            )
+
+        started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
+        window_start = started - timedelta(seconds=self.max_clock_skew_sec)
+        budget = single_call_timeout(timeout_sec)
+        rejected: list[str] = []
+        for repo, number in seen:
+            slug = f"{repo}#{number}"
+            url = _issue_api_url(forge, repo, number)
+            try:
+                status_code, payload = _http_get_json(url, token, budget)
+            except OSError as exc:
+                return done(
+                    False,
+                    f"could not reach the {label} API for {slug}: "
+                    f"{exc}; this check could not be evaluated",
+                    status="error",
+                )
+            if status_code == 404:
+                if forge == forges.FORGE_GITLAB and _is_configured_gitlab_project(repo):
+                    try:
+                        why = _gitlab_project_unseen(repo, token, budget)
+                    except OSError as exc:
+                        why = f"could not reach the GitLab API for {repo}: {exc}"
+                    if why:
+                        return done(False, why, status="error")
+                rejected.append(f"{slug}: no such issue (404)")
+                continue
+            if status_code in (401, 403):
+                return done(
+                    False,
+                    f"{label} returned {status_code} for {slug}: the configured token "
+                    "cannot read this repository's issues, so this check could not "
+                    "be evaluated",
+                    status="error",
+                )
+            if status_code != 200 or not isinstance(payload, dict):
+                return done(
+                    False,
+                    f"unexpected {label} response {status_code} for {slug}; "
+                    "this check could not be evaluated",
+                    status="error",
+                )
+            view = _issue_view(forge, payload)
+            closed_at: datetime | None = view["closed_at"]
+            faults: list[str] = []
+            if self.state is not None and view["state"] != self.state:
+                faults.append(f"is {view['state'] or 'in no readable state'}, not {self.state}")
+            elif self.state == "closed":
+                if closed_at is None:
+                    faults.append(
+                        "is closed with no readable closed_at, so the close cannot "
+                        "be placed inside this run"
+                    )
+                elif closed_at < window_start:
+                    faults.append(
+                        f"was closed at {closed_at.isoformat()}, "
+                        f"{(started - closed_at).total_seconds():.0f}s before this run "
+                        f"started ({started.isoformat()}): an earlier run's close"
+                    )
+            missing = [name for name in self.labels if name not in view["labels"]]
+            if missing:
+                faults.append(f"lacks the label(s) {missing} (labels: {sorted(view['labels'])})")
+            comments: int | None = None
+            if self.min_comments:
+                try:
+                    comments = self._comments_since(url, window_start, token, budget, forge)
+                except OSError as exc:
+                    return done(
+                        False,
+                        f"could not read the comments of {slug}: {exc}; "
+                        "this check could not be evaluated",
+                        status="error",
+                    )
+                if comments is None:
+                    return done(
+                        False,
+                        f"the comments of {slug} could not be read ({label} did not "
+                        "answer 200 with a list), so this check could not be evaluated",
+                        status="error",
+                    )
+                if comments < self.min_comments:
+                    faults.append(
+                        f"carries {comments} comment(s) posted since this run started, "
+                        f"{self.min_comments} required"
+                    )
+            if faults:
+                rejected.append(f"{slug} " + ", ".join(faults))
+                continue
+            reason = f"{slug} is {view['state']}"
+            if closed_at is not None:
+                reason += f" (closed at {closed_at.isoformat()})"
+            reason += f", labelled {sorted(view['labels'])}"
+            if comments is not None:
+                reason += f", with {comments} comment(s) posted since this run started"
+            return done(
+                True,
+                reason,
+                raw={
+                    "issue": slug,
+                    "state": view["state"],
+                    "closed_at": closed_at.isoformat() if closed_at else None,
+                    "labels": sorted(view["labels"]),
+                    "comments_since_start": comments,
+                },
+            )
+        return done(
+            False,
+            "none of the issues the reply names satisfies the check: " + "; ".join(rejected),
         )
 
 

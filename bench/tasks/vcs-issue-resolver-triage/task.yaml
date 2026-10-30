@@ -31,9 +31,13 @@
 # the seeded fleet, which is the difference between a case that runs in any dev
 # project and one parked behind a fleet-activation step -- see
 # vcs-history-only-fact, parked exactly there. So: `deployer: noop`, no
-# `fixtures:`, no cluster read, and the assertion is on `status:resolved`, a
-# fixed string the skill itself defines and only a completed transition puts in
-# the answer.
+# `fixtures:`, no cluster read, and the procedure is read off the issue the
+# answer names: closed inside this run, labelled `status:resolved`, with the
+# claim and the report posted inside this run. The answer itself only has to
+# name that label, a fixed string the skill defines and the prompt asks for
+# verbatim. How the answer words the rest is not graded: a phrase list for
+# "the report was posted" fails a run that did the work and described it
+# another way, and passes one that wrote the words and skipped the work.
 #
 # WHY THE CASE SEEDS ITS OWN ISSUE. The resolver polls for an open issue
 # carrying none of the skip labels. A GitOps repository holds audit ledgers,
@@ -112,12 +116,21 @@ verification_spec:
     role: objective
     mode: assert
     check:
+      # Read from the forge, for the issue the answer names. `transition`
+      # posts the report, swaps `status:in-progress` for `status:resolved` and
+      # closes the ticket; `claim` posted one comment before that. A close
+      # inside this run, the label, and two comments inside this run are the
+      # whole procedure -- poll, claim, comment, transition -- and say nothing
+      # about how the answer words it.
+      type: forge_issue_state
+      state: closed
+      labels: ["status:resolved"]
+      min_comments: 2
+  - name: the-answer-names-the-transition-label
+    role: objective
+    mode: assert
+    check:
       type: report_contains
       # A fixed string the skill defines, not a fact about any particular
-      # repository: only a completed `transition` puts this label on a ticket,
-      # and the prompt asks for it verbatim. Nothing short of the full
-      # procedure -- poll, claim, comment, transition -- produces it.
+      # repository, and the prompt asks for it verbatim.
       required_phrases: ["status:resolved"]
-      # That the report was actually posted, in the spellings a correct answer
-      # uses for it.
-      any_of_phrases: ["triage report", "posted", "commented on"]
