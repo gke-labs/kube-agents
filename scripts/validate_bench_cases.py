@@ -656,7 +656,8 @@ QUOTED_BOOLEANS = frozenset({"true", "false"})
 #: and on nothing else, so a string field that shares a name with a boolean
 #: (`spec.selector.enabled`, a CRD's `spec.enabled` string) is never blocked;
 #: a boolean pair missing here is a miss, and a case that needs it adds the
-#: row. A kind column is held in reserve: no shipped case needs one.
+#: row. A path the reader does not follow (PATH_UNREAD) is also a miss.
+#: A kind column is held in reserve: no shipped case needs one.
 BOOLEAN_FIELD_PAIRS = frozenset({
     ("spec", "suspend"), ("spec", "paused"), ("spec", "hostNetwork"), ("spec", "hostPID"),
     ("spec", "hostIPC"), ("spec", "shareProcessNamespace"), ("spec", "enableServiceLinks"),
@@ -672,10 +673,14 @@ BOOLEAN_FIELD_PAIRS = frozenset({
 #: A JSONPath filter, `[?(@.name=='data')]`: removed before the path is read,
 #: so a literal inside it is never mistaken for a segment.
 PATH_FILTER = re.compile(r"\[\?\([^\]]*\)\]")
+#: Path forms the reader does not follow: recursive descent and a script
+#: expression. A path with one yields no segments, so it is never judged.
+PATH_UNREAD = re.compile(r"\.\.|\[\(")
 #: One path segment: a bracket-quoted key kept whole (`['feature.enabled']`),
-#: a numeric index, or a bare name. `$.spec['suspend']` and `spec.suspend`
-#: therefore end in the same pair.
-PATH_TOKEN = re.compile(r"""\['([^']*)'\]|\["([^"]*)"\]|\[(\d+)\]|([^.\[\]'"]+)""")
+#: any other bracket group (an index, a slice, a union, a wildcard, all
+#: selectors the parser walks past), or a bare name. `$.spec['suspend']` and
+#: `spec.suspend` therefore end in the same pair.
+PATH_TOKEN = re.compile(r"""\['([^']*)'\]|\["([^"]*)"\]|\[([^\]'"]*)\]|([^.\[\]'"]+)""")
 #: Tokens that name no field: the root, the current node, a wildcard.
 PATH_NON_FIELDS = frozenset({"$", "@", "*"})
 
@@ -1083,13 +1088,17 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
 
 
 def _path_segments(path: Any) -> list[str]:
-    """The segments of a JSONPath, filters removed, bracket-quoted keys whole,
-    indices, wildcards and roots dropped: what a parser would walk, by name."""
+    """The segments of a JSONPath as its parser walks them by name: filters
+    removed, every other bracket group dropped as a selector, bracket-quoted
+    keys whole, padding around a bare name ignored. A form the reader does
+    not follow yields no segments, so nothing is judged."""
     text = PATH_FILTER.sub("", str(path or ""))
+    if PATH_UNREAD.search(text):
+        return []
     segments = []
-    for quoted_single, quoted_double, index, bare in PATH_TOKEN.findall(text):
-        segment = quoted_single or quoted_double or bare
-        if segment and segment not in PATH_NON_FIELDS and not index:
+    for quoted_single, quoted_double, selector, bare in PATH_TOKEN.findall(text):
+        segment = quoted_single or quoted_double or bare.strip()
+        if segment and segment not in PATH_NON_FIELDS and not selector:
             segments.append(segment)
     return segments
 
