@@ -48,6 +48,13 @@ _DISABLED_UNDO_TEXT = "undo"
 # runs the gateway on the chat profile, whose SOUL.md carries the answer.
 _GATEWAY_PROFILE_ENV = "HERMES_GATEWAY_PROFILE"
 _FRONT_DOOR_PROFILE = "platform"
+# Under spec.mode next the A2A gateway holds the chat backend and the home
+# channel lives in the record the operator projects, so Hermes' own
+# ``/sethome`` would write a file nothing reads and answer that the home is
+# set. The operator renders this variable exactly then (chat_notify.py); with
+# it set, ``sethome`` is handed to the agent as a question instead.
+_GATEWAY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+_SETHOME_SUBCOMMAND = "sethome"
 
 
 def _subcommand_map() -> Dict[str, str]:
@@ -103,6 +110,10 @@ def rewrite_legacy_hermes_command(text: str) -> Optional[str]:
     target = mapping.get(first_word)
     if target is None:
         # Not a command at all — treat it as the question the user asked.
+        return rest
+    if first_word == _SETHOME_SUBCOMMAND and os.environ.get(_GATEWAY_CONVERSATIONS_ENV, "").strip():
+        # The gateway holds the home channel; the agent answers where to
+        # move it (the app's Home tab) rather than Hermes claiming it is set.
         return rest
 
     return f"{target} {args}".strip()

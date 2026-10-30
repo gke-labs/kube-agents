@@ -36,6 +36,15 @@ class RewriteLegacyHermesCommandTest(unittest.TestCase):
     def test_known_subcommand_becomes_the_real_command(self):
         self.assertEqual(plugin.rewrite_legacy_hermes_command("/hermes sethome"), "/sethome")
 
+    def test_sethome_is_a_question_when_the_gateway_holds_the_chat_backend(self):
+        # Under next the home channel is the operator's record, moved from the
+        # app's Home tab; Hermes' /sethome would write a file nothing reads.
+        with mock.patch.dict(os.environ, {plugin._GATEWAY_CONVERSATIONS_ENV: "slack"}):
+            self.assertEqual(plugin.rewrite_legacy_hermes_command("/hermes sethome"), "sethome")
+            self.assertEqual(plugin.rewrite_legacy_hermes_command("/hermes model gpt-5"), "/model gpt-5")
+        with mock.patch.dict(os.environ, {plugin._GATEWAY_CONVERSATIONS_ENV: ""}):
+            self.assertEqual(plugin.rewrite_legacy_hermes_command("/hermes sethome"), "/sethome")
+
     def test_subcommand_arguments_are_preserved(self):
         self.assertEqual(
             plugin.rewrite_legacy_hermes_command("/hermes model gpt-5"), "/model gpt-5"

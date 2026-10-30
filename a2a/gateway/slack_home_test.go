@@ -78,7 +78,12 @@ func viewText(t *testing.T, v slack.HomeTabViewRequest) string {
 			}
 		}
 		if acc, ok := b["accessory"].(map[string]any); ok {
-			line += " [" + acc["text"].(map[string]any)["text"].(string) + " " + acc["url"].(string) + "]"
+			if acc["type"] == "conversations_select" {
+				// The Home channel picker: its placeholder and action id.
+				line += " [select " + acc["placeholder"].(map[string]any)["text"].(string) + " " + acc["action_id"].(string) + "]"
+			} else {
+				line += " [" + acc["text"].(map[string]any)["text"].(string) + " " + acc["url"].(string) + "]"
+			}
 		}
 		lines = append(lines, line)
 	}
