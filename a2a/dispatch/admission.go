@@ -58,6 +58,13 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	if !allowsTier(prof, tier) {
 		return &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
 	}
+	if rec := del.Received(); !rec.IsZero() {
+		if age, limit := now.Sub(rec), queueTimeout(prof); age > limit {
+			return &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
+		}
+	}
+	// After the age check: a submission a breaker holds still ends at its
+	// queue timeout.
 	queued := del.Received()
 	if queued.IsZero() {
 		queued = now
@@ -65,11 +72,6 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	if wait, _ := d.breakers.wait(prof.Name, tier, now, d.inFlight(prof.Name, tier),
 		d.olderWaiting(prof.Name, tier, hk.taskID, queued)); wait {
 		return nil, errHeldBack
-	}
-	if rec := del.Received(); !rec.IsZero() {
-		if age, limit := now.Sub(rec), queueTimeout(prof); age > limit {
-			return &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
-		}
 	}
 	target, bad := taskTarget(env, prof, snap.Namespace)
 	if bad != "" {

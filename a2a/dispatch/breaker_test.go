@@ -187,3 +187,24 @@ func (w *fakeWorker) startedTask(taskID string) bool {
 	}
 	return false
 }
+
+// A submission an open breaker holds still ends at its profile's queue
+// timeout, rejected queue-timeout, rather than waiting for ever.
+func TestAHeldSubmissionEndsAtItsQueueTimeout(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 1, 0, "read")
+	b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+	ti := oneProfile("tse", 1, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) {
+		c.BreakerThreshold, c.BreakerCooldownSeconds = 1, 600
+		c.Profiles[0].QueueTimeoutSeconds = 2
+	})
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	d.breakers.expired(ti.src.Config(), "tse", "read", time.Now())
+
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	ts := b.waitTerminal("task-1", 15*time.Second)
+	if ts.state != lib.StateRejected || !hasReason(ts, ReasonQueueTimeout) {
+		t.Errorf("terminal %+v, want rejected queue-timeout", ts)
+	}
+}
