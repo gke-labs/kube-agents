@@ -145,7 +145,7 @@ class Rerun:
     check_names: list
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class Skipped:
     name: str
     reason: str
@@ -187,12 +187,15 @@ def required_check_names(api, repo: str, branch: str) -> frozenset:
             raise
         log(f"Could not read the rules on {branch} ({error.code}: {refusal_message(error)}); reading every check name the Tide way")
         return frozenset()
-    return frozenset(
+    names = frozenset(
         check["context"]
         for rule in rules
         if rule.get("type") == RULE_REQUIRED_STATUS_CHECKS
         for check in (rule.get("parameters") or {}).get("required_status_checks", [])
     )
+    if not names:
+        log(f"The rules on {branch} require no check; reading every check name the Tide way")
+    return names
 
 
 def check_state(check_run: dict) -> str:
@@ -215,9 +218,11 @@ def best_state(states) -> str:
 def red_check_runs(check_runs, required=frozenset()) -> tuple:
     """The red check runs to re-run, as a list per name, and how many names are pending.
 
-    A name in `required` keeps every red check run it has, whatever else it
-    has. Any other name keeps its newest check run, and only when its best
-    state is failure.
+    A name in `required` keeps every red check run it has, beside a green one
+    too, unless one of its check runs is still going: that name is pending,
+    because re-running a red run of it now would join the running one's
+    concurrency group and could cancel it. Any other name keeps its newest
+    check run, and only when its best state is failure.
     """
     by_name = {}
     for check_run in check_runs:
@@ -225,11 +230,12 @@ def red_check_runs(check_runs, required=frozenset()) -> tuple:
     red = {}
     pending = 0
     for name, entries in by_name.items():
-        failed = [entry for entry in entries if check_state(entry) == STATE_FAILURE]
-        if name in required and failed:
+        states = [check_state(entry) for entry in entries]
+        failed = [entry for entry, state in zip(entries, states) if state == STATE_FAILURE]
+        if name in required and failed and STATE_PENDING not in states:
             red[name] = sorted(failed, key=lambda entry: entry["id"])
             continue
-        state = best_state(check_state(entry) for entry in entries)
+        state = best_state(states)
         if state == STATE_PENDING:
             pending += 1
         elif state == STATE_FAILURE:
@@ -295,6 +301,8 @@ def plan_reruns(check_runs, runs, head: dict, required=frozenset()) -> Plan:
             plan.rerun.append(by_run[run["id"]])
         if name not in by_run[run["id"]].check_names:
             by_run[run["id"]].check_names.append(name)
+    # A required name's red check runs can be left alone for one reason, said once.
+    plan.skipped = list(dict.fromkeys(plan.skipped))
     return plan
 
 

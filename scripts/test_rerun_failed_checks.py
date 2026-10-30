@@ -173,10 +173,17 @@ class StateTest(unittest.TestCase):
 
     def test_every_red_check_run_of_a_required_name_is_kept(self):
         """Each red check suite of a required name blocks on its own, so keeping the newest would leave the rest."""
-        checks = [check(3, "Title", "failure", 30), check(1, "Title", "cancelled", 10), check(2, "Title", None, 20, status="in_progress")]
+        checks = [check(3, "Title", "failure", 30), check(1, "Title", "cancelled", 10), check(2, "Title", "success", 20)]
         red, pending = rfc.red_check_runs(checks, required=frozenset({"Title"}))
         self.assertEqual({"Title": [1, 3]}, {name: [entry["id"] for entry in entries] for name, entries in red.items()})
         self.assertEqual(0, pending)
+
+    def test_a_required_name_with_a_run_still_going_is_pending(self):
+        """Re-running its red run now would join the running one's concurrency group and could cancel it."""
+        checks = [check(1, "Title", "cancelled", 10), check(2, "Title", None, 20, status="in_progress")]
+        red, pending = rfc.red_check_runs(checks, required=frozenset({"Title"}))
+        self.assertEqual({}, red)
+        self.assertEqual(1, pending)
 
     def test_a_required_name_with_nothing_red_reads_the_tide_way(self):
         red, pending = rfc.red_check_runs([check(1, "Title", "success", 10), check(2, "Build", None, 20, status="queued")], required=frozenset({"Title", "Build"}))
@@ -272,6 +279,11 @@ class PlanTest(unittest.TestCase):
     def test_two_red_check_runs_of_one_name_in_one_run_name_it_once(self):
         plan = rfc.plan_reruns([check(1, "Title", "cancelled", 10), check(2, "Title", "failure", 10)], [run(100, "cancelled", 10)], PR_HEAD, required=frozenset({"Title"}))
         self.assertEqual([(100, ["Title"])], [(e.run["id"], e.check_names) for e in plan.rerun])
+
+    def test_one_reason_for_a_required_names_red_runs_is_said_once(self):
+        checks = [check(1, "Review", "failure", 10, app="kube-agents-bot"), check(2, "Review", "cancelled", 20, app="kube-agents-bot")]
+        plan = rfc.plan_reruns(checks, [], PR_HEAD, required=frozenset({"Review"}))
+        self.assertEqual(["Review"], [entry.name for entry in plan.skipped])
 
     def test_a_green_head_plans_nothing(self):
         plan = rfc.plan_reruns([check(1, "Tests", "success", 10), check(2, "Docs", "skipped", 20)], [run(100, "success", 10), run(200, "success", 20)], PR_HEAD)
@@ -387,6 +399,12 @@ class MainTest(unittest.TestCase):
         self.assertEqual(0, code, err)
         self.assertEqual([("/repos/gke-labs/kube-agents/issues/comments/77/reactions", {"content": rfc.REACTION_DECLINED})], api.posts)
         self.assertIn("Could not read the rules on main (403: Resource not accessible by integration)", err)
+
+    def test_rules_that_require_no_check_say_so(self):
+        api = FakeAPI(runs=[run(1, "success", 10)], checks=[check(1, "Tests", "success", 10)], rules=[{"type": "deletion"}])
+        code, out, err = self.run_main(api)
+        self.assertEqual(0, code, err)
+        self.assertIn("The rules on main require no check", err)
 
     def test_the_api_failing_on_the_rules_read_fails_the_run(self):
         api = FakeAPI(runs=[run(1, "failure", 10)], checks=[check(1, "Tests", "failure", 10)], failing={RULES_PATH})
