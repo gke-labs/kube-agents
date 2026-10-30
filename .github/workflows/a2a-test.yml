@@ -46,6 +46,14 @@ on:
       - "agents/cluster/skills/**"
       - "agents/platform/scripts/command_policy.py"
       - "agents/platform/scripts/credential_proxy.py"
+      # lib/persona/claudecode's cluster persona tests read the persona, the
+      # cluster skills its copies must match, and the two scripts its skills
+      # carry byte-identical copies of; cmd/session-persona's
+      # TestSourceSkillsTeachNoWrites reads the persona's skills too. An edit
+      # to any of them alone has to run those tests.
+      - "agents/cluster/persona/**"
+      - "agents/platform/scripts/stall_report.py"
+      - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
       # lib/chatmsg validates every shared chat case, so a case-only change
       # has to run it.
       - "tests/conformance/chat/**"
@@ -94,6 +102,9 @@ jobs:
               - "agents/cluster/skills/**"
               - "agents/platform/scripts/command_policy.py"
               - "agents/platform/scripts/credential_proxy.py"
+              - "agents/cluster/persona/**"
+              - "agents/platform/scripts/stall_report.py"
+              - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
               - "tests/conformance/chat/**"
 
       - name: Set up Go

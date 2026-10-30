@@ -43,8 +43,10 @@ kube-agents/
 │   │                                              docs, onboarding templates,
 │   │                                              plugin design READMEs
 │   ├── cluster/                                   Cluster Agent profile TEMPLATE:
-│   │                                              persona docs + runtime-debugging
-│   │                                              SKILL.md bundles
+│   │                                              SOUL/AGENTS docs + runtime-debugging
+│   │                                              SKILL.md bundles; persona/: the
+│   │                                              same agent in the persona format
+│   │                                              (not scaffolded)
 │   ├── contributor/                               Contributor-agent protocol (claim/PR/review loop)
 │   ├── platform/                                  Platform Agent profile
 │   │   ├── AGENTS.md, SOUL.md, CAPABILITIES.md    persona and workspace docs
