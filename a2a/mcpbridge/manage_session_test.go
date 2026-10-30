@@ -74,19 +74,29 @@ func TestManageSessionDeleteSendsTheResolvedAliasUpstream(t *testing.T) {
 	}
 }
 
-func TestManageSessionDeleteByWorkerIDStopsTheRemoteSessionFirst(t *testing.T) {
+func TestManageSessionDeleteOfASessionDeletesLocallyWhenTheRemoteDeleteFails(t *testing.T) {
 	gw := startBlockingGateway(t, "")
 	srv := newStdioTestServer(t, gw)
+	// The server restarted and forgot the name: it refuses the delete.
+	putConversations(t, srv, ConversationEntry{Alias: "ghost", Token: MintConversationToken(), SessionMode: true})
+	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"ghost"}`))
+	if res.IsError || !strings.Contains(res.Content[0].Text, "no conversation named ghost") {
+		t.Fatalf("delete of a session the server forgot: %+v; want the local delete with the server's answer as a warning", res)
+	}
+	if _, ok := srv.Store().LookupConversation("ghost"); ok {
+		t.Fatal("ghost is still saved because the server no longer held the name")
+	}
+
 	putConversations(t, srv, ConversationEntry{Alias: "c1", Token: MintConversationToken(), SessionWorkerID: "worker-1"})
 	gw.srv.Close()
-	// DeleteConversation matches worker-1 to c1, whose session worker must be stopped upstream
-	// first: with the gateway gone, nothing is deleted.
-	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"worker-1"}`))
-	if !res.IsError {
-		t.Fatalf("delete by worker ID with no gateway: %+v; want the remote failure", res)
+	// DeleteConversation matches worker-1 to c1. With the gateway gone the remote delete fails:
+	// c1 is still deleted here, and the result warns about the server.
+	res = srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"worker-1"}`))
+	if res.IsError || !strings.Contains(res.Content[0].Text, "Deleted session **`c1`**") || !strings.Contains(res.Content[0].Text, "server's delete failed") {
+		t.Fatalf("delete by worker ID with no gateway: %+v; want the local delete with a warning about the server", res)
 	}
-	if _, ok := srv.Store().LookupConversation("c1"); !ok {
-		t.Fatal("c1 was deleted locally though its session worker was never stopped")
+	if _, ok := srv.Store().LookupConversation("c1"); ok {
+		t.Fatal("c1 is still saved because the server's delete failed")
 	}
 }
 

@@ -1403,18 +1403,25 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 			}
 			return FirstNonEmptyStr(txt, fmt.Sprintf("Deleted conversation **`%s`** on the in-cluster server.\n", target)), title, md, nil
 		}
-		needsRemoteStop := existing.SessionMode || strings.TrimSpace(existing.SessionWorkerID) != ""
-		fwd, _ := json.Marshal(map[string]any{"action": actionDelete, "alias": existing.Alias})
-		if sess, err := s.ensureConnected(ctx); err == nil {
-			if txt, title, md, rErr := sess.callRemoteTool(ctx, ToolManageSession, fwd, meta, s.store.Snapshot(), nil); rErr != nil && needsRemoteStop {
-				return txt, title, md, rErr
-			}
-		} else if needsRemoteStop {
-			return "", "", "", err
-		}
+		// The local entry goes first and the server's delete is best effort: it only forgets the
+		// name there (a2a/mcp sessions.go), and after a server restart it no longer holds it, so a
+		// failure must not keep a conversation the user asked to delete. For a session
+		// conversation the failure is reported as a warning; for a plain one, which the server
+		// may never have seen, it is not.
+		isSession := existing.SessionMode || strings.TrimSpace(existing.SessionWorkerID) != ""
 		deleted, ok := s.store.DeleteConversation(existing.Alias)
 		if !ok {
 			return "", "", "", fmt.Errorf("conversation %q was not found (another bridge process may have deleted it)", existing.Alias)
+		}
+		var remoteErr error
+		fwd, _ := json.Marshal(map[string]any{"action": actionDelete, "alias": existing.Alias})
+		if sess, err := s.ensureConnected(ctx); err != nil {
+			remoteErr = err
+		} else if _, _, _, rErr := sess.callRemoteTool(ctx, ToolManageSession, fwd, meta, s.store.Snapshot(), nil); rErr != nil {
+			remoteErr = rErr
+		}
+		if remoteErr != nil && isSession {
+			return fmt.Sprintf("Deleted session **`%s`** from this bridge.\n\n⚠️ The in-cluster server's delete failed (%v); it may still hold the name. A `/session` worker for it idles out by itself.\n", FirstNonEmptyStr(deleted.Alias, target), remoteErr), "", "", nil
 		}
 		return fmt.Sprintf("Deleted session **`%s`**.\n", FirstNonEmptyStr(deleted.Alias, target)), "", "", nil
 
