@@ -115,7 +115,7 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 		},
 		{
 			Name:        ToolSendMessage,
-			Description: "Send a prompt, question, task, or command to kube-agents over the A2A v2 JetStream bus and stream back thinking, tool activity timelines, progress plans, delegations (session -> platform -> wake), notices, PR links, and structured kube-agents.chat/v1 results.",
+			Description: "Send a prompt, question, task, or command to kube-agents over the A2A v2 JetStream bus and wait for the answer. A turn still running when the wait ends returns its task, to read later with task_control. The in-cluster server sends no progress while a turn runs yet: the answer shows when the turn ends.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"message"},

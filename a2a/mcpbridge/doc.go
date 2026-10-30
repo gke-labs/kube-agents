@@ -1,10 +1,11 @@
 // Package mcpbridge is the workstation-side kube-agents Model Context Protocol
 // (MCP) bridge: a stdio JSON-RPC server that lets a local coding agent drive a
 // kube-agents deployment through its in-cluster a2a-mcp server — discover and
-// connect to deployments across kubeconfig contexts, send a message and stream
-// the turn's steps back as it runs, manage persistent /session workers, read
-// and stop tasks, read blackboard topics, and inspect or download the GitHub
-// pull requests an agent filed.
+// connect to deployments across kubeconfig contexts, send a message and wait
+// for its answer, manage persistent /session workers, read and stop tasks,
+// read blackboard topics, and inspect or download the GitHub pull requests an
+// agent filed. It relays notifications/progress frames as live progress, but
+// the in-cluster server sends none yet: a turn's result shows when it ends.
 //
 // It is a thin client of the in-cluster a2a-mcp server (<agent>-a2a-mcp:8089):
 // it forwards tool calls over HTTP/NDJSON (a2a/mcpproto) and manages local
@@ -24,11 +25,17 @@
 //	                               (default ~/.config/kube-agents/mcp-config.json)
 //	KUBE_AGENTS_MCP_TOKEN          explicit Bearer token override for the
 //	                               in-cluster a2a-mcp listener: the
-//	                               deployment's when only one is configured
+//	                               deployment's when only one is configured;
+//	                               sent only to that deployment's saved
+//	                               kube context, namespace and direct URL,
+//	                               never to a connection that overrides them
 //	KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT
 //	                               with several deployments configured, the
-//	                               saved profile name the token belongs to;
-//	                               unset, the token is sent nowhere
+//	                               saved profile name the token belongs to
+//	                               (or its name before a <context>/<name>
+//	                               rename, if only one profile has it);
+//	                               unset or ambiguous, the token is sent
+//	                               nowhere
 //	GH_TOKEN / GITHUB_TOKEN        GitHub token for inspect_pr; when neither is
 //	                               set the bridge falls back to the github.com
 //	                               entry in ~/.git-credentials, if present

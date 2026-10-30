@@ -31,6 +31,12 @@ export KUBE_AGENTS_MCP_TOKEN="$(kubectl -n kubeagents-system get secret platform
 
 Reading the Secret needs `get` on it, and the port-forward needs `pods/portforward`; together they are the access gate. Point the MCP client at `http://localhost:8089/mcp` with the header `Authorization: Bearer <token>`. The endpoint takes JSON-RPC 2.0 over `POST`, one JSON answer per request. It refuses any request that carries an `Origin` header, so a browser page cannot use it, and `GET /healthz` answers without a token. A request naming an MCP revision the server does not speak (the `MCP-Protocol-Version` header) gets a 400; one without the header is served.
 
+The workstation bridge (`kube-agents-mcp`) reads `KUBE_AGENTS_MCP_TOKEN` too. With one deployment saved, the token is that one's. With several, set `KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT` to the saved name of the deployment the token belongs to. A deployment the bridge saved as `<kube-context>/<name>`, because another context holds one called `<name>`, also answers to `<name>`, as long as no other saved deployment does. Unset, or naming none or several of them, the bridge sends the token nowhere and logs a warning.
+
+The bridge's token belongs to the deployment's saved target, not its name. A connection whose kube context, namespace or direct MCP URL differs from the saved deployment's does not get it, such as a `connect_deployment` call that overrides `kube_context` or `namespace`. The bridge reads that target's own token Secret instead, where there is one, and logs a warning.
+
+The bridge relays `notifications/progress` frames from an NDJSON reply as live progress, but this server sends none yet: each call gets one JSON answer, so the bridge shows a turn's result when it ends, with no progress before it.
+
 To rotate the token, write a new value into the Secret. The server reads the mounted file on every request, so the new token is accepted and the old one refused as soon as the kubelet updates the mount, usually within a minute. A blank value, or one holding a byte no request header could carry, is replaced: the operator mints a new token over it.
 
 ## The tools
