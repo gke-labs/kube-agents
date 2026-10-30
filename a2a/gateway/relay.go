@@ -186,15 +186,34 @@ type relayItem struct {
 }
 
 // settle acks the item's delivery: it was rendered, or it is not one this
-// gateway will ever render. A failed ack releases the delivery all the same
-// (lib), so the stream redelivers it after AckWait, and the sequence guard
-// (SessionRecord.relayed) keeps a rendered one from posting twice.
+// gateway will ever render. A failed ack is tried again every requeueDelay
+// until it lands or the gateway stops: the delivery stays held, so it isn't
+// redelivered while this gateway runs (released, it would come back after
+// AckWait, and render again if the record write failed too), and a stop
+// gives it back with the rest, where the sequence guard (SessionRecord.relayed)
+// keeps a rendered one from posting twice.
 func (g *Gateway) settle(item relayItem) {
 	if item.d == nil {
 		return
 	}
 	if err := item.d.Ack(); err != nil {
-		g.log.Warn("relay: ack failed", "taskId", item.env.TaskID, "err", err)
+		g.log.Warn("relay: ack failed; trying again", "taskId", item.env.TaskID, "err", err)
+		go g.retryAck(item)
+	}
+}
+
+// retryAck tries a failed ack again every requeueDelay until it lands or the
+// gateway stops.
+func (g *Gateway) retryAck(item relayItem) {
+	for {
+		select {
+		case <-g.runCtx.Done():
+			return
+		case <-time.After(requeueDelay):
+		}
+		if err := item.d.Ack(); err == nil {
+			return
+		}
 	}
 }
 
@@ -379,6 +398,7 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	var dupes []relayItem
 	inBatch := map[uint64]bool{}
 	batchSeqs := map[string][]uint64{}
+	endedHere := map[string]bool{}
 	for _, item := range batch {
 		seq := item.sequence()
 		if rec.relayed(item.env.TaskID, seq) {
@@ -409,22 +429,17 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			g.log.Warn("relay: stop drain timed out; batch left for the next gateway", "session", sessionKey, "rendered", i, "events", len(fresh))
 			return
 		}
+		live := !g.routeRetired(item.env.TaskID)
 		g.applyEvent(ctx, rec, item, i == len(fresh)-1)
 		rec.markRelayed(item.env.TaskID, item.sequence())
 		if seq := item.sequence(); seq != 0 {
 			batchSeqs[item.env.TaskID] = append(batchSeqs[item.env.TaskID], seq)
 		}
-	}
-	// A task whose terminal rendered keeps only this batch's sequences: its
-	// task index is gone, so an older event's redelivery is acked as no
-	// longer routed before the guard is read, and only this batch's, which
-	// a crash before the ack would redeliver, still need it (in case the
-	// index drop failed).
-	for taskID, seqs := range batchSeqs {
-		if g.routeRetired(taskID) {
-			rec.keepRelayed(taskID, seqs)
+		if live && g.routeRetired(item.env.TaskID) {
+			endedHere[item.env.TaskID] = true
 		}
 	}
+	g.trimEndedTasks(ctx, rec, endedHere, batchSeqs)
 	if g.relayInFlight.abandoned() {
 		g.log.Warn("relay: stop drain timed out; batch left for the next gateway", "session", sessionKey, "rendered", len(fresh), "events", len(fresh))
 		return
@@ -440,6 +455,21 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	}
 	for _, item := range dupes {
 		g.settle(item)
+	}
+}
+
+// trimEndedTasks drops the older rendered sequences of a task whose terminal
+// rendered in this batch, keeping this batch's. It trims only once the task
+// index is confirmed gone: then a redelivery of an older event is acked as
+// no longer routed before the guard would be read, and only this batch's,
+// whose acks are still out, can come again. While the index survives (its
+// drop failed), the task keeps every sequence.
+func (g *Gateway) trimEndedTasks(ctx context.Context, rec *SessionRecord, endedHere map[string]bool, batchSeqs map[string][]uint64) {
+	for taskID := range endedHere {
+		if key, err := g.reg.SessionForTask(ctx, taskID); err != nil || key != "" {
+			continue
+		}
+		rec.keepRelayed(taskID, batchSeqs[taskID])
 	}
 }
 

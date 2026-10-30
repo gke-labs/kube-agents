@@ -19,8 +19,8 @@ import (
 )
 
 // relayedSeqCap bounds TaskRef.RelayedSeqs. Only an event rendered and not
-// yet acked can come again, and those are a task's most recent batch's, which
-// a burst of progress events can make long.
+// yet acked can come again: a recent batch's, or one whose ack is still
+// being retried, which a burst of progress events can make long.
 const relayedSeqCap = 256
 
 // ActiveTask is the task currently serializing a session's conversation.
@@ -257,7 +257,9 @@ type TaskRef struct {
 	// RelayedSeqs are the stream sequences of this task's most recent
 	// events the relay rendered (at most relayedSeqCap), written with the
 	// render. A redelivered event found here was rendered by a gateway that
-	// died before acking it, and is not rendered again.
+	// stopped or died before its ack landed, and is not rendered again. Once
+	// the task's terminal renders and its index is gone, only that last
+	// batch's are kept (trimEndedTasks).
 	RelayedSeqs []uint64 `json:"relayedSeqs,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.

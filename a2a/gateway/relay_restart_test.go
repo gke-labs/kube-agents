@@ -417,3 +417,29 @@ func TestATaskThatEndsKeepsOnlyItsLastBatchsSequences(t *testing.T) {
 		t.Fatalf("an ended task's sequences = %v, want only its last batch's [701]", ref.RelayedSeqs)
 	}
 }
+
+// TestAnEndedTaskKeepsEverySequenceWhileItsIndexSurvives: the trim waits for
+// the task index to be gone; a failed drop leaves the guard whole, since an
+// older event's redelivery would still be routed and read it.
+func TestAnEndedTaskKeepsEverySequenceWhileItsIndexSurvives(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	waitRunning(t, r)
+	ctx := context.Background()
+	rec := &SessionRecord{Key: "discord:g1/t-trim", Tasks: []TaskRef{{ID: "task-trim", RelayedSeqs: []uint64{1, 2, 3}}}}
+	if err := r.g.reg.IndexTask(ctx, "task-trim", rec.Key); err != nil {
+		t.Fatal(err)
+	}
+	ended := map[string]bool{"task-trim": true}
+	batch := map[string][]uint64{"task-trim": {3}}
+	r.g.trimEndedTasks(ctx, rec, ended, batch)
+	if !slices.Equal(rec.Tasks[0].RelayedSeqs, []uint64{1, 2, 3}) {
+		t.Fatalf("trimmed with the index still present: %v", rec.Tasks[0].RelayedSeqs)
+	}
+	if err := r.g.reg.DropTask(ctx, "task-trim"); err != nil {
+		t.Fatal(err)
+	}
+	r.g.trimEndedTasks(ctx, rec, ended, batch)
+	if !slices.Equal(rec.Tasks[0].RelayedSeqs, []uint64{3}) {
+		t.Fatalf("after the index drop, sequences = %v, want this batch's [3]", rec.Tasks[0].RelayedSeqs)
+	}
+}
