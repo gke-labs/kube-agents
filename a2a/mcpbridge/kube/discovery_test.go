@@ -301,3 +301,35 @@ current-context: %s
 		t.Fatalf("resolveServiceTargetPod(missing) = %q, %v; want an error naming the failed lookups", name, err)
 	}
 }
+
+func TestFullScanWithNoKubeconfigFileIsAnErrorNotAnEmptyScan(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("KUBECONFIG", filepath.Join(dir, "missing-a")+string(os.PathListSeparator)+filepath.Join(dir, "missing-b"))
+	if entries, err := DiscoverDeployments(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "no kubeconfig file found") {
+		t.Fatalf("full scan with no kubeconfig file = %v, %v; want an error, not a clean empty scan the store would prune on", entries, err)
+	}
+
+	// An unreadable one is an error too (client-go reports it; pinned here beside the missing case).
+	unreadable := filepath.Join(dir, "unreadable")
+	if err := os.WriteFile(unreadable, []byte("apiVersion: v1\nkind: Config\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := os.Open(unreadable); err == nil {
+		_ = f.Close() // running as root: the mode does not stop the read
+	} else {
+		t.Setenv("KUBECONFIG", unreadable)
+		if entries, err := DiscoverDeployments(context.Background(), ""); err == nil {
+			t.Fatalf("full scan with an unreadable kubeconfig = %v, nil; want an error", entries)
+		}
+	}
+
+	// A kubeconfig that exists and has no contexts is a clean empty scan.
+	empty := filepath.Join(dir, "empty")
+	if err := os.WriteFile(empty, []byte("apiVersion: v1\nkind: Config\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KUBECONFIG", filepath.Join(dir, "missing-a")+string(os.PathListSeparator)+empty)
+	if entries, err := DiscoverDeployments(context.Background(), ""); err != nil || len(entries) != 0 {
+		t.Fatalf("full scan of a kubeconfig with no contexts = %v, %v; want a clean empty scan", entries, err)
+	}
+}

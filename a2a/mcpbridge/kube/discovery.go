@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -105,6 +107,12 @@ func restConfigForKubeContext(kubeCtx string) (*rest.Config, error) {
 func listKubeContextsClientGo(trimmedFilter string) ([]string, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	rawCfg, err := loadingRules.Load()
+	if err == nil && trimmedFilter == "" {
+		// client-go skips a kubeconfig file that does not exist and loads an empty config
+		// without an error. A full scan must not read that as "no contexts": the caller prunes
+		// every saved kube profile on a clean empty scan.
+		err = noKubeconfigFileError(loadingRules.GetLoadingPrecedence())
+	}
 	if err != nil {
 		if trimmedFilter != "" {
 			return []string{trimmedFilter}, nil
@@ -127,6 +135,25 @@ func listKubeContextsClientGo(trimmedFilter string) ([]string, error) {
 		contexts = []string{trimmedFilter}
 	}
 	return contexts, nil
+}
+
+// noKubeconfigFileError reports that none of the kubeconfig files the loading rules look at
+// (KUBECONFIG's list, or ~/.kube/config) exists, or nil when one does.
+func noKubeconfigFileError(precedence []string) error {
+	var looked []string
+	for _, path := range precedence {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		if _, err := os.Stat(path); err == nil || !errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		looked = append(looked, path)
+	}
+	if len(looked) == 0 {
+		return errors.New("no kubeconfig file is configured (KUBECONFIG and HOME are unset)")
+	}
+	return fmt.Errorf("no kubeconfig file found (looked for %s)", strings.Join(looked, ", "))
 }
 
 // DiscoverDeployments scans Kubernetes contexts (or a single filtered context) in parallel
