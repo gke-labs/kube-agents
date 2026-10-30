@@ -98,7 +98,10 @@ readonly CREDENTIAL_PROXY_METRICS_SCRAPE='import os, sys, urllib.request; port =
 # only by the failure dump, so a green run kept no record of the
 # thinking-replay hook: its per-request "thinking replay: dropped N" line is
 # the only sign it touched the run's traffic. The 429s, Workload Identity
-# token fetches and Vertex 403/404s the failure dump took it for are here too.
+# token fetches and Vertex 403/404s the failure dump took it for are here too,
+# as is the cache probe's per-call "cache probe:" line (ci-deploy.sh turns it
+# on): one line per chat completion, about 6,400 across both pods on an
+# October 2026 nightly.
 # Every replica: the chart runs two, each serving its own share of requests,
 # and `logs deployment/...` reads one of them. Bounded like the gateway log:
 # kubectl's line tail, which it applies per pod (at 1000 lines a six-hour run
