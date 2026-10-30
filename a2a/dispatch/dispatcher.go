@@ -96,6 +96,9 @@ type holding struct {
 	// cluster is the cluster admission checked the task against, nil when
 	// it names none: the target of its credential-proxy token (#3889).
 	cluster *taskcred.Target
+	// changeRequested is the submission's ChangeRequested: whether its
+	// credential-proxy token carries the vcs:proposal-create permit (#3993).
+	changeRequested bool
 
 	// Guarded by Dispatcher.mu. pod is set from the offer on, so a pod
 	// with an offer out is busy before anything is written; confirmed is
@@ -601,7 +604,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	}
 
 	now := d.now()
-	cluster, ref, err := d.admit(ctx, del, snap, prof, hk, now)
+	adm, ref, err := d.admit(ctx, del, snap, prof, hk, now)
 	if err != nil {
 		return // stopping: the lib gives the delivery back
 	}
@@ -626,7 +629,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		return
 	}
 	d.clearWaiting(taskID)
-	h.cluster = cluster
+	h.cluster, h.changeRequested = adm.cluster, adm.changeRequested
 
 	rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
 	if err != nil || key == "" {
@@ -947,7 +950,10 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 // and re-created under its name) is not the pod that accepted, and gets
 // nothing. Both expire at the offer's deadline plus the callout's clock-skew
 // allowance, capped at the max lifetime from now so the callout never
-// refuses one as too long-lived. Each is read back with the key's public
+// refuses one as too long-lived. The proxy token carries the
+// vcs:proposal-create permit when the submission asked for a change, and no
+// permits claim at all otherwise (#3993); the bus credential never carries
+// one. Each is read back with the key's public
 // half before it is used, and only its jti is logged, never the token.
 func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid string, deadline time.Time) (natsToken, proxyToken string, err error) {
 	if now := d.pool.PodUID(h.profile, h.tier, pod); now != uid {
@@ -964,7 +970,11 @@ func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid stri
 		return "", "", err
 	}
 	if h.cluster != nil {
-		proxyToken, err = d.mintOne(log, base, taskcred.AudienceCredentialProxy, h.cluster, now)
+		proxy := base
+		if h.changeRequested {
+			proxy.Permits = []taskcred.Permit{taskcred.PermitVCSProposalCreate}
+		}
+		proxyToken, err = d.mintOne(log, proxy, taskcred.AudienceCredentialProxy, h.cluster, now)
 		if err != nil {
 			return "", "", err
 		}
@@ -987,7 +997,7 @@ func (d *Dispatcher) mintOne(log *slog.Logger, c taskcred.Claims, aud taskcred.A
 	if err != nil {
 		return "", fmt.Errorf("the %s credential just minted does not verify: %w", aud, err)
 	}
-	log.Info("task credential minted", "pod", c.Pod, "audience", string(aud), "jti", back.ID, "expires", back.Expires)
+	log.Info("task credential minted", "pod", c.Pod, "audience", string(aud), "jti", back.ID, "expires", back.Expires, "permits", back.Permits)
 	return token, nil
 }
 

@@ -361,7 +361,8 @@ What the operator renders per profile, as built (amended 10/6):
   shim, and they reach the shared broker, not a proxy in the worker's pod (one there could
   ask the metadata server for the broker's Workload Identity token). The broker gives them a
   role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
-  route only, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist.
+  route, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist, and the
+  version-control routes under the permit rule below.
   The operator renders the audience, an identity map from each tier's ServiceAccount to its
   (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
   entries), those ServiceAccounts on the broker's callers, and the task-signing public key
@@ -387,6 +388,22 @@ What the operator renders per profile, as built (amended 10/6):
     without a credential, so `get-credentials <cluster> --help` is a help read.
     `gcloud config` and `gcloud auth` are refused whole, since even their reads print the
     broker's own account and default project.
+  - Version control (#3993). `/v1/vcs/` admits the profile role, and every verb there needs a
+    valid task credential: one with no credential is refused before the body is read, not
+    run local-only. The reads (`clone`, `proposal-view`, `proposal-list`, `proposal-commits`,
+    `branch-view`, `identity`, `issue-list`, `issue-view`) need nothing more. `publish`,
+    `proposal-create` and `proposal-update` also need the credential's `permits` claim to hold
+    `vcs:proposal-create`, which the dispatcher mints only when the submission's
+    `changeRequested` is true, and only the gateway sets that, for a structured confirm. The
+    claim is a closed list of strings, allowed only on the `credential-proxy` audience: an
+    unknown permit, a malformed list or a `permits` key on a `nats` credential refuses the
+    token, in both verifiers. The permit names no repository; the managed list bounds where
+    every verb lands, a permitted write included. Every other verb is refused: `snapshot` and
+    `capabilities`, which skip the managed list, and every other write, `branch-delete`
+    among them. The shim sends the credential on these calls as it does on an exec. Known
+    limits: a task that names no cluster gets no `proxyToken`, so it reaches no
+    version-control verb at all; and `submit-suggestion` deletes a spent branch with
+    `branch-delete`, so on a profile worker that one path is refused.
   - With a credential, every call is held to its target (`task_confinement.py`). Every
     `kubectl --context`, `--kubeconfig` and `kubeconfigContext` must name the target, and a
     call naming none gets the target, not the host cluster; `--cluster`, `--server`, `--user`

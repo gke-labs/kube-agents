@@ -102,8 +102,20 @@ ED25519_SIGNATURE_LENGTH = 64
 # decodePayload, and a case variant of an allowed one in checkStrictClaims).
 TOP_LEVEL_CLAIMS = frozenset({"jti", "iat", "iss", "name", "sub", "aud", "exp", "nbf", "nats"})
 NATS_CLAIMS = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid", "target"})
+# The nats claims a credential may carry but need not: taskcred's Permits,
+# which Mint omits when there is none (#3993).
+NATS_OPTIONAL_CLAIMS = frozenset({"permits"})
 TARGET_CLAIMS = frozenset({"project", "location", "cluster"})
 HEADER_KEYS = frozenset({"typ", "alg"})
+
+# taskcred.PermitVCSProposalCreate: what a profile worker's credential carries
+# when its submission asked for a change, and what the broker's version-control
+# write verbs require of a profile caller.
+PERMIT_VCS_PROPOSAL_CREATE = "vcs:proposal-create"
+
+# Every permit taskcred mints and verifies. Closed: a credential naming any
+# other is refused, not read as carrying fewer permits.
+KNOWN_PERMITS = frozenset({PERMIT_VCS_PROPOSAL_CREATE})
 
 # int64, the width of jwt/v2's time claims. A JSON integer outside it fails
 # Go's decode; Python would read it as a bignum.
@@ -154,6 +166,9 @@ class TaskClaims:
     jti: str
     issuer: str
     target: TaskTarget
+    # The permits the credential carries (taskcred.Claims.Permits), empty
+    # when it carries none.
+    permits: frozenset[str] = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +368,30 @@ def _target_field(value: str, name: str) -> str:
     return value
 
 
+def _permits(nats: Mapping[str, Any]) -> frozenset[str]:
+    """The permits claim: absent, or a non-empty list of known permits, none twice.
+
+    taskcred's validate, plus what this verifier refuses on its own account: a
+    null or empty list (Mint omits the claim when there is no permit, so a
+    present-but-empty one was not minted there).
+    """
+    if "permits" not in nats:
+        return frozenset()
+    value = nats["permits"]
+    if type(value) is not list or not value:
+        raise TaskCredentialError("task credential permits is not a non-empty list")
+    seen: set[str] = set()
+    for permit in value:
+        if type(permit) is not str:
+            raise TaskCredentialError("task credential permits holds a value that is not a string")
+        if permit not in KNOWN_PERMITS:
+            raise TaskCredentialError(f"task credential permit {permit[:MAX_LABEL]!r} is not one this verifier knows")
+        if permit in seen:
+            raise TaskCredentialError(f"task credential permit {permit!r} appears twice")
+        seen.add(permit)
+    return frozenset(seen)
+
+
 # ---------------------------------------------------------------------------
 # Verify.
 # ---------------------------------------------------------------------------
@@ -415,7 +454,7 @@ def verify(
     nats = claims["nats"]
     if not isinstance(nats, dict):
         raise TaskCredentialError("task credential nats claim is not an object")
-    _exact_keys(nats, NATS_CLAIMS, NATS_CLAIMS, "nats")
+    _exact_keys(nats, NATS_CLAIMS | NATS_OPTIONAL_CLAIMS, NATS_CLAIMS, "nats")
     if _string(nats, "type", "nats") != TOKEN_TYPE:
         raise TaskCredentialError("task credential type is not a task credential")
     if _integer(nats, "version", "nats") != JWT_CLAIMS_VERSION:
@@ -426,6 +465,13 @@ def verify(
     _exact_keys(target_claim, TARGET_CLAIMS, TARGET_CLAIMS, "nats.target")
 
     audience = claims["aud"]
+    # taskcred's rule for permits, stated here although the audience check
+    # below refuses every other audience anyway: a permit is a grant only this
+    # audience enforces, so a credential for any other carrying one is refused
+    # for that, whatever else this verifier comes to accept.
+    if "permits" in nats and audience != AUDIENCE:
+        raise TaskCredentialError(f"task credential permits may appear only on a {AUDIENCE!r} credential")
+    permits = _permits(nats)
     if type(audience) is not str or audience != AUDIENCE:
         raise TaskCredentialError(f"task credential is not for {AUDIENCE!r}")
 
@@ -473,6 +519,7 @@ def verify(
             location=_target_field(_string(target_claim, "location", "nats.target"), "location"),
             cluster=_target_field(_string(target_claim, "cluster", "nats.target"), "cluster"),
         ),
+        permits=permits,
     )
 
 

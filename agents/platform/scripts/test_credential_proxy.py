@@ -13091,7 +13091,7 @@ class MCPRouteAdmissionTest(unittest.TestCase):
         self.assertTrue(permitted)
         self.assertEqual([], replies)
         self.assertEqual(
-            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_MCP),
+            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_MCP, credential_proxy.CALLER_ROLE_PROFILE),
             credential_proxy.required_roles("/v1/vcs/proposal-view"),
         )
 

@@ -29,6 +29,7 @@ import command_policy
 import credential_proxy
 import task_confinement
 import task_credential
+import vcs_broker
 from credential_proxy import CredentialProxyHandler, Policy
 from credential_proxy_client import ClusterTarget
 from task_confinement import ConfinementRefusal, confine
@@ -1367,10 +1368,32 @@ class ProfileSlotShareTest(unittest.TestCase):
 
 
 class ProfileRouteTableTest(unittest.TestCase):
-    def test_the_profile_role_reaches_the_exec_route_alone(self):
+    def test_the_profile_role_reaches_the_exec_and_vcs_routes_alone(self):
         for prefix, roles in credential_proxy.ROUTE_ROLES:
             with self.subTest(prefix=prefix):
-                self.assertEqual(prefix == "/v1/exec", credential_proxy.CALLER_ROLE_PROFILE in roles)
+                self.assertEqual(prefix in ("/v1/exec", "/v1/vcs/"), credential_proxy.CALLER_ROLE_PROFILE in roles)
+
+    def test_the_broker_and_the_verifier_name_one_permit(self):
+        self.assertEqual(task_credential.PERMIT_VCS_PROPOSAL_CREATE, credential_proxy.VCS_PROPOSAL_CREATE_PERMIT)
+        self.assertIn(credential_proxy.VCS_PROPOSAL_CREATE_PERMIT, task_credential.KNOWN_PERMITS)
+
+    def test_the_profile_vcs_verbs_are_the_reads_and_the_three_gated_writes(self):
+        self.assertEqual(PROFILE_VCS_READS | PROFILE_VCS_WRITES, credential_proxy.ROLE_VCS_VERBS[credential_proxy.CALLER_ROLE_PROFILE])
+        self.assertEqual(PROFILE_VCS_WRITES, credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS)
+        self.assertEqual(frozenset(), PROFILE_VCS_READS & vcs_broker.WRITE_VERBS)
+
+    def test_an_ungated_profile_write_is_refused_at_import(self):
+        for verb in ("branch-delete", "proposal-comment", "issue-create"):
+            with self.subTest(verb=verb), self.assertRaisesRegex(ValueError, "without the task credential's permit"):
+                credential_proxy._validate_role_vcs_verbs(
+                    {credential_proxy.CALLER_ROLE_PROFILE: frozenset({"proposal-view", verb})}
+                )
+        for verb in ("snapshot", "capabilities"):
+            with self.subTest(verb=verb), self.assertRaisesRegex(ValueError, "does not manage"):
+                credential_proxy._validate_role_vcs_verbs(
+                    {credential_proxy.CALLER_ROLE_PROFILE: frozenset({"proposal-view", verb})}
+                )
+        credential_proxy._validate_role_vcs_verbs(credential_proxy.ROLE_VCS_VERBS)
 
     def test_the_shim_and_the_broker_name_one_header(self):
         import credential_proxy_client
@@ -1379,6 +1402,173 @@ class ProfileRouteTableTest(unittest.TestCase):
 
     def test_kubectl_and_gcloud_only(self):
         self.assertEqual(frozenset({"kubectl", "gcloud"}), credential_proxy.ROLE_EXECUTABLES[credential_proxy.CALLER_ROLE_PROFILE])
+
+
+# The profile role's version-control verbs (#3993), spelled out here rather
+# than read off the broker's table, so a change to either side is a red test.
+PROFILE_VCS_READS = frozenset(
+    {"clone", "proposal-view", "proposal-list", "proposal-commits", "branch-view", "identity", "issue-list", "issue-view"}
+)
+PROFILE_VCS_WRITES = frozenset({"publish", "proposal-create", "proposal-update"})
+PERMIT = CASES["a permit"]
+
+
+class ProfileVcsRouteTest(unittest.TestCase):
+    """POST /v1/vcs/<verb> for a profile caller, end to end over HTTP.
+
+    Real fixture credentials through the real gate: "valid" carries no permit,
+    "a permit" carries vcs:proposal-create, both bound to the same pod. The
+    forge is a stand-in: every verb's route is a recording mock, and the
+    managed list answers what each test says.
+    """
+
+    PAYLOAD = {"repository": "https://github.com/acme/infra", "number": 7, "branch": "fix", "title": "t", "body": "b"}
+
+    setUp_base = ProfileRouteTest.setUp
+    _restore = ProfileRouteTest.__dict__["_restore"]
+    set_gate = ProfileRouteTest.set_gate
+    post = ProfileRouteTest.post
+
+    def setUp(self):
+        self.addCleanup(
+            ProfileRouteTest._restore, "vcs", "vcs" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("vcs"),
+        )
+        self.setUp_base()
+        vcs = mock.Mock()
+        vcs.snapshot_source.side_effect = lambda repository: (repository, None)
+        forge = mock.Mock()
+        forge.name = "github"
+        vcs.registry.resolve.return_value = (forge, "acme/infra")
+        CredentialProxyHandler.vcs = vcs
+        self.vcs = vcs
+        self.routes = {verb: mock.Mock(return_value={"ok": verb}) for verb in vcs_broker.VCS_VERBS}
+        patcher = mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value=self.routes)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.managed = mock.Mock(return_value=True)
+        patcher = mock.patch.object(credential_proxy, "repository_is_managed", self.managed)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def vcs_post(self, verb, token):
+        return self.post(self.PAYLOAD, token=token, path=f"/v1/vcs/{verb}")
+
+    def assert_ran(self, verb, status, body):
+        self.assertEqual(200, status, body)
+        self.assertEqual({"ok": verb}, body)
+        self.routes[verb].assert_called_once_with(self.PAYLOAD)
+
+    def assert_permit_refused(self, verb, status, body):
+        self.assertEqual(403, status, body)
+        self.assertEqual("CALLER_PERMIT_REQUIRED", body.get("code"), body)
+        self.assertEqual(credential_proxy.RULE_CALLER_VCS_PERMIT, body["rule"])
+        self.routes[verb].assert_not_called()
+        # Refused before the managed list or the forge were asked anything.
+        self.vcs.registry.resolve.assert_not_called()
+        self.managed.assert_not_called()
+
+    def reset(self):
+        for route in self.routes.values():
+            route.reset_mock()
+        self.vcs.registry.resolve.reset_mock()
+        self.managed.reset_mock()
+
+    # -- reads -----------------------------------------------------------------
+
+    def test_every_read_verb_runs_with_a_credential_and_no_permit(self):
+        for verb in sorted(PROFILE_VCS_READS):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, VALID["token"])
+                self.assert_ran(verb, status, body)
+
+    def test_every_read_verb_runs_with_the_permit_too(self):
+        for verb in sorted(PROFILE_VCS_READS):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, PERMIT["token"])
+                self.assert_ran(verb, status, body)
+
+    def test_a_read_still_meets_the_managed_list(self):
+        self.managed.return_value = False
+        status, body = self.vcs_post("proposal-view", VALID["token"])
+        self.assertEqual(403, status, body)
+        self.assertEqual("REPOSITORY_NOT_MANAGED", body["code"])
+        self.routes["proposal-view"].assert_not_called()
+
+    # -- no credential -----------------------------------------------------------
+
+    def test_no_credential_is_refused_for_every_admitted_verb(self):
+        for verb in sorted(PROFILE_VCS_READS | PROFILE_VCS_WRITES):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, None)
+                self.assert_permit_refused(verb, status, body)
+                self.assertIn("needs a task credential", body["error"])
+
+    def test_a_refused_credential_is_refused_whole(self):
+        status, body = self.vcs_post("publish", CASES["permits on the nats audience"]["token"])
+        self.assertEqual(403, status, body)
+        self.assertEqual(credential_proxy.RULE_TASK_CREDENTIAL, body["rule"])
+        self.routes["publish"].assert_not_called()
+
+    # -- writes ------------------------------------------------------------------
+
+    def test_every_write_verb_is_refused_without_the_permit(self):
+        for verb in sorted(PROFILE_VCS_WRITES):
+            for spelling in (verb, verb.replace("-", "_")):
+                with self.subTest(spelling=spelling):
+                    self.reset()
+                    status, body = self.vcs_post(spelling, VALID["token"])
+                    self.assert_permit_refused(verb, status, body)
+                    self.assertIn(credential_proxy.VCS_PROPOSAL_CREATE_PERMIT, body["error"])
+
+    def test_every_write_verb_runs_with_the_permit(self):
+        for verb in sorted(PROFILE_VCS_WRITES):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, PERMIT["token"])
+                self.assert_ran(verb, status, body)
+                self.managed.assert_called_once()
+
+    def test_a_permitted_write_to_an_unmanaged_repository_is_refused(self):
+        # The permit names no repository; the managed list is what bounds
+        # where a permitted write may land.
+        self.managed.return_value = False
+        for verb in sorted(PROFILE_VCS_WRITES):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, PERMIT["token"])
+                self.assertEqual(403, status, body)
+                self.assertEqual("REPOSITORY_NOT_MANAGED", body["code"])
+                self.routes[verb].assert_not_called()
+                self.managed.assert_called_once()
+
+    def test_every_other_verb_is_refused_even_with_the_permit(self):
+        others = sorted(vcs_broker.VCS_VERBS - PROFILE_VCS_READS - PROFILE_VCS_WRITES)
+        self.assertIn("branch-delete", others)
+        self.assertIn("snapshot", others)
+        self.assertIn("capabilities", others)
+        for verb in others:
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, PERMIT["token"])
+                self.assertEqual(403, status, body)
+                self.assertEqual("CALLER_VERB_FORBIDDEN", body["code"])
+                self.routes[verb].assert_not_called()
+
+    # -- the platform agent is unchanged ------------------------------------------
+
+    def test_the_shell_reaches_every_verb_with_no_task_credential(self):
+        CredentialProxyHandler.authenticator = _StubAuthenticator(
+            credential_proxy.Principal(workload="system:serviceaccount:ns:agent", uid="u", role=credential_proxy.CALLER_ROLE_SHELL)
+        )
+        for verb in sorted(vcs_broker.VCS_VERBS):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, None)
+                self.assert_ran(verb, status, body)
 
 
 class ProfileAuthenticatorTest(unittest.TestCase):

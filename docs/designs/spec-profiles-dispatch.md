@@ -345,7 +345,12 @@ leave open:
   mints for the confirmed pod once the lease record is written (contract addendum 8, #3889).
   `taskCredential` (audience `nats`) is the password of the worker's task connection.
   `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
-  admission, and a task that names no cluster gets none. Both name the task, its profile and
+  admission, and a task that names no cluster gets none. When the submission's
+  `taskParameters.changeRequested` is true, the `proxyToken` also carries
+  `permits: ["vcs:proposal-create"]`, which admits the worker's version-control writes at the
+  broker (#3993); otherwise it carries no `permits` key at all, never an empty list, so its
+  claims are those of a token minted before the claim existed. The `taskCredential` never
+  carries one, and the callout refuses one that does. Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
   offer's deadline plus the callout's 30s clock skew, and never later than
   `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon

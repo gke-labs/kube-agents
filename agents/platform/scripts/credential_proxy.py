@@ -904,6 +904,9 @@ RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
 RULE_CALLER_EXECUTABLE = "caller.executable-role"
 RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
 RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
+# A profile caller at the version-control routes without a task credential,
+# or at a write verb without the permit its credential must carry (#3993).
+RULE_CALLER_VCS_PERMIT = "caller.vcs-permit"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -1123,11 +1126,15 @@ CALLER_ROLE_WATCHER = "watcher"
 # so nothing it can be asked to do may write to a forge, clone into the broker,
 # or spend the forge credential on anything but a read of a managed repository.
 CALLER_ROLE_MCP = "mcp"
-# An AgentProfile worker pod (#3889). Exec route only, kubectl and gcloud only,
+# An AgentProfile worker pod (#3889). The exec route, kubectl and gcloud only,
 # with the session's kubectl flag allowlist, and every call held to the target
 # cluster in the task credential the pod presents (TASK_CREDENTIAL_HEADER). The
 # credential is mandatory for anything that reaches a cluster or a project: a
 # profile caller without a valid one runs local-only commands and nothing else.
+# And the version-control routes (#3993), credential required for every verb:
+# the read verbs ROLE_VCS_VERBS names with any valid credential, the three
+# writes that publish a change only under the permit
+# PROFILE_PERMIT_GATED_VCS_VERBS names.
 CALLER_ROLE_PROFILE = "profile"
 
 # The TokenReview user.extra key under which the API server names the Pod a
@@ -1197,9 +1204,55 @@ def executable_permitted(role: str, executable: str) -> bool:
 # credential's own login and reach, which the MCP pod has no use for), and
 # `clone` and `snapshot` (fill the broker's disk on a caller's say-so, and
 # `snapshot` reads repositories this install does not manage).
+#
+# The profile role (#3993) reads the managed repository its task works on and
+# publishes a change only when asked to:
+#
+#   * the reads a change needs: clone (the working copy publish builds on),
+#     proposal-view, proposal-list, proposal-commits, branch-view, identity
+#     (the forge login a submission checks it is not proposing as), issue-list
+#     and issue-view. Each is held to the managed list like every other verb.
+#   * publish, proposal-create and proposal-update, the writes that put a
+#     change up for review, each further gated in `_dispatch_vcs_post` on the
+#     task credential's permit (PROFILE_PERMIT_GATED_VCS_VERBS).
+#
+# Left out: `snapshot` (reads repositories this install does not manage),
+# `capabilities` (ungated by the managed list), and every other write --
+# comments, closes, labels, issues, acknowledgements and `branch-delete`. None
+# of them is a step of putting a change up, and a permit that names one action
+# does not stretch to the rest.
 ROLE_VCS_VERBS: dict[str, frozenset[str]] = {
     CALLER_ROLE_MCP: frozenset({"proposal-view"}),
+    CALLER_ROLE_PROFILE: frozenset(
+        {
+            "clone",
+            "proposal-view",
+            "proposal-list",
+            "proposal-commits",
+            "branch-view",
+            "identity",
+            "issue-list",
+            "issue-view",
+            "publish",
+            "proposal-create",
+            "proposal-update",
+        }
+    ),
 }
+
+# The permit a profile caller's task credential must carry for the write verbs
+# below (task_credential.PERMIT_VCS_PROPOSAL_CREATE, taskcred's
+# PermitVCSProposalCreate). Spelled here rather than imported because
+# task_credential needs `cryptography`, which this module loads only when the
+# profile role is configured; a test holds the two equal.
+VCS_PROPOSAL_CREATE_PERMIT = "vcs:proposal-create"
+
+# The profile role's write verbs, each admitted only when the caller's verified
+# task credential carries VCS_PROPOSAL_CREATE_PERMIT. The dispatcher mints that
+# permit only for a task whose submission asked for a change, which only a
+# structured confirm sets, so a profile worker the model drives to publish on
+# its own initiative is refused here however the call is spelled.
+PROFILE_PERMIT_GATED_VCS_VERBS = frozenset({"publish", "proposal-create", "proposal-update"})
 
 
 def vcs_verb_permitted(role: str, verb: str) -> bool:
@@ -1213,7 +1266,32 @@ def vcs_verb_permitted(role: str, verb: str) -> bool:
     return narrowed is None or verb in narrowed
 
 
-def _validate_role_vcs_verbs(table: dict[str, frozenset[str]]) -> None:
+def profile_vcs_refusal(principal: Any, verb: str) -> str | None:
+    """Why a profile caller may not reach ``POST /v1/vcs/<verb>``, or None.
+
+    Checked after ``vcs_verb_permitted`` and before the body is read or a slot
+    taken. Every verb needs a verified task credential: the profile role
+    reaches the forge credential only for a task the dispatcher handed this
+    pod, and a request with none (no header, a warm pod between tasks) is
+    refused rather than read as a task-less caller. A write verb in
+    PROFILE_PERMIT_GATED_VCS_VERBS also needs the credential's permit. Which
+    repository the request names is not this check's question: the managed
+    list bounds that for every verb, after the body is read.
+    """
+    task = getattr(principal, "task", None)
+    if task is None:
+        return "a profile caller needs a task credential for version control"
+    if verb in PROFILE_PERMIT_GATED_VCS_VERBS and VCS_PROPOSAL_CREATE_PERMIT not in getattr(task, "permits", ()):
+        return (
+            f"this task's credential carries no {VCS_PROPOSAL_CREATE_PERMIT} permit; a change is "
+            "published only for a request that asked for one"
+        )
+    return None
+
+
+def _validate_role_vcs_verbs(
+    table: dict[str, frozenset[str]], gated: frozenset[str] = PROFILE_PERMIT_GATED_VCS_VERBS
+) -> None:
     """Refuse a ``ROLE_VCS_VERBS`` entry that is not what it appears to be.
 
     Every key must be a caller role and every value a frozenset (a bare string
@@ -1241,18 +1319,32 @@ def _validate_role_vcs_verbs(table: dict[str, frozenset[str]]) -> None:
         raise ValueError(
             f"ROLE_VCS_VERBS[{CALLER_ROLE_MCP!r}]: {', '.join(sorted(writes))} writes to the forge"
         )
+    # The profile role's writes are claim-gated: every write in its set must be
+    # one `_dispatch_vcs_post` checks the permit for, so a write added to the
+    # set without the gate is a red import rather than an ungated write.
+    ungated = (table.get(CALLER_ROLE_PROFILE, frozenset()) & vcs_broker.WRITE_VERBS) - gated
+    if ungated:
+        raise ValueError(
+            f"ROLE_VCS_VERBS[{CALLER_ROLE_PROFILE!r}]: {', '.join(sorted(ungated))} writes to the "
+            "forge without the task credential's permit"
+        )
+    if not gated <= vcs_broker.WRITE_VERBS:
+        raise ValueError(
+            f"PROFILE_PERMIT_GATED_VCS_VERBS: {', '.join(sorted(gated - vcs_broker.WRITE_VERBS))} is not a write verb"
+        )
     # A role-selected verb reads repositories nobody registered and clones into
     # the broker on the caller's say-so, which is wider than a read of a managed
-    # repository.
-    unlisted = table.get(CALLER_ROLE_MCP, frozenset()) & vcs_broker.ROLE_SELECTED_VERBS
-    if unlisted:
-        raise ValueError(
-            f"ROLE_VCS_VERBS[{CALLER_ROLE_MCP!r}]: {', '.join(sorted(unlisted))} reads "
-            "repositories this install does not manage"
-        )
+    # repository. An ungated verb skips the managed list altogether.
+    for role in (CALLER_ROLE_MCP, CALLER_ROLE_PROFILE):
+        unlisted = table.get(role, frozenset()) & (vcs_broker.ROLE_SELECTED_VERBS | vcs_broker.UNGATED_VERBS)
+        if unlisted:
+            raise ValueError(
+                f"ROLE_VCS_VERBS[{role!r}]: {', '.join(sorted(unlisted))} reads "
+                "repositories this install does not manage"
+            )
 
 
-_validate_role_vcs_verbs(ROLE_VCS_VERBS)
+_validate_role_vcs_verbs(ROLE_VCS_VERBS, PROFILE_PERMIT_GATED_VCS_VERBS)
 
 
 # The kubectl flags a session caller may pass. An allowlist, for the reason
@@ -1398,8 +1490,9 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # rather than /v1/exec's roles. A sweep run under any other role is refused
     # here and falls back to four (broker_admission.sweep_width).
     (ADMISSION_PATH, (CALLER_ROLE_SHELL,)),
-    # The profile role reaches this route and no other: the Cloud API relay,
-    # the MCP relay, the watcher and Pub/Sub routes all stay closed to it.
+    # The profile role reaches this route and the version-control one, and no
+    # other: the Cloud API relay, the MCP relay, the watcher and Pub/Sub routes
+    # all stay closed to it.
     ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE)),
     # The feedback form verb: the sandbox's one way to file a report about
     # kube-agents itself (feedback_broker.py). The shell alone: a session pod
@@ -1426,9 +1519,11 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # subscription sets, and the prefix is what this table keys the role on.
     (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
-    # The MCP pod reaches this family and no other; which verbs within it is
-    # ROLE_VCS_VERBS's to say, checked in _dispatch_vcs_post.
-    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),
+    # The MCP pod reaches this family and no other; the profile role reaches
+    # it beside the exec route. Which verbs within it is ROLE_VCS_VERBS's to
+    # say, and for a profile caller the task credential's, checked in
+    # _dispatch_vcs_post.
+    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
 )
 
@@ -12492,6 +12587,26 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 },
             )
             return TOOL_STATUS_BLOCKED
+        if role == CALLER_ROLE_PROFILE:
+            refusal = profile_vcs_refusal(principal, verb)
+            if refusal is not None:
+                LOGGER.warning(
+                    "vcs verb refused for a profile caller verb=%s principal=%s rule=%s reason=%s",
+                    _sanitize_for_logging(verb),
+                    _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH),
+                    RULE_CALLER_VCS_PERMIT,
+                    refusal,
+                )
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "error": refusal,
+                        "code": "CALLER_PERMIT_REQUIRED",
+                        "rule": RULE_CALLER_VCS_PERMIT,
+                    },
+                )
+                return TOOL_STATUS_BLOCKED
         if self.vcs is None:
             self._json(
                 HTTPStatus.NOT_FOUND,

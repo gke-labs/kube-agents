@@ -85,13 +85,31 @@ MUTATIONS: list[Mutation] = [
         "the host cluster, so a task the dispatcher gave no target still works",
     ),
     Mutation(
-        "A3-profile-reaches-vcs",
+        "A3-profile-reaches-forge",
         "agents/platform/scripts/credential_proxy.py",
-        ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),\n',
-         '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),\n'),
-        "test_A3_the_profile_role_reaches_the_exec_route_alone",
-        "let a profile worker read a proposal the way the MCP pod does -- a "
-        "forge read no task target confines",
+        ('    ("/v1/forge/", (CALLER_ROLE_SHELL,)),\n',
+         '    ("/v1/forge/", (CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE)),\n'),
+        "test_A3_the_profile_role_reaches_the_exec_and_vcs_routes_alone",
+        "let a profile worker refresh the forge credential the way the shell "
+        "does, since it already reaches the version-control routes",
+    ),
+    Mutation(
+        "A3-profile-write-without-permit",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if verb in PROFILE_PERMIT_GATED_VCS_VERBS and VCS_PROPOSAL_CREATE_PERMIT not in",
+         "    if False and VCS_PROPOSAL_CREATE_PERMIT not in"),
+        "test_A3_a_profile_caller_publishes_a_change_only_under_the_permit",
+        "admit a profile worker's publish on any task credential, trusting the "
+        "persona rule to keep it from opening an unrequested pull request",
+    ),
+    Mutation(
+        "A3-profile-vcs-without-credential",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if task is None:\n        return "a profile caller needs a task credential for version control"\n',
+         '    if False:\n        return "a profile caller needs a task credential for version control"\n'),
+        "test_A3_a_profile_caller_publishes_a_change_only_under_the_permit",
+        "let a warm profile pod between tasks read the managed repository, "
+        "as the shell does with no per-task identity",
     ),
     Mutation(
         "A3-inject-auth",
