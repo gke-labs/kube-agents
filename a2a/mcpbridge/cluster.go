@@ -159,3 +159,17 @@ func NewDiscoveryError(failures []DeploymentProfile) error {
 	}
 	return fmt.Errorf("could not scan any kubeconfig context: %s", strings.Join(parts, "; "))
 }
+
+// NewPartialDiscoveryError is the error for a scan in which some kubeconfig contexts were
+// scanned cleanly and held no kube-agents deployment, and the others (failures) could not be
+// scanned, naming each of those and its failure.
+func NewPartialDiscoveryError(failures []DeploymentProfile) error {
+	if len(failures) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(failures))
+	for _, f := range failures {
+		parts = append(parts, fmt.Sprintf("%s: %s", f.KubeContext, f.StatusMessage))
+	}
+	return fmt.Errorf("no kube-agents deployment found in the kubeconfig contexts that were scanned; could not scan %s", strings.Join(parts, "; "))
+}

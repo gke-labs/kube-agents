@@ -1233,7 +1233,7 @@ func (s *Server) handleConnectDeployment(ctx context.Context, rawArgs json.RawMe
 		if len(deployments) > 0 {
 			prof, err = s.store.SelectDeployment(args.Deployment)
 		} else if dErr == nil && len(discovered) > 0 {
-			dErr = NewDiscoveryError(ProbeFailures(discovered))
+			dErr = NewPartialDiscoveryError(ProbeFailures(discovered))
 		}
 		if err != nil {
 			if dErr != nil {
@@ -2015,7 +2015,7 @@ func (s *Server) ensureConnected(ctx context.Context) (*gatewayBridgeSession, er
 		}
 		if len(deployments) == 0 {
 			if len(discovered) > 0 {
-				return nil, fmt.Errorf("%w: %v", errNotConnected, NewDiscoveryError(ProbeFailures(discovered)))
+				return nil, fmt.Errorf("%w: %v", errNotConnected, NewPartialDiscoveryError(ProbeFailures(discovered)))
 			}
 			return nil, errNoDeploymentsSaved
 		}

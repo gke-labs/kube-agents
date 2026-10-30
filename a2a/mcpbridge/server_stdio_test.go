@@ -523,3 +523,29 @@ func TestSignalWithAQueuedFrameReturnsNil(t *testing.T) {
 		t.Fatalf("a signal shutdown with a queued frame returned %v; want nil", err)
 	}
 }
+
+// A scan that reached some contexts cleanly (no install there) and failed others is not "could
+// not scan any kubeconfig context": both bridge paths say what was found and what failed.
+func TestPartlyFailedScanIsNotReportedAsNoContextScanned(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewServer(ServerOptions{Store: store, Cluster: failingClusterAccess{
+		discoverEntries: []DeploymentProfile{ContextProbeFailure("ctxB", errors.New("Unauthorized"))},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	check := func(path, got string) {
+		t.Helper()
+		if strings.Contains(got, "could not scan any kubeconfig context") || !strings.Contains(got, "no kube-agents deployment found") || !strings.Contains(got, "ctxB: Unauthorized") {
+			t.Fatalf("%s: %q; want no deployment found in the scanned contexts, and ctxB's failure", path, got)
+		}
+	}
+	_, err = srv.ensureConnected(context.Background())
+	check("ensureConnected", fmt.Sprint(err))
+	res := srv.CallTool(context.Background(), ToolConnectDeployment, json.RawMessage(`{"deployment":"x"}`))
+	check("connect_deployment", res.Content[0].Text)
+}
