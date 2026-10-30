@@ -365,10 +365,13 @@ func TestTheJobPolicyHoldsAfterEveryOperatorWrite(t *testing.T) {
 	b.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
 	reconcile("b drops the unattended tier", own("a", "custom-a2"), b)
 	reconcile("c is added", own("a", "custom-a2"), b, unattendedProfile(agent, "c"))
+	// a's account moves to d in one pass: d sorts after a, so a is
+	// rewritten first.
+	reconcile("a's account moves to d", own("a", "custom-a3"), b, unattendedProfile(agent, "c"), own("d", "custom-a2"))
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
-	reconcile("the policy signal goes away", own("a", "custom-a2"), b, unattendedProfile(agent, "c"))
+	reconcile("the policy signal goes away", own("a", "custom-a3"), b, unattendedProfile(agent, "c"), own("d", "custom-a2"))
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
-	reconcile("the signal is back", own("a", "custom-a2"), unattendedProfile(agent, "c"))
+	reconcile("the signal is back", own("a", "custom-a3"), unattendedProfile(agent, "c"))
 	if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
 		t.Fatalf("the dispatcher removed: %v", err)
 	}

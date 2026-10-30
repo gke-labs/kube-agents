@@ -129,18 +129,18 @@ spec:
     - expression: "variables.isIndex || variables.account != variables.templateAccount || variables.annotations == variables.templateAnnotations"
       messageExpression: "'a Job the dispatcher creates must carry exactly the pod annotations of its template ' + params.metadata.name"
       reason: Forbidden
-    # The Job's own labels: the dispatcher's marker and the agent's instance label, which every
-    # param carries, so the operator's teardown (which selects on them) finds every dispatcher
-    # Job; and no finalizer to outlive it.
+    # The Job's own labels: the dispatcher's marker and every agent label the params carry (all
+    # but the param marker), which are what the operator's teardown selects dispatcher Jobs by,
+    # so it finds every one; and no finalizer to outlive it.
     - expression: >-
         has(object.metadata.labels) &&
         'kubeagents.x-k8s.io/dispatch-job' in object.metadata.labels &&
         object.metadata.labels['kubeagents.x-k8s.io/dispatch-job'] == 'true' &&
         has(params.metadata.labels) && 'app.kubernetes.io/instance' in params.metadata.labels &&
-        'app.kubernetes.io/instance' in object.metadata.labels &&
-        object.metadata.labels['app.kubernetes.io/instance'] == params.metadata.labels['app.kubernetes.io/instance'] &&
+        params.metadata.labels.all(k, k == 'kube-agents.dev/dispatch-job-template' ||
+          (k in object.metadata.labels && object.metadata.labels[k] == params.metadata.labels[k])) &&
         (!has(object.metadata.finalizers) || size(object.metadata.finalizers) == 0)
-      message: "a Job the dispatcher creates must carry the dispatcher's marker and its agent's instance label, and no finalizer"
+      message: "a Job the dispatcher creates must carry the dispatcher's marker and its agent's labels, and no finalizer"
       reason: Forbidden
     # The static rules, for every dispatcher Job.
     - expression: >-

@@ -280,8 +280,8 @@ func (e errForeignDispatchJobParam) Error() string {
 // and holds it to that account's template only if the template is there, so
 // at no step may the index list an account without its template, nor name
 // one whose template now runs as another. So:
-//  1. the index narrows to the accounts the templates run as both now and
-//     after this pass;
+//  1. the index narrows to the accounts the same profile's template runs as
+//     both now and after this pass;
 //  2. the templates are written;
 //  3. the index lists the accounts they now run as;
 //  4. the templates no longer wanted are deleted.
@@ -301,10 +301,14 @@ func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context
 	var both []string
 	for i := range existing.Items {
 		pt := &existing.Items[i]
-		if pt.Name == dispatchJobIndexName || !strings.HasPrefix(pt.Name, dispatchJobTemplatePrefix) || !agentLabelsMark(pt, agent) {
+		profile, ok := strings.CutPrefix(pt.Name, dispatchJobTemplatePrefix)
+		if !ok || pt.Name == dispatchJobIndexName || !agentLabelsMark(pt, agent) {
 			continue
 		}
-		if sa := pt.Template.Spec.ServiceAccountName; want[sa] {
+		// Kept only where the same profile keeps the account: one moving to
+		// another profile would otherwise be listed while the template that
+		// ran as it is rewritten before its new owner's is written.
+		if sa := pt.Template.Spec.ServiceAccountName; templates[profile] != nil && templates[profile].Spec.ServiceAccountName == sa {
 			both = append(both, sa)
 		}
 	}

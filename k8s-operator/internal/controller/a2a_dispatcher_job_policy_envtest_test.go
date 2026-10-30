@@ -116,7 +116,7 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 		equality   = "must have exactly the pod spec"
 		podLabels  = "must carry exactly the pod labels"
 		podAnnots  = "must carry exactly the pod annotations"
-		jobMeta    = "must carry the dispatcher's marker and its agent's instance label"
+		jobMeta    = "must carry the dispatcher's marker and its agent's labels"
 		index      = "must run as a profile ServiceAccount the operator rendered"
 	)
 	main := func(s *corev1.PodSpec) *corev1.Container { return &s.Containers[0] }
@@ -261,6 +261,7 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 		"no dispatcher marker label":     {job: func(j *batchv1.Job) { delete(j.Labels, dispatchJobLabel) }, rule: jobMeta},
 		"the marker label false":         {job: func(j *batchv1.Job) { j.Labels[dispatchJobLabel] = "false" }, rule: jobMeta},
 		"another agent's instance label": {job: func(j *batchv1.Job) { j.Labels["app.kubernetes.io/instance"] = "other-ns-other-agent" }, rule: jobMeta},
+		"another component label":        {job: func(j *batchv1.Job) { j.Labels["kubeagents.x-k8s.io/a2a-component"] = "gateway" }, rule: jobMeta},
 		"a finalizer":                    {job: func(j *batchv1.Job) { j.Finalizers = []string{"example.com/keep"} }, rule: jobMeta},
 		"an unlisted ServiceAccount":     {pod: func(p *corev1.PodTemplateSpec) { p.Spec.ServiceAccountName = "agentprofile-other-unattended" }, rule: index},
 		"the default ServiceAccount":     {pod: func(p *corev1.PodTemplateSpec) { p.Spec.ServiceAccountName = "default" }, rule: index},
