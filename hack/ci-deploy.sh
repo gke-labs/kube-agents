@@ -2593,17 +2593,22 @@ trap cleanup_pf_and_dump EXIT
 
 CONNECTIVITY_ATTEMPTS=5
 # The ping is one real agent turn, so its deadline has to outlast what the
-# agent may wait inside it on a 429 that names no reset window: the gateway
-# holds each of the agent's four calls for EVAL_LITELLM_NUM_RETRIES + 1
-# pauses of EVAL_LITELLM_RETRY_AFTER_SECONDS (LiteLLM sleeps before each
-# retry and once more after the last failed one: 4 x 3 x 30s = 360s), and the
-# image's rate_limit_backoff_floor patch holds each of the agent's three
-# retries 30-60s (deploy/docker/patches/rate_limit_backoff_floor.py, up to
-# 180s): 540s of waiting before the model latency itself. A deadline inside
-# that cut such a turn off mid-retry, and the next attempt started another
-# one against the same closed quota. scripts/test_ci_connectivity_retry.py
-# holds the deadline above that sum.
-CONNECTIVITY_PING_MAX_TIME_SECONDS=600
+# agent may wait inside it on a 429 that names no reset window, and it moves
+# with the knobs that set those waits: the gateway holds each of the agent's
+# calls for EVAL_LITELLM_NUM_RETRIES + 1 pauses of
+# EVAL_LITELLM_RETRY_AFTER_SECONDS (LiteLLM sleeps before each retry and once
+# more after the last failed one), and the image's rate_limit_backoff_floor
+# patch holds each of the agent's retries up to
+# AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS. At the defaults: 4 x 3 x 30s = 360s at
+# the gateway, 3 x 60s = 180s in the agent, plus the allowance for the model
+# calls themselves, 600s. A deadline inside that sum cut such a turn off
+# mid-retry, and the next attempt started another one against the same closed
+# quota. scripts/test_ci_connectivity_retry.py holds the deadline above the
+# sum at the defaults and under an override.
+AGENT_API_CALLS_PER_TURN=4          # Hermes' default api_max_retries (3) plus the first call
+AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS=60 # FLOOR_MAX_SECONDS in deploy/docker/patches/rate_limit_backoff_floor.py
+PING_MODEL_LATENCY_ALLOWANCE_SECONDS=60
+CONNECTIVITY_PING_MAX_TIME_SECONDS=$((AGENT_API_CALLS_PER_TURN * (EVAL_LITELLM_NUM_RETRIES + 1) * EVAL_LITELLM_RETRY_AFTER_SECONDS + (AGENT_API_CALLS_PER_TURN - 1) * AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS + PING_MODEL_LATENCY_ALLOWANCE_SECONDS))
 CONNECTIVITY_OK="false"
 : >/tmp/pf-8642.log
 for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
