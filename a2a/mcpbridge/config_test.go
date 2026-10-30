@@ -426,3 +426,51 @@ func TestDiscoverDeploymentsEmptyFullScanPrunesSavedProfiles(t *testing.T) {
 		t.Fatal("the scan removed a direct-URL profile")
 	}
 }
+
+func TestSyncPrunesAProfileWhoseNameAnotherContextNowHolds(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncDiscoveredDeployments([]DeploymentProfile{
+		{Name: "kube-agents", KubeContext: "ctx-a", Namespace: "ns", PlatformAgentName: "pa", Ready: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// ctx-a left the kubeconfig; ctx-b's install resolves to the same alias.
+	if err := store.SyncDiscoveredDeployments([]DeploymentProfile{
+		{Name: "kube-agents", KubeContext: "ctx-b", Namespace: "ns", PlatformAgentName: "pa", Ready: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for k, p := range store.Snapshot().Deployments {
+		if p.KubeContext == "ctx-a" {
+			t.Fatalf("the ctx-a profile survived as %q after its context was gone: %v", k, store.Snapshot().Deployments)
+		}
+	}
+}
+
+func TestUpsertQualifiesAThirdSameNamedDeployment(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncDiscoveredDeployments([]DeploymentProfile{
+		{Name: "platform", KubeContext: "ctxA", Namespace: "ns", PlatformAgentName: "platform", Ready: true},
+		{Name: "platform", KubeContext: "ctxB", Namespace: "ns", PlatformAgentName: "platform", Ready: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertDeployments([]DeploymentProfile{
+		{Name: "platform", KubeContext: "ctxC", Namespace: "ns", PlatformAgentName: "platform", Ready: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snap := store.Snapshot()
+	if _, ok := snap.Deployments["platform"]; ok {
+		t.Fatalf("ctxC's deployment was stored bare beside two qualified siblings: %v", snap.Deployments)
+	}
+	if _, ok := snap.Deployments["ctxC/platform"]; !ok {
+		t.Fatalf("missing ctxC/platform in %v", snap.Deployments)
+	}
+}

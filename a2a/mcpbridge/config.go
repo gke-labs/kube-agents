@@ -441,8 +441,13 @@ func (s *ConfigStore) resolveDeploymentKeyLocked(p DeploymentProfile, batch []De
 			}
 		}
 		if !collides {
-			if existing, ok := s.cfg.Deployments[baseName]; ok && existing.KubeContext != "" && !sameKubeDeploymentIdentity(existing, p) {
-				collides = true
+			// Any saved deployment of this name from another identity collides, whether it is
+			// stored bare or already qualified as "<context>/<name>".
+			for k, existing := range s.cfg.Deployments {
+				if existing.KubeContext != "" && deploymentBaseName(k, existing) == baseName && !sameKubeDeploymentIdentity(existing, p) {
+					collides = true
+					break
+				}
 			}
 		}
 	}
@@ -573,8 +578,10 @@ func (s *ConfigStore) SyncDiscoveredDeployments(discovered []DeploymentProfile) 
 		}
 	}
 	wasDiscovered := func(name string, existing DeploymentProfile) bool {
-		if seenByName[name] {
-			return true
+		// A discovered profile of the same name may be another context's deployment, so the
+		// name stands in for the identity only for a profile that has none.
+		if existing.PlatformAgentName == "" {
+			return seenByName[name]
 		}
 		for _, d := range discovered {
 			if !d.IsContextProbeFailure() && sameKubeDeploymentIdentity(existing, d) {
