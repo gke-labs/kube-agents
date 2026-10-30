@@ -34,15 +34,21 @@ SKILL = REPO_ROOT / ".agents/skills/upgrade-kube-agents/SKILL.md"
 SECTION_HEADING = "## Report confirmed upgrade bugs"
 TRACKER = "gke-labs/kube-agents"
 # The period that ends a sentence: followed by whitespace or the end of the
-# text, after any closing paren or backtick (`... are fine.)`), so the one
+# text, after any closing punctuation -- a paren, bracket, quote or emphasis
+# marker (`... are fine.)`, `"... fine."`, `**... fine.**`) -- so the one
 # inside `install.env` or a version number does not end it.
-SENTENCE_END = r"\.[)`]*(?=\s|$)"
+SENTENCE_END = r"\.[)\]\"'*_`]*(?=\s|$)"
 # The body of one sentence: lazily, characters that contain no sentence end.
 # An opener that recurs in the section ("Remove ..." opens a labels sentence
 # as well as the strip sentence) otherwise matches from its first occurrence
 # to a closer several sentences later, and a pin against the group passes for
 # a term that sits anywhere in that span.
 WITHIN_SENTENCE = rf"(?:(?!{SENTENCE_END}).)+?"
+# One whole sentence: from the start of the text or after whitespace, without
+# the marker that opens a list item, to its end. A pin that is a whole sentence
+# is compared with these, so a qualifying tail (", unless ...", ", except ...")
+# fails it as surely as a rewrite does.
+SENTENCE = re.compile(rf"(?:(?<=\s)|^)(?:- )?(?P<body>{WITHIN_SENTENCE}){SENTENCE_END}")
 
 # Identity first: the refusal below turns on "identity is unverified", which is
 # a condition only if the check runs before every kind of write the section
@@ -161,6 +167,11 @@ def section(text: str) -> str:
     return text[start:] if end == -1 else text[start : end + 1]
 
 
+def sentences(text: str) -> list[str]:
+    """Each sentence of whitespace-normalised prose, without its end."""
+    return [match.group("body") for match in SENTENCE.finditer(text)]
+
+
 def prose(text: str) -> str:
     """The section as one line with single spaces.
 
@@ -196,15 +207,29 @@ class ReaderTest(unittest.TestCase):
         )
         self.assertEqual("credentials and tokens", STRIP_SENTENCE.search(text).group("classes"))
 
-    def test_a_period_before_a_closing_paren_ends_a_sentence(self) -> None:
-        # A parenthesised sentence ends at its period even with the paren after
-        # it, so a "Remove" that opens it cannot stretch the strip group across
-        # the boundary into the next sentence.
-        text = (
-            "Remove nothing the diagnosis needs (placeholders are fine.) "
-            "Remove credentials and tokens and other client-specific details. Next."
+    def test_a_period_before_closing_punctuation_ends_a_sentence(self) -> None:
+        # A sentence ends at its period even with a closer after it, so a
+        # "Remove" that opens a parenthesised, quoted or emphasised sentence
+        # cannot stretch the strip group across the boundary.
+        for opener, closer in (("(", ")"), ('("', '")'), ("[", "]"), ("**", "**"), ("_", "_"), ("`", "`"), ("'", "'")):
+            with self.subTest(closer=closer):
+                text = (
+                    f"Remove nothing the diagnosis needs {opener}placeholders are fine.{closer} "
+                    "Remove credentials and tokens and other client-specific details. Next."
+                )
+                self.assertEqual("credentials and tokens", STRIP_SENTENCE.search(text).group("classes"))
+
+    def test_a_whole_sentence_pin_refuses_a_qualifying_tail(self) -> None:
+        widened = f"- {NO_WRITE_FOR_REGULAR_USERS}, except for maintainers. Next."
+        self.assertNotIn(NO_WRITE_FOR_REGULAR_USERS, sentences(widened))
+        self.assertIn(NO_WRITE_FOR_REGULAR_USERS, sentences(f"Before. - {NO_WRITE_FOR_REGULAR_USERS}. Next."))
+        consent = (
+            f"Ask the user once before the first upgrade report is posted to `{TRACKER}` in a session, "
+            "unless the user has authorized posting upgrade reports there in this session"
         )
-        self.assertEqual("credentials and tokens", STRIP_SENTENCE.search(text).group("classes"))
+        self.assertTrue(any(CONSENT_ASK.fullmatch(s) for s in sentences(f"{consent}. Next.")))
+        widened_consent = f"{consent}, or has approved any other GitHub write earlier in it. Next."
+        self.assertFalse(any(CONSENT_ASK.fullmatch(s) for s in sentences(widened_consent)))
 
     def test_a_period_inside_a_word_does_not_end_a_sentence(self) -> None:
         text = "Never attach raw `install.env`, kubeconfig or unfiltered logs. Next."
@@ -216,9 +241,19 @@ class ReportingContractTest(unittest.TestCase):
         text = SKILL.read_text(encoding="utf-8")
         self.assertIn(SECTION_HEADING, text, "the reporting section is gone or renamed; nothing below guards anything")
         self.prose = prose(section(text))
+        self.sentences = sentences(self.prose)
 
     def assert_stated(self, phrase: str, why: str) -> None:
         self.assertIn(phrase, self.prose, f"{why}: {phrase!r} is no longer under {SECTION_HEADING!r}")
+
+    def assert_sentence(self, pinned: str | re.Pattern[str], why: str) -> None:
+        """`pinned` is one whole sentence of the section, with nothing after it."""
+        if isinstance(pinned, str):
+            found = pinned in self.sentences
+        else:
+            found = any(pinned.fullmatch(s) for s in self.sentences)
+        shown = pinned if isinstance(pinned, str) else pinned.pattern
+        self.assertTrue(found, f"{why}: no whole sentence under {SECTION_HEADING!r} reads {shown!r}")
 
     def sentence(self, pattern: re.Pattern[str], group: str, why: str) -> str:
         match = pattern.search(self.prose)
@@ -244,7 +279,7 @@ class ReportingContractTest(unittest.TestCase):
             with self.subTest(claim=claim):
                 self.assert_stated(claim, "an exclusion was dropped")
         self.assert_stated(INSUFFICIENT_SENTENCE_END, "the exclusions no longer say they are insufficient")
-        self.assert_stated(NOT_INFERRED_FROM, "shared or non-human credentials may now confer eligibility")
+        self.assert_sentence(NOT_INFERRED_FROM, "shared or non-human credentials may now confer eligibility")
 
     def test_an_ineligible_requester_gets_a_draft_and_no_write(self) -> None:
         refusal = self.sentence(REFUSAL_SENTENCE, 0, "the refusal sentence is gone")
@@ -252,7 +287,7 @@ class ReportingContractTest(unittest.TestCase):
             with self.subTest(condition=condition):
                 self.assertIn(condition, refusal, f"{condition!r} no longer leads to a refusal")
         self.assertIn(REFUSAL_OUTCOME, refusal, "a refusal no longer ends in a local draft")
-        self.assert_stated(NO_WRITE_FOR_REGULAR_USERS, "a regular user may now write, or an exception was added")
+        self.assert_sentence(NO_WRITE_FOR_REGULAR_USERS, "a regular user may now write, or an exception was added")
 
     def test_a_refused_requester_is_told_where_to_send_the_draft(self) -> None:
         handover = self.sentence(HANDOVER_SENTENCE, 0, "a refused requester no longer learns where to send the draft")
@@ -261,16 +296,18 @@ class ReportingContractTest(unittest.TestCase):
                 self.assertIn(destination, handover, f"{destination!r} is no longer offered for the draft")
 
     def test_the_payload_is_shown_before_every_post(self) -> None:
-        self.assert_stated(PAYLOAD_SHOWN_BEFORE_EVERY_POST, "the user sees the payload only when an ask happens")
+        self.assert_sentence(PAYLOAD_SHOWN_BEFORE_EVERY_POST, "the user sees the payload only when an ask happens")
 
     def test_consent_is_asked_for_the_act_not_the_repository(self) -> None:
-        self.assertRegex(self.prose, CONSENT_ASK, "the ask is no longer tied to posting upgrade reports to the tracker")
+        self.assert_sentence(
+            CONSENT_ASK, "the ask is no longer tied to posting upgrade reports to the tracker, or a condition was added"
+        )
         writes = self.sentence(OTHER_WRITES_SENTENCE, "writes", "another GitHub write may now stand in for consent")
         for write in WRITES_THAT_DO_NOT_COUNT:
             with self.subTest(write=write):
                 self.assertIn(write, writes, f"{write!r} may now stand in for consent")
         self.assert_stated(UPGRADE_REQUEST_IS_NOT_CONSENT, "the upgrade request may now count as consent")
-        self.assert_stated(DECLINE_KEEPS_DRAFT, "a decline no longer ends in a local draft")
+        self.assert_sentence(DECLINE_KEEPS_DRAFT, "a decline no longer ends in a local draft")
         self.assertNotRegex(
             self.prose,
             SUPERSEDED_CONSENT,
@@ -300,7 +337,7 @@ class ReportingContractTest(unittest.TestCase):
                 self.assertIn(artifact, artifacts, f"{artifact} may now be attached")
 
     def test_search_and_payload_carry_no_client_information(self) -> None:
-        self.assert_stated(SEARCH_IS_ANONYMIZED, "the duplicate search may now carry raw diagnostics")
+        self.assert_sentence(SEARCH_IS_ANONYMIZED, "the duplicate search may now carry raw diagnostics")
         self.assert_stated(PAYLOAD_REVIEW, "the payload is no longer reviewed before sending")
 
     def test_defect_reports_carry_both_labels(self) -> None:
@@ -314,7 +351,7 @@ class ReportingContractTest(unittest.TestCase):
         for condition in P0_CONDITIONS:
             with self.subTest(condition=condition):
                 self.assertIn(condition, conditions, f"{condition!r} is no longer a p0 condition")
-        self.assert_stated(P0_IS_NOT_AUTOMATIC, "a failed upgrade over a healthy install may now be p0")
+        self.assert_sentence(P0_IS_NOT_AUTOMATIC, "a failed upgrade over a healthy install may now be p0")
 
 
 if __name__ == "__main__":
