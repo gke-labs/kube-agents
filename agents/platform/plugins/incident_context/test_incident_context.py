@@ -372,7 +372,14 @@ class GuardTest(unittest.TestCase):
 class ApplyRecordingTest(unittest.TestCase):
     """An `apply` in an incident's thread is recorded for the recurrence hold."""
 
-    def reply(self, text, report="the report", recovered=None, thread_id="T1"):
+    REPORT = (
+        "## Triage\nOOMKilled at 64Mi.\n\n"
+        "**Option A: Raise the memory limit to 128Mi** (recommended)\n"
+        "**Option B: Restore the secret**\n"
+        "**Option C: Scale & wait**\n"
+    )
+
+    def reply(self, text, report=REPORT, recovered=None, thread_id="T1"):
         with patch.object(ic, "_lookup", return_value=report), \
                 patch.object(ic, "_recover_bot_thread", return_value=recovered), \
                 patch.object(ic, "_lookup_recent", return_value=[]), \
@@ -395,8 +402,11 @@ class ApplyRecordingTest(unittest.TestCase):
             "&gt; apply",
             ":+1: apply",
             "~not that one~ apply Option B",
-            "apply Option B: Raise the memory limit to 128Mi",
+            "apply Option B: Restore the secret",
+            "apply b: restore  the *secret*.",
             "apply: Raise the memory limit to 128Mi",
+            "apply Option A: Raise the memory limit to 128Mi (recommended)",
+            "apply C: Scale &amp; wait",
         )
         for text in forms:
             with self.subTest(text=text):
@@ -413,10 +423,23 @@ class ApplyRecordingTest(unittest.TestCase):
             "what would apply do?",
             "I am not sure — apply",
             "~apply~",
+            "apply: no wait",
+            "apply B: actually no, hold off",
+            "apply Option B:",
+            "Apply B: Restore the secret?",
+            "apply B: will it restart the pods?",
+            "apply: no wait, open a PR to bump the log level instead",
         ):
             with self.subTest(text=text):
                 _result, post = self.reply(text)
                 post.assert_not_called()
+
+    def test_a_question_is_not_an_apply_even_when_the_report_asks_it_too(self):
+        # The colon text is matched against the whole report, so a question the
+        # report's own prose asks would otherwise pass for one of its options.
+        report = self.REPORT + "\nWill it restart the pods? Yes, one at a time.\n"
+        _result, post = self.reply("apply B: will it restart the pods?", report=report)
+        post.assert_not_called()
 
     def test_an_apply_outside_an_incidents_thread_is_not_recorded(self):
         _result, post = self.reply("apply", report=None)

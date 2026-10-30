@@ -31,7 +31,9 @@ _LEADING_MENTION_RE = re.compile(r"^<@[UWB][A-Z0-9]+>\s*")
 # lead of mentions, a blockquote, emoji codes, punctuation or a yes/ok/please,
 # then `apply`, `apply Option B` or `apply B` ending the reply or ending in a
 # courtesy, or followed by `:` and the option's text as a Slack option button's
-# value is (slack_ux_incident.OPTION_REPLY / SINGLE_REPLY).
+# value is (slack_ux_incident.OPTION_REPLY / SINGLE_REPLY). Group 1 is the text
+# after a colon; it counts only as an option of this report (_is_apply), as
+# slack_ux_clicks._typed_apply counts it only as the alert's own button text.
 _APPLY_STRUCK = re.compile(r"(?<![\w~])~(?=\S)[^~\n]+?(?<=\S)~(?![\w~])")
 _APPLY_MARKUP = str.maketrans("", "", "*_~`'\"‘’“”")
 _APPLY_LEAD = re.compile(
@@ -40,19 +42,49 @@ _APPLY_LEAD = re.compile(
 )
 _APPLY_RE = re.compile(
     r"apply(?:\s+(?:option\s+)?[A-Z]\b)?"
-    r"(?::.*|[,.!]*(?:\s*(?:please|thanks|thank\s+you|ty)[.!]*)?\s*)",
+    r"(?::(.*)|[,.!]*(?:\s*(?:please|thanks|thank\s+you|ty)[.!]*)?\s*)",
     re.IGNORECASE | re.DOTALL,
 )
+# How text after `apply:` is compared with the report it must come from, as
+# slack_ux_clicks._option_text compares option text: Slack's escapes undone,
+# markup dropped, spaces collapsed, case folded, a closing `.`/`!` and the
+# recommended button's suffix (slack_ux_incident.RECOMMENDED_SUFFIX) ignored.
+_APPLY_ESCAPES = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
+_APPLY_TEXT_END = ".! "
+_APPLY_RECOMMENDED_SUFFIX = " (recommended)"
+_APPLY_QUESTION_END = "?"
 # Where an `apply` in an incident's thread is recorded, and how long the record
 # may take before the reply goes on without it (as long as a lookup's).
 APPLY_PATH = "/v1/incidents/apply"
 POST_TIMEOUT_S = 2
 
 
-def _is_apply(text):
-    """Whether *text* applies the incident's proposed fix (_APPLY_RE)."""
+def _option_text(text):
+    """*text* as option text is compared (_APPLY_ESCAPES)."""
+    for escaped, char in _APPLY_ESCAPES:
+        text = text.replace(escaped, char)
+    return " ".join(text.translate(_APPLY_MARKUP).split()).casefold()
+
+
+def _is_apply(text, report):
+    """Whether *text* applies the proposed fix in *report* (_APPLY_RE).
+
+    Text after a colon has to be one of the report's own options: a question
+    (`apply B: will it restart the pods?`), a retraction (`apply: no wait`) or a
+    bare colon asks for something else, and recording it would let the next
+    card in the thread pass for the fix.
+    """
     cleaned = _APPLY_STRUCK.sub("", text or "").translate(_APPLY_MARKUP)
-    return _APPLY_RE.fullmatch(cleaned, _APPLY_LEAD.match(cleaned).end()) is not None
+    match = _APPLY_RE.fullmatch(cleaned, _APPLY_LEAD.match(cleaned).end())
+    if match is None:
+        return False
+    if match.group(1) is None:
+        return True
+    option = _option_text(match.group(1)).rstrip(_APPLY_TEXT_END)
+    option = option.removesuffix(_APPLY_RECOMMENDED_SUFFIX).rstrip(_APPLY_TEXT_END)
+    if not option or option.endswith(_APPLY_QUESTION_END):
+        return False
+    return option in _option_text(report or "")
 
 
 def _is_slash_command(text):
@@ -94,7 +126,7 @@ def on_inbound(*, event, **_):
     # INCIDENT_APPLY_CARD_WINDOW_S). Only on this hit: a reply recovered below
     # is answered at top level, so the card it files carries no subscription
     # to the incident's thread for the hold to match.
-    if report and _is_apply(getattr(event, "text", "")):
+    if report and _is_apply(getattr(event, "text", ""), report):
         _post(APPLY_PATH, {"chat_id": chat_id, "thread_id": thread_id})
     if not report:
         report = _recover_bot_thread(platform, chat_id, thread_id, _raw_thread(event))
