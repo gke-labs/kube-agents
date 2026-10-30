@@ -299,6 +299,50 @@ class PlanTest(unittest.TestCase):
         self.assertIn("workflow run 300 waits", plan.skipped[0].reason)
         self.assertIn("/retest again", plan.skipped[0].reason)
 
+    def test_a_red_run_waits_while_another_run_of_its_workflow_is_going(self):
+        """One workflow, two required jobs: the newer run's fast job is green and its slow job still going.
+        Re-running the older run would join the group and cancel the slow job."""
+        required = frozenset({"Agent instructions cite assets that exist", "validate"})
+        plan = rfc.plan_reruns(
+            [
+                check(1, "Agent instructions cite assets that exist", "cancelled", 10),
+                check(2, "validate", "cancelled", 10),
+                check(3, "Agent instructions cite assets that exist", "success", 20),
+                check(4, "validate", None, 20, status="in_progress"),
+            ],
+            [run(100, "cancelled", 10, workflow_id=7), run(200, None, 20, status="in_progress", workflow_id=7)],
+            PR_HEAD,
+            required=required,
+        )
+        self.assertEqual([], plan.rerun)
+        self.assertEqual(["Agent instructions cite assets that exist"], [entry.name for entry in plan.skipped])
+        self.assertIn("run 200 of the same workflow is still going", plan.skipped[0].reason)
+        self.assertEqual(1, plan.pending)
+
+    def test_a_running_run_with_no_check_runs_yet_still_holds_its_workflow(self):
+        plan = rfc.plan_reruns(
+            [check(1, "Title", "cancelled", 10), check(2, "Title", "success", 20)],
+            [run(100, "cancelled", 10, workflow_id=7), run(200, "success", 20, workflow_id=7), run(300, None, 30, status="queued", workflow_id=7)],
+            PR_HEAD,
+            required=frozenset({"Title"}),
+        )
+        self.assertEqual([], plan.rerun)
+        self.assertIn("run 300 of the same workflow is still going", plan.skipped[0].reason)
+
+    def test_a_running_run_of_another_workflow_or_branch_holds_nothing(self):
+        plan = rfc.plan_reruns(
+            [check(1, "Title", "cancelled", 10), check(2, "Title", "success", 20)],
+            [
+                run(100, "cancelled", 10, workflow_id=7),
+                run(200, "success", 20, workflow_id=7),
+                run(300, None, 30, status="in_progress", workflow_id=8),
+                run(400, None, 40, status="in_progress", workflow_id=7, event="push", head_branch="main", head_repo="gke-labs/kube-agents"),
+            ],
+            PR_HEAD,
+            required=frozenset({"Title"}),
+        )
+        self.assertEqual([100], [entry.run["id"] for entry in plan.rerun])
+
     def test_runs_of_different_workflows_are_all_rerun(self):
         plan = rfc.plan_reruns(
             [check(1, "Title", "cancelled", 10), check(2, "Build", "cancelled", 20)],
