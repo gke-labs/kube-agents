@@ -275,3 +275,40 @@ func TestSendMessageSessionTextMarksTheSessionOnlyWhenTheTurnIsTaken(t *testing.
 		t.Fatalf("a taken /session turn left c1 %+v; want SessionMode", c)
 	}
 }
+
+func TestCallRemoteToolGatesAndTranslatesLikeTheBridgesTools(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	ctx := context.Background()
+
+	for _, refused := range []struct{ tool, args string }{
+		{ToolTaskControl, `{"action":"list"}`},
+		{ToolTaskControl, `{"action":"steer","task_id":"task-1","message":"go"}`},
+		{ToolSendMessage, `{"message":"hello","mode":"session"}`},
+	} {
+		if _, _, _, err := srv.CallRemoteTool(ctx, refused.tool, json.RawMessage(refused.args), CallMeta{}, nil); err == nil ||
+			!strings.Contains(err.Error(), "not supported by the in-cluster server yet") {
+			t.Fatalf("CallRemoteTool %s %s: err %v; want it refused as not supported yet", refused.tool, refused.args, err)
+		}
+	}
+	noCallNamed(t, gw, ToolTaskControl, 100*time.Millisecond)
+
+	if _, _, _, err := srv.CallRemoteTool(ctx, ToolSendMessage, json.RawMessage(`{"message":"hello","conversation":"c1"}`), CallMeta{}, nil); err != nil {
+		t.Fatalf("CallRemoteTool send_message: %v", err)
+	}
+	if args := nextCallNamed(t, gw, ToolSendMessage); args["text"] != "hello" || args["wait_seconds"] != float64(150) || args["message"] != nil {
+		t.Fatalf("CallRemoteTool forwarded send_message arguments %v; want text and wait_seconds", args)
+	}
+	if _, _, _, err := srv.CallRemoteTool(ctx, ToolTaskControl, json.RawMessage(`{"action":"get","task_id":"task-1"}`), CallMeta{}, nil); err != nil {
+		t.Fatalf("CallRemoteTool task_control get: %v", err)
+	}
+	if args := nextCallNamed(t, gw, ToolTaskControl); args["task"] != "task-1" || args["task_id"] != nil {
+		t.Fatalf("CallRemoteTool forwarded task_control arguments %v; want task", args)
+	}
+	if _, _, _, err := srv.CallRemoteTool(ctx, ToolTaskControl, json.RawMessage(`{"action":"cancel","conversation":"c1"}`), CallMeta{}, nil); err != nil {
+		t.Fatalf("CallRemoteTool task_control cancel: %v", err)
+	}
+	if args := nextCallNamed(t, gw, ToolTaskControl); args["action"] != "stop" || args["conversation"] != "c1" {
+		t.Fatalf("CallRemoteTool forwarded task_control cancel arguments %v; want stop on c1", args)
+	}
+}

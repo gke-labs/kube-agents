@@ -1,6 +1,7 @@
 package mcpbridge
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -116,4 +117,45 @@ func serverTaskControlArgs(raw json.RawMessage, stopConversation string) json.Ra
 	}
 	out, _ := json.Marshal(args)
 	return out
+}
+
+// upstreamArgs gates and translates a call to one of the in-cluster server's tools made in the
+// bridge's argument names (CallRemoteTool): a mode or action the server does not offer yet is
+// refused, and the arguments are renamed as send_message and task_control rename theirs. A stop
+// names the conversation alias the bridge resolves, as task_control's does.
+func (s *Server) upstreamArgs(ctx context.Context, toolName string, rawArgs json.RawMessage) (json.RawMessage, error) {
+	switch toolName {
+	case ToolSendMessage:
+		args := map[string]any{}
+		if len(rawArgs) > 0 {
+			_ = json.Unmarshal(rawArgs, &args)
+		}
+		if args == nil {
+			args = map[string]any{}
+		}
+		mode, _ := args["mode"].(string)
+		if mode = strings.ToLower(strings.TrimSpace(mode)); sendModeAwaitsServer(mode) {
+			return nil, errSendModeNotSupported(mode)
+		}
+		out, err := json.Marshal(serverSendMessageArgs(args))
+		return out, err
+	case ToolTaskControl:
+		var args struct {
+			Action       string `json:"action"`
+			Conversation string `json:"conversation"`
+		}
+		if len(rawArgs) > 0 {
+			_ = json.Unmarshal(rawArgs, &args)
+		}
+		act := strings.ToLower(strings.TrimSpace(args.Action))
+		if taskActionAwaitsServer(act) {
+			return nil, errTaskActionNotSupported(act)
+		}
+		stopConversation := ""
+		if act == taskActionStop || act == taskActionCancel {
+			stopConversation = s.ReadOnlyConversationFor(ctx, args.Conversation).Alias
+		}
+		return serverTaskControlArgs(rawArgs, stopConversation), nil
+	}
+	return rawArgs, nil
 }

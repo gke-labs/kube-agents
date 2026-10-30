@@ -665,13 +665,19 @@ func (s *Server) EnsureConnected(ctx context.Context) error {
 	return err
 }
 
-// CallRemoteTool invokes toolName on the connected in-cluster a2a-mcp server.
+// CallRemoteTool invokes toolName on the connected in-cluster a2a-mcp server. rawArgs are in the
+// bridge's argument names: they get the same gating (a refused action or mode is refused before
+// connecting) and the same translation to the server's names as the bridge's own tools.
 func (s *Server) CallRemoteTool(ctx context.Context, toolName string, rawArgs json.RawMessage, meta CallMeta, onProgress func(int, string)) (string, string, string, error) {
+	fwd, err := s.upstreamArgs(ctx, toolName, rawArgs)
+	if err != nil {
+		return "", "", "", err
+	}
 	sess, err := s.ensureConnected(ctx)
 	if err != nil {
 		return "", "", "", err
 	}
-	return sess.callRemoteTool(ctx, toolName, rawArgs, meta, s.store.Snapshot(), onProgress)
+	return sess.callRemoteTool(ctx, toolName, fwd, meta, s.store.Snapshot(), onProgress)
 }
 
 // QueryRemoteSwarm posts swarmReq to the connected in-cluster a2a-mcp /mcp/swarm endpoint.
