@@ -646,6 +646,32 @@ CLUSTER_READING_TYPES = frozenset(
 # Compound nodes assert nothing themselves; their children do.
 COMPOUND_TYPES = frozenset({"sequence", "parallel", "all", "any", "none"})
 
+#: The property checks whose `value` the upstream verifier compares raw, so
+#: a quoted boolean never equals the API's boolean.
+RESOURCE_PROPERTY_TYPES = frozenset({"resource_property", "fleet_resource_property"})
+EQUALITY_OPS = frozenset({"eq", "ne"})
+QUOTED_BOOLEANS = frozenset({"true", "false"})
+#: Fields the Kubernetes and GKE APIs serve as booleans. The rule fires only
+#: on these, by the path's last segment, so a string field a case compares to
+#: "true" (a label, an annotation, a nodeSelector, a taint value) is never
+#: blocked; a boolean field missing here is a miss, not a wrong rejection.
+BOOLEAN_FIELDS = frozenset({
+    "suspend", "automountServiceAccountToken", "hostNetwork", "hostPID", "hostIPC",
+    "privileged", "runAsNonRoot", "allowPrivilegeEscalation", "readOnlyRootFilesystem",
+    "enableServiceLinks", "shareProcessNamespace", "paused", "immutable", "optional",
+    "readOnly", "allowVolumeExpansion", "insecureSkipTLSVerify", "enabled", "autoUpgrade",
+    "autoRepair",
+})
+#: String maps and string fields: anything under these holds strings, so a
+#: key in them that happens to be named like a boolean field (`data.enabled`,
+#: `metadata.labels.enabled`) is compared as a string, which is correct.
+STRING_MAP_SEGMENTS = frozenset({
+    "data", "stringData", "labels", "annotations", "matchLabels", "nodeSelector", "parameters",
+})
+#: Splits a JSONPath into its segments: dots, brackets and quotes are separators,
+#: so `$.spec['suspend']` and `spec.suspend` end in the same segment.
+PATH_SEGMENT_SEPARATORS = re.compile(r"""[.\[\]'"]+""")
+
 # The entry vocabulary devops-bench's VerificationEntry accepts
 # (verification/spec.py). Every rule below is one devops-bench enforces at
 # spec-load time and this file enforces before a cluster is leased: a spec that
@@ -1023,6 +1049,28 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
         problems.append(
             f"{where}: check '{node_type}' populates none of "
             f"{list(fields)}, so it can only pass"
+        )
+
+    # A quoted boolean against a boolean field can never match: the verifier
+    # compares the value raw and the API holds a bool, so `eq` never passes
+    # and `ne` always does. Only fields known to be booleans are judged; a
+    # string field compared to "true" is a correct case and stays untouched.
+    op = node.get("op")
+    value = node.get("value")
+    segments = [part for part in PATH_SEGMENT_SEPARATORS.split(str(node.get("path") or "")) if part]
+    if (
+        node_type in RESOURCE_PROPERTY_TYPES
+        and isinstance(op, str) and op in EQUALITY_OPS
+        and isinstance(value, str) and value.strip().lower() in QUOTED_BOOLEANS
+        and segments and segments[-1] in BOOLEAN_FIELDS
+        and not any(segment in STRING_MAP_SEGMENTS for segment in segments[:-1])
+    ):
+        outcome = "never passes" if op == "eq" else "always passes"
+        problems.append(
+            f"{where}: check '{node_type}' compares the boolean field "
+            f"{node.get('path')!r} to the string {value!r}; the verifier compares "
+            f"raw, so the check {outcome}. Write the bare boolean: "
+            f"value: {value.strip().lower()}"
         )
 
 

@@ -562,7 +562,9 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
 written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
-that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
+that is not a bare YAML boolean, a `resource_property` or `fleet_resource_property` check that
+compares a known boolean field such as `spec.suspend` to the string `"true"` or `"false"` under
+`op: eq` or `ne` (the verifier compares raw, so `eq` never passes and `ne` always does), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters, names a slot
 `bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
@@ -622,7 +624,9 @@ classes of mistake get through it and fail at spec-load, after a cluster lease i
   into the boolean `True`. devops-bench reads them with `ruamel.yaml`'s `YAML(typ="safe")`
   (`devops_bench/tasks/loader.py:41`), which is YAML 1.2 and parses it into the string
   `"yes"` — the exact value the strict-mode note above warns fails validation. By the time
-  the validator sees the field, the trap has already been parsed away.
+  the validator sees the field, the trap has already been parsed away. The same split hides
+  `value: yes` under a property check: PyYAML hands the validator a boolean and devops-bench
+  compares the API's boolean to the string `"yes"`.
 
 A fourth divergence is caught: PyYAML's `safe_load` keeps the last of two equal keys
 silently, where `YAML(typ="safe")` raises `DuplicateKeyError`, so the validator loads with

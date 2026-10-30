@@ -436,6 +436,47 @@ class TestTheValidatorItself(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("can only pass", problems[0])
 
+    def test_a_quoted_boolean_against_a_boolean_field_is_rejected(self):
+        """The verifier compares `value` raw and the API holds a bool, so a
+        quoted boolean never matches; the run goes red only after the lease.
+        The message says what happens per operator and names the fix."""
+        for check_type in ("resource_property", "fleet_resource_property"):
+            for op, outcome in (("eq", "never passes"), ("ne", "always passes")):
+                for path in ("spec.suspend", "$.spec['suspend']", "spec.template.spec.hostNetwork",
+                             "spec.nodePoolAutoCreation.enabled"):
+                    problems = []
+                    validator._check_assertions(
+                        {"type": check_type, "path": path, "op": op, "value": "True "},
+                        "check 'x'", problems,
+                    )
+                    self.assertEqual(len(problems), 1, (check_type, op, path, problems))
+                    self.assertIn(outcome, problems[0])
+                    self.assertIn("value: true", problems[0])
+
+    def test_string_fields_bare_booleans_and_other_shapes_pass_the_boolean_rule(self):
+        """Only a known boolean field is judged: a label, an annotation, a
+        selector, a nodeSelector, a taint value or an unknown CRD field compared
+        to "true" is a correct case. A bare boolean, `op: exists` and a malformed
+        `op` raise no problem from this rule (the malformed `op` must not crash)."""
+        for node in (
+            {"type": "resource_property", "path": "spec.suspend", "op": "eq", "value": True},
+            {"type": "fleet_resource_property", "path": "spec.suspend", "op": "ne", "value": False},
+            {"type": "resource_property", "path": "metadata.labels.app", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.template.metadata.annotations['safe-to-evict']", "op": "eq", "value": "false"},
+            {"type": "resource_property", "path": "spec.selector.matchLabels.canary", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.template.spec.nodeSelector['seeded-role']", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.taints[?(@.key=='seeded-role')].value", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "data.enabled", "op": "eq", "value": "false"},
+            {"type": "resource_property", "path": "metadata.labels.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "status.conditions[?(@.type=='Ready')].status", "op": "eq", "value": "True"},
+            {"type": "resource_property", "path": "spec.mode", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.suspend", "op": "exists", "value": "true"},
+            {"type": "resource_property", "path": "spec.suspend", "op": ["eq"], "value": "true"},
+        ):
+            problems = []
+            validator._check_assertions(node, "check 'x'", problems)
+            self.assertEqual(problems, [], node)
+
     def test_a_check_that_asserts_without_a_field_is_not_rejected(self):
         # An empty CHECK_ASSERTIONS tuple is the "no field can switch this off"
         # case, not a missing entry: pull_request_opened fails on a report
