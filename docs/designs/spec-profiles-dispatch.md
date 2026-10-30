@@ -381,6 +381,21 @@ leave open:
   the gateway's relay already reads `.supervisor` beside `.events`. The codes are
   `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
   admission, and `lease-expired` and `deadline-exceeded` while it holds.
+- **Breaker (#3655 PR 6).** A run of `breakerThreshold` lease expiries in a row on one
+  (profile, tier), default 3, opens its breaker. A Job that never starts counts too. While it
+  is open, for `breakerCooldownSeconds` (default 300), new submissions there are held queued,
+  as over a cap, never refused: a refusal would let one input that keeps killing workers fail
+  every other user's task on that tier. They still end with `queue-timeout`. Then it is half
+  open: the oldest held task is admitted alone, the next expiry opens it again, and a task
+  that finishes closes it. The state is in memory, and the dispatcher's health lists open
+  breakers. A held task isn't told it is held yet (#4362).
+- **Job mode (#3655 PR 6).** With a Job runner, an unattended task runs on a Job of its own:
+  the dispatcher launches it, waits up to `jobStartSeconds` (default 300) for its pod to be
+  Ready, and offers that pod the task once, with the same offer, accept and confirm as a warm
+  worker. A Job that never comes up, fails or doesn't take the task is deleted, and the task
+  fails `no-worker`. Jobs count against the same caps. The Job is deleted when the task's
+  outcome is settled, never when the dispatcher stops, so a restart re-adopts the task.
+  Without a Job runner, unattended tasks go to the warm pool.
 
 ### Execution
 
