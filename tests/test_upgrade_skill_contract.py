@@ -34,8 +34,9 @@ SKILL = REPO_ROOT / ".agents/skills/upgrade-kube-agents/SKILL.md"
 SECTION_HEADING = "## Report confirmed upgrade bugs"
 TRACKER = "gke-labs/kube-agents"
 # The period that ends a sentence: followed by whitespace or the end of the
-# text, so the one inside `install.env` or a version number does not end it.
-SENTENCE_END = r"\.(?=\s|$)"
+# text, after any closing paren or backtick (`... are fine.)`), so the one
+# inside `install.env` or a version number does not end it.
+SENTENCE_END = r"\.[)`]*(?=\s|$)"
 # The body of one sentence: lazily, characters that contain no sentence end.
 # An opener that recurs in the section ("Remove ..." opens a labels sentence
 # as well as the strip sentence) otherwise matches from its first occurrence
@@ -191,6 +192,16 @@ class ReaderTest(unittest.TestCase):
         # and a group spanning both sentences would still contain it.
         text = (
             "Remove conflicting labels. Allow only URLs. "
+            "Remove credentials and tokens and other client-specific details. Next."
+        )
+        self.assertEqual("credentials and tokens", STRIP_SENTENCE.search(text).group("classes"))
+
+    def test_a_period_before_a_closing_paren_ends_a_sentence(self) -> None:
+        # A parenthesised sentence ends at its period even with the paren after
+        # it, so a "Remove" that opens it cannot stretch the strip group across
+        # the boundary into the next sentence.
+        text = (
+            "Remove nothing the diagnosis needs (placeholders are fine.) "
             "Remove credentials and tokens and other client-specific details. Next."
         )
         self.assertEqual("credentials and tokens", STRIP_SENTENCE.search(text).group("classes"))
