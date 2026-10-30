@@ -658,7 +658,9 @@ commit for it to merge: `cla/google`, `actionlint`, `build`, `prettier`, `valida
 requires conversation resolution, but **zero** approving reviews, because approval is the labels' business, which `Merge labels`
 checks. A reader who checks the repository settings for the review requirement therefore finds
 nothing and concludes wrongly. Only these checks block a merge: a red or cancelled check outside
-the list does not, and `AI Review` is not in it.
+the list does not, and `AI Review` is not in it. `Run Python Unit Tests` is a join: it also needs
+`Run Bench Harness Tests`, so a red bench job holds the merge through it even though the bench
+job is not in the list itself.
 
 `Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title` and
 `Agent instructions cite assets that exist` joined the set on 2026-09-02,

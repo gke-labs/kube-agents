@@ -133,6 +133,31 @@ def _verify(check: dict[str, Any] | None = None):
 # --- the verdicts ----------------------------------------------------------
 
 
+HELD = {"type": "workload_incident_folded", "namespace": NS, "name": NAME, "min_folded": 1,
+        "requires_pull_request": True, "max_age_sec": 5400}
+FIX = "https://github.com/acme/fleet/pull/7"
+
+
+def test_an_event_held_for_an_open_fix_passes(feed) -> None:
+    feed.rows = [_row(10, "injected", minutes_ago=40), _row(11, "folded", duplicate_of=10, pull_request=FIX)]
+    result = _verify(HELD)
+    assert result.status == "pass", result.reason
+
+
+def test_a_fold_without_a_pull_request_does_not_count_when_one_is_required(feed) -> None:
+    # Folded inside the window, not held for a fix: the case grades the hold.
+    feed.rows = [_row(10, "injected", minutes_ago=40), _row(11, "folded", duplicate_of=10, pull_request="")]
+    result = _verify(HELD)
+    assert result.status == "fail"
+    assert "held for an open pull request" in result.reason
+
+
+def test_a_recurrence_admitted_as_a_new_incident_fails_the_hold(feed) -> None:
+    # A daemon that does not hold for an open fix: the replaced pod is a new incident.
+    feed.rows = [_row(10, "injected", minutes_ago=40), _row(11, "injected")]
+    assert _verify(HELD).status == "fail"
+
+
 def test_a_burst_folded_into_one_incident_passes(feed) -> None:
     feed.rows = [_row(10, "injected"), _row(11, "folded", duplicate_of=10), _row(12, "folded", duplicate_of=10)]
     result = _verify()

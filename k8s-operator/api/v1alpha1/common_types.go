@@ -1117,6 +1117,14 @@ type CredentialProxySpec struct {
 	// workspace the broker clones into; the proxy's state and /tmp emptyDirs
 	// (sizeLimits 5Gi and 2Gi) follow it when it is raised above their
 	// defaults, so the kubelet does not evict the pod at the smaller figure.
+	// The limit a fleet needs grows with the size of its clusters as well as
+	// their number: the broker charges each command about 128Mi, the size of
+	// a listing of a small cluster, and a kubectl listing thousands of objects
+	// holds several hundred Mi on its own, so size the limit to the largest
+	// listing the fleet produces for every command that runs at once (eight
+	// at the slot cap) plus the 320Mi of fixed reserves (192Mi for the broker
+	// and Envoy, 128Mi for the content workspace); the broker's child peak and
+	// memory high-water series give the figure.
 	// Only cpu, memory and ephemeral-storage
 	// are accepted, the quantities the container declares. The operator
 	// refuses a memory limit below what admits two commands at once, a limits
@@ -2156,7 +2164,7 @@ type NetworkPolicyStatus struct {
 
 // AgentStatus defines the observed state of an agent.
 type AgentStatus struct {
-	// Phase is the overall state (Pending, Provisioning, Ready, Failed).
+	// Phase is the overall state (Pending, Provisioning, Ready, Degraded, Failed).
 	// +optional
 	Phase string `json:"phase,omitempty"`
 

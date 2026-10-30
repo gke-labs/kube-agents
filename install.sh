@@ -698,6 +698,7 @@ PARAM_SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
 PARAM_SLACK_ALLOWED_USERS="${SLACK_ALLOWED_USERS:-}"
 PARAM_SLACK_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}"
 PARAM_SLACK_HOME_CHANNEL_NAME="${SLACK_HOME_CHANNEL_NAME:-}"
+PARAM_SLACK_HOME_CHANNEL_POLICY="${SLACK_HOME_CHANNEL_POLICY:-}"
 # bootstrap_install_env clears NAMESPACE before reading
 # install.env, so this seeds from the file alone; --agent-namespace is the
 # other way in.
@@ -966,6 +967,10 @@ Flags for AI Agents & Automation:
   --slack-home-channel=CHANNEL  Slack channel ID for unsolicited alerts/messages (e.g. C01234567)
   --slack-home-channel-name=NAME
                                 Display name of that channel (e.g. #gke-alerts)
+  --slack-home-channel-policy=POLICY
+                                auto (the default, also empty) or manual: sets
+                                spec.integration.slack.homeChannelPolicy on the PlatformAgent;
+                                the CRD reference describes the field
   --migrate-node-pools          Authorize migrating an existing cluster's legacy node pools to
                                 GKE_METADATA. Recreates those nodes and restarts every workload on
                                 them, kube-agents' or not. Without it a cluster with legacy pools is
@@ -1288,6 +1293,10 @@ parse_args() {
       --slack-home-channel-name=*)
         PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"
         note_install_env_flag SLACK_HOME_CHANNEL_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_NAME
+        shift ;;
+      --slack-home-channel-policy=*)
+        PARAM_SLACK_HOME_CHANNEL_POLICY="${1#*=}"
+        note_install_env_flag SLACK_HOME_CHANNEL_POLICY "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_POLICY
         shift ;;
       --chat-topic-name=*)
         PARAM_CHAT_TOPIC_NAME="${1#*=}"
@@ -2388,7 +2397,7 @@ record_gitops_forge_keys() {
 # running install reads from Terraform state.
 install_env_toggle_companions() {
   case "${1:-}" in
-    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME" ;;
+    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME SLACK_HOME_CHANNEL_POLICY" ;;
     GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_MODE" ;;
     *) ;;
   esac
@@ -2935,6 +2944,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" SLACK_ALLOWED_USERS "${SLACK_ALLOWED_USERS:-}"
   write_env_var "$tmp" SLACK_HOME_CHANNEL "${SLACK_HOME_CHANNEL:-}"
   write_env_var "$tmp" SLACK_HOME_CHANNEL_NAME "${SLACK_HOME_CHANNEL_NAME:-}"
+  write_env_var "$tmp" SLACK_HOME_CHANNEL_POLICY "${SLACK_HOME_CHANNEL_POLICY:-}"
   write_secret_env_var "$tmp" API_SERVER_KEY "${API_SERVER_KEY:-}"
   write_env_var "$tmp" PLATFORM_AGENT_PERMISSION_SET "${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
@@ -6841,6 +6851,15 @@ main() {
   # the flag or install.env, before the interview and any --dry-run preview.
   validate_github_app_id "${PARAM_GITHUB_APP_ID:-}" \
     "$([ "${PARAM_GITHUB_APP_ID_FROM_FLAG:-false}" = "true" ] && echo "--github-app-id" || echo "GITHUB_APP_ID in ${INSTALL_ENV_FILE:-install.env}")" || exit 1
+  # SLACK_HOME_CHANNEL_POLICY, from the flag or install.env, before the file
+  # check below: a flag outside the enum would otherwise be refused as a
+  # disagreement with the file, with a remedy that records a value the
+  # generator and the CRD refuse. The generator checks again on every route.
+  # The remedy names the flag only when this run typed it (note_install_env_flag):
+  # a flag cannot correct a value the file carries, the file check below would
+  # refuse the disagreement, so that value is sent back to the file.
+  require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}" \
+    "$([[ $'\n'"$INSTALL_ENV_FLAGS_TYPED" == *$'\n'"SLACK_HOME_CHANNEL_POLICY|"* ]] && echo "flags" || echo "")" || exit 1
   # The chat flags and --mode against an existing install.env, as soon as
   # is_truthy and the defaults are loaded: a flag that disagrees with the file
   # stops the run here, before the interview and long before anything is
@@ -7145,6 +7164,7 @@ main() {
   local slack_allowed_users="${PARAM_SLACK_ALLOWED_USERS:-}"
   local slack_home_channel="${PARAM_SLACK_HOME_CHANNEL:-}"
   local slack_home_channel_name="${PARAM_SLACK_HOME_CHANNEL_NAME:-}"
+  local slack_home_channel_policy="${PARAM_SLACK_HOME_CHANNEL_POLICY:-}"
 
   # No Slack token check here. The obvious place for one is this step -- Slack
   # is asked for here and the relay cannot open a socket without both tokens --
@@ -8224,6 +8244,7 @@ main() {
   export SLACK_ALLOWED_USERS="$slack_allowed_users"
   export SLACK_HOME_CHANNEL="$slack_home_channel"
   export SLACK_HOME_CHANNEL_NAME="$slack_home_channel_name"
+  export SLACK_HOME_CHANNEL_POLICY="$slack_home_channel_policy"
   export API_SERVER_KEY="$api_server_key"
   export PLATFORM_AGENT_PERMISSION_SET="$permission_set"
   export PLATFORM_AGENT_CUSTOM_ROLES="$custom_roles"

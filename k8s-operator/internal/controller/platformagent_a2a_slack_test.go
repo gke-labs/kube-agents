@@ -418,9 +418,10 @@ func TestChatArmedDropsTheSlackReferences(t *testing.T) {
 // verb on Secrets - the a2a-slack-principal-map Secret is reachable by the
 // kubelet's mount alone. Every Role builder, next stack
 // and legacy, is rendered and read; a wildcard resource counts as reaching
-// them. What this does not bound is the gateway's `create` on pods, which can
-// mount a Secret into a pod it builds; buildA2AGatewayRole's comment records
-// that as the admission policy it owes.
+// them. What this does not bound is the gateway's `create` on pods, which RBAC
+// cannot keep from mounting a Secret into a pod it builds; the admission policy
+// kube-agents-a2a-gateway-pod does, where the chart installs it
+// (buildA2AGatewayRole's comment).
 func TestNoRenderedRoleReachesASecret(t *testing.T) {
 	agent := a2aTestAgent()
 	roles := map[string][]rbacv1.PolicyRule{

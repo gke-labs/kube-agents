@@ -582,7 +582,7 @@ func TestTheBrokerAdmitsTheMCPAccountOnlyWhenOwned(t *testing.T) {
 	if env := a2aMCPBrokerEnv(agent, false); len(env) != 0 {
 		t.Errorf("the MCP audience binding is rendered while somebody else owns the account: %+v", env)
 	}
-	unowned := buildCredentialProxyDeploymentForPlugins(agent, "policy-hash", nil, false).Spec.Template.Spec.Containers[0]
+	unowned := buildCredentialProxyDeploymentForPlugins(agent, "policy-hash", nil, false, credentialProxyProfileConfig{}).Spec.Template.Spec.Containers[0]
 	if _, found := brokerEnvValue(unowned.Env, "CREDENTIAL_PROXY_MCP_CALLERS"); found {
 		t.Error("CREDENTIAL_PROXY_MCP_CALLERS is rendered while somebody else owns the account")
 	}

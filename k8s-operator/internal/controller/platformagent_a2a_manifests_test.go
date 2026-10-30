@@ -2768,11 +2768,11 @@ func TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean measures the thing
+// TestCleanupA2ACostsThirteenReadsWhenThereIsNothingToClean measures the thing
 // the change was for. Counting is the only honest check here: the early exit
 // is a cost optimisation, and a correctness test passes just as well with the
 // reads still happening one object at a time.
-func TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean(t *testing.T) {
+func TestCleanupA2ACostsThirteenReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -2796,7 +2796,7 @@ func TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Twelve sentinel Gets and nothing else: no per-object walk, and in
+	// Thirteen sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
 	//
@@ -2811,15 +2811,18 @@ func TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean(t *testing.T) {
 	// fence did, for the console fence's reason (#3653), and 11 -> 12 when
 	// the profile namespace's fence did (#3655: it is the first write of the
 	// fence pass, and carries no owner reference, so a pass that dies after
-	// it leaves it alone); the fences are NetworkPolicies, so those eight
-	// reads come from the cache and only the two Secrets are uncached.
+	// it leaves it alone), and 12 -> 13 when the broker's task-signing key
+	// Secret did (#3889: the broker's reconcile writes it before
+	// reconcileA2A, so a render that dies between them leaves it alone); the
+	// fences are NetworkPolicies, so those eight reads come from the cache
+	// and only the three Secrets are uncached.
 	// Raising it is a
 	// real decision — every today install pays it on every reconcile,
 	// forever — so it is spelled out rather than derived. The inequality
 	// below is the part that must hold whatever the literal is: the exit is
 	// only worth having while it costs less than the walk.
-	if gets != 12 {
-		t.Errorf("Gets = %d, want 12 (the sentinels); the per-object walk is running on a no-op", gets)
+	if gets != 13 {
+		t.Errorf("Gets = %d, want 13 (the sentinels); the per-object walk is running on a no-op", gets)
 	}
 	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
 		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)

@@ -7,9 +7,11 @@
 // picks the pod, is how the task gets into the decision. Verifiers are told
 // apart by audience. The callout reads AudienceNATS and narrows a worker's
 // second bus connection to that task's subjects. AudienceCredentialProxy is for
-// the credential proxy, which will confine the clusters a task's tools reach;
-// that verifier is planned for a later #3889 PR and doesn't exist yet. A token
-// minted for one audience is refused by the other.
+// the credential proxy, which confines a task's kubectl and gcloud to the
+// cluster and project its target names; that verifier is Python
+// (agents/platform/scripts/task_credential.py), held to this one by the
+// fixtures in proxy_fixtures_test.go. A token minted for one audience is
+// refused by the other.
 //
 // The credential authenticates nothing by itself. Its pod and pod UID must
 // match a pod the cluster attests on the same connection, and its profile and
