@@ -543,6 +543,13 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 			Value: credentialProxyTokenMountPath + "/token",
 		})
+		// The exec tier, while it renders: the shim sends /v1/exec and
+		// /v1/gcp/ there and everything else to CREDENTIAL_PROXY_URL, and
+		// falls back to CREDENTIAL_PROXY_URL when it cannot connect. Read at
+		// start, so a change between 0 and a positive count rolls the sandbox.
+		if credentialProxyExecTierEnabled(agent) {
+			env = append(env, corev1.EnvVar{Name: credentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
+		}
 	}
 	if harness := agent.Spec.Harness; harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
 		env = append(env,
@@ -1063,6 +1070,17 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 // Off-pod, the shell's whole outbound world is DNS and one ClusterIP.
 // dnsIPs is the resolved Cluster DNS VIP list, the same one the gateway policy is
 // built from; an empty slice falls back to the standard VIP inside clusterDNSPeers.
+// sandboxBrokerPeers is the broker, and the exec tier while it renders.
+func sandboxBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyPeer {
+	peers := []networkingv1.NetworkPolicyPeer{{
+		PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
+	}}
+	if credentialProxyExecTierEnabled(agent) {
+		peers = append(peers, credentialProxyExecTierPodPeer(agent))
+	}
+	return peers
+}
+
 func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsIPs []string) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	udp := corev1.ProtocolUDP
@@ -1095,10 +1113,9 @@ func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsIPs [
 
 	egress = append(egress, networkingv1.NetworkPolicyEgressRule{
 		// The credential proxy in a pod of its own. This is the connection
-		// every wrapped CLI in the sandbox makes.
-		To: []networkingv1.NetworkPolicyPeer{{
-			PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
-		}},
+		// every wrapped CLI in the sandbox makes; the exec tier, while it
+		// renders, takes its commands.
+		To: sandboxBrokerPeers(agent),
 		Ports: []networkingv1.NetworkPolicyPort{{
 			Protocol: &tcp,
 			Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),

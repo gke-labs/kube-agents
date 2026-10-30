@@ -706,6 +706,8 @@ spec:
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: CREDENTIAL_PROXY_TOKEN_FILE
               value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: CREDENTIAL_PROXY_EXEC_URL
+              value: http://platformagent-credential-proxy-exec-tier.kubeagents-system.svc.cluster.local:8765
             - name: GKE_PROJECT_ID
               value: example-project
             - name: GKE_CLUSTER_NAME
@@ -929,6 +931,10 @@ spec:
             matchLabels:
               app: platformagent-credential-proxy
               kubeagents.x-k8s.io/component: credential-proxy
+        - podSelector:
+            matchLabels:
+              app: platformagent-credential-proxy-exec-tier
+              kubeagents.x-k8s.io/component: credential-proxy-exec-tier
   ingress:
     - from:
         - podSelector:

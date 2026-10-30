@@ -452,3 +452,124 @@ func TestTheExecTierRefusesAnAgentNameTooLongForItsObjects(t *testing.T) {
 		}
 	}
 }
+
+// brokerEgressPeers returns the peers of the egress rule on the broker's port.
+func brokerEgressPeers(t *testing.T, np *networkingv1.NetworkPolicy) []networkingv1.NetworkPolicyPeer {
+	t.Helper()
+	for _, rule := range np.Spec.Egress {
+		for _, port := range rule.Ports {
+			if port.Port != nil && port.Port.IntValue() == credentialProxyPort {
+				return rule.To
+			}
+		}
+	}
+	t.Fatalf("%s has no egress rule on %d", np.Name, credentialProxyPort)
+	return nil
+}
+
+// hasExecTierPeer reports whether the peers select the exec tier's pods.
+func hasExecTierPeer(agent *agentv1alpha1.PlatformAgent, peers []networkingv1.NetworkPolicyPeer) bool {
+	for _, p := range peers {
+		if p.PodSelector != nil && reflect.DeepEqual(p.PodSelector.MatchLabels, credentialProxyExecTierSelector(agent)) {
+			return true
+		}
+	}
+	return false
+}
+
+func execTierEnvValue(env []corev1.EnvVar, name string) (string, bool) {
+	for _, e := range env {
+		if e.Name == name {
+			return e.Value, true
+		}
+	}
+	return "", false
+}
+
+// The sandbox gets the tier's URL and an egress peer to it at a positive
+// count, and neither at 0.
+func TestTheSandboxReachesTheExecTierOnlyWhileItRenders(t *testing.T) {
+	for _, replicas := range []int32{0, 2} {
+		agent := execTierTestAgent(ptr.To(replicas))
+		sts := buildShellSandboxStatefulSet(agent, "keys", credentialProxySandboxURL(agent), "")
+		var env []corev1.EnvVar
+		for _, c := range sts.Spec.Template.Spec.Containers {
+			env = append(env, c.Env...)
+		}
+		url, set := execTierEnvValue(env, credentialProxyExecURLEnv)
+		if replicas > 0 && url != "http://test-agent-credential-proxy-exec-tier.test-ns.svc.cluster.local:8765" {
+			t.Errorf("at %d replicas the sandbox's %s = %q", replicas, credentialProxyExecURLEnv, url)
+		}
+		if replicas == 0 && set {
+			t.Errorf("at 0 replicas the sandbox has %s", credentialProxyExecURLEnv)
+		}
+		peers := brokerEgressPeers(t, buildShellSandboxNetworkPolicy(agent, []string{"10.96.0.10"}))
+		if hasExecTierPeer(agent, peers) != (replicas > 0) {
+			t.Errorf("at %d replicas the sandbox's egress to the exec tier is %v", replicas, hasExecTierPeer(agent, peers))
+		}
+		if len(peers) == 0 || !reflect.DeepEqual(peers[0].PodSelector.MatchLabels, credentialProxySelector(agent)) {
+			t.Errorf("at %d replicas the sandbox lost its egress to the broker", replicas)
+		}
+	}
+}
+
+// The A2A gateway is told the tier's URL only under the cluster view and at a
+// positive count; the session fence opens to the tier on the same terms.
+func TestSessionPodsReachTheExecTierOnlyUnderTheClusterView(t *testing.T) {
+	for name, tc := range map[string]struct {
+		view     string
+		replicas int32
+		want     bool
+	}{
+		"view, tier":    {view: "true", replicas: 2, want: true},
+		"view, no tier": {view: "true", replicas: 0},
+		"no view, tier": {view: "", replicas: 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(a2aSessionClusterViewEnvVar, tc.view)
+			agent := execTierTestAgent(ptr.To(tc.replicas))
+			url, set := execTierEnvValue(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env, a2aCredentialProxyExecURLEnv)
+			if set != tc.want || (tc.want && url != credentialProxyExecTierURL(agent)) {
+				t.Errorf("%s = %q (set %v), want set %v", a2aCredentialProxyExecURLEnv, url, set, tc.want)
+			}
+			np := buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"})
+			if tc.view == "" {
+				for _, rule := range np.Spec.Egress {
+					if hasExecTierPeer(agent, rule.To) {
+						t.Error("session fence opens to the exec tier without the cluster view")
+					}
+				}
+				return
+			}
+			if got := hasExecTierPeer(agent, brokerEgressPeers(t, np)); got != tc.want {
+				t.Errorf("session egress to the exec tier = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The profile namespace's fence opens to the tier at a positive count only.
+func TestProfileWorkersReachTheExecTierOnlyWhileItRenders(t *testing.T) {
+	for _, replicas := range []int32{0, 2} {
+		agent := execTierTestAgent(ptr.To(replicas))
+		peers := brokerEgressPeers(t, buildProfileNetworkPolicy(agent, []string{"10.96.0.10"}))
+		if hasExecTierPeer(agent, peers) != (replicas > 0) {
+			t.Errorf("at %d replicas the profile egress to the exec tier is %v", replicas, hasExecTierPeer(agent, peers))
+		}
+	}
+}
+
+// A refused name sends no caller to a tier that is not rendered.
+func TestARefusedNameGivesCallersNoExecTier(t *testing.T) {
+	agent := execTierTestAgent(ptr.To(int32(2)))
+	agent.Name = strings.Repeat("a", 37)
+	sts := buildShellSandboxStatefulSet(agent, "keys", credentialProxySandboxURL(agent), "")
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		if _, set := execTierEnvValue(c.Env, credentialProxyExecURLEnv); set {
+			t.Errorf("container %s gets %s for a refused tier", c.Name, credentialProxyExecURLEnv)
+		}
+	}
+	if hasExecTierPeer(agent, brokerEgressPeers(t, buildShellSandboxNetworkPolicy(agent, []string{"10.96.0.10"}))) {
+		t.Error("the sandbox's egress opens to a refused tier")
+	}
+}
