@@ -219,7 +219,10 @@ def exec_endpoints() -> tuple[str | None, str | None]:
     fallback is only taken when no connection to the exec tier could be made
     (`BrokerUnreachable`): then no request reached a broker, and nothing ran.
     """
-    stateful = os.getenv(BROKER_URL_ENV)
+    # Spelled out, not BROKER_URL_ENV: tests/conformance/test_C_enforcement.py
+    # (C1) pins that the shim reads this name, across the module boundary to
+    # the operator and the gateway that set it.
+    stateful = os.getenv("CREDENTIAL_PROXY_URL")
     exec_url = os.getenv(EXEC_URL_ENV, "").strip()
     if exec_url:
         return exec_url, stateful or None
