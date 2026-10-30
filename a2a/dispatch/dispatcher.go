@@ -209,6 +209,9 @@ type Dispatcher struct {
 	// one succeeds), and stopReadRetry when to read it again (stop.go).
 	stopStreamErr string
 	stopReadRetry time.Time
+	// jobAdmissionErr is the last refusal of a Job by the admission
+	// policy, "" once one is admitted (job.go).
+	jobAdmissionErr string
 }
 
 // New builds a dispatcher on bus. src is the install config, pool the

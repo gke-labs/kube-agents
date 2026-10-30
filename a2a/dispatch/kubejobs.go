@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
+	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -56,6 +58,15 @@ func JobName(profile, tier, taskID string) string {
 	return "dispatch-" + hex.EncodeToString(sum[:10])
 }
 
+// ErrJobRefusedByPolicy marks a Launch the dispatcher Job admission policy
+// refused: the Job, built from the operator's template, didn't match the
+// policy's copy of it.
+var ErrJobRefusedByPolicy = errors.New("the dispatcher Job admission policy refused the Job")
+
+// jobPolicyName is the dispatcher Job admission policy's name, as its
+// refusals name it.
+const jobPolicyName = "kube-agents-a2a-dispatcher-job"
+
 func (k *KubeJobs) Launch(ctx context.Context, profile, tier, taskID string) error {
 	cfg := k.config()
 	job, err := buildJob(cfg, profile, tier, taskID)
@@ -63,8 +74,11 @@ func (k *KubeJobs) Launch(ctx context.Context, profile, tier, taskID string) err
 		return err
 	}
 	_, err = k.kube.BatchV1().Jobs(cfg.ProfileNamespace).Create(ctx, job, metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
+	switch {
+	case apierrors.IsAlreadyExists(err):
 		return nil
+	case apierrors.IsForbidden(err) && strings.Contains(err.Error(), jobPolicyName):
+		return fmt.Errorf("%w: %v", ErrJobRefusedByPolicy, err)
 	}
 	return err
 }

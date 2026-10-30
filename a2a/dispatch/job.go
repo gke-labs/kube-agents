@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -70,8 +71,12 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 	}
 	h.lease, h.renew = seconds(snap.LeaseSeconds), seconds(snap.RenewSeconds)
 	if err := d.jobs.Launch(ctx, h.profile, h.tier, h.taskID); err != nil {
+		if errors.Is(err, ErrJobRefusedByPolicy) {
+			d.jobRefused(log, err)
+		}
 		return lib.LeaseRecord{}, "", false, fmt.Errorf("launch the task's Job: %w", err)
 	}
+	d.jobAdmitted()
 	limit := jobStart(snap)
 	until := d.now().Add(limit)
 	var pod string
@@ -155,4 +160,28 @@ func (d *Dispatcher) dropUnstartedJob(ctx context.Context, log *slog.Logger, pro
 	if err := d.jobs.Delete(ctx, hk.profile, hk.tier, hk.taskID); err != nil {
 		log.Warn("delete the Job of a task that ended at admission", "err", err)
 	}
+}
+
+// jobRefusedHint is what the dispatcher says when the Job admission policy
+// refuses a Job built from the operator's own template: the likeliest cause
+// is an upstream Kubernetes bug that freezes a policy's params after its
+// binding is deleted and recreated.
+const jobRefusedHint = "the Job admission policy refused a Job built from the operator's template. If the template changed since the policy's binding was last deleted and recreated, the API server's param cache is frozen (kubernetes/kubernetes#141015) until it restarts: on GKE, a control-plane upgrade or repair. The task stays queued."
+
+// jobRefused records a Job the admission policy refused: reported in Health
+// and logged once as an error until a Job is admitted.
+func (d *Dispatcher) jobRefused(log *slog.Logger, err error) {
+	d.mu.Lock()
+	first := d.jobAdmissionErr == ""
+	d.jobAdmissionErr = err.Error()
+	d.mu.Unlock()
+	if first {
+		log.Error(jobRefusedHint, "err", err)
+	}
+}
+
+func (d *Dispatcher) jobAdmitted() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.jobAdmissionErr = ""
 }

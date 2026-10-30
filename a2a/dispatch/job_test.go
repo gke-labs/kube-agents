@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
@@ -22,6 +23,8 @@ type fakeJobs struct {
 	deletes    []string
 	// pod, if set, is the name Pod reports for every Job.
 	pod string
+	// launchErr, if set, is what Launch returns.
+	launchErr error
 }
 
 func newFakeJobs(readyAfter time.Duration) *fakeJobs {
@@ -32,6 +35,9 @@ func (f *fakeJobs) Launch(_ context.Context, _, _, taskID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.launches = append(f.launches, taskID)
+	if f.launchErr != nil {
+		return f.launchErr
+	}
 	if _, ok := f.launchedAt[taskID]; !ok {
 		f.launchedAt[taskID] = time.Now()
 	}
@@ -307,5 +313,33 @@ func TestAnUnsentJobOfferKeepsTheTaskQueued(t *testing.T) {
 	}
 	if open := d.Health().OpenBreakers; len(open) != 0 {
 		t.Errorf("open breakers %v over an unsent offer", open)
+	}
+}
+
+// A Job the admission policy refuses is reported in Health (and logged as an
+// error naming the upstream param-cache bug), the task stays queued, and the
+// report clears once a Job is admitted.
+func TestAJobRefusedByThePolicyIsReported(t *testing.T) {
+	b := newBus(t, "job-task-1")
+	b.ensure("inv", 1, 0, "unattended")
+	b.worker("inv", "unattended", "job-task-1", answerAccept, 300*time.Millisecond)
+	jobs := newFakeJobs(0)
+	jobs.mu.Lock()
+	jobs.launchErr = fmt.Errorf("%w: forbidden by kube-agents-a2a-dispatcher-job", ErrJobRefusedByPolicy)
+	jobs.mu.Unlock()
+	d, _ := b.runDispatcherWith(testConfig(), unattendedInstall(1, nil), &fakeVerifier{}, jobs)
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "the refusal in Health", func() bool { return d.Health().JobAdmission != "" })
+	if ts := b.terminalsOf("task-1"); len(ts) != 0 {
+		t.Errorf("terminals %+v: a refused Job keeps the task queued", ts)
+	}
+	jobs.mu.Lock()
+	jobs.launchErr = nil
+	jobs.mu.Unlock()
+	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("terminal %+v once the policy admits, want completed", ts)
+	}
+	if h := d.Health(); h.JobAdmission != "" {
+		t.Errorf("Health still reports %q after a Job was admitted", h.JobAdmission)
 	}
 }

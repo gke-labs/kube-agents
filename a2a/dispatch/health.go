@@ -34,6 +34,9 @@ type Health struct {
 	// StopStream is why the dispatcher can't read the stop stream, or ""
 	// (stop.go): while it is set, a stop counts only if heard live.
 	StopStream string
+	// JobAdmission is the last refusal of a Job by the dispatcher Job
+	// admission policy, or "" (job.go).
+	JobAdmission string
 }
 
 func (d *Dispatcher) noteWaiting(taskID, durable string, queued time.Time, why string) {
@@ -86,6 +89,7 @@ func (d *Dispatcher) Health() Health {
 	sort.Strings(h.Stalled)
 	h.OpenBreakers = d.breakers.open(now)
 	h.StopStream = d.stopStreamErr
+	h.JobAdmission = d.jobAdmissionErr
 	return h
 }
 
@@ -93,6 +97,9 @@ func (d *Dispatcher) logHealth() {
 	h := d.Health()
 	d.log.Info("dispatcher health", "running", h.Running, "waiting", h.Waiting, "oldestWait", h.OldestWait,
 		"droppedAnswers", h.DroppedAnswers)
+	if h.JobAdmission != "" {
+		d.log.Warn(jobRefusedHint, "err", h.JobAdmission)
+	}
 	if h.StopStream != "" {
 		d.log.Warn("the stop stream can't be read; a stop counts only if heard live", "err", h.StopStream)
 	}

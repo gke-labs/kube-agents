@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"os"
 	"path/filepath"
@@ -13,7 +14,9 @@ import (
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -301,6 +304,30 @@ func TestAFinishedKubeJobIsFailed(t *testing.T) {
 			finish(t, kube, job)
 			if _, failed, err := k.Pod(ctx, "inv", "unattended", "task-1"); !failed || err != nil {
 				t.Errorf("failed %v err %v, want failed", failed, err)
+			}
+		})
+	}
+}
+
+// The dispatcher Job policy's refusal is ErrJobRefusedByPolicy; another
+// Forbidden (RBAC, say) is not.
+func TestAPolicyRefusalIsTold(t *testing.T) {
+	for name, c := range map[string]struct {
+		msg  string
+		want bool
+	}{
+		"the policy": {"ValidatingAdmissionPolicy 'kube-agents-a2a-dispatcher-job' with binding 'kube-agents-a2a-dispatcher-job' denied request: must have exactly the pod spec", true},
+		"rbac":       {"User cannot create resource jobs", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := kubeJobsConfig(t)
+			kube := fake.NewClientset()
+			kube.PrependReactor("create", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, apierrors.NewForbidden(batchv1.Resource("jobs"), "x", errors.New(c.msg))
+			})
+			err := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg }).Launch(context.Background(), "inv", "unattended", "task-1")
+			if err == nil || errors.Is(err, ErrJobRefusedByPolicy) != c.want {
+				t.Errorf("err %v: refused-by-policy %v, want %v", err, errors.Is(err, ErrJobRefusedByPolicy), c.want)
 			}
 		})
 	}
