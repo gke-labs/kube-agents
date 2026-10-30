@@ -52,8 +52,8 @@ the same cases -- gate_issue.py files one with the workflow's GitHub token
 recovery comments on it. A new `lost_pods` condition (the build cluster lost
 the nodes under running jobs, #1478) files one the same way, addressed to
 the cluster owner, unless an open issue already names the lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
-designed state on two consecutive hourly scans or on three pool projects at
-once, #1550) files one for the fleet owner the same way, unless an open
+designed state on two consecutive hourly scans, #1550) files one for the
+fleet owner the same way, unless an open
 issue already names the drifted roles. A new `pool_drift`
 condition (#1967) files one for the pool owner, with the repair per project,
 unless an open issue's title names every finding. A new `deadline_kill`
@@ -87,6 +87,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -224,6 +225,10 @@ SPACE_PREFIX = "spaces/"
 NOT_CONFIGURED = "webhook not configured: set CI_HEALTH_CHAT_SPACE (+ CI_HEALTH_CHAT_TOKEN) or CI_HEALTH_CHAT_WEBHOOK; nothing posted"
 REQUEST_TIMEOUT_S = 30
 USER_AGENT = "kube-agents-ci-health"
+# Chat's text markup, which a card's fallbackText (a notification) shows raw:
+# <url|label> links and *bold*.
+CHAT_LINK_RE = re.compile(r"<[^|<>]+\|([^<>]+)>")
+CHAT_BOLD = "*"
 
 # The digest goes out once per local day (`--digest-tz`, Toronto by
 # default), on the first tick inside [digest_hour:00 - window, digest_hour:00
@@ -1742,6 +1747,8 @@ class Sender:
         self.token = token.strip()
         self.webhook = webhook.strip()
         self.opener = opener
+        # The last send's HTTP status; None when no response came back.
+        self.status: int | None = None
 
     @classmethod
     def from_env(cls, environ=os.environ, opener=urllib.request.urlopen) -> Sender:
@@ -1763,8 +1770,17 @@ class Sender:
             return f"chat api (space set, {TOKEN_ENV} missing)"
         return "webhook" if self.webhook else "unconfigured"
 
-    def request(self, text: str) -> urllib.request.Request:
-        body = json.dumps({"text": text}).encode("utf-8")
+    @staticmethod
+    def body(text: str, card: dict | None = None) -> dict:
+        """The message: ``text``, or with a cardsV2 ``card`` the card and
+        ``text`` as its fallback (what a notification or a client without
+        cards shows; Chat would print a ``text`` above the card as well)."""
+        if card is None:
+            return {"text": text}
+        return {"fallbackText": CHAT_LINK_RE.sub(r"\1", text).replace(CHAT_BOLD, ""), "cardsV2": [card]}
+
+    def request(self, text: str, card: dict | None = None) -> urllib.request.Request:
+        body = json.dumps(self.body(text, card)).encode("utf-8")
         headers = {"Content-Type": "application/json; charset=UTF-8", "User-Agent": USER_AGENT}
         if self.space and self.token:
             url = f"{CHAT_API_ROOT}/{CHAT_MESSAGES_PATH.format(space=self.space)}"
@@ -1773,12 +1789,15 @@ class Sender:
             url = self.webhook
         return urllib.request.Request(url, data=body, headers=headers, method="POST")
 
-    def send(self, text: str) -> bool:
+    def send(self, text: str, card: dict | None = None) -> bool:
         """POST once. True on 2xx; a failure is logged without the URL."""
+        self.status = None
         try:
-            with self.opener(self.request(text), timeout=REQUEST_TIMEOUT_S) as response:
+            with self.opener(self.request(text, card), timeout=REQUEST_TIMEOUT_S) as response:
                 status = getattr(response, "status", 200)
+            self.status = status
         except urllib.error.HTTPError as exc:
+            self.status = exc.code
             log(f"post failed: HTTP {exc.code} from {self.describe()}")
             return False
         except (urllib.error.URLError, OSError) as exc:

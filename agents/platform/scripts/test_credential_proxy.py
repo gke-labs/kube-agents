@@ -41,6 +41,7 @@ from credential_proxy import (
     GoogleChatRelay,
     Policy,
     SlackRelay,
+    TeamsRelay,
     _chat_error_fields,
     _git_plan,
     _slack_error_detail,
@@ -287,6 +288,114 @@ class AgentAPIProxyTest(unittest.TestCase):
                     urllib.request.urlopen(request)
                 self.assertEqual(403, raised.exception.code)
                 self.assertEqual("", self.received_authorization)
+
+    def test_refuses_bridge_session_ids_in_any_top_level_body_key(self):
+        self._seed_state_db_sessions(
+            [
+                ("a2a-ctx-body", None, "compression"),
+                ("20261029_090000_bodychild", "a2a-ctx-body", None),
+            ]
+        )
+        id_keys = ("id", "session_id", "sessionId", "gateway_session_key")
+        body_keys = (*id_keys, "conversation", "previous_response_id", "other")
+        for key in body_keys:
+            for value in ("a2a-ctx-body", "A2A-ctx-body", "%612a-ctx-body", "20261029_090000_bodychild"):
+                with self.subTest(key=key, value=value):
+                    self.received_authorization = ""
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{self.proxy.server_port}/v1/runs",
+                        headers={"Authorization": "Bearer external-secret", "Content-Type": "application/json"},
+                        data=json.dumps({key: value, "input": "hi"}).encode(),
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(request)
+                    self.assertEqual(403, raised.exception.code)
+                    self.assertEqual("", self.received_authorization)
+        for key in id_keys:
+            with self.subTest(key=key, value=7):
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}/v1/runs",
+                    headers={"Authorization": "Bearer external-secret", "Content-Type": "application/json"},
+                    data=json.dumps({key: 7}).encode(),
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request)
+                self.assertEqual(403, raised.exception.code)
+
+    def test_refuses_a_body_with_more_short_strings_than_it_checks(self):
+        for count, refused in ((256, False), (257, True)):
+            with self.subTest(count=count):
+                self.received_authorization = ""
+                body = {f"k{i}": f"v{i}" for i in range(count)}
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}/v1/runs",
+                    headers={"Authorization": "Bearer external-secret", "Content-Type": "application/json"},
+                    data=json.dumps(body).encode(),
+                    method="POST",
+                )
+                if refused:
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(request)
+                    self.assertEqual(403, raised.exception.code)
+                    self.assertEqual("", self.received_authorization)
+                else:
+                    with urllib.request.urlopen(request) as response:
+                        self.assertEqual(b"proxied", response.read())
+
+    def test_one_request_opens_each_state_db_once(self):
+        self._seed_state_db_sessions([("plain-parent", None, None)])
+        opened = []
+        real = credential_proxy.AgentAPIProxyHandler._open_bridge_session_dbs.__func__
+
+        def counting(cls, stack, workspace_root=None):
+            opened.append(1)
+            return real(cls, stack, workspace_root)
+
+        with mock.patch.object(
+            credential_proxy.AgentAPIProxyHandler, "_open_bridge_session_dbs", classmethod(counting)
+        ):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/sessions/plain-parent/chat",
+                headers={
+                    "Authorization": "Bearer external-secret",
+                    "Content-Type": "application/json",
+                    "X-Hermes-Session-Id": "plain-parent",
+                },
+                data=json.dumps({"message": "hi", "note": "plain-other"}).encode(),
+                method="POST",
+            )
+            with urllib.request.urlopen(request) as response:
+                self.assertEqual(b"proxied", response.read())
+        self.assertEqual(1, len(opened))
+
+    def test_allows_body_keys_that_name_no_bridge_session(self):
+        for path, body in (
+            ("/api/sessions", {"id": "web-console-abc", "title": "Web console abc"}),
+            ("/v1/responses", {"conversation": "run-42", "input": "status of a2a-ctx-body?"}),
+            ("/v1/responses", {"input": "hi", "note": "a2a-" + "x" * 300}),
+            ("/api/sessions/web-console-abc/chat", {"message": "a2a-x"}),
+            ("/v1/responses", {"input": "a2a-x"}),
+            ("/v1/responses", {"input": "hi", "instructions": "A2A-x"}),
+            ("/api/sessions", {"session_id": "web-console-abc", "title": "a2a-x"}),
+            ("/api/sessions", {"session_id": "web-console-abc", "system_prompt": "a2a-x"}),
+            ("/api/sessions/web-console-abc/chat", {"message": "hi", "system_message": "a2a-x"}),
+            ("/v1/runs/run-1/steer", {"text": "a2a-x"}),
+            ("/api/jobs", {"name": "a2a-x", "prompt": "a2a-x"}),
+            ("/v1/runs", {"session_id": "plain", "input": "hi", "stream": True, "limit": 3}),
+        ):
+            with self.subTest(path=path, body=body):
+                self.received_authorization = ""
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}{path}",
+                    headers={"Authorization": "Bearer external-secret", "Content-Type": "application/json"},
+                    data=json.dumps(body).encode(),
+                    method="POST",
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(b"proxied", response.read())
+                self.assertEqual("Bearer internal-sentinel", self.received_authorization)
 
     def test_allows_non_a2a_session_paths_and_headers(self):
         self._seed_state_db_sessions(
@@ -3176,6 +3285,85 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertEqual(200, status, body)
 
 
+class GetCredentialsFlagsBetweenWordsTest(unittest.TestCase):
+    """get-credentials with flags between its command words goes through the
+    get-credentials path, the same as the plain spelling, for the session and
+    the shell. command_policy reads the command words past its flag walk, so
+    every spelling below is allowed as get-credentials; the executor has to
+    agree on what it is running."""
+
+    post_as = SessionRoleExecutableTest.post_as
+
+    def setUp(self):
+        SessionRoleExecutableTest.setUp(self)
+        stub = Path(self.temp_dir.name) / "bin" / "gcloud"
+        stub.write_text("#!/bin/bash\necho ran-$0\n", encoding="utf-8")
+        stub.chmod(0o755)
+        CredentialProxyHandler.executor.executables["gcloud"] = str(stub)
+
+    SPELLINGS = (
+        # The plain spelling, as the control.
+        ["gcloud", "container", "clusters", "get-credentials", "c", "--location=l", "--project=p"],
+        # A flag before `get-credentials`, attached and separate value.
+        ["gcloud", "container", "clusters", "--location=l", "get-credentials", "c", "--project=p"],
+        ["gcloud", "container", "clusters", "--location", "l", "get-credentials", "c", "--project", "p"],
+        # A flag before `clusters`, attached and separate value.
+        ["gcloud", "container", "--project=p", "clusters", "get-credentials", "c", "--location=l"],
+        ["gcloud", "container", "--project", "p", "clusters", "get-credentials", "c", "--location", "l"],
+        # Both at once, with a boolean flag between them.
+        ["gcloud", "container", "--quiet", "clusters", "--zone", "l", "get-credentials", "c"],
+    )
+
+    def _routed(self, role, argv):
+        executor = CredentialProxyHandler.executor
+        result = credential_proxy.ExecutionResult(
+            exit_code=0, stdout="", stderr="", duration_ms=0, truncated=False, timed_out=False
+        )
+        with mock.patch.object(executor, "_execute_get_credentials", return_value=result) as fetch, \
+                mock.patch.object(executor, "_execute", return_value=result) as plain:
+            status, body = self.post_as(role, {"argv": argv})
+        self.assertEqual(200, status, body)
+        return fetch.call_count, plain.call_count
+
+    def test_every_spelling_goes_through_the_get_credentials_path(self):
+        for role in (credential_proxy.CALLER_ROLE_SESSION, credential_proxy.CALLER_ROLE_SHELL):
+            for argv in self.SPELLINGS:
+                with self.subTest(role=role, argv=argv):
+                    self.assertTrue(credential_proxy.command_policy.evaluate(argv).allowed)
+                    fetches, plain = self._routed(role, argv)
+                    self.assertEqual(1, fetches)
+                    self.assertEqual(0, plain)
+
+    def test_a_plain_gcloud_read_does_not(self):
+        argv = ["gcloud", "container", "--project=p", "clusters", "list", "--location", "l"]
+        for role in (credential_proxy.CALLER_ROLE_SESSION, credential_proxy.CALLER_ROLE_SHELL):
+            with self.subTest(role=role):
+                fetches, plain = self._routed(role, argv)
+                self.assertEqual(0, fetches)
+                self.assertEqual(1, plain)
+
+    def test_the_detector_reads_the_words_past_the_flags(self):
+        for argv, want in (
+            *((argv, True) for argv in self.SPELLINGS),
+            # A release track ahead of the words is looked past.
+            (["gcloud", "beta", "container", "--quiet", "clusters", "--zone", "l", "get-credentials", "c"], True),
+            # A flag value that spells a command word is not one.
+            (["gcloud", "container", "--project", "clusters", "list"], False),
+            (["gcloud", "container", "clusters", "--format", "get-credentials", "list"], False),
+            # Unreadable (a flag of unknown arity) but carrying the verb.
+            (["gcloud", "container", "--no-such-flag", "clusters", "get-credentials", "c"], True),
+            (["gcloud", "container", "clusters", "list"], False),
+            # The verb as a positional of another command is that command.
+            (["gcloud", "container", "clusters", "describe", "get-credentials", "--zone", "z"], False),
+            (["gcloud", "container", "clusters", "list", "get-credentials"], False),
+            # An argv the walk can't read is routed only if it carries the verb.
+            (["gcloud", "container", "--no-such-flag", "clusters", "list"], False),
+            (["kubectl", "container", "clusters", "get-credentials"], False),
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(want, credential_proxy._is_get_credentials(argv))
+
+
 class ChildMemoryBudgetDerivationTest(unittest.TestCase):
     """Where the broker learns its memory limit (design §2.4)."""
 
@@ -4434,6 +4622,7 @@ class CommandExecutorTest(unittest.TestCase):
 
         process = mock.Mock(spec=subprocess.Popen)
         process.pid = 4242
+        process.returncode = None
         process.poll.return_value = None
         with (
             mock.patch.object(credential_proxy, "time", clock),
@@ -4492,6 +4681,7 @@ class CommandExecutorTest(unittest.TestCase):
 
         process = mock.Mock(spec=subprocess.Popen)
         process.pid = 4242
+        process.returncode = None
         process.poll.return_value = None
         with (
             mock.patch.object(credential_proxy, "time", clock),
@@ -11705,9 +11895,9 @@ class RequiredRoleTest(unittest.TestCase):
                     credential_proxy.required_roles(path),
                 )
 
-    def test_the_exec_route_admits_the_shell_and_the_session(self):
+    def test_the_exec_route_admits_the_shell_the_session_and_the_profile(self):
         self.assertEqual(
-            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_SESSION),
+            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_SESSION, credential_proxy.CALLER_ROLE_PROFILE),
             credential_proxy.required_roles("/v1/exec"),
         )
 
@@ -13918,7 +14108,6 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
         self.assertEqual([self.EMAIL], self.minted)
 
 
-
 class ChatRelaySubscriptionsTest(unittest.TestCase):
     def test_two_relays_on_one_subscription_are_refused_at_startup(self):
         environment = {
@@ -14387,6 +14576,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         roles = {
             "shell-token": credential_proxy.CALLER_ROLE_SHELL,
             "chat-token": credential_proxy.CALLER_ROLE_CHAT,
+            "session-token": credential_proxy.CALLER_ROLE_SESSION,
         }
         caller = self.CALLER
 
@@ -14597,6 +14787,63 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual([], self.upstream_requests)
         self.assertFalse(any("api request_id=" in r.getMessage() for r in logs.records),
                          "a caller the role table turns away never opens an api line")
+
+    # -- the GKE cluster routes (#3703): projected, shell only ------------
+
+    CLUSTER_GET = "/v1/gcp/container.googleapis.com/v1/projects/kagents-dev/locations/us-central1-a/clusters/seeded-a"
+    CLUSTER_LIST = "/v1/gcp/container.googleapis.com/v1/projects/kagents-dev/locations/-/clusters"
+    CREDENTIAL_MASTER_AUTH = {"clusterCaCertificate": "Q0E=", "fieldOne": "REDACTED-TEST-VALUE-1",
+                              "fieldTwo": "REDACTED-TEST-VALUE-2", "fieldThree": "REDACTED-TEST-VALUE-3",
+                              "fieldFour": "REDACTED-TEST-VALUE-4"}
+
+    def _cluster(self, name):
+        return {"name": name, "location": "us-central1-a", "status": "RUNNING", "id": "abc123",
+                "endpoint": "34.1.2.3", "masterAuth": dict(self.CREDENTIAL_MASTER_AUTH),
+                "nodePools": [{"name": "default-pool"}]}
+
+    def test_a_cluster_get_comes_back_projected_with_no_master_auth(self):
+        self.reply.update(body=json.dumps(self._cluster("seeded-a")).encode())
+        status, _, body = self._request(self.CLUSTER_GET)
+        self.assertEqual(200, status)
+        self.assertEqual({"name": "seeded-a", "location": "us-central1-a", "status": "RUNNING", "id": "abc123"},
+                         json.loads(body))
+        for secret in (b"REDACTED-TEST-VALUE", b"masterAuth"):
+            self.assertNotIn(secret, body)
+
+    def test_a_cluster_list_comes_back_projected_per_item_and_keeps_missing_zones(self):
+        self.reply.update(body=json.dumps({"clusters": [self._cluster("a"), self._cluster("b")],
+                                           "missingZones": ["us-east1-b"]}).encode())
+        status, _, body = self._request(self.CLUSTER_LIST)
+        self.assertEqual(200, status)
+        got = json.loads(body)
+        self.assertEqual(["a", "b"], [c["name"] for c in got["clusters"]])
+        self.assertEqual(["us-east1-b"], got["missingZones"])
+        for secret in (b"REDACTED-TEST-VALUE", b"masterAuth", b"34.1.2.3"):
+            self.assertNotIn(secret, body)
+
+    def test_a_cluster_answer_the_projection_cannot_read_is_502_not_relayed(self):
+        self.reply.update(body=b"[" + json.dumps(self.CREDENTIAL_MASTER_AUTH).encode() + b"]")
+        status, _, payload = self._json_request(self.CLUSTER_GET)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_UNEXPECTED", payload["code"])
+        self.assertNotIn("REDACTED-TEST-VALUE", json.dumps(payload))
+
+    def test_a_cluster_not_found_passes_through_for_the_reconcile_to_read(self):
+        not_found = b'{"error":{"code":404,"message":"Not found: cluster seeded-z","status":"NOT_FOUND"}}'
+        self.reply.update(status=404, body=not_found)
+        status, _, body = self._request(self.CLUSTER_GET)
+        self.assertEqual((404, not_found), (status, body))
+
+    def test_the_cluster_routes_refuse_the_chat_and_session_roles(self):
+        for path in (self.CLUSTER_GET, self.CLUSTER_LIST):
+            for role in (credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_SESSION):
+                with self.subTest(path=path, role=role):
+                    self.assertNotIn(role, credential_proxy.required_roles(path))
+            for token in ("chat-token", "session-token"):
+                with self.subTest(path=path, token=token):
+                    status, _, payload = self._json_request(path, token=token)
+                    self.assertEqual((403, "CALLER_ROLE_FORBIDDEN"), (status, payload["code"]))
+        self.assertEqual([], self.upstream_requests)
 
     def test_an_unauthenticated_caller_is_401(self):
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
@@ -15436,6 +15683,231 @@ class GitAllowProtocolForHttpForgeTest(unittest.TestCase):
             for verb, allow_http in asked:
                 if verb in remote_verbs:
                     self.assertTrue(allow_http, f"git {verb} did not ask for allow_http")
+
+
+class TeamsRelayTest(unittest.TestCase):
+    def test_teams_relay_requires_app_id_and_password(self):
+        with self.assertRaises(ValueError):
+            TeamsRelay(app_id="", app_password="password")
+        with self.assertRaises(ValueError):
+            TeamsRelay(app_id="app-id", app_password="")
+
+    def test_teams_relay_queue_pull_and_settle(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        activity = {"type": "message", "text": "hello teams"}
+
+        self.assertTrue(relay.enqueue_event(activity))
+
+        pulled = relay.pull(timeout_seconds=1)
+        self.assertIsNotNone(pulled)
+        self.assertEqual(pulled["event"]["text"], "hello teams")
+        receipt = pulled["receipt"]
+
+        # Settle ACK
+        self.assertTrue(relay.settle(receipt, acknowledge=True))
+        # Settle again is False because receipt is deleted
+        self.assertFalse(relay.settle(receipt, acknowledge=True))
+
+    def test_teams_relay_token_acquisition_and_caching(self):
+        relay = TeamsRelay(
+            app_id="app-id-123",
+            app_password="secret-password",
+            tenant_id="custom-tenant-456",
+        )
+        fake_token_response = {
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "access_token": "mock-entra-id-jwt-token",
+        }
+
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps(fake_token_response).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_open.return_value = mock_resp
+
+            token = relay._get_access_token()
+            self.assertEqual(token, "mock-entra-id-jwt-token")
+
+            # Subsequent call should return cached token without HTTP request
+            mock_open.reset_mock()
+            token2 = relay._get_access_token()
+            self.assertEqual(token2, "mock-entra-id-jwt-token")
+            mock_open.assert_not_called()
+
+    def test_teams_relay_service_url_and_endpoint_validation(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        # Untrusted or arbitrary *.trafficmanager.net hosts, or URLs with ? or #, must be rejected
+        for bad_url in (
+            "https://evil-attacker.com",
+            "https://attacker.trafficmanager.net/teams/",
+            "http://smba.trafficmanager.net/teams/",
+            "https://user:pass@smba.trafficmanager.net/teams/",
+            "https://smba.trafficmanager.net/teams?",
+            "https://smba.trafficmanager.net/teams#",
+            "https://smba.trafficmanager.net/teams?x=1",
+            "https://smba.trafficmanager.net/teams#frag",
+            "",
+        ):
+            with self.assertRaises(ValueError, msg=bad_url):
+                relay.api_call(
+                    service_url=bad_url,
+                    path="v3/conversations/123/activities",
+                )
+
+        # Destructive HTTP verbs and non-activity endpoints (including /activities/history) must be rejected
+        for bad_method in ("DELETE", "PUT", "GET", "PATCH"):
+            with self.assertRaises(ValueError, msg=bad_method):
+                relay.api_call(
+                    service_url="https://smba.trafficmanager.net/teams/",
+                    path="v3/conversations/123/activities",
+                    method=bad_method,
+                )
+        for bad_path in (
+            "v3/conversations/123/members",
+            "v3/conversations/123/../admin",
+            "v3/attachments/123",
+            "v3/conversations/123/activities/history",
+            "v3/conversations/123/activities/History",
+            "V3/Conversations/123/Activities/HISTORY",
+            "v3/conversations/123/activities/%68istory",
+            "v3/conversations/123/activities/hist%6Fry",
+            "v3/conversations/123%2F..%2Fmembers/activities",
+            "v3/conversations/123/activities\\history",
+        ):
+            with self.assertRaises(ValueError, msg=bad_path):
+                relay.api_call(
+                    service_url="https://smba.trafficmanager.net/teams/",
+                    path=bad_path,
+                    method="POST",
+                )
+
+    def test_teams_relay_api_call_success_and_json_parsing(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({"access_token": "token1", "expires_in": 3600}).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_open.return_value = mock_resp
+
+            # Force get token
+            relay._get_access_token()
+
+            # Now call api_call
+            mock_resp.read.return_value = json.dumps({"id": "act-resp-1"}).encode("utf-8")
+            res = relay.api_call(
+                service_url="https://smba.trafficmanager.net/teams/",
+                path="v3/conversations/123/activities",
+                method="POST",
+                payload={"text": "hello"},
+            )
+            self.assertEqual(res, {"id": "act-resp-1"})
+
+    def test_teams_relay_api_call_refuses_http_redirects_over_real_socket(self):
+        class RedirectingHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", "https://attacker.example/steal")
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                del format, args
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectingHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        relay._token = "cached-token"
+        relay._token_expires_at = 9999999999.0
+
+        with (
+            mock.patch.object(
+                credential_proxy, "is_trusted_teams_service_url", return_value=True
+            ),
+            self.assertRaisesRegex(ValueError, "Teams API redirect refused \\(HTTP 302\\)"),
+        ):
+            relay.api_call(
+                service_url=f"http://127.0.0.1:{server.server_port}/teams/",
+                path="v3/conversations/123/activities",
+                method="POST",
+                payload={"type": "message", "text": "hello"},
+            )
+
+    def test_teams_relay_enqueue_validates_tenant_and_activity_shape(self):
+        relay = TeamsRelay(
+            app_id="app-id-123",
+            app_password="secret-password",
+            tenant_id="tenant-allowed",
+        )
+        # Missing or mismatched tenant raises PermissionError
+        with self.assertRaises(PermissionError):
+            relay.enqueue_event({"type": "message", "text": "no tenant"})
+        with self.assertRaises(PermissionError):
+            relay.enqueue_event({
+                "type": "message",
+                "channelData": {"tenant": {"id": "tenant-other"}},
+            })
+        # Matching channelData.tenant.id or conversation.tenantId succeeds
+        self.assertTrue(
+            relay.enqueue_event({
+                "type": "message",
+                "channelData": {"tenant": {"id": "tenant-allowed"}},
+            })
+        )
+        self.assertTrue(
+            relay.enqueue_event({
+                "type": "message",
+                "conversation": {"id": "c1", "tenantId": "TENANT-ALLOWED"},
+            })
+        )
+        # Malformed field types or untrusted serviceUrl raise ValueError
+        for bad_event in (
+            {"type": "message", "channelData": "not-a-dict"},
+            {"type": "message", "from": "not-a-dict"},
+            {"type": "message", "text": 123},
+            {"type": "message", "serviceUrl": "https://attacker.trafficmanager.net/"},
+            {"type": "message", "serviceUrl": "https://smba.trafficmanager.net/teams?x=1"},
+            {"type": "message", "serviceUrl": "https://smba.trafficmanager.net/teams#frag"},
+        ):
+            with self.assertRaises(ValueError):
+                relay.enqueue_event(bad_event)
+
+    def test_teams_relay_nack_requeue_and_poison_drop_after_max_attempts(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        self.assertIsNone(relay.pull(timeout_seconds=0))
+
+        self.assertTrue(relay.enqueue_event({"type": "message", "id": "poison-1"}))
+        # Attempts 1 and 2 requeue; attempt 3 drops the poison message
+        for attempt in range(1, credential_proxy.TEAMS_MAX_DELIVERY_ATTEMPTS + 1):
+            pulled = relay.pull(timeout_seconds=1)
+            self.assertIsNotNone(pulled, f"missing on attempt {attempt}")
+            self.assertEqual(pulled["event"]["id"], "poison-1")
+            self.assertTrue(relay.settle(pulled["receipt"], acknowledge=False))
+
+        # After TEAMS_MAX_DELIVERY_ATTEMPTS nacks, the queue is empty
+        self.assertIsNone(relay.pull(timeout_seconds=1))
+
+    def test_teams_relay_token_lock_does_not_block_pull_or_settle(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        self.assertTrue(relay.enqueue_event({"type": "message", "id": "ev-1"}))
+        # Hold _token_lock to simulate an in-flight 20s Entra OAuth request
+        with relay._token_lock:
+            pulled = relay.pull(timeout_seconds=1)
+            self.assertIsNotNone(pulled)
+            self.assertTrue(relay.settle(pulled["receipt"], acknowledge=True))
+
+    def test_teams_relay_missing_token_raises(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({"error": "invalid_client"}).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_open.return_value = mock_resp
+
+            with self.assertRaises(RuntimeError):
+                relay._get_access_token()
 
 
 if __name__ == "__main__":

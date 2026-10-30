@@ -567,4 +567,35 @@ type ConversationState struct {
 	// which is the line the relay's rolling edit shows.
 	Activity []json.RawMessage
 	Progress string
+	// Usage is what the front door's own turns cost: the usage artifact's
+	// parts summed (lib.UsageTotal) over TaskID's stream and, for a
+	// delegation chain's root, every wake that continued it, whichever link
+	// the read follows. ChildUsage is the same sum over the chain's child
+	// tasks, the addressees the front door delegated to (the platform
+	// router that files the cards among them), kept apart because it is
+	// another addressee's work. Each is nil when none of its turns
+	// published usage. UsagePartial is set when a link's stream could not
+	// be read, so the sums leave out what that link cost. Each executor
+	// publishes a turn's usage before its terminal, so a read after the
+	// root's end carries all of it. Set only on a probe whose context asked
+	// for it (withChainUsage): summing a chain reads one stream per link,
+	// which a caller polling the read route has no use for on every poll.
+	Usage        *lib.Usage
+	ChildUsage   *lib.Usage
+	UsagePartial bool
+}
+
+// chainUsageKey marks a probe's context as asking for
+// ConversationState.Usage (withChainUsage).
+type chainUsageKey struct{}
+
+// withChainUsage asks the probe run under ctx to sum the front door's usage.
+func withChainUsage(ctx context.Context) context.Context {
+	return context.WithValue(ctx, chainUsageKey{}, true)
+}
+
+// chainUsageAsked reports whether ctx asks the probe for usage.
+func chainUsageAsked(ctx context.Context) bool {
+	asked, _ := ctx.Value(chainUsageKey{}).(bool)
+	return asked
 }

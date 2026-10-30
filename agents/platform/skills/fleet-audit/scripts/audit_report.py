@@ -1115,6 +1115,9 @@ NO_FORGE_SUMMARY_TOP_ROWS = 2
 # plain phrase for its check (`CHECK_PHRASES`), its severity as inline code.
 SUMMARY_ROW = "`{severity}` {where}: {phrase}"
 SUMMARY_ROW_OBJECT = "{phrase} ({object})"
+# A row's cluster with the finding's namespace, so same-named objects in two
+# namespaces of one cluster read as two rows.
+SUMMARY_ROW_WHERE_NAMESPACE = "{cluster}/{namespace}"
 SUMMARY_MORE = "{count} more ({breakdown}) {verb} saved on the install."
 SUMMARY_MORE_UNSTORED = "{count} more ({breakdown}) {verb} not listed here."
 SUMMARY_MORE_VERB = ("is", "are")
@@ -20612,16 +20615,36 @@ def _object_name(finding: dict) -> str:
     return name
 
 
+def _row_namespace(finding: dict) -> str:
+    """The finding's namespace as a row names it, or "" when it has none or the object is the namespace.
+
+    A namespace object in any spelling the join accepts (`NAMESPACE_KIND_SPELLINGS`),
+    and no namespace where the finding's id has none (`_id_segment` folds it to `_`).
+    """
+    namespace = str(finding.get("namespace") or "").strip()
+    if _id_segment(namespace) == ID_EMPTY_SEGMENT:
+        return ""
+    kind, _, name = str(finding.get("object") or "").strip().rpartition("/")
+    kind = kind.rpartition("/")[2].strip()
+    if kind.lower() in NAMESPACE_KIND_SPELLINGS or (not kind and name.strip() == namespace):
+        return ""
+    return namespace
+
+
 def summary_row(finding: dict) -> str:
     """One finding as the chat summary lists it: "`critical` seeded-a: control plane is public".
 
-    The cluster by its short name, and the check's plain phrase
+    The cluster by its short name, after it the finding's namespace when it has
+    one ("seeded-a/payments"), and the check's plain phrase
     (`CHECK_PHRASES`) with the object it judged; the finding's own title where
     the check has no phrase, or its phrase needs an object the finding does not
     name. Redacted, because the cluster, the object and the title are the
     model's words.
     """
     where = str(finding.get("cluster") or "").rpartition("/")[2]
+    namespace = _row_namespace(finding)
+    if namespace:
+        where = SUMMARY_ROW_WHERE_NAMESPACE.format(cluster=where, namespace=namespace)
     obj = _object_name(finding)
     phrase = CHECK_PHRASES.get(str(finding.get("check") or ""), "")
     if PHRASE_OBJECT in phrase:

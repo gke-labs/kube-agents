@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional` and `audit_streams`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `audit_streams` and `scope_exclude`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -58,9 +58,13 @@ A first line of `[bench:slack-question-wake]` makes the run a replay of the wake
 on a question sends, rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
 sends its turns to the agent's API server under either `AGENT_TRANSPORT`, as a card's wake reaches
-the front door there under `spec.mode: next` too. Under next the reply to that wake is posted
-nowhere, and a `session: fresh` answer carries today's Slack thread context, which next's door
-does not send, so a case that grades either stays in `hack/eval/inject-lane-exclusions.txt`. A
+the front door there under `spec.mode: next` too. A `session: fresh` answer carries today's Slack
+thread context, which next's door does not send, so a case with one stays in
+`hack/eval/inject-lane-exclusions.txt`. Under next the reply to a wake is posted nowhere, but the
+same front door writes it, so a case that grades that reply still runs on the inject lane. A
+first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability` or
+`dependency`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
+is sent, and the wake's reply is the run's one turn. A
 first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
 prompt an ask the harness stops once it has filed a card
@@ -140,6 +144,22 @@ releases them when devops-bench returns. A run that outlasts the unit is covered
 unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
 run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
 starts. devops-bench ignores the key.
+
+`scope_exclude` is for a case whose precondition is an install that leaves some seeded
+clusters out of its scope: `scope_exclude: {slots: [b]}` names catalogue slots, never
+cluster names, so the case runs unchanged on every pool project. The runner
+(`hack/ci-eval-pr.sh`, `scope_exclude_apply`) runs the case's repetitions alone, after every
+other unit, because a scope edit rolls the gateway and the Cluster Agent reconcile deletes an
+excluded cluster's profile. Before them it adds each slot's cluster, read from the fleet's
+`.fleet-context`, to the PlatformAgent's `spec.scope.exclude.clusters`, waits until the pod
+reads the new scope, and runs the reconcile once. After them it puts the scope back and runs the
+reconcile again to re-create the profiles. A CR that had no scope block first gets a block that
+excludes nothing, and loses it only after a reconcile has run under that block: the reconcile
+reads a missing block as "keep the last exclusions". The scope it replaced is saved on the CR
+(`bench/kube_agents_bench/scope_exclude.py`), so the EXIT trap and the next lease can restore it
+after a run that died first; the annotation stays until a reconcile has run under the restored scope. A repetition whose exclusion did not take effect is recorded as
+infrastructure. The validator refuses a slot the catalogue does not declare and a list that
+excludes every slot. devops-bench ignores the key.
 
 The runner pauses most of the Platform Agent's clock-started audits at lease time and again
 right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
@@ -298,7 +318,11 @@ Thirteen read the install under test, nine of them from that file. `bootstrap_fa
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
-card for anything else).
+card for anything else), or, with `cap`, one of the first-run cap's two (#3702):
+`cards_for_first_cap_profiles` (cards for exactly the carded profiles: the sweep marker's
+`carded=` set when it has one, else the first `cap` profiles by name) and
+`past_cap_clusters_sweep_audited` (every roster cluster outside that set shown in the sandbox's
+`INVENTORY.raw.md` as audited by the sweep itself).
 
 `bootstrap_handoff` reads both ends of the sweep's hand-off to the prioritization stage. Its
 `require` is `raw_report_has_findings_block` (the sandbox's own `inventory_findings.py` parses
@@ -542,8 +566,13 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
 written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
-that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
-does not have, a case that is registered nowhere, and a file that writes one key twice in
+that is not a bare YAML boolean, a `resource_property` or `fleet_resource_property` check that
+compares a known boolean field such as `spec.suspend` to the string `"true"` or `"false"` under
+`op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts
+nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table, and a path with recursive
+descent or a script expression is not judged), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
+does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters, names a slot
+`bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
 refuses (a key that overrides one merged in with `<<:` is not a repeat). It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
@@ -601,7 +630,9 @@ classes of mistake get through it and fail at spec-load, after a cluster lease i
   into the boolean `True`. devops-bench reads them with `ruamel.yaml`'s `YAML(typ="safe")`
   (`devops_bench/tasks/loader.py:41`), which is YAML 1.2 and parses it into the string
   `"yes"` — the exact value the strict-mode note above warns fails validation. By the time
-  the validator sees the field, the trap has already been parsed away.
+  the validator sees the field, the trap has already been parsed away. The same split hides
+  `value: yes` under a property check: PyYAML hands the validator a boolean and devops-bench
+  compares the API's boolean to the string `"yes"`.
 
 A fourth divergence is caught: PyYAML's `safe_load` keeps the last of two equal keys
 silently, where `YAML(typ="safe")` raises `DuplicateKeyError`, so the validator loads with

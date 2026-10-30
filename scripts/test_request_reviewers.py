@@ -52,6 +52,13 @@ CONFIG = {
         "**": ["repository-owners", "repository-reviewers"],
         "hack/eval/presubmit-cases.txt": ["eval-crew"],
         "hack/eval/blocking-roster.txt": ["eval-crew"],
+        "hack/ci-eval-pr.sh": ["eval-crew"],
+        "hack/ci-env.sh": ["eval-crew"],
+        "hack/fleet-kubeconfigs.sh": ["eval-crew"],
+        "hack/ci-deploy.sh": ["eval-crew"],
+        "hack/ci-revalidate.sh": ["eval-crew"],
+        "hack/fleet-fixture-state.py": ["eval-crew"],
+        "scripts/installer/gke_dns_endpoint.sh": ["eval-crew"],
     },
     "options": {
         "ignore_draft": True,
@@ -63,6 +70,19 @@ CONFIG = {
     },
 }
 
+# hack/ci-eval-pr.sh, which grades every pull request with main's grader, and
+# the files that run inside it (hack/OWNERS, scripts/installer/OWNERS). The
+# walk tests' OWNERS_TREE carries hack/OWNERS's shell-script filter alone, so
+# they read all but the last two.
+GRADER_PIN_FILES = (
+    "hack/ci-eval-pr.sh",
+    "hack/ci-env.sh",
+    "hack/fleet-kubeconfigs.sh",
+    "hack/ci-deploy.sh",
+    "hack/ci-revalidate.sh",
+    "hack/fleet-fixture-state.py",
+    "scripts/installer/gke_dns_endpoint.sh",
+)
 OWNERS = CONFIG["reviewers"]["groups"]["repository-owners"]
 REVIEWERS = CONFIG["reviewers"]["groups"]["repository-reviewers"]
 EVAL_CREW = CONFIG["reviewers"]["groups"]["eval-crew"]
@@ -90,6 +110,9 @@ OWNERS_TREE = {
     "hack/OWNERS": (
         "filters:\n"
         "  'eval/(presubmit-cases|blocking-roster)\\.txt$':\n"
+        "    approvers:\n"
+        "    - eval-crew\n"
+        "  '^(ci-eval-pr|ci-env|fleet-kubeconfigs|ci-deploy|ci-revalidate)\\.sh$':\n"
         "    approvers:\n"
         "    - eval-crew\n"
         "options:\n"
@@ -374,16 +397,17 @@ class SelectionTest(unittest.TestCase):
         # blocking-roster.txt (hack/OWNERS, no_parent_owners), so a random root
         # owner would review a pull request they cannot clear, and nothing
         # would tell eval-crew it exists.
-        for path in ("hack/eval/presubmit-cases.txt", "hack/eval/blocking-roster.txt"):
+        for path in ("hack/eval/presubmit-cases.txt", "hack/eval/blocking-roster.txt", *GRADER_PIN_FILES):
             with self.subTest(path=path):
                 self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [path], "author"), EVAL_CREW)
                 self.assertIn(self.select([path])[0], EVAL_CREW)
 
-    def test_the_nightly_file_a_case_and_the_script_stay_with_root(self):
+    def test_the_nightly_file_a_case_and_the_deploy_script_stay_with_root(self):
         # Decision A (#1546, 2026-09-15): the nightly file, a new case directory
-        # and ci-eval-pr.sh itself fall through to the root OWNERS, so they
-        # route to the default reviewers like any other change.
-        for path in ("hack/eval/nightly-cases.txt", "bench/tasks/new-case/task.yaml", "hack/ci-eval-pr.sh", "hack/ci-deploy.sh"):
+        # and hack/'s subprocess helpers fall through to the root OWNERS, so they
+        # route to the default reviewers like any other change. ci-eval-pr.sh
+        # and the files that run inside it left this list with the grader pin (#1560).
+        for path in ("hack/eval/nightly-cases.txt", "bench/tasks/new-case/task.yaml", "hack/boskos_heartbeat.sh"):
             with self.subTest(path=path):
                 self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [path], "author"), POOL)
 
@@ -499,16 +523,17 @@ class OwnersTest(unittest.TestCase):
         self.assertEqual(self.approvers("k8s-operator/internal/controller/pa.go"), ROOT_APPROVERS)
 
     def test_a_filtered_path_under_no_parent_owners_gets_only_the_filter(self):
-        # hack/OWNERS: only eval-crew can /approve the presubmit rosters, and a
-        # root approver does not count (#1546).
-        for path in ("hack/eval/presubmit-cases.txt", "hack/eval/blocking-roster.txt"):
+        # hack/OWNERS: only eval-crew can /approve the presubmit rosters (#1546)
+        # or the script that pins the grader a pull request is graded by
+        # (#1560), and a root approver does not count.
+        for path in ("hack/eval/presubmit-cases.txt", "hack/eval/blocking-roster.txt", *GRADER_PIN_FILES[:-2]):
             with self.subTest(path=path):
                 self.assertEqual(self.approvers(path), {"jayantid", "lapis2002"})
 
     def test_an_unfiltered_path_under_no_parent_owners_falls_through_to_the_root(self):
         # The same file's comment: everything else under hack/ matches no
         # filter and falls through, so no_parent_owners only bites on a match.
-        for path in ("hack/eval/nightly-cases.txt", "hack/ci-eval-pr.sh"):
+        for path in ("hack/eval/nightly-cases.txt", "hack/boskos_heartbeat.sh", "hack/eval/ci-eval-pr.sh"):
             with self.subTest(path=path):
                 self.assertEqual(self.approvers(path), ROOT_APPROVERS)
 
@@ -529,7 +554,7 @@ class OwnersTest(unittest.TestCase):
             {"hack/OWNERS": OWNERS_TREE["hack/OWNERS"].replace("    - eval-crew\n", "    - eval-crew\n    reviewers:\n    - roster-reader\n")},
         )
         self.assertEqual(rr.applicable_reviewers(["hack/eval/presubmit-cases.txt"], self.root.name), {"roster-reader"})
-        self.assertEqual(rr.applicable_reviewers(["hack/ci-eval-pr.sh"], self.root.name), ROOT_REVIEWERS)
+        self.assertEqual(rr.applicable_reviewers(["hack/boskos_heartbeat.sh"], self.root.name), ROOT_REVIEWERS)
 
     def test_an_author_self_approves_only_when_every_file_is_theirs(self):
         # Prow's `approved` is per file: a root approver's own pull request
@@ -567,7 +592,7 @@ class OwnersTest(unittest.TestCase):
         write_tree(self.root.name, {"hack/eval/OWNERS": "approvers:\n- sub\n"})
         self.assertEqual(self.approvers("hack/eval/nightly-cases.txt"), {"sub"})
         self.assertEqual(self.approvers("hack/eval/presubmit-cases.txt"), {"sub", "jayantid", "lapis2002"})
-        self.assertEqual(self.approvers("hack/ci-eval-pr.sh"), ROOT_APPROVERS)
+        self.assertEqual(self.approvers("hack/boskos_heartbeat.sh"), ROOT_APPROVERS)
 
     def test_top_level_approvers_beside_filters_are_ignored_as_prow_does(self):
         # Prow reads a file with `filters:` as a filtered file and drops a
@@ -577,7 +602,7 @@ class OwnersTest(unittest.TestCase):
             {"hack/OWNERS": "approvers:\n- stray\n" + OWNERS_TREE["hack/OWNERS"]},
         )
         self.assertEqual(self.approvers("hack/eval/presubmit-cases.txt"), {"jayantid", "lapis2002"})
-        self.assertEqual(self.approvers("hack/ci-eval-pr.sh"), ROOT_APPROVERS)
+        self.assertEqual(self.approvers("hack/boskos_heartbeat.sh"), ROOT_APPROVERS)
 
     def test_no_changed_files_means_no_approvers(self):
         self.assertEqual(self.approvers(), set())
@@ -595,6 +620,11 @@ class OwnersTest(unittest.TestCase):
         root_approvers = rr.applicable_approvers(["README.md"], REPO_ROOT)
         self.assertTrue(set(OWNERS) <= root_approvers, root_approvers)
         self.assertEqual(rr.applicable_approvers(["hack/eval/presubmit-cases.txt"], REPO_ROOT), set(EVAL_CREW))
+        # The script that pins a pull request's grader, and every file that
+        # runs inside it: eval-crew alone.
+        for path in GRADER_PIN_FILES:
+            self.assertEqual(rr.applicable_approvers([path], REPO_ROOT), set(EVAL_CREW), path)
+        self.assertEqual(rr.applicable_approvers(["scripts/installer/install.sh"], REPO_ROOT), root_approvers)
         self.assertNotIn(NON_APPROVER, root_approvers)
         # OWNERS repeats every root approver under `reviewers`: Prow's reviewer
         # walk falls through hack/OWNERS (no_parent_owners, no reviewers of its

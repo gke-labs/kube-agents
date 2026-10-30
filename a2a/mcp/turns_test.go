@@ -141,6 +141,13 @@ type gatewayScenario struct {
 	bigChild bool      // with delegate: the child's events total more than readMaxBytes, and no wake task comes
 	decoys   bool      // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
 	frames   *frameLog // when set, every frame the gateway reads is recorded
+	// after, when set, runs once the turn's tasks are published, on its
+	// own goroutine, with the gateway's connection: a card's posts come
+	// from there (publishNotify).
+	after func(nc *nats.Conn, token string, turn int32)
+	// root, when set, names the turn's task and says whether it finishes:
+	// a turn given an earlier turn's task is the gateway steering it.
+	root func(turn int32) (id string, finish bool)
 	// lateStart delays the root's first event after its submission, as an
 	// executor's cold start does.
 	lateStart time.Duration
@@ -217,7 +224,10 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 		if sc.lateNotice == 0 {
 			notice("Working on it…")
 		}
-		root := fmt.Sprintf("task-root%d", i)
+		root, finish := fmt.Sprintf("task-root%d", i), sc.finish
+		if sc.root != nil {
+			root, finish = sc.root(i)
+		}
 		text := f.Text
 		if rest, ok := strings.CutPrefix(text, "delegate "); ok {
 			text = rest
@@ -261,7 +271,10 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			if !pause(t, sc.lateStart) {
 				return
 			}
-			publishRun(t, js, fakeAddressee, root, answerText, sc.finish)
+			publishRun(t, js, fakeAddressee, root, answerText, finish)
+		}
+		if sc.after != nil {
+			go sc.after(nc, token, i)
 		}
 	})
 	if err != nil {
@@ -283,8 +296,8 @@ func turnServer(t *testing.T, sc gatewayScenario) (*Server, jetstream.JetStream,
 	url, js := testBus(t)
 	n := runFakeGateway(t, url, js, sc)
 	b := dial(t, url)
-	convs := NewConversations()
-	return mustServer(t, SendMessageTool(b, convs), TaskControlTool(b, convs)), js, n, b
+	convs := NewConversations().WithEvents(b.Events())
+	return mustServer(t, SendMessageTool(b, convs), TaskControlTool(b, convs), PollEventsTool(b.Events(), convs)), js, n, b
 }
 
 func mustContain(t *testing.T, text string, want ...string) {

@@ -395,10 +395,20 @@ func TestStopAnswersEveryAcceptedRequest(t *testing.T) {
 	n.handle(&nats.Msg{Subject: lib.NotifySubjectGchat, Reply: lib.NotifyReplyPrefix + "late", Data: body})
 }
 
+// routeArmWait bounds how long TestRunServesUntilItsContextEnds probes for
+// the route Run binds, in 250 ms requests; routeStopWait is how long Run
+// then has to return once its context ends. The test's context outlives
+// both, since Run stops serving the moment it ends and a probe after that
+// can only fail.
+const (
+	routeArmWait  = 30 * time.Second
+	routeStopWait = 5 * time.Second
+)
+
 // Run binds and serves, and returns when its context ends.
 func TestRunServesUntilItsContextEnds(t *testing.T) {
 	s := startServer(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), routeArmWait+2*routeStopWait)
 	defer cancel()
 	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("notify-gateway"))
 	if err != nil {
@@ -419,8 +429,10 @@ func TestRunServesUntilItsContextEnds(t *testing.T) {
 	}
 	defer agent.Close()
 	body, _ := json.Marshal(lib.NotifyRequest{Text: "x"})
+	// Run binds its route on its own goroutine; under the race detector on
+	// a loaded runner that took longer than the 5 s twenty probes gave it.
 	var answered bool
-	for i := 0; i < 20 && !answered; i++ {
+	for deadline := time.Now().Add(routeArmWait); !answered && time.Now().Before(deadline); {
 		in, _ := agent.SubscribeSync(lib.NotifyReplyPrefix + "run")
 		_ = agent.PublishRequest(lib.NotifySubjectGchat, lib.NotifyReplyPrefix+"run", body)
 		if _, err := in.NextMsg(250 * time.Millisecond); err == nil {
@@ -434,7 +446,7 @@ func TestRunServesUntilItsContextEnds(t *testing.T) {
 	stopRun()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(routeStopWait):
 		t.Fatal("Run did not return after its context ended")
 	}
 }

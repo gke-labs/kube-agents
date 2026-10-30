@@ -13,6 +13,10 @@
 # are cluster singletons with fixed names, so Helm refuses the second install on
 # ownership rather than duplicating them.
 #
+# The same value installs templates/a2a-gateway-pod-admission-policy.yaml, which
+# holds the pods the A2A gateway creates to the session pod shape, and sets
+# A2A_GATEWAY_POD_POLICY=true on the operator; turning it off removes both.
+#
 # What the policies do and do not enforce is in the header of
 # templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
 # on a default install with no GitOps overlay, the content policy matches
@@ -943,6 +947,14 @@ platformAgent:
       # minStallAgeMinutes: 30
       # Replaces the default kind list; ["all"] scans every namespaced kind.
       # kinds: ["deployments", "statefulsets", "gateways.gateway.networking.k8s.io"]
+    # How long the agent keeps its working data: ended sessions in every
+    # profile's state.db (with their transcript files) and rotated log backups.
+    # Hermes prunes on its own schedule and the session-retention cron job runs
+    # it daily. Empty keeps the operator's default (90 days, Hermes' own), which
+    # is also the minimum for now. A value lowered later deletes the older
+    # history at the next daily prune. A change rolls the agent pod.
+    retention: {}
+      # sessionDays: 180
     # Unsupported switches. Nothing under here carries a compatibility promise:
     # a field may change meaning, change default, or be removed between
     # releases, and an install that sets one is expected to re-check it at every
@@ -1498,15 +1510,14 @@ platformAgent:
       enabled: false
       # Microsoft Entra ID Tenant ID for single-tenant enterprise lock-down.
       tenantId: ""
-      # Restrict bot interactions to specific Entra ID Object IDs or UPN emails.
+      # Restrict bot interactions to specific Entra ID Object IDs (from.aadObjectId) or
+      # Bot Framework user IDs (from.id). An inbound Teams activity carries no UPN or email.
       # When empty and allowAllUsers is false, interactions are rejected.
       allowedUsers: []
       # Set to true to allow any authenticated user in the tenant to interact with the bot.
       allowAllUsers: false
       # Default conversation ID / channel for asynchronous alerts and reports.
       homeChannel: ""
-      # Bot Framework Service URL (defaults to Microsoft public cloud endpoint).
-      serviceUrl: "https://smba.trafficmanager.net/teams/"
       # Render responses with Microsoft Adaptive Cards v1.5 (markdown fallback if false).
       adaptiveCards: true
 

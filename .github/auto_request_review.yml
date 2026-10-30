@@ -26,8 +26,9 @@ reviewers:
       - stalhaali
       - Fuxiao-Gao
     # Mirrors the eval-crew alias in OWNERS_ALIASES: only it can /approve a
-    # change to hack/eval/presubmit-cases.txt or hack/eval/blocking-roster.txt
-    # (#1546; hack/OWNERS). Keep the two lists identical. A mixed pull request
+    # change to hack/eval/presubmit-cases.txt, hack/eval/blocking-roster.txt
+    # (#1546) or hack/ci-eval-pr.sh and the files that run inside it (#1560;
+    # hack/OWNERS, scripts/installer/OWNERS). Keep the two lists identical. A mixed pull request
     # routes here alone, so a member who is not a root approver can clear the
     # roster half and the rest still waits on a root approver's /approve.
     eval-crew:
@@ -46,6 +47,20 @@ files:
   "hack/eval/presubmit-cases.txt":
     - eval-crew
   "hack/eval/blocking-roster.txt":
+    - eval-crew
+  "hack/ci-eval-pr.sh":
+    - eval-crew
+  "hack/ci-env.sh":
+    - eval-crew
+  "hack/fleet-kubeconfigs.sh":
+    - eval-crew
+  "hack/ci-deploy.sh":
+    - eval-crew
+  "hack/ci-revalidate.sh":
+    - eval-crew
+  "hack/fleet-fixture-state.py":
+    - eval-crew
+  "scripts/installer/gke_dns_endpoint.sh":
     - eval-crew
 
 options:

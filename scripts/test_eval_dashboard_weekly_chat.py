@@ -23,6 +23,8 @@ TOKEN = "ya29.weekly-token-value"
 ENV = {post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN}
 WEEK_END = "2026-10-25"
 TEXT = "*kube-agents weekly health · Oct 19–25*\n83% of nightly test runs passed (767 of 924) across 103 scenarios."
+PLAIN = "kube-agents weekly health · Oct 19–25\n83% of nightly test runs passed (767 of 924) across 103 scenarios."
+CARD = {"cardId": "weekly-health", "card": {"header": {"title": "kube-agents · weekly health"}, "sections": []}}
 # Monday 2026-10-26, 9:00 AM EDT.
 DUE = "2026-10-26T13:00:00Z"
 GS_STATE = "gs://bucket/evals/weekly-chat-state.json"
@@ -39,14 +41,20 @@ class FakeResponse:
 
 
 class FakeOpener:
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, refuse_cards=False):
         self.texts = []
+        self.bodies = []
         self.fail = fail
+        self.refuse_cards = refuse_cards
 
     def __call__(self, request, timeout=None):
         if self.fail:
             raise urllib.error.HTTPError(request.full_url, 500, "nope", {}, None)
-        self.texts.append(json.loads(request.data.decode("utf-8"))["text"])
+        body = json.loads(request.data.decode("utf-8"))
+        if self.refuse_cards and "cardsV2" in body:
+            raise urllib.error.HTTPError(request.full_url, 400, "bad card", {}, None)
+        self.bodies.append(body)
+        self.texts.append(body.get("text", body.get("fallbackText")))
         return FakeResponse()
 
 
@@ -172,6 +180,52 @@ class WhenNothingIsPosted(Base):
         self.assertEqual(rc, 0)
         self.assertEqual(out.getvalue().strip(), TEXT)
         self.assertEqual(self.opener.texts, [])
+        self.assertFalse(self.state.exists())
+
+
+class TheCard(Base):
+    def setUp(self):
+        super().setUp()
+        self.message.write_text(json.dumps({"week_end": WEEK_END, "text": TEXT, "card": CARD}))
+
+    def test_the_card_is_posted_with_the_text_as_its_fallback_once(self):
+        self.assertEqual(self.tick(DUE), 0)
+        self.assertEqual(self.opener.bodies, [{"fallbackText": PLAIN, "cardsV2": [CARD]}])
+        self.assertEqual(self.tick("2026-10-26T13:15:00Z"), 0)
+        self.assertEqual(len(self.opener.bodies), 1)
+
+    def test_a_refused_card_posts_the_text_instead_still_once(self):
+        opener = FakeOpener(refuse_cards=True)
+        self.assertEqual(self.tick(DUE, opener=opener), 0)
+        self.assertEqual(opener.bodies, [{"text": TEXT}])
+        self.assertIn("refused the card", self.log)
+        self.assertEqual(self.tick("2026-10-26T13:15:00Z", opener=opener), 0)
+        self.assertEqual(len(opener.bodies), 1)
+
+    def test_a_server_error_on_the_card_is_not_retried(self):
+        opener = FakeOpener(fail=True)
+        self.assertEqual(self.tick(DUE, opener=opener), 1)
+        self.assertIn("NOT retried", self.log)
+        self.assertNotIn("refused the card", self.log)
+
+    def test_muted_posts_no_card(self):
+        self.assertEqual(self.tick(DUE, env={**ENV, wc.MUTE_ENV: "true"}), 0)
+        self.assertEqual(self.opener.bodies, [])
+        self.assertFalse(self.state.exists())
+
+    def test_a_summary_without_a_card_posts_the_text(self):
+        self.message.write_text(json.dumps({"week_end": WEEK_END, "text": TEXT}))
+        self.assertEqual(self.tick(DUE), 0)
+        self.assertEqual(self.opener.bodies, [{"text": TEXT}])
+
+    def test_dry_run_prints_the_message_body_and_records_nothing(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = wc.main(["--message", str(self.message), "--state", str(self.state), "--now", DUE, "--dry-run"],
+                         environ=ENV, opener=self.opener)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue()), {"fallbackText": PLAIN, "cardsV2": [CARD]})
+        self.assertEqual(self.opener.bodies, [])
         self.assertFalse(self.state.exists())
 
 

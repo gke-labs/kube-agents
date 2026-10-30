@@ -137,8 +137,8 @@ func newReservedTestService(t *testing.T, identityMap string, tokens map[string]
 func authorizeToken(svc *Service, token string) (string, error) {
 	req := &jwt.AuthorizationRequestClaims{}
 	req.ConnectOptions.Token = token
-	_, _, user, err := svc.authorize(context.Background(), req)
-	return user, err
+	d, err := svc.authorize(context.Background(), req)
+	return d.user, err
 }
 
 // One refusal per static name, with the reason the log line carries. Asserted

@@ -195,8 +195,10 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	defer bus.Close()
-	convs := mcp.NewConversations()
-	srv, err := mcp.NewServer(toolsFor(bus, convs, s.broker)...)
+	convs := mcp.NewConversations().WithEvents(bus.Events())
+	// poll_events reads the bus's listener, which toolsFor's bus-less
+	// callers (its tests) have none of.
+	srv, err := mcp.NewServer(append(toolsFor(bus, convs, s.broker), mcp.PollEventsTool(bus.Events(), convs))...)
 	if err != nil {
 		log.Error("mcp server", "err", err)
 		return err
@@ -206,7 +208,7 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		log.Error("mcp listen", "addr", s.listen, "err", err)
 		return err
 	}
-	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log))
+	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log, mcp.WithSwarm(bus, convs)))
 }
 
 // toolsFor is the tools this pod offers: inspect_pr only when it has a

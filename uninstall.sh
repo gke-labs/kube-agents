@@ -933,9 +933,16 @@ main() {
   # misspelt switch or a malformed cap, and the destroy removes the members
   # in state whatever these say.
   export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""
+  # The serving-project switch, likewise: the generator refuses a misspelt
+  # value, and the destroy removes the two serving-project resources in state
+  # whichever way the key renders.
+  export VERTEX_MANAGE_SERVING_PROJECT=""
   # The mode, likewise: the generator refuses a value outside the CRD's enum,
   # and the destroy removes the release whichever mode it renders.
   export PLATFORM_AGENT_MODE=""
+  # The Slack home channel policy, likewise: the generator refuses a value
+  # outside the CRD's enum, and the destroy removes the release whatever it says.
+  export SLACK_HOME_CHANNEL_POLICY=""
   # The data volume size, likewise: the generator refuses a malformed size,
   # and a teardown must not stop on a typo in install.env.
   export PLATFORM_AGENT_STORAGE_SIZE=""
@@ -977,7 +984,7 @@ main() {
 
   print_step "🎉 Uninstall Complete!"
   echo -e "${C_GREEN}${C_BOLD}🏆 All kube-agents infrastructure elements have been safely removed.${C_RESET}"
-  print_info "Kept by design: the Cloud KMS key rings (GCP cannot delete them; the next install adopts them) and the Terraform state bucket gs://$(tf_state_bucket)."
+  print_info "Kept by design: the Cloud KMS key rings (GCP cannot delete them; the next install adopts them), the cluster key's grant to the GKE service agent if this install made it (other installs that use the key need it), and the Terraform state bucket gs://$(tf_state_bucket)."
   print_info "Cluster-level settings kept on pre-existing clusters: CMEK database encryption, Workload Identity pool, GKE_METADATA node pool migrations, and Calico NetworkPolicy are preserved and not reverted."
   print_info "If this project will not host kube-agents again, delete the bucket yourself: gcloud storage rm -r gs://$(tf_state_bucket)"
 }

@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the console page can.
 
-It answers `connection_status` and `read_topics`, the turn tools `send_message` and `task_control`, and `manage_session`. Further tools come in later changes.
+It answers `connection_status`, `read_topics` and `inspect_pr`, the turn tools `send_message` and `task_control`, `manage_session`, and `poll_events`, and serves the workstation bridge's swarm view. Further tools come in later changes.
 
 ## Turn it on
 
@@ -44,6 +44,23 @@ To rotate the token, write a new value into the Secret. The server reads it on e
 
 `read_topics` reads the install's standing topics and agent cards, through the same grants. `list` shows every topic provisioned on `TOPICS-STATE` and `TOPICS-JOURNAL` with its newest entry, or that it has none yet (up to 256 per stream; past that the list says so). `read` shows one topic: a state topic's latest entry, or a journal topic's newest 16 entries from the last 1024 messages of its stream, or its latest entry alone if none falls in that window. `cards` shows the agent cards on `DIRECTORY`. A topic is named by its name, `shared.<name>` or `agent.<agent>.<name>`, or its subject; a bare name that several topics share is refused as ambiguous. A name that is not dot-separated subject tokens is refused before the bus is asked, and one that names no provisioned topic is refused before any consumer is opened. A repeated call within five seconds is answered from the last read. Entries are written by agents and shown as quoted data: one line each in the list, fenced and capped at 2 KiB per summary and per data block in a read. Every caller reads every topic the console can.
 
+## The swarm view
+
+`POST /mcp/swarm` serves the workstation bridge's swarm view (gke-labs/kube-agents#3689): the bridge posts its conversation table, its subagent lineage and the board ledger it kept from the last call, and gets back the members, new board posts and view it writes into Antigravity's Swarm UI. It sits behind the same `Origin` refusal and bearer token as `/mcp`, takes JSON of at most 1 MiB (413 past it), and answers 400 to a body that isn't a swarm request or that names more than 512 conversations or more than 512 subagents.
+
+It projects only the conversations the request names. This server's own conversation names only resolve them: where the server holds a request entry's name, the conversation is the server's, since that is where the name's turns went, so the server's token is used and returned; the entry keeps the bridge's name and every other field the bridge sent. An entry whose name or token isn't valid is dropped, and `notes` says how many were. The server's other names are neither shown nor returned.
+
+It reads, bounded:
+
+- the newest 4096 messages on `TASKS`, keeping those from the last hour, in one drain within a bus read's 4 MiB budget. When the hour holds more messages than that, the oldest are the ones not read. When the messages hold more bytes than the budget, the drain, which reads oldest first, stops before the newest, so the newest tasks and states may be missing. Either way `notes` says so. A read cut short (by the budget, its deadline or its caller), or skipped because the server's bus readers are busy, is still answered with a line in `notes`, and isn't kept for the next call;
+- the agent cards, from the same cached read `connection_status` uses.
+
+A call holds at most one bus reader, and concurrent calls share a complete read: one `TASKS` read answers every call for three seconds. A read cut short (by the budget, its deadline or its caller) isn't shared, so on an install past the budget every call reads again, and the swarm view can take readers the turn tools need (tracked in #4219).
+
+It keeps only the tasks of those conversations, and the tasks delegated from them. A task submitted before the hour that took a follow-up message inside it is still shown, since it is live, but without a prompt: the follow-up isn't its submission. A task whose submission is older than the read's start (the hour, or the newest 4096 messages) isn't shown even while it runs, since the conversation it belongs to is only on its submission.
+
+It never reads the request's `deployment`: the server takes no endpoint or credential from a client, and always answers for the install it runs in (`deploymentIgnored: true`). Pending push events aren't served yet (`pendingEventsServed: false`, `pendingEvents: []`).
+
 ## Conversations
 
 Each call names its conversation with `conversation` (a name; `default` if omitted) or `conversation_token` (the token an earlier answer reported, as `<token>` or `console:<token>`). A token given where a name goes, in either form, names that conversation too, whether or not this server still holds a name for it. There is no server-wide active conversation.
@@ -62,3 +79,23 @@ Names are this server's memory only, and they're shared:
 - `session_on`, `session_off`, `help`: send `/session`, `/session off` or `help` on the conversation, exactly as `send_message` would, and return the answer. `/session` and `/session off` are the gateway's commands. `help` is a message to the agent, sent like any other: while the conversation's turn is still running it waits for it to end, as a second `send_message` does.
 
 The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear_killed` are not offered, and neither is `status` yet: sent as a message, it would wait out a running turn rather than report its progress, so it comes back once it can (read a task's progress with `task_control get` meanwhile). A call to one is answered with an error that says why.
+
+## Card reports and poll_events
+
+A turn that files a card gets the card's reports later, often minutes after the turn's own task ended: the gateway posts each one to the conversation as a `notify` frame on `chat.console.<token>.out`, naming the task whose turn filed the card. A delegation chain's terminal result is posted there too, as a `result` frame; the server doesn't keep those, since the chain's tasks hold the result and `send_message` and `task_control` read it there. A turn in progress reads one flag off its own result frame, below.
+
+The server listens to every conversation it knows: every name in its table, and every token a caller has used. A conversation no name holds keeps its listener for an hour after its last use or report; that's checked when a listener is added, so one can stay longer. A conversation whose name is deleted while nothing is kept for it stops being listened to at once, unless a turn on it is still gathering. Listeners are capped at 1024: past that the least recently active goes, one without a name first, but a named conversation's listener can go too. It's listened to again the next time it's used, and frames posted in between are lost.
+
+It keeps each conversation's `notify` frames, at most 256 of them or 1 MiB, whichever comes first, and 32 MiB across all conversations, dropping the oldest and counting what it dropped. An update to a report replaces it in place; a report's original that arrives after its update is dropped. Frames that aren't JSON are dropped, and a frame's text is cut at 16 KiB characters.
+
+What it keeps is live only. Lost:
+
+- frames posted before the server first heard of the conversation, or while its listener was evicted;
+- frames past the bounds;
+- everything, across a restart of the server.
+
+`send_message` gathers the reports. Once the turn's task, and the tasks delegated from it, have ended, it keeps collecting the reports on any of those tasks until no new one has come for 15 seconds, or the wait ends, whichever is first. Only reports heard after the turn was sent count, so a report from an earlier turn on the same task isn't taken for this one. The turn also reads the gateway's `result` frame for its own task: one without `cardsPending` means no work went to cards, and gathering stops at once; with `cardsPending`, or when no result frame arrives (an older gateway), it waits for the quiet period as above. It returns them in the order they arrived, each labelled as a card's report and shown as quoted text, and says why it stopped: the tasks were still running, so these are only the reports that had arrived; or they ended and no new report came; or they ended and the wait ran out. A card's report can take minutes, so for card work pass a longer `wait_seconds`, or read later reports with `poll_events`.
+
+`poll_events` reads a conversation's kept frames: `conversation` or `conversation_token` as for `send_message`, `since` (a cursor; 0 for everything kept), and `wait_seconds` (up to 60) to wait for a frame newer than `since`. A name must be one the server knows; an unknown name is refused rather than created. A token the server hadn't heard of is listened to from that call on. It returns the frames newer than `since` in cursor order, the new cursor, how many were dropped, and whether any dropped frame was newer than `since`. An updated report comes back under a new cursor. One cursor counts across all conversations, so a cursor stays valid when a conversation's listener goes and comes back; a `since` past the server's cursor, as after a restart, reads from 0.
+
+The swarm view's pending events come from this buffer in a later change.
