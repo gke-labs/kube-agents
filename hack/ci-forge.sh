@@ -423,8 +423,11 @@ md() { curl -sf -H 'Metadata-Flavor: Google' "http://metadata.google.internal/co
 T0=$(date +%s); mark() { echo "FORGE $1 t=$(( $(date +%s) - T0 ))s"; }
 HOST=$(md host); IMAGE=$(md image); GROUP=$(md group); PROJECT=$(md project)
 BOT=$(md bot-login); BOT_EMAIL=$(md bot-email); TOKEN_DAYS=$(md token-days)
+# The omnibus image runs rails as its `git` user (uid 998); the mounted
+# private directory is that user's and nobody else's, so rails can read the
+# tokens and nothing else on the VM can.
+GIT_UID=998
 mkdir -p /var/gitlab/config/ssl /var/gitlab/logs /var/gitlab/data /var/gitlab/private /var/gitlab/seed
-chmod 700 /var/gitlab/private
 md manifest-path > /var/gitlab/seed/path; md manifest-message > /var/gitlab/seed/message; md manifest-content > /var/gitlab/seed/content
 # First boot copies the secrets out of metadata; `up` then removes them from
 # metadata, so a reboot keeps the copies on disk.
@@ -434,6 +437,7 @@ md manifest-path > /var/gitlab/seed/path; md manifest-message > /var/gitlab/seed
 [ -s /var/gitlab/private/agent-token ] || md agent-token > /var/gitlab/private/agent-token
 [ -s /var/gitlab/private/ledger-token ] || md ledger-token > /var/gitlab/private/ledger-token
 chmod 600 "/var/gitlab/config/ssl/${HOST}.key" /var/gitlab/private/*
+chown -R "${GIT_UID}:${GIT_UID}" /var/gitlab/private; chmod 700 /var/gitlab/private
 mark script-start
 docker pull "$IMAGE" >/dev/null 2>&1 && mark image-pulled || { echo "FORGE failed pull ${IMAGE}"; exit 1; }
 if docker inspect gitlab >/dev/null 2>&1; then
