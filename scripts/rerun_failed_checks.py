@@ -31,7 +31,8 @@ every red check run of a name the base branch's rules require, so a run an
 `edited` event superseded -- cancelled by its concurrency group, with a newer
 run of the same name green beside it -- still keeps the pull request out of
 the merge queue (#4355). For a required name the script keeps every red check
-run, not the newest of an all-red name, and re-runs each one's workflow run.
+run, not the newest of an all-red name, and re-runs each one's workflow run --
+unless a check run of the name is still going, when the name is pending.
 The required names come from the base branch's rules; when GitHub refuses
 that read, every name is read the Tide way and the log says so.
 
@@ -232,8 +233,11 @@ def red_check_runs(check_runs, required=frozenset()) -> tuple:
     for name, entries in by_name.items():
         states = [check_state(entry) for entry in entries]
         failed = [entry for entry, state in zip(entries, states) if state == STATE_FAILURE]
-        if name in required and failed and STATE_PENDING not in states:
-            red[name] = sorted(failed, key=lambda entry: entry["id"])
+        if name in required and failed:
+            if STATE_PENDING in states:
+                pending += 1
+            else:
+                red[name] = sorted(failed, key=lambda entry: entry["id"])
             continue
         state = best_state(states)
         if state == STATE_PENDING:

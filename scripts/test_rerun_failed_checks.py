@@ -180,10 +180,14 @@ class StateTest(unittest.TestCase):
 
     def test_a_required_name_with_a_run_still_going_is_pending(self):
         """Re-running its red run now would join the running one's concurrency group and could cancel it."""
-        checks = [check(1, "Title", "cancelled", 10), check(2, "Title", None, 20, status="in_progress")]
-        red, pending = rfc.red_check_runs(checks, required=frozenset({"Title"}))
-        self.assertEqual({}, red)
-        self.assertEqual(1, pending)
+        for checks in (
+            [check(1, "Title", "cancelled", 10), check(2, "Title", None, 20, status="in_progress")],
+            [check(1, "Title", "cancelled", 10), check(2, "Title", "success", 20), check(3, "Title", None, 30, status="in_progress")],
+        ):
+            with self.subTest(checks=[entry["conclusion"] or entry["status"] for entry in checks]):
+                red, pending = rfc.red_check_runs(checks, required=frozenset({"Title"}))
+                self.assertEqual({}, red)
+                self.assertEqual(1, pending)
 
     def test_a_required_name_with_nothing_red_reads_the_tide_way(self):
         red, pending = rfc.red_check_runs([check(1, "Title", "success", 10), check(2, "Build", None, 20, status="queued")], required=frozenset({"Title", "Build"}))
