@@ -187,16 +187,22 @@ type relayItem struct {
 
 // settle acks the item's delivery: it was rendered, or it is not one this
 // gateway will ever render. A failed ack is tried again every requeueDelay
-// until it lands or the gateway stops: the delivery stays held, so it isn't
-// redelivered while this gateway runs (released, it would come back after
-// AckWait, and render again if the record write failed too), and a stop
-// gives it back with the rest, where the sequence guard (SessionRecord.relayed)
-// keeps a rendered one from posting twice.
+// until it lands or the gateway stops. The delivery stays held meanwhile, so
+// it isn't redelivered while its heartbeat renews it; released, it would come
+// back after AckWait every time, and render again if the record write failed
+// too. A connection gone longer than AckWait fails the heartbeat with the ack,
+// and then the server redelivers it all the same. A stop gives it back with
+// the rest, and the sequence guard (SessionRecord.relayed) keeps a rendered
+// one from posting twice when its record write landed.
 func (g *Gateway) settle(item relayItem) {
 	if item.d == nil {
 		return
 	}
 	if err := item.d.Ack(); err != nil {
+		if g.runCtx.Err() != nil {
+			g.log.Warn("relay: ack failed; left for the stop's give-back", "taskId", item.env.TaskID, "err", err)
+			return
+		}
 		g.log.Warn("relay: ack failed; trying again", "taskId", item.env.TaskID, "err", err)
 		go g.retryAck(item)
 	}
@@ -384,9 +390,11 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 		return
 	}
 
-	// An event a gateway already rendered comes again only if that gateway
-	// died between its record write and its ack; its sequence is on the
-	// record then, and it is acked without rendering twice.
+	// An event a gateway already rendered comes again only if its ack never
+	// landed: the gateway died or stopped between its record write and its
+	// ack, or a connection outage outlasted AckWait while the ack was being
+	// retried. Its sequence is on the record then, and it is acked without
+	// rendering twice.
 	// In stream order: a stop gives deliveries back in order, but redelivery
 	// can still interleave with new events, and the stream sequence is the
 	// order they were written in. Items without one (not off the durable)
