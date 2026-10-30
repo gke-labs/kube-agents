@@ -21,8 +21,10 @@ Four things are checked:
    ``is_rate_limited`` is False and the branch never runs) and yields the body's
    delay from the real parser.
 3. **The real backoff.** ``compute_error_backoff`` itself, driven with that
-   error and a display-only agent, returns the body's delay; a plain 429 keeps
-   the stock backoff and a ``Retry-After`` header still wins.
+   error and a display-only agent, returns the body's delay; a ``Retry-After``
+   header still wins and a non-rate-limit error keeps the stock backoff. (A
+   plain 429's wait belongs to the backoff-floor patch applied after this one;
+   ``verify_rate_limit_backoff_floor.py`` holds it.)
 4. **Bounds.** The cap matches the header path's 600 s, and an error without a
    delay yields ``None`` so the stock backoff still applies.
 
@@ -314,9 +316,13 @@ check(
     _wait_for(storm, is_rate_limited=True) == STORM_DELAY_SECONDS,
     f"got {_wait_for(storm, is_rate_limited=True)!r}",
 )
+# A plain 429's wait is the backoff-floor patch's to decide, applied after this
+# one; verify_rate_limit_backoff_floor.py holds it. Here: the parser invents no
+# delay for it (bounds, below), and a non-rate-limit error is left alone.
 check(
-    "a plain 429 keeps the stock jittered backoff",
-    _wait_for(sdk_error(PLAIN_429_BODY), is_rate_limited=True) < STORM_DELAY_SECONDS,
+    "a non-rate-limit error keeps the stock jittered backoff",
+    _wait_for(storm, is_rate_limited=False) < STORM_DELAY_SECONDS,
+    f"got {_wait_for(storm, is_rate_limited=False)!r}",
 )
 check(
     "a header still wins over the body",
