@@ -255,10 +255,11 @@ requests' cost), and admits by slot alone. The case is real. GKE Autopilot witho
 container's limits equal to its requests, so the proxy's limit there is its memory request. At
 the 512Mi the operator first declared, the budget would admit one request and serialise every
 brokered command; a listing phase that cannot run two at once costs more than the out-of-memory
-exposure the budget prevents. The operator now declares the request at 1Gi, above the floor, so
-that the budget engages on Autopilot without bursting as well, admitting four there; the floor
-still applies to a CR override whose `requests.memory` is smaller, and a `limits.memory` set
-alone under 1Gi is refused as crossing the default request. The operator's sizing test
+exposure the budget prevents. The operator now declares the request at 2Gi on Autopilot (and 1Gi
+on Standard, where the 2Gi limit stands), above the floor, so that the budget engages on Autopilot
+without bursting as well, admitting nine there, held to eight by the slot cap; the floor still
+applies to a CR override whose `requests.memory` is smaller, and a `limits.memory` set alone below
+the default request lowers that request to it. The operator's sizing test
 holds its own limit to the same floor (`credentialProxyMinimumAdmittedRequests`) and its request
 to it too (`TestCredentialProxyBudgetArithmeticAtTheDefaults`).
 
@@ -298,9 +299,10 @@ env list, as it does the two caps: a CR that could set it would detach the budge
 ### 2.5 The sizing test's child term
 
 `TestCredentialProxyOutputCapClearsTheLargestFleetDump` asserts
-`request + output_burst(all slots) <= limit`, with the container's 1Gi memory request as the
-resting term, upstream's statement of what the pod holds with nothing in flight. It also makes a second assertion in the broker's own terms, with the broker's fixed reserves as the
-resting term, because those are the numbers the broker subtracts and so the budget the children
+`resting + output_burst(all slots) <= limit`, with the broker's two fixed reserves as the
+resting term (the memory request no longer models it: on Autopilot it is 2Gi, equal to the limit,
+to sit on the band). It also makes a second assertion in the broker's own terms, with the same
+fixed reserves as the resting term, because those are the numbers the broker subtracts and so the budget the children
 see. A slot in use is a request holding a reservation, so the slot count and the reservation
 count are one variable, not two, and the assertion is the admission rule itself at a floor:
 the budget admits at least two requests at once, each with its output allowance, so a listing
@@ -334,7 +336,8 @@ requests at once the eight-wide burst of both listing pools coinciding waits one
 retry is added here. (Those are the 1Gi figures; at the 2Gi default the budget admits nine and
 the slot cap of eight binds.) The proxy container's requests and limits, and so the
 chart's generated footprint and quota preflight (the request has since moved to 1Gi so that
-the budget runs on Autopilot without bursting, §2.3; the footprint moved with it). No
+the budget runs on Autopilot without bursting, §2.3, and later to 2 CPU and 2Gi on Autopilot,
+where the quota preflight counts that pair; the footprint moved with it). No
 agent-visible behaviour: no eval case.
 
 The reconciler's and the stall watch's listing pools are the caller settings the change moved.

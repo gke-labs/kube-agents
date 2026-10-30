@@ -5003,7 +5003,7 @@ class CommandExecutorTest(unittest.TestCase):
         mib = credential_proxy.MEBIBYTE
         with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
             executor = self.executor(memory_limit_bytes=1024 * mib, max_output_bytes=8 * mib)
-        # GKE Autopilot without bursting: the limit is the 1Gi request, and 704 MiB fits 4.
+        # GKE Autopilot without bursting, with a CR that sets a 1Gi request: the limit is the request, and 704 MiB fits 4.
         self.assertEqual(
             {"slot_cap": 8, "budget_admits": 4, "admitted": 4, "session_cap": 2},
             self._admission_report(executor),

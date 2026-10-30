@@ -1509,19 +1509,18 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	}
 	// Pinned here as well as in the goldens: a golden regeneration blesses
 	// whatever the builder renders, so a request that drifted back down would
-	// otherwise pass every test. 500m is what lets a mint finish inside its
-	// five-second timeouts while an evicted pod's replacement warms up, and
-	// 1Gi is the memory the child memory budget needs when Autopilot without
-	// bursting makes the request the limit: above the 512Mi the CPU:memory
-	// band would admit a 500m pod at, and above the budget's 672Mi floor.
+	// otherwise pass every test. This is the Standard render: 500m lets a mint
+	// finish inside its timeouts while an evicted pod's replacement warms up,
+	// 1Gi is above the budget's 672Mi floor, and the 2 CPU limit is the load
+	// measurement's figure (#4106), which the broker bursts to.
 	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
 		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
 	}
 	if got := container.Resources.Requests.Memory().String(); got != "1Gi" {
 		t.Errorf("expected a 1Gi memory request on the proxy container, got %s", got)
 	}
-	if got := container.Resources.Limits.Cpu().String(); got != "1" {
-		t.Errorf("expected the proxy CPU limit left at 1, got %s", got)
+	if got := container.Resources.Limits.Cpu().String(); got != "2" {
+		t.Errorf("expected a 2 CPU limit on the proxy container, got %s", got)
 	}
 	env := make(map[string]corev1.EnvVar)
 	for _, item := range container.Env {
@@ -1645,20 +1644,17 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	//
 	// The children are the second assertion below, in the broker's own terms.
 	//
-	// The resting footprint is the container's own memory request rather than
-	// a measured constant: the ~250Mi the old sidecar held steady was mostly
-	// the event watcher's informer caches, which stayed in the gateway Pod
-	// when #913 moved the proxy out, and the request is upstream's statement
-	// of what this pod holds with nothing in flight.
+	// The resting footprint is the broker's two fixed reserves, the figures its
+	// own budget holds back for what the container keeps with nothing in
+	// flight (Envoy and the broker process, and the content workspace). The
+	// memory request no longer models it: it is 2Gi to sit on Autopilot's
+	// CPU:memory band at 2 CPU (#4106), the same as the limit.
 	inFlight, err := strconv.ParseInt(env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"], 10, 64)
 	if err != nil || inFlight < 1 {
 		t.Fatalf("proxy concurrency cap %q is not a positive integer", env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"])
 	}
 	burst := int64(capBytes) * credentialProxyOutputCopiesPerCommand * inFlight
-	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
-	if steadyStateBytes == 0 {
-		t.Fatal("the proxy container declares no memory request, so the burst below has no resting footprint to add to")
-	}
+	steadyStateBytes := credentialProxyResidentReserveBytes + credentialProxyWorkspaceReserveBytes
 	limit := proxy.Resources.Limits.Memory().Value()
 	if burst+steadyStateBytes > limit {
 		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS), which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit, or lower one of the two caps",

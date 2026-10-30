@@ -2047,8 +2047,8 @@ these have passed.
 The credential proxy's footprint entry with platformAgent.deployment.credentialProxy.resources
 merged over it, per key, as resolveCredentialProxyResources does in the operator
 (k8s-operator/internal/controller/credential_proxy_manifests.go): a key the override
-carries replaces that number, a key it omits keeps footprint.yaml's -- with one exception
-that follows the API server rather than the operator. The operator renders a CPU and a
+carries replaces that number, a key it omits keeps footprint.yaml's -- with the exceptions below. The first
+follows the API server rather than the operator. The operator renders a CPU and a
 memory request explicitly, so an override that raises only the limit leaves the request where
 the operator put it. It renders no ephemeral-storage request at all: the 8Gi request in
 footprint.yaml is the API server defaulting an absent request to the limit
@@ -2057,8 +2057,12 @@ override's limit, so `limits: {ephemeral-storage: 10Gi}` alone is a 10Gi request
 it at 8Gi would pass a quota the pod is then refused on. kube-agents.workloadResources
 applies the request-follows-limit rule to every key, which is right for a chart workload
 whose requests the values own and wrong for the two the operator renders, so it is not
-reused here. Takes (dict "workload" <footprint entry> "override" <resources block>) and
-returns the entry's six numbers and pod count as JSON.
+reused here. Like the operator, a cpu or memory limit set alone below the request lowers
+the request to the limit. When "autopilot" is set, the requests start from the operator's
+Autopilot requests instead of footprint.yaml's, and a CPU request the override does not set
+is held to at most one CPU per GiB of the memory request. Takes (dict "workload" <footprint entry>
+"override" <resources block> "autopilot" <"true" or "">) and returns the entry's six numbers
+and pod count as JSON.
 */}}
 {{- define "kube-agents.credentialProxyFootprint" -}}
 {{- include "kube-agents.credentialProxyResourcesCheck" .override -}}
@@ -2141,6 +2145,13 @@ returns the entry's six numbers and pod count as JSON.
 {{- $cpuReq := $workload.cpuMillisRequest | default 0 | int64 -}}
 {{- $cpuLim := $workload.cpuMillisLimit | default 0 | int64 -}}
 {{- $memReq := $workload.memoryBytesRequest | default 0 | int64 -}}
+{{- /* On Autopilot the operator's default requests are the Autopilot pair, not the
+       Standard pair footprint.yaml was summed from. */ -}}
+{{- if .autopilot -}}
+{{- $autopilotRequests := (include "kube-agents.credentialProxyDefaults" . | fromJson).autopilotRequests -}}
+{{- $cpuReq = include "kube-agents.parseCpuMillis" $autopilotRequests.cpu | int64 -}}
+{{- $memReq = include "kube-agents.parseBytes" $autopilotRequests.memory | int64 -}}
+{{- end -}}
 {{- $memLim := $workload.memoryBytesLimit | default 0 | int64 -}}
 {{- $ephReq := $workload.ephemeralStorageBytesRequest | default 0 | int64 -}}
 {{- $ephLim := $workload.ephemeralStorageBytesLimit | default 0 | int64 -}}
@@ -2166,6 +2177,23 @@ returns the entry's six numbers and pod count as JSON.
 {{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "ephemeral-storage") "fallback" "") -}}
 {{- $ephReq = include "kube-agents.parseBytes" . | int64 -}}
 {{- end -}}
+{{- /* A cpu or memory limit set without its request, below the default request, takes the
+       request down with it, as resolveCredentialProxyResources does in the operator. */ -}}
+{{- if and (include "kube-agents.declaredQuantity" (dict "value" (index $lim "cpu") "fallback" "")) (not (include "kube-agents.declaredQuantity" (dict "value" (index $req "cpu") "fallback" ""))) (gt $cpuLim 0) (lt $cpuLim $cpuReq) -}}
+{{- $cpuReq = $cpuLim -}}
+{{- end -}}
+{{- if and (include "kube-agents.declaredQuantity" (dict "value" (index $lim "memory") "fallback" "")) (not (include "kube-agents.declaredQuantity" (dict "value" (index $req "memory") "fallback" ""))) (gt $memLim 0) (lt $memLim $memReq) -}}
+{{- $memReq = $memLim -}}
+{{- end -}}
+{{- /* On Autopilot a CPU request the override does not set stays at or under one CPU per
+       GiB of the memory request, the band's floor, as the operator holds it. */ -}}
+{{- if and .autopilot (not (include "kube-agents.declaredQuantity" (dict "value" (index $req "cpu") "fallback" ""))) -}}
+{{- /* floor(bytes x 1000 / 2^30), split so the product cannot overflow. */ -}}
+{{- $bandMilli := add (mul (div $memReq 1073741824) 1000) (div (mul (mod $memReq 1073741824) 1000) 1073741824) | int64 -}}
+{{- if and (gt $bandMilli 0) (gt $cpuReq $bandMilli) -}}
+{{- $cpuReq = $bandMilli -}}
+{{- end -}}
+{{- end -}}
 {{- dict
       "cpuMillisRequest" $cpuReq "cpuMillisLimit" $cpuLim
       "memoryBytesRequest" $memReq "memoryBytesLimit" $memLim
@@ -2186,12 +2214,28 @@ tests/test_credential_proxy_sizing_parity.py holds them equal, the floor to the 
 the broker's declared copies; each side's own test holds its copy to its formula. Change all
 sides together.
 The defaults carry no ephemeral-storage request because the operator renders none.
+autopilotRequests are the requests on GKE Autopilot (credentialProxyAutopilotCPURequest and
+credentialProxyAutopilotMemoryRequest), where the limits are clamped to the requests and only
+the request buys CPU; the quota preflight counts them where kube-agents.gkeAutopilot holds.
 */}}
 {{- define "kube-agents.credentialProxyDefaults" -}}
 {{- dict
       "requests" (dict "cpu" "500m" "memory" "1Gi")
-      "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "8Gi")
+      "autopilotRequests" (dict "cpu" "2" "memory" "2Gi")
+      "limits" (dict "cpu" "2" "memory" "2Gi" "ephemeral-storage" "8Gi")
    | toJson -}}
+{{- end }}
+
+{{/*
+Whether the cluster is GKE Autopilot: it serves auto.gke.io's AllowlistedWorkload, the
+resource the operator's isGKEAutopilot probes; the chart checks it at v1 and v1beta1.
+helm template without --api-versions sees no cluster and answers no, which only the
+quota preflight (a live cluster) reads anyway.
+*/}}
+{{- define "kube-agents.gkeAutopilot" -}}
+{{- if or (.Capabilities.APIVersions.Has "auto.gke.io/v1/AllowlistedWorkload") (.Capabilities.APIVersions.Has "auto.gke.io/v1beta1/AllowlistedWorkload") -}}
+true
+{{- end -}}
 {{- end }}
 
 {{- /* The agent-api-auth sidecar's defaults, the agentAPIAuth* constants in
@@ -2573,15 +2617,18 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          override at the defaults the operator then renders. An
          ephemeral-storage limit set alone is counted as a request of that size too: the
          operator renders no ephemeral-storage request and the API server defaults it to
-         the limit. The agent-api-auth sidecar has a sizing override too, but it is a
+         the limit. On GKE Autopilot the proxy's helper runs without an override too,
+         because the operator requests more there than footprint.yaml records. The
+         agent-api-auth sidecar has a sizing override too, but it is a
          container of the agent pod, so its delta is added to agentPod above rather than
          counted here. */ -}}
   {{- $proxyOverride := (((.Values.platformAgent.deployment | default dict).credentialProxy | default dict).resources) | default dict -}}
   {{- $sandboxOverride := ((((.Values.platformAgent.harness | default dict).experimental | default dict).shellSandbox | default dict).resources) | default dict -}}
+  {{- $proxyAutopilot := include "kube-agents.gkeAutopilot" . -}}
   {{- range $key, $workload := $op -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
-      {{- if and (eq $key "credentialProxy") $proxyOverride -}}
-        {{- $workload = include "kube-agents.credentialProxyFootprint" (dict "workload" $workload "override" $proxyOverride) | fromJson -}}
+      {{- if and (eq $key "credentialProxy") (or $proxyOverride $proxyAutopilot) -}}
+        {{- $workload = include "kube-agents.credentialProxyFootprint" (dict "workload" $workload "override" $proxyOverride "autopilot" $proxyAutopilot) | fromJson -}}
       {{- end -}}
       {{- if and (eq $key "shellSandbox") $sandboxOverride -}}
         {{- $workload = include "kube-agents.shellSandboxFootprint" (dict "workload" $workload "override" $sandboxOverride) | fromJson -}}

@@ -1113,7 +1113,11 @@ since the operator runs the gateway as a single replica whatever the value); the
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with
 it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
 merged over its footprint entry per key, as the operator renders it, so a raised limit is
-summed at the raised figure, and an override setting only `limits.ephemeral-storage` is counted
+summed at the raised figure; on GKE Autopilot (a cluster serving the `auto.gke.io` AllowlistedWorkload resource) it is counted at
+the operator's Autopilot requests, 2 CPU and 2Gi, with a CPU request the override does not set
+held to at most one CPU per GiB of the memory request. A cpu or memory limit set alone below the default
+request lowers the counted request to that limit, as the operator does. An override setting only
+`limits.ephemeral-storage` is counted
 as a request of that size too, because the operator renders no ephemeral-storage request and
 the API server defaults it to the limit. The shell sandbox is counted the same way with
 `platformAgent.harness.experimental.shellSandbox.resources` merged over its footprint entry, the

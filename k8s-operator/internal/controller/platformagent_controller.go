@@ -539,6 +539,15 @@ type PlatformAgentReconciler struct {
 	imageVolumeResolved bool
 	clusterImageVolumes bool
 
+	// autopilot caches whether the cluster is GKE Autopilot, which picks the
+	// credential proxy's default requests (resolveCredentialProxyResourcesFor).
+	// The cluster type cannot change under a running operator, so only an
+	// authoritative probe sets autopilotResolved; a failed one is retried, and
+	// renders the Standard requests meanwhile.
+	autopilotMu       sync.Mutex
+	autopilotResolved bool
+	autopilot         bool
+
 	// APIServerIP configures the Kubernetes API server control-plane egress CIDR
 	// for generated NetworkPolicy manifests.
 	APIServerIP string
@@ -3109,7 +3118,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, mcpIdentityOwned, profiles)
+	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, mcpIdentityOwned, profiles, r.clusterAutopilot())
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
@@ -6093,6 +6102,28 @@ func (r *PlatformAgentReconciler) imageVolumeSupported(agent *agentv1alpha1.Plat
 		r.imageVolumeResolved = true
 	}
 	return supported
+}
+
+// clusterAutopilot reports whether the cluster is GKE Autopilot, from
+// discovery (isGKEAutopilot), and reuses an authoritative answer. An answer
+// discovery could not give is false, the Standard requests, and is asked again
+// on the next reconcile: a smaller request than Autopilot wants delays the
+// broker's CPU, where a larger one than a Standard node can fit leaves it
+// Pending.
+func (r *PlatformAgentReconciler) clusterAutopilot() bool {
+	r.autopilotMu.Lock()
+	defer r.autopilotMu.Unlock()
+	if r.autopilotResolved {
+		return r.autopilot
+	}
+	autopilot, determined := isGKEAutopilot(r.DiscoveryClient)
+	if !determined {
+		logf.Log.WithName("platformagent-controller").Info("Could not determine whether cluster is GKE Autopilot due to discovery failure; rendering the credential proxy at the Standard requests until discovery answers.")
+		return false
+	}
+	r.autopilot = autopilot
+	r.autopilotResolved = true
+	return autopilot
 }
 
 type pluginFailure struct {

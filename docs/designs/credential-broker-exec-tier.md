@@ -42,7 +42,7 @@ TODAY: one pod does everything
   chat relays, workspace,  ──────────┘      │   relays, workspace, vcs/forge,   │
   vcs/forge, watchers                       │   watchers                        │
                                             └───────────────────────────────────┘
-                                              ▲ the 8 slots and 1 CPU are shared by
+                                              ▲ the 8 slots and 2 CPU are shared by
                                                 every caller, with no priority
 
 
@@ -92,9 +92,9 @@ and each caller routes to the right one.**
 
 - Slot cap: `DEFAULT_MAX_CONCURRENT_COMMANDS = 8` (`credential_proxy.py:261`). The operator pins
   it, and a CR cannot override it (`platformagent_manifests.go:82`).
-- Child memory budget: (limit − 320 MiB) / 176 MiB per request. That gives 9 at the 2 GiB default
-  and 4 on Autopilot without bursting (limit clamped to the 1 GiB request). The smaller of the
-  two numbers binds.
+- Child memory budget: (limit − 320 MiB) / 176 MiB per request. That gives 9 at the 2 GiB default,
+  on Autopilot without bursting too (limit clamped to the 2 GiB Autopilot request). The smaller of
+  the two numbers binds.
 - Session role: its own cap of 2, refused at once and not queued (`credential_proxy.py:322`).
 - Admission is one arrival-order queue with a 60 s timeout, then `503 CREDENTIAL_PROXY_BUSY`
   (`_admit`, `credential_proxy.py:6354`).
@@ -256,12 +256,12 @@ shim always takes the fallback and nothing reports it.
   per-replica series, and the `toolExecutionsTotal` usage counter, would miss it.
 
 - Resources per replica, on every cluster mode: requests 2 CPU / 2 GiB, limits 2 CPU / 2 GiB.
-  Today's broker requests 500m CPU / 1 GiB with limits 1 CPU / 2 GiB [code,
-  `credential_proxy_manifests.go:140-149`]. The 2 GiB request is the minimum from §4.2, and the
-  2-CPU limit follows step 0 (§9). The CPU request equals the limit, so the scheduler reserves
-  the 2 cores that §8.4's CPU term plans with. On Autopilot without bursting the operator already
-  sets limits equal to requests, so the same values hold there. The slot cap and the memory
-  budget stay per replica.
+  The 2 GiB request is the minimum from §4.2, and the 2-CPU limit follows step 0. The replica's
+  CPU request equals its limit, so the scheduler reserves the 2 cores that §8.4's CPU term plans
+  with. On Autopilot without bursting, Autopilot sets limits equal to requests, so the same
+  values hold there. The slot cap and the memory budget stay per replica. For comparison, before
+  step 0 the broker requested 500m CPU / 1 GiB with limits 1 CPU / 2 GiB. Step 0 (§9) raised
+  its limit to 2 CPU and, on Autopilot only, its requests to 2 CPU / 2 GiB.
 - A NetworkPolicy target for the exec tier: ingress on 8765 from the sandbox, from session pods
   only under the cluster-view flag (the condition the stateful broker has today), and the metrics
   port from GMP. The egress rules that select the broker's pod labels also need the exec tier as a
@@ -480,8 +480,7 @@ caller presents, and nothing the caller can set alone changes it.
 
 - Background work may hold at most `B = admitted − R` of a replica's admissions, where `admitted`
   is the smaller of the slot cap and what the memory budget admits. The proposal is `R = 2`:
-  6 of 8 at the 2 GiB default, and 2 of 4 on Autopilot at a 1 GiB request, without the 2 GiB
-  minimum below. The reserve is budget room as well
+  6 of 8 at the 2 GiB default, on every cluster mode. The reserve is budget room as well
   as slots, so a background child cannot take the memory an interactive request needs. This is
   like the session cap of 2 today, but it reserves capacity instead of only limiting it.
 - Interactive work may hold at most `I = admitted − 1`, so one admission is always free for
@@ -494,10 +493,10 @@ caller presents, and nothing the caller can set alone changes it.
   place, because the reserve already protects interactive work.
 - Inside a class the order stays arrival order. Interactive requests go ahead of queued background
   requests, within the cap.
-- Without a minimum, Autopilot's clamp to a 1 GiB request would make the budget admit 4, and
-  `B = 2`. When the tier is on, each exec replica requests at least 2 GiB (§3.3). On Autopilot
-  the limit then equals that request, so the budget admits 9, the slot cap holds it to 8, and
-  `B = 6` on every cluster mode.
+- On Autopilot without bursting the limit equals the request. The broker's Autopilot default
+  request is 2 GiB, so the budget admits 9 and the slot cap holds it to 8. A CR that lowers the
+  memory request to 1 GiB would make the budget admit 4, and `B = 2`. So when the tier is on,
+  each exec replica requests at least 2 GiB (§3.3), and `B = 6` on every cluster mode.
 - A background request held at `B` waits up to 60 s, as today's queue does, and is then refused
   with the bound `background` (§4.3).
 - The memory budget applies to both classes as it does today.
@@ -630,7 +629,7 @@ with an agent image that has the #3933 fix (`f8fc7905`) and the broker at 1 CPU 
 | Baseline, one pod | 2, 8, 16, 32 clusters, with a fleet audit that really runs                                                         | Where waits and refusals start, and the sweep's share                                     | 2 and 8 measured, 3 runs each (#4242); 16 and 32 not yet                                                            |
 | Mixed concurrency | 8, 10, 12, 15 interactive questions during a sweep; interactive command time under a background `gcloud` sweep     | Interactive waits and run time behind background work, today and with §4 (the nice value) | Questions measured at 8 clusters, 3 runs each, without a parallel sweep (#4242); command time under a sweep not yet |
 | Vertical control  | Broker CPU at 2 cores at 8 clusters (`bench/scale/broker-proxy-raised.yaml` on #4242); #4107 ran 4 CPU at 2 and 16 | CPU-bound or slot-bound                                                                   | Measured, 1 run (#4242)                                                                                             |
-| Autopilot         | One point at the 1 GiB clamp (budget admits 4)                                                                     | The worst default                                                                         | Not yet                                                                                                             |
+| Autopilot         | One point at the 2 CPU / 2 GiB Autopilot default (budget admits 9, slot cap 8)                                     | No burst above the requests                                                               | Not yet                                                                                                             |
 | Mode              | One baseline point in `spec.mode: today`                                                                           | Phase 1 covered `next` only                                                               | Not yet                                                                                                             |
 | Exec tier         | 1, 2 and 3 replicas at 16 and 32 clusters                                                                          | #4082 "Done when": the chosen shape at two or more sizes                                  | Not yet; needs the tier                                                                                             |
 | `kubectl` split   | The baseline points again with #4128's switch on                                                                   | The broker sized without the `kubectl` share, and the k8s-api-proxy's own load            | Not yet; needs #4128                                                                                                |
@@ -739,12 +738,13 @@ cache contract.
 ## 9. Rollout
 
 0. **Phase 0, useful at one replica:**
-   - **Raise the broker's CPU limit (#4106)** to at least 2 cores, the exec replica's limit
-     (§3.3). It is the first limit measured (§2.3), and it costs one value in the operator. On
-     Autopilot without bursting the limit equals the request, so raising the limit alone does
-     nothing there: the operator raises the broker's CPU request with its limit, and the footprint
-     and the quota preflight count that.
-     Because it is one operator value, it is the fastest single relief for current installs.
+   - **Raise the broker's CPU limit (#4106)** to 2 cores, the exec replica's limit (§3.3). It is
+     the first limit measured (§2.3). On Autopilot without bursting the limit equals the request,
+     so raising the limit alone does nothing there: the operator requests 2 CPU / 2 GiB on
+     Autopilot (it detects the cluster type), and the quota preflight counts that pair where the
+     cluster serves the `auto.gke.io` AllowlistedWorkload resource. On Standard the requests stay 500m / 1 GiB and the broker bursts
+     to the limit: a 2-CPU request has to fit on one node before the single, `Recreate` broker
+     can start, and a one-node default pool with the agent pods on it has no 2 cores free.
    - **Graceful shutdown.** Today `serve()` runs `serve_forever()` with no SIGTERM handler, and
      the Deployment sets no `terminationGracePeriodSeconds` and no `preStop`, so a pod stop drops
      the commands in flight. The broker gets a SIGTERM handler that stops admitting (new requests

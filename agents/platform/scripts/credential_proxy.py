@@ -314,8 +314,8 @@ OUTPUT_COPIES_PER_COMMAND = 6
 # is slower than the OOM exposure the budget prevents, and the case is real --
 # GKE Autopilot without bursting sets a container's limits equal to its
 # requests, so the proxy's limit there is its memory request, which a CR
-# override can set under this floor (the operator's own default is 1Gi,
-# above it, so that the budget runs there). The operator's sizing test holds
+# override can set under this floor (the operator's own default there is
+# 2Gi, above it, so that the budget runs there). The operator's sizing test holds
 # the limit and the default request to the same floor
 # (credentialProxyMinimumAdmittedRequests in credential_proxy_manifests.go).
 BUDGET_MINIMUM_ADMITTED_REQUESTS = 2

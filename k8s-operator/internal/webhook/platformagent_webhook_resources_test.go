@@ -74,8 +74,8 @@ func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedWithTheNumbers(t *testi
 	}
 }
 
-// A limit under the floor is refused once. It also sits under the default
-// 1Gi request, and is set without requests.memory; neither restates it,
+// A limit under the floor is refused once. It is also set without
+// requests.memory, which lowers the request to it; nothing restates it,
 // because raising requests.memory cannot make it valid and the
 // limit-without-request note is advice about a quantity already refused.
 func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedOnce(t *testing.T) {
@@ -93,13 +93,13 @@ func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedOnce(t *testing.T) {
 	}
 }
 
-// A crossed memory pair is refused once. 4Gi against the default 500m CPU
+// A crossed memory pair is refused once. 16Gi against the 2 CPU Autopilot
 // request is 8 GiB per vCPU, outside the Autopilot band, but the band warning
 // would restate a pair already refused.
 func TestCredentialProxyCrossedMemoryPairIsRefusedWithoutABandWarning(t *testing.T) {
 	path := field.NewPath("spec", "deployment", "credentialProxy", "resources")
 	errs, warnings := controller.ValidateCredentialProxyResources(proxyResourcesAgent(&corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("16Gi")},
 		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
 	}).Spec.Deployment, path)
 	if len(errs) != 1 || errs[0].Field != "spec.deployment.credentialProxy.resources.requests.memory" {
@@ -116,8 +116,8 @@ func TestCredentialProxyCrossedMemoryPairIsRefusedWithoutABandWarning(t *testing
 func TestCredentialProxyMemoryLimitAtTheFloorIsAdmitted(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
-		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("672Mi")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("672Mi")},
 	}))
 	if err != nil {
 		t.Fatalf("a limit exactly at the floor was refused: %v", err)
@@ -127,31 +127,27 @@ func TestCredentialProxyMemoryLimitAtTheFloorIsAdmitted(t *testing.T) {
 	}
 }
 
-// A limit at the floor set alone is under the operator's 1Gi default request,
-// which the override does not lower, so it is refused by name of that request
-// rather than rendered as a pod the API server would reject.
-func TestCredentialProxyMemoryLimitUnderTheDefaultRequestIsRefused(t *testing.T) {
+// A limit at the floor set alone is under the operator's Autopilot 2Gi default
+// request, which it lowers to the limit (resolveCredentialProxyResourcesFor),
+// so it is admitted rather than refused as a crossed pair. The CPU request
+// follows to stay in Autopilot's band, and the request equals the limit, so
+// neither warning applies.
+func TestCredentialProxyMemoryLimitUnderTheDefaultRequestLowersTheRequest(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
-	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
 	}))
-	if err == nil {
-		t.Fatal("a 672Mi limit under the 1Gi default request was admitted")
+	if err != nil {
+		t.Fatalf("a 672Mi limit set alone was refused: %v", err)
 	}
-	for _, want := range []string{
-		"spec.deployment.credentialProxy.resources.limits.memory",
-		"is below the operator's default 1Gi memory request",
-		"set requests.memory as well",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("refusal %q does not say %q", err.Error(), want)
-		}
+	if len(warnings) != 0 {
+		t.Errorf("expected no warnings, got %v", warnings)
 	}
 }
 
 // The case the field exists for (#2324): the limit raised past the 2Gi default
 // and nothing else. Admitted, with one note: GKE Autopilot without bursting sets
-// the limit equal to the 1Gi default request, so there the raise has no effect.
+// the limit equal to the 2Gi default request, so there the raise has no effect.
 func TestCredentialProxyRaisedLimitIsAdmittedWithTheLimitWithoutRequestNote(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
@@ -166,7 +162,7 @@ func TestCredentialProxyRaisedLimitIsAdmittedWithTheLimitWithoutRequestNote(t *t
 	for _, want := range []string{
 		"spec.deployment.credentialProxy.resources.limits.memory is set without requests.memory",
 		"GKE Autopilot without bursting sets a container's limits equal to its requests",
-		"runs at the 1Gi request and this limit has no effect",
+		"runs at the 2Gi request and this limit has no effect",
 		"set requests.memory to the same value, or enable bursting",
 	} {
 		if !strings.Contains(warnings[0], want) {
@@ -191,12 +187,12 @@ func TestCredentialProxyLimitWithItsRequestDrawsNoNote(t *testing.T) {
 	}
 }
 
-// 8Gi against the default 1 CPU limit is 8 GiB per vCPU, but Autopilot applies
+// 16Gi against the default 2 CPU limit is 8 GiB per vCPU, but Autopilot applies
 // the band to requests only: the limit draws the clamp note and no band text.
-func TestCredentialProxyEightGiLimitAloneDrawsTheNoteAndNoBandWarning(t *testing.T) {
+func TestCredentialProxySixteenGiLimitAloneDrawsTheNoteAndNoBandWarning(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("8Gi")},
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("16Gi")},
 	}))
 	if err != nil {
 		t.Fatalf("expected admission, got: %v", err)
@@ -214,7 +210,7 @@ func TestCredentialProxyEightGiLimitAloneDrawsTheNoteAndNoBandWarning(t *testing
 func TestCredentialProxyEachLimitWithoutItsRequestIsNoted(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
+		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 	}))
 	if err != nil {
 		t.Fatalf("expected admission, got: %v", err)
@@ -222,7 +218,7 @@ func TestCredentialProxyEachLimitWithoutItsRequestIsNoted(t *testing.T) {
 	if len(warnings) != 2 {
 		t.Fatalf("expected two notes, got %v", warnings)
 	}
-	if !strings.Contains(warnings[0], "limits.cpu is set without requests.cpu") || !strings.Contains(warnings[0], "at the 500m request") {
+	if !strings.Contains(warnings[0], "limits.cpu is set without requests.cpu") || !strings.Contains(warnings[0], "at the 2 request") {
 		t.Errorf("first note %q does not name the cpu request", warnings[0])
 	}
 	if !strings.Contains(warnings[1], "limits.memory is set without requests.memory") {
@@ -255,15 +251,19 @@ func TestCredentialProxyRequestAboveTheDefaultLimitIsRefused(t *testing.T) {
 	}
 }
 
-// The mirror image: a CPU limit lowered under the request the CR never wrote.
-func TestCredentialProxyLimitBelowTheDefaultRequestIsRefused(t *testing.T) {
+// The mirror image: a CPU limit lowered under the request the CR never wrote
+// takes that request down with it, so it is admitted. 2Gi per 200m is 10 GiB
+// per vCPU, above Autopilot's band, which warns.
+func TestCredentialProxyLimitBelowTheDefaultRequestLowersTheRequest(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
-	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
 	}))
-	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.limits.cpu")
-	if !strings.Contains(msg, "operator's default 500m cpu request") {
-		t.Errorf("message %q does not name the default request it collides with", msg)
+	if err != nil {
+		t.Fatalf("a 200m cpu limit set alone was refused: %v", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "10.00 GiB per vCPU") {
+		t.Errorf("expected one requests-pair warning at 10.00 GiB per vCPU and no clamp note, got %v", warnings)
 	}
 }
 
@@ -284,8 +284,8 @@ func TestCredentialProxyEphemeralStorageRequestAboveItsLimitIsRefused(t *testing
 func TestCredentialProxyRequestPairOutsideTheAutopilotBandWarns(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
-		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("4Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("4Gi")},
 	}))
 	if err != nil {
 		t.Fatalf("expected admission, got: %v", err)
@@ -303,13 +303,13 @@ func TestCredentialProxyRequestPairOutsideTheAutopilotBandWarns(t *testing.T) {
 	}
 }
 
-// The default 1Gi request against a 2-CPU request is 0.5 GiB per vCPU, below
+// The default 2Gi request against a 4-CPU request is 0.5 GiB per vCPU, below
 // the band's lower edge.
 func TestCredentialProxyBelowTheAutopilotBandWarns(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
-		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
 	}))
 	if err != nil {
 		t.Fatalf("expected admission, got: %v", err)
@@ -407,8 +407,8 @@ func TestCredentialProxyZeroLimitIsRefused(t *testing.T) {
 func TestCredentialProxyBandArithmeticDoesNotWrapAtPetabytes(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("9Pi")},
-		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("9Pi")},
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("9Pi")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("9Pi")},
 	}))
 	if err != nil {
 		t.Fatalf("a 9Pi pair is representable and above the floor, got: %v", err)

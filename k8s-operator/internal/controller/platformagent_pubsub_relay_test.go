@@ -157,7 +157,7 @@ func TestTheBrokerLearnsTheSubscriptionSetAndTheGatewayTheRelayURL(t *testing.T)
 		t.Fatalf("with no plugins the broker must not carry %s", platformPubsubSubscriptionsEnvVar)
 	}
 
-	deployment := buildCredentialProxyDeploymentForPlugins(agent, "hash", plugins, true, credentialProxyProfileConfig{})
+	deployment := buildCredentialProxyDeploymentForPlugins(agent, "hash", plugins, true, credentialProxyProfileConfig{}, false)
 	if _, count := envValueCount(deployment.Spec.Template.Spec.Containers[0].Env, platformPubsubSubscriptionsEnvVar); count != 1 {
 		t.Fatalf("the broker Deployment render must carry the set through to the container")
 	}

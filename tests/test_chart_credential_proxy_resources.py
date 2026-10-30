@@ -201,29 +201,29 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
             self.assertIn(f"{_VALUE_PATH}.limits.memory is {value}, under the 672Mi floor", err)
 
     def test_a_memory_limit_exactly_at_the_floor_in_millibytes_renders(self):
-        # With the request lowered to meet it: a limit alone under the 1Gi default
-        # request is the crossed pair the test below pins.
+        # With the request set beside it, so the pair is the one written.
         cr = self._render_cr([
             f"{_VALUE_PATH}.requests.memory=704643072000m",
             f"{_VALUE_PATH}.limits.memory=704643072000m",
         ])
         self.assertEqual(_cr_resources(cr)["limits"]["memory"], "704643072000m")
 
-    def test_a_memory_limit_alone_under_the_default_request_fails_naming_the_pair(self):
-        # 672Mi clears the floor but sits under the operator's 1Gi default request, which
-        # the override does not lower, so the pair is crossed and the render names it.
-        err = self._render_error([f"{_VALUE_PATH}.limits.memory=672Mi"])
-        self.assertIn(f"{_VALUE_PATH}.limits.memory (672Mi) is below the operator's default requests.memory (1Gi)", err)
-        self.assertIn("set requests.memory as well", err)
+    def test_a_memory_limit_alone_under_the_default_request_renders(self):
+        # 672Mi clears the floor and sits under the operator's 2Gi default request, which
+        # the operator lowers to the limit (resolveCredentialProxyResources), so the
+        # render passes and forwards the limit alone.
+        cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=672Mi"])
+        self.assertEqual(_cr_resources(cr)["limits"]["memory"], "672Mi")
+        self.assertNotIn("requests", _cr_resources(cr))
 
     def test_a_request_above_the_default_limit_fails_naming_the_pair(self):
         err = self._render_error([f"{_VALUE_PATH}.requests.memory=3Gi"])
         self.assertIn(f"{_VALUE_PATH}.requests.memory (3Gi) exceeds the operator's default limits.memory (2Gi)", err)
         self.assertIn("set limits.memory as well", err)
 
-    def test_a_limit_below_the_default_request_fails_naming_the_pair(self):
-        err = self._render_error([f"{_VALUE_PATH}.limits.cpu=200m"])
-        self.assertIn(f"{_VALUE_PATH}.limits.cpu (200m) is below the operator's default requests.cpu (500m)", err)
+    def test_a_cpu_limit_alone_under_the_default_request_renders(self):
+        cr = self._render_cr([f"{_VALUE_PATH}.limits.cpu=200m"])
+        self.assertEqual(_cr_resources(cr)["limits"]["cpu"], "200m")
 
     def test_a_request_above_the_limit_set_beside_it_fails(self):
         err = self._render_error([f"{_VALUE_PATH}.requests.memory=4Gi", f"{_VALUE_PATH}.limits.memory=2Gi"])
@@ -235,12 +235,11 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         # quantityExact scales in Sprig's decimal arithmetic, so a strict comparison
         # separates two 15-digit values one unit apart (the second case).
         cases = (
-            ([f"{_VALUE_PATH}.requests.cpu=1.0004"], "requests.cpu (1.0004) exceeds the operator's default limits.cpu (1)"),
+            ([f"{_VALUE_PATH}.requests.cpu=2.0004"], "requests.cpu (2.0004) exceeds the operator's default limits.cpu (2)"),
             ([f"{_VALUE_PATH}.requests.cpu=100000000000001m", f"{_VALUE_PATH}.limits.cpu=100000000000000m"],
              "requests.cpu (100000000000001m) exceeds limits.cpu (100000000000000m)"),
             ([f"{_VALUE_PATH}.requests.memory=2147483648.5"],
              "requests.memory (2147483648.5) exceeds the operator's default limits.memory (2Gi)"),
-            ([f"{_VALUE_PATH}.limits.cpu=499.5m"], "limits.cpu (499.5m) is below the operator's default requests.cpu (500m)"),
             ([f"{_VALUE_PATH}.requests.cpu=1999u", f"{_VALUE_PATH}.limits.cpu=1001u"],
              "requests.cpu (1999u) exceeds limits.cpu (1001u)"),
         )
@@ -368,7 +367,7 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         self.assertEqual(_cr_resources(cr), {"limits": {"memory": "1.Gi"}})
 
     def test_a_nano_cpu_request_renders_as_the_crd_and_operator_read_it(self):
-        # 500n is a positive quantity under the default 1-core limit: the CRD admits
+        # 500n is a positive quantity under the default 2-core limit: the CRD admits
         # it and the operator refuses nothing about it, so the render passes it on.
         cr = self._render_cr(values=_proxy_values({"requests": {"cpu": "500n"}}))
         self.assertEqual(_cr_resources(cr), {"requests": {"cpu": "500n"}})
