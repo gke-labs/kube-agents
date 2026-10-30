@@ -15,6 +15,7 @@ from typing import Any, NamedTuple
 
 import sandbox_artifact_patch
 from credential_proxy_client import authorization_headers
+from slack_relay_patch import is_silent_text
 
 
 LOGGER = logging.getLogger("google-chat-relay-patch")
@@ -588,6 +589,18 @@ def install() -> None:
         """
         # Signature parity, exactly as upstream: its REST path posts text only.
         del pconfig, media_files, force_document
+        # A silent cron tick, bare or with the marker dressed (``**[SILENT]**``),
+        # is dropped as the Slack relayed sender and the chat plugin drop it:
+        # the three senders are handed the same ``_deliver_result`` text, so
+        # one that posts what its siblings suppress puts the marker in the
+        # channel. ``is_silent_text`` is the Slack sender's predicate, shared
+        # rather than restated.
+        if is_silent_text(message):
+            LOGGER.info(
+                "google chat relay: dropped a %d-character message as a silent tick",
+                len(str(message or "")),
+            )
+            return {"success": True, "platform": PLATFORM_NAME, "skipped": "empty_text"}
         if not chat_id:
             return {"error": f"{STANDALONE_ERROR_PREFIX}: chat_id (space resource) is required"}
         body: dict[str, Any] = {"text": message}

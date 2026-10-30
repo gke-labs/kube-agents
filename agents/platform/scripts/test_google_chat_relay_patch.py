@@ -648,6 +648,35 @@ class StandaloneRelaySendTest(unittest.TestCase):
         entry = self._register()
         self.assertIs(entry.standalone_sender_fn, self.original_standalone_send)
 
+    def test_a_silent_cron_tick_is_dropped_as_its_siblings_drop_it(self):
+        from test_slack_relay_patch import _chat_adapter_modules
+
+        self.patch.install()
+        entry = self._register()
+        captured, patched = self._relay([])
+        skipped = {"success": True, "platform": "google_chat", "skipped": "empty_text"}
+        with mock.patch.dict(sys.modules, _chat_adapter_modules()):
+            with patched, self.assertLogs("google-chat-relay-patch", "INFO") as logs:
+                for silent in ("`[SILENT]`", "**[SILENT]**", "  **`[silent]`**  ", "  \n "):
+                    with self.subTest(silent=silent):
+                        self.assertEqual(skipped, self._send(entry, message=silent))
+        self.assertEqual([], captured, "a silent tick never reaches the relay")
+        self.assertIn("silent tick", logs.output[0])
+
+    def test_a_report_that_only_mentions_the_marker_still_posts(self):
+        from test_slack_relay_patch import _chat_adapter_modules
+
+        self.patch.install()
+        entry = self._register()
+        captured, patched = self._relay([{"name": "spaces/AAA/messages/abc.abc"}])
+        with mock.patch.dict(sys.modules, _chat_adapter_modules()):
+            with patched:
+                result = self._send(
+                    entry, message="Compliance Audit: 2 critical [SILENT] was not the answer"
+                )
+        self.assertTrue(result.get("success"))
+        self.assertEqual(1, len(captured))
+
     def test_the_alert_is_posted_through_the_relay(self):
         self.patch.install()
         entry = self._register()
