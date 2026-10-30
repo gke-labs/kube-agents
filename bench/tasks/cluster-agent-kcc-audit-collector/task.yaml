@@ -1,0 +1,84 @@
+# NIGHTLY — an entry in hack/eval/nightly-cases.txt.
+#
+# Domain: cluster-debugging (Cluster Agent, Config Connector). Journey: a user
+# asks for one cluster's Config Connector custom resource and synchronization
+# audit; the Platform Agent hands it to that cluster's Cluster Agent, which runs
+# the single-pass batched collector SOUL.md §3 names (`kcc_fleet_audit.py`) and
+# reports what it printed (#3142).
+#
+# What it catches. Without the collector a Cluster Agent enumerates up to 233
+# `*.cnrm.cloud.google.com` CRDs one brokered `kubectl get` RPC at a time (~12.8
+# minutes) or probes ad-hoc subsets. On main `kcc_fleet_audit.py` is not staged
+# in the sandbox image and SOUL.md does not name it, so the route check fails
+# there by construction. The checks grade the route: a Cluster Agent did the
+# work, executed `kcc_fleet_audit.py` (`required_runs` grades execution through
+# the verifier's argv/wrapper reader so reading the file or passing `--help`
+# does not count) alongside a command naming the staged path or
+# `cd /opt/data/scripts` outside `#` comments (`required_patterns`; until #3967
+# lands single-reader `WorkerRun.script_path` after #3348, the pair guarantees
+# the staged path was named outside comments and some `kcc_fleet_audit.py`
+# executed), and no later turn's result shows the script missing. The report
+# check requires Config Connector / `cnrm.cloud.google.com` and the installation
+# or synchronization summary.
+#
+# No planted defect: on a cluster without Config Connector CRDs the collector
+# completes in one CRD-discovery RPC and reports `0` installed KCC CRDs with
+# `CLEAN_AUDIT_STOP: YES`; on a KCC-enabled cluster it batches active CRDs in
+# parallel chunks and reports synchronization status. Isolation class:
+# read-only. Eligible tier: nightly.
+id: cluster-agent-kcc-audit-collector
+name: A Cluster Agent runs the batched Config Connector collector for a KCC audit
+prompt: >-
+  Have the Cluster Agent for the seeded-a cluster audit Config Connector custom
+  resources and synchronization status on seeded-a. Report whether Config
+  Connector is installed on seeded-a and whether any managed resources are
+  unhealthy.
+expected_output: >-
+  The Platform Agent delegates the audit to seeded-a's Cluster Agent, which
+  runs /opt/data/scripts/kcc_fleet_audit.py and reports the summary it printed:
+  whether *.cnrm.cloud.google.com CRDs are installed on seeded-a, managed
+  resource counts and Ready/synchronization status if installed, and no cluster
+  changes.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: cluster-debugging
+
+owner: fkc1e100
+
+# No fixtures: the seeded fleet's standing cluster is the target, and every
+# check reads the run's transcript.
+fixtures: []
+
+verification_spec:
+  - name: a-cluster-agent-did-the-work
+    role: objective
+    mode: assert
+    check:
+      type: worker_agents
+      required_agents: ["cluster-.+"]
+  - name: the-kcc-collector-ran-from-the-staged-path
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      after_result_pattern: '[\s\S]'
+      required_runs:
+        - script: kcc_fleet_audit.py
+      required_patterns:
+        - '(?m)^(?:[^#\x27"\\\n]|\\[^\n]|(?<=[^\s<>&|;()])#|\x27[^\x27\n]*\x27|"(?:\\.|[^"\\\n])*")*(?:\x27(?:[^#\x27\n]|(?<=[^\s<>&|;()\x27"])#)*|"(?:\\.|[^#"\\\n]|(?<=[^\s<>&|;()\x27"])#)*)?(?:(?<![^ \t\n\x27"(;|&])(?<!\\[ \t(|;&\x27"])(?<![^ \t\n(;|&]\x27)(?<![^ \t\n(;|&]")(?:/opt/data/scripts/kcc_fleet_audit\.py\b|\\"/opt/data/scripts/kcc_fleet_audit\.py\\")|\bcd(?:[ \t]|\\\n)+(?:/opt/data/scripts/?|\x27/opt/data/scripts/?\x27|"/opt/data/scripts/?"|\\"/opt/data/scripts/?\\")(?=(?:[ \t]|\\\n)*(?:&&|;|\n|$)|(?:[ \t]|\\\n)+#))'
+      forbidden_result_patterns:
+        - 'kcc_fleet_audit\.py[''"]?: (?:[Nn]o such file or directory|(?:command )?not found|[Pp]ermission denied)'
+        - "can't open file '[^']*kcc_fleet_audit\\.py'"
+  - name: report-carries-the-kcc-summary
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_patterns:
+        - '(?i)\bconfig[ -]?connector\b|\bcnrm\.cloud\.google\.com\b'
+      any_of_patterns:
+        - '(?i)\bnot installed\b|\b0 [a-z0-9 .*`-]*crds?\b|\bno [a-z0-9 .*`-]*crds?\b|\bready\b|\bsynchroniz(?:ed|ation)\b'
+      forbidden_patterns:
+        - '(?i)\b(?:crd listing failed|could not (?:read|audit)|failed to (?:read|audit)|verdict:\s*incomplete)\b'
