@@ -1050,8 +1050,9 @@ func (n *Notifier) editKeyed(conversation, message string, m, text OutMessage) (
 // message. where names the conversation or home channel for the outcome
 // count, scope is what the log says of the message's place, and text is the
 // edit made when the layout does not land, or nil when none may be (the
-// text does not fit one message): then the message is left as it was and
-// the answer is errNotifyNoTextEdit.
+// text does not fit one message): then a refused layout leaves the message
+// as it was and the answer is errNotifyNoTextEdit, and a gone message
+// reports no edit, as a failed text edit does, so the caller posts anew.
 func (n *Notifier) editKeyedWith(edit func(OutMessage) error, where string, scope []any, m OutMessage, text *OutMessage) (bool, error) {
 	var layoutErr error
 	if m.Chat != nil {
@@ -1076,6 +1077,12 @@ func (n *Notifier) editKeyedWith(edit func(OutMessage) error, where string, scop
 		}
 	}
 	if text == nil {
+		if errors.Is(layoutErr, ErrMessageGone) {
+			// The message itself is gone: the layout was not what failed,
+			// so nothing is counted refused, and the request posts anew.
+			n.log.Warn("notify: editing the keyed message failed; posting a new one", append(scope, "err", layoutErr)...)
+			return false, nil
+		}
 		if layoutErr != nil && !errors.Is(layoutErr, ErrTextOnly) {
 			n.chatOutcome(where, layoutErr)
 		}
@@ -1120,11 +1127,11 @@ func (n *Notifier) chatOutcome(conversation string, err error) bool {
 	return false
 }
 
-// notifyUpdates remembers, per conversation, the message each update key
-// last posted: at most notifyUpdateKeysMax keys a conversation and
-// notifyUpdateConversationsMax conversations, the least recently used
-// forgotten first, so a plan edited all along outlives the questions filed
-// after it.
+// notifyUpdates remembers, per conversation or home thread (keyed
+// notifyHomeKeyPrefix+thread), the message each update key last posted: at
+// most notifyUpdateKeysMax keys an entry and notifyUpdateConversationsMax
+// entries, the least recently used forgotten first, so a plan edited all
+// along outlives the questions filed after it.
 // Process memory, so a restart forgets every key and the next request with
 // one posts anew, as the spec allows. Only the notifier's one worker uses
 // it, so it takes no lock.

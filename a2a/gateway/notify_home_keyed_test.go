@@ -225,3 +225,22 @@ func TestNotifyUnkeyedHomeChatMessagePostsOnce(t *testing.T) {
 		t.Fatalf("replies %+v, %+v, posts %d, edits %d; want two posts", first, second, len(p.all()), len(p.edits))
 	}
 }
+
+// A keyed edit of a gone message posts anew, laid out and keyed, whether or
+// not the text fits one message: the message, not the layout, is what
+// failed.
+func TestNotifyHomeKeyedEditOfAGoneMessageWithOverflowingTextPostsAnewLaidOut(t *testing.T) {
+	n, p := newHomeKeyedNotifier(t)
+	first := serveJSON(t, n, homeKeyed("plan", "plan-c1-1", testHomeThread))
+	p.failEdits = true
+	long := strings.Repeat("report line\n", 400)
+	second := serveJSON(t, n, homeKeyed(long, "plan-c1-1", testHomeThread))
+	if second.Error != "" || second.MessageID == first.MessageID || len(p.all()) != 2 || len(p.chats) != 2 || p.chats[1] == nil {
+		t.Fatalf("replies %+v, %+v, posts %d, chats %d; want one laid-out post anew", first, second, len(p.all()), len(p.chats))
+	}
+	p.failEdits = false
+	third := serveJSON(t, n, homeKeyed("settled", "plan-c1-1", testHomeThread))
+	if third.MessageID != second.MessageID || len(p.edits) != 1 || p.edits[0].thread != second.MessageID {
+		t.Fatalf("third = %+v, edits = %+v; want the key on the second post", third, p.edits)
+	}
+}
