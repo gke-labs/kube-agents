@@ -452,3 +452,39 @@ func TestConnectFailureDoesNotStampLastConnectedAt(t *testing.T) {
 		t.Fatalf("LastConnectedAt was stamped (%v) despite tunnel failure", dep.LastConnectedAt)
 	}
 }
+
+func TestSignalDrainsTheRemoteStopsOfCancelledCalls(t *testing.T) {
+	gw := startBlockingGateway(t, ToolSendMessage)
+	srv := newStdioTestServer(t, gw)
+	inR, inW := io.Pipe()
+	t.Cleanup(func() { _ = inW.Close() })
+	// ctx stands in for signal.NotifyContext: cancelling it is the SIGINT/SIGTERM.
+	ctx, signal := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- srv.serveStdioUntilDone(ctx, inR, io.Discard) }()
+	frame, _ := json.Marshal(map[string]any{
+		"jsonrpc": jsonRPCVersion, "id": 1, "method": methodToolsCall,
+		"params": map[string]any{"name": ToolSendMessage, "arguments": map[string]any{"message": "look at prod", "conversation": "c1"}},
+	})
+	go func() { _, _ = fmt.Fprintf(inW, "%s\n", frame) }()
+	select {
+	case <-gw.started:
+	case <-time.After(stdioTestWait):
+		t.Fatal("the gateway never received the send_message")
+	}
+	signal()
+	select {
+	case <-served:
+	case <-time.After(stdioTestWait):
+		t.Fatal("the bridge did not return after the signal")
+	}
+	// Returning is the process exit: the stop must already have gone out.
+	select {
+	case stop := <-gw.stops:
+		if stop["conversation"] != "c1" {
+			t.Fatalf("the drained stop named conversation %v; want c1", stop["conversation"])
+		}
+	default:
+		t.Fatal("the bridge returned on a signal before the cancelled send_message's remote stop went out")
+	}
+}

@@ -545,9 +545,12 @@ type Server struct {
 	mu        sync.Mutex
 	connectMu sync.Mutex
 	// bgWG tracks the remote task stops issued when a streaming call is cancelled, so the
-	// stdio entry point can drain them before the process exits.
-	bgWG    sync.WaitGroup
-	session *gatewayBridgeSession
+	// stdio entry point can drain them before the process exits. handlerWG tracks ServeStdio's
+	// in-flight request handlers, which issue those stops as they return, so a signal can wait
+	// for them first.
+	bgWG      sync.WaitGroup
+	handlerWG sync.WaitGroup
+	session   *gatewayBridgeSession
 	// override is the target of the last connect_deployment that overrode its deployment's
 	// kube_context or namespace, nil when the last one did not. Such a connection is never
 	// saved, so a reconnect goes back to override rather than to the store's active deployment;
@@ -804,8 +807,10 @@ func (s *Server) ServeStdio(ctx context.Context, r io.Reader, w io.Writer) error
 			s.mu.Unlock()
 
 			wg.Add(1)
+			s.handlerWG.Add(1)
 			go func(rCtx context.Context, rCancel context.CancelFunc, key string, payload []byte) {
 				defer wg.Done()
+				defer s.handlerWG.Done()
 				defer func() {
 					rCancel()
 					s.mu.Lock()
@@ -873,13 +878,25 @@ func RunCLIWithOptions(args []string, opts ServerOptions) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	return srv.serveStdioUntilDone(ctx, os.Stdin, rpcOut)
+}
+
+// serveStdioUntilDone runs ServeStdio until stdin closes or ctx ends (SIGINT/SIGTERM), and
+// either way waits, at most remoteStopDrainTimeout in all, for the remote stops that cancelled
+// calls issue, so the turns they were waiting on do not keep running in the cluster.
+func (s *Server) serveStdioUntilDone(ctx context.Context, r io.Reader, w io.Writer) error {
 	served := make(chan error, 1)
-	go func() { served <- srv.ServeStdio(ctx, os.Stdin, rpcOut) }()
+	go func() { served <- s.ServeStdio(ctx, r, w) }()
 	select {
 	case err := <-served:
-		srv.waitBackground(remoteStopDrainTimeout)
+		s.waitBackground(remoteStopDrainTimeout)
 		return err
 	case <-ctx.Done():
+		// ServeStdio stays blocked reading stdin. The cancelled calls' handlers queue their
+		// remote stops on bgWG as they return, so wait for the handlers, then for the stops.
+		deadline := time.Now().Add(remoteStopDrainTimeout)
+		waitGroupUntil(&s.handlerWG, deadline)
+		waitGroupUntil(&s.bgWG, deadline)
 		return ctx.Err()
 	}
 }
@@ -888,14 +905,21 @@ func (s *Server) waitBackground(timeout time.Duration) {
 	if s == nil {
 		return
 	}
+	waitGroupUntil(&s.bgWG, time.Now().Add(timeout))
+}
+
+// waitGroupUntil waits for wg, or until deadline.
+func waitGroupUntil(wg *sync.WaitGroup, deadline time.Time) {
 	done := make(chan struct{})
 	go func() {
-		s.bgWG.Wait()
+		wg.Wait()
 		close(done)
 	}()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
 	case <-done:
-	case <-time.After(timeout):
+	case <-timer.C:
 	}
 }
 
