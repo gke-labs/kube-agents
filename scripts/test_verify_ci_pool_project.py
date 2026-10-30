@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 import eval_rosters
 import verify_ci_pool_project as checker
 
@@ -466,16 +468,30 @@ class GkeAndCmekTest(unittest.TestCase):
         # skill's own trigger without any of these words is an eval-crew
         # judgment at seating time, not something a grep can see.
         spellings = ("calendar-mode", "calendarmode", "calendar mode", "future window", "--duration-range", "--start-time-range")
+        # The fields a case reaches the probe through, read as YAML: a comment
+        # is gone and a `#` inside a value stays text (a seated prompt carries
+        # `## ...` headings), and whitespace is collapsed so a folded prompt
+        # that wraps between two words of a spelling still matches.
+        probe_fields = ("prompt", "goal", "input", "expected_output", "verification_spec")
+
+        def strings(node):
+            if isinstance(node, str):
+                yield node
+            elif isinstance(node, dict):
+                for value in node.values():
+                    yield from strings(value)
+            elif isinstance(node, list):
+                for value in node:
+                    yield from strings(value)
+
         for case_id in sorted(seated):
             case = checker._ROOT / "bench" / "tasks" / case_id / "task.yaml"
             self.assertTrue(case.is_file(), case_id)
-            # Comments dropped the way eval_rosters.is_stopped_ask drops them:
-            # a note about the probe reaches nothing, and the seated cases are
-            # mostly comments.
-            text = "\n".join(line.split("#", 1)[0] for line in case.read_text().splitlines()).lower()
+            doc = yaml.safe_load(case.read_text()) or {}
+            text = " ".join(" ".join(s.split()) for field in probe_fields for s in strings(doc.get(field))).lower()
             hits = [s for s in spellings if s in text]
             self.assertEqual(
-                hits, [], f"{case_id} names the calendar-mode probe outside a comment ({hits}); the finding can no longer be lease-silent"
+                hits, [], f"{case_id} names the calendar-mode probe in its prompt or checks ({hits}); the finding can no longer be lease-silent"
             )
         self.assertNotIn("obtainability-window-planning-probe", seated)
 
