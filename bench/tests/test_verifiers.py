@@ -9957,8 +9957,6 @@ def test_issue_state_missing_token_is_an_error_naming_the_variable(monkeypatch, 
 
 
 def test_issue_state_spec_must_bind_the_issue_to_the_run():
-    from pydantic import ValidationError
-
     # Nothing, labels alone and an open state alone would all pass on an issue
     # an earlier run left behind, so the model refuses them.
     for unbound in ({}, {"labels": ["status:resolved"]}, {"state": "open"}):
@@ -9999,33 +9997,43 @@ def test_issue_state_gitlab_skips_system_notes(monkeypatch, github):
     assert res.raw["comments_since_start"] == 2
 
 
-def test_issue_state_binding_rule_agrees_between_model_and_validator():
-    # Two hand-kept copies of one rule: the model's, which fires at spec load
-    # after the cluster lease, and the validator's, which fires in a second.
-    # This table is what holds them to one answer, coercions included.
-    from pydantic import ValidationError
-
+def test_issue_state_validator_refuses_nothing_the_model_accepts():
+    # Two copies of one rule: the model's fires at spec load, after the cluster
+    # lease; the validator's fires in a second. The validator may let a shape
+    # through that the model later refuses (the documented gap), never the
+    # reverse: that would block a case the harness runs.
     validator = _validator_module()
-    shapes = [
-        ({"state": "closed"}, True),
-        ({"state": "open", "min_comments": 1}, True),
-        ({"state": "open", "min_comments": "2"}, True),
-        ({"state": "open", "min_comments": 1.0}, True),
-        ({"state": "open", "min_comments": True}, True),
-        ({"labels": ["status:resolved"]}, False),
-        ({"state": "open"}, False),
-        ({"state": "open", "min_comments": 0}, False),
-        ({"state": "open", "min_comments": "0"}, False),
-        ({}, False),
-    ]
-    for shape, bound in shapes:
-        try:
-            verifiers.ForgeIssueStateVerifier(type="forge_issue_state", **shape)
-            model_bound = True
-        except ValidationError:
-            model_bound = False
+
+    def validator_accepts(shape: dict) -> bool:
         problems: list[str] = []
         validator._check_assertions({"type": "forge_issue_state", **shape}, "check", problems)
-        validator_bound = not any("binds the issue" in p for p in problems)
-        assert model_bound == bound, (shape, "model")
-        assert validator_bound == bound, (shape, "validator", problems)
+        return not any(validator.UNBOUND_ISSUE_STATE_REASON in p for p in problems)
+
+    both_accept = [
+        {"state": "closed"},
+        {"state": "open", "min_comments": 1},
+        {"state": "open", "min_comments": "2"},
+        {"state": "open", "min_comments": 1.0},
+        {"state": "open", "min_comments": True},
+    ]
+    for shape in both_accept:
+        verifiers.ForgeIssueStateVerifier(type="forge_issue_state", **shape)
+        assert validator_accepts(shape), shape
+    both_refuse = [
+        {"labels": ["status:resolved"]},
+        {"state": "open"},
+        {"state": "open", "min_comments": 0},
+        {"state": "open", "min_comments": "0"},
+        {"state": "open", "min_comments": False},
+        {},
+    ]
+    for shape in both_refuse:
+        with pytest.raises(ValidationError, match="bind the issue to this run"):
+            verifiers.ForgeIssueStateVerifier(type="forge_issue_state", **shape)
+        assert not validator_accepts(shape), shape
+    # Spellings only the harness can judge: the validator lets them through
+    # and the model's type check, not the binding rule, refuses them.
+    for shape in ({"state": "open", "min_comments": "abc"}, {"state": "open", "min_comments": "yes"}):
+        with pytest.raises(ValidationError, match="int_parsing"):
+            verifiers.ForgeIssueStateVerifier(type="forge_issue_state", **shape)
+        assert validator_accepts(shape), shape

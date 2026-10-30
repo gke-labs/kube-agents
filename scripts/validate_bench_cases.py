@@ -658,6 +658,9 @@ QUOTED_BOOLEANS = frozenset({"true", "false"})
 # The one run-reading type with a binding rule of its own, below.
 FORGE_ISSUE_STATE_TYPE = "forge_issue_state"
 ISSUE_STATE_CLOSED = "closed"
+UNBOUND_ISSUE_STATE_REASON = "nothing binds the issue it reads to this run"
+# A count written as digits, in the ASCII the harness's loader hands pydantic.
+WHOLE_NUMBER = re.compile(r"[+-]?[0-9]+")
 #: The (parent segment, field) pairs the Kubernetes and GKE APIs serve as
 #: booleans; "" is the object root. The rule fires on a pair in this table
 #: and on nothing else, so a string field that shares a name with a boolean
@@ -712,22 +715,28 @@ GREET_EVAL_STACK = "prebuilt/first-install-hello"
 GREET_EVAL_PHRASE_MIN_LENGTH = 12
 
 
-def _whole_number(value: Any) -> int | None:
-    """``value`` as the integer pydantic's lax mode reads it, or None.
+def _claims_comments(value: Any) -> bool:
+    """Whether ``min_comments`` asks for at least one comment.
 
-    A bool, an integral float and a digit string all load as an int on the
-    harness side, so the validator must count them the same way or refuse a
-    case the harness accepts.
+    Lenient on purpose: a number below one, an absent value and a digit string
+    that reads as zero are the shapes that bind nothing. Anything else, a
+    spelling the harness's YAML 1.2 loader and pydantic may still refuse
+    included, is left to the harness: this validator must never refuse a case
+    the harness accepts, and the reverse is the documented gap.
     """
+    if value is None:
+        return False
     if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
         return value
-    if isinstance(value, float):
-        return int(value) if value.is_integer() else None
-    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
-        return int(value.strip())
-    return None
+    if isinstance(value, (int, float)):
+        return value >= 1
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return False
+        if WHOLE_NUMBER.fullmatch(text):
+            return int(text) >= 1
+    return True
 
 
 def _populated(value: Any) -> bool:
@@ -1091,20 +1100,18 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
     # forge_issue_state binds the issue to the run through the close or the
     # comments posted inside it; `labels` alone, or `state: open` alone, would
     # pass on an issue an earlier run left behind. The verifier's own model
-    # applies the same rule, but only at spec load, after the cluster lease;
-    # bench/tests/test_verifiers.py holds the two copies to one answer, so the
-    # count is read the way the model reads it, as a whole number in any YAML
-    # spelling.
-    comments = _whole_number(node.get("min_comments"))
+    # applies the same rule, but only at spec load, after the cluster lease.
+    # This copy refuses only the shapes that bind nothing on any reading;
+    # bench/tests/test_verifiers.py checks it refuses nothing the model accepts.
     if (
         node_type == FORGE_ISSUE_STATE_TYPE
         and node.get("state") != ISSUE_STATE_CLOSED
-        and (comments is None or comments < 1)
+        and not _claims_comments(node.get("min_comments"))
     ):
         problems.append(
             f"{where}: check '{node_type}' sets neither state: {ISSUE_STATE_CLOSED} nor "
-            "min_comments of at least 1 (a whole number), so nothing binds the issue it "
-            "reads to this run and it would pass on an issue an earlier run left behind"
+            f"min_comments of at least 1, so {UNBOUND_ISSUE_STATE_REASON} and it would "
+            "pass on an issue an earlier run left behind"
         )
 
     # A quoted boolean against a boolean field never compares equal: the

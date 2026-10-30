@@ -315,7 +315,7 @@ is not checked, and a missing command is
 `status: "error"` when the capture has gaps, the pod withheld the workers' arguments, or the
 trajectory holds no worker terminal call).
 
-The cluster-reading types read the install under test, most of them from that file. `bootstrap_fanout` compares the
+The remaining types read the install under test, most of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
@@ -645,7 +645,9 @@ makes it cheap enough to run on every edit. Importing devops-bench to close thes
 would trade that for a second copy of a schema that already exists. Note the divergence
 when writing a case; do not add the dependency. One model rule is copied here on purpose,
 `forge_issue_state`'s binding rule, because the shape it refuses would otherwise cost a cluster
-lease to discover; a bench test holds the two copies to one answer.
+lease to discover. The copy refuses only the shapes that bind nothing on any reading, and a
+bench test checks it refuses nothing the harness accepts; a spelling the harness refuses, such
+as a YAML 1.1 `yes` for the count, still passes here.
 
 ## Changing the format
 

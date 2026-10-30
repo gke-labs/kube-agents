@@ -526,14 +526,15 @@ class TestTheValidatorItself(unittest.TestCase):
             problems = []
             validator._check_assertions(unbound, "check 'x'", problems)
             self.assertEqual(len(problems), 1, (unbound, problems))
-            self.assertIn("binds the issue", problems[0])
-        # The count is read as the harness reads it: a digit string, an
-        # integral float and a bool all load as an int there.
+            self.assertIn(validator.UNBOUND_ISSUE_STATE_REASON, problems[0])
+        # Lenient past the clear zeros: a digit string, an integral float and
+        # a spelling only the harness can judge all pass here.
         for bound in (
             {"type": "forge_issue_state", "state": "closed"},
             {"type": "forge_issue_state", "state": "open", "min_comments": 1},
             {"type": "forge_issue_state", "state": "open", "min_comments": "2"},
             {"type": "forge_issue_state", "state": "open", "min_comments": 1.0},
+            {"type": "forge_issue_state", "state": "open", "min_comments": "1e3"},
             {"type": "forge_issue_state", "state": "closed", "labels": ["status:resolved"], "min_comments": 2},
         ):
             problems = []
