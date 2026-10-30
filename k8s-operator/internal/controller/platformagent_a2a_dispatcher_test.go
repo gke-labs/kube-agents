@@ -378,7 +378,7 @@ func TestATaskDeadlinePastTheCapIsClampedAndWarned(t *testing.T) {
 		}
 	}
 	env := map[string]string{}
-	for _, e := range buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+	for _, e := range buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers[0].Env {
 		env[e.Name] = e.Value
 	}
 	if env["A2A_TASK_CREDENTIAL_MAX_LIFETIME"] != "6h0m0s" {
@@ -389,7 +389,7 @@ func TestATaskDeadlinePastTheCapIsClampedAndWarned(t *testing.T) {
 	lowered.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{Profiles: &agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(900)}}}
 	cfg, _ = desiredDispatchConfig(lowered, []agentv1alpha1.AgentProfile{short})
 	env = map[string]string{}
-	for _, e := range buildA2ACalloutDeployment(lowered).Spec.Template.Spec.Containers[0].Env {
+	for _, e := range buildA2ACalloutDeployment(lowered, "").Spec.Template.Spec.Containers[0].Env {
 		env[e.Name] = e.Value
 	}
 	lifetime, err := time.ParseDuration(env["A2A_TASK_CREDENTIAL_MAX_LIFETIME"])
