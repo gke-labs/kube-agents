@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -538,5 +539,25 @@ func TestTheCredentialLifetimeIsOneValueForMinterAndVerifiers(t *testing.T) {
 		if v != "15m0s" {
 			t.Errorf("the %s's credential lifetime = %s, want the install's 900s cap (15m0s); all three: %v", who, v, got)
 		}
+	}
+}
+
+// The dispatch config's submission retention is the stream's max age, as the
+// provision script renders it: a dispatcher keeping tombstones for less than
+// the stream keeps submissions would let a re-created durable replay
+// finished tasks.
+func TestTheDispatchConfigsRetentionIsTheSubmitStreamsMaxAge(t *testing.T) {
+	agent := a2aTestAgent()
+	cfg, err := desiredDispatchConfig(agent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`stream add PROFILE_SUBMITS[^\n]*\n[^\n]*\n\s*--max-age=(\d+)h`).FindStringSubmatch(a2aProvisionScript(agent))
+	if m == nil {
+		t.Fatal("no PROFILE_SUBMITS --max-age in the provision script")
+	}
+	hours, _ := strconv.Atoi(m[1])
+	if cfg.SubmitRetentionSeconds != hours*3600 || cfg.SubmitRetentionSeconds == 0 {
+		t.Errorf("the dispatch config's submitRetentionSeconds = %d, the stream's max age %dh", cfg.SubmitRetentionSeconds, hours)
 	}
 }

@@ -307,6 +307,12 @@ func TestOnlyTheDispatcherHoldsTheTaskSigningSeed(t *testing.T) {
 	if seedVolumes != 1 {
 		t.Errorf("the dispatcher has %d volumes of the task-signing Secret, want 1", seedVolumes)
 	}
+	// A Secret volume's files are root's. Only a group the pod runs with can
+	// read a 0400 seed, so the dispatcher's FSGroup must be a group its user
+	// is in: its own UID's, as rendered.
+	if sc := spec.SecurityContext; sc == nil || sc.FSGroup == nil || sc.RunAsUser == nil || *sc.FSGroup != *sc.RunAsUser {
+		t.Errorf("the dispatcher pod's security context %+v: without FSGroup set to its user's group, the 0400 seed is unreadable and the dispatcher can't start", sc)
+	}
 	for _, c := range append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...) {
 		for _, m := range c.VolumeMounts {
 			if m.Name != a2aTaskSigningSeedVolume {

@@ -181,6 +181,10 @@ func dispatcherIdentity(agent *agentv1alpha1.PlatformAgent, ns string, profiles,
 // RBAC. Nothing else in the install mounts or references that key
 // (TestOnlyTheDispatcherHoldsTheTaskSigningSeed).
 const (
+	// a2aDispatcherUID is the dispatcher's user, and its FSGroup, so the
+	// seed's group read reaches it.
+	a2aDispatcherUID = 1000
+
 	a2aTaskSigningSeedFileEnvVar = "A2A_TASK_SIGNING_SEED_FILE"
 	a2aTaskSigningSeedVolume     = "task-signing-seed"
 	a2aTaskSigningSeedMountPath  = "/var/run/kube-agents/task-signing"
@@ -246,8 +250,15 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 					// principal.
 					AutomountServiceAccountToken: ptr.To(true),
 					SecurityContext: &corev1.PodSecurityContext{
-						RunAsNonRoot:   ptr.To(true),
-						RunAsUser:      ptr.To(int64(1000)),
+						RunAsNonRoot: ptr.To(true),
+						RunAsUser:    ptr.To(int64(a2aDispatcherUID)),
+						// The seed is a Secret volume, whose files the kubelet
+						// writes as root. A projected token is owned by
+						// RunAsUser, a Secret's file isn't, so without a group
+						// the 0400 seed is unreadable to this UID and the
+						// dispatcher can't start. With FSGroup the kubelet makes
+						// it root:<FSGroup> and adds group read, 0440.
+						FSGroup:        ptr.To(int64(a2aDispatcherUID)),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Containers: []corev1.Container{{
@@ -459,17 +470,20 @@ func dispatcherGrantNames(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 // a2aDispatchConfig is lib.DispatchConfig as this module renders it; the
 // dispatch-config test decodes the render into lib's type.
 type a2aDispatchConfig struct {
-	Version              string               `json:"version"`
-	Namespace            string               `json:"namespace"`
-	ProfileNamespace     string               `json:"profileNamespace"`
-	Ceiling              int                  `json:"ceiling"`
-	InteractiveReserve   int                  `json:"interactiveReserve"`
-	ChildReserve         int                  `json:"childReserve"`
-	LeaseSeconds         int                  `json:"leaseSeconds"`
-	RenewSeconds         int                  `json:"renewSeconds"`
-	RestartGraceSeconds  int                  `json:"restartGraceSeconds"`
-	AcceptTimeoutSeconds int                  `json:"acceptTimeoutSeconds"`
-	Profiles             []a2aDispatchProfile `json:"profiles"`
+	Version              string `json:"version"`
+	Namespace            string `json:"namespace"`
+	ProfileNamespace     string `json:"profileNamespace"`
+	Ceiling              int    `json:"ceiling"`
+	InteractiveReserve   int    `json:"interactiveReserve"`
+	ChildReserve         int    `json:"childReserve"`
+	LeaseSeconds         int    `json:"leaseSeconds"`
+	RenewSeconds         int    `json:"renewSeconds"`
+	RestartGraceSeconds  int    `json:"restartGraceSeconds"`
+	AcceptTimeoutSeconds int    `json:"acceptTimeoutSeconds"`
+	// SubmitRetentionSeconds is lib.DispatchConfig's: PROFILE_SUBMITS'
+	// max age, from the constant the provision script renders it from.
+	SubmitRetentionSeconds int                  `json:"submitRetentionSeconds,omitempty"`
+	Profiles               []a2aDispatchProfile `json:"profiles"`
 }
 
 type a2aDispatchProfile struct {
@@ -503,16 +517,17 @@ func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 	ceiling := resolveProfileCeiling(agent)
 	child, interactive := dispatchReserves(agent, ceiling)
 	cfg := a2aDispatchConfig{
-		Namespace:            agent.Namespace,
-		ProfileNamespace:     profileNamespaceName(agent),
-		Ceiling:              ceiling,
-		InteractiveReserve:   interactive,
-		ChildReserve:         child,
-		LeaseSeconds:         resolveProfileLeaseSeconds(agent),
-		RenewSeconds:         resolveProfileRenewSeconds(agent),
-		RestartGraceSeconds:  resolveProfileRestartGraceSeconds(agent),
-		AcceptTimeoutSeconds: resolveProfileAcceptTimeoutSeconds(agent),
-		Profiles:             []a2aDispatchProfile{},
+		Namespace:              agent.Namespace,
+		ProfileNamespace:       profileNamespaceName(agent),
+		Ceiling:                ceiling,
+		InteractiveReserve:     interactive,
+		ChildReserve:           child,
+		LeaseSeconds:           resolveProfileLeaseSeconds(agent),
+		RenewSeconds:           resolveProfileRenewSeconds(agent),
+		RestartGraceSeconds:    resolveProfileRestartGraceSeconds(agent),
+		AcceptTimeoutSeconds:   resolveProfileAcceptTimeoutSeconds(agent),
+		SubmitRetentionSeconds: int(a2aProfileSubmitMaxAge / time.Second),
+		Profiles:               []a2aDispatchProfile{},
 	}
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {

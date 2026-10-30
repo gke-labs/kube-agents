@@ -271,6 +271,13 @@ type DispatchConfig struct {
 	RenewSeconds         int `json:"renewSeconds"`
 	RestartGraceSeconds  int `json:"restartGraceSeconds"`
 	AcceptTimeoutSeconds int `json:"acceptTimeoutSeconds"`
+	// SubmitRetentionSeconds is how long ProfileSubmitStream keeps a
+	// submission (the operator renders it from the same value as the
+	// stream's max age). A durable re-created over the stream replays
+	// everything inside it, so the dispatcher keeps a finished task's
+	// tombstone at least this long. Zero is from an operator that predates
+	// the field; the dispatcher then uses its own default.
+	SubmitRetentionSeconds int `json:"submitRetentionSeconds,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
 	// identity. A profile absent here has no durables to read.
 	Profiles []DispatchProfile `json:"profiles"`
@@ -314,6 +321,8 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: restart grace %ds must be at least two renewals of %ds", c.RestartGraceSeconds, c.RenewSeconds)
 	case c.AcceptTimeoutSeconds <= 0:
 		return fmt.Errorf("dispatch config: acceptTimeoutSeconds %d", c.AcceptTimeoutSeconds)
+	case c.SubmitRetentionSeconds < 0:
+		return fmt.Errorf("dispatch config: submitRetentionSeconds %d", c.SubmitRetentionSeconds)
 	}
 	seen := map[string]bool{}
 	for _, p := range c.Profiles {

@@ -121,6 +121,11 @@ const (
 	// lib.SubmitSubjectPrefix). Its consumers are the operator's alone.
 	a2aProfileSubmitStream = "PROFILE_SUBMITS"
 	a2aProfileSubmitPrefix = "a2a.submit."
+	// a2aProfileSubmitMaxAge is PROFILE_SUBMITS' max age. The dispatch
+	// config carries it too (SubmitRetentionSeconds), so the dispatcher
+	// keeps finished tasks' tombstones at least as long as a re-created
+	// durable could replay them.
+	a2aProfileSubmitMaxAge = 72 * time.Hour
 
 	// a2aDispatchStopStream holds the gateway's stop records, one per task
 	// on a2aDispatchStopPrefix<profile>.<task> (lib.DispatchStopStream and
@@ -3158,7 +3163,7 @@ $NATS kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --hi
 # profiles; nothing else makes a consumer here.
 $NATS stream info PROFILE_SUBMITS >/dev/null 2>&1 || $NATS stream add PROFILE_SUBMITS --allow-direct \
   --subjects='a2a.submit.>' --storage=file --retention=limits \
-  --max-age=72h --max-bytes=1073741824 --discard=old --replicas=1 \
+  --max-age=` + strconv.Itoa(int(a2aProfileSubmitMaxAge.Hours())) + `h --max-bytes=1073741824 --discard=old --replicas=1 \
   --max-msgs-per-subject=1 --dupe-window=2m \
   --max-consumers=` + strconv.Itoa(a2aProfileDurablesAllowed) + ` --defaults
 
