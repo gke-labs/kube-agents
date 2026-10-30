@@ -365,7 +365,8 @@ type TeamsSpec struct {
 	// +optional
 	TenantId string `json:"tenantId,omitempty"`
 
-	// AllowedUsers is a list of allowed Entra ID Object IDs or User Principal Names.
+	// AllowedUsers is a list of allowed Entra ID Object IDs (from.aadObjectId) or Bot Framework
+	// user IDs (from.id). An inbound Teams activity carries no User Principal Name or email.
 	// When empty and allowAllUsers is false (default), interactions are rejected.
 	// +listType=set
 	// +optional

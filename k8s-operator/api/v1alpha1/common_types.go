@@ -2156,7 +2156,7 @@ type NetworkPolicyStatus struct {
 
 // AgentStatus defines the observed state of an agent.
 type AgentStatus struct {
-	// Phase is the overall state (Pending, Provisioning, Ready, Failed).
+	// Phase is the overall state (Pending, Provisioning, Ready, Degraded, Failed).
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
