@@ -469,9 +469,14 @@ class GkeAndCmekTest(unittest.TestCase):
         for case_id in sorted(seated):
             case = checker._ROOT / "bench" / "tasks" / case_id / "task.yaml"
             self.assertTrue(case.is_file(), case_id)
-            text = case.read_text().lower()
+            # Comments dropped the way eval_rosters.is_stopped_ask drops them:
+            # a note about the probe reaches nothing, and the seated cases are
+            # mostly comments.
+            text = "\n".join(line.split("#", 1)[0] for line in case.read_text().splitlines()).lower()
             hits = [s for s in spellings if s in text]
-            self.assertEqual(hits, [], f"{case_id} names the calendar-mode probe ({hits}); the finding can no longer be lease-silent")
+            self.assertEqual(
+                hits, [], f"{case_id} names the calendar-mode probe outside a comment ({hits}); the finding can no longer be lease-silent"
+            )
         self.assertNotIn("obtainability-window-planning-probe", seated)
 
     def test_fleet_clusters_are_not_held_to_the_otel_scope(self):
@@ -4218,6 +4223,12 @@ class IamGrantsTest(unittest.TestCase):
         self.assertIn("gcloud iam roles describe kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 >/dev/null 2>&1 || gcloud iam roles create kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3", finding.repair)
         self.assertIn("--permissions=compute.advice.calendarMode", finding.repair)
         self.assertIn(f'; gcloud projects add-iam-policy-binding kube-agents-evals-3 --member="{member}" --role={role}', finding.repair)
+        # What the role grants and its stage are set before the binding goes
+        # live, so an undeleted or existing role that was widened or disabled
+        # is bound narrow and live: the finding never described it.
+        update = "gcloud iam roles update kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 --stage=GA --permissions=compute.advice.calendarMode"
+        self.assertIn(update, finding.repair)
+        self.assertLess(finding.repair.index(update), finding.repair.index("gcloud projects add-iam-policy-binding"))
         self.assertNotIn("&&", finding.repair)
         self.assertNotIn(checker.REPAIR_CONFIRM_PREFIX, finding.repair)
         # Pasteable as the pool-drift issue carries it: the runbook pointer is

@@ -98,6 +98,8 @@ Every registered project was provisioned before the script ran this step. Measur
     gcloud iam roles create kubeAgentsCalendarModeAdvice --project="${PROJECT_ID}" \
       --title="Calendar Mode Advice (read-only)" \
       --permissions=compute.advice.calendarMode --stage=GA
+  gcloud iam roles update kubeAgentsCalendarModeAdvice --project="${PROJECT_ID}" \
+    --stage=GA --permissions=compute.advice.calendarMode >/dev/null
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:kubeagents-platform-gsa@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="projects/${PROJECT_ID}/roles/kubeAgentsCalendarModeAdvice" --quiet >/dev/null

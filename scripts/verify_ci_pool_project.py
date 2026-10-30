@@ -263,12 +263,17 @@ REPAIR_LITELLM_GSA = "the hand repair in docs/ci-pool-projects.md section 3 (gcl
 # unbound (what turning the switch off on a Terraform-provisioned project
 # leaves for seven days): describe exits 0 on a soft-deleted role, so the
 # guard alone would skip the create and bind a dead role. On a live or absent
-# role the undelete is an error the `;` swallows.
+# role the undelete is an error the `;` swallows. The update before the
+# binding sets what the role grants and its stage whatever state it was in: the
+# finding reads only the policy, so an unbound role is never described, and an
+# undeleted or existing role keeps whatever its last update gave it. On a role
+# the create just made it changes nothing.
 REPAIR_CALENDAR_MODE_ROLE = (
     "gcloud iam roles undelete {role_id} --project={project_id} >/dev/null 2>&1; "
     "gcloud iam roles describe {role_id} --project={project_id} >/dev/null 2>&1 "
     "|| gcloud iam roles create {role_id} --project={project_id} "
     '--title="Calendar Mode Advice (read-only)" --permissions={permission} --stage=GA; '
+    "gcloud iam roles update {role_id} --project={project_id} --stage=GA --permissions={permission} >/dev/null; "
     'gcloud projects add-iam-policy-binding {project_id} --member="{member}" --role={role} '
     "# docs/ci-pool-projects.md section 3"
 )
