@@ -3,6 +3,7 @@ package mcpbridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -361,6 +362,39 @@ func TestSyncKeepsDisambiguatedNameWhenTheOtherContextFails(t *testing.T) {
 		}
 		if snap.ActiveDeployment != keyB {
 			t.Fatalf("active deployment re-targeted to %q; want %q", snap.ActiveDeployment, keyB)
+		}
+	}
+}
+
+func TestSelectDeploymentRefusesAnAmbiguousSelector(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WithUpdateLock(func(cfg *PersistentConfig) bool {
+		cfg.Deployments = map[string]DeploymentProfile{
+			"ctxA/platform": {Name: "ctxA/platform", KubeContext: "ctxA", Namespace: "ns", PlatformAgentName: "platform"},
+			"ctxB/platform": {Name: "ctxB/platform", KubeContext: "ctxB", Namespace: "ns", PlatformAgentName: "platform"},
+			"prod-east":     {Name: "prod-east", KubeContext: "ctxC", Namespace: "ns", PlatformAgentName: "pa-c", ClusterName: "c"},
+			"prod-west":     {Name: "prod-west", KubeContext: "ctxD", Namespace: "ns", PlatformAgentName: "pa-d", ClusterName: "d"},
+		}
+		cfg.ActiveDeployment = ""
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Run each lookup several times: a map-order pick would come back with a profile on some
+	// runs.
+	for i := 0; i < 20; i++ {
+		for _, sel := range []string{"platform", "prod", ""} {
+			if p, err := store.SelectDeployment(sel); !errors.Is(err, errDeploymentAmbiguous) {
+				t.Fatalf("SelectDeployment(%q) = %q, %v; want it refused as ambiguous", sel, p.Name, err)
+			}
+		}
+	}
+	for sel, want := range map[string]string{"ctxB/platform": "ctxB/platform", "ctxA": "ctxA/platform", "prod-west": "prod-west", "east": "prod-east"} {
+		if p, err := store.SelectDeployment(sel); err != nil || p.Name != want {
+			t.Errorf("SelectDeployment(%q) = %q, %v; want %q", sel, p.Name, err, want)
 		}
 	}
 }

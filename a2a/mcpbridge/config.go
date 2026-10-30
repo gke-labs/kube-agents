@@ -35,9 +35,10 @@ const (
 )
 
 var (
-	errDeploymentNotFound = errors.New("deployment profile not found")
-	errNoDeploymentsSaved = errors.New("no deployments configured or discovered")
-	errNotConnected       = errors.New("not connected to a kube-agents deployment")
+	errDeploymentNotFound  = errors.New("deployment profile not found")
+	errDeploymentAmbiguous = errors.New("more than one saved deployment matches")
+	errNoDeploymentsSaved  = errors.New("no deployments configured or discovered")
+	errNotConnected        = errors.New("not connected to a kube-agents deployment")
 )
 
 // SessionPodInfo describes a live a2a-session worker pod discovered in Kubernetes.
@@ -609,35 +610,68 @@ func (s *ConfigStore) SyncDiscoveredDeployments(discovered []DeploymentProfile) 
 	return s.UpsertDeployments(discovered)
 }
 
+// findDeploymentLocked resolves selector to one saved deployment: an exact key first, then an
+// exact field (base name, kube context, cluster, project, PlatformAgent), then a substring of
+// any of them. A tier that matches more than one deployment is an error naming them, never a
+// map-order pick; an empty selector with no active deployment resolves only when one is saved.
 func (s *ConfigStore) findDeploymentLocked(selector string) (string, DeploymentProfile, error) {
+	selector = strings.TrimSpace(selector)
 	if selector == "" {
 		selector = s.cfg.ActiveDeployment
 	}
-	if selector == "" && len(s.cfg.Deployments) == 0 {
-		return "", DeploymentProfile{}, errNoDeploymentsSaved
+	if len(s.cfg.Deployments) == 0 {
+		if selector == "" {
+			return "", DeploymentProfile{}, errNoDeploymentsSaved
+		}
+		return "", DeploymentProfile{}, fmt.Errorf("%w: %q", errDeploymentNotFound, selector)
 	}
 	if p, ok := s.cfg.Deployments[selector]; ok {
 		return selector, p, nil
 	}
-	for name, p := range s.cfg.Deployments {
-		if p.KubeContext == selector || p.ClusterName == selector || p.PlatformAgentName == selector || p.ProjectID == selector {
-			return name, p, nil
-		}
-	}
-	lowerSel := strings.ToLower(strings.TrimSpace(selector))
-	if lowerSel != "" {
-		for name, p := range s.cfg.Deployments {
-			if strings.Contains(strings.ToLower(name), lowerSel) ||
-				strings.Contains(strings.ToLower(p.KubeContext), lowerSel) ||
-				strings.Contains(strings.ToLower(p.ClusterName), lowerSel) ||
-				strings.Contains(strings.ToLower(p.ProjectID), lowerSel) ||
-				strings.Contains(strings.ToLower(p.PlatformAgentName), lowerSel) ||
-				strings.Contains(strings.ToLower(p.GitHubRepo), lowerSel) {
+	if selector == "" {
+		if len(s.cfg.Deployments) == 1 {
+			for name, p := range s.cfg.Deployments {
 				return name, p, nil
 			}
 		}
+		return "", DeploymentProfile{}, fmt.Errorf("%w: no deployment is active; name one of %s", errDeploymentAmbiguous, strings.Join(s.sortedDeploymentKeysLocked(nil), ", "))
+	}
+	eq := func(field string) bool { return field != "" && field == selector }
+	lowerSel := strings.ToLower(selector)
+	contains := func(field string) bool { return field != "" && strings.Contains(strings.ToLower(field), lowerSel) }
+	tiers := []func(name string, p DeploymentProfile) bool{
+		func(name string, p DeploymentProfile) bool {
+			return eq(deploymentBaseName(name, p)) || eq(p.KubeContext) || eq(p.ClusterName) || eq(p.PlatformAgentName) || eq(p.ProjectID)
+		},
+		func(name string, p DeploymentProfile) bool {
+			return contains(name) || contains(p.KubeContext) || contains(p.ClusterName) ||
+				contains(p.ProjectID) || contains(p.PlatformAgentName) || contains(p.GitHubRepo)
+		},
+	}
+	for _, match := range tiers {
+		matches := s.sortedDeploymentKeysLocked(match)
+		switch len(matches) {
+		case 0:
+			continue
+		case 1:
+			return matches[0], s.cfg.Deployments[matches[0]], nil
+		default:
+			return "", DeploymentProfile{}, fmt.Errorf("%w %q: %s; name one of them", errDeploymentAmbiguous, selector, strings.Join(matches, ", "))
+		}
 	}
 	return "", DeploymentProfile{}, fmt.Errorf("%w: %q", errDeploymentNotFound, selector)
+}
+
+// sortedDeploymentKeysLocked is the saved deployment keys match accepts (all with nil), sorted.
+func (s *ConfigStore) sortedDeploymentKeysLocked(match func(string, DeploymentProfile) bool) []string {
+	var keys []string
+	for name, p := range s.cfg.Deployments {
+		if match == nil || match(name, p) {
+			keys = append(keys, name)
+		}
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (s *ConfigStore) markDeploymentConnectedLocked(name string, p DeploymentProfile) DeploymentProfile {

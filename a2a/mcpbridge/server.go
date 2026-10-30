@@ -1145,6 +1145,10 @@ func (s *Server) handleConnectDeployment(ctx context.Context, rawArgs json.RawMe
 	}
 
 	prof, err := s.store.SelectDeployment(args.Deployment)
+	if errors.Is(err, errDeploymentAmbiguous) {
+		// Discovery cannot make an ambiguous name unambiguous; say which deployments it matches.
+		return "", err
+	}
 	if err != nil {
 		discovered, dErr := s.cluster.DiscoverDeployments(ctx, args.KubeContext)
 		deployments := Deployments(discovered)
