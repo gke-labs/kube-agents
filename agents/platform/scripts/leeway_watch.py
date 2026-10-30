@@ -327,13 +327,10 @@ def roster_projects() -> set[str]:
 
 
 def declared_scope(agent_home: str | os.PathLike | None = None) -> fleet_scope_targets.ScopeTargets | None:
-    """The install's declared scope as the reconcile resolved it, or None."""
-    try:
-        return fleet_scope_targets.declared_scope_targets(agent_home)
-    except fleet_scope_targets.ScopeRenderUnreadable:
-        return None
-    except Exception:
-        return None
+    """The install's declared scope as the reconcile resolved it, or None on an install
+    that declares none. An unreadable scope render is a fault that must fail the tick,
+    not an undeclared install."""
+    return fleet_scope_targets.declared_scope_targets(agent_home)
 
 
 def excluded_clusters(scope: fleet_scope_targets.ScopeTargets | None = None) -> set[str]:

@@ -863,6 +863,28 @@ class DiscoveryTests(unittest.TestCase):
             [["leeway", "report", "--topology-tier-c-signals", "--clusters", "p1/us-central1/c-ok"]],
         )
 
+    def test_unreadable_declared_scope_fails_tick_via_record_tick_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {
+                watch.WATCH_HOME_ENV: tmp,
+                watch.CLUSTERS_ENV: "",
+                watch.PROJECTS_ENV: "",
+            },
+            clear=False,
+        ), mock.patch.object(
+            watch.fleet_scope_targets,
+            "declared_scope_targets",
+            side_effect=watch.fleet_scope_targets.ScopeRenderUnreadable("unreadable json"),
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = watch.tick(now=T0)
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("failed", output)
+        self.assertIn("ScopeRenderUnreadable: unreadable json", output)
+
 
 class RosterTest(unittest.TestCase):
     def test_the_platform_roster_carries_leeway_watch_as_a_daily_no_agent_entry(self) -> None:
