@@ -1,7 +1,8 @@
 // Package kube is the Kubernetes-facing side of the kube-agents MCP bridge:
 // it discovers deployments from the local kubeconfig, reads their
-// <agent>-a2a-mcp-token Secret when connecting, and opens an in-process SPDY
-// port-forward to the <agent>-a2a-mcp HTTP listener. It implements
+// <agent>-a2a-mcp-token Secret when connecting, and carries the bridge's
+// connections to the <agent>-a2a-mcp HTTP listener as in-process SPDY
+// port-forward streams, with no local listener. It implements
 // mcpbridge.ClusterAccess so the bridge core stays free of k8s.io dependencies.
 package kube
 

@@ -255,12 +255,23 @@ func connectGatewayBridge(ctx context.Context, cluster ClusterAccess, prof Deplo
 		baseURL = pf.MCPURL()
 	}
 
+	httpClient := &http.Client{}
+	if st, ok := tun.(StreamTunnel); ok {
+		// Every connection is a stream the tunnel opens through the kube API server: no proxy,
+		// no DNS, no local socket.
+		httpClient = &http.Client{Transport: &http.Transport{
+			Proxy:               nil,
+			DialContext:         st.DialContext,
+			MaxIdleConnsPerHost: 4,
+			IdleConnTimeout:     90 * time.Second,
+		}}
+	}
 	return &gatewayBridgeSession{
 		profile:     prof,
 		tunnel:      tun,
 		baseURL:     baseURL,
 		bearerToken: bearer,
-		httpClient:  &http.Client{},
+		httpClient:  httpClient,
 	}, nil
 }
 
@@ -324,6 +335,9 @@ func (g *gatewayBridgeSession) Close() {
 	tun := g.tunnel
 	g.tunnel = nil
 	g.mu.Unlock()
+	if g.httpClient != nil {
+		g.httpClient.CloseIdleConnections()
+	}
 	if tun != nil {
 		tun.Close()
 	}

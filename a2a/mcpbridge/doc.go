@@ -14,7 +14,8 @@
 // conversation lineage tracking, and push notification wakeups) can be injected
 // via the HostIntegration interface on ServerOptions. Everything that touches
 // Kubernetes — kubeconfig discovery, reading the <agent>-a2a-mcp-token Secret,
-// and the in-process SPDY port-forward to the <agent>-a2a-mcp Service — sits
+// and the in-process port-forward to the <agent>-a2a-mcp Service, whose streams
+// carry the bridge's connections without a local listener — sits
 // behind the ClusterAccess interface and is implemented by the sibling package
 // kube (k8s.io/client-go), so this package itself has no Kubernetes dependency.
 // Linux and macOS are supported; process supervision relies on POSIX signals.

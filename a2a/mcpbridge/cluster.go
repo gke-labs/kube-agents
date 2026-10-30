@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 )
@@ -31,19 +32,28 @@ type ClusterAccess interface {
 	// from the deployment's <agent>-a2a-mcp-token Secret
 	// when connecting to that deployment.
 	PopulateDeploymentCredentials(ctx context.Context, prof *DeploymentProfile) error
-	// StartGatewayPortForward opens a supervised local port-forward to the
-	// deployment's in-cluster a2a-mcp listener.
+	// StartGatewayPortForward opens a port-forward to the deployment's
+	// in-cluster a2a-mcp listener.
 	StartGatewayPortForward(ctx context.Context, prof DeploymentProfile) (Tunnel, error)
 }
 
-// Tunnel is a supervised local port-forward to the in-cluster a2a-mcp listener.
+// Tunnel is a port-forward to the in-cluster a2a-mcp listener.
 type Tunnel interface {
-	// MCPURL returns the local http:// base URL of the forwarded listener.
+	// MCPURL returns the base URL requests through the tunnel use.
 	MCPURL() string
-	// Restart tears down and re-establishes the forward on the same local port.
+	// Restart tears down the forward so the next connection re-establishes it.
 	Restart()
-	// Close stops the forward and its supervisor.
+	// Close stops the forward.
 	Close()
+}
+
+// StreamTunnel is a Tunnel that carries each HTTP connection itself (the kube package's
+// port-forward streams through the API server) instead of through a local listener. The
+// bridge dials every request to it with DialContext, so its bearer token never crosses a local
+// port another process could hold; MCPURL's host is then only a placeholder.
+type StreamTunnel interface {
+	Tunnel
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // ErrNoClusterAccess is returned when a Kubernetes-backed operation is requested

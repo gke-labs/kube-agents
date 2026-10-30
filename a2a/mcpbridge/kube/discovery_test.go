@@ -228,6 +228,10 @@ func TestResolveServiceTargetPodPrefersReadyPod(t *testing.T) {
 				},
 			})
 		case fmt.Sprintf("/api/v1/namespaces/%s/pods", testNamespace):
+			if r.URL.Query().Get("labelSelector") != "app=a2a-mcp" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"apiVersion": "v1", "kind": "PodList", "items": []any{}})
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"apiVersion": "v1",
 				"kind":       "PodList",
@@ -285,13 +289,15 @@ current-context: %s
 	if err != nil {
 		t.Fatalf("kubernetes.NewForConfig: %v", err)
 	}
-	tun := &PortForwardTunnel{
-		namespace:  testNamespace,
-		service:    testPAName + mcpbridge.MCPServiceSuffix,
-		remotePort: mcpbridge.DefaultMCPPort,
+	podName, targetPort, err := resolveServiceTargetPod(context.Background(), clientset, testNamespace, testPAName+mcpbridge.MCPServiceSuffix, mcpbridge.DefaultMCPPort)
+	if err != nil || podName != "mcp-1-ready" || targetPort != mcpbridge.DefaultMCPPort {
+		t.Fatalf("resolveServiceTargetPod = (%q, %d, %v), want ('mcp-1-ready', %d)", podName, targetPort, err, mcpbridge.DefaultMCPPort)
 	}
-	podName, targetPort := tun.resolveServiceTargetPod(context.Background(), clientset)
-	if podName != "mcp-1-ready" || targetPort != mcpbridge.DefaultMCPPort {
-		t.Fatalf("resolveServiceTargetPod = (%q, %d), want ('mcp-1-ready', %d)", podName, targetPort, mcpbridge.DefaultMCPPort)
+
+	// With neither the Service nor any pod found, the reason is returned instead of a guessed
+	// StatefulSet-style pod name.
+	if name, _, err := resolveServiceTargetPod(context.Background(), clientset, testNamespace, "missing", mcpbridge.DefaultMCPPort); err == nil ||
+		!strings.Contains(err.Error(), "get service") {
+		t.Fatalf("resolveServiceTargetPod(missing) = %q, %v; want an error naming the failed lookups", name, err)
 	}
 }
