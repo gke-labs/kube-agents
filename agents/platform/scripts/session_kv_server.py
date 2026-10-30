@@ -2217,17 +2217,22 @@ def _slack_home_channel() -> str:
     as it did before; the files are consulted only when it is absent, which is
     the case that was broken. Under `spec.mode: next` a channel the gateway
     learned is never rendered into the pod: the operator projects it into a
-    file the kubelet refreshes in place (chat_notify.home_file_value), read
-    last, after the config files `/sethome` writes in today mode.
+    file the kubelet refreshes in place (chat_notify.home_file). A mounted file
+    decides, empty or not, so this answer is the channel the gateway posts
+    into; the config files `/sethome` writes in today mode count only where no
+    file is mounted, since the data volume keeps them across a mode switch.
     """
     env = os.environ.get("SLACK_HOME_CHANNEL", "").strip()
     if env:
         return env
+    projected, mounted = chat_notify.home_file()
+    if mounted:
+        return projected
     for path in (MANAGED_CONFIG_PATH, CONFIG_PATH):
         value = _platform_setting_in(path, "slack", "home_channel")
         if value:
             return value
-    return chat_notify.home_file_value()
+    return ""
 
 
 def enabled_chat_platforms() -> list[str]:

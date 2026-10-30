@@ -58,7 +58,10 @@ class HomeFileTest(unittest.TestCase):
             self.assertEqual(chat_notify.routed_platform(), "google_chat")
 
     def test_an_empty_or_absent_file_routes_nothing(self):
+        self.assertEqual(chat_notify.home_file(), ("", False))
         self.assertEqual(chat_notify.home_file_value(), "")
+        self._write("")
+        self.assertEqual(chat_notify.home_file(), ("", True))
         self.assertEqual(chat_notify.routed_platform(), "")
         self._write("")
         self.assertEqual(chat_notify.routed_platform(), "")

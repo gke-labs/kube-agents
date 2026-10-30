@@ -296,14 +296,8 @@ func (n *Notifier) SetHomeSource(source func() (home string, present bool)) {
 	n.homeSource = source
 }
 
-// homeChannel is the home channel as it stands, "" for none: the CR's when
-// set, else the projected file's.
-func (n *Notifier) homeChannel() string {
-	home, _ := n.homeState()
-	return home
-}
-
-// homeState is homeChannel plus where an empty answer came from, for the
+// homeState is the home channel as it stands, "" for none (the CR's when
+// set, else the projected file's), plus where an empty answer came from, for the
 // logs: "cr" (none configured and no source), "file" (the projection names
 // none) or "absent" (no projection is mounted: an operator older than it).
 func (n *Notifier) homeState() (home, source string) {

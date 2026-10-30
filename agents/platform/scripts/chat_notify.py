@@ -114,19 +114,25 @@ def alert_update_key(session_id: str) -> str:
     return ALERT_UPDATE_FORMAT.format(session=session_id) if session_id else ""
 
 
-def home_file_value() -> str:
-    """The Slack home channel the operator projected into the pod, or "" when none.
+def home_file() -> tuple[str, bool]:
+    """The projected Slack home channel, trimmed, and whether the file is mounted.
 
     Read on every call: the kubelet refreshes the file in place when the
     operator's projection changes, within about a minute, and no process
-    restarts for it. A directory or file that is absent reads as "".
+    restarts for it. A directory or file that is absent reads as ("", False):
+    today mode, or an operator older than the projection.
     """
     directory = os.environ.get(HOME_FILE_DIR_ENV, HOME_FILE_DIR)
     try:
         with open(os.path.join(directory, HOME_FILE_KEY), encoding="utf-8") as handle:
-            return handle.read().strip()
+            return handle.read().strip(), True
     except OSError:
-        return ""
+        return "", False
+
+
+def home_file_value() -> str:
+    """The Slack home channel the operator projected into the pod, or "" when none."""
+    return home_file()[0]
 
 
 def slack_home_channel() -> str:

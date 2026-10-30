@@ -2002,18 +2002,27 @@ class TestSlackHomeChannelResolution(unittest.TestCase):
         # degrades to "" rather than raising.
         self.assertEqual(session_kv_server._slack_home_channel(), "")
 
-    def test_the_projected_file_is_read_after_the_config_files(self):
-        # Under `next` the operator projects a learned channel into a file the
-        # kubelet refreshes in place; it is read last, after `/sethome`'s files.
+    def test_a_mounted_projection_outranks_the_config_files(self):
+        # Under `next` the operator projects the home channel into a file the
+        # kubelet refreshes in place, and the gateway posts into that value. A
+        # `/sethome` channel left in the data volume by today mode must not
+        # make the agent name a different channel than the gateway, so a
+        # mounted file decides, empty or not; the config files count only
+        # where no file is mounted.
         with tempfile.TemporaryDirectory() as directory:
-            with open(os.path.join(directory, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            path = os.path.join(directory, chat_notify.HOME_FILE_KEY)
+            with open(path, "w", encoding="utf-8") as handle:
                 handle.write("C0PROJECTED\n")
+            self._point("CONFIG_PATH", "platforms:\n  slack:\n    home_channel: C0FILE\n")
             with patch.dict(os.environ, {chat_notify.HOME_FILE_DIR_ENV: directory}):
                 self.assertEqual(session_kv_server._slack_home_channel(), "C0PROJECTED")
-                self._point("CONFIG_PATH", "platforms:\n  slack:\n    home_channel: C0FILE\n")
-                self.assertEqual(session_kv_server._slack_home_channel(), "C0FILE")
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("")
+                self.assertEqual(session_kv_server._slack_home_channel(), "")
                 os.environ["SLACK_HOME_CHANNEL"] = "C0ENV"
                 self.assertEqual(session_kv_server._slack_home_channel(), "C0ENV")
+            with patch.dict(os.environ, {chat_notify.HOME_FILE_DIR_ENV: os.path.join(directory, "unmounted")}):
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0FILE")
 
     def test_a_hostile_config_shape_costs_the_lookup_and_not_the_caller(self):
         self._point("CONFIG_PATH", "platforms: slack\n")
