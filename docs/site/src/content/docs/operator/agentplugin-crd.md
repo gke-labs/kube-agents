@@ -41,7 +41,7 @@ spec:
 
 ### Key Fields
 
-[AgentPlugin fields](/kube-agents/operator/agentplugin-fields/) lists every `spec` and `status` field with its type, default and constraints, generated from the Go API types. Targeting is opt-in: `agentRef` names the `PlatformAgent` the plugin reaches, and a plugin that omits it matches no agent.
+[AgentPlugin fields](/kube-agents/operator/agentplugin-fields/) lists every `spec` and `status` field with its type, default and constraints, generated from the Go API types. `agentRef` is required and names the one `PlatformAgent` the plugin reaches; a name that matches no `PlatformAgent` in the namespace leaves the plugin applied nowhere, reported as `AgentNotFound` below.
 
 ## Architecture & How It Works
 
