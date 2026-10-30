@@ -61,7 +61,8 @@ replacement. The operator writes a `maxUnavailable: 1` budget with `unhealthyPod
 AlwaysAllow`, which on one replica refuses no eviction and holds no drain; a budget that would
 protect the pod is the one the obtainability audit reports as blocking. While the pod is away the
 `PlatformAgent` reads `Provisioning` and, when its pod scan names no other fault, the `Ready` message
-names the Deployment and what waits on it.
+names the Deployment and what waits on it. The pause that remains under one pod, and what would
+shorten or remove it, is tracked in gke-labs/kube-agents#4409.
 
 ## 3. Measured: two replicas behind today's Service
 
