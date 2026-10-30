@@ -529,3 +529,57 @@ func TestABrokenPersonaStopsTheWorker(t *testing.T) {
 		t.Errorf("a worker with an empty persona dir = %v, want refused at start", err)
 	}
 }
+
+// The harness can't rewrite what the worker rendered: its user settings,
+// where hooks would run commands, and its instructions. It can still write
+// its own state in the directory.
+func TestTheHarnessCantRewriteItsRenderedConfig(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	root := t.TempDir()
+	harness := stub(t, fmt.Sprintf(`
+read first || exit 1
+c="$CLAUDE_CONFIG_DIR"
+s=ok; ( printf '{"hooks":{}}' > "$c/settings.json" ) 2>/dev/null || s=refused
+m=ok; ( printf 'x' >> "$c/CLAUDE.md" ) 2>/dev/null || m=refused
+st=ok; mkdir -p "$c/projects" 2>/dev/null && touch "$c/projects/state" 2>/dev/null || st=refused
+stat -f '%%Lp' "$c/settings.json" > %s/settings-mode 2>/dev/null || stat -c '%%a' "$c/settings.json" > %s/settings-mode
+printf '{"type":"result","subtype":"success","result":"settings=%%s md=%%s state=%%s"}\n' "$s" "$m" "$st"
+`, root, root))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := profileWorkerConfig(t, url, harness)
+	addr := freeAddr(t)
+	configRoot := t.TempDir()
+	go func() {
+		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{
+			Tier: pwTier, ReadyAddr: addr, deadlineMargin: time.Second,
+			PersonaDir: "../lib/persona/testdata/example", Harness: persona.ClaudeCode, ConfigRoot: configRoot,
+		})
+	}()
+	waitReady(t, addr)
+	const task = "task-locked"
+	d.offer(task, profileSubmission(t, task, "try it", nil), 5)
+	d.nextAccept(5 * time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
+	if _, final := drainLeases(d, task, 20*time.Second); !final {
+		t.Fatal("no final renewal")
+	}
+	mode, err := os.ReadFile(filepath.Join(root, "settings-mode"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(mode)); got != "444" {
+		t.Errorf("settings.json mode %s, want 444", got)
+	}
+	got := artifactText(foldTask(t, testClient(t, url), pwProfile, task), lib.ArtifactResult)
+	if !strings.HasSuffix(got, "state=ok") {
+		t.Errorf("the harness couldn't write its own state: %q", got)
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, which ignores file modes; the modes are checked above")
+	}
+	if got != "settings=refused md=refused state=ok" {
+		t.Errorf("the harness saw %q, want its settings and instructions refused and its state allowed", got)
+	}
+}

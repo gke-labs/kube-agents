@@ -131,3 +131,11 @@ const ProfileWorkerStatusPort = 8080
 // ProfilePersonaDir is where a profile pod mounts its persona, read-only
 // (#3662). The operator's profilepod.PersonaMountPath is the same path.
 const ProfilePersonaDir = "/persona"
+
+// EnvProfileConfigRoot is where a profile worker makes each task's harness
+// config directory: its own emptyDir, apart from the working directory.
+// ProfileConfigRoot is the path the operator mounts it at.
+const (
+	EnvProfileConfigRoot = "A2A_PROFILE_CONFIG_ROOT"
+	ProfileConfigRoot    = "/var/run/kube-agents/harness-config"
+)

@@ -18,9 +18,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -55,8 +57,8 @@ type ProfileWorkerConfig struct {
 	PersonaDir string
 	// Harness is the persona adapter to render with (persona.ClaudeCode).
 	Harness persona.Harness
-	// ConfigRoot is where each task's config directory is made (the pod's
-	// scratch).
+	// ConfigRoot is where each task's config directory is made: its own
+	// emptyDir, not the harness's working directory.
 	ConfigRoot string
 	// TaskTokenFile is where the confirm's proxy token is written for the
 	// task's lifetime (CREDENTIAL_PROXY_TASK_TOKEN_FILE, a tmpfs emptyDir),
@@ -165,18 +167,71 @@ func renderPersona(pw ProfileWorkerConfig) (*persona.Output, error) {
 	return &out, nil
 }
 
+// userSettingsFile is the harness's user settings, the only settings source
+// it reads (--setting-sources user). Settings can carry hooks, which run
+// commands, so the worker owns this file and the model never writes it.
+const userSettingsFile = "settings.json"
+
 // taskConfigDir writes the rendered persona into a fresh config directory
 // for one task and returns it, with what removes it.
+//
+// Everything the worker writes there is read-only to the harness, and an
+// empty settings.json is written read-only too. The directory itself stays
+// writable, for the harness's own session state. The Write tool isn't held
+// to the working directory, so without this a persona granting Write but no
+// shell would let the model add hooks to its own settings, or rewrite its
+// instructions, mid-task. A file write opens and truncates in place, so a
+// 0444 file can't be overwritten that way.
 func (w *profileWorker) taskConfigDir(task string) (string, func(), error) {
 	dir, err := os.MkdirTemp(w.pw.ConfigRoot, "config-"+task+"-")
 	if err != nil {
 		return "", nil, err
 	}
-	if err := render.WriteFiles(dir, w.persona.Files); err != nil {
+	remove := func() {
+		// Give the owner back write on the read-only tree so it can be
+		// removed.
+		_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				_ = os.Chmod(p, 0o755)
+			}
+			return nil
+		})
 		_ = os.RemoveAll(dir)
+	}
+	files := append(append([]persona.File(nil), w.persona.Files...), persona.File{Path: userSettingsFile, Data: []byte("{}\n")})
+	if err := render.WriteFiles(dir, files); err != nil {
+		remove()
 		return "", nil, err
 	}
-	return dir, func() { _ = os.RemoveAll(dir) }, nil
+	if err := lockRendered(dir); err != nil {
+		remove()
+		return "", nil, err
+	}
+	return dir, remove, nil
+}
+
+// lockRendered makes everything under dir read-only (files 0444, or 0555
+// when executable; directories 0555), leaving dir itself writable. A
+// directory is chmodded after WalkDir has listed it, so the walk still
+// reaches what's inside.
+func lockRendered(dir string) error {
+	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || p == dir {
+			return err
+		}
+		if d.IsDir() {
+			return os.Chmod(p, 0o555)
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		mode := os.FileMode(0o444)
+		if info.Mode()&0o100 != 0 {
+			mode = 0o555
+		}
+		return os.Chmod(p, mode)
+	})
 }
 
 // held is the task the worker has accepted: pending until the confirm, then
@@ -414,13 +469,17 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 	a.dispatched = true
 	a.abandon = h.abandon
 	go func() {
-		defer closeTaskBus()
-		defer removeToken()
-		defer removeConfig()
 		// Follow-ups and cancels arrive on the task's own .in; the
 		// submission isn't there (it's on PROFILE_SUBMITS), so the reader
 		// opens at the subject's start.
-		h.done <- a.execute(ctx, h.origin, 0, turnPlan{})
+		out := a.execute(ctx, h.origin, 0, turnPlan{})
+		// Cleaned up before the outcome is reported, so the final renewal,
+		// and with it the next task, never overlaps this task's token or
+		// config.
+		removeConfig()
+		removeToken()
+		closeTaskBus()
+		h.done <- out
 	}()
 	return h.done
 }

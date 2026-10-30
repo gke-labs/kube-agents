@@ -196,7 +196,7 @@ func run() int {
 			ReadyAddr:  fmt.Sprintf(":%d", lib.ProfileWorkerStatusPort),
 			PersonaDir: lib.ProfilePersonaDir,
 			Harness:    harness,
-			ConfigRoot: workdir,
+			ConfigRoot: envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
 		}
@@ -656,4 +656,12 @@ func readPrimer(log *slog.Logger) string {
 		return ""
 	}
 	return string(b)
+}
+
+// envOrDefault is the variable's value, or def when it's unset.
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
