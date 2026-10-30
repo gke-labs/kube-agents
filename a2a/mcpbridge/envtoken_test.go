@@ -210,7 +210,7 @@ func TestEnvMCPTokenIsNotSentWhenTheCallOverridesTheKubeTarget(t *testing.T) {
 	}
 }
 
-func TestEnvMCPTokenGoesNowhereWhenTheSelectorMatchesARenamedProfileAndAnother(t *testing.T) {
+func TestEnvMCPTokenSelectorNamesOnlyTheExactSavedKey(t *testing.T) {
 	gw, auth := envTokenGateway(t)
 	// The second save collides with the first by name from another context, so it is saved as
 	// "ctx-2/cluster-a" while the first keeps "cluster-a".
@@ -223,26 +223,70 @@ func TestEnvMCPTokenGoesNowhereWhenTheSelectorMatchesARenamedProfileAndAnother(t
 	}
 	t.Setenv(EnvMCPToken, envTokenValue)
 	t.Setenv(EnvMCPTokenDeployment, "cluster-a")
-	for dep, ctx := range map[string]string{"cluster-a": "ctx-1", "ctx-2/cluster-a": "ctx-2"} {
-		got := connectArgsAuth(t, srv, auth, `{"deployment":"`+dep+`"}`)
-		if want := "Bearer " + secretTokenFor(ctx, testNamespace); got != want {
-			t.Fatalf("ambiguous selector: %s got Authorization %q; want its own Secret's %q", dep, got, want)
-		}
+	if got := connectArgsAuth(t, srv, auth, `{"deployment":"cluster-a"}`); got != "Bearer "+envTokenValue {
+		t.Fatalf("cluster-a, the selector's exact key, got Authorization %q; want the env token", got)
+	}
+	got := connectArgsAuth(t, srv, auth, `{"deployment":"ctx-2/cluster-a"}`)
+	if want := "Bearer " + secretTokenFor("ctx-2", testNamespace); got != want {
+		t.Fatalf("ctx-2/cluster-a, whose base name is the selector, got Authorization %q; want its own Secret's %q", got, want)
 	}
 }
 
-func TestEnvMCPTokenSelectorMatchesARenamedProfileByItsBaseName(t *testing.T) {
+func TestEnvMCPTokenSelectorDoesNotMatchARenamedProfileByItsBaseName(t *testing.T) {
 	t.Setenv(EnvMCPToken, envTokenValue)
-	t.Setenv(EnvMCPTokenDeployment, "cluster-a")
 	renamed := DeploymentProfile{Name: "ctx-1/cluster-a", KubeContext: "ctx-1", Namespace: testNamespace}
 	other := DeploymentProfile{Name: "cluster-b", KubeContext: "ctx-2", Namespace: testNamespace}
 	saved := map[string]DeploymentProfile{renamed.Name: renamed, other.Name: other}
+	t.Setenv(EnvMCPTokenDeployment, "cluster-a")
+	if got := EnvMCPTokenFor(renamed, saved); got != "" {
+		t.Fatalf("the bare name reached the renamed profile as %q; want none", got)
+	}
+	t.Setenv(EnvMCPTokenDeployment, "ctx-1/cluster-a")
 	if got := EnvMCPTokenFor(renamed, saved); got != envTokenValue {
-		t.Fatalf("renamed profile got %q; want the env token", got)
+		t.Fatalf("the qualified key: renamed profile got %q; want the env token", got)
 	}
 	if got := EnvMCPTokenFor(other, saved); got != "" {
 		t.Fatalf("the other profile got %q; want none", got)
 	}
+}
+
+// A token bound to one "prod" never moves to another "prod": not when a same-named install in a
+// second context renames both to "<context>/prod", and not when the first is then pruned and the
+// second is the only one whose base name is "prod".
+func TestEnvMCPTokenNeverMovesOnARenameOrAPrune(t *testing.T) {
+	gw, auth := envTokenGateway(t)
+	prod1 := DeploymentProfile{Name: "prod", KubeContext: "ctx-1", Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true}
+	prod2 := DeploymentProfile{Name: "prod", KubeContext: "ctx-2", Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true}
+	srv := kubeTokenServer(t, gw.URL, []DeploymentProfile{prod1})
+	t.Setenv(EnvMCPToken, envTokenValue)
+	t.Setenv(EnvMCPTokenDeployment, "prod")
+	if got := connectArgsAuth(t, srv, auth, `{"deployment":"prod"}`); got != "Bearer "+envTokenValue {
+		t.Fatalf("setup: prod got Authorization %q; want the env token", got)
+	}
+	ownSecret := func(step, dep, kubeContext string) {
+		t.Helper()
+		got := connectArgsAuth(t, srv, auth, `{"deployment":"`+dep+`"}`)
+		if want := "Bearer " + secretTokenFor(kubeContext, testNamespace); got != want {
+			t.Fatalf("%s: %s got Authorization %q; want its own Secret's %q", step, dep, got, want)
+		}
+	}
+	// One scan finds both: both are saved qualified, and the bare selector names neither.
+	if err := srv.Store().SyncDiscoveredDeployments([]DeploymentProfile{prod1, prod2}); err != nil {
+		t.Fatal(err)
+	}
+	if d := srv.Store().Snapshot().Deployments; len(d) != 2 || d["ctx-1/prod"].Name == "" || d["ctx-2/prod"].Name == "" {
+		t.Fatalf("setup: want ctx-1/prod and ctx-2/prod saved, have %v", d)
+	}
+	ownSecret("after the rename", "ctx-1/prod", "ctx-1")
+	ownSecret("after the rename", "ctx-2/prod", "ctx-2")
+	// ctx-1 leaves the kubeconfig: the next full scan prunes ctx-1/prod.
+	if err := srv.Store().SyncDiscoveredDeployments([]DeploymentProfile{prod2}); err != nil {
+		t.Fatal(err)
+	}
+	if d := srv.Store().Snapshot().Deployments; len(d) != 1 || d["ctx-2/prod"].Name == "" {
+		t.Fatalf("setup: want only ctx-2/prod saved, have %v", d)
+	}
+	ownSecret("after the prune", "ctx-2/prod", "ctx-2")
 }
 
 func TestConnectDeploymentKeepsTheFullContextAPartialKubeContextMatched(t *testing.T) {
