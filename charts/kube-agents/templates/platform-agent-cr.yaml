@@ -948,9 +948,6 @@ spec:
       {{- with $integ.teams.homeChannel }}
       homeChannel: {{ . | quote }}
       {{- end }}
-      {{- with $integ.teams.serviceUrl }}
-      serviceUrl: {{ . | quote }}
-      {{- end }}
       {{- if hasKey $integ.teams "adaptiveCards" }}
       adaptiveCards: {{ $integ.teams.adaptiveCards }}
       {{- end }}

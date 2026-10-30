@@ -1,6 +1,6 @@
 """Runtime patches for the platform agent image.
 
-Every patch here exists to reach inside the running gateway -- the two relay
+Every patch here exists to reach inside the running gateway -- the relay
 patches monkeypatch ``gateway.platform_registry``, ``sandbox_artifact_patch``
 wraps ``gateway.kanban_watchers`` -- so all of them are dead weight in any
 process that never runs a gateway. That used to be a purely theoretical
@@ -26,7 +26,7 @@ regardless of which process imports it or what it is called.
 import os
 import sys
 
-# The import every patch here waits on. The two relay patches replace something
+# The import every patch here waits on. The relay patches replace something
 # in it; ``sandbox_artifact_patch`` does not, and uses it only as the signal that
 # this process is a gateway rather than one of the pod's short-lived
 # interpreters. Nothing else the gateway imports is as reliable a marker, and
@@ -37,6 +37,7 @@ TRIGGER_MODULE = "gateway.platform_registry"
 RELAY_PATCHES = (
     ("GOOGLE_CHAT_RELAY_URL", "google_chat_relay_patch"),
     ("SLACK_RELAY_URL", "slack_relay_patch"),
+    ("TEAMS_RELAY_URL", "teams_relay_patch"),
 )
 
 # Patches deferred the same way but applied whatever the chat wiring is, because

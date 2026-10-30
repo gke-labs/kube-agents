@@ -58,6 +58,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 import mcp_policy  # noqa: E402
+import task_confinement  # noqa: E402
 import watcher_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
