@@ -65,7 +65,10 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 	agent := a2aTestAgent()
 	pns := profileNamespaceName(agent)
 	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: agent.Namespace}})
-	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: pns}})
+	// Labelled as the chart labels it: the binding selects profile
+	// namespaces by it.
+	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: pns,
+		Labels: map[string]string{profileNamespaceComponentLabel: profileNamespaceComponent}}})
 	// The dispatcher's Jobs Role and binding, as the operator renders them.
 	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRole(agent))
 	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRoleBinding(agent))
@@ -113,6 +116,7 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 		equality   = "must have exactly the pod spec"
 		podLabels  = "must carry exactly the pod labels"
 		podAnnots  = "must carry exactly the pod annotations"
+		jobMeta    = "must carry the dispatcher's marker and its agent's instance label"
 		index      = "must run as a profile ServiceAccount the operator rendered"
 	)
 	main := func(s *corev1.PodSpec) *corev1.Container { return &s.Containers[0] }
@@ -142,6 +146,10 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 		"runAsNonRoot unset":  {func(s *corev1.PodSpec) { s.SecurityContext.RunAsNonRoot = nil }, restricted},
 		"unconfined seccomp":  {func(s *corev1.PodSpec) { s.SecurityContext.SeccompProfile.Type = corev1.SeccompProfileTypeUnconfined }, restricted},
 		"an added capability": {func(s *corev1.PodSpec) { main(s).SecurityContext.Capabilities.Add = []corev1.Capability{"SYS_ADMIN"} }, restricted},
+		"a privileged init container": {func(s *corev1.PodSpec) {
+			s.InitContainers = append(s.InitContainers, corev1.Container{Name: "evil", Image: "busybox",
+				SecurityContext: &corev1.SecurityContext{Privileged: ptr.To(true)}})
+		}, restricted},
 		"privilege escalation": {func(s *corev1.PodSpec) {
 			main(s).SecurityContext.AllowPrivilegeEscalation = ptr.To(true)
 		}, restricted},
@@ -249,15 +257,19 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 			j.Spec.CompletionMode = ptr.To(batchv1.IndexedCompletion)
 			j.Spec.Completions = ptr.To(int32(1))
 		}, rule: jobShape},
-		"suspended":                  {job: func(j *batchv1.Job) { j.Spec.Suspend = ptr.To(true) }, rule: jobShape},
-		"an unlisted ServiceAccount": {pod: func(p *corev1.PodTemplateSpec) { p.Spec.ServiceAccountName = "agentprofile-other-unattended" }, rule: index},
-		"the default ServiceAccount": {pod: func(p *corev1.PodTemplateSpec) { p.Spec.ServiceAccountName = "default" }, rule: index},
-		"backoffLimit 1":             {job: func(j *batchv1.Job) { j.Spec.BackoffLimit = ptr.To(int32(1)) }, rule: jobShape},
-		"backoffLimit unset":         {job: func(j *batchv1.Job) { j.Spec.BackoffLimit = nil }, rule: jobShape},
-		"parallelism 2":              {job: func(j *batchv1.Job) { j.Spec.Parallelism = ptr.To(int32(2)) }, rule: jobShape},
-		"completions 2":              {job: func(j *batchv1.Job) { j.Spec.Completions = ptr.To(int32(2)) }, rule: jobShape},
-		"no activeDeadlineSeconds":   {job: func(j *batchv1.Job) { j.Spec.ActiveDeadlineSeconds = nil }, rule: jobShape},
-		"no ttlSecondsAfterFinished": {job: func(j *batchv1.Job) { j.Spec.TTLSecondsAfterFinished = nil }, rule: jobShape},
+		"suspended":                      {job: func(j *batchv1.Job) { j.Spec.Suspend = ptr.To(true) }, rule: jobShape},
+		"no dispatcher marker label":     {job: func(j *batchv1.Job) { delete(j.Labels, dispatchJobLabel) }, rule: jobMeta},
+		"the marker label false":         {job: func(j *batchv1.Job) { j.Labels[dispatchJobLabel] = "false" }, rule: jobMeta},
+		"another agent's instance label": {job: func(j *batchv1.Job) { j.Labels["app.kubernetes.io/instance"] = "other-ns-other-agent" }, rule: jobMeta},
+		"a finalizer":                    {job: func(j *batchv1.Job) { j.Finalizers = []string{"example.com/keep"} }, rule: jobMeta},
+		"an unlisted ServiceAccount":     {pod: func(p *corev1.PodTemplateSpec) { p.Spec.ServiceAccountName = "agentprofile-other-unattended" }, rule: index},
+		"the default ServiceAccount":     {pod: func(p *corev1.PodTemplateSpec) { p.Spec.ServiceAccountName = "default" }, rule: index},
+		"backoffLimit 1":                 {job: func(j *batchv1.Job) { j.Spec.BackoffLimit = ptr.To(int32(1)) }, rule: jobShape},
+		"backoffLimit unset":             {job: func(j *batchv1.Job) { j.Spec.BackoffLimit = nil }, rule: jobShape},
+		"parallelism 2":                  {job: func(j *batchv1.Job) { j.Spec.Parallelism = ptr.To(int32(2)) }, rule: jobShape},
+		"completions 2":                  {job: func(j *batchv1.Job) { j.Spec.Completions = ptr.To(int32(2)) }, rule: jobShape},
+		"no activeDeadlineSeconds":       {job: func(j *batchv1.Job) { j.Spec.ActiveDeadlineSeconds = nil }, rule: jobShape},
+		"no ttlSecondsAfterFinished":     {job: func(j *batchv1.Job) { j.Spec.TTLSecondsAfterFinished = nil }, rule: jobShape},
 	}
 	if len(tse.Labels) == 0 {
 		t.Fatal("the rendered template has no pod labels, so the label cases prove nothing")
@@ -297,6 +309,15 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 	evil := buildDispatchJobTemplate(agent, "evil", tse)
 	if err := dispatcher.Create(ctx, evil); !apierrors.IsForbidden(err) {
 		t.Errorf("the dispatcher creating a PodTemplate: %v, want Forbidden", err)
+	}
+
+	// Not selected: a Job in a namespace that isn't a profile namespace,
+	// which has no params. Params are found before matchConditions run, so
+	// an unscoped binding denies it ("no params found"): every Job in the
+	// cluster, the operator's own provisioning Job among them (found live
+	// on GKE Autopilot).
+	if err := admin.Create(ctx, dispatcherJob("elsewhere", tse, func(j *batchv1.Job) { j.Namespace = agent.Namespace })); err != nil {
+		t.Errorf("a Job outside the profile namespace was refused: %v", err)
 	}
 
 	// Not selected: the same out-of-shape Job from a requester that is not

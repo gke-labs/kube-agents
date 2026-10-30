@@ -157,6 +157,10 @@ var requiredPermissions = []requiredPermission{
 	{Group: "batch", Resources: []string{"cronjobs"}, Verbs: rbacReadVerbs},
 	// jobs: the mode-next provisioning run is created and swept by the operator.
 	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacWriteVerbs},
+	// podtemplates: the dispatcher Job admission policy's params in the
+	// profile namespace, which the operator alone writes. No watch: read
+	// uncached.
+	{Group: "", Resources: []string{"podtemplates"}, Verbs: []string{"get", "list", "create", "update", "patch", "delete"}},
 	{Group: "coordination.k8s.io", Resources: []string{"leases"}, Verbs: rbacWriteVerbs},
 	{Group: "node.k8s.io", Resources: []string{"runtimeclasses"}, Verbs: rbacReadVerbs},
 	// storageclasses: growDataClaim reads a data claim's class by name.

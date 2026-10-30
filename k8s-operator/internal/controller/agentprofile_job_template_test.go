@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"slices"
+	"sort"
+	"strings"
 	"testing"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -15,6 +19,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -30,7 +36,8 @@ func jobTemplateTestReconciler(t *testing.T, agent *agentv1alpha1.PlatformAgent,
 	withDispatcher(t)
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	scheme := setupScheme()
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, chartProfileNamespace(agent)}, objs...)...).
+	policy, binding := shippedDispatcherJobPolicy(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, chartProfileNamespace(agent), policy, binding}, objs...)...).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 	return &PlatformAgentReconciler{Client: c, Scheme: scheme}, c
 }
@@ -247,4 +254,158 @@ func TestRenderedDispatchJobFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkFixture(t, dispatchJobConfigFixturePath, cm.Data[a2aDispatchConfigKey])
+}
+
+// The policy admits a Job as an account the index lists and holds it to
+// that account's template only if the template is there; a template with no
+// index admits any account no template runs as. So after every write the
+// operator makes in the profile namespace, while the dispatcher can create
+// Jobs (its Jobs RoleBinding exists) the index must exist, and every
+// account it lists must have a template running as it. Once the binding is
+// gone the order is free. Checked through a
+// first render, a profile's ServiceAccount changing, a tier dropped, a
+// profile added, the policy signal going away, and the dispatcher removed.
+func TestTheJobPolicyHoldsAfterEveryOperatorWrite(t *testing.T) {
+	withDispatcher(t)
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	agent := a2aTestAgent()
+	pns := profileNamespaceName(agent)
+	scheme := setupScheme()
+	var c client.Client
+	writes := 0
+	check := func(op string, obj client.Object) {
+		if obj.GetNamespace() != pns {
+			return
+		}
+		writes++
+		ctx := context.Background()
+		binding := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, &rbacv1.RoleBinding{}) == nil
+		var index corev1.PodTemplate
+		indexed := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index) == nil
+		if binding && !indexed {
+			t.Errorf("after %s %T %s: the Jobs RoleBinding exists with no index, so the templates admit any account none runs as", op, obj, obj.GetName())
+		}
+		if !binding || !indexed {
+			return // the dispatcher can't create a Job: nothing to admit
+		}
+		var all corev1.PodTemplateList
+		if err := c.List(ctx, &all, client.InNamespace(pns)); err != nil {
+			t.Fatal(err)
+		}
+		running := map[string]bool{}
+		for _, pt := range all.Items {
+			if strings.HasPrefix(pt.Name, dispatchJobTemplatePrefix) {
+				running[pt.Template.Spec.ServiceAccountName] = true
+			}
+		}
+		if listed := index.Annotations[dispatchJobAccountsAnnotation]; listed != "" {
+			for _, sa := range strings.Split(listed, ",") {
+				if !running[sa] {
+					t.Errorf("after %s %T %s: the index lists %s, which no template runs as, so a Job as %s is held to nothing", op, obj, obj.GetName(), sa, sa)
+				}
+			}
+		}
+	}
+	ssa := fakeServerSideApplyInterceptors()
+	policy, binding := shippedDispatcherJobPolicy(t)
+	c = fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent), policy, binding).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				err := ssa.Patch(ctx, cl, obj, patch, opts...)
+				check("apply", obj)
+				return err
+			},
+			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				err := cl.Create(ctx, obj, opts...)
+				check("create", obj)
+				return err
+			},
+			Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				err := cl.Delete(ctx, obj, opts...)
+				check("delete", obj)
+				return err
+			},
+		}).Build()
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+	reconcile := func(step string, profiles ...agentv1alpha1.AgentProfile) {
+		t.Helper()
+		if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+			t.Fatalf("%s: %v / %v", step, err, profileErr)
+		}
+		if !dispatcherJobPolicyRendered() {
+			return
+		}
+		// Settled, the index lists exactly the accounts the templates run
+		// as, so every unattended profile's Jobs are admitted.
+		var want []string
+		for _, tmpl := range dispatchJobTemplates(agent, profiles, false) {
+			want = append(want, tmpl.Spec.ServiceAccountName)
+		}
+		sort.Strings(want)
+		var index corev1.PodTemplate
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index); err != nil {
+			t.Fatalf("%s: the index: %v", step, err)
+		}
+		if got := index.Annotations[dispatchJobAccountsAnnotation]; got != strings.Join(want, ",") {
+			t.Errorf("%s: the index lists %q, want %q", step, got, strings.Join(want, ","))
+		}
+	}
+	own := func(name, sa string) agentv1alpha1.AgentProfile {
+		return testAgentProfile(agent.Namespace, name, func(p *agentv1alpha1.AgentProfile) {
+			p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierUnattended}
+			p.Spec.Identity.ServiceAccountName = sa
+		})
+	}
+
+	reconcile("first render", own("a", "custom-a"), unattendedProfile(agent, "b"))
+	reconcile("a's ServiceAccount changes", own("a", "custom-a2"), unattendedProfile(agent, "b"))
+	b := unattendedProfile(agent, "b")
+	b.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	reconcile("b drops the unattended tier", own("a", "custom-a2"), b)
+	reconcile("c is added", own("a", "custom-a2"), b, unattendedProfile(agent, "c"))
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
+	reconcile("the policy signal goes away", own("a", "custom-a2"), b, unattendedProfile(agent, "c"))
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	reconcile("the signal is back", own("a", "custom-a2"), unattendedProfile(agent, "c"))
+	if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
+		t.Fatalf("the dispatcher removed: %v", err)
+	}
+	if writes < 20 {
+		t.Fatalf("only %d writes in the profile namespace were checked; the sequence didn't exercise the params", writes)
+	}
+}
+
+// shippedDispatcherJobPolicy is the Job admission policy and its binding
+// from the shipped YAML, typed, for a fake client to hold.
+func shippedDispatcherJobPolicy(t *testing.T) (*admissionregistrationv1.ValidatingAdmissionPolicy, *admissionregistrationv1.ValidatingAdmissionPolicyBinding) {
+	t.Helper()
+	raw, err := os.ReadFile(dispatcherJobPolicyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var policy *admissionregistrationv1.ValidatingAdmissionPolicy
+	var binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding
+	for _, doc := range strings.Split(string(raw), "\n---\n") {
+		var meta metav1.TypeMeta
+		if err := yaml.Unmarshal([]byte(doc), &meta); err != nil {
+			t.Fatal(err)
+		}
+		switch meta.Kind {
+		case "ValidatingAdmissionPolicy":
+			policy = &admissionregistrationv1.ValidatingAdmissionPolicy{}
+			if err := yaml.UnmarshalStrict([]byte(doc), policy); err != nil {
+				t.Fatal(err)
+			}
+		case "ValidatingAdmissionPolicyBinding":
+			binding = &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}
+			if err := yaml.UnmarshalStrict([]byte(doc), binding); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if policy == nil || binding == nil {
+		t.Fatalf("%s holds no policy or no binding", dispatcherJobPolicyFile)
+	}
+	return policy, binding
 }

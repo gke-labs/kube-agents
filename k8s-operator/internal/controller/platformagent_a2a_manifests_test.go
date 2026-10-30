@@ -2162,9 +2162,10 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	agent := a2aTestAgent()
 
 	failRole := true
+	jobPolicy, jobBinding := shippedDispatcherJobPolicy(t)
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, chartProfileNamespace(agent)).
+		WithObjects(agent, chartProfileNamespace(agent), jobPolicy, jobBinding).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: fakeServerSideApplyInterceptors().Patch,

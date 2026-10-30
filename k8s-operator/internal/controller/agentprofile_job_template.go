@@ -216,6 +216,12 @@ func buildDispatchJobIndex(agent *agentv1alpha1.PlatformAgent, templates map[str
 	for _, t := range templates {
 		accounts = append(accounts, t.Spec.ServiceAccountName)
 	}
+	return buildDispatchJobIndexFor(agent, accounts)
+}
+
+// buildDispatchJobIndexFor is the index listing accounts.
+func buildDispatchJobIndexFor(agent *agentv1alpha1.PlatformAgent, accounts []string) *corev1.PodTemplate {
+	accounts = slices.Clone(accounts)
 	sort.Strings(accounts)
 	accounts = slices.Compact(accounts)
 	return &corev1.PodTemplate{
@@ -270,12 +276,41 @@ func (e errForeignDispatchJobParam) Error() string {
 }
 
 // reconcileDispatchJobParams brings the policy's params in line with
-// templates, in an order that never lets the index name a ServiceAccount
-// whose template is missing: each template is written first, then the index,
-// then the templates no longer wanted are deleted. A PodTemplate under a
-// param's name without this agent's labels stops the pass with an error.
+// templates. The policy admits a Job running as an account the index lists
+// and holds it to that account's template only if the template is there, so
+// at no step may the index list an account without its template, nor name
+// one whose template now runs as another. So:
+//  1. the index narrows to the accounts the templates run as both now and
+//     after this pass;
+//  2. the templates are written;
+//  3. the index lists the accounts they now run as;
+//  4. the templates no longer wanted are deleted.
+//
+// A PodTemplate under a param's name without this agent's labels stops the
+// pass with an error.
 func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context, agent *agentv1alpha1.PlatformAgent, templates map[string]*corev1.PodTemplateSpec) error {
 	ns := profileNamespaceName(agent)
+	var existing corev1.PodTemplateList
+	if err := r.a2aReader().List(ctx, &existing, client.InNamespace(ns), client.MatchingLabels(dispatchJobParamLabels(agent))); err != nil {
+		return fmt.Errorf("list the dispatcher's Job templates: %w", err)
+	}
+	want := map[string]bool{}
+	for _, t := range templates {
+		want[t.Spec.ServiceAccountName] = true
+	}
+	var both []string
+	for i := range existing.Items {
+		pt := &existing.Items[i]
+		if pt.Name == dispatchJobIndexName || !strings.HasPrefix(pt.Name, dispatchJobTemplatePrefix) || !agentLabelsMark(pt, agent) {
+			continue
+		}
+		if sa := pt.Template.Spec.ServiceAccountName; want[sa] {
+			both = append(both, sa)
+		}
+	}
+	if err := r.applyDispatchJobParam(ctx, agent, buildDispatchJobIndexFor(agent, both)); err != nil {
+		return err
+	}
 	names := make([]string, 0, len(templates))
 	for name := range templates {
 		names = append(names, name)
@@ -288,10 +323,6 @@ func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context
 	}
 	if err := r.applyDispatchJobParam(ctx, agent, buildDispatchJobIndex(agent, templates)); err != nil {
 		return err
-	}
-	var existing corev1.PodTemplateList
-	if err := r.a2aReader().List(ctx, &existing, client.InNamespace(ns), client.MatchingLabels(dispatchJobParamLabels(agent))); err != nil {
-		return fmt.Errorf("list the dispatcher's Job templates: %w", err)
 	}
 	for i := range existing.Items {
 		pt := &existing.Items[i]
@@ -325,14 +356,32 @@ func (r *PlatformAgentReconciler) applyDispatchJobParam(ctx context.Context, age
 }
 
 // deleteDispatcherJobResources removes what Job mode put in the profile
-// namespace: the dispatcher's Jobs (no dispatcher holds their leases once it
-// is gone; propagated, so their pods go too), the index before the templates
-// (so it never names one that's gone), and the Jobs Role and binding. Each
-// only if it carries this agent's labels. Read uncached.
+// namespace, each only if it carries this agent's labels, read uncached. The
+// Jobs Role and binding go first: once the dispatcher can't create a Job, the
+// order of the rest can't open the policy (a template left without its index
+// admits any account no template runs as). Then the dispatcher's Jobs (no
+// dispatcher holds their leases once it is gone; propagated, so their pods go
+// too), then the templates, and the index last.
 func (r *PlatformAgentReconciler) deleteDispatcherJobResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	ns := profileNamespaceName(agent)
+	key := types.NamespacedName{Namespace: ns, Name: a2aDispatcherJobsRoleName(agent)}
+	for _, obj := range []client.Object{&rbacv1.RoleBinding{}, &rbacv1.Role{}} {
+		if err := r.a2aReader().Get(ctx, key, obj); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("the dispatcher's Jobs %T: %w", obj, err)
+		}
+		if !agentLabelsMark(obj, agent) {
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
+			return fmt.Errorf("deleting the dispatcher's Jobs %T: %w", obj, err)
+		}
+	}
 	// One by one: the operator holds delete on Jobs, not deletecollection.
-	// Only those with this agent's labels (dispatchJobLabels).
+	// Only those with this agent's labels (dispatchJobLabels, which the
+	// policy requires of every dispatcher Job).
 	var jobs batchv1.JobList
 	if err := r.a2aReader().List(ctx, &jobs, client.InNamespace(ns), client.HasLabels{dispatchJobLabel}); err != nil {
 		return fmt.Errorf("list the dispatcher's Jobs: %w", err)
@@ -350,29 +399,16 @@ func (r *PlatformAgentReconciler) deleteDispatcherJobResources(ctx context.Conte
 	if err := r.a2aReader().List(ctx, &params, client.InNamespace(ns), client.MatchingLabels(dispatchJobParamLabels(agent))); err != nil {
 		return fmt.Errorf("list the dispatcher's Job templates: %w", err)
 	}
-	// The index first, so it never names a template that's gone.
-	sort.SliceStable(params.Items, func(i, j int) bool { return params.Items[i].Name == dispatchJobIndexName })
+	// The index last.
+	sort.SliceStable(params.Items, func(i, j int) bool {
+		return params.Items[j].Name == dispatchJobIndexName && params.Items[i].Name != dispatchJobIndexName
+	})
 	for i := range params.Items {
 		if !agentLabelsMark(&params.Items[i], agent) {
 			continue
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, &params.Items[i])); err != nil {
 			return fmt.Errorf("delete the Job template %s: %w", params.Items[i].Name, err)
-		}
-	}
-	key := types.NamespacedName{Namespace: ns, Name: a2aDispatcherJobsRoleName(agent)}
-	for _, obj := range []client.Object{&rbacv1.RoleBinding{}, &rbacv1.Role{}} {
-		if err := r.a2aReader().Get(ctx, key, obj); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return fmt.Errorf("the dispatcher's Jobs %T: %w", obj, err)
-		}
-		if !agentLabelsMark(obj, agent) {
-			continue
-		}
-		if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
-			return fmt.Errorf("deleting the dispatcher's Jobs %T: %w", obj, err)
 		}
 	}
 	return nil

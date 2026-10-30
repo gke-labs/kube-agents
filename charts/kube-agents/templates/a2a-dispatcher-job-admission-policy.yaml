@@ -50,7 +50,11 @@
 #   - It is installed only where the chart renders it (`admissionPolicy.enabled`, Kubernetes >= 1.30).
 #     Elsewhere the dispatcher's Job create is as wide as its Role.
 #   - It selects the requester by ServiceAccount name: any ServiceAccount named `*-a2a-dispatcher`
-#     creating a Job in `<its namespace>-profiles` is held to it.
+#     creating a Job in `<its namespace>-profiles` is held to it. The binding is scoped to
+#     namespaces labelled `app.kubernetes.io/component: profiles` (the label the operator requires
+#     of a profile namespace), because params are resolved before matchConditions: any Job created
+#     in such a namespace while it has no params is denied, whoever creates it. Nothing but the
+#     dispatcher creates Jobs there.
 #   - It constrains Job CREATE only. The dispatcher's Role holds no update or patch on jobs; it
 #     does hold delete, on any Job in its profile namespace, which is the agent's alone.
 #   - No upper bound on the Job's deadline or TTL: the install's task deadline cap is tunable,
@@ -130,6 +134,19 @@ spec:
     - expression: "variables.isIndex || variables.account != variables.templateAccount || variables.annotations == variables.templateAnnotations"
       messageExpression: "'a Job the dispatcher creates must carry exactly the pod annotations of its template ' + params.metadata.name"
       reason: Forbidden
+    # The Job's own labels: the dispatcher's marker and the agent's instance label, which every
+    # param carries, so the operator's teardown (which selects on them) finds every dispatcher
+    # Job; and no finalizer to outlive it.
+    - expression: >-
+        has(object.metadata.labels) &&
+        'kubeagents.x-k8s.io/dispatch-job' in object.metadata.labels &&
+        object.metadata.labels['kubeagents.x-k8s.io/dispatch-job'] == 'true' &&
+        has(params.metadata.labels) && 'app.kubernetes.io/instance' in params.metadata.labels &&
+        'app.kubernetes.io/instance' in object.metadata.labels &&
+        object.metadata.labels['app.kubernetes.io/instance'] == params.metadata.labels['app.kubernetes.io/instance'] &&
+        (!has(object.metadata.finalizers) || size(object.metadata.finalizers) == 0)
+      message: "a Job the dispatcher creates must carry the dispatcher's marker and its agent's instance label, and no finalizer"
+      reason: Forbidden
     # The static rules, for every dispatcher Job.
     - expression: >-
         has(object.spec.backoffLimit) && object.spec.backoffLimit == 0 &&
@@ -166,8 +183,15 @@ spec:
           has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) &&
           'ALL' in c.securityContext.capabilities.drop &&
           (!has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0)) &&
+        (!has(variables.pod.initContainers) || variables.pod.initContainers.all(c,
+          has(c.securityContext) &&
+          (!has(c.securityContext.privileged) || !c.securityContext.privileged) &&
+          has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation &&
+          has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) &&
+          'ALL' in c.securityContext.capabilities.drop &&
+          (!has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0))) &&
         (!has(variables.pod.volumes) || variables.pod.volumes.all(v, !has(v.hostPath) && !has(v.secret)))
-      message: "a Job the dispatcher creates must meet Pod Security restricted: no token automount, no host namespaces or nodeName, non-root with seccomp, unprivileged containers with every capability dropped, and no hostPath or Secret volume"
+      message: "a Job the dispatcher creates must meet Pod Security restricted: no token automount, no host namespaces or nodeName, non-root with seccomp, unprivileged containers and init containers with every capability dropped, and no hostPath or Secret volume"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -180,6 +204,14 @@ metadata:
 spec:
   policyName: kube-agents-a2a-dispatcher-job
   validationActions: ["Deny"]
+  # Profile namespaces only, by the label the operator requires of one (it uses no namespace
+  # without it). The API server finds params before it evaluates matchConditions, so without
+  # this every Job create in a namespace with no params would meet parameterNotFoundAction:
+  # Deny, the operator's own provisioning Jobs included. matchResources is evaluated first.
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        app.kubernetes.io/component: profiles
   paramRef:
     # No namespace: the Job's own. Only PodTemplates the operator rendered, by its labels.
     selector:
