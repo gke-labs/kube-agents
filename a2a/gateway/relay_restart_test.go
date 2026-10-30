@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"encoding/json"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -88,10 +87,7 @@ func TestAGatewayStoppedMidBatchLosesAndRepeatsNothing(t *testing.T) {
 	waitFor(t, "the terminal on the new gateway", func() bool {
 		rec, _ := r2.g.reg.Get(context.Background(), conv)
 		ref, ok := rec.TaskRefFor(origin.TaskID)
-		// The terminal released the conversation, and the ended task keeps
-		// its last batch's sequences (the terminal's, and the result's when
-		// they shared a batch).
-		return ok && len(ref.RelayedSeqs) >= 1 && (rec.ActiveTask == nil || rec.ActiveTask.TaskID != origin.TaskID)
+		return ok && len(ref.RelayedSeqs) >= 3
 	})
 	// Settle: nothing more should arrive.
 	time.Sleep(time.Second)
@@ -265,12 +261,11 @@ func TestABatchRenderingWhenTheGatewayStopsIsPostedOnce(t *testing.T) {
 	waitRunning(t, r2)
 	// The stopping gateway wrote the batch's record, sequences and all,
 	// though its run context was done: a crash after that write is covered.
-	// The task ended, so it keeps its last batch's sequences only.
 	rec, err := r2.g.reg.Get(context.Background(), conv)
 	if err != nil || rec == nil {
 		t.Fatalf("record: %v %v", rec, err)
 	}
-	if ref, ok := rec.TaskRefFor(origin.TaskID); !ok || len(ref.RelayedSeqs) == 0 {
+	if ref, ok := rec.TaskRefFor(origin.TaskID); !ok || len(ref.RelayedSeqs) < 2 {
 		t.Fatalf("the stopping gateway didn't write the batch's record: %+v", ref)
 	}
 	time.Sleep(2 * time.Second)
@@ -375,71 +370,5 @@ func TestABatchTheStopDrainGaveUpOnRecordsAndAcksNothing(t *testing.T) {
 	}
 	if !strings.Contains(r.logs.String(), "left for the next gateway") {
 		t.Fatalf("no log line for the abandoned batch:\n%s", r.logs.String())
-	}
-}
-
-// TestATaskThatEndsKeepsOnlyItsLastBatchsSequences: once a task's terminal
-// renders, its task index is gone and an older event's redelivery is acked
-// unrendered before the guard is read, so the record keeps only the last
-// batch's sequences, which a crash before their ack would redeliver.
-func TestATaskThatEndsKeepsOnlyItsLastBatchsSequences(t *testing.T) {
-	r, _ := startRigWithSpawner(t)
-	waitRunning(t, r)
-	conv := "discord:g1/t-ends"
-	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-ends", Text: "how is the fleet?"}
-	origin := r.awaitTask(t, targetPlatform)
-	subject := lib.TaskEventsSubject(targetPlatform, origin.TaskID)
-	status := func(state lib.TaskState, text string) *lib.Envelope {
-		payload, err := json.Marshal(lib.StatusUpdate{Status: lib.TaskStatus{State: state,
-			Message: &lib.Message{Role: "agent", Parts: []lib.Part{{Kind: "text", Text: text}}}}, Final: state.Terminal()})
-		if err != nil {
-			t.Fatal(err)
-		}
-		env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: targetPlatform}, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return env
-	}
-	working := status(lib.StateWorking, "looking")
-	r.g.relayBatch(conv, []relayItem{{env: working, subject: subject, d: &fakeDelivery{env: working, subj: subject, seq: 700}}})
-	rec, err := r.g.reg.Get(context.Background(), conv)
-	if err != nil || rec == nil || !rec.relayed(origin.TaskID, 700) {
-		t.Fatalf("a running task's rendered sequence wasn't recorded: %v", err)
-	}
-	done := status(lib.StateCompleted, "all healthy")
-	r.g.relayBatch(conv, []relayItem{{env: done, subject: subject, d: &fakeDelivery{env: done, subj: subject, seq: 701}}})
-	rec, err = r.g.reg.Get(context.Background(), conv)
-	if err != nil || rec == nil {
-		t.Fatalf("record: %v", err)
-	}
-	if ref, ok := rec.TaskRefFor(origin.TaskID); !ok || !slices.Equal(ref.RelayedSeqs, []uint64{701}) {
-		t.Fatalf("an ended task's sequences = %v, want only its last batch's [701]", ref.RelayedSeqs)
-	}
-}
-
-// TestAnEndedTaskKeepsEverySequenceWhileItsIndexSurvives: the trim waits for
-// the task index to be gone; a failed drop leaves the guard whole, since an
-// older event's redelivery would still be routed and read it.
-func TestAnEndedTaskKeepsEverySequenceWhileItsIndexSurvives(t *testing.T) {
-	r, _ := startRigWithSpawner(t)
-	waitRunning(t, r)
-	ctx := context.Background()
-	rec := &SessionRecord{Key: "discord:g1/t-trim", Tasks: []TaskRef{{ID: "task-trim", RelayedSeqs: []uint64{1, 2, 3}}}}
-	if err := r.g.reg.IndexTask(ctx, "task-trim", rec.Key); err != nil {
-		t.Fatal(err)
-	}
-	ended := map[string]bool{"task-trim": true}
-	batch := map[string][]uint64{"task-trim": {3}}
-	r.g.trimEndedTasks(ctx, rec, ended, batch)
-	if !slices.Equal(rec.Tasks[0].RelayedSeqs, []uint64{1, 2, 3}) {
-		t.Fatalf("trimmed with the index still present: %v", rec.Tasks[0].RelayedSeqs)
-	}
-	if err := r.g.reg.DropTask(ctx, "task-trim"); err != nil {
-		t.Fatal(err)
-	}
-	r.g.trimEndedTasks(ctx, rec, ended, batch)
-	if !slices.Equal(rec.Tasks[0].RelayedSeqs, []uint64{3}) {
-		t.Fatalf("after the index drop, sequences = %v, want this batch's [3]", rec.Tasks[0].RelayedSeqs)
 	}
 }

@@ -397,8 +397,6 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	fresh := batch[:0:0]
 	var dupes []relayItem
 	inBatch := map[uint64]bool{}
-	batchSeqs := map[string][]uint64{}
-	endedHere := map[string]bool{}
 	for _, item := range batch {
 		seq := item.sequence()
 		if rec.relayed(item.env.TaskID, seq) {
@@ -429,17 +427,9 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			g.log.Warn("relay: stop drain timed out; batch left for the next gateway", "session", sessionKey, "rendered", i, "events", len(fresh))
 			return
 		}
-		live := !g.routeRetired(item.env.TaskID)
 		g.applyEvent(ctx, rec, item, i == len(fresh)-1)
 		rec.markRelayed(item.env.TaskID, item.sequence())
-		if seq := item.sequence(); seq != 0 {
-			batchSeqs[item.env.TaskID] = append(batchSeqs[item.env.TaskID], seq)
-		}
-		if live && g.routeRetired(item.env.TaskID) {
-			endedHere[item.env.TaskID] = true
-		}
 	}
-	g.trimEndedTasks(ctx, rec, endedHere, batchSeqs)
 	if g.relayInFlight.abandoned() {
 		g.log.Warn("relay: stop drain timed out; batch left for the next gateway", "session", sessionKey, "rendered", len(fresh), "events", len(fresh))
 		return
@@ -456,30 +446,6 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	for _, item := range dupes {
 		g.settle(item)
 	}
-}
-
-// trimEndedTasks drops the older rendered sequences of a task whose terminal
-// rendered in this batch, keeping this batch's. It trims only once the task
-// index is confirmed gone: then a redelivery of an older event is acked as
-// no longer routed before the guard would be read, and only this batch's,
-// whose acks are still out, can come again. While the index survives (its
-// drop failed), the task keeps every sequence.
-func (g *Gateway) trimEndedTasks(ctx context.Context, rec *SessionRecord, endedHere map[string]bool, batchSeqs map[string][]uint64) {
-	for taskID := range endedHere {
-		if key, err := g.reg.SessionForTask(ctx, taskID); err != nil || key != "" {
-			continue
-		}
-		rec.keepRelayed(taskID, batchSeqs[taskID])
-	}
-}
-
-// routeRetired reports whether a task's routing state has been retired: its
-// terminal rendered (retireTaskRoute).
-func (g *Gateway) routeRetired(taskID string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	_, live := g.relays[taskID]
-	return !live
 }
 
 // applyEvent folds one event into the render state. render gates only the

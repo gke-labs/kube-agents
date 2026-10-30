@@ -257,9 +257,7 @@ type TaskRef struct {
 	// RelayedSeqs are the stream sequences of this task's most recent
 	// events the relay rendered (at most relayedSeqCap), written with the
 	// render. A redelivered event found here was rendered by a gateway that
-	// stopped or died before its ack landed, and is not rendered again. Once
-	// the task's terminal renders and its index is gone, only that last
-	// batch's are kept (trimEndedTasks).
+	// stopped or died before its ack landed, and is not rendered again.
 	RelayedSeqs []uint64 `json:"relayedSeqs,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.
@@ -875,17 +873,6 @@ func (rec *SessionRecord) relayed(taskID string, seq uint64) bool {
 		}
 	}
 	return false
-}
-
-// keepRelayed replaces taskID's rendered sequences with seqs: once the task
-// has ended, only its last batch's can come again.
-func (rec *SessionRecord) keepRelayed(taskID string, seqs []uint64) {
-	for i := range rec.Tasks {
-		if rec.Tasks[i].ID == taskID {
-			rec.Tasks[i].RelayedSeqs = slices.Clone(seqs)
-			return
-		}
-	}
 }
 
 // markRelayed records that taskID's event at seq was rendered.
