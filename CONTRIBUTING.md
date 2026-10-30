@@ -43,9 +43,6 @@ human contributors and AI coding agents:
 - [`docs/testing-map.md`](docs/testing-map.md) says where a new test goes and what runs it.
 - [`docs/designs/live-test-lease.md`](docs/designs/live-test-lease.md) is the lease to take before
   mutating an installation your team shares.
-- [`docs/kube-agents-success-criteria.md`](docs/kube-agents-success-criteria.md) lists the success
-  criteria the project measures itself against, from the end user's point of view, and the gaps to
-  each one.
 
 ## Where to file issues
 
