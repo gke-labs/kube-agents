@@ -517,6 +517,42 @@ func TestSlackHomeAHomeRefusedSinceTheLearnIsReplacedByTheNextMention(t *testing
 	}
 }
 
+// TestSlackHomeVerifyHomeForPostWritesTheRefusalBesideTheRecord: the
+// post-time check. A refused home is written to slack.refused once while
+// the record names it; a record that names another channel is not
+// relabelled; a check that cannot be made writes nothing; a healthy home
+// writes nothing.
+func TestSlackHomeVerifyHomeForPostWritesTheRefusalBesideTheRecord(t *testing.T) {
+	a, api, cs, _ := newHomeLearnAdapter(t, map[string]string{homeRecordKeySlack: "C0AA1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage})
+	ctx := context.Background()
+	api.conversations["C0AA1"] = homeChannelInfo("C0AA1", func(c *slack.Channel) { c.IsExtShared = true })
+	api.conversations["C0BB2"] = homeChannelInfo("C0BB2", func(c *slack.Channel) { c.IsArchived = true })
+	api.conversations["C0OK3"] = homeChannelInfo("C0OK3", nil)
+	if refused, err := a.VerifyHomeForPost(ctx, "C0BB2"); refused != homeRefusedArchived || err != nil || homePatches(cs) != 0 {
+		t.Fatalf("a channel the record does not name: refused=%q err=%v patches=%d; want archived and no write", refused, err, homePatches(cs))
+	}
+	if refused, err := a.VerifyHomeForPost(ctx, "C0AA1"); refused != homeRefusedShared || err != nil {
+		t.Fatalf("the shared home: refused=%q err=%v", refused, err)
+	}
+	if data := homeRecordData(t, cs); data[homeRecordKeyRefused] != homeRefusedShared || data[homeRecordKeySlack] != "C0AA1" || homePatches(cs) != 1 {
+		t.Fatalf("record after the refusal = %v (patches %d), want slack.refused=shared beside C0AA1 in one write", data, homePatches(cs))
+	}
+	a.VerifyHomeForPost(ctx, "C0AA1")
+	if homePatches(cs) != 1 {
+		t.Errorf("the same refusal was written twice")
+	}
+	// A check that cannot be made: the fake answers conversationErr for a
+	// channel it does not name.
+	api.conversationErr = errors.New("429")
+	if refused, err := a.VerifyHomeForPost(ctx, "C0XX9"); refused != "" || err == nil || homePatches(cs) != 1 {
+		t.Errorf("a check that cannot be made: refused=%q err=%v patches=%d", refused, err, homePatches(cs))
+	}
+	api.conversationErr = nil
+	if refused, err := a.VerifyHomeForPost(ctx, "C0OK3"); refused != "" || err != nil || homePatches(cs) != 1 {
+		t.Errorf("a healthy home: refused=%q err=%v patches=%d", refused, err, homePatches(cs))
+	}
+}
+
 // TestSlackHomeRefusedCandidateNeverRelabelsTheRecordedChannel: while a
 // channel is recorded, slack.refused describes that channel. A candidate
 // refused for another reason writes nothing; the next channel that passes

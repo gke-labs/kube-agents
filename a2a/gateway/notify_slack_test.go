@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -402,6 +403,67 @@ func TestSlackNotifyHomeSourceArmsHomePosts(t *testing.T) {
 	}
 	if posts := home.all(); len(posts) != 2 || posts[0].space != testSlackHome || posts[1].space != testSlackHome {
 		t.Errorf("posts = %+v, want two in %s", posts, testSlackHome)
+	}
+}
+
+// TestSlackNotifyAFileHomeIsCheckedBeforeEachPost: a home the file named is
+// checked once per job before the post. A definite refusal answers with the
+// word and posts nothing; a check that cannot be made posts as before; the
+// CR's home is never checked.
+func TestSlackNotifyAFileHomeIsCheckedBeforeEachPost(t *testing.T) {
+	cases := []struct {
+		name     string
+		refused  string
+		err      error
+		wantPost bool
+		wantErr  string
+	}{
+		{"shared since the learn", homeRefusedShared, nil, false, "home channel refused: shared"},
+		{"archived since the learn", homeRefusedArchived, nil, false, "home channel refused: archived"},
+		{"a check that cannot be made", "", errors.New("429"), true, ""},
+		{"a healthy home", "", nil, true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &fakeNotifyPoster{}
+			n, err := NewSlackNotifier(p, "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n.SetHomeSource(func() (string, bool) { return testSlackHome, true })
+			calls := 0
+			n.SetHomeVerifier(func(_ context.Context, home string) (string, error) {
+				calls++
+				if home != testSlackHome {
+					t.Errorf("checked %q, want the job's home %s", home, testSlackHome)
+				}
+				return tc.refused, tc.err
+			})
+			reply := serveJSON(t, n, lib.NotifyRequest{Text: strings.Repeat("alert ", 900)})
+			if calls != 1 {
+				t.Errorf("checks = %d, want one per job, not per chunk", calls)
+			}
+			if posted := len(p.all()) > 0; posted != tc.wantPost {
+				t.Errorf("posted = %v, want %v (reply %+v)", posted, tc.wantPost, reply)
+			}
+			if tc.wantErr != "" && reply.Error != tc.wantErr {
+				t.Errorf("reply = %+v, want error %q", reply, tc.wantErr)
+			}
+			if tc.wantErr == "" && reply.Error != "" {
+				t.Errorf("reply = %+v, want a posted answer", reply)
+			}
+		})
+	}
+	// The CR's home is the install's word: no check.
+	p := &fakeNotifyPoster{}
+	n, err := NewSlackNotifier(p, testSlackHome, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	n.SetHomeVerifier(func(context.Context, string) (string, error) { called = true; return homeRefusedShared, nil })
+	if reply := serveJSON(t, n, lib.NotifyRequest{Text: "drift"}); reply.Error != "" || called {
+		t.Errorf("a CR home was checked or refused: called=%v reply=%+v", called, reply)
 	}
 }
 

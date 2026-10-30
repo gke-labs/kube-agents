@@ -56,7 +56,9 @@ class HomeFileTest(unittest.TestCase):
             self.assertEqual(chat_notify.routed_platform(), "google_chat")
 
     def test_an_empty_or_absent_file_routes_nothing(self):
-        self.assertEqual(chat_notify.home_file(), ("", False))
+        # The directory is mounted and empty: the Optional volume before the
+        # operator writes the ConfigMap. Mounted, no home.
+        self.assertEqual(chat_notify.home_file(), ("", True))
         self.assertEqual(chat_notify.home_file_value(), "")
         self._write("")
         self.assertEqual(chat_notify.home_file(), ("", True))
@@ -89,6 +91,7 @@ class HomeFileTest(unittest.TestCase):
 
     def test_a_missing_directory_reads_as_nothing(self):
         with mock.patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(self.dir, "absent")):
+            self.assertEqual(chat_notify.home_file(), ("", False))
             self.assertEqual(chat_notify.home_file_value(), "")
             self.assertEqual(chat_notify.routed_platform(), "")
 

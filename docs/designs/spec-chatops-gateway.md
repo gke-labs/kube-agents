@@ -1602,10 +1602,13 @@ mounts as a directory in the gateway pod; the notify route reads that file once 
 into the channel it read, so a projection that changes while a report posts does not split the report
 across two channels; a value that is not a channel id reads as empty until the operator rewrites it,
 and a directory that is not mounted (an operator older than the projection) reads as absent: no home
-and no learn. The CR's own value, `A2A_SLACK_HOME_CHANNEL`, wins when set. Nothing checks the
-projected value before a post: a hand edit of the record carries the same trust as the CR field, which
-is not checked either, and a post Slack refuses (`channel_not_found`, `is_archived`, `not_in_channel`)
-is logged with where the value came from. With the switch set, the policy `auto` and `homeChannel`
+and no learn. The CR's own value, `A2A_SLACK_HOME_CHANNEL`, wins when set and is not checked. A home
+the file named is checked once per post job, on the worker, with `conversations.info` (5 s): a channel
+Slack refuses now (shared, archived, the app not a member, not a channel) is written to `slack.refused`
+beside the record while the record still names it, the post is answered "home channel refused" with
+the word and goes nowhere, and the operator empties the projection; a check that cannot be made posts
+as before and logs once. A post Slack still refuses (`channel_not_found`, `is_archived`,
+`not_in_channel`) is logged with where the value came from. With the switch set, the policy `auto` and `homeChannel`
 empty, a verified, top-level channel mention that is not a command is a candidate only while the file
 names no home, or while the home it names is one Slack now refuses (checked once per such mention
 outside it): its channel is checked with `conversations.info` (a channel id, not shared through
@@ -1615,8 +1618,8 @@ channel; the gateway's own home posts follow within one kubelet sync, about a mi
 home post is refused as having no home. A candidate the check refuses is written to `slack.refused`
 as one of the four words the operator matches, `shared`, `archived`, `not-member` or `malformed`,
 while the record names no channel and does not name that reason already (a write that fails is tried
-again at the next refusal; while a channel is recorded, a refusal beside it is a stale one from an
-older gateway or a hand edit, and a learn that adopts or replaces the channel clears it) and the next
+again at the next refusal; while a channel is recorded, a refusal beside it is the post-time check's
+or an older gateway's, and a learn that adopts or replaces the channel clears it) and the next
 mention may learn; a record another writer filled first, or the record of a learn the file has not
 caught up with, is adopted after the same check with no line posted, or replaced when that check
 refuses it; a group direct message is refused without a call and a direct message is never a
