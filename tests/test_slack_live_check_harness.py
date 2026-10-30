@@ -68,6 +68,7 @@ NOT_STARTED_NOTICES = (
     "⚠️ not started: could not mint this task's capability",
     "⚠️ not started: could not close the previous task on the bus; try again in a moment",
     "⚠️ not started: a task is still running here; stop it or wait for it before asking an agent profile",
+    "⚠️ not started: a task is still running here; stop it or wait for it before confirming a change",
 )
 # Far above any timeout a test sets: a poll that passes it is unbounded.
 SLEEP_BUDGET_SECONDS = 10_000

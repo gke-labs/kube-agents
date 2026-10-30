@@ -6468,8 +6468,8 @@ func TestA2AInjectBackendIsOffWithoutTheFlag(t *testing.T) {
 	dep := buildA2AGatewayDeployment(agent)
 	container := dep.Spec.Template.Spec.Containers[0]
 	for _, e := range container.Env {
-		if e.Name == a2aInjectListenEnvVar {
-			t.Errorf("%s is rendered without the flag", a2aInjectListenEnvVar)
+		if e.Name == a2aInjectListenEnvVar || e.Name == a2aInjectConfirmEnvVar {
+			t.Errorf("%s is rendered without the flag", e.Name)
 		}
 		// The chat map's path is rendered explicitly at the gateway's
 		// default; what the flag must not do is move it.
@@ -6524,6 +6524,11 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 	if got := env[a2aInjectPrincipalMapEnv].Value; got != a2aInjectPrincipalMapPath {
 		t.Errorf("%s = %q, want the operator's own map at %q",
 			a2aInjectPrincipalMapEnv, got, a2aInjectPrincipalMapPath)
+	}
+	// A confirm over the door is the eval harness's, and rides on the same
+	// flag as the door itself.
+	if got := env[a2aInjectConfirmEnvVar].Value; got != "true" {
+		t.Errorf("%s = %q, want \"true\" under the flag", a2aInjectConfirmEnvVar, got)
 	}
 	// Beside the chat map rather than over it. The door may be armed next to
 	// a real backend now, and repointing the one variable would take that

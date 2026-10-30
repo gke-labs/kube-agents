@@ -200,6 +200,9 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 			log.Error("inject door", "err", err)
 			return err
 		}
+		if cfg.InjectConfirm {
+			door.AllowConfirm()
+		}
 		doors = append(doors, gateway.InjectDoorSpec(door))
 	}
 	// The A2A door is the same kind of thing for an agent caller: armed

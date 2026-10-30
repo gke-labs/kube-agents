@@ -54,6 +54,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_INJECT_LISTEN", "")
 	t.Setenv("A2A_INJECT_TOKEN", "")
 	t.Setenv("A2A_INJECT_PRINCIPAL_MAP", "")
+	t.Setenv("A2A_INJECT_CONFIRM", "")
 	t.Setenv("A2A_DOOR_LISTEN", "")
 	t.Setenv("A2A_DOOR_TOKEN", "")
 	t.Setenv("A2A_DOOR_PRINCIPAL_MAP", "")

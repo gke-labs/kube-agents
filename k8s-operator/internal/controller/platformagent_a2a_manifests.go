@@ -293,6 +293,13 @@ const (
 	a2aInjectListenHost   = "127.0.0.1"
 	a2aInjectPort         = 8099
 
+	// a2aInjectConfirmEnvVar lets the door take intent "confirm", which
+	// submits a turn with a change requested (a2a/gateway inject.go). The
+	// door's caller is the eval harness, a program, so that is automation
+	// by design and rides on the same operator flag as the door; a gateway
+	// with the door armed by hand and without this refuses the intent.
+	a2aInjectConfirmEnvVar = "A2A_INJECT_CONFIRM"
+
 	// The one identity the inject door admits, and the principal it stands
 	// for. The gateway resolves an injected author through a principal map
 	// like any other non-gchat backend, so the eval runner needs an entry in
@@ -4728,6 +4735,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			// the door may be armed next to a real backend, and repointing
 			// A2A_PRINCIPAL_MAP would take that backend's identities away.
 			{Name: a2aInjectPrincipalMapEnv, Value: a2aInjectPrincipalMapPath},
+			{Name: a2aInjectConfirmEnvVar, Value: "true"},
 			// The bearer token every request to the door must carry. The
 			// gateway refuses to arm the door without it, so a Secret that
 			// has not been created yet crash-loops the pod rather than
