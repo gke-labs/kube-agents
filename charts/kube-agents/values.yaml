@@ -227,12 +227,29 @@ operator:
   # Sized from a measurement rather than the Kubebuilder scaffold it replaces:
   # on a 3-node install the store holds 675 objects in 3.7 MiB of live heap,
   # in a process of 22 MiB RSS. Kept in step with k8s-operator/config/manager.
+  #
+  # limits.memory has a floor at this default: the chart fails the render on a
+  # smaller limit, naming the key (README, "Upgrade notes: operator memory
+  # floor", for the --reuse-values upgrade that meets it and the way out). The
+  # manager sets its Go soft memory limit to nine tenths of whatever limit is
+  # rendered, so raising this is the one change for a larger cluster.
+  #
+  # requests.cpu is 50m rather than the 10m the manager needs because GKE
+  # Autopilot admits a pod unchanged only at 50m or more per pod and between
+  # 1 and 6.5 GiB of memory per vCPU on the requests pair, and raises the
+  # smaller request into that band: 10m beside 128Mi is 12.5 GiB per vCPU,
+  # so Autopilot wrote 50m onto the pod and the quota preflight, which sums
+  # this line, had counted 10m. Declared on the floor, the manifest is the
+  # pod the cluster admits on Standard and on Autopilot with bursting.
+  # Autopilot without bursting raises the pod to its per-pod minimums
+  # (250m CPU, 512 MiB) and sets the limits equal to the requests, so the
+  # manager runs under at least 512Mi there and reads that limit.
   resources:
     limits:
       cpu: 500m
       memory: 512Mi
     requests:
-      cpu: 10m
+      cpu: 50m
       memory: 128Mi
 
 telemetry:

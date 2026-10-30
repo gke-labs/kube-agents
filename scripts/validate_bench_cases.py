@@ -208,13 +208,14 @@ KNOWN_UNREGISTERED = {
     "notification-dead-thread-falls-back": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
     ),
-    # It grades a GitHub forge declared at a GitHub Enterprise Server host,
-    # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
-    # it. No eval lane deploys either, so it runs by hand with the recipe in
-    # its header. The entry goes when a lane deploys both.
+    # It grades a GitHub forge declared at a GitHub Enterprise Server host.
+    # The GHES lane (hack/eval/ghes-cases.txt) runs pdb-remediation-pr itself
+    # against the proxy, which proves the same path; registering this copy in
+    # the nightly would run it on the github.com nightly too. The entry goes
+    # when the registration rules grow a lane-only seat.
     "ghes-pdb-remediation-pr": (
-        "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
-        "run by hand with the recipe in the case header"
+        "the GHES lane runs pdb-remediation-pr against the proxy; a nightly registration "
+        "would run this copy on github.com too; run by hand with the recipe in the case header"
     ),
     # The upgrade-failure catalogue's scenario cases enter
     # hack/eval/nightly-cases.txt in batches of five (decided 2026-10-15 on
@@ -284,11 +285,6 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
-    "cluster-agent-scaled-zero-gateway-silence": (
-        "#4098: needs bench/tf/fleet's scaled-zero-gateway role on every pool project "
-        "(the postsubmit reconcile) and stall_report.py's scale-to-zero rule for Gateways "
-        "and HTTPRoutes; without the rule the case is red every run"
-    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no
@@ -1297,7 +1293,7 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         try:
             slots = reader.declared_slots(path)
         except reader.ScopeExcludeError as exc:
-            problems.append(f"'scope_exclude:' must be {{slots: [<slot>, ...]}}: {exc}")
+            problems.append(f"'scope_exclude:' must be {{slots: [<slot>, ...], absent: <n>}}: {exc}")
         else:
             catalog = _catalog_slots()
             unknown = sorted(set(slots) - catalog)
