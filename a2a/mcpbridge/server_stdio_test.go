@@ -474,7 +474,10 @@ func TestSignalDrainsTheRemoteStopsOfCancelledCalls(t *testing.T) {
 	}
 	signal()
 	select {
-	case <-served:
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("a signal shutdown returned %v; want nil, so the process exits 0", err)
+		}
 	case <-time.After(stdioTestWait):
 		t.Fatal("the bridge did not return after the signal")
 	}
@@ -486,5 +489,17 @@ func TestSignalDrainsTheRemoteStopsOfCancelledCalls(t *testing.T) {
 		}
 	default:
 		t.Fatal("the bridge returned on a signal before the cancelled send_message's remote stop went out")
+	}
+}
+
+// A signal that arrives with a frame already queued may reach ServeStdio first; that is the
+// same orderly shutdown and returns nil too.
+func TestSignalWithAQueuedFrameReturnsNil(t *testing.T) {
+	srv := newStdioTestServer(t, startBlockingGateway(t, ""))
+	ctx, signal := context.WithCancel(context.Background())
+	signal()
+	frame, _ := json.Marshal(map[string]any{"jsonrpc": jsonRPCVersion, "id": 1, "method": "ping"})
+	if err := srv.serveStdioUntilDone(ctx, strings.NewReader(string(frame)+"\n"), io.Discard); err != nil {
+		t.Fatalf("a signal shutdown with a queued frame returned %v; want nil", err)
 	}
 }

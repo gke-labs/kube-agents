@@ -893,13 +893,18 @@ func RunCLIWithOptions(args []string, opts ServerOptions) error {
 
 // serveStdioUntilDone runs ServeStdio until stdin closes or ctx ends (SIGINT/SIGTERM), and
 // either way waits, at most remoteStopDrainTimeout in all, for the remote stops that cancelled
-// calls issue, so the turns they were waiting on do not keep running in the cluster.
+// calls issue, so the turns they were waiting on do not keep running in the cluster. A signal
+// is an orderly shutdown and returns nil, so the process exits 0.
 func (s *Server) serveStdioUntilDone(ctx context.Context, r io.Reader, w io.Writer) error {
 	served := make(chan error, 1)
 	go func() { served <- s.ServeStdio(ctx, r, w) }()
 	select {
 	case err := <-served:
 		s.waitBackground(remoteStopDrainTimeout)
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			// ServeStdio saw the signal first, reading a frame queued with it.
+			return nil
+		}
 		return err
 	case <-ctx.Done():
 		// ServeStdio stays blocked reading stdin. The cancelled calls' handlers queue their
@@ -907,7 +912,7 @@ func (s *Server) serveStdioUntilDone(ctx context.Context, r io.Reader, w io.Writ
 		deadline := time.Now().Add(remoteStopDrainTimeout)
 		waitGroupUntil(&s.handlerWG, deadline)
 		waitGroupUntil(&s.bgWG, deadline)
-		return ctx.Err()
+		return nil
 	}
 }
 
