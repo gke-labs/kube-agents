@@ -231,3 +231,27 @@ func TestTaskControlStopOfAnUntrackedTaskRefusesBeforeConnecting(t *testing.T) {
 		t.Fatalf("task_control stop of an untracked task with no session: %+v; want the refusal, before any connect", res)
 	}
 }
+
+// A get by bare id that fails or is cancelled brought no answer: the owner the send recorded
+// under the task's other spelling is kept, so a later stop by task_id still finds it.
+func TestAFailedOrCancelledGetKeepsTheTasksOwner(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	for _, tc := range []struct {
+		name            string
+		ctxErr, callErr error
+	}{
+		{"failed", nil, errors.New("tunnel hiccup")},
+		{"cancelled", context.Canceled, nil},
+	} {
+		srv.mu.Lock()
+		srv.activeStreamingTasks["task:platform/task-1"] = &activeStreamingTask{TaskID: "platform/task-1", ConvAlias: "c1", UpdatedAt: time.Now()}
+		srv.mu.Unlock()
+		srv.registerStreamingCallStart("task:task-1", "task-1", "c1", "", "", func() {})
+		srv.finishStreamingCall("task:task-1", "c1", "", "", "", tc.ctxErr, tc.callErr)
+		srv.bgWG.Wait()
+		if owner := srv.taskOwnerConversation("task-1"); owner != "c1" {
+			t.Fatalf("%s get: the task's owner is %q; want c1 kept", tc.name, owner)
+		}
+	}
+}

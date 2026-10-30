@@ -1705,18 +1705,22 @@ func (s *Server) finishStreamingCall(key, convAlias, hostConvID, artifactsDir, r
 	// The same task may be tracked under its other spelling ("task:<addressee>/<id>" from a
 	// send, "task:<id>" from a get): this answer supersedes those entries too. Only the call's
 	// own task and the server's running-task line count, not any "task-" the text mentions.
-	refs := []string{runningTaskRef(responseText)}
-	if entry != nil {
-		refs = append(refs, entry.TaskID)
-	}
-	for k, st := range s.activeStreamingTasks {
-		if st == nil || st.InFlight {
-			continue
+	// A call that failed or was cancelled brought no answer and supersedes nothing: the owner
+	// recorded from the send is kept for the next stop or cancelled read.
+	if ctxErr == nil && callErr == nil {
+		refs := []string{runningTaskRef(responseText)}
+		if entry != nil {
+			refs = append(refs, entry.TaskID)
 		}
-		for _, ref := range refs {
-			if sameTaskRef(st.TaskID, ref) {
-				delete(s.activeStreamingTasks, k)
-				break
+		for k, st := range s.activeStreamingTasks {
+			if st == nil || st.InFlight {
+				continue
+			}
+			for _, ref := range refs {
+				if sameTaskRef(st.TaskID, ref) {
+					delete(s.activeStreamingTasks, k)
+					break
+				}
 			}
 		}
 	}
