@@ -474,3 +474,56 @@ func linesOutsideFences(md string) []string {
 	}
 	return out
 }
+
+func TestInspectPullRequestCutShortDiffIsNotAdvertised(t *testing.T) {
+	const prPath = "/repos/example-org/example-infra/pulls/42"
+	const partial = "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1,3 +1,3 @@\n-x\n"
+	for _, tc := range []struct {
+		name  string
+		serve func(w http.ResponseWriter)
+		want  string
+	}{
+		{"body ends early", func(w http.ResponseWriter) {
+			w.Header().Set("Content-Length", "100000")
+			_, _ = w.Write([]byte(partial))
+			w.(http.Flusher).Flush()
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			_ = conn.Close()
+		}, "cut short"},
+		{"over the read cap", func(w http.ResponseWriter) {
+			_, _ = w.Write([]byte(partial))
+			_, _ = w.Write([]byte(strings.Repeat("+", maxPRDiffReadBytes)))
+		}, "larger than"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == prPath && r.Header.Get(acceptHeader) == acceptGitHubDiff:
+					tc.serve(w)
+				case r.URL.Path == prPath:
+					_ = json.NewEncoder(w).Encode(map[string]any{"number": testPRNumber, "title": "t", "state": "open", "html_url": testPRURL, "changed_files": 1})
+				case r.URL.Path == prPath+"/files":
+					_ = json.NewEncoder(w).Encode([]map[string]any{{"filename": "a.go", "status": "modified"}})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(ghServer.Close)
+			outDir := filepath.Join(t.TempDir(), "pr-out")
+			insp, err := InspectPullRequest(context.Background(), nil, ghServer.URL, testPRURL, "", outDir)
+			if err != nil {
+				t.Fatalf("InspectPullRequest: %v", err)
+			}
+			if insp.DiffFilePath != "" || insp.UnifiedDiff != "" || !strings.Contains(insp.DiffError, tc.want) {
+				t.Fatalf("DiffFilePath=%q len(UnifiedDiff)=%d DiffError=%q; want no diff and an error saying %q",
+					insp.DiffFilePath, len(insp.UnifiedDiff), insp.DiffError, tc.want)
+			}
+			if _, err := os.Stat(filepath.Join(outDir, "pr-42.diff")); !os.IsNotExist(err) {
+				t.Fatalf("pr-42.diff was written from a partial diff (stat err %v)", err)
+			}
+			if _, err := os.Stat(filepath.Join(outDir, filesSubdirName, "a.go.patch")); !os.IsNotExist(err) {
+				t.Fatalf("a per-file patch was written from a partial diff (stat err %v)", err)
+			}
+		})
+	}
+}

@@ -280,6 +280,11 @@ func InspectPullRequest(
 	}
 
 	diffPath := filepath.Join(outputDir, fmt.Sprintf(diffFileNameFormat, num))
+	if insp.DiffError != "" {
+		// A diff whose download failed part-way (a gh pr diff that exited non-zero after
+		// writing some of it) is a prefix, not the diff.
+		insp.UnifiedDiff = ""
+	}
 	if strings.TrimSpace(insp.UnifiedDiff) == "" {
 		// A refused or failed diff download (GitHub answers 406 past 20k lines / 300 files) must
 		// not be advertised as a complete native diff file: leave DiffFilePath unset, drop any
@@ -490,9 +495,19 @@ func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int
 			_ = diffResp.Body.Close()
 			insp.DiffError = (&githubHTTPError{Endpoint: prEndpoint + " (" + acceptGitHubDiff + ")", StatusCode: diffResp.StatusCode, Body: strings.TrimSpace(string(body))}).Error()
 		default:
-			rawDiff, _ := io.ReadAll(io.LimitReader(diffResp.Body, maxPRDiffReadBytes))
+			// Read one byte past the cap so a diff the cap cut short is told from one that fits,
+			// and keep the read error: either way the result is a prefix of the diff, which must
+			// not be written or linked as the complete one.
+			rawDiff, rErr := io.ReadAll(io.LimitReader(diffResp.Body, maxPRDiffReadBytes+1))
 			_ = diffResp.Body.Close()
-			insp.UnifiedDiff = string(rawDiff)
+			switch {
+			case rErr != nil:
+				insp.DiffError = fmt.Sprintf("unified diff download was cut short after %d bytes: %v", len(rawDiff), rErr)
+			case len(rawDiff) > maxPRDiffReadBytes:
+				insp.DiffError = fmt.Sprintf("unified diff is larger than the %d MiB the bridge reads", maxPRDiffReadBytes>>20)
+			default:
+				insp.UnifiedDiff = string(rawDiff)
+			}
 		}
 	}
 	return insp, nil
