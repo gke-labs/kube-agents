@@ -150,7 +150,18 @@
                 }
               }
             ],
-            "resources": {},
+            "resources": {
+              "limits": {
+                "cpu": "1",
+                "ephemeral-storage": "1Gi",
+                "memory": "2Gi"
+              },
+              "requests": {
+                "cpu": "250m",
+                "ephemeral-storage": "1Gi",
+                "memory": "512Mi"
+              }
+            },
             "volumeMounts": [
               {
                 "name": "scratch",
@@ -189,7 +200,15 @@
           "seccompProfile": {
             "type": "RuntimeDefault"
           }
-        }
+        },
+        "tolerations": [
+          {
+            "key": "kubernetes.io/arch",
+            "operator": "Equal",
+            "value": "amd64",
+            "effect": "NoSchedule"
+          }
+        ]
       }
     },
     "ttlSecondsAfterFinished": 300

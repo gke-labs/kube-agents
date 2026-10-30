@@ -1,5 +1,5 @@
 {
-  "version": "0e508f3302c7517f",
+  "version": "deffb7c04adcc2ce",
   "namespace": "test-ns",
   "profileNamespace": "test-ns-profiles",
   "ceiling": 6,
@@ -170,7 +170,18 @@
                   }
                 }
               ],
-              "resources": {},
+              "resources": {
+                "limits": {
+                  "cpu": "1",
+                  "ephemeral-storage": "1Gi",
+                  "memory": "2Gi"
+                },
+                "requests": {
+                  "cpu": "250m",
+                  "ephemeral-storage": "1Gi",
+                  "memory": "512Mi"
+                }
+              },
               "volumeMounts": [
                 {
                   "name": "scratch",
@@ -209,7 +220,15 @@
             "seccompProfile": {
               "type": "RuntimeDefault"
             }
-          }
+          },
+          "tolerations": [
+            {
+              "key": "kubernetes.io/arch",
+              "operator": "Equal",
+              "value": "amd64",
+              "effect": "NoSchedule"
+            }
+          ]
         }
       }
     }

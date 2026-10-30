@@ -142,6 +142,7 @@ func buildProfileJobTemplate(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha
 	tier := agentv1alpha1.AgentProfileTierUnattended
 	spec := profileWorkerPodSpecForJob(agent, p, tier, imageVolumes)
 	spec.RestartPolicy = corev1.RestartPolicyNever
+	settleForPlatformMutation(&spec, p)
 	return &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
 			a2aComponentLabel:     agentProfileWorkerComponent,
@@ -149,6 +150,72 @@ func buildProfileJobTemplate(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha
 			agentProfileTierLabel: tier,
 		}},
 		Spec: spec,
+	}
+}
+
+// Autopilot's defaults for a container's unset resources, which the Job
+// template sets itself to the same values.
+var jobDefaultResources = corev1.ResourceList{
+	corev1.ResourceCPU:              resource.MustParse("500m"),
+	corev1.ResourceMemory:           resource.MustParse("2Gi"),
+	corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+}
+
+// jobArchToleration is the toleration GKE Autopilot adds to a pod that names
+// no architecture (the images are linux/amd64). Harmless elsewhere: it
+// tolerates only the architecture taint.
+var jobArchToleration = corev1.Toleration{Key: "kubernetes.io/arch", Operator: corev1.TolerationOpEqual, Value: "amd64", Effect: corev1.TaintEffectNoSchedule}
+
+// settleForPlatformMutation sets in the Job template what a managed
+// platform's mutating admission would otherwise fill in on the Job, after the
+// operator rendered the template and before the Job admission policy compares
+// the two, so the comparison holds. Found live on GKE Autopilot, whose
+// webhook defaults a container's unset cpu, memory and ephemeral-storage and
+// adds jobArchToleration: every container gets a request and a limit for all
+// three (the worker's cpu and memory from the profile, anything else unset
+// from jobDefaultResources, a limit from its request), and the toleration is
+// added. Autopilot also raises a request that breaks its cpu-to-memory ratio;
+// that it can't be told apart from a forged Job, so such a profile's Jobs are
+// refused there (fail closed).
+func settleForPlatformMutation(spec *corev1.PodSpec, p *agentv1alpha1.AgentProfile) {
+	settle := func(c *corev1.Container, requests, limits corev1.ResourceList) {
+		if c.Resources.Requests == nil {
+			c.Resources.Requests = corev1.ResourceList{}
+		}
+		if c.Resources.Limits == nil {
+			c.Resources.Limits = corev1.ResourceList{}
+		}
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage} {
+			if _, ok := c.Resources.Requests[name]; !ok {
+				if q, ok := requests[name]; ok {
+					c.Resources.Requests[name] = q
+				} else {
+					c.Resources.Requests[name] = jobDefaultResources[name]
+				}
+			}
+			if _, ok := c.Resources.Limits[name]; !ok {
+				if q, ok := limits[name]; ok {
+					c.Resources.Limits[name] = q
+				} else {
+					c.Resources.Limits[name] = c.Resources.Requests[name]
+				}
+			}
+		}
+	}
+	profile := p.Spec.Resources
+	for i := range spec.Containers {
+		var requests, limits corev1.ResourceList
+		if i == 0 { // the worker
+			requests = corev1.ResourceList{corev1.ResourceCPU: profile.Requests.CPU, corev1.ResourceMemory: profile.Requests.Memory}
+			limits = corev1.ResourceList{corev1.ResourceCPU: profile.Limits.CPU, corev1.ResourceMemory: profile.Limits.Memory}
+		}
+		settle(&spec.Containers[i], requests, limits)
+	}
+	for i := range spec.InitContainers {
+		settle(&spec.InitContainers[i], nil, nil)
+	}
+	if !slices.ContainsFunc(spec.Tolerations, func(t corev1.Toleration) bool { return t.Key == jobArchToleration.Key }) {
+		spec.Tolerations = append(spec.Tolerations, jobArchToleration)
 	}
 }
 

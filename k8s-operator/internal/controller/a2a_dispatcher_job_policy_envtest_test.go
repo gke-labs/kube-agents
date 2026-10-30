@@ -127,6 +127,12 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 		"tolerations": {func(s *corev1.PodSpec) {
 			s.Tolerations = []corev1.Toleration{{Key: "k", Operator: corev1.TolerationOpExists}}
 		}, scheduling},
+		"a toleration beside the architecture's": {func(s *corev1.PodSpec) {
+			s.Tolerations = append(s.Tolerations, corev1.Toleration{Key: "k", Operator: corev1.TolerationOpExists})
+		}, scheduling},
+		"an architecture toleration for NoExecute": {func(s *corev1.PodSpec) {
+			s.Tolerations = []corev1.Toleration{{Key: "kubernetes.io/arch", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute}}
+		}, scheduling},
 		"a nodeSelector": {func(s *corev1.PodSpec) { s.NodeSelector = map[string]string{"pool": "gpu"} }, scheduling},
 		"affinity": {func(s *corev1.PodSpec) {
 			s.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{

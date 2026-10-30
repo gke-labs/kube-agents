@@ -504,3 +504,41 @@ func TestJobModeNeedsThePolicyInPlace(t *testing.T) {
 		})
 	}
 }
+
+// The Job template carries what GKE Autopilot's mutating admission would
+// otherwise fill in on the Job, so the policy's comparison holds there (found
+// live): every container a request and a limit for cpu, memory and
+// ephemeral-storage, the worker's cpu and memory from the profile, and the
+// architecture toleration, once.
+func TestTheJobTemplateSettlesWhatAutopilotFillsIn(t *testing.T) {
+	agent := a2aTestAgent()
+	p := unattendedProfile(agent, "tse")
+	tmpl := buildProfileJobTemplate(agent, &p, false)
+	all := append(append([]corev1.Container{}, tmpl.Spec.Containers...), tmpl.Spec.InitContainers...)
+	if len(tmpl.Spec.InitContainers) == 0 {
+		t.Fatal("the template has no init container, so this checks only the worker")
+	}
+	for _, c := range all {
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage} {
+			if _, ok := c.Resources.Requests[name]; !ok {
+				t.Errorf("container %s has no %s request: Autopilot would default it, and the Job would no longer equal its template", c.Name, name)
+			}
+			if _, ok := c.Resources.Limits[name]; !ok {
+				t.Errorf("container %s has no %s limit", c.Name, name)
+			}
+		}
+	}
+	w := tmpl.Spec.Containers[0].Resources
+	if !w.Requests.Cpu().Equal(p.Spec.Resources.Requests.CPU) || !w.Limits.Memory().Equal(p.Spec.Resources.Limits.Memory) {
+		t.Errorf("the worker's resources %+v aren't the profile's %+v", w, p.Spec.Resources)
+	}
+	n := 0
+	for _, tol := range tmpl.Spec.Tolerations {
+		if tol == jobArchToleration {
+			n++
+		}
+	}
+	if n != 1 || len(tmpl.Spec.Tolerations) != 1 {
+		t.Errorf("tolerations %+v, want the architecture's alone, once", tmpl.Spec.Tolerations)
+	}
+}
