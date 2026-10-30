@@ -136,7 +136,7 @@ __all__ = [
 # already drops everything older than the run.
 _ISSUE_COMMENT_PAGES = 3
 # Tolerance between a forge's stamps and the harness's run-start clock, two
-# different machines; the figure the sibling forge checks use.
+# different machines.
 _DEFAULT_CLOCK_SKEW_SEC = 120.0
 
 _NO_TRANSCRIPT_REASON = (

@@ -510,9 +510,9 @@ KNOWN_JUDGE_ONLY: dict[str, str] = {}
 # devops-bench's registry is authoritative and rejects an unknown type at
 # spec-load time; this table is the pre-cluster copy. The upstream entries
 # come from the pinned devops-bench SHA in bench/pyproject.toml, the local
-# ones from bench/kube_agents_bench/verifiers.py -- a test re-derives the
-# local ones from the entry-point group so a new local verifier fails here
-# rather than drifting silently.
+# ones from the `devops_bench.verifiers` entry-point group in the same file
+# -- a test re-derives the local ones from that group so a new local
+# verifier fails here rather than drifting silently.
 #
 # For the upstream entries the named field is also required by the verifier's own
 # pydantic model, so this rule only moves the rejection earlier -- from after a
@@ -548,9 +548,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "every_finding_named",
     ),
-    # The issue state, its labels and its in-run comment count. The model
-    # holds the stricter rule: `state: closed` or `min_comments` >= 1, the two
-    # that bind the issue to the run.
+    # The issue state, its labels and its in-run comment count; the binding
+    # rule (`state: closed` or `min_comments` >= 1) is a clause of its own in
+    # _check_assertions.
     "forge_issue_state": ("state", "labels", "min_comments"),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
@@ -655,6 +655,8 @@ COMPOUND_TYPES = frozenset({"sequence", "parallel", "all", "any", "none"})
 RESOURCE_PROPERTY_TYPES = frozenset({"resource_property", "fleet_resource_property"})
 EQUALITY_OPS = frozenset({"eq", "ne"})
 QUOTED_BOOLEANS = frozenset({"true", "false"})
+# The one run-reading type with a binding rule of its own, below.
+FORGE_ISSUE_STATE_TYPE = "forge_issue_state"
 #: The (parent segment, field) pairs the Kubernetes and GKE APIs serve as
 #: booleans; "" is the object root. The rule fires on a pair in this table
 #: and on nothing else, so a string field that shares a name with a boolean
@@ -1065,6 +1067,20 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
         problems.append(
             f"{where}: check '{node_type}' populates none of "
             f"{list(fields)}, so it can only pass"
+        )
+
+    # forge_issue_state binds the issue to the run through the close or the
+    # comments posted inside it; `labels` alone, or `state: open` alone, would
+    # pass on an issue an earlier run left behind. The verifier's own model
+    # refuses the shape too, but only at spec load, after the cluster lease.
+    min_comments = node.get("min_comments")
+    if node_type == FORGE_ISSUE_STATE_TYPE and node.get("state") != "closed" and not (
+        isinstance(min_comments, int) and not isinstance(min_comments, bool) and min_comments >= 1
+    ):
+        problems.append(
+            f"{where}: check '{node_type}' sets neither state: closed nor "
+            "min_comments of at least 1, so nothing binds the issue it reads to "
+            "this run and it would pass on an issue an earlier run left behind"
         )
 
     # A quoted boolean against a boolean field never compares equal: the

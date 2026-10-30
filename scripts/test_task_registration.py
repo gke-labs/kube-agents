@@ -514,6 +514,28 @@ class TestTheValidatorItself(unittest.TestCase):
             validator._check_assertions(node, "check 'x'", problems)
             self.assertEqual(problems, [], node)
 
+    def test_a_forge_issue_state_check_must_bind_the_issue_to_the_run(self):
+        # Labels alone, or an open state alone, pass on an issue an earlier run
+        # left behind; the close or the in-run comments are the binding.
+        for unbound in (
+            {"type": "forge_issue_state", "labels": ["status:resolved"]},
+            {"type": "forge_issue_state", "state": "open"},
+            {"type": "forge_issue_state", "state": "open", "min_comments": 0},
+            {"type": "forge_issue_state", "state": "open", "min_comments": True},
+        ):
+            problems = []
+            validator._check_assertions(unbound, "check 'x'", problems)
+            self.assertEqual(len(problems), 1, (unbound, problems))
+            self.assertIn("binds the issue", problems[0])
+        for bound in (
+            {"type": "forge_issue_state", "state": "closed"},
+            {"type": "forge_issue_state", "state": "open", "min_comments": 1},
+            {"type": "forge_issue_state", "state": "closed", "labels": ["status:resolved"], "min_comments": 2},
+        ):
+            problems = []
+            validator._check_assertions(bound, "check 'x'", problems)
+            self.assertEqual(problems, [], bound)
+
     def test_a_check_that_asserts_without_a_field_is_not_rejected(self):
         # An empty CHECK_ASSERTIONS tuple is the "no field can switch this off"
         # case, not a missing entry: pull_request_opened fails on a report
