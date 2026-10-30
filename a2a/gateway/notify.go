@@ -615,6 +615,9 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, string, *lib.Notify
 		if kind := blocksInteractive(blocks); kind != "" {
 			return refuse("blocks carry an interactive element (type " + kind + "); the gateway answers clicks only on the buttons it draws, so strip it")
 		}
+		if req.Update != "" {
+			return refuse("a request with blocks takes no update key; the gateway edits chat messages and text by key, not Block Kit")
+		}
 	}
 	return req, home, nil
 }
@@ -1076,13 +1079,14 @@ func (n *Notifier) editKeyedWith(edit func(OutMessage) error, where string, scop
 			}
 		}
 	}
+	if errors.Is(layoutErr, ErrMessageGone) {
+		// The message itself is gone: the layout was not what failed, so
+		// nothing is counted refused, no text edit is tried on it, and the
+		// request posts anew.
+		n.log.Warn("notify: editing the keyed message failed; posting a new one", append(scope, "err", layoutErr)...)
+		return false, nil
+	}
 	if text == nil {
-		if errors.Is(layoutErr, ErrMessageGone) {
-			// The message itself is gone: the layout was not what failed,
-			// so nothing is counted refused, and the request posts anew.
-			n.log.Warn("notify: editing the keyed message failed; posting a new one", append(scope, "err", layoutErr)...)
-			return false, nil
-		}
 		if layoutErr != nil && !errors.Is(layoutErr, ErrTextOnly) {
 			n.chatOutcome(where, layoutErr)
 		}

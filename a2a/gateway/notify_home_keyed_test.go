@@ -25,6 +25,7 @@ type fakeHomePoster struct {
 	*fakeNotifyPoster
 	chats        []*chatmsg.Message
 	edits        []notifyPost
+	editCalls    int
 	refuseLayout bool
 	failEdits    bool
 }
@@ -38,6 +39,7 @@ func (f *fakeHomePoster) PostNotifyMessage(space, thread string, m OutMessage) (
 }
 
 func (f *fakeHomePoster) EditNotifyMessage(space, _, message string, m OutMessage) error {
+	f.editCalls++
 	if m.Chat != nil && f.refuseLayout {
 		return ErrLayoutRefused
 	}
@@ -117,9 +119,13 @@ func TestNotifyHomeUpdateKeyPostsAnewWhenTheEditFails(t *testing.T) {
 	n, p := newHomeKeyedNotifier(t)
 	first := serveJSON(t, n, homeKeyed("a", "plan-c1-1", testHomeThread))
 	p.failEdits = true
+	p.editCalls = 0
 	second := serveJSON(t, n, homeKeyed("b", "plan-c1-1", testHomeThread))
 	if second.Error != "" || second.MessageID == first.MessageID || len(p.all()) != 2 {
 		t.Fatalf("replies %+v, %+v, posts %d; want a second post", first, second, len(p.all()))
+	}
+	if p.editCalls != 1 {
+		t.Fatalf("edit calls = %d; want one, since a gone message is not edited again as text", p.editCalls)
 	}
 	p.failEdits = false
 	serveJSON(t, n, homeKeyed("c", "plan-c1-1", testHomeThread))
