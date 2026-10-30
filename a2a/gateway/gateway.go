@@ -1264,7 +1264,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// artifact and the terminal in order from its durable - and the
 		// heal leaves it alone (probeConversation reads the same fold as the
 		// chain running). Past it, the relay's delivery is taken as lost
-		// (an ack on enqueue and a crash, or a failed end-of-batch write),
+		// (a failed end-of-batch write after the render was acked),
 		// and the heal does the relay's work itself rather than leave the
 		// conversation wedged on a turn nothing will release.
 		if since := time.Since(g.relayLagStart(active.TaskID, storedAt, time.Now())); since <= g.relayLagGrace() {

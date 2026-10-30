@@ -222,3 +222,24 @@ func taskIDs(ds []DeferredDelivery) []string {
 	}
 	return out
 }
+
+// TestAFailedNakStillReleasesTheDelivery: a nak that can't reach the
+// connection stops the heartbeat and the tracking, so the server redelivers
+// the message after AckWait instead of a heartbeat renewing it for the life
+// of the subscription.
+func TestAFailedNakStillReleasesTheDelivery(t *testing.T) {
+	state := &deferredState{pending: map[*deferredDelivery]struct{}{}}
+	beatStopped := false
+	// No connection and no reply subject: the nak fails, as it does on a dead connection.
+	dd := &deferredDelivery{state: state, heldDelivery: &heldDelivery{c: &Client{}}, stopBeat: func() { beatStopped = true }}
+	state.pending[dd] = struct{}{}
+	if err := dd.Nak(time.Second); err == nil {
+		t.Fatal("a nak with nowhere to go reported success")
+	}
+	if !beatStopped {
+		t.Fatal("a failed nak left the heartbeat renewing the delivery")
+	}
+	if len(state.pending) != 0 {
+		t.Fatal("a failed nak left the delivery pending")
+	}
+}

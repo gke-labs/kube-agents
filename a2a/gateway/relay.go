@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -223,6 +224,16 @@ func (g *Gateway) giveBackLater(item relayItem) {
 	}
 }
 
+// firstDeliveryLevel is Error for an item's first delivery and Debug for a
+// redelivery: a KV outage gives every held event back every requeueDelay,
+// and one Error line per event says so without one per retry.
+func firstDeliveryLevel(item relayItem) slog.Level {
+	if item.d == nil || item.d.NumDelivered() <= 1 {
+		return slog.LevelError
+	}
+	return slog.LevelDebug
+}
+
 // sequence is the item's stream sequence, 0 when it has none.
 func (item relayItem) sequence() uint64 {
 	if item.d == nil {
@@ -272,7 +283,7 @@ func (g *Gateway) relayItemIn(ctx context.Context, item relayItem) {
 	if err != nil {
 		// A failed lookup isn't "not ours": give it back for a later try
 		// rather than ack away an event this gateway may own.
-		g.log.Error("task index lookup failed", "taskId", env.TaskID, "err", err)
+		g.log.Log(ctx, firstDeliveryLevel(item), "task index lookup failed", "taskId", env.TaskID, "err", err)
 		g.giveBackLater(item)
 		return
 	}
@@ -329,7 +340,7 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 		// nak keeps the event in the durable's pending count until it is
 		// redelivered, so an outage long enough to fill relayMaxAckPending
 		// still stalls new events; it no longer loses any.
-		g.log.Error("relay: session record unavailable; giving the batch back", "session", sessionKey, "err", err)
+		g.log.Log(ctx, firstDeliveryLevel(batch[0]), "relay: session record unavailable; giving the batch back", "session", sessionKey, "err", err)
 		for _, item := range batch {
 			g.giveBackLater(item)
 		}

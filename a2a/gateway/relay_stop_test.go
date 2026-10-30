@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -206,4 +207,26 @@ func TestADrainThatRunsOutMarksTheBatchesStillRenderingAbandoned(t *testing.T) {
 		t.Fatal("a drain that ran out on a rendering batch didn't mark it abandoned")
 	}
 	overrun.leave()
+}
+
+// redelivered is a fakeDelivery the server has sent before.
+type redelivered struct{ fakeDelivery }
+
+func (r *redelivered) NumDelivered() uint64 { return 2 }
+
+// TestAGiveBackIsAnErrorOnlyOnTheFirstDelivery: during a KV outage every
+// held event comes back every requeueDelay, so only its first failure logs
+// at Error.
+func TestAGiveBackIsAnErrorOnlyOnTheFirstDelivery(t *testing.T) {
+	first := &fakeDelivery{env: &lib.Envelope{TaskID: "t"}, subj: "s", seq: 1}
+	again := &redelivered{fakeDelivery: fakeDelivery{env: &lib.Envelope{TaskID: "t"}, subj: "s", seq: 1}}
+	if got := firstDeliveryLevel(relayItem{env: first.env, d: first}); got != slog.LevelError {
+		t.Errorf("first delivery logs at %v, want Error", got)
+	}
+	if got := firstDeliveryLevel(relayItem{env: again.env, d: again}); got != slog.LevelDebug {
+		t.Errorf("a redelivery logs at %v, want Debug", got)
+	}
+	if got := firstDeliveryLevel(relayItem{env: first.env}); got != slog.LevelError {
+		t.Errorf("an item off no durable logs at %v, want Error", got)
+	}
 }
