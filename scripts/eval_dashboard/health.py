@@ -187,6 +187,12 @@ SHARED_BREAK_MIN_RED_SHARE = 0.5
 # Rule 4 without a same-base pass: this many red runs of the one pull request
 # (a retest, or a new push) before its case is called the pull request's.
 PR_CAUSED_MIN_RUNS = 2
+# A case counts as failing on a pull request only on a record with at least
+# this many graded repetitions, all failed. One graded repetition beside two
+# infra ones (2026-10-30: a throttled run under a quota storm) is the storm's
+# shape, not a collapse the pull request owns; a record without
+# per-repetition detail grades as one and is never thick enough.
+PR_CAUSED_MIN_GRADED_REPS = 2
 PR_CAUSED_SAME_BASE = "same_base"
 PR_CAUSED_REPEATED = "repeated"
 
@@ -921,6 +927,10 @@ class Run:
     def collapsed_cases(self) -> set[str]:
         return {task.name for task in self.tasks if task.collapsed}
 
+    def graded_reps(self, case: str) -> int:
+        """How many of `case`'s repetitions this run graded (pass or fail)."""
+        return sum(task.graded for task in self.tasks if task.name == case)
+
     def passing_cases(self) -> set[str]:
         return {task.name for task in self.tasks if task.passes > 0}
 
@@ -1017,28 +1027,31 @@ def _in_window(runs, now: datetime, window: timedelta):
     return [run for run in runs if now - window < run.finished <= now]
 
 
-def pr_caused_path(case: str, runs, population) -> tuple[str | None, list]:
+def pr_caused_path(case: str, runs, population) -> tuple[str | None, list, list]:
     """Rule 4 for one case: `runs` are the runs that collapsed it, all of one
-    pull request or the case is nobody's. It is that pull request's when the
+    pull request or the case is nobody's (a thin record on a second pull
+    request still makes it nobody's). It is that pull request's when the
     evidence rules out a flake and a moving main: the case passed on another
     pull request's run built on the same main commit (PR_CAUSED_SAME_BASE,
     with those runs), or it failed on PR_CAUSED_MIN_RUNS of the pull request's
     runs (a retest counts) while passing on another pull request
-    (PR_CAUSED_REPEATED, with the passing runs). One red run and no same-base
-    pass says nothing: (None, [])."""
+    (PR_CAUSED_REPEATED, with the passing runs). Only runs whose record of the
+    case is thick enough (PR_CAUSED_MIN_GRADED_REPS) count, and they come back
+    third. One red run and no same-base pass says nothing: (None, [], [])."""
     prs = _prs(runs)
     if len(prs) != 1:
-        return None, []
+        return None, [], []
+    solid = [run for run in runs if run.graded_reps(case) >= PR_CAUSED_MIN_GRADED_REPS]
     elsewhere = [run for run in population if case in run.passing_cases() and run.pr != prs[0]]
-    if not elsewhere:
-        return None, []
-    bases = {run.base_sha for run in runs if run.base_sha}
+    if not solid or not elsewhere:
+        return None, [], []
+    bases = {run.base_sha for run in solid if run.base_sha}
     same_base = [run for run in elsewhere if run.base_sha and run.base_sha in bases]
     if same_base:
-        return PR_CAUSED_SAME_BASE, same_base
-    if len({run.build_id for run in runs}) >= PR_CAUSED_MIN_RUNS:
-        return PR_CAUSED_REPEATED, elsewhere
-    return None, []
+        return PR_CAUSED_SAME_BASE, same_base, solid
+    if len({run.build_id for run in solid}) >= PR_CAUSED_MIN_RUNS:
+        return PR_CAUSED_REPEATED, elsewhere, solid
+    return None, [], []
 
 
 def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
@@ -1058,9 +1071,9 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
     )
     # Rule 4 (pr_caused_path): a case failing on exactly one pull request is
     # that pull request's, and carries no state.
-    pr_caused = []
+    pr_caused, pr_caused_latest = [], []
     for case, runs in sorted(collapses.items()):
-        path, others = pr_caused_path(case, runs, window)
+        path, others, solid = pr_caused_path(case, runs, window)
         if path == PR_CAUSED_SAME_BASE:
             pr_caused.append(
                 f"PR-caused: {case} failing only on #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs built on the same main commit)"
@@ -1069,6 +1082,8 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
             pr_caused.append(
                 f"PR-caused: {case} failing on {len(runs)} runs of #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs)"
             )
+        if path is not None:
+            pr_caused_latest.append(max(run.finished for run in solid))
 
     concluded = [run for run in window if run.result in (RUN_SUCCESS, RUN_FAILURE)]
     reds = [run for run in concluded if run.result == RUN_FAILURE]
@@ -1098,6 +1113,9 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
         "cases": cases,
         "evidence": evidence,
         "pr_caused": pr_caused,
+        # The latest finish among each line's solid runs, in the same order:
+        # assess drops the lines a storm window reaches.
+        "pr_caused_latest": pr_caused_latest,
         "signature_runs": {run.build_id for run in covered},
         "prs": _prs(covered),
         "runs": len(covered),
@@ -1180,6 +1198,7 @@ def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
         evidence.append(line)
     return {
         "fires": fires,
+        "reps_fire": reps_fire,
         "reps": reps,
         "prs": prs,
         "start": start,
@@ -2286,6 +2305,14 @@ def assess(
     full_runs = [run for run in visible if run.full]
     r1 = shared_break(full_runs, now, roster)
     r2 = storm(full_runs, now, vertex_429)
+    # While the storm's repetitions are firing (confirmed or not), a thin
+    # record on one pull request is the storm's symptom: rule 4 says nothing
+    # about a collapse the storm's reach covers (its first hit run's finish,
+    # less the calls before it). A collapse that finished before that is
+    # named as usual: it cannot be the storm's.
+    if r2["reps_fire"]:
+        reach = r2["start"] - STORM_429_LOOKBACK
+        r1["pr_caused"] = [line for line, latest in zip(r1["pr_caused"], r1["pr_caused_latest"]) if latest < reach]
     r2b = delegation_ceiling(full_runs, now)
     r3 = setup_deaths(visible, now)
     r3b = lost_pods(visible, now)

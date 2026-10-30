@@ -205,7 +205,8 @@ recorded `null` is "no verdict".
 
 **GREEN** — none of the above. No message of its own beyond the recovery that
 announces it; the daily digest carries the last 24 hours' runs, greens,
-PR-caused reds (by rule 4's test, below) and infra reds (setup deaths, lost
+PR-caused reds (by rule 4's test, below, less its storm silence: a two-hour
+storm cannot blank a 24-hour count) and infra reds (setup deaths, lost
 pods and deadline kills that graded nothing are folded into the infra count),
 the typical run length and the typical wait before a run starts,
 and the delegation-ceiling repetitions on a day that had any. `health.json`'s
@@ -218,7 +219,13 @@ moves no state; the message lists it as "PR-caused" when the evidence rules out
 a flake and a moving main: the case passed on another pull request's run built
 on the same main commit, or it failed on two or more of that pull request's
 runs (a retest counts) while passing on another pull request. One red run with
-no same-base pass gets no line.
+no same-base pass gets no line. "Failing" means a record with at least two
+graded repetitions, all failed: one graded repetition beside two infra ones is
+a throttled run, not a collapse the pull request owns. While a storm's
+repetitions are firing, confirmed or not, no collapse the storm's reach covers
+(from three hours before its first hit run finished) is PR-caused: a thin
+record on one pull request is the storm's own symptom. A collapse that
+finished before the storm is named as usual.
 
 Only presubmit runs reach these rules and the digest's numbers. `data.json`
 also carries the nightly periodics' runs (`runs[].tier`, see
