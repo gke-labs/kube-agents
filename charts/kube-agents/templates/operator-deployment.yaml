@@ -88,6 +88,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.serviceAccountName
+            {{- if include "kube-agents.a2aGatewayPodPolicyEnabled" . }}
+            # The chart rendered the A2A gateway's pod admission policy
+            # (templates/a2a-gateway-pod-admission-policy.yaml), from the same helper:
+            # a signal for operator features that must run only where that policy is
+            # installed. Absent, as on the kustomize path or Kubernetes 1.29, such a
+            # feature stays off. It says the policy was rendered, not that it still holds.
+            - name: A2A_GATEWAY_POD_POLICY
+              value: "true"
+            {{- end }}
             # The three images the operator resolves for pods the chart never
             # renders: an agent Deployment whose PlatformAgent omits
             # spec.deployment.image, the shell sandbox StatefulSet it renders

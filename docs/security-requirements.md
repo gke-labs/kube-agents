@@ -97,7 +97,9 @@ token (one hour; the audience is per pod: `kubeagents-credential-proxy` for the 
 watchers in the gateway Pod's `agent-api-auth` container, `kubeagents-credential-proxy-a2a-chat` for
 the A2A gateway when it consumes Google Chat under `spec.mode: next`, and, under the operator's
 `A2A_SESSION_CLUSTER_VIEW` flag, `kubeagents-credential-proxy-session` for the session pods,
-bound to their ServiceAccount as [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next) describes)
+bound to their ServiceAccount as [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next) describes,
+and, under `spec.mode: next` with an `AgentProfile` bound, `kubeagents-credential-proxy-profile`
+for each profile tier's ServiceAccount, as [spec-subagent-profiles.md](designs/spec-subagent-profiles.md) describes)
 as a bearer header, and the broker verifies
 it with a `TokenReview` before serving any path on that listener but `/healthz`;
 `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the ServiceAccounts allowed to call. The one other TCP

@@ -29,7 +29,8 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from eval_dashboard import health, post_health
+import pool_pressure  # the holder map's keys, pinned against health's
+from eval_dashboard import health, post_health, vertex_429
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_health"
 FIXTURE = TESTDATA / "data.json.gz"
@@ -117,13 +118,15 @@ def task(name, letters):
     return {"name": name, "result": result, "duration_s": None, "outcome_validity": None, "reps": reps}
 
 
-def run(build_id, pr, finished, minutes=120, result=None, tasks=None):
-    """A run finishing at `finished` (datetime) after `minutes` of wall clock."""
+def run(build_id, pr, finished, minutes=120, result=None, tasks=None, base_sha=None):
+    """A run finishing at `finished` (datetime) after `minutes` of wall clock;
+    `base_sha` is the main commit it was built on, absent like an old record."""
     tasks = tasks or []
     if result is None:
         result = "FAILURE" if any(t["result"] == "fail" for t in tasks) else "SUCCESS"
     started = finished - timedelta(minutes=minutes)
     return {
+        **({"base_sha": base_sha} if base_sha else {}),
         "build_id": str(build_id),
         "pr": pr,
         "head_sha": "abc1234",
@@ -304,7 +307,8 @@ class SharedBreak(unittest.TestCase):
         doc = data(*(run(100 + i, i, T0 - timedelta(hours=i), tasks=green_tasks()) for i in range(1, 5)))
         self.assertEqual(assess(doc, T0)["state"], "GREEN")
 
-    def test_one_pr_failing_while_others_pass_is_pr_caused(self):
+    def test_one_pr_failing_twice_while_others_pass_is_pr_caused(self):
+        # Two red runs of #11 (a retest), passes on two other PRs, bases unknown.
         doc = data(
             run(1, 11, T0 - timedelta(hours=3), tasks=broken_tasks({"agent-kanban-smoke"})),
             run(2, 11, T0 - timedelta(hours=2), tasks=broken_tasks({"agent-kanban-smoke"})),
@@ -313,7 +317,30 @@ class SharedBreak(unittest.TestCase):
         )
         result = assess(doc, T0)
         self.assertEqual(result["state"], "GREEN")
-        self.assertIn("PR-caused: agent-kanban-smoke failing only on #11 (passing on 2 other PRs)", result["evidence"])
+        self.assertIn("PR-caused: agent-kanban-smoke failing on 2 runs of #11 (passing on 2 other PRs)", result["evidence"])
+
+    def test_one_red_run_is_pr_caused_only_against_a_pass_on_the_same_base(self):
+        # One red run of #11 and passes elsewhere on other main commits: a
+        # flake or a moving main, so nothing is said.
+        silent = data(
+            run(1, 11, T0 - timedelta(hours=2), tasks=broken_tasks({"agent-kanban-smoke"}), base_sha="aaaaaaa"),
+            run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set()), base_sha="bbbbbbb"),
+            run(4, 13, T0 - timedelta(minutes=30), tasks=broken_tasks(set())),
+        )
+        self.assertFalse([line for line in assess(silent, T0)["evidence"] if line.startswith("PR-caused")])
+        # The same red beside a pass built on the same main commit: the PR's.
+        same = data(
+            run(1, 11, T0 - timedelta(hours=2), tasks=broken_tasks({"agent-kanban-smoke"}), base_sha="aaaaaaa"),
+            run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set()), base_sha="aaaaaaa"),
+            run(4, 13, T0 - timedelta(minutes=30), tasks=broken_tasks(set()), base_sha="bbbbbbb"),
+        )
+        self.assertIn("PR-caused: agent-kanban-smoke failing only on #11 (passing on 1 other PRs built on the same main commit)", assess(same, T0)["evidence"])
+        # Two red runs of #11 with no pass anywhere else: not the PR's either.
+        alone = data(
+            run(1, 11, T0 - timedelta(hours=3), tasks=broken_tasks({"agent-kanban-smoke"})),
+            run(2, 11, T0 - timedelta(hours=2), tasks=broken_tasks({"agent-kanban-smoke"})),
+        )
+        self.assertFalse([line for line in assess(alone, T0)["evidence"] if line.startswith("PR-caused")])
 
     def test_the_break_must_explain_most_reds_and_most_runs(self):
         # Three PRs share the collapse, but nine other runs are green: the
@@ -395,8 +422,74 @@ class Storm(unittest.TestCase):
         result = assess(self.stormy([1, 2, 3], 6), T0)
         self.assertEqual(result["state"], "DEGRADED")
         self.assertEqual(result["condition"], "storm")
-        self.assertRegex(result["cause"], r"quota storm window \d\d:\d\d–\d\d:\d\d UTC")
-        self.assertIn("quota storm: 18 infra/empty-record reps across 3 PRs", result["evidence"][0])
+        self.assertRegex(result["cause"], r"quota storm window \d\d:\d\d–\d\d:\d\d UTC \(429 rate not read\)")
+        self.assertTrue(any(line.endswith("; unconfirmed: no Vertex 429 reading") for line in result["evidence"]), result["evidence"])
+
+    def reading(self, share, read_at=T0, requests=100, hours=4):
+        """vertex_429.py's document: ten-minute pool buckets back from T0 with
+        `requests` calls each, `share` of them 429s."""
+        buckets = [{"end": health.iso(T0 - timedelta(minutes=10 * i)), "requests": requests, "429": int(requests * share)} for i in range(hours * 6)]
+        return {"schema_version": 1, "read_at": health.iso(read_at), "window_start": health.iso(T0 - timedelta(hours=hours)), "window_end": health.iso(T0), "read": ["p"], "errors": {}, "bucket_seconds": 600, "buckets": buckets}
+
+    def judge(self, doc, vertex):
+        return health.assess(health.load_runs(doc), T0, health.Roster.fixed(ADMITTED), vertex_429=vertex)
+
+    def test_a_fresh_429_reading_confirms_or_denies_the_storm(self):
+        doc = self.stormy([1, 2, 3], 6)
+        confirmed = self.judge(doc, self.reading(0.12))
+        self.assertEqual((confirmed["state"], confirmed["condition"]), ("DEGRADED", "storm"))
+        self.assertTrue(confirmed["cause"].endswith("(peak 429 share 12 %)"), confirmed["cause"])
+        self.assertTrue(any("the pool's peak 429 share was 12.0 % of 600 Vertex calls in the hour to" in line for line in confirmed["evidence"]), confirmed["evidence"])
+        self.assertEqual((confirmed["vertex_429"]["read"], round(confirmed["vertex_429"]["peak"], 2)), (True, 0.12))
+        # The same reps under a 2 % pool share: infra deaths, not a quota storm.
+        denied = self.judge(doc, self.reading(0.02))
+        self.assertEqual((denied["state"], denied["condition"]), ("GREEN", None))
+        self.assertTrue(any("under the 10 % a storm needs: infra deaths, not a quota storm" in line for line in denied["evidence"]), denied["evidence"])
+        self.assertEqual("storm" in denied["open_conditions"], False)
+        # Exactly the threshold confirms.
+        self.assertEqual(self.judge(doc, self.reading(0.10))["condition"], "storm")
+
+    def test_a_reading_that_cannot_judge_leaves_the_rule_to_the_runs(self):
+        doc = self.stormy([1, 2, 3], 6)
+        for vertex, reason in (
+            (self.reading(0.01, read_at=T0 - timedelta(hours=4)), "the Vertex 429 reading is stale"),
+            (dict(self.reading(0.01), read=[], errors={"p": "HTTP 403"}), "the Vertex 429 reading covered no project (HTTP 403)"),
+            (self.reading(0.01, requests=10), "fewer than 200 Vertex calls in any hour of the window"),
+            (dict(self.reading(0.01), buckets=[{"end": health.iso(T0 - timedelta(hours=9)), "requests": 1000, "429": 0}]), "fewer than 200 Vertex calls in any hour of the window"),
+            # Two hours back from the tick: the runs that finished 40 minutes ago were calling three hours before that.
+            (self.reading(0.01, hours=2), "the Vertex 429 reading (22:00–00:00 UTC) does not cover the hours the hit runs spent on their calls"),
+            (dict(self.reading(0.01), window_end=health.iso(T0 - timedelta(minutes=70))), "the Vertex 429 reading (20:00–22:50 UTC) does not cover the hours the hit runs spent on their calls"),
+        ):
+            with self.subTest(reason=reason):
+                result = self.judge(doc, vertex)
+                self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "storm"))
+                self.assertTrue(result["cause"].endswith("(429 rate not read)"))
+                self.assertTrue(any(line.endswith(f"; unconfirmed: {reason}") for line in result["evidence"]), result["evidence"])
+        # Below the rep floors the reading is still published, and judges nothing.
+        quiet = self.judge(self.stormy([1, 2], 6), self.reading(0.5))
+        self.assertEqual((quiet["state"], quiet["vertex_429"]["read"], quiet["vertex_429"]["peak"], quiet["vertex_429"]["projects_read"]), ("GREEN", True, 0.5, 1))
+        self.assertEqual(self.judge(self.stormy([1, 2], 6), None)["vertex_429"], {"read": False, "peak": None, "requests": 0, "hour_end": None, "reason": "no Vertex 429 reading", "read_at": None, "projects_read": 0, "projects_failed": 0})
+        # health.json carries the coverage too, so a refused grant shows on a quiet day.
+        published = health.adjudicate(self.stormy([1, 2], 6), T0, None, health.Roster.fixed(ADMITTED), vertex_429=dict(self.reading(0.5), read=[], errors={"p": "HTTP 403", "q": "HTTP 403"}))["vertex_429"]
+        self.assertEqual((published["read"], published["read_at"], published["projects_read"], published["projects_failed"], published["reason"]), (False, health.iso(T0), 0, 2, "the Vertex 429 reading covered no project (HTTP 403)"))
+        self.assertIn("quota storm: 18 infra/empty-record reps across 3 PRs", self.judge(doc, None)["evidence"][0])
+
+    def test_a_reading_taken_after_the_collect_still_covers_the_window(self):
+        # The rule's clock is the collect step's; the read comes 20 minutes
+        # later, and the first hit run finished 1 h 50 min before the tick.
+        late = self.stormy([1, 2, 3], 6, spread_minutes=55)
+        read_at = T0 + timedelta(minutes=20)
+        buckets = [{"end": health.iso(read_at - timedelta(minutes=10 * i)), "requests": 100, "429": 2} for i in range(int(vertex_429.LOOKBACK / timedelta(minutes=10)))]
+        reading = {"schema_version": 1, "read_at": health.iso(read_at), "window_start": health.iso(read_at - vertex_429.LOOKBACK), "window_end": health.iso(read_at), "read": ["p"], "errors": {}, "bucket_seconds": 600, "buckets": buckets}
+        result = self.judge(late, reading)
+        self.assertEqual((result["state"], result["vertex_429"]["read"], round(result["vertex_429"]["peak"], 2)), ("GREEN", True, 0.02))
+
+    def test_a_reading_kept_from_the_previous_tick_still_judges(self):
+        # This tick's read reached no project, so the file is the previous
+        # tick's reading, 30 minutes behind the runs' window; it still denies.
+        kept = dict(self.reading(0.01), read_at=health.iso(T0 - timedelta(minutes=30)), window_end=health.iso(T0 - timedelta(minutes=30)))
+        result = self.judge(self.stormy([1, 2, 3], 6), kept)
+        self.assertEqual((result["state"], result["vertex_429"]["read"]), ("GREEN", True))
 
     def test_infra_verdicts_count_the_same_as_empty_records(self):
         self.assertEqual(assess(self.stormy([1, 2, 3], 6, letter="i"), T0)["state"], "DEGRADED")
@@ -749,12 +842,22 @@ class DeadlineKills(unittest.TestCase):
         other = run(3, 3, T0 - timedelta(minutes=10), tasks=[task("agent-kanban-smoke", "fff")], result="FAILURE")
         out = adjudicate(data(lost, other, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 2))
-        # The same record without the suite's word is the PR's own red, as it
-        # always was: the field is what moves it.
-        graded_red = dict(lost)
+        # The same record without the suite's word is the PR's own red when
+        # rule 4's test says so (here: a pass on another PR built on the same
+        # main commit); the field is what moves it between the two counts.
+        graded_red = dict(lost, base_sha="abc1234")
         del graded_red["eval_outcome"], graded_red["not_evaluated"]
-        out = adjudicate(data(graded_red, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        out = adjudicate(data(graded_red, dict(graded(2, 2, T0 - timedelta(minutes=30)), base_sha="abc1234")), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (1, 0))
+        # One red run with no same-base pass is not the PR's own in the digest
+        # either; the split is binary, so it lands on the gate's side.
+        del graded_red["base_sha"]
+        out = adjudicate(data(graded_red, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 1))
+        # A second red run of the same PR, with another PR passing, makes both the PR's own.
+        again = dict(run(9, 1, T0 - timedelta(minutes=10), tasks=[task("agent-kanban-smoke", "fff"), task("security-overgrant-probe", "iii")], result="FAILURE"), eval_verdict="RED")
+        out = adjudicate(data(graded_red, again, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (2, 0))
 
     def test_the_suites_word_on_an_aborted_build_is_not_the_not_evaluated_shape(self):
         # The field keys on Prow's FAILURE like lost_pod and deadline_kill:
@@ -2759,7 +2862,7 @@ class FixtureDrift(unittest.TestCase):
     def test_one_project_once_is_evidence_not_a_condition(self):
         result = self.judge(scan(drifted={project(1): [DRIFT_ROLE]}))
         self.assertEqual(result["state"], "GREEN")
-        self.assertIn(f"{DRIFT_ROLE} drifted on 1 pool project(s) ({project(1)}) at the 23:55 UTC scan; not yet repeated or widespread", result["evidence"])
+        self.assertIn(f"{DRIFT_ROLE} drifted on 1 pool project(s) ({project(1)}) at the 23:55 UTC scan; not yet repeated", result["evidence"])
         block = result["fixture_state"]
         self.assertEqual((block["projects"], block["checked"], block["drifted"], block["unknown"], block["stale"]), (30, 30, {project(1): [DRIFT_ROLE]}, False, False))
         self.assertEqual(block["scanned_at"], health.iso(T0 - timedelta(minutes=5)))
@@ -2836,41 +2939,50 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual(self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(2): [DRIFT_ROLE]}))["state"], "GREEN")
         self.assertEqual(self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(1): [OTHER_ROLE]}))["state"], "GREEN")
 
-    def test_three_projects_in_one_scan_degrade_and_two_do_not(self):
+    def test_a_repeated_reading_degrades_and_one_scan_does_not_however_many_projects(self):
         three = {project(i): [DRIFT_ROLE] for i in (1, 2, 3)}
-        result = self.judge(scan(drifted=three))
+        result = self.judge(scan(drifted=three, previous=three))
         self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "fixture_drift"))
         self.assertEqual(result["incident"]["projects"], [project(1), project(2), project(3)])
         self.assertEqual(result["cause"], f"seeded fixture drift: {DRIFT_ROLE} out of designed state on 3 pool project(s)")
-        self.assertEqual(self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2)}))["state"], "GREEN")
-        # Two roles on two projects each is still two projects per role.
-        self.assertEqual(self.judge(scan(drifted={project(1): [DRIFT_ROLE, OTHER_ROLE], project(2): [DRIFT_ROLE, OTHER_ROLE]}))["state"], "GREEN")
+        # One scan, whatever it covers: a reconcile rolling a batch of four
+        # holds them half-applied for an hour, and the next scan decides.
+        for count in (3, 4, 30):
+            with self.subTest(projects=count):
+                one = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in range(1, count + 1)}))
+                self.assertEqual(one["state"], "GREEN")
+                self.assertTrue(any(line.startswith(f"{DRIFT_ROLE} drifted on {count} pool project(s)") and line.endswith("not yet repeated") for line in one["evidence"]))
+        # A batch that moved on (projects 1-4 last scan, 5-8 this scan) never repeats.
+        moved = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (5, 6, 7, 8)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3, 4)}))
+        self.assertEqual(moved["state"], "GREEN")
+        # The repeat is per project and per role.
+        self.assertEqual(self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(1): [DRIFT_ROLE]}))["state"], "DEGRADED")
 
     def test_only_the_firing_roles_make_the_incident(self):
         drifted = {project(i): [DRIFT_ROLE] for i in (1, 2, 3)}
         drifted[project(4)] = [OTHER_ROLE]
-        result = self.judge(scan(drifted=drifted))
+        result = self.judge(scan(drifted=drifted, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}))
         self.assertEqual((result["incident"]["roles"], result["incident"]["projects"]), ([DRIFT_ROLE], [project(1), project(2), project(3)]))
         self.assertEqual(result["fixture_state"]["drifted"], drifted, "the block carries every drift, firing or not")
-        self.assertTrue(any(line.startswith(f"{OTHER_ROLE} drifted on 1 pool project(s)") and line.endswith("not yet repeated or widespread") for line in result["evidence"]))
+        self.assertTrue(any(line.startswith(f"{OTHER_ROLE} drifted on 1 pool project(s)") and line.endswith("not yet repeated") for line in result["evidence"]))
 
     def test_evidence_names_four_projects_then_counts(self):
         drifted = {project(i): [DRIFT_ROLE] for i in range(1, 8)}
-        result = self.judge(scan(drifted=drifted))
-        self.assertIn(f"{DRIFT_ROLE} drifted on 7 pool project(s) ({project(1)}, {project(2)}, {project(3)}, {project(4)} and 3 more) at the 23:55 UTC scan", result["evidence"])
+        result = self.judge(scan(drifted=drifted, previous=drifted))
+        self.assertTrue(any(line.startswith(f"{DRIFT_ROLE} drifted on 7 pool project(s) ({project(1)}, {project(2)}, {project(3)}, {project(4)} and 3 more) at the 23:55 UTC scan") for line in result["evidence"]), result["evidence"])
 
     def test_ranked_below_every_run_based_condition(self):
         lost_doc = data(*(lost(100 + i, i, T0 - timedelta(minutes=5 * i)) for i in range(3)))
-        result = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}), doc=lost_doc)
+        result = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}), doc=lost_doc)
         self.assertEqual(result["condition"], "lost_pods")
         self.assertTrue(any(line.startswith(f"{DRIFT_ROLE} drifted on 3 pool project(s)") for line in result["evidence"]), "the drift stays as context")
 
     def test_a_stale_scan_is_ignored_with_a_note(self):
-        result = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, at=T0 - timedelta(hours=4)))
+        result = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, at=T0 - timedelta(hours=4)))
         self.assertEqual(result["state"], "GREEN")
         self.assertTrue(result["fixture_state"]["stale"])
         self.assertIn(f"fixture-state scan is 4h old (last {health.iso(T0 - timedelta(hours=4))}); ignored, check the scan job", result["evidence"])
-        fresh = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, at=T0 - timedelta(hours=2, minutes=59)))
+        fresh = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, at=T0 - timedelta(hours=2, minutes=59)))
         self.assertEqual(fresh["state"], "DEGRADED", "inside three hours the scan counts")
 
     def test_a_scan_that_saw_nothing_is_unknown_never_a_drift(self):
@@ -2884,11 +2996,11 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual((partial["fixture_state"]["unknown"], partial["fixture_state"]["checked"]), (False, 1))
 
     def test_it_ends_the_hour_the_scan_clears_and_holds_while_it_does_not(self):
-        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
         prev = self.judge(firing)
         self.assertEqual(prev["condition"], "fixture_drift")
         later = T0 + timedelta(hours=1)
-        held = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, at=later - timedelta(minutes=5)), prev=prev, now=later)
+        held = self.judge(scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, at=later - timedelta(minutes=5)), prev=prev, now=later)
         self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "fixture_drift", health.iso(T0)))
         cleared = self.judge(scan(at=later - timedelta(minutes=5)), prev=held, now=later)
         self.assertEqual((cleared["state"], cleared["condition"], cleared["recovering"]), ("GREEN", None, False), "no three-green-runs bar: the scan is the recovery")
@@ -2902,7 +3014,7 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual(elsewhere["state"], "GREEN")
 
     def test_a_scan_that_could_not_see_the_incident_holds_it(self):
-        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
         prev = self.judge(firing)
         later = T0 + timedelta(hours=1)
         at = later - timedelta(minutes=5)
@@ -2925,7 +3037,7 @@ class FixtureDrift(unittest.TestCase):
         self.assertFalse(any("consecutive green runs" in line for line in self.judge(None, prev=prev, now=later)["evidence"]))
 
     def test_the_posters_issue_is_cited_for_the_condition_it_was_filed_for(self):
-        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
         owner = {"number": 1400, "url": "https://github.com/gke-labs/kube-agents/issues/1400", "condition": "fixture_drift"}
         cited = self.judge(firing, posted={"issue": owner})
         self.assertEqual((cited["issue"], cited["tracking_issues"]), (owner, ["#1400"]))
@@ -3094,7 +3206,7 @@ class PoolDrift(unittest.TestCase):
         )
 
     def test_ranked_below_fixture_drift_and_every_run_based_condition(self):
-        both = self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}), fleet=scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}))
+        both = self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}), fleet=scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}))
         self.assertEqual(both["condition"], "fixture_drift")
         self.assertTrue(any(line.startswith(f"{FINDING} found on 3 pool project(s)") for line in both["evidence"]), "the pool drift stays as context")
         lost_doc = data(*(lost(100 + i, i, T0 - timedelta(minutes=5 * i)) for i in range(3)))
@@ -3157,7 +3269,7 @@ class PoolDrift(unittest.TestCase):
         # incident stands until its own scan reads clean, then pool drift takes
         # over. Otherwise the state would leave through the pool scan's exit
         # with the fixture drift never read clean.
-        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
         prev = self.judge(None, fleet=firing)
         self.assertEqual(prev["condition"], "fixture_drift")
         later = T0 + timedelta(hours=1)
@@ -3171,7 +3283,7 @@ class PoolDrift(unittest.TestCase):
     def test_a_run_based_condition_still_displaces_a_held_scan_condition(self):
         # Lost pods, a storm, a break: read from the runs, ranked above the
         # scans, and reported the tick they fire, whatever a scan's hold says.
-        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
         prev = self.judge(None, fleet=firing)
         assessed = {"state": "DEGRADED", "condition": health.LOST_PODS, "cause": "the build cluster lost the node under 3 runs", "failing_cases": [], "current": True, "fixture": {"known": False}, "pool_state": {"known": False}}
         decided = health.transition(prev, assessed, T0 + timedelta(hours=1))
@@ -3210,7 +3322,7 @@ class PoolDrift(unittest.TestCase):
         prev = self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}))
         later = T0 + timedelta(hours=4)
         stale_pool = pool_scan(at=T0 - timedelta(minutes=5), drifted={project(i): [FINDING] for i in (1, 2, 3)})
-        fleet = scan(at=later - timedelta(minutes=5), drifted={project(i): [DRIFT_ROLE] for i in (10, 11, 12)})
+        fleet = scan(at=later - timedelta(minutes=5), drifted={project(i): [DRIFT_ROLE] for i in (10, 11, 12)}, previous={project(i): [DRIFT_ROLE] for i in (10, 11, 12)})
         result = self.judge(stale_pool, fleet=fleet, prev=prev, now=later)
         self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "fixture_drift"))
         self.assertEqual(sorted(result["incident"]["projects"]), [project(10), project(11), project(12)])
@@ -3299,7 +3411,7 @@ class PoolDrift(unittest.TestCase):
     def test_a_fixture_incident_recorded_before_reads_existed_still_exits_on_its_roles(self):
         # The live health.json at merge time may hold a fixture_drift incident
         # without `reads`; the exit then asks for the roles themselves.
-        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
+        firing = scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)})
         prev = self.judge(None, fleet=firing)
         self.assertEqual(prev["condition"], "fixture_drift")
         del prev["incident"]["reads"]
@@ -3327,7 +3439,7 @@ class OpenConditions(unittest.TestCase):
 
     def test_a_firing_rule_stays_listed_under_a_higher_ranked_one(self):
         lost_doc = data(*(lost(100 + i, i, T0 - timedelta(minutes=5 * i)) for i in range(3)))
-        both = self.judge(lost_doc, scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}), pool_scan())
+        both = self.judge(lost_doc, scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}, previous={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}), pool_scan())
         self.assertEqual((both["condition"], both["open_conditions"]), ("lost_pods", ["lost_pods", "fixture_drift"]))
 
     def test_lost_pods_and_deadline_kills_stay_open_until_the_runs_land(self):
@@ -3347,6 +3459,48 @@ class OpenConditions(unittest.TestCase):
         self.assertEqual(self.judge(data(*kills), scan(), pool_scan())["open_conditions"], ["deadline_kill"])
         reds = [graded(400 + i, 40 + i, T0 - timedelta(minutes=30 * i), verdict="RED") for i in range(3)]
         self.assertNotIn("deadline_kill", self.judge(data(*kills, *reds), scan(), pool_scan())["open_conditions"], "three reds with a verdict end the kills (and open a break of their own)")
+
+    def test_a_project_the_reconcile_holds_is_being_applied_not_drifted(self):
+        green = data(*(run(100 + i, 10 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)))
+        three = {project(i): [DRIFT_ROLE] for i in (1, 2, 3)}
+        at = T0 - timedelta(minutes=5)
+        holds = {project(1): {"owner": "fleet-reconcile", "state": "reconciling", "since": health.iso(at - timedelta(minutes=20))}, project(2): {"owner": "pull-kube-agents-smoke-test-123", "state": "busy", "since": health.iso(at)}}
+        # Held by the reconcile at a read 10 minutes before the scan: project 1 is not counted, 2 and 3 fire.
+        out = health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at - timedelta(minutes=10), held=holds))
+        self.assertEqual((out["condition"], out["incident"]["projects"], out["fixture_state"]["applying"]), ("fixture_drift", [project(2), project(3)], [project(1)]))
+        self.assertIn(f"{project(1)} is being applied by the fleet reconcile (Boskos hold near the 23:55 UTC scan); its fixture-state reading is not counted", out["evidence"])
+        # Every drifted project held: nothing fires, the block still shows the drift.
+        all_held = {p: {"owner": "fleet-reconcile", "state": "reconciling", "since": ""} for p in three}
+        quiet = health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at, held=all_held))
+        self.assertEqual((quiet["state"], quiet["fixture_state"]["drifted"], quiet["fixture_state"]["applying"]), ("GREEN", three, sorted(three)))
+        # A read more than the hold window away from the scan says nothing about it.
+        stale_hold = health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at - timedelta(minutes=70), held=all_held))
+        self.assertEqual(stale_hold["condition"], "fixture_drift")
+        # No artifact, or no `held` in it: as before.
+        self.assertEqual(health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["condition"], "fixture_drift")
+        # Held around the previous scan: last scan's reading cannot make this one a repeat.
+        prev_doc = {"fixture_holds": {"scanned_at": health.iso(at - timedelta(hours=1)), "applying": sorted(three), "applying_previous": []}, "state": "GREEN"}
+        not_yet = health.adjudicate(green, T0, prev_doc, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))
+        self.assertEqual((not_yet["state"], not_yet["fixture_state"]["applying_previous"]), ("GREEN", sorted(three)))
+        self.assertEqual(not_yet["fixture_holds"], {"scanned_at": health.iso(at), "applying": [], "applying_previous": sorted(three)})
+        # The next tick reads the same scan: the previous scan's holds come from the last tick's applying_previous, not its applying.
+        same_scan = {"fixture_holds": {"scanned_at": health.iso(at), "applying": [], "applying_previous": sorted(three)}, "state": "GREEN"}
+        self.assertEqual(health.adjudicate(green, T0, same_scan, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["state"], "GREEN")
+        # A tick that read neither this scan nor the one before (an hour of lost ticks) says nothing about the previous scan's holds.
+        lost = {"fixture_holds": {"scanned_at": health.iso(at - timedelta(hours=2)), "applying": sorted(three), "applying_previous": sorted(three)}, "state": "GREEN"}
+        self.assertEqual(health.adjudicate(green, T0, lost, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["condition"], "fixture_drift")
+        # A hold an earlier tick on this scan saw still covers the project once the next hourly read shows it released.
+        carried = {"fixture_holds": {"scanned_at": health.iso(at), "applying": [project(1)], "applying_previous": []}, "state": "GREEN"}
+        kept = health.adjudicate(green, T0, carried, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))
+        self.assertEqual((kept["incident"]["projects"], kept["fixture_state"]["applying"]), ([project(2), project(3)], [project(1)]))
+        # A tick that read no scan publishes no block but carries the memory, so the tick after it still knows.
+        blind = health.adjudicate(green, T0, carried, health.Roster.fixed(ADMITTED), fixture_state_doc=None, pool_pressure=pressure(window_end=at))
+        self.assertEqual((blind["fixture_state"], blind["fixture_holds"]), (None, carried["fixture_holds"]))
+        after_blind = health.adjudicate(green, T0, blind, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))
+        self.assertEqual(after_blind["incident"]["projects"], [project(2), project(3)])
+        self.assertIsNone(health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=None)["fixture_holds"])
+        # The two halves of the contract name the holder the same way.
+        self.assertEqual((pool_pressure.HELD_KEY_OWNER, pool_pressure.HELD_KEY), (health.POOL_HELD_OWNER_KEY, health.POOL_HELD_KEY))
 
     def test_a_clean_fresh_scan_clears_and_an_unread_one_does_not(self):
         green = data(*(run(100 + i, 10 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)))

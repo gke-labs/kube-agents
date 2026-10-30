@@ -63,7 +63,8 @@ jobs:
   # steps in the `test` job below are therefore continue-on-error -- a broken
   # report costs the comment, not the merge. What is left able to fail the
   # required check is the suite itself, coverage.py writing and joining its
-  # data, and a shard that did not finish, which are the things that should.
+  # data, a shard that did not finish, and the bench harness job, which are
+  # the things that should.
   #
   # The sweep runs as three shards on three runners (`test-shard`), and `test`
   # joins their coverage and carries the required check's name. On one runner
@@ -116,7 +117,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ".python-version"
           cache: "pip"
@@ -216,10 +217,12 @@ jobs:
   # The cost is a red join on a run that was cancelled, such as a pull
   # request's run superseded by a newer push. The last step also fails unless
   # every shard succeeded, so a shard that died before it uploaded anything
-  # cannot pass either.
+  # cannot pass either. The join also needs the bench job below: the queue
+  # re-tests every combined tree, and a bench red there must hold the merge,
+  # which a job outside the required context cannot do on its own.
   test:
     name: Run Python Unit Tests
-    needs: test-shard
+    needs: [test-shard, bench-tests]
     if: ${{ always() }}
     runs-on: ubuntu-24.04 # pinned, as the test-shard job above says
     timeout-minutes: 15
@@ -241,7 +244,7 @@ jobs:
       # No pip cache: the shards' cache holds the whole test set, and this job
       # installs two packages.
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ".python-version"
 
@@ -335,13 +338,18 @@ jobs:
             coverage-total.txt
           if-no-files-found: ignore
 
-      - name: Every shard succeeded
+      - name: Every shard and the bench job succeeded
         if: ${{ always() }}
         env:
           SHARDS: ${{ needs.test-shard.result }}
+          BENCH: ${{ needs.bench-tests.result }}
         run: |
           if [ "$SHARDS" != "success" ]; then
             echo "::error::The test shards ended '$SHARDS', not success."
+            exit 1
+          fi
+          if [ "$BENCH" != "success" ]; then
+            echo "::error::The bench harness tests ended '$BENCH', not success."
             exit 1
           fi
 
@@ -376,7 +384,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up the agent image's Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ".agent-python-version"
           cache: "pip"
@@ -415,7 +423,8 @@ jobs:
   # Separate job because bench/tests is pytest-native and cannot run under the
   # unittest discovery `make test-python` uses -- it sat outside every glob and
   # had never once run in CI. Installing bench/ resolves devops-bench from the
-  # git SHA pinned in bench/pyproject.toml.
+  # git SHA pinned in bench/pyproject.toml. The required join above needs this
+  # job, so a red here holds the merge.
   bench-tests:
     name: Run Bench Harness Tests
     runs-on: ubuntu-24.04 # pinned, as the test-shard job above says
@@ -426,7 +435,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ".python-version"
 

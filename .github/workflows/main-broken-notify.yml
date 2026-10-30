@@ -44,8 +44,9 @@ name: Notify on Broken Main
 # watching at run level files an issue when only one of them is red. `Run
 # Bench Harness Tests` resolves devops-bench and its dependencies at run time,
 # so a resolver outage during a push run would file an issue naming an
-# innocent commit. Accepted: the alternative is not watching the suite that
-# took thirteen hours to notice. `Run Python Unit Tests on the agent image's
+# innocent commit; since the required join needs that job, the same outage
+# also holds the merge queue until a re-run. Accepted: the alternative is not
+# watching the suite that took thirteen hours to notice. `Run Python Unit Tests on the agent image's
 # Python` runs the same sweep again on `.agent-python-version`, the interpreter
 # inside the platform agent image, where the required job runs it on
 # `.python-version`. An issue from it is wanted, not tolerated: a suite that
@@ -186,7 +187,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 

@@ -132,6 +132,7 @@ The Platform Agent runs these audits on a schedule and posts each report to chat
 | Manifests and remediation | `gcp-config-connector`, `gcp-terraform`, `gitops-helm-chart`, `gke-manifest-generation`, `submit-suggestion` |
 | Meta | `fleet-audit`, `fleet-audit-reports`, `github-issue-resolver`, `inspect-repository`, `kube-agents-feedback`, `pr-conversation`, `version-control` |
 | Cluster Agent (per-cluster runtime) | `gke-load-bearing-change`, `gke-observability`, `gke-reliability`, `gke-rightsizing-checks`, `gke-stall-detection`, `gke-storage`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`, `topology-drift` |
+| GKE Support Agent (tse) | `support-escalation-bundle` |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: capabilities -->

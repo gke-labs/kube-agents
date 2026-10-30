@@ -7,6 +7,9 @@
 #   - templates/agent-rbac-admission-policy.yaml is config/admission/agent-rbac-policy.yaml
 #     wrapped in the chart's values gate. The chart is the only thing that installs those
 #     policies, so a drifted copy is a backstop nobody applies.
+#   - templates/a2a-gateway-pod-admission-policy.yaml is config/admission/a2a-gateway-pod-policy.yaml,
+#     verbatim, wrapped in the kube-agents.a2aGatewayPodPolicyEnabled helper, which the operator's
+#     A2A_GATEWAY_POD_POLICY env is set from too.
 #   - templates/operator-webhooks.yaml is hand-maintained (the chart adds values gates and
 #     the cert-manager objects), so it is compared rather than rewritten:
 #     hack/check_chart_webhooks.py renders it and diffs the webhooks and Service
@@ -27,6 +30,8 @@ ROLE_SRC=k8s-operator/config/rbac/role.yaml
 RBAC_TPL=charts/kube-agents/templates/operator-rbac.yaml
 VAP_SRC=k8s-operator/config/admission/agent-rbac-policy.yaml
 VAP_TPL=charts/kube-agents/templates/agent-rbac-admission-policy.yaml
+readonly GATEWAY_POD_VAP_SRC=k8s-operator/config/admission/a2a-gateway-pod-policy.yaml
+readonly GATEWAY_POD_VAP_TPL=charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml
 readonly WEBHOOK_SRC_DIR=k8s-operator/config/webhook
 readonly WEBHOOK_TPL=charts/kube-agents/templates/operator-webhooks.yaml
 readonly WEBHOOK_CHECK=hack/check_chart_webhooks.py
@@ -132,6 +137,29 @@ if $check; then
   rm -f "$tmp"
 else
   mv "$tmp" "$VAP_TPL"
+fi
+
+# The gateway's pod policy: the same shape, under the helper rather than an inline gate,
+# because the operator Deployment's A2A_GATEWAY_POD_POLICY is rendered from that helper
+# too, and one condition in one place is what keeps the two from disagreeing. Verbatim:
+# the policy names no release-scoped identity, so there is nothing to substitute.
+[[ -f "$GATEWAY_POD_VAP_SRC" ]] || fail "admission policy source missing: $GATEWAY_POD_VAP_SRC"
+tmp=$(mktemp)
+{
+  echo '{{- if include "kube-agents.a2aGatewayPodPolicyEnabled" . }}'
+  echo "# GENERATED from $GATEWAY_POD_VAP_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo '# Rendered where kube-agents.a2aGatewayPodPolicyEnabled (_helpers.tpl) holds: the'
+  echo '# admissionPolicy values gate, on Kubernetes >= 1.30. The operator'"'"'s A2A_GATEWAY_POD_POLICY'
+  echo '# is set from the same helper.'
+  cat "$GATEWAY_POD_VAP_SRC"
+  echo '{{- end }}'
+} >"$tmp"
+
+if $check; then
+  diff -u "$GATEWAY_POD_VAP_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart admission policy out of date vs $GATEWAY_POD_VAP_SRC"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$GATEWAY_POD_VAP_TPL"
 fi
 
 # Webhooks: compared, not generated. The failure message is deliberately not fail(),

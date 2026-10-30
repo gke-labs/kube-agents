@@ -6,7 +6,7 @@ sidebar:
 ---
 
 :::note
-Only an install whose GitOps repository is on GitHub uses Minty. A GitLab install has no GitHub App, no token minter and no Cloud KMS key: the credential broker holds a GitLab access token in a Kubernetes Secret. See [GitLab as the GitOps forge](/kube-agents/install/gitlab/).
+Only an install whose GitOps repository is on GitHub uses Minty. A GitLab or Gitea install has no GitHub App, no token minter and no Cloud KMS key: the credential broker holds the forge's access token in a Kubernetes Secret. See [GitLab as the GitOps forge](/kube-agents/install/gitlab/) and [Gitea as the GitOps forge](/kube-agents/install/gitea/).
 :::
 
 Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) repository-scoped GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion`, `fleet-audit`, and `github-issue-resolver` skills, and read-only tokens for the credential broker's own clones of the repositories registered as context. The GitHub App's private key never leaves GCP KMS.

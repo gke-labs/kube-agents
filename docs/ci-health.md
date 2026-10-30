@@ -160,14 +160,18 @@ runs that finished in the last 2 hours, #1225 / #1214), a delegation-ceiling
 wave (15+ repetitions across 3+ pull requests, among the runs that finished in
 the last 2 hours, ended at the harness's delegation wait with the worker still
 running, #1874; the dispatcher stall of #1879 is its usual cause, and it ranks
-below a storm because a 429-starved worker hits the same wait), or setup
+below a storm because a 429-starved worker hits the same wait; the storm
+also needs the pool's peak hourly Vertex 429 share to clear 10 % over the hours
+those runs spent on their calls, when the 429 reading below covers them; a
+reading that does not, and no reading, leaves the runs to decide and the
+evidence says the storm is unconfirmed), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
 pull requests, in 2 hours, #1172; an aborted zero-task run is a superseded
 push), or seeded
 fixture drift (the hourly scan found the same fixture role out of its designed
-state on the same pool project on two consecutive scans, or on 3+ projects in
-one scan; #1550, below), or pool drift (the same rule over the pool-state scan's
-findings; #1967, below). A zero-task run
+state on the same pool project on two consecutive scans; #1550, below), or pool
+drift (the same over the pool-state scan's findings, or a finding on 3+
+projects in one scan; #1967, below). A zero-task run
 is at most one of a lost pod, a conflicted merge (below), a deadline kill
 (above) and a setup death, in that order: a lost pod is never a setup death,
 whatever its duration. When more
@@ -201,15 +205,20 @@ recorded `null` is "no verdict".
 
 **GREEN** — none of the above. No message of its own beyond the recovery that
 announces it; the daily digest carries the last 24 hours' runs, greens,
-PR-caused reds and infra reds (setup deaths, lost pods and deadline kills that
-graded nothing are folded into the infra count), the typical run length and the typical wait before a run starts,
+PR-caused reds (by rule 4's test, below) and infra reds (setup deaths, lost
+pods and deadline kills that graded nothing are folded into the infra count),
+the typical run length and the typical wait before a run starts,
 and the delegation-ceiling repetitions on a day that had any. `health.json`'s
 `metrics` keeps the rest — green rate, wall clock p50/p90, `queue_wait_p50_s`
 and whether it was read at all, the infra-rep rate, `setup_deaths`,
 `lost_pods`, `deadline_kills`, `ceiling_reps`.
 
-A case failing on exactly one pull request while passing elsewhere is that pull
-request's problem and moves no state; the message lists it as "PR-caused".
+A case failing on exactly one pull request is that pull request's problem and
+moves no state; the message lists it as "PR-caused" when the evidence rules out
+a flake and a moving main: the case passed on another pull request's run built
+on the same main commit, or it failed on two or more of that pull request's
+runs (a retest counts) while passing on another pull request. One red run with
+no same-base pass gets no line.
 
 Only presubmit runs reach these rules and the digest's numbers. `data.json`
 also carries the nightly periodics' runs (`runs[].tier`, see
@@ -349,6 +358,32 @@ still pass, they just start late, and DEGRADED would tell people to retest,
 which lengthens the queue being reported. Unlike the slow note it is **not**
 held back outside GREEN — a different job reading different data cannot be
 this incident's own symptom.
+
+The same artifact carries `held`, which project each Boskos lease holder has
+at the read (`{project: {owner, state, since}}`), read from Boskos's own
+resource objects through the API server as the job's pod. The seeded-fleet
+rule reads it to tell a project the fleet reconcile is applying from one that
+drifted (below). The pod's service account needs the Boskos namespace's
+`boskos-crd-reader` role bound to it, once, by someone with cluster access:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: boskos-crd-reader-prowjob
+  namespace: boskos
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: boskos-crd-reader
+subjects:
+  - kind: ServiceAccount
+    name: prowjob-default-sa
+    namespace: test-pods
+```
+
+Until it is, `held` is `null` and `held_error` says why, and the fleet rule
+reads every project as it did before.
 
 The poster sends one line when the note appears, and again if its verdict
 changes inside the episode. The header names the cause, because the four
@@ -1202,12 +1237,19 @@ Until the grant is in place the scan pre-flights one token mint per project,
 fails it, and records every role as "not checked" with gcloud's own words.
 
 **The condition.** `health.py`'s `fixture_drift` fires when the same role is
-drifted on the same project in two consecutive scans, or on 3 or more projects
-in one scan. One scan on one project is not enough: in #1278's retest sweep the
-crashloop fixture lagged the node repair by about 40 minutes on one project (it
-needs its first restart before OOMKilled evidence exists), and one hourly scan
-can land inside that window. Three projects at once is the fleet-wide shape
-(#1278 was all 30) and waits for nothing. It is DEGRADED, ranked below every
+drifted on the same project in two consecutive scans. A project the fleet
+reconcile holds in Boskos within 65 minutes of the scan (the pool-pressure
+artifact's `held`, above) is being applied, not drifted: its reading is left
+out of that scan and cannot make the next scan's a repeat, and the evidence
+says so. One scan is not enough,
+however many projects it covers: in #1278's retest sweep the crashloop fixture
+lagged the node repair by about 40 minutes on one project (it needs its first
+restart before OOMKilled evidence exists), and one hourly scan can land inside
+that window; and a reconcile rolling a patch in batches of four holds each
+batch half-applied for about an hour, which one scan reads as drift on four
+projects at once. The fleet-wide shape (#1278 was all 30) waits for the
+second scan like any other; the daily reconcile could not have repaired it
+sooner. It is DEGRADED, ranked below every
 run-based condition (the presubmit runs the same check on its own lease and
 records the cases that need a drifted role as infrastructure under
 `fixture-drift:<role>` rather than running them, so a fixture the lease's own
@@ -1308,6 +1350,27 @@ without naming one: `detail` is then what it saw), and a repair that removes
 something starts with `# confirm first:`. `previous` is the
 prior scan's `scanned_at` and its `{project: [finding ids]}` map.
 
+**The 429 reading.** Rule 2's evidence is read by the same identity, each tick,
+from Cloud Monitoring: per pool project, Vertex AI calls by response code in
+ten-minute buckets over the last six hours (`serviceruntime.googleapis.com/api/request_count`
+on the `consumed_api` resource; the rule's two-hour window, the three hours
+of calls a run makes before it finishes, and an hour for the tick's own clock
+gap), read on `data.json`'s clock so the window ends where the runs' does,
+summed pool-wide into `work/vertex-429.json` and published beside
+`health.json` as `vertex-429.json`. A read that reaches no project keeps the
+previous tick's reading when that one reached a project, so a storm the last
+reading denied is not re-declared on a blind tick; a kept reading may trail
+the runs' window by up to an hour at either edge. `health.json`'s `vertex_429` reports it every tick
+(`read`, `projects_read`, `projects_failed`, `read_at`, and the peak hourly
+share with its `requests` and `hour_end`), so a broken grant shows before a
+storm needs it; the share judges only when the repetitions would fire. It
+needs `roles/monitoring.viewer` on each pool project, the same loop as below
+with that one role. A project that refuses the read is recorded in the
+reading's `errors` and the rest are summed. The reading confirms nothing, and
+the runs decide, when it covered no project, is older than three hours, does
+not reach the hours the hit runs spent on their calls, or has no hour of 200
+or more calls; `reason` says which.
+
 **The identity and the grant.** Every read runs as the bot itself,
 `eval-dashboard-publisher@kube-agents-prow`, which needs `roles/iam.securityReviewer`,
 `roles/container.clusterViewer`, `roles/artifactregistry.reader`, `roles/cloudkms.viewer`
@@ -1392,7 +1455,7 @@ After `health.json` is uploaded, the same object is appended as one line to
 record per tick, oldest first, nothing trimmed). Each record is the
 `health.json` document verbatim — `schema_version`, `state`, `condition`,
 `since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
-`evidence`, `advice`, `recovering`, `open_conditions`, `stale`, `slow`, `pool`, `fixture_state`,
+`evidence`, `advice`, `recovering`, `open_conditions`, `vertex_429`, `stale`, `slow`, `pool`, `fixture_state`, `fixture_holds`,
 `pool_state`, `periodics`, `periodics_read`, `periodics_runs`, `periodics_streaks`,
 `periodics_since`, `metrics`, `dashboard_url`,
 `generated_at` — plus `tick`, the ISO 8601 UTC time the line
