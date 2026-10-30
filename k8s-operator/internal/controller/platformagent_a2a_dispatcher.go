@@ -117,6 +117,10 @@ func a2aDispatcherPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]str
 //     headers, so this publisher can't purge the stream.
 //   - the verifier, for CheckProfileRun, on its own caller subject, with
 //     answers in its own reply namespace.
+//   - stop records (contract addendum 9), per profile it dispatches for:
+//     subscribe on a2a.stop.<profile>.*, and a direct get of the same
+//     subjects on DISPATCH_STOPS to catch up after a restart. The gateway is
+//     their only writer.
 //
 // No subscribe on a2a.tasks.> or a2a.submit.>: it reads submissions only
 // through its durables, and never a task's .in or .events.
@@ -130,8 +134,14 @@ func dispatcherIdentity(agent *agentv1alpha1.PlatformAgent, ns string, profiles,
 			"$JS.ACK."+a2aProfileSubmitStream+"."+d+".>",
 		)
 	}
+	var stops []string
 	for _, p := range profiles {
-		perProfile = append(perProfile, "a2a.tasks."+p+".*.supervisor")
+		perProfile = append(perProfile,
+			"a2a.tasks."+p+".*.supervisor",
+			// A stop record's catch-up read after a restart, by subject.
+			"$JS.API.DIRECT.GET."+a2aDispatchStopStream+"."+a2aDispatchStopPrefix+p+".*",
+		)
+		stops = append(stops, a2aDispatchStopPrefix+p+".*")
 	}
 	return a2aIdentity{
 		user:    a2aDispatcherUser,
@@ -156,12 +166,12 @@ func dispatcherIdentity(agent *agentv1alpha1.PlatformAgent, ns string, profiles,
 			"a2a.cap.verify."+a2aDispatcherUser,
 			"_INBOX."+a2aDispatcherUser+".>",
 		),
-		subscribe: []string{
+		subscribe: append(stops,
 			"a2a.dispatch.*.*.*.accept",
 			"a2a.dispatch.*.*.*.lease",
-			"a2a.cap.reply." + a2aDispatcherUser + ".>",
-			"_INBOX." + a2aDispatcherUser + ".>",
-		},
+			"a2a.cap.reply."+a2aDispatcherUser+".>",
+			"_INBOX."+a2aDispatcherUser+".>",
+		),
 	}
 }
 

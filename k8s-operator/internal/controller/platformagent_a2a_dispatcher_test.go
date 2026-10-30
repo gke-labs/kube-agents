@@ -94,7 +94,15 @@ func TestTheDispatcherIdentityHoldsOnlyItsContractGrants(t *testing.T) {
 			t.Errorf("the dispatcher can't publish %s", want)
 		}
 	}
-	for _, want := range []string{"a2a.dispatch.*.*.*.accept", "a2a.dispatch.*.*.*.lease", "a2a.cap.reply.dispatcher.>"} {
+	if !slices.Contains(id.publish, "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.tse.*") {
+		t.Error("the dispatcher can't read its profile's stop records by subject")
+	}
+	for _, p := range id.publish {
+		if strings.HasPrefix(p, "a2a.stop.") || p == "$JS.API.DIRECT.GET.DISPATCH_STOPS.>" {
+			t.Errorf("the dispatcher publishes %s: stop records are the gateway's to write, and it reads only its own profiles'", p)
+		}
+	}
+	for _, want := range []string{"a2a.stop.tse.*", "a2a.dispatch.*.*.*.accept", "a2a.dispatch.*.*.*.lease", "a2a.cap.reply.dispatcher.>"} {
 		if !slices.Contains(id.subscribe, want) {
 			t.Errorf("the dispatcher can't subscribe %s", want)
 		}

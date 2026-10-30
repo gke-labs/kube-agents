@@ -122,6 +122,13 @@ const (
 	a2aProfileSubmitStream = "PROFILE_SUBMITS"
 	a2aProfileSubmitPrefix = "a2a.submit."
 
+	// a2aDispatchStopStream holds the gateway's stop records, one per task
+	// on a2aDispatchStopPrefix<profile>.<task> (lib.DispatchStopStream and
+	// lib.DispatchStopSubject; contract addendum 9). The gateway is its only
+	// writer and the dispatcher its only reader.
+	a2aDispatchStopStream = "DISPATCH_STOPS"
+	a2aDispatchStopPrefix = "a2a.stop."
+
 	// a2aNATSConfGrantLine renders one allow-list entry at the depth
 	// renderA2APermission puts them: the subject-list indent, two more for
 	// the bracketed list inside the direction's block, the quoted subject, a
@@ -1633,7 +1640,7 @@ var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": tr
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
 	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback",
-	"KV_PROFILE_LEASES", "PROFILE_SUBMITS",
+	"KV_PROFILE_LEASES", "PROFILE_SUBMITS", "DISPATCH_STOPS",
 }
 
 // a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
@@ -2824,7 +2831,7 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 	}}
 }
 
-// a2aProvisionScript is the provisioning payload: the five streams, five KV
+// a2aProvisionScript is the provisioning payload: the six streams, five KV
 // buckets, and four starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
@@ -3154,6 +3161,16 @@ $NATS stream info PROFILE_SUBMITS >/dev/null 2>&1 || $NATS stream add PROFILE_SU
   --max-age=72h --max-bytes=1073741824 --discard=old --replicas=1 \
   --max-msgs-per-subject=1 --dupe-window=2m \
   --max-consumers=` + strconv.Itoa(a2aProfileDurablesAllowed) + ` --defaults
+
+# DISPATCH_STOPS: the gateway's stop records for AgentProfile tasks, one per
+# task (a2a.stop.<profile>.<task>), read by the dispatcher by subject (contract
+# addendum 9). It is outside a2a.dispatch. on purpose: the dispatcher publishes
+# there, and a stop must have one writer, the gateway. A record outlives any
+# task (24h against the 6h deadline cap), and nothing makes a consumer here.
+$NATS stream info DISPATCH_STOPS >/dev/null 2>&1 || $NATS stream add DISPATCH_STOPS --allow-direct \
+  --subjects='a2a.stop.>' --storage=file --retention=limits \
+  --max-age=24h --max-bytes=67108864 --discard=old --replicas=1 \
+  --max-msgs-per-subject=1 --max-consumers=1 --defaults
 
 # TASKS older than this render: the limits the create above could not apply.
 #
