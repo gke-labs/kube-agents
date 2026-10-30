@@ -72,6 +72,12 @@ const (
 	// notifyNoHome refuses a home-channel post on an install that names no
 	// home channel: the route then serves conversation requests only.
 	notifyNoHome = "no home channel is configured; only a request naming a conversation is posted"
+	// notifyHomeRefused answers a home post whose channel Slack refuses now
+	// (homeVerify): the word is one the operator matches.
+	notifyHomeRefused = "home channel refused: %s"
+	// notifyHomeCheckTimeout bounds the one conversations.info a home post
+	// costs before it goes out.
+	notifyHomeCheckTimeout = 5 * time.Second
 	// notifyNoConversations refuses a conversation request on a notifier
 	// armed without the gateway's conversations.
 	notifyNoConversations = "this route does not post into conversations"
@@ -159,6 +165,12 @@ type Notifier struct {
 	// Each job takes one snapshot of it in validate and posts with that.
 	home       string
 	homeSource func() (home string, present bool)
+	// homeVerify, when set, checks a file-sourced home once per job before
+	// the post (SlackAdapter.VerifyHomeForPost): a channel Slack refuses now
+	// is written to the record as refused and the post is answered with the
+	// word, so a home shared or archived after it was learned receives no
+	// post; a check that cannot be made posts as before.
+	homeVerify func(ctx context.Context, home string) (refused string, err error)
 	poster     notifyPoster
 	// threadOK is the backend's test that a requested thread may be
 	// replied on. The home channel is the bound either way: Chat's thread
@@ -294,6 +306,12 @@ func (n *Notifier) ServesConversations() bool {
 // Start, read-only after.
 func (n *Notifier) SetHomeSource(source func() (home string, present bool)) {
 	n.homeSource = source
+}
+
+// SetHomeVerifier installs the check a file-sourced home passes before each
+// home post. Called before Start, read-only after.
+func (n *Notifier) SetHomeVerifier(verify func(ctx context.Context, home string) (refused string, err error)) {
+	n.homeVerify = verify
 }
 
 // homeState is the home channel as it stands, "" for none (the CR's when
@@ -643,6 +661,21 @@ func (n *Notifier) post(job notifyJob) {
 		}
 		if n.isStopping() {
 			n.reply(job, n.refuse(notifyStoppingRefusal))
+			return
+		}
+	}
+	if job.req.Conversation == "" && n.home == "" && job.home != "" && n.homeVerify != nil {
+		// One check per job, on the worker, for a home the file named: the
+		// CR's value is the install's word and is not checked.
+		ctx, cancel := context.WithTimeout(context.Background(), notifyHomeCheckTimeout)
+		refused, err := n.homeVerify(ctx, job.home)
+		cancel()
+		switch {
+		case err != nil:
+			n.log.Warn("notify: the home channel could not be checked; posting as it stands", "home", job.home, "err", err)
+		case refused != "":
+			n.log.Warn("notify refused", "home", job.home, "reason", refused)
+			n.reply(job, n.refuse(fmt.Sprintf(notifyHomeRefused, refused)))
 			return
 		}
 	}

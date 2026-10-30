@@ -69,6 +69,22 @@ ROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}
 UNROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: ""}
 
 
+class SharedHomeFileContractTest(unittest.TestCase):
+    """The patch imports nothing of ours, so it carries its own copy of the
+    projected file's mount path and key; the two copies must stay one file.
+    Outside the fixture above, which patches the directory per test."""
+
+    def test_the_stand_in_reads_the_same_file_as_chat_notify(self):
+        scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "agents", "platform", "scripts")
+        sys.path.insert(0, os.path.abspath(scripts))
+        try:
+            import chat_notify
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(kanban_chat_notify.HOME_FILE_DIR, chat_notify.HOME_FILE_DIR)
+        self.assertEqual(kanban_chat_notify.HOME_FILE_KEY, chat_notify.HOME_FILE_KEY)
+
+
 class RoutedPlatformFromTheFileTest(unittest.TestCase):
     """A learned Slack home channel reaches the stand-in through the operator's
     projected file, not the env: routed when the gateway holds Slack and the
@@ -92,6 +108,8 @@ class RoutedPlatformFromTheFileTest(unittest.TestCase):
             handle.write(text)
 
     def test_the_file_routes_slack(self):
+        self.assertEqual(kanban_chat_notify.routed_platform(), "")
+        self._write("")
         self.assertEqual(kanban_chat_notify.routed_platform(), "")
         self._write("C0FILE\n")
         self.assertEqual(kanban_chat_notify.routed_platform(), "slack")

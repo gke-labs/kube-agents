@@ -292,9 +292,9 @@ func (s *SlackAdapter) checkHomeChannel(ctx context.Context, id string) (refused
 }
 
 // refuseHome records why a candidate was refused. The record decides: while
-// it names a channel, slack.refused is not this learner's to write (a stale
-// one, from an older gateway or a hand edit, is cleared when a learn adopts
-// or replaces the channel), so a refused candidate writes nothing; otherwise
+// it names a channel, slack.refused is the post-time check's to write
+// (VerifyHomeForPost), or an older gateway's, and a learn that adopts or
+// replaces the channel clears it, so a refused candidate writes nothing; otherwise
 // the reason is written unless the record names it already, so a channel
 // that keeps being refused is one log line per mention, not one write, and a
 // read or a write that failed is tried again at the next refusal.
@@ -318,9 +318,48 @@ func (s *SlackAdapter) writeRefusal(ctx context.Context, cm *corev1.ConfigMap, r
 	}
 }
 
+// VerifyHomeForPost is the check a home post passes before it goes out
+// (Notifier.SetHomeVerifier): the same conversations.info a learn makes. A
+// channel Slack refuses now (shared, archived, the app removed, not a channel)
+// is written to slack.refused beside the record while the record still names
+// it, so the operator empties the projection and HomeChannelUnset names the
+// cause; a check that cannot be made is an error and writes nothing.
+func (s *SlackAdapter) VerifyHomeForPost(ctx context.Context, home string) (refused string, err error) {
+	refused, err = s.checkHomeChannel(ctx, home)
+	if err == nil && refused != "" {
+		s.refuseNamedHome(ctx, home, refused)
+	}
+	return refused, err
+}
+
+// refuseNamedHome writes reason beside channel while the record still names
+// channel and does not name that reason already: the sibling of refuseHome
+// for a record that names a channel. A record the learn or a hand edit moved
+// on is not relabelled.
+func (s *SlackAdapter) refuseNamedHome(ctx context.Context, channel, reason string) {
+	l := &s.homeLearn
+	l.mu.Lock()
+	armed := l.record.client != nil
+	l.mu.Unlock()
+	if !armed {
+		return
+	}
+	cm, err := l.record.get(ctx)
+	if err != nil {
+		s.log.Warn("slack: home-channel refusal not recorded", "record", l.record.name, "err", err)
+		return
+	}
+	if strings.TrimSpace(cm.Data[homeRecordKeySlack]) != channel || cm.Data[homeRecordKeyRefused] == reason {
+		return
+	}
+	s.log.Warn("slack: the home channel is refused now; recorded so the operator and the next mention act on it", "channel", channel, "reason", reason)
+	s.writeRefusal(ctx, cm, reason)
+}
+
 // recordHome writes the learned channel, unless the record names one already:
-// then that one is checked and kept instead (adopted), with a stale refusal
-// beside it cleared so the operator admits it, and nothing else written; a
+// then that one is checked and kept instead (adopted), with a refusal beside
+// it (the post-time check's, or an older gateway's) cleared when the check
+// passes now, so the operator admits it, and nothing else written; a
 // recorded channel the check refuses (one archived since another writer
 // learned it) is replaced. A write the record changed under (409) reads
 // again and does the same. The answer is the channel the record names and
@@ -340,7 +379,7 @@ func (s *SlackAdapter) recordHome(ctx context.Context, channel, member string) (
 			if refused == "" {
 				if cm.Data[homeRecordKeyRefused] != "" {
 					if err := l.record.patch(ctx, cm.ResourceVersion, map[string]*string{homeRecordKeyRefused: nil}); err != nil {
-						return "", false, fmt.Errorf("the record names %q beside a stale refusal that could not be cleared: %w", winner, err)
+						return "", false, fmt.Errorf("the record names %q beside a refusal that could not be cleared: %w", winner, err)
 					}
 				}
 				return winner, true, nil

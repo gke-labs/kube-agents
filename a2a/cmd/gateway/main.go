@@ -345,6 +345,7 @@ func armHomeLearn(cfg *gateway.Config, backend gateway.Adapter, notifier *gatewa
 	slack.SetHomeLearner(cs, cfg.Namespace, cfg.HomeChannelRecord, cfg.SelfImage, gateway.HomeFileDir)
 	if notifier != nil {
 		notifier.SetHomeSource(slack.LearnedHome)
+		notifier.SetHomeVerifier(slack.VerifyHomeForPost)
 	}
 	log.Info("home channel learn armed", "record", cfg.HomeChannelRecord, "file", gateway.HomeFileDir)
 }

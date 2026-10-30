@@ -118,8 +118,10 @@ def home_file() -> tuple[str, bool]:
 
     Read on every call: the kubelet refreshes the file in place when the
     operator's projection changes, within about a minute, and no process
-    restarts for it. A directory or file that is absent reads as ("", False):
-    today mode, or an operator older than the projection.
+    restarts for it. Mounted means the directory is there: the Optional
+    volume gives an empty directory until the operator writes the ConfigMap,
+    and in that gap the home is still the operator's to say. No directory at
+    all is today mode, or an operator older than the projection: ("", False).
     """
     try:
         with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
@@ -129,7 +131,7 @@ def home_file() -> tuple[str, bool]:
                 # Not text: mounted, but no channel to read, as the gateway reads it.
                 return "", True
     except OSError:
-        return "", False
+        return "", os.path.isdir(HOME_FILE_DIR)
 
 
 def home_file_value() -> str:

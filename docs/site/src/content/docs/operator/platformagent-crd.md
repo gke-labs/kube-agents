@@ -1152,7 +1152,7 @@ _and_ beyond the agent's own repair: `model.*`, `platforms.*`, `approvals.cron_m
 `display.platforms`, `kanban.max_in_progress` (the board is shared by every profile, and a burst of
 workers past it is lost to the OOM killer without a restart or an event), `terminal.*` (where the shell runs: one sandbox per Pod, reached the same way by every
 profile), when the agent Pod has a runtime class, `database.journal_mode` (one data volume per Pod, and a
-corrupted database is found only after the sessions in it are unreadable) and, when the A2A bridge is in the
+corrupted database is found only after the sessions in it are unreadable), `sessions.auto_prune` and `sessions.retention_days` (from `spec.harness.retention`: one period for every profile, which no profile can lengthen) and, when the A2A bridge is in the
 Pod, rendered by the operator or declared, and runs the `api` executor, one `hooks.outbound` entry that posts tool calls and model requests to the bridge's loopback activity endpoint (one endpoint per
 Pod, signed with a key from the A2A credentials Secret). A list is one leaf, so while that entry is rendered it
 replaces any `hooks.outbound` list a profile sets in its own `config.yaml`: those hooks do not fire. The reasoning is that as long as a

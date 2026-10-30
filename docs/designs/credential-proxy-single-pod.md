@@ -4,6 +4,10 @@
 > as one pod, `Replicas: 1` with the `Recreate` strategy. This document records why it is not
 > scaled horizontally today, what the load measurement behind that decision is, and what would
 > make it change.
+>
+> **Proposed successor (draft, not decided):**
+> [`credential-broker-exec-tier.md`](credential-broker-exec-tier.md). This decision stands until
+> that design is reviewed.
 
 **Scope:** whether the broker (`agents/platform/scripts/credential_proxy.py`, deployed by
 `buildCredentialProxyDeployment` in `k8s-operator/internal/controller/credential_proxy_manifests.go`)

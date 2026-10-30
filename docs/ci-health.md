@@ -230,7 +230,7 @@ forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only 
 nightly, `ci-kube-agents-eval-nightly-gitlab`, runs the same list and lands as the
 section's nights, read from its own log prefix), against a pool project's GitLab repository, listed in the Brief's "GitLab
 lane" section with its own counts and links, and in no gate number, case
-history or digest line.
+history or digest line. The GHES lane (`pull-kube-agents-smoke-test-ghes`, its two nightlies; `docs/ci-pool-projects.md` 5.8) is not collected yet: its runs show in Prow only until the dashboard reads a lane per forge.
 
 ## Hysteresis
 
@@ -1100,10 +1100,24 @@ counted in the closing note.
 The page carries the robot from the docs site, a one-paragraph intro, three
 tiles (pass rate and its change, scenarios compared, the median `agent_s` of
 the compared scenarios' graded repetitions with its 90th percentile, "the
-slowest 10%"), a "Needs attention" box, one row per area with
+slowest 10%"), and a fourth when the week has token counts (the median tokens
+per graded repetition and, when the week has a trend, its change from last
+week on the same scenarios, which the text says because it is not measured
+against that median), a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
+
+A repetition's tokens are its record's `total`
+([`SCHEMA.md`](../scripts/eval_dashboard/SCHEMA.md), `reps[].tokens`). With no
+`total`, input plus output stands in, but that sum misses what the workers
+billed, so it counts as partial like a record marked `partial`. Partial counts
+are left out of the median and their number is shown. The change compares
+the two weeks' figures over the scenarios with a full count in both weeks.
+Each such scenario's median is taken over its full counts in each week, and a
+week's figure is the median of those per-scenario medians, so every scenario
+weighs the same and its partial counts do not move it. The tokens tile and the Chat line are
+left out when no repetition the week compared carries a count.
 
 The page is written only when every check passes; otherwise the script prints
 each reason and exits 1, the step logs a warning, and the last published copy
@@ -1143,7 +1157,7 @@ why the rest were left out), the "Needs attention" areas with their open-bug
 counts and a button to each area's open bugs (the section is left out when no
 area needs attention), every area's pass rate as a ten-step bar, best first
 (collapsed to the first three), the task time (the median, the 90th percentile
-and the area with the slowest median), buttons to the page, the dashboard and
+and the area with the slowest median) and the tile's tokens line, buttons to the page, the dashboard and
 all open nightly bugs, and the models the week ran. The message carries the
 same week in a few lines of text, without Chat's markup, as the card's
 fallback for notifications; that text also names the three strongest areas and
@@ -1327,11 +1341,11 @@ first shows up as a 403 in an agent transcript on whichever pull request leased
 the project (#1927: a role missing on all 30 projects for two weeks). The
 `fixture-state-scan` job runs the verifier on a clock instead. After the fleet
 scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
-`verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,gitops_default_branch,token_minter_kms --report`
+`verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,forge_pieces,gitops_default_branch,token_minter_kms --report`
 against every pool project, eight at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
-`gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
+`forge_pieces` reads the once-per-project pieces a self-managed forge VM needs (the private zone, the two reserved addresses and their records, the 443 allow rule and the deny rule on the tag, each held to its shape, the VM identity; `docs/ci-pool-projects.md` 5.8); its findings pass every leased run on the public lanes, so the bot's pool-drift advice does not blame them. `gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
 
 The secret is a fine-grained personal access token: resource owner `gke-agentic`, repository access the pool's `*-infra` repositories picked one by one (a fine-grained token has no wildcard, so a new pool project's repository is added to the token's list before the project is registered, as `docs/ci-pool-projects.md` 5.4 does for the ledger App's installation), permission Repository -> Metadata: read-only and nothing else, expiry one year at most. Whoever creates it records their name and the expiry date here: held by _(unset)_, expires _(unset)_. Its expiry is silent by design: the check goes "not checked" on every project and the hourly digest reads "35 checks not read in full", with no alert and no issue, so the owner puts the renewal on a calendar. The durable form is the one 5.4 chose for the ledger read, a third App holding Metadata: read-only on the selected repositories, its PEM as the repository secret and `actions/create-github-app-token` in the step exporting `GH_TOKEN`; the verifier reads only `GH_TOKEN`, so that swap is a workflow-step and docs change.
 Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks

@@ -1013,6 +1013,62 @@ tests/test_chart_operator_monitoring.py holds them together.
 {{- end }}
 
 {{/*
+The smallest memory limit the chart renders for the manager, and the check that
+holds operator.resources.limits.memory to it. The floor is the default, 512Mi,
+which values.yaml sizes from a measurement of the manager's cache; the value
+exists to be raised for a larger cluster, never lowered. Releases up to 0.16.0
+shipped the Kubebuilder scaffold's 128Mi limit and 64Mi request, and
+`helm upgrade --reuse-values` renders this chart against that release's values
+rather than this chart's defaults, so an install upgraded that way kept the
+128Mi the sizing replaced and nothing said so. The check fails the render
+instead, naming the key and the way out. A missing limits.memory is left alone:
+it is no limit at all, not a small one. tests/test_chart_operator_resources.py
+holds the floor to the default and pins the message.
+*/}}
+{{- define "kube-agents.operatorMemoryFloorBytes" -}}
+536870912
+{{- end }}
+
+{{- define "kube-agents.operatorResourcesCheck" -}}
+{{- $prefix := "operator.resources" -}}
+{{- $floor := include "kube-agents.operatorMemoryFloorBytes" . | int64 -}}
+{{- $floorMi := div $floor 1048576 -}}
+{{- $resources := .Values.operator.resources | default dict -}}
+{{- if not (kindIs "map" $resources) -}}
+{{- fail (printf "%s is %v, which is not a map of requests and limits, for example `limits: {memory: %dMi}`" $prefix $resources $floorMi) -}}
+{{- end -}}
+{{- $limits := (index $resources "limits") | default dict -}}
+{{- if not (kindIs "map" $limits) -}}
+{{- fail (printf "%s.limits is %v, which is not a map of resource name to quantity, for example `limits: {memory: %dMi}`" $prefix $limits $floorMi) -}}
+{{- end -}}
+{{- $quantity := index $limits "memory" -}}
+{{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
+{{- $raw := toString $quantity | trim -}}
+{{- $key := printf "%s.limits.memory" $prefix -}}
+{{- /* The grammar kube-agents.containerResourcesCheck admits, so quantityExact
+       scales a value it can read rather than answering zero for one it cannot. */ -}}
+{{- if hasPrefix "-" $raw -}}
+{{- fail (printf "%s is %s; a quantity must not be negative" $key $raw) -}}
+{{- end -}}
+{{- if not (regexMatch (include "kube-agents.quantityPattern" .) (trimPrefix "+" $raw)) -}}
+{{- fail (printf "%s is %q, which is not a Kubernetes quantity (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $key $raw) -}}
+{{- end -}}
+{{- /* Sprig's float64 answers 0 for a value past float64's range, which the
+       compare below would read as under the floor and blame on the wrong thing. */ -}}
+{{- if include "kube-agents.quantityOverflowsFloat64" $raw -}}
+{{- fail (printf "%s is %s, which is not a representable byte count: it is past the range of a float64, which the chart would read as zero, and it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the manager" $key $raw) -}}
+{{- end -}}
+{{- /* Between float64's range and int64's: a float64 holds it, the Downward API does not. */ -}}
+{{- if include "kube-agents.bytesExceedInt64" $raw -}}
+{{- fail (printf "%s is %s, which exceeds the 9223372036854775807 bytes an int64 holds, the most the Downward API hands the manager" $key $raw) -}}
+{{- end -}}
+{{- if lt (include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" $key) | float64) (float64 $floor) -}}
+{{- fail (printf "%s is %s, under the %dMi floor the manager's cache is sized for; below it the manager is OOM-killed as the cache fills. Releases up to 0.16.0 shipped 128Mi, and `helm upgrade --reuse-values` keeps that release's defaults: upgrade with upgrade.sh or `--reset-then-reuse-values`, set at least %dMi, or omit the key for the default" $key $raw $floorMi $floorMi) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 topologySpreadConstraints for a multi-replica workload this chart owns.
 
 Renders nothing below two replicas, so the operator gets the field only if
@@ -1902,6 +1958,16 @@ these have passed.
        int64, a CPU past the millicore range) fails the render naming the key, rather
        than being pruned silently or reaching the footprint math as garbage. Caller
        passes resources, prefix, container, pod and consumer (the Downward API reader). */ -}}
+{{- /* The CRD's quantity grammar, the sign already stripped, with the exponent
+       narrowed to the integer form resource.ParseQuantity reads. parseCpuMillis,
+       parseBytes and quantityExact read every form this admits. One definition
+       for the two checks that gate those readers, kube-agents.containerResourcesCheck
+       and kube-agents.operatorResourcesCheck, so they cannot admit different
+       grammars. */ -}}
+{{- define "kube-agents.quantityPattern" -}}
+^(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$
+{{- end }}
+
 {{- define "kube-agents.containerResourcesCheck" -}}
 {{- $resources := .resources | default dict -}}
 {{- $prefix := .prefix -}}
@@ -1916,10 +1982,7 @@ these have passed.
 {{- fail (printf "%s.claims is not supported -- the %s declares no resourceClaims, so the operator refuses the key. Remove it." $prefix $pod) -}}
 {{- end -}}
 {{- $names := list "cpu" "memory" "ephemeral-storage" -}}
-{{- /* The CRD's quantity grammar, the sign already stripped, with the
-       exponent narrowed to the integer form resource.ParseQuantity reads.
-       parseCpuMillis and parseBytes read every form this admits. */ -}}
-{{- $quantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
+{{- $quantityPattern := include "kube-agents.quantityPattern" . -}}
 {{- range $side := list "limits" "requests" -}}
 {{- $quantities := index $resources $side -}}
 {{- /* `--set ...limits=2Gi` hands range a string, which it cannot walk, and a list
@@ -2077,6 +2140,17 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- end }}
 
 {{- define "kube-agents.quotaRequirements" -}}
+{{- /* Helm renders quota-preflight.yaml before operator-deployment.yaml, so on a
+       namespace with a ResourceQuota the workload loop below would read a bad
+       operator.resources.limits.memory first and parseBytes would refuse it with
+       "please report it" before the operator template could name the key. Both
+       readers call the check, as both readers of the credential-proxy override
+       call kube-agents.containerResourcesCheck. Gated as the operator template
+       and the workload loop below are: a chart that renders no manager has no
+       limit to hold to the floor. */ -}}
+{{- if .Values.operator.enabled -}}
+{{- include "kube-agents.operatorResourcesCheck" . -}}
+{{- end -}}
 {{- $footprint := .Files.Get "files/footprint.yaml" | fromYaml -}}
 {{- /* The footprint is the only source for the operator-rendered pods, which are most of
        the release. If it is missing or unparseable every one of them silently counts as
