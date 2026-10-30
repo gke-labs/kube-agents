@@ -313,7 +313,8 @@ func (g *gatewayBridgeSession) WaitForHealthy(ctx context.Context, timeout time.
 	}
 	resp, err := g.httpClient.Do(req)
 	if err != nil {
-		if g.tunnel != nil {
+		// The probe's own timeout is a tunnel failure; the caller's cancel is not.
+		if g.tunnel != nil && ctx.Err() == nil {
 			g.tunnel.Restart()
 		}
 		return false
@@ -409,7 +410,9 @@ func (g *gatewayBridgeSession) callRemoteTool(
 
 	resp, err := g.httpClient.Do(req)
 	if err != nil {
-		if g.tunnel != nil {
+		// The caller's own cancel or deadline says nothing about the tunnel, and restarting it
+		// would reset every other stream on the shared connection (a concurrent stop among them).
+		if g.tunnel != nil && ctx.Err() == nil {
 			g.tunnel.Restart()
 		}
 		return "", "", "", err

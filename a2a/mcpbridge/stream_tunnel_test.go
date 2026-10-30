@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // pipeListener hands the server ends of pipeTunnel's connections to an http.Server.
@@ -31,12 +32,13 @@ func (l *pipeListener) Addr() net.Addr { return &net.UnixAddr{Name: "pipe", Net:
 
 // pipeTunnel is a StreamTunnel whose connections are in-memory pipes: no socket exists.
 type pipeTunnel struct {
-	l     *pipeListener
-	dials atomic.Int32
+	l        *pipeListener
+	dials    atomic.Int32
+	restarts atomic.Int32
 }
 
 func (t *pipeTunnel) MCPURL() string { return "http://a2a-mcp" }
-func (t *pipeTunnel) Restart()       {}
+func (t *pipeTunnel) Restart()       { t.restarts.Add(1) }
 func (t *pipeTunnel) Close()         {}
 func (t *pipeTunnel) DialContext(context.Context, string, string) (net.Conn, error) {
 	t.dials.Add(1)
@@ -99,4 +101,80 @@ func TestKubePathSendsTheBearerOnlyThroughTheTunnelsDialer(t *testing.T) {
 	if tun.dials.Load() == 0 {
 		t.Fatal("the request did not go through the tunnel's DialContext")
 	}
+}
+
+func TestCallerCancellationDoesNotRestartTheSharedTunnel(t *testing.T) {
+	l := &pipeListener{conns: make(chan net.Conn, 8), closed: make(chan struct{})}
+	inHandler := make(chan struct{}, 8)
+	hs := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req rpcRequest
+		_ = json.Unmarshal(body, &req)
+		if containsBlockTool(body) {
+			inHandler <- struct{}{}
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", contentTypeNDJSON)
+		_, _ = fmt.Fprintf(w, "%s\n", marshalRPCResult(req.ID, CallToolResult{Content: []TextContent{{Type: contentTypeText, Text: "status ok"}}}))
+	})}
+	go func() { _ = hs.Serve(l) }()
+	t.Cleanup(func() { _ = hs.Close() })
+
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertDeployments([]DeploymentProfile{{Name: "d", KubeContext: "ctx", Namespace: "ns", PlatformAgentName: "pa", Ready: true}}); err != nil {
+		t.Fatal(err)
+	}
+	tun := &pipeTunnel{l: l}
+	srv, err := NewServer(ServerOptions{Store: store, Cluster: pipeClusterAccess{tun: tun}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	t.Setenv(EnvMCPToken, "")
+	if res := srv.CallTool(context.Background(), ToolConnectDeployment, json.RawMessage(`{"deployment":"d"}`)); res.IsError {
+		t.Fatalf("connect_deployment: %+v", res)
+	}
+	srv.mu.Lock()
+	sess := srv.session
+	srv.mu.Unlock()
+	if sess == nil {
+		t.Fatal("no session after connect_deployment")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := sess.callRemoteTool(ctx, "block_me", nil, CallMeta{}, PersistentConfig{}, nil)
+		done <- err
+	}()
+	select {
+	case <-inHandler:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the blocking call never reached the server")
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("the cancelled call returned no error")
+	}
+	if n := tun.restarts.Load(); n != 0 {
+		t.Fatalf("the caller's own cancellation restarted the shared tunnel %d time(s)", n)
+	}
+	if sess.WaitForHealthy(ctx, time.Second) {
+		t.Fatal("a health probe on a cancelled context reported healthy")
+	}
+	if n := tun.restarts.Load(); n != 0 {
+		t.Fatalf("a health probe on the caller's cancelled context restarted the tunnel %d time(s)", n)
+	}
+}
+
+func containsBlockTool(body []byte) bool {
+	var req struct {
+		Params struct {
+			Name string `json:"name"`
+		} `json:"params"`
+	}
+	return json.Unmarshal(body, &req) == nil && req.Params.Name == "block_me"
 }
