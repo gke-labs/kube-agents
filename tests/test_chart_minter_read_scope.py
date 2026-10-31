@@ -26,6 +26,7 @@ _KUSTOMIZE_TEMPLATE = (
 _MINTER_CONFIGMAP = "github-token-minter-config"
 _WRITE_SCOPE = "platform-agent-scope"
 _READ_SCOPE = "platform-agent-read-scope"
+_SWEEP_SCOPE = "platform-agent-sweep-scope"
 _REPO = "gke-fleet-iac"
 
 _HELM_ARGS = [
@@ -62,19 +63,26 @@ def _scopes(policy_text: str) -> dict:
 
 
 class MinterReadScopeTest(unittest.TestCase):
-    def assert_two_scopes(self, policy_text: str, where: str) -> None:
+    def assert_three_scopes(self, policy_text: str, where: str) -> None:
         scopes = _scopes(policy_text)
-        self.assertEqual({_WRITE_SCOPE, _READ_SCOPE}, set(scopes), where)
+        self.assertEqual({_WRITE_SCOPE, _READ_SCOPE, _SWEEP_SCOPE}, set(scopes), where)
         read = scopes[_READ_SCOPE]
         self.assertEqual({"contents": "read"}, read["permissions"], f"{where}: the read scope grants a read alone")
-        self.assertEqual(scopes[_WRITE_SCOPE]["repositories"], read["repositories"], where)
-        # The same caller rule, so the same GSA is the only one either scope answers.
-        self.assertEqual(scopes[_WRITE_SCOPE]["rule"], read["rule"], where)
+        sweep = scopes[_SWEEP_SCOPE]
+        self.assertEqual(
+            {"contents": "read", "pull_requests": "read", "issues": "read"},
+            sweep["permissions"],
+            f"{where}: the sweep scope reads contents, pull requests and issues, and writes nothing",
+        )
+        for other in (read, sweep):
+            self.assertEqual(scopes[_WRITE_SCOPE]["repositories"], other["repositories"], where)
+            # The same caller rule, so the same GSA is the only one any scope answers.
+            self.assertEqual(scopes[_WRITE_SCOPE]["rule"], other["rule"], where)
         write = scopes[_WRITE_SCOPE]["permissions"]
         self.assertEqual("write", write["contents"], f"{where}: the write scope is unchanged")
 
     @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
-    def test_the_chart_renders_both_scopes_in_default_and_repo_policies(self):
+    def test_the_chart_renders_all_three_scopes_in_default_and_repo_policies(self):
         proc = subprocess.run(
             ["helm", "template", "test-release", str(_CHART), *_HELM_ARGS],
             capture_output=True,
@@ -85,7 +93,7 @@ class MinterReadScopeTest(unittest.TestCase):
         self.assertEqual({"default.yaml", f"{_REPO}.yaml"}, set(data))
         for key, policy in data.items():
             with self.subTest(key=key):
-                self.assert_two_scopes(policy, key)
+                self.assert_three_scopes(policy, key)
 
     def test_the_kustomize_template_carries_the_same_scopes(self):
         # The dev path renders the same ConfigMap through envsubst; a scope the
@@ -103,7 +111,7 @@ class MinterReadScopeTest(unittest.TestCase):
         self.assertEqual({"default.yaml", f"{_REPO}.yaml"}, set(data))
         for key, policy in data.items():
             with self.subTest(key=key):
-                self.assert_two_scopes(policy, key)
+                self.assert_three_scopes(policy, key)
 
 
 if __name__ == "__main__":

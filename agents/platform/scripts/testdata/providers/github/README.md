@@ -51,6 +51,12 @@ ways and never regenerated wholesale:
   `{"__status__": 404, "__detail__": "..."}` is what the transport would have
   raised for that call; the harness raises it. `label-ensure.json` uses one, because
   the verb's logic is a read that 404s followed by a create.
+- **The sweep's readings.** `proposal-list-by-author.json` and
+  `proposal-tally.json` are search answers, one item in each state;
+  `proposal-reviews.json` carries a bodiless approval and a pending review the
+  forge drops; `proposal-closer.json` closes, reopens and closes again, so the
+  last close decides. `proposal-commits.json` carries one commit linked to an
+  App and one the install made under an address GitHub links to nobody.
 - **Three endpoints for one conversation.** `proposal-view.json` carries the
   conversation, the inline review comments and the review summaries as three
   responses, in the order the translation asks for them, with one empty-bodied

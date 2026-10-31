@@ -51,6 +51,30 @@ readonly COMPUTE_SWEEP_ROLE_ID="kubeAgentsComputePlantSweeper"
 readonly COMPUTE_SWEEP_ROLE_TITLE="kube-agents Compute plant sweeper"
 readonly COMPUTE_SWEEP_ROLE_STAGE="GA"
 readonly COMPUTE_SWEEP_PERMISSIONS="compute.addresses.delete,compute.addresses.deleteInternal,compute.addresses.list,compute.globalAddresses.delete,compute.globalAddresses.deleteInternal,compute.globalAddresses.list,compute.globalOperations.get,compute.networks.delete,compute.networks.list,compute.regionOperations.get,compute.subnetworks.delete,compute.subnetworks.list,monitoring.alertPolicies.delete,monitoring.alertPolicies.list"
+# The once-per-project pieces of a self-managed forge (hack/ci-forge.sh reads
+# them per run; docs/ci-pool-projects.md 5.8): the private zone, one reserved
+# address and one A record per row, the 443 firewall rule and the VM identity,
+# a registry reader. The rows' hosts are hack/ci-deploy.sh's forge table
+# defaults, read below; the names here are kept equal to
+# scripts/verify_ci_pool_project.py by its tests.
+readonly FORGE_DNS_ZONE="eval-internal"
+readonly FORGE_DNS_NAME="eval.internal."
+readonly FORGE_NETWORK="default"
+readonly FORGE_ROWS="ghes gitlab-ce"
+readonly FORGE_FIREWALL_RULE="allow-forge-443"
+readonly FORGE_FIREWALL_SOURCE_RANGES="10.0.0.0/8"
+readonly FORGE_FIREWALL_ALLOWED="tcp:443"
+# The deny rule on the same tag, one priority step below the allow (gcloud's
+# default 1000): a forge VM's external address answers nothing else, the
+# default network's stock allow-ssh included.
+readonly FORGE_DENY_RULE="deny-forge-ingress"
+readonly FORGE_DENY_PRIORITY=1100
+readonly FORGE_DENY_SOURCE_RANGES="0.0.0.0/0"
+readonly FORGE_DENY_RULES="all"
+readonly FORGE_NETWORK_TAG="forge"
+readonly FORGE_VM_SA_ID="forge-vm"
+readonly FORGE_VM_SA_ROLE="roles/artifactregistry.reader"
+readonly FORGE_RECORD_TTL=60
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
 # bench/tf/fleet needs on the project; step 2 grants it the state bucket.
@@ -364,6 +388,7 @@ gcloud services enable \
   gkehub.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
+  dns.googleapis.com \
   --project="${PROJECT_ID}"
 
 PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
@@ -426,7 +451,7 @@ done
 # (docs/designs/eval-scorer.md). In the pool the two need the same set: a
 # project granting only the presubmit's account leases fine and dies at
 # get-credentials the first night it is drawn, as kube-agents-evals-10 did on
-# 2026-09-16 (gke-labs/kube-agents#1491). The same thirteen, not a subset -- the
+# 2026-09-16 (gke-labs/kube-agents#1491). The same fourteen, not a subset -- the
 # run is the same script end to end, so a partial grant fails at a later step
 # on a later night instead.
 #
@@ -440,9 +465,12 @@ done
 PROW_RUNNER_SA="serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 NIGHTLY_RUNNER_SA="serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
 echo "Granting the Prow and nightly runners access to ${PROJECT_ID}..."
+# compute.instanceAdmin.v1: hack/ci-forge.sh creates and deletes the
+# self-managed forge VM per run and reads its serial console (section 5.8).
 for role in \
   roles/cloudbuild.builds.editor \
   roles/cloudbuild.builds.viewer \
+  roles/compute.instanceAdmin.v1 \
   roles/container.admin \
   roles/container.developer \
   roles/iam.serviceAccountAdmin \
@@ -625,6 +653,51 @@ fi
 echo "⚠ ${GITOPS_REPO} must also be added to GitHub App ${LEDGER_APP_ID}'s installation."
 echo "  That edit widens which repositories the App can read issues and pull requests in:"
 echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
+
+# ─── Step 1.5: The self-managed forges' pieces ────────────────────────────────
+echo -e "\n==> [Step 1.5] Reserving the self-managed forges' zone, addresses, firewall rule and VM identity..."
+# The rows' hosts, from the one table (forge_profile in hack/ci-deploy.sh).
+eval "$(sed -n 's/^\(EVAL_FORGE_DEFAULT_[A-Z_]*HOST=.*\)$/\1/p' "${REPO_ROOT}/hack/ci-deploy.sh")"
+forge_host_for_row() { # ghes -> EVAL_FORGE_DEFAULT_GHES_HOST, gitlab-ce -> EVAL_FORGE_DEFAULT_GITLAB_CE_HOST
+  local var
+  var="EVAL_FORGE_DEFAULT_$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')_HOST"
+  printf '%s' "${!var}"
+}
+if ! gcloud dns managed-zones describe "${FORGE_DNS_ZONE}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud dns managed-zones create "${FORGE_DNS_ZONE}" --dns-name="${FORGE_DNS_NAME}" --visibility=private \
+    --networks="${FORGE_NETWORK}" --description="Self-managed eval forges (hack/ci-forge.sh)" --project="${PROJECT_ID}" >/dev/null
+fi
+for row in ${FORGE_ROWS}; do
+  address="forge-${row}"
+  host="$(forge_host_for_row "${row}")"
+  if ! ip="$(gcloud compute addresses describe "${address}" --region="${REGION}" --project="${PROJECT_ID}" --format='value(address)' 2>/dev/null)"; then
+    gcloud compute addresses create "${address}" --region="${REGION}" --subnet="${FORGE_NETWORK}" --purpose=GCE_ENDPOINT \
+      --description="The ${row} forge VM's address (hack/ci-forge.sh)" --project="${PROJECT_ID}" >/dev/null
+    ip="$(gcloud compute addresses describe "${address}" --region="${REGION}" --project="${PROJECT_ID}" --format='value(address)')"
+  fi
+  if record="$(gcloud dns record-sets describe "${host}." --zone="${FORGE_DNS_ZONE}" --type=A --project="${PROJECT_ID}" --format='value(rrdatas[0])' 2>/dev/null)"; then
+    if [ "${record}" != "${ip}" ]; then
+      gcloud dns record-sets update "${host}." --zone="${FORGE_DNS_ZONE}" --type=A --ttl="${FORGE_RECORD_TTL}" --rrdatas="${ip}" --project="${PROJECT_ID}" >/dev/null
+    fi
+  else
+    gcloud dns record-sets create "${host}." --zone="${FORGE_DNS_ZONE}" --type=A --ttl="${FORGE_RECORD_TTL}" --rrdatas="${ip}" --project="${PROJECT_ID}" >/dev/null
+  fi
+  echo "✓ ${host} -> ${ip} (${address})"
+done
+if ! gcloud compute firewall-rules describe "${FORGE_FIREWALL_RULE}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud compute firewall-rules create "${FORGE_FIREWALL_RULE}" --network="${FORGE_NETWORK}" --direction=INGRESS --allow="${FORGE_FIREWALL_ALLOWED}" \
+    --source-ranges="${FORGE_FIREWALL_SOURCE_RANGES}" --target-tags="${FORGE_NETWORK_TAG}" --project="${PROJECT_ID}" >/dev/null
+fi
+if ! gcloud compute firewall-rules describe "${FORGE_DENY_RULE}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud compute firewall-rules create "${FORGE_DENY_RULE}" --network="${FORGE_NETWORK}" --direction=INGRESS --action=DENY --rules="${FORGE_DENY_RULES}" \
+    --priority="${FORGE_DENY_PRIORITY}" --source-ranges="${FORGE_DENY_SOURCE_RANGES}" --target-tags="${FORGE_NETWORK_TAG}" --project="${PROJECT_ID}" >/dev/null
+fi
+FORGE_VM_SA="${FORGE_VM_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+if ! gcloud iam service-accounts describe "${FORGE_VM_SA}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud iam service-accounts create "${FORGE_VM_SA_ID}" --display-name="kube-agents forge VM" --project="${PROJECT_ID}" >/dev/null
+fi
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null
+echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rules ${FORGE_FIREWALL_RULE} and ${FORGE_DENY_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
 
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
 # One bucket per project, one prefix per stack. Versioning and uniform

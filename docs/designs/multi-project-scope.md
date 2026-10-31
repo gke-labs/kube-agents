@@ -369,6 +369,28 @@ carries `spec.deployment.env` (`common_types.go:368-372`) only as a generic pass
 rendered file's hash joins the ConfigMap hash that rolls the agent workload, so editing the scope
 takes effect at the next pod start and the next reconcile tick, whichever is later.
 
+Under `spec.mode: next` the A2A gateway also needs the membership, to check a delegated task's
+target cluster before it mints a grant, and it cannot read this volume. The design adds a
+separate publisher for it. `scope_publisher.py` ships in the agent image: it runs the reconcile's
+own lookups, exclusion rules and cap with a runner that sends each gcloud command to the
+credential broker, probes each container and selector member with `container clusters list`, and
+merge-patches the result into the `<name>-resolved-scope` ConfigMap as one compact JSON document.
+The document holds the schema version, `resolvedAt` (the last run in which at least one source
+lookup answered), a `memberHash` of the declaration's membership fields (so a reader can tell a
+document resolved for an older declaration), a `state` (`ok`; `too-large` past 900 KiB; `error`
+when the declaration cannot be read, or when every source lookup failed and no earlier run
+resolved), the members an `exclude.projects` entry dropped, and one row per container or selector
+member with its `via`, its probe `outcome`, and `confirmedAt`, the last run in which a source
+listed it and its probe answered `ok`. Explicit projects and the management project have no rows.
+A failed source carries its members' rows forward with their outcome and `confirmedAt`, and two
+fields the gateway does not read carry the rest of what the reconcile's own snapshot carries: the
+number-to-ID memo and the members counted against the cap that have no row. The operator starts
+it as a Job every 15 minutes, when the membership fields change, and at creation. Two parts do not
+ship yet: the broker's `scope` caller role, whose only commands are the lookups' five argv
+shapes; and the gateway's check of the document, which admits explicit projects and the
+management project from the declaration and its own environment. The reconcile, its snapshot and
+today-mode installs do not change.
+
 Whether the snapshot should also be lifted into `.status` is open (§11). It would make `kubectl get
 platformagent -o yaml` answer "which projects does this install manage" without a pod exec, but the
 pod has no channel to the operator today and building one for this alone is out of proportion.

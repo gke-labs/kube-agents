@@ -726,6 +726,7 @@ type StallWatchSpec struct {
 // known when the CR is written: cluster profiles are scaffolded at runtime, one per
 // managed cluster, with generated names like `cluster-<project>-<cluster>-<region>`.
 // `Cluster` therefore applies to every `cluster-*` profile rather than to one of them.
+// +kubebuilder:validation:XValidation:rule="!has(self.profiles) || !has(self.profiles.childReserve) || self.profiles.childReserve < (has(self.profiles.ceiling) ? self.profiles.ceiling : (has(self.maxInProgress) ? self.maxInProgress : 6))",message="profiles.childReserve must be below the profile ceiling (profiles.ceiling, or maxInProgress when that is unset, default 6): the reserve is a share of the ceiling that top-level tasks can't take"
 type TuningSpec struct {
 	// Default applies to the `default` profile — the Chat Agent front door. Delivered
 	// as a config overlay merged into that profile at pod startup, like the others.
@@ -905,16 +906,82 @@ type TuningSpec struct {
 }
 
 // ProfileTuning carries the AgentProfile knobs on the PlatformAgent.
+//
+// The interval rules apply each field's default when it is absent, so a
+// field set alone is still checked against the other's default.
+// +kubebuilder:validation:XValidation:rule="(has(self.leaseSeconds) ? self.leaseSeconds : 90) >= 3 * (has(self.renewSeconds) ? self.renewSeconds : 20)",message="leaseSeconds must be at least three renewSeconds (defaults 90 and 20), so one late renewal doesn't expire a live task's lease"
+// +kubebuilder:validation:XValidation:rule="(has(self.restartGraceSeconds) ? self.restartGraceSeconds : 60) >= 2 * (has(self.renewSeconds) ? self.renewSeconds : 20)",message="restartGraceSeconds must be at least two renewSeconds (defaults 60 and 20), so a live worker renews at least twice inside a restarted dispatcher's grace"
 type ProfileTuning struct {
 	// Ceiling is the most profile tasks running at once across every profile
-	// on the install. The dispatcher enforces it, reserving max(1,
-	// ceil(Ceiling/3)) of it for interactive tiers so unattended work can't
-	// starve people, and the profile namespace's pod quota is derived from it.
-	// Absent means DefaultProfileCeiling.
+	// on the install, of every kind. The dispatcher keeps two disjoint
+	// reserves in it, ChildReserve for child tasks (so waiting parents can't
+	// hold every slot) and max(1, ceil(Ceiling/3)) for interactive tiers (so
+	// unattended work can't starve people), trimmed child first to leave at
+	// least one slot for top-level unattended work. With the default
+	// reserves, ceilings of 1, 2 and 4 can't honour both in full, and the
+	// PlatformAgent warns. The profile namespace's pod quota is derived
+	// from it. Absent means maxInProgress's resolved value, so an install's
+	// footprint doesn't jump while both exist (spec-profiles-dispatch.md).
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=1000
 	// +optional
 	Ceiling *int `json:"ceiling,omitempty"`
+
+	// ChildReserve is the share of Ceiling kept for child tasks, which
+	// top-level tasks can't take. A parent holds its slot while its children
+	// run, so without it a ceiling full of waiting parents could never start
+	// their children. Absent means max(1, ceil(Ceiling/3)), trimmed to
+	// Ceiling-1 so one slot stays unreserved (none at a ceiling of 1).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=999
+	// +optional
+	ChildReserve *int `json:"childReserve,omitempty"`
+
+	// LeaseSeconds is how long a task's liveness lease lasts without a
+	// renewal before the dispatcher fails the task (it is never re-run).
+	// Absent means DefaultProfileLeaseSeconds.
+	// +kubebuilder:validation:Minimum=15
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	LeaseSeconds *int `json:"leaseSeconds,omitempty"`
+
+	// RenewSeconds is how often a worker renews each task's lease; the
+	// dispatcher sends it with every offer. Absent means
+	// DefaultProfileRenewSeconds.
+	// +kubebuilder:validation:Minimum=5
+	// +kubebuilder:validation:Maximum=300
+	// +optional
+	RenewSeconds *int `json:"renewSeconds,omitempty"`
+
+	// RestartGraceSeconds is how long a restarted dispatcher waits, from its
+	// own start, for a renewal on each task it re-adopts before failing it.
+	// While the dispatcher is down nobody reads renewals, so this is what
+	// keeps a redeploy from failing every task in flight. Absent means
+	// DefaultProfileRestartGraceSeconds.
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	RestartGraceSeconds *int `json:"restartGraceSeconds,omitempty"`
+
+	// AcceptTimeoutSeconds is how long the dispatcher waits for a worker to
+	// accept an offer before treating it as declined. Absent means
+	// DefaultProfileAcceptTimeoutSeconds.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=120
+	// +optional
+	AcceptTimeoutSeconds *int `json:"acceptTimeoutSeconds,omitempty"`
+
+	// MaxTaskDeadlineSeconds caps the deadline any profile task gets: a
+	// profile whose lifecycle.activeDeadlineSeconds is longer has its tasks
+	// clamped to this, with a warning. Once profile tasks get their own bus
+	// credentials it is also the longest a task's credential may live, which the
+	// auth callout enforces, bounding a leaked one; the operator renders it
+	// to the callout already. It may only be lowered from the default.
+	// Absent means DefaultProfileMaxTaskDeadlineSeconds (6h).
+	// +kubebuilder:validation:Minimum=60
+	// +kubebuilder:validation:Maximum=21600
+	// +optional
+	MaxTaskDeadlineSeconds *int `json:"maxTaskDeadlineSeconds,omitempty"`
 
 	// WarmReplicas is how many warm worker pods each interactive (profile,
 	// tier) keeps running. Absent means DefaultProfileWarmReplicas.
@@ -929,10 +996,20 @@ type ProfileTuning struct {
 // streams. An existing bus keeps its own count.
 const DefaultBusReplicas = 3
 
-// The ProfileTuning defaults.
+// MaxProfileCeiling is ProfileTuning.Ceiling's maximum, which the ceiling
+// also holds to when it defaults to maxInProgress.
+const MaxProfileCeiling = 1000
+
+// The ProfileTuning defaults. The ceiling's is maxInProgress's resolved
+// value, which the controller owns, and ChildReserve's is derived from the
+// ceiling.
 const (
-	DefaultProfileCeiling      = 8
-	DefaultProfileWarmReplicas = 1
+	DefaultProfileWarmReplicas           = 1
+	DefaultProfileLeaseSeconds           = 90
+	DefaultProfileRenewSeconds           = 20
+	DefaultProfileRestartGraceSeconds    = 60
+	DefaultProfileAcceptTimeoutSeconds   = 10
+	DefaultProfileMaxTaskDeadlineSeconds = 21600
 )
 
 // AgentLimits bounds a single agent run. Both limits exist because they fail the same
@@ -1161,13 +1238,14 @@ type CredentialProxySpec struct {
 	// Each key set here replaces the operator's default for that key and the
 	// rest keep their defaults, unlike spec.deployment.resources, which replaces
 	// the agent container's block wholesale: a CR that sets only limits.memory
-	// keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage
+	// keeps the default 500m CPU request, 1 CPU limit and 8Gi ephemeral-storage
 	// limit. The broker sizes how many commands it admits at once from the
 	// memory limit, so raising the limit is the one knob for an install whose
 	// fleet outgrows the default; the ephemeral-storage limit bounds the content
-	// workspace the broker clones into; the proxy's state and /tmp emptyDirs
-	// (sizeLimits 5Gi and 2Gi) follow it when it is raised above their
-	// defaults, so the kubelet does not evict the pod at the smaller figure.
+	// workspace the broker clones into; the proxy's state emptyDir (sizeLimit
+	// 5Gi) grows by whatever the limit is raised above the 8Gi default, and
+	// its /tmp emptyDir keeps its 2Gi, so the kubelet does not evict the pod
+	// at the smaller figure.
 	// The limit a fleet needs grows with the size of its clusters as well as
 	// their number: the broker charges each command about 128Mi, the size of
 	// a listing of a small cluster, and a kubectl listing thousands of objects
@@ -2298,14 +2376,15 @@ type AgentStatus struct {
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
 // update, and ToolExecutionsTotal, ToolExecutionsBlockedTotal, EventsIngestedTotal,
-// SessionsTotal, RemediationsProposedTotal, RemediationsMergedTotal,
-// ChatMessagesInboundTotal, LastActiveTime, LastHumanActiveTime, ClustersRegistered and
+// SessionsTotal, RemediationsProposedTotal, ChatMessagesInboundTotal,
+// LastActiveTime, LastHumanActiveTime, ClustersRegistered and
 // ClustersMonitored from the broker's, the event watcher's, the chat
 // plugin's and, on a next install, the A2A gateway's metrics
-// listeners, which it reads every five minutes on the leader; the agent's own
-// ServiceAccount holds no write verb on this status. RemediationsAppliedTotal
-// is declared so that the schema names it, but nothing writes it yet, and it
-// is absent (omitempty) until a series exists for it.
+// listeners, and the six proposal readings (RemediationsMergedTotal,
+// RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
+// ProposalHumanTouches and ProposalsMergedUntouched) from the broker's, all
+// of which it reads every five minutes on the leader; the agent's own
+// ServiceAccount holds no write verb on this status.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative count of sessions the agent opened: the
 	// triage sessions the event watcher opened for events the daemon
@@ -2352,28 +2431,39 @@ type AgentUsageStatus struct {
 	// +optional
 	RemediationsProposedTotal int64 `json:"remediationsProposedTotal,omitempty"`
 
-	// RemediationsAppliedTotal is the cumulative count of remediations approved and applied.
-	// Nothing writes it yet.
+	// RemediationsMergedTotal is the forge's count now of the proposals this
+	// install authored in its managed repositories that are merged: the
+	// broker's readings sweep asks the forge, and this is its
+	// kubeagents_vcs_proposals under state merged, projected as the latest
+	// poll's reading. A reading, not an accumulation: it falls when a
+	// repository leaves the managed list, and the name keeps its Total for
+	// the readers that already use it. Part of the outcomes reading with
+	// RemediationsOpen and ProposalsAuthored: one poll that cannot read the
+	// broker, or reads it without that reading, leaves the three where they
+	// were, and a second in a row clears them to absent; the broker itself
+	// stops serving a reading more than an hour old. A 0 is a reading. A merge
+	// no longer moves LastActiveTime: a reading cannot say when a merge
+	// happened, and a merge is a person's or a forge rule's act.
 	// +optional
-	RemediationsAppliedTotal int64 `json:"remediationsAppliedTotal,omitempty"`
+	RemediationsMergedTotal *int64 `json:"remediationsMergedTotal,omitempty"`
 
-	// RemediationsMergedTotal is the cumulative count of proposals this install
-	// opened that the forge reported merged. The agent never merges, so the
-	// credential broker learns of a merge when one of its own reads of the
-	// proposal, proposal-list or proposal-view, shows the merged state; it
-	// counts each such proposal once per broker process, only when its author
-	// is the broker's own login and it merged no earlier than the broker
-	// process started, so a restart cannot count a merge twice, to within the
-	// forge's and the pod's clocks agreeing. Read from the
-	// broker's kubeagents_vcs_proposals_merged_total every five minutes and
-	// kept monotonic the same way as ToolExecutionsTotal. A merge no read of
-	// the broker's ever shows is not counted, and a credential whose login the
-	// broker cannot name counts nothing (the broker logs that once), so this
-	// under-counts rather than over-counts and stays absent on such an
-	// install; it is the forge's word, where RemediationsAppliedTotal is the
-	// install's. Moves LastActiveTime.
+	// RemediationsOpen is the forge's count now of this install's proposals
+	// that are open: kubeagents_vcs_proposals under state open. Part of the
+	// outcomes reading, absent on the same terms as RemediationsMergedTotal.
+	// Does not move LastActiveTime.
 	// +optional
-	RemediationsMergedTotal int64 `json:"remediationsMergedTotal,omitempty"`
+	RemediationsOpen *int64 `json:"remediationsOpen,omitempty"`
+
+	// ProposalsAuthored is the forge's count now of every proposal this
+	// install authored in its managed repositories, open, merged or closed,
+	// its own closes included: kubeagents_vcs_proposals summed over state.
+	// The denominator of the merge rate, from the same reading as
+	// RemediationsMergedTotal; RemediationsProposedTotal, the install's own
+	// record of the proposals it opened, can differ from it. Part of the
+	// outcomes reading, absent on the same terms as RemediationsMergedTotal.
+	// Does not move LastActiveTime.
+	// +optional
+	ProposalsAuthored *int64 `json:"proposalsAuthored,omitempty"`
 
 	// ChatMessagesInboundTotal is the cumulative count of chat messages that
 	// reached the gateway, from every platform it serves: Google Chat, Slack,
@@ -2481,23 +2571,42 @@ type AgentUsageStatus struct {
 	// reacted to already did.
 	// +optional
 	NegativeFeedbackTotal int64 `json:"negativeFeedbackTotal,omitempty"`
-	// RemediationsClosedUnmergedTotal is the cumulative count of proposals
-	// this install opened that the forge reported closed without a merge, by
-	// a person, a forge rule or a bot; a close the broker made itself, the
-	// fleet audit tidying a stale proposal, is not counted. The broker counts
-	// each once per broker process when one of its own reads, proposal-list
-	// or proposal-view, shows it closed, under the rules
-	// RemediationsMergedTotal uses: the author is the credential's login, the
-	// close is not before the process started, each proposal once. Read from the broker's
-	// kubeagents_vcs_proposals_closed_unmerged_total every five minutes and
-	// kept monotonic the same way as ToolExecutionsTotal. A close no read
-	// shows is not counted, so it under-counts; a proposal closed, reopened
-	// and merged counts here and in RemediationsMergedTotal once each. A high
-	// share of this against RemediationsMergedTotal says the agent's proposals
-	// are being rejected. Does not move LastActiveTime: a close is not the
-	// agent at work.
+	// RemediationsClosedUnmergedTotal is the forge's count now of this
+	// install's proposals closed without a merge by a person or a bot:
+	// kubeagents_vcs_proposals_closed_by under actor human plus actor bot. A
+	// close the install made itself, the fleet audit tidying a stale
+	// proposal, is not counted. A reading, not an accumulation, projected as
+	// the latest poll's; the name keeps its Total for the readers that already
+	// use it. A high share of this against RemediationsMergedTotal says the
+	// agent's proposals are being rejected. Part of the details reading with
+	// ProposalHumanTouches and ProposalsMergedUntouched: one poll that cannot
+	// read the broker, or reads it without that reading, leaves the three
+	// where they were, and a second in a row clears them to absent; a broker
+	// still warming serves the outcomes reading without this one, and one
+	// whose last sweep could not read the details keeps serving the details
+	// it last read, for an hour. A 0 is a reading. Does not
+	// move LastActiveTime: a close is not the agent at work.
 	// +optional
-	RemediationsClosedUnmergedTotal int64 `json:"remediationsClosedUnmergedTotal,omitempty"`
+	RemediationsClosedUnmergedTotal *int64 `json:"remediationsClosedUnmergedTotal,omitempty"`
+
+	// ProposalHumanTouches is the forge's count now of the events people
+	// made on this install's proposals: reviews, inline and conversation
+	// comments, commits on the source branch and /agent addresses by any
+	// account the forge does not mark as automation, summed over every
+	// proposal (kubeagents_vcs_proposal_touches under actor human, summed over
+	// kind). Part of the details reading, absent on the same terms as
+	// RemediationsClosedUnmergedTotal. Moves neither LastActiveTime nor
+	// LastHumanActiveTime.
+	// +optional
+	ProposalHumanTouches *int64 `json:"proposalHumanTouches,omitempty"`
+
+	// ProposalsMergedUntouched is the forge's count now of this install's
+	// merged proposals that carried no human touch of any kind:
+	// kubeagents_vcs_proposal_touches_per_proposal under outcome merged and le
+	// 0. Part of the details reading, absent on the same terms as
+	// RemediationsClosedUnmergedTotal. Does not move LastActiveTime.
+	// +optional
+	ProposalsMergedUntouched *int64 `json:"proposalsMergedUntouched,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
@@ -2542,11 +2651,11 @@ type AgentUsageStatus struct {
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
 	// LastActiveTime is the time of the last poll in which a counter above
-	// moved: a brokered command ran or was refused, a proposal was opened or
-	// merged, a chat message reached the gateway, or an event was accepted
-	// for triage; BrokerFailuresTotal, ChatTurnsErroredTotal,
-	// BackgroundTasksGaveUpTotal, NegativeFeedbackTotal and
-	// RemediationsClosedUnmergedTotal alone leave it where it was.
+	// moved: a brokered command ran or was refused, a proposal was opened, a
+	// chat message reached the gateway, or an event was accepted for triage;
+	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal
+	// and NegativeFeedbackTotal alone leave it where it was, and the six
+	// proposal readings never move it.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use
@@ -2560,10 +2669,9 @@ type AgentUsageStatus struct {
 	// message that reached the gateway, counted before the sender allowlist,
 	// so an unlisted sender is still a person. Nothing else moves it. Brokered
 	// commands and accepted events come from the stall-watch cron and the
-	// event watcher on their own, proposals from the fleet audits, which open
-	// them with nobody asking, and a merge or a close can be a forge rule or
-	// a bot; all of those
-	// move LastActiveTime and leave this alone, so an install nobody has
+	// event watcher on their own, and proposals from the fleet audits, which
+	// open them with nobody asking; those move LastActiveTime and leave this
+	// alone, as the proposal readings leave both alone, so an install nobody has
 	// talked to in a month shows it. Absent until a person has sent a message
 	// since the operator that writes it started. Advances at most once per
 	// five minutes.

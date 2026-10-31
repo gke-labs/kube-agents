@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "⚙️ check payments · b · step 2 ▸\n  ✓ a\n  ◌ b\n❌ check seeded-b",
+    "widgets": null
+  }
+]

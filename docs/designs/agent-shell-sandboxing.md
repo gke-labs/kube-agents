@@ -1802,7 +1802,7 @@ explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
 `github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
 `stall_report.py`, `audit_cluster.sh`, the three Cluster Agent domain collectors (`audit_storage.py`, `audit_networking.py`,
 `audit_certificates.py`) and `inventory_findings.py` — the entry points an agent is told to run,
-plus the transitive closure of what they import, and the shared modules the skill-tree collectors import from `/opt/defaults/scripts` (`credential_proxy_client.py`, `fleet_scope_args.py`, `collector_run.py`). `inventory_findings.py extract` and `select`
+plus the transitive closure of what they import, and the shared modules the skill-tree collectors import from `/opt/defaults/scripts` (`credential_proxy_client.py`, `fleet_scope_args.py`, `collector_run.py`, `broker_admission.py`). `inventory_findings.py extract` and `select`
 work there, and `select` chooses the report's items from the scores file alone. `register` calls
 the Session KV server on the agent pod's loopback and exits 13 from the sandbox, and the
 prioritization SOP answers that exit by going on to `select` and writing the report.
@@ -2668,7 +2668,11 @@ apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` 
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
 minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits `(shell, session, profile)`
 (the sixth role, `profile`, is below), and
-within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. Because a
+within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. One path
+under it is the shell's alone: `/v1/exec/admission`, the read-only report of how many commands
+the broker admits at once, which the shell's fleet sweeps size their pools by
+(`broker_admission.py`); the session and profile roles don't reach it, and a sweep run under
+either falls back to four. Because a
 Pod picks the audience it projects, the role is also bound to the caller:
 `CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
 the session audience, and no other caller may present that audience

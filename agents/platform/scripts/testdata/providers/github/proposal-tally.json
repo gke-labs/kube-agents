@@ -1,0 +1,106 @@
+{
+  "payload": {
+    "author": "app/kube-agents"
+  },
+  "responses": [
+    {
+      "total_count": 5,
+      "incomplete_results": false,
+      "items": [
+        {
+          "url": "https://api.github.com/repos/acme/infra/issues/4290",
+          "html_url": "https://github.com/acme/infra/pull/4290",
+          "number": 4290,
+          "title": "Pin the ingest image digest",
+          "user": {
+            "login": "kube-agents[bot]",
+            "id": 210943,
+            "type": "Bot"
+          },
+          "labels": [],
+          "state": "closed",
+          "locked": false,
+          "comments": 1,
+          "created_at": "2026-08-25T10:00:00Z",
+          "updated_at": "2026-08-27T16:02:11Z",
+          "closed_at": "2026-08-27T16:02:11Z",
+          "author_association": "NONE",
+          "draft": false,
+          "pull_request": {
+            "url": "https://api.github.com/repos/acme/infra/pulls/4290",
+            "html_url": "https://github.com/acme/infra/pull/4290",
+            "merged_at": "2026-08-27T16:02:11Z"
+          },
+          "body": "The floor of one meant a single eviction took ingest offline.\n",
+          "score": 1.0
+        }
+      ]
+    },
+    {
+      "total_count": 1,
+      "incomplete_results": false,
+      "items": [
+        {
+          "url": "https://api.github.com/repos/acme/infra/issues/4188",
+          "html_url": "https://github.com/acme/infra/pull/4188",
+          "number": 4188,
+          "title": "Drop the unused webhook receiver",
+          "user": {
+            "login": "kube-agents[bot]",
+            "id": 210943,
+            "type": "Bot"
+          },
+          "labels": [],
+          "state": "closed",
+          "locked": false,
+          "comments": 1,
+          "created_at": "2026-08-20T09:00:00Z",
+          "updated_at": "2026-08-21T11:40:03Z",
+          "closed_at": "2026-08-21T11:40:03Z",
+          "author_association": "NONE",
+          "draft": false,
+          "pull_request": {
+            "url": "https://api.github.com/repos/acme/infra/pulls/4188",
+            "html_url": "https://github.com/acme/infra/pull/4188",
+            "merged_at": null
+          },
+          "body": "The floor of one meant a single eviction took ingest offline.\n",
+          "score": 1.0
+        }
+      ]
+    },
+    {
+      "total_count": 8,
+      "incomplete_results": false,
+      "items": [
+        {
+          "url": "https://api.github.com/repos/acme/infra/issues/4321",
+          "html_url": "https://github.com/acme/infra/pull/4321",
+          "number": 4321,
+          "title": "Raise the replica floor on the ingest deployment",
+          "user": {
+            "login": "kube-agents[bot]",
+            "id": 210943,
+            "type": "Bot"
+          },
+          "labels": [],
+          "state": "open",
+          "locked": false,
+          "comments": 1,
+          "created_at": "2026-08-30T09:14:22Z",
+          "updated_at": "2026-08-31T08:00:00Z",
+          "closed_at": null,
+          "author_association": "NONE",
+          "draft": false,
+          "pull_request": {
+            "url": "https://api.github.com/repos/acme/infra/pulls/4321",
+            "html_url": "https://github.com/acme/infra/pull/4321",
+            "merged_at": null
+          },
+          "body": "The floor of one meant a single eviction took ingest offline.\n",
+          "score": 1.0
+        }
+      ]
+    }
+  ]
+}

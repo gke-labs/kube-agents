@@ -48,25 +48,33 @@ func TaskSupervisorSubject(addressee, taskID string) string {
 }
 
 // TaskSubmitSubject is where a new task for a profile is submitted (added
-// 10/22, #3660): a2a.tasks.{profile}.{tier}.{kind}.{taskId}.submit. The tier
-// and kind tokens exist only to route a submission to the operator's durable
-// for that (profile, tier, kind), whose dispatcher holds the task for its
-// life. Follow-ups and cancels for the task stay on TaskInSubject, and its
-// events on TaskEventsSubject and TaskSupervisorSubject, so no five-token
-// pattern (a2a.tasks.*.*.in and the rest) matches a submission and no
-// follow-up reaches the durable. Chat sessions and the platform agent keep
-// taking new tasks on TaskInSubject.
+// 10/22, #3660; moved off TASKS 10/28): a2a.submit.{profile}.{tier}.{kind}.{taskId},
+// on its own stream, ProfileSubmitStream. The tier and kind tokens exist only
+// to route a submission to the operator's durable for that (profile, tier,
+// kind), whose dispatcher holds the task for its life. The stream is its own
+// so that only the operator can make a consumer on it: every principal that
+// can create consumers on TASKS (the bridge, the gateway, the published web
+// credentials) would otherwise be able to pull a profile's submissions or
+// rewrite its durable. Follow-ups and cancels for the task stay on
+// TaskInSubject, and its events on TaskEventsSubject and
+// TaskSupervisorSubject, so no follow-up reaches the durable. Chat sessions
+// and the platform agent keep taking new tasks on TaskInSubject.
 func TaskSubmitSubject(profile, tier, kind, taskID string) string {
-	return fmt.Sprintf("a2a.tasks.%s.%s.%s.%s.%s", profile, tier, kind, taskID, TaskClassSubmit)
+	return fmt.Sprintf("%s%s.%s.%s.%s", SubmitSubjectPrefix, profile, tier, kind, taskID)
 }
 
+// SubmitSubjectPrefix starts every submission subject, and ProfileSubmitStream
+// is the stream that holds them (a2a.submit.>, provisioned by the operator).
+const (
+	SubmitSubjectPrefix = "a2a.submit."
+	ProfileSubmitStream = "PROFILE_SUBMITS"
+)
+
 // The task-subject classes: the last token of a2a.tasks.{addressee}.{taskId}.
-// TaskClassSubmit ends the longer submission subject instead.
 const (
 	TaskClassIn         = "in"
 	TaskClassEvents     = "events"
 	TaskClassSupervisor = "supervisor"
-	TaskClassSubmit     = "submit"
 )
 
 // The kind token of a submission subject: a task a client asked for, or one
@@ -109,12 +117,12 @@ func ParseTaskSubject(subject string) (addressee, taskID, class string, ok bool)
 // (SubmitKindTop or SubmitKindChild) and taskId. ok is false for any other
 // subject shape.
 func ParseSubmitSubject(subject string) (profile, tier, kind, taskID string, ok bool) {
-	rest, found := strings.CutPrefix(subject, "a2a.tasks.")
+	rest, found := strings.CutPrefix(subject, SubmitSubjectPrefix)
 	if !found {
 		return "", "", "", "", false
 	}
 	parts := strings.Split(rest, ".")
-	if len(parts) != 5 || parts[4] != TaskClassSubmit || parts[0] == "" || parts[1] == "" || parts[3] == "" {
+	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[3] == "" {
 		return "", "", "", "", false
 	}
 	switch parts[2] {
@@ -409,9 +417,23 @@ func (c *Client) resubscribe(subs []*durableSub, js jetstream.JetStream, nc *nat
 // Close shuts the client down deliberately; no rebuild follows.
 func (c *Client) Close() {
 	c.closing.Store(true)
+	// A deferred-mode subscription gives its deliveries back on the
+	// connection, which takes the client's read lock, so it stops before
+	// the write lock below.
+	c.mu.RLock()
+	subs := append([]*durableSub(nil), c.subs...)
+	c.mu.RUnlock()
+	for _, s := range subs {
+		if s.deferred != nil {
+			s.stopDeferred()
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, s := range c.subs {
+		if s.deferred != nil {
+			continue
+		}
 		s.stopLocal()
 	}
 	c.subs = nil
@@ -451,14 +473,17 @@ func (c *Client) PublishSeq(ctx context.Context, subject string, env *Envelope) 
 	}
 	// Task-subject tokens must be dot-free DNS-1123 labels - dots change the
 	// token count under every wildcard filter.
+	if strings.HasPrefix(subject, SubmitSubjectPrefix) {
+		profile, tier, _, taskID, ok := ParseSubmitSubject(subject)
+		if !ok {
+			return 0, &ProtocolError{Msg: fmt.Sprintf("malformed submission subject %q: want a2a.submit.<profile>.<tier>.<top|child>.<taskId>", subject)}
+		}
+		if !validDNS1123Label(profile) || !validDNS1123Label(tier) || !validDNS1123Label(taskID) {
+			return 0, &ProtocolError{Msg: fmt.Sprintf("malformed submission subject %q: profile, tier and taskId must be dot-free DNS-1123 labels", subject)}
+		}
+	}
 	if strings.HasPrefix(subject, "a2a.tasks.") {
-		if profile, tier, _, taskID, ok := ParseSubmitSubject(subject); ok {
-			if !validDNS1123Label(profile) || !validDNS1123Label(tier) || !validDNS1123Label(taskID) {
-				return 0, &ProtocolError{Msg: fmt.Sprintf("malformed submission subject %q: profile, tier and taskId must be dot-free DNS-1123 labels", subject)}
-			}
-		} else if strings.HasSuffix(subject, "."+TaskClassSubmit) {
-			return 0, &ProtocolError{Msg: fmt.Sprintf("malformed submission subject %q: want a2a.tasks.<profile>.<tier>.<top|child>.<taskId>.submit", subject)}
-		} else if addressee, taskID, _, ok := ParseTaskSubject(subject); !ok || !validDNS1123Label(addressee) || !validDNS1123Label(taskID) {
+		if addressee, taskID, _, ok := ParseTaskSubject(subject); !ok || !validDNS1123Label(addressee) || !validDNS1123Label(taskID) {
 			return 0, &ProtocolError{Msg: fmt.Sprintf("malformed task subject %q: addressee and taskId must be dot-free DNS-1123 labels", subject)}
 		}
 	}
@@ -536,6 +561,11 @@ type SubscribeConfig struct {
 	// Agreement overrides the client's envelope-subject agreement policy for
 	// this consumer. nil uses the client's.
 	Agreement *AgreementPolicy
+	// MaxAckPending caps the durable's unacknowledged deliveries; zero
+	// leaves the server's default (1000). A deferred-mode subscriber holds
+	// each delivery until it settles it, so the cap bounds how much it can
+	// hold before the server stops delivering to every holder.
+	MaxAckPending int
 }
 
 // filterSubjects is the consumer's filter set, however it was spelled.
@@ -589,8 +619,8 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 	}
 	s := &durableSub{c: c, cfg: cfg}
 	set(s)
-	if s.held == nil {
-		// The held mode skips the envelopeId dedup (see deliver).
+	if s.held == nil && s.deferred == nil {
+		// The held and deferred modes skip the envelopeId dedup (see deliver).
 		s.seen = newDedupSet(dedupWindow)
 	}
 	// Register before starting so a rebuild racing this call cannot snapshot
@@ -663,6 +693,8 @@ type durableSub struct {
 	stopped atomic.Bool
 	// held is the held-delivery mode (held.go); nil for auto-ack.
 	held *heldState
+	// deferred is the deferred-ack mode (deferred.go); nil for the others.
+	deferred *deferredState
 
 	mu sync.Mutex
 	cc jetstream.ConsumeContext
@@ -681,8 +713,9 @@ func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
 		return s.consume(cons)
 	}
 	consCfg := jetstream.ConsumerConfig{
-		Durable:   s.cfg.Durable,
-		AckPolicy: jetstream.AckExplicitPolicy,
+		Durable:       s.cfg.Durable,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		MaxAckPending: s.cfg.MaxAckPending,
 	}
 	if filters := s.cfg.filterSubjects(); len(filters) == 1 {
 		consCfg.FilterSubject = filters[0]
@@ -692,6 +725,9 @@ func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
 	cons, err := js.CreateOrUpdateConsumer(ctx, s.cfg.Stream, consCfg)
 	if err != nil {
 		return fmt.Errorf("consumer %s on %s: %w", s.cfg.Durable, s.cfg.Stream, err)
+	}
+	if s.deferred != nil {
+		s.deferred.bound(cons)
 	}
 	return s.consume(cons)
 }
@@ -758,6 +794,11 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 		s.held.dispatch(msg, env)
 		return
 	}
+	if s.deferred != nil {
+		// Deferred mode: the same, but in order on this goroutine.
+		s.deferred.dispatch(msg, env)
+		return
+	}
 	// Assertion 5: at most once per envelopeId across redeliveries.
 	if !s.seen.add(env.EnvelopeID) {
 		_ = msg.Ack()
@@ -788,10 +829,36 @@ func (s *durableSub) unregister() {
 // never waits for a handler: Close calls it under the client lock, and a
 // handler may be the caller.
 func (s *durableSub) stopLocal() {
+	if s.deferred != nil {
+		s.stopDeferred()
+		return
+	}
 	s.stopIntake()
 	if s.held != nil {
 		s.held.cancel()
 	}
+}
+
+// stopDeferred stops a deferred-mode subscription without leaving a delivery
+// to wait out AckWait: intake closes first, so whatever arrives from here on
+// is given back as it is dispatched, then the consume context drains (the
+// deliveries already buffered or in flight to the client are dispatched,
+// and so given back, rather than dropped unanswered), and finally every
+// delivery still unsettled is given back.
+func (s *durableSub) stopDeferred() {
+	s.stopped.Store(true)
+	s.deferred.close()
+	s.mu.Lock()
+	cc := s.cc
+	s.mu.Unlock()
+	if cc != nil {
+		cc.Drain()
+		select {
+		case <-cc.Closed():
+		case <-time.After(deferredDrainTimeout):
+		}
+	}
+	s.deferred.giveBack()
 }
 
 // stopIntake stops taking deliveries.

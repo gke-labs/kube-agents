@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "text": "*Yes, seeded-a is healthy*\n\n- one\n- two",
+    "widgets": null
+  }
+]
