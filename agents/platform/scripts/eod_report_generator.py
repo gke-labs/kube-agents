@@ -237,6 +237,9 @@ def load_intercepted_events(
                 # checked, and the recap keeps working against a ledger written
                 # by an older session server mid-rollout.
                 delivery_col = "delivery_error" if "delivery_error" in columns else "''"
+                # Absent on a ledger the session server has not migrated yet,
+                # where no row can have been folded.
+                duplicate_col = "duplicate_of" if "duplicate_of" in columns else "NULL"
                 # `intercepted_events` has had a second writer since the drift
                 # detector landed: session_kv_server.py records every
                 # out-of-band-change inject in it too, under
@@ -256,7 +259,7 @@ def load_intercepted_events(
                 # reads these rows next.
                 cursor.execute(
                     "SELECT cluster, namespace, workload, object_uid, object_kind, reason, message, "
-                    f"severity, occurrences, notified, created_at, {delivery_col} "
+                    f"severity, occurrences, notified, created_at, {delivery_col}, {duplicate_col} "
                     "FROM intercepted_events "
                     "WHERE created_at >= datetime('now', ?) "
                     "AND reason NOT IN (?, ?) "
@@ -294,6 +297,7 @@ def load_intercepted_events(
                 "notified": 2 if r[9] == 2 else bool(r[9]),
                 "created_at": r[10],
                 "delivery_error": r[11] or "",
+                "duplicate_of": r[12],
             }
             for r in rows
         ]
@@ -418,10 +422,11 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             total_occurrences += count
 
-        # `notified = 0` covers three unrelated outcomes and they must not be
+        # `notified = 0` covers four unrelated outcomes and they must not be
         # reported as one: the severity gate held the event back as
         # informational, the daily ceiling dropped an alert that was going to
-        # be posted, or chat itself refused the post. Conflating the second
+        # be posted, chat itself refused the post, or the event was folded into
+        # an incident already open for its workload. Conflating the second
         # with the first is how a day of cap-dropped OOMKills comes out as
         # "suppressed informational events"; conflating the third with the
         # second sends the reader to raise a limit that is not the problem.
@@ -463,6 +468,11 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         elif severity == "Info":
             if not excluded:
                 suppressed_info += count
+        elif event.get("duplicate_of") is not None:
+            # Folded into an incident already admitted for the same workload
+            # (INCIDENT_WORKLOAD_DEDUP_SECONDS in session_kv_server.py): the
+            # ceiling withheld nothing, whatever became of the anchor's post.
+            pass
         else:
             cap_dropped += 1
             cap_row = True
@@ -491,7 +501,14 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # holding one delivered row and one withheld row can be neither: keyed
         # without it, the two merge and the pair is listed as two withheld
         # events or as none, while the 📉 total counts one.
-        group_key = f"{cluster}/{ns}/{workload}/{reason}/{severity}/{int(bool(event.get('notified')))}"
+        #
+        # A folded row is keyed as one that went out: its incident was
+        # admitted, so it is not a second, withheld alert, and keyed on its own
+        # `notified = 0` one folded workload would read as two groups. It
+        # joins its anchor's group only when the reason, severity and the
+        # anchor's delivery match.
+        went_out = bool(event.get("notified")) or event.get("duplicate_of") is not None
+        group_key = f"{cluster}/{ns}/{workload}/{reason}/{severity}/{int(went_out)}"
         if cap_row:
             uid = event.get("object_uid", "") or ""
             stored_workload = event.get("workload", "") or ""
@@ -535,7 +552,7 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
                 # decided by the key: the namespace settles `excluded`, and
                 # `notified` is a key field in its own right.
                 "excluded": excluded,
-                "notified": bool(event.get("notified")),
+                "notified": went_out,
                 "count": count,
                 "message": msg,
             }

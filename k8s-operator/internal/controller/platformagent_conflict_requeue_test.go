@@ -638,4 +638,3 @@ func TestPlatformAgentReconciler_Reconcile_ConflictOnDifferentKindNotSwallowed(t
 		t.Errorf("Reconcile result.Requeue = true; want false when error is returned")
 	}
 }
-

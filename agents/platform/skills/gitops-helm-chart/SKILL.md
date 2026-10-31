@@ -11,7 +11,7 @@ description: >-
   add, deploy, or upgrade a chart or a packaged third-party component. Don't
   use for kube-agents itself (an operator upgrades it with the installer), plain
   workload YAML (use gke-manifest-generation), or Google Cloud resources (use
-  gcp-config-connector).
+  gcp-config-connector, or gcp-terraform on a Terraform repository).
 ---
 
 # Third-Party Helm Charts Through GitOps
@@ -159,11 +159,40 @@ ahead without it."
 ### Step 3: Pin the source and the version
 
 - **Source.** Take the chart repository URL and chart name from the
-  project's own install guide, read with `web_extract`. A chart found by
-  search on a mirror, a fork or a personal registry is not the project's
-  chart; when the guide and other sources disagree, the guide wins, and the
-  PR body says which sources you saw. No guide that names a chart: stop and
-  ask for the source.
+  project's own install guide, read in full. Do these steps in order before
+  deciding on a source; skipping to a search is the failure this rule
+  exists for:
+  1. **The Developer Knowledge MCP, always first.** Its tools are deferred:
+     run `tool_search("developer_knowledge")`, then call them through
+     `tool_call`:
+     - `mcp__developer_knowledge__search_documents` with
+       `query: "<project> install"`. Each result's `parent` names a page.
+     - `mcp__developer_knowledge__get_documents` with
+       `names: ["<parent>"]` reads that page. The page you read is the
+       source; a search result's chunk is not. Never `answer_query`.
+
+     An empty result (`{}`) means it does not cover the project: go to 2.
+
+  2. **The project's own repository, through inspect-repository.** Open it
+     and read its README, install docs and chart directory:
+
+     ```bash
+     python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py clone --repo "<owner>/<repo>" --depth 1 --into "/opt/data/scratch/repos/<owner>__<repo>__default"
+     ```
+
+     The repository's name may come from a search result; its files, not
+     the result, are the source. A `clone` that exits non-zero left an
+     incomplete copy: never read it. When a `clone` reports its directory is
+     not empty (a retry, or another card on this pod), clone again into a
+     new `--into` name (`…__default-2`); never `--force`.
+
+  A search result is never a source: its snippets name forks, mirrors and
+  personal repositories as readily as the project. A chart found by search
+  on a mirror, a fork or a personal registry is not the project's chart;
+  when the guide and other sources disagree, the guide wins, and the PR body
+  names the document or repository path you read. Steps 1 and 2 gave no
+  guide that names a chart: stop and ask for the source.
+
 - **No chart at all.** When the project's documented install is an installer
   script or CLI that fills in values and renders manifests itself (Agent
   Substrate's `ate-setup deploy` is one), there is no declarative package to
@@ -173,14 +202,19 @@ ahead without it."
   substitute (for Substrate, `ghcr.io/kagent-dev` is a fork with different
   images and snapshot storage).
 - **Version.** The version the user named. Otherwise the highest semantic
-  version with no `-rc`, `-alpha` or `-beta` suffix, from the project's
-  releases page or the chart repository's index. Compare versions, not
+  version with no `-rc`, `-alpha` or `-beta` suffix that the guide names, or
+  the chart's `Chart.yaml` at a release branch the guide names
+  (**inspect-repository** `clone --ref <branch> --into "/opt/data/scratch/repos/<owner>__<repo>__<branch>"`:
+  each ref into its own directory, because a second `clone` into the same
+  one is refused, and `--force` would mix two trees). Never the default branch's `Chart.yaml`:
+  it can carry an unreleased version. No released version you could read:
+  ask the user for it. Compare versions, not
   dates: a backport patch to an older minor is often published last. Never a range, `latest`, or
   an empty version: a reconciler re-resolves those and upgrades on its own.
 - **Values.** Read the chart's `values.yaml` at that version and set only
   what the request or Step 4 needs. A copied default becomes a value someone
   has to own.
-- Record each URL you read; the PR body cites them.
+- Record each document, repository path or URL you read; the PR body cites them.
 
 ### Step 4: Name what the chart needs outside the cluster
 
@@ -195,8 +229,8 @@ Read the install guide's prerequisites and the chart's values for:
 For each one, check the cluster (`gcloud container clusters describe`) or the
 repository. Already met: say so in the PR body. Not met, and the repository
 can declare it (KCC or Terraform under `provisioning/`, through
-`gcp-config-connector` or the repository's Terraform convention): put it in
-the same pull request. Not met and not declarable here (a setting that only
+`gcp-config-connector` or `gcp-terraform`): put it in the same pull
+request. Not met and not declarable here (a setting that only
 exists at cluster creation, an allowlist, a manual step): stop and name
 every such item. A partial install that fails after merge is worse than no
 pull request.
@@ -232,7 +266,7 @@ header:
 ```
 ### Helm chart
 - **Chart:** `<chart>` `<version>` from `<repository URL>`.
-- **Source:** <install guide URL>; version from <releases page or index URL>.
+- **Source:** <install guide: Developer Knowledge document or repository path>; version from <the guide, or Chart.yaml at release branch <branch>>.
 - **Form:** <Argo CD Application | Flux HelmRelease | Config Sync RootSync | kustomize helmCharts>,
   matching <sibling file path>.
 - **Target:** cluster `<cluster>`, namespace `<namespace>`.

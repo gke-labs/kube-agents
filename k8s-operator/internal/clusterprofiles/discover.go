@@ -61,7 +61,7 @@ const (
 // reservedProfiles are the Hermes profiles that live under the same directory
 // and are never a cluster's -- cluster_agent_profile.py's RESERVED_PROFILES --
 // so ReadIdentities says nothing about them whatever state they are in.
-var reservedProfiles = map[string]bool{"default": true, "platform": true}
+var reservedProfiles = map[string]bool{"default": true, "platform": true, "tse": true}
 
 // ErrNoClusterIdentity and ErrNoProfileConfig are the reasons ReadIdentities
 // reports for a cluster- prefixed profile whose config reads cleanly and
@@ -151,7 +151,8 @@ type Discoverer struct {
 	// profile it came from — or NoProfile, when the profiles directory itself
 	// could not be read. A skip is not an error return (see Discover), so this
 	// is the only channel through which "this cluster is not being watched"
-	// becomes visible. nil discards them.
+	// becomes visible. nil discards them. DiscoverAndBuild replaces it with its
+	// own; a caller of that reports through ScanOptions.OnSkip.
 	OnSkip func(profile string, err error)
 }
 

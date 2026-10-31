@@ -255,13 +255,33 @@ class C1IsolationIsStructural(unittest.TestCase):
             "api/v1/namespaces/default/serviceaccounts/x/token",
             "api/v1/namespaces/default/secrets/db",
             "apis/apps/v1/deployments",
-            # The deprecated watch/<resource> paths the API server still
-            # serves: a watch of anything, Secrets included.
-            "api/v1/watch/secrets",
-            "apis/apps/v1/watch/deployments",
         ):
             self.assertFalse(policy.evaluate_k8s("GET", target + path, {}).allowed, f"GET {path} is relayed")
+        # The deprecated watch/<resource> paths the API server still serves: a
+        # watch of anything, Secrets included. Refused by their own rule, not
+        # only because the kind table has no kind called `watch`.
+        for path in ("api/v1/watch/secrets", "apis/apps/v1/watch/deployments"):
+            decision = policy.evaluate_k8s("GET", target + path, {})
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_LEGACY, f"GET {path} is not refused as a legacy path")
         self.assertTrue(policy.evaluate_k8s("GET", target + "api/v1/events", {"watch": ["1"]}).allowed)
+        # The named read is a kind table, not "anything but Secrets" (#2990):
+        # a listed kind is read, an unlisted one is not, and a listed plural
+        # under another API group is not either.
+        self.assertTrue(
+            policy.evaluate_k8s("GET", target + "apis/apps/v1/namespaces/default/deployments/web", {}).allowed
+        )
+        for path in (
+            "api/v1/nodes/node-1",
+            "apis/cert-manager.io/v1/namespaces/default/certificates/tls",
+            "apis/example.com/v1/namespaces/default/deployments/web",
+        ):
+            decision = policy.evaluate_k8s("GET", target + path, {})
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_KIND, f"GET {path} is relayed")
+        # A Secret is refused by its own rule under any group, not merely by
+        # being absent from a table that a later edit could widen.
+        for path in ("api/v1/namespaces/default/secrets/db", "apis/example.com/v1/namespaces/default/secrets/db"):
+            decision = policy.evaluate_k8s("GET", target + path, {})
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_SECRETS, f"GET {path} is not refused as a Secret")
 
     def test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription(self) -> None:
         policy = h.watcher_policy
@@ -284,6 +304,129 @@ class C1IsolationIsStructural(unittest.TestCase):
         proxy = h.credential_proxy
         for prefix in (h.watcher_policy.WATCHER_GCP_PREFIX, h.watcher_policy.WATCHER_K8S_PREFIX):
             self.assertEqual(proxy.required_roles(prefix + "x"), (proxy.CALLER_ROLE_WATCHER,), prefix)
+
+    def test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read(self) -> None:
+        """The drift join's custom-resource kinds are the agent's own grant.
+
+        The broker lets the drift detector's join read a GitOps reconciler's
+        sync object by name (watcher_policy.RECONCILER_NAMED_READS), and the
+        operator grants the agent's minimal ClusterRole get/list/watch on the
+        same kinds (#2987). Two modules, so no single test compiles both: a
+        kind added to either side alone either relays an object the agent was
+        never granted or leaves a granted kind unenriched. Every custom-resource
+        kind (a group not on the built-in list below) in the rendered minimal
+        role, on every fixture, is a reconciler kind the join may read, and the
+        reverse, each with get.
+        """
+        expected = set(h.watcher_policy.RECONCILER_NAMED_READS)
+        self.assertTrue(expected, "the reconciler table is empty")
+
+        # Built-in groups by name, not by suffix: a CRD can live under
+        # *.k8s.io too (gateway.networking.k8s.io, snapshot.storage.k8s.io),
+        # and a suffix rule would wave it through on both sides. A built-in
+        # group new to the role or the table fails loudly here, and the fix
+        # is to add it to this list.
+        builtin = frozenset({
+            "", "admissionregistration.k8s.io", "apiextensions.k8s.io", "apps", "autoscaling",
+            "batch", "metrics.k8s.io", "networking.k8s.io", "policy", "rbac.authorization.k8s.io",
+        })
+
+        def custom(group: str) -> bool:
+            return group not in builtin
+
+        # The broker enforces WATCHER_NAMED_READS; the reconciler table is the
+        # only custom-resource part of it, and that is what keeps the two in
+        # step rather than a kind added to the wider table directly.
+        relayed = {kind for kind in h.watcher_policy.WATCHER_NAMED_READS if custom(kind[0])}
+        self.assertEqual(expected, relayed, "a custom-resource kind is relayed outside RECONCILER_NAMED_READS")
+
+        fixtures = h.golden_documents()
+        self.assertTrue(fixtures, "no golden fixtures to read")
+        for fixture, documents in fixtures.items():
+            roles = [
+                d for d in h.objects_of_kind(documents, "ClusterRole")
+                if d["metadata"]["name"].startswith("kubeagents:minimal:")
+            ]
+            with self.subTest(fixture=fixture):
+                self.assertEqual(len(roles), 1, "no single minimal ClusterRole rendered")
+                rules = roles[0].get("rules") or []
+                for rule in rules:
+                    self.assertNotIn("*", rule.get("apiGroups") or [], "a wildcard API group in the minimal role")
+                granted = {
+                    (group, resource)
+                    for rule in rules
+                    if {"get", "*"} & set(rule.get("verbs") or [])
+                    for group in rule.get("apiGroups") or []
+                    if custom(group)
+                    for resource in rule.get("resources") or []
+                }
+                self.assertEqual(
+                    expected,
+                    granted,
+                    "the agent's custom-resource reads and the drift join's reconciler kinds differ. "
+                    "If the role gained a built-in group, add it to builtin here; otherwise, unless the kind is a GitOps sync object, "
+                    "do not widen RECONCILER_NAMED_READS, which widens what the broker relays",
+                )
+
+    def test_C1_the_platform_pubsub_relay_reaches_only_the_configured_subscriptions(self) -> None:
+        """The gateway's Pub/Sub platform adapter pulls through the broker, and only its own subscriptions.
+
+        The gateway pod holds no Google credential (the identity tests above), so
+        the adapter's one path to a subscription is `/v1/pubsub/gcp/`, confined to
+        the set the operator rendered from the AgentPlugin configs. An empty set
+        refuses everything: an install with no Pub/Sub platform relays nothing.
+        """
+        policy = h.watcher_policy
+        configured = frozenset({"projects/kagents-dev/subscriptions/gke-stockout-alerts-sub"})
+        pull = "v1/projects/kagents-dev/subscriptions/gke-stockout-alerts-sub:pull"
+        self.assertTrue(policy.evaluate_pubsub("POST", policy.PUBSUB_HOST, pull, b'{"maxMessages":1}', configured).allowed)
+        for other in (
+            "projects/kagents-dev/subscriptions/platform-agent-drift-audit-sub",
+            "projects/elsewhere-1/subscriptions/gke-stockout-alerts-sub",
+        ):
+            decision = policy.evaluate_pubsub("POST", policy.PUBSUB_HOST, f"v1/{other}:pull", b"{}", configured)
+            self.assertFalse(decision.allowed, f"the platform relay pulls {other}")
+        self.assertFalse(policy.evaluate_pubsub("POST", policy.PUBSUB_HOST, pull, b"{}", frozenset()).allowed)
+        self.assertFalse(
+            policy.evaluate_pubsub("GET", policy.GKE_HOST, "v1/projects/p/locations/l/clusters/c", b"", configured).allowed,
+            "the platform relay reaches the GKE API",
+        )
+
+    def test_C1_only_the_chat_role_reaches_the_platform_pubsub_relay(self) -> None:
+        proxy = h.credential_proxy
+        prefix = h.watcher_policy.PLATFORM_PUBSUB_PREFIX
+        self.assertEqual(proxy.required_roles(prefix + "x"), (proxy.CALLER_ROLE_CHAT,), prefix)
+        self.assertNotIn(proxy.CALLER_ROLE_WATCHER, proxy.required_roles(prefix + "x"))
+
+    def test_C1_no_shipped_platform_adapter_holds_a_google_credential_path(self) -> None:
+        """A platform adapter runs in the gateway pod, which has no Google identity.
+
+        An adapter that imports a Google client library or reads a service
+        account key file is one that will call Google on a credential the pod
+        does not hold, and fail the way the Pub/Sub adapter failed when the
+        gateway lost Workload Identity. Every Google call goes through the broker.
+        """
+        forbidden_roots = {"google", "googleapiclient", "google_auth_httplib2"}
+        key_env = "GOOGLE_APPLICATION_CREDENTIALS"
+        adapters = sorted(h.REPO_ROOT.glob("agentplugins/*/files/platforms/*/*.py"))
+        self.assertTrue(adapters, "no shipped platform adapter found; the glob is stale")
+        for path in adapters:
+            source = path.read_text()
+            tree = ast.parse(source, filename=str(path))
+            for node in ast.walk(tree):
+                names: list[str] = []
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    names = [node.module]
+                for name in names:
+                    self.assertNotIn(
+                        name.split(".")[0], forbidden_roots,
+                        f"{path.relative_to(h.REPO_ROOT)} imports {name}: a platform adapter calls Google through the broker",
+                    )
+            self.assertNotIn(key_env, source, f"{path.relative_to(h.REPO_ROOT)} reads {key_env}")
+        for manifest in sorted(h.REPO_ROOT.glob("agentplugins/*/files/platforms/*/plugin.yaml")):
+            self.assertNotIn(key_env, manifest.read_text(), f"{manifest.relative_to(h.REPO_ROOT)} asks for {key_env}")
 
     def test_C1_the_operator_pins_the_drift_detectors_own_default_subscription(self) -> None:
         """The broker refuses every subscription but the one the operator names.
@@ -1488,7 +1631,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
 
     def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
-        """The MCP tool schema and `lib.DelegateRequest` spell the same two fields.
+        """The MCP tool schema and `lib.DelegateRequest` spell the same fields, bar `parameters`.
 
         The session's harness speaks MCP to the worker-adapter's own server,
         which answers `tools/list` with `delegateToolSchema` -- a
@@ -1505,12 +1648,23 @@ class C1IsolationIsStructural(unittest.TestCase):
         """
         payload = h.text("a2a_payload")
         struct = payload.split("type DelegateRequest struct {")[1].split("\n}")[0]
-        tags = sorted(re.findall(r'`json:"(\w+)"`', struct))
+        # A tag's name runs to its first comma or quote: `json:"parameters,omitempty"`.
+        all_tags = sorted(re.findall(r'`json:"(\w+)[,"]', struct))
         self.assertEqual(
-            ["addressee", "text"],
-            tags,
+            ["addressee", "parameters", "text"],
+            all_tags,
             "lib.DelegateRequest's wire shape changed; this test compared nothing",
         )
+        # `parameters` is on the wire struct but not the tool: the worker
+        # adapter refuses a request carrying any until a gateway reads them
+        # (validateDelegate), so the model is not offered the field. The
+        # exemption holds only while that refusal does.
+        self.assertIn(
+            "if len(req.Parameters) > 0 {",
+            h.text("a2a_worker_adapter_delegate"),
+            "the adapter no longer refuses delegate parameters; declare them in delegateToolSchema",
+        )
+        tags = [t for t in all_tags if t != "parameters"]
 
         mcp = h.text("a2a_worker_adapter_mcp")
         schema = mcp.split("var delegateToolSchema")[1].split("\n}\n")[0]
@@ -2092,6 +2246,29 @@ class C3UntrustedByDefault(unittest.TestCase):
                 self.assertNotEqual(pinned[0], "GKE_PROJECT_ID=", f"{fixture}: pinned empty, which reads as unset")
         self.assertGreater(checked, 0, "no golden renders a managed.env; this test would be vacuous")
 
+    def test_C3_the_stall_watch_knobs_cannot_come_from_the_agents_env_file(self) -> None:
+        """The stall watch's knobs are pinned where the agent cannot outrank them.
+
+        stall_watch.py reads STALL_WATCH_EXCLUDE_NAMESPACES, STALL_WATCH_MIN_AGE_MINUTES
+        and STALL_WATCH_KINDS from the environment it inherits after the agent-writable
+        PVC .env is applied, and each one changes what the watch reads or when it alerts.
+        Only the managed .env beats the PVC .env, so all three are pinned there on every
+        golden, empty when the CR's spec.harness.stallWatch does not set them.
+        """
+        keys = ("STALL_WATCH_EXCLUDE_NAMESPACES", "STALL_WATCH_MIN_AGE_MINUTES", "STALL_WATCH_KINDS")
+        checked = 0
+        for fixture, documents in h.golden_documents().items():
+            for document in documents:
+                managed = (document.get("data") or {}).get("managed.env") if document.get("kind") == "ConfigMap" else None
+                if managed is None:
+                    continue
+                checked += 1
+                lines = managed.splitlines()
+                for key in keys:
+                    pinned = [line for line in lines if line.startswith(f"{key}=")]
+                    self.assertEqual(len(pinned), 1, f"{fixture}: {key} is not pinned in managed.env")
+        self.assertGreater(checked, 0, "no golden renders a managed.env; this test would be vacuous")
+
     def test_C3_the_policy_decision_reads_nothing_but_its_argv(self) -> None:
         """The strongest form of "untrusted content cannot reach the decision".
 
@@ -2645,6 +2822,35 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         chart = h.text("chart_admission_policy")
         self.assertIn("failurePolicy: Fail", chart)
         self.assertNotIn("failurePolicy: Ignore", chart)
+
+    def test_C5_the_gateway_pod_policy_holds_its_pods_to_the_session_account(self) -> None:
+        """The A2A gateway's `create` on pods is confined by admission, not by RBAC.
+
+        RBAC cannot see a PodSpec, so buildA2AGatewayRole's grant would let a
+        compromised gateway run a pod as any ServiceAccount in its namespace.
+        kube-agents-a2a-gateway-pod holds those pods to `<name>-a2a-session`
+        and the session token audiences. This is the static half: the policy
+        fails closed, denies, keeps the identity rule, and is tied to the
+        chart copy. k8s-operator's a2a_gateway_pod_policy_envtest_test.go runs
+        it in an API server.
+        """
+        documents = h.yaml_documents("gateway_pod_policy")
+        policy = next(d for d in documents if d.get("kind") == "ValidatingAdmissionPolicy")
+        binding = next(d for d in documents if d.get("kind") == "ValidatingAdmissionPolicyBinding")
+        self.assertEqual("Fail", policy["spec"].get("failurePolicy"))
+        self.assertEqual(["Deny"], binding["spec"].get("validationActions"))
+        self.assertEqual(policy["metadata"]["name"], binding["spec"]["policyName"])
+        self.assertTrue(
+            any(
+                "object.spec.serviceAccountName == variables.sessionAccount" in v["expression"]
+                for v in policy["spec"]["validations"]
+            ),
+            "the policy no longer holds the gateway's pods to the session account",
+        )
+        sync = (h.REPO_ROOT / "hack/sync-chart-manifests.sh").read_text()
+        for tied in (h.SOURCES["gateway_pod_policy"].path, h.SOURCES["chart_gateway_pod_policy"].path):
+            self.assertIn(tied, sync, "the sync script no longer ties the chart copy to the source")
+        self.assertNotIn("failurePolicy: Ignore", h.text("chart_gateway_pod_policy"))
 
 
 def _executor():

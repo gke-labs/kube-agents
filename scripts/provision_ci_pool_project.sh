@@ -40,6 +40,41 @@ LEDGER_INSTALLATION_ID="157029058"
 # a Prow periodic on main). Step 4 grants it signer on this project's copy of
 # the App key, which is the whole reach it has here.
 PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+# The identity the Compute plant sweep runs as (hack/ci_sweep_compute_plants.py,
+# a Prow periodic on main). Step 1, after the reconciler's grants,
+# creates one custom role on this project with exactly these permissions and
+# grants it, which is the whole reach the identity has here. The reason for
+# each permission is beside COMPUTE_SWEEP_PERMISSIONS in
+# scripts/verify_ci_pool_project.py, whose tests keep the two copies equal.
+readonly COMPUTE_SWEEP_SA="serviceAccount:eval-compute-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+readonly COMPUTE_SWEEP_ROLE_ID="kubeAgentsComputePlantSweeper"
+readonly COMPUTE_SWEEP_ROLE_TITLE="kube-agents Compute plant sweeper"
+readonly COMPUTE_SWEEP_ROLE_STAGE="GA"
+readonly COMPUTE_SWEEP_PERMISSIONS="compute.addresses.delete,compute.addresses.deleteInternal,compute.addresses.list,compute.globalAddresses.delete,compute.globalAddresses.deleteInternal,compute.globalAddresses.list,compute.globalOperations.get,compute.networks.delete,compute.networks.list,compute.regionOperations.get,compute.subnetworks.delete,compute.subnetworks.list,monitoring.alertPolicies.delete,monitoring.alertPolicies.list"
+# The once-per-project pieces of a self-managed forge (hack/ci-forge.sh reads
+# them per run; docs/ci-pool-projects.md 5.8): the private zone, one reserved
+# address and one A record per row, the 443 firewall rule and the VM identity,
+# a registry reader. The rows' hosts are hack/ci-deploy.sh's forge table
+# defaults, read below; the names here are kept equal to
+# scripts/verify_ci_pool_project.py by its tests.
+readonly FORGE_DNS_ZONE="eval-internal"
+readonly FORGE_DNS_NAME="eval.internal."
+readonly FORGE_NETWORK="default"
+readonly FORGE_ROWS="ghes gitlab-ce"
+readonly FORGE_FIREWALL_RULE="allow-forge-443"
+readonly FORGE_FIREWALL_SOURCE_RANGES="10.0.0.0/8"
+readonly FORGE_FIREWALL_ALLOWED="tcp:443"
+# The deny rule on the same tag, one priority step below the allow (gcloud's
+# default 1000): a forge VM's external address answers nothing else, the
+# default network's stock allow-ssh included.
+readonly FORGE_DENY_RULE="deny-forge-ingress"
+readonly FORGE_DENY_PRIORITY=1100
+readonly FORGE_DENY_SOURCE_RANGES="0.0.0.0/0"
+readonly FORGE_DENY_RULES="all"
+readonly FORGE_NETWORK_TAG="forge"
+readonly FORGE_VM_SA_ID="forge-vm"
+readonly FORGE_VM_SA_ROLE="roles/artifactregistry.reader"
+readonly FORGE_RECORD_TTL=60
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
 # bench/tf/fleet needs on the project; step 2 grants it the state bucket.
@@ -97,6 +132,53 @@ the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory t
 design: it is sized for an ingest burst the measured week does not show. The obtainability,
 compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
 than as findings.'
+# checkout-gateway's declaration, the file the remediation cases propose a
+# PodDisruptionBudget beside (GITOPS_WORKLOAD_MANIFEST_CASES in the verifier).
+# With no manifest in the repository the agent finds nothing to fix and refuses
+# to open a pull request. It is bench/tf/fleet/defects-a.tf's Deployment as
+# YAML, at the path collect.py's workload_declarations reads a cluster off
+# (clusters/<cluster>/...), which is also the tie #2228's cases wait for. No
+# word about the budget: a note saying it is missing on purpose reads as
+# declared intent and silences the finding.
+readonly GITOPS_WORKLOAD_MANIFEST_PATH="clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
+readonly GITOPS_WORKLOAD_MANIFEST_MESSAGE="Declare seeded-a's checkout-gateway Deployment in seeded-reliability"
+readonly GITOPS_WORKLOAD_MANIFEST_CONTENT='apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-gateway
+  namespace: seeded-reliability
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: checkout-gateway
+  template:
+    metadata:
+      labels:
+        app: checkout-gateway
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: checkout-gateway
+      containers:
+        - name: gateway
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi'
 
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.
@@ -303,8 +385,10 @@ gcloud services enable \
   logging.googleapis.com \
   monitoring.googleapis.com \
   cloudtrace.googleapis.com \
+  gkehub.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
+  dns.googleapis.com \
   --project="${PROJECT_ID}"
 
 PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
@@ -367,7 +451,7 @@ done
 # (docs/designs/eval-scorer.md). In the pool the two need the same set: a
 # project granting only the presubmit's account leases fine and dies at
 # get-credentials the first night it is drawn, as kube-agents-evals-10 did on
-# 2026-09-16 (gke-labs/kube-agents#1491). The same twelve, not a subset -- the
+# 2026-09-16 (gke-labs/kube-agents#1491). The same fourteen, not a subset -- the
 # run is the same script end to end, so a partial grant fails at a later step
 # on a later night instead.
 #
@@ -375,18 +459,25 @@ done
 # Artifact Registry role: AR_REPO and CACHE_IMAGE reach hack/ci-deploy.sh's
 # `gcloud builds submit` as substitutions, so Cloud Build does the push and the
 # GKE nodes do the pull. This account touches the registry at no point.
+# monitoring.alertPolicyEditor: the monitoring-alert-policy-read case's fixture
+# stack plants one alert policy per lease and deletes it on teardown; no other
+# role here carries alertPolicies.create.
 PROW_RUNNER_SA="serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 NIGHTLY_RUNNER_SA="serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
 echo "Granting the Prow and nightly runners access to ${PROJECT_ID}..."
+# compute.instanceAdmin.v1: hack/ci-forge.sh creates and deletes the
+# self-managed forge VM per run and reads its serial console (section 5.8).
 for role in \
   roles/cloudbuild.builds.editor \
   roles/cloudbuild.builds.viewer \
+  roles/compute.instanceAdmin.v1 \
   roles/container.admin \
   roles/container.developer \
   roles/iam.serviceAccountAdmin \
   roles/iam.serviceAccountUser \
   roles/logging.logWriter \
   roles/logging.viewer \
+  roles/monitoring.alertPolicyEditor \
   roles/resourcemanager.projectIamAdmin \
   roles/serviceusage.serviceUsageConsumer \
   roles/storage.admin \
@@ -401,9 +492,14 @@ done
 
 # compute.viewer: the GKE provider lists each node pool's instance group
 # managers on refresh, which no other role here carries (seen live 2026-09-28).
+# compute.loadBalancerAdmin: the stack plants a backend service and a health
+# check on the default pool's instance group (readiness-lb-drain-timeout,
+# defects-b.tf), and the create needs compute.backendServices.*,
+# compute.healthChecks.* and compute.instanceGroups.use.
 echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
 for role in \
   roles/compute.instanceAdmin.v1 \
+  roles/compute.loadBalancerAdmin \
   roles/compute.securityAdmin \
   roles/compute.storageAdmin \
   roles/compute.viewer \
@@ -417,6 +513,27 @@ for role in \
     --role="${role}" \
     --quiet >/dev/null
 done
+
+# A custom role, not roles/compute.networkAdmin: that role holds almost a
+# thousand permissions, and the sweep needs only COMPUTE_SWEEP_PERMISSIONS.
+# `update` on a re-run keeps the role's permissions equal to the list above. On a project already registered,
+# run the commands in docs/ci-pool-projects.md section 5.7 by hand rather than
+# the script (section 8).
+echo "Granting the Compute plant sweeper its custom role on ${PROJECT_ID}..."
+COMPUTE_SWEEP_ROLE_VERB="create"
+if gcloud iam roles describe "${COMPUTE_SWEEP_ROLE_ID}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  COMPUTE_SWEEP_ROLE_VERB="update"
+fi
+gcloud iam roles "${COMPUTE_SWEEP_ROLE_VERB}" "${COMPUTE_SWEEP_ROLE_ID}" \
+  --project="${PROJECT_ID}" \
+  --title="${COMPUTE_SWEEP_ROLE_TITLE}" \
+  --permissions="${COMPUTE_SWEEP_PERMISSIONS}" \
+  --stage="${COMPUTE_SWEEP_ROLE_STAGE}" \
+  --quiet >/dev/null
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="${COMPUTE_SWEEP_SA}" \
+  --role="projects/${PROJECT_ID}/roles/${COMPUTE_SWEEP_ROLE_ID}" \
+  --quiet >/dev/null
 
 # ─── Artifact Registry Creation & Cleanup Policy ──────────────────────────────
 echo -e "\n==> [Step 1.3] Creating Regional Docker Artifact Registry & Cleanup Policy..."
@@ -488,22 +605,27 @@ if [ -z "${GITOPS_DEFAULT_BRANCH}" ]; then
     -f content="$(printf '%s\n' "${GITOPS_SEED_CONTENT}" | base64 | tr -d '\n')" >/dev/null
 fi
 
-# The declaration the declared-intent eval case reads. A PUT without `sha` on a
-# path that exists fails, so the read comes first, and only a 404 means
-# "absent": any other failure stops the step, as the branch read above does,
-# rather than PUT over a note that may be there. A note someone edited by
-# hand is left as it is.
-if GITOPS_INTENT_NOTE_READ_ERROR="$(gh api "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" 2>&1 >/dev/null)"; then
-  :
-elif printf '%s' "${GITOPS_INTENT_NOTE_READ_ERROR}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
-  echo "Seeding ${GITOPS_REPO} with ${GITOPS_INTENT_NOTE_PATH} (the declared-intent note)..."
-  gh api -X PUT "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" \
-    -f message="${GITOPS_INTENT_NOTE_MESSAGE}" \
-    -f content="$(printf '%s\n' "${GITOPS_INTENT_NOTE_CONTENT}" | base64 | tr -d '\n')" >/dev/null
-else
-  echo "ERROR: could not read ${GITOPS_INTENT_NOTE_PATH} in ${GITOPS_REPO} (${GITOPS_INTENT_NOTE_READ_ERROR}); not seeding it blind." >&2
-  exit 1
-fi
+# The two files the eval cases read: the declared-intent note and
+# checkout-gateway's declaration. A PUT without `sha` on a path that exists
+# fails, so the read comes first, and only a 404 means "absent": any other
+# failure stops the step, as the branch read above does, rather than PUT over
+# a file that may be there. A file someone edited by hand is left as it is.
+seed_gitops_file() {
+  local path="$1" message="$2" content="$3" what="$4" read_error
+  if read_error="$(gh api "repos/${GITOPS_REPO}/contents/${path}" 2>&1 >/dev/null)"; then
+    return 0
+  elif printf '%s' "${read_error}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
+    echo "Seeding ${GITOPS_REPO} with ${path} (${what})..."
+    gh api -X PUT "repos/${GITOPS_REPO}/contents/${path}" \
+      -f message="${message}" \
+      -f content="$(printf '%s\n' "${content}" | base64 | tr -d '\n')" >/dev/null
+  else
+    echo "ERROR: could not read ${path} in ${GITOPS_REPO} (${read_error}); not seeding it blind." >&2
+    exit 1
+  fi
+}
+seed_gitops_file "${GITOPS_INTENT_NOTE_PATH}" "${GITOPS_INTENT_NOTE_MESSAGE}" "${GITOPS_INTENT_NOTE_CONTENT}" "the declared-intent note"
+seed_gitops_file "${GITOPS_WORKLOAD_MANIFEST_PATH}" "${GITOPS_WORKLOAD_MANIFEST_MESSAGE}" "${GITOPS_WORKLOAD_MANIFEST_CONTENT}" "checkout-gateway's declaration"
 
 INST_JSON="$(gh api /orgs/gke-agentic/installations --jq ".installations[] | select(.app_id==${APP_ID})" 2>/dev/null || echo "")"
 if [ -n "${INST_JSON}" ]; then
@@ -531,6 +653,51 @@ fi
 echo "⚠ ${GITOPS_REPO} must also be added to GitHub App ${LEDGER_APP_ID}'s installation."
 echo "  That edit widens which repositories the App can read issues and pull requests in:"
 echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
+
+# ─── Step 1.5: The self-managed forges' pieces ────────────────────────────────
+echo -e "\n==> [Step 1.5] Reserving the self-managed forges' zone, addresses, firewall rule and VM identity..."
+# The rows' hosts, from the one table (forge_profile in hack/ci-deploy.sh).
+eval "$(sed -n 's/^\(EVAL_FORGE_DEFAULT_[A-Z_]*HOST=.*\)$/\1/p' "${REPO_ROOT}/hack/ci-deploy.sh")"
+forge_host_for_row() { # ghes -> EVAL_FORGE_DEFAULT_GHES_HOST, gitlab-ce -> EVAL_FORGE_DEFAULT_GITLAB_CE_HOST
+  local var
+  var="EVAL_FORGE_DEFAULT_$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')_HOST"
+  printf '%s' "${!var}"
+}
+if ! gcloud dns managed-zones describe "${FORGE_DNS_ZONE}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud dns managed-zones create "${FORGE_DNS_ZONE}" --dns-name="${FORGE_DNS_NAME}" --visibility=private \
+    --networks="${FORGE_NETWORK}" --description="Self-managed eval forges (hack/ci-forge.sh)" --project="${PROJECT_ID}" >/dev/null
+fi
+for row in ${FORGE_ROWS}; do
+  address="forge-${row}"
+  host="$(forge_host_for_row "${row}")"
+  if ! ip="$(gcloud compute addresses describe "${address}" --region="${REGION}" --project="${PROJECT_ID}" --format='value(address)' 2>/dev/null)"; then
+    gcloud compute addresses create "${address}" --region="${REGION}" --subnet="${FORGE_NETWORK}" --purpose=GCE_ENDPOINT \
+      --description="The ${row} forge VM's address (hack/ci-forge.sh)" --project="${PROJECT_ID}" >/dev/null
+    ip="$(gcloud compute addresses describe "${address}" --region="${REGION}" --project="${PROJECT_ID}" --format='value(address)')"
+  fi
+  if record="$(gcloud dns record-sets describe "${host}." --zone="${FORGE_DNS_ZONE}" --type=A --project="${PROJECT_ID}" --format='value(rrdatas[0])' 2>/dev/null)"; then
+    if [ "${record}" != "${ip}" ]; then
+      gcloud dns record-sets update "${host}." --zone="${FORGE_DNS_ZONE}" --type=A --ttl="${FORGE_RECORD_TTL}" --rrdatas="${ip}" --project="${PROJECT_ID}" >/dev/null
+    fi
+  else
+    gcloud dns record-sets create "${host}." --zone="${FORGE_DNS_ZONE}" --type=A --ttl="${FORGE_RECORD_TTL}" --rrdatas="${ip}" --project="${PROJECT_ID}" >/dev/null
+  fi
+  echo "✓ ${host} -> ${ip} (${address})"
+done
+if ! gcloud compute firewall-rules describe "${FORGE_FIREWALL_RULE}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud compute firewall-rules create "${FORGE_FIREWALL_RULE}" --network="${FORGE_NETWORK}" --direction=INGRESS --allow="${FORGE_FIREWALL_ALLOWED}" \
+    --source-ranges="${FORGE_FIREWALL_SOURCE_RANGES}" --target-tags="${FORGE_NETWORK_TAG}" --project="${PROJECT_ID}" >/dev/null
+fi
+if ! gcloud compute firewall-rules describe "${FORGE_DENY_RULE}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud compute firewall-rules create "${FORGE_DENY_RULE}" --network="${FORGE_NETWORK}" --direction=INGRESS --action=DENY --rules="${FORGE_DENY_RULES}" \
+    --priority="${FORGE_DENY_PRIORITY}" --source-ranges="${FORGE_DENY_SOURCE_RANGES}" --target-tags="${FORGE_NETWORK_TAG}" --project="${PROJECT_ID}" >/dev/null
+fi
+FORGE_VM_SA="${FORGE_VM_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+if ! gcloud iam service-accounts describe "${FORGE_VM_SA}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud iam service-accounts create "${FORGE_VM_SA_ID}" --display-name="kube-agents forge VM" --project="${PROJECT_ID}" >/dev/null
+fi
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null
+echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rules ${FORGE_FIREWALL_RULE} and ${FORGE_DENY_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
 
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
 # One bucket per project, one prefix per stack. Versioning and uniform
@@ -695,6 +862,12 @@ if [ "${SKIP_FLEET}" != "true" ]; then
     # the nightly's, and to the CI health bot, so this apply also grants each of
     # them impersonation on seeded-fleet-reader. Do not pass it with -var; variables.tf says why
     # every apply has to carry the same value.
+    # Two applies: the scaled-zero gateway fixture's kubernetes_manifest
+    # resources read the Gateway API CRDs at plan time, and those exist only
+    # once GKE has created seeded-a with gateway_api_config. The first apply
+    # creates that cluster on its own; on a project that has it, it changes
+    # nothing.
+    tofu apply -auto-approve -var="project_id=${PROJECT_ID}" -target=google_container_cluster.seeded_a
     tofu apply -auto-approve -var="project_id=${PROJECT_ID}"
   )
 else

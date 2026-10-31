@@ -13,7 +13,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent c
   - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images: review skills (adversarial, security, docs-drift, skill quality) run against pull requests and clusters, `review-preflight` runs the pre-PR set in a context that did not write the change, the `install-`/`uninstall-`/`upgrade-kube-agents` lifecycle skills drive the installer scripts, and `edit-mirrored-skill` edits mirrored `gke-*` skills.
 - `.agents/rules/`: Repository-level rules, one file per family: code (`core_engineering.md`), workflows (`github_actions.md`), pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`).
-- `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus persona, gateway and auth-callout.
+- `a2a/`: bus Go module: wire library, `a2a` topics CLI (`docs/designs/spec-a2a-payloads.md`), gateway, auth-callout, `persona/` (bus content), `lib/persona/` (persona format).
 - `charts/`: Canonical Helm chart (`kube-agents`) deploying the operator and profiles.
 - `terraform/`: Reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`), plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Dockerfile, Kustomize bases, shared runtime assets.
@@ -42,7 +42,7 @@ Tests live in many places. **Decide by whether a model call is in the loop:**
 - **Yes, and you plant the defect it has to find** — it is an eval in
   `bench/tasks/<name>/task.yaml` and runs in CI. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
   is the contract (`make bench-case-check`, `scripts/test_task_registration.py`). **A change to
-  agent behaviour starts from one:** red locally, implement, green three times, registered:
+  agent behaviour starts from one:** red, implement, three greens, registered, or exempt:
   [`.agents/rules/eval_driven_development.md`](.agents/rules/eval_driven_development.md).
 - **Yes, and it checks an install you already have** — it is a critical user journey in
   `bench/cuj/` ([`bench/cuj/README.md`](bench/cuj/README.md)). Manual by design: it grades a live
@@ -148,15 +148,15 @@ Rules (see also [`.agents/rules/documentation.md`](.agents/rules/documentation.m
   internal project, service account, Workload Identity pool, repo path, maintainer environment).
 - **Do not document pull-request status** or cite a PR/issue number as the reason a behaviour exists
   in user/maintainer docs.
-- **Verify identifiers against source, not against other docs** (`install.defaults.env`,
+- **Verify identifiers against source, not other docs** (`install.defaults.env`,
   `k8s-operator/go.mod`, the identifier table in `docs/README.md`).
 - **Link a new document from the page that owns its topic; add no map entry** to `docs/README.md`.
 - **Write it straight and match length to the task.** Lead with the fact; cut hype (`comprehensive`,
   `robust`, `seamless`), "not X, but Y", and filler sections; prefer prose to `**Bold term:**`
   lists (`SKILL.md` excepted per `.agents/skills/skill-review/SKILL.md`).
 
-Run `make docs-check` before pushing: generated regions, links/reachability, terminology, site
-audience, and this file plus `CLAUDE.md` against the context budget.
+Run `make docs-check` before pushing: generated regions, links/anchors/reachability, terminology,
+site audience, site prose, the context budget, and the PR template's sections.
 
 ## Contributing as an agent
 
@@ -192,9 +192,9 @@ user" clauses here. Agents with a user in the loop follow this file.
   merged disposition list under **Self-Review**: what you looked for, what was found, the context
   used. Mechanics: [`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md).
 - **Live-test the change before opening a PR:** fill in **Testing → Live validation** with how the
-  change was exercised against a running installation ([INSTALL.md](INSTALL.md)), the red-to-green
-  eval loop for agent behaviour changes, or "Not live-tested" with the reason when no install can
-  reach it. Mechanics and shared-install lease rules:
+  change ran against a running installation ([INSTALL.md](INSTALL.md)), the eval loop or
+  exemption record for agent behaviour changes, or "Not live-tested" with the reason when no install
+  can reach it. Mechanics and shared-install lease rules:
   [`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md).
 - **Keep `Self-Review` and `Live validation` current, not chronological:** fold later passes and
   fixes into the sections rather than appending rounds; round-by-round history belongs in the
@@ -210,8 +210,8 @@ user" clauses here. Agents with a user in the loop follow this file.
   [its author's outstanding work](docs/pull-request-workflow.md#who-owns-an-open-pull-request), a
   declined bot thread excepted (below). Reply first, then resolve every addressed thread per
   [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#resolving-conversations).
-- **You do not merge it; Tide does** once a reviewer's `lgtm` and an `OWNERS` approver's `approved`
-  are present and required checks pass. Never post `/lgtm` or `/approve` on someone's behalf unless
+- **You do not merge it; the merge queue does** once a reviewer's `lgtm` and an `OWNERS` approver's
+  `approved` are present and required checks pass. Never post `/lgtm` or `/approve` on someone's behalf unless
   asked. Mechanics: [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#how-a-change-merges).
 - **Local Validation Checks:** Before committing, run the checks for what you touched:
   `prettier --write` on changed Markdown/YAML, `make shellcheck` on shell scripts, a
@@ -222,19 +222,20 @@ user" clauses here. Agents with a user in the loop follow this file.
 
 ### The behavioural presubmit gate
 
-`pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` (3 repetitions per active
-case, 1.5–3.5 hours against a 360-minute ceiling). Non-inert pushes restart it, so open the PR early
-and batch changes; a Tide retest after `main` moves reuses the head's green in minutes. It goes red
-when a case on `BOOTSTRAP_ADMITTED` in `hack/ci-eval-pr.sh` fails all repetitions, or any case trips
-an absolute rung (forbidden cluster mutation, verifier error, inconsistent liveness signals; a record
-with no run at all is excluded as infrastructure unless every case hits one). Demotion:
-`docs/eval-gate-roster.md`; verdict ladder:
+`pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` on a `spec.mode: next`
+install (3 repetitions per active case, 1.5–3.5 hours). Non-inert
+pushes restart it, so open the PR early and batch changes; a green on the head stays valid when
+`main` moves. It goes red when a case on `BOOTSTRAP_ADMITTED` fails all repetitions,
+or any case trips an absolute rung (a forbidden cluster or GitHub write, verifier error,
+inconsistent liveness signals; a run-less record is infrastructure unless every case is one). Today
+mode and rollback: optional `pull-kube-agents-smoke-test-today` and a six-hourly periodic.
+Roster, inject-lane exclusions: `docs/eval-gate-roster.md`; verdict ladder:
 [`docs/designs/testing-strategy.md`](docs/designs/testing-strategy.md) §4.2. On a red, read the
 health bot comment and <https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html>:
 fix a regression your PR caused, or file a `presubmit-gate` issue for a gate flake. One `/retest` is
-reasonable for a suspected transient; never merge around a red gate, and never instruct anyone to.
-`/override` (admin-only) is only for a red the eval crew classified as not the PR's
-([how a change merges](docs/pull-request-workflow.md#how-a-change-merges)).
+fine for a suspected transient; never merge around a red gate or tell anyone to.
+`/override` (admin-only) is only for a red the eval crew classified as not the PR's. Never `/test`
+the smoke on an approved PR with a green `Smoke gate` ([why](docs/pull-request-workflow.md#how-a-change-merges)).
 
 ## Automated Review After Opening a Pull Request
 

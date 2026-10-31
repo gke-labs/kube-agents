@@ -305,8 +305,8 @@ func TestBuildPVC(t *testing.T) {
 		t.Errorf("expected PVC name test-agent-data, got %s", pvc.Name)
 	}
 	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	if storageReq.String() != "10Gi" {
-		t.Errorf("expected storage request 10Gi, got %s", storageReq.String())
+	if storageReq.String() != "50Gi" {
+		t.Errorf("expected storage request 50Gi, got %s", storageReq.String())
 	}
 }
 
@@ -1466,6 +1466,15 @@ func TestSafeSandboxEnvOverridesPassesFindingsPacingLimits(t *testing.T) {
 	// A neighbour sharing the prefix is not on the list.
 	if _, ok := values["FINDINGS_QUEUE_DB_PATH"]; ok {
 		t.Errorf("FINDINGS_QUEUE_DB_PATH must not pass, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesWorkloadDedupWindow(t *testing.T) {
+	// session_kv_server.py reads the window from its own environment; off the
+	// allowlist, the documented spec.deployment.env entry never reaches it.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "INCIDENT_WORKLOAD_DEDUP_SECONDS", Value: "900"}})
+	if len(got) != 1 || got[0].Name != "INCIDENT_WORKLOAD_DEDUP_SECONDS" || got[0].Value != "900" {
+		t.Errorf("expected INCIDENT_WORKLOAD_DEDUP_SECONDS=900 to pass, got %#v", got)
 	}
 }
 
@@ -3347,6 +3356,9 @@ func TestGetConfigMapHash(t *testing.T) {
 	}
 }
 
+// TestBuildDeploymentHA renders replicas: 2, which the operator caps at one
+// replica (supportedGatewayReplicas) because a multi-replica gateway does not
+// start.
 func TestBuildDeploymentHA(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3365,8 +3377,11 @@ func TestBuildDeploymentHA(t *testing.T) {
 	}
 
 	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	if *dep.Spec.Replicas != 2 {
-		t.Errorf("expected 2 replicas for HA deployment, got %d", *dep.Spec.Replicas)
+	if *dep.Spec.Replicas != 1 {
+		t.Errorf("expected replicas: 2 to be capped at 1, got %d", *dep.Spec.Replicas)
+	}
+	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("expected the single-replica Recreate strategy, got %s", dep.Spec.Strategy.Type)
 	}
 
 	if dep.Spec.Template.Spec.Affinity != nil {
@@ -3464,9 +3479,11 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 		},
 	}
 
+	// Capped at one replica (supportedGatewayReplicas): three renders the
+	// single-replica gateway, with none of the leader-election wiring.
 	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	if *dep.Spec.Replicas != 3 {
-		t.Errorf("expected 3 replicas when explicitly set, got %d", *dep.Spec.Replicas)
+	if *dep.Spec.Replicas != 1 {
+		t.Errorf("expected replicas: 3 to be capped at 1, got %d", *dep.Spec.Replicas)
 	}
 
 	// Leadership is the Lease that leader_elect.py holds, not a config key: nothing in
@@ -3484,11 +3501,10 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 	for _, env := range container.Env {
 		envMap[env.Name] = env
 	}
-	if envMap["ENABLE_LEADER_ELECTION"].Value != "true" {
-		t.Errorf("expected ENABLE_LEADER_ELECTION true, got %s", envMap["ENABLE_LEADER_ELECTION"].Value)
-	}
-	if envMap["LEADER_ELECTION_LEASE_NAME"].Value != "custom-replicas-agent-leader" {
-		t.Errorf("expected LEADER_ELECTION_LEASE_NAME custom-replicas-agent-leader, got %s", envMap["LEADER_ELECTION_LEASE_NAME"].Value)
+	for _, name := range []string{"ENABLE_LEADER_ELECTION", "LEADER_ELECTION_LEASE_NAME", "LEADER_ELECTION_NAMESPACE"} {
+		if env, found := envMap[name]; found {
+			t.Errorf("expected no %s on a capped gateway, got %q", name, env.Value)
+		}
 	}
 }
 
@@ -3529,36 +3545,20 @@ func envValue(c corev1.Container, name string) (string, bool) {
 	return value, found
 }
 
-// TestLeaderElectionKeepsTheImageEntrypoint guards the HA path against the regression
-// where nothing built the shared tree.
-//
-// Setting Command on this container replaces the image ENTRYPOINT
-// (/usr/local/bin/agent-entrypoint), so the setup that seeds $HERMES_HOME from
-// /opt/defaults, scaffolds the platform profile, links plugin volumes, merges the config
-// overlays and starts the Session KV server on 8699 never ran at all — leader_elect.py
-// went straight to Hermes. The dashboard was quietly covering for it by running the setup
-// itself; once the dashboard was correctly gated out, an HA pod had no container doing it.
-func TestLeaderElectionKeepsTheImageEntrypoint(t *testing.T) {
-	dep := buildDeployment(haAgent("ha-agent", 2), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	gateway := containerNamed(t, dep, "platform-agent")
-
-	if len(gateway.Command) != 0 {
-		t.Errorf("Command must stay unset so the image ENTRYPOINT runs the shared-state "+
-			"setup before leader_elect.py; got %v", gateway.Command)
-	}
-	want := []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}
-	if !reflect.DeepEqual(gateway.Args, want) {
-		t.Errorf("expected the leader-election wrapper as the entrypoint's exec target %v, got %v", want, gateway.Args)
-	}
-}
-
+// TestSingleReplicaGatewayUsesTheImageCMD covers the counts above one too: the
+// operator caps them at one replica, so none of them runs leader_elect.py,
+// which exits at startup in a container with no in-cluster token (#2995).
 func TestSingleReplicaGatewayUsesTheImageCMD(t *testing.T) {
-	dep := buildDeployment(haAgent("solo-agent", 1), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	gateway := containerNamed(t, dep, "platform-agent")
+	for _, replicas := range []int32{1, 2, 3} {
+		t.Run(fmt.Sprintf("replicas=%d", replicas), func(t *testing.T) {
+			dep := buildDeployment(haAgent("solo-agent", replicas), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+			gateway := containerNamed(t, dep, "platform-agent")
 
-	if len(gateway.Command) != 0 || len(gateway.Args) != 0 {
-		t.Errorf("expected the image CMD (`hermes gateway run`) to stand, got command=%v args=%v",
-			gateway.Command, gateway.Args)
+			if len(gateway.Command) != 0 || len(gateway.Args) != 0 {
+				t.Errorf("expected the image CMD (`hermes gateway run`) to stand, got command=%v args=%v",
+					gateway.Command, gateway.Args)
+			}
+		})
 	}
 }
 
@@ -3791,15 +3791,21 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// five unconditional pins, none of which is about chat: the loopback bearer (see
-	// the next test), the PVC's directory mode, the mode switch, the scope path, and
-	// the empty management-project override.
+	// ten unconditional pins, none of which is about chat: the loopback bearer (see
+	// the next test), the PVC's directory mode, the mode switch, the scope path, the
+	// empty management-project override, the stall watch's three knobs, empty, the
+	// Pub/Sub platform relay URL, empty, and the project that qualifies its routes.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
 		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
 		kubeagentsModeEnvKey + "=today\n" +
 		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
-		reconcileProjectEnvKey + "=\n"
+		reconcileProjectEnvKey + "=\n" +
+		stallWatchExcludeNamespacesEnvKey + "=\n" +
+		stallWatchMinAgeEnvKey + "=\n" +
+		stallWatchKindsEnvKey + "=\n" +
+		pubsubRelayURLEnvVar + "=\n" +
+		pubsubRelayProjectEnvVar + "=" + pubsubRelayProject(newTestPlatformAgent()) + "\n"
 	if bare != want {
 		t.Errorf("renderManagedEnv with no integration = %q, want %q", bare, want)
 	}
@@ -3866,11 +3872,15 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 	// container env is not a disagreement — only a different answer is.
 	// The mode key is pinned-only by design: the managed .env is the one path the
 	// mode takes into the runtime (spec-mode-switch.md), so a container-env copy
-	// would be a second answer to a question that must have exactly one.
+	// would be a second answer to a question that must have exactly one. The stall
+	// watch's knobs take the same single path to stall_watch.py.
 	pinnedOnly := map[string]bool{
-		"GATEWAY_ALLOWED_USERS":   true,
-		"GATEWAY_ALLOW_ALL_USERS": true,
-		kubeagentsModeEnvKey:      true,
+		"GATEWAY_ALLOWED_USERS":           true,
+		"GATEWAY_ALLOW_ALL_USERS":         true,
+		kubeagentsModeEnvKey:              true,
+		stallWatchExcludeNamespacesEnvKey: true,
+		stallWatchMinAgeEnvKey:            true,
+		stallWatchKindsEnvKey:             true,
 	}
 
 	for _, line := range strings.Split(strings.TrimSpace(renderManagedEnv(agent)), "\n") {
@@ -4051,26 +4061,33 @@ func TestRWOStoragePerReplica(t *testing.T) {
 		},
 	}
 
-	if !useStatefulSet(agent) {
-		t.Fatalf("expected useStatefulSet to be true for multi-replica agent with RWO storage")
+	// replicas > 1 over RWO storage used to select the StatefulSet gateway.
+	// The replica cap renders it as the single-replica Deployment, with the
+	// claim as a standalone PVC mounted from the pod spec.
+	if useStatefulSet(agent) {
+		t.Fatalf("expected the replica cap to keep a multi-replica agent with RWO storage on the Deployment")
 	}
 
 	pvcs, err := buildCustomPVCs(agent)
 	if err != nil {
 		t.Fatalf("unexpected error from buildCustomPVCs: %v", err)
 	}
-	if len(pvcs) != 0 {
-		t.Errorf("expected 0 standalone PVCs when using StatefulSet, got %d", len(pvcs))
+	if len(pvcs) != 1 {
+		t.Errorf("expected 1 standalone PVC on the capped Deployment, got %d", len(pvcs))
 	}
 
 	vols := buildCustomStorageVolumes(agent)
-	if len(vols) != 0 {
-		t.Errorf("expected 0 custom storage volumes in pod spec when using StatefulSet RWO, got %d", len(vols))
+	if len(vols) != 1 {
+		t.Errorf("expected 1 custom storage volume in the capped pod spec, got %d", len(vols))
 	}
 
+	// buildStatefulSet itself is unreachable from the spec under the cap and
+	// is called directly here so its claim-template shape stays pinned. Its
+	// replica count comes through the same capped resolver.
+
 	sts := buildStatefulSet(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	if *sts.Spec.Replicas != 2 {
-		t.Errorf("expected 2 replicas in StatefulSet, got %d", *sts.Spec.Replicas)
+	if *sts.Spec.Replicas != 1 {
+		t.Errorf("expected the capped 1 replica in StatefulSet, got %d", *sts.Spec.Replicas)
 	}
 	if len(sts.Spec.VolumeClaimTemplates) != 1 {
 		t.Fatalf("expected 1 VolumeClaimTemplate in StatefulSet, got %d", len(sts.Spec.VolumeClaimTemplates))
@@ -4211,6 +4228,11 @@ func TestBuildDeployment_AgentPlugins_ImageVolumeUnsupported(t *testing.T) {
 	}
 	if pluginVol.EmptyDir == nil {
 		t.Errorf("expected plugin-myplugin volume source to be EmptyDir, got %+v", pluginVol)
+	} else if sl := pluginVol.EmptyDir.SizeLimit; sl == nil || sl.Cmp(resource.MustParse(pluginStagingSizeLimit)) != 0 {
+		// The staging emptyDir is bounded at the figure emptydir_limits.go
+		// gives; this is the only render of it, since no golden fixture
+		// carries an AgentPlugin.
+		t.Errorf("plugin-myplugin staging emptyDir sizeLimit = %v, want %s", sl, pluginStagingSizeLimit)
 	}
 
 	// 2. InitContainer must stage the plugin
@@ -5433,6 +5455,50 @@ func TestMaxInProgressIsPinnedInTheManagedScope(t *testing.T) {
 	}
 }
 
+// Session retention rides the managed scope, so it applies to every profile in the pod (the
+// front door, the Platform Agent and each Cluster Agent) and a profile cannot lengthen its own
+// (#3704). auto_prune is pinned true; retention_days is the CR's value or the operator default.
+// The tests read defaultSessionRetentionDays rather than a literal, so flipping the default is a
+// one-line change.
+func TestSessionRetentionIsPinnedInTheManagedScope(t *testing.T) {
+	managedSessions := func(t *testing.T, agent *agentv1alpha1.PlatformAgent) map[string]any {
+		t.Helper()
+		var managed map[string]any
+		if err := yaml.Unmarshal([]byte(buildConfigMapData(agent, nil)[managedConfigKey]), &managed); err != nil {
+			t.Fatalf("unmarshal managed scope: %v", err)
+		}
+		sessions, ok := managed["sessions"].(map[string]any)
+		if !ok {
+			t.Fatalf("the managed scope carries no sessions block, got:\n%v", managed)
+		}
+		if got := sessions["auto_prune"]; got != true {
+			t.Errorf("sessions.auto_prune = %v, want true", got)
+		}
+		return sessions
+	}
+
+	if got := managedSessions(t, newTestPlatformAgent())["retention_days"]; fmt.Sprint(got) != fmt.Sprint(defaultSessionRetentionDays) {
+		t.Errorf("unset retention_days = %v, want the operator default %d", got, defaultSessionRetentionDays)
+	}
+	for _, want := range []int{defaultSessionRetentionDays + 1, 365} {
+		if want == defaultSessionRetentionDays {
+			t.Fatalf("test value %d must differ from the default to prove the override", want)
+		}
+		agent := newTestPlatformAgent()
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Retention: &agentv1alpha1.RetentionSpec{SessionDays: ptr.To(want)}}
+		if got := managedSessions(t, agent)["retention_days"]; fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("retention_days = %v, want the CR's %d", got, want)
+		}
+	}
+	// One route only: an overlay copy would be merged into a profile's config.yaml and then
+	// overruled by the pin, and would outlive the CR field.
+	for key, overlay := range buildConfigMapData(newTestPlatformAgent(), nil) {
+		if key != managedConfigKey && strings.Contains(overlay, "retention_days") {
+			t.Errorf("%s must not carry retention_days; it belongs to the managed scope alone", key)
+		}
+	}
+}
+
 // The cap has exactly one route. A copy in the default profile's overlay as well would be
 // merged into the agent's config.yaml and then overruled by the pin, which is the
 // "nothing the operator renders may appear in both" rule buildConfigMapData states. The
@@ -6369,8 +6435,9 @@ func TestPlatformFrontDoorArgsSelectTheProfile(t *testing.T) {
 	}{
 		{"off at one replica keeps the image CMD", 1, false, nil},
 		{"on at one replica names the profile", 1, true, []string{"hermes", "--profile", "platform", "gateway", "run"}},
-		{"off above one replica keeps the wrapper", 2, false, []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}},
-		{"on above one replica keeps the wrapper", 2, true, []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}},
+		// Two is capped at one replica, so the argv is the single-replica one.
+		{"off above one replica is capped to the image CMD", 2, false, nil},
+		{"on above one replica is capped and names the profile", 2, true, []string{"hermes", "--profile", "platform", "gateway", "run"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dep := buildDeployment(frontDoorAgent("fd-agent", tc.replicas, tc.on), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
@@ -7332,6 +7399,11 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 // carries namespace-wide pods:patch on the identity that also holds the agent's
 // Workload Identity annotation. Nothing breaks, nothing logs, and the grant is
 // only found by someone auditing RBAC.
+//
+// Under the replica cap (supportedGatewayReplicas) every row renders one replica,
+// so the pods rule and the arming are both off on every row; the agreement still
+// holds and is still checked. TestLeaderRolePodsRuleVerbsAboveOneReplica keeps
+// the verbs of the multi-replica rule pinned meanwhile.
 func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -7642,5 +7714,90 @@ func TestDeploymentEnvCannotMoveTheWatcherMetricsPort(t *testing.T) {
 	}
 	if found[0] != "9095" {
 		t.Errorf("spec.deployment.env moved the watcher's metrics port to %q", found[0])
+	}
+}
+
+// TestLeaderRolePodsRuleVerbsAboveOneReplica pins the verbs of the leader Role's
+// pods rule at a multi-replica count, read from leaderRoleRules directly because
+// the replica cap keeps every spec-driven render at one replica and so renders
+// the rule nowhere. It is the agent identity's only write grant on workloads, so
+// a verb added to it is worth a red test before the cap lifts (#3016).
+func TestLeaderRolePodsRuleVerbsAboveOneReplica(t *testing.T) {
+	var found bool
+	for _, r := range leaderRoleRules(3) {
+		if !slices.Contains(r.Resources, "pods") {
+			continue
+		}
+		found = true
+		if !slices.Equal(r.Verbs, []string{"get", "patch"}) {
+			t.Errorf("leader Role pods rule grants %v, want [get patch]", r.Verbs)
+		}
+		if !slices.Equal(r.Resources, []string{"pods"}) {
+			t.Errorf("leader Role pods rule reaches %v, want [pods]", r.Resources)
+		}
+	}
+	if !found {
+		t.Error("no pods rule at three replicas")
+	}
+	for _, r := range leaderRoleRules(1) {
+		if slices.Contains(r.Resources, "pods") {
+			t.Errorf("a pods rule at one replica: %v", r)
+		}
+	}
+}
+
+// The gateway's startup and readiness probes run the same curl against the
+// Hermes API on loopback. curl carries its own --max-time under kubelet's
+// TimeoutSeconds, so a hung listener is reported as curl's exit 28 rather
+// than cut off by kubelet's exec kill; each timeout stays within its probe's
+// period so a slow check never delays the next tick; and the startup probe's
+// budget is the 905s cold boot gatewayProgressDeadlineSeconds is sized over.
+// The golden manifests pin the exact numbers; this test holds the relations
+// between them.
+func TestAgentAPIProbesTimeOutUnderKubeletAndKeepTheStartupBudget(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+	}
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, renderOptions{imageVolumeSupported: true})
+	c, ok := findContainer(dep.Spec.Template.Spec, "platform-agent")
+	if !ok {
+		t.Fatal("the platform-agent container is missing")
+	}
+	maxTime := regexp.MustCompile(`--max-time (\d+)`)
+	probes := map[string]*corev1.Probe{"startup": c.StartupProbe, "readiness": c.ReadinessProbe}
+	for name, probe := range probes {
+		if probe == nil || probe.Exec == nil || len(probe.Exec.Command) == 0 {
+			t.Fatalf("%s probe = %+v, want an exec probe", name, probe)
+		}
+		cmd := strings.Join(probe.Exec.Command, " ")
+		for _, want := range []string{
+			`http://127.0.0.1:8642/api/sessions?limit=1`,
+			`-H "Authorization: Bearer $API_SERVER_KEY"`,
+			`[ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION" = "true" ] && exit 0`,
+		} {
+			if !strings.Contains(cmd, want) {
+				t.Errorf("%s probe command %q lacks %q", name, cmd, want)
+			}
+		}
+		m := maxTime.FindStringSubmatch(cmd)
+		if m == nil {
+			t.Errorf("%s probe command %q has no curl --max-time: a hung listener would run to kubelet's kill", name, cmd)
+		} else if secs, _ := strconv.Atoi(m[1]); secs <= 0 || int32(secs) >= probe.TimeoutSeconds {
+			t.Errorf("%s probe --max-time %d must sit under TimeoutSeconds %d", name, secs, probe.TimeoutSeconds)
+		}
+		if probe.TimeoutSeconds > probe.PeriodSeconds {
+			t.Errorf("%s probe TimeoutSeconds %d exceeds PeriodSeconds %d: a slow check would skip the next tick", name, probe.TimeoutSeconds, probe.PeriodSeconds)
+		}
+	}
+	startup, readiness := probes["startup"], probes["readiness"]
+	budget := startup.InitialDelaySeconds + startup.PeriodSeconds*startup.FailureThreshold
+	if budget != 905 {
+		t.Errorf("startup probe budget = %ds, want the 905s cold boot gatewayProgressDeadlineSeconds is sized over", budget)
+	}
+	if budget >= gatewayProgressDeadlineSeconds {
+		t.Errorf("startup probe budget %ds must stay under gatewayProgressDeadlineSeconds %d", budget, gatewayProgressDeadlineSeconds)
+	}
+	if window := readiness.PeriodSeconds * readiness.FailureThreshold; window >= budget {
+		t.Errorf("readiness withdraws after %ds, which is not quicker than the %ds startup budget", window, budget)
 	}
 }

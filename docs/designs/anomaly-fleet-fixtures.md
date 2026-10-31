@@ -1,8 +1,11 @@
 # Seeded-fleet fixtures for the anomaly-detection checks
 
 **Status:** partly built. Steps 1 and 2 of the [order of work](#order-of-work) — slot `d` and its
-three zonal-skew fixtures — are in `bench/tf/fleet/` and catalogued in
-[`bench-fleet-catalog.md`](bench-fleet-catalog.md); the rest is plan. It says what the seeded fleet
+three zonal-skew fixtures — are in `bench/tf/fleet/` (catalogued in
+[`bench-fleet-catalog.md`](bench-fleet-catalog.md)); step 3's
+[`topology-zonal-skew-probe`](../../bench/tasks/topology-zonal-skew-probe/task.yaml) eval case is
+defined in `bench/tasks/` and still `validated: false` (its red/green loop has not been run; see
+step 3 below); the rest is plan. It says what the seeded fleet
 must grow for the fleet anomaly-detection checks to be developed test-first, and which of those
 checks the fleet cannot serve at all.
 
@@ -86,8 +89,9 @@ Each is a Kubernetes object in `defects-a.tf`, a role in `fixtures.json` with it
 catalogue entry. No dollar cost beyond the objects themselves — but two of the five are not free in
 effort, because the condition they plant is already true of `seeded-a` and has to be closed
 elsewhere before the planted one means anything. Note also that `seeded-a`'s headroom is finite:
-`main.tf` records that a single `e2-medium`'s allocatable CPU was fully claimed by system pods and
-every fixture went Pending, which is why its pool is two nodes with roughly 600m to spare.
+`main.tf` records that GKE's system pods take 700-860m of an `e2-medium`'s 940m allocatable CPU
+and that on two of them the busier node was within 2-47m of full, which is why its pool is two
+dedicated-core nodes (`e2-standard-2`) with about a core to spare on each.
 
 ### Tier 2 — on `seeded-d` (built)
 
@@ -151,8 +155,13 @@ gate is a case that fails for the environment rather than the agent.
    [`fleet-fixtures.yaml`](fleet-fixtures.yaml), and the fixture counts in
    [`bench-fleet-catalog.md`](bench-fleet-catalog.md).
 2. Done: the three zonal-skew fixtures on `seeded-d`, their roles, probes and catalogue entries.
-3. The first failing eval case: skew with a stockout cause, asserting the agent names the zone,
-   the cause and the blast radius. Red against `main` before any behaviour changes.
+3. Case defined, not yet run (`validated: false` until one red against `main` and three greens
+   on a dev install with the fleet applied, which the eval rule requires and which needs the
+   sandbox image that ships `leeway`):
+   [`topology-zonal-skew-probe`](../../bench/tasks/topology-zonal-skew-probe/task.yaml),
+   asserting the agent names the zone, the cause (`scheduling`, `volume`, `capacity`, or
+   `node-pool` for the sponge pinned to a single-zone pool) and the running share for each of
+   the four single-zone workloads on slot `d`, and that it ran `leeway report` to get there.
 4. Tier 1 fixtures and their cases, one at a time, in the same red-then-green order.
 5. Tier 3 project fixtures last: they are the slowest to become assertable and the least
    informative about the checks' hard part, which is attribution.

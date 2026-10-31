@@ -1,0 +1,123 @@
+{
+  "sweep": {
+    "id": "t_sweep_posture",
+    "status": "done",
+    "created_at": 1000,
+    "block_reason": "",
+    "metadata": {
+      "fleet": [
+        {
+          "project": "onboarding-posture-prod",
+          "cluster": "prod-east",
+          "location": "us-east1",
+          "status": "RUNNING"
+        }
+      ]
+    }
+  },
+  "clusters": [
+    {
+      "id": "t_prod_east",
+      "status": "done",
+      "key": "bootstrap-inventory-cluster-t_prod_east",
+      "title": "Report cluster inventory: prod-east",
+      "block_reason": "",
+      "metadata": {
+        "project": "onboarding-posture-prod",
+        "cluster": "prod-east",
+        "location": "us-east1",
+        "topology": {
+          "k8s_version": "1.33.4-gke.1245000",
+          "node_pools": [
+            {
+              "name": "default-pool",
+              "machine_type": "e2-standard-4"
+            }
+          ],
+          "workload_identity": "enabled",
+          "dataplane_v2": "enabled",
+          "observability": "Cloud Logging only",
+          "deployment_toolchain": "kubectl apply from CI"
+        },
+        "workloads": [
+          {
+            "namespace": "web",
+            "name": "storefront",
+            "kind": "Deployment",
+            "replicas": "3/3",
+            "probes": {
+              "startup": true
+            },
+            "telemetry": "none",
+            "security_context": {
+              "read_only_root_fs": false
+            }
+          },
+          {
+            "namespace": "web",
+            "name": "search-api",
+            "kind": "Deployment",
+            "replicas": "2/2",
+            "probes": {
+              "startup": false
+            },
+            "telemetry": "none",
+            "security_context": {
+              "read_only_root_fs": true
+            }
+          },
+          {
+            "namespace": "jobs",
+            "name": "report-builder",
+            "kind": "Deployment",
+            "replicas": "1/1",
+            "probes": {
+              "startup": true
+            },
+            "telemetry": "none",
+            "security_context": {
+              "read_only_root_fs": true
+            }
+          }
+        ],
+        "findings": [
+          {
+            "check": "readonly-root-fs",
+            "severity": "low",
+            "area": "security",
+            "issue": "storefront runs with a writable root filesystem",
+            "recommendation": "Set readOnlyRootFilesystem: true and mount an emptyDir for the paths it writes",
+            "namespace": "web",
+            "workload": "storefront"
+          },
+          {
+            "check": "probes-startup",
+            "severity": "low",
+            "area": "reliability",
+            "issue": "search-api has no startupProbe",
+            "recommendation": "Add a startupProbe so a slow start is not read as a failed liveness check",
+            "namespace": "web",
+            "workload": "search-api"
+          },
+          {
+            "check": "no-resourcequota",
+            "severity": "low",
+            "area": "reliability",
+            "issue": "Namespace jobs has no ResourceQuota or LimitRange",
+            "recommendation": "Add a ResourceQuota and a LimitRange to jobs",
+            "namespace": "jobs"
+          },
+          {
+            "check": "managed-prometheus",
+            "severity": "low",
+            "area": "observability",
+            "issue": "Managed Service for Prometheus is not enabled on prod-east",
+            "recommendation": "Enable Managed Service for Prometheus so workload metrics are collected"
+          }
+        ],
+        "gaps": []
+      }
+    }
+  ],
+  "archived_clusters": 0
+}

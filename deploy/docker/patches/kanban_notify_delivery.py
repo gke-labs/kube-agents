@@ -143,8 +143,9 @@ and touches disjoint rows. (It has the same claim-before-deliver defect with
 *no* rewind anywhere, which is why the claim helper stays in
 ``kanban_db_notify.py``.)
 
-Setting ``availability.replicas: 2`` would make duplicate Slack posts reachable
-and would additionally require ``advance_notify_cursor`` to become monotonic
+The operator caps ``availability.replicas`` at one gateway replica today, so
+setting it to 2 renders one. Lifting that cap would make duplicate Slack posts
+reachable and would additionally require ``advance_notify_cursor`` to become monotonic
 (``AND last_event_id < ?``). Treat that as a correctness change, not a scaling
 knob.
 

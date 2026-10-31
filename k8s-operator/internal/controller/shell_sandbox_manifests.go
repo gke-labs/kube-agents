@@ -111,6 +111,13 @@ const (
 	// Read by agents/platform/scripts/fleet_scope_args.py; always set, so that a
 	// value a plugin or an operator env override supplied is never the only one.
 	envScopeDeclared = "KUBEAGENTS_SCOPE_DECLARED"
+	// The fleet audits' automatic remediation sweep, off when the value is
+	// "false": audit_report.py's finish then opens no pull request nobody asked
+	// for (an explicit /remediate still does). An operator sets it in
+	// spec.deployment.env; it is forwarded here because finish runs in this
+	// pod, not the agent's, and deploy/sandbox/entrypoint.sh writes it to a
+	// root-owned file the script reads before the session's variable (#3439).
+	envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"
 
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
@@ -533,6 +540,19 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	}
 
 	env = append(env, corev1.EnvVar{Name: envScopeDeclared, Value: strconv.FormatBool(agent.Spec.Scope != nil)})
+	// Normalised to the two words the script reads, so the bytes on the pod
+	// are the operator's, as every other forwarded variable's are: a valueFrom
+	// could name a credential this pod must never hold, and a literal with a
+	// quote or a backslash would stop the entrypoint before sshd starts.
+	if agent.Spec.Deployment != nil {
+		for _, v := range agent.Spec.Deployment.Env {
+			if v.Name == envAuditAutoPromote && v.ValueFrom == nil {
+				off := strings.EqualFold(strings.TrimSpace(v.Value), "false")
+				env = append(env, corev1.EnvVar{Name: envAuditAutoPromote, Value: strconv.FormatBool(!off)})
+				break
+			}
+		}
+	}
 
 	containers := buildShellSandboxContainers(agent, env)
 	volumes := buildShellSandboxVolumes(agent, authorizedKeysSecret)
@@ -644,23 +664,24 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			// Two claims, because one of them must be unreachable from the account
 			// that can write the other. See shellSandboxSshdPath.
 			//
-			// VolumeClaimTemplates is immutable, so an install that already has a
-			// sandbox needs its StatefulSet deleted (--cascade=orphan keeps the
-			// pod up meanwhile) before the operator can lay this down. The feature
-			// is experimental and off by default, which is what makes that
-			// acceptable rather than a migration.
+			// VolumeClaimTemplates is immutable, so a change here is refused on an
+			// install that already has a sandbox. applyShellSandboxStatefulSet
+			// answers that refusal by deleting the StatefulSet with Orphan
+			// propagation and creating it again, which leaves the pod and its
+			// claims running throughout.
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
 				{
 					// Sized from the agent's own /opt/data claim, not independently.
 					// sandbox_mirror.py copies a subset of that volume into this one
 					// on upgrade, so matching them makes the migration fit by
-					// construction — see agentDataStorageSize.
+					// construction — see agentDataStorageSize. spec.storage.size
+					// moves both, through ResolveDataStorageSize.
 					ObjectMeta: metav1.ObjectMeta{Name: shellSandboxDataVolume},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 						Resources: corev1.VolumeResourceRequirements{
 							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: resource.MustParse(agentDataStorageSize),
+								corev1.ResourceStorage: ResolveDataStorageSize(agent),
 							},
 						},
 					},
@@ -741,7 +762,7 @@ func buildShellSandboxVolumes(agent *agentv1alpha1.PlatformAgent, authorizedKeys
 		// See shellSandboxHermesHomePath. Empty and read-only: the point is the
 		// mount, not what is behind it.
 		Name:         shellSandboxHermesHomeVolume,
-		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(shellSandboxHermesHomeSizeLimit))}},
 	}, buildShellSandboxCredentialProxyTokenVolume(), buildGitopsStateVolume(agent)}
 	return volumes
 }
@@ -1110,7 +1131,7 @@ func buildShellSandboxClientKeyVolumes() []corev1.Volume {
 		},
 		{
 			Name:         shellSandboxClientKeyVolume,
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(shellSandboxClientKeySizeLimit))}},
 		},
 	}
 }
@@ -1148,12 +1169,14 @@ fi`,
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("10m"),
-				corev1.ResourceMemory: resource.MustParse("16Mi"),
+				corev1.ResourceCPU:              resource.MustParse("10m"),
+				corev1.ResourceMemory:           resource.MustParse("16Mi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse(shellSandboxClientKeyEphemeralRequest),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("100m"),
-				corev1.ResourceMemory: resource.MustParse("64Mi"),
+				corev1.ResourceCPU:              resource.MustParse("100m"),
+				corev1.ResourceMemory:           resource.MustParse("64Mi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse(shellSandboxClientKeyEphemeralRequest),
 			},
 		},
 		SecurityContext: &corev1.SecurityContext{

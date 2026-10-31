@@ -25,16 +25,27 @@ each role the runner published it reads the `state` assertions the catalog
 (bench/tf/fleet/fixtures.json) declares -- the crashloop has recorded an
 OOMKilled termination, the healthy workloads are Ready, the idle pool's node is
 Ready and tainted, slot b's control plane is still one minor behind its
-channel -- and reports the roles whose fixture is there but not in the shape
-the cases depend on.
+channel and on no patch newer than that channel offers, slots a, b and d keep
+the master authorized-networks block slot c is the drift outlier against, and
+slot c's cluster is past the drift SOP's 24-hour age gate -- and reports the
+roles whose fixture is there but not in the shape the cases depend on. One
+role asserts the room the others schedule into:
+`default-pool-headroom` reads seeded-a's default-pool nodes and every pod
+bound to them and fails when the busier node drops below the headroom margin
+the scan keeps for the next fixtures, ten of them at 10m (#3607: a 10m
+DaemonSet pod stranded for three days and read as drift on its own role,
+which a re-apply cannot fix).
 
-It runs in two places. `scripts/verify_ci_pool_project.py` runs it after the
+It runs in three places. `scripts/verify_ci_pool_project.py` runs it after the
 presence pass and fails a project whose fixtures have drifted. The CI health
 bot's hourly scan (`scripts/eval_dashboard/fixture_state.py`, #1550) runs it
 against every pool project with `--report`, which writes each role's verdict
-as JSON beside the summary so the scan need not parse the warnings. Detection
-is this script's whole job -- nothing here, and nothing in the presubmit, acts
-on a drift.
+as JSON beside the summary so the scan need not parse the warnings. And
+`hack/ci-eval-pr.sh` runs it with `--report` against its leased project,
+where `bench/kube_agents_bench/fixture_drift.py` turns each `drifted` role
+into a `fixture-drift:<role>` infrastructure record for the cases that need
+it. Detection is this script's whole job -- nothing here acts on a drift, and
+nothing anywhere repairs one.
 `--wait` is for a fixture that has just been rescheduled -- the crashloop needs
 its first restart before OOMKilled evidence exists -- and keeps re-reading a
 role that is positively out of shape until it converges or the deadline
@@ -81,6 +92,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -130,7 +142,8 @@ PATH_STEP_RE = re.compile(
 )
 
 # Comparison operators, applied to the LIST of values a path matched. `eq`,
-# `ge`, `after_now` and `minor_behind_channel_default` want exactly one value;
+# `ge`, `after_now`, `age_hours_ge`, `minor_behind_channel_default` and
+# `not_ahead_of_channel` want exactly one value;
 # `any_*` and `none_eq` quantify over however many the path found; `absent`
 # wants none (or, with no path, no objects at all).
 OP_EQ = "eq"
@@ -141,20 +154,72 @@ OP_NONE_EQ = "none_eq"
 OP_ABSENT = "absent"
 OP_AFTER_NOW = "after_now"
 OP_MINOR_BEHIND = "minor_behind_channel_default"
-OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND})
-OPS_WITHOUT_VALUE = frozenset({OP_ABSENT, OP_AFTER_NOW})
+# `not_ahead_of_channel` wants a version the cluster's own release channel
+# offers, or one it has moved past: some patch of the same minor it offers is
+# newer (or, when it offers none of that minor, some version at all). A
+# version newer than all of those is ahead of the channel. seeded-b ran
+# 1.34.12-gke.1011000, newer than both 1.34 patches REGULAR carried, and agents
+# compared it with them and called it current or ahead (#3025, #3269). A patch
+# the channel has moved past is not drift: upgrades cases read it.
+OP_NOT_AHEAD = "not_ahead_of_channel"
+# `age_hours_ge` wants an RFC 3339 timestamp at least `value` hours in the
+# past. The drift SOP leaves a cluster whose `createTime` is under 24 hours old
+# out of every cohort (agents/platform/governance/fleet_consistency_drift_sop.md
+# §1), so a replaced seeded cluster silences the drift finding for a day.
+OP_AGE_HOURS_GE = "age_hours_ge"
+# Ops a `--wait` cannot see converge: only the clock clears them, in hours.
+OPS_ONLY_TIME_CLEARS = frozenset({OP_AGE_HOURS_GE})
+# `node_cpu_spare_ge` reads the matched nodes whole plus the pods bound to each
+# (one all-namespaces pod read per role per pass) and wants every node to keep
+# at least `value` millicores of allocatable CPU unrequested, counting a pod
+# the way the scheduler does: the larger of its containers' sum (restartable
+# init containers included) and its biggest ordinary init container, plus the
+# pod's overhead; Succeeded and Failed pods excluded. No node matched fails it;
+# a matched node that reports no allocatable yet (still registering) leaves the
+# role not checked for the pass rather than drifted.
+OP_NODE_CPU_SPARE = "node_cpu_spare_ge"
+OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND, OP_NODE_CPU_SPARE, OP_AGE_HOURS_GE})
+# Ops whose `value` must be a number; anything else is a catalog bug.
+OPS_WITH_NUMERIC_VALUE = frozenset({OP_AGE_HOURS_GE})
+OPS_WITHOUT_VALUE = frozenset({OP_ABSENT, OP_AFTER_NOW, OP_NOT_AHEAD})
 OPS = OPS_WITH_VALUE | OPS_WITHOUT_VALUE
-# Only the cluster subject can be compared against its channel's default.
-CLUSTER_ONLY_OPS = frozenset({OP_MINOR_BEHIND})
+# Ops that read the subject's objects whole and therefore take no path.
+OPS_WITHOUT_PATH = frozenset({OP_ABSENT, OP_NODE_CPU_SPARE})
+# Ops whose subject must be a `node?<selector>`.
+NODE_SELECTOR_ONLY_OPS = frozenset({OP_NODE_CPU_SPARE})
+NODE_KIND = "node"
+POD_KIND = "pod"
+ALL_NAMESPACES_FLAG = "-A"
+# A pod in a terminal phase holds no CPU on its node.
+POD_PHASES_RELEASED = frozenset({"Succeeded", "Failed"})
+# An init container with this restartPolicy is a sidecar: it keeps running
+# beside the containers, so its request adds to theirs.
+INIT_RESTART_SIDECAR = "Always"
+# Kubernetes CPU quantity suffixes, as millicores per unit; a bare number is cores.
+CPU_SUFFIX_MILLICORES = {"m": 1.0, "u": 1e-3, "n": 1e-6}
+MILLICORES_PER_CORE = 1000.0
+SECONDS_PER_HOUR = 3600.0
+# RFC 3339's UTC designator, and the offset Python's parser wants for it.
+RFC3339_UTC_SUFFIX = "Z"
+ISO_UTC_OFFSET = "+00:00"
+# Only the cluster subject can be compared against its channel's versions.
+CLUSTER_ONLY_OPS = frozenset({OP_MINOR_BEHIND, OP_NOT_AHEAD})
 
-# GKE version strings: `1.33.4-gke.1134000`. Only the minor matters here.
+# GKE version strings: `1.33.4-gke.1134000`. The minor-behind operator reads
+# only the minor; `not_ahead_of_channel` orders whole versions, and refuses
+# anything else rather than misorder it (bench/tf/fleet/seeded_b_pin.py
+# parses the same shape).
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.")
-# Fields of a `clusters describe` document the minor-behind operator reads
-# beside the path it was given.
+GKE_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)-gke\.(\d+)$")
+# The (major, minor) prefix of a parsed version.
+MINOR_PREFIX_LEN = 2
+# Fields of a `clusters describe` document the two channel operators read
+# beside the path they were given, and of the get-server-config channel entry.
 RELEASE_CHANNEL_PATH = "releaseChannel.channel"
 SERVER_CONFIG_CHANNELS = "channels"
 SERVER_CONFIG_CHANNEL = "channel"
 SERVER_CONFIG_DEFAULT = "defaultVersion"
+SERVER_CONFIG_VALID = "validVersions"
 
 # Read ceilings. A fixture read is one API call; anything slower is weather,
 # and the poll loop asks again rather than hanging on it.
@@ -287,15 +352,22 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
                 raise CatalogError(f"{where} names unknown op {op!r} (known: {sorted(OPS)})")
             if op in CLUSTER_ONLY_OPS and subject != CLUSTER_SUBJECT:
                 raise CatalogError(f"{where}: op {op!r} applies to the cluster subject only")
+            if op in NODE_SELECTOR_ONLY_OPS and not str(subject).startswith(f"{NODE_KIND}?"):
+                raise CatalogError(f"{where}: op {op!r} applies to a `{NODE_KIND}?<selector>` subject only")
             if (op in OPS_WITH_VALUE) != ("value" in entry):
                 raise CatalogError(
                     f"{where}: op {op!r} {'takes' if op in OPS_WITH_VALUE else 'takes no'} value"
                 )
+            numeric = _number(entry.get("value")) if op in OPS_WITH_NUMERIC_VALUE else 0.0
+            if numeric is None or not math.isfinite(numeric):
+                raise CatalogError(f"{where}: op {op!r} takes a number")
             path = entry.get("path")
             if path is None:
-                if op != OP_ABSENT:
+                if op not in OPS_WITHOUT_PATH:
                     raise CatalogError(f"{where}: op {op!r} needs a path")
                 steps = None
+            elif op in NODE_SELECTOR_ONLY_OPS:
+                raise CatalogError(f"{where}: op {op!r} reads the nodes whole and takes no path")
             elif isinstance(path, str):
                 steps = parse_path(path)
             else:
@@ -371,6 +443,21 @@ def read_kubectl(kubeconfig: Path, namespace: str | None, subject: str) -> list[
         if named and NOT_FOUND_RE.search(err):
             return []
         raise Unreadable(f"kubectl get {kind} failed ({rc}): {err.strip().splitlines()[-1] if err.strip() else 'no output'}")
+    return _objects(kind, out)
+
+
+def read_pods_all_namespaces(kubeconfig: Path) -> list[dict]:
+    """Every pod in the cluster, the read behind `node_cpu_spare_ge`: a node's
+    requested CPU is the sum over the pods bound to it in any namespace."""
+    cmd = ["kubectl", f"--kubeconfig={kubeconfig}", f"--request-timeout={KUBECTL_REQUEST_TIMEOUT}", "get", POD_KIND, ALL_NAMESPACES_FLAG, "-o", "json"]
+    rc, out, err = _run(cmd, KUBECTL_TIMEOUT_SECONDS)
+    if rc != 0:
+        raise Unreadable(f"kubectl get {POD_KIND} {ALL_NAMESPACES_FLAG} failed ({rc}): {err.strip().splitlines()[-1] if err.strip() else 'no output'}")
+    return _objects(POD_KIND, out)
+
+
+def _objects(kind: str, out: str) -> list[dict]:
+    """The object or the items of a list kubectl printed as JSON."""
     try:
         doc = json.loads(out)
     except ValueError as exc:
@@ -399,8 +486,9 @@ def read_cluster(project: str, name: str, location: str) -> dict:
     return doc
 
 
-def read_channel_default(project: str, location: str, channel: str) -> str | None:
-    """The default version of `channel` at `location`, or None if not listed."""
+def read_channel(project: str, location: str, channel: str) -> dict | None:
+    """`channel`'s entry in get-server-config at `location` (its
+    `defaultVersion` and `validVersions`), or None if not listed."""
     cmd = [
         "gcloud", "container", "get-server-config",
         "--location", location, "--project", project, "--format", "json",
@@ -414,8 +502,7 @@ def read_channel_default(project: str, location: str, channel: str) -> str | Non
         raise Unreadable(f"get-server-config printed something other than JSON: {exc}") from exc
     for entry in (doc.get(SERVER_CONFIG_CHANNELS) or []) if isinstance(doc, dict) else []:
         if isinstance(entry, dict) and entry.get(SERVER_CONFIG_CHANNEL) == channel:
-            default = entry.get(SERVER_CONFIG_DEFAULT)
-            return str(default) if default else None
+            return entry
     return None
 
 
@@ -473,6 +560,81 @@ def _minor(version) -> int | None:
     return int(m.group(2)) if m else None
 
 
+def _gke_version(version) -> tuple[int, ...] | None:
+    """`1.34.11-gke.1209000` -> (1, 34, 11, 1209000), so patches order
+    numerically; None for anything else."""
+    m = GKE_VERSION_RE.match(str(version or ""))
+    return tuple(int(n) for n in m.groups()) if m else None
+
+
+def _timestamp(value) -> datetime | None:
+    """An RFC 3339 timestamp as an aware datetime (UTC when it names no
+    offset); None for anything else."""
+    try:
+        when = datetime.fromisoformat(str(value).replace(RFC3339_UTC_SUFFIX, ISO_UTC_OFFSET))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _millicores(quantity) -> float:
+    """A Kubernetes CPU quantity in millicores; 0 for anything that is not one."""
+    text = str(quantity if quantity is not None else "").strip()
+    if not text:
+        return 0.0
+    # float() admits "inf", "NaN" and an overflowing exponent, none of which
+    # the API server serialises; they count as nothing rather than taking the
+    # pass down when the difference is converted to an integer.
+    for suffix, factor in CPU_SUFFIX_MILLICORES.items():
+        if text.endswith(suffix):
+            n = _number(text[: -len(suffix)])
+            return n * factor if n is not None and math.isfinite(n) else 0.0
+    n = _number(text)
+    return n * MILLICORES_PER_CORE if n is not None and math.isfinite(n) else 0.0
+
+
+def _pod_cpu_request(pod: dict) -> float:
+    """What the scheduler reserves for a pod: the larger of its containers' sum
+    (sidecars included) and the biggest ordinary init container (plus the
+    sidecars started before it), plus the pod's overhead."""
+    spec = pod.get("spec") or {}
+
+    def request(container) -> float:
+        resources = container.get("resources") if isinstance(container, dict) else None
+        return _millicores(((resources or {}).get("requests") or {}).get("cpu"))
+
+    sidecars = 0.0
+    init_peak = 0.0
+    for init in spec.get("initContainers") or []:
+        if isinstance(init, dict) and init.get("restartPolicy") == INIT_RESTART_SIDECAR:
+            sidecars += request(init)
+        else:
+            init_peak = max(init_peak, request(init) + sidecars)
+    containers = sum(request(c) for c in spec.get("containers") or []) + sidecars
+    overhead = _millicores((spec.get("overhead") or {}).get("cpu"))
+    return max(containers, init_peak) + overhead
+
+
+def _spare_by_node(nodes: list, pods_by_node: dict) -> dict[str, int]:
+    """Per matched node, allocatable CPU minus what the pods bound to it request, in millicores, by node name."""
+    spare: dict[str, int] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        name = str((node.get("metadata") or {}).get("name") or "")
+        allocatable_cpu = ((node.get("status") or {}).get("allocatable") or {}).get("cpu")
+        if allocatable_cpu is None:
+            raise Unreadable(f"node {name or '(unnamed)'} reports no allocatable CPU yet; still registering")
+        allocatable = _millicores(allocatable_cpu)
+        requested = sum(
+            _pod_cpu_request(pod)
+            for pod in pods_by_node.get(name, [])
+            if isinstance(pod, dict) and (pod.get("status") or {}).get("phase") not in POD_PHASES_RELEASED
+        )
+        spare[name] = int(round(allocatable - requested))
+    return dict(sorted(spare.items()))
+
+
 def _describe(values: list) -> str:
     if not values:
         return "observed nothing"
@@ -480,12 +642,17 @@ def _describe(values: list) -> str:
     return f"observed {shown}"
 
 
-def evaluate(entry: dict, objects: list, *, channel_default=None) -> str | None:
+def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=None, pods_by_node=None) -> str | None:
     """None when the assertion holds; otherwise one line saying what was seen.
 
     `channel_default` is a callable returning the channel default version for
-    the cluster document, used by the minor-behind operator only; it is
+    the cluster document, used by the minor-behind operator only, and
+    `channel_valid` one returning the channel's valid versions (None when the
+    channel is not listed), used by `not_ahead_of_channel` only; both are
     resolved lazily so a role that never needs server-config never pays for it.
+    `pods_by_node` is a callable returning {node name: [pod, ...]} for every
+    bound pod in the cluster, used by `node_cpu_spare_ge` only, lazy for the
+    same reason.
     """
     op, expected = entry["op"], entry["value"]
     label = " ".join(part for part in (entry["subject"], entry["path"], op) if part)
@@ -517,6 +684,14 @@ def evaluate(entry: dict, objects: list, *, channel_default=None) -> str | None:
                 ok = when > datetime.now(timezone.utc)
             except ValueError:
                 ok = False
+    elif op == OP_AGE_HOURS_GE:
+        when = _timestamp(values[0]) if len(values) == 1 else None
+        if when is None:
+            return f"{label}: {_describe(values)}, not one RFC 3339 timestamp"
+        hours = (datetime.now(timezone.utc) - when).total_seconds() / SECONDS_PER_HOUR
+        if hours < float(expected):
+            return f"{label}: {_describe(values)}, {hours:.1f} hours old"
+        ok = True
     elif op == OP_MINOR_BEHIND:
         ok = False
         if len(values) == 1:
@@ -533,6 +708,41 @@ def evaluate(entry: dict, objects: list, *, channel_default=None) -> str | None:
             ok = want is not None and current == _minor(default) - int(want)
             if not ok:
                 return f"{label}: {_describe(values)} against channel default {default}"
+    elif op == OP_NOT_AHEAD:
+        channel = walk(parse_path(RELEASE_CHANNEL_PATH), objects)
+        name = str(channel[0]) if len(channel) == 1 else None
+        if name is None:
+            return f"{label}: {_describe(values)}; release channel unset"
+        valid = channel_valid(name) if channel_valid else None
+        if valid is None:
+            return f"{label}: {_describe(values)}; get-server-config lists no {name} channel"
+        ok = False
+        if len(values) == 1:
+            version = _gke_version(values[0])
+            if version is None:
+                return f"{label}: {_describe(values)}, not a GKE version"
+            # Any entry outside the GKE shape refuses the roster, as
+            # seeded_b_pin.py does: ordering against the rest could drop the
+            # newest patch and read the master as ahead.
+            offered = []
+            for v in valid:
+                key = _gke_version(v)
+                if key is None:
+                    raise Unreadable(f"{name}'s {SERVER_CONFIG_VALID} entry {v!r} is not a GKE version, so nothing can be ordered against the roster")
+                offered.append((key, str(v)))
+            same_minor = [(key, v) for key, v in offered if key[:MINOR_PREFIX_LEN] == version[:MINOR_PREFIX_LEN]]
+            ok = str(values[0]) in valid or any(key > version for key, _ in same_minor or offered)
+            if not ok:
+                line = ".".join(str(n) for n in version[:MINOR_PREFIX_LEN])
+                where = f"every {line} patch {name} offers (newest {max(same_minor)[1]})" if same_minor else f"every version {name} offers"
+                return f"{label}: {_describe(values)}, newer than {where}"
+    elif op == OP_NODE_CPU_SPARE:
+        if pods_by_node is None:  # pragma: no cover - check_role always supplies it
+            raise CatalogError(f"op {op!r} needs the pod reader")
+        want = _number(expected)
+        spare = _spare_by_node(objects, pods_by_node()) if objects else {}
+        ok = bool(spare) and want is not None and all(v >= want for v in spare.values())
+        return None if ok else f"{label}: {_describe([spare] if spare else [])}"
     else:  # pragma: no cover - load_assertions rejects unknown ops
         raise CatalogError(f"unknown op {op!r}")
     return None if ok else f"{label}: {_describe(values)}"
@@ -545,7 +755,7 @@ class Reader:
     """Reads for one pass, with the server-config lookups memoised.
 
     A pass over every catalog role must not pay one get-server-config per assertion;
-    a location's channel defaults do not change between two reads seconds
+    a location's channel versions do not change between two reads seconds
     apart.
     """
 
@@ -553,7 +763,10 @@ class Reader:
         self.directory = directory
         self.project = project
         self.context = context
-        self._defaults: dict[tuple[str, str], str | None] = {}
+        # A failed read is kept too, so the pass pays one get-server-config
+        # per location and channel whichever way it went.
+        self._channels: dict[tuple[str, str], dict | None | Unreadable] = {}
+        self._pods: dict[Path, dict[str, list]] = {}
 
     def objects_for(self, role: str, spec: dict, subject: str) -> list:
         kubeconfig = self.directory / f"{role}{KUBECONFIG_SUFFIX}"
@@ -569,31 +782,73 @@ class Reader:
             return [read_cluster(self.project, name, location)]
         return read_kubectl(kubeconfig, spec["namespace"], subject)
 
-    def channel_default_for(self, spec: dict):
+    def _channel(self, spec: dict, channel: str) -> dict | None:
         slot = spec["cluster_slot"]
         location = self.context.get(f"{CONTEXT_LOCATION_PREFIX}{slot}")
+        if not location:
+            raise Unreadable(f"{CONTEXT_FILE} records no location for slot {slot!r}")
+        key = (location, channel)
+        if key not in self._channels:
+            try:
+                self._channels[key] = read_channel(self.project, location, channel)
+            except Unreadable as exc:
+                self._channels[key] = exc
+        cached = self._channels[key]
+        if isinstance(cached, Unreadable):
+            raise cached
+        return cached
 
+    def channel_default_for(self, spec: dict):
         def lookup(channel: str) -> str | None:
-            if not location:
-                raise Unreadable(f"{CONTEXT_FILE} records no location for slot {slot!r}")
-            key = (location, channel)
-            if key not in self._defaults:
-                self._defaults[key] = read_channel_default(self.project, location, channel)
-            return self._defaults[key]
+            default = (self._channel(spec, channel) or {}).get(SERVER_CONFIG_DEFAULT)
+            return str(default) if default else None
+
+        return lookup
+
+    def channel_valid_for(self, spec: dict):
+        def lookup(channel: str) -> list[str] | None:
+            entry = self._channel(spec, channel)
+            if entry is None:
+                return None
+            valid = entry.get(SERVER_CONFIG_VALID)
+            # An empty roster is a failed read, as bench/tf/fleet/seeded_b_pin.py
+            # treats it: every master would otherwise read as ahead of it.
+            if not isinstance(valid, list) or not valid:
+                raise Unreadable(f"get-server-config's {channel} entry carries no {SERVER_CONFIG_VALID} list")
+            return [str(v) for v in valid]
+
+        return lookup
+
+    def pods_by_node_for(self, role: str):
+        """The cluster's bound pods grouped by node, read once per role per pass."""
+        kubeconfig = self.directory / f"{role}{KUBECONFIG_SUFFIX}"
+
+        def lookup() -> dict[str, list]:
+            if kubeconfig not in self._pods:
+                grouped: dict[str, list] = {}
+                for pod in read_pods_all_namespaces(kubeconfig):
+                    node = (pod.get("spec") or {}).get("nodeName")
+                    if node:
+                        grouped.setdefault(str(node), []).append(pod)
+                self._pods[kubeconfig] = grouped
+            return self._pods[kubeconfig]
 
         return lookup
 
 
-def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[str]]:
-    """(drift lines, unreadable lines) for one role in one pass.
+def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[str], bool]:
+    """(drift lines, unreadable lines, worth waiting for) for one role in one pass.
 
     Objects are read once per distinct subject, so two assertions on the same
     pod list cost one kubectl. An assertion whose subject could not be read
     lands in the second list; the caller decides what that means once it
-    knows whether anything else in the role was positively out of shape.
+    knows whether anything else in the role was positively out of shape. The
+    flag is true when some failed assertion could converge within a wait,
+    which an age gate cannot.
     """
     drift: list[str] = []
     unreadable: list[str] = []
+    settling = False
     cache: dict[str, list] = {}
     for entry in spec["state"]:
         subject = entry["subject"]
@@ -607,13 +862,20 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
             unreadable.append(f"{subject}: {objects}")
             continue
         try:
-            problem = evaluate(entry, objects, channel_default=reader.channel_default_for(spec))
+            problem = evaluate(
+                entry,
+                objects,
+                channel_default=reader.channel_default_for(spec),
+                channel_valid=reader.channel_valid_for(spec),
+                pods_by_node=reader.pods_by_node_for(role),
+            )
         except Unreadable as exc:
             unreadable.append(f"{subject}: {exc}")
             continue
         if problem:
             drift.append(problem + (f" (why: {entry['why']})" if entry["why"] else ""))
-    return drift, unreadable
+            settling = settling or entry["op"] not in OPS_ONLY_TIME_CLEARS
+    return drift, unreadable, settling
 
 
 def run(directory: Path, catalog: Path, project_override: str | None, wait: float, interval: float, report: Path | None = None) -> int:
@@ -644,11 +906,12 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
     }
     converged: list[str] = []
     last: dict[str, tuple[list[str], list[str]]] = {}
+    settling: dict[str, bool] = {}
     deadline = time.monotonic() + max(wait, 0.0)
     while True:
         reader = Reader(directory, project, context)
         for role in sorted(pending):
-            drift, unreadable = check_role(reader, role, pending[role])
+            drift, unreadable, settling[role] = check_role(reader, role, pending[role])
             last[role] = (drift, unreadable)
             if not drift and not unreadable:
                 converged.append(role)
@@ -667,7 +930,9 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
         # it would make every scan with one unreachable API server pay the
         # full deadline for nothing. Such a role is still re-read while another
         # role keeps the loop going, so a transient failure gets its retries.
-        waiting = [role for role in pending if last[role][0]]
+        # An age gate is the same exception: a cluster under a day old is still
+        # under it when the wait runs out.
+        waiting = [role for role in pending if settling[role]]
         if not waiting or remaining <= 0:
             break
         time.sleep(min(interval, remaining))

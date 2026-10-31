@@ -28,11 +28,12 @@ agent to do once the manifest hands it the outliers.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import re
 import shlex
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
 from collections import Counter
@@ -57,12 +58,9 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 ]
 
 DEFAULT_TIMEOUT_S = 60
-# What `timeout(1)` exits with, so a timed-out gcloud reads the same in the
-# manifest whichever layer cut it off.
-TIMEOUT_RC = 124
-# The credential proxy's admitted count at the operator's default limit;
-# collect.py's MAX_WORKERS comment has the reasoning.
-MAX_WORKERS = 4
+# How many clusters a sweep reads at once is broker_admission.sweep_width(),
+# resolved in collect_fleet: what the credential broker admits, less headroom
+# for chat (collect.py's comment above its own collect_fleet has the reasoning).
 # How much of gcloud's stderr a `gate-failed` entry keeps: enough to carry the
 # API's error sentence, short enough not to dominate the manifest.
 ERROR_EXCERPT_CHARS = 300
@@ -112,6 +110,8 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -229,36 +229,14 @@ def log(msg: str) -> None:
     print(f"[fleet_drift] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+TIMEOUT_RC = collector_run.TIMEOUT_RC
+Discovery = collector_run.Discovery
+run_and_gate = collector_run.run_and_gate
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
-
-
-def default_run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        return Run(argv, TIMEOUT_RC, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
-    except Exception as exc:
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
-
-
-def run_and_gate(argv: list[str], *, run: RunFn) -> tuple[object | None, Run]:
-    result = run(argv)
-    if result.rc != 0 or not result.stdout.strip():
-        return None, result
-    try:
-        return json.loads(result.stdout), result
-    except json.JSONDecodeError:
-        return None, result
 
 
 def output_digest(text: str) -> str:
@@ -277,26 +255,6 @@ def _record(argv_str: str, result: Run) -> dict:
 # --------------------------------------------------------------------------- #
 # §1: fleet enumeration
 # --------------------------------------------------------------------------- #
-
-class Discovery(NamedTuple):
-    projects: list[str]
-    # Set when no project could be resolved at all -- neither the active
-    # project nor `projects list` answered. An empty fleet is then a failure
-    # to look, not a fleet with nothing in it, and the manifest says so.
-    error: str | None
-    # Set when discovery resolved part of the fleet and lost the rest: the
-    # active project answered and `projects list` did not, so the scope is one
-    # project out of an unknown number. A warning on stderr was all this used
-    # to be, and stderr is not in the manifest -- so the run read one project,
-    # marked every entry `collected`, and the document that followed carried no
-    # coverage gap. `finish` then has no reason to hold a previous ledger
-    # finding on a cluster in any other project: it is absent from the
-    # document, absent from the manifest, and therefore announced resolved and
-    # its remediation pull request stale-closed. `collect_fleet` turns this
-    # into a `gate-failed` target so the loss is a row the document must
-    # account for, the way a project whose `clusters list` failed already is.
-    partial: str | None = None
-
 
 def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
     """§1.1's project scope. `--project` scopes the run to one project; else
@@ -1805,9 +1763,6 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
     checks_run: dict[tuple, list[str]] = {ckey(c): [] for c in clusters}
     candidates: dict[tuple, list[dict]] = {ckey(c): [] for c in clusters}
     outlier_facet_count: dict[tuple, int] = {ckey(c): 0 for c in clusters}
-    # §3.6's guard rewrites a cluster's candidates from its `ckey` alone, so it
-    # needs the same name the per-facet emits used.
-    targets: dict[tuple, str] = {ckey(c): target_name(c) for c in clusters}
 
     layout = cohort_layout(clusters, now=now)
     env_of, strategy = layout.env_of, layout.strategy
@@ -1873,7 +1828,6 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
                         continue
                     if _shape_mismatch(facet, c, baseline_clusters):
                         continue
-                    name = target_name(c)
                     inferred = baseline_inferred or (env_matters and env_of[ckey(c)][1] == "inferred")
                     base_sev = facet.base_severity(observed) if callable(facet.base_severity) else facet.base_severity
                     sev, downgrades = apply_severity_ladder(base_sev, r, k, inferred)
@@ -1908,7 +1862,8 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> tuple[list[di
     return enumerate_project_clusters(project, run=run)
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int | None = None, now: datetime | None = None) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
     discovery = discover_fleet(project, run=run)

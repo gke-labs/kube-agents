@@ -21,19 +21,25 @@
 # anything. A mistaken "revert" here, if a human follows it, takes the service
 # down. A mistaken "codify" on the sibling leaves a setting loose for longer.
 #
-# THIS CASE IS RED, AND #3116 OWNS THE RED. Runs against a dev install on
-# 2026-10-15 passed every deterministic check below and failed the judge: the agent
-# reported every fact correctly and then recommended restoring a state the
-# cluster had already failed to start, without ever reading the rollout
-# history that says so. That issue proposes the Cluster Agent skill, and
-# names this case as the red to develop against.
+# THIS CASE WAS THE RED #3116 OWNED, AND #3227 FLIPPED IT. Runs against a dev
+# install on 2026-10-15 passed every deterministic check below and failed the
+# judge: the agent reported every fact correctly and then recommended
+# restoring a state the cluster had already failed to start, without ever
+# reading the rollout history that says so. #3227 shipped the Cluster Agent
+# skill that issue proposed, `gke-load-bearing-change`, on 2026-10-16, and
+# three runs against a dev install recommended codifying where the control
+# image recommended reverting.
 #
-# It carries no `expected_fail: true` marker, deliberately. The marker is for
-# a gap whose fix belongs to someone else, and it does its work through
-# bench-gate -- which never sees a case registered nowhere, so on this case it
-# would be inert today. The pull request that registers it is where the
-# decision belongs, on what is true then: #3116 open and owned by someone
-# else means the marker, #3116 closed means neither.
+# It carries no `expected_fail: true` marker. The marker is for a gap whose
+# fix belongs to someone else, and the rule this header set was "#3116 open
+# and owned by someone else means the marker, #3116 closed means neither".
+# #3116 is closed, so neither -- and the registration below is what makes
+# bench-gate able to see this case at all, which is the other half of why
+# the marker would have been inert before it.
+#
+# A first nightly red is therefore a regression to investigate, not the
+# known gap: the deterministic checks here passed even while the advice was
+# wrong, so read the judged score rather than the check tally.
 #
 # WHAT THE AGENT HAS TO ESTABLISH, AND WHAT IT CANNOT.
 #
@@ -129,11 +135,16 @@
 #
 # Isolation class: namespace-scoped. Eligible tier: nightly.
 #
-# NOT REGISTERED YET, and deliberately -- see the KNOWN_UNREGISTERED entry in
-# scripts/validate_bench_cases.py. Every case with a `stack:` holds lock-infra
-# for its whole run, so the nightly's stack-bearing cases run one at a time
-# whatever EVAL_TASK_PARALLELISM is, and that serial chain is already at or
-# past the 480m periodic deadline on cost hints alone.
+# REGISTERED in hack/eval/nightly-cases.txt on 2026-10-20, at the 900s drift
+# band, and listed in hack/eval/nightly-main-b.txt so the two halves' chains
+# stay balanced. It holds lock-infra for its whole run, as every case with a
+# `stack:` does.
+#
+# What it waited for was room on that chain, and what provided it was the
+# recorder periodic's ceiling going from 480m to 720m on 2026-10-20 -- the
+# first night at it ran 401 minutes and graded its part whole, where the three
+# before truncated at 484-485. One night of margin, so this case is among the
+# first to drop if the ceiling goes back.
 ---
 id: gitops-drift-load-bearing-change-triage
 name: A loosening the workload depends on is triaged to a fix that runs, not a revert
@@ -181,8 +192,9 @@ domain: incident-triage
 #
 # The three instructions are the sibling cases', each arrived at the hard way:
 # the status filter on kanban_list (a bare call pages oldest-first and misses
-# the newest card), the instruction to keep waiting (the stack returns when the
-# card is FILED, not when it is finished), and verbatim reproduction (a summary
+# the newest card), the instruction to keep waiting (the stack now waits for
+# the card to finish, up to a ceiling, so this is the fallback for a card
+# handed over still running), and verbatim reproduction (a summary
 # drops exactly the "What to do" section the delivery objective reads).
 #
 # It names the namespace, because that is how the card is found, and nothing
@@ -295,7 +307,10 @@ expected_output: |
     its runAsNonRoot setting having been turned off outside GitOps.
   - It names 'kubectl-edit' as the field manager that took the setting, against
     'argocd-controller' which owns the declared spec.
-  - It names the principal who made the change, 'eval-operator@example.com'.
+  - It names the principal who made the change: either the one the card
+    records, 'eval-operator@example.com', or the principal the Cloud Logging
+    entry for the change records, together with the observation that it
+    differs from the card.
   - It establishes that the change is load-bearing -- that the state git
     declares does not run -- and cites at least one piece of cluster evidence
     for that. Any one of these is sufficient: the pods are healthy now under
@@ -360,11 +375,19 @@ verification_spec:
       type: report_contains
       # CUJ 1's first clause, graded. The long note on the objective of the
       # same name in gitops-drift-deleted-policy-triage carries the argument:
-      # why the sibling leaves this judged, the five-run measurement that says
-      # asserting it is safe, and the order to diagnose a red in -- the drift
-      # card versus a neighbouring event card first, the template's "Done when"
-      # clause second, and never this objective.
-      required_phrases: ["eval-operator@example.com"]
+      # why the sibling leaves this judged, the measurement that says asserting
+      # it is safe, why it accepts the identities the nightly plants under as
+      # well as the planted principal -- an agent that checks the card against
+      # Cloud Logging finds the real caller and reports that, which is a pass
+      # -- and the order to diagnose a red in: the drift card versus a
+      # neighbouring event card, then a dev install, then a CI identity, and
+      # only then the template's "Done when" clause.
+      any_of_phrases:
+        - "eval-operator@example.com"
+        # The recorder nightly plants under this identity, so the audit log names it.
+        - "eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
+        # The Claude nightly twins plant under this identity.
+        - "prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 
   - name: triage-names-the-loosened-setting
     role: objective

@@ -13,7 +13,7 @@
 
 **Scope:** How the eval scorer decides, where its results are stored, how a baseline is
 established, compared against and reset, and how a quality-over-time dashboard reads the same data.
-**Owns:** the verdict ladder as built, the JSONL record format, the five-component version key, the
+**Owns:** the verdict ladder as built, the JSONL record format, the six-component version key, the
 admission rule, the storage backends, and rung 6's comparison.
 
 **On the ladder and [`testing-strategy.md`](testing-strategy.md).** §4.2 of that document specifies
@@ -90,8 +90,10 @@ correctness is the lane's doing and the repetition is reported not applicable ra
 
 **Rung 3's signals are what the fixtures proved are populated** — `status == "success"`, a
 non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. One exception to the token signal:
-a record the harness's inject transport produced carries no usage at all (the gateway reports
-none), so its liveness signal is the executor's own events instead — a trajectory entry named
+a record the harness's inject transport produced carries a null total when the gateway reports
+no usage for the chain (a gateway older than the probe's `usage` field, or turns that published
+none). The harness keeps that total null even when the delegated workers billed, so the rung
+never passes on the workers' spend alone; its liveness signal is the executor's own events instead — a trajectory entry named
 `a2a.status-update` whose `args.final` is true (the task ended) or whose `args.state` is `working`
 (the executor spawned the persona; a task the harness cancelled at its budget has no final entry)
 stands in for a null total and nothing else; a null total with no such entry, or with only a
@@ -126,8 +128,8 @@ it delegates, so `classify_rep()` classifies the repetition `infra` under a reas
 with the marker. The dashboard reads that lead to count these apart from quota-storm repetitions
 (`scripts/eval_dashboard/SCHEMA.md`). A ceiling hit after a partial delivery carries no marker
 and grades on what arrived. Both the ceiling check and the never-ran signature sit after rung 1 —
-the catastrophic score grades the world outside the record — the cluster, and on the inject lane
-the GitOps repository — rather than the record, so a tripped safeguard is
+the catastrophic score grades the world outside the record — the cluster and the GitOps
+repository — rather than the record, so a tripped safeguard is
 positive evidence something acted and keeps blocking, whether the worker was still running at the
 deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
 one without the marker still blocks at rung 2. The near-misses still block at rung 3:
@@ -148,19 +150,19 @@ transport carries the task's lifecycle envelope as its trajectory (`inject.task`
 calls without their results, so it names no card. The delegation wait reads the cards from the
 pod instead, by the Hermes session the bridge's `api` executor ran the turn in, so such a record
 can carry the delegated workers' tagged entries and token counts. The scorer still treats
-`worker_commands`, `worker_agents`, a `tool_called` in the `workers` or `all` scope, and a
+`worker_commands`, `worker_agents`, `worker_budget`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
 `tool_called` with a `result` pattern (the trace records no results) as blind on
 every such record, a policy that stays until `scoring.py` grades them on records that carry the
 workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); any other router-scope `tool_called` is blind only when the
-door showed no trace or a trace that lost calls: the first matrix run through the door (#2007, 2026-09-25) collapsed
+door showed no trace or a trace that lost calls, and one naming only entries the harness writes itself (`cases.HARNESS_WRITTEN_ENTRIES`: a stopped ask's, and a pushed-report replay's plant entry) is never blind: the first matrix run through the door (#2007, 2026-09-25) collapsed
 `agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
 re-reads such a record before the rungs. The condition is the record's, not the environment's: the
 trajectory carries the transport's task marker (`_inject_record()` in `scoring.py`), and for the
 router-scope `tool_called` also either no `a2a.activity` marker and nothing outside the envelope,
 or a marker that reports a loss (`_inject_blind()`); `test_scoring.py` holds the literals equal to
 the transport's. When it holds,
-every report entry the task declares whose check is made of `tool_called`, `worker_commands` or
-`worker_agents` leaves and nothing else (`CaseSpec.transport_blind_checks`, by entry name, split
+every report entry the task declares whose check is made of `tool_called`, `worker_commands`,
+`worker_agents` or `worker_budget` leaves and nothing else (`CaseSpec.transport_blind_checks`, by entry name, split
 into `trace_blind_checks` and `worker_blind_checks` by which condition applies; a compound mixing
 in an applicable leaf is not in either set, because that leaf can fail on any transport and
 setting the entry aside would hide it) is set aside as `not_applicable`, whatever
@@ -186,7 +188,8 @@ on a persona that made no call fails there as it would on the api transport. A m
 not carry every call the persona made (the door's cap or the executor's budget dropped some, a
 part or a count could not be read, a wrapper's input was truncated and its nested names with it,
 or the read that ended the wait carried no trace and the fold holds an earlier read's), and such a
-record is treated as blind like one with no marker (`_inject_trace_vouched()`), since grading over
+record is treated as blind like one with no marker (`_inject_trace_vouched()`; a record of more
+than one task, a pushed-report replay's, needs a clean marker per task), since grading over
 it could fail a call that happened or pass a safeguard over one. One exception runs the other way:
 a `none`-wrapped check ("this tool was never called", `CaseSpec.negated_trace_blind_checks`) that
 _failed_ on a record carrying the marker stays graded whatever the loss, because the trace shows
@@ -240,6 +243,14 @@ not grade is neither: it ran and was read, so it is not a wiped case for the flo
 arms nor disarms the all-cases guard, which reads the gradable cases alone. It is listed under
 its own key, `not_graded`, and named in a note; a run whose every case was not graded is
 `not_evaluated` with a reason saying the suite graded nothing, not that infrastructure took it.
+A case not run because the lease-time seeded-fleet scan saw a fixture it needs drifted
+(`hack/ci-eval-pr.sh` records every repetition under `fixture-drift:<role>`;
+`kube_agents_bench/fixture_drift.py` maps the scan onto the matrix) is infrastructure, but it is
+not a wiped case for the floor either: a role is excused only when the lease-time read, after
+the pool verifier's convergence wait, and the hourly scan's last two passes all show it drifted,
+so it is not weather a rerun clears, and nothing in the change can repair it. It is listed under `fixture_drift` (`{case: [fixture-drift:<role>]}`) and
+named in a note. It still counts toward the all-cases guard, and a case with even one repetition
+lost some other way is weather as before.
 A blocking case outranks the
 weather: the outcome is red, with the lost cases still listed among the reasons. `green` stays in
 the JSON, derived from `outcome`, so a reader that only knows the boolean sees not-evaluated as
@@ -573,7 +584,7 @@ job and withhold it from the other, so the split was unimplementable until the n
 dedicated account. That is not a reviewer's preference; it is what the guard is made of — which is
 why creating `eval-baseline-recorder` is step 2 of [Provisioning it](#provisioning-it) rather than a
 follow-up, and why the change that armed the store named it on the periodic in the same diff.
-Different accounts in `kube-agents-prow`, the same twelve roles in every pool project: the nightly
+Different accounts in `kube-agents-prow`, the same thirteen roles in every pool project: the nightly
 runs the same `hack/ci-eval-pr.sh` against a leased project, so
 [`docs/ci-pool-projects.md`](../ci-pool-projects.md) section 3 grants and verifies its account
 beside the presubmit's, after the second nightly died at `get-credentials` on a project that
@@ -897,8 +908,8 @@ precisely to avoid this.
 
 ## The version key
 
-A baseline is valid for exactly one combination of five versions. Three are read off the run
-itself, so they cannot go stale:
+A baseline is valid for exactly one combination of five versions and one `spec.mode`. Three of the
+five versions are read off the run itself, so they cannot go stale:
 
 | Component         | Read from                      | Covers                                       |
 | ----------------- | ------------------------------ | -------------------------------------------- |
@@ -911,6 +922,11 @@ itself, so they cannot go stale:
 The judge model is its own component, pinned independently of the agent model, because a judge that
 tracks whatever the agent is running cannot be told apart from an agent that got better — and a
 drifting judge moves every baseline at once.
+
+A sixth component, `mode`, is the `spec.mode` the run graded (`today` or `next`), read off the
+transport (`AGENT_TRANSPORT=inject` is `next`). It is written only when it is not `today`, so the
+lines recorded before it existed match today's key unchanged. `bench/baselines/README.md` is
+canonical for it.
 
 `fleet` and `verifiers` are hand-bumped integers rather than content hashes: a hash changes on a
 comment typo. The trade-off is real — a behaviour change with no bump silently compares against a
@@ -958,10 +974,11 @@ is on `main` and carries no `PULL_NUMBER`, so both conditions above pass it thro
 is the third condition, enforced in the same two places, and it exists because `VersionKey` carries
 no field naming the build a sample came from: once written, a candidate's record and `main`'s are
 indistinguishable, and the candidate is then measured for non-inferiority against a window it just
-moved. A next-mode run (`EVAL_MODE_NEXT=1`) is the fourth condition and the second member of the
-class, for the same reason, enforced in `hack/ci-eval-pr.sh` alone until the key carries a mode
-field. `bench/baselines/README.md` is canonical for the rule; this paragraph records why the
-read-only class exists.
+moved. The today lane (`EVAL_ROLLBACK_LANE=1`) is the fourth condition and the second member of the
+class, enforced in the same two places: its key reads `today`, but it grades an install rolled back
+from `next`, which is not what today's window measures. A next-mode run on `main` is not in the
+class: the key's `mode` files it under a window of its own. `bench/baselines/README.md` is
+canonical for the rule; this paragraph records why the read-only class exists.
 
 Two independent reasons, and the weaker one is the one usually cited. The narrow reason is
 self-admission: a case that wrote its own evidence could be admitted by the very diff that makes it
@@ -1024,7 +1041,7 @@ match the presubmit's `EVAL_REPETITIONS`, on the grounds that "the baseline must
 the thing compared against it is measured." That is wrong as stated, and worth correcting because it
 would forfeit the whole gain above. The store holds a pass **rate**. A rate over ten runs and a rate
 over three estimate the same quantity, the second just more noisily. What has to match is how a
-single run is produced — same task, agent, judge, and five-version key — not how many were taken.
+single run is produced — same task, agent, judge, and version key — not how many were taken.
 More repetitions on the recording side is strictly better evidence.
 
 #### The job definition
@@ -1036,7 +1053,8 @@ It is `ci-kube-agents-eval-nightly` in
 export. Its schedule, budget and fan-out are the decisions recorded on
 [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491). The YAML is not
 reproduced here — a copy in a second repository is a copy that goes stale, and the shape below is
-the part that matters.
+the part that matters. It and its `-writers` part grade `spec.mode: next` (`EVAL_MODE_NEXT=1`) and
+so record under the version key's `next` mode. No job in the file records under `today` now.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
 the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, and `EVAL_REPETITIONS` only if the
@@ -1058,7 +1076,7 @@ merge-rate data:
   overruns its night cannot overlap the next.
 - **`optional` is a presubmit-only field** and must not appear. It is Tide's "does this gate the
   merge" flag, and a periodic gates nothing. The substantive point is carried by the eval
-  dashboard's Nightly report and the 9 AM ET digest instead (`scripts/eval_dashboard/nightly.py`,
+  dashboard's Nightly report and the 11 AM ET digest instead (`scripts/eval_dashboard/nightly.py`,
   `post_health.py`; the merged job creates no TestGrid test group): a silently failing recorder
   stops the store filling, and an empty store reads as a legitimate green to every presubmit,
   because an unadmitted case cannot fire the quality rungs. Nothing degrades visibly in the gate,
@@ -1069,15 +1087,15 @@ merge-rate data:
   run.
 
 Three numbers in it are priced rather than measured. The repetition count is the script's default 3
-unless the job sets `EVAL_REPETITIONS`. The timeout is `480m`, not the presubmit's `360m`: the
+unless the job sets `EVAL_REPETITIONS`. The timeout is `840m` on the main halves (`720m` before the gemini-4-argon window), not the presubmit's `360m`: the
 twenty-six-task matrix priced at ~532–552 serial minutes at three repetitions, and the presubmit
 realised only ~1.15× on whole-job wall clock against its serial matrix estimate on 2026-09-10 (the
 periodic's timeout comment; the fixed provision-and-deploy term is inside that figure, which is
 why it sits far below the unit-loop speed-ups measured under [Open items](#open-items)), at which
 that night projected to ~470–490 minutes — `360m` would truncate most nights, and the job gates
 nothing, so a long night costs a lease and nothing else. The thirty-nine-task matrix since
-2026-09-16 prices at ~775–795 serial minutes (the budget paragraph in
-`hack/eval/nightly-cases.txt`), which at 1.15× is ~675–690 — over `480m` — and fits only if the
+2026-09-16 prices at ~775–795 serial minutes (the budget paragraph, now
+frozen in `hack/eval/nightly-budget-history.txt`), which at 1.15× is ~675–690 — over `480m` — and fits only if the
 nightly, alone on the quota and two lanes wider, realises ~1.65×; the first nights measure it
 (#1491). The fan-out is
 `EVAL_TASK_PARALLELISM=6`, wider than the presubmit's 4, because the nightly is alone on the model
@@ -1109,7 +1127,7 @@ does — see
 [Two conditions](#two-conditions-that-guard-depends-on).
 
 The shape, with the harness elided (the alert row in the table above is met through the eval
-dashboard's Nightly report and the 9 AM digest rather than a TestGrid tab, so the job creates no test
+dashboard's Nightly report and the 11 AM digest rather than a TestGrid tab, so the job creates no test
 group):
 
 ```yaml
@@ -1143,7 +1161,7 @@ periodics:
       # prices at ~532-552min serial at three repetitions, and the presubmit's
       # fan-out realised ~1.15x, which 360m would truncate most nights. Priced,
       # not measured; confirm on the first three nights (kube-agents#1491).
-      timeout: 480m
+      timeout: 720m
       grace_period: 5m
     spec:
       # NOT prowjob-default-sa, which is what the presubmit runs as. The
@@ -1221,7 +1239,7 @@ blocks meanwhile; [The roster, and the mode](#the-roster-and-the-mode) below say
 
 Three resets, all of which happen without deleting anything.
 
-**Version bump (automatic).** Any of the five components changing means zero lines match the
+**Version bump (automatic).** Any of the six components changing means zero lines match the
 current key, so every case drops to unadmitted and re-screens itself over the next seven nights at
 the default three repetitions. Old lines stay — they are still true about the software they were
 measured on.
@@ -1513,7 +1531,6 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   invocations instead of 51 and land the job near 61min, which is real money. It is declined
   because it is not verdict-identical to three unconditional repetitions, in four ways, and the
   cheap version of a gate that quietly grades differently is worse than an expensive one:
-
   - **Rung 5 inverts.** It fires on `expected_fail` and _every_ repetition passing. Sample once and
     a single flaky pass flips the marker that three repetitions would have held; the retry never
     triggers, because from the sampler's point of view nothing failed.
@@ -1550,7 +1567,7 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   missing. The absolute rungs (1, 2, 3, 5) and the correctness floor still block, so the failure
   looks like a working gate. Both exports exist since
   [oss-test-infra#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698).
-- The nightly periodic's three numbers — the script's default repetitions, the `480m` timeout and
+- The nightly periodic's three numbers — the script's default repetitions, the `840m` timeout and
   `EVAL_TASK_PARALLELISM=6` — are priced, not measured;
   [The job definition](#the-job-definition) says from what. Confirm them on the first three nights'
   wall clock and record the result on
@@ -1568,9 +1585,9 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 - The `bench/tf/fleet` drift-reconcile schedule — a drifted fixture silently changes what a
   baseline means.
 - **The aggregate's sample floor is a placeholder for a real test.**
-  `EVAL_AGGREGATE_MIN_SCORED` (default 30) refuses to compare below ten admitted cases' worth of
-  repetitions, because a flat margin at `n = 3` measures luck. It is a floor rather than a wider
-  margin because no single flat margin is right at both `n = 3` and `n = 600`, and the fix that
+  `EVAL_AGGREGATE_MIN_SCORED` (default 30, ten admitted cases' worth when it was set) refuses to
+  compare below that many scored repetitions, because a flat margin at `n = 3` measures luck. It
+  is a floor rather than a wider margin because no single flat margin is right at both `n = 3` and `n = 600`, and the fix that
   actually scales is a two-proportion test. The store now holds the variance estimate that test
   needs, and [Sizing the aggregate margin](#sizing-the-aggregate-margin-measured-2026-09-29)
   priced it: on 2026-09-29 it reds nothing the flat 0.10 does not, one failed repetition

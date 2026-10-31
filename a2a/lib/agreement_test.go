@@ -20,6 +20,11 @@ import (
 	"time"
 )
 
+// deliveryWait bounds each wait for events to arrive through a durable.
+// Under the race detector on a loaded runner the two deliveries after a
+// rebind took longer than the 5 s these waits used to give.
+const deliveryWait = 30 * time.Second
+
 const (
 	agreementSupervisor = "gateway"
 	agreementRequester  = "chatops"
@@ -172,7 +177,7 @@ func TestAttacker_ForgedSupervisorTerminalOnTheExecutorsOwnSubject(t *testing.T)
 		if err != nil {
 			t.Fatal(err)
 		}
-		waitFor(t, 5*time.Second, "the two honest events", func() bool { return got.count() == 2 })
+		waitFor(t, deliveryWait, "the two honest events", func() bool { return got.count() == 2 })
 		time.Sleep(200 * time.Millisecond)
 		for _, env := range got.all() {
 			if env.From.Session == agreementSupervisor {
@@ -421,17 +426,21 @@ func TestTasksGet_FoldsTheSupervisorTerminalInStreamOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitFor(t, 5*time.Second, "four events across both subjects", func() bool { return live.count() == 4 })
+	waitFor(t, deliveryWait, "four events across both subjects", func() bool { return live.count() == 4 })
 	liveTask, err := FoldTask(taskID, live.all())
 	if err != nil {
 		t.Fatalf("fold of the live view: %v", err)
 	}
-	reader, err := Connect(ctx, clientURL(s), WithName("reader"), WithAgreementPolicy(AgreementPolicy{Supervisor: agreementSupervisor}))
+	// A fresh context for the reads: the wait above may run to deliveryWait,
+	// which is as long as testCtx, so a slow delivery the wait admits must
+	// not fail the two replays that check it.
+	readCtx := testCtx(t)
+	reader, err := Connect(readCtx, clientURL(s), WithName("reader"), WithAgreementPolicy(AgreementPolicy{Supervisor: agreementSupervisor}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	replayed, err := reader.TasksGet(ctx, addressee, taskID)
+	replayed, err := reader.TasksGet(readCtx, addressee, taskID)
 	if err != nil {
 		t.Fatalf("TasksGet: %v", err)
 	}
@@ -453,7 +462,7 @@ func TestTasksGet_FoldsTheSupervisorTerminalInStreamOrder(t *testing.T) {
 	// And the replay knows whose terminal it folded: the supervisor's, by
 	// its subject -- the one thing the live fold of bare envelopes cannot
 	// say, which is why it rides beside the Task rather than in it.
-	if _, subject, err := reader.TasksGetAttributed(ctx, addressee, taskID); err != nil {
+	if _, subject, err := reader.TasksGetAttributed(readCtx, addressee, taskID); err != nil {
 		t.Fatalf("TasksGetAttributed: %v", err)
 	} else if subject != TaskSupervisorSubject(addressee, taskID) {
 		t.Errorf("terminal subject = %q, want the supervisor subject", subject)
@@ -578,7 +587,7 @@ func TestSubscribeDurable_RebindsASingleFilterDurableToThePair(t *testing.T) {
 	if err := sup.Publish(ctx, TaskSupervisorSubject(addressee, taskID), supervisorTerminal(t, taskID, StateFailed, true)); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 5*time.Second, "both subjects delivered through the rebound durable", func() bool { return got.count() == 2 })
+	waitFor(t, deliveryWait, "both subjects delivered through the rebound durable", func() bool { return got.count() == 2 })
 }
 
 func mustMessage(t *testing.T, taskID, addressee string) *Envelope {
@@ -657,7 +666,7 @@ func TestSubscribeDurable_RetriesABindThatRacesStreamRecovery(t *testing.T) {
 		t.Fatal("SubscribeDurable never returned after the stream appeared")
 	}
 	replayFixture(t, clientURL(s), "task-recovery-race", []TaskState{StateSubmitted})
-	waitFor(t, 5*time.Second, "the recovered durable delivers", func() bool { return got.count() == 1 })
+	waitFor(t, deliveryWait, "the recovered durable delivers", func() bool { return got.count() == 1 })
 }
 
 // TestSubscribeDurable_GivesUpOnABindTheServerWillNeverAccept: the retry is

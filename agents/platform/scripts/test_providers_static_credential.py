@@ -51,6 +51,16 @@ class CredentialTest(unittest.TestCase):
         self.token.write_text("glpat-rotated\n")
         self.assertEqual({"PRIVATE-TOKEN": "glpat-rotated"}, credential.headers("acme/infra"))
 
+    def test_holds_token_answers_by_the_rule_the_header_applies(self):
+        credential = self.credential()
+        self.assertTrue(credential.holds_token())
+        for bad in ("", "  \n", "glpat first\n", "\ufeffglpat-first\n", "glpat-first\nmore\n"):
+            with self.subTest(bad=bad):
+                self.token.write_text(bad, encoding="utf-8")
+                self.assertFalse(credential.holds_token())
+        self.token.unlink()
+        self.assertFalse(credential.holds_token(), "a missing file holds no token")
+
     def test_the_forge_chooses_the_header_and_its_format(self):
         credential = self.credential(header="Authorization", header_format="Bearer {token}")
         self.assertEqual({"Authorization": "Bearer glpat-first"}, credential.headers("a/b"))

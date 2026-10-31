@@ -3,7 +3,8 @@
 # (kube-agents#2394, #2832), and ci-kube-agents-eval-nightly-gitlab-next runs
 # once a night under spec.mode next (EVAL_MODE_NEXT=1, through the inject
 # door). hack/ci-eval-pr.sh reads this file in place of the catalogue
-# whenever EVAL_FORGE=gitlab, on either tier: nothing else grades the forge,
+# whenever EVAL_FORGE is gitlab or gitlab-ce (a self-managed instance,
+# kube-agents#3682), on either tier: nothing else grades the forge,
 # so the presubmit cases and the other nightly-only cases run on GitHub
 # only. Neither nightly appends to the evidence store.
 #
@@ -26,9 +27,10 @@
 # runs and reports without arming it, as it does on the GitHub presubmit.
 # Rungs 1-3 red the lane like every case. pdb-remediation-pr was on the
 # roster from 2026-10-14 (#2016) until its demotion to the nightly on
-# 2026-10-17 (#3120), so today no case below is on the roster: all three are
-# held out, rung 4 is disarmed on the lane (the script says so in the log),
-# and the case returns to arming it with its roster line.
+# 2026-10-17 (#3120), and the lane ran with rung 4 disarmed from then until
+# vcs-spent-branch-reuse took its roster line on 2026-10-23; pdb-remediation-pr
+# took its own back on 2026-10-26: today those two arm rung 4 on the lane,
+# and vcs-review-feedback-read-back is held out.
 # The job runs on demand (`/test pull-kube-agents-smoke-test-gitlab`) and
 # nightly, never as a blocking presubmit: the agent goes through the same
 # forge abstraction on both forges, so the GitHub presubmit grades what a
@@ -51,9 +53,10 @@
 # after its first proposal closed; a second revision read back before it is
 # described) and pass 100 % and 92 % on the GitHub nightly over 30 days, so
 # a red here points at GitLab, not at the agent. No ledger case is in the
-# lane: none passes three repetitions anywhere today (the compliance canary
-# publishes a ledger in about half its runs on either forge, the agent's
-# doing), so the ledger path is proven by the harness, not by a case: the
+# lane: the compliance canary publishes a ledger in about half its runs on
+# either forge, the agent's doing, and consistency-drift-outlier, which
+# passes on the GitHub nightlies (a roster seat since 2026-10-26), has no
+# GitLab record yet. So the ledger path is proven by the harness, not by a case: the
 # lease-time probe, probe_gitlab_ledger_path in the script and
 # docs/ci-pool-projects.md 5.6. That says the forge takes a ledger; whether
 # the agent publishes one is #2856's question.
@@ -66,6 +69,6 @@
 ./tasks/vcs-review-feedback-read-back/task.yaml
 # The remediation path: the fix lands as a merge request on the project's
 # GitLab repository, never on the cluster (pull_request_opened). Registered
-# in nightly-cases.txt since its demotion (#3120); the lane picks from either
-# file.
+# in presubmit-cases.txt again since 2026-10-26 (nightly-cases.txt from
+# 2026-10-17, #3120); the lane picks from either file.
 ./tasks/pdb-remediation-pr/task.yaml

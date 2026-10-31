@@ -68,6 +68,7 @@ API call. It also performs the stale sweep, which the card cannot.
 - If the script outputs `{"status": "NO_ISSUES", ...}`:
   - If `unreachable_repos` is non-empty (contains one or more failed repositories), do NOT respond `[SILENT]`. Alert the chat room:
     `⚠️ **GitHub issue resolver warning:** Could not check repository: <unreachable_repos>` and end the turn per [Ending the turn](#ending-the-turn).
+  - `untracked_repos`, when present, lists repositories whose forge has no issue tracker or no labels. It is not a fault: do not alert on it.
   - Otherwise (`unreachable_repos` is empty and all managed repositories were checked cleanly), there is nothing to do. Arriving here from a card is normal and is not a fault — it means the issue was addressed between the poll and your dispatch. End the turn per [Ending the turn](#ending-the-turn).
 - If the script outputs `{"status": "NOT_CONFIGURED"}`, this deployment has no
   target repository. That is a supported state, not a fault. End the turn per

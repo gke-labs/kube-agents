@@ -104,6 +104,16 @@ INSTALL_ENV_FLAGS_TYPED=""
 INSTALL_ENV_KEYS_TO_RECORD=""
 # Those keys with their companions, toggles last (resolve_install_env_record_keys).
 INSTALL_ENV_RECORD_KEYS=""
+# The keys of the GitLab token Secret, and the server-side-apply field manager
+# that writes each one. The write token is "token" (ForgeCredentialsTokenKey
+# in gitspec.go). The optional read-only token, for context repositories, is
+# "read-token". Each key has its own manager: an apply that leaves out a field
+# its manager applied before deletes that field. So a run without
+# GITLAB_READ_TOKEN_FILE never deletes the read token.
+readonly GITLAB_TOKEN_SECRET_KEY="token"
+readonly GITLAB_READ_TOKEN_SECRET_KEY="read-token"
+readonly GITLAB_TOKEN_FIELD_MANAGER="kube-agents-installer"
+readonly GITLAB_READ_TOKEN_FIELD_MANAGER="kube-agents-installer-read-token"
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -164,11 +174,22 @@ on_error() {
   # function it was in, or this script and `main` at top level. $LINENO alone
   # counts from the top of whichever file the command sat in, so a bare line
   # number sent the reader to that line of install.sh instead. Piped through
-  # stdin, bash labels this script's frames `main` or not at all, and $0 is
-  # `bash`; both read as the script by name.
+  # stdin, bash labels this script's frames `main` (bash 5.2), after $0 (bash
+  # 5.3, measured: `bash` for the documented one-liner, `/bin/bash` when the
+  # interpreter is invoked by path, `sh` where that is bash), or not at all
+  # (bash 3.2); all read as the script by name. The $0 of a stdin or -c
+  # script is the shell as invoked, and resolves to the running interpreter,
+  # $BASH; a frame run from a file (`bash ./install.sh`) is labelled $0 on
+  # every bash too, and that $0 is the script, not $BASH, which keeps its
+  # path. A sourced file is never $0, whatever it is named.
   local source_file="${BASH_SOURCE[1]:-}"
   case "$source_file" in
     ""|main) source_file="$INSTALL_SCRIPT_NAME" ;;
+    "$0")
+      if [ "$(command -v -- "$0" 2>/dev/null || true)" = "$BASH" ]; then
+        source_file="$INSTALL_SCRIPT_NAME"
+      fi
+      ;;
   esac
   local func_name="${FUNCNAME[1]:-main}"
   echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
@@ -265,6 +286,12 @@ INSTALL_ENV_FILE="${KUBE_AGENTS_INSTALL_ENV:-}"
 INSTALL_ENV_EXPLICIT="false"
 if [ -n "$INSTALL_ENV_FILE" ]; then
   INSTALL_ENV_EXPLICIT="true"
+  # Absolute now, while the directory is the operator's: a run with no
+  # checkout clones one and cds into it before anything reads or writes this.
+  case "$INSTALL_ENV_FILE" in
+    /*) ;;
+    *) INSTALL_ENV_FILE="$(pwd)/${INSTALL_ENV_FILE}" ;;
+  esac
 else
   _install_env_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
   # An install.env the operator actually put beside the script, or in the
@@ -328,6 +355,10 @@ bootstrap_install_env() {
   # clean shell would switch it back. --mode is refused for the same reason
   # when it disagrees with this file (check_flags_against_install_env).
   unset PLATFORM_AGENT_MODE
+  # The data volume size too: an inherited PLATFORM_AGENT_STORAGE_SIZE would
+  # grow both data claims for one run, and the next run from a clean shell
+  # would drop the field again, leaving claims larger than the CR says.
+  unset PLATFORM_AGENT_STORAGE_SIZE
   # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
   # switch a recorded GitHub install's forge for this run. --gitops-forge is
   # the per-run way in.
@@ -462,6 +493,9 @@ PARAM_GITOPS_FORGE="${GITOPS_FORGE:-}"
 PARAM_GITOPS_HOST="${GITOPS_HOST:-}"
 PARAM_GITLAB_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
 PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
+# An optional FILE with a read-only GitLab token. The broker presents it only
+# to clone context repositories. Like the token file, it is never recorded.
+PARAM_GITLAB_READ_TOKEN_FILE="${GITLAB_READ_TOKEN_FILE:-}"
 # A self-managed GitLab behind a private CA: a FILE the CA is read from, and
 # the Secret it goes into, which install.env records. The file's path is
 # never recorded. GITOPS_CA_FILE in the environment counts as an interview
@@ -568,6 +602,8 @@ fi
 # the second. The same asymmetry applies to MEMORY / MEMORY_PROVIDER below and
 # to GOOGLE_CHAT_ENABLED below.
 PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-${HERMES_DASHBOARD_ENABLED:-}}"
+# WEB_CONSOLE_ENABLED is both the input and the recorded spelling.
+PARAM_ENABLE_WEB_CONSOLE="${WEB_CONSOLE_ENABLED:-}"
 # MEMORY is the input spelling (file | hindsight | off). MEMORY_PROVIDER is what
 # the install records, so translate it back when that is all there is.
 memory_mode_from_provider() {
@@ -611,10 +647,26 @@ PARAM_CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
 PARAM_CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
 CLI_CHAT_SUB_NAME=""
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
-# Empty takes DEFAULT_PLATFORM_AGENT_MODE. Seeded from install.env, so a re-run
+# Empty takes PLATFORM_AGENT_MODE_FALLBACK. Seeded from install.env, so a re-run
 # without --mode keeps the mode the file records.
 PARAM_PLATFORM_AGENT_MODE="${PLATFORM_AGENT_MODE:-}"
 PARAM_PLATFORM_AGENT_MODE_PASSED="false"
+# What an empty mode resolves to. It starts as a first install's,
+# DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE, and adopt_live_platform_agent_mode
+# moves it to the live install's once the target cluster is known: whether this
+# is a first install is the cluster's to say, not install.env's. A target tree
+# from before that default has only DEFAULT_PLATFORM_AGENT_MODE, today there.
+# Run here and again by resolve_shared_defaults: under curl | bash the
+# defaults are only in scope after the workspace step sources them. The file's
+# presence is taken here, before a first install writes one.
+INSTALL_ENV_FOUND_AT_START="false"
+if [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
+  INSTALL_ENV_FOUND_AT_START="true"
+fi
+resolve_platform_agent_mode_fallback() {
+  PLATFORM_AGENT_MODE_FALLBACK="${DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}"
+}
+resolve_platform_agent_mode_fallback
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
 # Whether --model-default-name was typed: a switch to openai_compatible does not
@@ -646,6 +698,7 @@ PARAM_SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
 PARAM_SLACK_ALLOWED_USERS="${SLACK_ALLOWED_USERS:-}"
 PARAM_SLACK_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}"
 PARAM_SLACK_HOME_CHANNEL_NAME="${SLACK_HOME_CHANNEL_NAME:-}"
+PARAM_SLACK_HOME_CHANNEL_POLICY="${SLACK_HOME_CHANNEL_POLICY:-}"
 # bootstrap_install_env clears NAMESPACE before reading
 # install.env, so this seeds from the file alone; --agent-namespace is the
 # other way in.
@@ -676,14 +729,19 @@ Flags for AI Agents & Automation:
                                 unset at a zonal --gcp-region builds Standard instead.
                                 Ignored when installing onto a cluster that already
                                 exists — its live shape wins.
-  --mode=MODE                   The PlatformAgent's spec.mode: today | next. next also
-                                renders the NATS bus and the A2A gateway, a development
-                                stack. Recorded in install.env as PLATFORM_AGENT_MODE when
+  --mode=MODE                   The PlatformAgent's spec.mode: next | today. next renders
+                                the NATS bus and the A2A gateway in front of the agent;
+                                today is the previous stack, kept as a rollback.
+                                Recorded in install.env as PLATFORM_AGENT_MODE when
                                 the file sets none; one that sets it differently refuses
                                 the flag, so change that key instead
                                 (a mode switch: the upgrade guide's
                                 "Switching spec.mode" section)
-                                (default: DEFAULT_PLATFORM_AGENT_MODE, currently today)
+                                (default when install.env sets none: on a cluster that
+                                already runs kube-agents, the mode it runs; on a first
+                                install, DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE,
+                                currently next, or today when it mirrors its third-party
+                                images with --third-party-registry-prefix)
   --agent-namespace=NAMESPACE   Kubernetes namespace the release installs into
                                 (default: DEFAULT_NAMESPACE, currently kubeagents-system).
                                 The chart wires the agent's model-gateway endpoint to this
@@ -823,6 +881,12 @@ Flags for AI Agents & Automation:
   --enable-hermes-dashboard[=true|false]
                                 Enable Hermes Web UI port 9119 dashboard
                                 (default: DEFAULT_ENABLE_WEBUI, currently false)
+  --enable-web-console[=true|false]
+                                Deploy the in-cluster web console, a browser chat
+                                page for the agent reached by kubectl port-forward.
+                                Requires NetworkPolicy enforcement on the cluster
+                                (cannot be combined with --accept-no-network-policy)
+                                (default: DEFAULT_ENABLE_WEB_CONSOLE, currently false)
   --enable-gke-backup-plan[=true|false]
                                 Provision a GKE Backup Plan for the cluster
                                 (default: DEFAULT_ENABLE_GKE_BACKUP_PLAN, currently false)
@@ -903,6 +967,10 @@ Flags for AI Agents & Automation:
   --slack-home-channel=CHANNEL  Slack channel ID for unsolicited alerts/messages (e.g. C01234567)
   --slack-home-channel-name=NAME
                                 Display name of that channel (e.g. #gke-alerts)
+  --slack-home-channel-policy=POLICY
+                                auto (the default, also empty) or manual: sets
+                                spec.integration.slack.homeChannelPolicy on the PlatformAgent;
+                                the CRD reference describes the field
   --migrate-node-pools          Authorize migrating an existing cluster's legacy node pools to
                                 GKE_METADATA. Recreates those nodes and restarts every workload on
                                 them, kube-agents' or not. Without it a cluster with legacy pools is
@@ -911,10 +979,13 @@ Flags for AI Agents & Automation:
   --enable-network-policy       Authorize enabling the legacy Calico NetworkPolicy addon and
                                 enforcement on an existing GKE Standard cluster that has neither it
                                 nor Dataplane V2. May recreate nodes and restart workloads. One of
-                                two answers for such a cluster; the other is below, and without
+                                two answers for such a cluster (or the only answer when
+                                --enable-web-console is on); the other is below, and without
                                 either the cluster is refused unchanged (REFUSED_MISSING_NETWORK_POLICY).
                                 The cluster's owner decides this.
-  --accept-no-network-policy    Install onto such a cluster without modifying it. Every NetworkPolicy
+  --accept-no-network-policy    Install onto such a cluster without modifying it (unavailable when
+                                --enable-web-console / WEB_CONSOLE_ENABLED=true is enabled, as the
+                                web console requires NetworkPolicy enforcement). Every NetworkPolicy
                                 kube-agents ships is then inert, including the ones that confine the
                                 agent's shell sandbox; the choice is recorded in the install report
                                 and on the PlatformAgent. Mutually exclusive with the flag above.
@@ -946,6 +1017,15 @@ flag_bool_value() {
   case "${1:-}" in
     *=*) printf '%s' "${1#*=}" ;;
     *) printf 'true' ;;
+  esac
+}
+
+is_truthy() {
+  local val="${1:-}"
+  val="${val//[[:space:]]/}"
+  case "$val" in
+    [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Yy] | 1 | [Oo][Nn]) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -1142,6 +1222,9 @@ parse_args() {
       --enable-hermes-dashboard|--enable-hermes-dashboard=*)
         PARAM_ENABLE_WEBUI="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_WEBUI"; shift ;;
+      --enable-web-console|--enable-web-console=*)
+        PARAM_ENABLE_WEB_CONSOLE="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_WEB_CONSOLE"; shift ;;
       --user-profile-enabled=*) PARAM_USER_PROFILE_ENABLED="${1#*=}"; shift ;;
       --enable-gke-backup-plan|--enable-gke-backup-plan=*)
         PARAM_ENABLE_GKE_BACKUP_PLAN="$(flag_bool_value "$1")"
@@ -1210,6 +1293,10 @@ parse_args() {
       --slack-home-channel-name=*)
         PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"
         note_install_env_flag SLACK_HOME_CHANNEL_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_NAME
+        shift ;;
+      --slack-home-channel-policy=*)
+        PARAM_SLACK_HOME_CHANNEL_POLICY="${1#*=}"
+        note_install_env_flag SLACK_HOME_CHANNEL_POLICY "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_POLICY
         shift ;;
       --chat-topic-name=*)
         PARAM_CHAT_TOPIC_NAME="${1#*=}"
@@ -1405,6 +1492,17 @@ require_creatable_cluster_mode() {
     print_info "For a zonal cluster, pass --gke-cluster-mode=standard."
     exit 1
   fi
+}
+
+# How to open the web console. It is reached only by port-forward: its Service
+# is ClusterIP behind a deny-all NetworkPolicy, and it answers only on
+# localhost. The console pod is not sandboxed, so port-forward reaches it even
+# when the agent runs under gVisor.
+print_web_console_access() {
+  local namespace=$1
+  echo -e "  • ${C_CYAN}Web Console:${C_RESET} ${C_GREEN}Enabled${C_RESET}"
+  echo -e "    ${C_YELLOW}Workstation Access Command:${C_RESET} kubectl port-forward svc/${WEB_CONSOLE_SERVICE} -n ${namespace} ${WEB_CONSOLE_PORT}:${WEB_CONSOLE_PORT}"
+  echo -e "    ${C_YELLOW}Browser URL:${C_RESET} ${C_UNDERLINE}http://localhost:${WEB_CONSOLE_PORT}${C_RESET}"
 }
 
 # How GKE writes the shape. bash 3.2, still macOS's /bin/bash, has no ${var^}.
@@ -2299,7 +2397,7 @@ record_gitops_forge_keys() {
 # running install reads from Terraform state.
 install_env_toggle_companions() {
   case "${1:-}" in
-    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME" ;;
+    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME SLACK_HOME_CHANNEL_POLICY" ;;
     GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_MODE" ;;
     *) ;;
   esac
@@ -2543,6 +2641,11 @@ bootstrap_install_env_file() {
     warn_flag_beats_unrecorded_file_value "$destination" ENABLE_GKE_BACKUP_PLAN --enable-gke-backup-plan \
       "${PARAM_ENABLE_GKE_BACKUP_PLAN:-}" \
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
+      true \
+      "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" WEB_CONSOLE_ENABLED --enable-web-console \
+      "${PARAM_ENABLE_WEB_CONSOLE:-}" \
+      "A later run without it renders the web console from what the file records; upgrade.sh and --menu take no --enable-web-console, so the next of either puts the console back to the recorded or default state." \
       true \
       "every later install.sh run"
     # Five consequence strings, unlike every other call here, which take one.
@@ -2789,7 +2892,17 @@ bootstrap_install_env_file() {
   # Recorded on every first install, the default included: the file is the one
   # place a later run, and every upgrade.sh, reads the mode from, and a --mode
   # that disagrees with it is refused (check_flags_against_install_env).
-  write_env_var "$tmp" PLATFORM_AGENT_MODE "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+  # Except a mode guessed because the cluster could not be read
+  # (adopt_live_platform_agent_mode): the next run that can read it settles it.
+  if [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" != "true" ] || [ -n "${PARAM_PLATFORM_AGENT_MODE:-}" ]; then
+    write_env_var "$tmp" PLATFORM_AGENT_MODE "${PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
+  fi
+  # Only when set: a first install that inherits a size records it, because
+  # every later run reads the file alone, and a size missing there would read
+  # as the lower default. Unset, later runs follow the default.
+  if [ -n "${PLATFORM_AGENT_STORAGE_SIZE:-}" ]; then
+    write_env_var "$tmp" PLATFORM_AGENT_STORAGE_SIZE "$PLATFORM_AGENT_STORAGE_SIZE"
+  fi
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
   write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
@@ -2831,6 +2944,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" SLACK_ALLOWED_USERS "${SLACK_ALLOWED_USERS:-}"
   write_env_var "$tmp" SLACK_HOME_CHANNEL "${SLACK_HOME_CHANNEL:-}"
   write_env_var "$tmp" SLACK_HOME_CHANNEL_NAME "${SLACK_HOME_CHANNEL_NAME:-}"
+  write_env_var "$tmp" SLACK_HOME_CHANNEL_POLICY "${SLACK_HOME_CHANNEL_POLICY:-}"
   write_secret_env_var "$tmp" API_SERVER_KEY "${API_SERVER_KEY:-}"
   write_env_var "$tmp" PLATFORM_AGENT_PERMISSION_SET "${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
@@ -2872,6 +2986,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" MEMORY "$PARAM_MEMORY"
   write_env_var "$tmp" USER_PROFILE_ENABLED "${USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}"
   write_env_var "$tmp" HERMES_DASHBOARD_ENABLED "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}"
+  write_env_var "$tmp" WEB_CONSOLE_ENABLED "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}"
   write_env_var "$tmp" ENABLE_GVISOR "${ENABLE_GVISOR:-$DEFAULT_ENABLE_GVISOR}"
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
@@ -3209,6 +3324,7 @@ source_provisioning_helpers() {
 # cannot be: this runs in step 2, before the interview.
 resolve_shared_defaults() {
   normalize_gitops_repo_vars
+  resolve_platform_agent_mode_fallback
   PARAM_MODEL_PROVIDER="${PARAM_MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   PARAM_REGISTRY_PREFIX="${PARAM_REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}"
   PARAM_PERMISSION_SET="${PARAM_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
@@ -3216,6 +3332,9 @@ resolve_shared_defaults() {
   # that has to survive to the validator rather than being read as the default.
   PARAM_ENABLE_GVISOR="${PARAM_ENABLE_GVISOR-$DEFAULT_ENABLE_GVISOR}"
   PARAM_ENABLE_WEBUI="${PARAM_ENABLE_WEBUI:-$DEFAULT_ENABLE_WEBUI}"
+  # No PARAM_ENABLE_WEB_CONSOLE, for the reason given below for
+  # PARAM_ENABLE_DRIFT_DETECTOR: empty means "this run did not say", which is
+  # what lets bootstrap_install_env_file warn only about a flag that was given.
   PARAM_USER_PROFILE_ENABLED="${PARAM_USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}"
   PARAM_MEMORY="${PARAM_MEMORY:-$DEFAULT_MEMORY}"
   PARAM_ENABLE_GOOGLE_CHAT="${PARAM_ENABLE_GOOGLE_CHAT:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
@@ -3231,6 +3350,9 @@ resolve_shared_defaults() {
     PARAM_GITOPS_FORGE_GIVEN="true"
   fi
   PARAM_GITOPS_FORGE="${PARAM_GITOPS_FORGE:-$DEFAULT_GITOPS_FORGE}"
+  # Set by ask_gitops_forge when the operator answers that there is no GitOps
+  # repository; main's step 8 then skips the repository menu.
+  GITOPS_INTERVIEW_DECLINED="false"
   PARAM_GITLAB_TOKEN_SECRET="${PARAM_GITLAB_TOKEN_SECRET:-$DEFAULT_GITLAB_TOKEN_SECRET}"
   # DEFAULT_GITOPS_REPO is a GitHub repository name; a GitLab project has no
   # default path, so the validator asks for one instead of inventing it.
@@ -3515,6 +3637,9 @@ prompt_menu() {
     [ "$default_choice" -lt 1 ] || [ "$default_choice" -gt "${#options[@]}" ]; then
     default_choice=1
   fi
+  # Canonical digits on this exit too, so a preset "04" and a typed "04"
+  # store the same answer.
+  default_choice=$((10#$default_choice))
 
   if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
     printf -v "$var_name" '%s' "$default_choice"
@@ -3538,7 +3663,9 @@ prompt_menu() {
   while true; do
     prompt_read "Select an option (1-${#options[@]})" choice "$default_choice"
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
-      printf -v "$var_name" '%s' "$choice"
+      # Canonical digits: callers compare the answer as a string (`case`,
+      # `=`), and "04" is within bounds but is not "4".
+      printf -v "$var_name" '%s' "$((10#$choice))"
       break
     else
       print_error "Invalid selection. Please enter a number between 1 and ${#options[@]}." >/dev/tty
@@ -3883,13 +4010,20 @@ print_generate_only_handoff() {
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
   # A GitHub Enterprise Server's private CA: a run that applies writes the
   # Secret and restarts the minter after the apply; this route does neither.
+  local step=4
   if [ "${GITOPS_FORGE:-github}" != "gitlab" ] && [ -n "${GITOPS_HOST:-}" ] && [ -n "${GITOPS_CA_SECRET:-}" ]; then
     local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
-    echo -e "${C_BOLD}4. After the apply, the GitHub Enterprise Server CA (any cluster):${C_RESET}"
+    echo -e "${C_BOLD}${step}. After the apply, the GitHub Enterprise Server CA (any cluster):${C_RESET}"
     echo -e "    kubectl create secret generic ${GITOPS_CA_SECRET} -n ${ns} --from-file=ca.crt=<path-to-ca.pem> --dry-run=client -o yaml | kubectl apply --server-side -f -"
     echo -e "    kubectl rollout restart deployment/${GITHUB_MINTER_DEPLOYMENT} -n ${ns}"
+    step=$((step + 1))
+  fi
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-}" || is_truthy "${SLACK_ENABLED:-}"; then
+    echo -e "${C_BOLD}${step}. After the apply, the chat app's setup checklist (settings no apply can make):${C_RESET}"
+    print_chat_checklist_commands
   fi
 }
+
 
 # Runs lifecycle.sh apply against the generated terraform.tfvars. Reads the
 # install coordinates from the environment (load install.env first).
@@ -4238,22 +4372,44 @@ print_no_network_policy_consequences() {
   print_info "Every NetworkPolicy this install ships is accepted by the API server and enforced by nothing:"
   print_info "  • the agent pod's ingress restriction and egress confinement (otherwise port 443 outside private ranges, and named in-cluster peers)"
   print_info "  • the shell sandbox's deny-all policy, which otherwise allows only cluster DNS and the credential proxy"
-  print_info "  • the LiteLLM gateway, GitHub token minter and Hindsight policies"
+  print_info "  • the LiteLLM gateway, GitHub token minter, Hindsight and web console policies"
   print_info "What is lost is the confinement of kube-agents' own workloads, not of yours: the sandbox that runs model-authored commands can reach anything routable in this VPC. Trusting the workloads already in this cluster is a different decision."
   print_info "Recorded as ${NETWORK_POLICY_REPORT_FIELD}=${NP_ENFORCEMENT_ABSENT_ACCEPTED} in the install report and as the ${NETWORK_POLICY_ENFORCEMENT_ANNOTATION} annotation on the PlatformAgent. To confine it later, enable Dataplane V2 or the Calico addon on the cluster and re-run the installer."
 }
 
 # The interactive fork for an adopted cluster that enforces no NetworkPolicy.
-# Three answers, and the default is the one that changes nothing: enable
-# Calico (a control-plane update that may recreate nodes), install without
-# enforcement (the cluster is untouched; print_no_network_policy_consequences
-# says what that costs), or stop. Sets the two PARAM_ variables; the caller
-# acts on them. Never reached without a controlling TTY: an agent-driven run
-# has to pass one of the two flags, and the skill tells it to ask first.
+# Three answers when the web console is off, and the default is the one that
+# changes nothing: enable Calico (a control-plane update that may recreate
+# nodes), install without enforcement (the cluster is untouched;
+# print_no_network_policy_consequences says what that costs), or stop. When
+# the web console is on (--enable-web-console / WEB_CONSOLE_ENABLED=true),
+# installing without enforcement is not offered: the operator either enables
+# Calico or stops (writing REFUSED_MISSING_NETWORK_POLICY before install.env
+# is created). Sets the two PARAM_ variables; the caller acts on them. Never
+# reached without a controlling TTY: an agent-driven run has to pass one of
+# the applicable flags, and the skill tells it to ask first.
 prompt_network_policy_choice() {
   local cluster_name="$1"
   local np_choice=""
   print_warning "Existing cluster '$cluster_name' enforces no NetworkPolicy (neither Dataplane V2 nor the legacy Calico addon)."
+  if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+    print_info "The web console (--enable-web-console) requires NetworkPolicy enforcement, so installing without enforcement is not available on this run."
+    print_info "  e) enable the legacy Calico addon and enforcement now: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents"
+    print_info "  n) stop here, changing nothing"
+    prompt_read "Choose (e/N)" np_choice "n"
+    case "$np_choice" in
+      [Ee])
+        PARAM_ENABLE_NETWORK_POLICY="true"
+        PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+        ;;
+      *)
+        print_info "Stopping without modifying the cluster or writing install.env."
+        write_json_report "REFUSED_MISSING_NETWORK_POLICY"
+        exit 1
+        ;;
+    esac
+    return 0
+  fi
   print_info "  e) enable the legacy Calico addon and enforcement now: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents"
   print_info "  a) install without NetworkPolicy enforcement: the cluster is not modified, and every policy kube-agents ships stays inert, including the ones confining the agent's shell sandbox"
   print_info "  n) stop here, changing nothing"
@@ -4282,11 +4438,15 @@ prompt_network_policy_choice() {
 # Clusters created by this repository's gke-cluster module have Dataplane V2;
 # clusters created by other Terraform configurations or pre-existing Standard
 # clusters may have neither Dataplane V2 nor Calico. Such a cluster has three
-# outcomes, and the operator picks: enable the legacy Calico addon
-# (--enable-network-policy, a control-plane update), install without
-# enforcement (--accept-no-network-policy, the cluster untouched and the
-# choice on record), or refuse. The gke-cluster module's postcondition
-# backstops bare-Terraform installs, relaxed by the same variable.
+# outcomes when the web console is off, and the operator picks: enable the
+# legacy Calico addon (--enable-network-policy, a control-plane update),
+# install without enforcement (--accept-no-network-policy, the cluster
+# untouched and the choice on record), or refuse. When the web console is on
+# (--enable-web-console / WEB_CONSOLE_ENABLED=true), installing without
+# enforcement is refused by the preflight and by the composition's
+# precondition, leaving only Calico enablement or refusal. The gke-cluster
+# module's postcondition backstops bare-Terraform installs, relaxed by the
+# same variable when the console is off.
 ensure_existing_cluster_network_policy() {
   local project_id="$1" cluster_name="$2" region="$3"
   local cluster_info
@@ -4329,7 +4489,11 @@ ensure_existing_cluster_network_policy() {
   if ! is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
     print_error "Existing cluster '$cluster_name' has neither Dataplane V2 nor legacy Calico NetworkPolicy."
     print_info "Enabling Calico may recreate nodes and restart workloads; installing without enforcement leaves the agent sandbox unconfined on the network. The cluster's owner decides which."
-    print_info "Explicit opt-in was not provided (--enable-network-policy or --accept-no-network-policy). Refusing to proceed."
+    if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+      print_info "The web console requires NetworkPolicy enforcement; pass --enable-network-policy (or disable the web console with --enable-web-console=false). Refusing to proceed."
+    else
+      print_info "Explicit opt-in was not provided (--enable-network-policy or --accept-no-network-policy). Refusing to proceed."
+    fi
     return 1
   fi
 
@@ -4430,6 +4594,17 @@ prompt_existing_cluster_opt_ins() {
 # and prints it; this only settles it before the bootstrap writes the file.
 settle_network_policy_acceptance() {
   local project_id="$1" cluster_name="$2" region="$3" tfvars_file="$4" image_tag="$5"
+  # When the web console is on, check_existing_cluster_network_policy_preflight
+  # runs here (before bootstrap_install_env_file writes install.env) so a
+  # refused non-interactive or no-TTY first install does not leave a stale
+  # install.env with WEB_CONSOLE_ENABLED=true on disk, while an enforcing
+  # cluster sets NETWORK_POLICY_ENFORCEMENT=enforced and proceeds.
+  if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+    if [ "${PARAM_DRY_RUN:-false}" != "true" ]; then
+      check_existing_cluster_network_policy_preflight "$1" "$2" "$3"
+    fi
+    return 0
+  fi
   if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}" && ! is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}"; then
     export ACCEPT_NO_NETWORK_POLICY="true"
     KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
@@ -4499,26 +4674,6 @@ check_existing_cluster_node_pools_preflight() {
   fi
 }
 
-is_existing_cluster_network_policy_satisfied() {
-  local project_id="$1" cluster_name="$2" region="$3"
-  [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ] || return 0
-
-  local cluster_info
-  cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
-    --location="$region" --project="$project_id" \
-    --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
-  local status="" dp_provider="" legacy_np=""
-  if [ -n "$cluster_info" ]; then
-    IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
-  fi
-  if [ -z "$status" ]; then
-    return 2
-  fi
-  [ "$dp_provider" != "ADVANCED_DATAPATH" ] || return 0
-  [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ] || return 1
-  return 0
-}
-
 check_existing_cluster_network_policy_preflight() {
   local project_id="$1" cluster_name="$2" region="$3"
   # A cluster this run creates comes up on Dataplane V2.
@@ -4543,8 +4698,17 @@ check_existing_cluster_network_policy_preflight() {
 
   # The third answer: install anyway, on record, without touching the cluster.
   # The generated tfvars carry accept_no_network_policy = true, which is what
-  # gets the plan past the module's postcondition.
+  # gets the plan past the module's postcondition. Refused when the web
+  # console is on: the console holds the Platform Agent's API key with no login
+  # of its own, and its deny-all-ingress NetworkPolicy is the only thing
+  # keeping other pods in the cluster from reaching it.
   if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+    if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+      print_error "Existing cluster '$cluster_name' enforces no NetworkPolicy, and the web console (--enable-web-console / WEB_CONSOLE_ENABLED=true) requires NetworkPolicy enforcement."
+      print_info "The web console holds the Platform Agent's API key with no login of its own; without NetworkPolicy enforcement, any pod in the cluster can reach it. Enable NetworkPolicy (--enable-network-policy, and remove ACCEPT_NO_NETWORK_POLICY=true from install.env) or disable the web console (--enable-web-console=false / WEB_CONSOLE_ENABLED=false)."
+      write_json_report "REFUSED_WEB_CONSOLE_WITHOUT_NETWORK_POLICY"
+      exit 1
+    fi
     print_no_network_policy_consequences "$cluster_name"
     NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
     # The settle step and this preflight each describe the cluster once. If
@@ -4558,9 +4722,15 @@ check_existing_cluster_network_policy_preflight() {
   if ! is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
     print_error "Existing cluster '$cluster_name' enforces no NetworkPolicy (neither Dataplane V2 nor legacy Calico)."
     print_info "kube-agents ships NetworkPolicies that isolate the agent's execution sandbox; on this cluster they would be accepted and inert, and the Terraform apply refuses the plan."
-    print_info "Two ways forward, and the cluster's owner chooses:"
-    print_info "  --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents."
-    print_info "  --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement: the cluster is not modified, and the agent sandbox is unconfined on the network. Recorded in the report and on the PlatformAgent."
+    if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+      print_info "The web console (--enable-web-console / WEB_CONSOLE_ENABLED=true) requires NetworkPolicy enforcement, so --accept-no-network-policy cannot be used:"
+      print_info "  --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents."
+      print_info "  Or pass --enable-web-console=false (WEB_CONSOLE_ENABLED=false) to disable the web console."
+    else
+      print_info "Two ways forward, and the cluster's owner chooses:"
+      print_info "  --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents."
+      print_info "  --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement: the cluster is not modified, and the agent sandbox is unconfined on the network. Recorded in the report and on the PlatformAgent."
+    fi
     print_info "Neither was given. Aborting before making any cluster changes."
     write_json_report "REFUSED_MISSING_NETWORK_POLICY"
     exit 1
@@ -4607,7 +4777,7 @@ validate_litellm_redaction_ip_action() {
 # PLATFORM_AGENT_MODE has the --mode recorded into it when the run commits
 # (record_flags_into_install_env). Needs installer_common.sh sourced.
 validate_platform_agent_mode() {
-  local value="${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+  local value="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   is_valid_platform_agent_mode "$value" && return 0
   if [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ]; then
     print_error "--mode must be today or next, got '${value}'."
@@ -4618,6 +4788,156 @@ validate_platform_agent_mode() {
     print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix the PLATFORM_AGENT_MODE this shell exports."
   fi
   return 1
+}
+
+# Whether this run is a first install is the target cluster's to say, not
+# install.env's. A new checkout, another machine, or an install.env copied from
+# install.env.example has no mode recorded, and the first-install default
+# (DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE) would switch a live today install
+# to next, without a prompt under -y. So when
+# nothing chose a mode (no --mode, no exported PLATFORM_AGENT_MODE, no key in
+# install.env, all of which win) and the cluster exists, the cluster decides:
+# a PlatformAgent's spec.mode (absent is today), or, with the CR gone but the
+# kube-agents release still installed, the mode the release records (absent
+# is today), since the next apply recreates the CR from it. A cluster with
+# neither is a first install.
+#
+# The read uses a kubeconfig of its own, so the operator's kubeconfig and its
+# current context are left as they were: --dry-run and --generate-only stay
+# free of side effects. Only gcloud's NOT_FOUND is no cluster, as the tfvars
+# generator reads it (gke_describe_error_is_not_found). A cluster that cannot
+# be described or read is not guessed at as a first install, because a wrong
+# guess is a mode switch: an install.env that records no mode keeps today, as
+# it did before the cluster was asked; with no install.env, --dry-run and
+# --generate-only fall back to today with a warning, and an applying run is
+# refused. Returns 1 to refuse.
+# Needs installer_common.sh sourced and PROJECT_ID, REGION and CLUSTER_NAME
+# exported.
+adopt_live_platform_agent_mode() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" live="" holder="" kubeconfig_dir
+  [ -n "${PARAM_PLATFORM_AGENT_MODE:-}" ] && return 0
+  # A key assigned empty is today to every front door (write_tfvars_from_state),
+  # and nothing can be recorded over it, so it is not the cluster's to decide.
+  if [ "$INSTALL_ENV_FOUND_AT_START" = "true" ] && install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
+    PLATFORM_AGENT_MODE_SETTLED="true"
+    PLATFORM_AGENT_MODE_FALLBACK="$DEFAULT_PLATFORM_AGENT_MODE"
+    return 0
+  fi
+  local describe_err="" seen="exists" why="" remedy_next="pass --mode=next" remedy_switch="Pass --mode=${PLATFORM_AGENT_MODE_FALLBACK}" remedy_choose="Pass --mode=today or --mode=next"
+  # The menu takes no --mode: its remedy is the key it applies.
+  if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
+    remedy_next="set PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
+    remedy_switch="Set PLATFORM_AGENT_MODE=${PLATFORM_AGENT_MODE_FALLBACK} in ${INSTALL_ENV_FILE}"
+    remedy_choose="Set PLATFORM_AGENT_MODE=today or PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
+  fi
+  # Only a NOT_FOUND is no cluster, as the tfvars generator reads it; any
+  # other failure is a cluster that could not be read.
+  if describe_err="$(trap - ERR; gcloud container clusters describe "$CLUSTER_NAME" --location "$REGION" \
+    --project "$PROJECT_ID" --format="value(name)" 2>&1 >/dev/null)"; then
+    kubeconfig_dir="$(mktemp -d)"
+    local -x KUBECONFIG="${kubeconfig_dir}/kubeconfig"
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID" || true
+    # shellcheck disable=SC2086
+    gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" \
+      --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+    read_platform_agent_install_state "$namespace"
+    rm -rf "$kubeconfig_dir"
+    # Not held for the mode notice: it was read through this function's own
+    # kubeconfig. Read by take_platform_agent_install_state.
+    # shellcheck disable=SC2034
+    PLATFORM_AGENT_READS_HELD_FOR=""
+    case "$PLATFORM_AGENT_CR_READ" in
+      "$PLATFORM_AGENT_READ_OK")
+        live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
+        holder="its PlatformAgent"
+        if [ -z "$live" ]; then
+          case "$PLATFORM_AGENT_RECORD_READ" in
+            "$PLATFORM_AGENT_READ_NONE") return 0 ;;
+            "$PLATFORM_AGENT_READ_OK")
+              live="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
+              holder="its kube-agents release: the PlatformAgent is gone, and the next apply recreates it from the release"
+              ;;
+          esac
+        fi
+        ;;
+      "$PLATFORM_AGENT_READ_NONE") return 0 ;;
+    esac
+    why="the kubeconfig has no context '$(gke_context_name)'"
+    [ -n "${PLATFORM_AGENT_READ_ERROR:-}" ] && why="the read failed (${PLATFORM_AGENT_READ_ERROR})"
+  else
+    gke_describe_error_is_not_found "$describe_err" && return 0
+    seen="may exist"
+    why="gcloud could not describe it (${describe_err:-unknown gcloud failure})"
+  fi
+  if [ -z "$live" ]; then
+    PLATFORM_AGENT_MODE_SETTLED="true"
+    # Not recorded in install.env (queue_unrecorded_platform_agent_mode,
+    # bootstrap_install_env_file): the next run that can read the cluster
+    # settles it from there instead.
+    PLATFORM_AGENT_MODE_GUESSED="true"
+    if [ "$INSTALL_ENV_FOUND_AT_START" = "true" ]; then
+      print_warning "Cluster '${CLUSTER_NAME}' ${seen}, but whether it already runs kube-agents, and on which spec.mode, could not be read: ${why}. ${INSTALL_ENV_FILE} records no PLATFORM_AGENT_MODE, so this run renders spec.mode ${DEFAULT_PLATFORM_AGENT_MODE}, as upgrade.sh reads that file, and records nothing. If the install runs next, stop and ${remedy_next}."
+      PLATFORM_AGENT_MODE_FALLBACK="$DEFAULT_PLATFORM_AGENT_MODE"
+      return 0
+    fi
+    if [ "$PARAM_DRY_RUN" = "true" ] || [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+      print_warning "Cluster '${CLUSTER_NAME}' ${seen} and there is no install.env, but whether it already runs kube-agents, and on which spec.mode, could not be read: ${why}. This run renders spec.mode ${DEFAULT_PLATFORM_AGENT_MODE} and records no mode in install.env; applying it would switch an install that runs next. ${remedy_choose} to say which mode this install runs. An applying run would be refused."
+      PLATFORM_AGENT_MODE_FALLBACK="$DEFAULT_PLATFORM_AGENT_MODE"
+      return 0
+    fi
+    print_error "Cluster '${CLUSTER_NAME}' ${seen} and there is no install.env, but whether it already runs kube-agents, and on which spec.mode, could not be read: ${why}."
+    print_info "${remedy_choose} to say which mode this install runs, or restore access to the cluster and run again. Guessing would switch a running install's mode."
+    return 1
+  fi
+  live="$(effective_platform_agent_mode "$live")"
+  PLATFORM_AGENT_MODE_SETTLED="true"
+  [ "$live" = "$PLATFORM_AGENT_MODE_FALLBACK" ] && return 0
+  print_info "Nothing chose a spec.mode for this run (no --mode, and install.env records none), and cluster '${CLUSTER_NAME}' already runs kube-agents on spec.mode ${live} (from ${holder}), so this run keeps ${live} rather than a first install's ${PLATFORM_AGENT_MODE_FALLBACK}. ${remedy_switch} to switch it (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
+  PLATFORM_AGENT_MODE_FALLBACK="$live"
+}
+
+# A first install that mirrors its third-party images ($1, the prefix)
+# defaults to today. next's NATS bus runs two images (nats, nats-box) that
+# are the operator's compiled defaults, which neither this installer nor the
+# chart points at a mirror, so on a cluster that pulls only from the mirror
+# the bus would sit in ImagePullBackOff. Only the fallback moves: --mode, an
+# exported PLATFORM_AGENT_MODE, a recorded key and the cluster's live mode all win.
+mirrored_first_install_mode() {
+  [ -n "${1:-}" ] || return 0
+  [ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ] || return 0
+  [ "${PLATFORM_AGENT_MODE_SETTLED:-false}" = "true" ] && return 0
+  [ "$PLATFORM_AGENT_MODE_FALLBACK" = "next" ] || return 0
+  local remedy="Pass --mode=next"
+  [ "${PARAM_MENU_MODE:-false}" = "true" ] && remedy="Set PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
+  print_info "This first install mirrors its third-party images (${1}), so it installs spec.mode today rather than next: next's NATS bus pulls nats and nats-box from Docker Hub, and nothing in this install points them at the mirror. ${remedy} to install next anyway."
+  PLATFORM_AGENT_MODE_FALLBACK="today"
+}
+
+# An install.env that records no PLATFORM_AGENT_MODE gets the mode this run
+# settled on, queued for record_flags_into_install_env like a typed --mode:
+# upgrade.sh reads such a file as today, so a next install it does not record
+# would be switched back by the next upgrade. A file this run cannot write is
+# named instead. A mode guessed because the cluster could not be read is not
+# recorded.
+queue_unrecorded_platform_agent_mode() {
+  local file="${INSTALL_ENV_FILE:-}"
+  [ "$INSTALL_ENV_FOUND_AT_START" = "true" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  [ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ] || return 0
+  [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" = "true" ] && return 0
+  install_env_records_key "$file" PLATFORM_AGENT_MODE && return 0
+  if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
+    print_info "${file} assigns no PLATFORM_AGENT_MODE; a run without --dry-run records the one it applies (${PLATFORM_AGENT_MODE_FALLBACK}) there."
+    return 0
+  fi
+  if [ ! -w "$file" ]; then
+    print_warning "${file} assigns no PLATFORM_AGENT_MODE and is not writable, so this run cannot record spec.mode ${PLATFORM_AGENT_MODE_FALLBACK} there; upgrade.sh reads a file with no key as ${DEFAULT_PLATFORM_AGENT_MODE}. Add PLATFORM_AGENT_MODE=${PLATFORM_AGENT_MODE_FALLBACK} to it."
+    return 0
+  fi
+  case " ${INSTALL_ENV_KEYS_TO_RECORD} " in
+    *" PLATFORM_AGENT_MODE "*) ;;
+    *) INSTALL_ENV_KEYS_TO_RECORD="${INSTALL_ENV_KEYS_TO_RECORD}${INSTALL_ENV_KEYS_TO_RECORD:+ }PLATFORM_AGENT_MODE" ;;
+  esac
 }
 
 # The openai_compatible questions, shared by step 7 and the Day-2 menu: the
@@ -4772,14 +5092,32 @@ validate_existing_cluster_opt_in_flags() {
     if [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" = "true" ] && [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" != "true" ]; then
       print_info "--enable-network-policy overrides the ACCEPT_NO_NETWORK_POLICY=true your install configuration records, for this run. Remove that line once Calico is on, or every later upgrade waives the enforcement check."
       PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+      export ACCEPT_NO_NETWORK_POLICY="false"
     elif [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" = "true" ] && [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" != "true" ]; then
       print_info "--accept-no-network-policy overrides the ENABLE_NETWORK_POLICY=true your install configuration records, for this run."
       PARAM_ENABLE_NETWORK_POLICY="false"
+      export ENABLE_NETWORK_POLICY="false"
     else
       print_error "--enable-network-policy and --accept-no-network-policy are two answers to one question; pass one (as flags, or as ENABLE_NETWORK_POLICY / ACCEPT_NO_NETWORK_POLICY in install.env)."
       print_info "The first enables the legacy Calico addon on the cluster (may recreate nodes); the second installs without NetworkPolicy enforcement and changes nothing."
       exit 1
     fi
+  fi
+  # Refuse up front only when --accept-no-network-policy was passed on the
+  # command line. When ACCEPT_NO_NETWORK_POLICY=true was only inherited from
+  # install.env, check_existing_cluster_network_policy_preflight probes the
+  # live cluster first: if the cluster still enforces nothing it refuses with
+  # REFUSED_WEB_CONSOLE_WITHOUT_NETWORK_POLICY, and if the cluster has since
+  # enabled Dataplane V2 or Calico (the "confine it later" path) it proceeds
+  # and note_stale_network_policy_acceptance tells the operator to remove the
+  # stale line from install.env.
+  if [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" = "true" ] && \
+     is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}" && \
+     is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+    print_error "--enable-web-console (WEB_CONSOLE_ENABLED=true) cannot be combined with --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true)."
+    print_info "The web console holds the Platform Agent's API key with no login of its own, and its NetworkPolicy is what keeps other pods in the cluster from reaching it. Enable NetworkPolicy enforcement (--enable-network-policy or Dataplane V2, and remove any stale ACCEPT_NO_NETWORK_POLICY=true from install.env if the cluster already enforces it), or leave the web console off (--enable-web-console=false)."
+    write_json_report "REFUSED_WEB_CONSOLE_WITHOUT_NETWORK_POLICY"
+    exit 1
   fi
 }
 
@@ -4936,23 +5274,25 @@ validate_gitops_forge_flags() {
     case "$PARAM_GITLAB_TOKEN_FILE" in
       \~/*) PARAM_GITLAB_TOKEN_FILE="${HOME}/${PARAM_GITLAB_TOKEN_FILE#\~/}" ;;
     esac
-    if [ ! -r "$PARAM_GITLAB_TOKEN_FILE" ] || [ -d "$PARAM_GITLAB_TOKEN_FILE" ]; then
-      print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is not readable."
+    check_gitlab_token_source "--gitlab-token-file" "$PARAM_GITLAB_TOKEN_FILE" || return 1
+  fi
+  if [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
+    case "$PARAM_GITLAB_READ_TOKEN_FILE" in
+      \~/*) PARAM_GITLAB_READ_TOKEN_FILE="${HOME}/${PARAM_GITLAB_READ_TOKEN_FILE#\~/}" ;;
+    esac
+    check_gitlab_token_source "GITLAB_READ_TOKEN_FILE" "$PARAM_GITLAB_READ_TOKEN_FILE" || return 1
+    # One source for both tokens is refused. A stream such as /dev/stdin
+    # cannot carry two tokens, and one file would store the write token as the
+    # read token. -ef also catches a second name for the same file or stream.
+    if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ] && {
+      [ "$PARAM_GITLAB_TOKEN_FILE" = "$PARAM_GITLAB_READ_TOKEN_FILE" ] ||
+        [ "$PARAM_GITLAB_TOKEN_FILE" -ef "$PARAM_GITLAB_READ_TOKEN_FILE" ] || {
+        gitlab_token_source_is_stdin "$PARAM_GITLAB_TOKEN_FILE" &&
+          gitlab_token_source_is_stdin "$PARAM_GITLAB_READ_TOKEN_FILE"
+      }
+    }; then
+      print_error "--gitlab-token-file ('${PARAM_GITLAB_TOKEN_FILE}') and GITLAB_READ_TOKEN_FILE ('${PARAM_GITLAB_READ_TOKEN_FILE}') name the same source. Give each token its own file or stream."
       return 1
-    fi
-    # A regular file can be read now and again after the apply, so an empty
-    # one stops the run here, before anything is built. A one-shot source
-    # (/dev/stdin, /dev/fd/N, a process substitution) is not read here: a read
-    # can use it up, so create_gitlab_token_secret checks it after the apply.
-    if gitops_source_is_rereadable "$PARAM_GITLAB_TOKEN_FILE"; then
-      local early_token=""
-      IFS= read -r -d '' early_token <"$PARAM_GITLAB_TOKEN_FILE" || true
-      early_token="$(gitlab_token_strip "$early_token")"
-      if [ -z "$early_token" ]; then
-        print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is empty."
-        return 1
-      fi
-      early_token=""
     fi
   fi
   # A private CA is for a self-managed host only: gitlab.com presents a
@@ -4975,6 +5315,38 @@ validate_gitops_forge_flags() {
     fi
   fi
   validate_gitops_ca_inputs "${DEFAULT_GITOPS_CA_SECRET:-gitlab-forge-ca}"
+}
+
+# True when PATH is one of the literal names of this process's standard input.
+# Two such names are one stream even where -ef cannot tell (a pipe on stdin).
+gitlab_token_source_is_stdin() {
+  case "$1" in
+    /dev/stdin | /dev/fd/0 | /proc/self/fd/0) return 0 ;;
+  esac
+  return 1
+}
+
+# Checks the GitLab token source PATH, which messages call LABEL: it must be
+# readable and not a directory. A regular file can be read now and again after
+# the apply, so an empty one stops the run here, before anything is built. A
+# one-shot source (/dev/stdin, /dev/fd/N, a process substitution) is not read
+# here: a read can use it up, so the Secret's writer checks it after the apply.
+check_gitlab_token_source() {
+  local label="$1" path="$2"
+  if [ ! -r "$path" ] || [ -d "$path" ]; then
+    print_error "${label} '${path}' is not readable."
+    return 1
+  fi
+  if gitops_source_is_rereadable "$path"; then
+    local early_token=""
+    IFS= read -r -d '' early_token <"$path" || true
+    early_token="$(gitlab_token_strip "$early_token")"
+    if [ -z "$early_token" ]; then
+      print_error "${label} '${path}' is empty."
+      return 1
+    fi
+    early_token=""
+  fi
 }
 
 # The checks a private CA's inputs get on either forge: the CA file is
@@ -5033,6 +5405,10 @@ GITHUB_RESERVED_HOST_RE='(^|\.)(github\.com|githubusercontent\.com|githubassets\
 validate_github_forge_flags() {
   if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
     print_error "--gitlab-token-file applies only with --gitops-forge=gitlab."
+    return 1
+  fi
+  if [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
+    print_error "GITLAB_READ_TOKEN_FILE applies only with --gitops-forge=gitlab."
     return 1
   fi
   case "${PARAM_GITOPS_HOST:-}" in
@@ -5134,7 +5510,9 @@ gitops_ca_pem_problem() {
   fi
 }
 
-# Writes the token on stdin into Secret NAME, key `token`. Server-side apply,
+# Writes the token on stdin into Secret NAME, under KEY, as field manager
+# MANAGER. The object sent holds KEY alone, so the apply leaves the other key
+# as it is (see GITLAB_TOKEN_FIELD_MANAGER). Server-side apply,
 # because a client-side apply copies the whole object, token included, into
 # the kubectl.kubernetes.io/last-applied-configuration annotation, where
 # anyone who can read the Secret's metadata reads it again. Both kubectl
@@ -5142,61 +5520,131 @@ gitops_ca_pem_problem() {
 # was sent, and that object carries the token. A failure prints a fixed
 # message and kubectl's exit codes, never kubectl's text.
 apply_gitlab_token_secret() {
-  local name="$1" namespace="$2" context="$3"
+  local name="$1" namespace="$2" context="$3" key="$4" manager="$5"
   kubectl create secret generic "$name" -n "$namespace" --context "$context" \
-    --from-file=token=/dev/stdin --dry-run=client -o yaml 2>/dev/null |
-    kubectl apply --server-side --force-conflicts --field-manager=kube-agents-installer \
+    --from-file="${key}=/dev/stdin" --dry-run=client -o yaml 2>/dev/null |
+    kubectl apply --server-side --force-conflicts --field-manager="$manager" \
       -n "$namespace" --context "$context" -f - >/dev/null 2>&1
   local rcs=("${PIPESTATUS[@]}")
   if [ "${rcs[0]}" -ne 0 ] || [ "${rcs[1]}" -ne 0 ]; then
-    print_error "Could not write the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
+    print_error "Could not write key '${key}' of the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
     return 1
   fi
 }
 
+# github.com presents a certificate the public CAs sign, and the later flag
+# check refuses a CA file with no host. Called by the forge menu's github.com
+# and no-repository answers: an exported GITOPS_CA_FILE is dropped without a
+# word, as the GitLab validator drops one for gitlab.com (a CA file typed for
+# an Enterprise Server host never reaches here: the validator's refusal puts
+# the entry value back); one given by flag is dropped with a line, since
+# refusing it after the whole interview would be the alternative. The CA
+# Secret name goes with it: a recorded forge, org, App or host flag settles
+# the forge before the menu, so the only name here is the default the early
+# flag check derived from an exported host and CA file (a refused attempt
+# at the menu derives none: the validator names the Secret only after it
+# accepts the file), and the later flag check would otherwise report it
+# dropped as a recorded one.
+drop_gitops_ca_file_for_github_com() {
+  if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ]; then
+    print_info "Dropping --gitops-ca-file '${PARAM_GITOPS_CA_FILE}': this run's GitOps forge is github.com, which uses the public CAs."
+  fi
+  PARAM_GITOPS_CA_FILE=""
+  PARAM_GITOPS_CA_SECRET=""
+}
+
 # The forge question, asked only when nothing has settled the forge: github.com,
 # a GitHub Enterprise Server (its host and an optional CA file, asked until
-# the validator accepts them), or GitLab, whose own questions follow in main.
+# the validator accepts them), GitLab, whose own questions follow in main, or
+# no repository at all. The last answer sets GITOPS_INTERVIEW_DECLINED, and
+# main then takes the same arm as "Skip for now" in the repository menu, so
+# an operator who wants no GitOps repository is not made to name a forge
+# first. An empty Enterprise Server hostname comes back to this menu rather
+# than asking for the hostname again: before this, an operator who picked
+# option 2 by mistake could only leave with Ctrl-C.
 ask_gitops_forge() {
-  if [ "$PARAM_NON_INTERACTIVE" != "true" ] && [ "${PARAM_GITOPS_FORGE_GIVEN:-false}" != "true" ]; then
-    local forge_choice="1"
-    [ "$PARAM_GITOPS_FORGE" = "github" ] && [ -n "${PARAM_GITOPS_HOST:-}" ] && forge_choice="2"
-    [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="3"
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || [ "${PARAM_GITOPS_FORGE_GIVEN:-false}" = "true" ]; then
+    return 0
+  fi
+  local forge_choice="1"
+  [ "$PARAM_GITOPS_FORGE" = "github" ] && [ -n "${PARAM_GITOPS_HOST:-}" ] && forge_choice="2"
+  [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="3"
+  # What the menu was first shown over. An option 2 attempt the validator
+  # refuses puts these back, so the next answer -- option 2 again, github.com
+  # or no repository -- starts from here and not from the refused host and
+  # CA file. The hostname prompt's default is the host the menu was shown
+  # over on the first attempt and nothing after a refusal: prompt_read
+  # substitutes a default for an empty answer, so a refused host offered
+  # again would make enter resubmit it instead of returning to the menu.
+  local host_on_entry="${PARAM_GITOPS_HOST:-}" ca_file_on_entry="${PARAM_GITOPS_CA_FILE:-}"
+  local ghes_host="${PARAM_GITOPS_HOST:-}"
+  while true; do
     prompt_menu "Where does the GitOps repository live?" \
       "GitHub (github.com)" \
       "GitHub Enterprise Server (a GitHub host that you run)" \
       "GitLab (gitlab.com or self-managed)" \
+      "Nowhere yet: install without a GitOps repository (you can connect one later)" \
       forge_choice
-    if [ "$forge_choice" = "3" ]; then
-      PARAM_GITOPS_FORGE="gitlab"
-    elif [ "$forge_choice" = "2" ]; then
-      PARAM_GITOPS_FORGE="github"
-      # The instance's host and its CA, asked until the validator accepts
-      # them. The CA prompt has no default, so empty stays a way to answer
-      # "a public CA signed it" on every pass.
-      while true; do
-        prompt_read "GitHub Enterprise Server hostname (for example github.example.com)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-}"
+    case "$forge_choice" in
+      4)
+        # The same install as option 1, with the repository menu declined:
+        # github.com, no host, and no CA file.
+        PARAM_GITOPS_FORGE="github"
+        PARAM_GITOPS_HOST=""
+        drop_gitops_ca_file_for_github_com
+        GITOPS_INTERVIEW_DECLINED="true"
+        return 0
+        ;;
+      3)
+        PARAM_GITOPS_FORGE="gitlab"
+        return 0
+        ;;
+      2)
+        prompt_read "GitHub Enterprise Server hostname (for example github.example.com)" ghes_host "$ghes_host"
+        if [ -z "$ghes_host" ]; then
+          print_error "A GitHub Enterprise Server install needs the instance's hostname. Choose 'Nowhere yet' to install without a GitOps repository."
+          # With no terminal every answer is the same default, so asking
+          # again would spin.
+          has_controlling_tty || exit 1
+          continue
+        fi
+        PARAM_GITOPS_FORGE="github"
+        PARAM_GITOPS_HOST="$ghes_host"
+        # The CA prompt has no default, so empty stays a way to answer "a
+        # public CA signed it" on every pass.
         if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
           PARAM_GITOPS_CA_FILE=""
-          if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+          if [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
             prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
           fi
         fi
-        if [ -n "${PARAM_GITOPS_HOST:-}" ] && validate_gitops_forge_flags; then
-          break
+        if validate_gitops_forge_flags; then
+          # A github.com spelling clears the host: the install is then github.com.
+          if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
+            print_info "Create the GitHub App on ${PARAM_GITOPS_HOST}, not on github.com: an App belongs to one GitHub host."
+          fi
+          return 0
         fi
-        [ -z "${PARAM_GITOPS_HOST:-}" ] && print_error "A GitHub Enterprise Server install needs the instance's hostname."
+        # The validator refused the host or the CA file: the menu comes back
+        # as it was first shown, with option 2 still selected, and enter asks
+        # for them again with no default. Options 1 and 4 clear the host and
+        # CA file themselves; option 3 does not, and without this it would
+        # offer the refused Enterprise Server host as the GitLab host's default.
+        ghes_host=""
+        PARAM_GITOPS_HOST="$host_on_entry"
+        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+          PARAM_GITOPS_CA_FILE="$ca_file_on_entry"
+        fi
         has_controlling_tty || exit 1
-      done
-      # A github.com spelling clears the host: the install is then github.com.
-      if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
-        print_info "Create the GitHub App on ${PARAM_GITOPS_HOST}, not on github.com: an App belongs to one GitHub host."
-      fi
-    else
-      PARAM_GITOPS_FORGE="github"
-      PARAM_GITOPS_HOST=""
-    fi
-  fi
+        ;;
+      *)
+        PARAM_GITOPS_FORGE="github"
+        PARAM_GITOPS_HOST=""
+        drop_gitops_ca_file_for_github_com
+        return 0
+        ;;
+    esac
+  done
 }
 
 # The CA file the organization check may hand to curl: --gitops-ca-file when
@@ -5335,7 +5783,8 @@ restart_github_minter_for_ca() {
   fi
 }
 
-# Creates (or replaces) the Secret the GitLab forge's credentialsRef names, in
+# Writes the `token` key of the Secret the GitLab forge's credentialsRef names
+# (field manager GITLAB_TOKEN_FIELD_MANAGER, so a read-token key stays), in
 # the agent's namespace, after the apply has made the namespace. The token
 # reaches kubectl through a pipe -- read from the named source, or from a
 # no-echo prompt, into a local that is cleared at once -- so it is never in
@@ -5346,7 +5795,10 @@ create_gitlab_token_secret() {
   local namespace="$1" context="$2"
   local name="${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
   local exists="false" token="" rc=0
-  if kubectl get secret "$name" -n "$namespace" --context "$context" >/dev/null 2>&1; then
+  # The write token's key, not the Secret: a Secret that holds only the
+  # read-token key has no write token to keep.
+  if [ -n "$(kubectl get secret "$name" -n "$namespace" --context "$context" \
+    -o "jsonpath={.data.${GITLAB_TOKEN_SECRET_KEY}}" 2>/dev/null)" ]; then
     exists="true"
   fi
   if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
@@ -5358,7 +5810,7 @@ create_gitlab_token_secret() {
       print_error "The GitLab token source '${PARAM_GITLAB_TOKEN_FILE}' is empty; nothing was stored."
       return 1
     fi
-    printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" || rc=$?
+    printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" "$GITLAB_TOKEN_SECRET_KEY" "$GITLAB_TOKEN_FIELD_MANAGER" || rc=$?
     token=""
     unset token
     [ "$rc" -eq 0 ] || return 1
@@ -5394,11 +5846,34 @@ create_gitlab_token_secret() {
     print_warning "No token entered; nothing was stored. Create Secret '${name}' later (see the install guide)."
     return 0
   fi
-  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" || rc=$?
+  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" "$GITLAB_TOKEN_SECRET_KEY" "$GITLAB_TOKEN_FIELD_MANAGER" || rc=$?
   token=""
   unset token
   [ "$rc" -eq 0 ] || return 1
   print_success "GitLab token stored in Secret '${name}' (namespace ${namespace})."
+}
+
+# Writes the read-only token from GITLAB_READ_TOKEN_FILE into the key
+# "read-token" of the same Secret. The broker presents it only to clone
+# context repositories, never on a write. The token travels as in
+# create_gitlab_token_secret. Without a file, nothing is applied, so an
+# existing read token stays in place.
+create_gitlab_read_token_secret() {
+  local namespace="$1" context="$2"
+  local name="${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
+  local token="" rc=0
+  [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ] || return 0
+  IFS= read -r -d '' token <"$PARAM_GITLAB_READ_TOKEN_FILE" || true
+  token="$(gitlab_token_strip "$token")"
+  if [ -z "$token" ]; then
+    print_error "The GitLab read token source '${PARAM_GITLAB_READ_TOKEN_FILE}' is empty; nothing was stored."
+    return 1
+  fi
+  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" "$GITLAB_READ_TOKEN_SECRET_KEY" "$GITLAB_READ_TOKEN_FIELD_MANAGER" || rc=$?
+  token=""
+  unset token
+  [ "$rc" -eq 0 ] || return 1
+  print_success "GitLab read token stored in Secret '${name}', key ${GITLAB_READ_TOKEN_SECRET_KEY} (namespace ${namespace})."
 }
 
 # Validates that non-interactive minter configuration has either an ENABLED KMS key
@@ -5568,6 +6043,8 @@ summarize_existing_cluster_mutations() {
   else
     if is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
       echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Will enable${C_RESET} legacy Calico addon & enforcement (${C_YELLOW}may recreate nodes, restart workloads${C_RESET})"
+    elif is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_RED}Refused${C_RESET} (the web console requires NetworkPolicy enforcement; pass --enable-network-policy or --enable-web-console=false; install will abort)"
     elif is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
       echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Absent, accepted${C_RESET} (--accept-no-network-policy: cluster unchanged; ${C_YELLOW}every NetworkPolicy kube-agents ships is inert, the agent sandbox included${C_RESET}; recorded on the PlatformAgent)"
     else
@@ -5777,7 +6254,7 @@ run_menu_system() {
   normalize_memory_vars
 
   local project_id="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}"
-  local project_number="${PROJECT_NUMBER:-}"
+  local project_number=""
   local cluster_name="${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}"
   local region="${REGION:-$DEFAULT_REGION}"
   local model_provider="${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
@@ -6004,6 +6481,23 @@ run_menu_system() {
         # The chat screen's home channel, which the home-channel warning below
         # reads; save_env_var exports it again when it writes install.env.
         export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"
+        # An install.env with no mode key (one copied from install.env.example
+        # onto a running install) would render today here, switching a next
+        # install back with nothing asked. The mode is settled from the
+        # cluster as main() does, and saved with the rest; a guess (a cluster
+        # that cannot be read) is rendered as today and not saved.
+        local menu_mode_to_save=""
+        if ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
+          PARAM_PLATFORM_AGENT_MODE="" PLATFORM_AGENT_MODE_GUESSED="false" PLATFORM_AGENT_MODE_SETTLED="false"
+          resolve_platform_agent_mode_fallback
+          PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \
+            adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || return 1
+          # The menu has no flag, so the recorded prefix is the mirror.
+          local menu_third_party_prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
+          mirrored_first_install_mode "${menu_third_party_prefix%/}"
+          export PLATFORM_AGENT_MODE="$PLATFORM_AGENT_MODE_FALLBACK"
+          [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" = "true" ] || menu_mode_to_save="$PLATFORM_AGENT_MODE_FALLBACK"
+        fi
         # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
         # from install.env, and if Slack moves to the A2A gateway under next,
         # the settings it cannot use are refused (and again after the
@@ -6073,6 +6567,9 @@ run_menu_system() {
         save_env_var GITHUB_APP_ID "$github_app_id"
         save_env_var KMS_KEYRING "$kms_keyring"
         save_env_var KMS_KEY "$kms_key"
+        if [ -n "$menu_mode_to_save" ]; then
+          save_env_var PLATFORM_AGENT_MODE "$menu_mode_to_save"
+        fi
         print_success "Updated configuration saved to: $INSTALL_ENV_FILE"
 
         # One engine for every kind of change: a full terraform apply
@@ -6141,6 +6638,34 @@ run_menu_system() {
         print_info "Re-applying the install to GKE cluster '$cluster_name' (terraform apply)..."
         run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-$(date -u +%Y%m%dT%H%M%SZ).log"
         print_success "Configuration applied!"
+        # The DM link in the Google Chat checklist is this project's number,
+        # read here rather than inherited: install.env never records it.
+        if is_truthy "$google_chat_enabled"; then
+          project_number="$(gcloud projects describe "$project_id" --format="value(projectNumber)" 2>/dev/null || echo "")"
+        fi
+        local menu_mode="${PLATFORM_AGENT_MODE_AFTER_APPLY:-${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}}"
+        PROJECT_NUMBER="$project_number" print_chat_setup_checklists "$menu_mode"
+        if [ "$CHAT_SETUP_CHECKLIST_PRINTED" = "true" ]; then
+          # Unlike main(), this apply does not wait for a rollout, and the menu
+          # redrawn below would push the checklist off screen. Under next the
+          # A2A gateway answers the platform it holds; the agent, the rest.
+          local menu_listeners="" menu_deployment
+          if google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled" ||
+            slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; then
+            menu_listeners="$PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT"
+          fi
+          if { is_truthy "$google_chat_enabled" && ! google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled"; } ||
+            { is_truthy "$slack_enabled" && ! slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; }; then
+            menu_listeners="${menu_listeners} ${PLATFORM_AGENT_DEPLOYMENT}"
+          fi
+          echo ""
+          for menu_deployment in $menu_listeners; do
+            print_info "Before the first chat message, wait for the rollout: kubectl rollout status deployment/${menu_deployment} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} --context $(gke_context_name)"
+          done
+          # shellcheck disable=SC2034  # the answer is not read
+          local menu_ack=""
+          prompt_read "Press Enter to return to the control panel" menu_ack "" || true
+        fi
         ;;
       7)
         print_info "Exiting Control Panel."
@@ -6326,6 +6851,15 @@ main() {
   # the flag or install.env, before the interview and any --dry-run preview.
   validate_github_app_id "${PARAM_GITHUB_APP_ID:-}" \
     "$([ "${PARAM_GITHUB_APP_ID_FROM_FLAG:-false}" = "true" ] && echo "--github-app-id" || echo "GITHUB_APP_ID in ${INSTALL_ENV_FILE:-install.env}")" || exit 1
+  # SLACK_HOME_CHANNEL_POLICY, from the flag or install.env, before the file
+  # check below: a flag outside the enum would otherwise be refused as a
+  # disagreement with the file, with a remedy that records a value the
+  # generator and the CRD refuse. The generator checks again on every route.
+  # The remedy names the flag only when this run typed it (note_install_env_flag):
+  # a flag cannot correct a value the file carries, the file check below would
+  # refuse the disagreement, so that value is sent back to the file.
+  require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}" \
+    "$([[ $'\n'"$INSTALL_ENV_FLAGS_TYPED" == *$'\n'"SLACK_HOME_CHANNEL_POLICY|"* ]] && echo "flags" || echo "")" || exit 1
   # The chat flags and --mode against an existing install.env, as soon as
   # is_truthy and the defaults are loaded: a flag that disagrees with the file
   # stops the run here, before the interview and long before anything is
@@ -6548,6 +7082,16 @@ main() {
   fi
   print_success "Selected Cluster Name: ${C_BOLD}${cluster_name}${C_RESET}"
 
+  # Settled before step 6, whose prompts and Slack refusals follow the mode:
+  # a run where nothing chose a mode, against a cluster that already runs
+  # kube-agents, keeps the mode it runs; a mirrored first install defaults to
+  # today; and an install.env with no mode key records the result. The target
+  # is known from here; the exports come later.
+  PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \
+    adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+  mirrored_first_install_mode "${PARAM_THIRD_PARTY_REGISTRY_PREFIX%/}"
+  queue_unrecorded_platform_agent_mode
+
   # 6. Chat & Messaging Platform Integration
   print_step "6. Chat & Messaging Integrations Setup"
   # The option the loaded configuration already corresponds to. It is a
@@ -6620,6 +7164,7 @@ main() {
   local slack_allowed_users="${PARAM_SLACK_ALLOWED_USERS:-}"
   local slack_home_channel="${PARAM_SLACK_HOME_CHANNEL:-}"
   local slack_home_channel_name="${PARAM_SLACK_HOME_CHANNEL_NAME:-}"
+  local slack_home_channel_policy="${PARAM_SLACK_HOME_CHANNEL_POLICY:-}"
 
   # No Slack token check here. The obvious place for one is this step -- Slack
   # is asked for here and the relay cannot open a socket without both tokens --
@@ -6665,7 +7210,7 @@ main() {
     # so and ask again on an answer the gateway cannot use, rather than let
     # the refusal after this step throw the interview away. A run with nobody
     # to ask keeps its values, and that refusal is its check.
-    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" true "$google_chat_enabled"; then
+    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" true "$google_chat_enabled"; then
       _prompt_slack_settings_for_gateway
       return 0
     fi
@@ -6753,7 +7298,7 @@ main() {
     fi
     chat_sub_name="$default_sub"
     prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
-    if [ "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" != "next" ]; then
+    if [ "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" != "next" ]; then
       prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
         google_chat_home_channel "$google_chat_home_channel"
       return 0
@@ -6775,7 +7320,8 @@ main() {
   # $3 whether anyone can be asked. With nobody to ask it keeps the answer;
   # the warning before the apply and the closing summary say it then.
   _confirm_no_home_channel() {
-    local home="${2//[[:space:]]/}" keep=""
+    local home keep=""
+    home="$(trim_go_space "${2:-}")"
     [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
     print_warning "$(next_home_channel_unset_message "$1")"
     prompt_read "Continue without a home channel, so alerts and reports are dropped? (y/N)" keep "n"
@@ -6790,6 +7336,9 @@ main() {
   # project_id, region and cluster_name are all set by earlier steps, and
   # NAMESPACE is exported before the menu runs.
   _prompt_no_chat_enabled() {
+    # after_summary is true for the repeat at the end of main(), where the
+    # component summary has already printed the web console command.
+    local after_summary="${1:-false}"
     print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
 
     # gcloud rejects --dns-endpoint on clusters without an external DNS
@@ -6838,6 +7387,17 @@ main() {
     echo -e "    Google Chat: ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} and ${C_BOLD}ALLOWED_USERS=${C_RESET}<emails> (or use ${C_BOLD}./install.sh --menu${C_RESET})"
     echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<member IDs, e.g. U0123ABCD>, re-run with --slack-bot-token and --slack-app-token"
     echo -e "  An allowlist left empty admits every user. --enable-google-chat and --enable-slack are refused over a file that records the key the other way."
+    if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}}"; then
+      if [ "$after_summary" = "true" ]; then
+        # The component summary just above already printed the command.
+        echo -e "  For a browser chat page instead of a terminal, use the Web Console command in the summary above."
+      else
+        echo ""
+        print_web_console_access "${NAMESPACE:-$DEFAULT_NAMESPACE}"
+      fi
+    else
+      echo -e "  For a browser chat page instead of a terminal, re-run with ${C_BOLD}--enable-web-console${C_RESET}."
+    fi
   }
 
   case "$chat_choice" in
@@ -6852,7 +7412,7 @@ main() {
     3)
       google_chat_enabled="true"
       slack_enabled="true"
-      print_info "With --mode=next, Google Chat holds the A2A gateway when both are enabled, and Slack stays on the Hermes Slack platform; choose Slack alone to run Slack on the A2A gateway."
+      print_info "Under spec.mode next, Google Chat holds the A2A gateway when both are enabled, and Slack stays on the Hermes Slack platform; choose Slack alone to run Slack on the A2A gateway."
       _prompt_google_chat_settings
       _prompt_slack_settings
       ;;
@@ -6868,7 +7428,7 @@ main() {
   # Secret is checked after it. A --dry-run applies nothing, so it is warned
   # there instead, once, with the recovered token included.
   if [ "$PARAM_DRY_RUN" != "true" ]; then
-    refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" flags || exit 1
+    refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" "$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" flags || exit 1
   fi
 
   # 7. LLM Model Provider Selection & API Key Auto-Discovery
@@ -6908,7 +7468,7 @@ main() {
   fi
   # The mode was checked at step 2, before check_flags_against_install_env
   # held --mode to install.env (validate_platform_agent_mode).
-  local platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+  local platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   # The scoped service account pool, checked here for the same reason as the
   # toggle above: a misspelt switch is refused rather than read as off, and a
   # cap the module would refuse is named with its key before the interview.
@@ -7163,11 +7723,16 @@ main() {
     if [ -n "$github_org" ]; then
       gitops_choice="2"
     fi
-    prompt_menu "Would you like to connect or create a GitOps repo for automated PRs?" \
-      "Create a NEW GitHub Repository automatically (Recommended)" \
-      "Connect an EXISTING GitHub Repository" \
-      "Skip for now (Can be enabled later)" \
-      gitops_choice
+    if [ "$GITOPS_INTERVIEW_DECLINED" = "true" ]; then
+      # The forge menu already took the answer: no second menu to decline.
+      gitops_choice="3"
+    else
+      prompt_menu "Would you like to connect or create a GitOps repo for automated PRs?" \
+        "Create a NEW GitHub Repository automatically (Recommended)" \
+        "Connect an EXISTING GitHub Repository" \
+        "Skip for now (Can be enabled later)" \
+        gitops_choice
+    fi
 
     if [ "$gitops_choice" = "1" ] || [ "$gitops_choice" = "2" ]; then
       # The repo must be organization-owned: the token minter resolves App
@@ -7645,6 +8210,7 @@ main() {
   export LITELLM_REDACTION_ENABLED="$redaction_enabled"
   export LITELLM_REDACTION_IP_ACTION="$redaction_ip_action"
   export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"
+  platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   export PLATFORM_AGENT_MODE="$platform_agent_mode"
   # The bus's two third-party images are the operator's compiled defaults
   # (A2A_NATS_IMAGE and A2A_PROVISION_IMAGE in images.json), which neither
@@ -7678,6 +8244,7 @@ main() {
   export SLACK_ALLOWED_USERS="$slack_allowed_users"
   export SLACK_HOME_CHANNEL="$slack_home_channel"
   export SLACK_HOME_CHANNEL_NAME="$slack_home_channel_name"
+  export SLACK_HOME_CHANNEL_POLICY="$slack_home_channel_policy"
   export API_SERVER_KEY="$api_server_key"
   export PLATFORM_AGENT_PERMISSION_SET="$permission_set"
   export PLATFORM_AGENT_CUSTOM_ROLES="$custom_roles"
@@ -7709,6 +8276,11 @@ main() {
   export MEMORY_PROVIDER="$memory_provider"
   export USER_PROFILE_ENABLED="$PARAM_USER_PROFILE_ENABLED"
   export HERMES_DASHBOARD_ENABLED="$PARAM_ENABLE_WEBUI"
+  # Conditional, like ENABLE_DRIFT_DETECTOR below: a run that did not say
+  # leaves the recorded value (or, with none, the default) to the generator.
+  if [ -n "${PARAM_ENABLE_WEB_CONSOLE:-}" ]; then
+    export WEB_CONSOLE_ENABLED="$PARAM_ENABLE_WEB_CONSOLE"
+  fi
   export REGISTRY_PREFIX="$registry_prefix"
   export ENABLE_PUBSUB_PLATFORM="$PARAM_ENABLE_PUBSUB_PLATFORM"
   export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
@@ -7837,6 +8409,19 @@ main() {
     mode_notice_route="$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
   fi
   announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"
+  # Under -y nothing stands between that notice and the apply, so a switch
+  # nobody chose is refused: one that comes from the fallback rather than
+  # from --mode, an exported PLATFORM_AGENT_MODE or the key install.env
+  # records (editing that key is the documented way to switch).
+  if [ "$mode_notice_route" = "$PLATFORM_AGENT_MODE_NOTICE_UNGATED" ] \
+    && [ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ] \
+    && [ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ] \
+    && ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
+    rm -f "$tfvars_file"
+    print_error "Refusing to switch spec.mode under -y when nothing asked for it: no --mode, and install.env records no PLATFORM_AGENT_MODE."
+    print_info "Pass --mode=today or --mode=next to say which mode this install runs, or run without -y to confirm the switch at the prompt."
+    exit 1
+  fi
   # A declared folder or organisation is bound by the apply with this
   # identity, in the container itself, and turns on the Asset API in the host
   # project; both are checked before anything is applied, first install
@@ -7891,10 +8476,10 @@ main() {
   fi
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
   # Named on every run, a first install included, where no switch notice
-  # fires: next is an unsupported stack, and a copied --mode=next would
-  # otherwise install it without a word before the confirmation.
+  # fires: a first install is next by default, and this is where it learns
+  # that and how to keep the previous stack instead.
   if [ "$platform_agent_mode" = "next" ]; then
-    echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (unsupported development stack: the NATS bus and the A2A gateway)"
+    echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (the NATS bus and the A2A gateway in front of the agent; --mode=today on a first install, or PLATFORM_AGENT_MODE=today in install.env, installs the previous stack)"
   else
     echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${platform_agent_mode}"
   fi
@@ -7969,12 +8554,16 @@ main() {
       is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
       if [ "$np_status" -eq 2 ]; then
         print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' could not be queried."
-      elif [ "$np_status" -ne 0 ] && ! is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+      elif [ "$np_status" -ne 0 ] && { ! is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}" || is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; }; then
         if is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
           print_info "Dry-run: skipping terraform plan because Calico has not yet been applied to the live cluster (a real run enables Calico prior to apply)."
         else
           print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' enforces no NetworkPolicy (postcondition would fail)."
-          print_info "A real run will abort unless told which way to go: --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon, a control-plane update that may recreate nodes; --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement and leaves the cluster as it is."
+          if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+            print_info "A real run will abort unless NetworkPolicy enforcement is enabled: --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon, a control-plane update that may recreate nodes (--accept-no-network-policy / ACCEPT_NO_NETWORK_POLICY=true cannot be combined with --enable-web-console)."
+          else
+            print_info "A real run will abort unless told which way to go: --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon, a control-plane update that may recreate nodes; --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement and leaves the cluster as it is."
+          fi
           print_info "To enable enforcement by hand beforehand, run these two commands in this order:"
           print_info "  gcloud container clusters update $cluster_name --location $region --project $project_id --update-addons=NetworkPolicy=ENABLED"
           print_info "  gcloud container clusters update $cluster_name --location $region --project $project_id --enable-network-policy"
@@ -8060,6 +8649,12 @@ main() {
         warn_install_env_keys_not_recorded
         print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
+        # After the lines above: the printers read the mode and the toggles
+        # from install.env, which this route leaves as it found it.
+        if is_truthy "${GOOGLE_CHAT_ENABLED:-}" || is_truthy "${SLACK_ENABLED:-}"; then
+          print_info "After the apply, set up the chat app with the checklist these print:"
+          print_chat_checklist_commands
+        fi
         write_json_report "PAUSED"
         print_next_home_channel_unset_summary flags
         exit 0
@@ -8198,6 +8793,7 @@ main() {
     # Secret must exist by then.
     create_gitops_ca_secret "$namespace" "$expected_ctx" || exit 1
     create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
+    create_gitlab_read_token_secret "$namespace" "$expected_ctx" || exit 1
   elif [ -n "${GITOPS_HOST:-}" ]; then
     # A GitHub Enterprise Server: the CA before the minter restart, which is
     # how the minter reads it. The broker reads it on each call.
@@ -8274,28 +8870,18 @@ main() {
     fi
     echo -e "    ${C_YELLOW}Browser Dashboard URL:${C_RESET} ${C_UNDERLINE}http://localhost:9119${C_RESET}"
   fi
+  if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}}"; then
+    print_web_console_access "$namespace"
+  fi
 
-  if [ "${google_chat_enabled:-false}" = "true" ]; then
-    echo ""
-    IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_gchat.sh" || true
-  fi
-  if [ "${slack_enabled:-false}" = "true" ]; then
-    echo ""
-    # The install.env this run read, which need not be the checkout's, and
-    # what the run applied, which an interview answer install.env does not
-    # record makes differ from the file.
-    IMAGE_TAG="$image_tag" KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE" \
-      SLACK_STEPS_PLATFORM_AGENT_MODE="$platform_agent_mode" \
-      SLACK_STEPS_SLACK_ENABLED="$slack_enabled" \
-      SLACK_STEPS_GOOGLE_CHAT_ENABLED="${google_chat_enabled:-false}" \
-      SLACK_STEPS_HOME_CHANNEL="$slack_home_channel" \
-      bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
-  fi
-  # Repeated here, where the two printers above give their instructions. Arm 4
+  # The checklists and the closing summary follow the mode the CR is left
+  # on, which a mode set outside this installer can keep from the key.
+  print_chat_setup_checklists "${PLATFORM_AGENT_MODE_AFTER_APPLY:-$platform_agent_mode}"
+  # Repeated here, where the checklists above give their instructions. Arm 4
   # prints it as well, for the runs that never reach the end of main().
   if [ "$chat_choice" = "4" ]; then
     echo ""
-    _prompt_no_chat_enabled
+    _prompt_no_chat_enabled true
   fi
   print_next_home_channel_unset_summary flags
 }

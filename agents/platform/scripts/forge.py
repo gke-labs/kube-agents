@@ -73,6 +73,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -116,6 +117,15 @@ AGENT_BRANCH_PREFIX = "platform-agent/"
 #: A label that opts a pull request out of every sweep, matching the convention
 #: `github-issue-resolver` already honours on issues.
 IGNORE_LABEL = "agent:ignore"
+
+#: The same opt-out on a forge with no labels (`capabilities` says
+#: `labels: false`): `agent:ignore` on a line of its own in the description,
+#: bare or as an HTML comment. Read only there, so a description on a forge
+#: with labels changes nothing.
+IGNORE_BODY_RE = re.compile(
+    r"^[ \t]*(?:<!--[ \t]*)?" + re.escape(IGNORE_LABEL) + r"(?:[ \t]*-->)?[ \t\r]*$",
+    re.MULTILINE,
+)
 
 #: Reason code for a repository whose host no forge module serves. Named here
 #: beside the other operator-facing strings rather than inline in
@@ -642,6 +652,7 @@ class BrokerProvider:
         # answer, meaning the credential could not name itself, and is cached.
         self._viewers: dict[str, str] = {}
         self._acknowledges: dict[str, bool] = {}
+        self._labels: dict[str, bool] = {}
         # Every listing this instance read that filled its page, in the words an
         # operator reads. Accumulated rather than only logged because the
         # sweep's channel to a human is the `warnings` list it prints on stdout:
@@ -825,6 +836,31 @@ class BrokerProvider:
             self._acknowledges[repo] = bool(answer.get("acknowledge"))
         return self._acknowledges[repo]
 
+    def supports_labels(self, repo: str) -> bool:
+        """Does this repository's forge carry labels on a pull request?
+
+        From `capabilities`, like `supports_acknowledge`. A field that is not
+        in the answer -- a broker older than the field -- answers True, which
+        is what every forge was taken to have before the field existed, and so
+        does an answer that cannot be read. Only a forge that says
+        `labels: false` changes anything.
+        """
+        known = self._labels_known(repo)
+        return True if known is None else known
+
+    def _labels_known(self, repo: str) -> Optional[bool]:
+        """`supports_labels`, with None when `capabilities` could not be read."""
+        if repo not in self._labels:
+            try:
+                answer = self._verb("capabilities", {}, repo)
+            except ForgeError as error:
+                LOGGER.info("capabilities unreadable for %s: %s", repo, error)
+                return None
+            # Only a served forge's answer: an unserved host also says no labels.
+            served = bool(answer.get("forge")) and not answer.get("missing")
+            self._labels[repo] = not served or answer.get("labels") is not False
+        return self._labels[repo]
+
     # -- the operations ----------------------------------------------------
     def list_open_prs(self, repo: str) -> list[PullRequest]:
         """Every open change proposal on one repository.
@@ -834,6 +870,24 @@ class BrokerProvider:
         branch on somebody's fork, and telling those apart is the first of the
         three things `is_agent_pull_request` checks.
         """
+        nodes = self._pages(
+            "proposal-list",
+            {"state": "open", "limit": PAGE_SIZE},
+            "proposals",
+            repo,
+            "the open proposals",
+        )
+        # The description opt-out counts only on a forge with no labels, and
+        # `capabilities` is asked only when a description carries one, so a
+        # forge with labels makes the same calls as before.
+        body_ignored = {
+            id(node) for node in nodes if IGNORE_BODY_RE.search(str(node.get("body") or ""))
+        }
+        # Not known is not "has labels": a proposal that a person parked with
+        # the description line stays parked for the tick, because sweeping it
+        # costs an action on it and holding it costs one tick.
+        if body_ignored and self._labels_known(repo) is True:
+            body_ignored = set()
         return [
             PullRequest(
                 number=int(node.get("number") or 0),
@@ -844,16 +898,11 @@ class BrokerProvider:
                 head_repo=str(node.get("sourceRepo") or ""),
                 head_sha=str(node.get("sourceRevision") or ""),
                 author=str(node.get("author") or ""),
-                labels=tuple(str(name) for name in (node.get("labels") or [])),
+                labels=tuple(str(name) for name in (node.get("labels") or []))
+                + ((IGNORE_LABEL,) if id(node) in body_ignored else ()),
                 url=str(node.get("url") or ""),
             )
-            for node in self._pages(
-                "proposal-list",
-                {"state": "open", "limit": PAGE_SIZE},
-                "proposals",
-                repo,
-                "the open proposals",
-            )
+            for node in nodes
         ]
 
     def list_comments(self, repo: str, pr: PullRequest) -> list[Comment]:

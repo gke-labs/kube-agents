@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
 // Profile narrowing: the map entry for an A2A AgentProfile's pods.
@@ -35,11 +36,33 @@ import (
 // Deliberately absent, as for sessions: STREAM.INFO and message get on TASKS
 // (neither is subject-scoped), $JS.ACK and $JS.FC (the adapter's consumers are
 // ack-none pulls), and any subscribe on the task subjects. Also absent, and
-// different from a session: the capability verify and reply subjects. A
-// session's caller identity at the verifier is its pod name, which is also its
-// addressee; a profile pod's addressee is the profile, and which name a profile
-// pod asks the verifier in is the dispatcher's design to settle. A grant for a
-// question nobody has decided how to ask would be a standing authorization.
+// different from a session: the capability verify and reply subjects, and any
+// fetch on the shared submission durables. #3660 settles both: the dispatcher
+// is the only fetcher and holder of submissions and the one that asks the
+// verifier, and a worker gets its task from the dispatcher.
+//
+// Per (profile, tier) since #3655: the operator renders one entry per tier
+// a profile allows, so the tier is the entry's. What a worker does with it is
+// the hand-off and the lease, both scoped to its own (profile, tier, pod):
+// the dispatcher's request on lib.DispatchSubject, its answer on
+// lib.DispatchAcceptSubject, and its lease renewals on
+// lib.DispatchLeaseSubject. No grant on the lease bucket itself: a KV bucket
+// allows rollup headers, so a put on any key would let a worker purge every
+// lease, and the dispatcher is the bucket's only writer.
+//
+// Per task with #3889, staged. The task subjects carry no tier (#3660,
+// "Subjects"), so a grant on the profile's .events and .in reaches every task
+// of the profile at any tier. The fix is two kinds of connection. A task
+// connection, opened after the worker accepts a task, presents the
+// ServiceAccount token plus the task credential the dispatcher signed
+// (a2a/taskcred), and gets that one task's executor grants and nothing else.
+// The pod connection, presenting the token alone, gets the hand-off, the lease
+// and the topics. It also keeps the profile-wide task reach it had before, for
+// now: this PR adds the task connection, and the worker moves onto it with
+// #3889's worker PR, which removes the pod connection's task reach
+// (profileWorkerGrants). That removal must land before any tier stronger than
+// Read goes live (#3659). See Service.authorize for how the two connections
+// are told apart on CONNECT and what the credential must match.
 
 // TopicGrants are an AgentProfile's blackboard grants as the profile spells
 // them, without the a2a.topics. prefix.
@@ -53,12 +76,19 @@ type TopicGrants struct {
 // to the one subject.
 var topicStreams = []string{lib.StreamTopicsState, lib.StreamTopicsJournal}
 
+// profileTiers are the tiers a profile entry may name, the AgentProfile
+// CRD's allowedTiers values. Duplicated here because the modules cannot
+// import each other, and kept equal by hand: the rendered fixture the
+// contract test reads carries only read.
+var profileTiers = map[string]bool{"read": true, "unattended": true}
+
 // topicPrefix is how a profile's topic grant becomes a subject.
 const topicPrefix = "a2a.topics."
 
-// profileGrants is what one pod of a profile may do on the bus: the executor
-// task plane for the profile's addressee with the pod's own consumers and
-// inbox, plus the profile's topics.
+// profileGrants is what one pod of a profile may do on its pod connection:
+// the hand-off, the lease, the pod's inbox and, until #3889's worker PR, the
+// profile-wide task plane (profileWorkerGrants), plus the profile's topics. A
+// task connection gets one task's subjects instead (profileTaskGrants).
 //
 // Any profile with a topic gets STREAM.INFO on both topic streams, a writer as
 // much as a reader: `a2a topics write` resolves the topic through
@@ -74,8 +104,8 @@ const topicPrefix = "a2a.topics."
 // An agent-scoped topic the profile publishes must be its own,
 // agent.<profile>.<topic>: the payload spec gives each agent namespace one
 // writer. Another agent's topic, or a shared one, is fine to read.
-func profileGrants(profile, pod string, topics TopicGrants) (Grants, error) {
-	g := executorGrants(profile, pod)
+func profileGrants(profile, tier, pod string, topics TopicGrants) (Grants, error) {
+	g := profileWorkerGrants(profile, tier, pod)
 	for _, t := range topics.Publish {
 		subject, err := topicSubject(t)
 		if err != nil {
@@ -126,12 +156,63 @@ func ownsAgentTopic(profile, grant string) error {
 	return nil
 }
 
+// profileWorkerGrants is a worker pod's own connection: an executor's task
+// plane over every task of the profile, the profile's .events publish and the
+// pod's own three consumers (origin, follow-ups, and the .events reader the
+// adapter uses to see whether a task already has a terminal before it runs
+// it); then, with a tier, the hand-off and lease grants above. An entry from
+// an operator before per-tier identities names no tier and gets none of the
+// hand-off, so a pod under it can't take dispatched work.
+//
+// TODO(#3889): drop the executor grants here, leaving the inbox, the hand-off
+// and the lease. The removal lands with the worker's per-task connection
+// (#3889's worker PR), which moves the adapter onto profileTaskGrants, and
+// must land before any tier stronger than Read goes live (#3659): until then
+// a worker at any tier reaches every task of its profile on this connection.
+// TestATokenlessWorkerKeepsProfileWideTaskReachUntilTheWorkerPR pins today's
+// shape and flips with it.
+func profileWorkerGrants(profile, tier, pod string) Grants {
+	g := executorGrants(profile, pod)
+	if tier == "" {
+		return g
+	}
+	g.Subscribe = append(g.Subscribe, lib.DispatchSubject(profile, tier, pod))
+	g.Publish = append(g.Publish,
+		lib.DispatchAcceptSubject(profile, tier, pod),
+		lib.DispatchLeaseSubject(profile, tier, pod),
+	)
+	return g
+}
+
+// profileTaskGrants is a worker's task connection: an executor's grants exact
+// on one task of its profile, the events publish and the task's own three
+// consumers (origin, follow-ups, and the events reader the adapter uses to see
+// whether a task already has a terminal before it runs it), and the task's
+// inbox, all named under the task's stem (below). No hand-off, lease or topic grant: the pod connection holds those.
+// The task comes from a verified credential (Service.verifyTaskCredential) and
+// the profile from the attested identity's map entry, never from the
+// credential alone.
+//
+// The consumer names and inbox are the task's own, under
+// taskcred.ConsumerStem(pod, task), not the pod's: a consumer's INFO, MSG.NEXT
+// and DELETE carry only its name, so a pod-named consumer would be reachable
+// from the next task's connection on the same warm pod.
+func profileTaskGrants(profile, task, pod string) Grants {
+	stem := taskcred.ConsumerStem(pod, task)
+	g := executorTaskGrants(profile, task, stem)
+	g.Publish = append(g.Publish, "_INBOX."+stem+".>")
+	return g
+}
+
 // validateProfileEntry is the map-time check for a NarrowingProfile entry. The
 // mint repeats the topic check, so a map that got past this function by some
 // other route still cannot mint a non-topic subject.
 func validateProfileEntry(id Identity) error {
 	if !lib.ValidSubjectToken(id.Profile) {
 		return fmt.Errorf("user %q narrows on %q but names profile %q, which is not a dot-free DNS-1123 label", id.User, id.Narrowing, id.Profile)
+	}
+	if id.Tier != "" && !profileTiers[id.Tier] {
+		return fmt.Errorf("user %q narrows on %q but names tier %q, which is not one of the profile tiers", id.User, id.Narrowing, id.Tier)
 	}
 	if id.Topics == nil {
 		return nil

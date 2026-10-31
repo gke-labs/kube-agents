@@ -58,6 +58,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 import mcp_policy  # noqa: E402
+import task_confinement  # noqa: E402
 import watcher_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
@@ -231,6 +232,14 @@ SOURCES: dict[str, Source] = {
         "charts/kube-agents/templates/agent-rbac-admission-policy.yaml",
         ("policyName",),
     ),
+    "gateway_pod_policy": Source(
+        "k8s-operator/config/admission/a2a-gateway-pod-policy.yaml",
+        ("kube-agents-a2a-gateway-pod", "failurePolicy", "variables.sessionAccount"),
+    ),
+    "chart_gateway_pod_policy": Source(
+        "charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml",
+        ("kube-agents.a2aGatewayPodPolicyEnabled", "policyName"),
+    ),
     # --- rendered output the operator is asserted against -----------------
     "shell_sandbox_manifests_go": Source(
         "k8s-operator/internal/controller/shell_sandbox_manifests.go",
@@ -259,15 +268,24 @@ SOURCES: dict[str, Source] = {
         "platformagent-tagged.yaml",
         ("kind: Deployment",),
     ),
-    # The above-one-replica shape. Its anchor is the leader Role's pods rule,
-    # because that rule is the only reason the fixture is registered here:
-    # every other golden is single-replica and renders it away, so without
-    # this key group C bounds the leader Role only in the shape where it holds
-    # no write verb on pods at all.
+    # The CR that asks for availability.replicas: 3. The operator caps the
+    # gateway at one replica, so this renders the single-replica shape: the
+    # gateway Deployment on Recreate and a leader Role holding leases only.
+    # No golden renders the leader Role's pods rule any more, because no
+    # install does. It stays registered so group C's bounds keep reading the
+    # one CR that would render that rule if the cap were lifted. The last
+    # anchor is the cap: it is the gateway Deployment's own selector label
+    # followed by its strategy, because a bare `type: Recreate` also matches
+    # the credential-proxy Deployment, which is always on Recreate. Losing it
+    # means the multi-replica shape is back and this key's comment is wrong.
     "golden_ha": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/"
         "platformagent-ha.yaml",
-        ("kind: Deployment", "kubeagents:leader:", "- pods"),
+        (
+            "kind: Deployment",
+            "kubeagents:leader:",
+            "app: platformagent-gateway\n  strategy:\n    type: Recreate",
+        ),
     ),
     # C1's cross-module pair. The session fence is rendered by the operator
     # (Go module k8s-operator) and its selector has to match the labels the
@@ -468,13 +486,14 @@ SOURCES: dict[str, Source] = {
     ),
     "a2a_session_grants": Source(
         "a2a/authcallout/session.go",
-        ("func sessionGrants", "func executorGrants", "lib.TaskEventsSubject(addressee,"),
+        ("func sessionGrants", "func executorGrants", "func executorTaskGrants", "lib.TaskEventsSubject(addressee,"),
     ),
-    # The other narrowing that starts from executorGrants: an AgentProfile's
-    # pods (the A2A profile resource, not a Hermes profile directory).
+    # The other narrowing that starts from executorTaskGrants: an
+    # AgentProfile's pods (the A2A profile resource, not a Hermes profile
+    # directory), on the task connection a task credential opens (#3889).
     "a2a_profile_grants": Source(
         "a2a/authcallout/profile_narrowing.go",
-        ("func profileGrants", "executorGrants(profile, pod)"),
+        ("func profileGrants", "func profileTaskGrants", "executorTaskGrants(profile, task, stem)"),
     ),
     # What the server actually loads, as opposed to what the Go builders say.
     # The writer-set tests read both and assert they agree: the Go map is what
@@ -630,6 +649,32 @@ SOURCES: dict[str, Source] = {
         "agents/cluster/config.yaml",
         ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
     ),
+    "tse_config": Source(
+        "agents/tse/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
+    # --- the tool-call audit ---------------------------------------------
+    # D1 reads that every profile config enables tool_call_audit. The Planning
+    # Agent's config is the one the image ships as the default profile. A
+    # Cluster Agent profile copies the shared plugins tree when it is
+    # scaffolded, and the image fills that tree from agents/chat/defaults/, so
+    # these anchors pin that the plugin a Cluster Agent enables is there to load.
+    "chat_config": Source("agents/chat/config.yaml", ("plugins:",)),
+    "tool_call_audit_manifest": Source(
+        "agents/chat/defaults/plugins/tool_call_audit/plugin.yaml",
+        ("name: tool_call_audit",),
+    ),
+    "cluster_agent_profile": Source(
+        "agents/platform/scripts/cluster_agent_profile.py",
+        (
+            'SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))',
+            "overlay_template(home, TEMPLATE_DIR, SHARED_PLUGINS_DIR",
+        ),
+    ),
+    "dockerfile_shared_plugins": Source(
+        "deploy/docker/Dockerfile",
+        ("COPY --chown=hermes:hermes agents/chat/defaults/ /opt/defaults/",),
+    ),
     "merge_configs": Source("deploy/docker/merge_configs.py", ("def merge(",)),
     "dockerfile_profile_configs": Source(
         "deploy/docker/Dockerfile",
@@ -637,6 +682,7 @@ SOURCES: dict[str, Source] = {
             "COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml",
             "merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml",
             "COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/",
+            "COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/",
         ),
     ),
     # --- supply chain -----------------------------------------------------

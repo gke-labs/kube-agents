@@ -38,6 +38,11 @@ at. Use the card's words in your reply — a user of a forge that calls them mer
 requests should not be answered in GitHub's vocabulary. If the card says
 nothing, it is a GitHub pull request.
 
+Pass `--repo` as the card names the repository: `<owner>/<repo>` on GitHub, or
+`<host>/<owner>/<repo>` on another declared forge (such as GitLab or Gitea) so
+installs that serve more than one forge do not have to guess which host a bare
+slug belongs to.
+
 ## Procedure
 
 ### Step 1: Re-read the conversation
@@ -261,4 +266,4 @@ has no cron caller. The card is the channel.
   own branch. Anything wider is a new `submit-suggestion` run, proposed in the
   reply and not performed.
 - **Never merge, close, or approve.** Human review gates every resolution.
-- **Never modify a pull request labelled `agent:ignore`.**
+- **Never modify a pull request labelled `agent:ignore`**, or, on a forge with no labels, one with `agent:ignore` on a line of its own in the description.

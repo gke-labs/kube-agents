@@ -225,9 +225,12 @@ After deploying alerting policies, run the following verification steps:
 1.  **Validate Terraform Syntax**:
 
     ```bash
-    terraform init
-    terraform validate
+    tofu fmt -check -diff <directory holding the .tf files>
     ```
+
+    `tofu fmt` parses every file it formats and needs no provider plugins,
+    state or credentials. `init` and `validate` need a provider registry and
+    a cloud this shell cannot reach; they are the repository's CI's to run.
 
 2.  **Validate PromQL Rules**:
 

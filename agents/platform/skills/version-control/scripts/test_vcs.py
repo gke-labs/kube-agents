@@ -1288,7 +1288,13 @@ class AbstractionTest(unittest.TestCase):
             "branch-view": ("remote-branch", "view"),
             "branch-delete": ("remote-branch", "delete"),
         }
+        # Served to library callers only, through `vcs_client.snapshot`: no
+        # `vcs.py` command, and `capabilities` does not advertise them
+        # (test_vcs_broker checks that half).
+        from providers import LIBRARY_VERBS as library_only
         for verb in vcs_broker.route_table(mock.Mock()):
+            if verb in library_only:
+                continue
             # `proposal-create` is `proposal create`: the hyphen is the space.
             command, _, action = verb.partition("-")
             command, action = spelled_otherwise.get(verb, (command, action))

@@ -36,9 +36,11 @@ class Api:
     def __init__(self, *responses):
         self.responses = list(responses)
         self.calls = []
+        self.with_headers = []
 
-    def __call__(self, method, path, *, params=None, body=None, raw=None):
+    def __call__(self, method, path, *, params=None, body=None, raw=None, with_headers=False):
         self.calls.append((method, path, params or {}, body, raw))
+        self.with_headers.append(with_headers)
         answer = self.responses.pop(0)
         if isinstance(answer, WorkspaceError):
             raise answer
@@ -201,6 +203,91 @@ class ConfigurationTest(unittest.TestCase):
                 f"credential.https://gitlab.com.helper",
                 built.credential.git_config("acme/infra")[1][0],
             )
+
+
+class ReadCredentialTest(unittest.TestCase):
+    """The optional read-only token a context repository clones with."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.token = self.dir / "token"
+        self.token.write_text("glpat-write\n")
+        self.read = self.dir / "read-token"
+
+    def built(self, read_token_path=None):
+        path = str(self.read) if read_token_path is None else read_token_path
+        return GitLabForge("gitlab.com", str(self.token), read_token_path=path)
+
+    def test_no_read_token_path_is_no_credential(self):
+        built = GitLabForge("gitlab.com", str(self.token))
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+
+    def test_a_missing_or_empty_file_is_no_credential(self):
+        # The Secret may lack the key: the operator's projection is optional,
+        # so the file is absent and the clone keeps today's behaviour.
+        built = self.built()
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+        for empty in ("", "\n", "  \n"):
+            with self.subTest(empty=empty):
+                self.read.write_text(empty)
+                self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+
+    def test_a_malformed_read_token_is_no_credential(self):
+        # The git helper drops a token that is not one line of printable ASCII
+        # in silence; the forge refuses it first, by the same rule, so the
+        # broker's "presents none" warning names the key.
+        built = self.built()
+        for bad in ("glpat read\n", "\ufeffglpat-read\n", "glpat-read\nsecond-line\n"):
+            with self.subTest(bad=bad):
+                self.read.write_text(bad, encoding="utf-8")
+                self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+        self.read.write_bytes("glpat-read".encode("utf-16"))
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+
+    def test_a_stored_read_token_is_presented_as_the_write_token_is_and_never_is_it(self):
+        self.read.write_text("glpat-read\n")
+        built = self.built()
+        first = built.read_credential("acme/notes")
+        self.assertIsInstance(first, providers.StaticFileCredential)
+        self.assertIsNot(first, built.read_credential("acme/notes"), "one object per clone")
+        self.assertEqual({"PRIVATE-TOKEN": "glpat-read"}, first.headers("acme/notes"))
+        config = dict(first.git_config("acme/notes"))
+        self.assertEqual("", config["credential.helper"])
+        helper = config["credential.https://gitlab.com.helper"].split()
+        self.assertEqual([str(self.read), "oauth2"], helper[1:])
+        # The write credential is untouched by the read one existing.
+        self.assertEqual({"PRIVATE-TOKEN": "glpat-write"}, built.credential.headers("acme/infra"))
+        self.assertEqual(
+            str(self.token),
+            dict(built.credential.git_config("acme/infra"))["credential.https://gitlab.com.helper"].split()[1],
+        )
+
+    def test_a_key_added_after_start_is_read_with_no_restart(self):
+        built = self.built()
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+        self.read.write_text("glpat-read")
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.StaticFileCredential)
+        self.read.unlink()
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+
+    def test_a_read_token_path_git_may_not_be_handed_stops_the_build(self):
+        for bad in ("relative/read-token", "/t/../read-token", "/t/read token"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.built(bad)
+
+    def test_the_configuration_carries_the_read_token_path(self):
+        [built] = GitLabForge.for_config({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "token_path": str(self.token),
+             "read_token_path": str(self.read), "allowed_paths": ()},
+        ]})
+        self.assertEqual(str(self.read), built.read_token_path)
+        [plain] = GitLabForge.for_config({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "token_path": str(self.token), "allowed_paths": ()},
+        ]})
+        self.assertEqual("", plain.read_token_path)
 
 
 class ProposalTest(unittest.TestCase):
@@ -468,6 +555,50 @@ class ProposalTest(unittest.TestCase):
         self.assertEqual(["c101", "c150"], [second["commits"][0]["sha"], second["commits"][-1]["sha"]])
         self.assertFalse(second["truncated"])
 
+    def test_list_by_author_reads_the_total_header(self):
+        bot = {"username": "project_1001_bot_3f2a9c"}
+        api = Api(([mr(4, state="merged", merged_at="2026-10-03T00:00:00Z", author=bot)], {"x-total": "41"}))
+        answer = forge().proposal_list_by_author(
+            api, "acme/infra", {"author": "project_1001_bot_3f2a9c", "authorId": 7, "page": 2, "limit": 1}
+        )
+        self.assertEqual([True], api.with_headers)
+        self.assertEqual(41, answer["total"])
+        self.assertEqual(["merged"], [p["state"] for p in answer["proposals"]])
+        self.assertTrue(answer["proposals"][0]["authorBot"])
+        self.assertTrue(answer["truncated"])
+        self.assertEqual("projects/acme%2Finfra/merge_requests", api.calls[0][1])
+        self.assertEqual(
+            {
+                "author_username": "project_1001_bot_3f2a9c",
+                "state": "all",
+                "order_by": "updated_at",
+                "sort": "desc",
+                "per_page": 1,
+                "page": 2,
+            },
+            api.calls[0][2],
+        )
+        # GitLab leaves the header off past ten thousand rows; that is no count.
+        missing = forge().proposal_list_by_author(
+            Api(([], {})), "acme/infra", {"author": "u", "authorId": 7}
+        )
+        self.assertIsNone(missing["total"])
+
+    def test_tally_reads_one_total_per_state_and_refuses_a_missing_one(self):
+        # Merged, closed and every state together; open is the difference,
+        # since the three counts are separate requests, not one snapshot.
+        api = Api(([], {"x-total": "5"}), ([], {"x-total": "1"}), ([], {"x-total": "8"}))
+        answer = forge().proposal_tally(api, "acme/infra", {"author": "u", "authorId": 7})
+        self.assertEqual({"open": 2, "merged": 5, "closed": 1, "total": 8}, answer)
+        self.assertEqual(["merged", "closed", "all"], [call[2]["state"] for call in api.calls])
+        self.assertEqual({1}, {call[2]["per_page"] for call in api.calls})
+        with self.assertRaises(WorkspaceError):
+            forge().proposal_tally(Api(([], {})), "acme/infra", {"author": "u", "authorId": 7})
+
+    def test_the_closer_of_a_merged_request_is_unknown(self):
+        answer = forge().proposal_closer(Api(mr(3, state="merged", closed_by=None)), "acme/infra", {"number": 3})
+        self.assertEqual({"actor": "", "bot": False}, answer)
+
     def test_any_note_takes_an_award_and_already_awarded_is_fine(self):
         api = Api({"id": 1})
         answer = forge().proposal_acknowledge(api, "acme/infra", {"number": 1, "comment": {"id": 9, "kind": "review_comment"}})
@@ -514,6 +645,19 @@ class LabelTest(unittest.TestCase):
         api = Api(WorkspaceError("404", status=404), {"name": "x", "color": "#fbca04"})
         forge().label_ensure(api, "acme/infra", {"name": "x", "color": "fbca04"})
         self.assertEqual("#fbca04", api.calls[1][3]["color"])
+
+    def test_an_unchanged_label_is_not_written(self):
+        held = {"name": "x", "color": "#FBCA04", "description": "d"}
+        api = Api(held)
+        answer = forge().label_ensure(api, "acme/infra", {"name": "x", "color": "fbca04", "description": "d"})
+        self.assertEqual(["GET"], [call[0] for call in api.calls])
+        self.assertEqual("FBCA04", answer["label"]["color"])
+
+    def test_only_a_changed_field_is_written(self):
+        api = Api({"name": "x", "color": "#fbca04", "description": "old"}, {"name": "x"})
+        forge().label_ensure(api, "acme/infra", {"name": "x", "color": "fbca04", "description": "new"})
+        self.assertEqual(["GET", "PUT"], [call[0] for call in api.calls])
+        self.assertEqual({"description": "new"}, api.calls[1][3])
 
     def test_a_label_name_is_encoded_in_its_path(self):
         api = Api({"name": "status:in progress", "color": "#000000"})

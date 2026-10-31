@@ -235,7 +235,8 @@ class ChartTemplatesCarryTheSameBlocks(unittest.TestCase):
         )
         for name, path in _LITELLM_WRITABLE.items():
             self.assertIn(f"- name: {name}\n              mountPath: {path}\n", template)
-            self.assertIn(f"- name: {name}\n          emptyDir: {{}}\n", template)
+            # Bounded: tests/test_emptydir_size_limits.py holds every emptyDir to a sizeLimit.
+            self.assertIn(f"- name: {name}\n          emptyDir:\n            sizeLimit: ", template)
         self.assertIn(f"- name: HOME\n              value: {_LITELLM_HOME}\n", template)
 
     def test_hindsight_template(self):
@@ -252,7 +253,8 @@ class ChartTemplatesCarryTheSameBlocks(unittest.TestCase):
         )
         for name, path in _POSTGRESQL_WRITABLE.items():
             self.assertIn(f"- name: {name}\n              mountPath: {path}\n", template)
-            self.assertIn(f"- name: {name}\n          emptyDir: {{}}\n", template)
+            # Bounded: tests/test_emptydir_size_limits.py holds every emptyDir to a sizeLimit.
+            self.assertIn(f"- name: {name}\n          emptyDir:\n            sizeLimit: ", template)
 
 
 @unittest.skipUnless(shutil.which("helm"), "helm is not on PATH")

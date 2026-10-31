@@ -19,10 +19,12 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
@@ -60,8 +62,26 @@ const DefaultPort = 10250
 // author reading the field error knows which line to change and why.
 const (
 	busTokenAudienceForbiddenFmt = "volume %q projects a serviceAccountToken for audience %q, which is the A2A bus token audience; the operator projects that token for the platform-agent container alone" // #nosec G101 -- Error message format, not a credential
-	busCredsSecretForbiddenFmt   = "volume %q mounts Secret %q, which the operator renders with A2A bus credentials for its own workloads; it may not be mounted by the CR"
+	busCredsSecretForbiddenFmt   = "volume %q mounts Secret %q, which the operator renders with A2A bus credentials for its own workloads; it may not be mounted by the CR"                                 // #nosec G101 -- Error message format, not a credential
+	forgeCredsSecretForbiddenFmt = "volume %q mounts Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be mounted by the CR"                         // #nosec G101 -- Error message format, not a credential
+	forgeCredsEnvForbiddenFmt    = "container %q references Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be referenced by the CR"               // #nosec G101 -- Error message format, not a credential
 )
+
+// The data volume size checks on spec.storage.size. A PersistentVolumeClaim
+// cannot shrink, so a lower size is refused. Removing the field is allowed with
+// a warning, because the operator never shrinks a claim and an upgrade can drop
+// a key the target chart does not declare.
+const (
+	storageSizeNotPositiveMsg = "the data volume size must be greater than zero"
+	storageSizeTooLargeFmt    = "the data volume size must be at most %s, the largest persistent disk size"
+	storageSizeShrinkFmt      = "cannot lower the data volume size from %[1]s to %[2]s: a PersistentVolumeClaim cannot shrink. Keep %[1]s or raise it."
+	storageSizeRemovedWarnFmt = "spec.storage.size was removed, so the data volume size goes from %s to the operator default %s. Existing data claims keep their current size, because a PersistentVolumeClaim cannot shrink; only new claims get the default."
+)
+
+// maxStorageSize is the largest spec.storage.size: 64TiB is the largest
+// persistent disk. A larger value is a typo (Ei for Gi, say) that would patch
+// both claims to a size no disk can reach, and a claim cannot shrink back.
+var maxStorageSize = resource.MustParse("64Ti")
 
 // restrictedServiceAccounts is the set of high-privilege service account names forbidden in PlatformAgent spec.
 var restrictedServiceAccounts = map[string]struct{}{
@@ -126,17 +146,19 @@ var _ admission.Validator[*agentv1alpha1.PlatformAgent] = &PlatformAgentCustomVa
 func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
 	platformagentlog.Info("validating PlatformAgent creation", "name", platformAgent.Name)
 
-	return v.validatePlatformAgent(ctx, platformAgent)
+	return v.validatePlatformAgent(ctx, nil, platformAgent)
 }
 
 // ValidateUpdate implements admission.Validator so a webhook will be registered for the type PlatformAgent.
 func (v *PlatformAgentCustomValidator) ValidateUpdate(ctx context.Context, oldObj, platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
 	platformagentlog.Info("validating PlatformAgent update", "name", platformAgent.Name)
 
-	return v.validatePlatformAgent(ctx, platformAgent)
+	return v.validatePlatformAgent(ctx, oldObj, platformAgent)
 }
 
-func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context, platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
+// validatePlatformAgent checks platformAgent. oldObj is the stored object on an
+// update and nil on a create; only the checks that compare the two read it.
+func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context, oldObj, platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
 	// Skip validation for terminating agents to avoid deadlocks during deletion (e.g. finalizer removal)
 	if platformAgent.DeletionTimestamp != nil {
 		return nil, nil
@@ -167,7 +189,8 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	if platformAgent.Spec.Deployment != nil {
 		depPath := field.NewPath("spec", "deployment")
 
-		// 2a. Validate sensitive environment variable overrides
+		// 2a. Validate sensitive environment variable overrides and forge credential Secret references
+		allErrs = append(allErrs, validateForgeCredentialEnvVars("platform-agent", platformAgent.Spec.Deployment.Env, platformAgent.Spec.Integration, depPath.Child("env"))...)
 		for i, env := range platformAgent.Spec.Deployment.Env {
 			if _, isSensitive := agentv1alpha1.SensitiveEnvVars[env.Name]; isSensitive {
 				allErrs = append(allErrs, field.Forbidden(
@@ -179,14 +202,18 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 
 		// 2b. Validate InitContainers security context
 		for i := range platformAgent.Spec.Deployment.InitContainers {
-			allErrs = append(allErrs, validateContainerSecurity(platformAgent.Spec.Deployment.InitContainers[i].SecurityContext, depPath.Child("initContainers").Index(i))...)
-			allErrs = append(allErrs, validateReservedVolumeMounts(platformAgent.Spec.Deployment.InitContainers[i].VolumeMounts, depPath.Child("initContainers").Index(i).Child("volumeMounts"))...)
+			initPath := depPath.Child("initContainers").Index(i)
+			allErrs = append(allErrs, validateContainerSecurity(platformAgent.Spec.Deployment.InitContainers[i].SecurityContext, initPath)...)
+			allErrs = append(allErrs, validateReservedVolumeMounts(platformAgent.Spec.Deployment.InitContainers[i].VolumeMounts, initPath.Child("volumeMounts"))...)
+			allErrs = append(allErrs, validateForgeCredentialContainerEnv(platformAgent.Spec.Deployment.InitContainers[i], platformAgent.Spec.Integration, initPath)...)
 		}
 
 		// 2c. Validate Sidecars security context
 		for i := range platformAgent.Spec.Deployment.Sidecars {
-			allErrs = append(allErrs, validateContainerSecurity(platformAgent.Spec.Deployment.Sidecars[i].SecurityContext, depPath.Child("sidecars").Index(i))...)
-			allErrs = append(allErrs, validateReservedVolumeMounts(platformAgent.Spec.Deployment.Sidecars[i].VolumeMounts, depPath.Child("sidecars").Index(i).Child("volumeMounts"))...)
+			sidecarPath := depPath.Child("sidecars").Index(i)
+			allErrs = append(allErrs, validateContainerSecurity(platformAgent.Spec.Deployment.Sidecars[i].SecurityContext, sidecarPath)...)
+			allErrs = append(allErrs, validateReservedVolumeMounts(platformAgent.Spec.Deployment.Sidecars[i].VolumeMounts, sidecarPath.Child("volumeMounts"))...)
+			allErrs = append(allErrs, validateForgeCredentialContainerEnv(platformAgent.Spec.Deployment.Sidecars[i], platformAgent.Spec.Integration, sidecarPath)...)
 		}
 
 		// 2d. Validate ExtraVolumes & SidecarVolumes (hostPath forbidden)
@@ -199,6 +226,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 			}
 			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("extraVolumes").Index(i).Child("name"))...)
 			allErrs = append(allErrs, validateBusCredentialSource(vol, platformAgent.Name, depPath.Child("extraVolumes").Index(i))...)
+			allErrs = append(allErrs, validateForgeCredentialSource(vol, platformAgent.Spec.Integration, depPath.Child("extraVolumes").Index(i))...)
 		}
 		for i, vol := range platformAgent.Spec.Deployment.SidecarVolumes {
 			if vol.HostPath != nil {
@@ -209,6 +237,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 			}
 			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("sidecarVolumes").Index(i).Child("name"))...)
 			allErrs = append(allErrs, validateBusCredentialSource(vol, platformAgent.Name, depPath.Child("sidecarVolumes").Index(i))...)
+			allErrs = append(allErrs, validateForgeCredentialSource(vol, platformAgent.Spec.Integration, depPath.Child("sidecarVolumes").Index(i))...)
 		}
 
 		// 2da. The fifth user-authored mount surface. Unlike the four above it
@@ -302,6 +331,12 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	allErrs = append(allErrs, gitErrs...)
 	warnings = append(warnings, gitWarnings...)
 
+	// 5. The data volume size: above zero, at most maxStorageSize, and on an
+	// update never lower than the size the stored object resolves to.
+	storageErrs, storageWarnings := validateStorageSize(oldObj, platformAgent)
+	allErrs = append(allErrs, storageErrs...)
+	warnings = append(warnings, storageWarnings...)
+
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
 			schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
@@ -311,6 +346,59 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	}
 
 	return warnings, nil
+}
+
+// validateStorageSize refuses a spec.storage.size of zero or less or above
+// maxStorageSize, and on an update (oldObj not nil) an explicit size lower
+// than the one the stored object resolves to. Both sides go through controller.ResolveDataStorageSize, so an
+// absent field compares as the operator default. A removed field is allowed
+// with a warning when the default is lower than the stored size: the operator
+// never shrinks a claim, so the claims keep their size.
+func validateStorageSize(oldObj, platformAgent *agentv1alpha1.PlatformAgent) (field.ErrorList, admission.Warnings) {
+	sizePath := field.NewPath("spec", "storage", "size")
+	newSize := storageSize(platformAgent)
+	// A value the stored object already carries passes the range checks, so a
+	// CR written while the webhook was off stays open to every other update.
+	unchanged := oldObj != nil && sameStorageSize(storageSize(oldObj), newSize)
+	if newSize != nil && !unchanged && newSize.Sign() <= 0 {
+		return field.ErrorList{field.Invalid(sizePath, newSize.String(), storageSizeNotPositiveMsg)}, nil
+	}
+	if newSize != nil && !unchanged && newSize.Cmp(maxStorageSize) > 0 {
+		return field.ErrorList{field.Invalid(sizePath, newSize.String(), fmt.Sprintf(storageSizeTooLargeFmt, maxStorageSize.String()))}, nil
+	}
+	if oldObj == nil {
+		return nil, nil
+	}
+	oldResolved := controller.ResolveDataStorageSize(oldObj)
+	// A stored size above the limit compares as the limit, so lowering it to a
+	// size the webhook admits is not refused as a shrink.
+	if oldResolved.Cmp(maxStorageSize) > 0 {
+		oldResolved = maxStorageSize.DeepCopy()
+	}
+	newResolved := controller.ResolveDataStorageSize(platformAgent)
+	if newResolved.Cmp(oldResolved) >= 0 {
+		return nil, nil
+	}
+	if newSize == nil {
+		return nil, admission.Warnings{fmt.Sprintf(storageSizeRemovedWarnFmt, oldResolved.String(), newResolved.String())}
+	}
+	return field.ErrorList{field.Forbidden(sizePath, fmt.Sprintf(storageSizeShrinkFmt, oldResolved.String(), newResolved.String()))}, nil
+}
+
+// sameStorageSize reports whether a and b are both absent or the same quantity.
+func sameStorageSize(a, b *resource.Quantity) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Cmp(*b) == 0
+}
+
+// storageSize is spec.storage.size as written, or nil when it is absent.
+func storageSize(platformAgent *agentv1alpha1.PlatformAgent) *resource.Quantity {
+	if platformAgent.Spec.Storage == nil {
+		return nil
+	}
+	return platformAgent.Spec.Storage.Size
 }
 
 // validateReservedVolumeMounts refuses a user-authored container that mounts a
@@ -326,7 +414,8 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 func validateReservedVolumeMounts(mounts []corev1.VolumeMount, path *field.Path) field.ErrorList {
 	var errs field.ErrorList
 	for i, m := range mounts {
-		if _, reserved := agentv1alpha1.ReservedVolumeNames[m.Name]; !reserved {
+		_, reserved := agentv1alpha1.ReservedVolumeNames[m.Name]
+		if !reserved && !agentv1alpha1.IsForgeCredentialVolumeName(m.Name) {
 			continue
 		}
 		errs = append(errs, field.Forbidden(
@@ -342,12 +431,68 @@ func validateReservedVolumeMounts(mounts []corev1.VolumeMount, path *field.Path)
 // rejects outright, so this is a wedged-reconcile guard as much as a credential
 // one.
 func validateReservedVolumeName(name string, path *field.Path) field.ErrorList {
-	if _, reserved := agentv1alpha1.ReservedVolumeNames[name]; !reserved {
+	_, reserved := agentv1alpha1.ReservedVolumeNames[name]
+	if !reserved && !agentv1alpha1.IsForgeCredentialVolumeName(name) {
 		return nil
 	}
 	return field.ErrorList{field.Forbidden(
 		path, fmt.Sprintf("volume name %q is reserved by the operator", name),
 	)}
+}
+
+func validateForgeCredentialSource(vol corev1.Volume, integration *agentv1alpha1.PlatformAgentIntegrationSpec, path *field.Path) field.ErrorList {
+	if integration == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	for _, route := range integration.ForgeCredentialRoutes(vol) {
+		at := path.Child("secret", "secretName")
+		if route.Source != agentv1alpha1.BusCredentialRouteVolumeSource {
+			at = path.Child("projected", "sources").Index(route.Source).Child("secret", "name")
+		}
+		errs = append(errs, field.Forbidden(at, fmt.Sprintf(forgeCredsSecretForbiddenFmt, vol.Name, route.Secret)))
+	}
+	return errs
+}
+
+func validateForgeCredentialEnvVars(containerName string, envVars []corev1.EnvVar, integration *agentv1alpha1.PlatformAgentIntegrationSpec, path *field.Path) field.ErrorList {
+	if integration == nil {
+		return nil
+	}
+	forgeSecrets := integration.ForgeCredentialSecretNames()
+	if len(forgeSecrets) == 0 {
+		return nil
+	}
+	var errs field.ErrorList
+	for i, e := range envVars {
+		if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+			errs = append(errs, field.Forbidden(
+				path.Index(i).Child("valueFrom", "secretKeyRef", "name"),
+				fmt.Sprintf(forgeCredsEnvForbiddenFmt, containerName, e.ValueFrom.SecretKeyRef.Name),
+			))
+		}
+	}
+	return errs
+}
+
+func validateForgeCredentialContainerEnv(container corev1.Container, integration *agentv1alpha1.PlatformAgentIntegrationSpec, path *field.Path) field.ErrorList {
+	if integration == nil {
+		return nil
+	}
+	errs := validateForgeCredentialEnvVars(container.Name, container.Env, integration, path.Child("env"))
+	forgeSecrets := integration.ForgeCredentialSecretNames()
+	if len(forgeSecrets) == 0 {
+		return errs
+	}
+	for i, ef := range container.EnvFrom {
+		if ef.SecretRef != nil && slices.Contains(forgeSecrets, ef.SecretRef.Name) {
+			errs = append(errs, field.Forbidden(
+				path.Child("envFrom").Index(i).Child("secretRef", "name"),
+				fmt.Sprintf(forgeCredsEnvForbiddenFmt, container.Name, ef.SecretRef.Name),
+			))
+		}
+	}
+	return errs
 }
 
 // validateBusCredentialSource refuses a user-supplied volume whose SOURCE

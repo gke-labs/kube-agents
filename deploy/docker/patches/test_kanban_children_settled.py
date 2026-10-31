@@ -6,6 +6,7 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -38,7 +39,7 @@ RECEIPT = (
 # own table is deliberately absent: the module creates it on first write, and
 # a board that predates the patch must read as "no children" (fail-open).
 BOARD_SCHEMA = """
-CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, current_run_id INTEGER, assignee TEXT);
+CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, current_run_id INTEGER, assignee TEXT, created_at INTEGER);
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id TEXT NOT NULL,
     child_id  TEXT NOT NULL,
@@ -63,8 +64,11 @@ def board(path):
     return conn
 
 
-def add_card(conn, task_id, status="running"):
-    conn.execute("INSERT INTO tasks (id, status, result) VALUES (?, ?, NULL)", (task_id, status))
+def add_card(conn, task_id, status="running", created_at=None):
+    conn.execute(
+        "INSERT INTO tasks (id, status, result, created_at) VALUES (?, ?, NULL, ?)",
+        (task_id, status, int(time.time()) if created_at is None else created_at),
+    )
     conn.commit()
 
 
@@ -304,6 +308,15 @@ class TestRecording(Fixture):
         self.assertEqual(
             [tuple(r) for r in self.rows()], [("t_kid", DELEGATION_CARD)]
         )
+
+    def test_a_create_that_hands_back_an_existing_card_is_not_recorded(self):
+        """A repeated idempotency_key returns an old card, here one cron made a day ago."""
+        add_card(self.conn, "t_cron", status="done", created_at=int(time.time()) - 86400)
+        with mock.patch.dict(os.environ, {WORKER_TASK_ENV: DELEGATION_CARD}):
+            self.assertFalse(maybe_record_worker_child(self.conn, "t_cron"))
+        # The table is created on the first write, so none was made.
+        self.assertIsNone(self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE name = ?", (CHILDREN_TABLE,)).fetchone())
 
     def test_a_non_worker_create_is_not_recorded(self):
         add_card(self.conn, "t_kid")

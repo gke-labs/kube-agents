@@ -176,7 +176,7 @@ fi
 # here reverts to failing after the teardown.
 INSTALL_REFUSAL_STATUS=0
 
-for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED ENABLE_DRIFT_DETECTOR; do
+for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED WEB_CONSOLE_ENABLED ENABLE_DRIFT_DETECTOR VERTEX_MANAGE_SERVING_PROJECT; do
   [ -n "${!_bool_var:-}" ] || continue
   _canonical="$(canonical_bool "${!_bool_var}")"
   case "$_canonical" in
@@ -284,6 +284,14 @@ INSTALL_ARGS=(
   --gcp-region="${GCP_REGION}"
   --gke-cluster-name="${GKE_CLUSTER_NAME}"
   --image-tag="${IMAGE_TAG}"
+  # Named, not left to install.sh's default: a first install with no
+  # install.env now defaults to next, and a today run must install today (the
+  # E2E readiness check compares the installed mode with this one). A next
+  # run installs next, as the exported PLATFORM_AGENT_MODE already made it,
+  # and the patch and gate at the bottom still run. On a long-lived
+  # environment, where next is refused above, the rendered install.env sets no
+  # mode, which resolves to today, so the flag agrees and is recorded there.
+  --mode="${RELEASE_PLATFORM_AGENT_MODE}"
 )
 
 # Everything below reaches install.sh as a flag rather than as an inherited
@@ -347,6 +355,9 @@ if [ "${SLACK_ENABLED:-false}" = "true" ]; then
   if [ -n "${SLACK_HOME_CHANNEL_NAME:-}" ]; then
     INSTALL_ARGS+=(--slack-home-channel-name="${SLACK_HOME_CHANNEL_NAME}")
   fi
+  if [ -n "${SLACK_HOME_CHANNEL_POLICY:-}" ]; then
+    INSTALL_ARGS+=(--slack-home-channel-policy="${SLACK_HOME_CHANNEL_POLICY}")
+  fi
 fi
 
 if [ -n "${ENABLE_GKE_BACKUP_PLAN:-}" ]; then
@@ -357,6 +368,10 @@ if [ -n "${HERMES_DASHBOARD_ENABLED:-}" ]; then
   INSTALL_ARGS+=(--enable-hermes-dashboard="$(canonical_bool "${HERMES_DASHBOARD_ENABLED}")")
 fi
 
+if [ -n "${WEB_CONSOLE_ENABLED:-}" ]; then
+  INSTALL_ARGS+=(--enable-web-console="$(canonical_bool "${WEB_CONSOLE_ENABLED}")")
+fi
+
 # Unset omits the flag and install.sh's own default answers, which for this one
 # is on. The flag is worth passing anyway: this is a fresh install, so it is the
 # one run that records the choice into the install.env it creates -- which is
@@ -364,6 +379,11 @@ fi
 # file as the durable answer.
 if [ -n "${ENABLE_DRIFT_DETECTOR:-}" ]; then
   INSTALL_ARGS+=(--enable-drift-detector="$(canonical_bool "${ENABLE_DRIFT_DETECTOR}")")
+fi
+
+# The same shape: unset omits the flag and install.sh's default (on) answers.
+if [ -n "${VERTEX_MANAGE_SERVING_PROJECT:-}" ]; then
+  INSTALL_ARGS+=(--vertex-manage-serving-project="$(canonical_bool "${VERTEX_MANAGE_SERVING_PROJECT}")")
 fi
 
 if [ -n "${MODEL_PROVIDER:-}" ]; then

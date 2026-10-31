@@ -43,6 +43,7 @@ Usage:
 import argparse
 import concurrent.futures
 import json
+import ssl
 import os
 import re
 import shutil
@@ -52,6 +53,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -75,6 +77,27 @@ BUILD_INDEX_SUFFIX = ".txt"
 # can 404 mid-copy and turn the hour into "could not measure" for a file the
 # check never reads (2 of 716 runs by 2026-10-08).
 GCS_BUILD_INDEX_GLOB = f"{GCS_BUILD_INDEX}/[0-9]*{BUILD_INDEX_SUFFIX}"
+# Prow rewrites a build's pointer while the build runs and when it finishes,
+# so one can vanish between the copy's listing and its fetch. gcloud copies
+# the rest and exits 1 with this line, the object name percent-encoded, among
+# the Copying lines (2 of 30 runs on 2026-10-14). That build is reported
+# unreadable and the hour is still measured; any other error still fails it.
+GCS_CP_ERROR_PREFIX = "ERROR: "
+GCS_CP_PROGRESS_DOT = "."
+GCS_OBJECT_NOT_FOUND = re.compile(r"^ERROR: (gs://\S+) not found: 404\.?$")
+INDEX_POINTER_VANISHED = "index pointer rewritten during the copy (404)"
+# gcloud's exit status when some operations failed and the rest completed;
+# a signal or a crash exits otherwise and may print no error line, so only
+# this status is read as a partial copy.
+GCLOUD_PARTIAL_FAILURE_EXIT = 1
+# Prow's rewrite touches one or two pointers an hour. More vanishing in one
+# copy is something removing index objects in bulk, and the hour is not
+# measured over whatever subset landed.
+VANISHED_POINTER_LIMIT = 10
+# How many of gcloud's error lines a refusal quotes; over the ceiling there
+# is one per vanished object, and the message lands in the JSON, the report
+# and four JUnit cells.
+REFUSAL_ERROR_LINES = 3
 
 # The three artifacts setup time is read from, in the order the run writes
 # them. Only prowjob.json is required: initupload writes it when the pod starts,
@@ -188,6 +211,10 @@ TOO_FEW_RUNS = "(too few runs to judge)"
 # the end of the wait and NOT for its start. SNOWFLAKE_SLACK covers both that
 # jitter and a wait that straddles the window edge.
 SNOWFLAKE_EPOCH_MS = 1288834974657
+# Every Prow build ID is a 19-digit snowflake, as BUILD_ID_IN_OWNER reads
+# them; a longer decimal stem is not one and would take snowflake_time past
+# the datetime range, so the index grammar stops at this length.
+BUILD_ID_DIGITS = 19
 SNOWFLAKE_TIMESTAMP_SHIFT = 22
 SNOWFLAKE_SLACK = timedelta(hours=6)
 
@@ -207,6 +234,27 @@ BOSKOS_SERVICE = "svc/boskos"
 BOSKOS_SERVICE_PORT = 80
 BOSKOS_RESOURCE_TYPE = "kube-agents-evals-project"
 BOSKOS_METRIC_PATH = "/metric?type=" + BOSKOS_RESOURCE_TYPE
+# Which project each lease holder has: Boskos keeps one `resources.boskos.k8s.io`
+# object per project in its namespace (name, status.state, status.owner,
+# status.lastUpdate), which /metric aggregates away. Read from inside the
+# cluster through the API server with the pod's own token (--boskos-via
+# http), through kubectl for a hand run, or from `boskos-resources.json`
+# under --from-dir. The job's service account needs the namespace's
+# `boskos-crd-reader` role bound to it (docs/ci-health.md, "A backed-up
+# pool"); until then the read fails and the artifact says so.
+BOSKOS_RESOURCES_API_PATH = "/apis/boskos.k8s.io/v1/namespaces/boskos/resources"
+BOSKOS_RESOURCES_KIND = "resources.boskos.k8s.io"
+BOSKOS_RESOURCES_FILE = "boskos-resources.json"
+IN_CLUSTER_HOST_ENV = "KUBERNETES_SERVICE_HOST"
+IN_CLUSTER_PORT_ENV = "KUBERNETES_SERVICE_PORT"
+IN_CLUSTER_TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+IN_CLUSTER_CA_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+# The summary keys the health bot reads them under (health.POOL_HELD_KEY).
+HELD_KEY = "held"
+HELD_ERROR_KEY = "held_error"
+HELD_KEY_OWNER = "owner"
+HELD_KEY_STATE = "state"
+HELD_KEY_SINCE = "since"
 BOSKOS_IN_CLUSTER_URL = (
     f"http://boskos.{BOSKOS_NAMESPACE}.svc.cluster.local{BOSKOS_METRIC_PATH}"
 )
@@ -852,8 +900,11 @@ def wait_from_prowjob(
     )
 
 
-def _index_entries_from_gcs(tmpdir: str) -> Tuple[Dict[int, str], Optional[str]]:
-    """Every build ID in the flat index, mapped to its artifact directory.
+def _index_entries_from_gcs(
+    tmpdir: str,
+) -> Tuple[Dict[int, str], Optional[str], List[Dict[str, str]]]:
+    """Every build ID in the flat index, mapped to its artifact directory,
+    with the builds whose pointer vanished mid-copy as unreadable entries.
 
     Copied in bulk rather than listed and read one at a time: one `gcloud
     storage cp` of the whole prefix is a few seconds, where a thousand
@@ -862,24 +913,82 @@ def _index_entries_from_gcs(tmpdir: str) -> Tuple[Dict[int, str], Optional[str]]
     dest = os.path.join(tmpdir, "index")
     os.makedirs(dest, exist_ok=True)
     # A wildcard, not `cp -r` on the directory, which exits 0 having copied
-    # nothing; and the build files only, for the reason beside the constant.
+    # nothing; the build files only, for the reason beside the constant; and
+    # the rest of the index after one failed object even when gcloud copies
+    # sequentially (a parallel copy, the default, carries on regardless).
     rc, _, err = run_cmd(
-        ["gcloud", "storage", "cp", GCS_BUILD_INDEX_GLOB, dest],
+        ["gcloud", "storage", "cp", GCS_BUILD_INDEX_GLOB, dest, "--continue-on-error"],
         timeout=GCS_INDEX_TIMEOUT_SECONDS,
     )
-    if rc != 0:
-        return {}, f"could not read the build index: {err.strip() or f'exit {rc}'}"
-    return _index_entries_from_dir(dest), None
+    if rc == 0:
+        return _index_entries_from_dir(dest), None, []
+    vanished, others, errors = _gcloud_errors(err)
+    partial = (
+        rc == GCLOUD_PARTIAL_FAILURE_EXIT and 0 < len(vanished) <= VANISHED_POINTER_LIMIT and not others
+    )
+    entries = _index_entries_from_dir(dest) if partial else {}
+    if not entries:
+        # What decided the refusal, then the error lines with the ones that
+        # are not a vanished pointer first, or the last line when there is
+        # none: the stderr is thousands of Copying lines, and a 404 line
+        # alone would read as the case the hour survives.
+        facts = [f"exit {rc}"]
+        if others:
+            facts.append(f"{len(others)} error(s) other than a vanished pointer")
+        if len(vanished) > VANISHED_POINTER_LIMIT:
+            facts.append(f"{len(vanished)} vanished pointers, over the ceiling of {VANISHED_POINTER_LIMIT}")
+        if partial:
+            facts.append("nothing landed")
+        tail = err.strip().splitlines()
+        quoted = others + [line for line in errors if line not in others]
+        detail = "; ".join(quoted[:REFUSAL_ERROR_LINES]) or (tail[-1] if tail else "")
+        if len(quoted) > REFUSAL_ERROR_LINES:
+            detail += f" and {len(quoted) - REFUSAL_ERROR_LINES} more"
+        reason = ", ".join(facts) + (f": {detail}" if detail else "")
+        return {}, f"could not read the build index: {reason}", []
+    return entries, None, [
+        {"build_id": str(build), "error": INDEX_POINTER_VANISHED} for build in vanished
+    ]
+
+
+def _gcloud_errors(stderr: str) -> Tuple[List[int], List[str], List[str]]:
+    """The build IDs whose index pointer gcloud reported missing, the error
+    lines that say anything else, and every error line in stderr order."""
+    vanished: List[int] = []
+    others: List[str] = []
+    errors: List[str] = []
+    prefix = f"{GCS_BUILD_INDEX}/"
+    for raw in stderr.splitlines():
+        # Progress dots land at the start of about one line in eighty.
+        line = raw.lstrip(GCS_CP_PROGRESS_DOT)
+        if not line.startswith(GCS_CP_ERROR_PREFIX):
+            continue
+        errors.append(line)
+        match = GCS_OBJECT_NOT_FOUND.match(line)
+        name = urllib.parse.unquote(match.group(1)) if match else ""
+        build_id = _build_id_of(name[len(prefix) :]) if name.startswith(prefix) else None
+        if build_id is not None:
+            vanished.append(build_id)
+        else:
+            others.append(line)
+    return vanished, others, errors
+
+
+def _build_id_of(name: str) -> Optional[int]:
+    """The build ID an index file name carries, or None: the one grammar for
+    the names the copy lands and the names gcloud reports missing."""
+    if not name.endswith(BUILD_INDEX_SUFFIX):
+        return None
+    stem = name[: -len(BUILD_INDEX_SUFFIX)]
+    # isdecimal, not isdigit: int() refuses the superscripts isdigit admits.
+    return int(stem) if stem.isdecimal() and len(stem) == BUILD_ID_DIGITS else None
 
 
 def _index_entries_from_dir(dest: str) -> Dict[int, str]:
     entries: Dict[int, str] = {}
     for name in os.listdir(dest):
-        if not name.endswith(BUILD_INDEX_SUFFIX):
-            continue
-        try:
-            build_id = int(name[: -len(BUILD_INDEX_SUFFIX)])
-        except ValueError:
+        build_id = _build_id_of(name)
+        if build_id is None:
             continue
         try:
             path = Path(dest, name).read_text(encoding="utf-8").strip()
@@ -1008,8 +1117,9 @@ class Sweep:
         self.elapsed_seconds = elapsed_seconds
         self.window_start = window_start
         self.truncated = truncated
-        # Builds whose read raised, each as {"build_id", "error"}; counted in
-        # builds_read, left out of waits.
+        # Builds whose read raised (counted in builds_read) or whose index
+        # pointer vanished mid-copy (never read, so not counted), each as
+        # {"build_id", "error"}; left out of waits.
         self.unreadable = unreadable or []
 
 
@@ -1042,11 +1152,24 @@ def collect_waits(
 
     began = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="pool-pressure-") as tmpdir:
-        entries, err = _index_entries_from_gcs(tmpdir)
+        entries, err, vanished = _index_entries_from_gcs(tmpdir)
         if err:
             return Source(error=err)
         if not entries:
             return Source(error=f"the build index at {GCS_BUILD_INDEX} is empty")
+        # A vanished pointer is a build the sweep never saw: named with the
+        # unreadable builds when its ID falls in the window, left out of the
+        # numbers, and not counted against the newest-builds share below,
+        # which judges the reader, not Prow. Slack on the high side only (a
+        # replay of a past day does not report today's); the ID encodes the
+        # end of the wait, so one below window_start was created below it.
+        vanished_in_window = [
+            gone
+            for gone in vanished
+            if window_start
+            <= snowflake_time(int(gone["build_id"]))
+            <= window_end + SNOWFLAKE_SLACK
+        ]
 
         candidates: Dict[str, List[int]] = {}
         for build_id in entries:
@@ -1059,7 +1182,9 @@ def collect_waits(
                 candidates.setdefault(moment.strftime(DATE_FORMAT), []).append(build_id)
         if not candidates:
             return Source(
-                value=Sweep([], 0, time.monotonic() - began, window_start)
+                value=Sweep(
+                    [], 0, time.monotonic() - began, window_start, False, vanished_in_window
+                )
             )
 
         collected: List[Wait] = []
@@ -1095,6 +1220,15 @@ def collect_waits(
         )
 
     waits = [w for w in collected if measured_start <= w.created <= window_end]
+    # A vanished pointer below the window the sweep covered is not named
+    # beside the days that were read, as the report says those days are
+    # missing. No slack on this side: the ID encodes the end of the wait, so
+    # one below measured_start was created below it too.
+    unreadable = [
+        gone
+        for gone in vanished_in_window
+        if snowflake_time(int(gone["build_id"])) >= measured_start
+    ] + unreadable
     sweep = Sweep(
         waits, read, time.monotonic() - began, measured_start, truncated, unreadable
     )
@@ -1336,6 +1470,87 @@ def fetch_pool_state(
     if err:
         return Source(error=f"could not read the Boskos metric: {err}")
     return Source(value=_pool_state_from(document))
+
+
+def _held_from(document: dict) -> Dict[str, dict]:
+    """{project: {owner, state, since}} for every Boskos resource object
+    with a holder, from a `kubectl get -o json`-shaped list."""
+    held: Dict[str, dict] = {}
+    for item in document.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("metadata") or {}).get("name")
+        status = item.get("status") if isinstance(item.get("status"), dict) else {}
+        owner = status.get("owner")
+        if not name or not owner:
+            continue
+        held[str(name)] = {
+            HELD_KEY_OWNER: str(owner),
+            HELD_KEY_STATE: str(status.get("state") or ""),
+            HELD_KEY_SINCE: str(status.get("lastUpdate") or ""),
+        }
+    return held
+
+
+def _read_in_cluster(path: str) -> Tuple[Optional[dict], Optional[str]]:
+    """One GET against the API server the pod runs under, as the pod."""
+    host, port = os.environ.get(IN_CLUSTER_HOST_ENV), os.environ.get(IN_CLUSTER_PORT_ENV)
+    if not host or not port:
+        return None, "not running in a cluster (no API server in the environment)"
+    try:
+        token = Path(IN_CLUSTER_TOKEN_FILE).read_text(encoding="utf-8").strip()
+        context = ssl.create_default_context(cafile=IN_CLUSTER_CA_FILE)
+    except (OSError, ssl.SSLError) as exc:
+        return None, f"no service-account token or CA: {exc}"
+    request = urllib.request.Request(f"https://{host}:{port}{path}", headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=BOSKOS_TIMEOUT_SECONDS, context=context) as response:
+            return json.loads(response.read().decode("utf-8")), None
+    except urllib.error.HTTPError as exc:
+        return None, f"HTTP {exc.code} from the API server (the pod's service account may lack the boskos-crd-reader role)"
+    except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
+        return None, str(exc)
+
+
+def fetch_held(via: str, context: str, from_dir: Optional[str] = None) -> Source:
+    """Which project each Boskos lease holder has right now.
+
+    Separate from fetch_pool_state because /metric cannot answer it: the
+    health bot needs the names to read a project the fleet reconcile holds as
+    being applied rather than drifted. Missing is reported, never defaulted.
+    """
+    if from_dir is not None:
+        payload = Path(from_dir, BOSKOS_RESOURCES_FILE)
+        if not payload.is_file():
+            return Source(error=f"no {BOSKOS_RESOURCES_FILE} under {from_dir}")
+        try:
+            document = json.loads(payload.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return Source(error=f"could not parse {payload}: {exc}")
+        if not isinstance(document, dict):
+            return Source(error=f"{payload} is not a JSON object")
+        return Source(value=_held_from(document))
+    if via == BOSKOS_VIA_NONE:
+        return Source(error="Boskos was not queried (--boskos-via none)")
+    if via == BOSKOS_VIA_HTTP:
+        document, err = _read_in_cluster(BOSKOS_RESOURCES_API_PATH)
+        if err:
+            return Source(error=f"could not list Boskos resources in-cluster: {err}")
+        if not isinstance(document, dict):
+            return Source(error="could not list Boskos resources in-cluster: the API server's answer is not a JSON object")
+        return Source(value=_held_from(document))
+    if shutil.which(KUBECTL_BINARY) is None:
+        return Source(error="kubectl is not on PATH, so Boskos resources cannot be listed")
+    code, out, err = run_cmd([KUBECTL_BINARY, "--context", context, "-n", BOSKOS_NAMESPACE, "get", BOSKOS_RESOURCES_KIND, "-o", "json"], timeout=BOSKOS_TIMEOUT_SECONDS)
+    if code != 0:
+        return Source(error=f"kubectl get {BOSKOS_RESOURCES_KIND}: {(err or '').strip() or f'exit {code}'}")
+    try:
+        document = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return Source(error=f"kubectl get {BOSKOS_RESOURCES_KIND}: not JSON ({exc})")
+    if not isinstance(document, dict):
+        return Source(error=f"kubectl get {BOSKOS_RESOURCES_KIND}: not a JSON object")
+    return Source(value=_held_from(document))
 
 
 def _pool_state_from(document: dict) -> PoolState:
@@ -2321,6 +2536,7 @@ def measure(
         # takes its own clock after the sweep (fetch_live_queue says why).
         live = fetch_live_queue(window_end if from_dir is not None else None, from_dir)
         pool = fetch_pool_state(boskos_via, context, from_dir)
+    held = fetch_held(boskos_via, context, from_dir) if from_dir is not None or as_of is None else Source(error="not read: --as-of replays a past window")
 
     summary = summarise(
         window_start,
@@ -2332,6 +2548,10 @@ def measure(
         live,
         pool,
     )
+    # Which project each holder has, for the health bot's fixture rule;
+    # None with the reason when the list could not be read.
+    summary[HELD_KEY] = held.value if held.ok else None
+    summary[HELD_ERROR_KEY] = held.error
 
     # Written before the report is printed, and a write that fails is reported
     # rather than raised: the exit code is the verdict, and the tab still shows

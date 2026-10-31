@@ -589,7 +589,7 @@ class ArtifactParsingTest(unittest.TestCase):
         self.assertIn(poller.DEFAULT_LOGS_PREFIX + "*", collect)
 
 
-class GsutilResultTest(unittest.TestCase):
+class GcloudStorageResultTest(unittest.TestCase):
     """Absence versus a failed read, which is the distinction `scan_once` rests on."""
 
     class _Proc:
@@ -605,19 +605,19 @@ class GsutilResultTest(unittest.TestCase):
 
             @staticmethod
             def run(*args, **kwargs):
-                return GsutilResultTest._Proc(returncode, stderr)
+                return GcloudStorageResultTest._Proc(returncode, stderr)
 
         real = poller.subprocess
         poller.subprocess = FakeSubprocess
         self.addCleanup(setattr, poller, "subprocess", real)
         with contextlib.redirect_stderr(io.StringIO()):
-            return poller._gsutil(["cat", f"{PREFIX}100/started.json"])
+            return poller._gcloud_storage(["cat", f"{PREFIX}100/started.json"])
 
-    def test_gsutils_absence_phrasings_read_as_absent(self):
+    def test_gcloud_storages_absence_phrasings_read_as_absent(self):
         for stderr in (
-            "CommandException: One or more URLs matched no objects.",
-            "CommandException: No URLs matched: gs://x/y",
-            "NotFoundException: 404 gs://x/y does not exist.",
+            "ERROR: (gcloud.storage.ls) One or more URLs matched no objects.",
+            "ERROR: (gcloud.storage.cat) The following URLs matched no objects or files:\ngs://x/y",
+            "ERROR: (gcloud.storage.cat) gs://x not found: 404.",
         ):
             with self.subTest(stderr=stderr):
                 self.assertIsNone(self._run(1, stderr))
@@ -630,13 +630,13 @@ class GsutilResultTest(unittest.TestCase):
         started.json at the top of the listing lets an older build answer.
         """
         stderr = (
-            "ServiceException: 503 Backend Error on"
+            "ERROR: (gcloud.storage.cat) HTTPError 503: Backend Error on"
             " gs://kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546404123/started.json"
         )
         self.assertIs(self._run(1, stderr), poller.UNREADABLE)
 
     def test_a_403_is_unreadable_and_not_an_absence(self):
-        self.assertIs(self._run(1, "AccessDeniedException: 403 Caller lacks permission"), poller.UNREADABLE)
+        self.assertIs(self._run(1, "ERROR: (gcloud.storage.cat) HTTPError 403: Caller lacks permission"), poller.UNREADABLE)
 
 
 class FakeClock:
@@ -852,15 +852,15 @@ class MainTest(unittest.TestCase):
         out.touch()
         summary_file.touch()
 
-        def fake_gsutil(args, gsutil="gsutil"):
+        def fake_gcloud_storage(args, gcloud="gcloud"):
             if args[0] == "ls":
                 return "".join(f"{PREFIX}{b}/\n" for b in sorted(builds))
             rest = args[1][len(PREFIX):]
             build_id, _, name = rest.partition("/")
             return builds.get(build_id, {}).get(name)
 
-        real = poller._gsutil
-        poller._gsutil = fake_gsutil
+        real = poller._gcloud_storage
+        poller._gcloud_storage = fake_gcloud_storage
         prior = {k: os.environ.get(k) for k in ("GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY")}
         os.environ["GITHUB_OUTPUT"] = str(out)
         os.environ["GITHUB_STEP_SUMMARY"] = str(summary_file)
@@ -875,7 +875,7 @@ class MainTest(unittest.TestCase):
                     code = poller.main(argv)
         finally:
             self.stderr = captured.getvalue()
-            poller._gsutil = real
+            poller._gcloud_storage = real
             for key, value in prior.items():
                 if value is None:
                     os.environ.pop(key, None)

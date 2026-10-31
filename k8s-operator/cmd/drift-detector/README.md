@@ -25,18 +25,22 @@ The inject is off unless `--daemon-url` is set, and off is the default. With it 
 does everything else and stops at the `DRIFT` log line, which is how it ran before T4 and is what a
 local run against a real subscription wants. With it on, each surviving record opens a session and
 posts one payload into it — except one from a cluster outside the install's scope, which is held (the
-rule is a few paragraphs below); `logDriftEvent` still runs first either way, so the `DRIFT` line is
+rule is a few paragraphs below), and most that arrived late, which go to the daemon's digest route
+with no session when the daemon advertises one ([The backlog](#the-backlog)); `logDriftEvent` still runs first either way, so the `DRIFT` line is
 emitted whether or not a daemon is configured and whether or not the inject lands.
 
 Two things about that are worth knowing before relying on it. A record whose inject fails is
 **acked anyway and never redelivered** — the handler signature returns nothing, so there is no way
-to tell the subscriber to nack, and the `INJECT FAILED` log line naming the `insert_id` is the only
-remaining trace of the change. And because Pub/Sub delivers at least once while the subscriber acks
+to tell the subscriber to nack, and the `INJECT FAILED` log line naming the `insert_id` (`BACKLOG POST FAILED` for a
+backlog record) is the only remaining trace of the change. And because Pub/Sub delivers at least once while the subscriber acks
 after the handler returns, redelivery is ordinary rather than exceptional: the detector remembers
 the last few thousand `insertId`s it has injected and suppresses a repeat before opening a second
 session, so one redelivered batch does not page a human twice for one change. That set is in memory
 and per-process, which leaves one case uncovered: a non-graceful exit leaves its batch unacked, and
-the next instance starts with an empty set and injects those records again. A climbing `duplicate=`
+the next instance starts with an empty set. Those records were published before its first pull, so
+they come back as backlog, and the daemon drops each one that already has a drift row. A late
+`kubectl` write is the exception: it is carded, not digested, so it is injected again, as every
+record is against a daemon without the digest route. A climbing `duplicate=`
 count in the shutdown tally is a sign the ack deadline is too tight, not that the cluster is busy.
 Climbing alongside `failed=` means something else — a record is marked seen before its send, so a
 failed inject is not retried on redelivery either.
@@ -51,7 +55,8 @@ chat line names no severity — but billed to a daily ceiling
 of its own rather than to the event watcher's, because one `kubectl apply` over a directory is one
 human action and several audit entries: sharing the bucket let routine use of this signal cap-drop
 the watcher's for the rest of the day. The two ceilings therefore add up, which is the cost of the
-split; what it does not fix is the fan-out itself, since the detector coalesces nothing. A record
+split; what it does not fix is the fan-out itself, since the detector coalesces nothing live. Most records
+that arrive late are the exception: they are digested instead ([The backlog](#the-backlog)). A record
 the ceiling refuses is lost rather than deferred: the daemon answers
 `suppressed`, the detector has already marked the `insertId` as seen, and the intercepted-events
 ledger row the daemon writes is the only place that change survives. `GET /v1/alert-quota` is where
@@ -228,12 +233,18 @@ joins its own cluster and every Cluster Agent profile, whichever project it name
 
 Inside the agent pod the detector reaches Pub/Sub through the credential proxy (`WATCHER_BROKER_URL`
 and `WATCHER_BROKER_TOKEN_FILE`, set by the operator; the broker relays the four calls on the one
-configured subscription, and fleet reads the same way as the event watcher's). The credential behind
+configured subscription, and fleet reads the same way as the event watcher's). On a profile cluster
+the join's read goes through the same broker, which reads only the kinds in its table
+(`WATCHER_NAMED_READS` in `agents/platform/scripts/watcher_policy.py`): built-in declarative kinds and
+the six GitOps sync objects the agent can read itself, never a Secret. A record of any other kind
+comes out `failed`, with the broker's rule in the lookup error, and so without the `reconciled`
+judgement: a GitOps-managed object of an unlisted kind (a Flux HelmRelease, say) is reported without
+"since reconciled by" even when its controller has already put it back. The credential behind
 those calls is then the broker's, which needs `roles/pubsub.subscriber` on the subscription; with
 neither variable set, Application Default Credentials need it — the Workload Identity the
 `drift-pubsub` module grants it to. Add `roles/pubsub.viewer`
 for the startup ack-deadline check described under
-[Three things to know before changing it](#three-things-to-know-before-changing-it): subscriber does
+[Before changing it](#before-changing-it): subscriber does
 not carry `subscriptions.get`. The module grants both, so this is a note for a
 hand-made subscription or a local run, where the check is skipped with a log line rather than
 failing the process.
@@ -514,7 +525,7 @@ flags are the only place a human states which cluster a credential reaches. The 
 the profile scan, so a run with both sources configured still refuses on a mismatch without first
 minting a token per profile.
 
-Five outcomes, all of them counted in the shutdown line. The table lists them by how a reader meets
+Six outcomes, all of them counted in the shutdown line. The table lists them by how a reader meets
 them, not in the order `join` decides them — and one of those decisions is worth knowing on its own:
 the `no_object` test runs before the cluster lookup, so a delete is `no_object` whether or not the
 join has a cluster to read. "The join is off" therefore does not mean "everything is `unreachable`".
@@ -529,15 +540,16 @@ rest collected under a label. Not every entry is a misconfiguration: a project h
 nobody intends to onboard sits on the second line every run, and the detector cannot tell that from
 one whose profile failed to write.
 
-| Outcome       | Means                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enriched`    | The object was read and `owners=` carries its field ownership.                                                                                                                                                                                                                                                                                                                                                                                    |
-| `no_object`   | Nothing to fetch: a delete, or a create whose name the API server had not assigned when audited.                                                                                                                                                                                                                                                                                                                                                  |
-| `gone`        | The cluster served the path and answered `NotFound`. The object existed when the call was audited and does not now.                                                                                                                                                                                                                                                                                                                               |
-| `unreachable` | The record names a live object this process cannot read: a cluster the join has no client for, or any cluster at all when neither source is configured. The shutdown lines name them. When no readable Cluster Agent profile names the cluster the record is outside the install's scope and is logged (`inject=held_out_of_scope`) and not escalated; when one does, or the scope is unknown, it is forwarded and injected as any other outcome. |
-| `failed`      | Any other lookup error: RBAC, a network fault, a timeout, an API group or version the cluster does not serve.                                                                                                                                                                                                                                                                                                                                     |
+| Outcome           | Means                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enriched`        | The object was read and `owners=` carries its field ownership.                                                                                                                                                                                                                                                                                                                                                                                    |
+| `no_object`       | Nothing to fetch: a delete, or a create whose name the API server had not assigned when audited.                                                                                                                                                                                                                                                                                                                                                  |
+| `gone`            | The cluster served the path and answered `NotFound`. The object existed when the call was audited and does not now.                                                                                                                                                                                                                                                                                                                               |
+| `unreachable`     | The record names a live object this process cannot read: a cluster the join has no client for, or any cluster at all when neither source is configured. The shutdown lines name them. When no readable Cluster Agent profile names the cluster the record is outside the install's scope and is logged (`inject=held_out_of_scope`) and not escalated; when one does, or the scope is unknown, it is forwarded and injected as any other outcome. |
+| `failed`          | Any other lookup error: RBAC, a network fault, a timeout, an API group or version the cluster does not serve, or a kind the credential proxy does not read for a profile cluster (`SECURITY_POLICY_BLOCKED (kubernetes.watcher.kind)`). Also a lookup not attempted because a slow one benched its cluster, counted `benched=` rather than `failed=` on the shutdown line ([Before changing it](#before-changing-it)).                            |
+| `skipped_backlog` | A backlog record the join did not look up, because the daemon takes the digest route and nothing reads its ownership ([The backlog](#the-backlog)). Decided after the delete test and the cluster lookup, so a backlog delete is still `no_object` and a backlog record from an unread cluster is still `unreachable`.                                                                                                                            |
 
-A 404 answers both of the last two, so they are told apart by what the error names rather than by
+A 404 answers both `gone` and `failed`, so they are told apart by what the error names rather than by
 its status code: a genuine absence names the group, resource and object that were looked up, while
 a refusal of the path names nothing. Without the distinction a CRD uninstalled — or a served
 version retired — between the audited write and the lookup would be reported `gone`, which says the
@@ -657,10 +669,53 @@ no `inject_kinds` at all are all refusals, because treating any of them as permi
 behaviour the check exists to prevent. A startup check rather than a per-record one because the
 answer cannot change under a running process, and a refusal rather than a fall back to log-only
 because an operator who set `--daemon-url` asked for escalation and the two modes are
-indistinguishable in every later line. The error names dropping the flag as the way to get the
+indistinguishable in every later line but the backlog marker. The error names dropping the flag as the way to get the
 degraded mode deliberately.
 
-## Three things to know before changing it
+The same reply's `features` is read too, and does not gate the start: without `drift-backlog` on it,
+backlog records are sent as cards ([The backlog](#the-backlog)).
+
+## The backlog
+
+A record that reached the detector late is backlog. The subscriber marks it (`subscriber.backlog`)
+when its message's `publishTime` is earlier than this process's first successful pull, or when it
+waited in the subscription longer than `backlogMaxWait` (30 minutes). The first rule catches
+everything that queued while no detector was pulling: an install, a pod roll. The test is the publish time, so an install write that reaches
+the topic after the first pull is live. The second catches a process that started and then could not
+pull.
+
+Against a daemon whose `/healthz` lists the `drift-backlog` feature, a backlog record skips the
+live-object join and is posted to `POST /v1/drift-backlog` with no session. The daemon records it,
+spends no alert quota, starts no triage turn, and posts one digest per burst that counts the records
+by principal. The `DRIFT` line of such a record carries `backlog=true` and the publish time, and the
+shutdown tally counts `skipped_backlog=` (join) and `backlog=` (inject). Against an older daemon, the
+startup line says so and every record is sent as a card, as before.
+
+A backlog record whose user agent starts with `kubectl/` is not sent to the digest: it is joined and
+injected as a live record is, with no `backlog=true` marker. An install's own writes come from Helm's
+Go client, so a late kubectl write is more likely a person's edit made just before a restart. The
+user agent is self-declared; the rule only routes such a record the way a live one goes.
+
+An install's own Helm apply is the burst this exists for. It runs under the installer's account,
+so the classifier sees a person, and before this route each object it wrote became a triage card
+and spent the day's drift budget.
+
+The cost: after every detector restart, records published before the new process's first pull are
+backlog. That includes records nacked at shutdown and changes made within the sink's export lag
+before the restart. Two rules keep a person's edit in that window carded: the kubectl rule above,
+and the daemon's, which cards every late row of a principal with fewer than three late rows in the
+digest. What is left without a card of its own is three or more late non-kubectl changes by one
+principal, which the digest names under that principal. On an install with no chat platform enabled
+(a `next` install whose only chat platform has no home channel counts) the digest is one card on the
+task board, unassigned and blocked, so no agent acts on it and it stays in view. The daily board
+health report names it while it stays blocked; that report reaches a person once the install
+has chat. One card per burst: the digest closes 60 seconds after its newest row or 10
+minutes after its oldest, so while the detector lags more than 30 minutes, each burst of three or
+more changes by one person, more than 60 seconds apart, files its own card. A Helm upgrade the old
+detector is still running for is not covered:
+its writes reach a running process and are triaged as live changes.
+
+## Before changing it
 
 **The join happens before the ack, inside the batch's deadline.** Synchronous pull does not extend
 the ack deadline while a handler runs, so every `GET` a batch makes has to finish inside the
@@ -676,6 +731,42 @@ other lookup error: the records that would have reached a `GET` come out `failed
 acked, while a delete or a foreign-cluster record is unaffected, since both are settled before the
 context is consulted. Adding retries, a second `GET`, or a per-record backoff means re-checking
 that arithmetic.
+
+**A slow cluster is benched so it cannot spend the other clusters' share of the budget.** The budget
+is one pool for the batch, so on a fan-in a cluster that is slow to answer, or never answers, would
+cost up to `joinRequestTimeout`, ten seconds, per record naming it: an overloaded control plane
+answering late, or a master authorized network that drops the packets so the connection itself
+hangs. Three such records exhaust a thirty-second batch for every cluster in it. On a join with more
+than one cluster, a lookup that runs at least `slowLookupThreshold` (2s) and then ends on a deadline
+benches its cluster for `slowClusterCooldown` at once. One that answers that slowly, with the object,
+a `NotFound` or any other error, is a strike instead, and the second slow answer in a row from one
+cluster (`slowAnswerStrikes`) benches it; a fast answer clears the streak, and a lookup a deadline ended before it answered leaves it alone. A slow answer keeps its
+own result, so it is still `enriched`. The cluster's later records skip the lookup and come out
+`failed` with a `lookup_error` naming the cluster and the slow lookup, counted `benched=` on the join
+tally rather than `failed=`, and one log line says when a cluster is benched. A healthy control plane
+answers in tens of milliseconds, error or not, so a two-second lookup was held up on its path: the
+cluster, or for a profile cluster the credential-proxy broker in front of it, which a slow broker
+therefore benches too — or this process's own, under a gVisor sandbox or on a cold first call, which
+is why an answer gets a second chance before a bench costs a healthy cluster five minutes of
+enrichment. Every record that was looked up carries `lookup_ms=` on its `DRIFT` line, so the latency
+the threshold judges can be read from the logs. A budget that cuts a lookup off benches its cluster
+only when that lookup had already run two seconds: a hung lookup started within two seconds of the
+budget's end is cut sooner and benches nothing, and a `--batch-join-budget` below two seconds never
+benches, which is why the threshold sits below the `4s` budget above. The cooldown is the flag's
+five-minute ceiling, so a batch starts at most one lookup against a hung cluster, which costs the
+rest of the batch at most ten seconds, and at most two against a cluster that keeps answering
+slowly. A cluster whose slow answers alternate with fast ones never benches, and each slow answer
+costs its own time; that is the price of the second chance. After the cooldown the next record probes: a hang benches again at once, a slow answer is
+the first strike of a new streak. The price is that a cluster which recovers at once stays
+unenriched for up to five minutes. The bound is per cluster, not on the sum: three hung clusters
+still take thirty seconds between them. A single-cluster join never benches, because there is no
+other cluster's budget to protect: every record keeps its lookup.
+
+The bench was chosen over the two other ways to share the budget. A per-cluster share needs the
+batch's cluster mix before the first lookup, which the joiner does not see, and splits the budget
+whether or not anyone is slow. Ordering the batch so each cluster gets one lookup before any gets
+a second only moves the slow cluster's records later: each still costs the full timeout, and the
+healthy clusters' second records wait behind them.
 
 **The inject spends that same budget, and it is the slowest thing in it.** With `--daemon-url` set,
 a surviving record makes two more calls after the join — `POST /sessions` then
@@ -696,7 +787,8 @@ exhausted batch still cuts it short.
 That bounds the blast radius rather than removing it. Six consecutive unresponsive records still
 exhaust a thirty-second budget between them, and what the operator sees when they do is a batch of
 `failed` **lookups** — every later record's `GET` returning a deadline error — which reads
-identically to a slow control plane and is not. Check the inject tally on the shutdown line before
+identically to a slow control plane and is not. Those lookups fail at once on the spent context, so
+they neither bench their clusters nor clear a slow cluster's strike, and `benched=` stays out of `failed=`. Check the inject tally on the shutdown line before
 blaming the API server, and turn the inject off with an empty `--daemon-url` to tell the two apart.
 Sizing the budget for an install with the inject on still means budgeting for the daemon's latency
 as well as the control plane's; a per-record budget covering the whole handler, rather than the

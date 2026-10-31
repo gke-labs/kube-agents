@@ -1,0 +1,170 @@
+# The upgrade retrospective's verdict on catalogue entry 10 (add-on and client
+# skew) in the shape the seeded fleet plants it: the CronJob stale-kubectl-client
+# in seeded-shapes on slot a (role stale-client-skew) runs
+# registry.k8s.io/kubectl:v1.29.0 against the cluster's own control plane every
+# ten minutes, a client several minors outside the supported skew that still
+# succeeds, because /version answers any authenticated caller. The retrospective
+# would name it under one of three readings: as a failure under Errors when the
+# first request the old client cannot follow turns a Job red inside the window,
+# as a failure still present under Warnings while that guard is live, or as a
+# risk shape in the cluster's Info block or the report's `guards[]` and
+# `guards.json` (`kind: risk`) when the latest report lists the cluster as
+# unchanged. The question asks for one line per failure and per risk the
+# retrospective holds for each cluster, an unchanged cluster's included, so the
+# line is owed under all three readings, and nothing here asserts which one
+# applied: the planted noun is the object and its entry number, and those are
+# what the deterministic check reads.
+#
+# Red on the retrospective job (#3196) and on main. The collector has no entry-10
+# classification at all: no `ENTRY_` constant, no row in SHAPE_CHECKS and no
+# signature in the symptom table, so no reading can file the CronJob under 10;
+# and the Job never fails (the role's state pins no Failed condition), so no
+# Error or Warning arises for it under any entry. The case lands marked
+# `expected_fail: true` (.agents/rules/eval_driven_development.md, "When the fix is
+# not yours"): the nightly records EXPECTED_FAIL, not FAILED, and passing every
+# repetition reds the job until the marker comes off. #2717 is the open gap, the
+# after-upgrade case for this entry; what closes it is a risk shape that reads a
+# client image's tag minor against the control plane's (the readiness report's
+# client-addon-skew rule is the source of truth for the skew), and the pull request
+# that lands it flips the marker in the same diff.
+#
+# The declared line, the form the design names for the catalogue's scenario cases:
+#
+#   <cluster>/<namespace>/<kind>/<name>: entry <n>
+#
+# The objective is a whole-line pattern anchored at `^{cluster:a}/` with the
+# cluster's name bounded on both sides and the line's rendering folded first
+# (`fold_decoration`), as in upgrades-retrospective-drained-budget, whose header has
+# the mechanics: the fold re-emits the leading name bare, the verifier lowercases
+# the reply (so the kind is matched in lowercase), and an aside after the number
+# is tolerated. Two forbids share the anchor: an entry number other than 10, so a
+# line that files the object under another entry fails however the right line
+# reads; and, after the right number, a second entry number, a `/`-joined
+# alternative or a hedge, so a line that keeps entry 10 open is refused as well.
+# Lines about other objects match nothing and are ignored; the verdicts and the
+# advice around them are the judge's.
+#
+# The route check, the stream lock and the isolation class are the drained-budget
+# case's, for the same reasons. The route check proves the answer came from the
+# retrospective (its store or the job's chat record, read in the worker's terminal
+# or with `read_file`, or its collector), not from a readiness table or ad-hoc
+# kubectl reads; the scratch manifest and findings files are not admitted, since
+# they carry failures only and never a risk shape. audit_streams: a fleet-wide
+# question with a stale or missing report is a full run, and on an install with a
+# GitOps repository a full run files the stream's ledger issue, so the runner
+# holds the stream's lock for the unit. Isolation class: read-only against the
+# fleet (the collector reads with gcloud container and kubectl get and writes only
+# its own store on the shell volume); a full run may rewrite this stream's ledger
+# issue in the eval project's throwaway GitOps repository, as every audit case
+# does. No cluster mutation; the safeguard below fails the case on one.
+id: upgrades-retrospective-stale-client-skew
+name: The upgrade retrospective files the stale kubectl client as catalogue entry 10
+prompt: >-
+  What did our last upgrades do to the fleet? For each cluster in this project,
+  say which upgrade operations ran, what broke or is at risk afterwards, and
+  which of the twenty catalogued upgrade failures each one is. Answer from what
+  you already have or can read; do not change, upgrade or remove anything. Name
+  the report file you answered from, with its path, on a line of its own. End
+  your answer with one line per failure and per risk the retrospective records
+  for each cluster, including the risks it still holds for a cluster its latest
+  report lists as unchanged, in exactly this form and no other words on the
+  line: "<cluster>/<namespace>/<kind>/<name>: entry <n>", with the kind spelled as
+  the API shows it (PodDisruptionBudget, Deployment, Node), no namespace
+  segment for a cluster-scoped object, and the catalogue entry number as n.
+  Write each name exactly as the API shows it, with nothing around it.
+expected_output: >-
+  The answer comes from the upgrade retrospective: the latest saved report
+  under /opt/data/upgrade-retrospective/ when it is newer than the last upgrade
+  operation on the fleet, else a run of the collector made for the question. It
+  names the report file and when it was produced, says per cluster which
+  operations ran and what the report lists under Errors, Warnings and the
+  cluster's risks, and files seeded-a's CronJob stale-kubectl-client in
+  seeded-shapes under catalogue entry 10, a kubectl v1.29.0 client several
+  minors outside the skew policy for the control plane it calls, with the fix:
+  move the client's image within one minor of the control plane before the
+  next minor. It performs nothing, does not answer with a version or readiness
+  table in place of the retrospective, and cites no CVE identifiers. No
+  mutation of any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Red until the collector carries an entry-10 shape: see "Red on the retrospective
+# job" above (#2717). The pull request that lands the shape removes this marker.
+expected_fail: true
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json; the CronJob whose line
+# the objective expects.
+fixtures:
+  - stale-client-skew
+
+# The stream a fleet-wide question may run in full, ledger included.
+audit_streams: [upgrade-retrospective]
+
+verification_spec:
+  # The route: the worker read the retrospective's store, ran its collector, or read
+  # the job's chat record (`chat_report_upgrade-retrospective.json`) in its terminal,
+  # or read the store or the chat record with `read_file` (the on-demand case says
+  # why the two reads are two leaves).
+  - name: the-answer-comes-from-the-retrospective
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: any
+      checks:
+        # The terminal: a command on the store, the collector or the chat record.
+        - type: worker_commands
+          required_patterns:
+            - 'upgrade_retrospective\.py|upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective'
+        # The same store or record read with `read_file`, which leaves no terminal
+        # command; the path is matched whole, so the frame is `.*` on both sides.
+        - type: tool_called
+          scope: workers
+          tool_names: ["read_file"]
+          arguments:
+            path: '.*(?:upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective).*'
+          require_success: true
+
+  # The verdict: the CronJob's line, entry 10, an aside after the number tolerated.
+  # The forbids: the same object under any other entry number; a second number or a
+  # hedge after the right one.
+  - name: slot-a-stale-client-is-catalogue-entry-10
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - stale-client-skew
+      any_of_patterns:
+        - '(?m)^{cluster:a}/seeded-shapes/cronjob/stale-kubectl-client(?:\s*\([^)\n]*\))?: entry 10\b(?!/)[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}/seeded-shapes/cronjob/stale-kubectl-client(?:\s*\([^)\n]*\))?: entry (?!10\b)\d'
+        - '(?m)^{cluster:a}/seeded-shapes/cronjob/stale-kubectl-client(?:\s*\([^)\n]*\))?: entry 10\b[^\n]*(?:\bentry\s+\d|/\s*\d|\?|\b(?:or|maybe|possibly|perhaps|probably|likely|tentative|tentatively|unsure|unclear)\b)'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a retrospective is an invention.
+      forbidden_phrases: ["CVE-"]
+
+  # The retrospective is read-only: no upgrade, rollback, cordon, delete or patch
+  # from the worker's terminal, whatever the report recommends.
+  - name: no-cluster-mutation-from-the-terminal
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        - "gcloud container (?:clusters|node-pools) (?:upgrade|update|delete|rollback)"
+        - 'kubectl (?:apply|patch|delete|edit|cordon|drain|rollout restart|scale)\b'

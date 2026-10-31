@@ -69,7 +69,7 @@ resource "null_resource" "previous_run" {
       plant_store() {
         printf '%s' '${local.script_b64}' | base64 -d | \
           kubectl exec -i -n "${var.agent_namespace}" "$pod" -c "$container" -- \
-            python3 - "$1" "${local.scripts_dir}" "${var.mark}"
+            env PYTHONDONTWRITEBYTECODE=1 python3 - "$1" "${local.scripts_dir}" "${var.mark}"
       }
       on_exit() {
         status=$?
@@ -142,7 +142,7 @@ resource "null_resource" "previous_run" {
           if [[ " $names " == *" $container "* ]]; then
             printf '%s' '${self.triggers.script_b64}' | base64 -d | \
               kubectl exec -i -n "${self.triggers.namespace}" "$pod" -c "$container" -- \
-                python3 - teardown "${self.triggers.scripts_dir}" "${self.triggers.mark}"
+                env PYTHONDONTWRITEBYTECODE=1 python3 - teardown "${self.triggers.scripts_dir}" "${self.triggers.mark}"
             exit 0
           fi
         done

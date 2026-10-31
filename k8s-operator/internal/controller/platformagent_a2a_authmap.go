@@ -114,6 +114,10 @@ type a2aAuthMapIdentity struct {
 	// adding them changed no other entry's bytes.
 	Profile string            `json:"profile,omitempty"`
 	Topics  *a2aAuthMapTopics `json:"topics,omitempty"`
+
+	// Tier is the tier a profile entry's pods run at (#3655): one entry, and
+	// one ServiceAccount, per tier the profile allows. Omitted elsewhere.
+	Tier string `json:"tier,omitempty"`
 }
 
 // a2aAuthMapTopics mirrors the callout's TopicGrants.
@@ -155,6 +159,19 @@ func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 		})
 	}
 	identities = append(identities, agentProfileMapEntries(agent, profiles)...)
+	// The dispatcher, when this operator has an image for it. Its grants
+	// name each durable the operator creates, so it is built here, from the
+	// same profiles (platformagent_a2a_dispatcher.go).
+	if a2aDispatcherEnabled() {
+		names, durables := dispatcherGrantNames(agent, profiles)
+		id := dispatcherIdentity(agent, agent.Namespace, names, durables)
+		identities = append(identities, a2aAuthMapIdentity{
+			ServiceAccount: id.serviceAccount,
+			User:           id.user,
+			Account:        id.account,
+			Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
+		})
+	}
 
 	// Refuse here what the callout would refuse there.
 	//

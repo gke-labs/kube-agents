@@ -150,6 +150,9 @@ class PushSandboxLayoutTest(unittest.TestCase):
         )
         argv = run.call_args.args[0]
         self.assertIn("--skeleton-only", argv)
+        # This profile's home alone: every home on every scaffold made onboarding
+        # N clusters O(N^2) (#3701).
+        self.assertEqual(argv[argv.index("--profile") + 1], "cluster-one")
         # Past the mirror's own wait, so this timeout only fires when the
         # mirror itself is stuck rather than racing it.
         self.assertLess(
@@ -1044,6 +1047,11 @@ class ListReadyProfilesTest(unittest.TestCase):
         cap.cmd_stamp_soul(args)
         cli_stamped = (p / "SOUL.md").read_text(encoding="utf-8")
         self.assertIn("- project: proj-cli\n- cluster: clus-cli\n- location: us-east1\n", cli_stamped)
+
+    def test_list_profiles_excludes_reserved_tse_and_dot_deleted(self):
+        for name in ("default", "platform", "tse", "cluster-demo", ".deleted"):
+            (self.tmp / name).mkdir(parents=True, exist_ok=True)
+        self.assertEqual(cap.list_profiles(), ["cluster-demo"])
 
 
 if __name__ == "__main__":

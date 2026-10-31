@@ -605,14 +605,14 @@ func TestTheDroppedVolumeMessageQualifiesItselfWhileTheRollIsUnfinished(t *testi
 func TestTheDroppedVolumeConditionFollowsTheGatewayRollout(t *testing.T) {
 	cases := []struct {
 		name string
-		// replicas > 1 over RWO storage is what puts the gateway on a
-		// StatefulSet, whose ordered roll has the same window.
-		statefulSet bool
-		generation  int64
-		observed    int64
-		replicas    int32
-		updated     int32
-		rolling     bool
+		// No StatefulSet rows: that kind was only selected by replicas > 1
+		// over RWO storage, and the replica cap renders every spec as the
+		// Deployment.
+		generation int64
+		observed   int64
+		replicas   int32
+		updated    int32
+		rolling    bool
 	}{
 		{
 			// The apply has landed and the workload controller has written
@@ -633,18 +633,6 @@ func TestTheDroppedVolumeConditionFollowsTheGatewayRollout(t *testing.T) {
 			generation: 4, observed: 4, replicas: 3, updated: 3,
 			rolling: false,
 		},
-		{
-			name:        "statefulset mid-roll",
-			statefulSet: true,
-			generation:  4, observed: 4, replicas: 3, updated: 1,
-			rolling: true,
-		},
-		{
-			name:        "statefulset fully rolled out",
-			statefulSet: true,
-			generation:  4, observed: 4, replicas: 3, updated: 3,
-			rolling: false,
-		},
 	}
 
 	for _, tc := range cases {
@@ -660,27 +648,6 @@ func TestTheDroppedVolumeConditionFollowsTheGatewayRollout(t *testing.T) {
 					ReadyReplicas:      tc.replicas,
 				},
 			}
-			if tc.statefulSet {
-				agent.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(tc.replicas)}
-				agent.Spec.Deployment.Storages = []agentv1alpha1.StorageSpec{{
-					Name:        "gateway-data",
-					MountPath:   "/srv/gateway-data",
-					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-				}}
-				if !useStatefulSet(agent) {
-					t.Fatalf("this case is meant to take the StatefulSet path and does not")
-				}
-				gateway = &appsv1.StatefulSet{
-					ObjectMeta: gatewayMeta,
-					Status: appsv1.StatefulSetStatus{
-						ObservedGeneration: tc.observed,
-						Replicas:           tc.replicas,
-						UpdatedReplicas:    tc.updated,
-						ReadyReplicas:      tc.replicas,
-					},
-				}
-			}
-
 			scheme := setupScheme()
 			cl := fake.NewClientBuilder().
 				WithScheme(scheme).
@@ -740,9 +707,9 @@ func TestTheDroppedVolumeConditionFollowsTheGatewayRollout(t *testing.T) {
 func TestTheDegradedPathQualifiesTheDroppedVolumeMessageWhileTheRollIsUnfinished(t *testing.T) {
 	cases := []struct {
 		name string
-		// replicas > 1 over RWO storage is what puts the gateway on a
-		// StatefulSet, whose ordered roll has the same window.
-		statefulSet bool
+		// No StatefulSet rows: that kind was only selected by replicas > 1
+		// over RWO storage, and the replica cap renders every spec as the
+		// Deployment.
 		// noGateway drops the workload entirely: a writer that cannot read the
 		// roll has to qualify, not to assume the roll is done.
 		noGateway  bool
@@ -768,12 +735,6 @@ func TestTheDegradedPathQualifiesTheDroppedVolumeMessageWhileTheRollIsUnfinished
 			rolling: false,
 		},
 		{
-			name:        "statefulset mid-roll",
-			statefulSet: true,
-			generation:  4, observed: 4, replicas: 3, updated: 1,
-			rolling: true,
-		},
-		{
 			name:      "no gateway to read the roll from",
 			noGateway: true,
 			rolling:   true,
@@ -793,27 +754,6 @@ func TestTheDegradedPathQualifiesTheDroppedVolumeMessageWhileTheRollIsUnfinished
 					ReadyReplicas:      tc.replicas,
 				},
 			}
-			if tc.statefulSet {
-				agent.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(tc.replicas)}
-				agent.Spec.Deployment.Storages = []agentv1alpha1.StorageSpec{{
-					Name:        "gateway-data",
-					MountPath:   "/srv/gateway-data",
-					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-				}}
-				if !useStatefulSet(agent) {
-					t.Fatalf("this case is meant to take the StatefulSet path and does not")
-				}
-				gateway = &appsv1.StatefulSet{
-					ObjectMeta: gatewayMeta,
-					Status: appsv1.StatefulSetStatus{
-						ObservedGeneration: tc.observed,
-						Replicas:           tc.replicas,
-						UpdatedReplicas:    tc.updated,
-						ReadyReplicas:      tc.replicas,
-					},
-				}
-			}
-
 			scheme := setupScheme()
 			builder := fake.NewClientBuilder().
 				WithScheme(scheme).

@@ -416,7 +416,7 @@ func TestAPluginCannotDisableCallerAuthentication(t *testing.T) {
 	envVars := buildCredentialProxyEnv(agent)
 	expected := map[string]string{
 		"CREDENTIAL_PROXY_AUTH_MODE":       "serviceaccount",
-		"CREDENTIAL_PROXY_ALLOWED_CALLERS": allowedBrokerCallers(agent),
+		"CREDENTIAL_PROXY_ALLOWED_CALLERS": allowedBrokerCallers(agent, true),
 		"CREDENTIAL_PROXY_AUDIENCE":        credentialProxyAudience,
 		"CREDENTIAL_PROXY_CHAT_AUDIENCE":   credentialProxyChatAudience,
 		"CREDENTIAL_PROXY_ENVOY_ADDRESS":   "0.0.0.0",
@@ -914,7 +914,7 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	sessionCaller := "system:serviceaccount:test-ns:test-agent-a2a-session"
 
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
-	if strings.Contains(allowedBrokerCallers(agent), sessionCaller) {
+	if strings.Contains(allowedBrokerCallers(agent, true), sessionCaller) {
 		t.Fatal("the session ServiceAccount is a broker caller with the flag unset")
 	}
 	off := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
@@ -927,7 +927,7 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
 	want := "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell," + sessionCaller
-	if got := allowedBrokerCallers(agent); got != want {
+	if got := allowedBrokerCallers(agent, true); got != want {
 		t.Fatalf("callers = %q, want %q", got, want)
 	}
 	on := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
@@ -952,7 +952,7 @@ func TestSessionClusterViewIsInertOutsideModeNext(t *testing.T) {
 	if a2aSessionClusterViewEnabled(agent) {
 		t.Fatal("enabled outside mode next")
 	}
-	if strings.Contains(allowedBrokerCallers(agent), "a2a-session") {
+	if strings.Contains(allowedBrokerCallers(agent, true), "a2a-session") {
 		t.Fatal("session caller named on a today install")
 	}
 	for _, v := range []string{"", "false", "TRUE", "1"} {

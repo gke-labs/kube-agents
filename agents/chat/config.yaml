@@ -100,7 +100,10 @@ model:
 # It is 600s because Gemini thinks in silence on this path: with the request
 # shape Hermes sends, no reasoning deltas stream, and a hard prompt measured
 # 140-210s before its first chunk, so a shorter bound would cut off healthy
-# long thinks, and every retry would repeat the same think.
+# long thinks, and every retry would repeat the same think. That was measured
+# before the chart's gateway asked Gemini for its thoughts; thought summaries
+# may now arrive as reasoning deltas before the answer, which has not been
+# measured, so the bound stays.
 # request_timeout_seconds is the per-read socket timeout (and the stream read
 # timeout), not a cap on a whole call; the chart's LiteLLM sets no timeout of
 # its own. A call that stalls is retried inside each of Hermes' 3 attempts
@@ -134,6 +137,16 @@ mcp_servers:
       - "${HERMES_HOME}/scripts/router_server.py"
     env:
       HERMES_HOME: "${HERMES_HOME}"
+      # For list_agents' Host Cluster Identity and GCP Projects in Scope
+      # sections (agent_roster.py), so the tool renders what the injected block
+      # renders. The operator sets the GKE_* and GCP_PROJECT_ID values outside
+      # kind only; an unset one arrives here as the literal "${...}"
+      # placeholder, which agent_roster.py treats as unset.
+      GKE_CLUSTER_NAME: "${GKE_CLUSTER_NAME}"
+      GKE_PROJECT_ID: "${GKE_PROJECT_ID}"
+      GKE_LOCATION: "${GKE_LOCATION}"
+      GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
+      KUBEAGENTS_SCOPE_FILE: "${KUBEAGENTS_SCOPE_FILE}"
 
 # Explicitly list platform_toolsets (reserved Hermes key). ONLY the router MCP —
 # no base tool bundle. `mcp-<name>` here maps to `mcp_servers.<name>` above.
@@ -175,6 +188,12 @@ platform_toolsets:
   # Real Google Chat ingress resolves under the `google_chat` platform key; pin
   # it to the delegation surface too so it never falls back to a full base bundle.
   google_chat:
+    - mcp-router
+    - kanban
+    - memory
+  # Microsoft Teams ingress resolves under the `teams` platform key; pin
+  # it to the delegation surface too so it never falls back to a full base bundle.
+  teams:
     - mcp-router
     - kanban
     - memory
@@ -339,6 +358,13 @@ platforms:
       # its input. Teaching an agent to emit Slack mrkdwn directly would defeat
       # both this renderer and format_message.
       rich_blocks: true
+  # Microsoft Teams egress presentation. `enabled` is the operator's to set, from the CR's
+  # spec.integration.teams.
+  teams:
+    typing_status_text: "Kage is thinking…"
+    extra:
+      # Render outbound messages as Adaptive Cards v1.5 JSON when enabled.
+      adaptive_cards: true
 
 # Memory. The built-in MEMORY.md/USER.md store stays off; the
 # `kube_agents_memory` provider (agents/chat/plugins/memory/kube_agents_memory/)
@@ -430,8 +456,12 @@ plugins:
     - incident_context
     - bootstrap_onboarding
     - legacy_slash_commands
-    # Counts every inbound message on pre_gateway_dispatch and serves the count on
-    # the listener the operator reads into status.usage.chatMessagesInboundTotal.
+    # Counts every inbound message on pre_gateway_dispatch, the failed turns the
+    # gateway patch reports, the board's cards that gave up and the thumbs-downs the
+    # chat_feedback_reactions hook reports from Hermes' reaction:added event, and
+    # serves them on the listener the operator reads into
+    # status.usage.chatMessagesInboundTotal, chatTurnsErroredTotal,
+    # backgroundTasksGaveUpTotal and negativeFeedbackTotal.
     # Rewrites nothing, so its place in the order does not matter.
     - chat_metrics
     # Injects the routable-specialist roster into every turn, so choosing an

@@ -73,11 +73,33 @@ describe("StatusStrip", () => {
     expect(tile.textContent).toContain("TASKS 90%");
   });
 
-  it("says why spend is tbd", () => {
+  it("says why spend is empty until a turn reports usage", () => {
     render(<StatusStrip state={state} onFocus={() => {}} />);
     const tile = screen.getByTestId("tile-spend");
-    expect(tile.textContent).toContain("tbd");
-    expect(tile.getAttribute("title")).toContain("a2a/worker-adapter/harness.go");
+    expect(tile.textContent).toContain("none yet");
+    expect(tile.getAttribute("title")).toContain("no task has reported usage yet");
+  });
+
+  it("shows the cost once a task priced a turn, and the tokens when none did", () => {
+    const t1 = state.tasks.get("t1")!;
+    const priced: UiState = {
+      ...state,
+      tasks: new Map([
+        ["t1", { ...t1, usage: { inputTokens: 1000, outputTokens: 50, costUsd: 0.25, durationMs: 3000 } }],
+        ["t2", { ...t1, taskId: "t2", usage: { inputTokens: 2000, outputTokens: 50, durationMs: 1000 } }],
+      ]),
+    };
+    render(<StatusStrip state={priced} onFocus={() => {}} />);
+    const tile = screen.getByTestId("tile-spend");
+    expect(tile.textContent).toContain("$0.2500");
+    expect(tile.getAttribute("title")).toBe("2 tasks reported usage: $0.2500 over 1 of 2 tasks");
+    cleanup();
+    const counted: UiState = {
+      ...state,
+      tasks: new Map([["t2", { ...t1, taskId: "t2", usage: { inputTokens: 2000, outputTokens: 400 } }]]),
+    };
+    render(<StatusStrip state={counted} onFocus={() => {}} />);
+    expect(screen.getByTestId("tile-spend").textContent).toContain("2.4k tok");
   });
 
   it("focuses the matching panel on click", async () => {

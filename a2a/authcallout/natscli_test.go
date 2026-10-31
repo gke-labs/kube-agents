@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // The provision Job's authentication path, run with the real nats CLI.
@@ -45,7 +47,7 @@ func TestTheProvisionJobsCredentialShapeWorksWithTheRealCLI(t *testing.T) {
 
 	run := func(extra ...string) (string, error) {
 		args := append([]string{
-			"--server", server,
+			"--server", server, "--tlsca", os.Getenv(lib.EnvNATSCAFile),
 			"--user", serviceAccount,
 			"--password", token,
 			"--inbox-prefix=_INBOX.provision",
@@ -124,7 +126,7 @@ func TestWithoutTheInboxPrefixTheProvisionCredentialTimesOutRatherThanFailing(t 
 	server := strings.TrimPrefix(h.nats.ClientURL(), "nats://")
 
 	out, err := exec.Command(cli,
-		"--server", server,
+		"--server", server, "--tlsca", os.Getenv(lib.EnvNATSCAFile),
 		"--user", serviceAccount,
 		"--password", token,
 		"stream", "ls",
@@ -163,7 +165,7 @@ func TestTheProvisionPrincipalCannotEscapeThroughTheJetStreamAPI(t *testing.T) {
 
 	run := func(extra ...string) (string, error) {
 		args := append([]string{
-			"--server", server,
+			"--server", server, "--tlsca", os.Getenv(lib.EnvNATSCAFile),
 			"--user", serviceAccount,
 			"--password", token,
 			"--inbox-prefix=_INBOX.provision",

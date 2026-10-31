@@ -308,6 +308,18 @@ func cardStopResult(r *cardStopResponse) *lib.CardStopResult {
 		}
 		out.Settled = append(out.Settled, lib.CardStopCard{ID: c.ID, Title: cardStopTitle(c.Title)})
 	}
+	var notStopped []cardStopCardRef
+	for _, c := range r.Failed {
+		notStopped = append(notStopped, cardStopCardRef{ID: c.ID, Title: c.Title})
+	}
+	notStopped = append(append(notStopped, r.Pending...), r.Unresolved...)
+	for _, c := range notStopped {
+		if len(out.NotStopped) == cardStopListMax {
+			out.ListsCut = true
+			break
+		}
+		out.NotStopped = append(out.NotStopped, lib.CardStopCard{ID: c.ID, Title: cardStopTitle(c.Title)})
+	}
 	return out
 }
 

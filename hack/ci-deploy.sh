@@ -11,8 +11,9 @@
 # behaves differently from the day this line was added.
 #
 # Setting EVAL_MODE_NEXT=1 flips the installed agent to `spec.mode: next` after
-# the today-mode install has proven itself (sections 2a and 2b refuse the flag
-# where it cannot work, step 4 builds the A2A images and the bridge sidecar,
+# the today-mode install has proven itself (section 2b refuses the flag
+# where it cannot work, step 4 builds the A2A images and the bridge sidecar
+# or, on the release-candidate path, names the candidate's published ones,
 # step 5 hands the operator their references, the bridge's settings and the
 # inject door, step 6b flips and gates; the constants block below says what
 # each does). Unset, nothing behaves differently either.
@@ -71,6 +72,34 @@ readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
 # here; #2491 tracks it.
 readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 
+# Folds a workload's repeat events into one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS
+# in agents/platform/scripts/session_kv_server.py), on so that
+# incident-triage-workload-fold can see three replicas become one incident.
+# Like the ceilings above it is install-wide, so it reaches every case, and the
+# value is bounded on both sides by measurements, not medians:
+#
+# - Above: the spread of one Deployment's replicas crossing the watcher's
+#   BackOff debounce, first event to last. Measured up to 32 s over eight
+#   bursts of that case's three replicas on a dev install (2026-10-22). A
+#   replica that lands after the window opens an incident of its own, which
+#   reds the case.
+# - Below: the gap between two repetitions of a case that re-plants one
+#   workload and waits for that repetition's own card
+#   (autoops-warning-event-triage, autoops-crashloop-config-triage,
+#   autoops-warning-event-no-action-triage, whose plant also fails on any
+#   answer but `injected`). A window longer than the gap folds repetition 2's
+#   incident into repetition 1's and no card comes. The unit queue below is
+#   repetition-major (`sort -k1,1n`), so the rest of the matrix runs between
+#   two repetitions of one case: over 18 nightlies (2026-10) the watcher's own
+#   log (artifacts/agent-api-auth.log) put consecutive repetitions of the first
+#   two at least 48.5 and 51.8 minutes apart, and the third's 181 minutes. A
+#   matrix holding one such case alone runs them back to back, and a
+#   repetition then still lasts at least 4.5 minutes (the third's shortest).
+#
+# 150 s clears the first by almost five times and stays under the second's
+# floor of 270 s. tests/test_ci_deploy_alert_quota.py holds it between them.
+readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="150"
+
 # The subscription the drift detector pulls from. The pool project's own
 # provisioning owns the resource: scripts/provision_ci_pool_project.sh sets
 # enable_drift_pubsub in the full-install tfvars, and terraform/modules/
@@ -123,8 +152,8 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # kanban.max_in_progress in its managed scope: 6 (defaultKanbanMaxInProgress),
 # or spec.harness.tuning.maxInProgress when the CR carries it.
 # The eval deliberately runs below that production default, at five. It fans
-# its units out at EVAL_TASK_PARALLELISM (4 on a pull request, 8 on the
-# nightly since oss-test-infra#2707), and nearly every unit's opening turn
+# its units out at EVAL_TASK_PARALLELISM (4 on a pull request, 6 on the
+# nightlies, 8 on the GitLab one), and nearly every unit's opening turn
 # delegates one platform card. The override was added when the image default
 # was two, where most lanes queued: a queued card waits out the cards ahead of
 # it and then runs its own 10-45 minutes, past the 2700-3000s delegation
@@ -152,7 +181,7 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # that leaves four for user cards: exactly the pull request's four lanes
 # (EVAL_TASK_PARALLELISM_DEFAULT below), with the fifth held for event triage.
 # A lane's fan-out child runs in the slot its waiting coordinator gives back.
-# The nightly's eight lanes still queue four deep. Raising the cap belongs with
+# The nightlies' six lanes still queue two deep. Raising the cap belongs with
 # that measurement. Each class may hold four of the five slots here, against
 # five of six in production. Set on this install only.
 # tests/test_ci_deploy_kanban_cap.py pins the flag, the floor (the lanes plus
@@ -220,26 +249,28 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 
 # EVAL_MODE_NEXT=1 flips the eval install to `spec.mode: next` once the
 # today-mode install has passed step 6, so the matrix can be run against the
-# next stack: the presubmit's on demand, or the next lane's periodic and
-# nightly on main (#1686, measuring #1661). Unset, or set to
+# next stack: the merge-blocking presubmit's, the main nightly's on main,
+# and the today lane's, which rolls the next install back to today before its
+# matrix (EVAL_ROLLBACK_LANE=1, hack/ci-eval-pr.sh) (#1686, #2007). Unset, or set to
 # anything but "1", is today: every line the flag guards is skipped and the
 # script behaves exactly as it did before the flag existed.
 #
 # What the flag has to do, and where:
-#   - section 2a refuses it on the release-candidate path (that path hands
-#     the operator none of the settings step 4 does) and section 2b refuses it on a Prow
-#     run that is neither a pull request's nor one of the next-lane jobs
-#     named below (a mis-set variable on the nightly or a postsubmit would
-#     otherwise run that job in next mode, recording and publishing nothing,
-#     so main's window and dashboard would silently miss it), and refuses a
+#   - section 2b refuses it on a Prow
+#     run that is neither a pull request's nor one of the jobs
+#     named below (a mis-set variable on any other periodic or postsubmit
+#     would otherwise run that job in next mode, so its today-mode record
+#     would silently go missing), and refuses a
 #     fan-out the bridge cannot be given as its concurrency, before anything
 #     is built;
 #   - step 4 also builds the A2A gateway, auth callout, worker and console
 #     images from a2a/Dockerfile.* (the pull request's own builds, the same
-#     way the four images above are; the operator would derive these same
+#     way the images above are; the operator would derive these same
 #     references from its own image, and step 5 names them anyway so the
 #     deploy's inputs are explicit) and the Hermes bridge sidecar image, FROM
-#     the platform-agent image of the same build;
+#     the platform-agent image of the same build; on the release-candidate
+#     path it builds nothing and names the candidate's published images of
+#     the same six instead;
 #   - step 5 passes those references to the operator through the chart's
 #     operator.extraEnv, which the operator reads as its image overrides,
 #     with the bridge's concurrency beside them, and arms
@@ -254,7 +285,8 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #     sidecar the operator rendered into the agent pod to log that it is
 #     consuming `platform` tasks.
 # hack/ci-eval-pr.sh then runs the matrix through the door (AGENT_TRANSPORT=
-# inject) under the same flag. The flip goes through the chart value rather
+# inject) under the same flag, or, on the today lane, rolls the install back
+# and runs it over the agent API. The flip goes through the chart value rather
 # than a patch on the CR so that the next lane exercises the value an
 # installer-driven next install sets (install.sh --mode, the composition's
 # platform_agent_mode), and it is still a second release after the today-mode
@@ -277,24 +309,58 @@ readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 # operator to clear its finalizer before uninstallation. Matches
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
-# The next lane's Prow jobs: its on-demand presubmit, its six-hourly periodic
-# on main, its daily full-catalog nightly on main (the agent on Claude,
-# compared with a today-mode nightly on the same model), and the GitLab
-# lane's nightly under next (EVAL_FORGE=gitlab, hack/eval/gitlab-cases.txt,
-# beside the today-mode GitLab nightly). Section 2b admits
-# the flag on a run whose JOB_NAME is one of these (space-separated, matched
-# whole) or that carries a PULL_NUMBER -- the presubmit is admitted by the
-# second on a pull request and by the first on a Tide batch, the periodic and
-# the nightlies only by the first -- and refuses it on any other Prow run, so
-# the flag leaking into the today nightly's or a postsubmit's environment
+# The Prow jobs that deploy under the flag with no PULL_NUMBER: the
+# merge-blocking presubmit in a batch Tide ran (it grades next since next became
+# the mode new installs get, #2007, "The cutover itself"); the today lane's
+# six-hourly periodic on main, which deploys next and rolls it back to today
+# before its matrix (EVAL_ROLLBACK_LANE=1); the main nightly's three parts on
+# main (the main part's two halves, main-a and main-b, and the writers part),
+# which grade the full catalog under next (the nightly the dashboard and
+# the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
+# hack/eval/gitlab-cases.txt) and the GHES lane's (EVAL_FORGE=ghes,
+# hack/eval/ghes-cases.txt), each beside its today-mode nightly; and the
+# release-candidate eval's postsubmit, which grades a candidate in the mode a
+# new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
+# is optional, so Tide never batched it, and a pull request's run of it
+# carries a PULL_NUMBER. Section 2b admits the flag on a run whose JOB_NAME is
+# one of these (space-separated, matched whole) or that carries a PULL_NUMBER
+# -- a presubmit is admitted by the second on a pull request and the blocking
+# one by the first on a batch Tide ran, the periodic, the nightlies and the RC
+# postsubmit only by the first -- and refuses it on any other Prow run, so
+# the flag leaking into the today-mode GitLab nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
 # oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
-# one-line edit here. hack/ci-eval-pr.sh keeps such a run out of the baseline
-# recorder on the flag alone, so admitting a job here never lets it write
-# main's window.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next ci-kube-agents-eval-nightly-next-claude ci-kube-agents-eval-nightly-gitlab-next"
+# one-line edit here. Admitting a job here never lets it write today's window:
+# a run graded through the inject door records under the version key's next
+# mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
+# lane and a release candidate out of the recorder altogether.
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
+# The broker Deployment, named after the CR the way the operator names it
+# (credential_proxy_manifests.go).
+readonly CREDENTIAL_PROXY_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-credential-proxy"
+# The two AgentPlugin images, under the names docker-publish-*.yml and
+# scripts/release/common.sh publish them by.
+readonly PLUGIN_IMAGE_PUBSUB_PLATFORM="pubsub-platform"
+readonly PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR="gke-stockout-investigator"
+# Section 7b: the Pub/Sub platform adapter must pull through the credential
+# broker. The adapter logs the first line when it connects; the broker logs
+# the second for every relayed pull. The route is the stockout investigator's
+# (agentplugins/gke-stockout-investigator/templates/agentplugin.yaml).
+readonly PUBSUB_RELAY_READY_ATTEMPTS=24
+readonly PUBSUB_RELAY_READY_INTERVAL_SECONDS=5
+readonly PUBSUB_RELAY_ADAPTER_MARKER="connected through the credential broker relay"
+readonly PUBSUB_RELAY_BROKER_MARKER="platform pubsub forwarded"
+# The forwarded line is logged for every relayed call of the family, the
+# adapter's preflight read of the subscription included; the rule id is what
+# says a pull went through (watcher_policy composes it from the family's
+# allowed prefix and the verb).
+readonly PUBSUB_RELAY_BROKER_RULE="rule=gcp.pubsub.subscription-pull"
+# The gateway container the adapter logs from, and how much of each log the
+# gate's failure dump shows.
+readonly PUBSUB_RELAY_GATEWAY_CONTAINER="platform-agent"
+readonly PUBSUB_RELAY_DIAG_LOG_LINES=200
 # The first change: the mode, and the maxSessions section 2b sizes for the
 # rendered bridge's workers, as one values document for one `helm upgrade`, so
 # the first render -- and so the first provision Job -- sees both. A printf
@@ -319,6 +385,12 @@ readonly A2A_INJECT_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-inject"
 readonly A2A_INJECT_TOKEN_KEY="token"
 readonly A2A_INJECT_BACKEND_ENV_VAR="A2A_INJECT_BACKEND"
 readonly A2A_INJECT_BACKEND_ON="true"
+# The card stop (a2a/gateway/cardstop.go): armed on the next lane, so a
+# `stop` sent through the inject door stops the conversation's kanban cards,
+# which chat-stop-halts-delegated-remediation grades. The operator renders
+# it onto the gateway from its own environment; only an exact "true" arms it.
+readonly A2A_CARD_STOP_ENV_VAR="A2A_CARD_STOP"
+readonly A2A_CARD_STOP_ON="true"
 # The bridge sidecar. The operator renders it into the agent pod under next
 # (platformagent_a2a_bridge.go): its bus identity, its env and the bus token
 # it must not mount are the operator's, not this script's. The script names
@@ -336,7 +408,7 @@ readonly BRIDGE_SIDECAR_NAME="hermes-bridge"
 readonly BRIDGE_EXECUTOR_EXPECTED="api"
 # BRIDGE_CONCURRENCY is sized against the matrix's fan-out: hack/ci-eval-pr.sh
 # runs EVAL_TASK_PARALLELISM units at once from the same job environment,
-# defaulting to 4 (the nightly sets 8), and every unit past the bridge's
+# defaulting to 4 (the next-mode nightlies set 6), and every unit past the bridge's
 # concurrency waits in its queue for the whole budget and is classified as
 # infrastructure (docs/designs/eval-next-transport.md, the executor
 # paragraph). The default here is pinned equal to the eval script's by
@@ -611,6 +683,23 @@ export IMAGE_TAG="${TAG}"
 # exist; step 5 expands it into the Helm install, where an empty array
 # contributes nothing and the release is byte-for-byte the today one.
 A2A_OPERATOR_ENV_ARGS=()
+# The next lane's audits open no remediation pull request on their own: the
+# inject lane's write safeguard charges any pull request in a repetition's
+# window to the case in flight, and the fleet audits' automatic sweep (the
+# first-run chain included) writes one whenever a pool repository declares a
+# workload with a major finding (#3439). spec.deployment.env carries the
+# switch; the operator forwards it to the shell sandbox, where finish runs.
+# It also enables the optional `tse` AgentProfile so `mode: next` eval lanes
+# scaffold `/opt/data/profiles/tse` (#3492). Empty on the today lane, so that
+# release stays byte-for-byte the same.
+MODE_NEXT_ENV_ARGS=()
+if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+  MODE_NEXT_ENV_ARGS=(
+    --set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+    --set-string "platformAgent.deployment.env[3].value=false"
+    --set "profiles.tse.enabled=true"
+  )
+fi
 
 # ─── 2a. Image Source: Pull Request Build, or Published Release Candidate ─────
 # RC_COMMIT_SHA unset is the presubmit and everything this script did before the
@@ -631,22 +720,21 @@ A2A_OPERATOR_ENV_ARGS=()
 # rewriting the trailing path element and keeping the tag
 # (resolveCredentialProxyImage in k8s-operator/internal/controller/
 # platformagent_manifests.go), so it follows whichever repository the agent uses
-# without being named here. Both plugin images default to enabled=false and are
-# not rendered on either path.
+# without being named here. The two AgentPlugin images (pubsub-platform and
+# gke-stockout-investigator) are rendered on both paths, so the Pub/Sub platform
+# adapter runs in the gateway of every install the presubmit tests: on the
+# pull-request path from this build (the `agent-plugins` step of
+# cloudbuild-ci.yaml), on the release-candidate path from the candidate's
+# published images. Section 7b gates on the adapter pulling through the broker.
+# The stockout investigator's own execution limits are not applied
+# (plugins.stockoutInvestigator.applyTuning=false): the eval agent keeps the
+# tuning it is graded under, and the plugin is here for its ingress alone.
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
-  # The release pipeline publishes the A2A images and the bridge beside the
-  # others, and the operator derives the references it renders, but this
-  # path hands the operator none of the settings step 4 puts
-  # in A2A_OPERATOR_ENV_ARGS: no inject door, so the eval's transport has no
-  # Service to reach, and no bridge concurrency, so the bridge would not be
-  # sized to the matrix's fan-out. Refuse the pair here rather than forty
-  # minutes in.
-  if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    echo "ERROR: EVAL_MODE_NEXT=1 is set together with RC_COMMIT_SHA. The mode-next flip needs" >&2
-    echo "       the pull-request build path, which hands the operator the inject door and the" >&2
-    echo "       Hermes bridge's settings; this path does not yet set them for the release." >&2
-    exit 1
-  fi
+  # EVAL_MODE_NEXT=1 is accepted here: the release pipeline publishes the A2A
+  # images and the bridge beside the others (REQUIRED_RELEASE_IMAGES, which
+  # the image check below requires), and step 4 hands the operator their
+  # published references with the inject door and the bridge's concurrency,
+  # as it does the pull request's builds.
 
   # Sourced inside the branch, deliberately. The presubmit path must not acquire
   # a second file's exports and functions just because this one exists.
@@ -694,6 +782,8 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
     --set-string "operator.image.tag=${TAG}"
     --set-string "platformAgent.deployment.image.tag=${TAG}"
     --set-string "agentSandbox.image.tag=${TAG}"
+    --set-string "plugins.pubsubPlatform.image.tag=${TAG}"
+    --set-string "plugins.stockoutInvestigator.image.tag=${TAG}"
   )
   DEPLOY_SOURCE="release candidate ${RC_COMMIT_SHA:0:7} from ${RC_REGISTRY_PREFIX}"
 else
@@ -704,6 +794,10 @@ else
     --set-string "platformAgent.deployment.image.tag=${TAG}"
     --set-string "agentSandbox.image.repository=${AR_REPO}/agent-sandbox"
     --set-string "agentSandbox.image.tag=${TAG}"
+    --set-string "plugins.pubsubPlatform.image.repository=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}"
+    --set-string "plugins.pubsubPlatform.image.tag=${TAG}"
+    --set-string "plugins.stockoutInvestigator.image.repository=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}"
+    --set-string "plugins.stockoutInvestigator.image.tag=${TAG}"
   )
   DEPLOY_SOURCE="PR #${PULL_NUMBER:-local} build (${TAG})"
 fi
@@ -886,15 +980,18 @@ else
   IS_PROW_RUN="false"
 fi
 
-# The mode flip exists for the next lane's runs: a pull request's, or one of
-# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic and nightlies on main).
-# A flagged run appends nothing to main's baseline and publishes no dashboard
-# (hack/ci-eval-pr.sh keeps it out of both on the flag alone; bench-gate
-# separately refuses a pull request's sample, bench/baselines/README.md), so
-# what the flag mis-set on a job that is not the lane's -- the today nightly,
-# a postsubmit -- would do is run that job in next mode and leave main's
-# window and dashboard silently missing it, its verdict measuring the wrong
-# stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's
+# The mode flip exists for the runs that grade next or roll it back: a pull
+# request's, or one of the jobs EVAL_MODE_NEXT_JOB_NAMES lists (the today
+# lane's periodic and the main, GitLab and GHES nightlies on main, the blocking presubmit
+# in a batch Tide ran, and the release-candidate eval).
+# A flagged run on main records under the version key's next mode, never into
+# today's window (bench-gate reads the mode off the transport; hack/ci-eval-pr.sh
+# keeps the today lane out of the recorder, and bench-gate separately refuses
+# a pull request's sample, bench/baselines/README.md), so what the flag
+# mis-set on a job that is not the lane's -- the today-mode GitLab nightly, another
+# postsubmit -- would do is run that job in next mode and leave the
+# dashboard silently missing its today-mode run, its verdict measuring the
+# wrong stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's
 # scheduled jobs are admitted by being named and every other Prow run without
 # a pull request is still refused.
 if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
@@ -908,15 +1005,24 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${P
     fi
   done
   if [ "${MODE_NEXT_JOB_ADMITTED}" = "true" ]; then
-    echo "EVAL_MODE_NEXT=1: accepted on ${JOB_NAME} (a next-lane job with no PULL_NUMBER; the baseline store is read, never written)"
+    echo "EVAL_MODE_NEXT=1: accepted on ${JOB_NAME} (a job named in EVAL_MODE_NEXT_JOB_NAMES with no PULL_NUMBER; a next-mode record files under the next key, never today's)"
   else
     echo "ERROR: EVAL_MODE_NEXT=1 is set on a Prow run with no PULL_NUMBER (JOB_NAME=${JOB_NAME:-})." >&2
-    echo "       The flag is for a pull request's presubmit or a next-lane job named in" >&2
+    echo "       The flag is for a pull request's presubmit or a job named in" >&2
     echo "       EVAL_MODE_NEXT_JOB_NAMES (${EVAL_MODE_NEXT_JOB_NAMES}); any other periodic or" >&2
-    echo "       postsubmit under it would run in next mode and record nothing to main's" >&2
-    echo "       baseline or dashboard, leaving that run silently missing from both." >&2
+    echo "       postsubmit under it would run in next mode instead of today's, leaving" >&2
+    echo "       its today-mode dashboard record silently missing." >&2
     exit 1
   fi
+fi
+
+# The today lane rolls a next install back to today before its matrix
+# (EVAL_ROLLBACK_LANE=1, hack/ci-eval-pr.sh's run_rollback_lane), so it needs
+# the flag that brings the install up under next. Refused here, at second
+# zero, rather than after the build and the install it would otherwise spend.
+if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ] && [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
+  echo "ERROR: EVAL_ROLLBACK_LANE=1 needs EVAL_MODE_NEXT=1: the lane rolls a next install back to today, and without the flag this deploy installs today with nothing to roll back." >&2
+  exit 1
 fi
 
 # The bridge sidecar's concurrency is the matrix's fan-out, read from the same
@@ -956,15 +1062,80 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   fi
 fi
 
+# The forge table (kube-agents#3682): one row per EVAL_FORGE value, giving the
+# forge's kind (the provider the chart registers), its host, and whether it is
+# self-managed (a private host with a private CA the run supplies). A lane is a
+# row; a new forge is a new row, nothing else here changes. The self-managed
+# hosts can be overridden for a developer's own instance. hack/ci-eval-pr.sh
+# and hack/ci-forge.sh lift this function, as the first lifts the project
+# tables, so the three scripts read one table; tests/test_ci_gitops_repo.py
+# pins the rows.
+EVAL_FORGE_DEFAULT_GHES_HOST="ghes.eval.internal"
+EVAL_FORGE_DEFAULT_GITLAB_CE_HOST="gitlab.eval.internal"
+forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no: self-managed>"; 1 unknown forge, 2 bad host override
+  local kind host var example
+  case "$1" in
+    github)    echo "github github.com no"; return 0 ;;
+    gitlab)    echo "gitlab gitlab.com no"; return 0 ;;
+    ghes)      kind=github; var=EVAL_GHES_HOST; example="${EVAL_FORGE_DEFAULT_GHES_HOST}"; host="${EVAL_GHES_HOST:-${example}}" ;;
+    gitlab-ce) kind=gitlab; var=EVAL_GITLAB_CE_HOST; example="${EVAL_FORGE_DEFAULT_GITLAB_CE_HOST}"; host="${EVAL_GITLAB_CE_HOST:-${example}}" ;;
+    *) return 1 ;;
+  esac
+  # A dotted bare hostname only: the row is split on whitespace, and the chart
+  # takes a host without scheme, port or path (hack/ghes-proxy/README.md). The
+  # two public hosts are not self-managed; the chart refuses them with a CA set.
+  # The chart's finer rules (reserved domains, length) stay the chart's.
+  if ! [[ "${host}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+    echo "ERROR: ${var}='${host}' is not a dotted bare hostname (no scheme, port, path or spaces); the forge table takes a name such as ${example}." >&2
+    return 2
+  fi
+  case "$(printf '%s' "${host}" | tr '[:upper:]' '[:lower:]')" in
+    github.com|www.github.com|ssh.github.com|gitlab.com|www.gitlab.com)
+      echo "ERROR: ${var}='${host}' is a public forge, not a self-managed one; EVAL_FORGE=github or gitlab is that row." >&2
+      return 2 ;;
+  esac
+  echo "${kind} ${host} yes"
+}
+
 # --- Which forge this run deploys against (EVAL_FORGE) ----------------------
-# EVAL_FORGE picks the forge the eval run drives: github (default; the
-# resolution below) or gitlab (issue #2394). Under gitlab the GitHub
-# integration and its minter stay off, the PlatformAgent declares one GitLab
-# forge whose credential is a Kubernetes Secret (step 5 fills it from the
-# pool's Secret Manager secret gitlab-agent-token in GITLAB_SECRETS_PROJECT),
-# and the pool project's GitLab project is its gitops repository. Mapped and gated here, ahead of the
-# GitHub resolution, so an unmapped project is refused naming this table.
+# EVAL_FORGE picks the forge the eval run drives, a row of forge_profile above:
+# github (default; the resolution below), gitlab (issue #2394), ghes (a GitHub
+# Enterprise Server at a private host) or gitlab-ce (a self-managed GitLab at a
+# private host), the last two kube-agents#3682. Under the gitlab kind the
+# GitHub integration and its minter stay off, the PlatformAgent declares one
+# GitLab forge whose credential is a Kubernetes Secret (step 5 fills it: from
+# the pool's Secret Manager secret gitlab-agent-token in GITLAB_SECRETS_PROJECT
+# on gitlab.com, from the run's own forge state directory on a self-managed
+# instance), and the pool project's GitLab project is its gitops repository.
+# Under ghes the GitHub path runs against the private host: the pool's App and
+# repositories stay on github.com behind the proxy that serves that host. A
+# self-managed forge needs the run's private CA in the state directory; the
+# deploy writes it into the Secret the forge's caBundleRef names. Mapped and
+# gated here, ahead of the GitHub resolution, so an unmapped project is refused
+# naming this table.
 EVAL_FORGE="${EVAL_FORGE:-github}"
+# Where the lane step that stands the forge up (the forge VM, kube-agents#3683
+# and #3684) leaves what this deploy and the eval need: ca.crt for a
+# self-managed forge, agent-token and ledger-token for a per-run GitLab. A
+# private directory of the job's pod, never under the artifacts, so none of it
+# is uploaded.
+EVAL_FORGE_STATE_DIR="${EVAL_FORGE_STATE_DIR:-/tmp/eval-forge}"
+case "${EVAL_FORGE_STATE_DIR}" in
+  /*) ;;
+  *) echo "ERROR: EVAL_FORGE_STATE_DIR='${EVAL_FORGE_STATE_DIR}' must be an absolute path: the grader runs under bench/ and reads the CA by this path (kube-agents#3682)." >&2; exit 1 ;;
+esac
+FORGE_CA_FILE="${EVAL_FORGE_STATE_DIR}/ca.crt"
+# The Secret the forge's caBundleRef names, per kind: the installer's names,
+# so an install made by hand and one made here read the same way.
+GITLAB_FORGE_CA_SECRET_NAME="gitlab-forge-ca"
+GITHUB_FORGE_CA_SECRET_NAME="github-forge-ca"
+FORGE_CA_SECRET_KEY="ca.crt"
+# On a per-run GitLab there is no table to map: the lane step seeds the group
+# and the project the pool's gitlab.com layout has, `gke-agentic/<PROJECT_ID>-infra`,
+# which is also what hack/ci_gitlab_forge.py's project guard accepts (GROUP,
+# PROJECT_SUFFIX there; scripts/test_ci_gitlab_forge.py pins the pair equal).
+GITLAB_FORGE_GROUP="gke-agentic"
+GITLAB_FORGE_PROJECT_SUFFIX="-infra"
 # The Secret the forge's credentialsRef names, and the key the token sits
 # under. The key is this deploy's choice: the operator reads only the Secret's
 # name today, and the GitLab provider, when it lands, fixes the key it reads.
@@ -977,12 +1148,39 @@ GITLAB_AGENT_SM_SECRET="gitlab-agent-token"
 # so the pair is rotated by a human with overlap, and one home keeps that
 # the same size however many projects the pool has (docs/ci-pool-projects.md 5.6).
 GITLAB_SECRETS_PROJECT="kube-agents-prow"
-GITLAB_FORGE_HOST="gitlab.com"
-case "${EVAL_FORGE}" in
+EVAL_FORGE_PROFILE_RC=0
+EVAL_FORGE_PROFILE="$(forge_profile "${EVAL_FORGE}")" || EVAL_FORGE_PROFILE_RC=$?
+if [ "${EVAL_FORGE_PROFILE_RC}" -ne 0 ]; then
+  # 2 is a host override that is not a bare hostname; forge_profile said so itself.
+  [ "${EVAL_FORGE_PROFILE_RC}" -eq 2 ] || echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this deploy knows; use github (default), gitlab, ghes or gitlab-ce (forge_profile in hack/ci-deploy.sh)." >&2
+  exit 1
+fi
+read -r EVAL_FORGE_KIND EVAL_FORGE_HOST EVAL_FORGE_SELF_MANAGED <<<"${EVAL_FORGE_PROFILE}"
+if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+  if [ ! -s "${FORGE_CA_FILE}" ]; then
+    echo "ERROR: EVAL_FORGE=${EVAL_FORGE} is a self-managed forge at ${EVAL_FORGE_HOST}, but ${FORGE_CA_FILE} (its private CA) is missing or empty." >&2
+    echo "       The lane step that stands the forge up writes it to EVAL_FORGE_STATE_DIR (kube-agents#3682); not deploying against a host the broker could not trust." >&2
+    exit 1
+  fi
+  # A CA, not any certificate: the grader verifies strictly, so a leaf or a
+  # CA without CA:TRUE fails after the build. hack/ghes-proxy/make-certs.sh sets it.
+  if ! openssl x509 -noout -text -in "${FORGE_CA_FILE}" 2>/dev/null | grep -q 'CA:TRUE'; then
+    echo "ERROR: ${FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh on Linux (kube-agents#3682)." >&2
+    exit 1
+  fi
+elif [ -s "${FORGE_CA_FILE}" ]; then
+  echo "ERROR: ${FORGE_CA_FILE} exists but EVAL_FORGE=${EVAL_FORGE} is ${EVAL_FORGE_HOST}, a public forge that takes no private CA; remove it or pick the self-managed forge it belongs to." >&2
+  exit 1
+fi
+# The GitLab host the values below name: the table's, public or self-managed.
+GITLAB_FORGE_HOST="${EVAL_FORGE_HOST}"
+case "${EVAL_FORGE_KIND}" in
   github) ;;
   gitlab)
-    if ! GITLAB_PROJECT="$(gitlab_project_for_project "${PROJECT_ID}")"; then
-      echo "ERROR: EVAL_FORGE=gitlab but no GitLab project is mapped for PROJECT_ID=${PROJECT_ID}." >&2
+    if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+      GITLAB_PROJECT="${GITLAB_FORGE_GROUP}/${PROJECT_ID}${GITLAB_FORGE_PROJECT_SUFFIX}"
+    elif ! GITLAB_PROJECT="$(gitlab_project_for_project "${PROJECT_ID}")"; then
+      echo "ERROR: EVAL_FORGE=${EVAL_FORGE} but no GitLab project is mapped for PROJECT_ID=${PROJECT_ID}." >&2
       echo "       Add it to gitlab_project_for_project() in hack/ci-deploy.sh once the project" >&2
       echo "       exists and the bot is a Developer on it (docs/ci-pool-projects.md 5.6)." >&2
       exit 1
@@ -995,16 +1193,12 @@ case "${EVAL_FORGE}" in
     CHART_HELPERS="${SCRIPT_DIR}/../charts/kube-agents/templates/_helpers.tpl"
     if ! grep -Eq '^[[:space:]]+- gitlab$' "${PLATFORM_AGENT_CRD}" \
       || ! grep -Eq 'registered := list .*"gitlab"' "${CHART_HELPERS}"; then
-      echo "ERROR: EVAL_FORGE=gitlab, but the chart in this checkout does not register provider" >&2
+      echo "ERROR: EVAL_FORGE=${EVAL_FORGE}, but the chart in this checkout does not register provider" >&2
       echo "       gitlab (${PLATFORM_AGENT_CRD#"${SCRIPT_DIR}/../"} and ${CHART_HELPERS#"${SCRIPT_DIR}/../"}" >&2
       echo "       both have to list it). The GitLab provider is the operator half of" >&2
       echo "       gke-labs/kube-agents#1154; this deploy waits for it (#2394)." >&2
       exit 1
     fi
-    ;;
-  *)
-    echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this deploy knows; use github (default) or gitlab." >&2
-    exit 1
     ;;
 esac
 
@@ -1025,6 +1219,13 @@ if [ -n "${EVAL_GITOPS_REPO:-}" ]; then
   echo "GitOps repo: ${GITOPS_REPO} (from EVAL_GITOPS_REPO)"
 elif GITOPS_REPO="$(gitops_repo_for_project "${PROJECT_ID}")"; then
   echo "GitOps repo: ${GITOPS_REPO} (mapped from PROJECT_ID=${PROJECT_ID})"
+elif [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
+  # The GitHub repository is not read under the gitlab kind (the GitLab
+  # project is the gitops repository and the alias is set empty below), so a
+  # project with no GitHub row, a per-run GitLab on an unmapped project, is
+  # not a refusal here.
+  GITOPS_REPO=""
+  echo "GitOps repo: none on GitHub (EVAL_FORGE=${EVAL_FORGE}; the GitLab project ${GITLAB_PROJECT} is the gitops repository)"
 elif [ "${IS_PROW_RUN}" = "true" ]; then
   echo "ERROR: no GitOps repo is mapped for PROJECT_ID=${PROJECT_ID}." >&2
   echo "       Every project in the kube-agents-evals-project Boskos pool needs its own" >&2
@@ -1049,6 +1250,8 @@ fi
 if [ "${GITOPS_REPO}" = "none" ]; then
   echo "GitHub integration: disabled for this deploy (EVAL_GITOPS_REPO=none)"
   GITOPS_REPO=""
+elif [ -z "${GITOPS_REPO}" ] && [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
+  : # resolved above: no GitHub repository under the gitlab kind
 elif ! printf '%s' "${GITOPS_REPO}" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
   echo "ERROR: GitOps repo '${GITOPS_REPO}' is not in owner/repo form." >&2
   echo "       The minty rule ConfigMap is keyed on the org and repo separately, so the" >&2
@@ -1083,9 +1286,9 @@ fi
 # kubeagents-platform-gsa@<harness.projectId> — exactly the GSA_NAME/PROJECT_ID
 # pair this deploy annotates the agent KSA with, so the rule is keyed on this
 # project's platform GSA and no other's.
-if [ "${EVAL_FORGE}" = "gitlab" ]; then
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   GITHUB_MINTER_ARGS=(--set "githubMinter.enabled=false")
-  echo "GitHub token minter: off (EVAL_FORGE=gitlab)"
+  echo "GitHub token minter: off (EVAL_FORGE=${EVAL_FORGE})"
 elif [ -n "${GITOPS_REPO}" ] && [ -n "${EVAL_GITHUB_APP_ID:-}" ]; then
   GITHUB_MINTER_ARGS=(
     --set "githubMinter.enabled=true"
@@ -1101,10 +1304,14 @@ else
 fi
 
 # The values the chart receives for the forge: forges[] + repositories[] for
-# gitlab, the deprecated github.gitRepo alias otherwise (the chart refuses both
-# at once, so the alias is set empty beside the lists).
-case "${EVAL_FORGE}" in
-  gitlab)
+# the gitlab kind and for a GitHub forge at a self-managed host (the deprecated
+# github.gitRepo alias has no host and always means github.com), the alias for
+# github.com (the chart refuses both at once, so the alias is set empty beside
+# the lists). A self-managed forge also names the CA Secret step 5 writes; the
+# chart hands it to the credential broker, and on a GitHub forge to the token
+# minter, which it points at https://<host>/api/v3.
+case "${EVAL_FORGE_KIND}:${EVAL_FORGE_SELF_MANAGED}" in
+  gitlab:*)
     GITOPS_REPO=""
     GITHUB_MINTER_ARGS=(--set "githubMinter.enabled=false")
     FORGE_ARGS=(
@@ -1118,7 +1325,32 @@ case "${EVAL_FORGE}" in
       --set-string "platformAgent.integration.repositories[0].repository=https://${GITLAB_FORGE_HOST}/${GITLAB_PROJECT}"
       --set-string "platformAgent.integration.repositories[0].role=gitops"
     )
-    echo "Forge: gitlab — ${GITLAB_FORGE_HOST}/${GITLAB_PROJECT} (mapped from PROJECT_ID=${PROJECT_ID}); GitHub integration and minter off"
+    if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+      FORGE_ARGS+=(
+        --set-string "platformAgent.integration.forges[0].caBundleRef.name=${GITLAB_FORGE_CA_SECRET_NAME}"
+        --set-string "platformAgent.integration.forges[0].caBundleRef.key=${FORGE_CA_SECRET_KEY}"
+      )
+    fi
+    echo "Forge: ${EVAL_FORGE} — ${GITLAB_FORGE_HOST}/${GITLAB_PROJECT} (mapped from PROJECT_ID=${PROJECT_ID}); GitHub integration and minter off"
+    ;;
+  github:yes)
+    if [ -z "${GITOPS_REPO}" ]; then
+      echo "ERROR: EVAL_FORGE=${EVAL_FORGE} declares the GitHub forge at ${EVAL_FORGE_HOST} for the pool's repository, and none resolved (EVAL_GITOPS_REPO=none is not an option on this forge)." >&2
+      exit 1
+    fi
+    FORGE_ARGS=(
+      --set-string "platformAgent.integration.github.gitRepo="
+      --set-string "platformAgent.integration.forges[0].name=github"
+      --set-string "platformAgent.integration.forges[0].provider=github"
+      --set-string "platformAgent.integration.forges[0].host=${EVAL_FORGE_HOST}"
+      --set-string "platformAgent.integration.forges[0].namespace=${GITOPS_REPO%%/*}"
+      --set-string "platformAgent.integration.forges[0].caBundleRef.name=${GITHUB_FORGE_CA_SECRET_NAME}"
+      --set-string "platformAgent.integration.forges[0].caBundleRef.key=${FORGE_CA_SECRET_KEY}"
+      --set-string "platformAgent.integration.repositories[0].forge=github"
+      --set-string "platformAgent.integration.repositories[0].repository=https://${EVAL_FORGE_HOST}/${GITOPS_REPO}"
+      --set-string "platformAgent.integration.repositories[0].role=gitops"
+    )
+    echo "Forge: ${EVAL_FORGE} — the GitHub forge at ${EVAL_FORGE_HOST}, repository ${GITOPS_REPO} (the pool's github.com repository behind that host); the minter follows the forge's host and CA"
     ;;
   *)
     FORGE_ARGS=(--set-string "platformAgent.integration.github.gitRepo=${GITOPS_REPO}")
@@ -1159,14 +1391,30 @@ preflight_fleet_reader
 # without the accessor grant, or a secret that is gone, should fail here,
 # not after the image build. The value is discarded; step 5 reads it again
 # into the Kubernetes Secret.
+# A per-run GitLab (gitlab-ce) has no pool secret: the lane step that stood
+# the instance up left the agent token in the forge state directory.
+GITLAB_FORGE_AGENT_TOKEN_FILE="${EVAL_FORGE_STATE_DIR}/agent-token"
+# Both functions below stand alone (the tests lift each by name): the source
+# switch is inline. On a self-managed instance the token is the file the lane
+# step left; on gitlab.com it is the pool's Secret Manager secret. The value is
+# newline-stripped either way (one stored with a trailing newline would
+# otherwise reach GitLab as part of the token).
 preflight_gitlab_forge_secret() {
+  if [ "${EVAL_FORGE_SELF_MANAGED:-no}" = "yes" ]; then
+    if [ ! -s "${GITLAB_FORGE_AGENT_TOKEN_FILE:-}" ]; then
+      echo "FATAL: stopping before the build: ${GITLAB_FORGE_AGENT_TOKEN_FILE:-the per-run agent token file} (the per-run GitLab agent token) is missing or empty; the lane step that stands the instance up writes it (kube-agents#3683)." >&2
+      exit 1
+    fi
+    echo "GitLab forge credential: ${GITLAB_FORGE_AGENT_TOKEN_FILE} readable"
+    return 0
+  fi
   if ! gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" >/dev/null; then
     echo "FATAL: stopping before the build: Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET} cannot be read as this runner (docs/ci-pool-projects.md 5.6: the secret and the runner's secretAccessor grant are hand steps)." >&2
     exit 1
   fi
   echo "GitLab forge credential: ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET} readable"
 }
-if [ "${EVAL_FORGE}" = "gitlab" ]; then
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   preflight_gitlab_forge_secret
 fi
 
@@ -1305,6 +1553,65 @@ gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --p
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # ─── 4. Build Container Images ────────────────────────────────────────────────
+# The next stack's references, under EVAL_MODE_NEXT=1 only. On the pull
+# request's path they are this build's (the `a2a` and `a2a-bridge` steps
+# below build them into AR_REPO); on the release-candidate path they are the
+# candidate's published images, under the same names in RC_REGISTRY_PREFIX
+# (section 2a) at its commit, beside the operator image that path installs.
+# The references go to the operator through operator.extraEnv
+# in step 5: the operator reads its A2A image overrides from its own
+# environment; without them it would derive the same five A2A references
+# from its own image and the bridge's from the agent's (on either path the
+# same repository and tag), so the overrides are belt and braces that keep the
+# deploy's inputs explicit and byte-pinned by the tests. The same
+# value list arms the gateway's inject door, which the operator likewise
+# reads from its own environment and never from the CR (a2aInjectBackendEnvVar
+# says why): without it there is no Service for the eval's transport to
+# reach. The bridge's reference goes to the operator the same way, with its
+# concurrency: the operator renders the bridge sidecar into the agent pod
+# under next and reads both from its environment. Its executor is left to
+# the bridge's default (BRIDGE_EXECUTOR_EXPECTED).
+if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+  if [ -n "${RC_COMMIT_SHA:-}" ]; then
+    A2A_IMAGE_PREFIX="${RC_REGISTRY_PREFIX}"
+  else
+    A2A_IMAGE_PREFIX="${AR_REPO}"
+  fi
+  A2A_GATEWAY_URI="${A2A_IMAGE_PREFIX}/${A2A_GATEWAY_IMAGE_NAME}:${TAG}"
+  A2A_CALLOUT_URI="${A2A_IMAGE_PREFIX}/${A2A_CALLOUT_IMAGE_NAME}:${TAG}"
+  A2A_WORKER_URI="${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}:${TAG}"
+  A2A_VERIFIER_URI="${A2A_IMAGE_PREFIX}/${A2A_VERIFIER_IMAGE_NAME}:${TAG}"
+  A2A_CONSOLE_URI="${A2A_IMAGE_PREFIX}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
+  A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
+  A2A_OPERATOR_ENV_ARGS=(
+    --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
+    --set-string "operator.extraEnv[1].name=${A2A_CALLOUT_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[1].value=${A2A_CALLOUT_URI}"
+    --set-string "operator.extraEnv[2].name=${A2A_WORKER_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[2].value=${A2A_WORKER_URI}"
+    # The verifier is on the request path: unoverridden it stays on a
+    # private dev registry a leased eval project cannot pull, the Deployment
+    # never comes up, and every executor refuses every task -- an eval that
+    # reads as a broken product rather than a missing override.
+    --set-string "operator.extraEnv[3].name=${A2A_VERIFIER_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[3].value=${A2A_VERIFIER_URI}"
+    --set-string "operator.extraEnv[4].name=${A2A_CONSOLE_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[4].value=${A2A_CONSOLE_URI}"
+    --set-string "operator.extraEnv[5].name=${A2A_INJECT_BACKEND_ENV_VAR}"
+    --set-string "operator.extraEnv[5].value=${A2A_INJECT_BACKEND_ON}"
+    # The rendered bridge: its image and the concurrency section 2b admitted
+    # (the TASKS budget reads the same value). No executor: the lane runs
+    # the bridge's default, api.
+    --set-string "operator.extraEnv[6].name=${A2A_BRIDGE_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[6].value=${A2A_BRIDGE_URI}"
+    --set-string "operator.extraEnv[7].name=${A2A_BRIDGE_CONCURRENCY_ENV_VAR}"
+    --set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"
+    --set-string "operator.extraEnv[8].name=${A2A_CARD_STOP_ENV_VAR}"
+    --set-string "operator.extraEnv[8].value=${A2A_CARD_STOP_ON}"
+  )
+fi
+
 # Skipped whole on the release-candidate path: the candidate's images are what
 # is being evaluated, and a rebuild from the same source is a different artefact
 # — different base-image digests, different build timestamps, and a different
@@ -1312,6 +1619,9 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # a rebuild would not be grading the thing the release ships.
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
+  if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier and console images and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
+  fi
 else
   STEP_START=$SECONDS
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, sandbox, operator) ==="
@@ -1329,56 +1639,16 @@ else
   export PROXY_BUILDCACHE_IMAGE="${PROXY_BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/credential-proxy:buildcache}"
   # Under EVAL_MODE_NEXT=1 the same build also produces the four first-party
   # A2A images and the Hermes bridge sidecar, in its `a2a` and `a2a-bridge`
-  # steps; with the
-  # substitutions absent that step is a no-op and the build is the four-image
-  # one above. Empty otherwise, so the command below is byte-for-byte what it
-  # was. The references go to the operator through operator.extraEnv
-  # in step 5: the operator reads its A2A image overrides from its own
-  # environment; without them it would derive the same five A2A references
-  # from its own image and the bridge's from the agent's (both are this
-  # build's, under the same repository and tag), so the overrides are belt and braces that keep the
-  # deploy's inputs explicit and byte-pinned by the tests. The same
-  # value list arms the gateway's inject door, which the operator likewise
-  # reads from its own environment and never from the CR (a2aInjectBackendEnvVar
-  # says why): without it there is no Service for the eval's transport to
-  # reach. The bridge's reference goes to the operator the same way, with its
-  # concurrency: the operator renders the bridge sidecar into the agent pod
-  # under next and reads both from its environment. Its executor is left to
-  # the bridge's default (BRIDGE_EXECUTOR_EXPECTED).
+  # steps, at the references named at the top of this step; with the
+  # substitutions absent that step is a no-op and the build is the one above.
+  # Empty otherwise, so the command below is byte-for-byte what it was.
+  # The two AgentPlugin images. This branch is the pull-request path (the
+  # release-candidate path installs the candidate's published ones, section
+  # 2a, and skipped this section above), so they are always built here.
+  PLUGIN_IMAGE_SUBSTITUTIONS=",_PUBSUB_PLATFORM_URI=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}:${TAG},_STOCKOUT_INVESTIGATOR_URI=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}:${TAG}"
   A2A_BUILD_SUBSTITUTIONS=""
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    A2A_GATEWAY_URI="${AR_REPO}/${A2A_GATEWAY_IMAGE_NAME}:${TAG}"
-    A2A_CALLOUT_URI="${AR_REPO}/${A2A_CALLOUT_IMAGE_NAME}:${TAG}"
-    A2A_WORKER_URI="${AR_REPO}/${A2A_WORKER_IMAGE_NAME}:${TAG}"
-    A2A_VERIFIER_URI="${AR_REPO}/${A2A_VERIFIER_IMAGE_NAME}:${TAG}"
-    A2A_CONSOLE_URI="${AR_REPO}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
-    A2A_BRIDGE_URI="${AR_REPO}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
     A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
-    A2A_OPERATOR_ENV_ARGS=(
-      --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
-      --set-string "operator.extraEnv[1].name=${A2A_CALLOUT_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[1].value=${A2A_CALLOUT_URI}"
-      --set-string "operator.extraEnv[2].name=${A2A_WORKER_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[2].value=${A2A_WORKER_URI}"
-      # The verifier is on the request path: unoverridden it stays on a
-      # private dev registry a leased eval project cannot pull, the Deployment
-      # never comes up, and every executor refuses every task -- an eval that
-      # reads as a broken product rather than a missing override.
-      --set-string "operator.extraEnv[3].name=${A2A_VERIFIER_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[3].value=${A2A_VERIFIER_URI}"
-      --set-string "operator.extraEnv[4].name=${A2A_CONSOLE_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[4].value=${A2A_CONSOLE_URI}"
-      --set-string "operator.extraEnv[5].name=${A2A_INJECT_BACKEND_ENV_VAR}"
-      --set-string "operator.extraEnv[5].value=${A2A_INJECT_BACKEND_ON}"
-      # The rendered bridge: its image and the concurrency section 2b admitted
-      # (the TASKS budget reads the same value). No executor: the lane runs
-      # the bridge's default, api.
-      --set-string "operator.extraEnv[6].name=${A2A_BRIDGE_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[6].value=${A2A_BRIDGE_URI}"
-      --set-string "operator.extraEnv[7].name=${A2A_BRIDGE_CONCURRENCY_ENV_VAR}"
-      --set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"
-    )
     echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier and console images and the Hermes bridge sidecar"
   fi
   # Submitted asynchronously and polled, never streamed (#3129). Without
@@ -1400,7 +1670,7 @@ else
   CLOUD_BUILD_ID=""
   CLOUD_BUILD_LOG_URL=""
   CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
     echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
     exit 1
@@ -1548,27 +1818,60 @@ ssh-keygen -q -t "${SANDBOX_SSH_KEY_TYPE}" -N '' -C "${SANDBOX_SSH_KEY_COMMENT}"
 # token leaves the host cluster with the lease instead of outliving it.
 GITLAB_FORGE_SECRET_LABEL="app.kubernetes.io/part-of=kube-agents"
 materialize_gitlab_forge_secret() {
-  local manifest
+  local manifest source
   # Rendered first, applied second: in one pipe the apply would run on the
   # empty stream a failed read leaves, and only then would pipefail report it.
   # tr: a value stored with a trailing newline (echo into --data-file=-) would
   # otherwise reach GitLab as part of the token.
-  manifest="$(gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" \
-    | tr -d '\r\n' \
-    | kubectl create secret generic "${GITLAB_FORGE_SECRET_NAME}" -n "${NAMESPACE}" \
-        --from-file="${GITLAB_FORGE_SECRET_KEY}=/dev/stdin" --dry-run=client -o yaml \
-    | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || {
+  if [ "${EVAL_FORGE_SELF_MANAGED:-no}" = "yes" ]; then
+    source="${GITLAB_FORGE_AGENT_TOKEN_FILE}"
+    manifest="$(tr -d '\r\n' <"${GITLAB_FORGE_AGENT_TOKEN_FILE}" \
+      | kubectl create secret generic "${GITLAB_FORGE_SECRET_NAME}" -n "${NAMESPACE}" \
+          --from-file="${GITLAB_FORGE_SECRET_KEY}=/dev/stdin" --dry-run=client -o yaml \
+      | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || manifest=""
+  else
+    source="Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}"
+    manifest="$(gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" \
+      | tr -d '\r\n' \
+      | kubectl create secret generic "${GITLAB_FORGE_SECRET_NAME}" -n "${NAMESPACE}" \
+          --from-file="${GITLAB_FORGE_SECRET_KEY}=/dev/stdin" --dry-run=client -o yaml \
+      | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || manifest=""
+  fi
+  if [ -z "${manifest}" ]; then
     # The read itself passed the preflight in 2d, so the stage that failed is
     # as likely a kubectl one; each stage's own stderr is just above this line.
-    echo "ERROR: could not render the GitLab forge Secret from Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}; the failing stage (gcloud, tr, kubectl create, kubectl label) reported just above (docs/ci-pool-projects.md 5.6)." >&2
+    echo "ERROR: could not render the GitLab forge Secret from ${source}; the failing stage (the read, tr, kubectl create, kubectl label) reported just above (docs/ci-pool-projects.md 5.6)." >&2
+    return 1
+  fi
+  kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  printf '%s\n' "${manifest}" | kubectl apply -f - >/dev/null
+  echo "GitLab forge credential: Secret ${NAMESPACE}/${GITLAB_FORGE_SECRET_NAME} (key ${GITLAB_FORGE_SECRET_KEY}) from ${source}"
+}
+# The private CA of a self-managed forge, as the Secret the forge's caBundleRef
+# names (the installer's name per kind), so the credential broker trusts the
+# host, and the token minter too on a GitHub forge. Read from the file the lane
+# step left; the file never reaches the artifacts.
+materialize_forge_ca_secret() {
+  local name manifest
+  case "${EVAL_FORGE_KIND}" in
+    gitlab) name="${GITLAB_FORGE_CA_SECRET_NAME}" ;;
+    *) name="${GITHUB_FORGE_CA_SECRET_NAME}" ;;
+  esac
+  manifest="$(kubectl create secret generic "${name}" -n "${NAMESPACE}" \
+        --from-file="${FORGE_CA_SECRET_KEY}=${FORGE_CA_FILE}" --dry-run=client -o yaml \
+    | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || {
+    echo "ERROR: could not render the forge CA Secret ${NAMESPACE}/${name} from ${FORGE_CA_FILE}; the failing stage reported just above (kube-agents#3682)." >&2
     return 1
   }
   kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   printf '%s\n' "${manifest}" | kubectl apply -f - >/dev/null
-  echo "GitLab forge credential: Secret ${NAMESPACE}/${GITLAB_FORGE_SECRET_NAME} (key ${GITLAB_FORGE_SECRET_KEY}) from Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}"
+  echo "Forge CA: Secret ${NAMESPACE}/${name} (key ${FORGE_CA_SECRET_KEY}) from ${FORGE_CA_FILE}, for ${EVAL_FORGE_HOST}"
 }
-if [ "${EVAL_FORGE}" = "gitlab" ]; then
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   materialize_gitlab_forge_secret
+fi
+if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+  materialize_forge_ca_secret
 fi
 
 # ─── 5b′. The chart's CRDs, before the chart ─────────────────────────────────
@@ -1621,9 +1924,15 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
     --set-string "platformAgent.deployment.env[1].name=ALERT_DAILY_LIMIT_DRIFT" \
     --set-string "platformAgent.deployment.env[1].value=${EVAL_ALERT_DAILY_LIMIT_DRIFT}" \
+    --set-string "platformAgent.deployment.env[2].name=INCIDENT_WORKLOAD_DEDUP_SECONDS" \
+    --set-string "platformAgent.deployment.env[2].value=${EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS}" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
+    --set "plugins.pubsubPlatform.enabled=true" \
+    --set "plugins.stockoutInvestigator.enabled=true" \
+    --set "plugins.stockoutInvestigator.applyTuning=false" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
+    ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
     --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
   HELM_EXIT="${PIPESTATUS[0]}"
   set -e
@@ -2325,6 +2634,44 @@ else
   kubectl get pods,svc -n "${NAMESPACE}" || true
   exit 1
 fi
+
+# ─── 7b. The Pub/Sub platform adapter pulls through the broker ───────────────
+# The gateway Pod holds no Google credential, so the adapter's one path to a
+# subscription is the broker's `/v1/pubsub/gcp/` relay, confined to the
+# subscriptions the operator rendered from the AgentPlugin configs. This gate
+# proves the whole chain on a real install: the plugin loads, the operator
+# wired the relay URL and the subscription set, the broker admits the
+# gateway's token on the route, and a pull reaches Pub/Sub on the broker's
+# credential. It does not prove delivery: the pool projects carry no stockout
+# topic, so Pub/Sub answers the pull with a 404 and the adapter logs a retry;
+# the staging promotion's E2E suite, on an install that has the topic, is
+# where a published alert is seen through. What this gate did catch is the
+# failure that reached staging unnoticed: an adapter that pulls on a
+# credential the gateway no longer holds never logs either marker.
+STEP_START=$SECONDS
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying the Pub/Sub platform adapter pulls through the broker ==="
+pubsub_relay_connected=false
+for _ in $(seq "${PUBSUB_RELAY_READY_ATTEMPTS}"); do
+  # `grep -F ... >/dev/null`, not `-q`: see the drift-detector gate in 6.
+  if kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${PUBSUB_RELAY_GATEWAY_CONTAINER}" 2>/dev/null |
+    grep -F "${PUBSUB_RELAY_ADAPTER_MARKER}" >/dev/null &&
+    kubectl logs -n "${NAMESPACE}" "deployment/${CREDENTIAL_PROXY_DEPLOYMENT_NAME}" 2>/dev/null |
+    grep -F "${PUBSUB_RELAY_BROKER_MARKER}" | grep -F "${PUBSUB_RELAY_BROKER_RULE}" >/dev/null; then
+    pubsub_relay_connected=true
+    break
+  fi
+  sleep "${PUBSUB_RELAY_READY_INTERVAL_SECONDS}"
+done
+if [[ "${pubsub_relay_connected}" != "true" ]]; then
+  echo "ERROR: the Pub/Sub platform adapter did not pull through the credential broker on this install"
+  echo "       (wanted '${PUBSUB_RELAY_ADAPTER_MARKER}' in the platform-agent container and"
+  echo "        '${PUBSUB_RELAY_BROKER_MARKER}' with '${PUBSUB_RELAY_BROKER_RULE}' in the credential proxy)"
+  kubectl get agentplugins -n "${NAMESPACE}" -o wide || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${PUBSUB_RELAY_GATEWAY_CONTAINER}" --tail="${PUBSUB_RELAY_DIAG_LOG_LINES}" 2>/dev/null | grep -i "pubsub" || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${CREDENTIAL_PROXY_DEPLOYMENT_NAME}" --tail="${PUBSUB_RELAY_DIAG_LOG_LINES}" 2>/dev/null | grep -i "pubsub" || true
+  exit 1
+fi
+echo "✓ Pub/Sub platform adapter pulls through the broker, verified in $((SECONDS - STEP_START))s"
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deployment Ready in Namespace: ${NAMESPACE} (Total Duration: ${TOTAL_DURATION}s) ==="

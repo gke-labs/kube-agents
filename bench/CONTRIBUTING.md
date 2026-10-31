@@ -14,11 +14,14 @@ repositories that CI pulls from.
 
 1. Write the case under `bench/tasks/<name>/task.yaml`, and its OpenTofu stack, if it has
    one, under `bench/tf/prebuilt/<name>/`. These directories (along with shared modules under
-   `bench/tf/modules/`) are what the rules below scan.
+   `bench/tf/modules/`) are what the rules below scan. A stack declares the outputs
+   `cluster_name` and `cluster_location`: `devops-bench` reads them after the apply and
+   fails the run without them.
 2. Run `make bench-case-check`. It applies every rule on this page that a machine can, in
    about a second, with PyYAML alone: no cluster, no `bench/` virtualenv.
-3. Register the case: add its `./tasks/<name>/task.yaml` line to
-   `hack/eval/nightly-cases.txt`, with a `#` line naming anything that still blocks it. That
+3. Register the case: add its `./tasks/<name>/task.yaml` line to the sorted section at the
+   foot of `hack/eval/nightly-cases.txt`, at its place in case-id order, with the `#` lines
+   directly above it saying why it's there and naming anything that still blocks it. That
    is where a new case lands; a presubmit seat (`hack/eval/presubmit-cases.txt`) is a later
    pull request that cites the case's nightly record, and it needs an `eval-crew` approver
    where the nightly line needs only the normal ones. A case whose fixture does not exist at
@@ -49,6 +52,10 @@ contract; this page does not restate it.
 
 **Check:** `make bench-case-check` locally, `scripts/test_task_registration.py` in CI. The CI
 lint asserts that the validator returned nothing at all, so every rule in it gates.
+
+A pull request's eval jobs grade its cases with `main`'s `bench/`, so a new check type, case key
+or fleet role lands before any case those jobs run uses it, including a nightly case on a lane list
+such as `hack/eval/gitlab-cases.txt` ([`testing-strategy.md`](../docs/designs/testing-strategy.md#pinning-and-baselines)).
 
 What review holds a case to beyond the validator: the objective names a thing the fixture
 planted, and a run that did not do the work cannot reach it; the safeguard names the thing
@@ -156,9 +163,13 @@ the verdict's **Record says** column once the store holds a full window (`would-
 before that the nightly runs, what failed and why each failure was the case's own regression
 or an infrastructure class the harness already excludes. The roster page's hold-out entries
 are the shape of the evidence a reviewer expects, and its "Admitted on the record since the
-split" entries are the shape of the admission itself.
+split" entries are the shape of the admission itself. A seat also meets the five rules under
+"The five rules a seat meets" on that page; the pull request shows the red run and the
+classified misses in the template's roster-admission block.
 
-**Check:** none mechanical, but the approver is: a roster edit, and a presubmit-seat edit,
+**Check:** `scripts/test_eval_rosters.py` checks three of those rules: a guarded fixture, an
+exact objective check, and the presubmit's wall-time budget. The approver checks the rest: a
+roster edit, and a presubmit-seat edit,
 needs an `approved` from the `eval-crew` alias ([`hack/OWNERS`](../hack/OWNERS) scopes
 `hack/eval/blocking-roster.txt` and `presubmit-cases.txt` to it), and a root approver
 alone cannot merge either. The nightly file and the case directory itself need only the

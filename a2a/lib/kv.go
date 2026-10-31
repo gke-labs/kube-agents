@@ -11,6 +11,12 @@ import (
 // (provisioned by the deployment; the gateway's user is the only writer).
 const SessionStateBucket = "session-state"
 
+// FeedbackBucket is the KV bucket holding the 👍 and 👎 ratings chat users gave the
+// gateway's answers, with the exchange each one rated (provisioned by the
+// deployment with a max age, which is the retention; the gateway's user is
+// the only reader and writer).
+const FeedbackBucket = "feedback"
+
 // KV returns a handle to the named KV bucket on the client's current
 // connection. Handles bind to that connection and do not survive a terminal
 // rebuild (NR-2), so callers fetch one per operation rather than caching it;

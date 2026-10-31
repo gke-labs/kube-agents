@@ -93,7 +93,8 @@ func chatDroppedWhat(c chatmsg.Carrier, r chatmsg.Reading) string {
 // postMessage posts m: laid out, as one message, when it carries a chat
 // message the adapter renders; otherwise its text through post, chunked
 // under the backend cap, which for a message without a chat message is
-// exactly the post the relay made before chat messages existed.
+// exactly the post the relay made before chat messages existed. An answer
+// marked for feedback keeps the mark on the text too, on its last chunk.
 func (g *Gateway) postMessage(conversation string, m OutMessage) {
 	if m.Chat != nil && strings.TrimSpace(m.Text) != "" {
 		_, err := g.adapter.PostMessage(conversation, m)
@@ -101,7 +102,25 @@ func (g *Gateway) postMessage(conversation string, m OutMessage) {
 			return
 		}
 	}
-	g.post(conversation, m.Text)
+	if m.Feedback == "" || strings.TrimSpace(m.Text) == "" {
+		g.post(conversation, m.Text)
+		return
+	}
+	chunks := chatChunks(m.Text, discordChunk)
+	last := len(chunks) - 1
+	for _, chunk := range chunks[:last] {
+		if _, err := g.adapter.Post(conversation, chunk); err != nil {
+			g.log.Error("post failed", "conversation", conversation, "err", err)
+			return
+		}
+	}
+	// A backend that draws no rating controls posts the text as Post would
+	// (postTextOnly); one whose API refuses them leaves the chunk to Post.
+	if _, err := g.adapter.PostMessage(conversation, OutMessage{Text: chunks[last], Feedback: m.Feedback}); err != nil {
+		g.log.Warn("posting an answer's last chunk with its rating controls failed; posting it as text",
+			"conversation", conversation, "err", err)
+		g.post(conversation, chunks[last])
+	}
 }
 
 // chatOutcome counts what became of one chat message the adapter was handed,

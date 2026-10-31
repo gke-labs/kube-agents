@@ -57,10 +57,16 @@ install without the interview.
   provider, and `install.sh` sets it from the `LITELLM_REDACTION_*` keys in
   `install.env`; `platform_agent_mode` (default `"today"`, which passes the
   chart nothing, so the CR carries no `mode` field) sets the `PlatformAgent`'s
-  `spec.mode`, and `"next"` also renders the NATS bus and the A2A gateway, a
-  development stack. `install.sh` sets it from `PLATFORM_AGENT_MODE` in
-  `install.env`. Changing it on a running install is a mode switch
+  `spec.mode`, and `"next"` puts the NATS bus and the A2A gateway in front of
+  the agent. `install.sh` sets it from `PLATFORM_AGENT_MODE` in `install.env`,
+  which a first install records as `"next"`. Changing it on a running install is a mode switch
   ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
+  `platform_agent_storage_size` (default `"50Gi"`, which passes the chart nothing,
+  so the CR carries no `storage` field) sets the `PlatformAgent`'s
+  `spec.storage.size`, the size of the agent's data volume and the shell
+  sandbox's. A raise grows both claims where the StorageClass allows it, and a
+  lower value is refused. `install.sh` sets it from `PLATFORM_AGENT_STORAGE_SIZE`
+  in `install.env`.
   `alert_daily_limits` (default `{}`) sets the daily alert ceilings, and
   `install.sh` sets it from the `ALERT_DAILY_LIMIT_*` keys in `install.env`.
   A key that is not set keeps the default in the agent image. Each apply that
@@ -522,7 +528,7 @@ Add `third_party_image_registry` to mirror third-party images (cert-manager,
 LiteLLM, fluent-bit, the GitHub token minter, Hindsight); empty leaves them on
 their upstream registries.
 
-`IMAGE_TAG` is not optional here. The four first-party images take whatever tag
+`IMAGE_TAG` is not optional here. The first-party images take whatever tag
 the mirror step was given (`latest` if it was given none), while Terraform asks
 for `image_tag` — so a mirror populated at `latest` against an `image_tag` of
 `v1.2.3` holds no reference the install will ever request. `terraform apply`
@@ -1074,6 +1080,7 @@ What each one does that raw Terraform cannot:
 | Asymmetry                                                                                                                                          | Handled by                                                                                                                                                                                                                                                                                                                                                                                     |
 | -------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | KMS key rings and keys can never be deleted, so the next apply 409s                                                                                | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                                                                                                                                                                                                                                                                    |
+| Installs in a project that use the same cluster key share its one grant to the GKE service agent                                                   | `tf-destroy` forgets the grant from state first (`forget_kms`), so the other clusters keep their access to the key; the next apply puts it back in state                                                                                                                                                                                                                                       |
 | Cloud KMS 403s some requests for a few minutes after a project's first enablement, which the same apply (or the installer just before it) performs | `tf-apply` retries an approved apply (`ARGS=-auto-approve`, which the front doors and CI pass) on that message after a wait, untainting a key ring or key the failed attempt created first (`run_apply`, `adopt_kms`); an unapproved apply at a terminal runs once, and its re-run untaints the same way; `KMS_API_PROPAGATION_ATTEMPTS` and `KMS_API_PROPAGATION_WAIT_SECONDS` size the retry |
 | The `PlatformAgent` finalizer strands the CR and hangs the namespace                                                                               | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                                                                                                                                                                                                                                                                  |
 | A `BackupPlan` cannot be deleted while it owns backups                                                                                             | `tf-destroy` purges the plan's backups first                                                                                                                                                                                                                                                                                                                                                   |
@@ -1092,6 +1099,10 @@ Running `terraform destroy` directly still works, but you own the destroy steps
 above yourself — starting with `kubectl delete platformagent <name> -n
 kubeagents-system --wait` while the operator is still running, and setting
 `deletion_protection = false` and applying before the cluster can be removed.
+`tf-destroy` also forgets the KMS key rings and keys and the cluster key's grant
+to the GKE service agent from state first (`forget_kms`). Other installs in the
+project that use the same key need that grant, so a raw destroy must
+`terraform state rm` the keys and the grant as well.
 
 > [!WARNING]
 > Destroying also uninstalls cert-manager when this composition installed it,

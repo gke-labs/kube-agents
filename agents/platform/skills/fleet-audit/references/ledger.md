@@ -52,6 +52,8 @@ Three of the five are easy to misread:
   and the discriminator is the `audit:stale-closed` label the harness applies when it closes one as
   stale. Its finding is promotable again on the usual terms; a `refused` one is not. Do not strip
   that label — without it the close reads as a human rejection and the finding is never re-proposed.
+  On a forge with no labels, the harness writes `<!-- audit:stale-closed -->` into the description
+  instead, and the same rule applies to it.
 
 The escape hatch for a `refused` finding is `/remediate <id>` from someone with write access, and it
 must be written **after** the close. An older command in the thread is reported as _superseded_
@@ -74,13 +76,19 @@ the record, and `finish` reports the count as `declared`.
 ## Size
 
 GitHub caps an issue body at 65,536 characters, and a pull request body at the same. The harness
-targets 60,000 and will truncate the ledger's findings section to stay under it. Three consequences
-you must not work around:
+targets 60,000 and will truncate the ledger's findings section to stay under it. Consequences you
+must not work around:
 
-- **Findings are rendered severity-first**, so truncation only ever eats the least-severe end.
-  Criticals are structurally safe. In a band, the cut takes one finding per target in turn: no
-  target gets a second row before every target in the band has one. A band with fewer slots than
-  targets still drops the targets late in the alphabet.
+- **Findings are rendered severity-first**, so a count only ever replaces the least-severe end. A
+  critical never gives up its full block to a less severe finding's name. In a band, the cut takes
+  one finding per target in turn: no target gets a second row before every target in the band has
+  one. In the band where full blocks run out, the targets late in the alphabet get a one-line row
+  while names fit; past that, and in the bands below, they may get no line, only the count.
+- **Findings are named while names fit, after the criticals' full blocks.** Findings without room
+  for their full block are each listed on one line (severity, title, location, id, and any fix state
+  with its pull request) under `### Listed without detail`. Below the critical band, full blocks give
+  way to names, so as many findings as possible are named; the critical band trades full blocks only
+  for names of more criticals. Past what one line each can hold, the body gives a count.
 - **The title's counts stay true.** If the body omits findings it says so explicitly. Never
   hand-trim your document to make it fit — the counts are how a reader learns the real total.
 - **Truncation does not make a run `partial`** — see [Partial coverage](finish.md#partial-coverage), which
@@ -95,7 +103,8 @@ identifier on one finding could overflow the whole body and publish nothing at a
 until that finding stopped reproducing.
 
 Resolution accounting is unaffected by truncation, because the two halves of the delta are measured
-against different sets: **new** is judged against what the body rendered, and **resolved** against
+against different sets: **new** is judged against what the body named (in full or on one line),
+less anything the last run filed when the report store holds its document, and **resolved** against
 every finding in the document, rendered or not. A finding cut for space still reproduces and is
 never reported as fixed.
 

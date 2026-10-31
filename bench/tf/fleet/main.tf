@@ -47,6 +47,22 @@ locals {
   # arithmetic (seeded_d's block below works it for the fourth).
   cluster_labels = merge(local.fleet_labels, {
     "environment" = "seeded"
+    # The rollout family. The upgrade rollout's family gate reads
+    # `resourceLabels.upgrade-family`: the first member of a family to take
+    # an upgrade is the canary whose post-upgrade diff releases or holds the
+    # rest. Three clusters share the regular family; seeded-b, pinned a minor
+    # behind, is a held family of its own (held_cluster_labels below), so the
+    # regular family's rollout never waits on the lag. The KEY is on every
+    # cluster in this stack because fleet_drift's label-keys facet compares
+    # label keys across the cohort: a key on three clusters and not the
+    # fourth would be a drift finding on the fourth.
+    "upgrade-family" = "seeded-regular"
+  })
+
+  # seeded-b's resource labels: the same keys as cluster_labels, with the
+  # held family's value.
+  held_cluster_labels = merge(local.cluster_labels, {
+    "upgrade-family" = "seeded-held"
   })
 }
 
@@ -272,6 +288,10 @@ resource "google_container_cluster" "seeded_a" {
   # The fleet is standing, but deletion protection stays off: the scheduled
   # re-apply must be able to replace a cluster when a facet change requires
   # it, and the label plus README are the guard against accidental sweeps.
+  # This cluster is the exception: the scaled-zero gateway fixture's
+  # kubernetes_manifest resources (defects-a.tf) cannot plan while its endpoint
+  # is unknown, so creating or replacing seeded-a is the README's two-apply
+  # hand recovery, not a reconcile.
   deletion_protection = false
 
   logging_config {
@@ -285,6 +305,16 @@ resource "google_container_cluster" "seeded_a" {
   # fixtures nothing.
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  # GKE installs and manages the standard Gateway API CRDs. A scaled-to-zero
+  # gateway fixture (#3198) plants Gateway API objects on this cluster, and the
+  # kubernetes provider reads a CRD at plan time, so the CRDs must exist on
+  # every project before that fixture's objects are added. Not a drift facet
+  # (fleet_consistency_drift_sop.md section 4), so enabling it on one cluster
+  # changes no consistency finding. An in-place update.
+  gateway_api_config {
+    channel = "CHANNEL_STANDARD"
   }
 
   # Upgrade-SOP background closure (3.4 no-channel, 3.7 no-window): a and c
@@ -331,20 +361,17 @@ resource "google_container_node_pool" "seeded_a_default" {
   node_count = 2
 
   node_config {
-    # e2-medium, two of them (2026-09-08, #1278). Cluster A hosts the defect
-    # workloads (checkout-gateway, payments-api) alongside GKE's system pods,
-    # and the binding constraint is CPU *requests*, not memory: one
-    # e2-medium's 940m allocatable is fully claimed by system pods alone
-    # (kube-proxy, kube-dns, metadata-server, fluentbit, konnectivity, ...).
-    # The fixtures only ever ran because they scheduled before the system
-    # set filled in; the weekend auto-upgrade rebuilt the node, system-
-    # critical pods scheduled first, and every fixture went Pending on all
-    # 30 pool projects. A second node holds the fixtures plus the Pending
-    # system deployments with ~600m to spare, and survives the next node
-    # rebuild (surge upgrades rotate one node at a time). Matches the live
-    # `gcloud container clusters resize` applied during the incident, so
-    # the next apply is a no-op, not a pool replacement.
-    machine_type    = "e2-medium"
+    # e2-standard-2, two of them (2026-10-20, #3607; two e2-mediums since
+    # #1278, one before). The binding constraint is CPU *requests*: GKE's
+    # system pods (kube-dns at 270m a replica, kube-proxy, metadata-server,
+    # fluentbit, konnectivity, ...) take 700-860m of an e2-medium's 940m
+    # allocatable, the fixtures are 10m each, and the busier node was within
+    # 2-47m of full on every pool project, so each new fixture strands a pod
+    # somewhere. A dedicated-core size allocates 1930m, about a core spare
+    # per node. The provider updates machine_type in place (plan: one
+    # update, no replace), so GKE recreates the two nodes one at a time
+    # under the pool's surge settings; no reconcile-allow.json entry.
+    machine_type    = "e2-standard-2"
     disk_size_gb    = 20
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
@@ -497,7 +524,7 @@ resource "google_container_cluster" "seeded_b" {
 
   remove_default_node_pool = true
   initial_node_count       = 1
-  resource_labels          = local.cluster_labels
+  resource_labels          = local.held_cluster_labels
   deletion_protection      = false
 
   # REGULAR's own newest previous-minor patch, or the hold when the running
@@ -841,7 +868,8 @@ resource "google_container_cluster" "seeded_d" {
   remove_default_node_pool = true
   initial_node_count       = 1
 
-  # local.cluster_labels, the same as a, b and c. The runner has no other way to
+  # local.cluster_labels, the same as a and c (seeded-b carries
+  # held_cluster_labels: the same keys). The runner has no other way to
   # find this cluster: hack/fleet-kubeconfigs.sh discovers slots with
   # `resourceLabels.environment=seeded AND resourceLabels.managed-by=...`, so a
   # cluster without the environment label is never listed, never resolves to a

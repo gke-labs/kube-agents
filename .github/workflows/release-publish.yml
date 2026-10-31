@@ -132,10 +132,13 @@ jobs:
       contents: write
       packages: write
       id-token: write
+      # Dispatches docs-deploy.yml on main after Publish GitHub Release so
+      # GitHub Pages serves the newly published GA installer scripts.
+      actions: write
     steps:
       - name: Generate Release Bot Token
         id: release-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
@@ -268,3 +271,12 @@ jobs:
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
           GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: ./scripts/release/publish_github_release.sh
+
+      - name: Refresh GitHub Pages Release Scripts
+        if: steps.verify-eligibility.outputs.skip_release != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh workflow run docs-deploy.yml --ref main; then
+            echo "::warning::Failed to dispatch docs-deploy.yml on main; run Docs Deploy manually to refresh Pages installer scripts."
+          fi

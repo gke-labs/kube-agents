@@ -1016,11 +1016,13 @@ def record_failed_turn(
     one card. The exit falls back to the reaper, as without this patch.
     """
     if run_id is None:
+        turn_kind = "no-turn run" if failure_reason == NO_TURN_FAILURE_REASON else "turn"
         logger.warning(
-            "kanban: task %s's turn failed in a worker with no run id "
+            "kanban: task %s's %s failed in a worker with no run id "
             "(HERMES_KANBAN_RUN_ID unset or unparseable); not charging it, "
             "so the reaper settles the exit",
             task_id,
+            turn_kind,
         )
         return False
     conn = connect()
@@ -1048,7 +1050,8 @@ def record_failed_turn(
         try:
             add_comment(conn, task_id, author, comment)
         except Exception:
-            logger.debug("failed-turn comment for task %s failed", task_id, exc_info=True)
+            label = "no-turn" if failure_reason == NO_TURN_FAILURE_REASON else "failed-turn"
+            logger.debug("%s comment for task %s failed", label, task_id, exc_info=True)
         return True
     finally:
         try:

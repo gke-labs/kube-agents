@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "text": "*The checkout-gateway deployment in seeded-a is restarting every few minutes.*\n\nBecause its readiness probe times out under load, which the HPA then reads as missing capacity. Raise the probe timeout to 5s.",
+    "widgets": null
+  }
+]

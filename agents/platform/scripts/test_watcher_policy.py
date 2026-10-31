@@ -119,16 +119,82 @@ class K8sTest(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertTrue(w.is_watch({"watch": ["true"]}))
 
-    def test_named_reads_of_any_kind_but_secrets_are_allowed(self):
+    def test_named_reads_of_the_listed_kinds_are_allowed(self):
         for path in (
             "api/v1/namespaces/default/configmaps/app",
-            "api/v1/nodes/node-1",
+            "api/v1/namespaces/team-a",
             "apis/apps/v1/namespaces/default/deployments/web",
             "apis/rbac.authorization.k8s.io/v1/clusterroles/admin",
+            "apis/argoproj.io/v1alpha1/namespaces/argocd/applications/guestbook",
+            "apis/configsync.gke.io/v1beta1/namespaces/config-management-system/rootsyncs/root-sync",
         ):
             with self.subTest(path=path):
                 self.assertEqual(self.evaluate(path).rule_id, "kubernetes.watcher.named-get")
         self.assertEqual(self.evaluate("api/v1/namespaces/default/secrets/db").rule_id, w.RULE_K8S_SECRETS)
+
+    def test_every_table_entry_is_a_named_read(self):
+        for group, resource in sorted(w.WATCHER_NAMED_READS):
+            prefix = "api/v1" if not group else f"apis/{group}/v1"
+            for path in (f"{prefix}/{resource}/x", f"{prefix}/namespaces/default/{resource}/x"):
+                with self.subTest(path=path):
+                    self.assertEqual(self.evaluate(path).rule_id, "kubernetes.watcher.named-get")
+
+    def test_an_unlisted_kind_is_refused_by_the_kind_rule(self):
+        for path in (
+            "api/v1/nodes/node-1",
+            "api/v1/namespaces/default/pods/web-0",
+            "apis/coordination.k8s.io/v1/namespaces/kube-system/leases/kube-scheduler",
+            "apis/cert-manager.io/v1/namespaces/default/certificates/tls",
+            "apis/networking.gke.io/v1/namespaces/default/managedcertificates/c",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.evaluate(path).rule_id, w.RULE_K8S_KIND)
+
+    def test_a_listed_plural_under_another_group_is_refused(self):
+        # The group used to be captured and never checked.
+        for path in (
+            "apis/apps/v1/namespaces/default/configmaps/app",
+            "apis/example.com/v1/namespaces/default/deployments/web",
+            "apis/evil.argoproj.io/v1/namespaces/argocd/applications/a",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.evaluate(path).rule_id, w.RULE_K8S_KIND)
+
+    def test_a_secret_keeps_its_own_rule_under_any_group(self):
+        for path in ("api/v1/namespaces/default/secrets/db", "apis/example.com/v1/namespaces/default/secrets/db"):
+            with self.subTest(path=path):
+                self.assertEqual(self.evaluate(path).rule_id, w.RULE_K8S_SECRETS)
+
+    def test_the_reconciler_kinds_are_the_six_the_agent_can_read(self):
+        # The agent's minimal ClusterRole grants get/list/watch on these six
+        # (gke-labs/kube-agents#2987, buildPlatformMinimalClusterRole). A change
+        # here without the same change there, or the reverse, is the drift the
+        # RECONCILER_NAMED_READS comment warns about.
+        self.assertEqual(
+            w.RECONCILER_NAMED_READS,
+            {
+                ("argoproj.io", "applications"),
+                ("kustomize.toolkit.fluxcd.io", "kustomizations"),
+                ("source.toolkit.fluxcd.io", "gitrepositories"),
+                ("source.toolkit.fluxcd.io", "ocirepositories"),
+                ("configsync.gke.io", "rootsyncs"),
+                ("configsync.gke.io", "reposyncs"),
+            },
+        )
+        self.assertLessEqual(w.RECONCILER_NAMED_READS, w.WATCHER_NAMED_READS)
+
+    def test_a_malformed_table_is_refused_at_import(self):
+        for table in (
+            frozenset({("", "secrets")}),
+            frozenset({("example.com", "secrets")}),
+            frozenset({("", "watch")}),
+            frozenset({("", "Deployments")}),
+            frozenset({("Apps", "deployments")}),
+            frozenset({("apps", "deployments/scale")}),
+        ):
+            with self.subTest(table=table):
+                with self.assertRaises(ValueError):
+                    w._validate_named_reads(table)
 
     def test_every_write_verb_is_refused(self):
         for method in ("POST", "PUT", "PATCH", "DELETE"):
@@ -201,7 +267,7 @@ class K8sTest(unittest.TestCase):
             self.evaluate("api/v1/events", query={"watch": ["1"], "dryRun": ["All"]}).rule_id, w.RULE_K8S_QUERY
         )
         self.assertEqual(
-            self.evaluate("api/v1/nodes/node-1", query={"watch": ["1"]}).rule_id, w.RULE_K8S_QUERY
+            self.evaluate("api/v1/namespaces/default/configmaps/app", query={"watch": ["1"]}).rule_id, w.RULE_K8S_QUERY
         )
 
     def test_a_malformed_target_is_refused(self):
@@ -218,6 +284,73 @@ class K8sTest(unittest.TestCase):
             with self.subTest(rule=decision.rule_id):
                 self.assertNotIn("MARKER", decision.message)
                 self.assertRegex(decision.rule_id, r"^[a-z0-9]+(\.[a-z0-9-]+)+$")
+
+
+ALERTS = "projects/kagents-dev/subscriptions/gke-stockout-alerts-sub"
+OTHER = "projects/kagents-dev/subscriptions/second-route-sub"
+PLATFORM_SET = frozenset({ALERTS, OTHER})
+
+
+class PlatformPubsubTest(unittest.TestCase):
+    """The platform adapter's relay: the same four calls, on a set of subscriptions."""
+
+    def test_the_four_calls_are_allowed_on_every_listed_subscription(self):
+        for sub in (ALERTS, OTHER):
+            cases = [
+                ("GET", "v1/" + sub, b"", "gcp.pubsub.subscription-get"),
+                ("POST", "v1/" + sub + ":pull", json.dumps({"maxMessages": 10}).encode(), "gcp.pubsub.subscription-pull"),
+                ("POST", "v1/" + sub + ":acknowledge", json.dumps({"ackIds": ["a"]}).encode(), "gcp.pubsub.subscription-acknowledge"),
+                ("POST", "v1/" + sub + ":modifyAckDeadline", json.dumps({"ackIds": ["a"], "ackDeadlineSeconds": 0}).encode(),
+                 "gcp.pubsub.subscription-modifyAckDeadline"),
+            ]
+            for method, path, body, rule in cases:
+                with self.subTest(sub=sub, path=path):
+                    decision = w.evaluate_pubsub(method, PUBSUB, path, body, PLATFORM_SET)
+                    self.assertTrue(decision.allowed, decision)
+                    self.assertEqual(decision.rule_id, rule)
+
+    def test_a_subscription_outside_the_set_is_refused(self):
+        for other in (SUB, "projects/another-project/subscriptions/gke-stockout-alerts-sub"):
+            with self.subTest(other=other):
+                decision = w.evaluate_pubsub("POST", PUBSUB, "v1/" + other + ":pull", b"{}", PLATFORM_SET)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(decision.rule_id, w.RULE_PUBSUB_SUBSCRIPTION)
+
+    def test_an_empty_set_refuses_every_pubsub_call(self):
+        decision = w.evaluate_pubsub("POST", PUBSUB, "v1/" + ALERTS + ":pull", b"{}", frozenset())
+        self.assertEqual(decision.rule_id, w.RULE_PUBSUB_SUBSCRIPTION)
+
+    def test_the_gke_host_and_every_other_host_are_refused(self):
+        for host in (w.GKE_HOST, "iamcredentials.googleapis.com", "container.googleapis.com"):
+            with self.subTest(host=host):
+                decision = w.evaluate_pubsub("GET", host, "v1/projects/p/locations/l/clusters/c", b"", PLATFORM_SET)
+                self.assertEqual(decision.rule_id, w.RULE_PUBSUB_ROUTE)
+
+    def test_other_verbs_topics_and_bodies_are_refused_as_for_the_watcher(self):
+        for method, path, body, rule in (
+            ("POST", "v1/" + ALERTS + ":seek", b"{}", w.RULE_PUBSUB_ROUTE),
+            ("DELETE", "v1/" + ALERTS, b"", w.RULE_PUBSUB_METHOD),
+            ("POST", "v1/projects/kagents-dev/topics/t:publish", b"{}", w.RULE_PUBSUB_ROUTE),
+            ("POST", "v1/" + ALERTS, b"{}", w.RULE_PUBSUB_METHOD),
+            ("POST", "v1/" + ALERTS + ":pull", json.dumps({"maxMessages": "10"}).encode(), w.RULE_PUBSUB_BODY),
+            ("POST", "v1/" + ALERTS + ":acknowledge", json.dumps({"ackIds": [1]}).encode(), w.RULE_PUBSUB_BODY),
+        ):
+            with self.subTest(method=method, path=path):
+                decision = w.evaluate_pubsub(method, PUBSUB, path, body, PLATFORM_SET)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(decision.rule_id, rule)
+
+    def test_the_platform_relay_names_itself_and_repeats_no_caller_text(self):
+        decision = w.evaluate_pubsub("POST", PUBSUB, "v1/projects/MARKER/subscriptions/MARKER:pull", b"{}", PLATFORM_SET)
+        self.assertFalse(decision.allowed)
+        self.assertNotIn("MARKER", decision.message)
+        self.assertNotIn("watcher", decision.message)
+
+    def test_the_watcher_evaluator_is_unchanged(self):
+        decision = w.evaluate_gcp("POST", PUBSUB, "v1/" + ALERTS + ":pull", b"{}", SUB)
+        self.assertEqual(decision.rule_id, w.RULE_GCP_SUBSCRIPTION)
+        self.assertEqual(decision.message, "The watcher relay reaches only the drift detector's configured subscription.")
+        self.assertEqual(w.evaluate_gcp("GET", PUBSUB, "v1/" + SUB, b"", SUB).rule_id, "gcp.watcher.subscription-get")
 
 
 if __name__ == "__main__":

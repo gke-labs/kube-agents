@@ -23,6 +23,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // DefaultHarnessPath is where the worker image carries the harness: the
@@ -100,8 +102,107 @@ type harnessEvent struct {
 	// type:"result" fields.
 	Result  string `json:"result,omitempty"`
 	IsError bool   `json:"is_error,omitempty"`
+	// What the turn cost, on a result line: the harness's own token counts
+	// for the turn, the turn's wall time, and the harness's running price
+	// for the whole process. Usage and DurationMs are per turn;
+	// TotalCostUSD is cumulative across every result line the process has
+	// emitted, plus what a resumed session had already spent, so the
+	// adapter publishes the difference between consecutive lines
+	// (adapter.turnCost), never the figure itself. Each is optional, and
+	// each is held raw and decoded on its own (telemetry, model): telemetry
+	// in a shape the adapter does not expect is dropped field by field,
+	// never the result line that carries the deliverable. The adapter
+	// publishes what decodes as the usage artifact (payload spec "Reserved
+	// artifact names") and nothing when nothing does.
+	Usage        json.RawMessage `json:"usage,omitempty"`
+	TotalCostUSD json.RawMessage `json:"total_cost_usd,omitempty"`
+	DurationMs   json.RawMessage `json:"duration_ms,omitempty"`
 	// type:"system" subtype:"init".
 	SessionID string `json:"session_id,omitempty"`
+	// Model is the model the harness runs, named once on the init line and
+	// carried onto every turn's usage. Raw for the same reason.
+	Model json.RawMessage `json:"model,omitempty"`
+}
+
+// harnessUsage is a result line's token counts. The three prompt figures
+// are what the model read for the turn, split by cache state; the usage
+// artifact sums them as inputTokens, since a cached read is still a read.
+// float64 so a count written with a fraction still decodes; the part
+// carries whole tokens.
+type harnessUsage struct {
+	InputTokens              float64 `json:"input_tokens,omitempty"`
+	OutputTokens             float64 `json:"output_tokens,omitempty"`
+	CacheCreationInputTokens float64 `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     float64 `json:"cache_read_input_tokens,omitempty"`
+}
+
+// model is the init line's model name, and whether the line carried one in
+// a shape the adapter reads; an absent model is "" and not dropped.
+func (ev harnessEvent) model() (name string, dropped bool) {
+	if len(ev.Model) == 0 {
+		return "", false
+	}
+	if json.Unmarshal(ev.Model, &name) != nil {
+		return "", true
+	}
+	return name, false
+}
+
+// resultTelemetry is one result line's figures for the usage artifact, read
+// field by field so one off-shape field costs that field alone: the
+// per-turn usage (model from the init line, every prompt token as input, the
+// wall time as the harness reported it; zero where the line had nothing),
+// the running total and whether the line carried one, and the names of the
+// fields that were present but did not decode, for the one warning the
+// adapter logs per line. The cost is not in the usage: it is the running
+// total's difference, which the adapter keeps.
+type resultTelemetry struct {
+	usage    lib.Usage
+	total    float64
+	hasTotal bool
+	dropped  []string
+}
+
+func (ev harnessEvent) telemetry(model string) resultTelemetry {
+	t := resultTelemetry{usage: lib.Usage{Model: model}}
+	// Each figure passes lib.UsageFigure: a negative or overflowing number
+	// is that field dropped and named, never a refused part or a wrapped
+	// value, so the line's other figures still reach the bus.
+	var ms float64
+	var ok bool
+	switch {
+	case len(ev.DurationMs) == 0:
+	case json.Unmarshal(ev.DurationMs, &ms) != nil:
+		t.dropped = append(t.dropped, "duration_ms")
+	default:
+		if t.usage.DurationMs, ok = lib.UsageFigure(ms); !ok {
+			t.dropped = append(t.dropped, "duration_ms")
+		}
+	}
+	var counts harnessUsage
+	switch {
+	case len(ev.Usage) == 0:
+	case json.Unmarshal(ev.Usage, &counts) != nil:
+		t.dropped = append(t.dropped, "usage")
+	default:
+		if t.usage.InputTokens, ok = lib.UsageFigure(counts.InputTokens + counts.CacheCreationInputTokens + counts.CacheReadInputTokens); !ok {
+			t.dropped = append(t.dropped, "usage.input_tokens")
+		}
+		if t.usage.OutputTokens, ok = lib.UsageFigure(counts.OutputTokens); !ok {
+			t.dropped = append(t.dropped, "usage.output_tokens")
+		}
+	}
+	// A null total is a line that carried none, not a total of zero: a zero
+	// would read as the total going down and rebase the baseline.
+	var total *float64
+	switch {
+	case len(ev.TotalCostUSD) == 0:
+	case json.Unmarshal(ev.TotalCostUSD, &total) != nil:
+		t.dropped = append(t.dropped, "total_cost_usd")
+	case total != nil:
+		t.total, t.hasTotal = *total, true
+	}
+	return t
 }
 
 type harnessMessage struct {

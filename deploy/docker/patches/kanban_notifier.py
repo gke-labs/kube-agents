@@ -19,7 +19,10 @@ The concerns, in the order the notifier reaches them:
    ``tools/cron_run_scope.py`` imports it too and needs it earlier in the
    build. The *wiring* of it into the notifier lives here.
 2. **Deliver** the report: :func:`handoff_with_result` puts the card's
-   ``result`` into the message the notifier already builds, and
+   ``result`` into the message the notifier already builds,
+   :func:`wake_handoff_with_result` carries that report into ``wake_handoff``
+   when ``_send_pings`` skips the passive chat ping (non-push adapters like
+   ``api_server``, and ``delivery_mode="wake"`` subscriptions), and
    :func:`unstructured_result` records in the log when that report will render
    flat in Slack for want of Markdown structure. The note changes nothing about
    what is sent — it exists because a flattened report raises no error to see.
@@ -83,6 +86,8 @@ __all__ = [
     "UNSTRUCTURED_MIN_CHARS",
     "unstructured_result",
     "handoff_with_result",
+    "API_SERVER_PLATFORM",
+    "wake_handoff_with_result",
     "DEFAULT_WAKE_KINDS",
     "UNDELIVERED_OUTCOME_KINDS",
     "CONFIG_KEY",
@@ -394,6 +399,73 @@ def handoff_with_result(delivered: object, task: object) -> str:
         return block or text
     except Exception:  # pragma: no cover - defensive
         return text
+
+
+API_SERVER_PLATFORM = "api_server"
+
+
+def _passive_ping_sent(notification: object) -> bool:
+    """Whether ``_send_pings`` sends the passive completion message for *notification*.
+
+    Mirrors the two ``continue`` branches in ``_KanbanNotification._send_pings``
+    (and the two no-send carve-outs in :func:`wake_kinds_for`):
+
+    * ``not n.send_passive`` — a ``delivery_mode="wake"`` subscription suppresses
+      the passive chat ping on every platform.
+    * ``not n.is_push_adapter and n.wake_agent`` — on a non-push adapter such as
+      ``api_server``, ``_send_pings`` skips the passive send because the wake
+      self-post is the sole delivery.
+    """
+    if notification is None:
+        return True
+    if not bool(getattr(notification, "send_passive", True)):
+        return False
+    if not bool(getattr(notification, "wake_agent", True)):
+        return True
+    is_push = getattr(notification, "is_push_adapter", None)
+    if is_push is False:
+        return False
+    adapter = getattr(notification, "adapter", None)
+    if adapter is not None:
+        return _adapter_can_push(adapter)
+    platform = str(getattr(notification, "platform_str", "") or "").strip().lower()
+    if platform:
+        return platform != API_SERVER_PLATFORM
+    if is_push is not None:
+        return bool(is_push)
+    return True
+
+
+def wake_handoff_with_result(
+    wake_handoff: object,
+    handoff: object,
+    notification: object = None,
+) -> Optional[str]:
+    """Return ``wake_handoff`` for ``_fmt_completed``, promoting ``handoff`` when no ping is sent.
+
+    On a push adapter with ``send_passive=True``, ``_send_pings`` posts ``handoff``
+    (carrying the full ``task.result`` from :func:`handoff_with_result`) directly to
+    the chat thread, so keeping ``wake_handoff`` as the short ``payload_summary``
+    clip avoids repeating a multi-line report when a wake also fires.
+
+    Where ``_send_pings`` skips the passive send (:func:`_passive_ping_sent` is
+    ``False`` — either ``api_server`` or ``delivery_mode="wake"``), ``build_wake_text``'s
+    ``Result: {self.wake_handoff}`` line is the *only* delivery of the card's
+    output. Leaving ``wake_handoff`` as ``_clip_handoff(payload_summary)`` there
+    drops ``task.result`` whenever a worker provides both a status ``summary`` and
+    a multi-line ``result``. Promoting the stripped ``handoff`` into ``wake_handoff``
+    delivers the full report through the wake turn while leaving the push path
+    untouched.
+    """
+    fallback = None if wake_handoff is None else str(wake_handoff)
+    try:
+        if _passive_ping_sent(notification):
+            return fallback
+        body = "" if handoff is None else str(handoff).lstrip("\n")
+        return body if body else fallback
+    except Exception:  # pragma: no cover - defensive
+        return fallback
+
 
 
 # ---------------------------------------------------------------------------

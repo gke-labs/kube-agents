@@ -10,11 +10,13 @@ cluster, which makes it the first chart to try this skill on.
   `oci://quay.io/jetstack/charts/cert-manager` (published first) and the HTTP
   repository `https://charts.jetstack.io` (updated a few hours later). Both
   are the project's own; follow `forms.md` "Repository transport" to choose.
-- Version: the newest release on
-  `https://github.com/cert-manager/cert-manager/releases` without a
-  pre-release suffix. Chart versions carry the `v`: `version: v1.21.2`, not
-  `1.21.2`.
-- Values: `https://raw.githubusercontent.com/cert-manager/cert-manager/<version>/deploy/charts/cert-manager/values.yaml`.
+- Version: the newest release without a pre-release suffix, from the
+  cert-manager install guide or the `release-<minor>` branch's chart
+  (**inspect-repository** on `cert-manager/cert-manager`). Chart versions
+  carry the `v`: `version: v1.21.2`, not `1.21.2`.
+- Values: the chart's `values.yaml`, under the deploy/charts directory of the
+  `cert-manager/cert-manager` repository at that release branch, read with
+  **inspect-repository**.
 
 ## Values
 

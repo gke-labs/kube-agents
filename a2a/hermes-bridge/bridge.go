@@ -429,6 +429,11 @@ type Bridge struct {
 	// part the last chunk carries: the kube-agents.chat/v1 DataPart (chat.go)
 	// for a turn, or the cardStop result part (cardstop.go) for a control.
 	resultPublish func(ctx context.Context, run *taskRun, output string, chat []byte) error
+	// chatPart folds a completed task's answer into the chat message its
+	// result carries, resultChatPart by default; a field so a test can see
+	// when the fold returns against the publish window finalizeResult opens
+	// after it, without an answer whose fold is slow enough to time.
+	chatPart func(answer string) (lib.Part, bool)
 
 	// apiClient is the API executor's HTTP client (api.go).
 	apiClient *http.Client
@@ -479,6 +484,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }
 	b.deliver = b.handle
 	b.resultPublish = b.publishResult
+	b.chatPart = resultChatPart
 	b.publishTurn = func(ctx context.Context, run *taskRun, artifactID, text string) error {
 		return b.publishTextArtifact(ctx, run, artifactID, lib.ArtifactTurn, text)
 	}
@@ -523,7 +529,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 			cfg.Logger.Warn("nats async error", "err", err, "subject", subject)
 		}),
 	}, cfg.NATSOptions...)
-	b.nc, err = nats.Connect(cfg.NATSURL, natsOpts...)
+	b.nc, err = nats.Connect(cfg.NATSURL, append(natsOpts, lib.TLSOptions()...)...)
 	if err != nil {
 		b.c.Close()
 		return nil, fmt.Errorf("kv connection: %w", err)
@@ -1489,6 +1495,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		return
 	}
 	run.act.Store(act)
+	started := time.Now()
 	if err := cmd.Start(); err != nil {
 		// No child, so no publisher to join and nothing to drain.
 		run.act.Store(nil)
@@ -1540,8 +1547,23 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	switch {
 	case err == nil:
 		// A canceled task that finished anyway won the race: completed wins,
-		// per the payload spec's cancel mapping.
+		// per the payload spec's cancel mapping, unless its answer is
+		// withheld below, which ends it failed. The CLI reports no tokens,
+		// so the turn's usage is its wall time alone.
+		run.mu.Lock()
+		if run.state == stateRunning {
+			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
+		}
+		run.mu.Unlock()
 		out := stdout.String()
+		if opensWithUnstructuredReasoning(out) {
+			// The model's reasoning, not an answer (#3206): withheld, as on
+			// the API executor, with the session hermes printed if any.
+			session := hermesSessionID(stderr.String())
+			b.withholdUnstructuredReasoning(run, session, 1, out)
+			b.finalize(run, lib.StateFailed, unstructuredReasoningReason(session, 1), nil)
+			return
+		}
 		b.finalize(run, lib.StateCompleted, "", &out)
 	case run.deadlineHit.Load():
 		b.finalize(run, lib.StateFailed,
@@ -1554,6 +1576,13 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		// kill, so this arm wins only when the reap was quick.
 		b.finalize(run, lib.StateFailed, shutdownReason, nil)
 	default:
+		// A run that failed on its own still took its time; a killed one
+		// (the arms above) has no turn to account for.
+		run.mu.Lock()
+		if run.state == stateRunning {
+			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
+		}
+		run.mu.Unlock()
 		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String()), nil)
 	}
 }
@@ -1625,14 +1654,23 @@ func failureReason(err error, stdout, stderr string) string {
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "reason: %s - %v", token, err)
-	// The last match: the CLI prints its own line last, after anything a
-	// tool's nested run echoed; a label with nothing after it matches
-	// nothing, so no id is reported rather than the next line's first word.
-	if all := sessionIDLine.FindAllStringSubmatch(stderr, -1); len(all) > 0 {
-		fmt.Fprintf(&sb, "; session: %s", all[len(all)-1][1])
+	if session := hermesSessionID(stderr); session != "" {
+		fmt.Fprintf(&sb, "; session: %s", session)
 	}
 	fmt.Fprintf(&sb, "; stdout tail: %s; stderr tail: %s", tail(stdout, stdoutTailBytes), stderr)
 	return sb.String()
+}
+
+// hermesSessionID is the session id `hermes chat -Q` printed on stderr, or
+// "". The last match: the CLI prints its own line last, after anything a
+// tool's nested run echoed; a label with nothing after it matches nothing, so
+// no id is reported rather than the next line's first word.
+func hermesSessionID(stderr string) string {
+	all := sessionIDLine.FindAllStringSubmatch(stderr, -1)
+	if len(all) == 0 {
+		return ""
+	}
+	return all[len(all)-1][1]
 }
 
 // resultPublishFailedReason is the terminal message for a result artifact
@@ -1748,17 +1786,23 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	// complete and nothing of it can follow the final event.
 	b.drainActivity(run)
 	run.state = stateDone
-	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	// The answer folded for a chat renderer, on a completed task only: any
+	// other state's result is a copy beside the terminal's reason. A
+	// caller's own data part (finalizeData) takes its place. Folded before
+	// the publish window opens: the fold is CPU only, and scanning an answer
+	// at the read cap under load would otherwise spend the window the
+	// result and terminal publishes need.
+	var chat []byte
 	if resultOutput != nil {
-		// The answer folded for a chat renderer, on a completed task only:
-		// any other state's result is a copy beside the terminal's reason.
-		// A caller's own data part (finalizeData) takes its place.
-		chat := data
+		chat = data
 		if chat == nil && state == lib.StateCompleted {
-			if part, ok := resultChatPart(*resultOutput); ok {
+			if part, ok := b.chatPart(*resultOutput); ok {
 				chat = part.Data
 			}
 		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	if resultOutput != nil {
 		// The chat message is read from the answer as the agent wrote it; the text a
 		// person sees carries no step line (visibleText).
 		if err := b.resultPublish(ctx, run, visibleOr(*resultOutput), chat); err != nil && copyOnly {
@@ -1837,6 +1881,35 @@ func (b *Bridge) publishHandoff(ctx context.Context, run *taskRun, state lib.Tas
 		return
 	}
 	b.publishArtifactPartsCtx(ctx, run, lib.ArtifactHandoff, lib.Part{Kind: "text", Text: lib.HandoffCards})
+}
+
+// publishUsageLocked publishes one finished turn's cost as a part on the
+// usage artifact (payload spec "Reserved artifact names"). The caller holds
+// run.mu with the run still running: a finalizer takes the same lock before
+// its terminal, so the part is on the stream ahead of the final event, never
+// after it. Best-effort, like every artifact but the result; a usage with no
+// figure publishes nothing, so a reader sees absence rather than zeroes.
+func (b *Bridge) publishUsageLocked(run *taskRun, u lib.Usage) {
+	part, err := lib.UsagePart(u)
+	if err != nil {
+		if u != (lib.Usage{Model: u.Model}) {
+			// A figure was there and the part was refused (a negative
+			// one): say so, since the turn's time and counts are not on
+			// the bus. A usage with no figure at all is the quiet case.
+			b.cfg.Logger.Warn("usage part refused; the turn's figures are not on the bus",
+				"task", run.origin.TaskID, "err", err)
+		}
+		return
+	}
+	if run.act.Load() == nil {
+		// No activity state means no turn was started through runTask or
+		// runTaskAPI (a turn driven by hand in a test); there is no
+		// append tracker to publish under, so there is no artifact.
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	defer cancel()
+	b.publishArtifactPartsCtx(ctx, run, lib.ArtifactUsage, part)
 }
 
 // cardsSettleTheAsk reports whether the cards of origin's conversation carry

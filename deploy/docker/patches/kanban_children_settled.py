@@ -221,6 +221,16 @@ CHILDREN_TABLE = "kanban_worker_children"
 #: ``hermes_cli/kanban_db.py``.
 SETTLED_STATUSES = ("done", "archived")
 
+#: How old the card ``kanban_create`` hands back may be and still be one this
+#: create made. A repeated ``idempotency_key`` returns an existing card, made by
+#: anyone (a person, cron, the gateway) and possibly long done; attributing it
+#: would make it a child of this card, and let this card relay its verified
+#: claims (``kanban_verified_claims.descendant_card_ids``). The window only
+#: approximates "a card this create made": a card that a person, cron or the
+#: gateway created in the last 60 seconds can still be adopted by a worker that
+#: knows its ``idempotency_key``.
+CREATED_JUST_NOW_SECONDS = 60
+
 #: How long a refusal stays on file — one attempt window. The value and the
 #: reasoning are ``kanban_result_required.NUDGE_TTL_SECONDS``: a model answers
 #: a refused tool call in its next turn, seconds later, and 15 minutes is the
@@ -392,12 +402,24 @@ def maybe_record_worker_child(conn, child_task_id: str) -> bool:
     applier runs last sits first, and the Dockerfile runs this one last. The
     two are order-independent -- each writes its own table and neither reads
     the other's -- and share the same worker test. A process with no
-    ``HERMES_KANBAN_TASK`` (chat session, CLI, cron) writes nothing.
+    ``HERMES_KANBAN_TASK`` (chat session, CLI, cron) writes nothing, and nor
+    does a create that handed back an existing card
+    (:data:`CREATED_JUST_NOW_SECONDS`).
     """
     creator = (os.environ.get(WORKER_TASK_ENV) or "").strip()
-    if not creator:
+    if not creator or not _created_just_now(conn, child_task_id):
         return False
     return record_worker_child(conn, child_task_id, creator)
+
+
+def _created_just_now(conn, task_id: str) -> bool:
+    """Whether ``task_id`` was created within :data:`CREATED_JUST_NOW_SECONDS`. Never raises."""
+    try:
+        row = conn.execute("SELECT created_at FROM tasks WHERE id = ?", ((task_id or "").strip(),)).fetchone()
+        return row is not None and row[0] is not None and time.time() - int(row[0]) <= CREATED_JUST_NOW_SECONDS
+    except Exception as exc:  # noqa: BLE001 — never break the create
+        logger.warning("kanban_children_settled: reading %r's age failed (not recorded): %r", task_id, exc)
+        return False
 
 
 def _format_refusal(children: list[tuple[str, str]]) -> str:

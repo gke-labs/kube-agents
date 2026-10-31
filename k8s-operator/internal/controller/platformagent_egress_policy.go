@@ -440,8 +440,9 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	// Service address is translated to it before policy is evaluated. So it
 	// has to be a CIDR the cluster's owner supplies. Left empty, this rule is
 	// absent and nothing in the agent Pod can reach the API — which matters
-	// above one replica, where the container runs leader_elect.py and holds a
-	// Lease, and to any sidecar or plugin the operator added. That is a
+	// to any sidecar or plugin the operator added, and would matter to
+	// leader_elect.py above one replica, which the operator does not render
+	// today (supportedGatewayReplicas). That is a
 	// deliberate under-allow: inventing a range here would mean permitting a
 	// guess.
 	//

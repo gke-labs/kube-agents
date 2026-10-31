@@ -561,9 +561,10 @@ they disagree.
   with their own severities stay separate: tell the user why, and do not merge them. In a plan,
   give each such policy its own `signal_type` (for example `errors_fast_burn` and
   `errors_slow_burn`), which `--plan` accepts.
-- **Terraform.** The agent's shell has no `terraform` binary, so the prerequisites' Verification
-  Runbook `terraform init` and `terraform validate` cannot run there: hand the user the `.tf`
-  changes with `terraform validate` as their step, and do not report it as run.
+- **Terraform.** The agent's shell has OpenTofu for `tofu fmt` only and no `terraform` binary. The
+  prerequisites' Verification Runbook check, `tofu fmt -check -diff`, runs there; `init`,
+  `validate` and `plan` are the user's or their CI's: name them as the user's step, and do not
+  report them as run.
 - **Catalog regexes.** The `metrics_and_alerts_catalog.md` table rows escape each `|` with a
   backslash for Markdown, and in PromQL's RE2 that backslash makes the pipe a literal, so a
   copied matcher never matches. Drop the backslashes: the regexes are `(4|5)..` (API client

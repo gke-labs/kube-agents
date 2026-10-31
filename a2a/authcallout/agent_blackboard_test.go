@@ -59,12 +59,13 @@ const (
 	renderedProvisionToken = "token-for-the-provision-serviceaccount-padded-to-a-realistic"
 )
 
-// The four topic subjects the provision script's `stream add` lines name. The
-// first three are the agent's; the fourth, shared.probe, is provisioned with
+// The five topic subjects the provision script's `stream add` lines name. The
+// first four are the agent's; the fifth, shared.probe, is provisioned with
 // no writer on purpose (see the script's comment) and is the refusal row below
 // that proves a publish grant rather than the existence of a subject.
 const (
 	topicUpgradeReadiness = "a2a.topics.agent.platform.upgrade-readiness"
+	topicTopologySkew     = "a2a.topics.agent.platform.topology-skew"
 	topicBlueprint        = "a2a.topics.shared.blueprint"
 	topicProbe            = "a2a.topics.shared.probe"
 	topicAnnotations      = "a2a.topics.shared.annotations"
@@ -137,7 +138,7 @@ func TestTheAgentPrincipalWorksTheBlackboardOnARealServer(t *testing.T) {
 		got = append(got, e.Subject)
 	}
 	sort.Strings(got)
-	want := []string{topicUpgradeReadiness, topicBlueprint, topicProbe, topicAnnotations}
+	want := []string{topicUpgradeReadiness, topicTopologySkew, topicBlueprint, topicProbe, topicAnnotations}
 	sort.Strings(want)
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("the registry the agent can see is\n  %v\nwant\n  %v\n(a short registry means STREAM.INFO was refused on a stream and TopicRegistry swallowed it)\nserver violations: %q",
@@ -158,10 +159,11 @@ func TestTheAgentPrincipalWorksTheBlackboardOnARealServer(t *testing.T) {
 
 	// 2 and 3. Write then read back every topic the agent owns, by the names
 	// the CLI resolves — one row per subject, because the publish grants are
-	// three concrete subjects and not a wildcard, so a subject dropped from
+	// concrete subjects and not a wildcard, so a subject dropped from
 	// the list is invisible in any other row.
 	for _, name := range []string{
 		"agent.platform.upgrade-readiness",
+		"agent.platform.topology-skew",
 		"shared.blueprint",
 		"shared.annotations",
 	} {
@@ -252,7 +254,7 @@ func provisionTopicStreams(t *testing.T, h *harness) {
 	defer cancel()
 	for _, cfg := range []jetstream.StreamConfig{{
 		Name:              lib.StreamTopicsState,
-		Subjects:          []string{topicUpgradeReadiness, topicBlueprint, topicProbe},
+		Subjects:          []string{topicUpgradeReadiness, topicTopologySkew, topicBlueprint, topicProbe},
 		Storage:           jetstream.FileStorage,
 		Retention:         jetstream.LimitsPolicy,
 		MaxMsgsPerSubject: 8,

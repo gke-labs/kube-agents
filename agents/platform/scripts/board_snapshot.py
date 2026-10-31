@@ -11,7 +11,14 @@ holds the field names this module writes). No model is in the loop:
   assignee profile is scoped to beside each;
 - prs: the newest ``pr_opened`` events (``agents/platform/plugins/pr_opened``);
 - audit: the most recent fleet-audit run to finish, from the report store
-  (``skills/fleet-audit/scripts/report_status.py``).
+  (``skills/fleet-audit/scripts/report_status.py``);
+- first_report_pending: onboarding has filed its sweep, its first report is
+  not out yet (the findings nudge's own marker pair,
+  ``findings_nudge.first_report_markers``), and delivery has not yet put the
+  sweep's findings in the queue (``.bootstrap_findings_registered``), so a
+  cluster with no open finding has not been checked yet; first_message_pending
+  adds that no message has primed onboarding yet (no ``.bootstrap_greeted``)
+  and that the sweep is young enough for a message to prime it.
 
 Every list is capped here, so the answer stays a few kilobytes. A source that
 cannot be read is an error on the whole snapshot, never an empty list: an
@@ -29,10 +36,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import findings_nudge
 import findings_queue
 
 HERMES_HOME = os.environ.get("HERMES_HOME") or "/opt/data"
 PROFILES_DIR = Path(HERMES_HOME) / "profiles"
+# The onboarding plugin's marker for a message that primed onboarding, in the
+# same home as the nudge's pair. Past FIRST_MESSAGE_MAX_AGE_SECONDS after the
+# sweep was filed, the plugin primes nothing (its SCAN_MAX_AGE_SECONDS), so
+# the tab stops asking for a message then.
+FIRST_MESSAGE_MARKER = ".bootstrap_greeted"
+FIRST_MESSAGE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+# Delivery's record that the sweep's findings are in the queue
+# (agents/chat/scripts/bootstrap_delivery.py, FINDINGS_REGISTERED_MARKER),
+# written before its claim: from then on the fleet was checked, whether or not
+# the report's post ever lands.
+FINDINGS_REGISTERED_MARKER = ".bootstrap_findings_registered"
 # The fleet-audit skill's scripts, scaffolded into the platform profile; the
 # report store's reader (report_status) and the stream titles (audit_report)
 # live there.
@@ -279,6 +298,14 @@ def snapshot(
             board["prs"] = prs(kanban)
         except sqlite3.Error as exc:
             raise BoardError(f"the kanban board could not be read: {exc}") from None
+    home = (profiles_dir or PROFILES_DIR).parent
+    filed, out = findings_nudge.first_report_markers(home)
+    if filed.exists() and not out.exists() and not (home / FINDINGS_REGISTERED_MARKER).exists():
+        board["first_report_pending"] = True
+        stamp = findings_nudge._filed_at(filed)
+        young = stamp is not None and (now - stamp[0]).total_seconds() <= FIRST_MESSAGE_MAX_AGE_SECONDS
+        if young and not (home / FIRST_MESSAGE_MARKER).exists():
+            board["first_message_pending"] = True
     if audit is None:
         audit = default_audit
     last = audit()

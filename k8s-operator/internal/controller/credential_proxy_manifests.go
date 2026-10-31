@@ -2,11 +2,13 @@ package controller
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -61,6 +63,28 @@ import (
 // reference that hands the broker its memory limit names it too.
 const credentialProxyContainerName = "envoy-credential-proxy" // #nosec G101 -- Container name, not a credential.
 
+// credentialProxyPDBMaxUnavailable is the budget's one field, on one replica.
+//
+// What it does: nothing to any drain. With one pod, desiredHealthy is 1 - 1 =
+// 0, so the eviction of a Ready proxy is always allowed, and there is never a
+// second pod for a refusal to protect. What it buys is the declaration: this
+// pod may be evicted, and leaves by its SIGTERM path
+// (install_shutdown_handler in agents/platform/scripts/credential_proxy.py).
+// The chart writes the same budget for its single-replica Hindsight
+// workloads (charts/kube-agents/templates/pdb.yaml) for the same reason, and
+// the obtainability audit never flags maxUnavailable 1 and lets it stand at a
+// floor of one (agents/platform/governance/obtainability_audit_sop.md §3.4).
+//
+// The shapes that would protect something were rejected because each one
+// holds a node: minAvailable 1 or maxUnavailable 0 on one replica sets
+// disruptionsAllowed to 0 for good, so no node holding the proxy could drain,
+// upgrade or scale down without a human deleting the budget, which the same
+// audit reports as its critical blocking-pdb finding (§3.4). Two replicas,
+// which would let a budget mean something, are the design question
+// docs/designs/credential-proxy-single-pod.md records; the budget follows
+// the Deployment's scale if that reopens.
+const credentialProxyPDBMaxUnavailable = 1
+
 const (
 	// Where the federated token and the ADC config derived from it live. Both
 	// are inside the proxy container's mount namespace and nowhere else — that
@@ -111,7 +135,21 @@ const (
 	// hold the limit to at least two. An install raises the limit through
 	// spec.deployment.credentialProxy.resources (resolveCredentialProxyResources
 	// merges it over these defaults per key), which raises the admitted count;
-	// the caps stay here.
+	// the caps stay here. Concurrency is bought vertically, not with
+	// replicas: the broker is one pod by design
+	// (docs/designs/credential-proxy-single-pod.md).
+	//
+	// What the per-request figure does not cover is cluster size. 102Mi is a
+	// listing of a small cluster; kubectl builds the whole list before it
+	// prints, and the image's kubectl held 432Mi listing 4,000 pods as JSON
+	// and 1.3Gi as YAML (#2025). The budget cannot see that growth, so on a
+	// fleet with thousands of objects per cluster the limit has to hold the
+	// largest listing the fleet produces for every command that may run at
+	// once, plus the two fixed reserves (320Mi): eight 500Mi listings need
+	// about 4.2Gi, not the 2Gi below. The broker measures this itself
+	// (kubeagents_credential_proxy_child_peak_rss_bytes and its memory
+	// high-water log lines), and that is what a large fleet's override is
+	// sized from (#4315).
 	//
 	// Autopilot enforces a CPU:memory ratio between 1:1 and 1:6.5 GiB per vCPU
 	// and raises the smaller request to meet it, so a 500m pod is admitted at
@@ -142,16 +180,44 @@ const (
 	// under its state emptyDir) together with /tmp, so a runaway clone fills
 	// the container's allowance rather than the node's disk. A CR override
 	// that sets only limits.memory keeps all three of the others.
+	//
+	// The kubelet counts the pod's disk-backed emptyDirs, its writable layer
+	// and its logs together against the sum of its containers' ephemeral-storage
+	// limits, and this pod has one container, so this limit has to hold the
+	// state volume (credentialProxyStateSizeLimit) and /tmp
+	// (credentialProxyTmpSizeLimit) at their caps with room left for the layer
+	// and the logs: 5Gi + 2Gi + 1Gi. At the earlier 2Gi the kubelet evicted the
+	// pod as soon as state, /tmp and logs together crossed 2Gi, three times in
+	// ten days on a hyperscale fleet, while the 5Gi cap on the state volume was
+	// out of reach (#4314). TestCredentialProxyEphemeralStorageLimitCoversItsEmptyDirs
+	// holds the limit above the two caps together.
+	//
+	// There is no ephemeral-storage request, by design, and the API server
+	// defaults the request to this limit, so the pod requests 8Gi too: the
+	// chart's footprint file and its quota preflight sum it at that figure
+	// against requests.ephemeral-storage, and a namespace quota sized to the
+	// earlier 2Gi is short by 6Gi. Autopilot sets a pod's ephemeral-storage
+	// limit equal to its request whether or not bursting is on, so a request
+	// declared below this limit would put the limit back under the caps there,
+	// and the install's default cluster type is where the eviction would return;
+	// the request is left to follow the limit instead. 8Gi stays inside the 10Gi
+	// Autopilot admits per pod.
 	credentialProxyCPULimit              = "1"
 	credentialProxyMemoryLimit           = "2Gi"
-	credentialProxyEphemeralStorageLimit = "2Gi"
+	credentialProxyEphemeralStorageLimit = "8Gi"
+	// credentialProxyEphemeralStorageHeadroom is the part of the limit above
+	// the two emptyDir caps, for the writable layer and the container's logs.
+	// The sizing test holds the limit to the caps plus this.
+	credentialProxyEphemeralStorageHeadroom = "1Gi"
 	// The emptyDir sizeLimits of the broker's /tmp and of its state volume (the
 	// content workspace and vcs scratch). The kubelet evicts the pod when either
-	// fills, whatever the container's ephemeral-storage limit, so each is sized
-	// as the larger of its default here and that merged limit
-	// (credentialProxyEmptyDirSizeLimit): an override that raises the limit past
-	// a volume's default widens the volume with it, and the default render keeps
-	// these figures.
+	// fills, whatever the container's ephemeral-storage limit, and the default
+	// render keeps these figures, each under the container's limit so that a
+	// runaway in one volume cannot take the other's share. A CR override that
+	// raises the limit past credentialProxyEphemeralStorageLimit gives the
+	// whole excess to the state volume (credentialProxyEmptyDirSizeLimit),
+	// which is what a larger limit is raised for; /tmp keeps its cap, so the
+	// two caps and the headroom still add up to the limit at any override.
 	credentialProxyTmpSizeLimit    = "2Gi"
 	credentialProxyStateSizeLimit  = "5Gi"
 	credentialProxyTmpVolumeName   = "credential-proxy-tmp"   // #nosec G101 -- Volume name, not a credential
@@ -342,16 +408,34 @@ func buildCredentialProxyService(agent *agentv1alpha1.PlatformAgent) *corev1.Ser
 	return svc
 }
 
-// buildCredentialProxyDeployment renders the standalone proxy pod.
+// buildCredentialProxyDeployment is buildCredentialProxyDeploymentForPlugins
+// with no plugins.
+func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHash string) *appsv1.Deployment {
+	return buildCredentialProxyDeploymentForPlugins(agent, policyHash, nil, true, credentialProxyProfileConfig{})
+}
+
+// buildCredentialProxyDeploymentForPlugins renders the standalone proxy pod.
 //
 // Recreate, not RollingUpdate. The Google Chat relay pulls from a Pub/Sub
-// subscription and buffers what it pulled until the gateway fetches it over this
-// Service; two pods pulling the same subscription during a rollout means
-// messages land in the buffer of the pod that is going away, and the Service
-// then load-balances the gateway's fetch to the other one. A few seconds of
-// unavailability is the cheaper failure — the gateway retries its long poll,
-// while a dropped chat message is silent.
-func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHash string) *appsv1.Deployment {
+// subscription when the gateway fetches over this Service and keeps each
+// message's ack id in this process; with two pods during a rollout, an ack the
+// Service sends to the other pod fails, and a message that misses its ack
+// deadline is delivered again and its turn runs twice. A few seconds of
+// unavailability is the cheaper failure: the gateway retries its long poll.
+//
+// One replica, by design. The Chat relay's ack ids, the Slack relay's
+// event queue and receipts, and the content workspace live in this process or its
+// emptyDir, so a second pod behind the Service breaks them; only the exec route
+// scales as it is. docs/designs/credential-proxy-single-pod.md records the
+// decision, the load it was sized against, and the split exec tier to build if
+// it reopens. What one pod costs on an eviction or a rollout, and how the pod
+// leaves, is buildCredentialProxyPDB's and the proxy's SIGTERM handler's.
+//
+// The AgentPlugins resolved for the agent reach the container's environment
+// (buildCredentialProxyEnvForPlugins); buildCredentialProxyDeployment is this
+// with none. So does the profile role's configuration (credential_proxy_profiles.go):
+// the AgentProfile identities and the task-signing public key.
+func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool, profiles credentialProxyProfileConfig) *appsv1.Deployment {
 	saName := agent.Name
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
 		saName = agent.Spec.Security.ServiceAccountName
@@ -410,7 +494,7 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 					Affinity:         affinity,
 					NodeSelector:     nodeSelector,
 					Tolerations:      tolerations,
-					Containers:       []corev1.Container{buildCredentialProxyContainer(agent)},
+					Containers:       []corev1.Container{buildCredentialProxyContainerForPlugins(agent, agentPlugins, mcpIdentityOwned, profiles)},
 					Volumes:          buildCredentialProxyRuntimeVolumes(agent),
 				},
 			},
@@ -421,7 +505,33 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 	return dep
 }
 
-// buildCredentialProxyContainer is the credential half of the old sidecar: Envoy
+// buildCredentialProxyPDB renders the proxy's PodDisruptionBudget:
+// maxUnavailable credentialProxyPDBMaxUnavailable (the argument is on the
+// constant), AlwaysAllow so a proxy that is Running and NotReady, during its
+// own cold start or a broken image, can still be evicted, and the
+// Deployment's own name and selector, so the budget cannot outlive the
+// Deployment's labels or select another workload's pods.
+func buildCredentialProxyPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptionBudget {
+	pdb := &policyv1.PodDisruptionBudget{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"},
+		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable:             ptr.To(intstr.FromInt32(credentialProxyPDBMaxUnavailable)),
+			Selector:                   &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
+			UnhealthyPodEvictionPolicy: ptr.To(policyv1.AlwaysAllow),
+		},
+	}
+	withCommonLabels(pdb, agent)
+	return pdb
+}
+
+// buildCredentialProxyContainer is buildCredentialProxyContainerForPlugins with
+// no plugins.
+func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
+	return buildCredentialProxyContainerForPlugins(agent, nil, true, credentialProxyProfileConfig{})
+}
+
+// buildCredentialProxyContainerForPlugins is the credential half of the old sidecar: Envoy
 // and the credential runtime, with the chat relays the runtime hosts. The event
 // watcher and the agent API authenticator stay in the gateway pod, because both
 // talk to processes on that pod's loopback — see buildAgentAPIAuthSidecar.
@@ -429,7 +539,7 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 // One variant, because the broker has one placement: a Deployment of its own.
 // It shares no pod with the agent, which holds the credentials it mints from,
 // and no pod with the sandbox, which runs model-authored code.
-func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
+func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool, profiles credentialProxyProfileConfig) corev1.Container {
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
@@ -438,7 +548,7 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 	// buildCredentialProxyEnv. 0.0.0.0 because both callers arrive over the
 	// Service — the sandbox's wrapped CLIs and the gateway's chat relays, which
 	// are hosted in this same process, and one listener serves both.
-	envVars := buildCredentialProxyEnv(agent)
+	envVars := buildCredentialProxyEnvForPlugins(agent, agentPlugins, mcpIdentityOwned, profiles)
 	volumeMounts := buildCredentialProxyVolumeMounts(agent)
 	securityContext := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -656,6 +766,9 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 		// that lets it connect.
 		callers = append(callers, networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()}})
 	}
+	// The MCP server's pod, under its flag, on the same condition as its
+	// place on allowedBrokerCallers (a2aMCPBrokerPeers).
+	callers = append(callers, a2aMCPBrokerPeers(agent)...)
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
@@ -737,20 +850,17 @@ var (
 // readable because that pod sets an fsGroup, which is what makes kubelet apply
 // group ownership to a projected file.
 //
-// The /tmp and state emptyDirs are widened here, not in
-// buildCredentialProxyVolumes, because the gateway pod shares the /tmp volume's
-// definition and sizes it from its own agentAPIAuth override, not the broker's.
-// buildAgentAPIAuthVolumes applies that override to the gateway pod's copy.
+// The state emptyDir is widened here, not in buildCredentialProxyVolumes,
+// because the gateway pod shares the /tmp volume's definition and sizes it from
+// its own agentAPIAuth override, not the broker's; the broker's /tmp keeps its
+// cap at any override. buildAgentAPIAuthVolumes applies the sidecar's override
+// to the gateway pod's copy.
 func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	volumes := filterVolumes(buildCredentialProxyVolumes(agent), credentialProxyRuntimeVolumeNames)
 	ephemeralLimit := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
 	for i := range volumes {
-		emptyDir := volumes[i].EmptyDir
-		switch volumes[i].Name {
-		case credentialProxyTmpVolumeName:
-			emptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyTmpSizeLimit, ephemeralLimit)
-		case credentialProxyStateVolumeName:
-			emptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyStateSizeLimit, ephemeralLimit)
+		if volumes[i].Name == credentialProxyStateVolumeName {
+			volumes[i].EmptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyStateSizeLimit, credentialProxyEphemeralStorageLimit, ephemeralLimit)
 		}
 	}
 	volumes = append(volumes, buildGitopsStateVolume(agent))
@@ -758,12 +868,21 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }
 
-// credentialProxyEmptyDirSizeLimit is the larger of a volume's default
-// sizeLimit and the container's merged ephemeral-storage limit.
-func credentialProxyEmptyDirSizeLimit(defaultSize string, ephemeralLimit resource.Quantity) *resource.Quantity {
+// credentialProxyEmptyDirSizeLimit is a volume's default sizeLimit plus
+// whatever a CR override has raised the container's merged ephemeral-storage
+// limit above the container's default limit. The comparison is with the
+// container's default and not the volume's, because the broker's default
+// limit is above both of its volumes' caps on purpose (the kubelet sums the
+// volumes against it), and comparing with the volume would widen it to the
+// limit on every default render. Adding the excess rather than taking the
+// limit keeps the other volume's cap and the layer-and-log headroom intact
+// under the raised limit; for a volume whose cap equals the default limit,
+// the gateway sidecar's /tmp, the two readings coincide.
+func credentialProxyEmptyDirSizeLimit(defaultSize, defaultLimit string, ephemeralLimit resource.Quantity) *resource.Quantity {
 	size := resource.MustParse(defaultSize)
-	if ephemeralLimit.Cmp(size) > 0 {
-		size = ephemeralLimit.DeepCopy()
+	if excess := ephemeralLimit.DeepCopy(); excess.Cmp(resource.MustParse(defaultLimit)) > 0 {
+		excess.Sub(resource.MustParse(defaultLimit))
+		size.Add(excess)
 	}
 	return &size
 }
@@ -772,7 +891,7 @@ func credentialProxyEmptyDirSizeLimit(defaultSize string, ephemeralLimit resourc
 // the watcher reads is not here: the gateway pod already declares it.
 //
 // The /tmp emptyDir is widened to the sidecar's own merged ephemeral-storage
-// limit, as buildCredentialProxyRuntimeVolumes widens the broker's: the sidecar
+// limit, as buildCredentialProxyRuntimeVolumes widens the broker's state: the sidecar
 // is the gateway pod's container and the kubelet evicts the pod when the volume
 // passes its sizeLimit, whatever the container's ephemeral-storage limit. The
 // override read here is agentAPIAuth's, not the broker's, so the gateway pod
@@ -784,7 +903,7 @@ func buildAgentAPIAuthVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volum
 	ephemeralLimit := resolveAgentAPIAuthResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
 	for i := range volumes {
 		if volumes[i].Name == credentialProxyTmpVolumeName {
-			volumes[i].EmptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyTmpSizeLimit, ephemeralLimit)
+			volumes[i].EmptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyTmpSizeLimit, agentAPIAuthEphemeralStorageLimit, ephemeralLimit)
 		}
 	}
 	return volumes
@@ -808,25 +927,135 @@ func filterVolumes(volumes []corev1.Volume, keep map[string]bool) []corev1.Volum
 // whose author believes it took effect, and the failure this guards against is
 // one nobody looks for: the manifest applies cleanly and the agent quietly gains
 // read access to the credentials the proxy exists to keep from it.
-func validateExtraVolumeMounts(agent *agentv1alpha1.PlatformAgent) string {
-	if agent.Spec.Deployment == nil {
-		return ""
+func validateExtraVolumeMounts(agent *agentv1alpha1.PlatformAgent, agentPlugins ...*agentv1alpha1.AgentPlugin) string {
+	var extraMounts []string
+	var containerMounts []string
+	var reservedVolumes []string
+	var forgeVolumeSources []string
+	var forgeEnvRefs []string
+	var forgeSecrets []string
+	if agent.Spec.Integration != nil {
+		forgeSecrets = agent.Spec.Integration.ForgeCredentialSecretNames()
 	}
-	var forbidden []string
-	for _, mount := range agent.Spec.Deployment.ExtraVolumeMounts {
-		if agentForbiddenVolumeNames[mount.Name] {
-			forbidden = append(forbidden, fmt.Sprintf("%s (at %s)", mount.Name, mount.MountPath))
+
+	if agent.Spec.Deployment != nil {
+		for _, mount := range agent.Spec.Deployment.ExtraVolumeMounts {
+			if agentForbiddenVolumeNames[mount.Name] || agentv1alpha1.IsForgeCredentialVolumeName(mount.Name) {
+				extraMounts = append(extraMounts, fmt.Sprintf("%s (at %s)", mount.Name, mount.MountPath))
+			}
+		}
+		for i, c := range agent.Spec.Deployment.InitContainers {
+			for _, mount := range c.VolumeMounts {
+				if agentForbiddenVolumeNames[mount.Name] || agentv1alpha1.IsForgeCredentialVolumeName(mount.Name) {
+					containerMounts = append(containerMounts, fmt.Sprintf("spec.deployment.initContainers[%d].volumeMounts (%s: %s at %s)", i, c.Name, mount.Name, mount.MountPath))
+				}
+			}
+		}
+		for i, c := range agent.Spec.Deployment.Sidecars {
+			for _, mount := range c.VolumeMounts {
+				if agentForbiddenVolumeNames[mount.Name] || agentv1alpha1.IsForgeCredentialVolumeName(mount.Name) {
+					containerMounts = append(containerMounts, fmt.Sprintf("spec.deployment.sidecars[%d].volumeMounts (%s: %s at %s)", i, c.Name, mount.Name, mount.MountPath))
+				}
+			}
+		}
+
+		for _, volList := range []struct {
+			field   string
+			volumes []corev1.Volume
+		}{
+			{"spec.deployment.extraVolumes", agent.Spec.Deployment.ExtraVolumes},
+			{"spec.deployment.sidecarVolumes", agent.Spec.Deployment.SidecarVolumes},
+		} {
+			for i, vol := range volList.volumes {
+				if agentForbiddenVolumeNames[vol.Name] || agentv1alpha1.IsForgeCredentialVolumeName(vol.Name) {
+					reservedVolumes = append(reservedVolumes, fmt.Sprintf("%s[%d].name (%s)", volList.field, i, vol.Name))
+					continue
+				}
+				if agent.Spec.Integration != nil {
+					for _, route := range agent.Spec.Integration.ForgeCredentialRoutes(vol) {
+						forgeVolumeSources = append(forgeVolumeSources, fmt.Sprintf("%s[%d] (%s -> Secret %s)", volList.field, i, vol.Name, route.Secret))
+					}
+				}
+			}
+		}
+
+		for i, e := range agent.Spec.Deployment.Env {
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+				forgeEnvRefs = append(forgeEnvRefs, fmt.Sprintf("spec.deployment.env[%d] (%s -> Secret %s)", i, e.Name, e.ValueFrom.SecretKeyRef.Name))
+			}
+		}
+		for _, cList := range []struct {
+			field      string
+			containers []corev1.Container
+		}{
+			{"spec.deployment.initContainers", agent.Spec.Deployment.InitContainers},
+			{"spec.deployment.sidecars", agent.Spec.Deployment.Sidecars},
+		} {
+			for ci, c := range cList.containers {
+				for ei, e := range c.Env {
+					if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+						forgeEnvRefs = append(forgeEnvRefs, fmt.Sprintf("%s[%d].env[%d] (%s.%s -> Secret %s)", cList.field, ci, ei, c.Name, e.Name, e.ValueFrom.SecretKeyRef.Name))
+					}
+				}
+				for efi, ef := range c.EnvFrom {
+					if ef.SecretRef != nil && slices.Contains(forgeSecrets, ef.SecretRef.Name) {
+						forgeEnvRefs = append(forgeEnvRefs, fmt.Sprintf("%s[%d].envFrom[%d] (%s -> Secret %s)", cList.field, ci, efi, c.Name, ef.SecretRef.Name))
+					}
+				}
+			}
 		}
 	}
-	if len(forbidden) == 0 {
-		return ""
+
+	for _, plugin := range agentPlugins {
+		if plugin == nil {
+			continue
+		}
+		for ei, e := range plugin.Spec.Env {
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+				forgeEnvRefs = append(forgeEnvRefs, fmt.Sprintf("AgentPlugin %s spec.env[%d] (%s -> Secret %s)", plugin.Name, ei, e.Name, e.ValueFrom.SecretKeyRef.Name))
+			}
+		}
 	}
-	return fmt.Sprintf(
-		"spec.deployment.extraVolumeMounts names volumes owned by the credential proxy: %s. "+
-			"Those hold the broker's home directory, its generated kubeconfigs, its git "+
-			"workspaces and the watchers' broker token, and mounting them into the agent "+
-			"container defeats the credential isolation the proxy provides. Remove them, or "+
-			"use a volume of your own.",
-		strings.Join(forbidden, ", "),
-	)
+	var messages []string
+	if len(extraMounts) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"spec.deployment.extraVolumeMounts names volumes owned by the credential proxy: %s. "+
+				"Those hold the broker's home directory, its generated kubeconfigs, its git "+
+				"workspaces, and its forge credentials or CA bundles, and mounting them into the agent container "+
+				"defeats the credential isolation the proxy provides. Remove them, or use a volume of your own.",
+			strings.Join(extraMounts, ", "),
+		))
+	}
+	if len(containerMounts) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"User-authored container volumeMounts name volumes owned by the credential proxy: %s. "+
+				"Those volumes belong to the credential proxy alone and may not be mounted into initContainers or sidecars. "+
+				"Remove those volumeMounts, or use a volume of your own.",
+			strings.Join(containerMounts, ", "),
+		))
+	}
+	if len(reservedVolumes) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"Volume declarations use names reserved by the operator for the credential proxy: %s. "+
+				"Choose a different volume name.",
+			strings.Join(reservedVolumes, ", "),
+		))
+	}
+	if len(forgeVolumeSources) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"Volume declarations reference forge credential Secrets owned by the credential proxy: %s. "+
+				"Forge credentialsRef Secrets are mounted into the credential proxy alone so "+
+				"forge credentials never reach the agent Pod. Remove those volume declarations from spec.deployment.",
+			strings.Join(forgeVolumeSources, ", "),
+		))
+	}
+	if len(forgeEnvRefs) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"Environment variable declarations reference forge credential Secrets owned by the credential proxy: %s. "+
+				"Forge credentialsRef Secrets are mounted into the credential proxy alone so "+
+				"forge credentials never reach the agent Pod. Remove those Secret references from spec.deployment or the offending AgentPlugin.",
+			strings.Join(forgeEnvRefs, ", "),
+		))
+	}
+	return strings.Join(messages, " ")
 }

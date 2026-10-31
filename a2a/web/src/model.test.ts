@@ -296,6 +296,114 @@ describe("artifact-update", () => {
     expect(answers.map((a) => a.text)).toEqual(["fleet: 3 clusters green", "prod: green"]);
     expect(state.tasks.get("task-1")?.artifacts.get("result")?.text).toBe("prod: green");
   });
+
+  function usageChunk(state: UiState, data: unknown, append = false): UiState {
+    return onSubject(
+      state,
+      "a2a.tasks.platform.task-1.events",
+      env({
+        kind: "artifact-update",
+        taskId: "task-1",
+        contextId: "ctx-1",
+        from: bridge,
+        payload: {
+          taskId: "task-1",
+          contextId: "ctx-1",
+          artifact: { artifactId: "art-usage", name: "usage", parts: [{ kind: "data", data }] },
+          append,
+        },
+      }),
+    );
+  }
+
+  it("sums the usage artifact's turns onto the task and keeps it out of the transcript", () => {
+    let state = submission();
+    expect(state.tasks.get("task-1")?.usage).toBeUndefined();
+    state = usageChunk(state, { model: "claude-opus-5-5", inputTokens: 1000, outputTokens: 40, durationMs: 3000 });
+    state = usageChunk(state, { inputTokens: 200, outputTokens: 10, costUsd: 0.01, durationMs: 500 }, true);
+    expect(state.tasks.get("task-1")?.usage).toEqual({
+      model: "claude-opus-5-5",
+      inputTokens: 1200,
+      outputTokens: 50,
+      costUsd: 0.01,
+      durationMs: 3500,
+    });
+    expect(state.chat).toHaveLength(1); // just the ask
+  });
+
+  it("gives each turn's answer the usage part published ahead of it as its footer", () => {
+    let state = submission();
+    state = usageChunk(state, { inputTokens: 1000, outputTokens: 40, durationMs: 3000 });
+    state = artifact(state, "turn", "fleet: ");
+    state = artifact(state, "turn", "3 clusters green", true);
+    state = usageChunk(state, { inputTokens: 200, outputTokens: 10, durationMs: 500 }, true);
+    state = artifact(state, "result", "prod: green");
+    const answers = state.chat.filter((c) => c.kind === "answer");
+    expect(answers.map((a) => a.usage?.inputTokens)).toEqual([1000, 200]);
+    expect(answers[0].text).toBe("fleet: 3 clusters green");
+    // The part is spent on the answer it preceded: a further answer without
+    // its own part carries no footer.
+    state = artifact(state, "result", "prod: still green");
+    const again = state.chat.filter((c) => c.kind === "answer");
+    expect(again[2].usage).toBeUndefined();
+  });
+
+  it("sums the parts published since the last answer into the next answer's footer", () => {
+    // The worker adapter publishes one part per harness result line and one
+    // answer for the steered turns they settle, so two parts before one
+    // answer are that answer's cost, the same figure the tasks table shows.
+    let state = submission();
+    state = usageChunk(state, { inputTokens: 100, outputTokens: 5, costUsd: 0.01 });
+    state = usageChunk(state, { inputTokens: 50, outputTokens: 2, costUsd: 0.005 }, true);
+    state = artifact(state, "result", "settled");
+    const answer = state.chat.filter((c) => c.kind === "answer")[0];
+    expect(answer.usage).toEqual({ model: undefined, inputTokens: 150, outputTokens: 7, costUsd: 0.015, durationMs: undefined });
+    expect(state.tasks.get("task-1")?.usage?.costUsd).toBe(0.015);
+  });
+
+  it("replaces the task's turns on a non-append usage chunk and extends them on append, as the library fold does", () => {
+    let state = submission();
+    state = usageChunk(state, { inputTokens: 1000 });
+    expect(state.tasks.get("task-1")?.usage?.inputTokens).toBe(1000);
+    // A re-publish of the whole artifact, non-append: counted once, not on top.
+    state = onSubject(
+      state,
+      "a2a.tasks.platform.task-1.events",
+      env({
+        kind: "artifact-update",
+        taskId: "task-1",
+        contextId: "ctx-1",
+        from: bridge,
+        payload: {
+          taskId: "task-1",
+          contextId: "ctx-1",
+          artifact: {
+            artifactId: "art-usage",
+            name: "usage",
+            parts: [
+              { kind: "data", data: { inputTokens: 1000 } },
+              { kind: "data", data: { inputTokens: 200 } },
+            ],
+          },
+          append: false,
+        },
+      }),
+    );
+    expect(state.tasks.get("task-1")?.usage?.inputTokens).toBe(1200);
+    expect(state.tasks.get("task-1")?.turnUsage?.inputTokens).toBe(1200);
+    state = usageChunk(state, { inputTokens: 50 }, true);
+    expect(state.tasks.get("task-1")?.usage?.inputTokens).toBe(1250);
+  });
+
+  it("skips a usage part that is not usage, as the library's reader does", () => {
+    let state = submission();
+    state = usageChunk(state, { model: "m" }); // a name is not a figure
+    state = usageChunk(state, { inputTokens: -1 }, true);
+    state = usageChunk(state, "1200 tokens", true);
+    expect(state.tasks.get("task-1")?.usage).toBeUndefined();
+    state = usageChunk(state, { outputTokens: 3, vendorNote: "x" }, true);
+    expect(state.tasks.get("task-1")?.usage).toEqual({ outputTokens: 3 });
+  });
 });
 
 describe("directory and topics", () => {

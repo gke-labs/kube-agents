@@ -1,0 +1,160 @@
+{
+  "version": "b410f03c5a5cf23f",
+  "identities": [
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
+      "user": "provision",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.agent.platform.topology-skew",
+          "a2a.topics.shared.blueprint",
+          "a2a.topics.shared.annotations",
+          "$JS.API.INFO",
+          "$JS.API.STREAM.NAMES",
+          "$JS.API.STREAM.LIST",
+          "$JS.API.STREAM.CREATE.TASKS",
+          "$JS.API.STREAM.CREATE.DIRECTORY",
+          "$JS.API.STREAM.CREATE.TOPICS-STATE",
+          "$JS.API.STREAM.CREATE.TOPICS-JOURNAL",
+          "$JS.API.STREAM.CREATE.KV_runtime-state",
+          "$JS.API.STREAM.CREATE.KV_session-state",
+          "$JS.API.STREAM.CREATE.KV_cap",
+          "$JS.API.STREAM.CREATE.KV_feedback",
+          "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
+          "$JS.API.STREAM.INFO.TASKS",
+          "$JS.API.STREAM.INFO.DIRECTORY",
+          "$JS.API.STREAM.INFO.TOPICS-STATE",
+          "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+          "$JS.API.STREAM.INFO.KV_runtime-state",
+          "$JS.API.STREAM.INFO.KV_session-state",
+          "$JS.API.STREAM.INFO.KV_cap",
+          "$JS.API.STREAM.INFO.KV_feedback",
+          "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+          "_INBOX.provision.>"
+        ],
+        "subscribe": [
+          "a2a.topics.>",
+          "_INBOX.provision.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-session",
+      "user": "session",
+      "account": "APP",
+      "grants": {
+        "publish": null,
+        "subscribe": null
+      },
+      "narrowing": "pod"
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-gateway-agent",
+      "user": "agent",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.agent.platform.topology-skew",
+          "a2a.topics.shared.blueprint",
+          "a2a.topics.shared.annotations",
+          "$JS.API.STREAM.INFO.TOPICS-STATE",
+          "$JS.API.DIRECT.GET.TOPICS-STATE.>",
+          "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+          "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
+          "chat.notify.gchat",
+          "chat.notify.slack",
+          "chat.notify.console",
+          "_INBOX.agent.>"
+        ],
+        "subscribe": [
+          "a2a.topics.>",
+          "chat.notify.reply.agent.>",
+          "_INBOX.agent.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-verifier",
+      "user": "verifier",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.cap.reply.>",
+          "$JS.API.STREAM.INFO.KV_cap",
+          "$JS.API.DIRECT.GET.KV_cap",
+          "$JS.API.STREAM.MSG.GET.KV_cap",
+          "_INBOX.verifier.>"
+        ],
+        "subscribe": [
+          "a2a.cap.verify.*",
+          "_INBOX.verifier.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-operator:kubeagents-controller-manager",
+      "user": "operator",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.agents.*",
+          "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
+          "$JS.API.CONSUMER.CREATE.PROFILE_SUBMITS.*.a2a.submit.*.*.*.*",
+          "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.*",
+          "$JS.API.CONSUMER.DELETE.PROFILE_SUBMITS.*"
+        ],
+        "subscribe": [
+          "_INBOX.operator.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system-profiles:agentprofile-tse-read",
+      "user": "profile-tse-read",
+      "account": "APP",
+      "grants": {
+        "publish": null,
+        "subscribe": null
+      },
+      "narrowing": "profile",
+      "profile": "tse",
+      "tier": "read"
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-dispatcher",
+      "user": "dispatcher",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-tse-read-top",
+          "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-tse-read-top",
+          "$JS.ACK.PROFILE_SUBMITS.profile-tse-read-top.>",
+          "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-tse-read-child",
+          "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-tse-read-child",
+          "$JS.ACK.PROFILE_SUBMITS.profile-tse-read-child.>",
+          "a2a.tasks.tse.*.supervisor",
+          "$KV.PROFILE_LEASES.>",
+          "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+          "$JS.API.DIRECT.GET.KV_PROFILE_LEASES.>",
+          "$JS.API.CONSUMER.CREATE.KV_PROFILE_LEASES.>",
+          "$JS.API.CONSUMER.DELETE.KV_PROFILE_LEASES.*",
+          "$JS.FC.KV_PROFILE_LEASES.>",
+          "a2a.dispatch.*.*.*",
+          "a2a.cap.verify.dispatcher",
+          "_INBOX.dispatcher.>"
+        ],
+        "subscribe": [
+          "a2a.dispatch.*.*.*.accept",
+          "a2a.dispatch.*.*.*.lease",
+          "a2a.cap.reply.dispatcher.>",
+          "_INBOX.dispatcher.>"
+        ]
+      }
+    }
+  ]
+}

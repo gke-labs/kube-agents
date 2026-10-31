@@ -10,7 +10,9 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+import urllib.error
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +33,116 @@ QUIET_AS_OF = datetime(2026, 8, 28, tzinfo=timezone.utc)
 # inside the recent window (#2747).
 SATURATED_DIR = os.path.join(TESTDATA, "saturated")
 SATURATED_AS_OF = datetime(2026, 10, 8, 18, 30, tzinfo=timezone.utc)
+
+
+RESOURCES_DOC = {"items": [
+    {"metadata": {"name": "kube-agents-evals-3"}, "status": {"state": "reconciling", "owner": "fleet-reconcile", "lastUpdate": "2026-10-27T08:31:00Z"}},
+    {"metadata": {"name": "kube-agents-evals-4"}, "status": {"state": "busy", "owner": "pull-kube-agents-smoke-test-2115", "lastUpdate": "2026-10-27T08:40:00Z"}},
+    {"metadata": {"name": "kube-agents-evals-5"}, "status": {"state": "free", "owner": "", "lastUpdate": "2026-10-27T08:00:00Z"}},
+    "not an object",
+    {"metadata": {}, "status": {"owner": "x"}},
+]}
+
+
+class HeldProjectsTest(unittest.TestCase):
+    def test_the_held_map_names_each_holders_project(self):
+        self.assertEqual(pp._held_from(RESOURCES_DOC), {
+            "kube-agents-evals-3": {"owner": "fleet-reconcile", "state": "reconciling", "since": "2026-10-27T08:31:00Z"},
+            "kube-agents-evals-4": {"owner": "pull-kube-agents-smoke-test-2115", "state": "busy", "since": "2026-10-27T08:40:00Z"},
+        })
+
+    def test_from_dir_reads_the_resources_file_or_says_it_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx", from_dir=tmp).ok)
+            with open(os.path.join(tmp, pp.BOSKOS_RESOURCES_FILE), "w") as fh:
+                json.dump(RESOURCES_DOC, fh)
+            source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx", from_dir=tmp)
+            self.assertTrue(source.ok)
+            self.assertEqual(sorted(source.value), ["kube-agents-evals-3", "kube-agents-evals-4"])
+            # A capture that is not an object (`jq .items`) is an error line, not a traceback.
+            Path(tmp, pp.BOSKOS_RESOURCES_FILE).write_text("[]")
+            shape = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx", from_dir=tmp)
+        self.assertFalse(shape.ok)
+        self.assertIn("not a JSON object", shape.error)
+
+    def test_the_kubectl_path_lists_the_resource_objects(self):
+        calls = []
+        def fake_run(cmd, timeout=0):
+            calls.append((list(cmd), timeout))
+            return 0, json.dumps(RESOURCES_DOC), ""
+        with unittest.mock.patch.object(pp, "run_cmd", fake_run), unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/kubectl"):
+            source = pp.fetch_held(pp.BOSKOS_VIA_KUBECTL, "my-ctx")
+        self.assertTrue(source.ok)
+        self.assertEqual(calls, [(["kubectl", "--context", "my-ctx", "-n", "boskos", "get", "resources.boskos.k8s.io", "-o", "json"], pp.BOSKOS_TIMEOUT_SECONDS)], "the Boskos timeout, like the other Boskos reads")
+        with unittest.mock.patch.object(pp, "run_cmd", lambda cmd, timeout=0: (0, "[]", "")), unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/kubectl"):
+            self.assertIn("not a JSON object", pp.fetch_held(pp.BOSKOS_VIA_KUBECTL, "my-ctx").error)
+        with unittest.mock.patch.object(pp, "run_cmd", lambda cmd, timeout=0: (1, "", "Error from server (Forbidden)")), unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/kubectl"):
+            denied = pp.fetch_held(pp.BOSKOS_VIA_KUBECTL, "my-ctx")
+        self.assertFalse(denied.ok)
+        self.assertIn("Forbidden", denied.error)
+
+    def test_the_in_cluster_path_needs_the_pods_environment(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx")
+        self.assertFalse(source.ok)
+        self.assertIn("not running in a cluster", source.error)
+        self.assertFalse(pp.fetch_held(pp.BOSKOS_VIA_NONE, "ctx").ok)
+
+    def test_the_in_cluster_path_reads_as_the_pod(self):
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        seen = {}
+        def fake_urlopen(request, timeout=None, context=None):
+            seen.update(url=request.full_url, auth=request.get_header("Authorization"), timeout=timeout)
+            if seen.get("code"):
+                raise urllib.error.HTTPError(request.full_url, seen["code"], "nope", {}, None)
+            return Response(json.dumps(seen.get("body", RESOURCES_DOC)).encode("utf-8"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            token, ca = Path(tmp, "token"), Path(tmp, "ca.crt")
+            token.write_text("pod-token\n")
+            ca.write_text("not read: the TLS context is stubbed")
+            env = {pp.IN_CLUSTER_HOST_ENV: "10.0.0.1", pp.IN_CLUSTER_PORT_ENV: "443"}
+            with unittest.mock.patch.dict(os.environ, env), \
+                    unittest.mock.patch.object(pp, "IN_CLUSTER_TOKEN_FILE", str(token)), \
+                    unittest.mock.patch.object(pp, "IN_CLUSTER_CA_FILE", str(ca)), \
+                    unittest.mock.patch.object(pp.ssl, "create_default_context", lambda cafile=None: cafile), \
+                    unittest.mock.patch.object(pp.urllib.request, "urlopen", fake_urlopen):
+                source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx")
+                self.assertTrue(source.ok, source.error)
+                self.assertEqual(sorted(source.value), ["kube-agents-evals-3", "kube-agents-evals-4"])
+                self.assertEqual((seen["url"], seen["auth"], seen["timeout"]), (f"https://10.0.0.1:443{pp.BOSKOS_RESOURCES_API_PATH}", "Bearer pod-token", pp.BOSKOS_TIMEOUT_SECONDS))
+                # The answer the periodic gets until the RoleBinding exists.
+                seen["code"] = 403
+                denied = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx")
+                self.assertFalse(denied.ok)
+                self.assertIn("HTTP 403", denied.error)
+                self.assertIn("boskos-crd-reader", denied.error)
+                seen["code"], seen["body"] = None, []
+                self.assertIn("not a JSON object", pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx").error)
+                token.unlink()
+                self.assertIn("no service-account token", pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx").error)
+
+    def test_measure_publishes_held_and_its_error(self):
+        code, out = run(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1, as_json=True)
+        summary = json.loads(out)
+        self.assertIn("held", summary)
+        self.assertIsNone(summary["held"])
+        self.assertIn(pp.BOSKOS_RESOURCES_FILE, summary["held_error"])
+        # With the file beside the other artifacts the map is published as read.
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in os.listdir(BREACH_DIR):
+                os.symlink(os.path.join(BREACH_DIR, name), os.path.join(tmp, name))
+            with open(os.path.join(tmp, pp.BOSKOS_RESOURCES_FILE), "w") as fh:
+                json.dump(RESOURCES_DOC, fh)
+            code, out = run(from_dir=tmp, as_of=BREACH_AS_OF, window_days=1, as_json=True)
+        summary = json.loads(out)
+        self.assertEqual((summary["held"], summary["held_error"]), (pp._held_from(RESOURCES_DOC), None))
 
 
 def run(**kwargs):
@@ -847,6 +959,7 @@ class LiveClock(unittest.TestCase):
         calls = []
         with unittest.mock.patch.object(pp, "collect_waits", return_value=pp.Source(error="not read")), \
                 unittest.mock.patch.object(pp, "fetch_pool_state", return_value=pp.Source(error="not read")), \
+                unittest.mock.patch.object(pp, "fetch_held", return_value=pp.Source(error="not read")), \
                 unittest.mock.patch.object(pp, "fetch_live_queue",
                                            side_effect=lambda now, from_dir=None: calls.append(now) or pp.Source(error="not read")):
             with contextlib.redirect_stdout(io.StringIO()):
@@ -886,7 +999,7 @@ class SweepDeadline(unittest.TestCase):
     STRADDLING_BUILD = 2092904488661684225
     STRADDLING_CREATED = datetime(2026, 8, 26, 22, 0, tzinfo=timezone.utc)
 
-    def _sweep(self, clock):
+    def _sweep(self, clock, vanished=()):
         """collect_waits over two days, with monotonic() reading from `clock`."""
         builds = (self.OLD_BUILD, self.NEW_BUILD, self.STRADDLING_BUILD)
         entries = {build: str(build) for build in builds}
@@ -901,12 +1014,37 @@ class SweepDeadline(unittest.TestCase):
 
         with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
                 unittest.mock.patch.object(pp, "_index_entries_from_gcs",
-                                           return_value=(entries, None)), \
+                                           return_value=(entries, None, list(vanished))), \
                 unittest.mock.patch.object(pp, "_wait_from_gcs", side_effect=wait_for), \
                 unittest.mock.patch.object(pp.time, "monotonic", side_effect=clock):
             return pp.collect_waits(
                 self.AS_OF - timedelta(days=2), self.AS_OF, deadline_seconds=10
             )
+
+    def test_a_vanished_pointer_on_an_unread_day_is_not_named(self):
+        """The report says the days the deadline cut are missing, not empty;
+        a pointer that vanished on one of them is not listed beside the
+        builds from the days that were read."""
+        # Four pointers. The first two are on the cut day (08-26), the second
+        # within the six hours a window slack would admit: both dropped,
+        # because the ID encodes the end of the wait, so a build below the
+        # measured start was created below it too, and no slack applies on
+        # that side. The last two are on the day that was read (08-27), the
+        # fourth after that day's last landed build: both kept, because the
+        # window the sweep covered is the bound, not the builds it read.
+        def at(moment):
+            return str(int(moment.timestamp() * 1000 - pp.SNOWFLAKE_EPOCH_MS)
+                       << pp.SNOWFLAKE_TIMESTAMP_SHIFT)
+        day = datetime(2026, 8, 27, tzinfo=timezone.utc)
+        gone = [{"build_id": str(self.OLD_BUILD + 1), "error": pp.INDEX_POINTER_VANISHED},
+                {"build_id": at(day - timedelta(hours=5)), "error": pp.INDEX_POINTER_VANISHED},
+                {"build_id": str(self.NEW_BUILD + 2), "error": pp.INDEX_POINTER_VANISHED},
+                {"build_id": at(day + timedelta(hours=20)), "error": pp.INDEX_POINTER_VANISHED}]
+        full = self._sweep([0, 0, 0, 5], gone).value
+        self.assertEqual(gone, full.unreadable)
+        cut = self._sweep([0, 0, 99, 99], gone).value
+        self.assertTrue(cut.truncated)
+        self.assertEqual(gone[2:], cut.unreadable)
 
     def test_a_sweep_inside_the_deadline_covers_the_window_it_was_asked_for(self):
         sweep = self._sweep([0, 0, 0, 5]).value
@@ -955,6 +1093,153 @@ class IndexCopy(unittest.TestCase):
             "gs://kube-agents-prow/pr-logs/directory/pull-kube-agents-smoke-test/[0-9]*.txt",
             argv[3],
         )
+        # Parallel copies already carry on past one failed object; the flag
+        # makes a sequential one do the same, so a vanished pointer never
+        # stops the rest of the index from landing.
+        self.assertIn("--continue-on-error", argv)
+
+    # Prow rewrites a build's pointer while the build runs and again when it
+    # finishes, so any pointer can be replaced between the copy's listing and
+    # its fetch. gcloud then exits 1 after copying the rest, with this line
+    # (the object name comes back percent-encoded) among the `Copying` ones:
+    # builds 2110421170670014464 and 2110451369931444224 on 2026-10-14.
+    VANISHED = (
+        "ERROR: gs://kube-agents-prow/pr-logs%2Fdirectory%2Fpull-kube-agents-smoke-test"
+        "%2F2110431553740869632.txt not found: 404."
+    )
+
+    def _copy(self, rc, stderr, landed=("2110451366894768128",)):
+        """Run the index copy with gcloud stubbed to exit `rc` after writing
+        the `landed` pointers, as a real partial copy leaves them."""
+        def fake_cp(cmd, timeout=0):
+            dest = cmd[4]  # gcloud storage cp <glob> <dest> ...
+            for build in landed:
+                Path(dest, f"{build}.txt").write_text(f"gs://b/{build}", encoding="utf-8")
+            return rc, "", stderr
+        with unittest.mock.patch.object(pp, "run_cmd", side_effect=fake_cp), \
+                tempfile.TemporaryDirectory() as tmp:
+            return pp._index_entries_from_gcs(tmp)
+
+    def test_a_pointer_that_vanished_mid_copy_is_unreadable_not_the_whole_hour(self):
+        stderr = "Copying gs://b/2110451366894768128.txt to file:///tmp/x\n" + self.VANISHED + "\n..\n"
+        entries, err, vanished = self._copy(1, stderr)
+        self.assertIsNone(err)
+        self.assertEqual({2110451366894768128: "gs://b/2110451366894768128"}, entries)
+        self.assertEqual([{"build_id": "2110431553740869632",
+                           "error": pp.INDEX_POINTER_VANISHED}], vanished)
+
+    def test_progress_dots_glued_to_the_error_line_do_not_hide_it(self):
+        # gcloud's progress dots land at the start of about one line in
+        # eighty, the error line included.
+        entries, err, vanished = self._copy(1, "....." + self.VANISHED + "\n")
+        self.assertIsNone(err)
+        self.assertEqual(["2110431553740869632"], [v["build_id"] for v in vanished])
+
+    def test_a_stem_int_refuses_is_not_a_build(self):
+        # isdigit() admits a superscript that int() refuses; the sweep must
+        # not reach int() on it (the periodic died with no artifact).
+        odd = self.VANISHED.replace("2110431553740869632", "1%C2%B2")
+        entries, err, vanished = self._copy(1, odd)
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        self.assertEqual([], vanished)
+        self.assertIsNone(pp._build_id_of("1².txt"))
+        self.assertEqual(2110431553740869632, pp._build_id_of("2110431553740869632.txt"))
+        # A decimal stem of another length is not a snowflake: 22 digits would
+        # take snowflake_time past year 9999 at the window filter.
+        long_stem = self.VANISHED.replace("2110431553740869632", "1057500000000000000000")
+        entries, err, vanished = self._copy(1, long_stem)
+        self.assertEqual({}, entries)
+        self.assertEqual([], vanished)
+        self.assertIsNone(pp._build_id_of("1057500000000000000000.txt"))
+        self.assertIsNone(pp._build_id_of("211043155374086963.txt"))
+
+    def test_an_exit_other_than_a_partial_failure_still_fails(self):
+        # A copy killed by a signal after a pointer 404'd prints no further
+        # error line; the exit status is what says it did not finish.
+        entries, err, vanished = self._copy(-9, self.VANISHED)
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        # The message says what decided it, not only the 404 the hour survives.
+        self.assertIn("exit -9", err)
+        # With no error line, the last line of stderr stands in, not all of it.
+        _, err, _ = self._copy(-9, "Copying a\nCopying b\nCopying c\n")
+        self.assertIn("exit -9", err)
+        self.assertEqual(1, err.count("Copying"))
+
+    def test_more_vanished_pointers_than_the_limit_fail_the_copy(self):
+        lines = [self.VANISHED.replace("2110431553740869632", f"21104315537408696{i:02d}")
+                 for i in range(pp.VANISHED_POINTER_LIMIT + 1)]
+        entries, err, vanished = self._copy(1, "\n".join(lines))
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        self.assertIn(f"{pp.VANISHED_POINTER_LIMIT + 1} vanished pointers, over the ceiling", err)
+        # The message quotes a few of the lines, not one per vanished object.
+        self.assertEqual(pp.REFUSAL_ERROR_LINES, err.count("not found: 404"))
+        self.assertIn(f"and {pp.VANISHED_POINTER_LIMIT + 1 - pp.REFUSAL_ERROR_LINES} more", err)
+        entries, err, vanished = self._copy(1, "\n".join(lines[:-1]))
+        self.assertIsNone(err)
+        self.assertEqual(pp.VANISHED_POINTER_LIMIT, len(vanished))
+
+    def test_any_other_error_still_fails_the_copy(self):
+        denied = "ERROR: (gcloud.storage.cp) HTTPError 403: caller does not have storage.objects.get"
+        entries, err, vanished = self._copy(1, self.VANISHED + "\n" + denied + "\n")
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        self.assertIn("403", err)
+        # The error names what went wrong, not the thousands of Copying lines.
+        self.assertNotIn("Copying", err)
+        self.assertEqual([], vanished)
+        # The line that decided the refusal is quoted first, however many
+        # tolerated 404 lines came before it.
+        many = [self.VANISHED.replace("2110431553740869632", f"211043155374086963{i}") for i in range(4)]
+        _, err, _ = self._copy(1, "\n".join(many + [denied]))
+        self.assertIn("1 error(s) other than a vanished pointer", err)
+        self.assertLess(err.index("403"), err.index("not found: 404"))
+
+    def test_a_404_outside_the_index_is_not_a_vanished_pointer(self):
+        other = "ERROR: gs://kube-agents-prow/pr-logs%2Fdirectory%2Fother-job%2F2110431553740869632.txt not found: 404."
+        entries, err, vanished = self._copy(1, other)
+        self.assertEqual({}, entries)
+        self.assertIn("other-job", err)
+
+    def test_a_failed_exit_with_nothing_copied_still_fails(self):
+        entries, err, vanished = self._copy(1, self.VANISHED, landed=())
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        self.assertIn("nothing landed", err)
+
+    def test_a_failed_exit_with_no_error_line_still_fails(self):
+        entries, err, vanished = self._copy(124, "timed out after 300s: gcloud storage cp")
+        self.assertEqual({}, entries)
+        self.assertIn("timed out", err)
+
+    def test_a_vanished_pointer_is_named_with_the_unreadable_builds(self):
+        build = 2110451366894768128
+        gone = {"build_id": "2110431553740869632", "error": pp.INDEX_POINTER_VANISHED}
+        as_of = pp.snowflake_time(build) + timedelta(hours=1)
+        wait = pp.Wait(build, "1", pp.snowflake_time(build), pp.snowflake_time(build), 15)
+        with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
+                unittest.mock.patch.object(pp, "_index_entries_from_gcs",
+                                           return_value=({build: "p"}, None, [gone])), \
+                unittest.mock.patch.object(pp, "_wait_from_gcs", return_value=wait):
+            source = pp.collect_waits(as_of - timedelta(days=1), as_of)
+        self.assertIsNone(source.error)
+        self.assertEqual([gone], source.value.unreadable)
+        self.assertEqual([build], [w.build_id for w in source.value.waits])
+        summary = pp.summarise(as_of - timedelta(days=1), as_of, 15, 45, 45, source,
+                               pp.Source(error="not read"), pp.Source(error="not read"))
+        self.assertEqual([gone], summary["trend"]["unreadable"])
+        self.assertIn("2110431553740869632", pp.render(summary))
+        # A replay of a past window does not report a pointer that vanished
+        # today: the build was never in the window it describes.
+        past = as_of - timedelta(days=30)
+        with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
+                unittest.mock.patch.object(pp, "_index_entries_from_gcs",
+                                           return_value=({build: "p"}, None, [gone])), \
+                unittest.mock.patch.object(pp, "_wait_from_gcs", return_value=wait):
+            replay = pp.collect_waits(past - timedelta(days=1), past)
+        self.assertEqual([], replay.value.unreadable)
 
 
 class LogHead(unittest.TestCase):
@@ -1042,7 +1327,7 @@ class SweepUnreadable(unittest.TestCase):
 
         with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
                 unittest.mock.patch.object(pp, "_index_entries_from_gcs",
-                                           return_value=(entries, None)), \
+                                           return_value=(entries, None, [])), \
                 unittest.mock.patch.object(pp, "_wait_from_gcs", side_effect=wait_for):
             return pp.collect_waits(self.AS_OF - timedelta(days=days), self.AS_OF)
 

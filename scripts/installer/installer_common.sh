@@ -94,6 +94,11 @@ readonly SCOPE_MAX_PROJECTS_MIN=1
 readonly SCOPE_MAX_PROJECTS_MAX=5000
 readonly SCOPE_MAX_PROJECTS_DEFAULT=100
 
+# ─── Data volume size ─────────────────────────────
+# The largest PLATFORM_AGENT_STORAGE_SIZE, in Mi: 64Ti, the largest persistent
+# disk, which the admission webhook and the chart also take as the limit.
+readonly PLATFORM_AGENT_STORAGE_SIZE_MAX_MI=67108864
+
 # ─── OpenAI-compatible model server ───────────────────────────────────────────
 # The ports a base URL without one is dialled on, and the TCP port range.
 readonly HTTP_DEFAULT_PORT=80
@@ -189,6 +194,13 @@ KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
 # install configuration and do not belong in install.defaults.env; they are
 # named here so that no front door spells one differently from the others.
 readonly KUBE_AGENTS_HELM_RELEASE="kube-agents"
+# The web console's Service (charts/kube-agents/templates/web-console.yaml
+# names it <release>-web-console) and the port it listens on, which the chart
+# fixes at 8080.
+# shellcheck disable=SC2034  # read by install.sh
+readonly WEB_CONSOLE_SERVICE="${KUBE_AGENTS_HELM_RELEASE}-web-console"
+# shellcheck disable=SC2034  # read by install.sh
+readonly WEB_CONSOLE_PORT="8080"
 # shellcheck disable=SC2034  # read by install.sh and upgrade.sh
 readonly KUBE_AGENTS_OPERATOR_DEPLOYMENT="kube-agents-controller-manager"
 readonly PLATFORM_AGENT_DEPLOYMENT="platform-agent-gateway"
@@ -235,6 +247,32 @@ readonly SLACK_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/
 # the same rule. Keep the three in step (docs/README.md lists them; a test
 # checks all three agree).
 readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
+# spec.integration.slack.homeChannelPolicy on the PlatformAgent: "auto" (the
+# default, also empty) or "manual". The CRD enum (HomeChannelPolicy in
+# k8s-operator/api/v1alpha1/platformagent_types.go) is the source of the two
+# values and is exact: the API server rejects any other spelling, so the
+# installer matches exactly too, with no trim or case folding. Terraform's
+# slack_home_channel_policy validation holds the same three values.
+readonly SLACK_HOME_CHANNEL_POLICY_AUTO="auto"
+readonly SLACK_HOME_CHANNEL_POLICY_MANUAL="manual"
+# The prefix of a Google Chat space's resource name, the only home channel
+# form the A2A gateway arms its notify route on (gchat_home_channel_not_a_space_name).
+# The gateway and the operator hold the same rule; keep the three in step
+# (docs/README.md lists them; a test checks all three agree).
+readonly GCHAT_SPACE_PREFIX="spaces/"
+# What Go's strings.TrimSpace strips (unicode.IsSpace), as UTF-8: ASCII
+# whitespace, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F,
+# U+205F and U+3000. The operator and the gateway trim a home channel this
+# way, so a value pasted with a no-break space is still the space they use.
+# Assigned, then marked readonly: a `readonly -a` here is local to the
+# function the front doors source this file from, on bash 3.2 (macOS).
+GO_TRIMSPACE_CHARS=(
+  $'\t' $'\n' $'\v' $'\f' $'\r' ' ' $'\xc2\x85' $'\xc2\xa0' $'\xe1\x9a\x80'
+  $'\xe2\x80\x80' $'\xe2\x80\x81' $'\xe2\x80\x82' $'\xe2\x80\x83' $'\xe2\x80\x84' $'\xe2\x80\x85'
+  $'\xe2\x80\x86' $'\xe2\x80\x87' $'\xe2\x80\x88' $'\xe2\x80\x89' $'\xe2\x80\x8a'
+  $'\xe2\x80\xa8' $'\xe2\x80\xa9' $'\xe2\x80\xaf' $'\xe2\x81\x9f' $'\xe3\x80\x80'
+)
+readonly GO_TRIMSPACE_CHARS
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a
 # CR with no spec.mode. Told apart from printing nothing, which means there is
@@ -370,6 +408,9 @@ readonly SCOPE_PROBE_UNDECIDED=2
 # is nothing live to protect, not that the read failed.
 readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="the server doesn't have a resource type|could not find the requested resource"
 readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
+# gcloud's answer for a cluster that does not exist. Any other describe failure
+# (auth expiry, a 403, a network blip) is a cluster that could not be read.
+readonly GKE_CLUSTER_NOT_FOUND_PATTERN="not.?found|404"
 # The two verdicts refuse_apply_over_undeclared_scope's python half prints
 # on its first line.
 readonly SCOPE_VERDICT_OK="ok"
@@ -819,6 +860,24 @@ is_valid_platform_agent_mode() {
   [[ "${1:-}" =~ ^(today|next)$ ]]
 }
 
+# PLATFORM_AGENT_STORAGE_SIZE: a whole number of Mi, Gi or Ti above zero and at
+# most 64Ti, what the composition's platform_agent_storage_size validation
+# takes. The CRD's spec.storage.size takes any quantity; this is the narrower
+# subset a disk is sized in. A number with more digits than the limit in Mi is
+# over it in every unit, which keeps the multiply inside Bash's int64.
+is_valid_platform_agent_storage_size() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*(Mi|Gi|Ti)$ ]] || return 1
+  local unit="${BASH_REMATCH[1]}" number mi_per_unit
+  number="${1%"$unit"}"
+  [ "${#number}" -le "${#PLATFORM_AGENT_STORAGE_SIZE_MAX_MI}" ] || return 1
+  case "$unit" in
+    Mi) mi_per_unit=1 ;;
+    Gi) mi_per_unit=1024 ;;
+    Ti) mi_per_unit=1048576 ;;
+  esac
+  [ $((number * mi_per_unit)) -le "$PLATFORM_AGENT_STORAGE_SIZE_MAX_MI" ]
+}
+
 # The PlatformAgent and its release, read once for the scope check and the
 # mode notice beside it. Each front door calls refuse_apply_over_undeclared_scope
 # and then announce_platform_agent_mode_for_apply against the same namespace,
@@ -1008,11 +1067,15 @@ platform_agent_mode_extra_values_caveat() {
 # that applies it names it first. A key the apply cannot bring the CR to,
 # because the CR carries a mode set outside this installer, is named too.
 # Silent when either value is empty (no CR, no release: a first install),
-# and on a re-apply of the same mode. A read that failed is not empty: the
+# and on a re-apply of the same mode. Sets PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED
+# to true when it names a switch, so install.sh -y can refuse one nobody chose. A read that failed is not empty: the
 # front-door call says so itself (announce_platform_agent_mode_for_apply).
 # Caller defines print_warning / print_info.
 announce_platform_agent_mode_switch() {
   local record="${1:-}" live="${2:-}" key="${3:-}" route="${4:-}" from to
+  # Read by install.sh's -y refusal.
+  # shellcheck disable=SC2034
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
   [ -n "$record" ] && [ -n "$live" ] || return 0
   from="$(effective_platform_agent_mode "$live")"
   to="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
@@ -1024,9 +1087,11 @@ announce_platform_agent_mode_switch() {
     fi
     return 0
   fi
+  # shellcheck disable=SC2034
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="true"
   print_warning "This apply switches the install from spec.mode ${from} to ${to} (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change."
   if [ "$to" = "next" ]; then
-    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, Google Chat moves from the agent to the A2A gateway."
+    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, chat moves from the agent to the A2A gateway: Google Chat, or Slack when it is the only chat platform enabled."
   else
     print_info "The operator retires the A2A stack and rolls the agent back onto today's path."
   fi
@@ -1064,6 +1129,14 @@ slack_moves_to_a2a_gateway() {
   [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
 }
 
+# Whether Google Chat is consumed by the A2A gateway after this apply: the
+# operator's a2aChatArmed (k8s-operator platformagent_a2a_manifests.go),
+# spec.mode next with Google Chat enabled. $1 the mode the apply renders, $2
+# GOOGLE_CHAT_ENABLED.
+google_chat_moves_to_a2a_gateway() {
+  [ "${1:-}" = "next" ] && is_truthy "${2:-}"
+}
+
 # The three checks behind refuse_next_slack_gateway_settings, one per
 # setting, which the install.sh interview also uses to re-ask. Each prints
 # nothing for a setting that passes.
@@ -1078,18 +1151,53 @@ slack_allowlist_emails() {
   printf '%s' "$emails"
 }
 
-# A Slack home channel ($1), trimmed, when it is set and is not a channel id
-# (SLACK_HOME_CHANNEL_ID_RE).
+# A Slack home channel ($1), trimmed as the operator trims it (trim_go_space),
+# when it is set and is not a channel id (SLACK_HOME_CHANNEL_ID_RE).
 slack_home_channel_not_an_id() {
   # The C locale: under a legacy collation (glibc before 2.28) the range
   # A-Z also matches lowercase, which the gateway's rune comparison refuses.
   local LC_ALL=C
-  local home="${1:-}"
-  home="${home#"${home%%[![:space:]]*}"}"
-  home="${home%"${home##*[![:space:]]}"}"
+  local home
+  home="$(trim_go_space "${1:-}")"
   if [ -n "$home" ] && ! [[ "$home" =~ $SLACK_HOME_CHANNEL_ID_RE ]]; then
     printf '%s' "$home"
   fi
+}
+
+# $1 with what Go's strings.TrimSpace strips (GO_TRIMSPACE_CHARS) removed
+# from both ends. Byte-wise, so the result does not depend on the locale.
+trim_go_space() {
+  local LC_ALL=C value="${1:-}" sp trimmed=false
+  until $trimmed; do
+    trimmed=true
+    for sp in "${GO_TRIMSPACE_CHARS[@]}"; do
+      if [[ "$value" == "$sp"* ]]; then value="${value#"$sp"}"; trimmed=false; fi
+      if [[ "$value" == *"$sp" ]]; then value="${value%"$sp"}"; trimmed=false; fi
+    done
+  done
+  printf '%s' "$value"
+}
+
+# A Google Chat home channel ($1), trimmed, when it is set and is not a bare
+# space name: "spaces/" and an id with no further "/". The gateway's
+# gchatIsSpaceName (a2a/gateway/gchat.go) refuses anything else and leaves
+# its notify route unarmed; the operator's a2aGchatHomeSpace holds the same
+# rule.
+gchat_home_channel_not_a_space_name() {
+  local home id
+  home="$(trim_go_space "${1:-}")"
+  [ -n "$home" ] || return 0
+  id="${home#"$GCHAT_SPACE_PREFIX"}"
+  if [ "$id" = "$home" ] || [ -z "$id" ] || [[ "$id" == */* ]]; then
+    printf '%s' "$home"
+  fi
+}
+
+# Whether a Google Chat allowlist ($1) holds no address once split the way
+# hcl_csv_list renders it, which drops blank items: the operator then renders
+# allow-all for the gateway.
+gchat_allowlist_is_empty() {
+  [ -z "$(csv_list_items "${1:-}")" ]
 }
 
 # The number of tokens a Slack bot token ($1) holds, when it is more than
@@ -1144,7 +1252,7 @@ slack_bot_token_has_separator() {
 # returns 0.
 refuse_next_slack_gateway_settings() {
   local allowlist="${4:-}" home="${5:-}" token="${6:-}" flags="${7:-}" mode="${8:-}"
-  local emails bad_home count refused=false via say=print_error lead=""
+  local emails bad_home count refused=false via keep_today say=print_error lead=""
   slack_moves_to_a2a_gateway "${1:-}" "${2:-}" "${3:-}" || return 0
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
     say=print_warning
@@ -1166,9 +1274,14 @@ refuse_next_slack_gateway_settings() {
   fi
   count="$(slack_bot_token_list_count "$token")"
   if [ -n "$count" ]; then
-    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
+    via="install.env"; keep_today="PLATFORM_AGENT_MODE=today"
+    if [ "$flags" = "flags" ]; then
+      via="install.env or --slack-bot-token"
+      # A first install is next by default, so the flag is the way to stay on today.
+      keep_today="PLATFORM_AGENT_MODE=today (--mode=today on a first install with no install.env)"
+    fi
     "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. Under spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
-    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on PLATFORM_AGENT_MODE=today."
+    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on ${keep_today}."
     refused=true
   elif slack_bot_token_has_separator "$token"; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
@@ -1207,13 +1320,13 @@ next_home_channel_unset_key() {
   [ "${1:-}" = "next" ] || return 0
   if is_truthy "${3:-}"; then
     home="${5:-}"
-    home="${home//[[:space:]]/}"
+    home="$(trim_go_space "$home")"
     [ -n "$home" ] || printf '%s' GOOGLE_CHAT_HOME_CHANNEL
     return 0
   fi
   if is_truthy "${2:-}"; then
     home="${4:-}"
-    home="${home//[[:space:]]/}"
+    home="$(trim_go_space "$home")"
     [ -n "$home" ] || printf '%s' SLACK_HOME_CHANNEL
   fi
   return 0
@@ -1240,8 +1353,9 @@ next_home_channel_unset_remedy() {
   esac
 }
 
-# Set by warn_next_home_channel_unset so the front door's closing summary can
-# say it again where the reader of a non-interactive run's log will see it.
+# Set by warn_next_home_channel_unset, and again by install.sh from the mode
+# after the apply, so the front door's closing summary can say it again where
+# the reader of a non-interactive run's log will see it.
 NEXT_HOME_CHANNEL_UNSET_KEY=""
 
 # Warns when the apply leaves the gateway's chat backend without a home
@@ -1272,6 +1386,72 @@ print_next_home_channel_unset_summary() {
   print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${1:-}")"
 }
 
+# Set by print_chat_setup_checklists: "true" when it printed a checklist.
+CHAT_SETUP_CHECKLIST_PRINTED="false"
+
+# The commands that print the chat setup checklist for each chat platform that
+# is on, one per line, for a reader to paste later. They name the run's
+# install.env, which need not be the checkout's; the front door has made
+# INSTALL_ENV_FILE absolute.
+print_chat_checklist_commands() {
+  local printers
+  printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "${INSTALL_ENV_FILE:-}" "${printers}/print_instructions_gchat.sh"
+  fi
+  if is_truthy "${SLACK_ENABLED:-}"; then
+    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "${INSTALL_ENV_FILE:-}" "${printers}/print_instructions_slack.sh"
+  fi
+  return 0
+}
+
+# The chat setup checklists after an apply, and the closing summary's key: $1
+# the spec.mode the CR is on after it. The chat keys, NAMESPACE, PROJECT_NUMBER
+# and INSTALL_ENV_FILE are read from the environment the apply rendered from,
+# which every caller has exported by then; what the apply used wins over
+# install.env in the printers. Returns 0 whatever it printed, because the
+# front doors call it bare under set -e.
+# shellcheck disable=SC2034  # both globals are read by install.sh
+print_chat_setup_checklists() {
+  local mode="${1:-}" printers failed="false"
+  printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  CHAT_SETUP_CHECKLIST_PRINTED="false"
+  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "$mode" "${SLACK_ENABLED:-}" \
+    "${GOOGLE_CHAT_ENABLED:-}" "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
+  # --dry-run: a printer changes nothing, yet load_state would otherwise ask
+  # for REGISTRY_PREFIX on a terminal when no file records it, and write it to
+  # vars.sh, which no front door writes.
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+    echo ""
+    KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
+      GCHAT_STEPS_PLATFORM_AGENT_MODE="$mode" \
+      GCHAT_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-}" \
+      GCHAT_STEPS_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}" \
+      GCHAT_STEPS_ALLOWED_USERS="${ALLOWED_USERS:-}" \
+      GCHAT_STEPS_TOPIC_NAME="${CHAT_TOPIC_NAME:-}" \
+      GCHAT_STEPS_SUB_NAME="${CHAT_SUB_NAME:-}" \
+      GCHAT_STEPS_NAMESPACE="${NAMESPACE:-}" \
+      bash "${printers}/print_instructions_gchat.sh" --dry-run || failed="true"
+    CHAT_SETUP_CHECKLIST_PRINTED="true"
+  fi
+  if is_truthy "${SLACK_ENABLED:-}"; then
+    echo ""
+    KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
+      SLACK_STEPS_PLATFORM_AGENT_MODE="$mode" \
+      SLACK_STEPS_SLACK_ENABLED="${SLACK_ENABLED:-}" \
+      SLACK_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-false}" \
+      SLACK_STEPS_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}" \
+      SLACK_STEPS_NAMESPACE="${NAMESPACE:-}" \
+      bash "${printers}/print_instructions_slack.sh" --dry-run || failed="true"
+    CHAT_SETUP_CHECKLIST_PRINTED="true"
+  fi
+  if [ "$failed" = "true" ]; then
+    print_warning "A chat setup checklist did not print in full. Show it again with:"
+    print_chat_checklist_commands
+  fi
+  return 0
+}
+
 # Said when a read the notice needs failed, so the run does not go on as if
 # the notice had been weighed and found nothing to say. $1 what could not be
 # read, $2 the key, $3 namespace.
@@ -1279,6 +1459,13 @@ _platform_agent_mode_unread() {
   print_warning "The mode-switch check did not run: ${1}. This apply renders spec.mode from PLATFORM_AGENT_MODE=${2} in install.env whatever the PlatformAgent carries now, so if that differs it is a mode switch (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
   print_info "Check before confirming: kubectl get platformagents -n ${3} --context $(gke_context_name) -o jsonpath='{.items[*].spec.mode}' (empty is today)."
 }
+
+# The spec.mode the CR carries after this apply, for the chat checklists that
+# follow it: the key, unless the reads below show a CR the apply leaves on
+# another mode (platform_agent_mode_after_apply). A platformAgent.mode in the
+# composition's extra_helm_values is not followed: the installer cannot read
+# it (platform_agent_mode_extra_values_caveat).
+PLATFORM_AGENT_MODE_AFTER_APPLY=""
 
 # The front door's call, after the scope check beside it: $1 namespace, $2
 # the key, $3 PLATFORM_AGENT_MODE_NOTICE_UNGATED on a route with no
@@ -1291,8 +1478,13 @@ _platform_agent_mode_unread() {
 # absent, or a get-credentials that did not land on the --dry-run and
 # --generate-only routes the scope check skips) is a read that did not
 # happen, and is said with the scope check's remedy.
+# shellcheck disable=SC2034  # PLATFORM_AGENT_MODE_AFTER_APPLY is read by install.sh
 announce_platform_agent_mode_for_apply() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
+  # Read by install.sh's -y refusal.
+  # shellcheck disable=SC2034
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
+  PLATFORM_AGENT_MODE_AFTER_APPLY="$(effective_platform_agent_mode "$key")"
   if [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ]; then
     PLATFORM_AGENT_READS_HELD_FOR=""
     return 0
@@ -1322,7 +1514,41 @@ announce_platform_agent_mode_for_apply() {
   else
     record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
   fi
+  PLATFORM_AGENT_MODE_AFTER_APPLY="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
   announce_platform_agent_mode_switch "$record" "$live" "$key" "${3:-}"
+}
+
+# After announce_platform_agent_mode_for_apply, from the reads it left:
+# succeeds unless they show that no install runs next, that is no cluster, no
+# PlatformAgent type, a CR on today, or, with the CR gone, no release or one
+# that records today (the next apply recreates the CR from it). A read that
+# failed or did not happen is not today. upgrade.sh refuses a keyless
+# install.env on this, since such a file renders today.
+platform_agent_install_may_run_next() {
+  local live record
+  [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ] && return 1
+  case "${PLATFORM_AGENT_CR_READ:-}" in
+    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
+    "$PLATFORM_AGENT_READ_OK") ;;
+    *) return 0 ;;
+  esac
+  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
+  if [ -n "$live" ]; then
+    [ "$(effective_platform_agent_mode "$live")" = "next" ]
+    return
+  fi
+  case "${PLATFORM_AGENT_RECORD_READ:-}" in
+    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
+    "$PLATFORM_AGENT_READ_OK") ;;
+    *) return 0 ;;
+  esac
+  [ "${PLATFORM_AGENT_SERVED_READ:-}" = "$PLATFORM_AGENT_READ_FAILED" ] && return 0
+  if [ -n "${PLATFORM_AGENT_SERVED_REVISION:-}" ]; then
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_SERVED_JSON")"
+  else
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
+  fi
+  [ "$(effective_platform_agent_mode "$record")" = "next" ]
 }
 
 # upgrade.sh's retag arms, after retag_values: $1 namespace, $2 the key, $3
@@ -1568,6 +1794,10 @@ load_install_env() {
   # switch the install's component stack for one run, and the next run from a
   # clean shell would switch it back and retire the A2A stack.
   unset PLATFORM_AGENT_MODE
+  # The data volume size too: an inherited PLATFORM_AGENT_STORAGE_SIZE would
+  # grow both data claims for one run, and the next run from a clean shell
+  # would drop the field again, leaving claims larger than the CR says.
+  unset PLATFORM_AGENT_STORAGE_SIZE
   # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
   # GitLab forge, and drop the GitHub alias and minter, for one run of an
   # install the file records as GitHub, and an inherited GITOPS_HOST would
@@ -2086,6 +2316,21 @@ require_scope_max_projects() {
     fi
   fi
   print_error "SCOPE_MAX_PROJECTS='${value}' is not a whole number from ${SCOPE_MAX_PROJECTS_MIN} to ${SCOPE_MAX_PROJECTS_MAX}, the bounds the PlatformAgent puts on spec.scope.maxProjects. Set one, or leave it empty for the default (${SCOPE_MAX_PROJECTS_DEFAULT}), in install.env."
+  return 1
+}
+
+# SLACK_HOME_CHANNEL_POLICY is empty, auto or manual, or the run stops before
+# a file is written and names the key: it renders
+# spec.integration.slack.homeChannelPolicy, whose CRD enum accepts only those
+# two spellings (SLACK_HOME_CHANNEL_POLICY_AUTO, _MANUAL). $1 the value; $2 is
+# "flags" when install.sh's flag can set it too, so the remedy names it.
+require_slack_home_channel_policy() {
+  local value="${1:-}" via="install.env"
+  case "$value" in
+    "" | "$SLACK_HOME_CHANNEL_POLICY_AUTO" | "$SLACK_HOME_CHANNEL_POLICY_MANUAL") return 0 ;;
+  esac
+  [ "${2:-}" = "flags" ] && via="install.env or --slack-home-channel-policy"
+  print_error "SLACK_HOME_CHANNEL_POLICY is '${value}', which is not ${SLACK_HOME_CHANNEL_POLICY_AUTO} or ${SLACK_HOME_CHANNEL_POLICY_MANUAL} (empty means ${SLACK_HOME_CHANNEL_POLICY_AUTO}). It sets spec.integration.slack.homeChannelPolicy on the PlatformAgent, whose CRD accepts only those two spellings. Set it in ${via} and run again."
   return 1
 }
 
@@ -4228,6 +4473,34 @@ sys.exit(0 if any(r.get("status") in served for r in revisions) else 1)
   return 1
 }
 
+# Whether $1, the stderr of a failed `gcloud container clusters describe`,
+# says the cluster does not exist. The tfvars generator and install.sh's mode
+# settle both ask this, so they cannot disagree about what absence is.
+gke_describe_error_is_not_found() {
+  printf '%s' "${1:-}" | grep -qiE "$GKE_CLUSTER_NOT_FOUND_PATTERN"
+}
+
+is_existing_cluster_network_policy_satisfied() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  local create_cluster_flag="${4:-${TFVARS_CREATE_CLUSTER:-true}}"
+  [ "$create_cluster_flag" = "false" ] || return 0
+
+  local cluster_info
+  cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
+  local status="" dp_provider="" legacy_np=""
+  if [ -n "$cluster_info" ]; then
+    IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
+  fi
+  if [ -z "$status" ]; then
+    return 2
+  fi
+  [ "$dp_provider" != "ADVANCED_DATAPATH" ] || return 0
+  [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ] || return 1
+  return 0
+}
+
 
 # Writes the terraform.tfvars the full-install composition consumes, from the
 # install.env variable set in the environment (load it first). The same
@@ -4318,7 +4591,7 @@ write_tfvars_from_state() {
     describe_err="$({ gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(name)" 2>&1 >/dev/null || true; })"
-    if ! printf '%s' "$describe_err" | grep -qiE "not.?found|404"; then
+    if ! gke_describe_error_is_not_found "$describe_err"; then
       print_error "Could not probe cluster '${CLUSTER_NAME}': ${describe_err:-unknown gcloud failure}"
       print_info "Refusing to guess between creating and adopting — a wrong guess can plan a live cluster's replacement. Fix the gcloud error and re-run."
       return 1
@@ -4675,6 +4948,10 @@ write_tfvars_from_state() {
   require_scope_cluster_triples "${SCOPE_EXCLUDE_CLUSTERS:-}" || return 1
   require_scope_container_ids "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" || return 1
   require_scope_max_projects "${SCOPE_MAX_PROJECTS:-}" || return 1
+  # Same reason: the CRD accepts two spellings, and Terraform's validation
+  # would name the variable after the interview, or after the Day-2 menu has
+  # rewritten install.env. Every route to Terraform passes here.
+  require_slack_home_channel_policy "${SLACK_HOME_CHANNEL_POLICY:-}" || return 1
   # Checked here for the MODEL_MAX_TOKENS reason: the chart refuses to render
   # openai_compatible without these, and upgrade.sh regenerates without
   # install.sh's interview.
@@ -4717,6 +4994,15 @@ write_tfvars_from_state() {
     return 1
   fi
   require_scoped_sa_pool_max_accounts "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" || return 1
+  # The same reason, with a sharper edge: read as off, a misspelt value
+  # revokes the gateway's role on the serving project at the next apply, and
+  # a long-lived environment's reconcile renders this key from a GitHub
+  # variable a human typed.
+  local vertex_manage_serving_project="${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}"
+  if ! is_bool_spelling "$vertex_manage_serving_project"; then
+    print_error "VERTEX_MANAGE_SERVING_PROJECT='${vertex_manage_serving_project}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
   # The mode, for the MODEL_MAX_TOKENS reason: upgrade.sh and the Day-2 menu
   # regenerate from install.env without install.sh's check, and the variable's
   # validation would otherwise refuse it at plan, naming neither the key nor
@@ -4725,6 +5011,40 @@ write_tfvars_from_state() {
   if ! is_valid_platform_agent_mode "$platform_agent_mode"; then
     print_error "PLATFORM_AGENT_MODE='${platform_agent_mode}' is not one of today, next. Fix it in install.env."
     return 1
+  fi
+  # The data volume size, for the same reason.
+  local platform_agent_storage_size="${PLATFORM_AGENT_STORAGE_SIZE:-$DEFAULT_PLATFORM_AGENT_STORAGE_SIZE}"
+  if ! is_valid_platform_agent_storage_size "$platform_agent_storage_size"; then
+    print_error "PLATFORM_AGENT_STORAGE_SIZE='${platform_agent_storage_size}' is not a whole number of Mi, Gi or Ti above zero and at most 64Ti, for example 80Gi. Fix it in install.env, or on a first install, in the value this shell exports."
+    return 1
+  fi
+  # Refused when the web console is on and the operator has accepted an
+  # unconfined cluster: the web console holds the Platform Agent's API key with
+  # no login of its own, and its deny-all-ingress NetworkPolicy is the only
+  # thing keeping other pods in the cluster from reaching it. Checked here so
+  # upgrade.sh and `install.sh --menu` cannot write a tfvars that enables the
+  # console when both keys are set in install.env without install.sh's
+  # preflight, when the cluster still enforces no NetworkPolicy. install.sh
+  # (which passes KUBE_AGENTS_GENERATE_API_SERVER_KEY=true) defers this check to
+  # check_existing_cluster_network_policy_preflight. On an adopted cluster that
+  # enforces NetworkPolicy (Autopilot, or a Standard cluster that has since
+  # enabled Dataplane V2 or Calico on the "confine it later" route), the live
+  # probe below finds enforcement active and lets upgrade.sh and --menu proceed
+  # despite a stale ACCEPT_NO_NETWORK_POLICY=true.
+  if ! is_truthy "${KUBE_AGENTS_GENERATE_API_SERVER_KEY:-false}" && \
+     is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}" && \
+     is_truthy "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}"; then
+    local np_rc=0
+    is_existing_cluster_network_policy_satisfied "${PROJECT_ID}" "${CLUSTER_NAME}" "${REGION}" "$create_cluster" || np_rc=$?
+    if [ "$np_rc" -eq 2 ]; then
+      print_error "Could not query NetworkPolicy configuration for existing cluster '${CLUSTER_NAME}'."
+      print_info "Failed to read cluster details from GCP while validating WEB_CONSOLE_ENABLED=true with ACCEPT_NO_NETWORK_POLICY=true. Check cluster name, region, permissions, and network connectivity."
+      return 1
+    elif [ "$np_rc" -ne 0 ]; then
+      print_error "WEB_CONSOLE_ENABLED=true cannot be combined with ACCEPT_NO_NETWORK_POLICY=true."
+      print_info "The web console holds the Platform Agent's API key with no login of its own, and its NetworkPolicy is what keeps other pods in the cluster from reaching it. Enable NetworkPolicy enforcement on the cluster (and remove any stale ACCEPT_NO_NETWORK_POLICY=true from install.env if the cluster already enforces it), or set WEB_CONSOLE_ENABLED=false in install.env."
+      return 1
+    fi
   fi
 
   local old_umask
@@ -4804,6 +5124,10 @@ write_tfvars_from_state() {
     echo "# The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The"
     echo "# composition passes the chart nothing for \"today\", so its CR carries no mode."
     echo "platform_agent_mode = $(hcl_str "$platform_agent_mode")"
+    echo ""
+    echo "# The PlatformAgent's spec.storage.size (PLATFORM_AGENT_STORAGE_SIZE in"
+    echo "# install.env). The composition passes the chart nothing for the default."
+    echo "platform_agent_storage_size = $(hcl_str "$platform_agent_storage_size")"
     echo ""
     echo "# Gateway redaction (LITELLM_REDACTION_* in install.env). The composition"
     echo "# renders nothing into the chart while enabled is false."
@@ -4892,6 +5216,7 @@ write_tfvars_from_state() {
     echo "slack_allowed_users     = $(hcl_csv_list "${SLACK_ALLOWED_USERS:-}")"
     echo "slack_home_channel      = $(hcl_str "${SLACK_HOME_CHANNEL:-}")"
     echo "slack_home_channel_name = $(hcl_str "${SLACK_HOME_CHANNEL_NAME:-}")"
+    echo "slack_home_channel_policy = $(hcl_str "${SLACK_HOME_CHANNEL_POLICY:-}")"
     echo ""
     # Written only for a GitLab install, so a GitHub one renders the exact
     # lines it always has. GITOPS_REPO is the project's full path there.
@@ -4931,6 +5256,7 @@ write_tfvars_from_state() {
     echo "# The CRD defaults dashboardEnabled to true; the installer has always"
     echo "# defaulted it to false and asks. Memory settings mirror --memory."
     echo "hermes_dashboard_enabled = $(hcl_bool "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}")"
+    echo "web_console_enabled      = $(hcl_bool "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}")"
     echo "memory_enabled           = $(hcl_bool "${MEMORY_ENABLED:-$DEFAULT_MEMORY_ENABLED}")"
     echo "memory_provider          = $(hcl_str "$memory_provider")"
     echo "user_profile_enabled     = $(hcl_bool "${USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}")"

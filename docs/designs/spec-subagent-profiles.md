@@ -3,9 +3,10 @@
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
 - **Status:** stage 3 in progress. Built: the `AgentProfile` CRD and what the operator renders
-  from one (the ServiceAccount, the callout identity, the agent card). Not built: the
-  dispatcher and janitor, the cluster-agent profile, and the gateway reading the `chat`
-  profile.
+  from one (the ServiceAccount, the callout identity, the agent card). The execution model,
+  routing, persona format and tiers are now decided in
+  [`spec-profiles-dispatch.md`](spec-profiles-dispatch.md), which supersedes this spec where
+  they differ (warm pools for interactive profiles, one generic cluster agent, no kanban).
 - **Companions:** the A2A payload spec (`spec-a2a-payloads.md`) - envelope, subjects, task
   lifecycle; the NATS deployment spec (`spec-nats-deployment.md`) - streams, accounts,
   connection-time authz
@@ -132,11 +133,14 @@ spec:
   description: >-
     One-paragraph routing description.  Feeds the agent card and the roster.
   persona:
-    image: <registry>/kube-agents/persona-platform:2026.08 # SOUL.md, AGENTS.md, skills/
+    image: <registry>/kube-agents/persona-platform:2026.08 # /files: persona.yaml, instructions.md, skills/, mcp.yaml
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08 # headless-contract runner + adapter
     model: model-default # via LiteLLM, as today
     maxTurns: 250
+  tools: # each mounted read-only at /opt/tools/<name>, bin/ on PATH
+    - name: helm
+      image: <registry>/kube-agents/tools-helm:3.17 # /files/bin/helm
   bus:
     publishTopics:
       - agent.platform.upgrade-readiness
@@ -154,20 +158,23 @@ spec:
     limits: { cpu: "1", memory: 2Gi }
 ```
 
-| Field                                   | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `description`                           | The routing blurb - today's `CAPABILITIES.md` first line. Rendered into the A2A agent card.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `persona.image`                         | OCI artifact holding the persona: `SOUL.md`, `AGENTS.md`, skills, persona config. Mounted read-only via image volume, the `AgentPlugin` mechanism - and it inherits that mechanism's availability gate: the operator already skips image-volume mounts below Kubernetes 1.35 and logs it (`platformagent_manifests.go`), so no new fallback is invented here. (Decided 8/24: OCI-only, no `configMapRef` variant.)                                                                                                                                        |
-| `harness.image`                         | The worker image: a harness speaking the headless CLI contract, wrapped by the bus adapter (below). The harness is a container image choice, nothing more.                                                                                                                                                                                                                                                                                                                                                                                                |
-| `harness.model`, `maxTurns`             | Model routing and the turn budget, as in profile config today.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `bus.publishTopics` / `subscribeTopics` | Topic grants beyond the task subjects every executor gets. The operator renders these into the auth callout's identity-to-permissions map; the deny-by-default posture is the deployment spec's.                                                                                                                                                                                                                                                                                                                                                          |
-| `identity.serviceAccountName`           | The KSA the pod runs as. Optional. Absent means the operator creates a KSA with **zero** RBAC bindings, which is the default posture - the token exists to authenticate to NATS, not to talk to the API server.                                                                                                                                                                                                                                                                                                                                           |
-| `clusterRef`                            | (Cluster agents only.) `{projectId, cluster, location}` as structured fields. The operator renders the scoped read-only kubeconfig from it. This also ends the parse-the-sanitized-name problem: the cluster identity is spec data, not a naming convention.                                                                                                                                                                                                                                                                                              |
-| `lifecycle.activeDeadlineSeconds`       | Hard ceiling on one task's wall clock, enforced by Kubernetes. The clock starts at Job spawn - queue time is bounded separately by `queueTimeoutSeconds`.                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `queueTimeoutSeconds`                   | Optional, default 3600. How stale a queued submission may be before the dispatcher refuses to run it: at dequeue, if the message's JetStream server ingest timestamp is older than this, the dispatcher acks and publishes terminal `failed` (`reason: queue-deadline-exceeded`) instead of spawning a Job. A burst past `concurrency` cannot silently execute hours-stale diagnostics. The arbiter is the server ingest time, deliberately - the envelope's `ts` is publisher-asserted, and a freshness guard keyed to a spoofable field is not a guard. |
-| `lifecycle.ttlSecondsAfterFinished`     | How long a finished Job lingers for `kubectl` inspection before GC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `concurrency`                           | Max simultaneous pods for this profile. Replaces the board-wide `max_in_progress`, per profile instead of global.                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `resources`                             | Pod resources. Default is the demo-proven class: 250m/512Mi requests, 1 CPU/2Gi limits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Field                                   | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `description`                           | The routing blurb - today's `CAPABILITIES.md` first line. Rendered into the A2A agent card.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `persona.image`                         | OCI artifact holding the persona (the neutral layout of #3656: `persona.yaml`, `instructions.md`, `skills/`, `mcp.yaml`) under the image's `/files` directory, mounted read-only at `/persona`. Image volume (with `subPath: files`), the `AgentPlugin` mechanism, including its fallback: where image volumes are unavailable (GKE Autopilot, Kubernetes below 1.35) an init container copies `/files` into an emptyDir, so the image must also ship `/bin/sh`. One image works in both modes. Rendered by `k8s-operator/internal/profilepod`. (Decided 8/24: OCI-only, no `configMapRef` variant.) |
+| `harness.image`                         | The worker image: a harness speaking the headless CLI contract, wrapped by the bus adapter (below). The harness is a container image choice, nothing more.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `harness.model`, `maxTurns`             | Model routing and the turn budget, as in profile config today.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `tools`                                 | Optional list of `{name, image, imagePullPolicy}` (name at most 24 characters): OCI images of command-line tools, each with its payload under `/files` mounted read-only at `/opt/tools/<name>` (same mechanism and fallback as `persona.image`), and `/opt/tools/<name>/bin` put on `PATH` in list order, so one tools image serves every harness. A tools image holds no credentials; a tool that needs them gets them from the broker, per task. Rendered by `k8s-operator/internal/profilepod`.                                                                                                  |
+| `bus.publishTopics` / `subscribeTopics` | Topic grants beyond the task subjects every executor gets. The operator renders these into the auth callout's identity-to-permissions map; the deny-by-default posture is the deployment spec's.                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `identity.serviceAccountName`           | The KSA the pod runs as. Optional. Absent means the operator creates a KSA with **zero** RBAC bindings, which is the default posture - the token exists to authenticate to NATS, not to talk to the API server.                                                                                                                                                                                                                                                                                                                                                                                      |
+| `clusterRef`                            | (Cluster agents only.) `{projectId, cluster, location}` as structured fields. The operator renders the scoped read-only kubeconfig from it. This also ends the parse-the-sanitized-name problem: the cluster identity is spec data, not a naming convention.                                                                                                                                                                                                                                                                                                                                         |
+| `lifecycle.activeDeadlineSeconds`       | Hard ceiling on one task's wall clock, enforced by Kubernetes. The clock starts at Job spawn - queue time is bounded separately by `queueTimeoutSeconds`.                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `queueTimeoutSeconds`                   | Optional, default 3600. How stale a queued submission may be before the dispatcher refuses to run it: at dequeue, if the message's JetStream server ingest timestamp is older than this, the dispatcher acks and publishes terminal `failed` (`reason: queue-deadline-exceeded`) instead of spawning a Job. A burst past `concurrency` cannot silently execute hours-stale diagnostics. The arbiter is the server ingest time, deliberately - the envelope's `ts` is publisher-asserted, and a freshness guard keyed to a spoofable field is not a guard.                                            |
+| `lifecycle.ttlSecondsAfterFinished`     | How long a finished Job lingers for `kubectl` inspection before GC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `concurrency`                           | Max simultaneous pods for this profile. Replaces the board-wide `max_in_progress`, per profile instead of global.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `allowedTiers`                          | Optional, default `[read]`. The tiers this profile may run at, `read` and `unattended` (#3660, "Tiers and identity"). A task runs at its requester's tier and the dispatcher refuses one whose tier is not listed; a pinned production profile might allow only `read`. Tier is authority, so it lives on the CR, never in the persona.                                                                                                                                                                                                                                                              |
+| `parameters`                            | Optional. The task parameters the persona declares, `[{name, required}]`, at most 16 (amended 10/28, #3655). The gateway routes cluster work by them and the dispatcher refuses a submission missing a required one, since neither can read the persona image; the worker refuses to run when this list and the persona's differ.                                                                                                                                                                                                                                                                    |
+| `resources`                             | Pod resources. Default is the demo-proven class: 250m/512Mi requests, 1 CPU/2Gi limits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 Everything here is dark content: the dispatcher and the profile CRD render nothing unless
 the mode switch says `next`.
@@ -177,6 +184,8 @@ executor, and `resources` and `concurrency` are required rather than defaulted. 
 above and the platform worked profile below are design sketches from before the CRD existed.
 
 ## How a profile becomes a pod
+
+**Amended 10/22 (#3655, #3660):** profile pods and their ServiceAccounts run in their own namespace, `<agent-ns>-profiles`, not the CR's, so profile work never takes a session slot. The chart creates it, and the operator renders its pod quota (the warm workers, a surge pod per warm pool, and `spec.harness.tuning.profiles.ceiling` for Jobs) and a fence that lets its pods reach DNS, the bus, LiteLLM and the credential broker's credentialed port only. The rest of this section describes the Job-per-task path and changes with the dispatcher PRs, as #3660's "Changes to companion specs" lists.
 
 **Submission is a message, not an API call.** An orchestrator delegates by publishing a
 `kind: message` envelope to `a2a.tasks.{profile}.{taskId}.in` - the profile is the
@@ -291,12 +300,18 @@ running.
 
 What the operator renders per profile, as built (amended 10/6):
 
-- The ServiceAccount: `agentprofile-<profile>`, owned by the CR, token automount off, no
-  RoleBinding anywhere. A profile that names its own in `identity.serviceAccountName` gets
-  none created. A profile may not name a ServiceAccount the operator already uses for
-  something else (the agent's, the session pods', the callout's, and so on) or `default`.
+- The ServiceAccounts: one per allowed tier, `agentprofile-<profile>-<tier>`, in the
+  profile namespace, token automount off, no RoleBinding anywhere (amended 10/23). They
+  carry the profile's name and UID instead of an owner reference, which can't cross
+  namespaces. A profile that names its own in `identity.serviceAccountName` gets none
+  created, and may then allow only one tier. A profile may not name a ServiceAccount name
+  the operator uses for the agent (the agent's, the session pods', the callout's, and so on)
+  or `default`.
   Those are refused with a condition, and the profile renders nothing.
-- The callout identity: one entry per profile in the PlatformAgent's identity map. A static
+- The callout identity: one entry per profile and tier in the PlatformAgent's identity map,
+  user `profile-<profile>-<tier>`. A tier's entry adds the dispatch subjects for its own pod
+  (`a2a.dispatch.<profile>.<tier>.<pod>`, plus `.accept` and `.lease` to publish) and no KV
+  grant: the dispatcher is the only writer of `PROFILE_LEASES`. A static
   entry cannot work here. Every pod of a profile publishes as the profile, but two of them
   running at once need their own consumers and inboxes, and a shared consumer name or a
   wildcard one is worse than either. So the entry narrows on `profile`. It carries the
@@ -304,14 +319,105 @@ What the operator renders per profile, as built (amended 10/6):
   from the profile and the consumer names and inbox from the attested pod name, the same way
   it already does for session pods. A refused profile is left out of the map rather than
   failing it for everyone.
+- Per-task credentials (#3889), staged. A worker gets two connections. Its pod connection,
+  which presents the ServiceAccount token alone, gets the dispatch subjects, its inbox and
+  its topics. After it accepts a task it opens a task connection with the token as the
+  connection token and a task credential as the password. The dispatcher signs the
+  credential (`a2a/taskcred`), and the callout refuses it unless its pod name and UID are
+  the pod the token is bound to, and its profile and tier are the entry's. The task
+  connection gets that one task's `.events` publish and its three consumers, filtered
+  exactly on the task. They and its inbox are named for the task, not the pod
+  (`<pod>_<task>-origin`, `-in`, `-events`, and `_INBOX.<pod>_<task>`), because a consumer's
+  info, pull and delete subjects carry only its name, and a pod-named consumer would be
+  reachable from the pod's next task. A credential may run to the callout's maximum task
+  lifetime, measured both from now and from its issue time. That is 6h until #4121's
+  operator renders it from the profile deadline cap, and it can exceed the grant TTL. A setting the callout can't use refuses every task credential, never
+  falling back to 6h, and the callout keeps serving everything else. The connection's JWT
+  still expires at the earlier of the credential and the grant TTL, and the worker
+  reconnects with the same credential. The password carries the credential because the
+  server copies CONNECT's `jwt` field into its `$SYS` advisories and `connz`, and a refused
+  connection would publish it. The operator generates the task-signing key beside the
+  callout's keys, in a Secret only the dispatcher will mount (nothing mounts it yet), and
+  renders the public half into the callout's environment. The narrowing lands in steps: the
+  first PR adds the task connection, and the pod connection keeps its profile-wide task
+  reach. The worker PR moves the worker onto the task connection and removes that reach, and
+  it has to land before #3659's tiers stronger than Read go live.
+- Proxy confinement (#3889). A worker's `kubectl` and `gcloud` are the credential-proxy
+  shim, and they reach the shared broker, not a proxy in the worker's pod (one there could
+  ask the metadata server for the broker's Workload Identity token). The broker gives them a
+  role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
+  route only, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist.
+  The operator renders the audience, an identity map from each tier's ServiceAccount to its
+  (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
+  entries), those ServiceAccounts on the broker's callers, and the task-signing public key
+  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). It newly reserves four names against `spec.deployment.env`:
+  `CREDENTIAL_PROXY_PROFILE_AUDIENCE`, `CREDENTIAL_PROXY_PROFILE_IDENTITIES`,
+  `A2A_TASK_SIGNING_PUBLIC_KEYS` and `A2A_TASK_CREDENTIAL_MAX_LIFETIME`;
+  `CREDENTIAL_PROXY_ALLOWED_CALLERS` was reserved already. The operator doesn't render the
+  max lifetime yet. The broker's fence admits the profile namespace and
+  the profile namespace's fence lets it out to the broker's credentialed port.
+  - The shim reads the dispatcher's `proxyToken` from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` on
+    every call and sends it in `X-Kube-Agents-Task-Credential`, never in the body. The
+    broker verifies it in Python (`task_credential.py`, held to `taskcred.Verify` by golden
+    fixtures in `a2a/taskcred/testdata`) and binds it: its pod and pod UID must be the ones
+    the TokenReview attests, and its profile and tier the ServiceAccount's map entry. It logs
+    the credential's `jti`, never the token. A credential that fails refuses the request. No
+    credential leaves the caller local-only commands: `gcloud version`,
+    `kubectl version --client`, `--help` on a command, and the `kubectl config` reads
+    `get-contexts` and `current-context`, the ones the read-only policy admits (`config view` is refused, since
+    `--flatten` prints credentials). The confinement asks the policy rather than
+    mirroring it: `--help` on a command the policy refuses (`kubectl apply --help`,
+    `gcloud init --help`) gets the policy's own refusal. A local-only command runs
+    isolated, against no kubeconfig and with no `get-credentials` handling, with or
+    without a credential, so `get-credentials <cluster> --help` is a help read.
+    `gcloud config` and `gcloud auth` are refused whole, since even their reads print the
+    broker's own account and default project.
+  - With a credential, every call is held to its target (`task_confinement.py`). Every
+    `kubectl --context`, `--kubeconfig` and `kubeconfigContext` must name the target, and a
+    call naming none gets the target, not the host cluster; `--cluster`, `--server`, `--user`
+    and `--insecure-skip-tls-verify` are refused. `gcloud --project` must be the target's, and
+    a missing one is set to it, not the broker's default; `--cluster`, `--location`,
+    `--region` and `--zone` must be the target's; `get-credentials` must name the target
+    exactly; `--impersonate-service-account`, `--account` and the other identity flags are
+    refused; reads with no project scope (`projects list`, `organizations`, `billing`,
+    org-scoped `asset` searches, `storage`) are refused; and a `projects/<id>/...` name in any
+    argument must name the target. gcloud is held to an allowlist of its own
+    (`GCLOUD_CONFINED_COMMANDS`): each read says how it names a project (by `--project`, by a
+    positional project id, by a metrics scope, by a `<location>-docker.pkg.dev/<project>` or
+    `gcr.io/<project>` image path), and a read the policy admits but the table doesn't name is
+    refused, so a later addition to the read list fails closed. Each argv is parsed once,
+    with the CLI's flag arity; a flag whose value starts with `-` when written apart from it,
+    or with `--` when written `=value`, is refused, as is an unknown flag. The broker runs
+    the argv rebuilt from that parse (the command words, then each flag as one
+    `--name=value` token, then positionals), and its executor reads the parse for the
+    kubeconfig, isolation and `get-credentials`, never parsing the argv again. The shim honours no
+    `KUBECONFIG` or `CLOUDSDK_*` override for a task, and says so. Profile calls hold at most
+    `CREDENTIAL_PROXY_PROFILE_SLOTS` (default 4) of the broker's command slots, clamped to the pool
+    less the session share and one (never below one), so the platform agent's shell keeps a
+    slot given a pool larger than the session share plus one.
+  - Nothing may change what a later bare command targets. `gcloud config set`, `unset` and
+    `configurations`, and every `kubectl config` write (`use-context`, `set-context`,
+    `set-cluster`, `set-credentials` and the rest) are refused with or without a credential.
+    And the injection is unconditional: every credentialed `kubectl` call carries `--context`
+    for the target, and every `gcloud` call `--project` (a GKE call `--location`, a node-pool
+    call `--cluster`), so a stored default changed some other way still can't move a call.
+  - Known limits. It is a confinement layer over the broker's IAM, not a sandbox. A project
+    named by number is refused; one inside a `--filter` or `--format` expression, or in a form
+    the allowlist doesn't parse for a command it admits as flag-named, is bounded by IAM
+    alone. A zonal read
+    under a regional target is refused rather than matched. A warm pod's credential stays
+    valid until its task's deadline plus the skew: the adapter removes the file at task end,
+    and a broker check that a newer credential supersedes an older one would need per-pod
+    state across replicas. A change to the identity map re-renders the broker's environment
+    and so restarts it.
 - The card: the operator is a bus principal for this and nothing else. Its entry publishes on
   `a2a.agents.*` and direct-gets the directory, so reconcile can tell a missing or stale card
   from a current one. The grant is a wildcard over the profile token because callout grants are
   fixed for the life of a connection, and a profile created later still has to be publishable.
 
-Two limits of what is built. Credentials are per profile, as decided 8/24, so two pods of one
-profile can reach each other's task subjects; per-task credentials stay with the authority
-work. And a profile deleted while its agent is on `today` releases its finalizer with no
+Two limits of what is built. Until #3889's later PRs (the dispatcher's mint and the worker's
+task connection) land, a worker's pod connection still reaches every task of its profile, so
+two pods of one profile can reach each other's task subjects. And a profile deleted while its agent is on `today` releases its finalizer with no
 tombstone, because there is no bus to publish one on. The directory survives a flip to
 `today` on the bus's PVC, so that card is still there when the agent goes back to `next`.
 Nothing sweeps directory entries that have no profile. Fixing that means either holding
@@ -504,12 +610,12 @@ spec:
     lifecycle and acting on cluster agents' proposed fixes.
   persona:
     image: <registry>/kube-agents/persona-platform:2026.08
-    # SOUL.md, AGENTS.md, governance SOPs, the platform skills, persona config
+    # /files: persona.yaml, instructions.md (with the governance SOPs), the platform skills, mcp.yaml
     # (toolsets: mcp-platform_control, mcp-gke, mcp-developer_knowledge, memory read-only)
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08
     model: model-default
-    maxTurns: 250 # today's value, set for fleet-audit remediation loops
+    maxTurns: 250 # the fleet audits' per-entry value today; the profile itself carries 150
   bus:
     publishTopics:
       - agent.platform.upgrade-readiness
@@ -567,7 +673,7 @@ spec:
     location: us-east1
   persona:
     image: <registry>/kube-agents/persona-cluster:2026.08
-    # SOUL.md, AGENTS.md, the gke-* debugging skills, persona config
+    # /files: persona.yaml, instructions.md, the gke-* debugging skills, mcp.yaml
     # (read-only gke MCP + developer_knowledge; platform_control deliberately absent)
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08
@@ -602,23 +708,23 @@ chat notification, DAG scheduling. Stage 3 retires it, so here is the full inven
 where each piece lands. "Gateway" means the chatops gateway design owns rebuilding it -
 this spec only guarantees the bus carries what that rebuild needs.
 
-| Kanban capability (where it lives today)                                                                                                                                                                                                       | Under profiles                                                                                             | Verdict                          |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | -------------------------------- |
-| Card body as the worker's pre-built context                                                                                                                                                                                                    | The submission message's parts                                                                             | Covered                          |
-| Dispatch: 5s poll plus wake-file nudge (`kanban_wake_nudge.py`)                                                                                                                                                                                | Push durable consumer                                                                                      | Covered                          |
-| Claim/lease, `host:pid` fencing, 15-min lease (`kanban_ownership.py`, `kanban_scheduling.py` part 2)                                                                                                                                           | Single dispatcher, idempotent Job create keyed on taskId, envelope dedup                                   | Covered                          |
-| `max_in_progress` board cap (`common_types.go:278-311`)                                                                                                                                                                                        | `spec.concurrency`, per profile                                                                            | Covered                          |
-| Structured result posted verbatim, summary clipping (`kanban_result_required.py`)                                                                                                                                                              | `result` artifact + terminal status; rendering moves                                                       | Gateway                          |
-| Heartbeat notes as a rolling, edited chat line at zero LLM cost (`kanban_progress_lines.py`)                                                                                                                                                   | `progress` artifact carries the notes; the rolling-message rendering must be rebuilt                       | Gateway                          |
-| Auto-subscribe of the originating thread, inheritance to child cards, at-least-once delivery cursor, wake policy - completed does not wake the creator (the upstream `create_task()`, `kanban_auto_subscribe.py`, `kanban_notify_delivery.py`) | `correlationId` + durable replay are the substrate; subscription and wake policy are gateway session state | Gateway                          |
-| Report-by-thread `incidents` store, so "apply Option A" replies have context (`kanban_notifier.py`)                                                                                                                                            | No bus home; gateway session state                                                                         | Gateway - flagged to that design |
-| `needs_input` escalation to a human                                                                                                                                                                                                            | `input-required` state, first-class                                                                        | Covered                          |
-| Mid-run steering: `kanban_comment` injected into a running worker (`kanban_comment_status.py`)                                                                                                                                                 | Follow-up message on `…in`, adapter injects via harness stdin                                              | Covered (adapter work)           |
-| Exit-without-terminal reaper stamping `protocol_violation` (`kanban_guardrail_exit.py`)                                                                                                                                                        | Janitor synthesizes terminal `failed` with reason                                                          | Covered                          |
-| Attachments (`kanban_attach`)                                                                                                                                                                                                                  | A2A FileParts; backing store is the payload spec's open question                                           | Covered, pending that call       |
-| Board inspection (`kanban_list`, board-health cron)                                                                                                                                                                                            | `kubectl get jobs`, stream replay, the `runtime-state` KV                                                  | Covered, different tools         |
-| **Parent/child DAG, ready-gating, fan-in cards fed every parent's metadata, self-parenting repair** (`kanban_scheduling.py`)                                                                                                                   | Nothing. The orchestrating agent sequences its own fan-out and feeds results forward itself                | **Gap**                          |
-| **Retry budget, forgiveness classes (pod-replaced vs died-in-place), failure-limit breaker, crash-loop fingerprinting** (`kanban_scheduling.py` part 3, `kanban_board_health.py`)                                                              | Nothing. The janitor states the failure honestly; nobody counts them                                       | **Gap**                          |
+| Kanban capability (where it lives today)                                                                                                                                                                                                       | Under profiles                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Verdict                                                                  |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Card body as the worker's pre-built context                                                                                                                                                                                                    | The submission message's parts                                                                                                                                                                                                                                                                                                                                                                                                                                   | Covered                                                                  |
+| Dispatch: 5s poll plus wake-file nudge (`kanban_wake_nudge.py`)                                                                                                                                                                                | Push durable consumer                                                                                                                                                                                                                                                                                                                                                                                                                                            | Covered                                                                  |
+| Claim/lease, `host:pid` fencing, 15-min lease (`kanban_ownership.py`, `kanban_scheduling.py` part 2)                                                                                                                                           | Single dispatcher, idempotent Job create keyed on taskId, envelope dedup                                                                                                                                                                                                                                                                                                                                                                                         | Covered                                                                  |
+| `max_in_progress` board cap (`common_types.go:278-311`)                                                                                                                                                                                        | `spec.concurrency`, per profile                                                                                                                                                                                                                                                                                                                                                                                                                                  | Covered                                                                  |
+| Structured result posted verbatim, summary clipping (`kanban_result_required.py`)                                                                                                                                                              | `result` artifact + terminal status; rendering moves                                                                                                                                                                                                                                                                                                                                                                                                             | Gateway                                                                  |
+| Heartbeat notes as a rolling, edited chat line at zero LLM cost (`kanban_progress_lines.py`)                                                                                                                                                   | `progress` artifact carries the notes; the rolling-message rendering must be rebuilt                                                                                                                                                                                                                                                                                                                                                                             | Gateway                                                                  |
+| Auto-subscribe of the originating thread, inheritance to child cards, at-least-once delivery cursor, wake policy - completed does not wake the creator (the upstream `create_task()`, `kanban_auto_subscribe.py`, `kanban_notify_delivery.py`) | `correlationId` + durable replay are the substrate; subscription and wake policy are gateway session state                                                                                                                                                                                                                                                                                                                                                       | Gateway                                                                  |
+| Report-by-thread `incidents` store, so "apply Option A" replies have context (`kanban_notifier.py`)                                                                                                                                            | No bus home; gateway session state                                                                                                                                                                                                                                                                                                                                                                                                                               | Gateway - flagged to that design                                         |
+| `needs_input` escalation to a human                                                                                                                                                                                                            | `input-required` state, first-class                                                                                                                                                                                                                                                                                                                                                                                                                              | Covered                                                                  |
+| Mid-run steering: `kanban_comment` injected into a running worker (`kanban_comment_status.py`)                                                                                                                                                 | Follow-up message on `…in`, adapter injects via harness stdin                                                                                                                                                                                                                                                                                                                                                                                                    | Covered (adapter work)                                                   |
+| Exit-without-terminal reaper stamping `protocol_violation` (`kanban_guardrail_exit.py`)                                                                                                                                                        | Janitor synthesizes terminal `failed` with reason                                                                                                                                                                                                                                                                                                                                                                                                                | Covered                                                                  |
+| Attachments (`kanban_attach`)                                                                                                                                                                                                                  | A2A FileParts; backing store is the payload spec's open question                                                                                                                                                                                                                                                                                                                                                                                                 | Covered, pending that call                                               |
+| Board inspection (`kanban_list`, board-health cron)                                                                                                                                                                                            | `kubectl get jobs`, stream replay, the `runtime-state` KV                                                                                                                                                                                                                                                                                                                                                                                                        | Covered, different tools                                                 |
+| **Parent/child DAG, ready-gating, fan-in cards fed every parent's metadata, self-parenting repair** (`kanban_scheduling.py`)                                                                                                                   | Nothing. The orchestrating agent sequences its own fan-out and feeds results forward itself                                                                                                                                                                                                                                                                                                                                                                      | **Gap**                                                                  |
+| **Retry budget, forgiveness classes (pod-replaced vs died-in-place), failure-limit breaker, crash-loop fingerprinting** (`kanban_scheduling.py` part 3, `kanban_board_health.py`)                                                              | Nothing for the budget and the classes. The count survives the move: `status.usage.backgroundTasksGaveUpTotal` is the cards that gave up, read by the operator from the `chat_metrics` plugin's `kubeagents_kanban_tasks_gave_up_total`, which today reads the board's `gave_up` events; the stage-3 breaker must emit that series, or a sibling the poller is taught, when it trips, or the counter stops moving and a failing install passes the At-Risk check | **Gap** for the budget and the classes; the count is owed by the breaker |
 
 The two gaps, plainly:
 
@@ -667,7 +773,12 @@ Three small items to fold back into the payload spec rather than fork here (fold
   management section.
 - ~~**Persona packaging.**~~ Decided 8/24: OCI-only. One versioned path; dev friction is
   a tooling problem (a push target is seconds), not a second mechanism. Revisit only if
-  the iteration friction proves real.
+  the iteration friction proves real. **Amended 10/21 (#3656):** what the image carries is
+  a harness-neutral persona directory (`persona.yaml`, `instructions.md`, `skills/`,
+  `mcp.yaml`; [`a2a/lib/persona`](../../a2a/lib/persona/README.md), with the cluster agent as
+  the example in [`agents/cluster/persona`](../../agents/cluster/persona/README.md)), and an adapter per
+  harness renders it into that harness's config inside the pod. MCP servers are named on the
+  broker's relay only, so a persona cannot route a tool call around the broker's policy.
 - ~~**Per-task bus credentials.**~~ Decided 8/24: lands with the authority work - it is
   the same attenuation machinery, and that stream owns it. Stays reserved as a named
   tightening; stage 3 ships profile-level credentials. **Amended 9/9:** the authority
@@ -675,6 +786,9 @@ Three small items to fold back into the payload spec rather than fork here (fold
   attenuation machinery exists (`Attenuate`, the hop chain) but has no production
   caller, and bus credentials are still per-principal. It is a named tightening
   against built machinery now rather than against a plan, which is a better position
-  to be in, but it is not done.
+  to be in, but it is not done. **Amended 10/28 (#3889):** staged. Its first PR adds a
+  worker's task connection, granted one task's subjects on a task credential the
+  dispatcher signs; the worker PR moves the worker onto it and removes the pod
+  connection's profile-wide task reach, before #3659's tiers stronger than Read go live.
 - ~~**Worker session naming.**~~ Decided 8/24: the animals stay - `<profile>-<animal>`
   per run, with `from.profile` carrying the structure.

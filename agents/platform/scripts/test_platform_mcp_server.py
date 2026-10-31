@@ -69,6 +69,49 @@ platform_mcp_server._run_env = lambda extra=None: {"HOME": "/tmp", "SLACK_BOT_TO
 # whole subject is that function. Every call there passes an explicit path.
 sandbox_exec.MANAGED_CONFIG_PATH = "/nonexistent/kube-agents-test/config.yaml"
 
+# Same treatment, same reason, for the platform resolution `send_notification`
+# delegates to. `chat_platforms` reads the managed scope first and the profile's
+# config.yaml second, both of which exist in the agent pod and on a developer's
+# machine but not on a CI runner — so unpinned, whether a case resolves off a
+# file or off the environment depends on where it runs. Pinned to nothing, the
+# file sources are closed and the cases that are about them point these at a
+# tmpdir.
+import chat_notify  # noqa: E402
+import chat_platforms  # noqa: E402
+chat_platforms.MANAGED_CONFIG_PATH = "/nonexistent/kube-agents-test/managed.yaml"
+chat_platforms.CONFIG_PATH = "/nonexistent/kube-agents-test/profile.yaml"
+
+# Closing the files leaves the third source open, and it is the one that runs in
+# the maintainer's own shell: `SLACK_HOME_CHANNEL` and `SLACK_RELAY_URL` are
+# exactly the variables a contributor with a live install exports. A case that
+# names two signals and inherits the rest therefore resolves differently on a
+# workstation than on a runner, which reds the suite on the machine the eval
+# loop runs from. `tests/integration/_seams.py` pops the same list for the same
+# reason. Derived from `_ENV_SIGNALS` rather than listed out, so a signal added
+# there cannot escape the blanking; a case states the ones it wants by merging
+# them over this.
+#
+# `_ENV_SIGNALS` is not the whole of the third source any more. Since the gateway
+# took the backend under `next`, `A2A_NOTIFY_PLATFORM` decides two things these
+# cases assert on: `enabled_chat_platforms` counts the routed platform as enabled
+# whatever the files say, and `chat_notify.command` turns a `hermes send` argv into
+# an `a2a notify` one. An operator renders it, so it is on a maintainer's shell for
+# the same reason the relay URLs are. Named from `chat_notify`'s own constants.
+BLANK_CHAT_ENV = {
+    var: "" for signals in chat_platforms._ENV_SIGNALS.values() for var in signals
+} | {chat_notify.NOTIFY_PLATFORM_ENV: "", chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}
+# The projected home-channel file is absent on a test runner; say so rather
+# than rely on it.
+_HOME_DIR_PATCH = patch.object(chat_notify, "HOME_FILE_DIR", "/nonexistent/kube-agents-chat-home")
+
+
+def setUpModule():
+    _HOME_DIR_PATCH.start()
+
+
+def tearDownModule():
+    _HOME_DIR_PATCH.stop()
+
 from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics, audit_log_searcher, send_notification, report_to_chat, _sanitize_log_text, _sanitize_audit_value, _strip_audit_log_noise
 
 class TestVerifyGkeCluster(unittest.TestCase):
@@ -675,7 +718,7 @@ class TestSendNotification(unittest.TestCase):
 
     @patch('platform_mcp_server._run_env')
     @patch('platform_mcp_server.subprocess.run')
-    @patch.dict(os.environ, {'SLACK_BOT_TOKEN': ''})
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV})
     def test_send_notification_no_session(self, mock_run, mock_env):
         mock_env.return_value = {}
         mock_response = MagicMock()
@@ -692,6 +735,7 @@ class TestSendNotification(unittest.TestCase):
     @patch('platform_mcp_server._run_env')
     @patch('urllib.request.urlopen')
     @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV})
     def test_send_notification_with_session_success(self, mock_run, mock_urlopen, mock_env):
         mock_env.return_value = {}
         
@@ -717,7 +761,7 @@ class TestSendNotification(unittest.TestCase):
     @patch('platform_mcp_server._run_env')
     @patch('urllib.request.urlopen')
     @patch('platform_mcp_server.subprocess.run')
-    @patch.dict(os.environ, {'SLACK_BOT_TOKEN': ''})
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV})
     def test_send_notification_metadata_api_error_fallback(self, mock_run, mock_urlopen, mock_env):
         mock_env.return_value = {}
         
@@ -739,10 +783,9 @@ class TestSendNotification(unittest.TestCase):
     @patch('platform_mcp_server._run_env')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {
+        **BLANK_CHAT_ENV,
         'SLACK_BOT_TOKEN': 'xoxb-dummy',
         'SLACK_HOME_CHANNEL': 'C12345',
-        'GOOGLE_CHAT_HOME_CHANNEL': '',
-        'GOOGLE_CHAT_PROJECT_ID': '',
     })
     def test_send_notification_slack_only(self, mock_run, mock_env):
         mock_env.return_value = {}
@@ -760,8 +803,32 @@ class TestSendNotification(unittest.TestCase):
     @patch('platform_mcp_server._run_env')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {
-        'SLACK_BOT_TOKEN': '',
-        'SLACK_HOME_CHANNEL': '',
+        **BLANK_CHAT_ENV,
+        'SLACK_BOT_TOKEN': 'xoxb-dummy',
+        'A2A_NOTIFY_CONVERSATIONS': 'slack',
+    })
+    def test_send_notification_slack_learned_home_targets_the_bare_platform(self, mock_run, mock_env):
+        # A learned home channel is projected into a file, never into env: the
+        # target is the bare platform (the gateway posts into its home) and the
+        # gateway path carries no channel.
+        mock_env.return_value = {}
+        mock_response = MagicMock()
+        mock_response.stdout = '{"ok": true}'
+        mock_run.return_value = mock_response
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, 'slack_home'), 'w', encoding='utf-8') as handle:
+                handle.write('C0FILE\n')
+            with patch.object(chat_notify, "HOME_FILE_DIR", directory):
+                result = send_notification("alert", session_id="")
+        self.assertIn("SUCCESS: Notification posted to slack", result)
+        argv = mock_run.call_args[0][0]
+        self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "slack"])
+        self.assertNotIn("C0FILE", " ".join(argv))
+
+    @patch('platform_mcp_server._run_env')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {
+        **BLANK_CHAT_ENV,
         'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAA',
     })
     def test_send_notification_google_chat_only(self, mock_run, mock_env):
@@ -780,6 +847,7 @@ class TestSendNotification(unittest.TestCase):
     @patch('platform_mcp_server._run_env')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {
+        **BLANK_CHAT_ENV,
         'SLACK_BOT_TOKEN': 'xoxb-dummy',
         'SLACK_HOME_CHANNEL': 'C12345',
         'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAA',
@@ -802,6 +870,269 @@ class TestSendNotification(unittest.TestCase):
             ["hermes", "send", "--to", "google_chat:spaces/AAAA", "alert"],
             capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
+
+
+class TestSendNotificationTargetIntegrity(unittest.TestCase):
+    """A composed target names the platform its coordinates came from, or is not composed.
+
+    `hermes send` refuses a Google Chat thread addressed as Slack rather than
+    degrading it to the home channel, so a target assembled from two platforms
+    is not a misdelivery risk — it is a guaranteed non-delivery, and one that
+    used to take the working fallback down with it (#743).
+    """
+
+    # Coordinates that are unambiguously Google Chat's, as the live metadata row
+    # in #743 held them.
+    GCHAT_CHAT_ID = "spaces/AAAAexample"
+    GCHAT_THREAD_ID = "spaces/AAAAexample/threads/TTTTexample"
+
+    def _metadata(self, **fields):
+        resp = MagicMock()
+        resp.status = 200
+        resp.read.return_value = json.dumps(fields).encode()
+        return resp
+
+    def _hermes_ok(self):
+        res = MagicMock()
+        res.stdout = "posted"
+        return res
+
+    def _targets(self, mock_run):
+        """The `--to` argument of every hermes call, in order."""
+        return [call.args[0][3] for call in mock_run.call_args_list]
+
+    @patch('platform_mcp_server._run_env')
+    @patch('urllib.request.urlopen')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {
+        **BLANK_CHAT_ENV,
+        'SLACK_HOME_CHANNEL': 'C12345',
+        'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAAexample',
+    })
+    def test_a_watcher_session_is_not_addressed_as_slack(self, mock_run, mock_urlopen, mock_env):
+        # The exact row #743 observed: Google Chat coordinates under the
+        # `k8s-watcher` sentinel `POST /sessions` stamps at creation, on an
+        # install where Slack is also enabled. The old code guessed "slack"
+        # because Slack was enabled, kept the Google Chat ids, and emitted
+        # `slack:spaces/...:spaces/.../threads/...`.
+        mock_env.return_value = {}
+        mock_urlopen.return_value.__enter__.return_value = self._metadata(
+            platform="k8s-watcher",
+            chat_id=self.GCHAT_CHAT_ID,
+            thread_id=self.GCHAT_THREAD_ID,
+        )
+        mock_run.return_value = self._hermes_ok()
+
+        send_notification("rca report", session_id="k8s-evt-abc")
+
+        self.assertEqual(
+            {"slack:C12345", "google_chat:spaces/AAAAexample"},
+            set(self._targets(mock_run)),
+            "an unattributable thread should fall through to the home channels",
+        )
+
+    @patch('platform_mcp_server._run_env')
+    @patch('urllib.request.urlopen')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAAexample'})
+    def test_a_row_with_no_platform_at_all_is_not_guessed_at(self, mock_run, mock_urlopen, mock_env):
+        # The other half of the same condition: a row predating the writer that
+        # records the platform carries coordinates and no `platform` key.
+        mock_env.return_value = {}
+        mock_urlopen.return_value.__enter__.return_value = self._metadata(
+            chat_id=self.GCHAT_CHAT_ID, thread_id=self.GCHAT_THREAD_ID,
+        )
+        mock_run.return_value = self._hermes_ok()
+
+        send_notification("rca report", session_id="k8s-evt-abc")
+
+        self.assertEqual(["google_chat:spaces/AAAAexample"], self._targets(mock_run))
+
+    @patch('platform_mcp_server._run_env')
+    @patch('urllib.request.urlopen')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAAexample'})
+    def test_a_row_that_names_its_platform_is_still_threaded(self, mock_run, mock_urlopen, mock_env):
+        # The fix must not cost the threading it exists to make correct.
+        mock_env.return_value = {}
+        mock_urlopen.return_value.__enter__.return_value = self._metadata(
+            platform="google_chat",
+            chat_id=self.GCHAT_CHAT_ID,
+            thread_id=self.GCHAT_THREAD_ID,
+        )
+        mock_run.return_value = self._hermes_ok()
+
+        send_notification("rca report", session_id="k8s-evt-abc")
+
+        self.assertEqual(
+            [f"google_chat:{self.GCHAT_CHAT_ID}:{self.GCHAT_THREAD_ID}"],
+            self._targets(mock_run),
+        )
+
+    @patch('platform_mcp_server._run_env')
+    @patch('urllib.request.urlopen')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAAexample'})
+    def test_a_row_with_no_thread_is_not_reported_as_a_declined_guess(
+        self, mock_run, mock_urlopen, mock_env
+    ):
+        # `POST /sessions` stamps `k8s-watcher` at creation, and the alert path
+        # skips `_register_session_routing` when its own `hermes send` failed —
+        # so this row, sentinel and no coordinates, is what a broken chat leg
+        # leaves behind. It goes to the home channel for the ordinary reason
+        # (there is no thread), not because a thread was declined. Testing the
+        # platform before the coordinates logged the #743 guess at an operator
+        # who could have made no guess.
+        mock_env.return_value = {}
+        mock_urlopen.return_value.__enter__.return_value = self._metadata(
+            platform="k8s-watcher",
+        )
+        mock_run.return_value = self._hermes_ok()
+
+        with patch.object(platform_mcp_server, "log") as mock_log:
+            send_notification("rca report", session_id="k8s-evt-abc")
+
+        self.assertEqual(["google_chat:spaces/AAAAexample"], self._targets(mock_run))
+        self.assertNotIn(
+            "rather than guessing a thread",
+            " ".join(str(call) for call in mock_log.call_args_list),
+            "no thread existed to decline, so the log must not claim one was",
+        )
+
+
+class TestSendNotificationDeliveryFallback(unittest.TestCase):
+    """A thread target that fails does not suppress the home-channel broadcast.
+
+    The broadcast used to be gated on `if not targets:` — on whether a target
+    had been *composed* rather than on whether one had *landed* — so a single
+    unsendable address cost the report every delivery it had (#743).
+    """
+
+    THREAD_TARGET = "google_chat:spaces/AAAA:spaces/AAAA/threads/TTTT"
+
+    def _metadata(self):
+        resp = MagicMock()
+        resp.status = 200
+        resp.read.return_value = json.dumps({
+            "platform": "google_chat",
+            "chat_id": "spaces/AAAA",
+            "thread_id": "spaces/AAAA/threads/TTTT",
+        }).encode()
+        return resp
+
+    def _targets(self, mock_run):
+        return [call.args[0][3] for call in mock_run.call_args_list]
+
+    @patch('platform_mcp_server._run_env')
+    @patch('urllib.request.urlopen')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/HOME'})
+    def test_a_failed_thread_send_falls_back_to_the_home_channel(self, mock_run, mock_urlopen, mock_env):
+        mock_env.return_value = {}
+        mock_urlopen.return_value.__enter__.return_value = self._metadata()
+
+        def hermes(cmd, **kwargs):
+            if cmd[3] == self.THREAD_TARGET:
+                raise subprocess.CalledProcessError(
+                    1, cmd, stderr="hermes send: could not resolve thread",
+                )
+            res = MagicMock()
+            res.stdout = "posted"
+            return res
+
+        mock_run.side_effect = hermes
+
+        result = send_notification("rca report", session_id="k8s-evt-abc")
+
+        self.assertEqual(
+            [self.THREAD_TARGET, "google_chat:spaces/HOME"], self._targets(mock_run),
+        )
+        self.assertIn("SUCCESS: Notification posted to google_chat", result)
+
+    @patch('platform_mcp_server._run_env')
+    @patch('urllib.request.urlopen')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/HOME'})
+    def test_a_thread_send_that_lands_is_not_also_broadcast(self, mock_run, mock_urlopen, mock_env):
+        # The fallback is for a report that reached nobody. A threaded report
+        # that arrived must not arrive a second time in the home channel.
+        mock_env.return_value = {}
+        mock_urlopen.return_value.__enter__.return_value = self._metadata()
+        res = MagicMock()
+        res.stdout = "posted"
+        mock_run.return_value = res
+
+        send_notification("rca report", session_id="k8s-evt-abc")
+
+        self.assertEqual([self.THREAD_TARGET], self._targets(mock_run))
+
+    @patch('platform_mcp_server._run_env')
+    @patch('urllib.request.urlopen')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/HOME'})
+    def test_a_thread_send_of_unknown_outcome_is_not_broadcast_again(self, mock_run, mock_urlopen, mock_env):
+        # `a2a notify` exits NOTIFY_OUTCOME_UNKNOWN when the gateway did not
+        # answer in time: the post may have landed, and `chat_notify` says not
+        # to resend it. The fallback keys on delivery, so it has to read that
+        # exit as delivered rather than as the failure its non-zero code looks
+        # like, or a report that did post gets a second copy in the home
+        # channel -- the duplicate this fallback is built not to create.
+        mock_env.return_value = {}
+        mock_urlopen.return_value.__enter__.return_value = self._metadata()
+        mock_run.side_effect = subprocess.CalledProcessError(
+            chat_notify.NOTIFY_OUTCOME_UNKNOWN, ["a2a"], stderr="the gateway did not answer",
+        )
+
+        result = send_notification("rca report", session_id="k8s-evt-abc")
+
+        self.assertEqual([self.THREAD_TARGET], self._targets(mock_run))
+        self.assertNotIn("NOTE: thread delivery failed", result)
+        self.assertIn("do not resend it", result)
+
+
+class TestSendNotificationPlatformResolution(unittest.TestCase):
+    """`send_notification` resolves platforms the way every other reader does.
+
+    Its own copy read CONFIG_PATH and then `SLACK_BOT_TOKEN or
+    SLACK_HOME_CHANNEL`, never the managed scope — the one file that states what
+    the CR turned on. On a credential-proxy install the token is absent by design
+    and the home channel is rendered regardless, so the copy could name a
+    platform the operator had disabled (#743).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.managed = os.path.join(self.tmp, "managed.yaml")
+        patcher = patch.object(chat_platforms, "MANAGED_CONFIG_PATH", self.managed)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _targets(self, mock_run):
+        return [call.args[0][3] for call in mock_run.call_args_list]
+
+    @patch('platform_mcp_server._run_env')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {
+        **BLANK_CHAT_ENV,
+        'SLACK_HOME_CHANNEL': 'C12345',
+        'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAA',
+    })
+    def test_a_platform_the_cr_disabled_gets_no_notification(self, mock_run, mock_env):
+        Path(self.managed).write_text(
+            "platforms:\n"
+            "  slack:\n    enabled: false\n"
+            "  google_chat:\n    enabled: true\n"
+        )
+        mock_env.return_value = {}
+        res = MagicMock()
+        res.stdout = "posted"
+        mock_run.return_value = res
+
+        result = send_notification("alert", session_id="")
+
+        self.assertEqual(["google_chat:spaces/AAAA"], self._targets(mock_run))
+        self.assertNotIn("slack", result)
 
 
 class TestSessionKvHeaders(unittest.TestCase):
@@ -1066,16 +1397,19 @@ class TestSanitizationAndMutationRemoval(unittest.TestCase):
     def test_sanitize_log_text_zero_width_bidi_c1_and_tags(self):
         # Verify stripping of zero-width space (U+200B), BOM (U+FEFF), bidi override (U+202E),
         # DEL (0x7F), C1 control (0x80), 8-bit CSI (0x9B), and Unicode tag block (U+E0001).
-        raw = "normal\u200btext\ufeff\u202esmuggled\x7f\x80\x9b31mcolor\U000e0041end\n"
+        raw = "normal\u200btext\ufeff\u202esmuggled\x7f\x80\x9b31mcolor\U000e0041end\u2028sep\u2029par\u2800blank\n"
         sanitized = _sanitize_log_text(raw)
         self.assertNotIn("\u200b", sanitized)
+        # The three code points the shared filter added over the server's old copy.
+        for separator in ("\u2028", "\u2029", "\u2800"):
+            self.assertNotIn(separator, sanitized)
         self.assertNotIn("\ufeff", sanitized)
         self.assertNotIn("\u202e", sanitized)
         self.assertNotIn("\x7f", sanitized)
         self.assertNotIn("\x80", sanitized)
         self.assertNotIn("\x9b", sanitized)
         self.assertNotIn("\U000e0041", sanitized)
-        self.assertIn("normaltextsmuggledcolorend", sanitized)
+        self.assertIn("normaltextsmuggledcolorendseppar", sanitized)
 
     def test_sanitize_audit_value_zero_width_bidi_c1_and_tags(self):
         raw = {
@@ -1246,6 +1580,18 @@ class TestFindingsQueueTools(unittest.TestCase):
     def test_a_hash_only_publication_does_not_clobber_the_target(self):
         platform_mcp_server.findings_publication("nudge", "chat", content_hash="h1")
         self.assertEqual(self.captured[-1][2], {"target_kind": "chat", "content_hash": "h1"})
+
+    def test_a_decision_covers_its_named_rows_and_says_what_stays_open(self):
+        # The model reads this docstring as the tool's description: without
+        # the rule, a careful model asks before a permanent decision that also
+        # covers rows the user did not name (findings-decision-covers-item).
+        # The cascade leaves 'queued' (never named) rows open, so the model is
+        # told to report them rather than to look for them first.
+        doc = " ".join(platform_mcp_server.update_finding.__doc__.split())
+        self.assertIn("Covering the rest of the item is the decision's design, not a side effect to confirm", doc)
+        self.assertIn("say in the reply which other findings it covered", doc)
+        self.assertIn("its id comes back in `item_rows_left_open`: say in the reply that it is still open", doc)
+        self.assertNotIn("ask the user instead of calling", doc)
 
     def test_a_finding_id_cannot_reroute_the_call(self):
         platform_mcp_server.update_finding("../../v1/sessions", state="accepted")

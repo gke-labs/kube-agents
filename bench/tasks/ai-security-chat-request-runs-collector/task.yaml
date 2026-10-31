@@ -140,6 +140,12 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
+      # Read each tagged `terminal` call as typed. Without after_result_pattern
+      # the check reads Hermes's one-line rendering of the worker's command,
+      # which shows a chain as its first command plus `+ N commands` and joins
+      # a second line into the first (#3128). The pattern never matches a
+      # result and no forbidden pattern is set, so it opens no window.
+      after_result_pattern: "(?!)"
       required_runs:
         - script: collect.py
           word_patterns: ["^ai-security-audit$"]

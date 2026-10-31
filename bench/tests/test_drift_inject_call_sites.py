@@ -21,11 +21,10 @@ or that grew an `owners` argument where its case requires none would still
 produce a payload the builder accepts and the daemon files. The case would
 then fail on a judged objective as though the agent were wrong.
 
-That is worth a test rather than a comment because of who runs these: only
-`gitops-drift-out-of-band-triage` is registered. `scripts/validate_bench_cases.py`
-holds the other two as KNOWN_UNREGISTERED while the nightly's infra-lock chain
-has no room, so two of the three call sites are exercised by nothing until
-somebody runs them by hand.
+That is worth a test rather than a comment because of when these run: every
+one is nightly-only, so a swapped argument is seen once a night at best,
+and the nightly truncated three times in the week before the two CUJ 1 halves
+were registered into it. A test sees it on the pull request instead.
 
 This reads the `.tf` files rather than mocking them: the subject is the call
 site, and a test that restated the arguments would drift from the stack the
@@ -93,6 +92,7 @@ class EveryStackPassesWhatItsCaseNeeds(unittest.TestCase):
         "gitops-drift",
         "gitops-drift-deleted-policy",
         "gitops-drift-load-bearing",
+        "gitops-drift-unmanaged-object",
     )
 
     def test_every_call_has_the_arity_the_builder_requires(self):
@@ -125,6 +125,8 @@ class EveryStackPassesWhatItsCaseNeeds(unittest.TestCase):
                 "networking.k8s.io",
             ),
             "gitops-drift-load-bearing": ("patch", "deployments", "apps"),
+            # The core group is empty on the record, as the detector maps it.
+            "gitops-drift-unmanaged-object": ("patch", "namespaces", ""),
         }
         for stack, (verb, resource, group) in expected.items():
             with self.subTest(stack=stack):
@@ -207,6 +209,15 @@ class EveryStackPassesWhatItsCaseNeeds(unittest.TestCase):
                 "principal": "TF_var.drift_principal",
                 "namespace": "TF_local.ns",
                 "name": "TF_local.workload",
+            },
+            # The namespace object itself: no namespace scope, and the
+            # namespace is the name.
+            "gitops-drift-unmanaged-object": {
+                "cluster": "TF_var.host_cluster_name",
+                "location": "TF_var.host_cluster_location",
+                "principal": "TF_var.drift_principal",
+                "namespace": "",
+                "name": "TF_local.ns",
             },
         }
         for stack, fields_expected in expected.items():

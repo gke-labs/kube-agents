@@ -43,11 +43,13 @@ or every model call will time out.
 {{- end }}
 
 {{- if .Values.platformAgent.enabled }}
+{{- $vertexCredRef := ((.Values.litellm.vertex).credentialsSecretRef) | default dict }}
+{{- $vertexProjectRef := ((.Values.litellm.vertex).projectSecretRef) | default dict }}
 
 Before the agent pod can start, the Secret "{{ .Values.platformAgent.credentials.secretName }}"
-must exist in {{ .Release.Namespace }} with an API_SERVER_KEY entry{{ if and .Values.litellm.enabled (eq .Values.litellm.modelProvider "vertex_ai") }}. The
+must exist in {{ .Release.Namespace }} with an API_SERVER_KEY entry{{ if and .Values.litellm.enabled (eq .Values.litellm.modelProvider "vertex_ai") }}{{ if and $vertexCredRef.name (eq $vertexCredRef.name .Values.platformAgent.credentials.secretName) }} and the Vertex service-account key in {{ $vertexCredRef.key }}{{ end }}{{ if and $vertexProjectRef.name (eq $vertexProjectRef.name .Values.platformAgent.credentials.secretName) }} and the Vertex project ID in {{ $vertexProjectRef.key }}{{ end }}.{{ if and $vertexCredRef.name (ne $vertexCredRef.name .Values.platformAgent.credentials.secretName) }} The Vertex service-account key is read from Secret "{{ $vertexCredRef.name }}" ({{ $vertexCredRef.key }}).{{ else if not $vertexCredRef.name }} The
 vertex_ai provider needs no model API key — the gateway authenticates with
-Workload Identity.{{ else if and .Values.litellm.enabled (eq .Values.litellm.modelProvider "openai_compatible") }}. The
+Workload Identity.{{ end }}{{ if and $vertexProjectRef.name (ne $vertexProjectRef.name .Values.platformAgent.credentials.secretName) }} The Vertex project ID is read from Secret "{{ $vertexProjectRef.name }}" ({{ $vertexProjectRef.key }}).{{ end }}{{ else if and .Values.litellm.enabled (eq .Values.litellm.modelProvider "openai_compatible") }}. The
 openai_compatible provider's key is optional: add OPENAI_COMPATIBLE_API_KEY
 when the server at {{ .Values.litellm.openaiCompatible.apiBase }} checks one.
 {{- with .Values.litellm.openaiCompatible.caBundleSecretRef.name }}

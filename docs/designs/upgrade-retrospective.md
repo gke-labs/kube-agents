@@ -1,7 +1,12 @@
 # Upgrade retrospective: what the last upgrade did, and the fix set up before the next one
 
-**Status:** design. Nothing here is built on `main`. The collector it specifies is the first of
-three changes; the schedule and the agent's part follow it. The
+**Status:** the collector (work item 1, §5) and the weekly job (work item 2) are on `main`:
+`agents/platform/skills/fleet-audit/scripts/upgrade_retrospective.py`; the `upgrade-retrospective`
+roster entry and its SOP; the first-run stage's start of it, with or without a repository; the
+on-demand route; and the stream's `AUDITS` and `COLLECTOR_AUDITS` entries. Not built: the
+`upgrade-retrospective-after-upgrade` roster entry and `upgrade_retrospective_watch.py` (§3.1, and
+the SOP's after-upgrade route with them), the readiness watch's `guards.json` reader (§3.5), and
+the proof (work item 3). The
 [upgrade failure catalogue](upgrade-failure-catalogue.md) is the list of failures it classifies
 against, and the [readiness checks](upgrade-readiness-checks.md) are the before-the-upgrade half it
 feeds.
@@ -13,8 +18,11 @@ workloads on the cluster. A collector script reads each cluster after an upgrade
 with the record from the previous run. The review runs once at install time, at the end of each
 weekend, and soon after each upgrade. The report lists Errors, Warnings and Info, with the matching
 entry of the upgrade failure catalogue for each incident. For each failure the review writes a
-guard, a record the readiness report shows before the next upgrade. A user can also ask about the
-last upgrades in chat and get the same report.
+guard, a record the readiness report shows before the next upgrade. Each reviewed cluster also
+carries a gate, `clear`, `risk` or `pending`, from the diff and from the log bytes each container
+wrote in the week after the upgrade against the week before; the rollout orchestration SOP reads
+it before the rest of a cluster family follows. A user can also ask about the last upgrades in
+chat and get the same report.
 
 ## Requirements
 
@@ -102,8 +110,7 @@ This design adds a scheduled review, the **upgrade retrospective**. The requirem
    failure that is gone by then leaves no entry. "None" appears only when the count is zero.
 
 4. **Store the report where the agent can read it,** on the storage its tools use, with the latest
-   report at a fixed path. Post one line per reviewed cluster in chat, with the counts and the most
-   important finding. A weekend with no change posts nothing. A GitHub repository is not required;
+   report at a fixed path. Post the headline and the most important findings in chat, each with its cluster and object, from the record `finish` writes; the report carries one block per reviewed cluster with its counts. A weekend with no change posts nothing. A GitHub repository is not required;
    it adds only the tracked issue.
 5. **Be testable on the failures the test fleet already contains.** The test fleet has planted
    examples of the catalogue's failures. The first report over that fleet must classify those
@@ -117,11 +124,13 @@ stays a user's "apply", through the route the agent uses for every other propose
 The [readiness checks](upgrade-readiness-checks.md) end with "a diff after the upgrade", and the
 [catalogue](upgrade-failure-catalogue.md) says post-upgrade detection is one mechanism for every
 entry: watch the operation, then compare pod health against the same measurements taken before.
-Neither is built. The reproductions behind the catalogue measured why it matters: on a surge
+The diff after the upgrade now runs as the `upgrade-retrospective` job; the guards reader is not
+built. The reproductions behind the catalogue measured why it matters: on a surge
 upgrade GKE refused the eviction a budget protected for an hour, force-killed the pod, and reported
 the operation `DONE` two minutes later while the replacement was still Pending. The symptoms of the
 twenty failures sit in pod status, node conditions and `Warning` events that nothing scheduled
-reads, and what one cluster's upgrade broke never reaches the next cluster's readiness report.
+read until the retrospective, and what one cluster's upgrade broke never reaches the next cluster's
+readiness report.
 
 One thing on the roster and one design shape this one. The fleet audits pair a deterministic
 collector (`collect.py`, `patch_readiness.py`) with a governance SOP the Platform Agent follows,
@@ -177,12 +186,11 @@ first run comes from the Chat Agent's first-run stage, the same place the four f
 once the onboarding scan settles, so a fresh install's first report is a baseline of every cluster
 it manages rather than a blank. With no GitOps repository the first-run stage still starts the
 audits, and the fleet-audit skill's `start` runs without a forge (`"mode": "none"`). This stream needs
-no repository either: the collector needs none and the report on the volume is the record. Where a repository is configured and the run is full,
+no repository either: without one `start` runs with no forge (`"mode": "none"`), and `finish` stores the document in the report store (`status: "NO_FORGE"`) instead of a ledger issue; the report on the volume is the record either way. On a full run,
 the SOP calls the `fleet_scope` tool (§3.2), probes the collector's lock (§3.6; a probe that
 names a pending reset makes the run the baseline of §3.6, the collector alone with no `start` or
-`finish`), calls `start`, runs the collector, then `finish` with the collector's manifest (`finish`
-refuses a manifest older than the run); without a repository it runs the collector alone, manifest
-included, and the first-run stage marks this job due without one. An install that onboarded before the job existed gets its baseline from
+`finish`), calls `start`, runs the collector, then `draft` and `finish` with the collector's manifest (`finish`
+refuses a manifest older than the run), with or without a repository, and the first-run stage marks this job due without one. An install that onboarded before the job existed gets its baseline from
 the first Sunday tick; the after-upgrade sweep, which on most such installs arrives first, finds no
 full run in the ledger and prints only that (§3.2).
 
@@ -425,7 +433,7 @@ The boundary between the collector and the fleet-audit harness is the one every 
 already uses, the collector manifest
 ([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md)), not a contract of this
 design's own; the harness's rules are used as they stand on `main`, and this paragraph is the one
-statement of what the manifest carries. The stream's roster, its `AUDITS` entry, is six check ids.
+statement of what the manifest carries. The stream's roster, its `AUDITS` entry, is seven check ids.
 Each has one read that decides it and a set of reads that feed it:
 
 - `upgrade-operation-failed`: decided by the operations listing; nothing else feeds it.
@@ -437,6 +445,12 @@ Each has one read that decides it and a set of reads that feed it:
   workloads (entry 3), nodes (the pod's pool), the cluster describe
   (versions and the maintenance policy for entry 5) and the operations listing (the window and the
   gate).
+- `upgrade-log-volume-rose`: decided by the Monitoring read of Cloud Logging ingestion bytes
+  per container (`logging.googleapis.com/byte_count` on `k8s_container`, summed per namespace
+  and container over the seven days after the window's last operation and the seven days before
+  its first, through the credential proxy's Monitoring route); fed by the operations listing
+  (the window's anchors). A failure there is the check unevaluated with the read in
+  `limitations`, and the cluster's gate `pending`.
 - Info alone, no limitation: the server config (the next upgrade) and the storage, webhook and
   endpoint-slice lists (the risks table); a failure there is a "Reads that failed" line.
 
@@ -449,8 +463,8 @@ failed read is filed, and every guard that read could have shown is held unchang
 candidate (a guard is dropped only when every read that could show it answered). Either way
 `coverage_gaps` reads the `limitations` as a gap, so the run is partial: `finish` announces nothing
 resolved, and the cluster's previous findings wait for a run that reads it (below). `coverage_gaps`
-also measures every `scope.clusters` entry against all six checks and files a gap for any it finds
-in neither `checks_run` nor `checks_not_applicable`, so each `collected` entry carries all six or
+also measures every `scope.clusters` entry against all seven checks and files a gap for any it finds
+in neither `checks_run` nor `checks_not_applicable`, so each `collected` entry carries all seven or
 names its gap. On a full run the collector writes the manifest at the harness's manifest path
 for the stream (`audit_report.manifest_path_for`: `manifest_upgrade-retrospective.json` under the
 scratch directory, `/opt/data/scratch` by default), which the SOP passes as `--manifest-file`, as
@@ -460,7 +474,7 @@ scrub of a previous run's manifest read that path and no other (§3.6). The mani
 `collected`, with a `commands[]` record per check naming its deciding read. An unchanged cluster
 is `collected` too: the operations listing, with the cluster's versions, decided that nothing
 upgraded it, which answers every check that asks what the upgrade did, so `commands[]` carries all
-six checks backed by that listing; a check whose deciding read the run made there, the pods and
+seven checks backed by that listing; a check whose deciding read the run made there, the pods and
 nodes refresh reads or a guard's re-check reads, is backed by that read instead, or is unevaluated
 when it failed; "only the reads that guard needs" (§3.2) is a read rule, and the listing is what
 the checks rest on. A failed operations listing leaves `upgrade-operation-failed` unevaluated on
@@ -536,6 +550,23 @@ what this design would otherwise state as prose: an unreachable cluster must be 
 `scope.skipped`, a check the collector did not run cannot be claimed, every candidate is published
 or disclosed, and the held set is the manifest's. `report.json` and the Markdown remain the human
 report; they are not what `finish` reads.
+
+**The gate.** Every reviewed cluster with an upgrade operation in the window carries a gate,
+in its Info block (`**Gate.**`), in `reviews[].gate` and in the ledger entry (`gate`): `risk`
+when the upgrade brought an Error or a Warning (a symptom group that does not predate it and is
+not a recreated pod alone, by the one rule `triage` applies, or a failed operation) or a
+container's Cloud Logging ingestion in the seven days after the last operation is at least
+2.0 times its seven days before the first and at least 1 GiB (`LOG_VOLUME_RISK_RATIO`,
+`LOG_VOLUME_RISK_MIN_BYTES`; such a container is the seventh check's Warning); `pending` while
+the after-week is not complete, the review was partial or the Monitoring read failed; `clear`
+otherwise. A pending gate is kept in the ledger with its anchors and read again on the next full
+run (Info's `Gates re-read:`), so a Sunday run a few days after an upgrade reads `clear` or
+`risk` a week later without reviewing the cluster again. The `upgrade-family` cluster label
+groups the clusters into families; `families[]` (and Info's `Families:`) reads each family from
+its first-upgraded member's gate: `hold` on `risk`, `pending` on `pending`, `go` once every read
+gate is `clear`. The rollout orchestration SOP
+(`agents/platform/governance/upgrade_rollout_orchestration_sop.md`) is the reader: it runs the
+scoped diff on a family's first cluster (`--cluster <project>/<location>/<name> --since <the first operation's start>`, beside the `fleet_scope` tool's `collector_args`) and lets the rest follow on `clear`.
 
 ### 3.4 Classification by signature, with the evidence attached
 
@@ -762,7 +793,7 @@ the shell sandbox on, the sandbox pod's own data volume, which is not the gatewa
 streams). The root is fixed at `/opt/data/upgrade-retrospective/`, overridable by an environment
 variable, rather than under `$HERMES_HOME`, because a cron worker and a chat session resolve that
 variable to different directories and a store rooted there is written at one path and read from
-another. Under the root: `reports/<timestamp>.md`, `upgrade-retro-report.md` beside `reports/` pointing
+another. Under the root: `reports/<timestamp>.md`, `reports/upgrade-retro-report.md` beside them pointing
 at the latest full run, the same report as `.json`, `ledger.json` and `guards.json`. The volume survives a
 pod restart, every session's tools can read it, and the on-demand route finds the Sunday report
 there. Three triggers write the same files, so one run holds an exclusive lock on `.lock` under the
@@ -895,8 +926,9 @@ the records and the live ledger and guards files under `archive/<stamp>/` and ma
 the next full run is a baseline that reviews every cluster as new under the first-run rules of
 §3.2, writes its manifest with `after_reset: true`, and the SOP calls no `finish` for it. The SOP learns
 of the pending reset before `start`: the collector's `--probe-lock`, which every route that calls
-`start` runs first, names the marker on its line, and the SOP then runs the baseline as it runs the
-no-repository route, the collector alone with no `start`, so no in-flight note is left standing
+`start` runs first, names the marker on its line, and the SOP then runs the baseline as the one route
+with no `start`, the collector alone, so no in-flight note is left standing (the no-repository route
+runs `start` and `finish` as a linked install does)
 (the case §3.1a's one refusal would otherwise gain). The ledger issue keeps its findings until the following full run files them again from its own reads
 or resolves them, and every guard's first-seen date and review count restart. Every run between
 the reset and that baseline carries the same marker. A run starts
@@ -904,8 +936,9 @@ from an empty ledger on its own only when neither a ledger nor a crash record ex
 route that may: the after-upgrade route with no full run recorded prints its no-baseline line
 instead (§3.2). The readiness watch runs on the gateway pod and reads the file as §3.5 states,
 `sandbox_exec.read_bytes` as the `agent` principal, not the `hermes` login its `gcloud` hop uses.
-The chat line still carries the counts and the top finding, so
-a reader who never opens the file gets the verdict.
+Chat receives what `finish` renders, the headline with the fleet's finding and cluster counts and
+the most severe findings by object, so a reader who never opens the file gets the verdict; the
+per-cluster lines are in the report.
 
 ### 3.7 What the run may not do
 
@@ -957,6 +990,12 @@ What happened: UPGRADE_MASTER 2026-10-06 03:27 (8m), UPGRADE_NODES default-pool 
   (5m); no failure found.
 Next upgrade: at the channel default, 1.35.8-gke.1225000 (cluster is ahead; nothing pending);
   window daily 03:00Z for 4h, next opens 2026-10-12 03:00Z; no exclusion.
+Gate: pending: the after-week completes 2026-10-14 03:31Z. Before: 2026-09-29 03:27Z to
+  2026-10-06 03:27Z; after: 2026-10-07 03:31Z to 2026-10-14 03:31Z (after-week completes
+  2026-10-14 03:31Z).
+Log volume by container: total 425.3 MiB -> 433.9 MiB per week; none past the thresholds (2.0x
+  and 1.0 GiB per week); the largest: kube-system/konnectivity-agent: 301.2 MiB -> 316.1 MiB per
+  week (1.05x); gmp-system/prometheus: 15.0 MiB -> 16.4 MiB per week (1.09x).
 Risks present: none of the catalogue shapes checked (budgets, selectors, image hosts, in-tree
   volumes, node agents, local state, GPU pins, webhooks).
 Baseline recorded: control plane and 1 pool at 1.35.8-gke.1380001, 14 pods, 2 budgets, 0 shapes;
@@ -970,6 +1009,11 @@ Risks present:
 | <namespace>/Deployment/<name>            | image host k8s.gcr.io                     | 20    | high       |
 | <namespace>/PersistentVolume/<name>      | gcePersistentDisk in-tree, CSI add-on off | 19    | high       |
 Baseline recorded: 3 pools, 41 pods, 4 budgets, 2 shapes; 2 risk guards written.
+
+Families:
+- seeded-regular: first upgraded seeded-c (gate pending: the after-week completes 2026-10-14
+  03:31Z); rollout pending; waiting: <cluster>, seeded-d
+- seeded-held: no member upgraded in this run's window; members: seeded-b
 
 - Unchanged: seeded-d, last upgraded <date> (UPGRADE_NODES second-zone-pool), next target
   1.35.8-gke.1225000.
@@ -995,10 +1039,10 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 2. **The job and the on-demand route.** `agents/platform/governance/upgrade_retrospective_sop.md`
    (including the freshness rule for a question); the routing lines in `CAPABILITIES.md` and the
    platform `AGENTS.md`; the roster entry
-   (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` entry with the six check ids §3.3 lists, so findings file, with check
-   ids off `MAJOR_SWEEP_CHECKS`); the SOP's two paths (the `fleet_scope` call, the lock probe, `start`, the collector and `finish` with its
-   manifest where a repository is linked, with the recovery `finish` for a collector exit without a manifest after `start`, §3.6; the
-   collector alone without one, and on either install when the probe names a pending reset, §3.6) and the first-run stage
+   (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` entry with the seven check ids §3.3 lists, so findings file, with check
+   ids off `MAJOR_SWEEP_CHECKS`); the SOP's paths (the `fleet_scope` call, the lock probe, `start`, the collector, `draft` and `finish` with its
+   manifest, with or without a repository (`"mode": "none"` and `NO_FORGE` without one), with the recovery `finish` for a collector exit without a manifest after `start`, §3.6; the
+   collector alone when the probe names a pending reset, §3.6) and the first-run stage
    marking this job due without a repository; the `upgrade-retrospective-after-upgrade` roster
    entry (daily 05:00 UTC, the SOP's after-upgrade route, the collector's `--after-upgrade`
    selection) and `agents/platform/scripts/upgrade_retrospective_watch.py` with its `no_agent`
@@ -1078,7 +1122,7 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   a failed budgets, events, owners or workloads read on a review naming the read in `limitations`,
   holding the guards it could show with no candidate, filing what the pods read shows, and making
   the run partial, and a failed storage, webhooks or endpoint-slices read making no limitation;
-  the manifest entry of an unchanged cluster carrying all six checks backed by the operations
+  the manifest entry of an unchanged cluster carrying all seven checks backed by the operations
   listing, so `coverage_gaps` is empty; the operation incident's candidate under
   `upgrade-operation-failed` with the object `Operation/<name>`; a guard's id, first-seen date and
   review count unchanged across a run that did not read its cluster, and the candidate the next
@@ -1122,8 +1166,8 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   lines (`<cluster>/<object>: entry <n>`), red on `main` where the report does not exist, green
   three times on the branch; one case for the on-demand route, a generic question ("did anything
   break in the last upgrades") that must be answered from the report; registered in the nightly
-  roster. The out-of-the-box path (collector
-  alone, no model) is a test, not an eval.
+  roster. The gate and the families add two cases on a recorded-weeks report the stack `bench/tf/prebuilt/upgrade-retro-recorded-weeks` seeds in the store (the collector's own rendering of a synthetic run, pinned to the renderer by a unit test): the per-cluster gate line (`upgrades-retrospective-log-volume-gate`) and the rollout orchestration SOP's family line (`upgrades-rollout-family-held-by-canary-gate`); a third case grades the precheck's line against a standing RolloutSequence (`upgrades-readiness-rollout-sequence-precheck`, parked until the pool projects carry the fixture); the six after-upgrade cases (entries 7, 10, 14, 15, 16, 18) grade the report's lines for the seeded shapes, four of them `expected_fail` until the collector carries a shape for their entry or the fixture's webhook gate reaches pod creation. The out-of-the-box path (collector alone, no model) is a test, not an
+  eval.
 - **Live.** The first run on a dev install: the first-run stage producing the baseline report; a
   weekend tick after an upgrade producing an incident with all four parts; a guard appearing in the
   next readiness report once the collector merges; the ledger issue where a repository is linked.

@@ -208,7 +208,7 @@ func TestBrokerForgesPutsGitHubAtTheEnterpriseHostWithItsCA(t *testing.T) {
 	}
 	got, _ := json.Marshal(resolved.BrokerForges("/creds", "/ca"))
 	want := `[{"provider":"github","host":"ghe.example.com","caSecret":"ghe-ca","caKey":"bundle.pem","caFile":"/ca/ghe/ca.crt"},` +
-		`{"provider":"gitlab","host":"gitlab.com","tokenPath":"/creds/gl/token","allowedPaths":["acme"]}]`
+		`{"provider":"gitlab","host":"gitlab.com","tokenPath":"/creds/gl/token","readTokenPath":"/creds/gl/read-token","allowedPaths":["acme"]}]`
 	if string(got) != want {
 		t.Errorf("BrokerForges =\n %s\nexpected\n %s", got, want)
 	}

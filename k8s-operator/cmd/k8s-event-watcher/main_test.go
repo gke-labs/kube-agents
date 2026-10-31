@@ -211,9 +211,10 @@ func writeNonClusterProfile(t *testing.T, base, profile string) {
 	}
 }
 
-// clusterprofiles.Discoverer owns the scan itself and is tested there; these
-// cover what discoverClusterProfiles adds on top of it — a Kubernetes client
-// per cluster, and a skipped profile becoming a log line and a metric.
+// clusterprofiles.DiscoverAndBuild owns the scan, the skip policy and the skip
+// log lines, and is tested there; these cover what discoverClusterProfiles adds
+// on top of it — a Kubernetes client per cluster, and a skipped profile
+// becoming a metric.
 
 func TestDiscoverClusterProfiles_BuildsAClientPerCluster(t *testing.T) {
 	stubGKE(t)
@@ -633,6 +634,19 @@ func TestValidate_ProfilesDirFlagRules(t *testing.T) {
 			wantErr: "",
 		},
 		{
+			// Shared mode sends the operator's id on every inject, where the
+			// same pattern would refuse it one alert at a time with nothing
+			// said at startup.
+			name: "shared mode refuses a target-session the daemon could not have issued",
+			f: flags{
+				mode:          "shared",
+				dryRun:        true,
+				targetSession: "gateway:conv@1",
+				dedupWindow:   1,
+			},
+			wantErr: "--target-session \"gateway:conv@1\" is not a session id the daemon issues",
+		},
+		{
 			name: "dry-run still validates dedup-window",
 			f: flags{
 				mode:        "per-incident",
@@ -696,42 +710,11 @@ func clusterNames(clusters []targetCluster) []string {
 	return out
 }
 
-// The soft memory limit is half of what the operator reports as the container's
-// limit, and only when nothing else has already set one.
-func TestDeriveMemoryLimit(t *testing.T) {
-	tests := []struct {
-		name           string
-		goMemLimit     string
-		containerLimit string
-		wantApply      bool
-		wantBytes      int64
-		wantReason     string
-	}{
-		{name: "container limit set", containerLimit: "2147483648", wantApply: true, wantBytes: 1073741824},
-		{name: "explicit GOMEMLIMIT wins", goMemLimit: "512MiB", containerLimit: "2147483648", wantReason: "GOMEMLIMIT=512MiB is set and takes precedence"},
-		{name: "nothing set", wantReason: "EVENT_WATCHER_MEMORY_LIMIT_BYTES is not set"},
-		{name: "garbage", containerLimit: "2Gi", wantReason: `EVENT_WATCHER_MEMORY_LIMIT_BYTES="2Gi" is not a positive byte count`},
-		{name: "zero", containerLimit: "0", wantReason: `EVENT_WATCHER_MEMORY_LIMIT_BYTES="0" is not a positive byte count`},
-		{name: "negative", containerLimit: "-5", wantReason: `EVENT_WATCHER_MEMORY_LIMIT_BYTES="-5" is not a positive byte count`},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotBytes, gotApply, gotReason := deriveMemoryLimit(tt.goMemLimit, tt.containerLimit)
-			if gotApply != tt.wantApply {
-				t.Fatalf("apply = %v, want %v (reason %q)", gotApply, tt.wantApply, gotReason)
-			}
-			if gotBytes != tt.wantBytes {
-				t.Errorf("bytes = %d, want %d", gotBytes, tt.wantBytes)
-			}
-			if !strings.Contains(gotReason, tt.wantReason) {
-				t.Errorf("reason = %q, want it to contain %q", gotReason, tt.wantReason)
-			}
-		})
-	}
-}
-
-// applyMemoryLimit turns the derived value into the runtime's soft limit —
-// the same setting GOMEMLIMIT controls — and leaves it alone otherwise.
+// applyMemoryLimit sets the runtime's soft limit, the same setting GOMEMLIMIT
+// controls, to half of what the operator reports as the container's limit, and
+// leaves it alone when something else has already set one. The derivation's
+// input classes are internal/memlimit's tests; what is pinned here is that the
+// watcher hands it its own variable and its own share.
 func TestApplyMemoryLimit_SetsTheRuntimeSoftLimit(t *testing.T) {
 	// SetMemoryLimit(-1) reads the current limit without changing it.
 	prev := debug.SetMemoryLimit(-1)

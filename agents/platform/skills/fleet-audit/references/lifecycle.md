@@ -30,6 +30,41 @@ Between `content` and `directory` everything else is identical, including where 
 and what `finish` publishes. Where the two differ, this file says which mode it is talking about.
 `none` differs throughout, and its own section says how.
 
+### Which repository
+
+The ledger issue and every remediation pull request or merge request go to one repository. `start`
+and `finish` resolve it in this order:
+
+1. `--repo`, when you pass it. It must be in the managed list.
+2. The workspace lease record, only when the `start` of this run wrote it. A lease from an earlier
+   run is ignored, so a `--repo` run does not change the repository of later runs.
+3. The repository with `role: gitops`, when more than one repository is managed. The operator
+   writes it to the `gitops_repo` key of `$GITOPS_STATE_CONFIGMAP`.
+4. The one managed repository, when there is only one.
+
+`finish` follows the repository that the `start` of this run chose. Pass `--repo` to `finish` only
+when you passed it to `start`, with the same value.
+
+A context repository is never the target: it is only read. With several managed repositories and
+none with `role: gitops`, the run takes the no-forge path: its `no_forge` note says to give one
+repository `role: gitops`, or to pass `--repo` for one run, and `finish` sends the findings to chat
+and the report store. Do not choose a repository yourself. A `--repo` that is not in the managed list
+is an error. With no managed repository, the run has no forge; see
+[No forge configured](finish.md#no-forge-configured).
+
+Before it publishes, `start` lists one open issue in the resolved repository through the broker.
+`finish` follows the result that `start` recorded, and lists one only when this run has no record.
+If the forge says that the repository does not exist, or that the install's credential cannot read
+it, or the broker does not manage it, the run does not choose another repository. It takes the
+no-forge path, and its `no_forge` note names the repository and the reason; see
+[No forge configured](finish.md#no-forge-configured). Such a run is never silent.
+
+Before that listing, `start` asks the forge's `capabilities`. A forge with no issue tracker, or with
+no labels, gets no ledger issue: `start` prints `"ledger": "store"` and a `ledger_note`, the ledger
+goes to the report store and chat, and the remediation pull requests still open on the forge. The
+listing is then one open pull request, not one open issue. See
+[A forge with no issue tracker](finish.md#a-forge-with-no-issue-tracker).
+
 ### Step 1 — `start`
 
 Before inspecting anything, claim the workspace:
@@ -40,15 +75,16 @@ Before inspecting anything, claim the workspace:
   [--repo "<owner>/<repo>"]
 ```
 
-This resolves the target repository (using `--repo` if specified, falling back to the single
-configured repo in `$GITOPS_STATE_CONFIGMAP`, failing if ambiguous across multiple repos, and
-running with no forge when none is registered — see [No forge configured](finish.md#no-forge-configured)), makes
+This resolves the target repository (see [Which repository](#which-repository) below), makes
 the forge credential current, establishes a clean workspace, ensures the audit's labels exist, locates
 the stream's open ledger issue, and clears any findings document a crashed run left behind. If the
 user asked for a specific repository that is not yet registered, instruct the user or cluster
-administrator to add it to `$GITOPS_STATE_CONFIGMAP`. `--repo` takes the name as the managed list
+administrator to add it to `$GITOPS_STATE_CONFIGMAP`. A refusal of the repository from the
+credential proxy or the broker is the same answer, and you stop there: see the skill's rule on
+working around a refusal (`SKILL.md`, "Never work around a refusal").
+`--repo` takes the name as the managed list
 gives it: `owner/name` on github.com, `<host>/owner/name` on a GitHub Enterprise Server, and
-`<host>/<path>` for a repository on another forge (`gitlab.com/acme/platform/infra`). In content mode the broker's file workspace clones a repository
+`<host>/<path>` for a repository on another forge (`gitlab.com/<group>/<subgroup>/<project>`). In content mode the broker's file workspace clones a repository
 from its own forge, so `fetch`, `list`, `grep`, the remediation step and the declared-intent search
 work the same way on every forge, and a remediation on GitLab is a merge request. Directory mode
 serves GitHub only: its local clone reaches no other forge, so `start` and `finish` on a repository
@@ -112,7 +148,7 @@ in `content` mode the workspace is empty rather than a checkout. Read it rather 
 what is on disk. `none` means no forge is configured; see [No forge configured](finish.md#no-forge-configured).
 
 `pending_remediation_requests` lists the findings a repository writer has already asked to be fixed,
-parsed from the ledger's comments. **Write those manifests during inspection** — if the finding is
+parsed from the ledger's comments (always empty when `ledger` is `store`: there is no ledger thread). **Write those manifests during inspection** — if the finding is
 still reproducing at `finish`, its pull request opens immediately instead of a week later.
 
 `carried` lists every finding the open ledger carries — its id, the check that found it, where it

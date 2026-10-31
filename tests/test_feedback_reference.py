@@ -71,13 +71,31 @@ REDACTION_RULE = re.compile(r"read from a Secret")
 ROUTING_REQUEST = "report a bug in kube-agents"
 ROUTING_TARGET = "`platform`"
 
+# Filing on request (docs/designs/chat-feedback-command.md): the Planning Agent
+# composes and confirms, the card carries the confirmation line, the platform
+# worker files through the skill, and the broker and the gateway hand out the
+# same two links the personas do.
+CHAT_BULLET_MARKER = "**`/feedback <text>`"
+FEEDBACK_ROW_MARKER = '"/feedback'
+CONFIRMATION_LINE = "user-confirmed: yes"
+SKILL_NAME = "kube-agents-feedback"
+TITLE_CAP = "120"
+SKILL_MD = REPO_ROOT / "agents/platform/skills/kube-agents-feedback/SKILL.md"
+BROKER_MODULE = REPO_ROOT / "agents/platform/scripts/feedback_broker.py"
+GATEWAY_COMMANDS = REPO_ROOT / "a2a/lib/chattext/commands.go"
+
+
+def _line_with(path: Path, marker: str) -> str:
+    """The first line of the file carrying marker, or "" if there is none."""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if marker in line:
+            return line
+    return ""
+
 
 def _feedback_bullet(path: Path) -> str:
     """The one persona bullet that answers the question, or "" if there is none."""
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if BULLET_MARKER in line:
-            return line
-    return ""
+    return _line_with(path, BULLET_MARKER)
 
 
 class FeedbackReferenceTest(unittest.TestCase):
@@ -176,6 +194,34 @@ class FeedbackReferenceTest(unittest.TestCase):
                 "the planning agent holds no knowledge tools; this request goes "
                 "to the platform specialist",
             )
+
+    def test_chat_persona_composes_and_confirms_before_dispatch(self) -> None:
+        bullet = _line_with(CHAT_SOUL, CHAT_BULLET_MARKER)
+        self.assertTrue(bullet, f"no {CHAT_BULLET_MARKER} bullet in {CHAT_SOUL}")
+        for phrase in (CONFIRMATION_LINE, TITLE_CAP, *SUBMISSION_REQUIREMENTS):
+            self.assertIn(phrase, bullet, "the front door composes the whole submission and dispatches it confirmed")
+        self.assertRegex(bullet, PUBLIC_WARNING)
+        self.assertRegex(bullet, REDACTION_RULE)
+
+    def test_chat_persona_routes_the_feedback_command_to_platform(self) -> None:
+        rows = [line for line in CHAT_SOUL.read_text(encoding="utf-8").splitlines()
+                if line.startswith("|") and FEEDBACK_ROW_MARKER in line]
+        self.assertTrue(rows, f"no /feedback row in {CHAT_SOUL}")
+        for row in rows:
+            self.assertIn(ROUTING_TARGET, row)
+
+    def test_platform_persona_and_skill_share_the_confirmation_contract(self) -> None:
+        bullet = _feedback_bullet(SPECIALIST_SOULS[0])
+        self.assertIn(SKILL_NAME, bullet, "the platform bullet names the one path that files")
+        self.assertIn(CONFIRMATION_LINE, bullet)
+        self.assertIn(CONFIRMATION_LINE, SKILL_MD.read_text(encoding="utf-8"))
+
+    def test_the_broker_and_the_gateway_hand_out_the_same_links(self) -> None:
+        for path in (BROKER_MODULE, GATEWAY_COMMANDS):
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.relative_to(REPO_ROOT)):
+                self.assertIn(SHORT_LINK, text)
+                self.assertIn(TRACKER, text)
 
 
 if __name__ == "__main__":

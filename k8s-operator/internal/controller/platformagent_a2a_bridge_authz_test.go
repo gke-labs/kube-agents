@@ -142,7 +142,7 @@ func a2aStartRenderedServer(t *testing.T, conf string) (*natsserver.Server, *a2a
 func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string) (*natsserver.Server, *a2aServerLog) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "nats.conf")
-	if err := os.WriteFile(path, []byte(conf), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, conf)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	opts, err := natsserver.ProcessConfigFile(path)
@@ -150,6 +150,8 @@ func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string)
 		t.Fatalf("the rendered nats.conf does not parse: %v", err)
 	}
 	opts.Port = port
+	// The test pair names localhost, and clients dial the loopback address.
+	opts.Host = "127.0.0.1"
 	opts.HTTPPort = 0
 	opts.Websocket.Port = 0
 	opts.StoreDir = store
@@ -177,7 +179,7 @@ func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string)
 // reply.
 func a2aConnectAs(t *testing.T, url, user, password string) (*nats.Conn, jetstream.JetStream) {
 	t.Helper()
-	nc, err := nats.Connect(url,
+	nc, err := nats.Connect(url, a2aTestBusTLS(t),
 		nats.UserInfo(user, password),
 		nats.CustomInboxPrefix("_INBOX."+user),
 		nats.Name(user),
@@ -218,7 +220,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 		{Name: "DIRECTORY", Subjects: []string{"a2a.agents.>"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
 			MaxMsgsPerSubject: 1, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
-		{Name: "TOPICS-STATE", Subjects: []string{"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"},
+		{Name: "TOPICS-STATE", Subjects: []string{"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.agent.platform.topology-skew", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
 			MaxMsgsPerSubject: 8, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
 		{Name: "TOPICS-JOURNAL", Subjects: []string{"a2a.topics.shared.annotations"},
@@ -228,7 +230,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 }
 
 // a2aProvisionLikeTheScript seeds a test bus with what the provision Job
-// creates: the streams above and three KV buckets.
+// creates: the streams above and five KV buckets.
 func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 	t.Helper()
 	_, js := a2aConnectAs(t, url, "seed", seedPassword)
@@ -246,6 +248,18 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 		if err != nil {
 			t.Fatalf("provision bucket %s as seed: %v", bucket, err)
 		}
+	}
+	// `nats kv add feedback --ttl=720h`: the one bucket with a max age.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "feedback", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 67108864, TTL: 720 * time.Hour,
+	}); err != nil {
+		t.Fatalf("provision bucket feedback as seed: %v", err)
+	}
+	// `nats kv add PROFILE_LEASES`: the dispatcher's leases, no TTL.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "PROFILE_LEASES", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 67108864,
+	}); err != nil {
+		t.Fatalf("provision bucket PROFILE_LEASES as seed: %v", err)
 	}
 }
 
@@ -463,6 +477,7 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 		// WRITE the blackboard, which is the half an agent would notice.
 		{"a2a.topics.shared.blueprint", `{"kind":"topic-entry"}`},
 		{"a2a.topics.agent.platform.upgrade-readiness", `{"kind":"topic-entry"}`},
+		{"a2a.topics.agent.platform.topology-skew", `{"kind":"topic-entry"}`},
 		{"$JS.API.INFO", ""},
 		{"$JS.API.STREAM.NAMES", ""},
 		{"$JS.API.STREAM.LIST", ""},
@@ -904,7 +919,7 @@ func TestBridgeConsumersSurviveABusRestart(t *testing.T) {
 	// The lib's reconnect posture (MaxReconnects -1), with a short wait so
 	// the test is not paced by backoff.
 	reconnected := make(chan struct{}, 4)
-	bridge, err := nats.Connect(url,
+	bridge, err := nats.Connect(url, a2aTestBusTLS(t),
 		nats.UserInfo("bridge", bridgePW), nats.CustomInboxPrefix("_INBOX.bridge"), nats.Name("bridge"),
 		nats.MaxReconnects(-1), nats.ReconnectWait(200*time.Millisecond),
 		nats.ReconnectHandler(func(*nats.Conn) { reconnected <- struct{}{} }),
@@ -957,7 +972,7 @@ func TestBridgeConsumersSurviveABusRestart(t *testing.T) {
 
 	submitAsGateway := func(body string) {
 		t.Helper()
-		nc, err := nats.Connect(url, nats.UserInfo("gateway", gatewayPW), nats.CustomInboxPrefix("_INBOX.gateway"))
+		nc, err := nats.Connect(url, a2aTestBusTLS(t), nats.UserInfo("gateway", gatewayPW), nats.CustomInboxPrefix("_INBOX.gateway"))
 		if err != nil {
 			t.Fatal(err)
 		}

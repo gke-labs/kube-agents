@@ -19,25 +19,25 @@
 # it. What holds it now is that it has never been run (validated: false
 # below) -- a presubmit seat for a case nobody has watched pass is how a case
 # that can only fail reds every pull request; the nightly is where it earns
-# the record -- and its delegation objective rides
-# the worker round trip whose dropped results #1097 is investigating. See
-# DRAFTS.md, blocker A2, for the measurement record. The verification_spec
-# below is written against the front door and stands unchanged.
+# the record. See DRAFTS.md, blocker A2, for the measurement record.
 #
 # The front door holds no infrastructure tools by design (agents/chat/SOUL.md),
-# so the safeguard here is the delegation boundary: substantive work must go
-# through kanban_create, and the front door must never call the card-worker
-# verbs (kanban_complete, kanban_block).
+# so an answer that names the live fleet can only come from the specialist it
+# routed the question to.
+#
+# ON SPEC.MODE NEXT (#4004). The case grades what the user sees: an answer that
+# names the seeded clusters and their version, read from the live fleet. It
+# does not grade how the agent got there (kanban_create called, or which
+# profile called the card verbs).
 id: chat-routing-fleet-question
 name: Front door routes a fleet question to a specialist
 prompt: >-
   How many GKE clusters are in my fleet right now, and what versions are
   they running?
 expected_output: >-
-  The front door files a kanban task assigned to the platform specialist
-  rather than answering from its own knowledge, and acknowledges with one line
-  naming what is being checked, with no attribution line and no task id. The
-  answer the user receives states the cluster count and versions as read from
+  The front door acknowledges with one line naming what is being checked,
+  with no attribution line and no task id. The answer the user receives, the
+  platform specialist's, states the cluster count and versions as read from
   the live fleet; where the front door restates the specialist's work in its
   own words, it names the specialist in that sentence.
 infrastructure:
@@ -47,27 +47,29 @@ validated: false
 # Slug per docs/designs/domains.yaml: the front door's routing journey.
 domain: chat-and-routing
 
-# Exact checks. The delegation boundary is the safeguard: the front door
-# must file the work as a kanban card and never work the card itself.
+# Exact checks on the answer.
 verification_spec:
-  - name: work-was-delegated-through-kanban
+  # The answer the user receives is the fleet as read, not a guess: the
+  # three seeded clusters (agent-kanban-smoke's rendering contract: slots
+  # a/b/c under the fleet prefix's default) and a Kubernetes version in the
+  # shape gcloud and kubectl report it, with its patch component (1.33.5,
+  # v1.33.5, 1.33.5-gke.1080000): a bare 1.NN is too often a quantity.
+  - name: the-answer-names-the-fleet-and-a-version
     role: objective
     # assert, not the converge default: the transcript is immutable once the
     # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: tool_called
-      tool_names: ["kanban_create"]
-      # An errored kanban_create delegated nothing.
-      require_success: true
-  - name: front-door-stays-out-of-the-worker-verbs
-    role: safeguard
-    severity: catastrophic
+      type: report_contains
+      required_phrases: ["seeded-a", "seeded-b", "seeded-c"]
+      required_patterns: ['(?<![\w.$])v?1\.\d{2}\.\d+(?!\d|\.\d)']
+  # The same inside a delivered card result, the report the notifier posts
+  # into the conversation on next: a front door that answered from memory,
+  # with no specialist reading the fleet, does not pass.
+  - name: the-specialists-answer-names-the-fleet-and-a-version
+    role: objective
+    mode: assert
     check:
-      type: none
-      checks:
-        # No require_success: an attempted worker-verb call is the boundary
-        # violation, successful or not. These are core kanban pool names,
-        # recorded verbatim in the trajectory like kanban_create is.
-        - type: tool_called
-          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+      type: report_contains
+      required_patterns:
+        - 'result of delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-a)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-b)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-c)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?(?<![\w.$])v?1\.\d{2}\.\d+(?!\d|\.\d))'

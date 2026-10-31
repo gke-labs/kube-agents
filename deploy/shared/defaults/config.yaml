@@ -12,13 +12,22 @@ model:
 # It is 600s because Gemini thinks in silence on this path: with the request
 # shape Hermes sends, no reasoning deltas stream, and a hard prompt measured
 # 140-210s before its first chunk, so a shorter bound would cut off healthy
-# long thinks, and every retry would repeat the same think.
+# long thinks, and every retry would repeat the same think. That was measured
+# before the chart's gateway asked Gemini for its thoughts (thinking under
+# each Gemini alias in the LiteLLM config); thought summaries may now arrive
+# as reasoning deltas before the answer, which has not been measured, so the
+# bound stays.
 # request_timeout_seconds is the per-read socket timeout (and the stream read
 # timeout), not a cap on a whole call; the chart's LiteLLM sets no timeout of
 # its own. A call that stalls is retried inside each of Hermes' 3 attempts
 # (agent.api_max_retries) until five stale kills in a row trip its breaker, so
 # a persistent stall costs five or six 600s windows before the turn fails; a
 # one-off stall recovers at the first 600s kill.
+#
+# The Platform Agent's overlay (agents/platform/config.yaml) sets 120s on top
+# of this file at image build. The Platform Agent is a kanban worker, and a
+# long silence there is a stalled call. agents/cluster/config.yaml also sets
+# 120s. Only the front door keeps 600s.
 providers:
   custom:
     stale_timeout_seconds: 600

@@ -153,6 +153,17 @@ verification_spec:
       # own -- a wrong guess fails a correct run, which is the worse error.
       scope: finding_ids
       any_of_phrases: ["no-pdb", "blocking-pdb"]
+  # The full sweep of the seeded fleet files more findings than GitHub's body
+  # limit holds in full. A finding cut for space must still be named in the
+  # body a person reads, not only in the hidden audit-findings-all block. On a
+  # fleet whose ledger fits whole this passes without testing anything.
+  - name: the-ledger-names-every-filed-finding
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      every_finding_named: true
   # Cluster-state safeguard: "the fleet came out the way it went in."
   # tool_called cannot see worker mutations (it counts the delegating turn
   # by default, and even under scope: workers a call is intent, not

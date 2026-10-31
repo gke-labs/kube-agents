@@ -15,6 +15,7 @@ fingerprint drifted; and doubling a row when the same event is handled twice.
 import io
 import json
 import sys
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -29,6 +30,10 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import notify_flaky_check as reporter
+
+CRAFTED_SEGMENTS = 10000
+CRAFTED_TAIL = 300000
+CRAFTED_LINE_BUDGET_SECONDS = 5.0
 
 REPO = "gke-labs/kube-agents"
 WORKFLOW_ID = 327115835
@@ -177,8 +182,30 @@ class FingerprintTest(unittest.TestCase):
         log = (
             "2026-09-09T01:04:59.4322202Z FAILED bench/tests/test_x.py::test_y - AssertionError: boom\n"
             "2026-09-09T01:04:59.4322202Z ERROR bench/tests/test_z.py::test_w - fixture 'tmp' errored\n"
+            "2026-09-09T01:04:59.4322202Z FAILED bench/tests/test_x.py::test_v[a parent that did not end in compression] - AssertionError: boom\n"
+            "2026-09-09T01:04:59.4322202Z FAILED bench/tests/test_x.py::test_u[cd /tmp && audit_report.py start --audit compliance-audit > start.json]\n"
+            "2026-09-09T01:04:59.4322202Z FAILED bench/tests/test_x.py::test_t[failed-reason: bridge-queue-overflow - detail-True] - AssertionError: Lists differ: [1] != [2]\n"
         )
-        self.assertEqual(reporter.extract_test_ids(log), ["bench/tests/test_x.py::test_y", "bench/tests/test_z.py::test_w"])
+        self.assertEqual(
+            reporter.extract_test_ids(log),
+            [
+                "bench/tests/test_x.py::test_t[failed-reason: bridge-queue-overflow - detail-True]",
+                "bench/tests/test_x.py::test_u[cd /tmp && audit_report.py start --audit compliance-audit > start.json]",
+                "bench/tests/test_x.py::test_v[a parent that did not end in compression]",
+                "bench/tests/test_x.py::test_y",
+                "bench/tests/test_z.py::test_w",
+            ],
+        )
+
+    def test_a_long_crafted_pytest_line_costs_linear_time(self):
+        """A log line is the pull request's own test output. One with thousands of
+        `::` and an unclosed `[` must not send the pattern into a retry at every
+        `::`; the bound is a hundred times what the linear match takes."""
+        line = "FAILED " + "a::" * CRAFTED_SEGMENTS + "[" + "x" * CRAFTED_TAIL
+        started = time.monotonic()
+        ids = reporter.extract_test_ids(line)
+        self.assertLess(time.monotonic() - started, CRAFTED_LINE_BUDGET_SECONDS)
+        self.assertEqual(ids, [])
 
     def test_a_subtest_failure_is_its_test_not_its_parameters(self):
         """unittest prints `FAIL: test_x (m.C.test_x) (conclusion='a')` per

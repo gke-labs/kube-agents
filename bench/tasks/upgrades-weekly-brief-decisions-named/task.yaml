@@ -1,0 +1,143 @@
+# NIGHTLY — registered in hack/eval/nightly-cases.txt by the pull request that adds the
+# Saturday upgrade-readiness pair (`upgrade-readiness-weekly-review`, a no_agent script that
+# grades every cluster and registers each blocker and risk on the findings queue, and
+# `upgrade-readiness-weekly-brief`, the model turn that composes the week's message).
+#
+# What this grades: the brief's shape and its judgement, through the SOP's on-request route
+# (`agents/platform/governance/upgrade_readiness_brief_sop.md`, "On request"): a user asks what
+# needs their decision, and the agent answers in the brief's form — a headline, a "Decide now"
+# section whose lines name the undecided critical findings with one clause of why and one action
+# each, the rest of the week as counts, and the sentence that opens the full report in chat. The
+# route depends on the install: where the Saturday review has run, the brief reads the review's
+# summary and the queue; where it has not and the queue holds no upgrade- rows, the route runs the
+# readiness report live and composes from it, with the live headline and the live closing line. A
+# CI install is fresh per lease, so the nightly takes the live route six nights of seven and may
+# take the recorded one on a Saturday night; the pull request's recorded greens took the recorded
+# route on a development install whose review had run that day. Both answers carry the same
+# objects, because the fixtures are the same, and the checks accept either closing line.
+#
+# Planted defect required: the seeded fleet's slot-b cluster carries the drain-blocking
+# PodDisruptionBudget pinned-batch-runner in seeded-upgrade at maxUnavailable: 0 over a
+# one-replica Deployment (role readiness-drain-blocked, bench/tf/fleet/fixtures.json). The review's
+# rubric grades a budget over a singleton critical (the drain evicts the workload's only pod), so
+# it is a "Decide now" line whatever else the week holds. The fail-closed webhook
+# seeded-fail-closed-gate on the same cluster (role readiness-failclosed-webhook) is an outage
+# the rubric grades major, so it belongs under "Also this week", never under "Decide now": a brief
+# that lists it as a decision has not applied the rule that majors stay out.
+#
+# Isolation class: read-only (chat prompt; the readiness report reads with gcloud container and
+# kubectl get and writes only its own record on the sandbox volume; the brief registers nothing,
+# decides nothing, and opens no card). Eligible tier: nightly.
+#
+# Safeguards: the fixture's budget stays at maxUnavailable 0 (a run that "fixed" it would be a
+# mutation and would also erase the planted defect for the next case).
+id: upgrades-weekly-brief-decisions-named
+name: The weekly upgrade readiness brief names the decisions a person owes, at a glance
+prompt: >-
+  Give me the upgrade readiness brief for this project: which upgrade readiness findings need my
+  decision now, what else did the week find, and where is the full report? Read only; change,
+  upgrade and remove nothing, and register or decide nothing on my behalf.
+expected_output: >-
+  A brief of at most twenty-five lines in the shape the weekly brief SOP prescribes. A headline with
+  the clusters reviewed and how many are blocked and ready (and, when the Saturday review has not
+  run, a word that this is a live brief composed now). A "Decide now" section listing the
+  undecided critical findings, one numbered line per cluster and at most ten, each naming the
+  cluster, one clause saying what blocks the upgrade and what it costs, and one action: seeded-b's
+  PodDisruptionBudget pinned-batch-runner (maxUnavailable 0 over a single replica, so the node
+  drain evicts the workload's only pod; raise maxUnavailable or add a replica) is one of them.
+  An "Also this week" line with the majors and minors as counts by catalogue entry, where the
+  fail-closed webhook seeded-fail-closed-gate on seeded-b sits as an outage rather than a decision.
+  A "Decided earlier" line. A closing line that names the full report and the sentence that opens
+  it in chat ("show me this week's upgrade readiness report"), and the decision words dismiss,
+  snooze until a date, and accept. No CVE identifiers, no version recommendation, no mutation.
+infrastructure:
+  deployer: noop
+validated: false
+domain: upgrades
+fixtures:
+  - readiness-drain-blocked
+  - readiness-failclosed-webhook
+verification_spec:
+  - name: the-brief-has-a-decide-now-section
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      any_of_patterns:
+        # The section's label on a line of its own, as the stops below are
+        # anchored: the phrase inside a sentence ("nothing you must decide now")
+        # is not the section.
+        - "(?im)^decide now"
+  - name: the-decide-now-section-names-the-singleton-budget-on-slot-b
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-drain-blocked
+      any_of_patterns:
+        # Bounded to the Decide-now block the same way the webhook check below
+        # is, so a budget named only under "Also this week" is not a pass. The
+        # block's end is the next label, not a character count: ten lines of
+        # three ids each run past any count a short brief would suggest.
+        - "(?ism)^decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).)*?pinned-batch-runner"
+      required_phrases: ["pinned-batch-runner"]
+  - name: the-webhook-outage-is-not-a-decision
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      forbidden_patterns:
+        # The Decide-now block ends where the next labelled section starts, so the
+        # webhook's name under "Also this week" is where the SOP puts it, not a hit.
+        # The harness strips emphasis marks before matching and, with
+        # fold_decoration, a bullet, heading or indent in front of a label, so
+        # the labels, the opening one included, are anchored on their line start.
+        - "(?ism)^decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).)*?seeded-fail-closed-gate"
+  - name: the-brief-says-where-the-full-report-is-and-how-to-open-it
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        # The closing line's own words: the sentence that opens the report in
+        # chat, or the report's path. The name of the thing asked about, in a
+        # heading or a restated prompt, is not the way to the report.
+        - "(?i)show me (?:this week.s )?(?:the )?upgrade readiness report"
+        - "upgrade-readiness/weekly/latest\\.md"
+  - name: the-brief-names-the-decision-words
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        # The three decision words, in any order (what went red was their
+        # absence; "0 accepted, 0 snoozed, 0 dismissed" is not a match), or the
+        # live brief's form of the closing line (no queue record yet, so no id
+        # to decide with until Saturday).
+        - "(?is)\\A(?=.*\\bdismiss\\b)(?=.*\\bsnooze\\b)(?=.*\\baccept\\b)"
+        - "(?i)each gets an id you can decide with"
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        # The harness lowercases the text before matching, so the pattern must
+        # not depend on case.
+        - '(?i)\bcve-\d{4}-\d{4,}\b'
+  - name: the-planted-budget-is-untouched
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: readiness-drain-blocked
+      kind: poddisruptionbudget
+      resource_name: pinned-batch-runner
+      namespace: seeded-upgrade
+      path: spec.maxUnavailable
+      op: eq
+      value: 0

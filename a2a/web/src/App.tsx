@@ -29,7 +29,9 @@ const PERCENT = 100;
  * silently dropped by nats.ws's own reconnect bookkeeping (bus.ts's file
  * doc comment) with no record it ever happened.
  */
-const LINK_DOWN_SEND_NOTE = "not sent: the bus link is down. Your text is still in the box.";
+// Quotes the turn, since the footer's usage summary button sends one that was
+// never in the box; a typed line stays there as well.
+const linkDownSendNote = (text: string) => `not sent: the bus link is down. "${text}"`;
 
 /**
  * Where the page is in finding its bus. `remember` is false for a config the
@@ -190,7 +192,7 @@ export default function App() {
       // pending and then vanish with no record. Chat only clears the box
       // when this returns true, so the text survives to be sent again.
       if (stateRef.current.connection !== "up") {
-        local(LINK_DOWN_SEND_NOTE);
+        local(linkDownSendNote(text));
         return false;
       }
       handle.send(text);

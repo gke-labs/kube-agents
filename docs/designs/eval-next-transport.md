@@ -4,8 +4,9 @@
 > and the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator renders the door
 > only under its eval flag; `EVAL_MODE_NEXT=1` on the presubmit scripts builds the bridge image,
 > flips the install, hands the operator the bridge's settings and runs the matrix through the door (The CI flag). The
-> presubmit still runs `today` unless a job sets the flag, and stage 2's operator wiring is
-> rendered and its eval-install half is not started.
+> merge-blocking presubmit sets the flag, so every pull request is graded through the door; the
+> today lane grades `today` after a scripted rollback. Stage 2's operator wiring is rendered and
+> its eval-install half is not started.
 > The measurement that motivates the document is on
 > gke-labs/kube-agents#1661; the presubmit run it cites is build `2100310325382352896`. The A2A
 > owner answered the first draft's questions on 2026-09-17 and reviewed the draft the same day;
@@ -109,8 +110,9 @@ the presubmit exports nothing new until it chooses to. The exchange:
    reached the bus; and the bound expiring without `ActiveTask` appearing, whatever else the
    record holds. The harness classifies a refusal as the gateway refusing the injection or
    failing to publish it, infrastructure. The prompt is routed like any text, the gateway's
-   literal affordances included, `Delegate` among them; the harness sends none, and a case whose
-   prompt opens with one is the case's defect. The adapter dedupes on the backend message id,
+   literal affordances included, `Delegate` among them; the harness sends none as a prompt, and a
+   case whose prompt opens with one is the case's defect. The one it sends itself is the `stop`
+   after a stopped ask's opening turn (`bench/kube_agents_bench/stop_hook.py`). The adapter dedupes on the backend message id,
    bounded the way the Chat adapter bounds its seen set: a repeated `POST` with an id it has
    already accepted gets the answer the first one got, the record's task id or the same refusal,
    and starts nothing. Because the id
@@ -137,8 +139,8 @@ the presubmit exports nothing new until it chooses to. The exchange:
    cancels whenever that state still holds an active task, whether or not an executor has
    touched it; the cancel goes through an explicit cancel route that takes the task id the
    adapter answered with, whether or not the record still holds it, and lands on the bus as
-   `kind: cancel` exactly as the text route's `stop` does, and the harness never sends the stop
-   text. The harness sends no message at the deadline, so nothing it does there can mint a
+   `kind: cancel` exactly as the text route's `stop` does, and the timeout never sends the stop
+   text (a stopped ask does, on purpose, to reach the cards). The harness sends no message at the deadline, so nothing it does there can mint a
    task or spend a model turn. The failure edit of step 2 can also arrive after the answer,
    when the record showed the active task before the publish failed; the harness is already
    reading the conversation, so it treats that edit as the terminal: infrastructure, the
@@ -146,12 +148,16 @@ the presubmit exports nothing new until it chooses to. The exchange:
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
    `final_message`); map `activity` artifacts into the trajectory when the executor publishes them
    (the `progress` artifact's last line goes to the harness result's `metadata`, which devops-bench
-   does not write to the record, so it reaches the log and nothing graded). Token counts are not
-   on the bus, and the scorer's liveness rule
+   does not write to the record, so it reaches the log and nothing graded). The front door's
+   token counts come from one probed read after the terminal (`usage=chain`), which sums the `usage` artifact of the root
+   turn and every wake that continued its chain
+   (`input` and `output` and their `total`; Hermes reports no cached or reasoning split), reports
+   the chain's child tasks apart (`tokens.children`, added into `total` with the workers'), and
+   leaves them null when it carries none. The scorer's liveness rule
    fails a record whose token total is null, so the inject record is written the way the
    diagnostic transport below writes its own: every lifecycle event of the task, `submitted`,
-   `working` and the terminal, is a trajectory entry under the status-event name, the token
-   buckets are null, the latency is set, and the scorer's rung-3 rule accepts a `working` or a
+   `working` and the terminal, is a trajectory entry under the status-event name, the latency
+   is set, and the scorer's rung-3 rule accepts a `working` or a
    final status entry as liveness evidence in place of a token total; `working` counts because
    a graded timeout, canceled at the budget with the cancel unconfirmed, has no final entry and
    would otherwise block as not a real run, and a `submitted` entry alone still blocks. A task
@@ -252,8 +258,8 @@ other; an active task with no executor event, nobody took it, infrastructure, wh
 gateway has released the conversation yet; an active task at `submitted` and never `working`, an
 executor accepted it and queued it for the whole budget, infrastructure; an active task at
 `working`, a graded timeout; and an active task whose stream already folds to a terminal, which
-is the relay's lost record write, the event acked when the relay enqueued it, before the queued
-write cleared `ActiveTask`, and an acked event is never redelivered. That fifth outcome is graded
+is the relay's lost record write: the relay acks a terminal once it has rendered it, whether or
+not the record write after it cleared `ActiveTask`, and an acked event is never redelivered. That fifth outcome is graded
 like the first, with the answer read from the fold rather than the posted message, and gets no
 cancel, because there is nothing left to cancel; the record then holds a finished task until
 something releases it, which on a key never reused is nothing and costs nothing. The sixth is
@@ -303,7 +309,8 @@ transport gives an exhausted transport retry, because they say the executor lost
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the
 persona's reasons, `hermes-exited-nonzero` and `deadline-exceeded`, the API server's 5xx or failed turn,
 unparseable, broken-off or oversize answers (`hermes-api-failed`, `hermes-api-unreadable`,
-`hermes-api-read-failed`, `hermes-api-oversize`), and any reason the harness does not know, are graded failures. A `rejected` terminal, which both executors publish for a
+`hermes-api-read-failed`, `hermes-api-oversize`), an answer the bridge withheld as the model's own
+reasoning (`hermes-unstructured-reasoning`), and any reason the harness does not know, are graded failures. A `rejected` terminal, which both executors publish for a
 submission with no text parts, is infrastructure and never graded, because it is the harness's
 own defect. A `canceled` terminal after the harness's own cancel is the graded timeout above, and
 `canceled-before-start` the infrastructure outcome above. The rule is the same on both
@@ -338,12 +345,12 @@ webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation wit
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
 the kanban worker logs by card id (with `after_result_pattern`, the tagged `terminal` and `execute_code` entries
-the harness appends to the trajectory from the workers' sessions instead, present when the
+the harness appends to the trajectory from the workers' sessions as well, present when the
 wait found the cards and the door showed the trace); on
 this path it has data when the case runner's delegation wait finds the cards in the session store
 (Completion signals), and none when the wait falls back. Neither is graded
-as a failure here: on this transport's record the scorer sets every `worker_commands` and
-`worker_agents` entry aside as not applicable, and every `tool_called` entry too when the record
+as a failure here: on this transport's record the scorer sets every `worker_commands`,
+`worker_agents` and `worker_budget` entry aside as not applicable, and every `tool_called` entry too when the record
 carries no `a2a.activity` marker or a marker that reports a loss (calls the door's cap or the
 executor's budget dropped, a count or part it could not read, an input truncated with its nested
 names, or a trace older than the read that ended the wait), and grades the checks that remain
@@ -356,9 +363,8 @@ scope reads the workers' tagged entries, which the trace does not carry, and sta
 the worker checks, as does a `tool_called` with a `result` pattern, since the trace records no results
 ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
 cannot show"). A case whose premise
-needs the front door — `agent-kanban-smoke`, which grades
-the chat profile's `kanban_create` — is a different matter:
-`hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason below, and the
+the transport removes is a different matter:
+`hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with its reason, and the
 api lane's roster is untouched. The lane runs the bridge's shipped default executor, `api`, the
 one a customer install runs: `hack/ci-deploy.sh` leaves the operator's `A2A_BRIDGE_EXECUTOR`
 unset, so the rendered bridge carries no `BRIDGE_EXECUTOR` and picks `api` from the
@@ -366,11 +372,12 @@ unset, so the rendered bridge carries no `BRIDGE_EXECUTOR` and picks `api` from 
 `"executor":"api"`, which a bridge that fell back to `cli` for want of the key fails. Under `api`
 the turn runs under the pod's API server, whose profile is the chat path's own (`default` on a
 stock install), so the agent that answers a case on this lane is the one the chat path reaches
-("What the lane grades" below). That does not return the exclusion's premise: the default
-profile may file the card, but the card's completion never reaches the A2A thread
-([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Executors"). The delegation
-wait appends the card's result to the graded answer (Completion signals), but it reads that from
-the pod, not from the thread, so the exclusion stays.
+("What the lane grades" below). A card that turn files completes after the turn has answered,
+and its report never reaches the inject door's thread, which records no notify route
+([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Executors"). On a chat door
+the notifier posts that report into the conversation, and the delegation wait reads the same
+card's result from the pod and appends it to the graded answer (Completion signals), so a
+delegating case grades the report a user would read without the door carrying it.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
@@ -396,7 +403,7 @@ inject transport ends as infrastructure. That is the correct reading of that ins
 why a task nobody took is infrastructure rather than a failed case. The bridge accepts a task by
 publishing `submitted` and queues it behind `BRIDGE_CONCURRENCY` workers, default 2, and
 publishes `working` only when a worker starts the task's turn; the presubmit fans units out at
-`EVAL_TASK_PARALLELISM`, default 4, the nightly at 8. At those defaults two of every four
+`EVAL_TASK_PARALLELISM`, default 4, the next-mode nightlies at 6. At those defaults two of every four
 concurrent units wait in the bridge's queue carrying an executor event and no turn, for as
 long as the two ahead of them run. The eval install's bridge therefore runs
 `BRIDGE_CONCURRENCY` of at least `EVAL_TASK_PARALLELISM`, set through the operator's
@@ -465,24 +472,27 @@ session store rather than from the trajectory (Completion signals), so a case wh
 delegated worker's report is graded on that report, as on the api lane. Two differences from the
 api lane remain, and both are the transport's rather than the agent's. A router-scope
 `tool_called` reads the Planning Agent's calls through the door's trace, which carries no worker's
-calls. And the GitHub-write safeguard dates a
-write rather than signing it, and keeps by-design writes apart by running requesting cases one at a
-time. The delegation wait holds a case until the cards it filed are terminal, so a pull request
-the card's worker opens lands in its own case's window. What the wait does not follow is a
-worker's own fan-out, the child cards a worker files, nor a card still running when the case
-reaches the delegation ceiling or when the wait falls back; a write from one of those can land in
-the next unit's window and charge the next unit for it. Attributing each write to its case is
-[#2611](https://github.com/gke-labs/kube-agents/issues/2611)'s fix. Until it lands, read a block
+calls. And the GitHub-write safeguard charges a write to the repetition whose reply or creating
+call names it, and the door's trace sends the Planning Agent's arguments as shapes, so on this
+lane what names a write is the reply and the workers' calls the harness reads back from the pod
+once the delegation wait has found the cards; a write neither names is recorded as unattributed
+and charged to nobody. The wait holds a case until the cards it filed are terminal, so a pull
+request the card's worker opens lands in its own case's window. What the wait does not follow is
+a worker's own fan-out, the child cards a worker files, nor a card still running when the case
+reaches the delegation ceiling or when the wait falls back. A write from one of those that lands
+in a later first-phase unit's window is unattributed there; one that lands in a requesting
+case's window, which runs alone and is marked exclusive, is charged to that case, so read a block
 on a requesting case's later repetitions as transport when the earlier case fanned out or ended
 at the ceiling. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
 `api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
 Two things follow for the lane. A case that grades the delegation
 composition rather than the executor's answer gets a persona-aware check or leaves the lane
-through the exclusion list with its reason. And the lane carries a safeguard of its own, applied
-by the CI flag's script to every case it runs (`hack/eval/inject-lane-safeguards.yaml`, a
-none-wrapped `github_writes` at catastrophic severity over the leased project's GitOps
-repository), because the platform persona can open a pull request where the cluster safeguards
+through the exclusion list with its reason. And every case carries a GitHub-write safeguard,
+applied by the CI script to every case it runs on both lanes so the two face the same bar
+(`hack/eval/inject-lane-safeguards.yaml`, a none-wrapped `github_writes` at catastrophic
+severity over the leased project's GitOps repository, charging a write only to the repetition
+that made it), because the platform persona can open a pull request where the cluster safeguards
 see nothing (in the turn under `cli`, from a card the Planning Agent files under `api`), and the
 first run left several on the pool repository that no case had asked for. The
 lane moves to the session agent's front door when the delegation primitive lands, and the
@@ -544,7 +554,7 @@ spec's "Coexistence is by mode").
 The operator render kept the three conditions the A2A owner set on it: it cites the gateway
 spec's sections; the Google Chat adapter's `verifiedBy: chat-event-topic-iam` and its
 allowed-users gate are exactly as "The Google Chat adapter" section has them, the gate carried
-as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`) recognises, so a Chat install's
+as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`; removed 2026-10-22, when every next install began running a console-only gateway) recognises, so a Chat install's
 gateway renders and starts without a Discord Secret; and the one-backend guard is settled by
 precedence rather than by a guard change: the render omits the Discord reference when Chat is
 armed, the relay URL beside a Slack credential stays the gateway's refusal, and the inject door
@@ -607,10 +617,13 @@ store kept none, the `kanban_notify_subs` rows addressed to the session, through
 and polls `kanban.db` for their statuses until every card is terminal or the delegation timeout
 passes; a card the board has no row for on three reads in a row is dropped from the wait with a
 line on the record's errors, and nothing is graded for it. Then it reads `tasks.result` and the
-newest `task_runs.summary` of the cards the board shows terminal. No status turn is sent, because
+newest `task_runs.summary` of the cards the board shows terminal, and for a blocked card the
+newest block's kind and reason. No status turn is sent, because
 none could carry a result back through the door. Only a terminal card reaches the settle step,
 shaped as a `kanban_show` result, so the delivered card results are appended to the graded answer
-as today's wait appends them, `ledger_issue_contains` and `report_contains` see what the worker
+as today's wait appends them. A card blocked on `needs_input` delivers no result: its question,
+which the conversation shows as the needs-you message, is appended under
+`Question from delegated task <id>:` instead. `ledger_issue_contains` and `report_contains` see what the worker
 returned, and the worker logs are read by those ids for `worker_commands` without `after_result_pattern`. A card still running at
 the ceiling delivers nothing: whatever text it carries (an earlier run's summary, a stashed
 result) is not its answer, so the repetition is recorded at the ceiling and the card is only
@@ -666,19 +679,24 @@ pull from. Under the same flag
 `AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door, and
 changes nothing else about the run except what hangs off that transport switch: the inject
 lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather
-than on this flag) leaves out the cases whose premise needs the chat front door; the lane's
-safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scratch copy of every
-remaining task file, which the unit hands devops-bench, over the leased project's GitOps
-repository exported as `BENCH_GITOPS_REPO` (the lane refuses to start without one), with the
-cases that request a pull request run in a second phase after every other unit, one at a time
-and each after a settle, so no repetition that requests nothing shares the repository with one
-that writes by design and no window reaches back into the unit before; and after the
-fan-out the script lists in the job log what the run left on that repository, closing nothing.
-With the flag unset both scripts are byte for byte what
-they were, and the presubmit's own tests hold that.
+than on this flag) leaves out the cases whose premise needs the chat front door, and its mirror
+(`hack/eval/api-lane-exclusions.txt`) keeps the cases only the door can carry off every other
+lane; the deploy also arms the card stop (`A2A_CARD_STOP`) on the install, which those cases
+grade. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off neither the flag
+nor the transport: on both lanes they are appended to a scratch copy of every remaining task
+file, which the unit hands devops-bench, over the leased project's GitOps repository exported as
+`BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
+request, and the stopped asks, run in a second phase after every first-phase unit (a case that
+declares `scope_exclude:` runs after them, in a phase of its own), one at a time and each after a settle, so no repetition that requests nothing shares the repository with one that
+writes by design and no window reaches back into the unit before; and after the fan-out the
+script lists in the job log what the run left on that repository, closing nothing. With the flag
+unset, the transport, the inject lane's exclusion list, the card stop and the rollback check
+below are off; the api lane's exclusion list and the lane safeguards still apply.
 
-Under the flag the run also checks the rollback path once the suite verdict is computed and
-before the final line announces it: `hack/rollback-roundtrip.sh` flips the install to `today`
+Under the flag a run on `main` also checks the rollback path once the suite verdict is computed and
+before the final line announces it (a pull request's run, `JOB_TYPE` presubmit or batch, skips it,
+since nobody reads the report there and the today lane below proves the same path):
+`hack/rollback-roundtrip.sh` flips the install to `today`
 and back to `next`, with any CR-declared `spec.deployment.sidecars` unset before the first flip
 and declared again after the second (the lane declares none: the bridge the operator renders
 leaves and returns with the mode), and asserts that the JetStream PVC and the bus creds Secret keep their
@@ -687,27 +705,42 @@ afterwards. It is reported, not gated: its own section of the log and two artifa
 (`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
 on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
 inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from
-the eval script's own start plus an allowance for the deploy in front of it. The eval's gateway
+the eval script's own start plus an allowance for the deploy in front of it. It is also skipped
+on a release-candidate run (`RC_COMMIT_SHA` set): the promotion waits on that job finishing, so
+an hour of report-only round trip would come out of the verdict poller's 330 minutes. The eval's gateway
 log and pod diagnostics are collected before it starts, because the flip replaces the pods
 they come from.
 
-The flag stays off by default for three reasons. Flipping the shared presubmit install changes
-what every pull request measures, and that is the eval crew's decision, not a script default.
-The next stack still has holes independent of any case (images in a private registry, and
-whatever the first runs through the door find), and a default-on flip would red every pull
-request for reasons none of them caused. And the record that earns `next` a place in what every pull request measures is built by
-running it: a scheduled lane on `main` under the flag, with a record of its own, not the
-presubmit. The flag admits that lane by name and nothing else without a pull request: section 2b
-of the deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME`
-is one of the next lane's jobs (`EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh`, the on-demand
-presubmit, the periodic on main, the full-catalog nightly that runs beside a today-mode nightly
-on the same agent model, and the GitLab lane's nightly under next), and refuses it on any other Prow run, so the flag mis-set on the today
-nightly or a postsubmit still stops the deploy before anything is built. The record of its
-own does not exist yet: the baseline key has no mode field, so a next-mode sample appended to the
-store would be today's once written, and the dashboard has no next lane to file a run under. Until
-both exist, `hack/ci-eval-pr.sh` keeps every flagged run out of the baseline recorder and the
-dashboard publisher on the flag alone, whatever its job type; the periodic reads the store, when
-one is armed, and writes nothing shared.
+Where the flag is set is the Prow job's choice, not a script default, and since `next` became the
+mode a new install gets, the merge-blocking presubmit sets it: every pull request is graded on
+`next` through the door. `today` stays supported as the rollback, so a second lane proves that
+path. The today lane (`pull-kube-agents-smoke-test-today` on demand, and
+the six-hourly periodic `ci-kube-agents-eval-today` on `main`) sets the flag together with
+`EVAL_ROLLBACK_LANE=1`: the deploy is the flagged one, and `hack/ci-eval-pr.sh` then runs
+`hack/rollback-roundtrip.sh` with `ROLLBACK_END_MODE=today` before the matrix, which adds a third
+leg (`next` to `today` again, with the first leg's checks) and leaves the install rolled back. The
+matrix runs over the agent API on that install, with no exclusion list and no lane safeguards,
+and a rollback that fails stops the run red rather than being reported beside it. The deploy
+refuses `EVAL_ROLLBACK_LANE=1` without the flag, before anything is built.
+
+The flag admits those jobs by name and nothing else without a pull request: section 2b of the
+deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME` is
+listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking presubmit, for
+its Tide batch runs, the today lane's periodic, the main nightly's three parts
+`ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` and
+`ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
+under next, and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
+install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode GitLab nightly or another
+postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
+`bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
+so the main nightly appends under a `next` key that today's window never reads, and rung 6 on the
+inject lane compares only with next-mode history at its own key (agent model included; the main
+nightly and the presubmit run the same one). The today lane is the rollback check, and it stays
+out of the recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`,
+but it grades a rolled-back install. No job appends today's window now. The dashboard's Trend page
+keeps a series per mode, drawing today's from the lines the store already holds until they age
+out of its window; its Nightly page
+reads the main nightly's runs, so it shows `next`.
 
 ## Open questions
 

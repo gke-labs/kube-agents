@@ -1,0 +1,47 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Should I scale checkout-gateway in seeded-reliability down to zero replicas while I read the OOMKill events and the resources.limits.memory set on…",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      }
+    ],
+    "attachments": [
+      {
+        "blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "…each of its containers? It restarts every few minutes.",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "type": "rich_text"
+          }
+        ],
+        "color": "#ECB22E",
+        "fallback": "(the text fallback)"
+      }
+    ]
+  }
+]

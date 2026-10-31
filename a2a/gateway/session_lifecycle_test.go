@@ -582,10 +582,8 @@ func TestReapOnceResumableCursor(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed 6 sessions
-	var seededKeys []string
 	for i := 1; i <= 6; i++ {
 		key := fmt.Sprintf("discord:g1/reap-cursor-%02d", i)
-		seededKeys = append(seededKeys, key)
 		rec := &SessionRecord{
 			Key:          key,
 			ContextID:    fmt.Sprintf("ctx-reap-%02d", i),
@@ -771,6 +769,10 @@ func TestReapOnceResumableCursorAfterDelete(t *testing.T) {
 // task routing index instead of entering an unbounded 2-second requeue loop.
 func TestLateTaskEventForPrunedSessionDroppedWithoutRequeueLoop(t *testing.T) {
 	r := startRig(t)
+	// This test calls relayBatch itself, and relayBatch reads g.runCtx, which
+	// Run writes first and the relay durable follows; a call before Run got
+	// that far is a data race the detector reports on a loaded runner.
+	waitForRelayDurable(t, r)
 	ctx := context.Background()
 
 	conv := "discord:g1/pruned-conv"

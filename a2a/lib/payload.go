@@ -2,7 +2,10 @@ package lib
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
+	"regexp"
 	"strings"
 )
 
@@ -73,11 +76,104 @@ const (
 	// with KAGE_SLACK_UX on (#3258; spec-a2a-payloads.md, "Reserved artifact
 	// names").
 	ArtifactHandoff = "handoff"
+	// ArtifactUsage is what a task's turns cost: one data part per finished
+	// turn, a Usage object, published by the executor before the turn's
+	// answer settles (the worker adapter on each harness result, the
+	// hermes-bridge on each API turn's answer) and never after the
+	// terminal. Every field is optional and a reader tolerates the
+	// artifact's absence; UsageTotal folds a task's turns (#2816;
+	// spec-a2a-payloads.md, "Reserved artifact names").
+	ArtifactUsage = "usage"
 )
 
 // HandoffCards is the ArtifactHandoff text part: the work went to kanban
 // cards.
 const HandoffCards = "cards"
+
+// Usage is one finished turn's cost, the ArtifactUsage data part. Model is
+// the model the executor asked for or was told it ran; InputTokens is every
+// token the model read for the turn, cached reads included, and OutputTokens
+// every token it wrote; CostUsd is the producer's own estimate, carried only
+// when the producer had a figure it did not invent (a harness that prices
+// its turns; never Hermes behind the gateway, which records 0.0); DurationMs
+// is the turn's wall time as the producer measured it. A zero is "not
+// known" and is omitted on the wire, so a reader never mistakes unknown for
+// free; a part with no figure at all is refused.
+type Usage struct {
+	Model        string  `json:"model,omitempty"`
+	InputTokens  int64   `json:"inputTokens,omitempty"`
+	OutputTokens int64   `json:"outputTokens,omitempty"`
+	CostUsd      float64 `json:"costUsd,omitempty"`
+	DurationMs   int64   `json:"durationMs,omitempty"`
+}
+
+// hasFigure reports whether u carries at least one figure; a model name
+// alone is not usage.
+func (u Usage) hasFigure() bool {
+	return u.InputTokens > 0 || u.OutputTokens > 0 || u.CostUsd > 0 || u.DurationMs > 0
+}
+
+// negative reports whether any figure is below zero, which no producer can
+// have measured.
+func (u Usage) negative() bool {
+	return u.InputTokens < 0 || u.OutputTokens < 0 || u.CostUsd < 0 || u.DurationMs < 0
+}
+
+// UsagePart is u as the ArtifactUsage data part: the object itself, as an
+// activity entry is. A usage with no figure, or a negative one, is refused
+// here so it never reaches the bus.
+func UsagePart(u Usage) (Part, error) {
+	if !u.hasFigure() || u.negative() {
+		return Part{}, fmt.Errorf("usage part carries no figure, or a negative one: %+v", u)
+	}
+	data, err := json.Marshal(u)
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// UsageOf reads p as a usage part. A part that is not data, does not decode
+// as an object, carries no figure or a negative one is not usage; a key the
+// reader does not know is ignored.
+func UsageOf(p Part) (Usage, bool) {
+	if p.Kind != "data" || len(p.Data) == 0 {
+		return Usage{}, false
+	}
+	var u Usage
+	if err := json.Unmarshal(p.Data, &u); err != nil || !u.hasFigure() || u.negative() {
+		return Usage{}, false
+	}
+	return u, true
+}
+
+// UsageFigure is a producer's count or duration, read from a float, as the
+// whole number a Usage part carries, and whether it is one: a figure that is
+// not finite, below zero or at or above 2^63 (which int64 cannot hold and a
+// conversion would wrap) is not, and the producer drops that field and names
+// it rather than refuse the part or publish a wrapped value.
+func UsageFigure(f float64) (int64, bool) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f >= math.MaxInt64 {
+		return 0, false
+	}
+	return int64(f), true
+}
+
+// UsageTotal folds the turns of one task: the figures sum and Model is the
+// last one named. An absent figure stays absent.
+func UsageTotal(turns []Usage) Usage {
+	var total Usage
+	for _, u := range turns {
+		if u.Model != "" {
+			total.Model = u.Model
+		}
+		total.InputTokens += u.InputTokens
+		total.OutputTokens += u.OutputTokens
+		total.CostUsd += u.CostUsd
+		total.DurationMs += u.DurationMs
+	}
+	return total
+}
 
 // DelegateRequest is the ArtifactDelegate data part's shape: one child task
 // to mint, addressee and the task text. It is also the wire shape the
@@ -85,15 +181,193 @@ const HandoffCards = "cards"
 // hop is how the call gets from the harness's delegate tool to the adapter
 // that actually publishes the artifact), so it is named here, beside
 // ArtifactDelegate, rather than duplicated per caller.
+//
+// Parameters are the child task's parameters (TaskParameters), the target
+// cluster among them. The contract (spec-a2a-payloads.md, "Task parameters
+// and child results"): the gateway carries them into the child's submission
+// and refuses a child whose target is not inside its parent's. No gateway
+// reads them yet.
 type DelegateRequest struct {
-	Addressee string `json:"addressee"`
-	Text      string `json:"text"`
+	Addressee  string            `json:"addressee"`
+	Text       string            `json:"text"`
+	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
 // DelegateTextCap bounds DelegateRequest.Text in bytes: the adapter refuses a
 // longer request before it reaches the bus and the gateway ignores one that
 // arrives anyway, so the two sides cannot disagree on the number.
 const DelegateTextCap = 16 * 1024
+
+// TaskParameters is the taskParameters data part on a profile task's
+// submission: the parameters its persona declares (the cluster persona's
+// project, location and cluster), set by the gateway from what the client
+// or the parent task asked. The dispatcher builds the verifier's resource
+// from them and hands each to the worker as PROFILE_TASK_<NAME>; the
+// verifier refuses a target outside the grant's scope, which is what makes
+// these message fields authoritative. They never ride the authority block.
+type TaskParameters struct {
+	Parameters map[string]string `json:"parameters"`
+}
+
+// The bounds ValidateTaskParameters holds a parameter set to. A name is a
+// lower-case identifier (TaskParameterNameRE), as a persona declares it and as the worker's
+// PROFILE_TASK_<NAME> spells it upper-cased. A value is one token with no
+// '/' or space, because the dispatcher joins values into a verifier resource
+// path (project/<p>/location/<l>/cluster/<c>) and a '/' would let a value
+// name a different resource. It starts with a letter or digit, so it is
+// never "." or ".." (a path step) and never reads as a flag ("-x") where a
+// worker passes it to a command.
+const (
+	TaskParametersMax        = 16
+	TaskParameterValueMaxLen = 128
+)
+
+var (
+	// TaskParameterNameRE is a parameter name: the persona loader declares
+	// names by it (lib/persona), and a submission carries names by it, so a
+	// name a persona can declare is one its tasks can be handed.
+	TaskParameterNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
+	taskParameterValue  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*$`)
+)
+
+// ValidateTaskParameters reports the first way params break the bounds
+// above, or nil. An empty or nil set is valid: a task with no parameters.
+func ValidateTaskParameters(params map[string]string) error {
+	if len(params) > TaskParametersMax {
+		return fmt.Errorf("task parameters: %d, at most %d", len(params), TaskParametersMax)
+	}
+	for name, value := range params {
+		if !TaskParameterNameRE.MatchString(name) {
+			return fmt.Errorf("task parameter name %q is not a lower-case identifier of at most 63 characters", name)
+		}
+		if len(value) > TaskParameterValueMaxLen || !taskParameterValue.MatchString(value) {
+			return fmt.Errorf("task parameter %s: the value is not one token (a letter or digit, then letters, digits, . _ : -) of at most %d characters", name, TaskParameterValueMaxLen)
+		}
+	}
+	return nil
+}
+
+const taskParametersKey = "taskParameters"
+
+// TaskParametersPart is p as a data part, refused when p breaks the bounds.
+func TaskParametersPart(p TaskParameters) (Part, error) {
+	if err := ValidateTaskParameters(p.Parameters); err != nil {
+		return Part{}, err
+	}
+	if p.Parameters == nil {
+		p.Parameters = map[string]string{}
+	}
+	data, err := json.Marshal(map[string]TaskParameters{taskParametersKey: p})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// TaskParametersOf finds the taskParameters part among parts. A data part
+// that is not one is skipped. One that is but breaks the bounds is an
+// error rather than skipped, so a reader never runs a task as though it had
+// no parameters when its submission carried bad ones; so are two such
+// parts, which leave the task's target ambiguous.
+func TaskParametersOf(parts []Part) (TaskParameters, bool, error) {
+	var found *TaskParameters
+	for _, p := range parts {
+		raw, ok := wrappedData(p, taskParametersKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return TaskParameters{}, true, errors.New("task parameters: more than one taskParameters part")
+		}
+		var tp TaskParameters
+		if err := json.Unmarshal(raw, &tp); err != nil {
+			return TaskParameters{}, true, fmt.Errorf("task parameters: %w", err)
+		}
+		// A null part, a null set or a misspelt field decodes to no
+		// parameters at all; that is a broken part, not an empty set, which
+		// is written {"parameters":{}}.
+		if tp.Parameters == nil {
+			return TaskParameters{}, true, errors.New("task parameters: the part carries no parameters object")
+		}
+		if err := ValidateTaskParameters(tp.Parameters); err != nil {
+			return TaskParameters{}, true, err
+		}
+		found = &tp
+	}
+	if found == nil {
+		return TaskParameters{}, false, nil
+	}
+	return *found, true, nil
+}
+
+// ChildResult is the childResult data part: a child task's end, which the
+// gateway delivers on its parent's .in as a message, for a parent that waits
+// by staying open (a profile task under the dispatcher). A chat session's
+// turn ends when it delegates, so a session parent is woken with the child's
+// result as a new turn instead (spec-a2a-payloads.md, "Task parameters and
+// child results").
+type ChildResult struct {
+	ChildTaskID string    `json:"childTaskId"`
+	Addressee   string    `json:"addressee"`
+	State       TaskState `json:"state"`
+	// Text is the child's deliverable when it completed, and the reason it
+	// gave otherwise; at most ChildResultTextCap bytes, cut by the gateway.
+	Text string `json:"text,omitempty"`
+}
+
+// ChildResultTextCap bounds ChildResult.Text in bytes. The gateway cuts a
+// longer deliverable and says so; the child's own result artifact keeps it
+// whole on TASKS.
+const ChildResultTextCap = 64 * 1024
+
+const childResultKey = "childResult"
+
+// ChildResultPart is c as a data part, refused without a child task id or a
+// terminal state, or with text past ChildResultTextCap.
+func ChildResultPart(c ChildResult) (Part, error) {
+	if !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() || len(c.Text) > ChildResultTextCap {
+		return Part{}, fmt.Errorf("child result: needs a task id, a terminal state and at most %d bytes of text", ChildResultTextCap)
+	}
+	data, err := json.Marshal(map[string]ChildResult{childResultKey: c})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// ChildResultOf finds the childResult part among parts. A data part that is
+// not one, or one without a task id or a terminal state or with text past
+// the cap, is skipped: a malformed child result is no event, where a
+// malformed parameter set (TaskParametersOf) would change what runs.
+func ChildResultOf(parts []Part) (ChildResult, bool) {
+	for _, p := range parts {
+		raw, ok := wrappedData(p, childResultKey)
+		if !ok {
+			continue
+		}
+		var c ChildResult
+		if json.Unmarshal(raw, &c) != nil || !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() ||
+			len(c.Text) > ChildResultTextCap {
+			continue
+		}
+		return c, true
+	}
+	return ChildResult{}, false
+}
+
+// wrappedData is a data part's payload under key, when p is a data part
+// wrapping one.
+func wrappedData(p Part, key string) (json.RawMessage, bool) {
+	if p.Kind != "data" || len(p.Data) == 0 {
+		return nil, false
+	}
+	var wrap map[string]json.RawMessage
+	if json.Unmarshal(p.Data, &wrap) != nil {
+		return nil, false
+	}
+	raw, ok := wrap[key]
+	return raw, ok
+}
 
 // SteerNotice is the data part an executor that queues follow-ups puts on
 // the non-final status-update it publishes for each follow-up message it
@@ -186,7 +460,7 @@ func SteerNoticeOf(parts []Part) (SteerNotice, bool) {
 // them (the executor's log names each card). truncated says the
 // conversation had more open cards than one stop takes, so some may still
 // be open; deadline that the stop ran out of time. listsCut says only that
-// the executor cut stopped or settled to fit the part, each at
+// the executor cut stopped, settled or notStopped to fit the part, each at
 // CardStopListMax, so the list that was cut is one at that length: the
 // cards themselves are as the counts say. A stop that found nothing open answers empty lists.
 // A stop that failed answers no part: its terminal is failed, and the
@@ -212,6 +486,10 @@ type CardStopResult struct {
 	Truncated  bool           `json:"truncated"`
 	Deadline   bool           `json:"deadline"`
 	ListsCut   bool           `json:"listsCut"`
+	// NotStopped names the cards Failed, Pending and Unresolved count, in that
+	// order, cut at CardStopListMax (ListsCut covers it too). Absent from an
+	// older executor's result, which reads as none named.
+	NotStopped []CardStopCard `json:"notStopped,omitempty"`
 }
 
 // CardStopCard is one card a result names. PriorStatus is set on a stopped
@@ -350,9 +628,34 @@ type ArtifactUpdate struct {
 	LastChunk bool     `json:"lastChunk,omitempty"`
 }
 
-// AgentCard carries only the field validation needs.
+// AgentCard is the directory card on a2a.agents.<name>. Validation needs
+// only Name; the rest is what the gateway routes a profile on (#3655), all
+// optional so a card without them still parses.
 type AgentCard struct {
 	Name string `json:"name"`
+	// Description is the routing blurb, a sentence a router can read.
+	Description string `json:"description,omitempty"`
+	// Tiers are the tiers the profile may run at (its allowedTiers).
+	Tiers []string `json:"tiers,omitempty"`
+	// ClusterRef pins a profile to one cluster; absent on a profile that
+	// takes its target as task parameters.
+	ClusterRef *ClusterRef `json:"clusterRef,omitempty"`
+	// Parameters are the task parameters the profile's persona declares.
+	Parameters []ProfileParameter `json:"parameters,omitempty"`
+}
+
+// ClusterRef names one GKE cluster.
+type ClusterRef struct {
+	ProjectID string `json:"projectId"`
+	Location  string `json:"location"`
+	Cluster   string `json:"cluster"`
+}
+
+// ProfileParameter is one task parameter a profile declares: its name, as
+// TaskParameterNameRE, and whether a submission must carry it.
+type ProfileParameter struct {
+	Name     string `json:"name"`
+	Required bool   `json:"required,omitempty"`
 }
 
 func protocolErrf(format string, args ...any) error {

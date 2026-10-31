@@ -1,0 +1,149 @@
+# Upgrade-failure catalogue entry 15 (the OOM killer starts killing the whole
+# container), in the shape the seeded fleet plants it: multi-process-container
+# on seeded-a, a Deployment (multi-process-worker, in seeded-shapes) whose one
+# container is a shell supervisor forking two workers and waiting on them,
+# under a 32Mi memory limit. From Kubernetes 1.28 the kubelet sets
+# memory.oom.group on every container on a cgroup v2 node, so an
+# out-of-memory event kills the whole container instead of the one process
+# that grew; a container that used to lose one worker and carry on now dies
+# at exit 137. Nothing here allocates, so the pod runs today; the shape is
+# the before-signal.
+#
+# The prompt names no workload and no command. It asks which containers run
+# more than one process under a single memory limit, and for the answer to
+# end in one declared line per such workload, in a fixed form; the
+# deterministic objectives read the planted Deployment's line and nothing
+# else. The process count is declared as one or several rather than as a
+# number, so a count that includes or omits the supervisor is not a wrong
+# line.
+#
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
+#
+# A pod of the workload names it too: the pod-template hash (or a Job's
+# minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
+# alphabet. A sibling's name (`-canary`) is another object and is refused.
+#
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the forking command. One process per container in its
+# place is the heal that passes every objective and empties the fixture.
+id: upgrades-multi-process-oom-group-named
+name: The multi-process container under one limit is named before the kubelet that kills it whole
+
+prompt: >-
+  Before the node pools of the seeded clusters in this project are upgraded,
+  tell me which containers run more than one process under a single memory
+  limit, and what a cgroup v2 node with a kubelet at 1.28 or later does when
+  one of those processes runs out of memory, compared with what happened
+  before. Read only; change nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End your answer with one line per such
+  workload in exactly this form, no other words on the line:
+  "<cluster>/<namespace>/<workload>: processes per container <one|several>;
+  memory limit <value or none>; oom kills the whole container: <yes|no>".
+
+expected_output: >-
+  It reads the container commands on the seeded clusters, and where it can
+  the process list inside them, and names multi-process-worker in
+  seeded-shapes on seeded-a: one busybox container whose shell forks two
+  sleeping workers and waits, under a 32Mi limit. It says that from
+  Kubernetes 1.28 the kubelet sets memory.oom.group on a cgroup v2 node, so
+  when one worker exceeds the limit the whole container is killed and
+  restarted at exit 137 rather than losing the one process, and that
+  singleProcessOOMKill in the pool's node system config is the opt-out from
+  1.32. It recommends one process per container, a limit sized for all of
+  them, or that opt-out, and performs no change. It cites no CVE identifiers
+  and ends with the declared line for each such workload, the planted one
+  reading "processes per container several; memory limit 32Mi; oom kills
+  the whole container: yes".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+fixtures:
+  - multi-process-container
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases.
+  - name: the-planted-workload-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - multi-process-container
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: ?\([^)\n;]*\))?; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-container-runs-several-processes
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - multi-process-container
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?several(?: ?\([^)\n;]*\))?; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?(?!several(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: (?:yes|no)$'
+
+  # The shared limit is what the group kill applies to; the fold lowercases
+  # the quantity, and a space or a MiB spelling is the same number.
+  - name: the-declared-line-names-the-shared-limit
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - multi-process-container
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: ?\([^)\n;]*\))?; memory limit:? ?32 ?mib?(?: ?\([^)\n;]*\))?; oom kills the whole container: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: ?\([^)\n;]*\))?; memory limit:? ?(?!32 ?mib?(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; oom kills the whole container: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-whole-container-dies
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - multi-process-container
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: ?\([^)\n;]*\))?; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: yes$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?multi-process-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: processes per container:? ?(?:one|several)(?: ?\([^)\n;]*\))?; memory limit:? ?[^ :;\n][^;\n]*; oom kills the whole container: (?!yes$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The container still forks its workers.
+  - name: the-planted-forking-command-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: multi-process-container
+      kind: deployment
+      resource_name: multi-process-worker
+      namespace: seeded-shapes
+      path: spec.template.spec.containers[0].command[2]
+      op: eq
+      value: sleep infinity & sleep infinity & wait

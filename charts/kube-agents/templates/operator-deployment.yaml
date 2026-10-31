@@ -48,7 +48,20 @@ spec:
           args:
             - --leader-elect
             - --health-probe-bind-address=:8081
+            {{- /* `| default dict`: a `helm upgrade --reuse-values` from a release
+                   that predates operator.metrics reaches this line with it nil,
+                   as the agentSandbox guard below explains; such a release keeps
+                   the listener off until the value is set. */}}
+            {{- if (.Values.operator.metrics | default dict).enabled }}
+            # Plain HTTP on the pod network: the scrape is GKE Managed
+            # Prometheus from gke-gmp-system, which does not carry a bearer
+            # token the manager's authn/authz filter would accept; the
+            # operator's NetworkPolicy (operator-netpol.yaml) bounds who reads it.
+            - --metrics-bind-address=:{{ include "kube-agents.operatorMetricsPort" . }}
+            - --metrics-secure=false
+            {{- else }}
             - --metrics-bind-address=0
+            {{- end }}
           image: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.operator.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
           env:
@@ -75,6 +88,26 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.serviceAccountName
+            # This container's memory limit in bytes, which the manager turns
+            # into the Go runtime's soft memory limit (nine tenths of it; a
+            # GOMEMLIMIT set through operator.extraEnv wins). Read from the
+            # container itself so it follows operator.resources.limits.memory,
+            # and on Autopilot the limit the cluster admitted rather than the
+            # one written here. With no limit set the Downward API reports the
+            # node's allocatable memory, and the soft limit is a share of that.
+            - name: OPERATOR_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
+            {{- if include "kube-agents.a2aGatewayPodPolicyEnabled" . }}
+            # The chart rendered the A2A gateway's pod admission policy
+            # (templates/a2a-gateway-pod-admission-policy.yaml), from the same helper:
+            # a signal for operator features that must run only where that policy is
+            # installed. Absent, as on the kustomize path or Kubernetes 1.29, such a
+            # feature stays off. It says the policy was rendered, not that it still holds.
+            - name: A2A_GATEWAY_POD_POLICY
+              value: "true"
+            {{- end }}
             # The three images the operator resolves for pods the chart never
             # renders: an agent Deployment whose PlatformAgent omits
             # spec.deployment.image, the shell sandbox StatefulSet it renders
@@ -130,6 +163,11 @@ spec:
             - containerPort: 8081
               name: health
               protocol: TCP
+            {{- if (.Values.operator.metrics | default dict).enabled }}
+            - containerPort: {{ include "kube-agents.operatorMetricsPort" . }}
+              name: metrics
+              protocol: TCP
+            {{- end }}
             {{- if .Values.operator.webhooks.enabled }}
             # 10250, not controller-runtime's default 9443: it is the only non-443 port
             # GKE's automatic control-plane-to-node firewall rule permits, so a private
@@ -158,6 +196,12 @@ spec:
               port: 8081
             initialDelaySeconds: 5
             periodSeconds: 10
+          {{- /* Fails the render on a memory limit under
+                 kube-agents.operatorMemoryFloorBytes: a `helm upgrade
+                 --reuse-values` from a release up to 0.16.0 otherwise keeps
+                 that release's 128Mi, and the manager is OOM-killed as its
+                 cache fills. */}}
+          {{- include "kube-agents.operatorResourcesCheck" . }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           volumeMounts:

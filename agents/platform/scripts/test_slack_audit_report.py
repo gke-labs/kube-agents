@@ -10,7 +10,11 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# fleet-audit's harness, which writes the reports this module reads; appended, so
+# this directory's modules still win.
+sys.path.append(str(Path(__file__).resolve().parent.parent / "skills" / "fleet-audit" / "scripts"))
 
+import audit_report
 import slack_audit_report as sar
 
 LEDGER = "https://github.com/acme/fleet-config/issues/231"
@@ -1123,6 +1127,7 @@ class FailedLineTest(unittest.TestCase):
             "https://gitlab.com/acme/platform/infra/-/issues/12",
             "https://gitlab.example.com/group/fleet/-/work_items/42",
             "http://ghe.example.com/acme/fleet/issues/7",
+            "https://ghe.example.com:8443/acme/fleet/issues/7",
         ):
             with self.subTest(url=url):
                 self.assertIsNone(sar.failed_line(WALL_HEADING + f"\n## What to do\n- Review {url} first.\n"))
@@ -1188,6 +1193,211 @@ class FailedLineTest(unittest.TestCase):
         start = time.monotonic()
         sar.failed_line("x " * LONG_INPUT * 10 + "\n## What's wrong\n" + "y " * LONG_INPUT)
         self.assertLess(time.monotonic() - start, FAST_SECONDS)
+
+    def test_a_run_of_urls_is_read_quickly(self):
+        # Each URL's scan ends at the next "://" rather than reading to the end of the run.
+        start = time.monotonic()
+        self.assertIsNone(sar.failed_line("http://" * LONG_INPUT))
+        self.assertLess(time.monotonic() - start, FAST_SECONDS)
+
+    def test_a_label_before_a_long_blank_run_is_read_quickly(self):
+        # The label matched in the search window, then again on the whole report where the
+        # trailing text fails it: the blank run is read once, not once per split of it.
+        start = time.monotonic()
+        self.assertIsNone(sar.failed_line("What's wrong" + "\t" * LONG_INPUT * 2 + "x\n"))
+        self.assertLess(time.monotonic() - start, FAST_SECONDS)
+
+
+#: fleet-audit's lines for the run that published to ``ISSUE``, as ``render_chat_report`` writes them.
+FINISH_REPORT = f"Security & RBAC Posture Audit: 2 critical findings, 1 new, 1 resolved.\nLedger: {LEDGER}"
+#: fleet-audit's summary of a run with no ledger, as ``render_no_forge_summary`` writes it.
+SUMMARY = (
+    "Security & RBAC Posture Audit: 2 critical findings, 2 resolved.\n"
+    "`critical` seeded-a: control plane is public\n"
+    "`critical` seeded-security: debug-binding grants cluster-admin\n"
+    "5 more (1 major, 4 minor) are saved on the install.\n"
+    "No GitOps repository is connected, so no ledger issue or fix pull requests were opened."
+)
+
+
+class FinishLineTest(unittest.TestCase):
+    """fleet-audit's own line, which drops its zero counts, still builds the card and the fallback."""
+
+    def test_the_line_builds_the_card(self):
+        self.assertEqual(sar.headline_from_issue(ISSUE, REF, FINISH_REPORT).splitlines()[0], HEADLINE)
+
+    def test_the_fallback_is_the_line_in_bold(self):
+        self.assertEqual(
+            sar.headline_fallback(FINISH_REPORT, REF),
+            f"**Security & RBAC Posture Audit: 2 critical findings, 1 new, 1 resolved.**\n{LINK}",
+        )
+
+    def test_a_clean_line_reads_clean_on_a_closed_ledger(self):
+        report = f"Security & RBAC Posture Audit: clean, 2 resolved across 3 clusters.\nLedger: {LEDGER}"
+        self.assertEqual(
+            sar.headline_from_issue(dict(ISSUE, state="closed"), REF, report),
+            f"**{sar.CLEAN_CARD.format(name='Security & RBAC Posture Audit')}**\n{LINK}",
+        )
+
+    def test_a_lead_count_the_issue_disagrees_with_falls_back(self):
+        # The ledger was not rewritten this run: the line's count at its severity is not the issue's.
+        for line in (
+            "Security & RBAC Posture Audit: 3 critical findings, 1 new.",
+            "Security & RBAC Posture Audit: 1 major finding, 1 new.",
+        ):
+            with self.subTest(line=line):
+                report = f"{line}\nLedger: {LEDGER}"
+                self.assertIsNone(sar.headline_from_issue(ISSUE, REF, report))
+                self.assertIsNone(sar.blocks_from_issue(ISSUE, REF, report))
+
+    def test_a_lead_count_below_the_most_severe_level_agrees(self):
+        body = BODY.replace("7 findings: 2 critical, 1 major, 4 minor.", "5 findings: 0 critical, 1 major, 4 minor.")
+        body = body.split("### Major (1)", 1)[1]
+        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 5 findings (0 critical)",
+                     body="5 findings: 0 critical, 1 major, 4 minor.\n\n### Major (1)" + body)
+        report = f"Security & RBAC Posture Audit: 1 major finding, 1 resolved.\nLedger: {LEDGER}"
+        self.assertEqual(
+            sar.headline_from_issue(issue, REF, report).splitlines()[0],
+            "**Security & RBAC Posture Audit: 1 major finding**",
+        )
+
+    def test_every_count_by_severity_the_line_states_is_checked(self):
+        # A model-written line may name a lower level first; the issue agrees with both counts.
+        report = f"Security audit, 7 findings: 1 major finding and 2 critical findings.\nLedger: {LEDGER}"
+        self.assertEqual(sar.headline_from_issue(ISSUE, REF, report).splitlines()[0], HEADLINE)
+        disagreeing = f"Security audit: 3 major findings and 2 critical findings.\nLedger: {LEDGER}"
+        self.assertIsNone(sar.headline_from_issue(ISSUE, REF, disagreeing))
+
+    def test_a_zero_finding_line_with_no_digit_still_reads_as_the_line(self):
+        # "no findings" states a total in words; a run with lost memory writes no digit.
+        report = (
+            "Security & RBAC Posture Audit: no findings; the change since the last run is unknown.\n"
+            f"Ledger: {LEDGER}"
+        )
+        self.assertIsNone(sar.headline_from_issue(ISSUE, REF, report))
+        self.assertEqual(
+            sar.headline_fallback(report, REF),
+            f"**Security & RBAC Posture Audit: no findings; the change since the last run is unknown.**\n{LINK}",
+        )
+
+    def test_a_held_line_does_not_rebuild_the_card(self):
+        report = (
+            "Security & RBAC Posture Audit: no findings across 3 clusters, but the ledger stays open: "
+            f"2 carried findings were not accounted for.\nLedger: {LEDGER}"
+        )
+        self.assertIsNone(sar.headline_from_issue(ISSUE, REF, report))
+
+
+class SummaryCardTest(unittest.TestCase):
+    """The card of a run with no ledger issue, read from fleet-audit's summary."""
+
+    def test_approved_layout(self):
+        self.assertEqual(
+            sar.headline_from_summary(SUMMARY),
+            "**Security & RBAC Posture Audit: 2 critical findings, 2 resolved.**\n"
+            "`critical` seeded-a: control plane is public\n"
+            "`critical` seeded-security: debug-binding grants cluster-admin\n"
+            "5 more (1 major, 4 minor) are saved on the install.\n"
+            "No GitOps repository is connected, so no ledger issue or fix pull requests were opened.",
+        )
+
+    def test_the_blocks_offer_the_first_finding_and_no_ledger(self):
+        blocks, text = sar.blocks_from_summary(SUMMARY)
+        buttons = [element for block in blocks if block["type"] == "actions" for element in block["elements"]]
+        self.assertEqual([button["text"]["text"] for button in buttons], [sar.LOOK_FIRST])
+        self.assertFalse(any("url" in button for button in buttons))
+        self.assertIn("seeded-a: control plane is public", text)
+
+    def test_the_card_as_a_chat_message(self):
+        chat, text = sar.chat_from_summary(SUMMARY)
+        self.assertEqual(chat["headline"], "Security & RBAC Posture Audit: 2 critical findings, 2 resolved.")
+        self.assertEqual(
+            chat["rows"],
+            [
+                {"text": "seeded-a: control plane is public", "severity": "critical"},
+                {"text": "seeded-security: debug-binding grants cluster-admin", "severity": "critical"},
+            ],
+        )
+        self.assertEqual(chat["after"][-1], "No GitOps repository is connected, so no ledger issue or fix pull requests were opened.")
+        self.assertEqual(chat["choices"], [{"text": sar.LOOK_FIRST, "primary": True}])
+        self.assertNotIn("links", chat)
+        self.assertEqual(text, sar.headline_from_summary(SUMMARY))
+
+    def test_a_run_with_no_findings_has_no_button(self):
+        summary = "Security & RBAC Posture Audit: no findings, 2 resolved.\nNo GitOps repository is connected, so no ledger issue or fix pull requests were opened."
+        blocks, _ = sar.blocks_from_summary(summary)
+        self.assertFalse([block for block in blocks if block["type"] == "actions"])
+
+    def test_a_report_with_a_ledger_is_not_a_summary(self):
+        self.assertIsNone(sar.summary_card(f"{SUMMARY}\nLedger: {LEDGER}"))
+        self.assertIsNone(sar.summary_card(FINISH_REPORT))
+
+    def test_a_summary_with_another_note_posts_as_written(self):
+        # A repository the broker cannot reach, or several and none chosen: the note carries a
+        # remedy the card's lines would clip, so the summary goes out whole.
+        unreachable = (
+            "The repository acme/fleet could not be reached through the broker (FORGE_NOT_FOUND), so no ledger "
+            "issue was written and no remediation pull request was opened. The run did not choose another "
+            "repository. Make sure that the repository exists and that the install's forge credential can read "
+            "and write it. The findings are in the report store."
+        )
+        summary = SUMMARY.replace(SUMMARY.splitlines()[-1], unreachable)
+        self.assertIsNone(sar.summary_card(summary))
+        self.assertIsNone(sar.blocks_from_summary(summary))
+        self.assertIsNone(sar.chat_from_summary(summary))
+
+    def test_a_line_the_card_would_clip_posts_the_summary_whole(self):
+        gap = "Coverage is incomplete: " + "seeded-c: 3 of 16 checks did not run; " * 10
+        summary = SUMMARY.replace("\nNo GitOps", f"\n{gap}\nNo GitOps")
+        self.assertIsNone(sar.summary_card(summary))
+
+    def test_more_lines_than_a_chat_message_keeps_post_the_summary_whole(self):
+        extra = "".join(f"\nline {i}" for i in range(sar._chat.AFTER_MAX))
+        summary = SUMMARY.replace("\nNo GitOps", f"{extra}\nNo GitOps")
+        self.assertIsNone(sar.summary_card(summary))
+
+    def test_a_run_that_finished_twice_posts_both_summaries_whole(self):
+        first = "Security & RBAC Posture Audit: 1 critical finding.\n`critical` seeded-a: control plane is public\n" + sar.NO_LEDGER_NOTES[0]
+        second = "Security & RBAC Posture Audit: 1 critical finding.\n`critical` seeded-b: control plane is public\n" + sar.NO_LEDGER_NOTES[0]
+        report = f"{first}\n\nRe-run in this audit; counts are against the report above.\n{second}"
+        self.assertIsNone(sar.summary_card(report))
+
+    def test_a_rerun_label_above_the_summary_is_dropped(self):
+        for label in (audit_report.CHAT_REPORT_RERUN_RELATIVE_LABEL, audit_report.CHAT_REPORT_RERUN_LABEL):
+            with self.subTest(label=label[-30:]):
+                report = f"{label}\n{SUMMARY}"
+                self.assertEqual(sar.summary_card(report), sar.summary_card(SUMMARY))
+                self.assertEqual(sar.headline_from_summary(report), sar.headline_from_summary(SUMMARY))
+                self.assertEqual(sar.chat_from_summary(report)[0], sar.chat_from_summary(SUMMARY)[0])
+                self.assertNotIn(label, sar.blocks_from_summary(report)[1])
+
+    def test_a_rerun_label_alone_or_over_another_shape_posts_as_written(self):
+        label = audit_report.CHAT_REPORT_RERUN_LABEL
+        for report in (label, f"{label}\nHere's the audit.\n{sar.NO_LEDGER_NOTES[0]}"):
+            with self.subTest(report=report[-20:]):
+                self.assertIsNone(sar.summary_card(report))
+
+    def test_a_namespaced_row_is_a_row(self):
+        summary = SUMMARY.replace("seeded-a: control plane is public", "seeded-a/payments: payments-api runs a privileged container")
+        card = sar.summary_card(summary)
+        self.assertEqual(card.rows[0], {"severity": "critical", "text": "seeded-a/payments: payments-api runs a privileged container"})
+
+    def test_another_shape_posts_as_written(self):
+        for report in ("", "Here's the audit.", "## What's wrong\nThe audit could not write its ledger.", REPORT):
+            with self.subTest(report=report[:20]):
+                self.assertIsNone(sar.summary_card(report))
+
+    def test_a_row_keeps_a_links_text_and_drops_its_target(self):
+        summary = SUMMARY.replace("control plane is public", "[click](https://evil.example/x) <!channel>")
+        card = sar.summary_card(summary)
+        self.assertNotIn("evil.example", card.rows[0]["text"])
+        self.assertNotIn("<!channel>", card.rows[0]["text"])
+
+    def test_a_long_report_is_read_quickly(self):
+        start = time.monotonic()
+        sar.summary_card("Audit: 1 critical finding" + "x" * LONG_INPUT + "\n" + "`critical` y" * LONG_INPUT + "\n" + sar.NO_LEDGER_NOTES[0])
+        self.assertLess(time.monotonic() - start, FAST_SECONDS)
+
 
 if __name__ == "__main__":
     unittest.main()

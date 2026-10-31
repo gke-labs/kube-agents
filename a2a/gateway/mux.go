@@ -116,6 +116,23 @@ func (m *MultiAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	return err
 }
 
+// Close closes every backend that holds a connection of its own to close.
+// Gateway.Run calls it after the relay's stop drain, so a batch still
+// rendering when ingress stopped can post through the backend.
+func (m *MultiAdapter) Close() {
+	for _, a := range m.byPrefix {
+		closeAdapter(a)
+	}
+}
+
+// closeAdapter closes an adapter that holds a connection of its own; the
+// rest have nothing to close.
+func closeAdapter(a Adapter) {
+	if c, ok := a.(interface{ Close() }); ok {
+		c.Close()
+	}
+}
+
 // stopped names why a backend's Run returned: nil if ctx ended it, its own
 // error otherwise, and an error of our own if it returned nil early.
 func stopped(ctx context.Context, name string, err error) error {
@@ -222,6 +239,21 @@ func (m *MultiAdapter) MarkChanged(conversation, ask, settle string) {
 	}
 }
 
+// PostTerminal goes to the backend that owns the conversation
+// (TerminalPoster); one that does not implement it answers
+// errNoTerminalFrames, which the caller treats as nothing to do.
+func (m *MultiAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	poster, ok := a.(TerminalPoster)
+	if !ok {
+		return errNoTerminalFrames
+	}
+	return poster.PostTerminal(conversation, t)
+}
+
 // ShowsTaskStatus answers for the backend that owns the conversation
 // (StatusShower); one that does not implement it keeps the rolling line.
 func (m *MultiAdapter) ShowsTaskStatus(conversation string) bool {
@@ -292,10 +324,28 @@ func (m *MultiAdapter) SetHome(admits HomeAdmits, board BoardReader) {
 	}
 }
 
+func (m *MultiAdapter) SetBoardActor(actor BoardActor) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(BoardActSink); ok {
+			sink.SetBoardActor(actor)
+		}
+	}
+}
+
 func (m *MultiAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	for _, a := range m.byPrefix {
 		if sink, ok := a.(SessionLookupSink); ok {
 			sink.SetSessionLookup(lookup, idleTTL)
+		}
+	}
+}
+
+// SetFeedbackRecorder hands the answer-feedback recorder to every backend
+// that draws rating controls (FeedbackSink), as SetSessionLookup does.
+func (m *MultiAdapter) SetFeedbackRecorder(r FeedbackRecorder) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(FeedbackSink); ok {
+			sink.SetFeedbackRecorder(r)
 		}
 	}
 }

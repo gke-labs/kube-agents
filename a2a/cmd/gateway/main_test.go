@@ -143,6 +143,8 @@ func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 			t.Setenv("SLACK_APP_TOKEN", "")
 			t.Setenv("A2A_INJECT_LISTEN", "")
 			t.Setenv("A2A_INJECT_TOKEN", "")
+			t.Setenv("A2A_DOOR_LISTEN", "")
+			t.Setenv("A2A_CONSOLE_DOOR", "")
 			for k, v := range tc.env {
 				t.Setenv(k, v)
 			}

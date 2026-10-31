@@ -68,7 +68,8 @@ type InboundMessage struct {
 	// message of its own: MessageID then names the click (the audit chain's
 	// join), not a message anything can be drawn on. A chain a click starts
 	// carries its mark on the conversation's previous ask instead (mark.go).
-	// False for a typed message, and for every backend but Slack.
+	// False for a typed message, and for every backend but Slack and Google
+	// Chat.
 	Click bool
 	// Answer marks a typed message that answers a question the conversation
 	// has open (one the adapter laid out with choices). Like a click, it
@@ -84,15 +85,22 @@ type InboundMessage struct {
 	// sender's such message is dropped without the public refusal notice,
 	// since they asked the bot nothing. False on every other path.
 	Unaddressed bool
+	// Shortcut marks a message a member sent by using the "ask about this"
+	// message shortcut on someone's message: the conversation is the thread
+	// under that message, MessageID names it, and Text quotes it. A sender
+	// the gateway cannot verify gets no refusal in that thread, which the
+	// channel reads; the adapter tells them privately. False on every other
+	// path, and on every backend but Slack.
+	Shortcut bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
-// task. The chat backends have no way to express it -- a human types "stop"
-// and the text matcher reads it -- but a program should not have to spell a
-// phrase to reach a control path, and a phrase that changes meaning is a
-// class of bug an API does not have. The inject door has an explicit route
-// for it, and it lands on the bus as kind: cancel exactly as the text route
-// does.
+// task. A chat message cannot express it -- a human types "stop" and the
+// text matcher reads it -- but a program should not have to spell a phrase
+// to reach a control path, and a phrase that changes meaning is a class of
+// bug an API does not have. The inject door has an explicit route for it,
+// Slack's Stop button arrives as it (slack_stop.go), and it lands on the bus
+// as kind: cancel exactly as the text route does.
 const IntentCancel = "cancel"
 
 // Adapter is the five-operation backend interface from the gateway design:
@@ -121,7 +129,8 @@ type Adapter interface {
 	// a backend that cannot hold this one, or whose API refuses it, returns
 	// the reason. Either way nothing was posted, and the gateway posts
 	// m.Text instead, chunked under the backend's cap (Gateway.postMessage).
-	// With m.Chat nil it is Post(conversation, m.Text).
+	// With m.Chat nil it is Post(conversation, m.Text), unless m.Feedback
+	// marks an answer a backend draws rating controls on (feedback.go).
 	PostMessage(conversation string, m OutMessage) (messageID string, err error)
 
 	// EditMessage replaces a posted message with m, laid out or not, under
@@ -210,12 +219,18 @@ type OutMessage struct {
 	// already read and validated for its carrier (chatmsg.Read); an adapter
 	// renders it or declines it, and never repairs one.
 	Chat *chatmsg.Message
+	// Feedback, when set, is the task id an answer can be rated under: the
+	// root of the chain whose final answer this message is (answer
+	// feedback, feedback.go). A backend that draws rating controls draws
+	// them on this message; every other backend ignores it.
+	Feedback string
 }
 
 // ErrTextOnly is a backend's answer to a message value with a chat message
-// when it renders none: Discord, Google Chat, the inject door, the console
-// and the A2A door. The gateway posts the text instead, so every one of them
-// posts exactly what it posted before chat messages existed.
+// when it renders none: Discord, the inject door, the console and the A2A
+// door. The gateway posts the text instead, so every one of them posts
+// exactly what it posted before chat messages existed. Slack and Google
+// Chat render one (slack_chat.go, gchat_chat.go).
 var ErrTextOnly = errors.New("this backend posts text only")
 
 // ErrLayoutRefused wraps a backend's refusal of one chat message's layout:
@@ -554,4 +569,35 @@ type ConversationState struct {
 	// which is the line the relay's rolling edit shows.
 	Activity []json.RawMessage
 	Progress string
+	// Usage is what the front door's own turns cost: the usage artifact's
+	// parts summed (lib.UsageTotal) over TaskID's stream and, for a
+	// delegation chain's root, every wake that continued it, whichever link
+	// the read follows. ChildUsage is the same sum over the chain's child
+	// tasks, the addressees the front door delegated to (the platform
+	// router that files the cards among them), kept apart because it is
+	// another addressee's work. Each is nil when none of its turns
+	// published usage. UsagePartial is set when a link's stream could not
+	// be read, so the sums leave out what that link cost. Each executor
+	// publishes a turn's usage before its terminal, so a read after the
+	// root's end carries all of it. Set only on a probe whose context asked
+	// for it (withChainUsage): summing a chain reads one stream per link,
+	// which a caller polling the read route has no use for on every poll.
+	Usage        *lib.Usage
+	ChildUsage   *lib.Usage
+	UsagePartial bool
+}
+
+// chainUsageKey marks a probe's context as asking for
+// ConversationState.Usage (withChainUsage).
+type chainUsageKey struct{}
+
+// withChainUsage asks the probe run under ctx to sum the front door's usage.
+func withChainUsage(ctx context.Context) context.Context {
+	return context.WithValue(ctx, chainUsageKey{}, true)
+}
+
+// chainUsageAsked reports whether ctx asks the probe for usage.
+func chainUsageAsked(ctx context.Context) bool {
+	asked, _ := ctx.Value(chainUsageKey{}).(bool)
+	return asked
 }

@@ -27,7 +27,7 @@
  *   index.html#since=<ISO>&until=<ISO>&cases=a,b&view=gate|agent
  *   run.html#build=<prow build id>
  *   grid.html#since=<ISO>&until=<ISO>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]
- *   cases.html#<case>, or cases.html#sort=worst|domain|name&show=all|blocking|held
+ *   cases.html#<case>, or cases.html#sort=worst|domain|name&show=all|blocking|held, or cases.html#view=scenarios[&domain=<domain slug>]
  *   trend.html#cases=a,b | trend.html#domain=<domain> [&metric=<judged metric>][&since=<ISO>[&until=<ISO>]]
  * The older query form (`?cases=a,b&since=<ISO>&until=<ISO>` before a bare
  * `#gate` or `#agent`; `?build=<id>` on run.html; the same on the Grid and
@@ -95,6 +95,10 @@ const PAGE = {
   trendFile: "trend.json",
   pages: { brief: "index.html", run: "run.html", grid: "grid.html", cases: "cases.html", nightly: "nightly.html", trend: "trend.html" },
   titles: { brief: "kube-agents · smoke gate brief", run: "kube-agents · smoke run", grid: "kube-agents · cases by run", cases: "kube-agents · how reliable is each test", nightly: "kube-agents · last night's run", trend: "kube-agents · scores over time on main" },
+  // The Cases page's two views: the team's table, and the customer-side
+  // scenarios view (`#view=scenarios`); its <title> while that view is up.
+  casesViews: { reliability: "reliability", scenarios: "scenarios" },
+  scenariosTitle: "kube-agents · what it can do",
   // The Grid's window chips, and the one it opens with when the URL names none.
   gridWindows: [["6h", 6 * 3600 * 1000], ["24h", 24 * 3600 * 1000], ["36h", 36 * 3600 * 1000], ["7d", 7 * 24 * 3600 * 1000]],
   gridDefaultWindow: "36h",
@@ -107,6 +111,11 @@ const PAGE = {
   rateWarnMin: 0.75,
   // The words for a case's roster status (render.py's STATUS_* values).
   statusWords: { blocking: "blocking", held_out: "held out", demoted: "demoted", nightly_only: "nightly only", retired: "not in any matrix" },
+  // The scenarios view: the words for a confidence level (render.py's
+  // CONFIDENCE_* values) and for a roster status read from the customer's
+  // side (statusWords above are the team's).
+  confidenceWords: { proven: "Proven", proving: "Proving", in_development: "In development" },
+  scenarioStatusWords: { blocking: "guards every pull request", held_out: "in development", demoted: "in development", nightly_only: "nightly", retired: "in development" },
   // Verdict pill colour by the banner hack/ci-eval-rc.sh prints. NOT RUN is the
   // deploy-failed path: nothing was measured, which is neither a pass nor a
   // judgement on the candidate, so it takes the neutral infra colour.
@@ -116,9 +125,9 @@ const PAGE = {
   nightStateClass: { pass: "p-pass", partial: "p-partial", fail: "p-fail", infra: "p-infra" },
   nightStateWords: { pass: "passed all reps", partial: "failed some reps", fail: "failed all reps", infra: "quota / infra, not graded" },
   nightsListed: 14,
-  // A night split across two jobs names its parts as the digest does
+  // A night split across jobs names its parts as the digest does
   // (nightly.py's PART_WORDS).
-  nightPartWords: { main: "main part", writers: "writers part" },
+  nightPartWords: { main: "main part", "main-b": "main-b part", writers: "writers part" },
   // The chat-turn target the opening turn's p95 is shown beside, as advice
   // only (nightly.py's TURN1_P95_TARGET_S).
   turn1P95TargetS: 10,
@@ -360,7 +369,7 @@ function linkCaseIds(values) {
 // `#agent`, the old anchors, still selects that view; a bare case id on
 // the Cases page names its row.
 function linkState() {
-  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, view: "", caseHash: null, sort: null, show: null, window: null, rows: null, domain: null, metric: null };
+  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, view: "", caseHash: null, sort: null, show: null, window: null, rows: null, domain: null, metric: null, casesView: null };
   let query, fragment;
   try {
     query = new URLSearchParams(location.search);
@@ -390,6 +399,9 @@ function linkState() {
   // when the page renders.
   const domain = param("domain").trim();
   if (PAGE.caseIdRe.test(domain)) out.domain = domain;
+  // The Cases page's second view (`cases.html#view=scenarios`); the Brief's
+  // `view=` values are its own and read below.
+  out.casesView = param("view") === PAGE.casesViews.scenarios ? PAGE.casesViews.scenarios : null;
   const metric = param("metric").trim();
   if (PAGE.metricRe.test(metric)) out.metric = metric;
   const view = param("view") || location.hash.slice(1);
@@ -1084,7 +1096,7 @@ function briefHtml(link) {
 
 function footHtml() {
   const generated = parseIso(brief.generated_at);
-  return `<div class="foot"><span>Every case by run: <a href="${PAGE.pages.grid}">grid</a></span><span>How reliable is each test: <a href="${PAGE.pages.cases}">cases</a></span><span>Last night's run: <a href="${PAGE.pages.nightly}">nightly</a></span><span>Scores over time on main: <a href="${PAGE.pages.trend}">trend</a></span><span><a href="${esc(numbersHref())}">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
+  return `<div class="foot"><span>Every case by run: <a href="${PAGE.pages.grid}">grid</a></span><span>How reliable is each test: <a href="${PAGE.pages.cases}">cases</a></span><span>Last night's run: <a href="${PAGE.pages.nightly}">nightly</a></span><span>Scores over time on main: <a href="${PAGE.pages.trend}">trend</a></span><span>What kube-agents can do: <a href="${esc(scenariosHref())}">scenarios</a></span><span><a href="${esc(numbersHref())}">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
 }
 
 /* ---- the PR view ---- */
@@ -1121,29 +1133,36 @@ function tagFor(c) {
   if (c.cls === "only-this-pr") return '<span class="tag yours">only your PR</span>';
   if (c.cls === "storm") return '<span class="tag storm">quota storm</span>';
   if (c.cls === "delegation-ceiling") return '<span class="tag storm">delegation ceiling</span>';
+  if (c.cls === "fixture-drift") return '<span class="tag storm">fixture drifted</span>';
   return '<span class="tag unclear">unexplained</span>';
 }
 
 // A case's repetitions by kind. `ceiling` is the repetitions the harness
 // stopped watching at its delegation wait with the worker still running
 // (#1874): ungraded like a storm-lost rep, counted apart from it, and part of
-// the total or a three-rep case would read "all 0 reps lost".
-function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0); }
+// the total or a three-rep case would read "all 0 reps lost". `fixture` is
+// the repetitions never run because the lease-time scan saw a fixture the
+// case needs drifted (classify.py's REP_FIXTURE), counted apart the same way.
+function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0) + (reps.fixture || 0); }
 function lostText(reps) {
   const parts = [];
   if (reps.infra) parts.push(`${reps.infra} lost`);
   if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
+  if (reps.fixture) parts.push(`${reps.fixture} not run, fixture drifted`);
   return parts.length ? ` (${parts.join(", ")})` : "";
 }
 function ungradedText(reps) {
   const total = plural(repTotal(reps), "rep");
+  if (reps.fixture && !reps.infra && !reps.ceiling) return `all ${total} not run: a seeded-fleet fixture this case needs had drifted on the leased project`;
   if (reps.ceiling && !reps.infra) return `all ${total} hit the delegation ceiling with the worker still running`;
-  if (reps.ceiling) return `all ${total} ungraded: ${reps.infra} lost before grading, ${reps.ceiling} at the delegation ceiling`;
+  const fixture = reps.fixture ? `, ${reps.fixture} not run, fixture drifted` : "";
+  if (reps.ceiling) return `all ${total} ungraded: ${reps.infra} lost before grading, ${reps.ceiling} at the delegation ceiling${fixture}`;
+  if (reps.fixture) return `all ${total} ungraded: ${reps.infra} lost before grading${fixture}`;
   return `all ${total} lost before grading`;
 }
 
 function caseCard(run, c) {
-  const reps = c.reps || { pass: 0, fail: 0, infra: 0, ceiling: 0 };
+  const reps = c.reps || { pass: 0, fail: 0, infra: 0, ceiling: 0, fixture: 0 };
   const total = repTotal(reps);
   const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${lostText(reps)}` : c.outcome === "infra" ? ungradedText(reps) : `${reps.pass} of ${total} reps passed${lostText(reps)}`;
   const rate = c.pass_rate_30d != null ? ` · this case passed ${pct(c.pass_rate_30d)} of the time over the last 30 days on PRs` : "";
@@ -1299,6 +1318,7 @@ function lastFailureHtml(c) {
   else if (f.cls === "shared") head = f.also_failing_prs >= 1 ? `the gate's: failing on ${plural(f.also_failing_prs, "other PR")} at the time` : "the gate's: in the outage at the time";
   else if (f.cls === "storm") head = "a quota storm: repetitions lost before grading";
   else if (f.cls === "delegation-ceiling") head = "the delegation ceiling: the harness stopped waiting with the worker still running";
+  else if (f.cls === "fixture-drift") head = "a drifted fixture: the case was not run on that lease";
   else if (f.cls === "only-this-pr") head = "PR-caused: passed on other PRs around it";
   else if (f.event) head = "failed all reps in a run where almost everything failed";
   else head = "failed all reps";
@@ -1368,7 +1388,22 @@ function caseGroups(cases, sort) {
   return groups;
 }
 
+// The Cases page's view: the team's reliability table, or the customer-side
+// scenarios view, chosen by the URL (`#view=scenarios`); the sub-nav under
+// the top bar links the two, so a switch is a hash change and no reload.
+const casesView = (link) => (link.casesView || PAGE.casesViews.reliability);
+const casesViewHref = (view) => `${PAGE.pages.cases}#view=${view}`;
+const scenariosHref = () => casesViewHref(PAGE.casesViews.scenarios);
+// The scenarios view scoped to one domain, or the whole view for null.
+const SCENARIOS_ALL_DOMAINS = "all";
+const scenariosDomainHref = (slug) => (slug ? `${scenariosHref()}&domain=${enc(slug)}` : scenariosHref());
+function casesSubnav(view) {
+  const item = (key, label) => `<a href="${esc(casesViewHref(key))}"${view === key ? ' class="on"' : ""}>${esc(label)}</a>`;
+  return `<nav class="subnav">${item(PAGE.casesViews.reliability, "How reliable is each test")}${item(PAGE.casesViews.scenarios, "What kube-agents can do")}</nav>`;
+}
+
 function casesHtml(link) {
+  if (casesView(link) === PAGE.casesViews.scenarios) return scenariosHtml(link);
   const sort = ui.sort || link.sort || "worst";
   const show = ui.show || link.show || "all";
   const all = caseDocs();
@@ -1391,7 +1426,8 @@ function casesHtml(link) {
     ? ` The suite has caught ${plural(catches.product_bugs, "real product bug")}${Number.isInteger(catches.prs_blocked) ? ` and stopped ${plural(catches.prs_blocked, "PR")} from merging` : ""}${catches.ledger ? ` (catch ledger ${issueLink(catches.ledger)})` : ""}.`
     : "";
   const generated = parseIso(brief.generated_at);
-  return `<div class="sec head"><h1>How reliable is each test?</h1><div class="lede">One row per case. Pass rates count only repetitions the grader scored: quota and setup losses are left out, and a run where almost everything failed is charged to the run, not the cases. Blocking means the case is on the admitted roster and can red a PR.</div></div>` +
+  return casesSubnav(PAGE.casesViews.reliability) +
+    `<div class="sec head"><h1>How reliable is each test?</h1><div class="lede">One row per case. Pass rates count only repetitions the grader scored: quota and setup losses are left out, and a run where almost everything failed is charged to the run, not the cases. Blocking means the case is on the admitted roster and can red a PR.</div></div>` +
     `<div class="ctl">sort by ${chip("sort", "worst", `worst ${windows[0]}d`, sort === "worst")}${chip("sort", "domain", "domain", sort === "domain")}${chip("sort", "name", "name", sort === "name")}` +
     `<span class="sep">·</span>show ${chip("show", "all", `all ${counts.all}`, show === "all")}${chip("show", "blocking", `blocking only · ${counts.blocking}`, show === "blocking")}${chip("show", "held", `held out only · ${counts.held}`, show === "held")}</div>` +
     `<table class="cases"><thead><tr><th>Case</th><th>Last ${esc(brief.strip_runs ?? 30)} runs</th><th>${windows[0]}d</th><th>${windows[1]}d</th><th>Nightly ${windows[0]}d</th><th>Nightly ${windows[1]}d</th><th>Status</th><th>Issue</th></tr></thead><tbody>${rows.join("")}</tbody></table>` +
@@ -1564,7 +1600,7 @@ function detailHtml() {
   const run = runs().find((r) => String(r.build) === sel.build);
   const c = run ? (run.cases || []).find((x) => x.case === sel.case) : null;
   if (!run || !c) return "";
-  const reps = c.reps || { pass: 0, fail: 0, infra: 0, ceiling: 0 };
+  const reps = c.reps || { pass: 0, fail: 0, infra: 0, ceiling: 0, fixture: 0 };
   const total = repTotal(reps);
   const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${lostText(reps)}` : c.outcome === "infra" ? ungradedText(reps) : c.outcome === "partial" ? `${reps.fail} of ${total} reps failed${lostText(reps)}` : `passed all ${plural(reps.pass, "rep")}${lostText(reps)}`;
   const others = (run.cases || []).filter((x) => x.case !== c.case && x.outcome === "passed").length;
@@ -1600,16 +1636,20 @@ function partNotes(night, cut = true) {
   const notes = cut ? nightParts(night).filter((p) => p.truncated).map((p) => `${word(p.part)} cut short after ${p.duration_s != null ? minutesText(p.duration_s * 1000) : "an unknown time"}`) : [];
   return notes.concat(list(night.missing_parts).map((p) => `${word(p)} missing`), list(night.running_parts).map((p) => `${word(p)} still running`));
 }
-// A split night without its main part (missing or still running) has only
-// the writers part's cases on record: no verdict on what is newly failing,
-// as the digest gives none (nightly.py's digest_line).
-const nightLacksMain = (night) => nightParts(night).length > 0 && !nightParts(night).some((p) => p.part === "main");
+// The main half (main or main-b) a night lacks, missing or still running,
+// or null: its cases were never compared, so no verdict on what is newly
+// failing. nightly.py decides it once (verdict_withheld_by) for the page and
+// the digest alike.
+const nightWithheldBy = (night) => night.verdict_withheld_by || null;
 // A truncated night was cut short by its main part when it has one: that
 // part's wall clock, not the longest part's (nightly.py's digest_line).
 const nightCutSeconds = (night) => {
   const main = nightParts(night).find((p) => p.part === "main");
   return main ? main.duration_s : night.duration_s;
 };
+// A night with a main-b part names each part cut short with its own wall
+// clock, as the digest does, rather than one wall clock for the night.
+const nightHasMainB = (night) => nightParts(night).some((p) => p.part === "main-b");
 const nightStart = (night) => parseIso(night.started) ?? parseIso(night.finished);
 // The night's headline state, worst first: cut short, failed cases, partial
 // cases, nothing recorded or nothing graded, a pass short of the matrix
@@ -1650,13 +1690,15 @@ function nightlyBriefHtml() {
   const list = nights();
   const night = list[0];
   let body;
-  if (!night) body = `<p class="mut">No night on record yet. Once <code>${esc(brief.nightly && brief.nightly.job || "the nightly periodic")}</code> has run, last night's report is here and one line of it goes into the 9 AM digest.</p>`;
+  if (!night) body = `<p class="mut">No night on record yet. Once <code>${esc(brief.nightly && brief.nightly.job || "the nightly periodic")}</code> has run, last night's report is here and one line of it goes into the 11 AM digest.</p>`;
   else {
     const c = night.counts;
-    const notes = partNotes(night, !night.truncated).map((n) => ` · ${esc(n)}`).join("");
+    // With a main-b part, each half cut short is named with its own wall
+    // clock (as on the Nightly page and in the digest), not one for the night.
+    const notes = partNotes(night, !night.truncated || nightHasMainB(night)).map((n) => ` · ${esc(n)}`).join("");
     const summary = night.truncated
-      ? `truncated after ${nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "an unknown time"}: ${c.recorded} of ${c.expected || "?"} cases recorded${notes}`
-      : `${plural(c.recorded, "case")} · ${c.passed} passed all reps · ${c.partial} partial · ${c.failed} failed${c.infra ? ` · ${c.infra} infra` : ""}${night.newly_failing.length && !nightLacksMain(night) ? ` · newly failing: <code>${night.newly_failing.map(esc).join("</code>, <code>")}</code>` : ""}${notes}${night.duration_s != null ? ` · ${minutesText(night.duration_s * 1000)}` : ""}`;
+      ? `truncated${nightHasMainB(night) ? "" : ` after ${nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "an unknown time"}`}: ${c.recorded} of ${c.expected || "?"} cases recorded${notes}`
+      : `${plural(c.recorded, "case")} · ${c.passed} passed all reps · ${c.partial} partial · ${c.failed} failed${c.infra ? ` · ${c.infra} infra` : ""}${night.newly_failing.length && !nightWithheldBy(night) ? ` · newly failing: <code>${night.newly_failing.map(esc).join("</code>, <code>")}</code>` : ""}${notes}${night.duration_s != null ? ` · ${minutesText(night.duration_s * 1000)}` : ""}`;
     body = `<p>${nightPill(night)} <b>${esc(nightDay(night))}</b> — ${summary}. <a href="${esc(nightHref(night))}">Read the report →</a></p>`;
   }
   return `<div class="sec" id="nightly"><h2>Last night's run</h2>${body}${runningNoteHtml()}</div>`;
@@ -1688,7 +1730,7 @@ function nightCaseRow(night, c, newly) {
 function nightCasesTable(night) {
   const cases = Array.isArray(night.cases) ? night.cases.filter((c) => c && typeof c === "object") : [];
   if (!cases.length) return `<p class="mut">This night recorded no case${night.truncated ? ": the job was ended before any case finished" : ""}.</p>`;
-  const newly = new Set(nightLacksMain(night) ? [] : night.newly_failing || []);
+  const newly = new Set(nightWithheldBy(night) ? [] : night.newly_failing || []);
   const rows = [];
   let domain = null;
   for (const c of cases) {
@@ -1704,7 +1746,8 @@ function nightChangesHtml(night) {
   const prevText = prev ? `<a href="${esc(nightHref(prev))}">${esc(nightDay(prev))}</a>` : `the night before (build ${esc(night.previous_build)})`;
   const list = (names) => `<code>${names.map(esc).join("</code>, <code>")}</code>`;
   const parts = [];
-  if (nightLacksMain(night)) parts.push(`<p class="mut">No verdict on what is newly failing: the main part of this night is ${(night.running_parts || []).includes("main") ? "still running" : "missing"}, so only the writers part's cases are on record.</p>`);
+  const withheld = nightWithheldBy(night);
+  if (withheld) parts.push(`<p class="mut">No verdict on what is newly failing: the ${esc(PAGE.nightPartWords[withheld] || withheld)} of this night is ${(night.running_parts || []).includes(withheld) ? "still running" : "missing"}, so only the ${esc(nightParts(night).map((p) => PAGE.nightPartWords[p.part] || p.part).join(" and "))}'s cases are on record.</p>`);
   else parts.push(night.newly_failing.length ? `<p><b>Newly failing</b> against ${prevText}: ${list(night.newly_failing)} — failed every rep tonight and did not the night before.</p>` : `<p>Nothing newly failing against ${prevText}.</p>`);
   if (night.fixed.length) parts.push(`<p><b>Passing again:</b> ${list(night.fixed)} — failed every rep the night before, passed every rep tonight.</p>`);
   if (night.missing.length) parts.push(`<p><b>Not recorded</b> (${plural(night.missing.length, "case")} the nightly matrix on this checkout expects): ${list(night.missing)}.</p>`);
@@ -1767,10 +1810,10 @@ function nightlyHtml(link) {
   const took = night.duration_s != null ? minutesText(night.duration_s * 1000) : "unknown wall clock";
   // A split night's own notes (a part cut short, missing or running) lead
   // the sentence; a night of one job reads as it always has.
-  const notes = partNotes(night, !night.truncated);
+  const notes = partNotes(night, !night.truncated || nightHasMainB(night));
   const notesText = notes.length ? `${esc(notes.join(" · "))}. ` : "";
   let ledeHow;
-  if (night.truncated) ledeHow = `<b>The night was cut short:</b> ${notesText}Prow ended the job after ${esc(nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "unknown wall clock")} with ${c.recorded} of ${c.expected || "?"} cases recorded, so the counts below are not comparable with a full night.`;
+  if (night.truncated) ledeHow = `<b>The night was cut short:</b> ${notesText}Prow ended the job${nightHasMainB(night) ? "" : ` after ${esc(nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "unknown wall clock")}`} with ${c.recorded} of ${c.expected || "?"} cases recorded, so the counts below are not comparable with a full night.`;
   else if (!night.complete && notes.length) ledeHow = `<b>Incomplete:</b> ${notesText}${c.recorded} of the ${c.expected} cases the nightly matrix on this checkout expects are recorded.`;
   else if (!night.complete) ledeHow = `<b>Incomplete:</b> the job concluded after ${esc(took)} but recorded ${c.recorded} of the ${c.expected} cases the nightly matrix on this checkout expects.`;
   else ledeHow = `The job ran to the end in ${esc(took)}: ${c.recorded} cases recorded${c.expected ? ` of ${c.expected} expected` : ""}.`;
@@ -1791,13 +1834,174 @@ function nightlyHtml(link) {
     tile("Passed all reps", `${c.passed}`, c.recorded ? `${pct(c.passed / c.recorded)} of recorded cases` : "no case recorded") +
     tile("Partial", `${c.partial}`, "failed some repetitions") +
     tile("Failed", `${c.failed}`, `failed every graded rep · ${plural(c.infra, "case")} lost to infra`) +
-    tile("Newly failing", `${night.previous_build == null || nightLacksMain(night) ? "—" : night.newly_failing.length}`, nightLacksMain(night) ? "no main part on record" : night.previous_build == null ? "first night on record" : "against the night before") +
+    tile("Newly failing", `${night.previous_build == null || nightWithheldBy(night) ? "—" : night.newly_failing.length}`, nightWithheldBy(night) ? `no ${PAGE.nightPartWords[nightWithheldBy(night)] || nightWithheldBy(night)} on record` : night.previous_build == null ? "first night on record" : "against the night before") +
     (turn1 ? tile("Chat turn 1", `${night.turn1_p50_s.toFixed(1)}<small>s p50</small>`, `p95 ${secText(night.turn1_p95_s)} · advisory target p95 < ${PAGE.turn1P95TargetS} s`) : "") +
     `</div></div>`;
   return head + tiles +
     `<div class="sec"><h2>Against the night before</h2>${nightChangesHtml(night)}</div>` +
     `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. Turn 1 / agent are medians over the repetitions not lost to infra: the opening chat turn, then the agent's whole run, with the p90 of each under them. The transcript is the first repetition's.</p></div>` +
     nightTimingHtml(link) + nightsListHtml(night) + footHtml();
+}
+
+/* ---- the Cases page's scenarios view (SCHEMA.md: brief.json's domains[], confidence_bar and cases{}.summary / confidence / times / transcript_url) ---- */
+
+// Seconds as a reader says them: "13 s", "2 min 20 s", "1 h 5 min".
+function taskTimeText(s) {
+  if (!Number.isFinite(s) || s < 0) return "—";
+  const whole = Math.round(s);
+  if (whole < 60) return `${whole} s`;
+  const minutes = Math.floor(whole / 60), seconds = whole % 60;
+  if (minutes < 60) return seconds ? `${minutes} min ${seconds} s` : `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} h ${minutes - hours * 60} min`;
+}
+// The lower median of the finite values, or null.
+const lowerMedian = (values) => { const v = values.filter(Number.isFinite).sort((a, b) => a - b); return v.length ? v[Math.floor((v.length - 1) / 2)] : null; };
+const confidenceOf = (c) => (c.confidence && typeof c.confidence === "object" ? c.confidence : { level: "proving", runs: 0, passes: 0, rate: null, full: false, min_runs: null, as_of: null });
+const LEVELS = ["proven", "proving", "in_development"];
+const levelOf = (c) => (LEVELS.includes(confidenceOf(c).level) ? confidenceOf(c).level : "proving");
+const byLevelThenTitle = (a, b) => LEVELS.indexOf(levelOf(a)) - LEVELS.indexOf(levelOf(b)) || String(a.summary.name).localeCompare(String(b.summary.name));
+const timesOf = (c) => (c.times && typeof c.times === "object" ? c.times : {});
+const confidenceBar = () => (brief.confidence_bar && typeof brief.confidence_bar === "object" ? brief.confidence_bar : {});
+const isUnadmitted = (c) => c.status === "held_out" || c.status === "demoted" || c.status === "retired";
+
+function confidenceBadge(c) {
+  const level = levelOf(c);
+  return `<span class="lvl ${esc(level)}">${esc(PAGE.confidenceWords[level])}</span>`;
+}
+
+function scenarioStatusPill(c) {
+  const word = PAGE.scenarioStatusWords[c.status] || PAGE.statusWords[c.status] || String(c.status);
+  const tip = c.status === "demoted" && c.demoted_on ? `demoted from the blocking roster ${c.demoted_on}; the nightly still runs it` : (PAGE.statusWords[c.status] || "");
+  return `<span class="st ${esc(c.status)}"${tipAttr(tip)}>${esc(word)}</span>`;
+}
+
+// A hover note the page draws itself (CSS: [data-tip]), so it shows on
+// every browser the same way; "" draws nothing.
+const tipAttr = (tip) => (tip ? ` data-tip="${esc(tip)}"` : "");
+const etDate = (ms) => (ms == null ? "an unknown day" : fmtParts(ms, { month: "short", day: "numeric" }));
+
+// The record behind the level, in words: how many nightly repetitions of
+// the case at the current build passed and since when, how many more a
+// Proven reading needs, and why an unadmitted or expected-to-fail case
+// reads In development.
+function scenarioRecordHtml(c) {
+  const k = confidenceOf(c);
+  const parts = [];
+  if (k.runs) parts.push(`${k.passes} of ${plural(k.runs, "nightly repetition")} passed in the last ${plural(k.window_days ?? confidenceBar().window_days ?? "", "day")}`);
+  else parts.push(`no nightly repetition at the current build in the last ${plural(confidenceBar().window_days ?? "", "day")}`);
+  const knownGap = Boolean(c.summary && c.summary.expected_fail);
+  // A card held at In development by its status or marker cannot read
+  // Proven however many repetitions come in, so it is not told it can.
+  if (!k.full && Number.isFinite(k.min_runs) && !knownGap && !isUnadmitted(c)) parts.push(`${Math.max(0, k.min_runs - k.runs)} more needed before it can read Proven`);
+  if (knownGap) parts.push("marked expected_fail: a known gap, not yet closed");
+  else if (isUnadmitted(c)) parts.push("not on the roster that guards pull requests");
+  const tip = k.runs ? `repetitions of the nightly eval at the current build, ${etDate(parseIso(k.since))} to ${et(parseIso(k.as_of))}${Number.isFinite(k.min_runs) ? `; Proven needs ${k.min_runs} of them at ${pct(confidenceBar().rate ?? 0)} or better` : ""}` : "";
+  return `<div class="rec"><span class="lbl">Record</span><span${tipAttr(tip)}>${esc(parts.join(" · "))}</span></div>`;
+}
+
+// The two times, each named for what it measures. The detail sits behind
+// a hover: a first reply nobody recorded, and times from the last recorded
+// night when the window's night is not collected yet.
+function scenarioTimesHtml(c) {
+  const t = timesOf(c);
+  const parts = [];
+  if (Number.isFinite(t.turn1_p50_s)) parts.push(`<span${tipAttr(`until the agent's first chat message comes back: median of ${plural(t.n_turn1, "repetition")}, p95 ${taskTimeText(t.turn1_p95_s)}`)}>first reply <b>${esc(taskTimeText(t.turn1_p50_s))}</b></span>`);
+  else if (Number.isFinite(t.agent_p50_s)) parts.push(`<span>first reply <span class="hint"${tipAttr("none of these repetitions recorded a first-reply time")}>not recorded</span></span>`);
+  if (Number.isFinite(t.agent_p50_s)) parts.push(`<span${tipAttr(`the whole run, from the request to the final report, delegations included: median of ${plural(t.n_agent, "repetition")}`)}>task finished <b>${esc(taskTimeText(t.agent_p50_s))}</b></span>`);
+  if (!parts.length) return `<span class="tms"><span class="mut">no timing on record</span></span>`;
+  const when = t.source === "last_night" ? ` · <span class="hint"${tipAttr(`from the last recorded night${t.at ? `, ${et(parseIso(t.at))}` : ""}: no repetition in the current window carries timing yet`)}>older night</span>` : "";
+  return `<span class="tms">${parts.join(" · ")}${when}</span>`;
+}
+
+// One card, folded to its title line (level, pill, title, times) until the
+// reader opens it; the open state survives the poll's re-render
+// (ui.openTables, keyed scenario:<case>).
+function scenarioCard(c) {
+  const s = c.summary;
+  const key = `scenario:${c.name}`;
+  const missing = `<span class="mut">not written in the task yet</span>`;
+  const links = [c.transcript_url ? `<a href="${esc(c.transcript_url)}">newest passing transcript</a>` : `<span class="mut">no passing run on record</span>`,
+    `<a href="${esc(caseHref(c.name))}">history</a>`, `<a href="${esc(trendHref([c.name]))}">trend</a>`];
+  return `<details class="card" id="scenario-${esc(c.name)}" data-tv="${esc(key)}"${ui.openTables.has(key) ? " open" : ""}>` +
+    `<summary><div class="hd">${confidenceBadge(c)}${scenarioStatusPill(c)}</div><h3>${esc(s.name)}</h3><div class="ft">${scenarioTimesHtml(c)}<span class="more"><span class="open">details ▾</span><span class="close">hide ▴</span></span></div></summary>` +
+    `<p><span class="lbl">The situation</span>${s.prompt ? esc(s.prompt) : missing}</p>` +
+    `<p><span class="lbl">What a good answer does</span>${s.expected_output ? esc(s.expected_output) : missing}</p>` +
+    scenarioRecordHtml(c) + `<div class="links">${links.join("")}</div></details>`;
+}
+
+// Sections in domains.yaml order (brief.domains), then any slug the file
+// does not list, alphabetically, "no domain" among them.
+function scenarioGroups(cases) {
+  const rows = Array.isArray(brief.domains) ? brief.domains.filter((d) => d && typeof d === "object" && typeof d.slug === "string") : [];
+  const byDomain = new Map();
+  for (const c of cases) { if (!byDomain.has(c.domain)) byDomain.set(c.domain, []); byDomain.get(c.domain).push(c); }
+  const groups = [];
+  for (const row of rows) {
+    if (!byDomain.has(row.slug)) continue;
+    groups.push({ slug: row.slug, name: domainWords(row.slug), meaning: typeof row.meaning === "string" ? row.meaning : null, cases: byDomain.get(row.slug) });
+    byDomain.delete(row.slug);
+  }
+  for (const slug of [...byDomain.keys()].sort()) groups.push({ slug, name: domainWords(slug), meaning: slug === DOMAIN_UNKNOWN ? DOMAIN_UNKNOWN_TOOLTIP : null, cases: byDomain.get(slug) });
+  for (const g of groups) g.cases.sort(byLevelThenTitle);
+  return groups;
+}
+
+// One line per section: how many, how many proven, the weakest record, the median task time.
+function scenarioGroupSummary(g) {
+  const proven = g.cases.filter((c) => levelOf(c) === "proven").length;
+  const rated = g.cases.filter((c) => confidenceOf(c).runs > 0 && Number.isFinite(confidenceOf(c).rate));
+  const weakest = rated.length ? rated.reduce((a, b) => (confidenceOf(b).rate < confidenceOf(a).rate ? b : a)) : null;
+  const med = lowerMedian(g.cases.map((c) => timesOf(c).agent_p50_s));
+  const parts = [esc(plural(g.cases.length, "scenario")), `${proven} proven`];
+  if (weakest) parts.push(`weakest ${esc(weakest.summary.name)} (${confidenceOf(weakest).passes}/${confidenceOf(weakest).runs})`);
+  if (med != null) parts.push(`median task time ${esc(taskTimeText(med))}`);
+  return parts.join(" · ");
+}
+
+// How to read the cards: one line per word they use, folded away under the
+// counts so it reads as a note, not as the page.
+function scenarioGlossaryHtml() {
+  const bar = confidenceBar();
+  const ok = Number.isFinite(bar.rate) && Number.isFinite(bar.min_runs) && Number.isFinite(bar.window_days) && Number.isFinite(bar.proving_min_rate);
+  const runs = ok ? bar.min_runs : "the bar's";
+  return `<details class="gloss" data-tv="gloss"${ui.openTables.has("gloss") ? " open" : ""}><summary>How to read the cards</summary><ul>` +
+    `<li><b>Nightly repetition</b>: one run of the scenario in the nightly eval on <code>main</code>, graded pass or fail; a repetition lost to quota or setup is not counted. Each night runs a scenario a few times.</li>` +
+    `<li><b>Proven</b>: ${ok ? `${pct(bar.rate)} or better over the scenario's repetitions in the last ${plural(bar.window_days, "day")} at the current build, at least ${runs} of them` : "the bar holds over the scenario's recent repetitions at the current build"}. ${ok ? pct(bar.rate) : "The rate"} is the same bar that lets a scenario guard every pull request.</li>` +
+    `<li><b>Proving</b>: fewer than ${runs} repetitions at the current build in the window${ok ? `, or ${pct(bar.proving_min_rate)} to ${pct(bar.rate)} over them` : ""}. A new build starts every scenario here; the record fills in night by night.</li>` +
+    `<li><b>In development</b>: ${ok ? `below ${pct(bar.proving_min_rate)}` : "below the proving line"}, or a scenario not yet admitted to the roster, or one marked as a known gap.</li>` +
+    `<li><b>First reply</b>: how long until the agent's first chat message comes back. <b>Task finished</b>: the whole run, from the request to the final report, delegations included. Both are medians over the same repetitions; no target yet.</li>` +
+    `<li><b>Guards every pull request</b>: on the blocking roster. <b>Nightly</b>: runs on <code>main</code> every night only.</li>` +
+    `</ul></details>`;
+}
+
+function scenariosHtml(link) {
+  const every = caseDocs();
+  const cases = every.filter((c) => c.summary && typeof c.summary === "object");
+  const unsummarised = every.length - cases.length;
+  const head = casesSubnav(PAGE.casesViews.scenarios) + `<div class="sec head"><h1>What kube-agents can do</h1>` +
+    `<div class="lede">One card per scenario the evaluation suite runs, by job area: the request the agent gets, what the grader looks for, and how sure the nightly record is. Scenarios run against our seeded test fleet, so cluster names such as <code>seeded-b</code> are the fleet's.</div></div>`;
+  if (!cases.length) {
+    return head + `<div class="sec"><p class="mut">No scenario to show: the checkout this view was rendered from has no <code>bench/tasks</code> for the ${plural(every.length, "case")} on record.</p></div>` + footHtml();
+  }
+  const groups = scenarioGroups(cases);
+  // The filter is the URL's `domain=` alone (linkState); a slug no section has shows every one.
+  const filtered = groups.find((g) => g.slug === link.domain) || null;
+  const shown = filtered ? [filtered] : groups;
+  const counts = { proven: 0, proving: 0, in_development: 0 };
+  for (const c of cases) counts[levelOf(c)] += 1;
+  const chips = [chip("domain", SCENARIOS_ALL_DOMAINS, `all · ${cases.length}`, !filtered)]
+    .concat(groups.map((g) => chip("domain", g.slug, `${g.name} · ${g.cases.length}`, filtered != null && filtered.slug === g.slug, g.meaning || "")));
+  // With nothing Proven yet, say why in one line: the earliest night any
+  // card's current record reaches back to.
+  const starts = cases.map((c) => parseIso(confidenceOf(c).since)).filter((ms) => ms != null);
+  const none = !counts.proven && starts.length ? ` No scenario reads Proven yet: the cards' records at their current builds reach back to ${esc(etDate(Math.min(...starts)))} at the earliest, and a Proven reading needs ${esc(confidenceBar().min_runs ?? "the bar's")} repetitions in the last ${esc(plural(confidenceBar().window_days ?? "", "day"))}.` : "";
+  const totals = `<div class="sec"><p>${esc(plural(cases.length, "scenario"))} in ${esc(plural(groups.length, "domain"))} · <b>${counts.proven}</b> proven · <b>${counts.proving}</b> proving · <b>${counts.in_development}</b> in development.${none} <span class="mut">Click a card for the situation, what a good answer does, its record and its transcript.</span></p>` +
+    `<div class="ctl">domain ${chips.join("")}</div>${scenarioGlossaryHtml()}</div>`;
+  const sections = shown.map((g) => `<div class="sec" id="domain-${esc(g.slug)}"><h2>${esc(g.name)}</h2>${g.meaning ? `<div class="lede">${esc(g.meaning)}</div>` : ""}<div class="dsum">${scenarioGroupSummary(g)}</div><div class="scn">${g.cases.map(scenarioCard).join("")}</div></div>`).join("");
+  const generated = parseIso(brief.generated_at);
+  const foot = `<div class="foot block"><p class="mut">A card is the three fields its task carries (the title, the request, what a good answer does), cut short; the task itself has the full text. The transcript is the newest nightly run in which every repetition passed.${unsummarised ? ` ${plural(unsummarised, "historical case")} with no task on this checkout ${unsummarised === 1 ? "is" : "are"} not shown.` : ""} Data generated ${esc(generated != null ? et(generated) : "unknown")}.</p></div>`;
+  return head + totals + sections + foot + footHtml();
 }
 
 /* ---- the Trend page (SCHEMA.md: brief.json's trend block; trend.py) ---- */
@@ -2161,7 +2365,7 @@ function trendHtml(link) {
   const lede = `Every night the nightly tier runs each case against <code>main</code> three times and appends one record per case to the evidence store; this page reads those records back, each night dated by when its record was written. <b>Pass rate is the gate's number</b>: passes over scored repetitions, with the trailing window computed admission reads drawn beside each night. <b>Judged quality is advisory</b> and is never shown as one point: the store carries a mean and its n per night, so the band is the range of nightly means over the last ${esc(t && t.spread_nights || 7)} nights at one version key (a domain's band is the range across its cases). A vertical marker is a night the version key changed, so a step has its explanation next to it. <b>Latency is advisory too</b>: under each card (and over every case above the domain cards), the opening chat turn and the agent run by night, p50 and ${esc(slowName(t, "turn1"))} for the turn, p50 and ${esc(slowName(t, "agent"))} for the run, over the scope's repetitions not lost to infra, from the nightly runs on record (the store carries no timing), beside the ${esc(latencyTarget(t))} s chat-turn target. <a href="${PAGE.scoreDocUrl}">What a score is</a> is written once, in the eval-scorer design.`;
   const head = (title) => `<div class="sec head"><h1>${title}</h1><div class="lede">${lede}</div></div>`;
   if (!t || (!t.source && !t.read_at) || !t.records) {
-    const why = t && t.source ? `<p class="mut">The store <code>${esc(t.source)}</code> was read ${esc(et(parseIso(t.read_at)))} and holds no record inside its ${esc(t.window_days || "")}-day window yet. The first night that records fills this page.</p>` : "";
+    const why = t && t.source ? `<p class="mut">The store <code>${esc(t.source)}</code> was read ${esc(et(parseIso(t.read_at)))} and holds no today-mode record inside its ${esc(t.window_days || "")}-day window yet${t.next && t.next.records ? ` (it holds ${esc(t.next.records)} next-mode record(s), which this page does not draw yet)` : ""}. The first night that records today-mode evidence fills this page.</p>` : "";
     return head("Scores over time on main") + trendStatusHtml(t) + why + footHtml();
   }
   const metric = trendMetric(t, link);
@@ -2239,13 +2443,21 @@ function onToggle(event) {
 /* ---- clicks on the Grid and the Cases page ---- */
 
 function onClick(event) {
-  const target = event.target.closest("button[data-sort],button[data-show],button[data-window],button[data-rows],button[data-marker],button[data-toggle],button[data-build],button[data-scope],button[data-metric]");
+  const target = event.target.closest("button[data-sort],button[data-show],button[data-window],button[data-rows],button[data-domain],button[data-marker],button[data-toggle],button[data-build],button[data-scope],button[data-metric]");
   if (!target) return;
   const d = target.dataset;
   if (d.sort) ui.sort = d.sort;
   else if (d.show) ui.show = d.show;
   else if (d.window) ui.window = d.window;
   else if (d.rows) ui.rows = d.rows;
+  else if (d.domain) {
+    // The scenarios view's domain chips navigate, as the Trend page's do:
+    // the fragment is the one source of truth, so a chip's choice is a link
+    // that can be pasted and does not outlive the next navigation.
+    const href = scenariosDomainHref(d.domain === SCENARIOS_ALL_DOMAINS ? null : d.domain);
+    location.hash = href.slice(href.indexOf("#"));
+    return;
+  }
   else if (d.marker) ui.markers[d.marker] = !ui.markers[d.marker];
   else if (d.toggle === "held") ui.showHeld = true;
   else if (d.toggle === "retired") ui.showRetired = true;
@@ -2306,7 +2518,7 @@ function renderAll(scroll = false) {
   } catch (err) {
     app.innerHTML = `<div class="sec head"><h1>This page could not render.</h1><div class="lede">${esc(String(err && err.message || err))}. The data behind it is <a href="${PAGE.briefFile}">${PAGE.briefFile}</a>.</div></div>`;
   }
-  document.title = PAGE.titles[page];
+  document.title = page === "cases" && casesView(link) === PAGE.casesViews.scenarios ? PAGE.scenariosTitle : PAGE.titles[page];
   renderFreshness();
   if (focusedHit != null) {
     const again = app.querySelector(`[data-hit="${CSS.escape(focusedHit)}"]`);
@@ -2324,6 +2536,7 @@ function renderAll(scroll = false) {
     const section = document.getElementById("timing");
     if (section) section.scrollIntoView();
   }
+
   if (page === "grid") {
     // First paint: a live window is read from its newest run, a linked
     // incident from its start. Afterwards the reader's position stands.

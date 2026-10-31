@@ -23,11 +23,13 @@ their own copies:
 | `DEFAULT_CLUSTER_NAME`                                                    | GKE cluster name (`platform-agent-host`)                                               |
 | `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                             |
 | `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
-| `DEFAULT_PLATFORM_AGENT_MODE`                                             | The PlatformAgent's `spec.mode` (`today`); the composition then renders no mode        |
+| `DEFAULT_PLATFORM_AGENT_MODE`                                             | What an `install.env` with no mode, and a CR with none, resolve to (`today`)           |
+| `DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`                               | A first install's `spec.mode` (`next`); `install.sh` alone applies it                  |
+| `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE`                                     | The data volume size (`50Gi`), the operator's default; it renders no `spec.storage`    |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
-| `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `litellm.yaml` mirrors them     |
+| `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `_helpers.tpl` mirrors them     |
 | `DEFAULT_MODEL_MAX_TOKENS`                                                | Output tokens the gateway asks for on a request that names none (`0`: no `max_tokens`) |
 | `DEFAULT_LITELLM_REDACTION_ENABLED` / `_IP_ACTION`                        | Gateway redaction (`false`) and what it does with IP literals (`pseudonym`)            |
 | `DEFAULT_GEMINI_API_KEY_SECRET_NAME`                                      | Secret Manager secret a Gemini key is read from when none is given (`gemini-api-key`)  |
@@ -162,7 +164,8 @@ The chat flags are held to the file rather than overriding it for one run, becau
 `upgrade.sh` renders the chat integrations from the file alone and takes none of them, so a
 one-run override would be undone by the next full upgrade without a word. They are
 `--enable-slack`, `--enable-google-chat`, `--slack-allowed-users`, `--slack-home-channel`,
-`--slack-home-channel-name`, `--google-chat-allowed-users`, `--google-chat-home-channel`,
+`--slack-home-channel-name`, `--slack-home-channel-policy`, `--google-chat-allowed-users`,
+`--google-chat-home-channel`,
 `--google-chat-mode`, `--chat-topic-name`, `--slack-bot-token` and `--slack-app-token`.
 `--mode` follows the same rule, for the same reason, with `PLATFORM_AGENT_MODE` (below); it
 is not a chat key and brings no other settings with it.
@@ -188,7 +191,7 @@ nothing, since it is as often a decline as a hand-off: it prints the `KEY=value`
 record (never a token), for an operator who goes on to run `lifecycle.sh apply` by hand to add
 first, so a later `upgrade.sh` renders what they applied. A toggle recorded `true` brings the settings of
 its integration the file also lacks, with the values the run applied: `SLACK_ALLOWED_USERS`,
-`SLACK_HOME_CHANNEL` and `SLACK_HOME_CHANNEL_NAME` for Slack; `ALLOWED_USERS`,
+`SLACK_HOME_CHANNEL`, `SLACK_HOME_CHANNEL_NAME` and `SLACK_HOME_CHANNEL_POLICY` for Slack; `ALLOWED_USERS`,
 `CHAT_TOPIC_NAME`, `GOOGLE_CHAT_HOME_CHANNEL` and `GOOGLE_CHAT_MODE` for Google Chat. The
 toggle is written after them, so a record cut short leaves the settings with the integration
 off, never the integration on without its allowlist. Otherwise
@@ -208,6 +211,19 @@ variable that renders its key (the Google Chat allowlist flag also reads
 `GOOGLE_CHAT_ALLOWED_USERS` first, which no workflow sets), so on a runner a flag either agrees
 with the rendered key or is appended to the runner's copy, which goes when the runner does. The `--menu` route refuses the chat flags; it
 edits the keys on its own screens.
+
+`SLACK_HOME_CHANNEL_POLICY` (`--slack-home-channel-policy`) is `auto` (the default, also empty) or
+`manual`, and renders `spec.integration.slack.homeChannelPolicy` on the PlatformAgent; the
+[CRD reference](../../docs/site/src/content/docs/operator/platformagent-crd.md#specintegration)
+describes the field. The interview does not ask for it: the field is an opt-out, set in the
+file by the few installs that want it. `write_tfvars_from_state` refuses any other spelling before
+a file is written, on every route, because the CRD accepts only those two. A shell export of the
+key, like an export of any Slack key, is read only when the file does not assign it: a first
+`install.sh` run records it in the `install.env` it writes, and `upgrade.sh` applies it for that
+run alone. A
+full or operator `upgrade.sh` applies the CRDs before the chart; a `lifecycle.sh apply` run by hand
+after `--generate-only` does not, so on an install whose CRD predates the field apply
+`charts/kube-agents/crds/` first, or the chart refuses the value with a message that says so.
 
 **`terraform/examples/full-install/terraform.tfvars`** is the derived artifact,
 regenerated on every run from the loaded environment. Nobody edits it.
@@ -369,6 +385,17 @@ The token, and the paths of the token file and the CA file, are never recorded.
 `--gitops-ca-file` for one run, and are never recorded either. One difference: with gitlab.com as
 the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuses the flag. With
 github.com, it refuses both.
+
+`GITLAB_READ_TOKEN_FILE`, in `install.env` or the environment, is the optional path to a file that
+holds a read-only GitLab token. The broker presents this token only to clone private context
+repositories, never on a write. `install.sh` writes it into the `GITLAB_TOKEN_SECRET` Secret under
+the key `read-token`, beside `token`, and does not record the path. Set it only for the run that
+stores or replaces the read token, then remove it: a run with it set applies the file again, over a
+token rotated since, and stops when the file is gone. A later run without the key keeps the stored
+read token: the installer writes each key with its own server-side-apply field
+manager, so the write-token apply never removes `read-token`. Use a GitLab project or group access
+token with the Reporter role and only the `read_repository` scope, on the GitOps forge's host
+(gitlab.com or self-managed). On GitHub, `install.sh` refuses the key.
 
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.
@@ -546,9 +573,27 @@ cannot refuse a teardown.
 
 `PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`
 ([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md) says what each
-renders). The generator writes `platform_agent_mode` on every run, `today` by default, and the
+renders). An `install.sh` run that chooses no mode (no `--mode`, no `PLATFORM_AGENT_MODE` in
+`install.env`, whose line `install.env.example` leaves commented out, and on a first install none
+exported) settles it from the target cluster. A cluster already running a `PlatformAgent` keeps
+its `spec.mode` (absent is `today`); one whose `PlatformAgent` was deleted while the
+`kube-agents` release is still installed keeps the mode the release records. Only a cluster with
+neither, or none yet, is a first install, which gets `next`
+(`DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`), or `today` when it mirrors its third-party images
+with `--third-party-registry-prefix`, because nothing points `next`'s NATS images at the mirror;
+`--mode=next` overrides that. The read uses a kubeconfig of its own, so `--dry-run` and
+`--generate-only` leave the current context alone. Only gcloud's NOT_FOUND is no cluster: one
+that cannot be described or read is never taken for a first install, and over an `install.env`
+with no key the run renders `today`; with no `install.env`, `--dry-run` and `--generate-only`
+render `today` with a warning and an applying run is refused until `--mode` names one. `install.sh` then records the mode it settled on in an
+`install.env` that assigns none, unless it was that unread guess. The Day-2 menu's Save & Apply
+settles and saves a missing key the same way. `upgrade.sh` and the generator read a file with no
+key, or an empty one, as `today` (`DEFAULT_PLATFORM_AGENT_MODE`, the name released scripts read as
+an existing install's mode), and a full `upgrade.sh` over a file with no key is refused unless
+its reads show no install on `next` (a read that failed shows nothing), rather than apply a
+switch nobody chose. The generator writes `platform_agent_mode` on every run, and the
 composition passes the chart nothing for `today`, so the CR carries no mode field. `install.sh`
-takes `--mode` and records it, or the default, on a first install. Over an existing
+takes `--mode` and records it, or the settled mode, on a first install. Over an existing
 `install.env` it is held to the file by the chat flags' rule above: a `--mode` that disagrees
 with what the file resolves to (an empty key is `today`) is refused rather than applied for one
 run, because the next run, and every `upgrade.sh`, which takes no `--mode`, would switch the
@@ -578,6 +623,17 @@ refuses `PLATFORM_AGENT_MODE=next` in `install.env` for the same reason. An olde
 the release rollback runbook's route, has no such refusal and drops it with its generic
 "Dropping" line, so roll a `next` install back only after switching it to `today` on purpose. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
 before it regenerates.
+
+`PLATFORM_AGENT_STORAGE_SIZE` is the `PlatformAgent`'s `spec.storage.size`, the size of the
+agent's data claim and of the shell sandbox's. Empty takes `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE`,
+which equals the operator's own default. The generator writes `platform_agent_storage_size` on
+every run, and the composition passes the chart nothing for the default, so the CR carries no
+`storage` field. A first install records a value it inherits from the shell; after that, the file
+is the only way in, because `bootstrap_install_env` and `load_install_env` drop an inherited
+value: one run at a raised size followed by a run from a clean shell would drop the field again,
+leaving the claims larger than the CR says. A value that is not a whole number of `Mi`, `Gi` or
+`Ti` above zero and at most `64Ti` stops every front door but `uninstall.sh`, which exports it empty before it
+regenerates.
 
 When `next` hands Slack to the A2A gateway (Slack on, Google Chat off: the operator's
 `a2aSlackArmed`), `install.sh`, the menu's apply and a full upgrade refuse, before their apply,
@@ -776,6 +832,7 @@ is a hand-authored dotenv and a hand may well write `export`.
   `install.sh` can source it standalone before any checkout exists.
 - **[print_instructions_gchat.sh](print_instructions_gchat.sh)** /
   **[print_instructions_slack.sh](print_instructions_slack.sh)**: post-install manual-step
-  instructions, printed by `install.sh` when the integration is enabled.
+  instructions, printed by `install.sh` after every apply that leaves the integration on,
+  `--menu`'s Save & Apply included.
 - **[../dev/dev_rebuild_agent.sh](../dev/dev_rebuild_agent.sh)**: fast local development utility
   that builds, pushes, and redeploys agent container images.

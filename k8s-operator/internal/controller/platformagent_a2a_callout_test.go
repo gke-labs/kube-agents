@@ -124,6 +124,9 @@ func TestA2ACalloutIsGatedByMode(t *testing.T) {
 		{"keys Secret", func() error {
 			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-callout-keys", Namespace: "test-ns"}, &corev1.Secret{})
 		}},
+		{"task-signing key Secret", func() error {
+			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-task-signing-key", Namespace: "test-ns"}, &corev1.Secret{})
+		}},
 		{"identity map", func() error {
 			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-authmap", Namespace: "test-ns"}, &corev1.ConfigMap{})
 		}},
@@ -172,8 +175,9 @@ var rbacBindingKinds = map[string]bool{
 // scope: they take the subject as an argument and have their own coverage.)
 func TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs(t *testing.T) {
 	agent := a2aTestAgent()
-	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.ServiceAccountName
+	callout := buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.ServiceAccountName
 	gateway := buildA2AGatewayDeployment(agent).Spec.Template.Spec.ServiceAccountName
+	dispatcher := buildA2ADispatcherDeployment(agent).Spec.Template.Spec.ServiceAccountName
 
 	cases := []struct {
 		builder  string
@@ -186,6 +190,9 @@ func TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs(t *testing.T
 		{"buildA2ACalloutClusterRoleBinding", buildA2ACalloutClusterRoleBinding(agent).Subjects, callout},
 		{"buildA2ACalloutRoleBinding", buildA2ACalloutRoleBinding(agent).Subjects, callout},
 		{"buildA2AGatewayRoleBinding", buildA2AGatewayRoleBinding(agent).Subjects, gateway},
+		{"buildA2ADispatcherConfigRoleBinding", buildA2ADispatcherConfigRoleBinding(agent).Subjects, dispatcher},
+		// In the profile namespace, naming the ServiceAccount in the agent's.
+		{"buildA2ADispatcherPodsRoleBinding", buildA2ADispatcherPodsRoleBinding(agent).Subjects, dispatcher},
 	}
 
 	covered := map[string]bool{}
@@ -245,7 +252,19 @@ func TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs(t *testing.T
 // the JetStream PVC (the file store is the audit substrate). Everything else
 // must be gone. The PVC does not appear here because the fake client does not
 // run the StatefulSet controller, so no PVC is ever created.
+//
+// It runs twice: as rendered by default, and with the MCP server's flag on,
+// whose objects render only under it and so are swept only then.
 func TestNothingA2ALabelledSurvivesAFlipToToday(t *testing.T) {
+	t.Run("default", func(t *testing.T) { nothingA2ALabelledSurvivesAFlipToToday(t, false) })
+	t.Run("with the MCP server", func(t *testing.T) {
+		t.Setenv(a2aMCPDoorEnvVar, "true")
+		nothingA2ALabelledSurvivesAFlipToToday(t, true)
+	})
+}
+
+func nothingA2ALabelledSurvivesAFlipToToday(t *testing.T, mcpOn bool) {
+	t.Helper()
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -270,6 +289,19 @@ func TestNothingA2ALabelledSurvivesAFlipToToday(t *testing.T) {
 	// vacuous version of this test.
 	if n := countA2ALabelled(ctx, t, cl); n == 0 {
 		t.Fatal("no A2A-labelled objects under next; the sweep would pass vacuously")
+	}
+	if mcpOn {
+		for name, obj := range map[string]client.Object{
+			a2aMCPName(agent):       &appsv1.Deployment{},
+			a2aMCPAccessName(agent): &corev1.Secret{},
+			// The broker identity: the pod's own ServiceAccount, which
+			// must go with the rest of the MCP server on the flip.
+			a2aMCPServiceAccountName(agent): &corev1.ServiceAccount{},
+		} {
+			if err := cl.Get(ctx, types.NamespacedName{Name: name, Namespace: agent.Namespace}, obj); err != nil {
+				t.Fatalf("the MCP server's %s was not rendered under its flag, so sweeping it proves nothing: %v", name, err)
+			}
+		}
 	}
 
 	fresh := &agentv1alpha1.PlatformAgent{}

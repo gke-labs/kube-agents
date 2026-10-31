@@ -145,7 +145,7 @@ def test_the_status_set_matches_what_the_status_view_knows():
     block = view[view.index("STATUS_STYLE = {"):]
     block = block[: block.index("}")]
     known = set(re.findall(r'^\s+"([A-Z_]+)": "', block, re.M))
-    assert len(known) == 5, known
+    assert len(known) == 6, known
     assert known == set(verifiers.AuditStatus.__args__)
 
 

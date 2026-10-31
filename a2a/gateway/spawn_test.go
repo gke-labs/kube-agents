@@ -10,6 +10,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
@@ -204,6 +205,18 @@ func TestSpawnedSessionsCarryNoBusPasswordAndAPodBoundTokenInstead(t *testing.T)
 		}
 		if ok && req.Cmp(lim) > 0 {
 			t.Errorf("session pod %s request %s exceeds its limit %s", res, req.String(), lim.String())
+		}
+	}
+
+	// Ephemeral storage too, with the limit equal to the request: the
+	// scratch emptyDir is bounded, and a LimitRange defaulting a smaller
+	// limit would refuse a request with no limit of its own.
+	if req, lim := c.Resources.Requests[corev1.ResourceEphemeralStorage], c.Resources.Limits[corev1.ResourceEphemeralStorage]; req.Cmp(resource.MustParse(workerEphemeralStorageRequest)) != 0 || lim.Cmp(req) != 0 {
+		t.Errorf("session pod ephemeral-storage request %s, limit %s; want both %s", req.String(), lim.String(), workerEphemeralStorageRequest)
+	}
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "scratch" && (v.EmptyDir == nil || v.EmptyDir.SizeLimit == nil || v.EmptyDir.SizeLimit.Cmp(resource.MustParse(workerScratchSizeLimit)) != 0) {
+			t.Errorf("session scratch volume = %+v, want an emptyDir with sizeLimit %s", v, workerScratchSizeLimit)
 		}
 	}
 

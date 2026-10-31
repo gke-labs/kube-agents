@@ -10,8 +10,15 @@
 #   hack/rollback-roundtrip.sh [namespace] [platformagent-name]
 #
 # Defaults: kubeagents-system and platform-agent. ROLLBACK_KUBE_CONTEXT pins
-# every kubectl call to one context. hack/ci-eval-pr.sh runs it after the
-# next lane's matrix and reports the result beside the eval verdict, not in it.
+# every kubectl call to one context. hack/ci-eval-pr.sh runs it after a
+# next-mode matrix on main and reports the result beside the eval verdict, not
+# in it.
+#
+# ROLLBACK_END_MODE=today adds a third leg, next -> today again, with leg 1's
+# assertions, so the install is left rolled back: what the today lane
+# (EVAL_ROLLBACK_LANE=1 in hack/ci-eval-pr.sh) runs before it grades today's
+# matrix on that install. It refuses a CR that declares sidecars of its own,
+# before anything changes, since the third flip would have to leave them unset.
 #
 # The two kept objects, as the operator renders them for a CR named <cr>
 # (k8s-operator/internal/controller/platformagent_a2a_manifests.go, cleanupA2A
@@ -231,6 +238,9 @@ AGENT_URL="${ROLLBACK_AGENT_URL:-}"
 INJECT_URL="${ROLLBACK_INJECT_URL:-}"
 # Optional: every PASS, FAIL and SKIP line is appended here too.
 RESULTS_FILE="${ROLLBACK_RESULTS_FILE:-}"
+# Where the run leaves the install: next (the round trip) or today (a third
+# leg rolls it back again; header).
+END_MODE="${ROLLBACK_END_MODE:-${MODE_NEXT}}"
 
 readonly NATS_NAME="${CR_NAME}${NATS_NAME_SUFFIX}"
 readonly NATS_PVC="${NATS_DATA_CLAIM}-${NATS_NAME}${NATS_ORDINAL_SUFFIX}"
@@ -967,7 +977,7 @@ patch_and_reconcile() {
   local leg="$1" what="$2" patch="$3" before
   before="$(agent_generation)" || fail "${leg}.${what}.patched" "deployment/${AGENT_DEPLOYMENT} could not be read"
   k patch platformagent "${CR_NAME}" --type merge -p "${patch}" >/dev/null || fail "${leg}.${what}.patched" "kubectl patch was refused"
-  if [ "${leg}.${what}" = "leg1.mode-today" ]; then
+  if [ "${what}" = "mode-today" ]; then
     BUS_DOWN=1
   fi
   pass "${leg}.${what}.patched" "merge patch applied"
@@ -991,6 +1001,22 @@ bringup_left() {
   echo $((left > 0 ? left : 0))
 }
 
+# The flip to today and what it must leave: leg 1's, and leg 3's under
+# ROLLBACK_END_MODE=today. The teardown ran to its end: the StatefulSet is
+# the last thing cleanupA2A deletes, and the callout keys Secret is one it
+# deletes rather than keeps, so a kept PVC and creds Secret are kept through
+# a teardown that happened, not through one that never started.
+flip_to_today() {
+  local leg="$1"
+  patch_and_settle "${leg}" "mode-today" "{\"spec\":{\"mode\":\"${MODE_TODAY}\"}}"
+  wait_absent "${leg}.a2a-torn-down" "${TEARDOWN_TIMEOUT}" "statefulset ${NATS_NAME}" "deployment ${CALLOUT_NAME}" "secret ${CALLOUT_KEYS_SECRET}"
+  assert_same_uid "${leg}.pvc-kept" pvc "${NATS_PVC}" "${PVC_UID}"
+  assert_same_uid "${leg}.creds-kept" secret "${CREDS_SECRET}" "${CREDS_UID}"
+  wait_settled "${leg}.nothing-stuck" "${MODE_TODAY}" "${SETTLE_TIMEOUT}"
+  assert_not_degraded "${leg}.not-degraded"
+  assert_today_turn "${leg}.today-turn"
+}
+
 # ─── The run ─────────────────────────────────────────────────────────────────
 command -v python3 >/dev/null 2>&1 || {
   echo "FAIL preflight.tools: python3 is required"
@@ -1002,9 +1028,22 @@ note "kept across the flip: pvc/${NATS_PVC}, secret/${CREDS_SECRET}"
 
 # Leg 0: a healthy next install, and the two objects as they are now.
 CURRENT_LEG="pre"
+case "${END_MODE}" in
+  "${MODE_NEXT}" | "${MODE_TODAY}") ;;
+  *) fail "pre.end-mode" "ROLLBACK_END_MODE is '${END_MODE}'; it is ${MODE_NEXT} (the round trip) or ${MODE_TODAY} (a third leg rolls the install back again)" ;;
+esac
 read_cr_state || fail "pre.cr-readable" "platformagent/${CR_NAME} could not be read in ${NAMESPACE}"
 [ "${CR_MODE}" = "${MODE_NEXT}" ] || fail "pre.mode-next" "spec.mode is ${CR_MODE}; the round trip starts from a next install"
 pass "pre.mode-next" "spec.mode is next"
+if [ "${END_MODE}" = "${MODE_TODAY}" ]; then
+  # Read before anything changes: leg 3 would have to unset a declared
+  # sidecar and leave it unset under today, which is a change to the CR this
+  # run does not own. The lane's install declares none.
+  CR_JSON="$(k_read get platformagent "${CR_NAME}" -o json)" || fail "pre.end-mode-today" "platformagent/${CR_NAME} could not be read"
+  DECLARED_SIDECARS="$(printf '%s' "${CR_JSON}" | python3 -c "${PY_SIDECARS}" "${CREDS_SECRET}" "${NATS_NAME}" | sed -n 1p)"
+  [ -z "${DECLARED_SIDECARS}" ] || fail "pre.end-mode-today" "the CR declares spec.deployment.sidecars (${DECLARED_SIDECARS}); ending at ${MODE_TODAY} would leave them unset, so run the round trip without ROLLBACK_END_MODE=${MODE_TODAY}"
+  pass "pre.end-mode-today" "the CR declares no sidecars; the run ends with the install at ${MODE_TODAY}"
+fi
 wait_cr_ready "pre.ready" "${PRE_READY_TIMEOUT}"
 record_degraded_baseline "pre.degraded-baseline"
 wait_rolled "pre.nats-ready" statefulset "${NATS_NAME}" "${PRE_READY_TIMEOUT}"
@@ -1035,17 +1074,7 @@ if [ -n "${UNSET_SIDECARS}" ]; then
 else
   skip "leg1.sidecars-unset" "the CR declares no sidecars (a bridge the operator renders leaves with the mode and needs no unset)"
 fi
-patch_and_settle "leg1" "mode-today" "{\"spec\":{\"mode\":\"${MODE_TODAY}\"}}"
-# The teardown ran to its end: the StatefulSet is the last thing cleanupA2A
-# deletes, and the callout keys Secret is one it deletes rather than keeps,
-# so a kept PVC and creds Secret below are kept through a teardown that
-# happened, not through one that never started.
-wait_absent "leg1.a2a-torn-down" "${TEARDOWN_TIMEOUT}" "statefulset ${NATS_NAME}" "deployment ${CALLOUT_NAME}" "secret ${CALLOUT_KEYS_SECRET}"
-assert_same_uid "leg1.pvc-kept" pvc "${NATS_PVC}" "${PVC_UID}"
-assert_same_uid "leg1.creds-kept" secret "${CREDS_SECRET}" "${CREDS_UID}"
-wait_settled "leg1.nothing-stuck" "${MODE_TODAY}" "${SETTLE_TIMEOUT}"
-assert_not_degraded "leg1.not-degraded"
-assert_today_turn "leg1.today-turn"
+flip_to_today "leg1"
 
 # Leg 2: today -> next, on the kept objects.
 CURRENT_LEG="leg2"
@@ -1062,11 +1091,13 @@ CURRENT_LEG="leg2"
 # The arithmetic, at the defaults: patch to Ready is at most
 # GENERATION_TIMEOUT + BUS_UP_TIMEOUT = 300 + 1500 = 1800s, whatever the
 # split between the five. That leaves 1800s of the 3600s ci-eval-pr.sh gives
-# the whole run (EVAL_ROLLBACK_TIMEOUT_SECONDS) for pre, leg 1 and the rest of
-# leg 2, which take minutes on a healthy install (each not-degraded check's
-# capacity wait, UNSCHEDULABLE_TIMEOUT, adds at most 300s, 600s for both);
-# a run that needs more is stopped there and reports itself interrupted at
-# the leg it was in. The
+# the whole run (EVAL_ROLLBACK_TIMEOUT_SECONDS) for pre, leg 1, the rest of
+# leg 2 and, under ROLLBACK_END_MODE=today, leg 3, which take minutes on a
+# healthy install (the round trip has measured about four in CI; each
+# not-degraded check's capacity wait, UNSCHEDULABLE_TIMEOUT, adds at most
+# 300s, 900s for all three); a run that needs more is stopped there and
+# reports itself interrupted at the leg it was in. The today lane runs it
+# before its matrix, where no start-by bound applies. The next-mode run's
 # job-level bound is ci-eval-pr.sh's, beside EVAL_ROLLBACK_START_BY_SECONDS:
 # the run starts by 15600s of job age, deploy included, and with the 3600s
 # bound and its 60s kill grace ends by 19260s, inside the 21600s deadline. The
@@ -1113,6 +1144,15 @@ assert_bus_task "leg2.bus-task"
 wait_settled "leg2.nothing-stuck" "${MODE_NEXT}" "${SETTLE_TIMEOUT}"
 assert_not_degraded "leg2.not-degraded"
 
+ROUTE="next -> today -> next"
+if [ "${END_MODE}" = "${MODE_TODAY}" ]; then
+  # Leg 3: next -> today again, on the objects leg 2 brought back, and the
+  # install is left there for whatever runs after.
+  CURRENT_LEG="leg3"
+  flip_to_today "leg3"
+  ROUTE="${ROUTE} -> today"
+fi
+
 CURRENT_LEG="done"
-echo "ROLLBACK ROUND TRIP PASSED: next -> today -> next on platformagent/${CR_NAME}, pvc/${NATS_PVC} (uid ${PVC_UID}) and secret/${CREDS_SECRET} (uid ${CREDS_UID}) kept throughout"
+echo "ROLLBACK ROUND TRIP PASSED: ${ROUTE} on platformagent/${CR_NAME}, pvc/${NATS_PVC} (uid ${PVC_UID}) and secret/${CREDS_SECRET} (uid ${CREDS_UID}) kept throughout"
 record "PASSED"

@@ -9,7 +9,9 @@ project access token, or, on gitlab.com's Free tier where those do not exist,
 a personal access token of an account that exists for this install. The
 mechanism is the same for all three; what differs is how far the token
 reaches, which is why `allowed_paths` is enforced here before a credential is
-spent and the broker's managed list is enforced before that.
+spent and the broker's managed list is enforced before that. A second,
+read-only token in the same Secret, when there is one, is what a context
+repository clones with (`read_credential`).
 
 What GitLab's API does differently from the shapes every caller expects, and
 where it is absorbed:
@@ -33,8 +35,8 @@ from urllib.parse import quote
 
 import repo_ref
 
-from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
-from ..credentials import StaticFileCredential
+from ..base import COLLABORATION_VERBS, TALLY_TOTAL, Forge, WorkspaceError, listing, tally_with_open
+from ..credentials import Credential, NoCredential, StaticFileCredential
 from ..validate import (
     MAX_CONVERSATION_SIZE,
     MAX_PAGE_SIZE,
@@ -43,6 +45,7 @@ from ..validate import (
     validate_comment_limit,
     validate_labels,
     validate_limit,
+    validate_login,
     validate_number,
     validate_page,
     validate_state,
@@ -58,6 +61,9 @@ DEVELOPER_ACCESS = 30
 #: The username git is given beside the token. GitLab reads the token and
 #: accepts any non-empty username for an access token over HTTPS.
 GIT_USERNAME = "oauth2"
+
+#: The header GitLab's API reads an access token from.
+TOKEN_HEADER = "PRIVATE-TOKEN"
 
 #: The colour a label is created with when the caller names none. GitLab
 #: requires one; GitHub picks one itself.
@@ -78,11 +84,34 @@ RESERVED_LABEL_FILTERS = frozenset({"none", "any"})
 #: The validation message GitLab sends, as a 404, for an emoji already awarded.
 ALREADY_AWARDED = "has already been taken"
 
+#: The header GitLab counts a listing's rows in. It leaves it off a listing
+#: past ten thousand rows, which is then no count.
+TOTAL_HEADER = "x-total"
+
+#: How an author's merge requests are asked for: every state, newest activity
+#: first, as GitHub's search is asked.
+AUTHORED_STATE = "all"
+AUTHORED_ORDER_BY = "updated_at"
+AUTHORED_SORT = "desc"
+
+#: GitLab's state filter for each count a tally makes: the two terminal
+#: outcomes and `all`, every state together, from which `open` is the remainder
+#: (the three counts are separate requests, not one snapshot).
+TALLY_STATES = {"merged": "merged", "closed": "closed", TALLY_TOTAL: "all"}
+
 
 def _states(neutral: str) -> str:
     """The neutral state as GitLab's `state` parameter."""
     return {"open": "opened", "closed": "closed", "all": "all"}[neutral]
 
+
+
+def _total(headers: Mapping[str, str]) -> int | None:
+    """The row count GitLab sent in `X-Total`, or None when it sent none."""
+    try:
+        return int(headers.get(TOTAL_HEADER, ""))
+    except ValueError:
+        return None
 
 
 def _filter_labels(raw: Any) -> list[str]:
@@ -108,6 +137,7 @@ class GitLabForge(Forge):
     transport = "http"
     error_overrides = ERROR_OVERRIDES
     acknowledges = True
+    labels = True
     whoami_route = ("user", "username")
     # What an install that has not configured GitLab answers for gitlab.com: a
     # named gap rather than "not a forge this install serves".
@@ -125,6 +155,7 @@ class GitLabForge(Forge):
         allowed_paths: Iterable[str] = (),
         ca_file: str = "",
         ca_source: str = "",
+        read_token_path: str = "",
     ) -> None:
         super().__init__()
         # gitlab.com presents a certificate the public CAs sign, and a private
@@ -140,9 +171,12 @@ class GitLabForge(Forge):
         # are built from it.
         self.hosts = (host, "www.gitlab.com") if host == "gitlab.com" else (host,)
         self.api_url = f"https://{host}/api/v4"
-        self.credential = StaticFileCredential(
-            token_path, host, header="PRIVATE-TOKEN", username=GIT_USERNAME
-        )
+        self.credential = self._stored(token_path)
+        self.read_token_path = read_token_path
+        if read_token_path:
+            # Built once here, so a path git may not be handed stops the build
+            # as a bad tokenPath does, and not the first context clone.
+            self._stored(read_token_path)
         prefixes = []
         for path in allowed_paths:
             trimmed = path.strip("/")
@@ -156,6 +190,12 @@ class GitLabForge(Forge):
                 )
             prefixes.append(self._prefix(host, path, trimmed))
         self.allowed_paths = tuple(prefixes)
+
+    def _stored(self, token_path: str) -> StaticFileCredential:
+        """A token file on this host, as git and the API are handed it."""
+        return StaticFileCredential(
+            token_path, self.hosts[0], header=TOKEN_HEADER, username=GIT_USERNAME
+        )
 
     @staticmethod
     def _prefix(host: str, path: str, trimmed: str) -> tuple[str, ...]:
@@ -209,6 +249,15 @@ class GitLabForge(Forge):
         for entry in config.get("forges") or ():
             if entry.get("provider") != cls.name:
                 continue
+            if entry.get("port") not in (None, "", 0):
+                raise ValueError(
+                    f"port is not supported for {cls.name}: the broker reaches "
+                    f"{entry.get('host')} on its standard HTTPS port only"
+                )
+            if entry.get("scheme") not in (None, "", "https"):
+                raise ValueError(
+                    f"scheme {entry.get('scheme')!r} is not supported for {cls.name}"
+                )
             token_path = str(entry.get("token_path") or "")
             if not token_path:
                 raise ValueError(f"the {cls.name} forge at {entry.get('host')} names no tokenPath")
@@ -228,9 +277,30 @@ class GitLabForge(Forge):
                     allowed,
                     str(entry.get("ca_file") or ""),
                     str(entry.get("ca_source") or ""),
+                    str(entry.get("read_token_path") or ""),
                 )
             )
         return tuple(built)
+
+    def read_credential(self, repo: str) -> Credential:
+        """The read-only token stored beside the write one, for one clone.
+
+        The optional key `read-token` in the forge's credentials Secret, which
+        the operator projects next to `token`. The file is checked on each
+        call: a Secret without the key mounts no file, and a key added later
+        appears with no restart. With no file, an empty one, or one that
+        does not hold a token, there is nothing to present, and a context repository clones with no
+        credential, as it did before the key existed. Never the write token:
+        `credential` is a different file.
+        """
+        if not self.read_token_path:
+            return NoCredential()
+        credential = self._stored(self.read_token_path)
+        # The credential's own rule, the one the git helper applies: a token
+        # with a space, a byte-order mark or a second line is no token.
+        if not credential.holds_token():
+            return NoCredential()
+        return credential
 
     #: How many pages of the token account's projects `reach` reads: enough
     #: for an account that belongs to a thousand projects, which is already the
@@ -664,6 +734,67 @@ class GitLabForge(Forge):
         commits = [translate.commit(node) for node in reversed(nodes[: self.COMMIT_CAP])]
         return listing(commits[(page - 1) * limit : page * limit], limit, "commits")
 
+    # -- the readings sweep's calls -------------------------------------------
+
+    def _authored(
+        self, api: Callable, repo: str, author: str, state: str, per_page: int, page: int
+    ) -> tuple[list, int | None]:
+        # Filtered on the username: `author_username` and the `author_id` of
+        # the same account answer the same merge requests.
+        nodes, headers = api(
+            "GET",
+            f"{self._project(repo)}/merge_requests",
+            params={
+                "author_username": author,
+                "state": state,
+                "order_by": AUTHORED_ORDER_BY,
+                "sort": AUTHORED_SORT,
+                "per_page": per_page,
+                "page": page,
+            },
+            with_headers=True,
+        )
+        return nodes or [], _total(headers)
+
+    def proposal_list_by_author(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        author = validate_login(payload.get("author"))
+        limit = validate_limit(payload.get("limit"))
+        page = validate_page(payload.get("page"))
+        nodes, total = self._authored(api, repo, author, AUTHORED_STATE, limit, page)
+        answer = listing([translate.authored(node) for node in nodes], limit, "proposals")
+        answer["total"] = total
+        return answer
+
+    def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # One row a state is enough: the count is in the header.
+        author = validate_login(payload.get("author"))
+        tally: dict[str, Any] = {}
+        for neutral, state in TALLY_STATES.items():
+            _, total = self._authored(api, repo, author, state, 1, 1)
+            if total is None:
+                raise WorkspaceError(
+                    f"GitLab answered the {neutral} merge requests with no `X-Total` count",
+                    status=502,
+                    code="FORGE_CALL_FAILED",
+                )
+            tally[neutral] = total
+        return tally_with_open(tally)
+
+    def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # GitLab has approvals, not reviews: one unpaged answer naming every
+        # approver. Its comments are notes, which the conversation reader has.
+        number = validate_number(payload.get("number"))
+        limit = validate_comment_limit(payload.get("limit"))
+        answer = api("GET", f"{self._project(repo)}/merge_requests/{number}/approvals") or {}
+        entries = [entry for entry in answer.get("approved_by") or [] if isinstance(entry, dict)]
+        reviews = [translate.approval(entry) for entry in entries[:limit]]
+        return {"reviews": reviews, "count": len(reviews), "truncated": len(entries) > limit}
+
+    def proposal_closer(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        node = api("GET", f"{self._project(repo)}/merge_requests/{number}") or {}
+        return translate.closer(node)
+
     def proposal_acknowledge(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         # Best-effort by contract. Any note -- conversation or diff -- takes an
         # award emoji; GitLab keys it on the merge request and the note
@@ -788,10 +919,13 @@ class GitLabForge(Forge):
                 body["description"] = description
             node = api("POST", labels, body=body)
         else:
+            # Write only a change, as the GitHub forge does: a caller ensures
+            # the same labels on every run.
             changes: dict[str, Any] = {}
-            if color:
+            held = existing if isinstance(existing, dict) else {}
+            if color and str(held.get("color") or "").lstrip("#").lower() != color.lower():
                 changes["color"] = f"#{color}"
-            if description:
+            if description and (held.get("description") or "") != description:
                 changes["description"] = description
             node = api("PUT", f"{labels}/{quoted}", body=changes) if changes else existing
         return {"label": translate.label(node)}

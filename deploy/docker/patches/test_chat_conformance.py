@@ -5,8 +5,8 @@ Run: python3 -m pytest deploy/docker/patches/test_chat_conformance.py
 The cases are ``tests/conformance/chat/`` (``agents/platform/scripts/chat_cases.py``
 reads them). A case with one input runs through the composer that lays it out
 (``agents/platform/scripts/chat_message.py``, ``slack_ux_incident.chat_triage``, or the
-fleet-audit and first-inventory cards, ``slack_audit_report.chat_from_issue`` and
-``agents/chat/scripts/inventory_presenter.chat``).
+fleet-audit and first-inventory cards, ``slack_audit_report.chat_from_issue``,
+``agents/chat/scripts/inventory_presenter.chat`` and ``agents/chat/scripts/inventory_card.chat``).
 A case that is a sequence of card events runs through the gateway patches that
 send it, with a stand-in for the chat.notify adapter recording each send:
 ``kanban_progress_lines.deliver`` and ``slack_ux_status`` for the plan (the fold
@@ -20,6 +20,7 @@ the ask kind they carry is the one ``chat_message.ask_kind`` gives.
 """
 
 import asyncio
+import html
 import itertools
 import json
 import sys
@@ -41,6 +42,8 @@ sys.path.insert(0, str(CHAT_SCRIPTS))
 
 import chat_cases
 import chat_message
+import findings_queue
+import inventory_card
 import inventory_presenter
 import kanban_notifier
 import kanban_progress_lines
@@ -56,6 +59,10 @@ BRIDGE_CARRIERS = frozenset({"progress", "terminal"})
 CHAT_ID = "a2a-ctx-1"
 THREAD = "slack:C1/1.2"
 HEADER = "@platform "
+#: What a clipped headline ends with.
+ELLIPSIS = chat_message._presenter.ELLIPSIS
+#: The mrkdwn marker around today's bold headline.
+BOLD = "*"
 
 
 class _ChatAdapter:
@@ -169,6 +176,17 @@ class SharedCasesTest(unittest.TestCase):
         if "inventory_report" in given:
             built = inventory_presenter.chat(given["inventory_report"])
             return [_out(built and built[0], NOTIFY)]
+        if "first_report" in given:
+            # The first inventory's card from the stage's files, on the conversation chat.notify route.
+            files = given["first_report"]
+            card = inventory_card.build(
+                files["items"],
+                files.get("scores"),
+                findings_queue.PacingLimits(**files["limits"]),
+                files["shown"],
+                frozenset(files.get("suppressed", ())),
+            )
+            return [_out(inventory_card.chat(card)[0], NOTIFY)]
         if "markdown" in given:
             return [_out(chat_message.answer_message(given["markdown"]), RESULT)]
         if "reason" in given:
@@ -287,6 +305,30 @@ class SharedCasesTest(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case["name"]):
                 self.assertEqual(_as_case(self.run_case(case), case["expected"]), case["expected"])
+
+
+class QuestionDrawnOnceTest(unittest.TestCase):
+    """A question case's headline is not repeated in its detail, under next or today.
+
+    The headline is plain text, so the detail is read as plain too: a code span's
+    backticks, a link's url and paired markup do not hide a repeat."""
+
+    def test_every_question_case(self):
+        cases = [c for c in chat_cases.load() if "reason" in c["input"]]
+        self.assertGreater(len(cases), 0)
+        moments = chat_message._moments
+        for case in cases:
+            reason = case["input"]["reason"]
+            with self.subTest(case=case["name"]):
+                chat = chat_message.needs_you_message(reason)
+                detail = [moments._headline_text(line) for line in chat.get("detail", "").splitlines()]
+                shown = chat["headline"].removesuffix(ELLIPSIS)
+                self.assertFalse(any(shown in line for line in detail), detail)
+                blocks, _text = moments.needs_you(reason)
+                title = html.unescape(blocks[0]["text"]["text"]).strip(BOLD).removesuffix(ELLIPSIS)
+                _head, rest, _options = moments._question(reason, True)
+                below = [moments._headline_text(line) for line in "\n".join(rest).splitlines()]
+                self.assertFalse(any(title in line for line in below), below)
 
 
 class PlanDrawnAlikeTest(unittest.TestCase):

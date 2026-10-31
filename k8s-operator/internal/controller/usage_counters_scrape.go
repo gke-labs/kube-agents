@@ -69,26 +69,84 @@ const (
 	toolInvocationsSeries  = "kubeagents_tool_invocations_total"
 	eventsInjectedSeries   = "k8s_event_watcher_events_injected_total"
 	processStartTimeSeries = "process_start_time_seconds"
-	// vcsRequestsSeries is the broker's version-control counter, by verb and
-	// status; remediationsProposedTotal sums it under vcsProposalCreateVerb
-	// and vcsStatusSuccess alone: a proposal the forge accepted is a proposal.
+	// vcsRequestsSeries is the broker's version-control counter, by verb,
+	// status and provider; remediationsProposedTotal sums it under
+	// vcsProposalCreateVerb and vcsStatusSuccess alone, over every provider:
+	// a proposal the forge accepted is a proposal.
 	vcsRequestsSeries     = "kubeagents_vcs_requests_total"
 	vcsVerbLabel          = "verb"
 	vcsProposalCreateVerb = "proposal-create"
 	vcsStatusSuccess      = "success"
-	// vcsMergedSeries is the broker's count of its own proposals the forge
-	// reported merged, once each per broker process; no labels, so it is
-	// summed whole.
-	vcsMergedSeries = "kubeagents_vcs_proposals_merged_total"
 	// chatInboundSeries is the chat_metrics plugin's counter of messages the
 	// gateway accepted, by platform; summed over every platform.
 	chatInboundSeries = "kubeagents_chat_messages_inbound_total"
+	// brokerFailuresSeries is the broker's failure counter, summed over its
+	// kind and tool labels into brokerFailuresTotal; the kinds, and the tool a
+	// timed-out command ran, stay in Prometheus.
+	brokerFailuresSeries = "kubeagents_broker_execution_failures_total"
+	// chatTurnsErroredSeries is the chat plugin's count of synchronous turns
+	// the Hermes gateway failed to complete, summed over its platform label
+	// into chatTurnsErroredTotal; on a next-mode install the A2A gateway's
+	// task terminals under a2aErroredTerminalStates join it, as the
+	// counter's sibling on that pod.
+	chatTurnsErroredSeries = "kubeagents_chat_turns_errored_total"
+	a2aTaskTerminalsSeries = "kubeagents_a2a_gateway_task_terminals_total"
+	a2aTerminalStateLabel  = "state"
+	// kanbanGaveUpSeries is the chat plugin's count of board cards that gave
+	// up since its process started, summed whole into backgroundTasksGaveUpTotal.
+	kanbanGaveUpSeries = "kubeagents_kanban_tasks_gave_up_total"
+	// chatFeedbackNegativeSeries is the chat plugin's count of thumbs-down
+	// reactions a person put on the bot's messages, summed over its platform
+	// label into negativeFeedbackTotal; the chat_feedback_reactions hook feeds
+	// it, and no A2A family joins it.
+	chatFeedbackNegativeSeries = "kubeagents_chat_feedback_negative_total"
 	// a2aMessagesInboundSeries is the A2A gateway's counter of the chat
 	// messages it accepted as turns, by platform: the same counter on a
 	// next-mode install, where Chat ingress is the A2A gateway's rather than
 	// the Hermes gateway's (a2a/gateway/metrics.go). A body carries one of the
 	// two families; both fold into chatMessagesInboundTotal.
 	a2aMessagesInboundSeries = "kubeagents_a2a_gateway_messages_inbound_total"
+	// triageSessionsSeries is the watcher's count of the triage sessions it
+	// opened whose event the daemon delivered, by cluster: one per injected
+	// event in per-incident mode, never a session whose inject was filtered,
+	// suppressed or failed. The triage half of sessionsTotal sums it whole.
+	triageSessionsSeries = "k8s_event_watcher_triage_sessions_total"
+	// chatSessionsSeries is the session_store plugin's count of the
+	// conversations it first saw, by platform, served on the chat_metrics
+	// listener beside the inbound counter; a2aSessionsSeries is the A2A
+	// gateway's count of the conversations it minted a session for, on its
+	// own pod. Both fold into the chat half of sessionsTotal, summed over
+	// the platform label.
+	chatSessionsSeries = "kubeagents_chat_sessions_total"
+	a2aSessionsSeries  = "kubeagents_a2a_gateway_sessions_total"
+	// The broker's proposal readings (vcs_readings.py), gauges its readings
+	// sweep sets from what the forge reports now: the install's proposals by
+	// state; the closed ones by who closed them; the touches by anyone but
+	// the install, by kind and actor; the terminal proposals by how many
+	// human touches each carried, cumulative over le; the ignored ones; and
+	// each reading's age, served from a reading's first taking on and never
+	// omitted after, where the value series go once the reading is an hour
+	// old. usageReadingSpecs maps them to status.usage; the ignored gauge is
+	// named here for the series-name pin and projects to no field.
+	vcsProposalsSeries          = "kubeagents_vcs_proposals"
+	vcsProposalsClosedBySeries  = "kubeagents_vcs_proposals_closed_by"
+	vcsTouchesSeries            = "kubeagents_vcs_proposal_touches"
+	vcsTouchesPerProposalSeries = "kubeagents_vcs_proposal_touches_per_proposal"
+	vcsProposalsIgnoredSeries   = "kubeagents_vcs_proposals_ignored"
+	vcsReadingsAgeSeries        = "kubeagents_vcs_readings_age_seconds"
+	// The readings' labels and the values the specs select.
+	vcsReadingsStateLabel   = "state"
+	vcsReadingsActorLabel   = "actor"
+	vcsReadingsOutcomeLabel = "outcome"
+	vcsReadingsLeLabel      = "le"
+	vcsReadingsReadingLabel = "reading"
+	vcsStateOpen            = "open"
+	vcsStateMerged          = "merged"
+	vcsStateClosed          = "closed"
+	vcsActorHuman           = "human"
+	vcsActorBot             = "bot"
+	vcsOutcomeMerged        = "merged"
+	vcsLeUntouched          = "0"
 	// clusterUpSeries is the watcher's per-cluster gauge, one series per
 	// cluster it built a client for, 1 once that cluster's informer has
 	// synced and is delivering events. Read from the same body as the
@@ -103,11 +161,22 @@ const (
 	// (GKE's own per-project quotas keep a fleet far below it) and refused, not
 	// clamped, so a body past it reads as the hostile or broken one it is.
 	usageClusterGaugeCeiling int64 = 10000
+	// dataVolumeSeries is the watcher's reading of the agent's data volume,
+	// one series per dataVolumeKindLabel value: the filesystem's size and the
+	// space a non-root writer has left. Read from the watcher's body beside
+	// the cluster gauge, and projected to status.storageStatus
+	// (usage_storage.go).
+	dataVolumeSeries    = "kubeagents_data_volume_bytes"
+	dataVolumeKindLabel = "kind"
+	dataVolumeKindTotal = "total"
+	dataVolumeKindFree  = "free"
 	// toolInvocationsStatusLabel is the broker's outcome label. The outcomes
 	// toolInvocationsCountedStatuses sums are the broker's success and error:
 	// the commands it ran and the requests it rejected or failed on before
-	// running. blocked and busy are refusals, and abandoned cannot say
-	// whether the command had started.
+	// running. toolInvocationsRefusedStatuses are the rest, the requests the
+	// broker turned away: blocked and busy are refusals, and abandoned cannot
+	// say whether the command had started. The two sets partition the
+	// broker's vocabulary, so the two counters together are every request.
 	toolInvocationsStatusLabel = "status"
 
 	// The kinds a failed scrape is logged as: a closed vocabulary, never a
@@ -130,16 +199,38 @@ const (
 	usageScrapeKindOther = "error"
 )
 
-var toolInvocationsCountedStatuses = map[string]bool{"success": true, "error": true}
+var (
+	toolInvocationsCountedStatuses = map[string]bool{"success": true, "error": true}
+	toolInvocationsRefusedStatuses = map[string]bool{"blocked": true, "busy": true, "abandoned": true}
+)
+
+// a2aErroredTerminalStates are the A2A task terminals that are a failed turn:
+// failed, and rejected, which is a task the executor refused; not completed
+// and not canceled.
+var a2aErroredTerminalStates = map[string]bool{"failed": true, "rejected": true}
+
+// usageSibling is another family a counter is read from on a pod whose body
+// carries it in place of the counter's own, with the filter that family takes.
+type usageSibling struct {
+	family string
+	filter usageLabelFilter
+}
+
+// usageRead is one counter a family feeds and the filter it is read through.
+type usageRead struct {
+	counter string
+	filter  usageLabelFilter
+}
 
 // usageLabelFilter is, per label name, the values a metric must carry to be
 // summed into a counter; a nil filter sums every label set.
 type usageLabelFilter map[string]map[string]bool
 
 // usageSeriesFor is the family each counter is read from and the label values
-// summed: the broker's tool counter over its counted statuses, the proposals
-// counter over the one verb and status that is a proposal opened, the
-// watcher's injected counter over every label set.
+// summed: the broker's tool counter over its counted statuses, the same
+// counter over its refused statuses, the proposals counter over the one verb
+// and status that is a proposal opened, the watcher's injected counter over
+// every label set.
 func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 	switch counter {
 	case usageCounterEventsIngested:
@@ -149,34 +240,110 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 			vcsVerbLabel:               {vcsProposalCreateVerb: true},
 			toolInvocationsStatusLabel: {vcsStatusSuccess: true},
 		}
-	case usageCounterRemediationsMerged:
-		return vcsMergedSeries, nil
 	case usageCounterChatMessagesInbound:
 		return chatInboundSeries, nil
+	case usageCounterSessionsTriage:
+		return triageSessionsSeries, nil
+	case usageCounterSessionsChat:
+		return chatSessionsSeries, nil
+	case usageCounterToolExecutionsBlocked:
+		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsRefusedStatuses}
+	case usageCounterBrokerFailures:
+		return brokerFailuresSeries, nil
+	case usageCounterChatTurnsErrored:
+		return chatTurnsErroredSeries, nil
+	case usageCounterBackgroundTasksGaveUp:
+		return kanbanGaveUpSeries, nil
+	case usageCounterNegativeFeedback:
+		return chatFeedbackNegativeSeries, nil
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}
 }
 
-// usageSiblingFamiliesFor is the other families a counter is read from, on
-// pods whose body carries one of them in place of the family usageSeriesFor
-// names: the chat counter comes from the chat_metrics plugin on a gateway pod
-// and from the A2A gateway on its own pod, under the same label set.
-func usageSiblingFamiliesFor(counter string) []string {
-	if counter == usageCounterChatMessagesInbound {
-		return []string{a2aMessagesInboundSeries}
+// usageSiblingsFor is the other families a counter is read from, on pods
+// whose body carries one of them in place of the family usageSeriesFor names,
+// each with its own filter: the chat counter and the chat sessions come from
+// the chat_metrics plugin on a gateway pod and from the A2A gateway on its own
+// pod, under the same label set; the errored counter comes from the plugin
+// whole and from the A2A gateway's task terminals under the errored states.
+func usageSiblingsFor(counter string) []usageSibling {
+	switch counter {
+	case usageCounterChatMessagesInbound:
+		return []usageSibling{{family: a2aMessagesInboundSeries}}
+	case usageCounterSessionsChat:
+		return []usageSibling{{family: a2aSessionsSeries}}
+	case usageCounterChatTurnsErrored:
+		return []usageSibling{{family: a2aTaskTerminalsSeries, filter: usageLabelFilter{a2aTerminalStateLabel: a2aErroredTerminalStates}}}
 	}
 	return nil
 }
+
+// usageReadingKind names one of the broker's two proposal readings, the value
+// of vcsReadingsAgeSeries's reading label: the outcomes, the proposals by
+// state, and the details, everything the sweep's second step reads. A sweep
+// can serve the first without the second, so each has its own presence and
+// its own miss streak.
+type usageReadingKind string
+
+const (
+	usageReadingOutcomes usageReadingKind = "outcomes"
+	usageReadingDetails  usageReadingKind = "details"
+)
+
+// usageReadingSpec is one status field a reading lands in: the family it is
+// read from, the label values it takes, the reading it belongs to, and
+// whether it is a sum over every matching sample or one sample's value. A
+// sum over no matching sample is a zero, since the broker serves only the
+// touch label sets it has seen; a single-sample field resolves only on its
+// sample, and a reading is present only when every field of it resolved and
+// its age series is in the body.
+type usageReadingSpec struct {
+	field   string
+	family  string
+	filter  usageLabelFilter
+	reading usageReadingKind
+	sum     bool
+}
+
+// usageReadingSpecs is the declared list of reading fields, in the order the
+// status and the gauge export name them.
+var usageReadingSpecs = []usageReadingSpec{
+	{field: usageExportRemediationsMerged, family: vcsProposalsSeries, filter: usageLabelFilter{vcsReadingsStateLabel: {vcsStateMerged: true}}, reading: usageReadingOutcomes},
+	{field: usageExportRemediationsOpen, family: vcsProposalsSeries, filter: usageLabelFilter{vcsReadingsStateLabel: {vcsStateOpen: true}}, reading: usageReadingOutcomes},
+	{field: usageExportProposalsAuthored, family: vcsProposalsSeries, filter: usageLabelFilter{vcsReadingsStateLabel: {vcsStateOpen: true, vcsStateMerged: true, vcsStateClosed: true}}, reading: usageReadingOutcomes, sum: true},
+	{field: usageExportRemediationsClosedUnmerged, family: vcsProposalsClosedBySeries, filter: usageLabelFilter{vcsReadingsActorLabel: {vcsActorHuman: true, vcsActorBot: true}}, reading: usageReadingDetails, sum: true},
+	{field: usageExportProposalHumanTouches, family: vcsTouchesSeries, filter: usageLabelFilter{vcsReadingsActorLabel: {vcsActorHuman: true}}, reading: usageReadingDetails, sum: true},
+	{field: usageExportProposalsMergedUntouched, family: vcsTouchesPerProposalSeries, filter: usageLabelFilter{vcsReadingsOutcomeLabel: {vcsOutcomeMerged: true}, vcsReadingsLeLabel: {vcsLeUntouched: true}}, reading: usageReadingDetails},
+}
+
+// usageReadingKinds is every reading, in a fixed order.
+var usageReadingKinds = []usageReadingKind{usageReadingOutcomes, usageReadingDetails}
 
 // usageReading is what one scrape yields: each wanted counter summed over its
 // label sets, the start time the body carried, nil when it carried none, and,
 // for the watcher's body alone, its cluster gauges; nil for any other body, so
 // that a poll can tell a watcher reporting no clusters from no watcher read.
+// For the broker's body alone, Readings holds the reading fields of every
+// reading present in it, by status field, and ReadingsPresent says which
+// readings those are; both nil for any other body. Neither is folded: the poll
+// projects them as they stand.
 type usageReading struct {
-	Samples   map[string]int64
-	StartTime *float64
-	Clusters  *usageClusterGauges
+	Samples         map[string]int64
+	StartTime       *float64
+	Clusters        *usageClusterGauges
+	Readings        map[string]int64
+	ReadingsPresent map[usageReadingKind]bool
+	// DataVolume is the watcher's data volume reading, nil when the body
+	// carried no complete one: not the watcher's, or a watcher whose statfs
+	// failed, or one built before it exported the series.
+	DataVolume *usageDataVolume
+}
+
+// usageDataVolume is one reading of the agent's data volume, in bytes.
+type usageDataVolume struct {
+	Total int64
+	Free  int64
 }
 
 // usageClusterGauges is the watcher's view of the fleet in one body: the
@@ -297,41 +464,65 @@ func (s *podUsageSource) Scrape(ctx context.Context, addr string, counters []str
 
 // foldUsageBody scans body line by line and keeps none of it: a line that could
 // be a wanted family -- each counter's own, the start-time gauge, and for the
-// watcher's body the per-cluster up gauge, one that contains a wanted name as a
-// substring -- is parsed on its own with expfmt, and a metric expfmt names as
-// one of them is folded as it is read, a counter's into its running sum under
-// its label filter and the up gauge into the cluster counts; every other line
-// is skipped unread. The substring is only a prefilter: the parser,
+// watcher's body the per-cluster up gauge and the data volume pair, one that
+// contains a wanted name as a substring -- is parsed on its own with expfmt,
+// and a metric expfmt names as one of them is folded as it is read, a
+// counter's into its running sum under its label filter, the up gauge into the
+// cluster counts and the volume pair into one reading; every other line is
+// skipped unread. The substring is only a prefilter: the parser,
 // not a hand-read of the line, names the metric, so the name in a comment or a
 // label value adds nothing and a UTF-8 name the parser accepts is not dropped by
 // a stricter hand-read. A candidate line that does not parse, or a sample that
 // is negative or not finite, is a failed scrape; a wanted line past the bound is
 // too, but a line of any other family past the bound is skipped, not a failure
-// (usageReadScrapeLine).
+// (usageReadScrapeLine). The broker's body, the one whose counters include the
+// proposals counter, is read for the proposal readings as well
+// (usageReadingSpecs), each field folded under its filter.
 func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	sums := make(map[string]float64, len(counters))
 	var start *float64
 	// wanted is every family the parser is asked to name in this body: each
 	// counter's, the start-time gauge, and the watcher's cluster gauge when
-	// the body is the watcher's.
+	// the body is the watcher's. A family feeds every counter that names it,
+	// each through its own filter: the broker's tool counter is read into
+	// two, over disjoint statuses.
 	var clusters *usageClusterGauges
-	counterOf := make(map[string]string, len(counters))
-	filters := make(map[string]usageLabelFilter, len(counters))
+	// volume collects the data volume series; a reading needs both kinds.
+	var volume map[string]float64
+	// readsOf is every (counter, filter) pair a family feeds, so a sibling
+	// family takes its own filter, not the one its counter's own family takes.
+	readsOf := make(map[string][]usageRead, len(counters))
 	wanted := []string{processStartTimeSeries}
+	want := func(family, counter string, filter usageLabelFilter) {
+		readsOf[family] = append(readsOf[family], usageRead{counter: counter, filter: filter})
+		if !slices.Contains(wanted, family) {
+			wanted = append(wanted, family)
+		}
+	}
 	for _, counter := range counters {
 		family, filter := usageSeriesFor(counter)
-		counterOf[family] = counter
-		filters[counter] = filter
 		sums[counter] = 0
-		wanted = append(wanted, family)
-		for _, sibling := range usageSiblingFamiliesFor(counter) {
-			counterOf[sibling] = counter
-			wanted = append(wanted, sibling)
+		want(family, counter, filter)
+		for _, sibling := range usageSiblingsFor(counter) {
+			want(sibling.family, counter, sibling.filter)
 		}
 		if family == eventsInjectedSeries {
 			clusters = &usageClusterGauges{}
-			wanted = append(wanted, clusterUpSeries)
+			volume = map[string]float64{}
+			wanted = append(wanted, clusterUpSeries, dataVolumeSeries)
+		}
+	}
+	// The reading slot, for the broker's body alone: a running sum per spec,
+	// whether a sample resolved it, and the readings whose age series the
+	// body carries.
+	var readings *usageReadingFold
+	if slices.Contains(counters, usageCounterRemediationsProposed) {
+		readings = newUsageReadingFold()
+		for _, family := range append([]string{vcsReadingsAgeSeries}, usageReadingFamilies()...) {
+			if !slices.Contains(wanted, family) {
+				wanted = append(wanted, family)
+			}
 		}
 	}
 	reader := bufio.NewReaderSize(body, usageScrapeLineBuffer)
@@ -388,6 +579,12 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 						start = &captured
 						continue
 					}
+					if name == dataVolumeSeries {
+						if kind := usageLabelValue(metric, dataVolumeKindLabel); kind == dataVolumeKindTotal || kind == dataVolumeKindFree {
+							volume[kind] = value
+						}
+						continue
+					}
 					if name == clusterUpSeries {
 						clusters.Registered++
 						if clusters.Registered > usageClusterGaugeCeiling {
@@ -398,11 +595,14 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 						}
 						continue
 					}
-					counter := counterOf[name]
-					if !usageLabelsMatch(metric, filters[counter]) {
+					if readings != nil && readings.fold(name, metric, value) {
 						continue
 					}
-					sums[counter] += value
+					for _, read := range readsOf[name] {
+						if usageLabelsMatch(metric, read.filter) {
+							sums[read.counter] += value
+						}
+					}
 				}
 			}
 		}
@@ -417,7 +617,114 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 		}
 		samples[counter] = int64(sum)
 	}
-	return usageReading{Samples: samples, StartTime: start, Clusters: clusters}, nil
+	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume)}
+	if readings != nil {
+		var ok bool
+		if out.Readings, out.ReadingsPresent, ok = readings.result(); !ok {
+			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+		}
+	}
+	return out, nil
+}
+
+// usageDataVolumeReading turns the data volume series a body carried into a
+// reading, or nil when it carried neither kind, only one, or a pair no statfs
+// produces (free past total, or a size past int64). Nil rather than a failed
+// scrape, so such a pair costs the volume fields and not the counters and
+// cluster gauges read from the same body. A NaN or negative sample fails the
+// whole scrape in foldUsageBody's sample check, as it does for any series.
+func usageDataVolumeReading(volume map[string]float64) *usageDataVolume {
+	total, hasTotal := volume[dataVolumeKindTotal]
+	free, hasFree := volume[dataVolumeKindFree]
+	if !hasTotal || !hasFree || total >= float64(math.MaxInt64) || free > total {
+		return nil
+	}
+	return &usageDataVolume{Total: int64(total), Free: int64(free)}
+}
+
+// usageReadingFold is the reading slot's state through one broker body.
+type usageReadingFold struct {
+	sums     []float64
+	resolved []bool
+	aged     map[usageReadingKind]bool
+}
+
+func newUsageReadingFold() *usageReadingFold {
+	return &usageReadingFold{
+		sums:     make([]float64, len(usageReadingSpecs)),
+		resolved: make([]bool, len(usageReadingSpecs)),
+		aged:     map[usageReadingKind]bool{},
+	}
+}
+
+// usageReadingFamilies is every family a reading field is read from.
+func usageReadingFamilies() []string {
+	var families []string
+	for _, spec := range usageReadingSpecs {
+		if !slices.Contains(families, spec.family) {
+			families = append(families, spec.family)
+		}
+	}
+	return families
+}
+
+// fold takes one sample of family name into the reading fields it feeds, or
+// marks a reading aged, and reports whether name is a readings family.
+func (f *usageReadingFold) fold(name string, metric *dto.Metric, value float64) bool {
+	if name == vcsReadingsAgeSeries {
+		kind := usageReadingKind(usageLabelValue(metric, vcsReadingsReadingLabel))
+		if slices.Contains(usageReadingKinds, kind) {
+			f.aged[kind] = true
+		}
+		return true
+	}
+	matched := false
+	for i, spec := range usageReadingSpecs {
+		if spec.family != name {
+			continue
+		}
+		matched = true
+		if usageLabelsMatch(metric, spec.filter) {
+			// A summed field adds every matching sample; a single-sample
+			// field takes the largest, so a body that repeats a label set
+			// (which no broker renders) cannot double it.
+			if spec.sum || !f.resolved[i] || value > f.sums[i] {
+				if spec.sum {
+					f.sums[i] += value
+				} else {
+					f.sums[i] = value
+				}
+			}
+			f.resolved[i] = true
+		}
+	}
+	return matched
+}
+
+// result is the readings present in the body and their fields' values: a
+// reading is present when its age series was in the body and every field of
+// it resolved, a sum resolving on no sample at all. ok is false when a value
+// is past the float64-exact ceiling, which no forge's count reaches.
+func (f *usageReadingFold) result() (values map[string]int64, present map[usageReadingKind]bool, ok bool) {
+	present = map[usageReadingKind]bool{}
+	for _, kind := range usageReadingKinds {
+		present[kind] = f.aged[kind]
+	}
+	for i, spec := range usageReadingSpecs {
+		if !spec.sum && !f.resolved[i] {
+			present[spec.reading] = false
+		}
+	}
+	values = map[string]int64{}
+	for i, spec := range usageReadingSpecs {
+		if f.sums[i] > float64(usageTotalCeiling) {
+			return nil, nil, false
+		}
+		if present[spec.reading] {
+			values[spec.field] = int64(f.sums[i])
+		}
+	}
+	return values, present, true
 }
 
 // usageLabelsMatch reports whether metric carries, for every label the filter

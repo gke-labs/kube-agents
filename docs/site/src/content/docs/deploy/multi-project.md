@@ -135,7 +135,7 @@ which is the canonical list. Set them once:
 ```bash
 AGENT_SA="kubeagents-platform-gsa@<INSTALL_PROJECT_ID>.iam.gserviceaccount.com"
 ROLES="roles/container.clusterViewer roles/container.viewer roles/compute.viewer
-  roles/monitoring.viewer roles/logging.viewer roles/iam.securityReviewer"
+  roles/monitoring.viewer roles/logging.viewer roles/iam.securityReviewer roles/gkehub.viewer"
 ```
 
 Then bind them with **either** per-project bindings or a single folder-level

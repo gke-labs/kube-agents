@@ -88,6 +88,14 @@ MANAGED_REPOS_KEY = "managed_repos"
 CONTEXT_REPOS_KEY = "context_repos"
 
 
+#: The gitops-state ConfigMap key that names the repository with role gitops,
+#: as one `managed_repos` entry (`{"type", "url"}`). The operator writes it
+#: only when exactly one repository has that role, and removes it when none
+#: has or when two have it (`gitopsStateGitOpsRepoKey` in
+#: `platformagent_controller.go`).
+GITOPS_REPO_KEY = "gitops_repo"
+
+
 def agent_home() -> str:
     """The agent's data root — which is not always `/opt/data`.
 
@@ -167,6 +175,9 @@ LOGGER = logging.getLogger(__name__)
 #: there.
 GITHUB_REPO_TYPE = "github"
 
+#: The `type` of a self-managed Gitea forge's `managed_repos` entries.
+GITEA_REPO_TYPE = "gitea"
+
 #: What a forge with no noun of its own calls a change proposal, and what every
 #: name that is not a managed repository on another forge is spoken of as.
 DEFAULT_PROPOSAL_NOUN = "pull request"
@@ -177,7 +188,11 @@ DEFAULT_PROPOSAL_NOUN = "pull request"
 #: broker's dependencies, and an import there would fail every consumer on
 #: every install. Kept in step with the forge classes by
 #: `test_gitops_workspace.TestForgeTable`, which runs where `providers` is.
-FORGE_PROPOSAL_NOUNS = {GITHUB_REPO_TYPE: "pull request", "gitlab": "merge request"}
+FORGE_PROPOSAL_NOUNS = {
+    GITHUB_REPO_TYPE: "pull request",
+    "gitlab": "merge request",
+    GITEA_REPO_TYPE: "pull request",
+}
 
 #: How a host-qualified name's `/` is spelt in its workspace directory name.
 ENCODED_SEPARATOR = "%2F"
@@ -755,7 +770,13 @@ def ensure_scratch_workspace(
 
 
 def _now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # The argument is deliberate. `time.gmtime()` with none reads the C
+    # `time()` call, the coarse clock on Linux, which trails `time.time()`
+    # by a second for a moment after each second boundary. The fleet audit's
+    # in-flight note stamps `started_at` from `time.time()` and accepts a
+    # lease only if `refreshed_at` is not older than that, so the two stamps
+    # have to come from one clock or the run disowns the lease it just wrote.
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
 
 
 def _remove_tree(path: Path) -> None:
@@ -1571,15 +1592,26 @@ def _forge_repo_names(
         if kind not in served:
             LOGGER.warning("Skipping %s repository %r: no provider for type %r.", key, url, kind)
             continue
-        if _names_a_port(url):
+        if _names_a_port(url) and (kind != GITEA_REPO_TYPE or "://" not in str(url)):
             # Before parsing: the parser reads a URL's host without its port
             # and a bare `host:8443/path` as an scp remote, so either would
             # come back named on another endpoint than the one registered.
-            LOGGER.warning(
-                "Skipping %s repository %r: a host with a port is not supported; "
-                "the broker serves a forge on its standard HTTPS port only.",
-                key, url,
-            )
+            # Self-managed Gitea URLs seeded by the operator carry `://` and
+            # an explicit port (`http://gitea:3000/owner/repo`), which the
+            # broker's GiteaForge matches by host and reaches on its
+            # configured port.
+            if kind == GITEA_REPO_TYPE:
+                LOGGER.warning(
+                    "Skipping %s repository %r: write a Gitea repository with a port "
+                    "as a full URL (scheme://host:port/owner/repo), or omit the port.",
+                    key, url,
+                )
+            else:
+                LOGGER.warning(
+                    "Skipping %s repository %r: a host with a port is not supported; "
+                    "the broker serves a forge on its standard HTTPS port only.",
+                    key, url,
+                )
             continue
         ref = repo_ref.try_parse(url)
         if ref is None or not ref.host or not HOSTNAME_RE.fullmatch(ref.host):
@@ -1620,7 +1652,10 @@ def _forge_repo_names(
     return github + others
 
 
-_PORT_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^/@]+@)?[^/:]+:\d+(?:/|$)", re.I)
+_PORT_RE = re.compile(
+    r"^(?:[a-z][a-z0-9+.-]*://(?:[^/@]+@)?[^/:]+:\d+(?:/|$)|[^/@:]+:\d+(?:/|$)|[^/@]+@[^/:]+:\d+/[^/]+/)",
+    re.I,
+)
 
 
 def _names_a_port(url: str) -> bool:
@@ -1694,6 +1729,79 @@ def get_context_github_repo_entries() -> list[dict]:
     rule, same warning, same one-way relationship to the managed list.
     """
     return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True, enterprise=True)
+
+
+def gitops_repo_key_text() -> str:
+    """The raw value of the `gitops_repo` key, stripped; "" when the key is absent.
+
+    Raises `RuntimeError` when the value cannot be read, as `get_managed_repos`
+    does, so that a caller can tell "no key" from "could not read the key".
+    """
+    return _read_state_text(GITOPS_REPO_KEY).strip()
+
+
+def get_gitops_repo(managed: list[str] | None = None) -> str | None:
+    """The repository with role gitops, with the name that `get_managed_repos` gives it.
+
+    That is the bare `owner/name` on github.com, and `<host>/<path>` on GitLab
+    and on a GitHub Enterprise Server host. The value is read from the
+    operator's `gitops_repo` key and matched against `managed_repos`, so the
+    name is always a name that the verbs accept. `managed` is the result of
+    `get_managed_repos` when the caller has read it already.
+
+    None when the key is absent, empty, cannot be read or parsed, or names a
+    repository that is not in `managed_repos`. The ConfigMap is
+    administrator-writable, and an administrator can remove the repository
+    from the list and keep the key: a stale key must not choose a repository
+    that the install does not manage.
+    """
+    try:
+        text = gitops_repo_key_text()
+    except Exception:  # noqa: BLE001 - None is the documented answer
+        return None
+    if not text:
+        return None
+    try:
+        item = json.loads(text)
+    except json.JSONDecodeError as err:
+        LOGGER.warning("Ignoring %s: it is not a JSON {type, url} entry: %s", GITOPS_REPO_KEY, err)
+        return None
+    if not isinstance(item, dict):
+        LOGGER.warning("Ignoring %s: it is not a JSON {type, url} entry: %r", GITOPS_REPO_KEY, text)
+        return None
+    wanted = _parse_repos_json(json.dumps([item]), GITOPS_REPO_KEY)
+    wanted_keys = _repository_keys(wanted, GITOPS_REPO_KEY) if wanted else []
+    if not wanted_keys:
+        return None
+    try:
+        entries = get_managed_repo_entries()
+        if managed is None:
+            managed = get_managed_repos()
+    except Exception:  # noqa: BLE001 - the resolver's own read reports it
+        return None
+    # The entry as the list spells it: the same URL first, then the same
+    # repository in another spelling.
+    exact = [entry for entry in entries if entry == wanted[0]]
+    same = exact or [
+        entry for entry in entries
+        if _repository_keys([entry], MANAGED_REPOS_KEY) == wanted_keys
+    ]
+    if not same:
+        LOGGER.warning(
+            "Ignoring %s %r: it names a repository that is not in %s.",
+            GITOPS_REPO_KEY, wanted[0].get("url"), MANAGED_REPOS_KEY,
+        )
+        return None
+    context = mounted_repo_entries(CONTEXT_REPOS_KEY)
+    for name in _forge_repo_names(same[:1], MANAGED_REPOS_KEY, list(entries) + list(context)):
+        if name in managed:
+            return name
+    LOGGER.warning(
+        "Ignoring %s %r: its %s entry is one that this image skips (the warning "
+        "above for that entry says why), so it names no repository the verbs accept.",
+        GITOPS_REPO_KEY, wanted[0].get("url"), MANAGED_REPOS_KEY,
+    )
+    return None
 
 
 def resolve_repo(workspace: str | Path | None = None) -> str:
