@@ -607,6 +607,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.CREATE.KV_feedback",
 			"$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
+			"$JS.API.STREAM.CREATE.DISPATCH_STOPS",
 			"$JS.API.STREAM.INFO.TASKS",
 			"$JS.API.STREAM.INFO.DIRECTORY",
 			"$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -617,6 +618,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.INFO.KV_feedback",
 			"$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+			"$JS.API.STREAM.INFO.DISPATCH_STOPS",
 			"_INBOX.provision.>",
 		},
 		subscribe: []string{
@@ -1055,13 +1057,19 @@ func webIdentity() a2aIdentity {
 		// subject alone also takes away the reply traffic, which this
 		// credential had no reason to see either.
 		//
-		// TODO(#3889): deny `a2a.dispatch.>` here and on console when the
-		// dispatch subjects land. Neither reads offers, and an offer will
-		// carry a task credential (bound to its pod, so useless copied, but
-		// no reason to hand it to a browser).
-		denySubscribe: []string{"a2a.cap.>"},
+		// The dispatch hand-off and the stop records are denied too. Neither
+		// is this credential's to read: a confirm carries a task's
+		// credentials (bound to its pod, so useless copied, but no reason to
+		// hand them to a browser), and a stop record names a task being
+		// cancelled.
+		denySubscribe: a2aBrowserSubscribeDeny,
 	}
 }
+
+// a2aBrowserSubscribeDeny is what web and console, the credentials a
+// browser holds, may not read under their `a2a.>`: the verifier's subjects
+// (see webIdentity), the dispatcher's hand-off, and the stop records.
+var a2aBrowserSubscribeDeny = []string{"a2a.cap.>", "a2a.dispatch.>", a2aDispatchStopPrefix + ">"}
 
 // console: the web console's credential - the read surface plus one narrow
 // publish, the inbound chat subject the gateway's console adapter subscribes.
@@ -1127,7 +1135,7 @@ func consoleIdentity() a2aIdentity {
 		// verifier's request subject, and any subscriber may join its
 		// queue group and swallow a share of every verify request. This
 		// password is handed to a browser too (console.go's /config.json).
-		denySubscribe: []string{"a2a.cap.>"},
+		denySubscribe: a2aBrowserSubscribeDeny,
 	}
 }
 

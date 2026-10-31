@@ -51,7 +51,7 @@ var consoleSubscribe = []string{"a2a.>", "chat.console.*.out", "_INBOX.console.>
 // would grant what the cluster refuses.
 var (
 	consolePublishDeny   []string
-	consoleSubscribeDeny = []string{"a2a.cap.>"}
+	consoleSubscribeDeny = []string{"a2a.cap.>", "a2a.dispatch.>", "a2a.stop.>"}
 )
 
 // renderedConf is the operator's render the callout suite starts from.

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -94,7 +95,15 @@ func TestTheDispatcherIdentityHoldsOnlyItsContractGrants(t *testing.T) {
 			t.Errorf("the dispatcher can't publish %s", want)
 		}
 	}
-	for _, want := range []string{"a2a.dispatch.*.*.*.accept", "a2a.dispatch.*.*.*.lease", "a2a.cap.reply.dispatcher.>"} {
+	if !slices.Contains(id.publish, "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.tse.*") {
+		t.Error("the dispatcher can't read its profile's stop records by subject")
+	}
+	for _, p := range id.publish {
+		if strings.HasPrefix(p, "a2a.stop.") || p == "$JS.API.DIRECT.GET.DISPATCH_STOPS.>" {
+			t.Errorf("the dispatcher publishes %s: stop records are the gateway's to write, and it reads only its own profiles'", p)
+		}
+	}
+	for _, want := range []string{"a2a.stop.tse.*", "a2a.dispatch.*.*.*.accept", "a2a.dispatch.*.*.*.lease", "a2a.cap.reply.dispatcher.>"} {
 		if !slices.Contains(id.subscribe, want) {
 			t.Errorf("the dispatcher can't subscribe %s", want)
 		}
@@ -493,5 +502,62 @@ func TestHandleDeletionRemovesTheDispatchersPodReadRBAC(t *testing.T) {
 				t.Errorf("a foreign %T under the dispatcher's name was deleted: %v", obj, err)
 			}
 		}
+	}
+}
+
+// The task credential lifetime ceiling is one value for the minter and both
+// verifiers. A dispatcher minting longer than the callout or the broker
+// allows has every credential refused, which fails every profile task.
+func TestTheCredentialLifetimeIsOneValueForMinterAndVerifiers(t *testing.T) {
+	withDispatcher(t)
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.UID = "agent-uid"
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{
+		Profiles: &agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(900)},
+	}}
+	profile := testAgentProfile(agent.Namespace, "auditor")
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, &profile, profileNamespaceObject(agent)).Build()
+	cfg, err := (&PlatformAgentReconciler{Client: cl, Scheme: scheme}).credentialProxyProfileConfigFor(context.Background(), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifetime := func(env []corev1.EnvVar) string {
+		for _, e := range env {
+			if e.Name == credentialProxyTaskCredentialMaxLifetimeEnvVar {
+				return e.Value
+			}
+		}
+		return "(absent)"
+	}
+	got := map[string]string{
+		"callout":    lifetime(buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers[0].Env),
+		"broker":     lifetime(credentialProxyProfileEnv(cfg)),
+		"dispatcher": lifetime(buildA2ADispatcherDeployment(agent).Spec.Template.Spec.Containers[0].Env),
+	}
+	for who, v := range got {
+		if v != "15m0s" {
+			t.Errorf("the %s's credential lifetime = %s, want the install's 900s cap (15m0s); all three: %v", who, v, got)
+		}
+	}
+}
+
+// The dispatch config's submission retention is the stream's max age, as the
+// provision script renders it: a dispatcher keeping tombstones for less than
+// the stream keeps submissions would let a re-created durable replay
+// finished tasks.
+func TestTheDispatchConfigsRetentionIsTheSubmitStreamsMaxAge(t *testing.T) {
+	agent := a2aTestAgent()
+	cfg, err := desiredDispatchConfig(agent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`stream add PROFILE_SUBMITS[^\n]*\n[^\n]*\n\s*--max-age=(\d+)h`).FindStringSubmatch(a2aProvisionScript(agent))
+	if m == nil {
+		t.Fatal("no PROFILE_SUBMITS --max-age in the provision script")
+	}
+	hours, _ := strconv.Atoi(m[1])
+	if cfg.SubmitRetentionSeconds != hours*3600 || cfg.SubmitRetentionSeconds == 0 {
+		t.Errorf("the dispatch config's submitRetentionSeconds = %d, the stream's max age %dh", cfg.SubmitRetentionSeconds, hours)
 	}
 }

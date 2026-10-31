@@ -768,8 +768,9 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	if !reflect.DeepEqual(gotSub, wantSub) {
 		t.Errorf("console subscribe allow-list changed.\n got: %q\nwant: %q", gotSub, wantSub)
 	}
-	// web's subtraction: `a2a.>` covers the verifier's queue group.
-	if want := []string{"a2a.cap.>"}; !reflect.DeepEqual(gotSubDeny, want) {
+	// web's subtractions: `a2a.>` covers the verifier's queue group, the
+	// dispatcher's hand-off and the stop records.
+	if want := []string{"a2a.cap.>", "a2a.dispatch.>", "a2a.stop.>"}; !reflect.DeepEqual(gotSubDeny, want) {
 		t.Errorf("console subscribe deny-list = %q, want %q", gotSubDeny, want)
 	}
 	// No verb on any KV_* stream, STREAM.INFO included: its subjects_filter

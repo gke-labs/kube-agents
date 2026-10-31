@@ -744,7 +744,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 							// clamps task deadlines with, so the dispatcher never
 							// issues a credential this callout refuses. A callout
 							// from before #3889 ignores it.
-							{Name: "A2A_TASK_CREDENTIAL_MAX_LIFETIME", Value: resolveProfileMaxTaskDeadline(agent).String()},
+							a2aTaskCredentialMaxLifetimeEnv(agent),
 							// The static nats.conf users, which no identity map
 							// carries: a narrowed pod named after one would
 							// hold its inbox. Plain names, no password.

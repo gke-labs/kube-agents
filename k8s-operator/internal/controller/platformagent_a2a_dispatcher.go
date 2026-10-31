@@ -117,6 +117,10 @@ func a2aDispatcherPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]str
 //     headers, so this publisher can't purge the stream.
 //   - the verifier, for CheckProfileRun, on its own caller subject, with
 //     answers in its own reply namespace.
+//   - stop records (contract addendum 9), per profile it dispatches for:
+//     subscribe on a2a.stop.<profile>.*, and a direct get of the same
+//     subjects on DISPATCH_STOPS to catch up after a restart. The gateway is
+//     their only writer.
 //
 // No subscribe on a2a.tasks.> or a2a.submit.>: it reads submissions only
 // through its durables, and never a task's .in or .events.
@@ -130,8 +134,14 @@ func dispatcherIdentity(agent *agentv1alpha1.PlatformAgent, ns string, profiles,
 			"$JS.ACK."+a2aProfileSubmitStream+"."+d+".>",
 		)
 	}
+	var stops []string
 	for _, p := range profiles {
-		perProfile = append(perProfile, "a2a.tasks."+p+".*.supervisor")
+		perProfile = append(perProfile,
+			"a2a.tasks."+p+".*.supervisor",
+			// A stop record's catch-up read after a restart, by subject.
+			"$JS.API.DIRECT.GET."+a2aDispatchStopStream+"."+a2aDispatchStopPrefix+p+".*",
+		)
+		stops = append(stops, a2aDispatchStopPrefix+p+".*")
 	}
 	return a2aIdentity{
 		user:    a2aDispatcherUser,
@@ -156,13 +166,49 @@ func dispatcherIdentity(agent *agentv1alpha1.PlatformAgent, ns string, profiles,
 			"a2a.cap.verify."+a2aDispatcherUser,
 			"_INBOX."+a2aDispatcherUser+".>",
 		),
-		subscribe: []string{
+		subscribe: append(stops,
 			"a2a.dispatch.*.*.*.accept",
 			"a2a.dispatch.*.*.*.lease",
-			"a2a.cap.reply." + a2aDispatcherUser + ".>",
-			"_INBOX." + a2aDispatcherUser + ".>",
-		},
+			"a2a.cap.reply."+a2aDispatcherUser+".>",
+			"_INBOX."+a2aDispatcherUser+".>",
+		),
 	}
+}
+
+// The dispatcher signs task credentials (#3889, contract addendum 8) with the
+// task-signing seed from #4130's Secret, mounted into its container alone:
+// read-only, mode 0400, by file and not by env, and with no Secret read in its
+// RBAC. Nothing else in the install mounts or references that key
+// (TestOnlyTheDispatcherHoldsTheTaskSigningSeed).
+const (
+	// a2aDispatcherUID is the dispatcher's user, and its FSGroup, so the
+	// seed's group read reaches it.
+	a2aDispatcherUID = 1000
+
+	a2aTaskSigningSeedFileEnvVar = "A2A_TASK_SIGNING_SEED_FILE"
+	a2aTaskSigningSeedVolume     = "task-signing-seed"
+	a2aTaskSigningSeedMountPath  = "/var/run/kube-agents/task-signing"
+	a2aTaskSigningSeedFile       = "seed"
+)
+
+func a2aTaskSigningSeedVolumeSource(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+	return corev1.Volume{
+		Name: a2aTaskSigningSeedVolume,
+		VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+			SecretName:  a2aTaskSigningKeyName(agent),
+			Items:       []corev1.KeyToPath{{Key: a2aTaskSigningSeedKey, Path: a2aTaskSigningSeedFile}},
+			DefaultMode: ptr.To(int32(0o400)),
+		}},
+	}
+}
+
+// a2aTaskCredentialMaxLifetimeEnv is the one lifetime ceiling the minter and
+// both verifiers read: the dispatcher mints no credential past it, and the
+// callout and the broker refuse one that is. Rendered from one resolver for
+// all three, because a dispatcher minting longer than a verifier allows has
+// every credential refused, which fails every profile task.
+func a2aTaskCredentialMaxLifetimeEnv(agent *agentv1alpha1.PlatformAgent) corev1.EnvVar {
+	return corev1.EnvVar{Name: credentialProxyTaskCredentialMaxLifetimeEnvVar, Value: resolveProfileMaxTaskDeadline(agent).String()}
 }
 
 func buildA2ADispatcherServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.ServiceAccount {
@@ -204,8 +250,15 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 					// principal.
 					AutomountServiceAccountToken: ptr.To(true),
 					SecurityContext: &corev1.PodSecurityContext{
-						RunAsNonRoot:   ptr.To(true),
-						RunAsUser:      ptr.To(int64(1000)),
+						RunAsNonRoot: ptr.To(true),
+						RunAsUser:    ptr.To(int64(a2aDispatcherUID)),
+						// The seed is a Secret volume, whose files the kubelet
+						// writes as root. A projected token is owned by
+						// RunAsUser, a Secret's file isn't, so without a group
+						// the 0400 seed is unreadable to this UID and the
+						// dispatcher can't start. With FSGroup the kubelet makes
+						// it root:<FSGroup> and adds group read, 0440.
+						FSGroup:        ptr.To(int64(a2aDispatcherUID)),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Containers: []corev1.Container{{
@@ -219,9 +272,12 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 								FieldPath: "metadata.namespace",
 							}}},
 							{Name: "DISPATCH_CONFIGMAP", Value: a2aDispatchConfigName(agent)},
+							{Name: a2aTaskSigningSeedFileEnvVar, Value: a2aTaskSigningSeedMountPath + "/" + a2aTaskSigningSeedFile},
+							a2aTaskCredentialMaxLifetimeEnv(agent),
 						},
-						VolumeMounts: []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount()},
-						Ports:        []corev1.ContainerPort{{Name: "status", ContainerPort: a2aDispatcherStatusPort}},
+						VolumeMounts: []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount(),
+							{Name: a2aTaskSigningSeedVolume, MountPath: a2aTaskSigningSeedMountPath, ReadOnly: true}},
+						Ports: []corev1.ContainerPort{{Name: "status", ContainerPort: a2aDispatcherStatusPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 								Path: "/readyz", Port: intstr.FromInt32(a2aDispatcherStatusPort),
@@ -240,7 +296,7 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 							a2aDispatcherCPULimit, a2aDispatcherMemoryLimit),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent)},
+					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), a2aTaskSigningSeedVolumeSource(agent)},
 				},
 			},
 		},
@@ -414,17 +470,20 @@ func dispatcherGrantNames(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 // a2aDispatchConfig is lib.DispatchConfig as this module renders it; the
 // dispatch-config test decodes the render into lib's type.
 type a2aDispatchConfig struct {
-	Version              string               `json:"version"`
-	Namespace            string               `json:"namespace"`
-	ProfileNamespace     string               `json:"profileNamespace"`
-	Ceiling              int                  `json:"ceiling"`
-	InteractiveReserve   int                  `json:"interactiveReserve"`
-	ChildReserve         int                  `json:"childReserve"`
-	LeaseSeconds         int                  `json:"leaseSeconds"`
-	RenewSeconds         int                  `json:"renewSeconds"`
-	RestartGraceSeconds  int                  `json:"restartGraceSeconds"`
-	AcceptTimeoutSeconds int                  `json:"acceptTimeoutSeconds"`
-	Profiles             []a2aDispatchProfile `json:"profiles"`
+	Version              string `json:"version"`
+	Namespace            string `json:"namespace"`
+	ProfileNamespace     string `json:"profileNamespace"`
+	Ceiling              int    `json:"ceiling"`
+	InteractiveReserve   int    `json:"interactiveReserve"`
+	ChildReserve         int    `json:"childReserve"`
+	LeaseSeconds         int    `json:"leaseSeconds"`
+	RenewSeconds         int    `json:"renewSeconds"`
+	RestartGraceSeconds  int    `json:"restartGraceSeconds"`
+	AcceptTimeoutSeconds int    `json:"acceptTimeoutSeconds"`
+	// SubmitRetentionSeconds is lib.DispatchConfig's: PROFILE_SUBMITS'
+	// max age, from the constant the provision script renders it from.
+	SubmitRetentionSeconds int                  `json:"submitRetentionSeconds,omitempty"`
+	Profiles               []a2aDispatchProfile `json:"profiles"`
 }
 
 type a2aDispatchProfile struct {
@@ -458,16 +517,17 @@ func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 	ceiling := resolveProfileCeiling(agent)
 	child, interactive := dispatchReserves(agent, ceiling)
 	cfg := a2aDispatchConfig{
-		Namespace:            agent.Namespace,
-		ProfileNamespace:     profileNamespaceName(agent),
-		Ceiling:              ceiling,
-		InteractiveReserve:   interactive,
-		ChildReserve:         child,
-		LeaseSeconds:         resolveProfileLeaseSeconds(agent),
-		RenewSeconds:         resolveProfileRenewSeconds(agent),
-		RestartGraceSeconds:  resolveProfileRestartGraceSeconds(agent),
-		AcceptTimeoutSeconds: resolveProfileAcceptTimeoutSeconds(agent),
-		Profiles:             []a2aDispatchProfile{},
+		Namespace:              agent.Namespace,
+		ProfileNamespace:       profileNamespaceName(agent),
+		Ceiling:                ceiling,
+		InteractiveReserve:     interactive,
+		ChildReserve:           child,
+		LeaseSeconds:           resolveProfileLeaseSeconds(agent),
+		RenewSeconds:           resolveProfileRenewSeconds(agent),
+		RestartGraceSeconds:    resolveProfileRestartGraceSeconds(agent),
+		AcceptTimeoutSeconds:   resolveProfileAcceptTimeoutSeconds(agent),
+		SubmitRetentionSeconds: int(a2aProfileSubmitMaxAge / time.Second),
+		Profiles:               []a2aDispatchProfile{},
 	}
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {
@@ -552,6 +612,12 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 				"AgentProfile %s: spec.lifecycle.activeDeadlineSeconds %d is clamped to %ds by the install's task deadline cap (spec.harness.tuning.profiles.maxTaskDeadlineSeconds), so its tasks end at %ds",
 				profiles[i].Name, profiles[i].Spec.Lifecycle.ActiveDeadlineSeconds, d, d))
 		}
+	}
+	// The task-signing key before the Deployment that mounts its seed: the
+	// pod can't start on a Secret that isn't there. #4130 made the key; this
+	// only ensures it exists.
+	if _, err := r.ensureA2ATaskSigningKeySecret(ctx, agent); err != nil {
+		return nil, fmt.Errorf("failed to ensure the A2A task-signing key for the dispatcher: %w", err)
 	}
 	// The identity before the Deployment that mounts a token for it, and the
 	// config and its Role before the pod that watches them.
