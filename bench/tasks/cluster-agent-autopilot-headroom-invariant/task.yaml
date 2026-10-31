@@ -1,0 +1,94 @@
+# NIGHTLY — an entry in hack/eval/nightly-cases.txt.
+#
+# Domain: cost (GKE Autopilot headroom invariant). Journey: a user asks for a
+# compute optimization audit on the host Autopilot cluster after a naive cost
+# scan flagged `kube-system/gke-system-balloon-pod` pods reserving whole vCPUs;
+# the delegated worker recognizes `gke-system-balloon-pod` as normal GKE
+# Autopilot scheduling headroom from its persona invariant without burning turns
+# on per-pod inspection or documentation/web search rabbit holes, and scopes its
+# live optimization read to non-system user workloads (#3141).
+#
+# What it catches. Without the Autopilot Headroom Invariant in the Cluster Agent
+# and Platform Agent personas, workers dispatched to GKE Autopilot clusters
+# investigate `gke-system-balloon-pod` pods through `kubectl` queries,
+# `mcp-developer_knowledge` searches, and `web_search` loops, or flag them as
+# idle waste. The route checks verify that work was delegated through kanban,
+# no worker command targets `balloon` pods directly, and no worker invokes
+# `mcp-developer_knowledge` or `web_search` to look them up; the report check
+# verifies that `gke-system-balloon-pod` is explained as GKE Autopilot headroom
+# rather than proposed for deletion or rightsizing.
+#
+# Works whether the host cluster routes to its dedicated Cluster Agent profile
+# or falls back to `platform` when the host profile has not yet been scaffolded
+# (same routing contract as `chat-routing-this-cluster-namespaces`).
+#
+# Planted defect required: none. Isolation class: read-only. Eligible tier:
+# nightly.
+id: cluster-agent-autopilot-headroom-invariant
+name: Autopilot optimization audit treats gke-system-balloon-pod as platform headroom without inspection loops
+prompt: >-
+  Audit compute optimization opportunities on this cluster. Our cost scan
+  flagged kube-system/gke-system-balloon-pod pods reserving whole vCPUs —
+  inspect this cluster's workloads and tell me whether gke-system-balloon-pod
+  or any user workloads are idle waste or candidates for rightsizing. Do not
+  change anything.
+expected_output: >-
+  The front door delegates the audit for this host cluster without asking which
+  cluster is meant. The worker explains directly from the GKE Autopilot
+  Headroom Invariant that gke-system-balloon-pod pods are normal GKE Autopilot
+  spare scheduling headroom (preempted automatically when user pods need
+  capacity) rather than idle waste or rightsizing candidates, runs no per-pod
+  kubectl queries or documentation/web searches on gke-system-balloon-pod, and
+  scopes its live workload inspection strictly to non-system user namespaces.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: cost
+
+owner: fkc1e100
+
+fixtures: []
+
+verification_spec:
+  - name: work-was-delegated-through-kanban
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  - name: no-deep-inspection-commands-target-balloon-pods
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        - '(?i)\bkubectl\b[^\n|]*\b(?:get|describe|logs|top)\b[^\n|]*balloon|(?:^|\|)\s*grep\b(?![^\n|]*\s-v\b)[^\n|]*balloon'
+  - name: no-doc-or-web-search-rabbit-hole
+    role: objective
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          scope: workers
+          tool_names:
+            - "web_search"
+            - "mcp__developer_knowledge__search_documents"
+            - "mcp_developer_knowledge_search_documents"
+            - "mcp__developer_knowledge__get_documents"
+            - "mcp_developer_knowledge_get_documents"
+            - "mcp__developer_knowledge__answer_query"
+            - "mcp_developer_knowledge_answer_query"
+  - name: report-identifies-balloon-pods-as-autopilot-headroom
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["gke-system-balloon-pod"]
+      required_patterns:
+        - '(?i)\bautopilot\b'
+        - '(?i)\b(?:headroom|spare capacity|capacity reservation|overprovisioning|placeholder|preempt(?:ible|ed|ion)?)\b'
+      forbidden_patterns:
+        - '(?i)(?:^|[.!?;]\s+)(?![^.!?;]*\b(?:do not|dont|never|not|neither|nor|avoid|refrain|cannot|cant|shouldnt|mustnt|instead of|rather than)\b)[^.!?;]*\b(?:delete|remove|scale down|right-?size)\s+(?:(?:the|all|these|those|any)\s+)?(?:kube-system/)?gke-system-balloon-pod'
