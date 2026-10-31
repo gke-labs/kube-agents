@@ -348,8 +348,8 @@ Execution limits per agent persona, where `<persona>` is one of `default` (the P
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
 `maxInProgress`, the mode-next session-pod cap `maxSessions`, and the AgentProfile knobs under
 `profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)). Unset,
-`maxSessions` renders `10`, `profiles.ceiling` takes `maxInProgress`'s value (`6` unless set) and
-`profiles.warmReplicas` `1`; all three are inert under `mode: today`.
+`maxSessions` renders `10`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`; all three are
+inert under `mode: today`.
 
 **The per-run limits are opt-in.** The operator pins nothing of its own there: what a fleet needs
 depends on its model quota and on what its agents actually do, so a deployment doing short

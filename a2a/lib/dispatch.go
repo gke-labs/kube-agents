@@ -351,7 +351,7 @@ type DispatchProfile struct {
 	Durables []DispatchDurable `json:"durables"`
 }
 
-// DispatchDurable names one shared durable on TASKS.
+// DispatchDurable names one shared durable on ProfileSubmitStream.
 type DispatchDurable struct {
 	Tier string `json:"tier"`
 	Kind string `json:"kind"`

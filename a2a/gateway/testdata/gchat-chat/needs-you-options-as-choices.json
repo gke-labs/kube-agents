@@ -1,0 +1,51 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*Which checkout-gateway did you mean?*\n\nTwo clusters run one. Which?",
+    "widgets": [
+      {
+        "buttonList": {
+          "buttons": [
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "seeded-reliability"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "0"
+                    }
+                  ]
+                }
+              },
+              "text": "seeded-reliability"
+            },
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "seeded-debug"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "1"
+                    }
+                  ]
+                }
+              },
+              "text": "seeded-debug"
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

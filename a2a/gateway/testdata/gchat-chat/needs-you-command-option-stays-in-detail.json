@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*Should I go on with the drain?*\n\n- continue\n- stop",
+    "widgets": null
+  }
+]
