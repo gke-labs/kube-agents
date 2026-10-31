@@ -3,11 +3,14 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -21,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
 )
 
 // walkBusMigration runs a migration from its first phase, failing the phase
@@ -827,5 +831,125 @@ func TestAStepsJobStopsBeforeItsCredentialExpires(t *testing.T) {
 	}
 	if gap := ids[0].notAfter.Sub(jobEnd); gap < 5*time.Minute {
 		t.Errorf("the Job stops %v before its principal expires; want a margin of minutes", gap)
+	}
+}
+
+// provisionCreateLines is every `stream add` / `kv add` in the rendered
+// provision script, continuations joined, keyed by stream name, as flag maps.
+func provisionCreateLines(t *testing.T) map[string]map[string]string {
+	t.Helper()
+	script := buildA2AProvisionJob(a2aTestAgent()).Spec.Template.Spec.Containers[0].Command[2]
+	script = strings.ReplaceAll(script, "\\\n", " ")
+	lines := map[string]map[string]string{}
+	for _, line := range strings.Split(script, "\n") {
+		_, add, ok := strings.Cut(line, "|| $NATS ")
+		if !ok {
+			continue
+		}
+		f := strings.Fields(add)
+		if len(f) < 3 || f[1] != "add" || (f[0] != "stream" && f[0] != "kv") {
+			continue
+		}
+		name := f[2]
+		if f[0] == "kv" {
+			name = "KV_" + name
+		}
+		flags := map[string]string{"kind": f[0]}
+		for _, tok := range f[3:] {
+			k, v, _ := strings.Cut(strings.TrimPrefix(tok, "--"), "=")
+			flags[k] = strings.Trim(v, `'"`)
+		}
+		lines[name] = flags
+	}
+	if len(lines) == 0 {
+		t.Fatal("no create lines found in the provision script; this test would pass vacuously")
+	}
+	return lines
+}
+
+// The table the restore checks is the provision script, flag for flag: the
+// same streams, and every value the script passes on a policy field.
+func TestTheStreamPoliciesAreTheProvisionScripts(t *testing.T) {
+	lines := provisionCreateLines(t)
+	policies := a2aStreamPolicies(1)
+	var names []string
+	for _, p := range policies {
+		names = append(names, p.Name)
+	}
+	if !slices.Equal(names, a2aProvisionedStreams) {
+		t.Errorf("policy streams %v, provisioned %v", names, a2aProvisionedStreams)
+	}
+	dur := func(s string) time.Duration {
+		if s == "" {
+			return 0
+		}
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			t.Fatalf("duration %q: %v", s, err)
+		}
+		return d
+	}
+	num := func(s string, absent int64) int64 {
+		if s == "" {
+			return absent
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			t.Fatalf("number %q: %v", s, err)
+		}
+		return n
+	}
+	for _, p := range policies {
+		f, ok := lines[p.Name]
+		if !ok {
+			t.Errorf("%s: no create line in the provision script", p.Name)
+			continue
+		}
+		if f["replicas"] != "${STREAM_REPLICAS}" {
+			t.Errorf("%s: replicas %q, want the run's STREAM_REPLICAS", p.Name, f["replicas"])
+		}
+		if !strings.EqualFold(f["storage"], p.Storage.String()) {
+			t.Errorf("%s: storage %q, policy %s", p.Name, f["storage"], p.Storage)
+		}
+		var want busmigrate.StreamPolicy
+		switch f["kind"] {
+		case "stream":
+			if f["retention"] != "limits" || f["discard"] != "old" {
+				t.Errorf("%s: retention %q discard %q", p.Name, f["retention"], f["discard"])
+			}
+			_, direct := f["allow-direct"]
+			want = busmigrate.StreamPolicy{Name: p.Name, Subjects: strings.Split(f["subjects"], ","), Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
+				MaxBytes: num(f["max-bytes"], -1), MaxAge: dur(f["max-age"]), Discard: nats.DiscardOld, MaxMsgsPerSubject: num(f["max-msgs-per-subject"], -1),
+				AllowDirect: direct, Replicas: 1}
+		case "kv":
+			bucket := strings.TrimPrefix(p.Name, "KV_")
+			want = busmigrate.StreamPolicy{Name: p.Name, Subjects: []string{"$KV." + bucket + ".>"}, Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
+				MaxBytes: num(f["max-bucket-size"], -1), MaxAge: dur(f["ttl"]), Discard: nats.DiscardNew, MaxMsgsPerSubject: num(f["history"], 1),
+				AllowRollup: true, DenyDelete: true, AllowDirect: true, Replicas: 1}
+		}
+		if !reflect.DeepEqual(p, want) {
+			t.Errorf("%s: policy\n %+v\nscript\n %+v", p.Name, p, want)
+		}
+	}
+}
+
+// The table's KV implications, and every value the script leaves to the
+// CLI's defaults, are what a fresh install creates (busmigrate's
+// fresh_streams.json, captured with the provision image's CLI against the
+// bus image's server): each reference stream passes its policy's Check.
+func TestTheStreamPoliciesMatchAFreshInstall(t *testing.T) {
+	fresh, err := busmigrate.LoadFreshStreams()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range a2aStreamPolicies(1) {
+		ref, ok := fresh.Streams[p.Name]
+		if !ok {
+			t.Errorf("%s: not in the fresh-install reference; regenerate it", p.Name)
+			continue
+		}
+		if d := p.Check(ref); len(d) != 0 {
+			t.Errorf("%s: a fresh install differs from the policy: %v", p.Name, d)
+		}
 	}
 }

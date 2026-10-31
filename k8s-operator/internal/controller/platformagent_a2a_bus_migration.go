@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -18,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
 )
 
 // The A2A bus migration (#4225): converting an existing bus between one NATS
@@ -645,4 +647,35 @@ func (r *PlatformAgentReconciler) ensureBusMigrationWorkload(ctx context.Context
 		return err
 	}
 	return nil
+}
+
+// a2aStreamPolicies is the provision script's streams on the fields a
+// restore checks (busmigrate.StreamPolicy), at replicas. Literal for literal
+// with the script's `stream add` and `kv add` lines, which
+// TestTheStreamPoliciesAreTheProvisionScripts holds it to; a `kv add`
+// implies the KV fields (its subjects, rollup, deny delete, direct, discard
+// new), which TestTheStreamPoliciesMatchAFreshInstall holds to a fresh
+// install. The restore pod reads it from the operator's run Secret.
+func a2aStreamPolicies(replicas int) []busmigrate.StreamPolicy {
+	const day = 24 * time.Hour
+	stream := func(name string, subjects []string, maxAge time.Duration, maxBytes, perSubject int64) busmigrate.StreamPolicy {
+		return busmigrate.StreamPolicy{Name: name, Subjects: subjects, Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
+			MaxBytes: maxBytes, MaxAge: maxAge, Discard: nats.DiscardOld, MaxMsgsPerSubject: perSubject, AllowDirect: true, Replicas: replicas}
+	}
+	kv := func(bucket string, maxBytes int64, ttl time.Duration) busmigrate.StreamPolicy {
+		return busmigrate.StreamPolicy{Name: "KV_" + bucket, Subjects: []string{"$KV." + bucket + ".>"}, Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
+			MaxBytes: maxBytes, MaxAge: ttl, Discard: nats.DiscardNew, MaxMsgsPerSubject: 1, AllowRollup: true, DenyDelete: true, AllowDirect: true, Replicas: replicas}
+	}
+	return []busmigrate.StreamPolicy{
+		stream("TASKS", []string{"a2a.tasks.>"}, 3*day, 21474836480, 4096),
+		stream("DIRECTORY", []string{"a2a.agents.>"}, 0, 1073741824, 1),
+		stream(a2aTopicsStateStream, []string{"a2a.topics.agent.platform.upgrade-readiness", a2aTopologySkewSubject, "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"}, 0, 1073741824, 8),
+		stream("TOPICS-JOURNAL", []string{"a2a.topics.shared.annotations"}, 30*day, 5368709120, -1),
+		kv("runtime-state", 268435456, 0),
+		kv("session-state", 268435456, 0),
+		kv("cap", 268435456, 0),
+		kv("feedback", 67108864, 30*day),
+		kv("PROFILE_LEASES", 67108864, 0),
+		stream("PROFILE_SUBMITS", []string{"a2a.submit.>"}, 3*day, 1073741824, 1),
+	}
 }
