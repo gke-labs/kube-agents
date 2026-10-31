@@ -213,8 +213,10 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `deploymentStatus.readyReplicas` | `integer` | no |  |  | ReadyReplicas indicates how many replicas are fully ready. |
 | `serviceStatus` | `object` | no |  |  | ServiceStatus holds internal/external endpoints. |
 | `serviceStatus.endpoint` | `string` | no |  |  | Endpoint is the primary URL or IP (including protocol and port) to reach the agent. |
-| `storageStatus` | `object` | no |  |  | StorageStatus tracks PVC binding state. |
+| `storageStatus` | `object` | no |  |  | StorageStatus tracks PVC binding state and the data volume's usage. |
 | `storageStatus.bound` | `boolean` | no |  |  | Bound indicates if the primary PVC has been successfully provisioned. |
+| `storageStatus.capacityBytes` | `integer` | no |  |  | CapacityBytes is the size of the filesystem on the agent's data volume, as the gateway pod's event watcher last read it. Absent when the watcher is disabled or the operator has no current reading from it. |
+| `storageStatus.freeBytes` | `integer` | no |  |  | FreeBytes is the space left on the agent's data volume for the agent's own non-root user, read with CapacityBytes. The DataVolumeNearlyFull condition is computed from the two. |
 | `busReplicas` | `integer` | no |  |  | BusReplicas is the A2A bus's NATS server count under spec.mode: next: the count the bus already runs, which spec.harness.tuning.busReplicas does not change; for a new bus, that field, or 3. Re-derived from the cluster on every reconcile, so it is a reading of the bus rather than a setting. |
 | `busMigration` | `object` | no |  |  | BusMigration is the A2A bus's server-count migration under spec.mode: next, while one runs or since the last one ended: setting spec.harness.tuning.busReplicas to another count on an existing bus starts one, and it converts the bus without emptying it. Unset when no migration has run. |
 | `busMigration.leg` | `string` | yes |  | one of `OneToThree`, `ThreeToOne` | Leg is the direction: OneToThree (snapshot and restore, behind a write freeze) or ThreeToOne (in place). |

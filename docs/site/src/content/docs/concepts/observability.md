@@ -36,7 +36,7 @@ The operator's gateway NetworkPolicy admits the managed collector and the operat
 
 #### Event watcher series
 
-Per watched cluster: events seen, filtered, injected, deduplicated and folded into a workload's open incident, what became of the keys the settle period held and the quiet follow-ups sent, inject errors, session creates, triage sessions opened (`k8s_event_watcher_triage_sessions_total`, the creates whose event was delivered), active incidents, and `k8s_event_watcher_cluster_up`, the one series that says events are flowing from that cluster. The listener also serves `process_start_time_seconds`, a gauge captured once at process start rather than re-derived per scrape, which the operator reads to tell a restart from a counter that fell.
+Per watched cluster: events seen, filtered, injected, deduplicated and folded into a workload's open incident, what became of the keys the settle period held and the quiet follow-ups sent, inject errors, session creates, triage sessions opened (`k8s_event_watcher_triage_sessions_total`, the creates whose event was delivered), active incidents, and `k8s_event_watcher_cluster_up`, the one series that says events are flowing from that cluster. Beside those, `kubeagents_data_volume_bytes{kind}`, the agent's data volume's size (`total`) and the space left to the agent's own user (`free`), read with `statfs` at each scrape. The listener also serves `process_start_time_seconds`, a gauge captured once at process start rather than re-derived per scrape, which the operator reads to tell a restart from a counter that fell.
 
 In Cloud Monitoring the collector's own `cluster` and `location` labels take precedence, so the watcher's arrive as `exported_cluster` and `exported_location`. The watcher's [README](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/cmd/k8s-event-watcher/README.md) says which series to alert on and how.
 
@@ -143,6 +143,8 @@ After a broker restart the three details fields (`remediationsClosedUnmergedTota
 | `negativeFeedbackTotal`                   | the plugin's `kubeagents_chat_feedback_negative_total`                                                                                                                                                                                              | does not move `lastActiveTime`                                                                                  |
 | `clustersRegistered`, `clustersMonitored` | the watcher's `k8s_event_watcher_cluster_up`: the series present, and those at `1`                                                                                                                                                                  | the latest reading rather than a total                                                                          |
 | `lastHumanActiveTime`                     | the poll in which a chat message last moved its counter                                                                                                                                                                                             | `lastActiveTime` moves on any counter, the stall-watch cron's commands and the fleet audits' proposals included |
+
+The same poll reads the watcher's `kubeagents_data_volume_bytes` into `status.storageStatus.capacityBytes` and `freeBytes` and the `DataVolumeNearlyFull` condition.
 
 #### The operator's gauges
 
