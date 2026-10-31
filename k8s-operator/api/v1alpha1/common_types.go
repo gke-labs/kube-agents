@@ -2257,6 +2257,14 @@ type AgentStatus struct {
 	// +optional
 	BusReplicas int32 `json:"busReplicas,omitempty"`
 
+	// BusMigration is the A2A bus's server-count migration under spec.mode:
+	// next, while one runs or since the last one ended: setting
+	// spec.harness.tuning.busReplicas to another count on an existing bus
+	// starts one, and it converts the bus without emptying it. Unset when no
+	// migration has run.
+	// +optional
+	BusMigration *BusMigrationStatus `json:"busMigration,omitempty"`
+
 	// Note, deliberately not a doc comment — the blank line below keeps it out of the
 	// CRD description that `kubectl explain` prints. As on the three status structs
 	// above, omitempty does nothing here: encoding/json has no notion of an empty
@@ -2306,6 +2314,40 @@ type AgentStatus struct {
 // ServiceAccount holds no write verb on this status. RemediationsAppliedTotal
 // is declared so that the schema names it, but nothing writes it yet, and it
 // is absent (omitempty) until a series exists for it.
+// BusMigrationStatus is one migration of the A2A bus between one NATS server
+// and three.
+type BusMigrationStatus struct {
+	// Leg is the direction: OneToThree (snapshot and restore, behind a write
+	// freeze) or ThreeToOne (in place).
+	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne
+	Leg string `json:"leg"`
+
+	// RunID names this migration's own Jobs, pods, ServiceAccounts and bus
+	// principals.
+	RunID string `json:"runID"`
+
+	// Phase is where the migration is. Done converted the bus with its data;
+	// Abandoned left it at its old count with its data; Failed stopped where
+	// a person has to act, and Message says what.
+	Phase string `json:"phase"`
+
+	// Abandoning is set once the migration is on its way back to the old
+	// count.
+	// +optional
+	Abandoning bool `json:"abandoning,omitempty"`
+
+	// StartedAt is when the migration began.
+	StartedAt metav1.Time `json:"startedAt"`
+
+	// Deadline is when an unfinished phase counts as failed, and when the
+	// migration's bus credentials stop working.
+	Deadline metav1.Time `json:"deadline"`
+
+	// Message is the manual step a Failed migration names.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative count of sessions the agent opened: the
 	// triage sessions the event watcher opened for events the daemon

@@ -11520,6 +11520,58 @@ spec:
                     Address is the fully qualified domain name (FQDN) of
                     the agent service.
                   type: string
+                busMigration:
+                  description: |-
+                    BusMigration is the A2A bus's server-count migration under spec.mode:
+                    next, while one runs or since the last one ended: setting
+                    spec.harness.tuning.busReplicas to another count on an existing bus
+                    starts one, and it converts the bus without emptying it. Unset when no
+                    migration has run.
+                  properties:
+                    abandoning:
+                      description: |-
+                        Abandoning is set once the migration is on its way back to the old
+                        count.
+                      type: boolean
+                    deadline:
+                      description: |-
+                        Deadline is when an unfinished phase counts as failed, and when the
+                        migration's bus credentials stop working.
+                      format: date-time
+                      type: string
+                    leg:
+                      description: |-
+                        Leg is the direction: OneToThree (snapshot and restore, behind a write
+                        freeze) or ThreeToOne (in place).
+                      enum:
+                        - OneToThree
+                        - ThreeToOne
+                      type: string
+                    message:
+                      description: Message is the manual step a Failed migration names.
+                      type: string
+                    phase:
+                      description: |-
+                        Phase is where the migration is. Done converted the bus with its data;
+                        Abandoned left it at its old count with its data; Failed stopped where
+                        a person has to act, and Message says what.
+                      type: string
+                    runID:
+                      description: |-
+                        RunID names this migration's own Jobs, pods, ServiceAccounts and bus
+                        principals.
+                      type: string
+                    startedAt:
+                      description: StartedAt is when the migration began.
+                      format: date-time
+                      type: string
+                  required:
+                    - deadline
+                    - leg
+                    - phase
+                    - runID
+                    - startedAt
+                  type: object
                 busReplicas:
                   description: |-
                     BusReplicas is the A2A bus's NATS server count under spec.mode: next:

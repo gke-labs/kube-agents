@@ -210,6 +210,14 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `storageStatus` | `object` | no |  |  | StorageStatus tracks PVC binding state. |
 | `storageStatus.bound` | `boolean` | no |  |  | Bound indicates if the primary PVC has been successfully provisioned. |
 | `busReplicas` | `integer` | no |  |  | BusReplicas is the A2A bus's NATS server count under spec.mode: next: the count the bus already runs, which spec.harness.tuning.busReplicas does not change; for a new bus, that field, or 3. Re-derived from the cluster on every reconcile, so it is a reading of the bus rather than a setting. |
+| `busMigration` | `object` | no |  |  | BusMigration is the A2A bus's server-count migration under spec.mode: next, while one runs or since the last one ended: setting spec.harness.tuning.busReplicas to another count on an existing bus starts one, and it converts the bus without emptying it. Unset when no migration has run. |
+| `busMigration.leg` | `string` | yes |  | one of `OneToThree`, `ThreeToOne` | Leg is the direction: OneToThree (snapshot and restore, behind a write freeze) or ThreeToOne (in place). |
+| `busMigration.runID` | `string` | yes |  |  | RunID names this migration's own Jobs, pods, ServiceAccounts and bus principals. |
+| `busMigration.phase` | `string` | yes |  |  | Phase is where the migration is. Done converted the bus with its data; Abandoned left it at its old count with its data; Failed stopped where a person has to act, and Message says what. |
+| `busMigration.abandoning` | `boolean` | no |  |  | Abandoning is set once the migration is on its way back to the old count. |
+| `busMigration.startedAt` | `metav1.Time` | yes |  |  | StartedAt is when the migration began. |
+| `busMigration.deadline` | `metav1.Time` | yes |  |  | Deadline is when an unfinished phase counts as failed, and when the migration's bus credentials stop working. |
+| `busMigration.message` | `string` | no |  |  | Message is the manual step a Failed migration names. |
 | `telemetry` | `object` | no |  |  | Telemetry reports the resolved OpenTelemetry export configuration. |
 | `telemetry.otlpEndpoint` | `string` | no |  |  | OTLPEndpoint is the collector endpoint written into the agent pod. Empty when the source is None, which is the one case where the pod is given no endpoint at all. |
 | `telemetry.otlpEndpointSource` | `string` | no |  |  | OTLPEndpointSource is how the endpoint was chosen: DeploymentEnv, Spec, OperatorEnv, Discovered, Default, or None. None means discovery completed and this cluster has no collector, so the agent runs with OTEL_SDK_DISABLED=true and exports nothing; Default still means the GKE managed collector, and is what an install gets when discovery is switched off or could not complete. |
