@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -145,7 +146,7 @@ func TestSlackClickIsATurnFromTheClicker(t *testing.T) {
 		t.Fatal("a choice click must be a turn")
 	}
 	want := InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U1", MessageID: "60.1", Text: "Option A: restart", Click: true}
-	if msg != want {
+	if !reflect.DeepEqual(msg, want) {
 		t.Errorf("turn = %+v, want %+v", msg, want)
 	}
 	if len(api.updated) != 0 {

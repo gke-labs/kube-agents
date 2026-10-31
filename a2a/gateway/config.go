@@ -35,6 +35,11 @@ const defaultMaxSessions = 10
 // field's comment carries the rationale.
 const defaultDelegationDepthMax = 3
 
+// defaultScopeFile is where the operator projects the install's rendered
+// spec.scope into the gateway pod: the same scope.json, at the same path, the
+// platform agent reads.
+const defaultScopeFile = "/etc/kube-agents/scope.json"
+
 // defaultGchatTokenPath is where the operator projects the gateway's
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
@@ -583,6 +588,19 @@ type Config struct {
 	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
 	DelegationDepthMax int
 
+	// ScopeFile is the rendered spec.scope a profile task's target is
+	// checked against (A2A_SCOPE_FILE; checkTargetScope). It is read per
+	// routed task, so an edit reaches the gateway without a restart. A
+	// missing or unreadable file refuses every target.
+	ScopeFile string
+
+	// ManagementProject is the install's own project
+	// (A2A_MANAGEMENT_PROJECT, spec.harness.projectId). checkTargetScope
+	// admits it whatever the scope lists, and ignores an exclude.projects
+	// entry that matches it, as the reconcile does. Empty admits nothing
+	// extra.
+	ManagementProject string
+
 	// BusyNoticeAt is how many tasks have to be ahead of a new fixed-route
 	// turn before the gateway marks the turn's status line queued
 	// (A2A_BUSY_NOTICE_AT). The count is the fixed addressee's outstanding
@@ -671,6 +689,8 @@ func FromEnv() (*Config, error) {
 		AuthorityTier:         capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
 		CapabilityOptional:    capability.OptionalFromEnv(),
+		ScopeFile:             envOr("A2A_SCOPE_FILE", defaultScopeFile),
+		ManagementProject:     os.Getenv("A2A_MANAGEMENT_PROJECT"),
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)

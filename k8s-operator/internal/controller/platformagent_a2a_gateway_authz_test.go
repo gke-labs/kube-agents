@@ -204,6 +204,19 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 		t.Errorf("the wildcard direct get answered %q, not the submission; live_test.go reads this reply's body", lastIn.Data)
 	}
 
+	// gateway.readDirectory, the profile cards' start-up read: the
+	// directory's subject list, then a direct get by card subject. An empty
+	// subject answers not-found, which is the server answering, not refusing.
+	dirStream, err := js.Stream(ctx, a2aDirectoryStream)
+	allowed("STREAM.INFO DIRECTORY (readDirectory js.Stream)", err)
+	_, err = dirStream.Info(ctx, jetstream.WithSubjectFilter(a2aDirectorySubjectPrefix+"*"))
+	allowed("STREAM.INFO DIRECTORY with a subject filter (readDirectory)", err)
+	_, err = dirStream.GetLastMsgForSubject(ctx, a2aDirectorySubjectPrefix+"platform")
+	if errors.Is(err, jetstream.ErrMsgNotFound) {
+		err = nil
+	}
+	allowed("DIRECT.GET DIRECTORY last-for-subject, a card (readDirectory)", err)
+
 	// gateway.Registry, over the session-state bucket.
 	kv, err := js.KeyValue(ctx, a2aSessionStateBucket)
 	allowed("STREAM.INFO KV_session-state (Registry js.KeyValue)", err)
@@ -275,13 +288,14 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 		{"$JS.API.CONSUMER.DELETE." + a2aTasksStream + ".bridge-platform", ""},
 		{"$JS.API.CONSUMER.DELETE." + a2aTasksStream + "." + a2aGatewayRelayDurable, ""},
 		{"$JS.API.CONSUMER.INFO." + a2aTasksStream + "." + a2aGatewayRelayDurable, ""},
-		// The directory: the identity plane. The gateway reads it by
-		// subscribing to the cards, and holds nothing on it here.
-		{"$JS.API.STREAM.INFO.DIRECTORY", ""},
+		// The directory: the identity plane. Subscribing alone misses cards
+		// published before the gateway started, so it reads them too, by
+		// DIRECT.GET on card subjects only (table 1). Nothing past that: no
+		// purge or delete, no consumer, no batch get across the stream.
 		{"$JS.API.STREAM.PURGE.DIRECTORY", ""},
 		{"$JS.API.STREAM.DELETE.DIRECTORY", ""},
 		{"$JS.API.CONSUMER.CREATE.DIRECTORY.peek", `{"stream_name":"DIRECTORY","config":{"name":"peek","deliver_subject":"_INBOX.gateway.peek"}}`},
-		{"$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.platform", ""},
+		{"$JS.API.DIRECT.GET.DIRECTORY", `{"multi_last":["a2a.agents.*"],"batch":10}`},
 		// The blackboard, which nothing in a2a/gateway touches.
 		{"$JS.API.STREAM.INFO." + a2aTopicsStateStream, ""},
 		{"$JS.API.DIRECT.GET." + a2aTopicsStateStream + ".a2a.topics.shared.blueprint", ""},

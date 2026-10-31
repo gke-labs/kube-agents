@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -93,7 +94,7 @@ func TestSlackStopBecomesAnUnnamedCancel(t *testing.T) {
 	}
 	want := InboundMessage{Conversation: "slack:C123/1700000000.000100", Kind: "group",
 		AuthorID: "UALICE", MessageID: "1700000050.000200", Intent: IntentCancel}
-	if msg != want {
+	if !reflect.DeepEqual(msg, want) {
 		t.Fatalf("got %+v, want %+v", msg, want)
 	}
 	if msg.TaskID != "" {

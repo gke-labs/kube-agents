@@ -5013,6 +5013,16 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// name, so the render and the spawner must agree
 		// or every session is refused at connect.
 		{Name: "A2A_SESSION_SERVICE_ACCOUNT", Value: a2aSessionServiceAccountName(agent)},
+		// The install's rendered spec.scope, which a profile
+		// task's target is checked against
+		// (a2aGatewayScopeVolume). Rendered at the gateway's
+		// default, so a reader of the live Deployment sees where
+		// the file comes from.
+		{Name: a2aGatewayScopeFileEnv, Value: scopeDir + "/" + scopeFileName},
+		// The install's own project, which the target check
+		// admits whatever spec.scope lists, as the reconcile
+		// does. Empty on an install with no harness block.
+		{Name: a2aGatewayManagementProjectEnv, Value: a2aManagementProject(agent)},
 		// Rendered explicitly at the gateway's default, like
 		// A2A_GCHAT_TOKEN_PATH: the path and the projected
 		// volume below are one fact, and a reader of the live
@@ -5077,10 +5087,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						}),
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
-						}, a2aNATSCABundleMount()}, chatMounts...), injectMounts...),
+						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, chatMounts...), injectMounts...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent)}, chatVolumes...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, chatVolumes...), injectVolumes...),
 				},
 			},
 		},
@@ -6689,4 +6699,52 @@ func (r *PlatformAgentReconciler) deleteA2ACalloutClusterRoleBinding(ctx context
 		return nil
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, crb))
+}
+
+// a2aGatewayScopeFileEnv names the gateway's scope file (A2A_SCOPE_FILE in
+// a2a/gateway/config.go).
+const a2aGatewayScopeFileEnv = "A2A_SCOPE_FILE"
+
+// a2aGatewayManagementProjectEnv names the gateway's management project
+// (A2A_MANAGEMENT_PROJECT in a2a/gateway/config.go).
+const a2aGatewayManagementProjectEnv = "A2A_MANAGEMENT_PROJECT"
+
+// a2aManagementProject is spec.harness.projectId, the project the agent
+// container gets as GKE_PROJECT_ID and the reconcile treats as always in
+// scope.
+func a2aManagementProject(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Harness == nil {
+		return ""
+	}
+	return agent.Spec.Harness.ProjectID
+}
+
+// a2aGatewayScopeVolumeName projects the install's rendered spec.scope into
+// the gateway pod.
+const a2aGatewayScopeVolumeName = "a2a-gateway-scope"
+
+// a2aGatewayScopeVolume is the agent's scope.json, from the config ConfigMap
+// the platform agent mounts it from (scopeConfigKey), so the gateway checks a
+// profile task's target against the declaration the agent reads. Optional,
+// like the agent's: a ConfigMap from an operator predating the key mounts an
+// empty directory, and the gateway then refuses every profile target rather
+// than holding the pod in ContainerCreating.
+func a2aGatewayScopeVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+	return corev1.Volume{
+		Name: a2aGatewayScopeVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + "-config"},
+				Items:                []corev1.KeyToPath{{Key: scopeConfigKey, Path: scopeFileName}},
+				Optional:             ptr.To(true),
+				DefaultMode:          ptr.To(int32(0444)),
+			},
+		},
+	}
+}
+
+// a2aGatewayScopeMount is a directory mount, so a CR edit reaches the file
+// without a restart; the gateway reads it per routed task.
+func a2aGatewayScopeMount() corev1.VolumeMount {
+	return corev1.VolumeMount{Name: a2aGatewayScopeVolumeName, MountPath: scopeDir, ReadOnly: true}
 }

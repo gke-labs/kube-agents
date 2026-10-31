@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
@@ -66,6 +67,10 @@ const delegateAddresseeLogCap = 64
 // delegatedLineNote suffixes a child's rolling line, so the room can tell the
 // task the session handed on from one a human asked for.
 const delegatedLineNote = "(delegated to platform)"
+
+// delegatedProfileLineNote is delegatedLineNote for a child sent to an
+// AgentProfile, naming the profile it resolved to.
+const delegatedProfileLineNote = "(delegated to %s)"
 
 // requesterGone is the one spelling of "the turn's requester has aged out of
 // the record" (AskTTL clears it), for the delegation refusal and the wake
@@ -136,7 +141,14 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// now: the subject's session is the record's bus session and the task
 	// was addressed to it. That is a session-routed turn or a delegate:
 	// incarnation; a platform task, or a pod a later turn retired, is not.
-	if !known || rec.BusSession == "" || session != rec.BusSession || parent.Addressee != rec.BusSession {
+	// A task addressed to an AgentProfile delegates too: its subject's
+	// addressee is the profile it was submitted to. It waits open for its
+	// child, and its context is its own task alone (a warm worker is reset
+	// between tasks), so the incarnation's author set below is a session's
+	// check, not its.
+	profileParent := known && parent.Tier != "" && session == parent.Addressee
+	sessionParent := known && rec.BusSession != "" && session == rec.BusSession && parent.Addressee == rec.BusSession
+	if !profileParent && !sessionParent {
 		ignore(ruleDelegationStale, "busSession", rec.BusSession)
 		return
 	}
@@ -170,10 +182,6 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		return
 	}
 
-	if addressee != targetPlatform {
-		refuse(ruleDelegationTarget, "⚠️ delegation refused: only platform can be delegated to today")
-		return
-	}
 	// One live child per conversation, whichever turn asked
 	// for it: a stop detaches a child without ending it.
 	if live := g.liveChild(ctx, rec); live != "" {
@@ -189,14 +197,43 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		refuse(ruleDelegationNoRequester, noticeDelegationNoRequester)
 		return
 	}
+	// Anything but platform is an AgentProfile: resolved, its target checked
+	// against the scope, and minted at the parent's tier, which for a
+	// session parent is its requester's (profileRouteFor).
+	var route *profileRoute
+	// A profile task delegates only to another profile: a platform child is
+	// minted at the install's tier and scope, wider than the parent's.
+	if profileParent && addressee == targetPlatform {
+		refuse(ruleDelegationTarget, noticeDelegationRefusedFor+noticeProfileParentToPlatform)
+		return
+	}
+	if addressee != targetPlatform {
+		tier := capability.Tier(parent.Tier)
+		if !profileParent {
+			if tier, err = requesterTier(*parent.Requester); err != nil {
+				refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
+				return
+			}
+		}
+		if route, err = g.profileRouteFor(addressee, req.Parameters, tier, lib.SubmitKindChild); err != nil {
+			refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
+			return
+		}
+	}
+	// The lists are the target's: the profile the address resolved to, so a
+	// list on a pinned profile can't be stepped round by addressing another.
+	target := addressee
+	if route != nil {
+		target = route.Profile
+	}
 	// The A2A door's callers delegate only under a list of their own,
 	// which nothing renders yet (gke-labs#2478): an absent list there is
 	// nobody, where on a chat backend it is everyone the ingress admits.
-	if g.doorUnlisted(addressee, parent.Requester.Backend) {
+	if g.doorUnlisted(target, parent.Requester.Backend) {
 		refuse(ruleDelegationDoorUnlisted, noticeDelegationNotAllowed)
 		return
 	}
-	if !g.targetAllows(addressee, parent.Requester.Backend, parent.Requester.Subject) {
+	if !g.targetAllows(target, parent.Requester.Backend, parent.Requester.Subject) {
 		refuse(ruleDelegationAllowedUsers, noticeDelegationNotAllowed)
 		return
 	}
@@ -208,7 +245,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		return
 	}
 	for _, a := range parent.SteerAuthors {
-		if rule := g.authorRefusal(addressee, a, ruleDelegationSteerAuthor); rule != "" {
+		if rule := g.authorRefusal(target, a, ruleDelegationSteerAuthor); rule != "" {
 			refuse(rule, noticeDelegationNotAllowed, "steerBackend", a.Backend, "steerAuthor", a.Subject)
 			return
 		}
@@ -219,17 +256,20 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// above pinned the parent to rec.BusSession, so the set is the parent's
 	// incarnation's.
 	sessionAuthors, sessionUnknown, _ := rec.sessionAuthorsOf()
+	if profileParent {
+		sessionAuthors, sessionUnknown = nil, false
+	}
 	if sessionUnknown {
 		refuse(ruleDelegationSessionAuthor, noticeDelegationSessionIncomplete, "sessionAuthors", "incomplete")
 		return
 	}
 	for _, a := range sessionAuthors {
-		if rule := g.authorRefusal(addressee, a, ruleDelegationSessionAuthor); rule != "" {
+		if rule := g.authorRefusal(target, a, ruleDelegationSessionAuthor); rule != "" {
 			refuse(rule, noticeDelegationNotAllowed, "sessionBackend", a.Backend, "sessionAuthor", a.Subject)
 			return
 		}
 	}
-	authority.Via = &AuthorityVia{TaskID: taskID, Session: rec.BusSession}
+	authority.Via = &AuthorityVia{TaskID: taskID, Session: session}
 
 	// The child is a fixed-route task: addressed to platform so steers and a
 	// stop reach it, with BusSession left in place for the wake turn.
@@ -240,7 +280,11 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// about to take; kept on the parent's entry, it still closes on the
 	// parent's terminal (relayTerminal).
 	setParentLine(rec, taskID, prevActive.StatusMsgID)
+	lineNote := delegatedLineNote
 	rec.Addressee = addressee
+	if route != nil {
+		rec.Addressee, lineNote = route.Profile, fmt.Sprintf(delegatedProfileLineNote, route.Profile)
+	}
 	childID, ok := g.startTaskWith(ctx, rec, taskStart{
 		Text:                 req.Text,
 		Requester:            *parent.Requester,
@@ -249,7 +293,8 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		Role:                 taskRoleChild,
 		ParentTaskID:         taskID,
 		Depth:                parent.Depth + 1,
-		LineNote:             delegatedLineNote,
+		LineNote:             lineNote,
+		Route:                route,
 		SteerAuthors:         parent.SteerAuthors,
 		SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 		RootTaskID:           parent.rootID(),

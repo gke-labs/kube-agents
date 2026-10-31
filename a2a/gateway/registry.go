@@ -259,6 +259,11 @@ type TaskRef struct {
 	// render. A redelivered event found here was rendered by a gateway that
 	// died before acking it, and is not rendered again.
 	RelayedSeqs []uint64 `json:"relayedSeqs,omitempty"`
+	// Tier is the tier a task addressed to an AgentProfile runs at; empty
+	// for a task addressed to platform or a session. A profile task's child
+	// runs at its tier, and the child's end reaches it as a childResult on
+	// its .in rather than as a wake (deliverChildResult).
+	Tier string `json:"tier,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.
@@ -522,14 +527,16 @@ func (rec *SessionRecord) TaskRefFor(taskID string) (TaskRef, bool) {
 // one task to them, its root (TaskRef.RootTaskID): a child is never named,
 // and neither is a turn that delegated, whose end is not the chain's. Every
 // other turn's end is its root's - a human turn is its own root, and a
-// wake that did not delegate ends the chain it continues. An id the record
-// does not hold is passed through as it is.
+// wake that did not delegate ends the chain it continues. A turn addressed
+// to an AgentProfile ends its chain even when it delegated: it waits open
+// for its children and ends after them. An id the record does not hold is
+// passed through as it is.
 func (rec *SessionRecord) observedAs(taskID string) (id string, ends bool) {
 	ref, ok := rec.TaskRefFor(taskID)
 	if !ok {
 		return taskID, true
 	}
-	return ref.rootID(), ref.Role != taskRoleChild && len(ref.Children) == 0
+	return ref.rootID(), ref.Role != taskRoleChild && (len(ref.Children) == 0 || ref.Tier != "")
 }
 
 // delegationHandled reports whether the task's history entry shows a

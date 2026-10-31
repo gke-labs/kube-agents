@@ -294,6 +294,18 @@ const (
 // publish for an addressee this grant does not name.
 const a2aBridgeAddressee = "platform"
 
+// a2aProfileSubmitSubjects is every AgentProfile's submission subject,
+// a2a.submit.<profile>.<tier>.<kind>.<task> (lib.TaskSubmitSubject), on the
+// PROFILE_SUBMITS stream. Publish only: the gateway holds no consumer or
+// stream right there, and its publish ack returns on _INBOX.gateway.>.
+const a2aProfileSubmitSubjects = "a2a.submit.*.*.*.*"
+
+// a2aDispatchStopSubjects is every profile task's stop record,
+// a2a.stop.<profile>.<task> (lib.DispatchStopSubject), on the DISPATCH_STOPS
+// stream. Publish only, like the submission: the gateway writes a record
+// beside each cancel it sends a profile task, and the dispatcher reads it.
+const a2aDispatchStopSubjects = "a2a.stop.*.*"
+
 // The operator's own bus principal: its NATS user and inbox owner, and the
 // directory it writes AgentProfile cards to (agentprofile_card.go).
 const (
@@ -413,6 +425,15 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 	publish := []string{
 		"a2a.tasks.*.*.in",
 		"a2a.tasks.*.*.supervisor",
+		// A new task for an AgentProfile, on the profile's submission subject
+		// with its tier and kind (spec-profiles-dispatch.md, "Addressing").
+		// The gateway is the subject's one writer: the dispatcher reads it
+		// through its durables, and no worker or session holds it.
+		a2aProfileSubmitSubjects,
+		// A stop for a profile task, the record the dispatcher reads in place
+		// of the task's `…in` (addendum 9 on #3655). The gateway is its one
+		// writer.
+		a2aDispatchStopSubjects,
 		// The session registry's data plane. The bucket is spelled here and
 		// named by constant inside the grant function; the two are held
 		// together by TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo,
@@ -455,6 +476,14 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		a2aBoardSubject,
 	}
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
+	// The profile cards' start-up read (a2a/gateway/profiledir.go): the
+	// directory's subject list, then a direct get per profile. The live half
+	// is the a2a.agents.> subscription below. STREAM.INFO on DIRECTORY tells
+	// the gateway the profile names its subscription already shows it.
+	publish = append(publish,
+		"$JS.API.STREAM.INFO."+a2aDirectoryStream,
+		"$JS.API.DIRECT.GET."+a2aDirectoryStream+"."+a2aDirectorySubjectPrefix+"*",
+	)
 	publish = append(publish,
 		"$JS.ACK.TASKS.>",
 		"$JS.FC.>",
@@ -478,7 +507,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"answer ratings. So no STREAM.DELETE, PURGE,\n" +
 			"UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here\n" +
 			"used to destroy every task's history and the five consumers on it -\n" +
-			"no CONSUMER.DELETE on TASKS, and nothing at all on DIRECTORY, the\n" +
+			"no CONSUMER.DELETE on TASKS, nothing on DIRECTORY but its subject list\n" +
+			"and a direct get on the card subjects, and nothing at all on the\n" +
 			"topic streams or the other two buckets.",
 		auth:     a2aAuthStatic,
 		credsKey: a2aGatewayPasswordKey,

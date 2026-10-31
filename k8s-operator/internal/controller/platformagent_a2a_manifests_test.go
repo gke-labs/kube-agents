@@ -5127,6 +5127,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	want := []string{
 		"a2a.tasks.*.*.in",
 		"a2a.tasks.*.*.supervisor",
+		// A profile task's submission; the gateway is its one writer.
+		"a2a.submit.*.*.*.*",
+		// A profile task's stop record; the gateway is its one writer too.
+		"a2a.stop.*.*",
 		"$KV.session-state.>",
 		"$KV.feedback.>",
 		"chat.console.*.out",
@@ -5139,6 +5143,9 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"chat.board",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
+	// The profile cards' start-up read: the directory's subject list and a
+	// direct get per card subject, and no consumer.
+	want = append(want, "$JS.API.STREAM.INFO.DIRECTORY", "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*")
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("gateway publish allow-list changed.\n got: %q\nwant: %q", got, want)
@@ -5196,11 +5203,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		forbidden = append(forbidden, "$JS.API.CONSUMER.INFO."+s+".x")
 	}
 	// Streams the gateway has no business on at all: not a read, not a
-	// consumer, not a direct get. The directory is the identity plane and
-	// the gateway reads it by subscribing to the cards; the topic streams
-	// are the blackboard, which nothing in a2a/gateway touches; the other
-	// two buckets are the bridge's and the capability envelope's.
-	for _, s := range []string{"DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
+	// consumer, not a direct get. The topic streams are the blackboard,
+	// which nothing in a2a/gateway touches; the other two buckets are the
+	// bridge's and the capability envelope's.
+	for _, s := range []string{"TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
 		forbidden = append(forbidden,
 			"$JS.API.STREAM.INFO."+s,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
@@ -5212,6 +5218,21 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 			"$JS.API.DIRECT.GET."+s,
 		)
 	}
+	// The directory, the identity plane. The gateway follows the cards by
+	// subscribing, but subscribing alone misses cards published before it
+	// started, so it also reads them: the subject list, then DIRECT.GET on
+	// card subjects only. No consumer on it, and no direct get past the card
+	// subjects.
+	forbidden = append(forbidden,
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.x",
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.x.a2a.agents.platform",
+		"$JS.API.CONSUMER.DURABLE.CREATE.DIRECTORY.x",
+		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.x",
+		"$JS.API.CONSUMER.DELETE.DIRECTORY.x",
+		"$JS.API.DIRECT.GET.DIRECTORY",
+		"$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.platform.x",
+		"$JS.API.DIRECT.GET.DIRECTORY.a2a.tasks.platform.task-0001.in",
+	)
 	forbidden = append(forbidden,
 		// A session pod's three consumers, and the bridge's durable: the
 		// gateway may create consumers on TASKS, and create-as-update
@@ -5316,6 +5337,9 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		// gateway answer feedback, over the feedback bucket.
 		{"startFeedback js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aFeedbackBucket},
 		{"feedbackDesk kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aFeedbackBucket + ".$KV." + a2aFeedbackBucket + ".t1.U1"},
+		// gateway.readDirectory, the profile cards' start-up read.
+		{"readDirectory js.Stream / stream.Info", "$JS.API.STREAM.INFO." + a2aDirectoryStream},
+		{"readDirectory GetLastMsgForSubject", "$JS.API.DIRECT.GET." + a2aDirectoryStream + ".a2a.agents.cluster"},
 		{"ExportFeedback ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		{"ExportFeedback watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		// The ack the relay's explicit-ack durable publishes, granted
@@ -5836,6 +5860,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			streams: map[string][]string{
 				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
 				kvSessionState: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				// The profile cards' start-up read: the subject list and a
+				// direct get per card, no consumer (readDirectory).
+				a2aDirectoryStream: {"STREAM.INFO", "DIRECT.GET"},
 				// The kept answer ratings: the registry's four verbs, for
 				// the same four calls (a2aGatewayJetStreamGrants).
 				a2aKVStreamPrefix + a2aFeedbackBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
