@@ -845,10 +845,10 @@ docs-check-context-budget:
 docs-check-pr-template: ## Fail when a section of .github/PULL_REQUEST_TEMPLATE.md tells the author to delete it, opens with a condition and names no one-line answer for the rest, or holds a comment the description readers split on (why: .agents/rules/pre_pr_review.md).
 	@python3 scripts/check_pr_template.py
 
-chart-sync: ## Sync the chart's CRD, ClusterRole-rule and admission-policy copies from k8s-operator/config, and regenerate files/footprint.yaml from the operator golden; the webhook template is hand-maintained and only checked.
+chart-sync: ## Sync the chart's CRD, ClusterRole-rule and admission-policy copies from k8s-operator/config, and regenerate files/footprint.yaml from the operator goldens (today and next mode); the webhook template is hand-maintained and only checked.
 	@./hack/sync-chart-manifests.sh
 
-chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies match k8s-operator/config, its hand-written webhook template matches config/webhook, and files/footprint.yaml matches the operator golden (CI runs this; needs helm and PyYAML).
+chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies match k8s-operator/config, its hand-written webhook template matches config/webhook, and files/footprint.yaml matches the operator goldens (CI runs this; needs helm and PyYAML).
 	@./hack/sync-chart-manifests.sh --check
 
 iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy copies (CI runs this via scripts/test_check_iac_parity.py).
