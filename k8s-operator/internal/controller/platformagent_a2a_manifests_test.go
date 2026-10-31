@@ -8160,47 +8160,62 @@ func TestTheGatewayAlwaysArmsTheConsoleDoor(t *testing.T) {
 const a2aJetStreamCapMargin = int64(2) << 30
 
 // TestProvisionedJetStreamCapsFitTheStore holds the provision script's byte caps,
-// summed, under the server's max_file_store less a2aJetStreamCapMargin (#4476).
-// Every create must carry a cap: one without reserves nothing, and then grows
-// into the room every other stream's reservation counted on.
+// summed, under the server's max_file_store less a2aJetStreamCapMargin, and the
+// store under the bus's claim (#4476). Every create must carry a cap: one without
+// reserves nothing, and then grows into the room every other stream's reservation
+// counted on. Lines the script only prints (an `echo` naming an edit for an
+// operator) are not commands and are skipped; an executed edit that raises a cap
+// re-reserves, so it counts.
 func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 	agent := a2aTestAgent()
 	// One logical line per command: the creates are wrapped with `\` continuations.
 	script := strings.ReplaceAll(a2aProvisionScript(agent), "\\\n", " ")
 
+	// natscli's create spellings, aliases included, and the edits that can raise a cap.
+	creates := regexp.MustCompile(`\b(stream (?:add|create|new)|kv (?:add|new|create))\s+(\S+)(.*)$`)
+	edits := regexp.MustCompile(`\b(stream (?:edit|update))\s+(\S+)(.*)$`)
+	capOf := func(name, flag, rest string) (int64, bool) {
+		for _, f := range strings.Fields(rest) {
+			if v, ok := strings.CutPrefix(f, flag); ok {
+				n, err := strconv.ParseInt(v, 10, 64)
+				if err != nil || n <= 0 {
+					t.Fatalf("%s: %s%s is not a positive byte count", name, flag, v)
+				}
+				return n, true
+			}
+		}
+		return 0, false
+	}
 	caps := map[string]int64{}
+	created := map[string]bool{}
 	for _, line := range strings.Split(script, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "echo ") {
 			continue
 		}
-		for _, verb := range []string{"stream add ", "kv add "} {
-			idx := strings.Index(line, verb)
-			if idx < 0 {
-				continue
-			}
-			fields := strings.Fields(line[idx+len(verb):])
-			name, flag := fields[0], "--max-bytes="
-			if verb == "kv add " {
+		if m := creates.FindStringSubmatch(line); m != nil {
+			name, flag := m[2], "--max-bytes="
+			if strings.HasPrefix(m[1], "kv ") {
 				name, flag = "KV_"+name, "--max-bucket-size="
 			}
-			var found bool
-			for _, f := range fields[1:] {
-				if v, ok := strings.CutPrefix(f, flag); ok {
-					n, err := strconv.ParseInt(v, 10, 64)
-					if err != nil || n <= 0 {
-						t.Fatalf("%s: %s%s is not a positive byte count", name, flag, v)
-					}
-					caps[name], found = n, true
-				}
+			if created[name] {
+				t.Fatalf("%s is created twice in the provision script; which cap holds is not a question this test answers", name)
 			}
+			created[name] = true
+			n, found := capOf(name, flag, m[3])
 			if !found {
 				t.Errorf("%s is created without %s: it reserves nothing, and grows into the room the other caps count on", name, flag)
+			}
+			caps[name] = max(caps[name], n)
+		}
+		if m := edits.FindStringSubmatch(line); m != nil {
+			if n, found := capOf(m[2], "--max-bytes=", m[3]); found && n > caps[m[2]] {
+				caps[m[2]] = n
 			}
 		}
 	}
 	// Not vacuous: every provisioned stream and bucket was found and counted.
 	for _, s := range a2aProvisionedStreams {
-		if _, ok := caps[s]; !ok {
+		if !created[s] {
 			t.Errorf("no capped create found for %s; the sum below would leave it out", s)
 		}
 	}
@@ -8211,6 +8226,12 @@ func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 		t.Fatal("nats.conf renders no max_file_store")
 	}
 	store, _ := strconv.ParseInt(m[1], 10, 64)
+	// The store has to fit the volume it is on, or the caps' arithmetic is about room
+	// the disk does not have.
+	claim := buildA2ANATSStatefulSet(agent, "").Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]
+	if store > claim.Value() {
+		t.Errorf("max_file_store is %d bytes, more than the bus's %s claim", store, claim.String())
+	}
 
 	var sum int64
 	names := make([]string, 0, len(caps))
