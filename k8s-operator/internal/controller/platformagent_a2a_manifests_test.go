@@ -8168,8 +8168,22 @@ const a2aJetStreamCapMargin = int64(2) << 30
 // re-reserves, so it counts.
 func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 	agent := a2aTestAgent()
-	// One logical line per command: the creates are wrapped with `\` continuations.
-	script := strings.ReplaceAll(a2aProvisionScript(agent), "\\\n", " ")
+	// Comment lines go first: bash doesn't continue a comment that ends in `\`, so
+	// joining before dropping them would fold the next command into the comment.
+	// Then one logical line per command line (the creates wrap with `\`), split at
+	// && || ; and | so each create's flags stop at the next command.
+	var kept []string
+	for _, line := range strings.Split(a2aProvisionScript(agent), "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "#") {
+			kept = append(kept, line)
+		}
+	}
+	script := strings.ReplaceAll(strings.Join(kept, "\n"), "\\\n", " ")
+	separators := regexp.MustCompile(`&&|\|\||;|\|`)
+	var commands []string
+	for _, line := range strings.Split(script, "\n") {
+		commands = append(commands, separators.Split(line, -1)...)
+	}
 
 	// natscli's create spellings, aliases included, and the edits that can raise a cap.
 	creates := regexp.MustCompile(`\b(stream (?:add|create|new)|kv (?:add|new|create))\s+(\S+)(.*)$`)
@@ -8188,8 +8202,8 @@ func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 	}
 	caps := map[string]int64{}
 	created := map[string]bool{}
-	for _, line := range strings.Split(script, "\n") {
-		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "echo ") {
+	for _, line := range commands {
+		if strings.HasPrefix(strings.TrimSpace(line), "echo ") {
 			continue
 		}
 		if m := creates.FindStringSubmatch(line); m != nil {
