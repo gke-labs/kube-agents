@@ -1425,6 +1425,26 @@ def test_worker_commands_as_typed_a_run_on_the_log_but_not_in_the_trajectory_sti
     assert "1 worker command(s)" in _AS_TYPED_RUN.verify(5.0).reason
 
 
+def test_worker_commands_as_typed_succeeded_run_on_log_but_not_in_trajectory_is_error():
+    # Under after_result_pattern and succeeded: true, a card-log run missed by
+    # the trajectory capture is inconclusive (status="error"), not a fail (#3335).
+    one_line = "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py ai-security-audit"
+    verifier = WorkerCommandsVerifier(
+        type="worker_commands",
+        after_result_pattern="(?!)",
+        required_runs=[{"script": "collect.py", "word_patterns": ["^ai-security-audit$"], "succeeded": True}],
+    )
+    transcript.set(
+        "ok",
+        _TRAJECTORY + [_terminal("ls /opt/data/scratch", at=1)],
+        worker_commands=[{"task": "t_1", "command": one_line}],
+        worker_capture_gaps=[],
+    )
+    res = verifier.verify(5.0)
+    assert res.status == "error", res.reason
+    assert "the worker card log shows collect.py ran, but the worker trajectory did not capture the call" in res.reason
+
+
 def test_worker_commands_after_result_a_clipped_head_with_a_cut_escape_is_kept_raw():
     raw = {"raw": '{"command": "kubectl apply -f /tmp/dns.yaml \\u1'}
     _stash_terminal(
@@ -7521,6 +7541,390 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     # an escaped character never opens a word, so a `#` after an escaped space is part of it
     assert _shell_argvs("python3 f.py --output r\\ #1.json --readiness") == [["python3", "f.py", "--output", "r #1.json", "--readiness"]]
     assert _shell_argvs("echo \\ #x") == [["echo", " #x"]]
+    # _shell_argvs_with_exit_propagation tracks whether subsequent operators propagate exit failure
+    from kube_agents_bench.verifiers import _shell_argvs_with_exit_propagation
+
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness") == [(["python3", "f.py", "--readiness"], True)]
+    assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness)") == [(["python3", "f.py", "--readiness"], True)]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness > /tmp/out 2>&1") == [
+        (["python3", "f.py", "--readiness", ">", "/tmp/out", "2", ">&", "1"], True)
+    ]
+    assert _shell_argvs_with_exit_propagation("VAR=1 python3 f.py --readiness") == [
+        (["VAR=1", "python3", "f.py", "--readiness"], True)
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo python3 f.py --readiness") == [
+        (["sudo", "python3", "f.py", "--readiness"], True)
+    ]
+    assert _shell_argvs_with_exit_propagation("timeout 60 python3 f.py --readiness") == [
+        (["timeout", "60", "python3", "f.py", "--readiness"], True)
+    ]
+    assert _shell_argvs_with_exit_propagation('python3 f.py --readiness "quoted && and ;"') == [
+        (["python3", "f.py", "--readiness", "quoted && and ;"], True)
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness && echo DONE") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "DONE"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("mkdir -p /tmp && python3 f.py --readiness") == [
+        (["mkdir", "-p", "/tmp"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness || echo failed") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "failed"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness ; echo done") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "done"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness | tee /tmp/log") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["tee", "/tmp/log"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness &") == [
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -c "python3 f.py --readiness || true"') == [
+        (["bash", "-c", "python3 f.py --readiness || true"], True),
+        (["python3", "f.py", "--readiness"], False),
+        (["true"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("test -f /opt/data/scratch/m.json || python3 f.py --readiness") == [
+        (["test", "-f", "/opt/data/scratch/m.json"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! python3 f.py --readiness") == [
+        (["!", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness && echo DONE &") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "DONE"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness && echo DONE) &") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "DONE"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness &&\necho DONE") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "DONE"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("OUT=$(python3 f.py --readiness)") == [
+        (["OUT=$(python3 f.py --readiness)"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("OUT='$(python3 f.py --readiness)'") == [
+        (["OUT=$(python3 f.py --readiness)"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("OUT=<(python3 f.py --readiness)") == [
+        (["OUT=<(python3 f.py --readiness)"], True),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -c "OUT=$(python3 f.py --readiness)"') == [
+        (["bash", "-c", "OUT=$(python3 f.py --readiness)"], True),
+        (["OUT=$(python3 f.py --readiness)"], True),
+        (["python3", "f.py", "--readiness"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("bash -c 'OUT=$(python3 f.py --readiness)'") == [
+        (["bash", "-c", "OUT=$(python3 f.py --readiness)"], True),
+        (["OUT=$(python3 f.py --readiness)"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs("KC=/tmp/kc\nkubectl get pods") == [
+        ["KC=/tmp/kc"],
+        ["kubectl", "get", "pods"],
+    ]
+    assert _shell_argvs_with_exit_propagation("test -f /opt/data/scratch/m.json ||\npython3 f.py --readiness") == [
+        (["test", "-f", "/opt/data/scratch/m.json"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("time ! python3 f.py --readiness") == [
+        (["time", "!", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("test -d /x || mkdir -p /x && python3 f.py --readiness") == [
+        (["test", "-d", "/x"], False),
+        (["mkdir", "-p", "/x"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("test -d /x || (mkdir -p /x && python3 f.py --readiness)") == [
+        (["test", "-d", "/x"], False),
+        (["mkdir", "-p", "/x"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("(test -d /x || mkdir -p /x) && python3 f.py --readiness") == [
+        (["test", "-d", "/x"], False),
+        (["mkdir", "-p", "/x"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("test -d /x || (mkdir -p /x) && python3 f.py --readiness") == [
+        (["test", "-d", "/x"], False),
+        (["mkdir", "-p", "/x"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("time ! ./f.py --readiness") == [
+        (["time", "!", "./f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! (python3 f.py --readiness)") == [
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! (python3 f.py --readiness && echo DONE)") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "DONE"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! (test -f /x) && python3 f.py --readiness") == [
+        (["test", "-f", "/x"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness && ! (grep -q x out)") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["grep", "-q", "x", "out"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! cat scope.json | python3 f.py --readiness") == [
+        (["!", "cat", "scope.json"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! cat scope.json |& python3 f.py --readiness") == [
+        (["!", "cat", "scope.json"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! cat scope.json |&\npython3 f.py --readiness") == [
+        (["!", "cat", "scope.json"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! A | B && python3 f.py --readiness") == [
+        (["!", "A"], False),
+        (["B"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! A |& B && python3 f.py --readiness") == [
+        (["!", "A"], False),
+        (["B"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("trap 'exit 0' EXIT; python3 f.py --readiness") == [
+        (["trap", "exit 0", "EXIT"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3(){ :; }; python3 f.py --readiness") == [
+        (["python3"], False),
+        (["{", ":"], False),
+        (["}"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("watch python3 f.py --readiness") == [
+        (["watch", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid -f python3 f.py --readiness") == [
+        (["setsid", "-f", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid --fork python3 f.py --readiness") == [
+        (["setsid", "--fork", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -b python3 f.py --readiness") == [
+        (["sudo", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -u hermes -b python3 f.py --readiness") == [
+        (["sudo", "-u", "hermes", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -h box -b python3 f.py --readiness") == [
+        (["sudo", "-h", "box", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -r role -b python3 f.py --readiness") == [
+        (["sudo", "-r", "role", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --user hermes --background python3 f.py --readiness") == [
+        (["sudo", "--user", "hermes", "--background", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --user hermes -b python3 f.py --readiness") == [
+        (["sudo", "--user", "hermes", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -t sysadm_t -b python3 f.py --readiness") == [
+        (["sudo", "-t", "sysadm_t", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -bu hermes python3 f.py --readiness") == [
+        (["sudo", "-bu", "hermes", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -Hbu hermes python3 f.py --readiness") == [
+        (["sudo", "-Hbu", "hermes", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -bC 3 python3 f.py --readiness") == [
+        (["sudo", "-bC", "3", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -bC3 python3 f.py --readiness") == [
+        (["sudo", "-bC3", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -buhermes python3 f.py --readiness") == [
+        (["sudo", "-buhermes", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -Hbuhermes python3 f.py --readiness") == [
+        (["sudo", "-Hbuhermes", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -bgbin python3 f.py --readiness") == [
+        (["sudo", "-bgbin", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -Nb python3 f.py --readiness") == [
+        (["sudo", "-Nb", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -Bb python3 f.py --readiness") == [
+        (["sudo", "-Bb", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -Nbu hermes python3 f.py --readiness") == [
+        (["sudo", "-Nbu", "hermes", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo 2>/dev/null -b python3 f.py --readiness") == [
+        (["sudo", "2", ">", "/dev/null", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo > log -b python3 f.py --readiness") == [
+        (["sudo", ">", "log", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -u hermes 2>&1 -b python3 f.py --readiness") == [
+        (["sudo", "-u", "hermes", "2", ">&", "1", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid 2>/dev/null -f python3 f.py --readiness") == [
+        (["setsid", "2", ">", "/dev/null", "-f", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid > log -f python3 f.py --readiness") == [
+        (["setsid", ">", "log", "-f", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo 2>/dev/null python3 f.py --readiness") == [
+        (["sudo", "2", ">", "/dev/null", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid 2>/dev/null python3 f.py --readiness") == [
+        (["setsid", "2", ">", "/dev/null", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid -w python3 f.py --readiness") == [
+        (["setsid", "-w", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid --wait python3 f.py --readiness") == [
+        (["setsid", "--wait", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid --wai python3 f.py --readiness") == [
+        (["setsid", "--wai", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid -fw python3 f.py --readiness") == [
+        (["setsid", "-fw", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid -wf python3 f.py --readiness") == [
+        (["setsid", "-wf", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('eval "python3 f.py --readiness"') == [
+        (["eval", "python3 f.py --readiness"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation('eval "python3 f.py --readiness && echo done"') == [
+        (["eval", "python3 f.py --readiness && echo done"], True),
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "done"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('eval "python3 f.py --readiness" && echo done') == [
+        (["eval", "python3 f.py --readiness"], False),
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "done"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -ubob python3 f.py --readiness") == [
+        (["sudo", "-ubob", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -gbin python3 f.py --readiness") == [
+        (["sudo", "-gbin", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --backg python3 f.py --readiness") == [
+        (["sudo", "--backg", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid --fo python3 f.py --readiness") == [
+        (["setsid", "--fo", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\necho done") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "done"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo python3 f.py --readiness") == [
+        (["sudo", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -l python3 f.py --readiness") == [
+        (["sudo", "-l", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --list python3 f.py --readiness") == [
+        (["sudo", "--list", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo FOO=bar python3 f.py --readiness") == [
+        (["sudo", "FOO=bar", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --set-home python3 f.py --readiness") == [
+        (["sudo", "--set-home", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --preserve-groups python3 f.py --readiness") == [
+        (["sudo", "--preserve-groups", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --no-update python3 f.py --readiness") == [
+        (["sudo", "--no-update", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --edit python3 f.py --readiness") == [
+        (["sudo", "--edit", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("./f.py --readiness --out /tmp/setsid") == [
+        (["./f.py", "--readiness", "--out", "/tmp/setsid"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("./f.py --readiness --exclude watch") == [
+        (["./f.py", "--readiness", "--exclude", "watch"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\n") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("# run\npython3 f.py --readiness") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\n# done") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\n\n") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("(\npython3 f.py --readiness\n)") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness &\n") == [
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness > /tmp/setsid") == [
+        (["python3", "f.py", "--readiness", ">", "/tmp/setsid"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness > /tmp/sudo") == [
+        (["python3", "f.py", "--readiness", ">", "/tmp/sudo"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid python3 f.py --readiness") == [
+        (["setsid", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("stdbuf -oL setsid python3 f.py --readiness") == [
+        (["stdbuf", "-oL", "setsid", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("xargs -r python3 f.py --readiness < /dev/null") == [
+        (["xargs", "-r", "python3", "f.py", "--readiness", "<", "/dev/null"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("flock -n -E 0 /tmp/lock python3 f.py --readiness") == [
+        (["flock", "-n", "-E", "0", "/tmp/lock", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness) > /tmp/out") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness) 2>&1") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness) >> /tmp/out") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness;") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness ;\n") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness;)") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("echo $(python3 f.py --readiness)") == [
+        (["echo", "$(python3 f.py --readiness)"], True),
+        (["python3", "f.py", "--readiness"], False),
+    ]
     # a script is a bare name and a flag one word, refused at case load otherwise
     for bad in ({"script": "scripts/f.py"}, {"script": ""}, {"script": "f.py", "flags": ["--a b"]}):
         with pytest.raises(ValueError):
@@ -7547,6 +7951,777 @@ def test_worker_commands_required_run_names_what_did_not_run():
     v = WorkerCommandsVerifier(type="worker_commands", required_runs=_WEBHOOK_RUNS)
     res = v.verify(5.0)
     assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
+
+
+def test_worker_commands_required_run_succeeded_card_log_trajectory_discrepancy_is_error():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo other"}, "result": "other", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "kubectl get nodes"}, "result": "node-1", "status": "completed", "at": 2.0},
+    ]
+    # Card log has 1 command carrying the collector, while trajectory has 2 completed non-matching calls.
+    # The two sources disagree: card log shows it ran, but trajectory lacks the call, so success
+    # cannot be verified -> capture discrepancy (status="error").
+    transcript.set(
+        "ok",
+        traj,
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+    )
+    res = v.verify(5.0)
+    assert res.status == "error"
+    assert "the worker card log shows fleet_upgrade_report.py --readiness ran, but the worker trajectory did not capture the call" in res.reason
+
+
+def test_worker_commands_required_run_succeeded_missing_from_both_is_fail():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo other"}, "result": "other", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "kubectl get nodes"}, "result": "node-1", "status": "completed", "at": 2.0},
+    ]
+    # Neither card log nor trajectory carries the collector. Conclusive fail.
+    transcript.set(
+        "ok",
+        traj,
+        worker_commands=[{"task": "t_1", "command": "kubectl get pods"}],
+    )
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "no worker command ran fleet_upgrade_report.py --readiness across 1 command(s)" in res.reason
+
+
+def test_worker_commands_required_run_succeeded_flag():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+
+    # Trajectory entry with status="completed" and exit_code 0 passes.
+    traj_ok = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 0, "output": "done"}', "exit_code": 0, "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_ok, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    assert v.verify(5.0).status == "pass"
+
+    # Trajectory entry with status="completed", exit_code 0, but a clipped non-JSON result passes via entry["exit_code"].
+    clipped_result_zero = '{"exit_code": 0, "output": "' + "x" * 2000 + ' ...[clipped 1200 chars]'
+    traj_clipped_zero = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": clipped_result_zero, "exit_code": 0, "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_clipped_zero, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    assert v.verify(5.0).status == "pass"
+
+    # Trajectory entry with status="completed", exit_code 1, and a clipped non-JSON result fails via entry["exit_code"].
+    clipped_result_nonzero = '{"exit_code": 1, "output": "' + "x" * 2000 + ' ...[clipped 1200 chars]'
+    traj_clipped_nonzero = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": clipped_result_nonzero, "exit_code": 1, "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_clipped_nonzero, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_clipped_nonzero = v.verify(5.0)
+    assert res_clipped_nonzero.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_clipped_nonzero.reason
+
+    # Trajectory entry with status="completed" but unrecorded exit (plain text or non-zero) fails.
+    traj_unrecorded = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": "started in background", "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_unrecorded, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_unrecorded = v.verify(5.0)
+    assert res_unrecorded.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_unrecorded.reason
+
+    # Trajectory entry with status="completed" and non-zero exit code fails.
+    traj_nonzero = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_nonzero, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_nonzero = v.verify(5.0)
+    assert res_nonzero.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_nonzero.reason
+
+    # Trajectory entry with status="error" fails.
+    traj_err = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": "error: failed", "status": "error", "at": 1.0}
+    ]
+    transcript.set("ok", traj_err, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res = v.verify(5.0)
+    assert res.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res.reason
+
+    # Trajectory entry with status="called" (unrecorded exit) fails.
+    traj_called = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": None, "status": "called", "at": 1.0}
+    ]
+    transcript.set("ok", traj_called, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_called = v.verify(5.0)
+    assert res_called.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_called.reason
+
+    # Trajectory entry where the command is joined with trailing ||, ;, |, &, or newline, preceded by || or !,
+    # backgrounded with &, or combined with other commands is not credited even if exit_code is 0.
+    for joined_cmd in [
+        f"python3 {_SCRIPT_PATH} --readiness || true",
+        f'python3 {_SCRIPT_PATH} --readiness || echo "failed"',
+        f"python3 {_SCRIPT_PATH} --readiness ; echo done",
+        f"python3 {_SCRIPT_PATH} --readiness 2>&1 | tee /tmp/log",
+        f"python3 {_SCRIPT_PATH} --readiness |& tee /tmp/log",
+        f"python3 {_SCRIPT_PATH} --readiness > /tmp/out &",
+        f"python3 {_SCRIPT_PATH} --readiness\necho done",
+        f"test -f /tmp/m.json || python3 {_SCRIPT_PATH} --readiness",
+        f"! python3 {_SCRIPT_PATH} --readiness",
+        f"python3 {_SCRIPT_PATH} --readiness && echo DONE &",
+        f"sudo -b python3 {_SCRIPT_PATH} --readiness",
+        f"setsid -f python3 {_SCRIPT_PATH} --readiness",
+        f'python3 {_SCRIPT_PATH} --readiness && echo "DONE"',
+        f"python3 {_SCRIPT_PATH} --readiness && echo ok",
+        f"mkdir -p /tmp && python3 {_SCRIPT_PATH} --readiness",
+        f"cd /tmp ; python3 {_SCRIPT_PATH} --readiness",
+        f"python3 {_SCRIPT_PATH} --readiness &&\necho DONE",
+        f"test -d /tmp || mkdir -p /tmp && python3 {_SCRIPT_PATH} --readiness",
+        f"trap 'exit 0' EXIT; python3 {_SCRIPT_PATH} --readiness",
+        f"python3(){{ :; }}; python3 {_SCRIPT_PATH} --readiness",
+        f"watch python3 {_SCRIPT_PATH} --readiness",
+    ]:
+        traj_joined = [
+            {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": joined_cmd}, "result": '{"exit_code": 0, "output": "ok"}', "exit_code": 0, "status": "completed", "at": 1.0}
+        ]
+        transcript.set("ok", traj_joined, worker_commands=[{"task": "t_1", "command": joined_cmd}])
+        res_joined = v.verify(5.0)
+        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but the dictated form is the command alone on its line" in res_joined.reason and "means its exit is not credited" in res_joined.reason
+
+    # Trajectory entry whose arguments were clipped in the pod (falling back to head regex)
+    # is inconclusive under succeeded: true when the call succeeded (error status, not pass).
+    raw_clipped_arg = '{"command": "python3 ' + _SCRIPT_PATH + ' --readiness > out.js ...[clipped 40 chars]'
+    traj_arg_clipped = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"raw": raw_clipped_arg}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_arg_clipped, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_arg_clipped = v.verify(5.0)
+    assert res_arg_clipped.status == "error"
+    assert "the call's command was clipped in the pod, so what followed the run on the line is unknown (fleet_upgrade_report.py --readiness)" in res_arg_clipped.reason
+
+    # A clipped call whose head ends inside an open quote on a worker-filed card
+    # yields no argv and folds into gaps under succeeded: true, returning status="error" (#3335).
+    raw_unclosed = '{"command": "python3 ' + _SCRIPT_PATH + ' --readiness --scope-projects \\"p1,p2 ...[clipped 40 chars]'
+    traj_unclosed = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_worker_child",
+            "args": {"raw": raw_unclosed},
+            "result": '{"exit_code": 0}',
+            "exit_code": 0,
+            "status": "completed",
+            "at": 1.0,
+        }
+    ]
+    transcript.set("ok", traj_unclosed, worker_commands=[])
+    res_unclosed = v.verify(5.0)
+    assert res_unclosed.status == "error"
+    assert "the pod clipped a worker terminal call's arguments" in res_unclosed.reason
+
+    # A clipped match whose exit was non-zero is a conclusive fail (ran but exited non-zero).
+    traj_clipped_failed = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"raw": raw_clipped_arg}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_clipped_failed, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_clipped_failed = v.verify(5.0)
+    assert res_clipped_failed.status == "fail"
+    assert "fleet_upgrade_report.py --readiness ran but exited non-zero" in res_clipped_failed.reason
+
+    # A clipped exit-0 match beside an earlier failed unclipped match remains inconclusive (error status, not conclusive fail).
+    traj_failed_then_clipped = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"raw": raw_clipped_arg}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj_failed_then_clipped, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_failed_then_clipped = v.verify(5.0)
+    assert res_failed_then_clipped.status == "error"
+    assert "the call's command was clipped in the pod, so what followed the run on the line is unknown (fleet_upgrade_report.py --readiness)" in res_failed_then_clipped.reason
+
+    # The same clipped head passes under succeeded: false as it always has (tested with empty card log so only trajectory clipped head satisfies it).
+    transcript.set("ok", traj_arg_clipped, worker_commands=[])
+    v_succeeded_false = WorkerCommandsVerifier(type="worker_commands", required_runs=[WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=False)])
+    res_succeeded_false = v_succeeded_false.verify(5.0)
+    assert res_succeeded_false.status == "pass"
+
+    # Two succeeded: true runs A and B: when a clipped call carries A in its head and B
+    # sits past the cut, B is not seen but folds into capture gaps rather than failing (#3335).
+    run_b = WorkerRun(script="audit_report.py", flags=["--summary"], succeeded=True)
+    v_two_runs = WorkerCommandsVerifier(type="worker_commands", required_runs=[WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True), run_b])
+    transcript.set("ok", traj_arg_clipped, worker_commands=[])
+    res_two_runs = v_two_runs.verify(5.0)
+    assert res_two_runs.status == "error"
+    assert "the pod clipped a worker terminal call's arguments" in res_two_runs.reason
+
+    # Trajectory entry where the command runs alone on its line (bare, with redirects, env vars,
+    # non-detaching wrappers, transparent subshell parens, quotes, or lone assignments) IS credited when the call exited 0.
+    for valid_cmd in [
+        f"python3 {_SCRIPT_PATH} --readiness",
+        f"python3 {_SCRIPT_PATH} --readiness > /tmp/out 2>&1",
+        f"VAR=1 python3 {_SCRIPT_PATH} --readiness",
+        f"sudo python3 {_SCRIPT_PATH} --readiness",
+        f"timeout 60 python3 {_SCRIPT_PATH} --readiness",
+        f"(python3 {_SCRIPT_PATH} --readiness)",
+        f'python3 {_SCRIPT_PATH} --readiness "with && and ; in quotes"',
+        f"OUT=$(python3 {_SCRIPT_PATH} --readiness)",
+    ]:
+        traj_valid = [
+            {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": valid_cmd}, "result": '{"exit_code": 0, "output": "ok"}', "exit_code": 0, "status": "completed", "at": 1.0}
+        ]
+        transcript.set("ok", traj_valid, worker_commands=[{"task": "t_1", "command": valid_cmd}])
+        assert v.verify(5.0).status == "pass"
+
+    # Card log only (no worker trajectory) yields status="error" under succeeded: true.
+    transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_notraj = v.verify(5.0)
+    assert res_notraj.status == "error" and "no delegated worker's terminal or execute_code calls are readable in the trajectory" in res_notraj.reason
+
+    # Credited run with capture gaps passes (positive evidence is conclusive).
+    transcript.set(
+        "ok",
+        traj_ok,
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_ok = v.verify(5.0)
+    assert res_gap_ok.status == "pass"
+
+    # Absent/uncredited run with capture gaps yields status="error".
+    traj_other = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo other"}, "result": "other", "status": "completed", "at": 1.0}
+    ]
+    transcript.set(
+        "ok",
+        traj_other,
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_missing = v.verify(5.0)
+    assert res_gap_missing.status == "error" and "the worker-trajectory capture was partial (card_1 unread session store)" in res_gap_missing.reason
+    assert "fleet_upgrade_report.py --readiness" in res_gap_missing.reason
+
+    # Absent/uncredited succeeded: true run from both sources beside capture gaps lands in unrun_missing
+    # and yields status="error" via partial (not conclusive fail).
+    transcript.set(
+        "ok",
+        traj_other,
+        worker_commands=[{"task": "t_1", "command": "kubectl get pods"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_unrun_missing = v.verify(5.0)
+    assert res_gap_unrun_missing.status == "error"
+    assert "the worker-trajectory capture was partial (card_1 unread session store)" in res_gap_unrun_missing.reason
+    assert "could not be verified" in res_gap_unrun_missing.reason
+    assert "fleet_upgrade_report.py --readiness" in res_gap_unrun_missing.reason
+    assert "fleet_upgrade_report.py --readiness not seen in what was read" in res_gap_unrun_missing.reason
+
+    # Run in unrun_failed (trajectory captured non-zero exit) beside capture gaps yields status="error"
+    # and names that it ran but exited non-zero and that a retry may sit in the unread part.
+    traj_failed = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"},
+            "result": '{"output": "boom", "exit_code": 1}',
+            "status": "completed",
+            "at": 1.0,
+        }
+    ]
+    transcript.set(
+        "ok",
+        traj_failed,
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_unrun_failed = v.verify(5.0)
+    assert res_gap_unrun_failed.status == "error"
+    assert "the worker-trajectory capture was partial (card_1 unread session store)" in res_gap_unrun_failed.reason
+    assert "could not be verified" in res_gap_unrun_failed.reason
+    assert (
+        "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded); "
+        "a retry may sit in the unread part (card_1 unread session store)"
+    ) in res_gap_unrun_failed.reason
+
+    # Card-log required pattern miss beside capture gaps yields conclusive failure (status="fail").
+    v_with_pattern = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_patterns=[r"pattern_that_is_missing"],
+        required_runs=[run],
+    )
+    transcript.set(
+        "ok",
+        traj_ok,
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_card_miss = v_with_pattern.verify(5.0)
+    assert res_gap_card_miss.status == "fail"
+    assert "no worker command matched required pattern(s)" in res_gap_card_miss.reason
+
+    # Conclusive card-log pattern miss beside an uncredited succeeded: true run and capture gaps yields conclusive failure (status="fail").
+    transcript.set(
+        "ok",
+        traj_other,
+        worker_commands=[{"task": "t_1", "command": "kubectl get pods"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_uncredited_card_miss = v_with_pattern.verify(5.0)
+    assert res_gap_uncredited_card_miss.status == "fail"
+    assert "no worker command matched required pattern(s)" in res_gap_uncredited_card_miss.reason
+    assert "fleet_upgrade_report.py --readiness not seen in what was read" in res_gap_uncredited_card_miss.reason
+
+    # Conclusive card-log unrun required_run (succeeded: false) miss beside an uncredited succeeded: true run and capture gaps yields conclusive failure (status="fail").
+    v_with_unrun_fail = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_runs=[run, WorkerRun(script="other_missing.py", flags=[], succeeded=False)],
+    )
+    res_gap_uncredited_unrun_fail = v_with_unrun_fail.verify(5.0)
+    assert res_gap_uncredited_unrun_fail.status == "fail"
+    assert "no worker command ran other_missing.py across 1 command(s)" in res_gap_uncredited_unrun_fail.reason
+    assert "fleet_upgrade_report.py --readiness not seen in what was read" in res_gap_uncredited_unrun_fail.reason
+
+    # Conclusive pattern miss beside an unrun_failed succeeded: true run and capture gaps yields conclusive failure (status="fail")
+    # and qualifies the failed run rather than dropping it silently.
+    transcript.set(
+        "ok",
+        traj_failed,
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_failed_card_miss = v_with_pattern.verify(5.0)
+    assert res_gap_failed_card_miss.status == "fail"
+    assert "no worker command matched required pattern(s)" in res_gap_failed_card_miss.reason
+    assert (
+        "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded); "
+        "a retry may sit in the unread part (card_1 unread session store)"
+    ) in res_gap_failed_card_miss.reason
+
+    # Without succeeded=True (default False), card log alone is credited.
+    run_any = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"])
+    v_any = WorkerCommandsVerifier(type="worker_commands", required_runs=[run_any])
+    transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    assert v_any.verify(5.0).status == "pass"
+
+    # Forbidden runs cannot set succeeded=True.
+    with pytest.raises(ValueError, match="forbidden_runs cannot set succeeded: true"):
+        WorkerCommandsVerifier(type="worker_commands", forbidden_runs=[run])
+
+
+def test_worker_commands_succeeded_worker_typed_nothing_grades_as_zero_commands():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+    mcp = {
+        "agent": "worker",
+        "name": "mcp__gke__get_k8s_resource",
+        "task": "t_1",
+        "args": {"name": "test"},
+        "result": "{}",
+        "status": "completed",
+        "at": 10.0,
+    }
+    # Tagged MCP calls beside an empty card log: reads 0 commands, fails conclusively rather than erroring.
+    transcript.set("ok", [mcp], worker_commands=[])
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "no worker command ran fleet_upgrade_report.py --readiness across 0 command(s)" in res.reason
+
+
+def test_worker_commands_succeeded_tagged_mcp_beside_card_log_missing_from_both_is_fail():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+    mcp = {
+        "agent": "worker",
+        "name": "mcp__gke__get_k8s_resource",
+        "task": "t_1",
+        "args": {"name": "test"},
+        "result": "{}",
+        "status": "completed",
+        "at": 10.0,
+    }
+    # Tagged MCP calls beside non-empty card log with 0 terminal calls in trajectory:
+    # command is absent from both sources, so it fails conclusively.
+    transcript.set(
+        "ok",
+        [mcp],
+        worker_commands=[{"task": "t_1", "command": "kubectl get pods"}],
+    )
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "no worker command ran fleet_upgrade_report.py --readiness across 1 command(s)" in res.reason
+
+
+def test_worker_commands_succeeded_tagged_mcp_beside_card_log_with_command_is_error():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+    mcp = {
+        "agent": "worker",
+        "name": "mcp__gke__get_k8s_resource",
+        "task": "t_1",
+        "args": {"name": "test"},
+        "result": "{}",
+        "status": "completed",
+        "at": 10.0,
+    }
+    # Tagged MCP calls beside card log carrying the required run:
+    # discrepancy between capture sources yields status="error".
+    transcript.set(
+        "ok",
+        [mcp],
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+    )
+    res = v.verify(5.0)
+    assert res.status == "error"
+    assert "the worker card log shows fleet_upgrade_report.py --readiness ran, but the worker trajectory did not capture the call" in res.reason
+
+
+def test_worker_commands_succeeded_no_trajectory_with_conclusive_card_log_failure_fails():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        forbidden_patterns=[r"kubectl delete"],
+        required_runs=[run],
+    )
+    # No tagged worker terminal calls in trajectory, but card log has forbidden pattern.
+    # Conclusive card log evidence must fail conclusively rather than returning error.
+    transcript.set(
+        "ok",
+        [],
+        worker_commands=[
+            {"task": "t_1", "command": "kubectl delete pod x"},
+            {"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"},
+        ],
+    )
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "forbidden pattern(s) matched worker commands" in res.reason
+    assert "fleet_upgrade_report.py" in res.reason
+    assert "the worker card log shows fleet_upgrade_report.py --readiness ran, but the worker trajectory did not capture the call" in res.reason
+
+
+def test_worker_commands_succeeded_withheld_call_beside_readable_call_is_error():
+    from kube_agents_bench.verifiers import WorkerRun
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_runs=[run],
+    )
+    # 1 readable sibling terminal call, 1 terminal call with withheld arguments
+    traj = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": "kubectl get nodes"},
+            "result": '{"output": "", "exit_code": 0}',
+            "status": "completed",
+            "at": 1.0,
+        },
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": worker_trajectory.WITHHELD,
+            "status": "completed",
+            "at": 2.0,
+        },
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": "kubectl get nodes"}])
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "the pod withheld a worker terminal call's arguments" in res.reason
+    assert "fleet_upgrade_report.py --readiness" in res.reason
+
+
+def test_worker_commands_succeeded_withheld_call_beside_failed_run_is_error():
+    from kube_agents_bench.verifiers import WorkerRun
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_runs=[run],
+    )
+    # 1 readable terminal call that exited 1, 1 terminal call with withheld arguments
+    traj = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"},
+            "result": '{"output": "failed", "exit_code": 1}',
+            "status": "completed",
+            "at": 1.0,
+        },
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": worker_trajectory.WITHHELD,
+            "status": "completed",
+            "at": 2.0,
+        },
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "the worker-trajectory capture was partial (the pod withheld a worker terminal call's arguments)" in res.reason
+    assert "fleet_upgrade_report.py --readiness ran but exited non-zero" in res.reason
+    assert "a retry may sit in the unread part (the pod withheld a worker terminal call's arguments)" in res.reason
+
+
+def test_worker_commands_succeeded_empty_args_beside_readable_call_fails():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_runs=[run],
+    )
+    # 1 readable sibling terminal call, 1 terminal call with empty args {} (agent miss, not withheld by pod)
+    traj = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": "kubectl get nodes"},
+            "result": '{"output": "", "exit_code": 0}',
+            "status": "completed",
+            "at": 1.0,
+        },
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {},
+            "status": "completed",
+            "at": 2.0,
+        },
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": "kubectl get nodes"}])
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "fail"
+    assert "withheld" not in res.reason
+    assert "no worker command ran fleet_upgrade_report.py --readiness" in res.reason
+
+
+def test_worker_commands_succeeded_no_trajectory_with_forbidden_failure_does_not_say_withheld():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        forbidden_patterns=[r"kubectl delete"],
+        required_runs=[run],
+    )
+    # Card log has forbidden pattern, trajectory is empty (capture did not run), required run not in card log.
+    # Must fail conclusively and report no trajectory rather than claiming withheld arguments.
+    transcript.set(
+        "ok",
+        [],
+        worker_commands=[
+            {"task": "t_1", "command": "kubectl delete pod x"},
+        ],
+    )
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "fail"
+    assert "forbidden pattern(s) matched worker commands" in res.reason
+    assert "withheld" not in res.reason
+    assert "no card was delegated or the worker-trajectory capture did not run, so fleet_upgrade_report.py --readiness could not be verified" in res.reason
+
+
+def test_worker_commands_succeeded_no_trajectory_with_gaps_does_not_say_withheld():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_runs=[run],
+    )
+    # Trajectory is empty, gaps present, required run not in card log.
+    # Partial error must cite the gap and no-trajectory clause, without saying withheld.
+    transcript.set(
+        "ok",
+        [],
+        worker_commands=[{"task": "t_1", "command": "kubectl get pods"}],
+        worker_capture_gaps=["card t_1: unread session store"],
+    )
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "card t_1: unread session store" in res.reason
+    assert "withheld" not in res.reason
+    assert "no card was delegated or the worker-trajectory capture did not run, so fleet_upgrade_report.py --readiness could not be verified" in res.reason
+
+
+def test_worker_commands_after_result_partial_capture_preserves_missing_in_fail_reason():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        after_result_pattern=r"START",
+        required_patterns=[r"must_run_this"],
+        forbidden_patterns=[r"forbidden_cmd"],
+        required_runs=[WorkerRun(script="worker.py", flags=[], succeeded=False)],
+    )
+    calls = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo START"}, "result": "START", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "forbidden_cmd"}, "result": "ok", "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", calls, worker_commands=[], worker_capture_gaps=["card t_9: locked"])
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "no worker command matched required pattern(s) ['must_run_this']" in res.reason
+    assert "no worker command ran worker.py across 2 command(s)" in res.reason
+    assert "forbidden pattern(s) matched worker commands" in res.reason
+
+
+def test_worker_commands_required_run_succeeded_with_after_result_pattern():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", forbidden_patterns=[r"never_matches"], required_runs=[run])
+
+    # Trajectory entry with status="completed" passes.
+    traj_completed = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj_completed)
+    assert v.verify(5.0).status == "pass"
+
+    # Trajectory entry with status="error" fails.
+    traj_error = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": "failed", "status": "error", "at": 2.0},
+    ]
+    transcript.set("ok", traj_error)
+    res = v.verify(5.0)
+    assert res.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res.reason
+
+    # Required run completes before the opener pattern matches (runs read every command).
+    traj_before_opener = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj_before_opener)
+    assert v.verify(5.0).status == "pass"
+
+
+def test_worker_commands_succeeded_with_after_result_pattern_withheld_call_beside_readable_is_error():
+    from kube_agents_bench.verifiers import WorkerRun
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", required_runs=[run])
+
+    # 1 readable sibling terminal call that opens the window, 1 terminal call with withheld arguments
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj)
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "the worker-trajectory capture was partial (the pod withheld a worker terminal call's arguments)" in res.reason
+    assert "fleet_upgrade_report.py --readiness" in res.reason
+
+
+def test_worker_commands_after_result_pattern_withheld_call_beside_readable_passes_when_no_succeeded_run():
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    # When no required run specifies succeeded: true, a withheld call beside a readable call is skipped per docstring.
+    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", forbidden_patterns=[r"never_matches"], required_patterns=[r"^echo OPEN$"])
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj)
+    res = v.verify(5.0)
+    assert res.success
+    assert res.status == "pass"
+
+
+def test_worker_commands_after_result_pattern_withheld_call_beside_credited_succeeded_run_passes():
+    from kube_agents_bench.verifiers import WorkerRun
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    run = WorkerRun(script="collect.py", word_patterns=[r"^compliance-audit$"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", forbidden_patterns=[r"never_matches"], required_runs=[run])
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "python3 /opt/data/skills/collect.py compliance-audit"}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 2.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 3.0},
+    ]
+    transcript.set("ok", traj)
+    res = v.verify(5.0)
+    assert res.success
+    assert res.status == "pass"
+
+
+def test_worker_commands_succeeded_all_withheld_trajectory_is_error_without_claiming_no_capture():
+    from kube_agents_bench.verifiers import WorkerRun
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    run = WorkerRun(script="collect.py", word_patterns=[r"^compliance-audit$"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+
+    # Worker trajectory where every code tool call's argument was withheld
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 1.0},
+    ]
+    # Run absent from card log
+    card_commands = [{"task": "t_1", "command": "kubectl get pods"}]
+    transcript.set("ok", traj, worker_commands=card_commands)
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "capture did not run" not in res.reason
+    assert "withheld" in res.reason
+    assert "collect.py not seen in what was read" in res.reason
+
+    # Run present in card log
+    card_commands_with_run = [{"task": "t_1", "command": "python3 collect.py compliance-audit"}]
+    transcript.set("ok", traj, worker_commands=card_commands_with_run)
+    res_card = v.verify(5.0)
+    assert not res_card.success
+    assert res_card.status == "error"
+    assert "capture did not run" not in res_card.reason
+    assert "withheld" in res_card.reason
+    assert "shows collect.py ran, but the worker trajectory did not capture the call" in res_card.reason
+
+
+def test_worker_commands_succeeded_no_trajectory_split_card_log_reporting():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run_a = WorkerRun(script="collect.py", word_patterns=[r"^compliance-audit$"], succeeded=True)
+    run_b = WorkerRun(script="audit_report.py", succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run_a, run_b])
+
+    # Trajectory with no tagged worker calls, card log has run_a but not run_b
+    card_commands = [{"task": "t_1", "command": "python3 collect.py compliance-audit"}]
+    transcript.set("ok", [], worker_commands=card_commands, worker_capture_gaps=["card t_1: unread session store"])
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "shows collect.py ran, but the worker trajectory did not capture the call" in res.reason
+    assert "no card was delegated or the worker-trajectory capture did not run, so audit_report.py could not be verified" in res.reason
 
 
 # ------------------------------- the retrospective's drained-budget case's line
