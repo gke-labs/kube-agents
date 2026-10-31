@@ -549,3 +549,14 @@ func TestSlackNotifyPostsWithTheHomeValidateSaw(t *testing.T) {
 		t.Errorf("the projection was read %d times for one request, want 1", reads)
 	}
 }
+
+// A Block Kit request takes no update key: the gateway edits chat messages
+// and text by key, and a key it would accept and never read is refused.
+func TestSlackNotifyRefusesAKeyedBlocksRequest(t *testing.T) {
+	adapter, stub := startSlackStubAdapter(t)
+	n := newTestSlackNotifier(t, adapter)
+	got := serveJSON(t, n, lib.NotifyRequest{Text: "fallback", Blocks: json.RawMessage(testBlocks), Update: "audit-1"})
+	if got.Error == "" || len(stub.forms) != 0 {
+		t.Fatalf("answer = %+v, posts = %d; want a refusal and no post", got, len(stub.forms))
+	}
+}

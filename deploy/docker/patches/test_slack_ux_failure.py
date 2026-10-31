@@ -291,6 +291,24 @@ class MarkTest(FlagOn):
         self.assertIn("Check it there?", blocks[0]["text"]["text"])
         self.assertRegex(button["action_id"], slack_presenter.CHOICE_ACTION_ID_PATTERN)
 
+    def test_under_next_a_google_chat_failure_reply_is_laid_out_too(self):
+        # The gateway lays the reply out on Google Chat under next, so the wake marks a
+        # Google Chat thread as it marks a Slack one; under today it marks nothing there.
+        gsub = {**SUB, "platform": "google_chat", "chat_id": "spaces/H", "thread_id": "spaces/H/threads/T"}
+        served = {"A2A_NOTIFY_PLATFORM": "google_chat", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}
+        with mock.patch.dict(os.environ, served):
+            runtime.note_wake(gsub, {"gave_up"}, WAKE)
+            token = runtime.begin(_turn(platform="google_chat", chat_id="spaces/H", thread_id="spaces/H/threads/T"))
+            try:
+                chat = runtime.chat_for(REPLY)
+            finally:
+                runtime.end(token)
+        self.assertEqual(chat["headline"], "I couldn't find seeded-z.")
+        runtime._marks.clear()
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            runtime.note_wake(gsub, {"gave_up"}, WAKE)
+        self.assertEqual(runtime._marks, {}, "under today Google Chat takes text: nothing is marked")
+
     def test_under_next_a_marked_reply_is_laid_out_as_a_chat_message(self):
         # The chat.notify stand-in asks chat_for under the same mark, and gets
         # the reply's first sentence as the headline and Try again as a choice.

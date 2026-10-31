@@ -1547,7 +1547,8 @@ works and until the parent's own answer has been delivered on that thread, then 
 cursor moved past it, and posted after all if the parent ends blocked, its subscription is gone,
 or the hold passes two hours (then led "Interim result from <card title> …"). One that arrives after
 the parent's answer has posted opens with "Late result from <card title>:". On Slack with
-`KAGE_SLACK_UX` on, a child whose parent still works is not held: its `completed` delivers, and
+`KAGE_SLACK_UX` on, and on Google Chat under `next`, where the gateway lays the plan out, a
+child whose parent still works is not held: its `completed` delivers, and
 `kanban_progress_lines` settles its plan row and posts nothing, as under `today`. Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
 notifier when the route is unavailable (the gateway restarting), and it holds deliveries
 unclaimed then; only a send that meets the outage before the next probe spends one unit of
@@ -1638,8 +1639,19 @@ card filed under `today` in a DM or another channel and delivered after the swit
 refused rather than reported into home; a Slack subscription with no channel is not sent. Slack
 lays out a home-channel request's `chat` message as it lays out a conversation's (the fleet
 audit's report card, `a2a notify --chat-file`): one that breaks a rule, or that Slack refuses,
-is dropped and its `text` posted, and the request's `update` and `mark` are not read. Chat posts
-the `text`. Slack also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
+is dropped and its `text` posted. The `mark` is not read on a home post (it is drawn on an ask's
+plan, which a home thread has none of); the `update` key is kept per home thread as it is per
+conversation, in the same table and under the same bounds (16 keys a thread, 1,024 threads and
+conversations together, the least recently used forgotten first): a later request with the key on
+that thread edits the message, laid out or as text; one that finds no message there (another
+thread's, one forgotten, one lost to a restart) or a message that can no longer be edited posts
+anew; and a laid-out edit that fails otherwise is retried once and then left as it was, as a
+conversation's is ("Chat messages" below). A keyed message is one message, so its text is posted or
+edited as text only when it fits one chunk; a keyed request whose text is longer and whose layout
+does not land is posted in chunks and unkeyed, as before. A keyed request with no thread starts one
+and binds its key to it, which is how the event watcher's alert, posted under `alert-<session>`, is
+edited into its triage. Google Chat under `next` lays a home-channel `chat` message out and edits it
+the same way ("Chat messages on Google Chat"). Slack also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
 `text` as its notification and fallback (`a2a notify --blocks-file`). A backend without blocks, Chat today, refuses such a request
 rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back as the
 `error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
@@ -1737,8 +1749,10 @@ redelivered click is a duplicate like a redelivered message, and a click or repl
 sender the gateway drops changes
 nothing. A remembered question binds its click to the conversation it was posted in; the
 event's surface binds only a click on one the adapter does not remember. A question posted
-to the home channel (chat.notify) has no conversation at post time, so its click is bound by
-the event and a typed reply in its thread does not answer it; its buttons do. A
+to the home channel (chat.notify) has no conversation at post time, so its click binds to the
+thread the post is in, in the kind the event names (its buttons carry a mark that says it is a
+home card's, so the binding survives a restart), and a typed reply in its thread does not answer
+it; its buttons do. A
 rewrite that fails posts the line in the conversation instead. The questions and answers
 are held in the process: after a restart a question keeps its buttons until clicked, the click
 is still a turn, and the rewrite reads the message the event carries, its text, its link
@@ -2187,8 +2201,8 @@ Chat and posted as the text elsewhere. The first request with an `update` key po
 chunk since an edit reaches only one message, and a later request with the same key in the same
 conversation edits it, laid out or as text, on Google Chat too. A key with no message here
 (another conversation's, one forgotten, one lost to a restart) or a message the backend says can no longer be edited posts anew. A laid-out edit that fails otherwise (a rate limit, an outage) is tried once more, laid out, and failing again leaves the message as it was and answers the request with the error: a text edit would strip the card and close an open question.
-A conversation keeps 16 keys and the gateway keys for 1,024 conversations, the least recently used
-forgotten first, so a plan edited all along outlives the questions filed after it. A notify's
+A conversation or home thread keeps 16 keys and the gateway keys for 1,024 of them together, the
+least recently used forgotten first, so a plan edited all along outlives the questions filed after it. A notify's
 `mark` is drawn once its post lands, on the ask of the chain its `update` key is bound to
 (spec-a2a-payloads.md, "Card work after the task ends"): the first keyed `mark` binds the key
 to the conversation's latest chain, recorded on that chain's root history entry beside its

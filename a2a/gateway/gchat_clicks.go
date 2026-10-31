@@ -116,10 +116,14 @@ type gchatClick struct {
 // answer can rewrite it.
 type gchatQuestion struct {
 	conversation string
-	asks         bool
-	layout       gchatChatLayout
-	choices      []string
-	links        []chatmsg.Link
+	// thread is the thread the post landed in (createLaidOut's landed,
+	// EditNotifyMessage's thread; "" for an edit that names its
+	// conversation), read for a home post, whose conversation is empty.
+	thread  string
+	asks    bool
+	layout  gchatChatLayout
+	choices []string
+	links   []chatmsg.Link
 }
 
 // gchatPendingClick is a click handed to the gateway and not yet verified:
@@ -169,14 +173,15 @@ func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 // trackQuestion remembers a laid-out message with choices, keyed by its
 // name and bound to conversation, so a click or a typed reply can rewrite
 // it. A home post has no conversation here (its space's kind is not known
-// without a read), so its click is bound by the event and a typed reply in
-// its thread does not answer it. Laying
+// without a read) but keeps its thread, so its click is bound to that thread
+// in the kind the event names (classifyClick), and a typed reply in its
+// thread does not answer it. Laying
 // choices out on a message opens it, even one answered before: a card
 // asking again on its update key is a fresh question, so the earlier answer
 // and its line are forgotten. Laying a message out again without choices
 // closes it, so a late click on buttons a client still shows does not write
 // the old question back.
-func (a *GoogleChatAdapter) trackQuestion(name, conversation string, m *chatmsg.Message, layout gchatChatLayout) {
+func (a *GoogleChatAdapter) trackQuestion(name, conversation, thread string, m *chatmsg.Message, layout gchatChatLayout) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	ux := a.uxLocked()
@@ -195,7 +200,7 @@ func (a *GoogleChatAdapter) trackQuestion(name, conversation string, m *chatmsg.
 	for i, c := range m.Choices {
 		labels[i] = c.Text
 	}
-	q := gchatQuestion{conversation: conversation, asks: asksQuestion(m.Choices), layout: layout, choices: labels, links: m.Links}
+	q := gchatQuestion{conversation: conversation, thread: thread, asks: asksQuestion(m.Choices), layout: layout, choices: labels, links: m.Links}
 	ux.questions[name] = q
 	remember(&ux.questionsOrder, name, func(k string) { ux.dropQuestionLocked(k) })
 	switch {
@@ -325,6 +330,14 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 		// posted in; the event's surface is read only for one it does not
 		// remember (a home post, or one from before a restart).
 		bound = q.conversation
+		if bound == "" && q.thread != "" && (thread != "" || kind == sessionKindDM) {
+			// A home post is bound to no conversation but to its thread: a
+			// click on the head of a thread in a DM home space (the alert,
+			// edited into its triage) carries no threadReply, which would
+			// bind it to the DM's root, where a typed reply in the thread
+			// does not go.
+			bound = gchatConversationID(ev.Space.Name, q.thread, kind)
+		}
 		p.text, p.links = q.layout.Text, q.links
 		if index >= 0 && index < len(q.choices) {
 			p.label = q.choices[index]
@@ -334,6 +347,12 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 		// Chat shows, text and buttons.
 		p.text = ev.Message.Text
 		p.links, p.label = gchatMessageButtons(ev.Message, index, p.label)
+		if click.Parameters[gchatChatParamHome] != "" && ev.Message.Thread.Name != "" && (thread != "" || kind == sessionKindDM) {
+			// A home card says so on its buttons (gchatHomeButtons), so its
+			// click binds to the thread the event names, as a remembered
+			// one's does, rather than to a DM's root.
+			bound = gchatConversationID(ev.Space.Name, ev.Message.Thread.Name, kind)
+		}
 	}
 	ux.pending[id] = p
 	ux.waiting[ev.Message.Name] = true

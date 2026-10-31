@@ -135,3 +135,22 @@ func TestNotifyPostsTheTextOfAHomeChatMessageOnABackendWithoutLayout(t *testing.
 		t.Fatalf("posts = %+v, want the text alone", posts)
 	}
 }
+
+// A keyed home chat message on a thread is edited in place by the next
+// request with its key there: chat.update on the message's ts, laid out.
+func TestSlackNotifyEditsAKeyedHomeChatMessage(t *testing.T) {
+	adapter, stub := startSlackStubAdapter(t)
+	n := newTestSlackNotifier(t, adapter)
+	thread := testSlackHome + "/1700000000.000100"
+	first := serveJSON(t, n, lib.NotifyRequest{Text: testHomeChatText, Chat: json.RawMessage(testHomeChat), Update: "plan-c1-1", Thread: thread})
+	second := serveJSON(t, n, lib.NotifyRequest{Text: "settled", Chat: json.RawMessage(testHomeChat), Update: "plan-c1-1", Thread: thread})
+	if first.Error != "" || second.Error != "" || second.MessageID != first.MessageID || second.ThreadID != "1700000000.000100" {
+		t.Fatalf("answers = %+v, %+v; want the second to name the first's message", first, second)
+	}
+	if len(stub.forms) != 2 || stub.forms[1].Get("ts") != first.MessageID || stub.forms[1].Get("channel") != testSlackHome {
+		t.Fatalf("calls = %v, want a post then chat.update on it", stub.forms)
+	}
+	if !strings.Contains(stub.forms[1].Get("blocks")+stub.forms[1].Get("attachments"), "RBAC audit: 2 critical findings") {
+		t.Errorf("the edit is not laid out: %v", stub.forms[1])
+	}
+}
