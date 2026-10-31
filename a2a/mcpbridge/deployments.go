@@ -670,13 +670,19 @@ func envTokenSelectorKey(scope string, saved map[string]DeploymentProfile) (stri
 		return scope, true
 	}
 	// "<kube-context>/<name>" also names the profile that kept the bare key, whatever characters
-	// the context name holds (an EKS ARN or an OpenShift context has slashes of its own).
+	// the context name holds (an EKS ARN or an OpenShift context has slashes of its own). With
+	// slashes on both sides two profiles can spell the same string (context "a" with key "b/c",
+	// context "a/b" with key "c"), so it names a profile only when exactly one matches.
+	match := ""
 	for key, p := range saved {
 		if ctx := strings.TrimSpace(p.KubeContext); ctx != "" && scope == ctx+"/"+key {
-			return key, true
+			if match != "" {
+				return "", false
+			}
+			match = key
 		}
 	}
-	return "", false
+	return match, match != ""
 }
 
 // deploymentBaseName is the name a profile saved as name had before a cross-context collision

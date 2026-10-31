@@ -286,13 +286,28 @@ func TestEnvMCPTokenQualifiedFormWorksForAContextWithSlashes(t *testing.T) {
 	}
 }
 
+// Two profiles can spell the same "<kube-context>/<name>" when both sides hold slashes; such a
+// selector names neither.
+func TestEnvMCPTokenQualifiedFormTwoProfilesSpellAlikeIsAmbiguous(t *testing.T) {
+	t.Setenv(EnvMCPToken, envTokenValue)
+	nsAlias := DeploymentProfile{Name: "b/c", KubeContext: "a", Namespace: "b"}
+	slashCtx := DeploymentProfile{Name: "c", KubeContext: "a/b", Namespace: testNamespace}
+	saved := map[string]DeploymentProfile{nsAlias.Name: nsAlias, slashCtx.Name: slashCtx}
+	t.Setenv(EnvMCPTokenDeployment, "a/b/c")
+	for _, p := range []DeploymentProfile{nsAlias, slashCtx} {
+		if got := EnvMCPTokenFor(p, saved); got != "" {
+			t.Fatalf("a/b/c, spelled by both a + b/c and a/b + c, reached %s as %q; want none", p.Name, got)
+		}
+	}
+}
+
 // For any selector, KUBE_AGENTS_MCP_TOKEN reaches at most one saved deployment; a bare name that two
 // saved keys share as their base name reaches none. Checked over saved sets mixing bare,
 // namespace-qualified and context-qualified keys, with contexts that hold slashes of their own.
 func TestEnvMCPTokenReachesAtMostOneDeploymentForAnySelector(t *testing.T) {
 	t.Setenv(EnvMCPToken, envTokenValue)
-	contexts := []string{"ctx-1", "ctx-2", "arn:aws:eks:us-east-1:111122223333:cluster/prod", "default/api-example-com:6443/admin"}
-	names := []string{"prod", "ns-a/pa"}
+	contexts := []string{"ctx-1", "ctx-1/ns-a", "arn:aws:eks:us-east-1:111122223333:cluster/prod", "default/api-example-com:6443/admin"}
+	names := []string{"prod", "ns-a/pa", "pa"}
 	// Every saved set of up to three installs, each kept bare or qualified by its context.
 	type install struct{ ctx, name string }
 	var all []install
