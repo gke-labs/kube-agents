@@ -1690,7 +1690,7 @@ function nightlyBriefHtml() {
   const list = nights();
   const night = list[0];
   let body;
-  if (!night) body = `<p class="mut">No night on record yet. Once <code>${esc(brief.nightly && brief.nightly.job || "the nightly periodic")}</code> has run, last night's report is here and one line of it goes into the 9 AM digest.</p>`;
+  if (!night) body = `<p class="mut">No night on record yet. Once <code>${esc(brief.nightly && brief.nightly.job || "the nightly periodic")}</code> has run, last night's report is here and one line of it goes into the 11 AM digest.</p>`;
   else {
     const c = night.counts;
     // With a main-b part, each half cut short is named with its own wall

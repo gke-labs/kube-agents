@@ -533,6 +533,33 @@ resource "google_service_account" "agent" {
         self.assertIn("forgetting module.gke_cluster.google_kms_crypto_key.gke_key[0]", proc.stdout)
         self.assertIn("forgetting module.gke_cluster.google_kms_key_ring.gke_keyring[0]", proc.stdout)
 
+    def test_destroy_forgets_the_shared_kms_grant_with_the_key(self):
+        """Installs in a project that use the same cluster key share the key's
+        one grant to the GKE service agent, so destroying the grant cut off the
+        other clusters (#4261). The cluster itself is still destroyed."""
+        kms = [
+            "module.gke_cluster.google_kms_crypto_key.gke_key[0]",
+            "module.gke_cluster.google_kms_key_ring.gke_keyring[0]",
+            "module.gke_cluster.google_kms_crypto_key_iam_member.gke_kms_binding[0]",
+            "module.gke_cluster.google_project_service_identity.gke_service_agent[0]",
+            "module.github_minter[0].google_kms_crypto_key.minter",
+            "module.github_minter[0].google_kms_key_ring.minter",
+        ]
+        cluster = "module.gke_cluster.google_container_cluster.standard[0]"
+        proc = self._run_guard("forget_kms", state_list="\n".join(kms + [cluster]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for address in kms:
+            self.assertIn(f"forgetting {address} ", proc.stdout)
+        self.assertNotIn(f"forgetting {cluster}", proc.stdout)
+
+    def test_forget_kms_skips_what_is_not_in_state(self):
+        proc = self._run_guard(
+            "forget_kms",
+            state_list="module.gke_cluster.google_kms_crypto_key_iam_member.gke_kms_binding[0]",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.count("forgetting "), 1, proc.stdout)
+
     def test_cluster_kms_is_kept_when_this_state_creates_the_cluster(self):
         proc = self._run_guard(
             "forget_unmanaged_cluster_kms",

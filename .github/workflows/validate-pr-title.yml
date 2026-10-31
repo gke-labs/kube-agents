@@ -10,15 +10,16 @@ on:
   merge_group:
     branches: [main]
 
-# One run per pull request head, newest wins. Without a group every push and
+# One run per pull request head, newest runs. Without a group every push and
 # every title or body edit queued a run behind the one before it: on
 # 2026-10-13 eight pull requests each held two queued runs of this workflow at
 # once, and 44% of its runs over 36 hours repeated a head another run had
 # already covered (#2943). `synchronize` stays in the list above, because the
 # context is a required check that GitHub records per commit: a new head with
 # no run of its own could never merge. A cancelled run on the same head (two
-# edits seconds apart) is superseded by the newer check run under the same
-# name, which is what GitHub's required-check rule reads.
+# edits seconds apart) is not superseded by the newer check run under the same
+# name: GitHub's required-check rule still counts it and keeps the pull request
+# out of the merge queue. `/retest` re-runs it (`scripts/rerun_failed_checks.py`).
 #
 # The head SHA is in the key, not just the number, the way `risk_classify.yml`
 # keys its group, and for the same reason (#1364): `edited` does not advance

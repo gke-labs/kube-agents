@@ -190,7 +190,9 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
 # adapter.py upstream) restores placeholders in insertion order, so a header/bold/link wrapping inline
 # code leaks its \x00GCn\x00 key; reversing the restore fixes nesting (kube-agents #277). (2) The standalone
 # REST send (_standalone_send, used by send_message from cron) posts thread.name without messageReplyOption,
-# which the Chat API ignores by default -- upstream's _create_kwargs docstring says so, SDK path only.
+# which the Chat API ignores by default -- upstream's _create_kwargs docstring says so, SDK path only. With
+# GOOGLE_CHAT_RELAY_URL set, google_chat_relay_patch replaces that sender and sets the option itself, so this
+# edit matters only on an install that sends with its own credential.
 # Both edits are exact-count guarded (c.count(t) == 1) until they become an applier + verifier.
 RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/plugins/platforms/google_chat/cards.py'); c = p.read_text(); t = 'for key, value in placeholders.items():'; r = 'for key, value in reversed(list(placeholders.items())):'; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
     /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/plugins/platforms/google_chat/adapter.py'); c = p.read_text(); t = 'f\"https://chat.googleapis.com/v1/{chat_id}/messages\", json=_thread_body(message, thread_id),'; r = 'f\"https://chat.googleapis.com/v1/{chat_id}/messages\" + (\"?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD\" if thread_id else \"\"), json=_thread_body(message, thread_id),'; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
@@ -2340,8 +2342,9 @@ COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/go
 # reason in step 2a.
 COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hindsight/
 
-# Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
-# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
+# Copy the Cluster Agent profile TEMPLATE (SOUL, config, skills), scaffolded
+# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py,
+# plus persona/, copied but not scaffolded.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
 # Copy the GKE Support Agent (tse) profile TEMPLATE (persona, config, skills),
@@ -2392,7 +2395,7 @@ COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 #
 # check_skill_commands.py rides along the same way, with skill_documents.py,
 # which it imports. It runs every shell block in the skill documents of the
-# image's three skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
+# image's four skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
 # copied above this block rather than below it.
 # It scans with the image's pinned tirith (--tirith-bin), the binary that ships.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
@@ -2421,6 +2424,7 @@ assert cfg.get('agent', {}).get('max_turns') == 150, 'worker iteration budget lo
         --tirith-bin /usr/local/bin/tirith \
         agents/platform/skills=/opt/platform-template/skills \
         agents/cluster/skills=/opt/cluster-template/skills \
+        agents/cluster/persona/skills=/opt/cluster-template/persona/skills \
         agents/tse/skills=/opt/tse-template/skills \
         a2a/persona/platform/skills=/opt/a2a-template/skills && \
     rm -rf /tmp/platform-config

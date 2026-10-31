@@ -177,6 +177,7 @@ func TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs(t *testing.T
 	agent := a2aTestAgent()
 	callout := buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.ServiceAccountName
 	gateway := buildA2AGatewayDeployment(agent).Spec.Template.Spec.ServiceAccountName
+	dispatcher := buildA2ADispatcherDeployment(agent).Spec.Template.Spec.ServiceAccountName
 
 	cases := []struct {
 		builder  string
@@ -189,6 +190,9 @@ func TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs(t *testing.T
 		{"buildA2ACalloutClusterRoleBinding", buildA2ACalloutClusterRoleBinding(agent).Subjects, callout},
 		{"buildA2ACalloutRoleBinding", buildA2ACalloutRoleBinding(agent).Subjects, callout},
 		{"buildA2AGatewayRoleBinding", buildA2AGatewayRoleBinding(agent).Subjects, gateway},
+		{"buildA2ADispatcherConfigRoleBinding", buildA2ADispatcherConfigRoleBinding(agent).Subjects, dispatcher},
+		// In the profile namespace, naming the ServiceAccount in the agent's.
+		{"buildA2ADispatcherPodsRoleBinding", buildA2ADispatcherPodsRoleBinding(agent).Subjects, dispatcher},
 	}
 
 	covered := map[string]bool{}

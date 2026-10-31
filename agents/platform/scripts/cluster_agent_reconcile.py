@@ -245,6 +245,11 @@ _DENIED_MARKERS = ("PERMISSION_DENIED", "403", "does not have permission", "Perm
 _CREATE_DENIED_MARKERS = ("PERMISSION_DENIED", "code=403", "does not have permission")
 _API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "API has not been used",
                          "is not enabled", "has not been enabled")
+# The runner the scope lookups' gcloud goes through (`_run`). None is `sandbox_exec.run`, the
+# reconcile's own route through the shell sandbox. The scope publisher (scope_publisher.py), a
+# Job with no sandbox, sets its broker runner here before its first lookup. Read at call time,
+# so a test that patches `sandbox_exec.run` still reaches the lookups.
+COMMAND_RUNNER = None
 
 
 
@@ -272,9 +277,16 @@ def _run_env() -> dict[str, str]:
     For `hermes` only. Every gcloud call in this file goes through
     `sandbox_exec.run`, which runs it in the shell sandbox and builds its own
     environment there — this one carries the agent pod's, including
-    `API_SERVER_KEY`, and must not travel over the connection.
+    `API_SERVER_KEY`, and must not travel over the connection. The scope lookups
+    go by way of `_run`, which a caller with no sandbox (scope_publisher.py)
+    points at its own runner instead.
     """
     return {**os.environ, "HOME": "/tmp"}
+
+
+def _run(argv: list[str], *, check: bool, timeout: float):
+    """One scope lookup's gcloud, through COMMAND_RUNNER when one is set, else `sandbox_exec.run`."""
+    return (COMMAND_RUNNER or sandbox_exec.run)(argv, check=check, timeout=timeout)
 
 
 def _project_source() -> tuple[str | None, bool]:
@@ -672,7 +684,7 @@ def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
     which projects the roster it is about to read actually covers.
     """
     try:
-        r = sandbox_exec.run(
+        r = _run(
             ["gcloud", "container", "clusters", "list", "--project", project,
              "--format=value(name,location)"],
             check=True, timeout=timeout,
@@ -875,7 +887,7 @@ def _search_container(container: str, timeout: float = LIST_TIMEOUT_SECONDS) -> 
     cmd = ["gcloud", "asset", "search-all-resources", f"--scope={container}",
            f"--asset-types={ASSET_TYPE_CLUSTER}", f"--format={ASSET_SEARCH_FORMAT}"]
     try:
-        result = sandbox_exec.run(cmd, check=True, timeout=timeout)
+        result = _run(cmd, check=True, timeout=timeout)
         try:
             assets = json.loads(result.stdout or "[]")
         except ValueError as e:
@@ -930,7 +942,7 @@ def _resolve_selector(selector: str, timeout: float = LIST_TIMEOUT_SECONDS) -> t
         cmd = ["gcloud", "beta", "monitoring", "metrics-scopes", "describe",
                f"{METRICS_SCOPE_NAME_PREFIX}{value}", f"--format={METRICS_SCOPE_FORMAT}"]
     try:
-        result = sandbox_exec.run(cmd, check=True, timeout=timeout)
+        result = _run(cmd, check=True, timeout=timeout)
         parsed = json.loads(result.stdout or "null")
         members = (_xpn_members(parsed) if kind == SELECTOR_KIND_SHARED_VPC
                    else _monitored_members(parsed))
@@ -997,7 +1009,7 @@ def _project_id_of(number: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
     """
     cmd = ["gcloud", "projects", "describe", number, f"--format={PROJECT_ID_FORMAT}"]
     try:
-        result = sandbox_exec.run(cmd, check=True, timeout=timeout)
+        result = _run(cmd, check=True, timeout=timeout)
         project = (result.stdout or "").strip()
         if not project:
             raise ValueError("projects describe returned no project ID")

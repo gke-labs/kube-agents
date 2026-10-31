@@ -23,6 +23,7 @@ type heldHarness struct {
 	ctx     context.Context
 	req     *Client
 	profile string
+	url     string
 }
 
 func newHeldHarness(t *testing.T, profile string) (*heldHarness, *Client) {
@@ -40,7 +41,7 @@ func newHeldHarness(t *testing.T, profile string) (*heldHarness, *Client) {
 		t.Fatalf("Connect worker: %v", err)
 	}
 	t.Cleanup(worker.Close)
-	return &heldHarness{t: t, ctx: ctx, req: req, profile: profile}, worker
+	return &heldHarness{t: t, ctx: ctx, req: req, profile: profile, url: clientURL(s)}, worker
 }
 
 func (h *heldHarness) cfg() SubscribeConfig {
@@ -934,5 +935,46 @@ func TestEnsureHeldConsumerRefusesWhenTheLookupFails(t *testing.T) {
 	}
 	if w := cons.CachedInfo().Config.AckWait; w != 90*time.Second {
 		t.Errorf("after a failed lookup the durable's AckWait is %v, want 90s unchanged", w)
+	}
+}
+
+// The held marker is a public constant, so a durable that carries it with the
+// filter and caps right is still refused when a setting EnsureHeldConsumer
+// never touches has been changed: each of these quietly breaks held delivery.
+func TestSubscribeHeldRefusesADurableWithAForgedMark(t *testing.T) {
+	for name, tc := range map[string]struct {
+		edit func(*jetstream.ConsumerConfig)
+		want string
+	}{
+		"headers only":       {func(c *jetstream.ConsumerConfig) { c.HeadersOnly = true }, "headers only"},
+		"inactivity reaper":  {func(c *jetstream.ConsumerConfig) { c.InactiveThreshold = 5 * time.Second }, "inactive"},
+		"one delivery":       {func(c *jetstream.ConsumerConfig) { c.MaxDeliver = 1 }, "stops redelivering"},
+		"starts at the tail": {func(c *jetstream.ConsumerConfig) { c.DeliverPolicy = jetstream.DeliverNewPolicy }, "first submission"},
+		"backoff":            {func(c *jetstream.ConsumerConfig) { c.BackOff = []time.Duration{time.Minute}; c.MaxDeliver = -1 }, "backs off"},
+		"paused":             {func(c *jetstream.ConsumerConfig) { u := time.Now().Add(time.Hour); c.PauseUntil = &u }, "paused"},
+		"pull limits":        {func(c *jetstream.ConsumerConfig) { c.MaxRequestBatch = 1 }, "limits pull requests"},
+		"memory":             {func(c *jetstream.ConsumerConfig) { c.MemoryStorage = true }, "in memory"},
+		"priority group": {func(c *jetstream.ConsumerConfig) {
+			c.PriorityPolicy = jetstream.PriorityPolicyOverflow
+			c.PriorityGroups = []string{"g"}
+		}, "priority group"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, worker := newHeldHarness(t, "forged")
+			_, js := h.req.conn()
+			c := h.cfg()
+			cfg := jetstream.ConsumerConfig{
+				Durable: c.Durable, FilterSubject: c.Subject, AckPolicy: jetstream.AckExplicitPolicy,
+				MaxAckPending: 1, AckWait: DefaultHeldAckWait, Metadata: map[string]string{heldMarkerKey: heldMarkerValue},
+			}
+			tc.edit(&cfg)
+			if _, err := js.CreateOrUpdateConsumer(h.ctx, c.Stream, cfg); err != nil {
+				t.Fatalf("create forged consumer: %v", err)
+			}
+			if _, err := worker.SubscribeHeld(h.ctx, c, func(context.Context, Delivery) {}); err == nil ||
+				!errors.Is(err, ErrHeldBindRefused) || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("bound a durable with a forged mark that %s: %v", name, err)
+			}
+		})
 	}
 }

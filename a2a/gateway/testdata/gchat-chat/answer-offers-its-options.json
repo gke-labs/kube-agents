@@ -1,0 +1,70 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "text": "*The payments-api workload is CrashLooping.*\n\nDue to an OOMKill (exit code 137) caused by the container running `tail /dev/zero`, which rapidly exhausts its `64Mi` memory limit. The `payments-api` workload in the `seeded-debug` namespace is failing to start and is stuck in `CrashLoopBackOff` due to being `OOMKilled` (exit code 137).\n\n1. *Fix the command* — If the container's purpose is simply to stay alive for debugging (which is common for `busybox` images), the command should be changed to one that does not consume memory.\n2. *Increase the memory limit* — If reading from `/dev/zero` is a legitimate requirement for this workload, the memory limit of `64Mi` needs to be significantly increased to accommodate the data being buffered.\n3. *Change the workload image and logic* — If this is supposed to be the actual `payments-api` service, the image is currently set to `busybox:1.36` and running a shell command.\n\nWhich of these options would you like to proceed with?\n\n*why*\n*Root Cause*\nThe container is executing a command that consumes infinite memory unbounded until it hits its limit. Specifically, the deployment runs:\n```yaml\n      containers:\n      - command:\n        - sh\n        - -c\n        - tail /dev/zero\n```\nRunning `tail` on `/dev/zero` continually reads null bytes into memory. The container is configured with a strict memory limit of `64Mi`, which is exhausted almost immediately upon startup, leading the node to kill the process.\n\n*Evidence*\n- The pod is in `CrashLoopBackOff` state.\n- Inspecting the previous container termination state:\n  ```json\n  {\"exitCode\":137,\"finishedAt\":\"2026-10-14T16:58:24Z\",\"reason\":\"OOMKilled\"}\n  ```\n- The deployment manifest defines the memory limit at `64Mi`.\n\n*Remediation Options*\nTo fix the restarts, we need to address the root cause of the memory exhaustion.\n\n1. *Option 1 (Recommended): Fix the command*\n   If the container's purpose is simply to stay alive for debugging (which is common for `busybox` images), the command should be changed to one that does not consume memory.\n   Change the command in the deployment manifest to `tail -f /dev/null` or `sleep infinity`.\n2. *Option 2: Increase the memory limit*\n   If reading from `/dev/zero` is a legitimate requirement for this workload, the memory limit of `64Mi` needs to be significantly increased to accommodate the data being buffered.\n3. *Option 3: Change the workload image and logic*\n   If this is supposed to be the actual `payments-api` service, the image is currently set to `busybox:1.36` and running a shell command. The manifest should be updated to use the correct application image and start command.",
+    "widgets": [
+      {
+        "buttonList": {
+          "buttons": [
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "Fix the command"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "0"
+                    }
+                  ]
+                }
+              },
+              "text": "Fix the command",
+              "type": "FILLED"
+            },
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "Increase the memory limit"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "1"
+                    }
+                  ]
+                }
+              },
+              "text": "Increase the memory limit"
+            },
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "Change the workload image and logic"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "2"
+                    }
+                  ]
+                }
+              },
+              "text": "Change the workload image and logic"
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

@@ -4,6 +4,10 @@
 > as one pod, `Replicas: 1` with the `Recreate` strategy. This document records why it is not
 > scaled horizontally today, what the load measurement behind that decision is, and what would
 > make it change.
+>
+> **Proposed successor (draft, not decided):**
+> [`credential-broker-exec-tier.md`](credential-broker-exec-tier.md). This decision stands until
+> that design is reviewed.
 
 **Scope:** whether the broker (`agents/platform/scripts/credential_proxy.py`, deployed by
 `buildCredentialProxyDeployment` in `k8s-operator/internal/controller/credential_proxy_manifests.go`)
@@ -48,6 +52,17 @@ the first reason for one replica; this document owns the decision now.
 
 The `Recreate` strategy follows from the same state: two pods behind the Service during a
 rollout split traffic that assumes one pod.
+
+What one pod costs is a gap on every eviction, drain and rollout, and the gap is bounded rather
+than removed. On SIGTERM the broker refuses new Chat event pulls, keeps the settle routes open for a few
+seconds so the gateway's acks for pulls already answered land, hands any receipt still unsettled
+back to Pub/Sub, and exits; without that the message waits out its 60 s ack deadline on the
+replacement. The operator writes a `maxUnavailable: 1` budget with `unhealthyPodEvictionPolicy:
+AlwaysAllow`, which on one replica refuses no eviction and holds no drain; a budget that would
+protect the pod is the one the obtainability audit reports as blocking. While the pod is away the
+`PlatformAgent` reads `Provisioning` and, when its pod scan names no other fault, the `Ready` message
+names the Deployment and what waits on it. The pause that remains under one pod, and what would
+shorten or remove it, is tracked in gke-labs/kube-agents#4409.
 
 ## 3. Measured: two replicas behind today's Service
 

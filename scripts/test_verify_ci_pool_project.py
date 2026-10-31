@@ -439,8 +439,10 @@ class GkeAndCmekTest(unittest.TestCase):
         # missing grant fails only the hourly sweep.
         self.assertEqual(
             checker.LEASE_SILENT_FINDINGS,
-            frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_COMPUTE_SWEEPER_MISSING}),
+            frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_COMPUTE_SWEEPER_MISSING, checker.FINDING_DNS_API}) | checker.FORGE_FINDINGS,
         )
+        # The forge pieces serve the self-managed lanes alone (docs 5.8): the two
+        # public lanes read none of them, so a leased run passes with any of them.
 
     def test_fleet_clusters_are_not_held_to_the_otel_scope(self):
         # Nothing reads the seeded clusters' traces, and bench/tf/fleet does not
@@ -4328,7 +4330,7 @@ class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
 class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
     """PROW_RUNNER_ROLES and RUNNERS must equal what the two granting sites grant.
 
-    The thirteen roles and the two members are written here, in the provisioning
+    The fourteen roles and the two members are written here, in the provisioning
     script's loop, and in the repair block on the prerequisites page, and none
     reads another. Drift is silent the worst way round: a role dropped from the
     script leaves a project the verifier still passes, registered, dying on its
@@ -5010,6 +5012,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gitops_workload_manifest", return_value=checker.CheckResult("w", True)), \
              mock.patch.object(checker, "check_gitlab_workload_manifest", return_value=checker.CheckResult("gl", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
+             mock.patch.object(checker, "check_forge_pieces", return_value=checker.CheckResult("fp", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-6")
         dependent = [c for c in results if c.name in
@@ -5027,7 +5030,7 @@ class ChecksSelectionTest(unittest.TestCase):
     def _mocks(self):
         return {
             name: mock.patch.object(checker, name, return_value=checker.CheckResult(name, True))
-            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_gitops_workload_manifest", "check_gitlab_workload_manifest", "check_ledger_read_credential", "check_warm_cache_readers")
+            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_gitops_workload_manifest", "check_gitlab_workload_manifest", "check_ledger_read_credential", "check_warm_cache_readers", "check_forge_pieces")
         }
 
     def test_parse_checks_orders_and_refuses_unknown_ids(self):
@@ -5072,10 +5075,11 @@ class ChecksSelectionTest(unittest.TestCase):
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)) as minter, \
              mocks["check_codebase_mapping"] as mapping, mocks["check_gke_and_state"] as gke, mocks["check_seeded_fleet_fixtures"] as fleet, \
              mocks["check_github_repo_and_app"] as app, mocks["check_gitops_default_branch"] as branch, mocks["check_gitops_declaration"] as note, mocks["check_gitops_workload_manifest"] as manifest, mocks["check_gitlab_workload_manifest"] as gitlab_manifest, mocks["check_ledger_read_credential"] as ledger, \
-             mocks["check_warm_cache_readers"] as warm, mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
+             mocks["check_warm_cache_readers"] as warm, mocks["check_forge_pieces"] as forge, mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS))
             self.assertEqual(warm.call_count, 0, "the warm-cache check is not in the scan's set")
             branch.assert_called_once_with("kube-agents-evals-3")
+            forge.assert_called_once_with("kube-agents-evals-3", "us-central1")
             self.assertEqual([r.check_id for r in results], list(checker.POOL_STATE_CHECKS))
             for never in (mapping, fleet, app, note, manifest, gitlab_manifest, ledger):
                 never.assert_not_called()
@@ -5632,7 +5636,6 @@ def _without_hcl_comments(text):
     return "".join(out)
 
 
-
 class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
     """POOL_STATE_READER_ROLES and the bot member must equal bench/tf/fleet's
     pool_state_readers default and pool_state_reader_roles local: the verifier
@@ -5660,7 +5663,6 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
         self.assertEqual(re.search(r"x\s*=\s*\[(.*?)\]", stripped, re.S).group(1).count('"'), 8, "the bracket in the comment did not end the list")
 
 
-
 class DrainTimeoutWindowTest(unittest.TestCase):
     """seeded-b's planted backend drain stays inside the window the patch roll
     survives. Above GKE's 600-second per-node wait, or the readiness rule's
@@ -5682,6 +5684,161 @@ class DrainTimeoutWindowTest(unittest.TestCase):
         seconds = int(value.group(1))
         self.assertGreater(seconds, self.GKE_NODE_WAIT_SECONDS, "at or under GKE's wait the fixture's defect is gone")
         self.assertLess(seconds, self.NODE_POOL_UPDATE_TIMEOUT_SECONDS, "the pool's patch roll would outlast the update timeout and fail")
+
+
+class ForgePiecesTest(unittest.TestCase):
+    """The once-per-project pieces a self-managed forge VM needs (docs 5.8),
+    read back by check_forge_pieces and provisioned by the script."""
+
+    PROJECT = "kube-agents-evals-2"
+    SA = f"serviceAccount:forge-vm@{PROJECT}.iam.gserviceaccount.com"
+
+    FIREWALL = "10.0.0.0/8\tforge\ttcp:443"
+    DENY = "INGRESS\t1100\t0.0.0.0/0\tforge\tall"
+
+    def _answers(self, zone="eval.internal.\tprivate\tdefault", ips=("10.128.0.251", "10.128.0.250"), records=None, firewall=FIREWALL, deny=DENY, sa="forge-vm@x", roles="roles/artifactregistry.reader"):
+        records = list(records) if records is not None else list(ips)
+        out = [_ok(zone) if zone is not None else _fail("NOT_FOUND")]
+        for ip, record in zip(ips, records):
+            out.append(_ok(ip) if ip else _fail("NOT_FOUND"))
+            out.append(_ok(record) if record else _fail("NOT_FOUND"))
+        out.append(_ok(firewall) if firewall else _fail("NOT_FOUND"))
+        out.append(_ok(deny) if deny else _fail("NOT_FOUND"))
+        out.append(_ok(sa) if sa else _fail("NOT_FOUND"))
+        if sa:
+            out.append(_ok(roles))
+        return out
+
+    def test_every_piece_present_passes(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = self._answers()
+            result = checker.check_forge_pieces(self.PROJECT)
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(result.findings, [])
+        self.assertIn("✓ ghes.eval.internal -> 10.128.0.251 (forge-ghes)", result.details)
+        self.assertIn("✓ gitlab.eval.internal -> 10.128.0.250 (forge-gitlab-ce)", result.details)
+        self.assertTrue(result.read)
+        # The reads name the region and the zone the forge script reads.
+        argv = [" ".join(c.args[0]) for c in run.call_args_list]
+        self.assertIn("gcloud compute addresses describe forge-ghes --region=us-central1", argv[1])
+        self.assertIn("gcloud dns record-sets describe ghes.eval.internal. --zone=eval-internal --type=A", argv[2])
+
+    def test_a_bare_project_carries_every_piece_as_a_finding_with_the_provisioning_as_repair(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = self._answers(zone=None, ips=("", ""), records=("", ""), firewall="", deny="", sa="")
+            result = checker.check_forge_pieces(self.PROJECT)
+        self.assertFalse(result.passed)
+        ids = {f.id for f in result.findings}
+        self.assertEqual(ids, {
+            "forge/zone/missing", "forge/address/missing/ghes", "forge/address/missing/gitlab-ce",
+            "forge/record/missing/ghes.eval.internal", "forge/record/missing/gitlab.eval.internal",
+            "forge/firewall/missing", "forge/firewall-deny/missing", "forge/vm-sa/missing",
+        })
+        repair = result.findings[0].repair
+        for cmd in (
+            "gcloud dns managed-zones create eval-internal --dns-name=eval.internal. --visibility=private --networks=default",
+            "gcloud compute addresses create forge-ghes --region=us-central1 --subnet=default --purpose=GCE_ENDPOINT",
+            "gcloud dns record-sets create gitlab.eval.internal. --zone=eval-internal --type=A --ttl=60",
+            "gcloud compute firewall-rules create allow-forge-443 --network=default --direction=INGRESS --allow=tcp:443 --source-ranges=10.0.0.0/8 --target-tags=forge",
+            "gcloud compute firewall-rules create deny-forge-ingress --network=default --direction=INGRESS --action=DENY --rules=all --priority=1100 --source-ranges=0.0.0.0/0 --target-tags=forge",
+            "gcloud iam service-accounts create forge-vm",
+            "--role=roles/artifactregistry.reader",
+            "docs/ci-pool-projects.md 5.8",
+        ):
+            self.assertIn(cmd, repair)
+        self.assertIn("5.8", result.message)
+
+    def test_a_record_that_points_elsewhere_and_a_missing_role_are_findings(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = self._answers(records=("10.128.0.9", "10.128.0.250"), roles="roles/viewer")
+            result = checker.check_forge_pieces(self.PROJECT)
+        self.assertFalse(result.passed)
+        ids = {f.id: f for f in result.findings}
+        # roles/viewer in place of the registry read: the read is missing and the viewer role is extra.
+        self.assertEqual(set(ids), {"forge/record/mismatch/ghes.eval.internal", "forge/vm-sa/missing/roles/artifactregistry.reader", "forge/vm-sa/extra"})
+        self.assertIn("resolves to 10.128.0.9", ids["forge/record/mismatch/ghes.eval.internal"].observed)
+
+    def test_a_zone_of_the_right_name_but_another_shape_is_a_mismatch(self):
+        for zone in ("other.\tprivate\tdefault", "eval.internal.\tpublic\t", "eval.internal.\tprivate\tother-net"):
+            with self.subTest(zone=zone), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = self._answers(zone=zone)
+                result = checker.check_forge_pieces(self.PROJECT)
+            self.assertFalse(result.passed)
+            self.assertEqual([f.id for f in result.findings], ["forge/zone/mismatch"])
+            self.assertIn("delete the zone", result.findings[0].observed)
+            self.assertIn("managed-zones delete", result.findings[0].repair)
+
+    def test_a_rule_of_the_right_name_but_another_shape_is_a_mismatch(self):
+        for kw, finding in (
+            ({"firewall": "0.0.0.0/8\tforge\ttcp:443"}, "forge/firewall/mismatch"),
+            ({"firewall": "10.0.0.0/8\t\ttcp:443"}, "forge/firewall/mismatch"),
+            ({"firewall": "10.0.0.0/8\tforge\ttcp:22,tcp:443"}, "forge/firewall/mismatch"),
+            ({"deny": "INGRESS\t65000\t0.0.0.0/0\tforge\tall"}, "forge/firewall-deny/mismatch"),
+            ({"deny": "INGRESS\t1100\t0.0.0.0/0\t\tall"}, "forge/firewall-deny/mismatch"),
+        ):
+            with self.subTest(**kw), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = self._answers(**kw)
+                result = checker.check_forge_pieces(self.PROJECT)
+            self.assertFalse(result.passed)
+            self.assertEqual([f.id for f in result.findings], [finding])
+            self.assertIn("delete it and run the provisioning commands", result.findings[0].observed)
+
+    def test_a_role_beyond_the_registry_read_is_a_finding(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = self._answers(roles="roles/artifactregistry.reader\nroles/editor")
+            result = checker.check_forge_pieces(self.PROJECT)
+        self.assertFalse(result.passed)
+        self.assertEqual([f.id for f in result.findings], ["forge/vm-sa/extra"])
+        self.assertIn("also holds roles/editor", result.findings[0].observed)
+
+    def test_a_refused_read_is_unverified_not_missing(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [(1, "", "PERMISSION_DENIED: dns.managedZones.get")] + self._answers()[1:]
+            result = checker.check_forge_pieces(self.PROJECT)
+        self.assertTrue(result.passed)
+        self.assertEqual(result.findings, [])
+        self.assertTrue(any("Could not read the private zone eval-internal" in w for w in result.warnings), result.warnings)
+        # The summary names what was not read instead of asserting it present.
+        self.assertEqual(result.message, "the reserved addresses, the A records, the firewall rule, the deny rule, the VM identity and its role verified; the private zone not checked")
+        self.assertNotIn("present", result.message)
+
+    def test_the_forge_findings_pass_a_lease_and_the_check_is_a_default(self):
+        self.assertTrue(checker.FORGE_FINDINGS <= checker.LEASE_SILENT_FINDINGS)
+        self.assertIn(checker.CHECK_FORGE_PIECES, checker.CHECK_IDS)
+        self.assertIn(checker.CHECK_FORGE_PIECES, checker.DEFAULT_CHECKS)
+        self.assertIn(checker.CHECK_FORGE_PIECES, checker.CHECK_DISPLAY_NAMES)
+        self.assertIn("roles/compute.instanceAdmin.v1", checker.PROW_RUNNER_ROLES)
+        self.assertIn("dns.googleapis.com", checker.REQUIRED_APIS)
+
+    def test_the_pieces_the_verifier_names_are_the_ones_provisioning_makes(self):
+        # One set of names, defined twice: the script creates them, the verifier
+        # reads them back and prints the script's commands as the repair, and
+        # hack/ci-forge.sh reads them per run. They drift apart unless pinned.
+        script = (pathlib.Path(__file__).resolve().parent / "provision_ci_pool_project.sh").read_text()
+        for name, value in (
+            ("FORGE_DNS_ZONE", checker.FORGE_DNS_ZONE), ("FORGE_DNS_NAME", checker.FORGE_DNS_NAME), ("FORGE_NETWORK", checker.FORGE_NETWORK),
+            ("FORGE_FIREWALL_RULE", checker.FORGE_FIREWALL_RULE), ("FORGE_FIREWALL_SOURCE_RANGES", checker.FORGE_FIREWALL_SOURCE_RANGES),
+            ("FORGE_FIREWALL_ALLOWED", checker.FORGE_FIREWALL_ALLOWED), ("FORGE_DENY_RULE", checker.FORGE_DENY_RULE),
+            ("FORGE_DENY_SOURCE_RANGES", checker.FORGE_DENY_SOURCE_RANGES), ("FORGE_DENY_RULES", checker.FORGE_DENY_RULES),
+            ("FORGE_NETWORK_TAG", checker.FORGE_NETWORK_TAG), ("FORGE_VM_SA_ID", checker.FORGE_VM_SA_ID),
+        ):
+            self.assertIn(f'readonly {name}="{value}"', script, name)
+        self.assertIn(f"readonly FORGE_DENY_PRIORITY={checker.FORGE_DENY_PRIORITY}", script)
+        self.assertIn(f'readonly FORGE_ROWS="{" ".join(checker.FORGE_ROW_HOSTS)}"', script)
+        self.assertEqual(checker.FORGE_VM_SA_ROLES, {"roles/artifactregistry.reader"})
+        self.assertIn('readonly FORGE_VM_SA_ROLE="roles/artifactregistry.reader"', script)
+        self.assertIn(f"readonly FORGE_RECORD_TTL={checker.FORGE_RECORD_TTL}", script)
+        self.assertIn("  roles/compute.instanceAdmin.v1 \\\n", script)
+        self.assertIn("  dns.googleapis.com \\\n", script)
+        # The rows' hosts are the forge table's defaults in hack/ci-deploy.sh, which the script reads at run time.
+        deploy = (pathlib.Path(__file__).resolve().parent.parent / "hack" / "ci-deploy.sh").read_text()
+        self.assertIn(f'EVAL_FORGE_DEFAULT_GHES_HOST="{checker.FORGE_ROW_HOSTS["ghes"]}"', deploy)
+        self.assertIn(f'EVAL_FORGE_DEFAULT_GITLAB_CE_HOST="{checker.FORGE_ROW_HOSTS["gitlab-ce"]}"', deploy)
+        # And the forge script reads the same names.
+        forge = (pathlib.Path(__file__).resolve().parent.parent / "hack" / "ci-forge.sh").read_text()
+        for name, value in (("FORGE_FIREWALL_RULE", checker.FORGE_FIREWALL_RULE), ("FORGE_DENY_RULE", checker.FORGE_DENY_RULE), ("FORGE_DNS_ZONE", checker.FORGE_DNS_ZONE), ("FORGE_VM_SERVICE_ACCOUNT_ID", checker.FORGE_VM_SA_ID), ("FORGE_NETWORK_TAG", checker.FORGE_NETWORK_TAG), ("FORGE_VM_NETWORK", checker.FORGE_NETWORK)):
+            self.assertIn(f'readonly {name}="{value}"', forge, name)
+
 
 if __name__ == "__main__":
     unittest.main()

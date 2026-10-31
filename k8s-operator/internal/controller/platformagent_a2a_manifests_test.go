@@ -304,7 +304,7 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	}
 }
 
-// The provisioning payload: four streams, four KV buckets, four starter
+// The provisioning payload: five streams, five KV buckets, four starter
 // topics, the deployment spec's retention numbers verbatim.
 func TestBuildA2AProvisionJob(t *testing.T) {
 	agent := a2aTestAgent()
@@ -757,6 +757,7 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+		"$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
 		"chat.console.*.in",
 		"_INBOX.console.>",
 	}
@@ -1080,6 +1081,7 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		{"app": "test-agent-gateway"},
 		{"app": "test-agent-a2a-gateway"},
 		{"app": "test-agent-a2a-verifier"},
+		{"app": "test-agent-a2a-dispatcher"},
 		{labelPartOf: a2aPartOf, "app.kubernetes.io/component": "a2a-session"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "provision"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "seed"},
@@ -1695,6 +1697,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	dep := buildA2AGatewayDeployment(agent)
 	callout := buildA2ACalloutDeployment(agent, "")
 	verifier := buildA2AVerifierDeployment(agent)
+	dispatcher := buildA2ADispatcherDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
 
@@ -1703,6 +1706,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 		builder string
 		spec    corev1.PodSpec
 	}{
+		{"dispatcher", "buildA2ADispatcherDeployment", dispatcher.Spec.Template.Spec},
 		{"nats", "buildA2ANATSStatefulSet", sts.Spec.Template.Spec},
 		{"provision", "buildA2AProvisionJob", job.Spec.Template.Spec},
 		{"gateway", "buildA2AGatewayDeployment", dep.Spec.Template.Spec},
@@ -1780,6 +1784,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	dep := buildA2AGatewayDeployment(agent)
 	callout := buildA2ACalloutDeployment(agent, "")
 	verifier := buildA2AVerifierDeployment(agent)
+	dispatcher := buildA2ADispatcherDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
 
@@ -1828,6 +1833,13 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// ends it would not announce itself. The callout writes nothing, so
 		// traversable is enough.
 		{render: "callout", builder: "buildA2ACalloutDeployment", container: "callout", spec: callout.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+		// The dispatcher's image is the dispatcher PR's, on the same
+		// distroless static nonroot base as the gateway, callout and
+		// verifier: WorkingDir /home/nonroot, UID 1000 imposed here, and a
+		// binary that writes nothing. Pinned ahead of the image so that PR
+		// builds to it.
+		{render: "dispatcher", builder: "buildA2ADispatcherDeployment", container: a2aDispatcherContainerName, spec: dispatcher.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 		// The third pod on that same distroless static nonroot base, same
 		// shape and same row: WorkingDir /home/nonroot in the image, UID 1000
@@ -2153,13 +2165,16 @@ func remedyRecreateWidth(t *testing.T, message string) int {
 // clean pass run, and require the tree to be empty at the end rather than
 // merely error-free.
 func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
+	// With the dispatcher on, so its objects are rendered and the cleanup
+	// is held to deleting them too.
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
 	failRole := true
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, chartProfileNamespace(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: fakeServerSideApplyInterceptors().Patch,
@@ -2191,6 +2206,13 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 
 	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatalf("render: %v", err)
+	}
+	// Precondition: the profile namespace's half rendered, so its delete
+	// below proves something.
+	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher", Namespace: "test-ns-profiles"}, obj); err != nil {
+			t.Fatalf("precondition: the dispatcher's pod-read %T in the profile namespace wasn't rendered: %v", obj, err)
+		}
 	}
 
 	// The render has to have produced what the cleanup is asked to remove.
@@ -2230,6 +2252,13 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		{"gateway Role", &rbacv1.Role{}, "test-agent-a2a-gateway"},
 		{"gateway RoleBinding", &rbacv1.RoleBinding{}, "test-agent-a2a-gateway"},
 		{"gateway ServiceAccount", &corev1.ServiceAccount{}, "test-agent-a2a-gateway"},
+		// The dispatcher, rendered because the image is set above; its Role
+		// is the first the injected failure stops on.
+		{"dispatcher Deployment", &appsv1.Deployment{}, "test-agent-a2a-dispatcher"},
+		{"dispatch ConfigMap", &corev1.ConfigMap{}, "test-agent-a2a-dispatch"},
+		{"dispatcher Role", &rbacv1.Role{}, "test-agent-a2a-dispatcher"},
+		{"dispatcher RoleBinding", &rbacv1.RoleBinding{}, "test-agent-a2a-dispatcher"},
+		{"dispatcher ServiceAccount", &corev1.ServiceAccount{}, "test-agent-a2a-dispatcher"},
 		{"NATS Service", &corev1.Service{}, "test-agent-a2a-nats"},
 		{"NATS config Secret", &corev1.Secret{}, "test-agent-a2a-nats-config"},
 		{"NATS StatefulSet", &appsv1.StatefulSet{}, "test-agent-a2a-nats"},
@@ -2237,6 +2266,15 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		err := cl.Get(ctx, types.NamespacedName{Name: tc.name, Namespace: "test-ns"}, tc.obj)
 		if !errors.IsNotFound(err) {
 			t.Errorf("%s survived the resumed cleanup (err=%v) — the early exit stepped over it", tc.what, err)
+		}
+	}
+
+	// The dispatcher's pod-read Role and binding in the profile namespace,
+	// which carry no owner reference and so need the flip's own delete.
+	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher", Namespace: "test-ns-profiles"}, obj)
+		if !errors.IsNotFound(err) {
+			t.Errorf("the dispatcher's pod-read %T in the profile namespace survived the cleanup (err=%v)", obj, err)
 		}
 	}
 
@@ -2256,6 +2294,8 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 // StatefulSet sentinel.
 func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
+	// The dispatcher too, so the labelled-kind sweep sees its objects.
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
 	scheme := setupScheme()
 	next := a2aTestAgent()
 	today := next.DeepCopy()
@@ -5799,6 +5839,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	consoleStreams := a2aSameVerbsOn(
 		[]string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream},
 		"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT")
+	// Plus the profiles' submissions, read by subject and nothing else: no
+	// STREAM.INFO (the same subjects_filter listing) and no consumer verb,
+	// so a browser credential can't pull a profile's queue.
+	consoleStreams[a2aProfileSubmitStream] = []string{"DIRECT.GET"}
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{

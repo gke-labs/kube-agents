@@ -739,6 +739,12 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 							{Name: "A2A_AUTHMAP_NAME", Value: a2aAuthMapName(agent)},
 							{Name: "A2A_AUTHMAP_KEY", Value: a2aAuthMapKey},
 							{Name: "A2A_TOKEN_AUDIENCE", Value: a2aBusTokenAudience},
+							// The longest a profile task's credential may live
+							// (#3889): the same resolver the dispatch config
+							// clamps task deadlines with, so the dispatcher never
+							// issues a credential this callout refuses. A callout
+							// from before #3889 ignores it.
+							{Name: "A2A_TASK_CREDENTIAL_MAX_LIFETIME", Value: resolveProfileMaxTaskDeadline(agent).String()},
 							// The static nats.conf users, which no identity map
 							// carries: a narrowed pod named after one would
 							// hold its inbox. Plain names, no password.

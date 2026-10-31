@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -81,12 +82,61 @@ func agentNamespaceOfProfileServiceAccount(ns string) (string, bool) {
 	return agentNS, ok && agentNS != ""
 }
 
-// resolveProfileCeiling is spec.harness.tuning.profiles.ceiling, defaulted.
+// resolveProfileCeiling is spec.harness.tuning.profiles.ceiling, defaulted
+// to maxInProgress's resolved value: the profile ceiling replaces kanban's
+// in-progress limit, and while both exist an install's footprint shouldn't
+// jump when it moves from one to the other (spec-profiles-dispatch.md).
 func resolveProfileCeiling(agent *agentv1alpha1.PlatformAgent) int {
-	if t := agentTuning(agent); t != nil && t.Profiles != nil && t.Profiles.Ceiling != nil {
-		return *t.Profiles.Ceiling
+	if t := profileTuning(agent); t != nil && t.Ceiling != nil {
+		return *t.Ceiling
 	}
-	return agentv1alpha1.DefaultProfileCeiling
+	// maxInProgress has no maximum of its own (it only capped kanban
+	// workers); clamp it to the ceiling's, so the quota arithmetic and the
+	// reserves never see a value the ceiling field itself would refuse.
+	return min(resolveKanbanMaxInProgress(agent), agentv1alpha1.MaxProfileCeiling)
+}
+
+// profileTuning is spec.harness.tuning.profiles, or nil.
+func profileTuning(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.ProfileTuning {
+	if t := agentTuning(agent); t != nil {
+		return t.Profiles
+	}
+	return nil
+}
+
+// profileIntOr is one of the interval fields, or its default.
+func profileIntOr(agent *agentv1alpha1.PlatformAgent, field func(*agentv1alpha1.ProfileTuning) *int, def int) int {
+	if t := profileTuning(agent); t != nil {
+		if v := field(t); v != nil {
+			return *v
+		}
+	}
+	return def
+}
+
+// The dispatcher's intervals, defaulted (contract on #3655, section 5).
+func resolveProfileLeaseSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.LeaseSeconds }, agentv1alpha1.DefaultProfileLeaseSeconds)
+}
+
+func resolveProfileRenewSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.RenewSeconds }, agentv1alpha1.DefaultProfileRenewSeconds)
+}
+
+func resolveProfileRestartGraceSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.RestartGraceSeconds }, agentv1alpha1.DefaultProfileRestartGraceSeconds)
+}
+
+// resolveProfileMaxTaskDeadline is the install's task deadline cap: what the
+// dispatch config clamps every profile task's deadline to, and the auth
+// callout's longest task credential. One resolver for both, so they can't
+// disagree and the dispatcher never issues a credential the callout refuses.
+func resolveProfileMaxTaskDeadline(agent *agentv1alpha1.PlatformAgent) time.Duration {
+	return time.Duration(profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.MaxTaskDeadlineSeconds }, agentv1alpha1.DefaultProfileMaxTaskDeadlineSeconds)) * time.Second
+}
+
+func resolveProfileAcceptTimeoutSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.AcceptTimeoutSeconds }, agentv1alpha1.DefaultProfileAcceptTimeoutSeconds)
 }
 
 // resolveProfileWarmReplicas is spec.harness.tuning.profiles.warmReplicas,
