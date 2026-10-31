@@ -346,12 +346,35 @@ SECTION_SENTENCES = (
     ),
 )
 
+# The run that opens or closes a fenced block: three or more backticks or tildes
+# after any indent, list marker or quote marker.
+FENCE_MARKER = re.compile(r"^[ \t]*(?:(?:[-*+>]|\d{1,9}[.)])[ \t]+)*(`{3,}|~{3,})")
+
 
 def section(text: str) -> str:
-    """The reporting section: from its heading to the next `## ` heading."""
-    start = text.index(SECTION_HEADING)
-    end = text.find("\n## ", start + len(SECTION_HEADING))
-    return text[start:] if end == -1 else text[start : end + 1]
+    """The reporting section: from its heading to the next `## ` heading.
+
+    A `## ` line inside a fenced block (an issue-body template, a bash comment)
+    is code, not the next heading, so fences are tracked line by line: a fence
+    opens on a run of three or more backticks or tildes, after any indent or
+    list or quote marker, and closes on a run of the same character at least as
+    long. An unclosed fence runs to the end of the text, as in CommonMark.
+    """
+    lines = text.split("\n")
+    start = next(i for i, line in enumerate(lines) if line.startswith(SECTION_HEADING))
+    fence = None
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        opener = FENCE_MARKER.match(lines[i])
+        if fence is None:
+            if opener:
+                fence = opener.group(1)
+            elif lines[i].startswith("## "):
+                end = i
+                break
+        elif opener and opener.group(1)[0] == fence[0] and len(opener.group(1)) >= len(fence):
+            fence = None
+    return "\n".join(lines[start:end]) + ("\n" if end < len(lines) else "")
 
 
 def sentences(text: str) -> list[str]:
@@ -385,6 +408,20 @@ class ReaderTest(unittest.TestCase):
     def test_section_stops_at_the_next_heading(self) -> None:
         text = f"intro\n\n{SECTION_HEADING}\n\n- one\n- two\n\n## Next\n\n- three\n"
         self.assertEqual(f"{SECTION_HEADING}\n\n- one\n- two\n\n", section(text))
+
+    def test_a_heading_inside_a_fence_does_not_end_the_section(self) -> None:
+        text = (
+            f"intro\n\n{SECTION_HEADING}\n\n- one\n\nUse this body:\n\n```markdown\n## Environment\n- two\n```\n\n"
+            "- three\n\n## Next\n\n- four\n"
+        )
+        self.assertEqual(
+            f"{SECTION_HEADING}\n\n- one\n\nUse this body:\n\n```markdown\n## Environment\n- two\n```\n\n- three\n\n",
+            section(text),
+        )
+
+    def test_an_unclosed_fence_runs_to_the_end(self) -> None:
+        text = f"{SECTION_HEADING}\n\n- one\n\n~~~\n## Environment\n\n## Next\n"
+        self.assertEqual(text, section(text))
 
     def test_section_runs_to_the_end_when_it_is_last(self) -> None:
         text = f"{SECTION_HEADING}\n\n- only\n"
