@@ -130,8 +130,8 @@ func ensureDurable(ctx context.Context, js jetstream.JetStream, d profileDurable
 // heldConfigTampered is lib's check of the same name: the first setting the
 // operator leaves at its default that a stored consumer has changed, or "".
 // The dispatcher refuses to bind such a durable, and the operator refuses to
-// adopt one (lib.heldConfigTampered holds the list; the durable-config
-// fixture test holds the two equal).
+// adopt one. lib.heldConfigTampered holds the list. Nothing compares the
+// two: a drift makes the dispatcher refuse to bind, which fails safe.
 func heldConfigTampered(cc jetstream.ConsumerConfig) string {
 	switch {
 	case cc.DeliverSubject != "":

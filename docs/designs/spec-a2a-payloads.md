@@ -930,7 +930,7 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
 - **Size.** The part counts against the envelope's max message size like any other. A
   carrier too large with it is published without it: the text is the deliverable.
 - **A backend that can't hold it.** The caps fit Slack. A valid chat message may still be
-  more than another backend takes (a Google Chat card message is capped at 32,000 bytes,
+  more than another backend takes (a Google Chat message is capped at 32,000 bytes,
   a Discord embed at 6,000 characters). A renderer whose backend can't hold a valid chat
   message posts the fallback, logged and counted, as for an invalid one, and never clips
   it or sends a card the API will refuse. The same goes for a post the backend's API

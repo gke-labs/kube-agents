@@ -503,3 +503,48 @@ func TestDefaultOffRendersNoDispatcherAndNoGrantsForIt(t *testing.T) {
 		t.Errorf("durables synced with the dispatcher off: %+v", h.dir.durables)
 	}
 }
+
+// Deleting the PlatformAgent removes the dispatcher's pod-read Role and
+// binding in the profile namespace, which nothing owns: left behind, a later
+// ServiceAccount of the dispatcher's name would inherit pod read there. A
+// pair under that name without this agent's labels is someone else's, and
+// stays.
+func TestHandleDeletionRemovesTheDispatchersPodReadRBAC(t *testing.T) {
+	for _, own := range []bool{true, false} {
+		scheme := setupScheme()
+		agent := a2aTestAgent()
+		agent.Finalizers = []string{platformAgentFinalizer}
+		now := metav1.Now()
+		agent.DeletionTimestamp = &now
+		role, binding := buildA2ADispatcherPodsRole(agent), buildA2ADispatcherPodsRoleBinding(agent)
+		if own {
+			withCommonLabels(role, agent)
+			withCommonLabels(binding, agent)
+		} else {
+			role.Labels = map[string]string{labelInstance: "foreign-agent"}
+			binding.Labels = map[string]string{labelInstance: "foreign-agent"}
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(agent.DeepCopy(), role, binding).
+			WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		ctx := context.Background()
+		current := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, current); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.handleDeletion(ctx, current); err != nil {
+			t.Fatalf("handleDeletion (own=%v): %v", own, err)
+		}
+		key := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: a2aDispatcherName(agent)}
+		for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+			err := cl.Get(ctx, key, obj)
+			switch {
+			case own && !apierrors.IsNotFound(err):
+				t.Errorf("this agent's dispatcher pod-read %T survived deletion: %v", obj, err)
+			case !own && err != nil:
+				t.Errorf("a foreign %T under the dispatcher's name was deleted: %v", obj, err)
+			}
+		}
+	}
+}

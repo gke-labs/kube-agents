@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "✅ Both pods are up\n  ✓ reading pods",
+    "widgets": null
+  }
+]
