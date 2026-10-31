@@ -64,16 +64,21 @@ class _SteppedClock:
     """A stand-in for the script's `time`: monotonic() moves only by sleep().
 
     `between_passes` runs at every sleep, so a test can assert what the script
-    has not done yet. A sleep that does not move the clock, or one past a
-    hundred, fails rather than looping forever on a clock that never runs out.
+    has not done yet. A sleep that does not move the clock, a hundredth sleep,
+    or a fiftieth read of it fails rather than looping forever on a clock
+    that never runs out: the read cap catches a loop that polls without
+    sleeping at all.
     """
 
     def __init__(self, between_passes=lambda: None) -> None:
         self.now = 0.0
         self.sleeps: list[float] = []
+        self.reads = 0
         self.between_passes = between_passes
 
     def monotonic(self) -> float:
+        self.reads += 1
+        assert self.reads < 50, "fifty clock reads without reaching the deadline"
         return self.now
 
     def sleep(self, seconds: float) -> None:
