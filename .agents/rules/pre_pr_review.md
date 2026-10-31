@@ -16,7 +16,12 @@ recurring. This file holds the mechanics of carrying them out, and what the auto
 with the self-review. The comments in
 [`.github/PULL_REQUEST_TEMPLATE.md`](../../.github/PULL_REQUEST_TEMPLATE.md) summarise the pair —
 change `AGENTS.md` or this file, whichever owns what you are changing, then reconcile the template
-summary to it.
+summary to it. A template section stays in every pull request: the review bot holds a description
+to every heading and has no optional section, and the contributor robot's one exception is the
+"delete this section" phrase. So a section that applies to some pull requests only opens its
+comment with the condition and names the one-line answer the rest write (`Required when ...
+Otherwise write "Not a bug fix."`), never "delete this section"; `make docs-check-pr-template`
+is the tripwire for the shapes seen so far, and a reviewer reads the rest.
 
 ## Adversarial self-review
 

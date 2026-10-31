@@ -79,6 +79,23 @@ func TestParseFlags_FailedSchedulingDefaults(t *testing.T) {
 	if f.scaleUpHold != 15*time.Minute {
 		t.Errorf("--scaleup-hold default = %s; want 15m", f.scaleUpHold)
 	}
+	if f.failedSchedulingMinSpan != 2*time.Minute {
+		t.Errorf("--failedscheduling-min-span default = %s; want 2m", f.failedSchedulingMinSpan)
+	}
+
+	// 0 on the flag is off, and reaches the filter as off rather than as
+	// the default the threshold group reads a zero as.
+	f, err = parseFlags([]string{"--failedscheduling-min-span=0"})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if cfg := newFilterConfig(nil, nil, nil, f.filterThresholds()); cfg.failedSchedulingMinSpan != 0 {
+		t.Errorf("--failedscheduling-min-span=0 reached the filter as %s; want 0 (off)", cfg.failedSchedulingMinSpan)
+	}
+	negative := flags{daemonURL: "http://localhost:8699", tokenEnv: "TOKEN", mode: "per-incident", owner: "watcher", clusterName: "c", dedupWindow: 1, failedSchedulingMinSpan: -time.Second}
+	if err := negative.validate(); err == nil || !strings.Contains(err.Error(), "--failedscheduling-min-span") {
+		t.Errorf("validate() with --failedscheduling-min-span=-1s = %v; want a --failedscheduling-min-span error", err)
+	}
 
 	f, err = parseFlags([]string{"--failedscheduling-min-count=2", "--scaleup-hold=3m"})
 	if err != nil {
@@ -158,12 +175,12 @@ func TestFlagsFilterThresholds(t *testing.T) {
 
 	// The rest of the group travels unchanged; a transposition here is the bug
 	// filterThresholds' own doc comment describes.
-	f, err := parseFlags([]string{"--unhealthy-min-count=2", "--backoff-min-count=4", "--imagepull-transient-min-count=6", "--failedscheduling-min-count=8", "--scaleup-hold=7m"})
+	f, err := parseFlags([]string{"--unhealthy-min-count=2", "--backoff-min-count=4", "--imagepull-transient-min-count=6", "--failedscheduling-min-count=8", "--failedscheduling-min-span=9m", "--scaleup-hold=7m"})
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
 	}
 	got := f.filterThresholds()
-	want := filterThresholds{unhealthyMinCount: 2, backoffMinCount: 4, imagePullTransientMinCount: 6, failedSchedulingMinCount: 8, scaleUpHold: 7 * time.Minute, settle: defaultSettle}
+	want := filterThresholds{unhealthyMinCount: 2, backoffMinCount: 4, imagePullTransientMinCount: 6, failedSchedulingMinCount: 8, failedSchedulingMinSpan: 9 * time.Minute, scaleUpHold: 7 * time.Minute, settle: defaultSettle}
 	if got != want {
 		t.Errorf("filterThresholds() = %+v; want %+v", got, want)
 	}

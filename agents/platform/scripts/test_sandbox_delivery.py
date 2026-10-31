@@ -152,12 +152,14 @@ def forwarded_paths() -> dict[str, str]:
     sys.path.insert(0, str(SKILL_SCRIPTS / "github-issue-resolver/scripts"))
     try:
         import forge
+        import gke_cluster_reads
         import resolver
     finally:
         sys.path.pop(0)
 
     return {
         "forge": forge.SANDBOX_FORGE,
+        "gke_cluster_reads": gke_cluster_reads.SANDBOX_GKE_READS,
         "resolver": resolver.SANDBOX_RESOLVER,
     }
 

@@ -8,6 +8,8 @@ import "time"
 // process beside the agent that holds the session KV's key, answers it with
 // GET /v1/board and replies on the request's subject under BoardReplyPrefix.
 // No model is in the loop: every field is a row something already wrote.
+// A request with a body is a BoardAction instead, a board-health row's Retry
+// or Drop, answered the same way with a BoardActionResult.
 const (
 	// BoardSubject is the subject a board request is published on.
 	BoardSubject = "chat.board"
@@ -84,3 +86,44 @@ type BoardAudit struct {
 	Issue      int       `json:"issue,omitempty"`
 	FinishedAt time.Time `json:"finished_at"`
 }
+
+// BoardAction is the board route's other request: a Retry or Drop tap on a
+// board-health row (a2a/gateway/slack_board.go), carried as the request's
+// body where a snapshot request carries none. The bridge relays it to
+// session-kv's POST /v1/board/actions, which acts only on cards still
+// blocked, and answers with a BoardActionResult. The gateway has decided the
+// presser may act before it sends one.
+type BoardAction struct {
+	// Action is chatmsg.RowActionRetry or chatmsg.RowActionDrop.
+	Action string `json:"action"`
+	// Tasks are the row's card ids.
+	Tasks []string `json:"tasks"`
+	// By is who pressed, for session-kv's log line.
+	By string `json:"by,omitempty"`
+}
+
+// BoardActionResult is session-kv's answer to a BoardAction, relayed as it
+// came.
+type BoardActionResult struct {
+	Action  string               `json:"action"`
+	Results []BoardActionOutcome `json:"results"`
+	// Error, when set, is why the bridge could not get an answer; Results is
+	// then empty and says nothing about the cards.
+	Error string `json:"error,omitempty"`
+}
+
+// BoardActionOutcome is one card's: BoardOutcomeDone, BoardOutcomeMoved (no
+// longer blocked), BoardOutcomeGone (no such card, or archived), or failed.
+type BoardActionOutcome struct {
+	ID      string `json:"id"`
+	Title   string `json:"title,omitempty"`
+	Status  string `json:"status,omitempty"`
+	Outcome string `json:"outcome"`
+}
+
+// The outcomes of a BoardActionOutcome that settle its card.
+const (
+	BoardOutcomeDone  = "done"
+	BoardOutcomeMoved = "moved"
+	BoardOutcomeGone  = "gone"
+)

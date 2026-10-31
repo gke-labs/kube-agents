@@ -10,7 +10,7 @@ grader's reason and a transcript link; which cases fail tonight that did not
 fail the night before; the wall clock; and whether the night finished or was
 cut short. ``render.py`` puts the result into ``brief.json`` for
 ``nightly.html`` and the Brief, ``post_health.py`` writes one line of it into
-the 9 AM digest, so the two say the same thing by construction. A night
+the 11 AM digest, so the two say the same thing by construction. A night
 still in flight -- a nightly build on the collector's ``pending_builds`` --
 is reported as running rather than missing (``running_nights``).
 
@@ -97,16 +97,30 @@ RESULT_ABORTED = "ABORTED"
 RESULT_SUCCESS = "SUCCESS"
 EVAL_VERDICT_KEY = "eval_verdict"
 # A nightly build on the collector's pending_builds (listed, no finished.json
-# yet) is a night still running only while its first sighting is this
-# recent: the periodic's budget is 8 hours (oss-test-infra: timeout 480m)
-# and Prow needs a little longer to write finished.json after ending the
-# job. Past that the build is a pod that died without uploading, which the
-# collector keeps on pending_builds for two days; it is not a running night.
-RUNNING_MAX_AGE = datetime.timedelta(hours=9)
+# yet) is a night still running only while it started this recently: the
+# longest part's budget is 14 hours (oss-test-infra: timeout 840m on the main
+# and main-b parts for the gemini-4-argon window, 720m before), plus Prow's
+# 5-minute grace and the minutes a pod cut at its deadline takes to end (seen
+# at 12h04m-12h06m on the 720m budget). Past that the build is a pod that
+# died without uploading, which the collector keeps on pending_builds for
+# two days; it is not a running night. Keep it under 14h39m: the summer
+# digest window opens at 14:40 UTC (11 AM Toronto, 20 minutes early), and
+# must read a dead 00:00 UTC night as missing, not still running.
+RUNNING_MAX_AGE = datetime.timedelta(hours=14, minutes=30)
+# A Prow build ID is a snowflake of this many digits: milliseconds since
+# this epoch, shifted left this many bits (scripts/pool_pressure.py reads
+# it the same way). It dates a build's start exactly; first_seen, the
+# collector's first sighting, lags it by 30-70 minutes because GitHub runs
+# the */15 cron late, too unevenly for an age cut to absorb.
+PROW_BUILD_ID_DIGITS = 19
+PROW_BUILD_ID_EPOCH_MS = 1288834974657
+PROW_BUILD_ID_TIME_SHIFT = 22
+MILLIS_PER_SECOND = 1000
 # A night whose start is older than this when the digest goes out is not
-# "last night": the 8 PM ET run ends by 4 AM under its 8-hour budget, so at
-# 9 AM the newest night is at most 13 hours old; 36 hours tolerates one
-# late or re-run night without reading the night before as last night.
+# "last night": the 00:00 UTC run starts 15 (EDT) or 16 (EST) hours before
+# the 11 AM ET digest, so its 14-hour budget has ended by then; 36 hours
+# tolerates one late or re-run night without reading the night before as
+# last night.
 LAST_NIGHT_MAX_AGE = datetime.timedelta(hours=36)
 # A nightly build is dated by its start plus this. Both periodics start at
 # 00:00 UTC, so a slow clock or a cron a few minutes early must not move a
@@ -766,12 +780,25 @@ def nightly_job(data: dict) -> str:
     return next((r.get("job") for r in reversed(sorted_nightly_runs(data)) if isinstance(r.get("job"), str) and night_part(r) == PART_MAIN), DEFAULT_NIGHTLY_JOB)
 
 
+def build_started(build: str, first_seen: datetime.datetime) -> datetime.datetime:
+    """When a pending build started, read from its snowflake ID. An ID of
+    another length, or one that decodes to after ``first_seen`` (a build
+    cannot be seen before it starts), is not a snowflake, and its first
+    sighting stands in."""
+    if len(build) != PROW_BUILD_ID_DIGITS:
+        return first_seen
+    ms = (int(build) >> PROW_BUILD_ID_TIME_SHIFT) + PROW_BUILD_ID_EPOCH_MS
+    started = datetime.datetime.fromtimestamp(ms / MILLIS_PER_SECOND, UTC)
+    return min(started, first_seen)
+
+
 def running_nights(data: dict, now: datetime.datetime | None) -> list[dict]:
     """The nightly builds still in flight: the ``tier: "nightly"`` entries of
-    the collector's ``pending_builds`` (SCHEMA.md) first seen inside
-    RUNNING_MAX_AGE of ``now``, oldest first, each ``{build, first_seen,
-    log_url}``. Without a ``now`` the age is not judged. A malformed entry
-    is skipped; a value that is not a list is no entries."""
+    the collector's ``pending_builds`` (SCHEMA.md) started inside
+    RUNNING_MAX_AGE of ``now`` (build_started), oldest first, each
+    ``{build, first_seen, log_url}``. Without a ``now`` the age is not
+    judged. A malformed entry is skipped; a value that is not a list is no
+    entries."""
     raw = data.get("pending_builds")
     if not isinstance(raw, list):
         return []
@@ -784,7 +811,7 @@ def running_nights(data: dict, now: datetime.datetime | None) -> list[dict]:
         seen = parse_iso(entry.get("first_seen"))
         if not isinstance(build, str) or not build.isdigit() or seen is None:
             continue
-        if now is not None and now - seen > RUNNING_MAX_AGE:
+        if now is not None and now - build_started(build, seen) > RUNNING_MAX_AGE:
             continue
         out.append({"build": build, "first_seen": seen.isoformat(), "log_url": build_url({"build_id": build, "job": job, "log_url": entry.get("log_url")})})
     out.sort(key=lambda e: int(e["build"]))
@@ -870,7 +897,7 @@ def turn1_note(night: dict) -> str | None:
 
 
 def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
-    """One line for the 9 AM digest. ``clock`` renders a datetime the way
+    """One line for the 11 AM digest. ``clock`` renders a datetime the way
     the rest of the digest does (post_health.clock); without one the ISO
     form is used. A truncated or missing night says so instead of numbers,
     and so does a split night whose main or main-b part is still running; a

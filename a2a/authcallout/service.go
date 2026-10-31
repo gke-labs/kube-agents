@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"strings"
 	"time"
 
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
+
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
 const (
@@ -59,6 +62,19 @@ const (
 	// as an authorization failure, it surfaces as "expected 'PONG', got
 	// 'PING'" — which names nothing about authorization at all. See handle.
 	authDecisionBudget = 1500 * time.Millisecond
+
+	// taskCredentialSkew is the clock skew a task credential's expiry and
+	// issue time are allowed against this callout's clock: the dispatcher
+	// that signed it runs on another node.
+	taskCredentialSkew = 30 * time.Second
+
+	// defaultTaskCredentialMaxLifetime bounds how far out a task
+	// credential's expiry may be. See Config.TaskCredentialMaxLifetime.
+	defaultTaskCredentialMaxLifetime = 6 * time.Hour
+
+	// maxTaskCredentialMaxLifetime is the most TaskCredentialMaxLifetime may
+	// be set to; see ParseTaskCredentialMaxLifetime.
+	maxTaskCredentialMaxLifetime = 7 * 24 * time.Hour
 )
 
 // Config is what the callout needs to answer.
@@ -101,8 +117,104 @@ type Config struct {
 	// join ReservedPrincipals in the one set reservedAs checks.
 	ReservedAddressees []string
 
+	// TaskSigningKeys are the public task-signing keys (C...) whose task
+	// credentials this callout honours on a profile worker's task
+	// connection (#3889, a2a/taskcred): the current key, and during a
+	// rotation the one it replaces. Empty means no task connection is
+	// honoured; a worker's pod connection still is. NewService refuses a
+	// key that is not a task-signing public key, or more than
+	// taskcred.MaxTrustedKeys of them.
+	TaskSigningKeys []string
+
+	// TaskCredentialMaxLifetime is the furthest a task credential's expiry
+	// may be, both from now (exp-now) and from its issue time (exp-iat), each
+	// plus the skew; one further out either way is refused, not shortened.
+	// It is
+	// decoupled from GrantTTL on purpose: a task runs to its profile's
+	// deadline (spec.lifecycle.activeDeadlineSeconds, which has no CRD
+	// maximum), and the credential has to last that long. Revocation stays
+	// at GrantTTL anyway, because the connection JWT is still capped by it
+	// (see mint); a worker whose connection expires reconnects with the
+	// same credential until the credential's own expiry.
+	//
+	// Zero means the default, 6h, which matches #4121's. The operator
+	// doesn't render it in this PR; #4121's operator will render it from the
+	// PlatformAgent's spec.harness.tuning.profiles.maxTaskDeadlineSeconds,
+	// the same value it clamps profile deadlines to, so the dispatcher never
+	// signs an expiry the callout refuses.
+	TaskCredentialMaxLifetime time.Duration
+
+	// TaskCredentialMaxLifetimeInvalid, when set, says the configured
+	// lifetime could not be used (ParseTaskCredentialMaxLifetime's error).
+	// The callout then refuses every task credential, naming it, and serves
+	// every other connection as usual. It never falls back to the default:
+	// a cap someone set and got wrong is not a cap of 6h. A negative
+	// TaskCredentialMaxLifetime is treated the same way.
+	TaskCredentialMaxLifetimeInvalid error
+
 	// Now is injectable for tests.
 	Now func() time.Time
+}
+
+// envTaskCredentialMaxLifetimeName is the variable ParseTaskCredentialMaxLifetime
+// reads, named in its errors so a refusal says which setting to fix.
+const envTaskCredentialMaxLifetimeName = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+
+// ParseTaskCredentialMaxLifetime reads the task credential lifetime #4121's
+// operator will render (time.Duration.String, e.g. "6h0m0s"). Empty is
+// (0, nil): unset, the default. Anything that isn't a positive Go duration is
+// an error, which the caller passes on as Config.TaskCredentialMaxLifetimeInvalid
+// rather than stopping: see that field.
+func ParseTaskCredentialMaxLifetime(raw string) (time.Duration, error) {
+	// Trimmed like the other rendered settings: a value written through a
+	// ConfigMap or by hand may carry a newline, and whitespace alone is unset.
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q is not a Go duration: %w", envTaskCredentialMaxLifetimeName, raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s=%q is not positive", envTaskCredentialMaxLifetimeName, raw)
+	}
+	// A ceiling, so a typo can't make credentials good for years, and so the
+	// exp arithmetic in taskcred.Verify (maxLifetime plus skew) stays far
+	// from time.Duration's ~292-year overflow. 7 days is well above #4121's
+	// own maximum (21600s), so it bounds mistakes, not configurations.
+	if d > maxTaskCredentialMaxLifetime {
+		return 0, fmt.Errorf("%s=%q is above the %s ceiling", envTaskCredentialMaxLifetimeName, raw, maxTaskCredentialMaxLifetime)
+	}
+	return d, nil
+}
+
+// taskSigningKeySeparator separates the keys in ParseTaskSigningKeys' input.
+const taskSigningKeySeparator = ","
+
+// ParseTaskSigningKeys reads the task-signing public keys the operator renders
+// for the callout, comma separated. Empty is allowed and means none (no task
+// connection is honoured); an empty element, a key that is not a task-signing
+// public key, or more than taskcred.MaxTrustedKeys is refused.
+func ParseTaskSigningKeys(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var keys []string
+	for _, field := range strings.Split(raw, taskSigningKeySeparator) {
+		key := strings.TrimSpace(field)
+		if key == "" {
+			return nil, fmt.Errorf("the task-signing key list %q has an empty element", raw)
+		}
+		if !taskcred.ValidPublicKey(key) {
+			return nil, fmt.Errorf("%q is not a task-signing public key (C...)", key)
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) > taskcred.MaxTrustedKeys {
+		return nil, fmt.Errorf("%d task-signing keys; at most %d (the current one and the one it replaces)", len(keys), taskcred.MaxTrustedKeys)
+	}
+	return keys, nil
 }
 
 // Service answers the server's authorization requests.
@@ -112,9 +224,16 @@ type Service struct {
 	issuer    nkeys.KeyPair
 	xkey      nkeys.KeyPair
 	grantTTL  time.Duration
-	reserved  map[string]reservedKind
-	now       func() time.Time
-	log       *slog.Logger
+	taskKeys  []string
+	// taskMaxLifetime is Config.TaskCredentialMaxLifetime, defaulted.
+	taskMaxLifetime time.Duration
+	// taskLifetimeErr, when set, refuses every task credential: the
+	// configured lifetime was unusable. See
+	// Config.TaskCredentialMaxLifetimeInvalid.
+	taskLifetimeErr error
+	reserved        map[string]reservedKind
+	now             func() time.Time
+	log             *slog.Logger
 }
 
 // NewService builds the callout.
@@ -153,17 +272,44 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 		return nil, err
 	}
 
+	if len(cfg.TaskSigningKeys) > taskcred.MaxTrustedKeys {
+		return nil, fmt.Errorf("%d task-signing keys configured; at most %d (the current one and the one it replaces)", len(cfg.TaskSigningKeys), taskcred.MaxTrustedKeys)
+	}
+	for _, k := range cfg.TaskSigningKeys {
+		if !taskcred.ValidPublicKey(k) {
+			return nil, fmt.Errorf("task-signing key %q is not a task-signing public key (C...)", k)
+		}
+	}
+
 	svc := &Service{
 		store:     store,
 		validator: validator,
 		issuer:    issuer,
 		grantTTL:  cfg.GrantTTL,
+		taskKeys:  append([]string(nil), cfg.TaskSigningKeys...),
 		reserved:  reserved,
 		now:       cfg.Now,
 		log:       log,
 	}
 	if svc.grantTTL <= 0 {
 		svc.grantTTL = defaultGrantTTL
+	}
+	// Three explicit cases. An unusable setting refuses task credentials and
+	// nothing else; it is not a reason to take the callout down, which would
+	// refuse every connection on the bus, and it is not a reason to apply the
+	// default either. Unset is the default. Anything else is the setting.
+	switch {
+	case cfg.TaskCredentialMaxLifetimeInvalid != nil:
+		svc.taskLifetimeErr = cfg.TaskCredentialMaxLifetimeInvalid
+	case cfg.TaskCredentialMaxLifetime < 0:
+		svc.taskLifetimeErr = fmt.Errorf("the task credential max lifetime %s is negative", cfg.TaskCredentialMaxLifetime)
+	case cfg.TaskCredentialMaxLifetime == 0:
+		svc.taskMaxLifetime = defaultTaskCredentialMaxLifetime
+	default:
+		svc.taskMaxLifetime = cfg.TaskCredentialMaxLifetime
+	}
+	if svc.taskLifetimeErr != nil {
+		log.Error("every task credential will be refused; other connections are served as usual", "reason", svc.taskLifetimeErr)
 	}
 	if svc.now == nil {
 		svc.now = time.Now
@@ -219,7 +365,7 @@ func (s *Service) handle(m *nats.Msg) {
 	resp := jwt.NewAuthorizationResponseClaims(req.UserNkey)
 	resp.Audience = req.Server.ID
 
-	account, perms, user, err := s.authorize(ctx, req)
+	d, err := s.authorize(ctx, req)
 	if err != nil {
 		// This string never reaches the client. The client sees a bare
 		// "Authorization Violation" whether its token was bad, the callout
@@ -232,15 +378,16 @@ func (s *Service) handle(m *nats.Msg) {
 			"map_version", s.store.Version())
 		resp.Error = err.Error()
 	} else {
-		ujwt, jerr := s.mint(req, account, user, perms)
+		ujwt, jerr := s.mint(req, d)
 		if jerr != nil {
-			s.log.Error("could not mint a user JWT", "user", user, "error", jerr)
+			s.log.Error("could not mint a user JWT", "user", d.user, "error", jerr)
 			resp.Error = "internal error"
 		} else {
 			resp.Jwt = ujwt
 			s.log.Info("authorized a connection",
-				"user", user,
-				"account", account,
+				"user", d.user,
+				"account", d.account,
+				"task", d.task,
 				"host", req.ClientInformation.Host,
 				"map_version", s.store.Version())
 		}
@@ -293,27 +440,65 @@ func (s *Service) decode(m *nats.Msg) (*jwt.AuthorizationRequestClaims, string, 
 	return req, serverXKey, nil
 }
 
+// decision is what authorize resolved a connection to.
+type decision struct {
+	account string
+	perms   *jwt.Permissions
+	user    string
+
+	// task and notAfter are set on a profile worker's task connection
+	// alone: the task its grants are scoped to, and its credential's
+	// expiry, which caps the minted JWT's (see mint).
+	task     string
+	notAfter time.Time
+}
+
 // authorize resolves the presented token to a mapped identity.
-func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestClaims) (account string, perms *jwt.Permissions, user string, err error) {
+func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestClaims) (decision, error) {
 	m := s.store.Current()
 	if m == nil {
-		return "", nil, "", fmt.Errorf("no identity map is being served")
+		return decision{}, fmt.Errorf("no identity map is being served")
 	}
 
-	// The token may arrive as the connection token or as the password. Both
-	// deliver it byte-identical; accepting either means a client library can
-	// use whichever fits it without the callout caring.
-	token := req.ConnectOptions.Token
-	if token == "" {
+	// The ServiceAccount token may arrive as the connection token or as the
+	// password. Both deliver it byte-identical; accepting either means a
+	// client library can use whichever fits it without the callout caring.
+	//
+	// A profile worker's task connection presents a second credential, the
+	// task credential, and it rides the password beside a token. So: a token
+	// is the ServiceAccount token and the password, if any, the task
+	// credential; with no token, the password is the ServiceAccount token
+	// and there is no task credential.
+	//
+	// Why the password and not CONNECT's jwt field, which nats-server
+	// v2.15.1 also forwards to the callout in this (non-operator) mode:
+	// fillConnectOpts (server/auth_callout.go) copies the client's jwt into
+	// ConnectOptions.JWT, and processClientOrLeafAuthentication
+	// (server/auth.go) only decodes it as a user JWT when trusted keys are
+	// configured, which they aren't here. But the server also copies
+	// c.opts.JWT into the $SYS connect, disconnect and auth-error
+	// advisories (server/events.go, accountConnectEvent and
+	// sendAccountAuthErrorEvent among them) and into connz's jwt field
+	// (server/monitor.go, redacted only for a bearer USER JWT). The callout
+	// clears it on success (processClientOrLeafCallout, "the JWT is
+	// cleared"), so a refused connection is exactly when the task
+	// credential would be published in cleartext. The password appears in
+	// none of those, crosses the bus only inside the authorization request
+	// (sealed when the xkey is configured, as the operator renders it), and
+	// nats.go sends it beside a token with no conflict (connectProto).
+	token, taskToken := req.ConnectOptions.Token, ""
+	if token != "" {
+		taskToken = req.ConnectOptions.Password
+	} else {
 		token = req.ConnectOptions.Password
 	}
 	if token == "" {
-		return "", nil, "", fmt.Errorf("no token presented")
+		return decision{}, fmt.Errorf("no token presented")
 	}
 
 	att, err := s.validator.Validate(ctx, token)
 	if err != nil {
-		return "", nil, "", fmt.Errorf("token rejected: %w", err)
+		return decision{}, fmt.Errorf("token rejected: %w", err)
 	}
 
 	id, ok := m.Lookup(att.ServiceAccount)
@@ -321,10 +506,19 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 		// The cluster vouches for this identity and this deployment has no
 		// entry for it. Named in the log because it is the single most
 		// likely thing to be wrong after a rename.
-		return "", nil, "", fmt.Errorf("%s is not in the identity map (version %s)", att.ServiceAccount, m.Version)
+		return decision{}, fmt.Errorf("%s is not in the identity map (version %s)", att.ServiceAccount, m.Version)
+	}
+
+	// A task credential means something only on a profile worker's entry.
+	// Anywhere else it is refused, not ignored: a client presenting one
+	// believes it is getting a task's scope.
+	if taskToken != "" && id.Narrowing != NarrowingProfile {
+		return decision{}, fmt.Errorf("%s presented a task credential, but its entry is not a profile worker's", att.ServiceAccount)
 	}
 
 	grants, user := id.Grants, id.User
+	var task string
+	var notAfter time.Time
 	if id.Narrowing != "" {
 		// A narrowed entry holds no grants; they are built here from what
 		// the cluster attested about this connection specifically. The
@@ -337,17 +531,17 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 		switch id.Narrowing {
 		case NarrowingPod:
 			if err := validSessionName(att.PodName); err != nil {
-				return "", nil, "", fmt.Errorf("%s narrows on the pod, but %w", att.ServiceAccount, err)
+				return decision{}, fmt.Errorf("%s narrows on the pod, but %w", att.ServiceAccount, err)
 			}
 			if att.PodUID == "" {
-				return "", nil, "", fmt.Errorf("%s narrows on the pod, but the token attests no pod UID", att.ServiceAccount)
+				return decision{}, fmt.Errorf("%s narrows on the pod, but the token attests no pod UID", att.ServiceAccount)
 			}
 			// The user is named for the pod, so `connz`, the $SYS
 			// advisories and the line below all say which session —
 			// otherwise every session on the bus is called "session".
 			g, err := sessionGrants(att.PodName)
 			if err != nil {
-				return "", nil, "", fmt.Errorf("%s narrows on the pod, but %w", att.ServiceAccount, err)
+				return decision{}, fmt.Errorf("%s narrows on the pod, but %w", att.ServiceAccount, err)
 			}
 			grants, user = g, att.PodName
 		case NarrowingProfile:
@@ -355,22 +549,37 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 			// reason: the pod name becomes the consumer names and the
 			// inbox, so it has to be one the API server vouched for.
 			if err := validSessionName(att.PodName); err != nil {
-				return "", nil, "", fmt.Errorf("%s narrows on its profile's pod, but %w", att.ServiceAccount, err)
+				return decision{}, fmt.Errorf("%s narrows on its profile's pod, but %w", att.ServiceAccount, err)
 			}
 			if att.PodUID == "" {
-				return "", nil, "", fmt.Errorf("%s narrows on its profile's pod, but the token attests no pod UID", att.ServiceAccount)
+				return decision{}, fmt.Errorf("%s narrows on its profile's pod, but the token attests no pod UID", att.ServiceAccount)
 			}
-			var topics TopicGrants
-			if id.Topics != nil {
-				topics = *id.Topics
+			if taskToken == "" {
+				// The pod connection: hand-off, lease and topics, and,
+				// until #3889's worker PR, the profile-wide task plane
+				// (see the TODO on profileWorkerGrants).
+				var topics TopicGrants
+				if id.Topics != nil {
+					topics = *id.Topics
+				}
+				g, err := profileGrants(id.Profile, id.Tier, att.PodName, topics)
+				if err != nil {
+					return decision{}, fmt.Errorf("%s narrows on profile %q, but %w", att.ServiceAccount, id.Profile, err)
+				}
+				grants, user = g, att.PodName
+				break
 			}
-			g, err := profileGrants(id.Profile, id.Tier, att.PodName, topics)
+			// The task connection. Every failure below is a refusal, never
+			// a fall back to the pod connection's grants: the client asked
+			// for one task's scope and gets that or nothing.
+			c, err := s.verifyTaskCredential(taskToken, id, att)
 			if err != nil {
-				return "", nil, "", fmt.Errorf("%s narrows on profile %q, but %w", att.ServiceAccount, id.Profile, err)
+				return decision{}, fmt.Errorf("%s presented a task credential that was refused: %w", att.ServiceAccount, err)
 			}
-			grants, user = g, att.PodName
+			grants, user = profileTaskGrants(id.Profile, c.Task, att.PodName), att.PodName
+			task, notAfter = c.Task, c.Expires
 		default:
-			return "", nil, "", fmt.Errorf("%s names narrowing %q, which this callout does not implement", att.ServiceAccount, id.Narrowing)
+			return decision{}, fmt.Errorf("%s names narrowing %q, which this callout does not implement", att.ServiceAccount, id.Narrowing)
 		}
 		// A narrowed user is named for its pod, and that name is both its
 		// inbox prefix and the addressee its task subjects are keyed on. A
@@ -384,7 +593,7 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 		// is covered by one check, whatever derived the user, and against m,
 		// the snapshot the identity was resolved from.
 		if kind, ok := s.reservedAs(m, user); ok {
-			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is the name of %s; %s", att.ServiceAccount, user, kind, kind.copied())
+			return decision{}, fmt.Errorf("%s narrows on pod %q, which is the name of %s; %s", att.ServiceAccount, user, kind, kind.copied())
 		}
 	}
 
@@ -395,11 +604,59 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 	// enforces this for mapped entries; the callout is the enforcement point
 	// and enforces it for all of them.
 	if len(grants.Publish) == 0 || len(grants.Subscribe) == 0 {
-		return "", nil, "", fmt.Errorf("%s resolved to %d publish and %d subscribe grants; a side with none would mint a client unrestricted on that side",
+		return decision{}, fmt.Errorf("%s resolved to %d publish and %d subscribe grants; a side with none would mint a client unrestricted on that side",
 			att.ServiceAccount, len(grants.Publish), len(grants.Subscribe))
 	}
 
-	return id.Account, permissionsFor(grants), user, nil
+	return decision{account: id.Account, perms: permissionsFor(grants), user: user, task: task, notAfter: notAfter}, nil
+}
+
+// verifyTaskCredential checks a task credential against the connection that
+// presented it. taskcred.Verify checks the credential itself: the signature,
+// a trusted task-signing key, the nats audience, an expiry within
+// TaskCredentialMaxLifetime both from now and from the credential's issue time
+// (refused, not shortened), and well-formed claims. What only the callout can
+// check is that it is this connection's:
+//
+//   - the pod and its UID are the pod the cluster attested for the
+//     ServiceAccount token on this same CONNECT, so a copied credential is
+//     useless without that pod's own token, and a credential minted for a
+//     pod that has since been replaced under the same name is refused too;
+//   - the profile and tier are the attested identity's map entry's. The
+//     subjects are built from the entry's profile, not the credential's, so
+//     this check is what refuses a credential for another profile rather
+//     than quietly granting the entry's own; an entry naming no tier (an
+//     operator before #3655) matches no credential.
+func (s *Service) verifyTaskCredential(raw string, id Identity, att Attested) (taskcred.Claims, error) {
+	if s.taskLifetimeErr != nil {
+		return taskcred.Claims{}, fmt.Errorf("the callout's task credential lifetime setting is unusable, so every task credential is refused: %w", s.taskLifetimeErr)
+	}
+	if len(s.taskKeys) == 0 {
+		return taskcred.Claims{}, fmt.Errorf("this callout trusts no task-signing key")
+	}
+	now := s.now()
+	c, err := taskcred.Verify(raw, s.taskKeys, taskcred.AudienceNATS, now, s.taskMaxLifetime, taskCredentialSkew)
+	if err != nil {
+		return taskcred.Claims{}, err
+	}
+	if c.Pod != att.PodName {
+		return taskcred.Claims{}, fmt.Errorf("it is for pod %q, and the token is bound to pod %q", c.Pod, att.PodName)
+	}
+	if c.PodUID != att.PodUID {
+		return taskcred.Claims{}, fmt.Errorf("it is for pod UID %q, and the token is bound to pod UID %q", c.PodUID, att.PodUID)
+	}
+	if c.Profile != id.Profile {
+		return taskcred.Claims{}, fmt.Errorf("it is for profile %q, and the entry is profile %q's", c.Profile, id.Profile)
+	}
+	if c.Tier != id.Tier {
+		return taskcred.Claims{}, fmt.Errorf("it is for tier %q, and the entry is tier %q's", c.Tier, id.Tier)
+	}
+	// Inside the skew Verify allows, but a JWT minted to expire now would
+	// be refused by the server with nothing naming why.
+	if !c.Expires.After(now) {
+		return taskcred.Claims{}, fmt.Errorf("it expired at %s", c.Expires.UTC().Format(time.RFC3339))
+	}
+	return c, nil
 }
 
 // permissionsFor turns a grant set into the permissions the user JWT carries.
@@ -451,17 +708,26 @@ func permissionsFor(grants Grants) *jwt.Permissions {
 }
 
 // mint builds the user JWT the server will enforce.
-func (s *Service) mint(req *jwt.AuthorizationRequestClaims, account, user string, perms *jwt.Permissions) (string, error) {
+func (s *Service) mint(req *jwt.AuthorizationRequestClaims, d decision) (string, error) {
 	// Every one of these three was proven load-bearing by violating it:
 	// a subject that is not the server's ephemeral user nkey, an audience
 	// that is not an account the server knows by name, or a signature from
 	// anything but the configured issuer account key, each produce an
 	// Authorization Violation the client cannot tell from a bad token.
 	uc := jwt.NewUserClaims(req.UserNkey)
-	uc.Audience = account
-	uc.Name = user
-	uc.Expires = s.grantExpiry().Unix()
-	uc.Permissions = *perms
+	uc.Audience = d.account
+	uc.Name = d.user
+	// A task connection ends with its task: the server closes a connection
+	// when its JWT expires, so the credential's expiry caps the grant's.
+	// GrantTTL still caps it too, so a credential that outlives GrantTTL
+	// (TaskCredentialMaxLifetime) means a reconnect, re-checked here, not a
+	// longer connection.
+	expiry := s.grantExpiry()
+	if !d.notAfter.IsZero() && d.notAfter.Before(expiry) {
+		expiry = d.notAfter
+	}
+	uc.Expires = expiry.Unix()
+	uc.Permissions = *d.perms
 	return uc.Encode(s.issuer)
 }
 

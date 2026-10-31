@@ -117,6 +117,11 @@ NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # (a2aNotifyConversationsEnvVar). Rendered whenever the gateway arms the route,
 # home channel or not; A2A_NOTIFY_PLATFORM above is home posts, and needs one.
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+# The operator's projection of the home channel, mounted in the agent pod
+# (agents/platform/scripts/chat_notify.py keeps the same three names).
+HOME_FILE_DIR = "/etc/kube-agents/chat-home"
+HOME_FILE_KEY = "slack_home"
+HOME_FILE_PLATFORM = "slack"
 # The bus CLI in the agent image, on PATH.
 A2A_CLI = "a2a"
 # `a2a notify` exit statuses (a2a/cmd/a2a/notify.go): the gateway took the
@@ -228,8 +233,23 @@ def _on_event_loop() -> bool:
 
 
 def routed_platform() -> str:
-    """The platform name the gateway holds, or "" when none."""
-    return os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+    """The platform name the gateway holds, or "" when none.
+
+    The rendered env names it when the CR sets the home channel; a channel the
+    gateway learned is projected into a file instead (the operator's
+    ``slack_home`` mount), so with the env empty the answer is derived from the
+    platform the gateway holds and a non-empty file.
+    """
+    routed = os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+    if routed:
+        return routed
+    if conversation_platform() != HOME_FILE_PLATFORM:
+        return ""
+    try:
+        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
+            return HOME_FILE_PLATFORM if handle.read().strip() else ""
+    except (OSError, ValueError):
+        return ""
 
 
 def routes(platform: Any) -> bool:

@@ -37,14 +37,43 @@ func busBoardReader(client *lib.Client) BoardReader {
 	}
 }
 
-func requestBoard(ctx context.Context, nc *nats.Conn) (*lib.Board, error) {
+// busBoardActor sends a board-health row's Retry or Drop over client's
+// connection, on the same route with the action as the request's body.
+func busBoardActor(client *lib.Client) BoardActor {
+	return func(ctx context.Context, a lib.BoardAction) (*lib.BoardActionResult, error) {
+		nc := client.Conn()
+		if nc == nil {
+			return nil, errors.New("board action: no bus connection")
+		}
+		body, err := json.Marshal(a)
+		if err != nil {
+			return nil, err
+		}
+		data, err := boardRoundTrip(ctx, nc, body)
+		if err != nil {
+			return nil, err
+		}
+		var r lib.BoardActionResult
+		if err := json.Unmarshal(data, &r); err != nil {
+			return nil, fmt.Errorf("board action: unreadable answer: %w", err)
+		}
+		if r.Error != "" {
+			return nil, fmt.Errorf("board action: the bridge could not act: %s", r.Error)
+		}
+		return &r, nil
+	}
+}
+
+// boardRoundTrip publishes one request on the board route, body empty for a
+// snapshot, and returns the answer.
+func boardRoundTrip(ctx context.Context, nc *nats.Conn, body []byte) ([]byte, error) {
 	reply := lib.BoardReplyPrefix + nuid.Next()
 	in, err := nc.SubscribeSync(reply)
 	if err != nil {
 		return nil, fmt.Errorf("board: subscribe %s: %w", reply, err)
 	}
 	defer func() { _ = in.Unsubscribe() }()
-	if err := nc.PublishRequest(lib.BoardSubject, reply, nil); err != nil {
+	if err := nc.PublishRequest(lib.BoardSubject, reply, body); err != nil {
 		return nil, fmt.Errorf("board: publish: %w", err)
 	}
 	wait := time.Until(deadlineOr(ctx))
@@ -60,8 +89,16 @@ func requestBoard(ctx context.Context, nc *nats.Conn) (*lib.Board, error) {
 	if len(msg.Data) > boardMaxReply {
 		return nil, fmt.Errorf("board: answer is %d bytes; the limit is %d", len(msg.Data), boardMaxReply)
 	}
+	return msg.Data, nil
+}
+
+func requestBoard(ctx context.Context, nc *nats.Conn) (*lib.Board, error) {
+	data, err := boardRoundTrip(ctx, nc, nil)
+	if err != nil {
+		return nil, err
+	}
 	var b lib.Board
-	if err := json.Unmarshal(msg.Data, &b); err != nil {
+	if err := json.Unmarshal(data, &b); err != nil {
 		return nil, fmt.Errorf("board: unreadable answer: %w", err)
 	}
 	if b.Error != "" {

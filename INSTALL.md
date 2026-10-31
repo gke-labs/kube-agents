@@ -410,7 +410,7 @@ Before beginning installation, ensure your environment meets the requirements fo
 | **`gke-gcloud-auth-plugin`**    | Standard                                        | `gke-gcloud-auth-plugin --version` | Required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin`).                                                                                                                                            | **All Methods** (GKE)                            |
 | **`kubectl`**                   | `1.28+`                                         | `kubectl version --client`         | Communicates with your target Kubernetes or GKE cluster.                                                                                                                                                                                                | **All Methods**                                  |
 | **Terraform**                   | `~> 1.5`                                        | `terraform version`                | The install and lifecycle engine. `install.sh` offers to install it when missing.                                                                                                                                                                       | **Methods 0 & 1**                                |
-| **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path, standalone chart install, and the teardown's release uninstall on a cluster the install did not create.                                                                                                                       | **Methods 0, 1, & 2**                            |
+| **Helm**                        | `3.14+`                                         | `helm version`                     | `upgrade.sh`'s fast path, standalone chart install, and the teardown's release uninstall on a cluster the install did not create. 3.14 for `--reset-then-reuse-values`, the hand-run upgrade path the chart documents.                                  | **Methods 0, 1, & 2**                            |
 | **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`, and by `upgrade.sh` to read the release's values and confirm the images it re-tagged.                                                                               | **All Methods**                                  |
 | **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation. The installer checks for it on every install, a GitLab install too, and installs it when it is missing.                                                                               | **Methods 0 & 1**                                |
 | **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                                                                               | **All Methods**                                  |
@@ -907,7 +907,7 @@ Or on an existing one:
 
 ```bash
 helm upgrade kube-agents ./charts/kube-agents \
-  --namespace kubeagents-system --reuse-values \
+  --namespace kubeagents-system --reset-then-reuse-values \
   --set platformAgent.harness.experimental.shellSandbox.runtimeClassName=gvisor \
   --wait --timeout 10m
 ```
@@ -1111,20 +1111,24 @@ make install
 make deploy IMG=$IMG
 ```
 
-Then apply the agent-RBAC admission policies. `make deploy` does **not** include them — they are
+Then apply the admission policies. `make deploy` does **not** include them — they are
 deliberately outside the kustomize overlay, because its `namePrefix` would rewrite each policy's
-name without rewriting the `spec.policyName` its binding refers to, leaving both bindings pointing
+name without rewriting the `spec.policyName` its binding refers to, leaving the bindings pointing
 at nothing and the policies silently inert:
 
 ```bash
 # Kubernetes 1.30+ only (ValidatingAdmissionPolicy v1). Skip on older clusters -- unlike
 # the chart, which checks the version itself, this apply will fail there.
 kubectl apply -f config/admission/agent-rbac-policy.yaml
+kubectl apply -f config/admission/a2a-gateway-pod-policy.yaml
 ```
 
 [Method 1](#method-1-the-install-engine--terraform--helm) gets these from the chart and needs no
-such step. Skipping it here leaves agent RBAC without its admission backstop. Read that file's
-header for what the policies do and do not enforce — notably, they cannot check the rules of a role
+such step. Skipping it here leaves agent RBAC without its admission backstop, and leaves the
+pods the A2A gateway creates under `spec.mode: next` free to run as any ServiceAccount in the
+namespace. The operator on this path does not get the chart's `A2A_GATEWAY_POD_POLICY` signal, so
+an operator feature that needs the second policy stays off. Read each file's header for what the
+policies do and do not enforce — notably, the agent-RBAC policies cannot check the rules of a role
 that a binding merely _references_.
 
 If the agent images are mirrored into a private registry, tell the operator where to find them.

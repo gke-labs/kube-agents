@@ -84,10 +84,11 @@ type harness struct {
 	url    string
 	store  *Store
 	tokens map[string]Attested
-	// tls trusts the CA the rendered conf's serving pair was minted from;
-	// every connection the suite makes needs it, since the render requires
-	// TLS of every client.
-	tls nats.Option
+	// dial trusts the CA the rendered conf's serving pair was minted from
+	// and sets the suite's connect timeout (withTestTLS); every connection
+	// the suite makes needs it, since the render requires TLS of every
+	// client.
+	dial nats.Option
 }
 
 // tokenReviewer maps a presented token to what the cluster would vouch for,
@@ -123,7 +124,7 @@ func tokenReviewer(tokens map[string]Attested, onReview func(token string) func(
 	return c
 }
 
-// harnessOption tweaks one harness. There is one so far; see onTokenReview.
+// harnessOption tweaks one harness.
 type harnessOption func(*harnessOptions)
 
 type harnessOptions struct {
@@ -135,11 +136,37 @@ type harnessOptions struct {
 	// grantTTL, when set, replaces the callout's one-hour grant lifetime,
 	// so a test can watch a connection outlive the JWT it was issued.
 	grantTTL time.Duration
+	// taskKeys are the task-signing public keys the callout trusts, for the
+	// per-task credential tests (task_credential_test.go).
+	taskKeys []string
+	// now, when set, is the callout's clock.
+	now func() time.Time
+	// taskLifetime and taskLifetimeErr are the callout's task credential
+	// lifetime settings (Config.TaskCredentialMaxLifetime and ...Invalid).
+	taskLifetime    time.Duration
+	taskLifetimeErr error
 }
 
 // withGrantTTL shortens every grant the callout issues.
 func withGrantTTL(d time.Duration) harnessOption {
 	return func(o *harnessOptions) { o.grantTTL = d }
+}
+
+// withTaskSigningKeys makes the callout honour task credentials from these
+// keys.
+func withTaskSigningKeys(keys ...string) harnessOption {
+	return func(o *harnessOptions) { o.taskKeys = keys }
+}
+
+// withTaskLifetime sets the callout's task credential lifetime, as
+// ParseTaskCredentialMaxLifetime returned it.
+func withTaskLifetime(d time.Duration, err error) harnessOption {
+	return func(o *harnessOptions) { o.taskLifetime, o.taskLifetimeErr = d, err }
+}
+
+// withNow sets the callout's clock.
+func withNow(now func() time.Time) harnessOption {
+	return func(o *harnessOptions) { o.now = now }
 }
 
 // watchingTokenReviews wraps every TokenReview the callout performs.
@@ -198,7 +225,7 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	}
 	conf := replaceConfKey(string(rendered), "issuer: ", issuerPub)
 	conf = replaceConfKey(conf, "xkey: ", xkeyPub)
-	conf, tlsOpt := withTestTLS(t, conf)
+	conf, dialOpt := withTestTLS(t, conf)
 
 	confPath := filepath.Join(t.TempDir(), "nats.conf")
 	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
@@ -210,12 +237,15 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		t.Fatalf("the rendered nats.conf was refused by the server: %v", err)
 	}
 	opts.NoLog, opts.NoSigs = true, true
-	// Ports and paths are the only things a test may move: the render pins
-	// 4222, 8222 and 9222 and a JetStream store at /data, none of which a
-	// test process can have. -1 asks the server for a free port on each
-	// listener, the monitor included, so the server keeps the shipped shape
-	// while nothing fixed is bound. Everything the test is actually asserting
-	// about — accounts, users, grants, the callout block — is untouched.
+	serverConnectBudget(opts)
+	// Ports, paths and the connect budget are the only things a test may
+	// move: the render pins 4222, 8222 and 9222 and a JetStream store at
+	// /data, none of which a test process can have. -1 asks the server for a
+	// free port on each listener, the monitor included, so the server keeps
+	// the shipped shape while nothing fixed is bound. Everything the test is
+	// actually asserting about — accounts, users, grants, the callout block's
+	// keys and policy — is untouched; its two-second timeout is the one
+	// value serverConnectBudget lifts, and why.
 	opts.Port = -1
 	opts.Websocket.Port = -1
 	opts.HTTPPort = -1
@@ -254,7 +284,12 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		// keeps equal to its render.
 		ReservedAddressees: renderedFixtureAddressees(t),
 
-		GrantTTL: options.grantTTL,
+		GrantTTL:        options.grantTTL,
+		TaskSigningKeys: options.taskKeys,
+		Now:             options.now,
+
+		TaskCredentialMaxLifetime:        options.taskLifetime,
+		TaskCredentialMaxLifetimeInvalid: options.taskLifetimeErr,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
@@ -263,7 +298,7 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	// The callout is itself a bus client, and it authenticates statically
 	// because it cannot authenticate through itself. auth_users is what
 	// exempts it.
-	svcConn, err := nats.Connect(srv.ClientURL(), nats.UserInfo(svcUser, svcPass), nats.Name("auth-callout"), tlsOpt)
+	svcConn, err := nats.Connect(srv.ClientURL(), nats.UserInfo(svcUser, svcPass), nats.Name("auth-callout"), dialOpt)
 	if err != nil {
 		t.Fatalf("the callout service could not connect: %v", err)
 	}
@@ -272,14 +307,14 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		t.Fatalf("Subscribe: %v", err)
 	}
 
-	return &harness{server: srv, url: srv.ClientURL(), store: store, tokens: tokens, tls: tlsOpt}
+	return &harness{server: srv, url: srv.ClientURL(), store: store, tokens: tokens, dial: dialOpt}
 }
 
 // connectAs dials with a ServiceAccount token, the way a workload will.
 func (h *harness) connectAs(t *testing.T, user, token string) (*nats.Conn, chan error) {
 	t.Helper()
 	violations := make(chan error, 16)
-	nc, err := nats.Connect(h.url, h.tls,
+	nc, err := nats.Connect(h.url, h.dial,
 		nats.Token(token),
 		nats.CustomInboxPrefix("_INBOX."+user),
 		nats.Name(user),
@@ -369,7 +404,7 @@ func TestADifferentServiceAccountGetsADifferentGrantSet(t *testing.T) {
 func TestAnUnmappedServiceAccountIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, h.tls, nats.Token(strangerTok), nats.Name("stranger"))
+	nc, err := nats.Connect(h.url, h.dial, nats.Token(strangerTok), nats.Name("stranger"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a ServiceAccount absent from the identity map connected")
@@ -382,7 +417,7 @@ func TestAnUnmappedServiceAccountIsRefusedAtConnect(t *testing.T) {
 func TestATokenTheClusterRefusesIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, h.tls, nats.Token("a-token-no-cluster-ever-issued"), nats.Name("forged"))
+	nc, err := nats.Connect(h.url, h.dial, nats.Token("a-token-no-cluster-ever-issued"), nats.Name("forged"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a token the cluster does not authenticate was accepted")
@@ -423,7 +458,7 @@ func TestTheRenderedBusRefusesPlaintextAndUntrustedClients(t *testing.T) {
 	}
 
 	t.Setenv(lib.EnvNATSCAFile, "")
-	nc, err := nats.Connect(h.url, nats.Token(tokenPodA), nats.Name("untrusted"))
+	nc, err := nats.Connect(h.url, nats.Token(tokenPodA), nats.Name("untrusted"), nats.Timeout(testDialTimeout))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a client that does not trust the bus CA connected")
@@ -455,7 +490,7 @@ func TestLibTLSOptionsVerifiesTheBus(t *testing.T) {
 		t.Helper()
 		t.Setenv(lib.EnvNATSCAFile, ca)
 		t.Setenv(lib.EnvNATSTLSServerName, serverName)
-		nc, err := nats.Connect(h.url, append(lib.TLSOptions(), nats.Token(gatewayToken), nats.Name("tls-options"))...)
+		nc, err := nats.Connect(h.url, append(lib.TLSOptions(), nats.Token(gatewayToken), nats.Name("tls-options"), nats.Timeout(testDialTimeout))...)
 		if err == nil {
 			nc.Close()
 		}
@@ -475,7 +510,7 @@ func TestLibTLSOptionsVerifiesTheBus(t *testing.T) {
 func TestNoTokenIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, h.tls, nats.Name("anonymous"))
+	nc, err := nats.Connect(h.url, h.dial, nats.Name("anonymous"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a client presenting no credential at all connected")
@@ -488,7 +523,7 @@ func TestNoTokenIsRefusedAtConnect(t *testing.T) {
 func TestTheTokenIsAcceptedAsAPasswordToo(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, h.tls,
+	nc, err := nats.Connect(h.url, h.dial,
 		nats.UserInfo(agentSA, agentToken),
 		nats.CustomInboxPrefix("_INBOX.agent"),
 		nats.Name("agent-via-userinfo"))
@@ -516,7 +551,7 @@ func TestAClientMustUseTheInboxPrefixItsGrantsCover(t *testing.T) {
 	}
 
 	// The default random inbox is not covered by the gateway's grant.
-	wrong, err := nats.Connect(h.url, h.tls, nats.Token(gatewayToken), nats.Name("gateway-default-inbox"))
+	wrong, err := nats.Connect(h.url, h.dial, nats.Token(gatewayToken), nats.Name("gateway-default-inbox"))
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -547,7 +582,7 @@ func TestACalloutWithNoMapRefusesEveryConnection(t *testing.T) {
 	// the same state a callout is in before its first informer sync.
 	h.store.current.Store(nil)
 
-	nc, err := nats.Connect(h.url, h.tls, nats.Token(gatewayToken), nats.Name("gateway"))
+	nc, err := nats.Connect(h.url, h.dial, nats.Token(gatewayToken), nats.Name("gateway"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a connection was authorized while no identity map was being served")
@@ -665,7 +700,7 @@ func TestTheCalloutAnswersOneAuthorizationAtATime(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			nc, err := nats.Connect(h.url, h.tls, nats.Token(agentToken), nats.CustomInboxPrefix("_INBOX.agent"), nats.Name("agent"))
+			nc, err := nats.Connect(h.url, h.dial, nats.Token(agentToken), nats.CustomInboxPrefix("_INBOX.agent"), nats.Name("agent"))
 			if err != nil {
 				failures <- err
 				return

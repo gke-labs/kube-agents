@@ -42,16 +42,20 @@ func post(h http.Handler, header http.Header, body string) *httptest.ResponseRec
 
 const pingFrame = `{"jsonrpc":"2.0","id":1,"method":"ping"}`
 
-// Every way in, and what it gets. The token is the only credential: there is
-// no first-caller adoption and no fallback when it is missing.
-func TestTheEndpointAuthenticatesEveryRequest(t *testing.T) {
+// authCase is one way in and what it gets.
+type authCase struct {
+	name      string
+	tokenFile func(t *testing.T) string
+	header    http.Header
+	want      int
+}
+
+// authCases are every way in, for every authenticated route. The token is
+// the only credential: there is no first-caller adoption and no fallback
+// when it is missing.
+func authCases() []authCase {
 	bearer := func(v string) http.Header { return http.Header{headerAuthorization: {v}} }
-	cases := []struct {
-		name      string
-		tokenFile func(t *testing.T) string
-		header    http.Header
-		want      int
-	}{
+	return []authCase{
 		{"the right token", func(t *testing.T) string { return writeToken(t, testToken) }, bearer("Bearer " + testToken), http.StatusOK},
 		{"the right token with a trailing newline in the file", func(t *testing.T) string { return writeToken(t, testToken+"\n") }, bearer("Bearer " + testToken), http.StatusOK},
 		{"the scheme in another case", func(t *testing.T) string { return writeToken(t, testToken) }, bearer("bearer " + testToken), http.StatusOK},
@@ -65,7 +69,10 @@ func TestTheEndpointAuthenticatesEveryRequest(t *testing.T) {
 		{"a browser is refused before auth", func(t *testing.T) string { return writeToken(t, testToken) },
 			http.Header{headerAuthorization: {"Bearer " + testToken}, headerOrigin: {"http://localhost:8089"}}, http.StatusForbidden},
 	}
-	for _, tc := range cases {
+}
+
+func TestTheEndpointAuthenticatesEveryRequest(t *testing.T) {
+	for _, tc := range authCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			h := Handler(mustServer(t), tc.tokenFile(t), quietLog())
 			if rec := post(h, tc.header, pingFrame); rec.Code != tc.want {

@@ -41,7 +41,7 @@ import yaml
 from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.spec import parse_node
 
-from kube_agents_bench import discovery, verifiers
+from kube_agents_bench import discovery, onboarding, verifiers
 from kube_agents_bench.verifiers import BootstrapFanoutVerifier
 
 BOARDS = json.loads(
@@ -386,6 +386,285 @@ def test_a_fail_outranks_a_final_read_that_errors(pod, monkeypatch: pytest.Monke
 def test_an_unreadable_pod_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(verifiers, "_agent_shell", lambda s, t: "")
     assert _verify("one_card_per_cluster_agent").status == "error"
+
+
+# --- the first-run cap (#3702) ---------------------------------------------
+#
+# A five-profile roster under a cap of two. The change's shape: cards for the
+# first two profiles by name, and the raw report the real hand-off composes
+# with the other three audited by the sweep itself. Main's shape: a card for
+# every profile, and a report whose rows all come from those cards.
+
+CAP = 2
+CAPPED_SWEEP = "t_csweep"
+CAPPED_SWEEP_AT = 1790600000
+# Listed out of order, so a check that kept the roster's own order would miss.
+CAPPED_ROSTER = {
+    f"cluster-proj-{c}-us-east4": {"project": "proj", "cluster": c, "location": "us-east4"}
+    for c in ("c3", "c0", "c4", "c1", "c2")
+}
+FIRST = sorted(CAPPED_ROSTER)[:CAP]
+PAST = sorted(CAPPED_ROSTER)[CAP:]
+HANDOFF_DIR = REPO / "agents" / "chat" / "scripts"
+PARSER_DIR = REPO / "agents" / "platform" / "scripts"
+
+
+def _capped_board(profiles: list[str]) -> dict[str, Any]:
+    tasks = [
+        {"id": CAPPED_SWEEP, "title": "Discover the environment", "assignee": "platform", "status": "done",
+         "created_by": "oobe", "created_at": CAPPED_SWEEP_AT, "idempotency_key": "bootstrap-inventory-scan"}
+    ]
+    for i, profile in enumerate(profiles):
+        tasks.append(
+            {"id": f"t_card{i}", "title": f"Report cluster inventory: {profile}", "assignee": profile,
+             "status": "done", "created_by": "oobe", "created_at": CAPPED_SWEEP_AT + 1 + i,
+             "idempotency_key": discovery.CLUSTER_KEY_PREFIX + profile}
+        )
+    return {"sweep": CAPPED_SWEEP, "tasks": tasks, "task_links": [], "kanban_worker_children": []}
+
+
+def _audit(profile: str) -> dict[str, Any]:
+    ident = CAPPED_ROSTER[profile]
+    return {**ident, "workloads": [], "findings": [], "topology": {}}
+
+
+def _compose(carded: list[str], swept: list[str], fleet: list[str] | None = None) -> str:
+    """INVENTORY.raw.md as the hand-off itself writes it: a done card for each of
+    ``carded``, and the sweep's own audits of ``swept`` with ``fleet`` listed."""
+    fleet = sorted(CAPPED_ROSTER) if fleet is None else fleet
+    state = {
+        "sweep": {
+            "id": CAPPED_SWEEP, "status": "done", "created_at": CAPPED_SWEEP_AT, "block_reason": "",
+            "metadata": {
+                "clusters": [_audit(p) for p in swept],
+                "fleet": [dict(CAPPED_ROSTER[p], status="RUNNING") for p in fleet],
+            },
+        },
+        "clusters": [
+            {"id": f"t_card{i}", "status": "done", "key": discovery.CLUSTER_KEY_PREFIX + p,
+             "title": f"Report cluster inventory: {p}", "metadata": _audit(p), "block_reason": ""}
+            for i, p in enumerate(carded)
+        ],
+        "archived_clusters": 0,
+    }
+    # compose imports inventory_findings, which the pod keeps beside it, when it runs.
+    for path in (str(HANDOFF_DIR), str(PARSER_DIR)):
+        sys.path.insert(0, path)
+    try:
+        import bootstrap_handoff
+
+        return bootstrap_handoff.compose(state, timed_out=False, now=CAPPED_SWEEP_AT + 900)
+    finally:
+        for path in (str(HANDOFF_DIR), str(PARSER_DIR)):
+            sys.path.remove(path)
+
+
+def _local_shell(script: str, timeout: float) -> str:
+    return subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=timeout, check=False).stdout
+
+
+@pytest.fixture
+def capped(pod, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """``pod`` with the capped roster, plus a sandbox raw file read locally."""
+    raw = tmp_path / "sandbox" / "INVENTORY.raw.md"
+    raw.parent.mkdir()
+    monkeypatch.setattr(onboarding, "RAW_FILE", str(raw))
+    monkeypatch.setattr(onboarding, "sandbox_shell", _local_shell)
+
+    def build(carded: list[str], raw_text: str | None, roster: dict[str, Any] | None = None) -> Path:
+        pod(_capped_board(carded), CAPPED_ROSTER if roster is None else roster)
+        if raw_text is not None:
+            raw.write_text(raw_text)
+        return raw
+
+    return build
+
+
+def _verify_capped(require: str, cap: int = CAP):
+    return BootstrapFanoutVerifier(type="bootstrap_fanout", require=require, cap=cap).verify(0.0)
+
+
+def test_the_read_carries_each_profiles_cluster_identity(tmp_path: Path) -> None:
+    root = _write_root(tmp_path, _capped_board([]), CAPPED_ROSTER)
+    payload, why = discovery.read_fanout(lambda s, t: _run_script(root), 5.0)
+    assert why == ""
+    by_profile = {r["profile"]: r for r in payload["roster"]}
+    assert by_profile["cluster-proj-c3-us-east4"] == {
+        "profile": "cluster-proj-c3-us-east4",
+        "key": discovery.CLUSTER_KEY_PREFIX + "cluster-proj-c3-us-east4",
+        "project": "proj", "cluster": "c3", "location": "us-east4",
+    }
+
+
+def test_the_changes_shape_passes_both_capped_requirements(capped) -> None:
+    capped(FIRST, _compose(FIRST, PAST))
+    cards = _verify_capped("cards_for_first_cap_profiles")
+    assert cards.status == "pass", cards.reason
+    assert "first 2 of 5 Cluster Agent(s)" in cards.reason
+    audited = _verify_capped("past_cap_clusters_sweep_audited")
+    assert audited.status == "pass", audited.reason
+    assert "all 3 cluster(s) past the cap of 2" in audited.reason
+
+
+def test_mains_shape_fails_both_capped_requirements(capped) -> None:
+    # Main ignores the cap file: a card for every profile, so the sweep audits
+    # nothing itself and every Coverage row is a card's.
+    every = sorted(CAPPED_ROSTER)
+    capped(every, _compose(every, []))
+    cards = _verify_capped("cards_for_first_cap_profiles")
+    assert cards.status == "fail", cards.reason
+    assert f"card(s) for profile(s) past the cap: {PAST}" in cards.reason
+    audited = _verify_capped("past_cap_clusters_sweep_audited")
+    assert audited.status == "fail", audited.reason
+    assert "not by the sweep" in audited.reason
+
+
+def test_a_card_for_the_wrong_profiles_fails(capped) -> None:
+    # Two cards, but not the first two by name: a gate that kept the roster's order.
+    capped(list(CAPPED_ROSTER)[:CAP], _compose(list(CAPPED_ROSTER)[:CAP], list(CAPPED_ROSTER)[CAP:]))
+    result = _verify_capped("cards_for_first_cap_profiles")
+    assert result.status == "fail", result.reason
+    assert "among the first 2 by profile name" in result.reason
+
+
+LATE = "cluster-proj-a0-us-east4"  # sorts before every CAPPED_ROSTER profile
+
+
+def _with_late_profile(capped, monkeypatch: pytest.MonkeyPatch, marker_carded: list[str] | None) -> None:
+    # A profile scaffolded after the sweep was filed, which sorts first: the
+    # gate carded FIRST and the sweep audited the late one with the rest.
+    monkeypatch.setitem(CAPPED_ROSTER, LATE, {"project": "proj", "cluster": "a0", "location": "us-east4"})
+    # capped returns the sandbox's raw file, under tmp_path/sandbox; the pod's root is tmp_path.
+    root = capped(FIRST, _compose(FIRST, [LATE, *PAST]), roster=dict(CAPPED_ROSTER)).parent.parent
+    if marker_carded is not None:
+        with (root / discovery.SCAN_MARKER).open("a") as fh:
+            fh.write("carded=" + ",".join(discovery.CLUSTER_KEY_PREFIX + p for p in marker_carded) + "\n")
+
+
+def test_a_late_profile_that_sorts_first_is_graded_against_the_carded_set(capped, monkeypatch) -> None:
+    _with_late_profile(capped, monkeypatch, FIRST)
+    cards = _verify_capped("cards_for_first_cap_profiles")
+    assert cards.status == "pass", cards.reason
+    assert "the sweep marker lists as carded" in cards.reason
+    audited = _verify_capped("past_cap_clusters_sweep_audited")
+    assert audited.status == "pass", audited.reason
+    assert "all 4 cluster(s) past the cap of 2" in audited.reason
+
+
+def test_a_marker_without_carded_grades_the_first_cap_by_name(capped, monkeypatch) -> None:
+    # An older build's marker: the late profile is among the first two by name.
+    _with_late_profile(capped, monkeypatch, None)
+    cards = _verify_capped("cards_for_first_cap_profiles")
+    assert cards.status == "fail", cards.reason
+    assert f"no card for {[LATE]}, among the first 2 by profile name" in cards.reason
+
+
+def _with_carded_marker(capped, carded: list[str]) -> None:
+    root = capped(FIRST, _compose(FIRST, PAST)).parent.parent
+    with (root / discovery.SCAN_MARKER).open("a") as fh:
+        fh.write("carded=" + ",".join(discovery.CLUSTER_KEY_PREFIX + p for p in carded) + "\n")
+
+
+@pytest.mark.parametrize("require", ["cards_for_first_cap_profiles", "past_cap_clusters_sweep_audited"])
+def test_a_carded_set_short_of_the_cap_fails(capped, require: str) -> None:
+    # One of a cap of two over a roster of five: graded against the marker
+    # alone, a gate that carded too few would pass.
+    _with_carded_marker(capped, FIRST[:1])
+    result = _verify_capped(require)
+    assert result.status == "fail", result.reason
+    assert "lists 1 carded profile(s); a cap of 2 over a roster of 5 cards 2" in result.reason
+
+
+@pytest.mark.parametrize("require", ["cards_for_first_cap_profiles", "past_cap_clusters_sweep_audited"])
+def test_a_carded_key_for_no_roster_profile_fails(capped, require: str) -> None:
+    _with_carded_marker(capped, [FIRST[0], "cluster-proj-gone-us-east4"])
+    result = _verify_capped(require)
+    assert result.status == "fail", result.reason
+    assert "carded key(s) for no roster profile" in result.reason
+    assert "cluster-proj-gone-us-east4" in result.reason
+
+
+def test_the_read_drops_carded_entries_that_are_not_card_keys(tmp_path: Path) -> None:
+    root = _write_root(tmp_path, _capped_board([]), CAPPED_ROSTER)
+    good = discovery.CLUSTER_KEY_PREFIX + FIRST[0]
+    with (root / discovery.SCAN_MARKER).open("a") as fh:
+        fh.write(f"carded={good},junk,{discovery.CLUSTER_KEY_PREFIX}\n")
+    payload, why = discovery.read_fanout(lambda s, t: _run_script(root), 5.0)
+    assert why == "" and payload["carded"] == [good]
+    root2 = _write_root(tmp_path / "old", _capped_board([]), CAPPED_ROSTER)
+    payload, _ = discovery.read_fanout(lambda s, t: _run_script(root2), 5.0)
+    assert payload["carded"] is None
+
+
+def test_a_past_cap_cluster_missing_from_the_raw_report_fails(capped) -> None:
+    # The sweep audited two of the three and listed the third in the fleet only.
+    capped(FIRST, _compose(FIRST, PAST[:-1]))
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "fail", result.reason
+    assert f"{PAST[-1]} (c4 in proj) is listed in the fleet but no audit reported on it" in result.reason
+
+
+def test_a_past_cap_cluster_with_no_row_and_no_gap_line_fails(capped) -> None:
+    fleet = [p for p in sorted(CAPPED_ROSTER) if p != PAST[0]]
+    capped(FIRST, _compose(FIRST, PAST[1:], fleet=fleet))
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "fail", result.reason
+    assert f"{PAST[0]} (c2 in proj) has no Coverage row" in result.reason
+
+
+def test_no_raw_report_fails(capped) -> None:
+    capped(FIRST, None)
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "fail", result.reason
+    assert "there is no" in result.reason
+
+
+def test_a_raw_report_without_a_coverage_table_fails(capped) -> None:
+    capped(FIRST, "# GKE Environment Discovery Report\n\nNothing here.\n")
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "fail", result.reason
+    assert "Coverage" in result.reason
+
+
+@pytest.mark.parametrize("require", ["cards_for_first_cap_profiles", "past_cap_clusters_sweep_audited"])
+def test_a_roster_no_longer_than_the_cap_is_an_error(capped, require: str) -> None:
+    roster = {p: CAPPED_ROSTER[p] for p in FIRST}
+    capped(FIRST, _compose(FIRST, []), roster=roster)
+    result = _verify_capped(require)
+    assert result.status == "error", result.reason
+    assert "roster of 2 is not above the cap of 2; the case cannot tell" in result.reason
+
+
+@pytest.mark.parametrize("require", ["cards_for_first_cap_profiles", "past_cap_clusters_sweep_audited"])
+def test_an_unreadable_agent_pod_is_an_error_for_the_capped_requirements(monkeypatch: pytest.MonkeyPatch, require: str) -> None:
+    monkeypatch.setattr(verifiers, "_agent_shell", lambda s, t: "")
+    assert _verify_capped(require).status == "error"
+
+
+def test_an_unreadable_sandbox_is_an_error(capped, monkeypatch: pytest.MonkeyPatch) -> None:
+    capped(FIRST, _compose(FIRST, PAST))
+    monkeypatch.setattr(onboarding, "sandbox_shell", lambda s, t: "")
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "error", result.reason
+    assert "could not be read" in result.reason
+
+
+def test_cap_is_required_by_the_capped_requirements_and_refused_elsewhere() -> None:
+    with pytest.raises(Exception):
+        parse_node({"type": "bootstrap_fanout", "require": "cards_for_first_cap_profiles"})
+    with pytest.raises(Exception):
+        parse_node({"type": "bootstrap_fanout", "require": "one_card_per_cluster_agent", "cap": 2})
+    with pytest.raises(Exception):
+        parse_node({"type": "bootstrap_fanout", "require": "past_cap_clusters_sweep_audited", "cap": 0})
+    node = parse_node({"type": "bootstrap_fanout", "require": "past_cap_clusters_sweep_audited", "cap": 2})
+    assert isinstance(node, BootstrapFanoutVerifier) and node.cap == 2
+
+
+def test_the_capped_task_sets_the_same_cap_as_its_stack_variable() -> None:
+    task = yaml.safe_load((REPO / "bench" / "tasks" / "bootstrap-discovery-capped" / "task.yaml").read_text())
+    stack_cap = task["infrastructure"]["variables"]["first_run_cluster_cards"]
+    caps = {c["check"]["require"]: c["check"].get("cap") for c in task["verification_spec"] if c["check"]["type"] == "bootstrap_fanout"}
+    assert caps == {"cards_for_first_cap_profiles": stack_cap, "past_cap_clusters_sweep_audited": stack_cap}
 
 
 # --- registration ---------------------------------------------------------

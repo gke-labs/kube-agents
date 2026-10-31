@@ -4,8 +4,10 @@ Run by ``deploy/docker/Dockerfile`` in the ``platform`` stage, against the real
 ``/opt/hermes`` tree and the scripts that will be on the runtime PYTHONPATH.
 A failure here fails the image build.
 
-The unit suite in ``agents/platform/scripts/test_slack_relay_patch.py`` covers
-the shim against fakes, and fakes are written by the same hand as the shim.
+The unit suites in ``agents/platform/scripts/test_slack_relay_patch.py`` and
+``test_google_chat_relay_patch.py`` cover the two ``register`` shims (Slack's,
+and Google Chat's for its standalone sender) against fakes, and fakes are
+written by the same hand as the shims.
 That is not a hypothetical weakness. ``slack_relay_patch.install()`` replaces
 ``PlatformRegistry.register`` on the class, and until v2026.8.13 both the shim
 and both test fakes declared ``register(self, entry)``. The base-image bump in
@@ -19,7 +21,7 @@ for *every* platform plugin -- Google Chat and Discord included, because the
 shim sits on the class the whole gateway registers through. The gateway came up
 with no chat adapters and nothing in the symptom pointed at a Slack file.
 
-So this checks the shim against the thing it actually wraps:
+So this checks the shims against the thing they actually wrap:
 
 1. the signatures and parameter defaults of every upstream callable the runtime
    patches replace, reimplement or call into are still the signatures and
@@ -28,8 +30,10 @@ So this checks the shim against the thing it actually wraps:
    delivery and reuses upstream's media-delivery denylist;
 2. a plugin-sourced entry registers through the shim exactly as
    ``hermes_cli/plugins.py`` registers one, scope and all, and comes back
-   relay-backed and findable;
-3. a non-Slack entry registers untouched -- the blast radius, not the symptom;
+   relay-backed and findable -- Slack's, and Google Chat's once its relay is
+   configured, whose sender must also still take upstream's arguments;
+3. an entry no installed relay claims registers untouched -- the blast radius,
+   not the symptom;
 4. the install-time sweep still finds an entry that was registered before the
    patch loaded, which since v2026.8.13 means finding it in ``_scoped_entries``
    rather than ``_entries``;
@@ -43,7 +47,7 @@ either fails, read the upstream method, decide whether the shim needs to change,
 and then update the expectation deliberately -- do not refresh it to whatever
 the new image says.
 
-Checks 1-4 run in a process where ``SLACK_RELAY_URL`` is *unset at startup*,
+Checks 1-4 run in a process where no relay variable is *set at startup*,
 because ``sitecustomize.install_hook()`` reads the environment as it is
 imported: with the variable set, the hook is armed before this file gets a
 word in and ``PlatformRegistry.register`` is already wrapped by the time the
@@ -144,6 +148,14 @@ UPSTREAM_SIGNATURES = {
         "pconfig, chat_id, message, *, thread_id=..., media_files=..., "
         "force_document=..., caption=..."
     ),
+    # google_chat_relay_patch's relay_standalone_send stands in for this one
+    # and declares the same parameters: send_message_tool calls it with
+    # upstream's keywords, so one it does not declare is a TypeError on every
+    # `hermes send` and every alert on a today-mode install.
+    "google_chat._standalone_send": (
+        "pconfig, chat_id, message, *, thread_id=..., media_files=..., "
+        "force_document=..."
+    ),
     "GoogleChatAdapter.connect": "self, *, is_reconnect=...",
     "GoogleChatAdapter.disconnect": "self",
     "GoogleChatAdapter._new_authed_http": "self",
@@ -176,6 +188,9 @@ PINNED_DEFAULTS: dict[tuple[str, str], object] = {
     ("slack._standalone_send", "media_files"): None,
     ("slack._standalone_send", "force_document"): False,
     ("slack._standalone_send", "caption"): None,
+    ("google_chat._standalone_send", "thread_id"): None,
+    ("google_chat._standalone_send", "media_files"): None,
+    ("google_chat._standalone_send", "force_document"): False,
     ("GoogleChatAdapter._handle_setup_files_command", "sender_email"): None,
 }
 
@@ -234,6 +249,7 @@ def upstream_callables() -> dict[str, Any]:
         "SlackAdapter._download_slack_file_bytes": slack._download_slack_file_bytes,
         "SlackAdapter.format_message": slack.format_message,
         "slack._standalone_send": slack_adapter._standalone_send,
+        "google_chat._standalone_send": google_chat_adapter._standalone_send,
         "GoogleChatAdapter.connect": google_chat.connect,
         "GoogleChatAdapter.disconnect": google_chat.disconnect,
         "GoogleChatAdapter._new_authed_http": google_chat._new_authed_http,
@@ -295,8 +311,12 @@ def relay_backed(entry) -> bool:
     )
 
 
-def registry_checks(scope: str) -> None:
-    """The behaviour both the hand-installed and the wired process must show."""
+def registry_checks(scope: str, google_chat_relayed: bool) -> None:
+    """The behaviour both the hand-installed and the wired process must show.
+
+    ``google_chat_relayed`` says whether ``google_chat_relay_patch`` is
+    installed in this process, which decides what its entry should come back as.
+    """
     from gateway.platform_registry import platform_registry
 
     slack_entry = make_entry("slack")
@@ -321,18 +341,43 @@ def registry_checks(scope: str) -> None:
             slack_entry,
         )
 
-    # The blast radius, not the symptom: the shim sits on the class, so this is
-    # the registration the v2026.8.13 TypeError actually broke most of.
-    other = make_entry("google_chat")
-    if register_scoped("a non-Slack platform still registers", other, scope):
+    chat_entry = make_entry("google_chat")
+    if register_scoped("a scoped Google Chat registration survives the shim", chat_entry, scope):
+        if google_chat_relayed:
+            check(
+                "the Google Chat entry relays its standalone sends",
+                relay_backed(chat_entry),
+                True,
+            )
+            check(
+                "the Google Chat relay sender takes upstream's arguments",
+                shape(chat_entry.standalone_sender_fn),
+                UPSTREAM_SIGNATURES["google_chat._standalone_send"],
+            )
+        else:
+            check(
+                "the Google Chat entry is left alone with its relay unset",
+                chat_entry.standalone_sender_fn,
+                upstream_sender,
+            )
         check(
-            "a non-Slack platform is left alone",
+            "the Google Chat entry reached the registry",
+            platform_registry.get("google_chat"),
+            chat_entry,
+        )
+
+    # The blast radius, not the symptom: the shims sit on the class, so this is
+    # the registration the v2026.8.13 TypeError actually broke most of.
+    other = make_entry("discord")
+    if register_scoped("a platform no relay claims still registers", other, scope):
+        check(
+            "a platform no relay claims is left alone",
             other.standalone_sender_fn,
             upstream_sender,
         )
         check(
-            "the non-Slack entry reached the registry",
-            platform_registry.get("google_chat"),
+            "the unclaimed entry reached the registry",
+            platform_registry.get("discord"),
             other,
         )
 
@@ -351,6 +396,7 @@ def unwired() -> int:
         "_slack_credential_proxy_relay_patched",
         "_slack_standalone_relay_patched",
         "_credential_proxy_relay_patched",
+        "_google_chat_standalone_relay_patched",
     ):
         check(
             f"no relay patch installed before the pin is read ({sentinel})",
@@ -427,7 +473,7 @@ def unwired() -> int:
     )
 
     scope = hermes_home_key()
-    registry_checks(scope)
+    registry_checks(scope, google_chat_relayed=False)
 
     # --- the ordering the register() wrapper cannot cover -------------------
     # An entry already in place when install() runs is reached only by the
@@ -458,6 +504,25 @@ def unwired() -> int:
         True,
     )
 
+    # --- the Google Chat relay, stacked on the Slack one ---------------------
+    # Both patches wrap register() on the class, so with both installed every
+    # registration passes through two wrappers. The pod installs both.
+    os.environ["GOOGLE_CHAT_RELAY_URL"] = RELAY_URL
+    pre_registered_chat = make_entry("google_chat")
+    platform_registry.register(pre_registered_chat, scope=scope)
+    google_chat_relay_patch.install()
+    check(
+        "install() marked the Google Chat standalone relay installed",
+        getattr(PlatformRegistry, "_google_chat_standalone_relay_patched", False),
+        True,
+    )
+    check(
+        "the sweep finds a Google Chat entry registered before the patch loaded",
+        relay_backed(pre_registered_chat),
+        True,
+    )
+    registry_checks(scope, google_chat_relayed=True)
+
     return report("unwired")
 
 
@@ -472,18 +537,27 @@ def wired() -> int:
     from gateway.platform_registry import PlatformRegistry
     from hermes_constants import hermes_home_key
 
-    if not getattr(PlatformRegistry, "_slack_standalone_relay_patched", False):
-        # Everything below asks what the patch did, so with no patch installed
-        # they answer a question nobody asked. Report the one real fault.
+    installed = True
+    for platform, sentinel, variable in (
+        ("Slack", "_slack_standalone_relay_patched", "SLACK_RELAY_URL"),
+        ("Google Chat", "_google_chat_standalone_relay_patched", "GOOGLE_CHAT_RELAY_URL"),
+    ):
+        label = f"importing the registry installed the {platform} relay patch"
+        if getattr(PlatformRegistry, sentinel, False):
+            print(f"  ok    {label}")
+            continue
         fail(
-            "importing the registry installed the Slack relay patch",
-            "PlatformRegistry._slack_standalone_relay_patched is unset -- "
-            "sitecustomize did not arm the hook for SLACK_RELAY_URL",
+            label,
+            f"PlatformRegistry.{sentinel} is unset -- "
+            f"sitecustomize did not arm the hook for {variable}",
         )
+        installed = False
+    if not installed:
+        # Everything below asks what the patches did, so with one missing they
+        # answer a question nobody asked. Report the real fault alone.
         return report("wired")
-    print("  ok    importing the registry installed the Slack relay patch")
 
-    registry_checks(hermes_home_key())
+    registry_checks(hermes_home_key(), google_chat_relayed=True)
     return report("wired")
 
 
@@ -521,7 +595,10 @@ def main() -> int:
     status = unwired()
 
     print("\n-- again, wired the way the pod wires it --")
-    child_env = dict(os.environ, **{WIRED: "1", "SLACK_RELAY_URL": RELAY_URL})
+    child_env = dict(
+        os.environ,
+        **{WIRED: "1", "SLACK_RELAY_URL": RELAY_URL, "GOOGLE_CHAT_RELAY_URL": RELAY_URL},
+    )
     child_env.pop("SLACK_BOT_TOKEN", None)
     child = subprocess.run(
         [sys.executable, os.path.abspath(__file__)], env=child_env, check=False

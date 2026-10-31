@@ -318,6 +318,39 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_PAST_FALLBACK + 10 * oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS)
         self.assertEqual(self._started_ids(), FIRST)
 
+    def test_a_fleet_past_the_first_run_cap_waits_for_its_uncarded_clusters(self):
+        # #3702: the marker's uncarded= agents have no card but are still in the hand-off's deadline.
+        per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
+        clusters = [(f"t_c{i}", "running", f"bootstrap-inventory-cluster-c{i}", SWEEP_CREATED_AT + 1) for i in range(6)]
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(
+            f"task_id={SWEEP_ID}\nfiled_at={FILED_AT}\nuncarded=4\n", encoding="utf-8"
+        )
+        _board(self.board, clusters)
+        self._main(now=NOW_PAST_FALLBACK + 6 * per_card)
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK + 10 * per_card - 1)
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK + 10 * per_card)
+        self.assertEqual(self._started_ids(), FIRST)
+
+    def test_an_unpinned_sweep_waits_for_the_live_roster_past_the_cap(self):
+        # #3702: the marker pinned nothing (an empty or failed listing at filing), so the
+        # stage budgets the live roster's agents past the cap, as the hand-off does.
+        per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
+        clusters = [(f"t_c{i}", "running", f"bootstrap-inventory-cluster-c{i}", SWEEP_CREATED_AT + 1) for i in range(6)]
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(
+            f"task_id={SWEEP_ID}\nfiled_at={FILED_AT}\ncap=6\n", encoding="utf-8"
+        )
+        _board(self.board, clusters)
+        with mock.patch.object(oobe.bootstrap_scan_gate, "cluster_agents", return_value=[{}] * 10) as listing:
+            self._main(now=NOW_PAST_FALLBACK + 6 * per_card)
+            self.assertEqual(self.started, [])
+            self._main(now=NOW_PAST_FALLBACK + 10 * per_card - 1)
+            self.assertEqual(self.started, [])
+            self._main(now=NOW_PAST_FALLBACK + 10 * per_card)
+        self.assertEqual(self._started_ids(), FIRST)
+        listing.assert_called_with(capped=False)
+
     def test_the_fallback_is_the_hand_offs_deadline_for_the_cards_it_counts(self):
         # An archived cluster card is not one the hand-off waits for, so the stage does not either.
         per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS

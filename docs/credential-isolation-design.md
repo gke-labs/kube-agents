@@ -239,7 +239,10 @@ runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLE
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
 consumes Google Chat, and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
 pods' (bound to the audience `kubeagents-credential-proxy-session`; see
-[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and does not vary on
+[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and, under `mode: next`
+with an `AgentProfile` bound, each profile tier's (bound to the audience
+`kubeagents-credential-proxy-profile`; see
+[spec-subagent-profiles.md](designs/spec-subagent-profiles.md)), and does not vary on
 which one presented the token — the audience and the route table it feeds do — so the
 allowlist itself keeps other workloads out rather than telling those callers apart. The token
 crosses the cluster network in cleartext;
@@ -743,7 +746,9 @@ get-credentials`, which already runs in the broker. The proxy reads exactly one
 string out of the caller's file — `current-context` — accepts it only if it is a
 well-formed `gke_<project>_<location>_<cluster>` name, and regenerates the
 kubeconfig itself into a directory backed by a broker-only `emptyDir`. That
-regenerated file is what every proxied command runs against. No field the
+regenerated file is what every proxied `kubectl` command runs against. A gcloud
+call gets an empty per-call file instead (get-credentials fetches into its own
+scratch file). No field the
 sandbox wrote is ever interpreted, and there is no check-then-open window,
 because the sandbox never had a handle on the document that is opened.
 
@@ -939,7 +944,8 @@ host, method and path against the code allowlist in
 `agents/platform/scripts/api_policy.py`, forwards it on its own identity with
 only its own `Authorization` and `Accept` headers and the credential-substituting
 query keys removed, and returns the upstream status, `Content-Type` and body
-unchanged under a response cap and a deadline. The shell role alone may call it;
+unchanged under a response cap and a deadline (a route with a projection, the GKE
+cluster list and get, returns its 2xx body cut down to the fields it names). The shell role alone may call it;
 token-issuing hosts are refused before the table, redirects are not followed, and
 a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull request.
 [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md) is canonical.
@@ -959,6 +965,10 @@ key and replaces it with the fixed, non-secret sentinel before forwarding to por
 8642 on loopback.
 Existing API clients retain bearer-key authentication without placing the real
 key in the sandbox.
+
+A proposed route allowlist for this door, owned by kube-agents and part of the
+harness contract, is in the draft
+[`designs/agent-api-door-allowlist.md`](designs/agent-api-door-allowlist.md).
 
 ### GitHub and Minty
 

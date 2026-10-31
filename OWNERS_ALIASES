@@ -2,8 +2,9 @@ aliases:
   # Who approves what runs and what blocks in the presubmit eval gate:
   # hack/eval/presubmit-cases.txt and hack/eval/blocking-roster.txt, and the
   # inject lane's exclusions and safeguards the presubmit runs under
-  # (hack/OWNERS). The nightly file beside them and the case directories
-  # under bench/tasks/ need only the root approvers. Membership is
+  # (hack/OWNERS), and hack/ci-eval-pr.sh, which pins the grader a pull
+  # request is graded by, with the files that run inside it. The nightly file beside them and the case
+  # directories under bench/tasks/ need only the root approvers. Membership is
   # Jayanti's to set (#1546).
   eval-crew:
     - jayantid

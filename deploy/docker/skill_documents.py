@@ -42,6 +42,7 @@ from pathlib import Path
 # generated from.
 SKILL_ROOT_GLOBS = (
     "agents/*/skills",
+    "agents/*/persona/skills",
     "a2a/persona/*/skills",
     "agentplugins/*/files/skills",
 )

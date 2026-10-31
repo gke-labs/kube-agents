@@ -31,6 +31,9 @@ const sessionProfile = "chat"
 // surface that carries every message without a mention.
 const sessionKindDM = "dm"
 
+// sessionKindGroup is the other kind: a channel, a space, a group chat.
+const sessionKindGroup = "group"
+
 // topLevelNothingRunningNotice answers a "stop" or a status question typed
 // in a message the adapter marked TopLevel: one that roots a conversation of
 // its own (a top-level Slack DM), so nothing is running in it and the task
@@ -169,14 +172,17 @@ type Gateway struct {
 	// profiles is the AgentProfiles this gateway can address, kept from
 	// their cards on DIRECTORY (startProfileDirectory).
 	profiles *profileDirectory
-	cfg      *Config
-	client   *lib.Client
-	reg      *Registry
-	adapter  Adapter
-	pm       *PrincipalMap
-	ps       *Pseudonymizer
-	log      *slog.Logger
-	spawner  spawner // nil until SpawnSessions arms (W4)
+	// relayInFlight counts the relay batches rendering (relayBatch), which a
+	// stop waits for.
+	relayInFlight inFlight
+	cfg           *Config
+	client        *lib.Client
+	reg           *Registry
+	adapter       Adapter
+	pm            *PrincipalMap
+	ps            *Pseudonymizer
+	log           *slog.Logger
+	spawner       spawner // nil until SpawnSessions arms (W4)
 	// usage reads what "/feedback summary" prints (feedback_summary.go);
 	// nil where the gateway has no cluster credentials, and the command then
 	// answers that the summary is unavailable.
@@ -546,6 +552,11 @@ func New(o Options) (*Gateway, error) {
 			return g.slackRosterPrincipal(member) != "", g.slackAllowAll && !g.slackAllowed[member]
 		}, busBoardReader(o.Client))
 	}
+	// The board-health card's Retry and Drop, over the same route
+	// (slack_board.go); the adapter admits the presser by the Home tab's rule.
+	if sink, ok := o.Adapter.(BoardActSink); ok {
+		sink.SetBoardActor(busBoardActor(o.Client))
+	}
 	g.events = newKeyedQueue(g.relayBatch)
 	if o.Spawner != nil {
 		g.spawner = o.Spawner
@@ -598,17 +609,31 @@ func (g *Gateway) Run(ctx context.Context) error {
 	// it is the only thing that tells a supervisor terminal from an
 	// executor's, and the relay owes the adapter that distinction
 	// (TerminalSource) the same way the heal and the read route give it.
-	sub, err := g.client.SubscribeDurableAttributed(ctx, lib.SubscribeConfig{
-		Stream:    lib.TasksStream,
-		Subjects:  []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
-		Durable:   g.relayDurable,
-		Session:   gatewayParty.Session,
-		Agreement: &agreement,
-	}, func(subject string, env *lib.Envelope) { g.relayEvent(ctx, subject, env) })
+	//
+	// Deferred-ack: each event is acked once it has been rendered, not when it
+	// is queued, and stopping gives every unrendered one back to the stream,
+	// so a gateway that stops with events queued loses none of them.
+	sub, err := g.client.SubscribeDurableDeferred(ctx, lib.SubscribeConfig{
+		Stream:        lib.TasksStream,
+		Subjects:      []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
+		Durable:       g.relayDurable,
+		Session:       gatewayParty.Session,
+		Agreement:     &agreement,
+		MaxAckPending: relayMaxAckPending,
+	}, func(d lib.DeferredDelivery) { g.relayDelivery(ctx, d) })
 	if err != nil {
 		return fmt.Errorf("event relay subscription: %w", err)
 	}
-	defer sub.Stop()
+	// The batches already rendering finish first, then the subscription's
+	// stop gives every event not yet rendered back to the stream.
+	// Only then do the adapters close their connections: ingress stopped
+	// when ctx ended, but a batch rendering past its stop check posts
+	// through them.
+	defer func() {
+		g.relayInFlight.drain(relayStopDrainTimeout)
+		sub.Stop()
+		closeAdapter(g.adapter)
+	}()
 
 	g.startProfileDirectory(ctx)
 	go g.reapLoop(ctx)
@@ -1274,7 +1299,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// artifact and the terminal in order from its durable - and the
 		// heal leaves it alone (probeConversation reads the same fold as the
 		// chain running). Past it, the relay's delivery is taken as lost
-		// (an ack on enqueue and a crash, or a failed end-of-batch write),
+		// (a failed end-of-batch write after the render was acked),
 		// and the heal does the relay's work itself rather than leave the
 		// conversation wedged on a turn nothing will release.
 		if since := time.Since(g.relayLagStart(active.TaskID, storedAt, time.Now())); since <= g.relayLagGrace() {
@@ -1752,6 +1777,13 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		// never that nothing is there.
 		return state, fmt.Errorf("reading task %s on %s: %w", read, addressee, terr)
 	}
+	if chainUsageAsked(ctx) {
+		readTask := task
+		if terr != nil {
+			readTask = nil
+		}
+		state.Usage, state.ChildUsage, state.UsagePartial = g.chainUsage(ctx, rec, taskID, read, readTask)
+	}
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a
@@ -1775,6 +1807,69 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		}
 	}
 	return state, nil
+}
+
+// chainUsage is what taskID's turns cost, from the usage artifact's parts
+// summed (lib.UsageTotal) per tier. front is the front door's own turns:
+// taskID's stream and, when taskID is a delegation chain's root, every wake
+// that continued it. children is the chain's child tasks, the addressees the
+// front door delegated to (the platform router that files the cards among
+// them). Either is nil when none of its turns published usage. partial
+// reports that a link's stream could not be read, so the sums leave out
+// whatever that link cost. The stream the probe already folded (read,
+// readTask; nil when it found no events) is not read twice.
+func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, read string, readTask *lib.Task) (front, children *lib.Usage, partial bool) {
+	links := []TaskRef{{ID: taskID}}
+	if ref, ok := rec.TaskRefFor(taskID); ok {
+		links[0] = ref
+		if ref.Role != taskRoleChild && ref.rootID() == taskID {
+			for _, other := range rec.Tasks {
+				if other.ID != taskID && other.rootID() == taskID {
+					links = append(links, other)
+				}
+			}
+		}
+	}
+	var frontTurns, childTurns []lib.Usage
+	for i, link := range links {
+		folded := readTask
+		if link.ID != read {
+			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID)
+			switch {
+			case err == nil:
+				folded = t
+			case isTaskNotFound(err):
+				folded = nil
+			default:
+				partial = true
+				continue
+			}
+		}
+		if folded == nil {
+			continue
+		}
+		for _, p := range artifactParts(folded, lib.ArtifactUsage) {
+			u, ok := lib.UsageOf(p)
+			if !ok {
+				continue
+			}
+			if i > 0 && link.Role == taskRoleChild {
+				childTurns = append(childTurns, u)
+			} else {
+				frontTurns = append(frontTurns, u)
+			}
+		}
+	}
+	return usageSum(frontTurns), usageSum(childTurns), partial
+}
+
+// usageSum is turns folded by lib.UsageTotal, or nil when there are none.
+func usageSum(turns []lib.Usage) *lib.Usage {
+	if len(turns) == 0 {
+		return nil
+	}
+	total := lib.UsageTotal(turns)
+	return &total
 }
 
 // retireIncarnation deletes the record's lingering session pod before a

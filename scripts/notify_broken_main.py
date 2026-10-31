@@ -170,6 +170,7 @@ WATCHED_WORKFLOWS = (
     "Actionlint",
     "Docker Build",
     "Documentation Checks",
+    "k8s-api-proxy Tests",
     "Operator Tests",
     "Python Unit Tests",
     "Validate Repo Structure",

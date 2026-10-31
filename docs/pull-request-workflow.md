@@ -169,7 +169,10 @@ one shared key, restored everywhere and saved only on main — so editing the ma
 cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
 `make test-bench-deps` retries its pip install the same way, because the devops-bench pin is a git
 clone that pip does not retry, and `tests/test_bench_deps_install_retry.py` runs that loop against a
-stub pip.
+stub pip. The artifact download in `python-tests.yml`'s join gets a second attempt a minute after a
+failed first one, because the action's own retries ran out twice with every shard uploaded;
+`test_the_join_downloads_the_shards_coverage_twice` in `scripts/test_integration_contracts.py` holds
+that shape.
 
 **Operator code.** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to
 ensure compilation succeeds.
@@ -598,10 +601,11 @@ The two labels are the two people:
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
   the changed paths — [`OWNERS`](../OWNERS) at the root,
   [`k8s-api-proxy/OWNERS`](../k8s-api-proxy/OWNERS), which adds approvers for that module, and
-  [`hack/OWNERS`](../hack/OWNERS) for the presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
-  and the inject lane's exclusions and safeguards under `hack/eval/` alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
+  [`hack/OWNERS`](../hack/OWNERS) for the presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`),
+  the inject lane's exclusions and safeguards under `hack/eval/`, and `hack/ci-eval-pr.sh` with the files that run inside it
+  ([`docs/eval-gate-roster.md`](eval-gate-roster.md) lists them; one is under `scripts/installer/OWNERS`), with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
-  to what the presubmit runs or what blocks; the nightly file and the case directories under
+  to what the presubmit runs, what blocks, or what grades it; the nightly file and the case directories under
   `bench/tasks/` fall through to the root approvers (#1546). An approver's
   "Approve" review sets both labels at once, which is why most pull requests here need exactly one
   review from one person (#1070). An approver's own pull request counts as self-approved, so a
@@ -617,8 +621,8 @@ between them by what the author's own approval already covers (#1075): an approv
 only `lgtm`, so the draw is the whole pool at equal weight; any other change still needs an
 approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files. The
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
-settles a self-approved change and nothing else. The `hack/eval/presubmit-cases.txt` and
-`hack/eval/blocking-roster.txt` entries send a change there to its own `eval-crew` group, so the
+settles a self-approved change and nothing else. The `hack/eval/presubmit-cases.txt`,
+`hack/eval/blocking-roster.txt` and grader-pin entries send a change there to its own `eval-crew` group, so the
 reviewer the workflow summons can clear both labels in one action. Not every `eval-crew`
 member is a root approver, so a change that also touches root-owned paths still waits on a root
 approver's `/approve` after that review. The bot never requests the author, so a member's own case
@@ -653,16 +657,18 @@ ruleset requires these checks — on the head for a pull request to enter the qu
 commit for it to merge: `cla/google`, `actionlint`, `build`, `prettier`, `validate`,
 `Run Controller Tests`, `Run Python Unit Tests`, `Documentation Checks`,
 `Validate Conventional Commit PR Title`, `Agent instructions cite assets that exist`,
-`Run A2A Module Tests`, `Smoke gate`, and `Merge labels`. It also requires conversation resolution,
-but **zero** approving reviews, because approval is the labels' business, which `Merge labels`
+`Run A2A Module Tests`, `Run k8s-api-proxy Tests`, `Smoke gate`, and `Merge labels`. It also
+requires conversation resolution, but **zero** approving reviews, because approval is the labels' business, which `Merge labels`
 checks. A reader who checks the repository settings for the review requirement therefore finds
 nothing and concludes wrongly. Only these checks block a merge: a red or cancelled check outside
-the list does not, and `AI Review` is not in it.
+the list does not, and `AI Review` is not in it. `Run Python Unit Tests` is a join: it also needs
+`Run Bench Harness Tests`, so a red bench job holds the merge through it even though the bench
+job is not in the list itself.
 
 `Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title` and
-`Agent instructions cite assets that exist` joined the set on 2026-09-02, and
-`Run A2A Module Tests` on 2026-10-13; before its date, a pull request one of them had not run on
-could merge without it. `Smoke gate` and `Merge labels` joined with the move to the merge queue. The ruleset holds the full set, so read it from the rules for the branch:
+`Agent instructions cite assets that exist` joined the set on 2026-09-02,
+`Run A2A Module Tests` on 2026-10-13, and `Run k8s-api-proxy Tests` on 2026-10-28; before its
+date, a pull request one of them had not run on could merge without it. `Smoke gate` and `Merge labels` joined with the move to the merge queue. The ruleset holds the full set, so read it from the rules for the branch:
 
 ```bash
 gh api repos/gke-labs/kube-agents/rules/branches/main \
@@ -673,7 +679,8 @@ Every workflow behind one of those checks, bar `Smoke gate` and `Merge labels`, 
 pull request whose base is a `release/` branch, and `tests/test_merge_group_triggers.py` fails if one is filtered back to `main`.
 A backport pull request branches from `upstream/release/<X.Y>` and targets it; the release runbook
 in `scripts/release/README.md` ("Patch releases from a release line") is what happens after it
-merges. A `release/` branch requires the same contexts bar `Smoke gate` and `Merge labels`, also
+merges. A `release/` branch requires the same contexts bar `Smoke gate`, `Merge labels` and
+`Run k8s-api-proxy Tests` (no line carries it yet; see `scripts/release/README.md`), also
 through a ruleset; its branch protection rule has no `required_status_checks` at all. No queue
 runs on a `release/` branch and Tide no longer merges in this repository, so nothing merges a
 backport yet. How one merges is still open, and `scripts/release/README.md` still describes Tide. Read a line's
@@ -726,6 +733,11 @@ ordinary `Job succeeded.`; the `/override` comment, the build log's `REVALIDATED
 run leaves in its `finished.json` metadata are the record that it was one, and step 0 reads the key
 so that such a run is never itself taken for a green.
 
+The smoke grades a pull request with `main`'s grader: `bench/` at the commit the change was merged
+onto, with the change's own `bench/tasks/`, and the verdict's `Graded by` line names that commit
+([`testing-strategy.md`](designs/testing-strategy.md#pinning-and-baselines) has the rule for a
+case that needs a grader change).
+
 Do not post `/test pull-kube-agents-smoke-test` on an approved pull request whose `Smoke gate` is
 green, above all one in the merge queue. The run posts a pending smoke status, and if the queue's
 `Smoke gate` reads it before the run reports, the queue fails the group and removes the pull
@@ -775,8 +787,10 @@ a required check blocks on it the same way) for any owner, member or collaborato
 at the start of a later line; the Actions re-run, like `/request-review`, reads the start of the
 comment only, so a `/retest` under a line of explanation re-runs the Prow jobs alone. It re-runs
 only the pull request's own runs: a head commit that is also a commit on `main` or a release line
-carries that line's push runs too, and a red one of those is named and left alone. It reads the best state per check name, so a run a newer success superseded or one cancelled while still queued is
-not re-run: neither blocks anything. GitHub's own re-run button needs Write access, which most
+carries that line's push runs too, and a red one of those is named and left alone. It reads the best state per check name, so a run a newer success superseded is not re-run, except
+under a check name the base branch requires: GitHub still counts that red run and keeps the pull request out
+of the queue, so it is re-run once no run of its workflow on the pull request is still going, one run per workflow per `/retest`. A run cancelled while still queued made no check run and is never
+re-run. GitHub's own re-run button needs Write access, which most
 collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
 was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
 red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot

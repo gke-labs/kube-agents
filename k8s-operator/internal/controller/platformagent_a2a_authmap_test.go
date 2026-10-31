@@ -449,7 +449,7 @@ func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing
 
 	// The constant is only worth anything if it reaches the pod template,
 	// which is the thing that actually rolls.
-	dep := buildA2ACalloutDeployment(agent)
+	dep := buildA2ACalloutDeployment(agent, "")
 	if got := dep.Spec.Template.ObjectMeta.Annotations[a2aIdentityMapSchemaAnnotation]; got != a2aIdentityMapSchema {
 		t.Errorf("the callout pod template's %s annotation is %q, want %q; without it on the TEMPLATE a schema bump changes no pod spec and the old callout is never rolled",
 			a2aIdentityMapSchemaAnnotation, got, a2aIdentityMapSchema)
@@ -460,7 +460,7 @@ func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing
 // the template is part of the pod spec the Deployment controller diffs, so an
 // annotation one level up would look like a fix and roll nothing.
 func TestTheSchemaAnnotationIsOnThePodTemplateNotTheDeployment(t *testing.T) {
-	dep := buildA2ACalloutDeployment(a2aTestAgent())
+	dep := buildA2ACalloutDeployment(a2aTestAgent(), "")
 	if _, onDeployment := dep.ObjectMeta.Annotations[a2aIdentityMapSchemaAnnotation]; onDeployment {
 		if _, onTemplate := dep.Spec.Template.ObjectMeta.Annotations[a2aIdentityMapSchemaAnnotation]; !onTemplate {
 			t.Error("the schema annotation is on the Deployment but not its pod template; changing it would roll nothing")
