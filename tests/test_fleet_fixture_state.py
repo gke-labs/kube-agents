@@ -30,7 +30,9 @@ passes is expressed.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -41,6 +43,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 _REPO = pathlib.Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "hack" / "fleet-fixture-state.py"
@@ -55,6 +58,21 @@ def _load_module():
 
 
 ffs = _load_module()
+
+
+class _SteppedClock:
+    """A stand-in for the script's `time`: monotonic() moves only by sleep()."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
 _STUB_KUBECTL = r'''#!/usr/bin/env python3
@@ -816,12 +834,18 @@ class PassTest(_Harness):
     def test_drift_is_recorded_only_at_the_deadline(self):
         world = _healthy_world()
         world["kubectl"]["pod?app=payments-api"] = _pods(_pod(restarts=0, last_reason=None, phase="Pending"))
-        # Long enough for a second pass on a slow machine (a pass is every
-        # role through two stub interpreters), short enough not to matter.
-        done = self.run_script(world, "--wait", "4", "--interval", "0.1")
-        assert done.returncode == 0
+        # In-process on a clock that moves only when the script sleeps, so the
+        # passes are counted rather than raced against the wall clock (#4415):
+        # with --wait 1 --interval 0.25 the loop reads at 0, 0.25, 0.5, 0.75
+        # and 1.0, five passes on any machine, and only then records the drift.
+        clock = _SteppedClock()
+        self.world.write_text(json.dumps(world))
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "STUB_LOG": str(self.log), "STUB_WORLD": str(self.world)}
+        with mock.patch.object(ffs, "time", clock), mock.patch.dict(os.environ, env), contextlib.redirect_stderr(io.StringIO()):
+            assert ffs.run(self.fleet, _CATALOG, None, wait=1.0, interval=0.25) == 0
+        assert clock.sleeps == [0.25] * 4
         assert set(self.drift_files()) == {"crashloop-workload"}
-        assert self.log.read_text().count("get pod -l app=payments-api") >= 2
+        assert self.log.read_text().count("get pod -l app=payments-api") == 5
 
     def test_an_unreadable_subject_is_not_checked_and_leaves_no_drift_file(self):
         world = _healthy_world()
