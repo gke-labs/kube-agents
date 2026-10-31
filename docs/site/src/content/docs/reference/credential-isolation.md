@@ -1,11 +1,11 @@
 ---
 title: Credential isolation
-description: How the operator keeps API keys, tokens, and ServiceAccount credentials out of the agent sandbox by running the credential broker in a Pod of its own.
+description: How the operator keeps every credential but an audience-bound broker token out of the agent sandbox by running the credential broker in a Pod of its own.
 sidebar:
   order: 7
 ---
 
-The PlatformAgent shell sandbox receives no API keys, access tokens, refresh tokens, or Kubernetes ServiceAccount tokens through its environment or filesystem. Its ServiceAccount is bound to no Google service account, so the metadata server has nothing to give it either. Credentials live in a trusted **credential broker** that runs as a Pod of its own, and the sandbox reaches credentialed capabilities only through a policy-enforced proxy across the network.
+The PlatformAgent shell sandbox receives no API keys, access tokens, or refresh tokens through its environment or filesystem. The one credential it holds is a projected ServiceAccount token bound to the credential broker's audience, which the Kubernetes API server does not accept; the audience is what keeps it from being a general Kubernetes credential. Its ServiceAccount is bound to no Google service account, so the metadata server has nothing to give it either. Credentials live in a trusted **credential broker** that runs as a Pod of its own, and the sandbox reaches credentialed capabilities only through a policy-enforced proxy across the network.
 
 This is the only layout. There is no configuration that puts the broker back in the agent Pod and none that turns the shell sandbox off — `spec.harness.experimental.shellSandbox.enabled: false` is refused with `Degraded`/`ShellSandboxCannotBeDisabled`. The gateway's `platform-agent` container does hold one credential, the audience-bound token it presents to the broker. Under `mode: next` it holds two: the mode adds a second audience-bound projected ServiceAccount token for the A2A bus. There is no password: the container names its bus principal in `A2A_BUS_USER` and the bus's auth callout resolves the token to that principal's grants. [The agent now holds a credential](#the-agent-now-holds-a-credential-and-that-was-a-choice) has the trade.
 
