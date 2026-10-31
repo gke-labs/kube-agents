@@ -1971,6 +1971,11 @@ func (in *TuningSpec) DeepCopyInto(out *TuningSpec) {
 		*out = new(int)
 		**out = **in
 	}
+	if in.BusReplicas != nil {
+		in, out := &in.BusReplicas, &out.BusReplicas
+		*out = new(int)
+		**out = **in
+	}
 	if in.Profiles != nil {
 		in, out := &in.Profiles, &out.Profiles
 		*out = new(ProfileTuning)

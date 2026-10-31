@@ -109,10 +109,10 @@ The subshell keeps the file's variables out of your shell. After the teardown, r
 
 ### What `spec.mode: next` leaves behind
 
-The objects the operator creates for `spec.mode: next` go with the `PlatformAgent`: its finalizer deletes the JetStream volume, `data-platform-agent-a2a-nats-0`, and the rest, the bus credentials Secret `platform-agent-a2a-nats-creds` among them, are owned by the resource and garbage-collected. Flipping an install back to `today` without removing it keeps that volume and that Secret, so a later flip to `next` finds the bus where it left it. The `a2a-slack-principal-map` Secret, if you created it, is yours and stays either way. To drop them on an install that stays on `today`:
+The objects the operator creates for `spec.mode: next` go with the `PlatformAgent`. Its finalizer deletes the JetStream volumes, one per bus server (`data-platform-agent-a2a-nats-0` through `-2` on a three-server bus). The rest, the bus credentials Secret `platform-agent-a2a-nats-creds` among them, are owned by the resource and garbage-collected. Flipping an install back to `today` without removing it keeps those volumes and that Secret, so a later flip to `next` finds the bus where it left it. The `a2a-slack-principal-map` Secret, if you created it, is yours and stays either way. To drop them on an install that stays on `today`:
 
 ```bash
-kubectl delete pvc data-platform-agent-a2a-nats-0 -n kubeagents-system
+kubectl delete pvc data-platform-agent-a2a-nats-0 data-platform-agent-a2a-nats-1 data-platform-agent-a2a-nats-2 -n kubeagents-system --ignore-not-found=true
 kubectl delete secret platform-agent-a2a-nats-creds a2a-slack-principal-map -n kubeagents-system --ignore-not-found=true
 ```
 
@@ -131,7 +131,7 @@ The finalizer is what deletes the agent's cluster-scoped RBAC and, under `spec.m
 for o in $(kubectl get clusterrole,clusterrolebinding -o name | grep ':kubeagents-system:platform-agent$'); do
   kubectl delete "$o"
 done
-kubectl delete pvc data-platform-agent-a2a-nats-0 -n kubeagents-system --ignore-not-found=true
+kubectl delete pvc data-platform-agent-a2a-nats-0 data-platform-agent-a2a-nats-1 data-platform-agent-a2a-nats-2 -n kubeagents-system --ignore-not-found=true
 ```
 
 ## Where to go next

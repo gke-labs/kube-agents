@@ -159,14 +159,29 @@ func a2aNATSCAFileEnvVar() corev1.EnvVar {
 	return corev1.EnvVar{Name: a2aNATSCAFileEnv, Value: a2aNATSCAFile()}
 }
 
-// a2aNATSDNSNames are the serving certificate's SANs: the NATS Service's
-// in-cluster names and nothing else. No localhost and no external host,
-// because nothing reaches the bus from outside the cluster; a port-forwarded
-// check sets the TLS server name to one of these instead.
+// a2aNATSServingExtKeyUsage is the serving certificate's extended key usage.
+// ServerAuth for the client, websocket and route listeners; ClientAuth because
+// on a multi-server bus each server also dials its peers' route listeners and
+// presents this certificate as the client (verify: true in the cluster block).
+var a2aNATSServingExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}
+
+// a2aNATSDNSNames are the serving certificate's SANs: the client Service's
+// in-cluster names, then the routes Service's, and nothing else. No localhost
+// and no external host, because nothing reaches the bus from outside the
+// cluster; a port-forwarded check sets the TLS server name to one of these
+// instead.
+//
+// The routes names are what a server checks its peer against on a cluster
+// route (renderA2ANATSCluster), including the peers it reaches by IP. They
+// are on every certificate, single server or not, so changing busReplicas
+// does not reissue the certificate and roll the bus a second time.
 func a2aNATSDNSNames(agent *agentv1alpha1.PlatformAgent) []string {
-	svc := a2aNATSName(agent)
 	ns := agent.Namespace
-	return []string{svc, svc + "." + ns, svc + "." + ns + ".svc", svc + "." + ns + ".svc." + a2aNATSClusterDomain}
+	var names []string
+	for _, svc := range []string{a2aNATSName(agent), a2aNATSRoutesName(agent)} {
+		names = append(names, svc, svc+"."+ns, svc+"."+ns+".svc", svc+"."+ns+".svc."+a2aNATSClusterDomain)
+	}
+	return names
 }
 
 // ensureA2ANATSTLS keeps the CA, the serving certificate and the bundle
@@ -345,6 +360,12 @@ func readA2ANATSServing(secret *corev1.Secret, caCert *x509.Certificate, caPEM [
 	if !slices.Equal(slices.Sorted(slices.Values(cert.DNSNames)), slices.Sorted(slices.Values(dnsNames))) {
 		return nil, false
 	}
+	// A certificate issued before cluster routes has ServerAuth alone; a
+	// server presenting it on a route is refused by its peer, so it is
+	// reissued rather than kept.
+	if !slices.Equal(cert.ExtKeyUsage, a2aNATSServingExtKeyUsage) {
+		return nil, false
+	}
 	key, err := parseA2AKey(secret.Data[a2aNATSTLSKeyKey])
 	if err != nil || !key.PublicKey.Equal(cert.PublicKey) {
 		return nil, false
@@ -406,7 +427,7 @@ func generateA2ANATSServing(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, d
 		NotBefore:    now.Add(-a2aNATSTLSBackdate),
 		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		ExtKeyUsage:  a2aNATSServingExtKeyUsage,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &key.PublicKey, caKey)
 	if err != nil {
