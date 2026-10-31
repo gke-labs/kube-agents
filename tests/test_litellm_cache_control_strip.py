@@ -299,8 +299,8 @@ class TestChartRender(unittest.TestCase):
                 return deployment["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
 
             before = checksum()
-            copy = chart / "files" / _KEY
-            copy.write_text(copy.read_text() + "\n# edited\n")
+            hook_copy = chart / "files" / _KEY
+            hook_copy.write_text(hook_copy.read_text() + "\n# edited\n")
             self.assertNotEqual(checksum(), before)
 
 

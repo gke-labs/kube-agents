@@ -355,7 +355,7 @@ check(
     retry_delay_from_error(sdk_error(HUGE_DELAY_BODY)) == HEADER_CAP_SECONDS,
 )
 check(
-    "a 429 without a delay leaves the stock backoff in charge",
+    "a 429 without a delay yields no delay from the parser (the floor patch decides its wait)",
     retry_delay_from_error(sdk_error(PLAIN_429_BODY)) is None,
 )
 check(
