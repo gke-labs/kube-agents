@@ -852,7 +852,7 @@ POOL_STATE_READER_ROLES = {
     "roles/storage.bucketViewer",
     # CHECK_FORGE_PIECES reads the forge addresses and firewall rules
     # (networkViewer) and the private zone and its records (dns.reader);
-    # without them every forge piece scans as "not checked".
+    # without them those scan as unchecked (the VM identity still reads).
     "roles/compute.networkViewer",
     "roles/dns.reader",
 }

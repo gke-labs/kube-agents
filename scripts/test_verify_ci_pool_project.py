@@ -5686,7 +5686,7 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
                     # checked against that API's wording and not assumed.
                     self.assertTrue(
                         any(f"(gcloud.{surface}." in err for err in DenialClassifierTest.REFUSALS),
-                        f"no refusal fixture observed from gcloud {surface}",
+                        f"no refusal fixture from gcloud {surface}",
                     )
 
     def test_the_member_matches_the_variable_default(self):
