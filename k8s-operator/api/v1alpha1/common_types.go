@@ -2414,13 +2414,18 @@ type BusMigrationStatus struct {
 	// StartedAt is when the migration began.
 	StartedAt metav1.Time `json:"startedAt"`
 
-	// Deadline is when an unfinished phase counts as failed, and when the
-	// migration's bus credentials stop working.
+	// Deadline is when an unfinished phase counts as failed. The
+	// migration's bus credentials stop working ten minutes after it.
 	Deadline metav1.Time `json:"deadline"`
 
 	// Message is the manual step a Failed migration names.
 	// +optional
 	Message string `json:"message,omitempty"`
+
+	// Cause is why the run turned back: the phase that failed, and whether
+	// it was still running at Deadline. Set at the first failure and kept.
+	// +optional
+	Cause string `json:"cause,omitempty"`
 
 	// ObservedGeneration is the PlatformAgent generation that started this
 	// migration. A migration that ended without converting is not started

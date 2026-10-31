@@ -224,8 +224,9 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `busMigration.phase` | `string` | yes |  |  | Phase is where the migration is. Done converted the bus with its data; Abandoned left it at its old count with its data; Failed stopped where a person has to act, and Message says what. |
 | `busMigration.abandoning` | `boolean` | no |  |  | Abandoning is set once the migration is on its way back to the old count. |
 | `busMigration.startedAt` | `metav1.Time` | yes |  |  | StartedAt is when the migration began. |
-| `busMigration.deadline` | `metav1.Time` | yes |  |  | Deadline is when an unfinished phase counts as failed, and when the migration's bus credentials stop working. |
+| `busMigration.deadline` | `metav1.Time` | yes |  |  | Deadline is when an unfinished phase counts as failed. The migration's bus credentials stop working ten minutes after it. |
 | `busMigration.message` | `string` | no |  |  | Message is the manual step a Failed migration names. |
+| `busMigration.cause` | `string` | no |  |  | Cause is why the run turned back: the phase that failed, and whether it was still running at Deadline. Set at the first failure and kept. |
 | `busMigration.observedGeneration` | `integer` | yes |  |  | ObservedGeneration is the PlatformAgent generation that started this migration. A migration that ended without converting is not started again until the spec changes. |
 | `telemetry` | `object` | no |  |  | Telemetry reports the resolved OpenTelemetry export configuration. |
 | `telemetry.otlpEndpoint` | `string` | no |  |  | OTLPEndpoint is the collector endpoint written into the agent pod. Empty when the source is None, which is the one case where the pod is given no endpoint at all. |

@@ -223,6 +223,17 @@ func jobOutcome(job *batchv1.Job) busMigrationOutcome {
 
 // withDeadline turns a pending outcome into a failure once the run is past
 // its deadline.
+// jobDeadlineExceeded reports a Job the API server stopped at its
+// activeDeadlineSeconds, which the run's deadline sets.
+func jobDeadlineExceeded(job *batchv1.Job) bool {
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue && c.Reason == batchv1.JobReasonDeadlineExceeded {
+			return true
+		}
+	}
+	return false
+}
+
 func withDeadline(outcome busMigrationOutcome, deadline, now time.Time) busMigrationOutcome {
 	if outcome == busMigrationPending && !deadline.IsZero() && now.After(deadline) {
 		return busMigrationErred
@@ -249,17 +260,17 @@ func busNATSRolledOutAt(sts *appsv1.StatefulSet, replicas int32) bool {
 // the phase's Job, the hashing pod, or the StatefulSet's rollout at the
 // count the phase renders. The restore pod's phases stay pending until it
 // exists.
-func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (busMigrationOutcome, error) {
+func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (busMigrationOutcome, bool, error) {
 	leg, phase := busMigrationLeg(run.Leg), busMigrationPhase(run.Phase)
-	job := func(step string) (busMigrationOutcome, error) {
+	job := func(step string) (busMigrationOutcome, bool, error) {
 		j := &batchv1.Job{}
 		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkloadName(agent, step, run.RunID)}, j); {
 		case errors.IsNotFound(err):
-			return busMigrationPending, nil
+			return busMigrationPending, false, nil
 		case err != nil:
-			return busMigrationPending, err
+			return busMigrationPending, false, err
 		}
-		return jobOutcome(j), nil
+		return jobOutcome(j), jobDeadlineExceeded(j), nil
 	}
 	switch phase {
 	case busMigrationPinning:
@@ -272,31 +283,31 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 		pod := &corev1.Pod{}
 		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkloadName(agent, "hash", run.RunID)}, pod); {
 		case errors.IsNotFound(err):
-			return busMigrationPending, nil
+			return busMigrationPending, false, nil
 		case err != nil:
-			return busMigrationPending, err
+			return busMigrationPending, false, err
 		}
 		switch pod.Status.Phase {
 		case corev1.PodSucceeded:
-			return busMigrationSucceeded, nil
+			return busMigrationSucceeded, false, nil
 		case corev1.PodFailed:
-			return busMigrationErred, nil
+			return busMigrationErred, false, nil
 		}
-		return busMigrationPending, nil
+		return busMigrationPending, false, nil
 	case busMigrationFreezing, busMigrationShrinking, busMigrationConverting, busMigrationRollingBack, busMigrationReleasing:
 		sts := &appsv1.StatefulSet{}
 		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); {
 		case errors.IsNotFound(err):
-			return busMigrationPending, nil
+			return busMigrationPending, false, nil
 		case err != nil:
-			return busMigrationPending, err
+			return busMigrationPending, false, err
 		}
 		if busNATSRolledOutAt(sts, int32(busMigrationReplicas(leg, phase, run.Abandoning))) { // #nosec G115 -- 1 or 3
-			return busMigrationSucceeded, nil
+			return busMigrationSucceeded, false, nil
 		}
-		return busMigrationPending, nil
+		return busMigrationPending, false, nil
 	}
-	return busMigrationPending, nil
+	return busMigrationPending, false, nil
 }
 
 // advanceBusMigration moves a running migration on by what this pass
@@ -306,11 +317,15 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 	run := agent.Status.BusMigration
 	leg := busMigrationLeg(run.Leg)
 	if !busMigrationTerminal(busMigrationPhase(run.Phase)) {
-		outcome, err := r.observeBusMigration(ctx, agent, run)
+		observed, late, err := r.observeBusMigration(ctx, agent, run)
 		if err != nil {
 			return 0, err
 		}
-		step := nextBusMigrationPhase(leg, busMigrationPhase(run.Phase), run.Abandoning, withDeadline(outcome, run.Deadline.Time, now))
+		outcome := withDeadline(observed, run.Deadline.Time, now)
+		if outcome == busMigrationErred && run.Cause == "" {
+			run.Cause = busMigrationCause(run, late || observed == busMigrationPending)
+		}
+		step := nextBusMigrationPhase(leg, busMigrationPhase(run.Phase), run.Abandoning, outcome)
 		run.Phase, run.Abandoning = string(step.next), step.abandoning
 		if step.manual != "" {
 			run.Message = step.manual
@@ -320,6 +335,16 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 		}
 	}
 	return busMigrationReplicas(leg, busMigrationPhase(run.Phase), run.Abandoning), nil
+}
+
+// busMigrationCause says why a run turned back: the phase that failed, and
+// the deadline when that is what stopped it, so a slow run is not read as a
+// broken one.
+func busMigrationCause(run *agentv1alpha1.BusMigrationStatus, late bool) string {
+	if late {
+		return fmt.Sprintf("the %s phase was still running at the run's deadline, %s", run.Phase, run.Deadline.UTC().Format(time.RFC3339))
+	}
+	return fmt.Sprintf("the %s phase failed", run.Phase)
 }
 
 // busMigrationHoldsProvision reports a migration under way, during which the
@@ -356,10 +381,10 @@ func busMigratingCondition(agent *agentv1alpha1.PlatformAgent) (cond metav1.Cond
 		return metav1.Condition{}, false
 	case busMigrationAbandoned:
 		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Abandoned",
-			Message: fmt.Sprintf("the migration from %d NATS servers to %d did not complete and was undone; the bus runs %d servers with its data. Change the spec to try again.", from, to, from)}, true
+			Message: fmt.Sprintf("the migration from %d NATS servers to %d did not complete and was undone (%s); the bus runs %d servers with its data. Change the spec to try again.", from, to, run.Cause, from)}, true
 	case busMigrationFailed:
 		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Failed",
-			Message: fmt.Sprintf("the migration from %d NATS servers to %d stopped: %s", from, to, run.Message)}, true
+			Message: fmt.Sprintf("the migration from %d NATS servers to %d stopped (%s): %s", from, to, run.Cause, run.Message)}, true
 	}
 	msg := fmt.Sprintf("migrating the A2A bus from %d NATS servers to %d (phase %s)", from, to, phase)
 	if run.Abandoning {
@@ -439,10 +464,11 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		serviceAccount: a2aServiceAccountName(agent.Namespace, busMigrationWorkloadName(agent, step, run.RunID)),
 		publish:        publish,
 		subscribe:      []string{"_INBOX." + user + ".>"},
-		// The callout refuses this principal from the run's deadline on and
-		// mints it no JWT that outlives it, so a credential outlasts the run
-		// only if the run ends early, and then the entry leaves the map.
-		notAfter: ptr.To(run.Deadline.UTC()),
+		// The callout refuses this principal a grace period after the run's
+		// deadline and mints it no JWT that outlives that. The grace keeps
+		// the credential from being what stops a slow run: the Job's own
+		// deadline and the operator's fire first, and say so in Cause.
+		notAfter: ptr.To(run.Deadline.Add(busMigrationCredentialGrace).UTC()),
 	}}
 }
 
@@ -453,6 +479,9 @@ func busMigrationPrincipal(step, runID string) string {
 }
 
 const (
+	// busMigrationCredentialGrace is how long a run's principals outlive its
+	// deadline.
+	busMigrationCredentialGrace = 10 * time.Minute
 	// busMigrationStageMount is where the staging volume is mounted in the
 	// snapshot Job and the hashing pod.
 	busMigrationStageMount = "/stage"

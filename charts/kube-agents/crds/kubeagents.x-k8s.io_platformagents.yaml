@@ -11622,10 +11622,15 @@ spec:
                         Abandoning is set once the migration is on its way back to the old
                         count.
                       type: boolean
+                    cause:
+                      description: |-
+                        Cause is why the run turned back: the phase that failed, and whether
+                        it was still running at Deadline. Set at the first failure and kept.
+                      type: string
                     deadline:
                       description: |-
-                        Deadline is when an unfinished phase counts as failed, and when the
-                        migration's bus credentials stop working.
+                        Deadline is when an unfinished phase counts as failed. The
+                        migration's bus credentials stop working ten minutes after it.
                       format: date-time
                       type: string
                     leg:

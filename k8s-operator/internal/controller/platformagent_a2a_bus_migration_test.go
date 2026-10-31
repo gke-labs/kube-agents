@@ -717,8 +717,8 @@ const busMigrationMapFixturePath = "../../../a2a/authcallout/testdata/rendered-i
 
 // The map mid-snapshot, as the callout reads it (a2a/authcallout:
 // migration_contract_test.go): the step's principal with its exact grants
-// and the run's deadline as its notAfter. The deadline is far off so the
-// callout's real-server test can still connect as it.
+// and a grace period past the run's deadline as its notAfter. The deadline
+// is far off so the callout's real-server test can still connect as it.
 func TestRenderedBusMigrationFixture(t *testing.T) {
 	agent := authMapTestAgent()
 	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(busMigrationSnapshot),
@@ -735,14 +735,14 @@ func TestRenderedBusMigrationFixture(t *testing.T) {
 	var stamped int
 	for _, id := range doc.Identities {
 		switch {
-		case id.User == busMigrationPrincipal("snapshot", "3-1") && id.NotAfter != nil && id.NotAfter.Equal(agent.Status.BusMigration.Deadline.Time):
+		case id.User == busMigrationPrincipal("snapshot", "3-1") && id.NotAfter != nil && id.NotAfter.Equal(agent.Status.BusMigration.Deadline.Add(busMigrationCredentialGrace)):
 			stamped++
 		case id.NotAfter != nil:
 			t.Errorf("%s carries notAfter %v; only the run's principal expires", id.User, id.NotAfter)
 		}
 	}
 	if stamped != 1 {
-		t.Errorf("the snapshot principal is not in the map with notAfter at the run's deadline:\n%s", rendered)
+		t.Errorf("the snapshot principal is not in the map with notAfter a grace period past the run's deadline:\n%s", rendered)
 	}
 	checkFixture(t, busMigrationMapFixturePath, rendered)
 }
@@ -755,5 +755,74 @@ func TestNotAfterOnANarrowedEntryFailsTheRender(t *testing.T) {
 	ids := []a2aAuthMapIdentity{{ServiceAccount: "system:serviceaccount:ns:s", User: "session", Account: a2aAccountApp, Narrowing: a2aNarrowingPod, NotAfter: &deadline}}
 	if err := validateA2AAuthMapIdentities(ids); err == nil || !strings.Contains(err.Error(), "notAfter") {
 		t.Errorf("validate error %v, want a refusal naming notAfter", err)
+	}
+}
+
+// Why a run turned back is kept in Cause and named in the condition: a phase
+// still running at the deadline, or a Job the API server stopped at its
+// activeDeadlineSeconds, says the deadline; any other failure says the phase
+// failed. The first cause is kept through the way back.
+func TestATurnedBackRunNamesItsCause(t *testing.T) {
+	late := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(-time.Minute))
+	late.pass(busMigrationUnpinning, 3)
+	run := late.agent.Status.BusMigration
+	if want := "the Pinning phase was still running at the run's deadline, " + run.Deadline.UTC().Format(time.RFC3339); run.Cause != want {
+		t.Errorf("late pin cause %q, want %q", run.Cause, want)
+	}
+
+	stopped := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	j := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(stopped.agent, "pin", "3-1"), Namespace: stopped.agent.Namespace}}
+	if err := stopped.cl.Create(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	j.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonDeadlineExceeded}}
+	if err := stopped.cl.Status().Update(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	stopped.pass(busMigrationUnpinning, 3)
+	if c := stopped.agent.Status.BusMigration.Cause; !strings.Contains(c, "still running at the run's deadline") {
+		t.Errorf("a Job stopped at its deadline gives cause %q", c)
+	}
+
+	failed := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	failed.finishJob("pin", batchv1.JobFailed)
+	failed.pass(busMigrationUnpinning, 3)
+	if c := failed.agent.Status.BusMigration.Cause; c != "the Pinning phase failed" {
+		t.Errorf("failed pin cause %q", c)
+	}
+	// The unpin fails too: the run is Failed, and the cause stays the pin's.
+	failed.finishJob("unpin", batchv1.JobFailed)
+	failed.pass(busMigrationFailed, 3)
+	if c := failed.agent.Status.BusMigration.Cause; c != "the Pinning phase failed" {
+		t.Errorf("after the unpin failed, cause %q; want the first failure kept", c)
+	}
+	if cond, ok := busMigratingCondition(failed.agent); !ok || !strings.Contains(cond.Message, "(the Pinning phase failed)") {
+		t.Errorf("Failed condition %q does not name the cause", cond.Message)
+	}
+
+	done := newMigrationRig(t, busMigrationShrink, busMigrationAbandoned, 3, time.Now().Add(time.Hour))
+	done.agent.Status.BusMigration.Cause = "the Pinning phase failed"
+	if cond, ok := busMigratingCondition(done.agent); !ok || !strings.Contains(cond.Message, "(the Pinning phase failed)") {
+		t.Errorf("Abandoned condition %q does not name the cause", cond.Message)
+	}
+}
+
+// The credential outlives the work: a step's Job is stopped at the run's
+// deadline, and its principal stops authenticating only a grace period
+// later, so the failure a slow step reports is the deadline, not an
+// authorization error halfway through a stream.
+func TestTheCredentialOutlivesTheJobsDeadline(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	agent := a2aTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "3-1", Phase: string(busMigrationPinning),
+		Deadline: metav1.NewTime(now.Add(time.Hour))}
+	job := buildBusMigrationJob(agent, agent.Status.BusMigration, "pin", now)
+	jobEnd := now.Add(time.Duration(*job.Spec.ActiveDeadlineSeconds) * time.Second)
+	ids := busMigrationIdentities(agent)
+	if len(ids) != 1 || ids[0].notAfter == nil {
+		t.Fatalf("identities %+v", ids)
+	}
+	if gap := ids[0].notAfter.Sub(jobEnd); gap < 5*time.Minute {
+		t.Errorf("the principal expires %v after the Job's deadline; want a margin of minutes", gap)
 	}
 }

@@ -28,7 +28,7 @@ func renderedMigrationMap(t *testing.T) string {
 	return string(raw)
 }
 
-// The map parses, and the snapshot principal carries the run's deadline.
+// The map parses, and the snapshot principal carries the run's deadline plus the grace.
 func TestTheOperatorsMigrationMapParses(t *testing.T) {
 	m, err := ParseIdentityMap([]byte(renderedMigrationMap(t)))
 	if err != nil {
@@ -38,7 +38,7 @@ func TestTheOperatorsMigrationMapParses(t *testing.T) {
 	if !ok {
 		t.Fatal("the operator's map has no snapshot principal")
 	}
-	if id.User != renderedMigrationUser || id.NotAfter == nil || !id.NotAfter.Equal(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)) {
+	if id.User != renderedMigrationUser || id.NotAfter == nil || !id.NotAfter.Equal(time.Date(2099, 1, 1, 0, 10, 0, 0, time.UTC)) {
 		t.Errorf("snapshot entry = user %q notAfter %v", id.User, id.NotAfter)
 	}
 }
@@ -70,7 +70,7 @@ func TestTheRenderedSnapshotPrincipalReachesItsStepAndNothingNear(t *testing.T) 
 
 // Past its notAfter the same principal does not connect at all.
 func TestTheRenderedSnapshotPrincipalPastItsDeadlineCannotConnect(t *testing.T) {
-	expired := strings.Replace(renderedMigrationMap(t), "2099-01-01T00:00:00Z", time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), 1)
+	expired := strings.Replace(renderedMigrationMap(t), "2099-01-01T00:10:00Z", time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), 1)
 	h := startHarness(t, expired, map[string]Attested{
 		tokenMigrationSnapshot: {ServiceAccount: renderedMigrationSA},
 	})
