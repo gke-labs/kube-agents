@@ -99,27 +99,57 @@ def prepare_destination(into: Path, force: bool) -> Path:
 
 
 def copy_over(staging: Path, into: Path) -> None:
-    """Copy a checked snapshot over `into`; an entry already there gives way.
+    """Copy a checked snapshot over `into`: a file or a link gives way, a directory merges.
 
     `--force` adds a second `--prefix` to a tree, and the two can overlap.
     `copytree` cannot replace a symbolic link that is already there, and it
-    writes a file or a directory through one. So each name the snapshot holds
-    is removed from `into` first, unless both are directories.
+    writes a file or a directory through one. So a file or a link that the
+    snapshot names again is removed first. A directory is never removed: the
+    repository being read chooses its names, and a file it calls `notes` must
+    not cost the caller a `notes/` directory. A directory and a file under one
+    name is refused, and every name is checked before anything is removed, so
+    a refusal leaves `into` as it was.
     """
+    replace = []
     for root, dirs, files in os.walk(staging):
         for name in dirs + files:
             new = Path(root) / name
             old = into / new.relative_to(staging)
-            old_is_dir = old.is_dir() and not old.is_symlink()
-            if not old_is_dir and not old.is_symlink() and not old.exists():
+            new_is_dir = new.is_dir() and not new.is_symlink()
+            if old.is_symlink() or not old.exists():
+                if old.is_symlink():
+                    replace.append(old)
+                if new_is_dir:
+                    # Nothing of `into` lies below: a link goes, so the walk
+                    # must not follow it to whatever it names.
+                    dirs.remove(name)
                 continue
-            if old_is_dir and new.is_dir() and not new.is_symlink():
-                continue
-            if old_is_dir:
-                shutil.rmtree(old)
-            else:
-                old.unlink()
+            if old.is_dir() != new_is_dir:
+                kind = "directory" if old.is_dir() else "file"
+                raise SystemExit(
+                    f"{old} is a {kind}, and the copy holds a "
+                    f"{'directory' if new_is_dir else 'file'} of that name. "
+                    "Nothing was written. Name an empty directory with --into."
+                )
+            if not new_is_dir:
+                replace.append(old)
+    for old in replace:
+        old.unlink()
     shutil.copytree(staging, into, symlinks=True, dirs_exist_ok=True)
+
+
+# The reasons the old copy gave under `skipped`. The fleet audit tells a file
+# it may have missed from a path that is not a file by them
+# (audit_report.BROKER_SKIP_NOT_A_FILE_REASONS), and every path the snapshot
+# skips is one of these two: a symbolic link, or a member of a directory laid
+# out as a bare repository.
+SKIPPED_LINK = "symlink"
+SKIPPED_NOT_A_FILE = "notAFile"
+
+
+def skipped_reason(reason: str) -> str:
+    """The old reply's word for one of the snapshot's `skipped` reasons."""
+    return SKIPPED_NOT_A_FILE if "bare" in reason else SKIPPED_LINK
 
 
 def clone_content(args) -> int:
@@ -175,7 +205,10 @@ def clone_content(args) -> int:
         "into": str(into),
         "written": copy["files"],
         "bytes": copy["bytes"],
-        "skipped": copy["skipped"],
+        "skipped": [
+            {"path": entry["path"], "reason": skipped_reason(entry["reason"])}
+            for entry in copy["skipped"]
+        ],
         # A bound refuses the whole copy, so nothing is ever cut short. Kept so
         # that a caller that reads the key sees no bound bit.
         "stopped": None,

@@ -54,7 +54,8 @@ python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_re
 ```
 
 Compare the `sha` of each part. If they differ, the branch moved between the
-copies; take the parts again.
+copies; take every part again into an empty `--into`. `--force` replaces what
+the new copy holds and never removes a file the new commit no longer has.
 
 ## Rules
 
@@ -69,9 +70,9 @@ copies; take the parts again.
   commit gives `written: 0` and `missing`; it is not proof that the code does
   not exist under another name.
 - **Read `complete` and `skipped` before you conclude anything.** `skipped`
-  lists what was not written, each with the reason: a symbolic link (the file it
-  names is not copied; if it is in the repository, take it with its own
-  `--prefix`), or a directory laid out as a bare repository. A copy of one `--prefix`
+  lists what was not written, each with the reason: `symlink`, a symbolic link
+  (the file it names is not copied; if it is in the repository, take it with
+  its own `--prefix`), or `notAFile`, a directory laid out as a bare repository. A copy of one `--prefix`
   is a copy of part of a repository: "the repository does not contain X" is not
   a claim it supports.
 - **Do not run `git` against what lands.** There is no repository there, on
@@ -81,16 +82,16 @@ copies; take the parts again.
 
 ## Reference
 
-| Flag                        | What it does                                                      |
-| --------------------------- | ----------------------------------------------------------------- |
-| `--repo`                    | `owner/name` on GitHub, or `<host>/<path>` on another forge       |
-| `--ref`                     | Branch or tag to read                                             |
-| `--prefix`                  | Copy only this directory or file                                  |
-| `--into`                    | Destination directory; must be empty unless `--force`             |
-| `--force`                   | Write into a non-empty directory, adding to what is there         |
-| `--max-files`/`--max-bytes` | Refuse a copy over this many files or bytes; nothing is written   |
-| `--depth`                   | Accepted and not needed: a snapshot is always one revision        |
-| `--lease`                   | Directory mode only: the lease the leased checkout is taken under |
+| Flag                        | What it does                                                                              |
+| --------------------------- | ----------------------------------------------------------------------------------------- |
+| `--repo`                    | `owner/name` on GitHub, or `<host>/<path>` on another forge                               |
+| `--ref`                     | Branch or tag to read                                                                     |
+| `--prefix`                  | Copy only this directory or file                                                          |
+| `--into`                    | Destination directory; must be empty unless `--force`                                     |
+| `--force`                   | Write into a non-empty directory; replaces a file or link, refuses a file-directory clash |
+| `--max-files`/`--max-bytes` | Refuse a copy over this many files or bytes; nothing is written                           |
+| `--depth`                   | Accepted and not needed: a snapshot is always one revision                                |
+| `--lease`                   | Directory mode only: the lease the leased checkout is taken under                         |
 
 On an install with no broker, `clone`
 reports `"mode": "directory"` and hands back a leased checkout on the shared

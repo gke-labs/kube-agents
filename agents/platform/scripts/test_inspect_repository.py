@@ -204,6 +204,57 @@ class TestClone(InspectRepositoryTestCase):
         self.assertFalse((into / "cmd").is_symlink())
         self.assertTrue((into / "cmd" / "main.go").is_file())
 
+    def test_force_refuses_a_file_over_a_directory_and_changes_nothing(self):
+        """The repository names the file; the directory is the caller's."""
+        into = self.tmp / "copy"
+        (into / "cmd" / "serve.go").mkdir(parents=True)
+        (into / "cmd" / "serve.go" / "keep.txt").write_text("the caller's\n")
+        # Walked before the clash: removed at once, it would be gone after the refusal.
+        (into / "README.md").write_text("older\n")
+        with self.assertRaises(SystemExit) as refused:
+            inspect_repository.dispatch(["clone", "--repo", "acme/public", "--into", str(into), "--force"])
+        self.assertIn("is a directory", str(refused.exception))
+        self.assertEqual((into / "cmd" / "serve.go" / "keep.txt").read_text(), "the caller's\n")
+        self.assertEqual((into / "README.md").read_text(), "older\n")
+        self.assertFalse((into / "cmd" / "main.go").exists())
+
+    def test_force_removes_nothing_through_a_link_in_the_destination(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "main.go").write_text("not the repository's\n")
+        into = self.tmp / "copy"
+        into.mkdir()
+        os.symlink(str(outside), into / "cmd")
+        self.run_command(["clone", "--repo", "acme/public", "--into", str(into), "--force"])
+        self.assertEqual((outside / "main.go").read_text(), "not the repository's\n")
+        self.assertEqual((into / "cmd" / "main.go").read_text(), "func main() { serve() }\n")
+
+    def test_force_refuses_a_directory_over_a_file(self):
+        into = self.tmp / "copy"
+        into.mkdir()
+        (into / "cmd").write_text("the caller's\n")
+        with self.assertRaises(SystemExit) as refused:
+            inspect_repository.dispatch(["clone", "--repo", "acme/public", "--into", str(into), "--force"])
+        self.assertIn("is a file", str(refused.exception))
+        self.assertEqual((into / "cmd").read_text(), "the caller's\n")
+        self.assertFalse((into / "README.md").exists())
+
+    def test_skipped_paths_carry_the_reasons_the_fleet_audit_reads(self):
+        """audit_report counts a skipped note as missed unless its reason is `symlink` or `notAFile`."""
+        os.symlink("/etc/hostname", self.seed / "outside.md")
+        for name in ("HEAD", "objects/pack/info", "refs/heads/main"):
+            (self.seed / "fixture" / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.seed / "fixture" / name).write_text("x\n")
+        self._git(self.seed, "add", "-A")
+        self._git(self.seed, "commit", "--quiet", "-m", "a link and a bare layout")
+        self.revision = self._git(self.seed, "rev-parse", "HEAD").stdout.strip()
+        result = self.run_command(["clone", "--repo", "acme/public", "--into", str(self.tmp / "copy")])
+        self.assertEqual(
+            sorted((entry["path"], entry["reason"]) for entry in result["skipped"]),
+            [("fixture", "notAFile"), ("outside.md", "symlink")],
+        )
+        self.assertFalse(result["complete"])
+
     def test_a_non_empty_destination_is_refused_without_force(self):
         into = self.tmp / "copy"
         into.mkdir()
