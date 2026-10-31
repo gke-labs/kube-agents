@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,7 +18,7 @@ import (
 // deletes the standalone streams as orphans), restore each from bytes whose
 // digest matches with the operator's config at R1, raise it to R3, and read
 // everything back through another server. A snapshot changed after hashing is
-// refused before any restore request.
+// refused before the restore's final message, and no stream is created.
 func TestOneToThreeKeepsTheBus(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()
@@ -66,17 +67,42 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 
 	tampered := append([]byte(nil), data["TASKS"]...)
 	tampered[len(tampered)/2] ^= 0xff
-	if err := RestoreVerified(ctx, nc, withReplicas(rendered["TASKS"], 1), metas["TASKS"].State, tampered, digests["TASKS"]); !errors.Is(err, ErrDigestMismatch) {
+	if err := RestoreVerified(ctx, nc, withReplicas(rendered["TASKS"], 1), metas["TASKS"].State, opener(tampered), digests["TASKS"]); !errors.Is(err, ErrDigestMismatch) {
 		t.Fatalf("a snapshot changed after hashing: %v, want ErrDigestMismatch", err)
 	}
 	if _, err := streamInfo(ctx, nc, "TASKS"); err == nil {
 		t.Fatal("a refused snapshot still created TASKS")
 	}
 
+	// A snapshot that changes after the pre-pass (a second open returns other
+	// bytes) is caught as it is sent: no stream, and the name is free again.
+	opens := 0
+	late := func() (io.ReadCloser, error) {
+		opens++
+		if opens == 1 {
+			return io.NopCloser(bytes.NewReader(data["TASKS"])), nil
+		}
+		return io.NopCloser(bytes.NewReader(tampered)), nil
+	}
+	for i := 0; ; i++ {
+		err := RestoreVerified(ctx, nc, withReplicas(rendered["TASKS"], 1), metas["TASKS"].State, late, digests["TASKS"])
+		if errors.Is(err, ErrDigestMismatch) {
+			break
+		}
+		if i > 30 {
+			t.Fatalf("a snapshot changed after the pre-pass: %v, want ErrDigestMismatch", err)
+		}
+		opens = 0
+		time.Sleep(time.Second)
+	}
+	if _, err := streamInfo(ctx, nc, "TASKS"); err == nil {
+		t.Fatal("a late-tampered snapshot created TASKS")
+	}
+
 	for _, n := range streams {
 		var err error
 		for i := 0; i < 30; i++ {
-			if err = RestoreVerified(ctx, nc, withReplicas(rendered[n], 1), metas[n].State, data[n], digests[n]); err == nil {
+			if err = RestoreVerified(ctx, nc, withReplicas(rendered[n], 1), metas[n].State, opener(data[n]), digests[n]); err == nil {
 				break
 			}
 			t.Logf("restore %s attempt %d: %v", n, i, err)
@@ -113,6 +139,10 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 	if err != nil || string(e.Value()) != "3" || e.Revision() != 3 {
 		t.Errorf("cap/k after the restore: %v, err %v; want 3 at revision 3", e, err)
 	}
+}
+
+func opener(b []byte) Opener {
+	return func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil }
 }
 
 func withReplicas(cfg nats.StreamConfig, n int) nats.StreamConfig {

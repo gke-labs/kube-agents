@@ -1,7 +1,6 @@
 package busmigrate
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -116,22 +115,57 @@ func Snapshot(ctx context.Context, nc *nats.Conn, name string, w io.Writer) (*Me
 // hashed.
 var ErrDigestMismatch = errors.New("snapshot digest does not match the operator's")
 
-// RestoreVerified restores one stream from data, which the caller read once:
-// it hashes exactly these bytes and refuses before any request if they are
-// not the snapshot the operator hashed (wantDigest), so nothing is re-read
-// between the check and the restore. The stream is created with cfg, the
-// config the operator renders for it, never the snapshot's own; state is
-// the snapshot's, which the server uses only to size the restore. The
-// restored config is then read back, and a stream whose config is not cfg is
-// deleted.
-func RestoreVerified(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, data []byte, wantDigest string) error {
-	if Digest(data) != wantDigest {
+// Opener opens a snapshot's data for one read from the start. The restore pod
+// reads the staging volume read-only, and it is the only pod holding that
+// volume (ReadWriteOncePod), so nothing writes it between two opens.
+type Opener func() (io.ReadCloser, error)
+
+// RestoreVerified restores one stream from its staged snapshot. It hashes the
+// data first and sends nothing when it is not the snapshot the operator
+// hashed (wantDigest), so a mismatch holds no name. It then restores, hashing
+// exactly the bytes it sends, and sends the restore's final message, the one
+// on which nats-server builds the stream, only when they match too. On a late
+// mismatch it withholds that message and deletes the name, which a
+// clustered server keeps reserved after a stalled restore. The stream is
+// created with cfg, the config the operator renders for it, never the
+// snapshot's own; state is the snapshot's, which the server uses only to size
+// the restore. The restored config is then read back, and a stream whose
+// config is not cfg is deleted.
+func RestoreVerified(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, open Opener, wantDigest string) error {
+	pre, err := digestOf(open)
+	if err != nil {
+		return fmt.Errorf("stream %s: hashing the snapshot: %w", cfg.Name, err)
+	}
+	if pre != wantDigest {
 		return fmt.Errorf("stream %s: %w", cfg.Name, ErrDigestMismatch)
 	}
-	if err := restore(ctx, nc, cfg, state, data); err != nil {
+	data, err := open()
+	if err != nil {
+		return fmt.Errorf("stream %s: %w", cfg.Name, err)
+	}
+	defer data.Close()
+	if err := restore(ctx, nc, cfg, state, data, wantDigest); err != nil {
+		if errors.Is(err, ErrDigestMismatch) {
+			if derr := request(ctx, nc, fmt.Sprintf(streamDeleteSubject, cfg.Name), nil, nil); derr != nil {
+				return fmt.Errorf("stream %s: %w, and freeing its name failed: %v", cfg.Name, err, derr)
+			}
+		}
 		return fmt.Errorf("stream %s: %w", cfg.Name, err)
 	}
 	return verifyOrDelete(ctx, nc, cfg)
+}
+
+func digestOf(open Opener) (string, error) {
+	r, err := open()
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, r); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // verifyOrDelete reads a restored stream's config back and deletes the
@@ -150,7 +184,7 @@ func verifyOrDelete(ctx context.Context, nc *nats.Conn, want nats.StreamConfig) 
 	return nil
 }
 
-func restore(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, data []byte) error {
+func restore(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, data io.Reader, wantDigest string) error {
 	body, err := json.Marshal(map[string]any{"config": cfg, "state": state})
 	if err != nil {
 		return err
@@ -164,19 +198,25 @@ func restore(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state na
 	if resp.DeliverSubject == "" {
 		return errors.New("restore answered with no deliver subject")
 	}
-	r := bytes.NewReader(data)
+	hash := sha256.New()
 	chunk := make([]byte, restoreChunkSize)
 	for {
-		n, err := r.Read(chunk)
-		if err == io.EOF {
+		n, err := io.ReadFull(data, chunk)
+		if n > 0 {
+			hash.Write(chunk[:n])
+			if err := sendChunk(ctx, nc, resp.DeliverSubject, chunk[:n]); err != nil {
+				return fmt.Errorf("sending a chunk: %w", err)
+			}
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			break
 		}
 		if err != nil {
 			return err
 		}
-		if err := sendChunk(ctx, nc, resp.DeliverSubject, chunk[:n]); err != nil {
-			return fmt.Errorf("sending a chunk: %w", err)
-		}
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != wantDigest {
+		return ErrDigestMismatch
 	}
 	fctx, cancel := context.WithTimeout(ctx, restoreFinishTimeout)
 	defer cancel()
