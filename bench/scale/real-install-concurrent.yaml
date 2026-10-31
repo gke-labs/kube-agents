@@ -1,0 +1,72 @@
+# Step 5's fair use for the real-install test: the same fleet with 2 and then 3 questions at once, after
+# real-install.yaml's first-run flow and single questions. Points 2 and 3 are this file's; point 1 is
+# real-install.yaml's, listed so the indexes match.
+# (Below: the same target, base and settings as real-install.yaml.)
+# The real-install test (bench/scale/real-install-test-plan.md): one fleet point on a new install at the
+# L container size. `runner apply real-install.yaml --factor combined --level 1` builds it; the
+# questions and the first-run flow are driven and measured outside the plan's matrix.
+phase: real-install-concurrent
+target:
+  host_cluster: scale-host
+  host_location: us-central1-c
+  namespace: kubeagents-system
+  zone: us-central1-f
+  cluster_prefix: scale-
+  cluster_label: purpose=harness-scale
+  mode: next
+  data_file: harness-limits.json
+
+base:
+  clusters: 2
+  nodes: 2
+  objects: 100
+  churn_per_minute: 10
+  failing_pods: 1
+  concurrent: 1
+  listing_pods: 100
+
+factors:
+  combined: [2, 3]
+
+# 40 clusters of about 1,200 objects; about 3 Pods created per minute and 5 failing at once, an XL
+# fleet's share for one install of 40 clusters, below the 10 to 30 failing Pods where sessions start.
+combined:
+  - clusters: 40
+    objects: 1200
+    churn_per_minute: 3
+    failing_pods: 5
+  # Step 5's fair use: the same fleet with 2 and then 3 questions at once.
+  - clusters: 40
+    objects: 1200
+    churn_per_minute: 3
+    failing_pods: 5
+    concurrent: 2
+  - clusters: 40
+    objects: 1200
+    churn_per_minute: 3
+    failing_pods: 5
+    concurrent: 3
+
+settings:
+  settle_seconds: 180
+  pods_per_node: 60
+  fixture_pool: scale-pool
+  fixture_machine_type: e2-small
+  default_pool_pods: 150
+  test_cluster_machine_type: e2-standard-2
+  churn_pod_lifetime_seconds: 30
+  cluster_registration_timeout_seconds: 5400
+  trigger_reconcile: true
+  cluster_create_parallelism: 10
+  watcher_wait_seconds: 600
+  lease_ttl_minutes: 1440
+
+operations:
+  # (A) with (B) beside it: 2 at once on point 2, and (A) with two copies of (B) on point 3.
+  upgrade_report:
+    kind: prompt
+    factors: [combined]
+    runs: 1
+    timeout_seconds: 3600
+    prompt: Prepare an upgrade readiness report for my whole fleet. Which clusters are behind, what blocks their upgrade, and in what order should they be upgraded?
+    follow_up: Analyse my fleet's health. Which clusters and workloads carry the heaviest traffic, is the load skewed toward one zone, and what looks anomalous?

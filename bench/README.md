@@ -2,6 +2,8 @@
 
 Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent, with devops-bench consumed as a pip-installed library (pinned git SHA — no PyPI release yet) instead of the legacy evaluator baked into the eval image. Tasks and the agent transport live here, so kube-agents and devops-bench ship independently.
 
+Load and sizing measurements of the harness at fleet scale, as opposed to answer quality, are designed in [`docs/designs/agent-harness-bottlenecks.md`](../docs/designs/agent-harness-bottlenecks.md) and run by `kube_agents_bench/scale/`.
+
 ## Layout
 
 - `kube_agents_bench/harness.py` — the `kubeagents` agent harness: establishes `kubectl port-forward` to `svc/platform-agent` when the local port is closed, POSTs the task prompt to `/v1/responses`, and waits out any work the agent delegates to a subagent. That transport needs either a standard-runtime install or a relay pre-opened on its local port — see [Sandboxed installs](#sandboxed-installs). Environment variables are documented in the module docstring.
@@ -34,6 +36,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 - `hack/` — `run-gitops-pilot.sh`, the laptop driver for the `b-0011-gitops` and `b-0022b-gitops` cases (`TASK` picks one, or `CASE` names a variant such as `b-0022b-gitops-pinned-base`, whose own variables pin the agent's base on the PlatformAgent's GitOps repository entry, `spec.integration.repositories[].baseBranch`, on an operator that has the field, with `AGENT_STATE_RESET=true` writing that entry, and refused before anything is built when that entry already carries a base of the install's own; optional devops-bench pin with the case rendered to `mode: hold`, result-row model, agent base branch, tokens, stack and harness env, the pull requests the run opened with their bases, cleanup; `GITOPS_REPO` and `AGENT_STATE_RESET` for an isolated run); `gitops-run-repo.sh`, one GitOps repository per run (create, mint check, archive); `gitops-run-prs.sh`, the pull requests opened since a run started, with their bases; `gitops-audit.py`, the isolation counts of a run record; `gitops-compare.py`, two run records side by side.
 - `upgrade-scenarios/` — a manual harness, run by hand against a GCP project of your own, that planted each failure in [`docs/designs/upgrade-failure-catalogue.md`](../docs/designs/upgrade-failure-catalogue.md) on a throwaway GKE cluster and upgraded it; the results table, one quoted evidence file per scenario, and the scripts. No CI job runs it. See [upgrade-scenarios/README.md](upgrade-scenarios/README.md).
 - `tools/` — operator-run scripts that are neither tasks nor tests. `live_check_fleet_safeguards.py` drives every `fleet_resource_property` check in the cluster-debugging cases against a live cluster, through the real verifier, without running an agent.
+- `kube_agents_bench/scale/` and `scale/` — the harness load measurement: a runner driven by a plan file that applies fixture levels to a test fleet, times agent operations, and merges one record per run into `scale/harness-limits.json`. [`scale/README.md`](scale/README.md) has the commands and the record schema.
 
 To add a task or plug in a different agent, see
 [CUSTOM-TASKS.md](CUSTOM-TASKS.md). To contribute a case to this repository — the format
@@ -246,4 +249,4 @@ uv sync
 uv run pytest tests
 ```
 
-No cluster or `kubectl` required — the suite drives the full request → parse → `AgentResult` path against a local stub, and grades the gate against run records captured from a live cluster and then mutated. Every gate failure mode is a mutation of a real record rather than a hand-written dict, so a test cannot agree with the scorer about a field devops-bench does not actually emit; `tests/fixtures/runs/README.md` records where the captures came from.
+No cluster or `kubectl` required. `test_scale.py` covers the load-measurement runner's records, plan, fixtures and counter arithmetic; the rest of the suite drives the full request → parse → `AgentResult` path against a local stub, and grades the gate against run records captured from a live cluster and then mutated. Every gate failure mode is a mutation of a real record rather than a hand-written dict, so a test cannot agree with the scorer about a field devops-bench does not actually emit; `tests/fixtures/runs/README.md` records where the captures came from.
