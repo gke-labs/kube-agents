@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"reflect"
 	"slices"
 	"strconv"
@@ -856,10 +857,14 @@ func TestNoOperatorImageRunsNothing(t *testing.T) {
 const busMigrationMapFixturePath = "../../../a2a/authcallout/testdata/rendered-identity-map-migration.json"
 
 // The map mid-snapshot, as the callout reads it (a2a/authcallout:
-// migration_contract_test.go): the stream identity with its exact grants
-// and the run's deadline as its notAfter. The deadline is far off so the
-// callout's real-server test can still connect as it.
+// migration_contract_test.go). The snapshot runs inside the write freeze, so
+// the map is exactly the stream identity, with its exact grants, and the
+// run's sentinel, both expiring at the run's deadline, and no other
+// principal: no gateway, agent, verifier, provisioner, profile or
+// dispatcher. The deadline is far off so the callout's real-server test can
+// still connect.
 func TestRenderedBusMigrationFixture(t *testing.T) {
+	withDispatcher(t)
 	agent := authMapTestAgent()
 	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(busMigrationSnapshot),
 		Deadline: metav1.NewTime(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC))}
@@ -872,19 +877,111 @@ func TestRenderedBusMigrationFixture(t *testing.T) {
 	if err := json.Unmarshal([]byte(rendered), &doc); err != nil {
 		t.Fatal(err)
 	}
-	var stamped int
+	var users []string
 	for _, id := range doc.Identities {
-		switch {
-		case id.User == busMigrationPrincipal(busMigrationStreamIdentity, "3-1") && id.NotAfter != nil && id.NotAfter.Equal(agent.Status.BusMigration.Deadline.Time):
-			stamped++
-		case id.NotAfter != nil:
-			t.Errorf("%s carries notAfter %v; only the run's principal expires", id.User, id.NotAfter)
+		users = append(users, id.User)
+		if id.NotAfter == nil || !id.NotAfter.Equal(agent.Status.BusMigration.Deadline.Time) {
+			t.Errorf("%s notAfter %v, want the run's deadline", id.User, id.NotAfter)
 		}
 	}
-	if stamped != 1 {
-		t.Errorf("the stream identity is not in the map with notAfter at the run's deadline:\n%s", rendered)
+	if want := []string{busMigrationPrincipal(busMigrationStreamIdentity, "3-1"), busMigrationPrincipal(busMigrationSentinelIdentity, "3-1")}; !slices.Equal(users, want) {
+		t.Errorf("the frozen map holds %v, want exactly %v", users, want)
 	}
 	checkFixture(t, busMigrationMapFixturePath, rendered)
+}
+
+// The freeze holds from Freezing until Releasing begins: in every phase in
+// between the map is the phase's migration principal, if any, and the
+// sentinel; outside it (the three to one leg, Releasing, a finished run) the
+// map is the install's own.
+func TestTheFreezeMapsOnlyTheMigration(t *testing.T) {
+	frozen := []busMigrationPhase{busMigrationFreezing, busMigrationSnapshot, busMigrationHashing, busMigrationConverting,
+		busMigrationRestoring, busMigrationRollingBack, busMigrationRollbackRestoring}
+	for _, phase := range frozen {
+		agent := authMapTestAgent()
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(phase), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+		doc, err := renderA2AAuthMap(agent, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", phase, err)
+		}
+		want := map[string]bool{busMigrationPrincipal(busMigrationSentinelIdentity, "3-1"): true}
+		for _, id := range busMigrationIdentities(agent) {
+			want[id.user] = true
+		}
+		if len(doc.Identities) != len(want) {
+			t.Errorf("%s: %d entries, want %d", phase, len(doc.Identities), len(want))
+		}
+		for _, id := range doc.Identities {
+			if !want[id.User] {
+				t.Errorf("%s: %s is in the frozen map", phase, id.User)
+			}
+			if strings.HasPrefix(id.User, "migrate-frozen-") {
+				inbox := []string{"_INBOX." + id.User + ".>"}
+				if !slices.Equal(id.Grants.Publish, inbox) || !slices.Equal(id.Grants.Subscribe, inbox) || id.Narrowing != "" {
+					t.Errorf("%s: the sentinel grants %+v, want its own inbox only", phase, id.Grants)
+				}
+				if id.ServiceAccount != a2aServiceAccountName(agent.Namespace, busMigrationWorkloadName(agent, busMigrationSentinelIdentity, "3-1")) {
+					t.Errorf("%s: the sentinel is bound to %s", phase, id.ServiceAccount)
+				}
+			}
+		}
+	}
+	thawed := []struct {
+		leg   busMigrationLeg
+		phase busMigrationPhase
+	}{{busMigrationGrow, busMigrationReleasing}, {busMigrationGrow, busMigrationDone}, {busMigrationGrow, busMigrationAbandoned},
+		{busMigrationGrow, busMigrationFailed}, {busMigrationShrink, busMigrationPinning}, {busMigrationShrink, busMigrationShrinking}}
+	for _, tc := range thawed {
+		agent := authMapTestAgent()
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(tc.leg), RunID: "3-1", Phase: string(tc.phase), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+		doc, err := renderA2AAuthMap(agent, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var gateway, sentinel bool
+		for _, id := range doc.Identities {
+			gateway = gateway || id.User == "gateway" || id.User == a2aAgentBusUser
+			sentinel = sentinel || strings.HasPrefix(id.User, "migrate-frozen-")
+		}
+		if !gateway || sentinel {
+			t.Errorf("%s %s: install principals %v, sentinel %v; want the install's map", tc.leg, tc.phase, gateway, sentinel)
+		}
+	}
+}
+
+// The sentinel's ServiceAccount is never made: the operator refuses to
+// create it, and a sentinel ServiceAccount someone else made is left as it
+// is, never adopted (no owner reference, no label, no change).
+func TestTheSentinelsServiceAccountIsNeverMadeOrAdopted(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	name := busMigrationWorkloadName(m.agent, busMigrationSentinelIdentity, "3-1")
+	planted := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: m.agent.Namespace}}
+	if err := m.cl.Create(context.Background(), planted); err != nil {
+		t.Fatal(err)
+	}
+	before := planted.ResourceVersion
+	// Walk every phase of the leg, creating each phase's work.
+	for _, phase := range []busMigrationPhase{busMigrationFreezing, busMigrationSnapshot, busMigrationHashing, busMigrationConverting,
+		busMigrationRestoring, busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationReleasing} {
+		m.agent.Status.BusMigration.Phase = string(phase)
+		if err := m.r.ensureBusMigrationWorkload(context.Background(), m.agent, m.agent.Status.BusMigration, time.Now()); err != nil {
+			t.Fatalf("%s: %v", phase, err)
+		}
+	}
+	got := &corev1.ServiceAccount{}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(planted), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ResourceVersion != before || len(got.OwnerReferences) != 0 {
+		t.Errorf("the planted sentinel ServiceAccount was touched: rv %s->%s owners %v", before, got.ResourceVersion, got.OwnerReferences)
+	}
+	// And asked to make it, the operator refuses.
+	run := m.agent.Status.BusMigration
+	err := m.r.ensureBusMigrationWorkloadFor(context.Background(), m.agent, run, busMigrationWork{name: "x", identity: busMigrationSentinelIdentity, pod: true}, time.Now())
+	if err == nil || !strings.Contains(err.Error(), "sentinel") {
+		t.Errorf("creating the sentinel's ServiceAccount: %v, want a refusal", err)
+	}
 }
 
 // notAfter is refused on a narrowed entry here as the callout refuses it
@@ -1280,4 +1377,57 @@ func TestTheRunSecretIsReadUncached(t *testing.T) {
 		},
 	})
 	m.pass(busMigrationConverting, 3)
+}
+
+// Nothing the operator renders for the namespace can make the freeze
+// sentinel's ServiceAccount, mint a token for any ServiceAccount, or run a
+// pod as a migration identity: no rule grants serviceaccounts create,
+// serviceaccounts/token create, or a wildcard; pods create is the gateway's
+// alone, and the chart's admission policy pins every pod the gateway makes
+// to the session ServiceAccount. So the sentinel stays an identity nothing
+// holds, and the migration identities stay the operator's pods'. Every
+// pod-bearing and RBAC builder of this package is listed here (the walk's
+// own guard covers the pod builders).
+func TestNoRenderedPrincipalCanMakeOrBorrowAMigrationIdentity(t *testing.T) {
+	agent := a2aTestAgent()
+	roles := map[string][]rbacv1.PolicyRule{
+		"buildA2ACalloutRole":                  buildA2ACalloutRole(agent).Rules,
+		"buildA2ADispatcherConfigRole":         buildA2ADispatcherConfigRole(agent).Rules,
+		"buildA2ADispatcherPodsRole":           buildA2ADispatcherPodsRole(agent).Rules,
+		"buildA2AGatewayRole":                  buildA2AGatewayRole(agent).Rules,
+		"buildCredentialBrokerTokenReviewRole": buildCredentialBrokerTokenReviewRole(agent).Rules,
+		"buildMinimalPlatformRole":             buildMinimalPlatformRole(agent).Rules,
+		"buildPlatformLocalRole":               buildPlatformLocalRole(agent).Rules,
+		"buildPlatformLeaderRole":              buildPlatformLeaderRole(agent).Rules,
+	}
+	if got := buildersReturning(t, map[string]bool{"Role": true, "ClusterRole": true}); len(got) != len(roles) {
+		var names []string
+		for n := range got {
+			names = append(names, n)
+		}
+		t.Fatalf("RBAC builders in the package %v, checked here %d; list the new one", names, len(roles))
+	}
+	grants := func(r rbacv1.PolicyRule, resource, verb string) bool {
+		return (slices.Contains(r.Resources, resource) || slices.Contains(r.Resources, "*")) && (slices.Contains(r.Verbs, verb) || slices.Contains(r.Verbs, "*"))
+	}
+	for name, rules := range roles {
+		for _, r := range rules {
+			if slices.Contains(r.APIGroups, "*") || slices.Contains(r.Resources, "*") || slices.Contains(r.Verbs, "*") {
+				t.Errorf("%s has a wildcard rule: %+v", name, r)
+			}
+			if grants(r, "serviceaccounts", "create") || grants(r, "serviceaccounts/token", "create") {
+				t.Errorf("%s may create ServiceAccounts or their tokens: %+v", name, r)
+			}
+			if grants(r, "pods", "create") && name != "buildA2AGatewayRole" {
+				t.Errorf("%s may create pods, and so run one as any ServiceAccount: %+v", name, r)
+			}
+		}
+	}
+	policy, err := os.ReadFile("../../../charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(policy), `object.spec.serviceAccountName == variables.sessionAccount`) {
+		t.Error("the gateway pod admission policy no longer pins the gateway's pods to the session ServiceAccount")
+	}
 }

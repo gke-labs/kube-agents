@@ -93,3 +93,40 @@ func TestTheRenderedStreamIdentityPastItsDeadlineCannotConnect(t *testing.T) {
 		t.Errorf("connect error %v, want an authorization refusal", err)
 	}
 }
+
+// The rendered map mid-snapshot is the write freeze: the gateway, whose
+// ServiceAccount the cluster still vouches for, is not in it and cannot
+// connect; the sentinel, were its token ever minted, reaches only its own
+// inbox.
+func TestTheFrozenMapAdmitsOnlyTheMigration(t *testing.T) {
+	const (
+		gatewaySA     = "system:serviceaccount:kubeagents-system:agent-a2a-gateway"
+		tokenGateway  = "token-for-the-gateway-during-the-freeze-padded-to-the-length"
+		sentinelSA    = "system:serviceaccount:kubeagents-system:agent-bus-frozen-3-1"
+		sentinelUser  = "migrate-frozen-3-1"
+		tokenSentinel = "token-for-the-sentinel-that-nothing-should-ever-mint-padded"
+	)
+	m, err := ParseIdentityMap([]byte(renderedMigrationMap(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Lookup(gatewaySA); ok {
+		t.Fatal("the frozen map names the gateway")
+	}
+	h := startHarness(t, renderedMigrationMap(t), map[string]Attested{
+		tokenGateway:  {ServiceAccount: gatewaySA},
+		tokenSentinel: {ServiceAccount: sentinelSA},
+	})
+	if nc, err := nats.Connect(h.url, h.dial, nats.Token(tokenGateway), nats.CustomInboxPrefix("_INBOX.gateway"), nats.MaxReconnects(0)); err == nil {
+		nc.Close()
+		t.Error("the gateway connected during the freeze")
+	}
+	nc, violations := h.connectAs(t, sentinelUser, tokenSentinel)
+	checkPublish(t, nc, violations, map[string]bool{
+		"_INBOX." + sentinelUser + ".x":  false,
+		"a2a.tasks.x":                    true,
+		"$JS.API.STREAM.INFO.TASKS":      true,
+		"$JS.SNAPSHOT.RESTORE.TASKS.abc": true,
+		"_INBOX.gateway.x":               true,
+	})
+}

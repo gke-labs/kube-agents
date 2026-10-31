@@ -751,9 +751,18 @@ func busMigrationPhaseWorkload(phase busMigrationPhase) busMigrationWork {
 // it comes first; it holds no RBAC. Nothing is created without
 // OPERATOR_IMAGE, and the phase then waits out the run's deadline.
 func (r *PlatformAgentReconciler) ensureBusMigrationWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, now time.Time) error {
-	work := busMigrationPhaseWorkload(busMigrationPhase(run.Phase))
+	return r.ensureBusMigrationWorkloadFor(ctx, agent, run, busMigrationPhaseWorkload(busMigrationPhase(run.Phase)), now)
+}
+
+// ensureBusMigrationWorkloadFor is ensureBusMigrationWorkload for one work.
+func (r *PlatformAgentReconciler) ensureBusMigrationWorkloadFor(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, work busMigrationWork, now time.Time) error {
 	if work.name == "" || busMigrationImage() == "" {
 		return nil
+	}
+	if work.identity == busMigrationSentinelIdentity {
+		// Never: the sentinel's ServiceAccount must not exist, or its
+		// entry would be an identity something could hold.
+		return fmt.Errorf("refusing to create the freeze sentinel's ServiceAccount")
 	}
 	if work.name == "snapshot" {
 		pvc := buildBusStagePVC(agent, run)
@@ -982,4 +991,47 @@ func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent
 		}
 	}
 	return nil
+}
+
+// busMigrationFreezeActive reports the one to three leg's write freeze in
+// force: from Freezing until Releasing begins. While it is, the identity map
+// holds only busMigrationFrozenIdentities, and, once the callout serves that
+// map (FreezeConfirmed), the bus renders without its APP account's static
+// users.
+func busMigrationFreezeActive(agent *agentv1alpha1.PlatformAgent) bool {
+	run := agent.Status.BusMigration
+	if run == nil {
+		return false
+	}
+	phase := busMigrationPhase(run.Phase)
+	return busMigrationFrozen(busMigrationLeg(run.Leg), phase) && phase != busMigrationReleasing && !busMigrationTerminal(phase)
+}
+
+// busMigrationSentinelIdentity names the freeze's sentinel: an identity-map
+// entry that keeps the frozen map non-empty in the phases where no migration
+// principal is present (the callout refuses an empty map and goes on serving
+// the previous one, which would end the freeze unannounced). Its
+// ServiceAccount is one the operator never creates
+// (ensureBusMigrationWorkload refuses it), and it grants its own inbox only.
+const busMigrationSentinelIdentity = "frozen"
+
+// busMigrationSentinel is the run's sentinel entry.
+func busMigrationSentinel(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) a2aIdentity {
+	user := busMigrationPrincipal(busMigrationSentinelIdentity, run.RunID)
+	return a2aIdentity{
+		user:           user,
+		account:        a2aAccountApp,
+		comment:        "the bus migration's freeze sentinel for run " + run.RunID + "; keeps the frozen map non-empty, bound to a ServiceAccount nothing creates",
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(agent.Namespace, busMigrationWorkloadName(agent, busMigrationSentinelIdentity, run.RunID)),
+		publish:        []string{"_INBOX." + user + ".>"},
+		subscribe:      []string{"_INBOX." + user + ".>"},
+		notAfter:       ptr.To(run.Deadline.UTC()),
+	}
+}
+
+// busMigrationFrozenIdentities is the whole callout identity map during the
+// freeze: the migration principal of the phase, if any, and the sentinel.
+func busMigrationFrozenIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
+	return append(busMigrationIdentities(agent), busMigrationSentinel(agent, agent.Status.BusMigration))
 }

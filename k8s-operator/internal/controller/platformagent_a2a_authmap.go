@@ -152,7 +152,14 @@ type a2aAuthMapDocument struct {
 // left out rather than failing the render (agentProfileMapEntries).
 func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (a2aAuthMapDocument, error) {
 	identities := make([]a2aAuthMapIdentity, 0)
-	for _, id := range calloutIdentities(agent) {
+	ids := calloutIdentities(agent)
+	if busMigrationFreezeActive(agent) {
+		// The write freeze: the migration's principals and the run's
+		// sentinel, and nothing else, so no other workload authenticates
+		// (busMigrationFrozenIdentities). No profiles, no dispatcher.
+		ids, profiles = busMigrationFrozenIdentities(agent), nil
+	}
+	for _, id := range ids {
 		identities = append(identities, a2aAuthMapIdentity{
 			ServiceAccount: id.serviceAccount,
 			User:           id.user,
@@ -169,7 +176,7 @@ func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 	// The dispatcher, when this operator has an image for it. Its grants
 	// name each durable the operator creates, so it is built here, from the
 	// same profiles (platformagent_a2a_dispatcher.go).
-	if a2aDispatcherEnabled() {
+	if a2aDispatcherEnabled() && !busMigrationFreezeActive(agent) {
 		names, durables := dispatcherGrantNames(agent, profiles)
 		id := dispatcherIdentity(agent, agent.Namespace, names, durables)
 		identities = append(identities, a2aAuthMapIdentity{
