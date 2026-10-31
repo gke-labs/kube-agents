@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 )
@@ -247,6 +248,138 @@ func TestEnvMCPTokenBareSelectorSharedByAnotherKeyIsAmbiguous(t *testing.T) {
 	if got := EnvMCPTokenFor(bare, saved); got != envTokenValue {
 		t.Fatalf("a bare selector with no namesake got %q; want the env token", got)
 	}
+}
+
+// A bare key that holds a slash of its own (discovery's "<namespace>/<alias>") is still bare: a
+// namesake qualified by another context makes it ambiguous.
+func TestEnvMCPTokenBareKeyWithASlashIsStillAmbiguous(t *testing.T) {
+	t.Setenv(EnvMCPToken, envTokenValue)
+	bare := DeploymentProfile{Name: "ns-a/pa", KubeContext: "ctx-1", Namespace: "ns-a"}
+	qualified := DeploymentProfile{Name: "ctx-2/ns-a/pa", KubeContext: "ctx-2", Namespace: "ns-a"}
+	saved := map[string]DeploymentProfile{bare.Name: bare, qualified.Name: qualified}
+	t.Setenv(EnvMCPTokenDeployment, "ns-a/pa")
+	if got := EnvMCPTokenFor(bare, saved); got != "" {
+		t.Fatalf("a bare ns-qualified key shared by ctx-2/ns-a/pa reached ctx-1 as %q; want none", got)
+	}
+	t.Setenv(EnvMCPTokenDeployment, "ctx-1/ns-a/pa")
+	if got := EnvMCPTokenFor(bare, saved); got != envTokenValue {
+		t.Fatalf("ctx-1/ns-a/pa: the bare-key install got %q; want the env token", got)
+	}
+	if got := EnvMCPTokenFor(qualified, saved); got != "" {
+		t.Fatalf("ctx-1/ns-a/pa: ctx-2/ns-a/pa got %q; want none", got)
+	}
+}
+
+// A kube context whose name holds slashes (an EKS ARN) still qualifies the bare key it kept.
+func TestEnvMCPTokenQualifiedFormWorksForAContextWithSlashes(t *testing.T) {
+	t.Setenv(EnvMCPToken, envTokenValue)
+	eks := "arn:aws:eks:us-east-1:111122223333:cluster/prod"
+	bare := DeploymentProfile{Name: "prod", KubeContext: eks, Namespace: testNamespace}
+	qualified := DeploymentProfile{Name: "ctx-2/prod", KubeContext: "ctx-2", Namespace: testNamespace}
+	saved := map[string]DeploymentProfile{bare.Name: bare, qualified.Name: qualified}
+	t.Setenv(EnvMCPTokenDeployment, eks+"/prod")
+	if got := EnvMCPTokenFor(bare, saved); got != envTokenValue {
+		t.Fatalf("%s/prod: the bare-key install got %q; want the env token", eks, got)
+	}
+	if got := EnvMCPTokenFor(qualified, saved); got != "" {
+		t.Fatalf("%s/prod: ctx-2/prod got %q; want none", eks, got)
+	}
+}
+
+// For any selector, KUBE_AGENTS_MCP_TOKEN reaches at most one saved deployment; a bare name that two
+// saved keys share as their base name reaches none. Checked over saved sets mixing bare,
+// namespace-qualified and context-qualified keys, with contexts that hold slashes of their own.
+func TestEnvMCPTokenReachesAtMostOneDeploymentForAnySelector(t *testing.T) {
+	t.Setenv(EnvMCPToken, envTokenValue)
+	contexts := []string{"ctx-1", "ctx-2", "arn:aws:eks:us-east-1:111122223333:cluster/prod", "default/api-example-com:6443/admin"}
+	names := []string{"prod", "ns-a/pa"}
+	// Every saved set of up to three installs, each kept bare or qualified by its context.
+	type install struct{ ctx, name string }
+	var all []install
+	for _, c := range contexts {
+		for _, n := range names {
+			all = append(all, install{c, n})
+		}
+	}
+	sets := 0
+	for a := 0; a < len(all); a++ {
+		for b := a; b < len(all); b++ {
+			for c := b; c < len(all); c++ {
+				picked := []install{all[a], all[b], all[c]}
+				for mask := 0; mask < 8; mask++ {
+					saved := map[string]DeploymentProfile{}
+					seen := map[string]bool{}
+					valid := true
+					for i, in := range picked {
+						if seen[in.ctx+"\x00"+in.name] {
+							valid = false
+							break
+						}
+						seen[in.ctx+"\x00"+in.name] = true
+						key := in.name
+						if mask&(1<<i) != 0 {
+							key = in.ctx + "/" + in.name
+						}
+						if _, dup := saved[key]; dup {
+							valid = false
+							break
+						}
+						saved[key] = DeploymentProfile{Name: key, KubeContext: in.ctx, Namespace: testNamespace}
+					}
+					if !valid {
+						continue
+					}
+					sets++
+					selectors := map[string]bool{}
+					for key, p := range saved {
+						selectors[key] = true
+						selectors[deploymentBaseName(key, p)] = true
+						selectors[p.KubeContext+"/"+key] = true
+						selectors[p.KubeContext+"/"+deploymentBaseName(key, p)] = true
+					}
+					for sel := range selectors {
+						t.Setenv(EnvMCPTokenDeployment, sel)
+						var got []string
+						for key, p := range saved {
+							if EnvMCPTokenFor(p, saved) != "" {
+								got = append(got, key)
+							}
+						}
+						if len(got) > 1 {
+							t.Fatalf("selector %q reached %d deployments %v of %v; want at most one", sel, len(got), got, keysOf(saved))
+						}
+						if _, exact := saved[sel]; !exact {
+							continue
+						}
+						if deploymentBaseName(sel, saved[sel]) != sel {
+							continue
+						}
+						shared := 0
+						for key, p := range saved {
+							if deploymentBaseName(key, p) == sel {
+								shared++
+							}
+						}
+						if shared > 1 && len(got) != 0 {
+							t.Fatalf("bare selector %q shared by %d saved keys reached %v of %v; want none", sel, shared, got, keysOf(saved))
+						}
+					}
+				}
+			}
+		}
+	}
+	if sets < 50 {
+		t.Fatalf("only %d saved sets were checked; the generator is not covering the space", sets)
+	}
+}
+
+func keysOf(saved map[string]DeploymentProfile) []string {
+	out := make([]string, 0, len(saved))
+	for k := range saved {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func TestEnvMCPTokenSelectorDoesNotMatchARenamedProfileByItsBaseName(t *testing.T) {

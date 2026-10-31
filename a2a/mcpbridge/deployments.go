@@ -656,20 +656,24 @@ func envTokenSelectorKey(scope string, saved map[string]DeploymentProfile) (stri
 	if scope == "" {
 		return "", false
 	}
-	if _, ok := saved[scope]; ok && !strings.Contains(scope, "/") {
-		for key, p := range saved {
-			if key != scope && deploymentBaseName(key, p) == scope {
-				return "", false
+	if p, ok := saved[scope]; ok {
+		// A key stored bare (not qualified by its own kube context) never settles which install
+		// gets the credential when another saved key shares it as its base name. Whether a key is
+		// bare comes from its profile, never from the characters in the selector.
+		if deploymentBaseName(scope, p) == scope {
+			for key, other := range saved {
+				if key != scope && deploymentBaseName(key, other) == scope {
+					return "", false
+				}
 			}
 		}
 		return scope, true
 	}
-	if _, ok := saved[scope]; ok {
-		return scope, true
-	}
-	if ctx, name, ok := strings.Cut(scope, "/"); ok {
-		if p, found := saved[name]; found && strings.TrimSpace(p.KubeContext) == ctx {
-			return name, true
+	// "<kube-context>/<name>" also names the profile that kept the bare key, whatever characters
+	// the context name holds (an EKS ARN or an OpenShift context has slashes of its own).
+	for key, p := range saved {
+		if ctx := strings.TrimSpace(p.KubeContext); ctx != "" && scope == ctx+"/"+key {
+			return key, true
 		}
 	}
 	return "", false
