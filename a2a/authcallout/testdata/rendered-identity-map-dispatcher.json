@@ -1,5 +1,5 @@
 {
-  "version": "b410f03c5a5cf23f",
+  "version": "2907236dd31c696f",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -24,6 +24,7 @@
           "$JS.API.STREAM.CREATE.KV_feedback",
           "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
           "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
+          "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
           "$JS.API.STREAM.INFO.TASKS",
           "$JS.API.STREAM.INFO.DIRECTORY",
           "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -34,6 +35,7 @@
           "$JS.API.STREAM.INFO.KV_feedback",
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+          "$JS.API.STREAM.INFO.DISPATCH_STOPS",
           "_INBOX.provision.>"
         ],
         "subscribe": [
@@ -138,6 +140,7 @@
           "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-tse-read-child",
           "$JS.ACK.PROFILE_SUBMITS.profile-tse-read-child.>",
           "a2a.tasks.tse.*.supervisor",
+          "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.tse.*",
           "$KV.PROFILE_LEASES.>",
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.DIRECT.GET.KV_PROFILE_LEASES.>",
@@ -149,6 +152,7 @@
           "_INBOX.dispatcher.>"
         ],
         "subscribe": [
+          "a2a.stop.tse.*",
           "a2a.dispatch.*.*.*.accept",
           "a2a.dispatch.*.*.*.lease",
           "a2a.cap.reply.dispatcher.>",

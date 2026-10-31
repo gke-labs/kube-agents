@@ -317,3 +317,17 @@ func TestTheOperatorsHeldDurableIsOneSubscribeHeldBinds(t *testing.T) {
 		t.Errorf("pool labels %v, want exactly %v", doc.PoolLabels, want)
 	}
 }
+
+// A negative submission retention is refused; zero is an operator that
+// predates the field.
+func TestDispatchConfigRefusesANegativeRetention(t *testing.T) {
+	base := DispatchConfig{Namespace: "ns", ProfileNamespace: "ns-profiles", Ceiling: 6, LeaseSeconds: 90, RenewSeconds: 20, RestartGraceSeconds: 60, AcceptTimeoutSeconds: 10}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("the base config: %v", err)
+	}
+	neg := base
+	neg.SubmitRetentionSeconds = -1
+	if err := neg.Validate(); err == nil || !strings.Contains(err.Error(), "submitRetentionSeconds") {
+		t.Errorf("a negative retention = %v, want refused", err)
+	}
+}

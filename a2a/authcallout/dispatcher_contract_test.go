@@ -84,12 +84,18 @@ func TestTheRenderedDispatcherReachesItsContractAndNothingNear(t *testing.T) {
 		"a2a.agents.tse":         true,
 		// The supervisor subject of something it doesn't dispatch for: a session's.
 		lib.TaskSupervisorSubject("session-abc", "t1"): true,
+		// Stop records: read by subject for its own profiles, never written.
+		"$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.tse.t1":   false,
+		"$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.other.t1": true,
+		"a2a.stop.tse.t1": true,
 	})
 	for subject, wantRefused := range map[string]bool{
 		lib.DispatchAcceptSubject("tse", "read", pod): false,
 		lib.DispatchLeaseSubject("tse", "read", pod):  false,
 		"a2a.tasks.>":                           true,
 		"a2a.submit.>":                          true,
+		"a2a.stop.tse.*":                        false,
+		"a2a.stop.other.*":                      true,
 		lib.TaskEventsSubject("tse", "t1"):      true,
 		lib.DispatchSubject("tse", "read", pod): true,
 		"_INBOX.gateway.>":                      true,
@@ -194,6 +200,13 @@ func TestTheRenderedConsoleReadsSubmissionsOnly(t *testing.T) {
 		"$JS.ACK." + lib.ProfileSubmitStream + ".>":                                                                 true,
 		subject: true,
 	})
+	// A browser credential reads neither the dispatcher's hand-off, whose
+	// confirms carry a task's credentials, nor the stop records.
+	for _, s := range []string{lib.DispatchSubject("tse", "read", "pod-1"), "a2a.dispatch.>", "a2a.stop.tse.t1", "a2a.stop.>"} {
+		if !subscribeRefused(t, nc, violations, s) {
+			t.Errorf("the console may subscribe to %s", s)
+		}
+	}
 }
 
 // The dispatcher lists a (profile, tier)'s leases after a restart, through
