@@ -88,7 +88,15 @@ STUB_KUBECTL = textwrap.dedent(
     #!/usr/bin/env bash
     printf 'kubectl %s\\n' "$*" >> "${STUB_CALLS}"
     case "$*" in
-      "port-forward "*|"--context "*" port-forward "*) exec sleep 600 ;;
+      "--context "*" port-forward "*)
+        # STUB_RELAY_GONE: a marker path; the first port-forward exits and the
+        # relay reads as gone once, as after a node drain.
+        if [ -n "${STUB_RELAY_GONE:-}" ] && [ ! -e "${STUB_RELAY_GONE}.pf" ]; then : > "${STUB_RELAY_GONE}.pf"; exit 1; fi
+        exec sleep 600 ;;
+      "--context "*" get pod "*)
+        if [ -n "${STUB_RELAY_GONE:-}" ] && [ ! -e "${STUB_RELAY_GONE}.get" ]; then : > "${STUB_RELAY_GONE}.get"; echo 'Error from server (NotFound): pods "forge-relay" not found'; exit 1; fi
+        echo Running; exit 0 ;;
+      "port-forward "*) exec sleep 600 ;;
       "wait "*|"delete pod "*|"--context "*|"run forge-relay "*) exit 0 ;;
       "config current-context") echo host-ctx; exit 0 ;;
     esac
@@ -534,6 +542,27 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("is not writable, so gitlab.eval.internal cannot point at the tunnel", proc.stderr)
         self.assertTrue(self.calls_of("compute instances delete forge-gitlab-ce"))
+
+    def test_up_on_gitlab_ce_puts_the_entry_on_its_own_line_after_a_last_line_without_a_newline(self):
+        self.provision()
+        self.hosts.write_text("127.0.0.1 localhost")
+        self.assertEqual(self.run_forge("up", forge="gitlab-ce").returncode, 0)
+        self.assertEqual(self.hosts.read_text().splitlines(), ["127.0.0.1 localhost", "127.0.0.1 gitlab.eval.internal"])
+
+    def test_the_keeper_re_creates_a_relay_pod_that_is_gone(self):
+        self.provision()
+        marker = self.dir / "relay-gone"
+        self.assertEqual(self.run_forge("up", forge="gitlab-ce", STUB_RELAY_GONE=str(marker)).returncode, 0)
+        recreated = []
+        for _ in range(100):  # the keeper's restart pause is 2 s
+            recreated = self.calls_of("kubectl --context host-ctx run forge-relay ")
+            if recreated:
+                break
+            time.sleep(0.1)
+        self.assertTrue(recreated, "a relay the drain took is re-created, in the recorded context")
+        self.assertIn("TCP-LISTEN:8443,fork,reuseaddr", recreated[0])
+        self.assertTrue(self.calls_of("kubectl --context host-ctx wait --for=condition=Ready pod/forge-relay"))
+        self.assertEqual(self.run_forge("down", forge="gitlab-ce").returncode, 0)
 
     def test_down_on_gitlab_ce_removes_an_entry_that_was_the_hosts_files_only_line(self):
         self.provision()

@@ -672,10 +672,12 @@ open_tunnel() {
       return 1
     }
   fi
+  # The relay's create, here and in the keeper below, which re-creates it.
+  local relay_run=(run "${FORGE_RELAY_POD}" -n "${FORGE_CLUSTER_CHECK_NAMESPACE}" --image="${FORGE_RELAY_IMAGE}" --restart=Never
+    --labels="app.kubernetes.io/part-of=kube-agents-eval,${FORGE_VM_LABEL_KEY}=${EVAL_FORGE}" --port="${FORGE_RELAY_PORT}"
+    -- "TCP-LISTEN:${FORGE_RELAY_PORT},fork,reuseaddr" "TCP:${FORGE_IP}:443")
   kubectl delete pod "${FORGE_RELAY_POD}" -n "${FORGE_CLUSTER_CHECK_NAMESPACE}" --ignore-not-found --wait=true >/dev/null
-  kubectl run "${FORGE_RELAY_POD}" -n "${FORGE_CLUSTER_CHECK_NAMESPACE}" --image="${FORGE_RELAY_IMAGE}" --restart=Never \
-    --labels="app.kubernetes.io/part-of=kube-agents-eval,${FORGE_VM_LABEL_KEY}=${EVAL_FORGE}" --port="${FORGE_RELAY_PORT}" \
-    -- "TCP-LISTEN:${FORGE_RELAY_PORT},fork,reuseaddr" "TCP:${FORGE_IP}:443" >/dev/null || {
+  kubectl "${relay_run[@]}" >/dev/null || {
     echo "ERROR: could not create the relay pod ${FORGE_RELAY_POD} in ${CLUSTER_NAME}." >&2
     return 1
   }
@@ -685,12 +687,27 @@ open_tunnel() {
   }
   [ -d "${EVAL_FORGE_STATE_DIR}" ] || install -d -m 700 "${EVAL_FORGE_STATE_DIR}"
   kubectl config current-context > "${FORGE_TUNNEL_CONTEXT_FILE}" 2>/dev/null || true
-  # A port-forward dies with its API stream (a control-plane roll, the relay's
-  # node); the keeper restarts it for the run's length, in the recorded
-  # context (a case's stack may move the current one), and `down` kills both.
-  nohup bash -c 'while :; do kubectl --context "$6" port-forward -n "$1" "pod/$2" --address 127.0.0.1 "$3:$4"; sleep "$5"; done' _ \
+  # A port-forward dies with its API stream (a control-plane roll) or with the
+  # relay, which has no controller: a node drain or an eviction takes it. The
+  # keeper restarts the stream for the run's length and re-creates a relay
+  # that is gone or finished, in the recorded context (a case's stack may move
+  # the current one); `down` kills both.
+  # shellcheck disable=SC2016 # expanded by the keeper's own shell
+  nohup bash -c '
+    ns=$1 pod=$2 lport=$3 rport=$4 pause=$5 ctx=$6 ready=$7; shift 7
+    while :; do
+      kubectl --context "$ctx" port-forward -n "$ns" "pod/$pod" --address 127.0.0.1 "$lport:$rport"
+      state="$(kubectl --context "$ctx" get pod "$pod" -n "$ns" -o "jsonpath={.status.phase}" 2>&1)"
+      case "$state" in
+        *NotFound*|Failed|Succeeded)
+          echo "relay pod $pod is ${state}; re-creating it"
+          kubectl --context "$ctx" delete pod "$pod" -n "$ns" --ignore-not-found --wait=true >/dev/null
+          kubectl --context "$ctx" "$@" >/dev/null && kubectl --context "$ctx" wait --for=condition=Ready "pod/$pod" -n "$ns" --timeout="$ready" >/dev/null ;;
+      esac
+      sleep "$pause"
+    done' _ \
     "${FORGE_CLUSTER_CHECK_NAMESPACE}" "${FORGE_RELAY_POD}" "${FORGE_TUNNEL_LOCAL_PORT}" "${FORGE_RELAY_PORT}" "${FORGE_TUNNEL_RESTART_SECONDS}" \
-    "$(cat "${FORGE_TUNNEL_CONTEXT_FILE}")" \
+    "$(cat "${FORGE_TUNNEL_CONTEXT_FILE}")" "${FORGE_CLUSTER_CHECK_TIMEOUT}" "${relay_run[@]}" \
     > "${FORGE_TUNNEL_LOG_FILE}" 2>&1 &
   echo "$!" > "${FORGE_TUNNEL_PID_FILE}"
   if ! grep -qxF "$(hosts_entry)" "${FORGE_TUNNEL_HOSTS_FILE}" 2>/dev/null; then
@@ -698,6 +715,8 @@ open_tunnel() {
       echo "ERROR: ${FORGE_TUNNEL_HOSTS_FILE} is not writable, so ${EVAL_FORGE_HOST} cannot point at the tunnel; run as root, or set FORGE_TUNNEL_HOSTS_FILE to a hosts file the resolver reads." >&2
       return 1
     }
+    # A file whose last line has no newline would take the entry onto that line.
+    [ ! -s "${FORGE_TUNNEL_HOSTS_FILE}" ] || [ -z "$(tail -c 1 "${FORGE_TUNNEL_HOSTS_FILE}")" ] || printf '\n' >> "${FORGE_TUNNEL_HOSTS_FILE}"
     printf '%s\n' "$(hosts_entry)" >> "${FORGE_TUNNEL_HOSTS_FILE}"
   fi
   deadline=$(( SECONDS + FORGE_TUNNEL_READY_SECONDS ))
