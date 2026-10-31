@@ -254,26 +254,25 @@ Even at **30,000 clusters and 60,000 workloads**, the entire Git knowledge base 
 ```mermaid
 flowchart TB
   subgraph Input["1. Chat & Task Ingress"]
-    DM["Engineer in DM\n(chat_type=dm)"]
-    GRP["Group Thread / Task\n(chat_type=group)"]
+    DM["Engineer in Direct Message (DM)"]
+    GRP["Group Space or Background Task"]
   end
-  subgraph Identity["2. Identity & Fail-Closed Scoping"]
-    GW["a2a/gateway + hermes-bridge\n(hmac:<32-hex> + session_kv.db)"]
-    ST["5 Session States\n(attributed-dm | unattributable-shared |\nunattributable-interactive | unattended | read-only)"]
+  subgraph Identity["2. Caller Identity & Per-User Privacy Scoping"]
+    GW["API Gateway Identity Propagation\n(Pseudonymous user:<id> + Conversation Scope)"]
+    DM_OK["Direct Message (Verified Caller)\nReads & writes personal user:<id> + reads scope:shared"]
+    GRP_NO["Group Space / Background Task / Missing Identity\nPersonal user:<id> blocked (reads scope:shared only)"]
   end
-  subgraph Store["3. Layer 1 Store: kube-agents-memory (PostgreSQL pgvector)"]
-    P["Personal Scope (user:<id>)\nAuto DM capture & memory_retain(personal)"]
-    R["Hybrid Retrieval (Vector + BM25 + Graph)\n+ Offline CPU Rerank (~4.3K tokens/turn)"]
-  end
-  subgraph L2Route["4. Shared Policy Handoff"]
-    L2["memory_retain(scope=shared)\nRoutes to Layer 2 Curator (status:proposed)"]
+  subgraph Store["3. Layer 1 Store: Self-Hosted Hindsight (kube-agents-memory on PostgreSQL pgvector)"]
+    P["Memory Population & Consolidation\nAuto DM capture & explicit memory_retain"]
+    R["Hybrid Retrieval (Vector + BM25 + Graph)\n+ Offline CPU Reranking (tags_match: any_strict)"]
   end
   DM --> GW
   GRP --> GW
-  GW --> ST
-  ST -->|"attributed-dm only"| P
-  ST -->|"scope:shared rule"| L2
-  P --> R -->|"prefetch / memory_recall\n(tags_match: any_strict)"| Ctx["Agent Turn Context\n(api_content sidecar)"]
+  GW --> DM_OK
+  GW --> GRP_NO
+  DM_OK --> P
+  GRP_NO --> R
+  P --> R -->|"prefetch & memory_recall / reflect"| Ctx["Agent Runtime Turn Context\n(Bounded per-turn sidecar, prompt cache preserved)"]
 ```
 
 #### Choosing a provider
