@@ -471,6 +471,18 @@ SOURCES: dict[str, Source] = {
             "a2aBridgeUser",
         ),
     ),
+    # The AgentProfile dispatcher's identity is built in its own file, from the
+    # profiles and durables the authmap lists, and joins the identity map
+    # beside the rows above. A writer set read from the identities file alone
+    # leaves it out of every one-writer assertion.
+    "a2a_dispatcher": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        (
+            "func dispatcherIdentity(",
+            "a2aDispatcherUser",
+            "var perProfile []string",
+        ),
+    ),
     # The JetStream halves of the publish lists live in the manifests file, and
     # the identity builders append them by call. A reader of the identities file
     # alone sees an unresolved `append(publish, a2aAgentJetStreamGrants()...)`

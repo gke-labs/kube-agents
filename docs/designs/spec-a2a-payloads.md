@@ -734,7 +734,8 @@ delegation to profiles onward; nothing writes them yet. Until a gateway reads a 
 worker adapter refuses a request carrying any, rather than publish one whose child would be minted
 without its target. Both are `data` parts, and only the gateway
 writes them: the gateway strips any a client or a task supplies, and a reader refuses a message carrying two
-`taskParameters` parts.
+`taskParameters` parts. Of the task parameters' fields, `changeRequested` is set true only for a
+turn that arrived as a structured confirm.
 
 **Task parameters.** A profile task's submission carries
 `{"taskParameters": {"parameters": {"<name>": "<value>", …}}}`: the parameters its persona
@@ -743,6 +744,12 @@ from what the client or the parent task asked. They never ride the authority blo
 builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`) and passes each
 to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
 and that check is what makes these message fields authoritative.
+
+`changeRequested` (bool, absent means false) beside `parameters` says the requester asked for a
+change rather than an answer, and so whether the dispatcher grants the worker the permit to open
+a pull request. The gateway sets it only for a turn that arrived as a structured confirm, never
+from free text or a delegation's arguments. Children and wakes inherit it from the gateway's own
+task record. When it is true the gateway attaches the part even with no parameters.
 
 - A name is a lower-case identifier of at most 63 characters, the persona loader's own rule (`lib.TaskParameterNameRE`). A value is one token of at most 128
   characters, starting with a letter or digit and then letters, digits and `. _ : -`, so it is never

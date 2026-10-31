@@ -1142,10 +1142,14 @@ not be silent about it.
 **The three endpoints.**
 
 - `POST /inject` takes a conversation key, an author and the text. The adapter prefixes the key
-  with `inject:` and delivers an `InboundMessage`; from there the turn is indistinguishable from
+  with `inject:` and delivers an `InboundMessage`; from there a typed turn is indistinguishable from
   a Discord message - the text is routed the way any text is, the gateway's literal affordances
   included, so a prompt whose first word is `delegate` or `stop` reaches those paths rather than
-  the persona. The harness sends none of them as a prompt, and a case whose prompt opens with
+  the persona. The body may also carry `"intent":"confirm"`, which submits the turn with a change
+  requested. The door accepts it only when the gateway has `A2A_INJECT_CONFIRM=true`, which the
+  operator renders only under `A2A_INJECT_BACKEND` (eval installs), and refuses it otherwise. A
+  confirm skips the text paths (the stop, feedback, session and status matchers), so it is not a
+  typed message. The harness sends none of them as a prompt, and a case whose prompt opens with
   one is the case's defect; a stopped ask's `stop`, sent during or after the opening turn, is the one it
   sends itself. The reply carries the task id, so the caller can await a named task rather
   than guessing which post belongs to its submission, and the gateway's first-event grace, so the

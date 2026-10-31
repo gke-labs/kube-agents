@@ -64,6 +64,13 @@ const (
 	// of each door, which is how inbound tells them apart.
 	consoleInSuffix      = "in"
 	consoleConfirmSuffix = "confirm"
+	// consoleSubjectRoot and consoleSubjectFamily are the first two subject
+	// tokens every console door carries; inbound checks them before it
+	// reads the door, so a frame on any other subject is not a console turn.
+	consoleSubjectRoot   = "chat"
+	consoleSubjectFamily = "console"
+	// consoleSubjectTokens is the token count of a console door subject.
+	consoleSubjectTokens = 4
 
 	// consoleConnName is the adapter's NATS connection name, and the
 	// "console" field on its connection-state log lines.
@@ -495,9 +502,12 @@ func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) 
 // gateway's own drop notice exists to avoid.
 func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 	// Subject is chat.console.<token>.in or chat.console.<token>.confirm;
-	// the token is the third field and the door the fourth.
+	// the token is the third field and the door the fourth. The prefix is
+	// checked here too, not left to the subscription: the door decides the
+	// intent, so it is read only off a subject that is a console door.
 	parts := strings.Split(m.Subject, ".")
-	if len(parts) != 4 || (parts[3] != consoleInSuffix && parts[3] != consoleConfirmSuffix) {
+	if len(parts) != consoleSubjectTokens || parts[0] != consoleSubjectRoot || parts[1] != consoleSubjectFamily ||
+		(parts[3] != consoleInSuffix && parts[3] != consoleConfirmSuffix) {
 		a.log.Warn("console frame dropped", "reason", "subject shape", "subject", m.Subject)
 		return InboundMessage{}, "", false
 	}

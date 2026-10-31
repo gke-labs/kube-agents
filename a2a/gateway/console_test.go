@@ -553,6 +553,31 @@ func TestConsoleLogsARefusedSubscriptionWithTheRemedy(t *testing.T) {
 	}
 }
 
+// inbound reads the door (in or confirm) only off a chat.console.<token>.*
+// subject. A four-token subject that ends in confirm but is not a console
+// door is dropped like any unknown subject and yields no message.
+func TestConsoleDropsAConfirmShapedSubjectOutsideTheConsoleFamily(t *testing.T) {
+	logs := &bytes.Buffer{}
+	a := &ConsoleAdapter{log: slog.New(slog.NewTextHandler(logs, nil))}
+	data, _ := json.Marshal(ConsoleInFrame{MessageID: "m1", Text: "yes, go ahead"})
+	for _, subject := range []string{"a2a.topics.shared.confirm", "x.console.tok.confirm", "chat.x.tok.confirm"} {
+		logs.Reset()
+		msg, notice, ok := a.inbound(&nats.Msg{Subject: subject, Data: data})
+		if ok || notice != "" || !reflect.DeepEqual(msg, InboundMessage{}) {
+			t.Errorf("%s: inbound = (%+v, %q, %v), want a drop", subject, msg, notice, ok)
+		}
+		if !strings.Contains(logs.String(), "console frame dropped") || !strings.Contains(logs.String(), "reason=\"subject shape\"") {
+			t.Errorf("%s: drop not logged as a subject-shape drop:\n%s", subject, logs.String())
+		}
+	}
+	// The same frame on the real confirm door is a confirm, so the drops
+	// above are the prefix check and not a frame the adapter refuses anyway.
+	msg, _, ok := a.inbound(&nats.Msg{Subject: "chat.console.tok.confirm", Data: data})
+	if !ok || msg.Intent != IntentConfirm {
+		t.Errorf("console confirm door: inbound = (%+v, %v), want a confirm", msg, ok)
+	}
+}
+
 // The confirm door is a second subscription: a render that grants the
 // gateway chat.console.*.in but not chat.console.*.confirm has its confirm
 // subscribe refused, and the log names the confirm subject, not .in.

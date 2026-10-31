@@ -2391,6 +2391,36 @@ Mutation(
         "then grant its own task the permit to open a pull request",
     ),
     Mutation(
+        "A3-session-derives-all-chat",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\t"chat.>",\n\t\t},'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "derive every executor publish on `chat.>` so a worker can post its "
+        "own progress to a chat surface. It never spells `chat.console`, and "
+        "it reaches the console's confirm door all the same",
+    ),
+    Mutation(
+        "A3-dispatcher-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ('\t\t\t"a2a.cap.verify."+a2aDispatcherUser,',
+         '\t\t\t"a2a.cap.verify."+a2aDispatcherUser,\n\t\t\t"chat.console.*.confirm",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the AgentProfile dispatcher the console's confirm door, so it "
+        "can confirm a queued change on the requester's behalf. Its identity "
+        "is built in its own file, outside the identities file the writer "
+        "sets used to read",
+    ),
+    Mutation(
+        "A3-dispatcher-stops-tasks",
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ('\t\t\t"a2a.cap.verify."+a2aDispatcherUser,',
+         '\t\t\t"a2a.cap.verify."+a2aDispatcherUser,\n\t\t\t"a2a.stop.*.*",'),
+        "test_A3_the_stop_record_has_exactly_one_writer",
+        "grant the dispatcher publish on stop records, so it can drop a "
+        "queued task itself on a deadline. It can then stop any requester's task",
+    ),
+    Mutation(
         "A3-bridge-confirms",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
