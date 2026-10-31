@@ -910,6 +910,9 @@ RULE_CALLER_VCS_PERMIT = "caller.vcs-permit"
 # A profile caller's permitted write that names a proposal or branch this
 # install does not own (VcsBroker.require_agent_proposal, #3993).
 RULE_CALLER_VCS_OWNERSHIP = "caller.vcs-ownership"
+# A profile caller's proposal-update that edits labels (#3993): refused whoever
+# owns the proposal (vcs_broker.ProfileLabelsRefused).
+RULE_CALLER_VCS_LABELS = "caller.vcs-labels"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -1301,7 +1304,9 @@ def profile_vcs_refusal(principal: Any, verb: str) -> str | None:
 
 
 def _validate_role_vcs_verbs(
-    table: dict[str, frozenset[str]], gated: frozenset[str] = PROFILE_PERMIT_GATED_VCS_VERBS
+    table: dict[str, frozenset[str]],
+    gated: frozenset[str] = PROFILE_PERMIT_GATED_VCS_VERBS,
+    owned: frozenset[str] = PROFILE_OWNERSHIP_GATED_VCS_VERBS,
 ) -> None:
     """Refuse a ``ROLE_VCS_VERBS`` entry that is not what it appears to be.
 
@@ -1339,6 +1344,15 @@ def _validate_role_vcs_verbs(
             f"ROLE_VCS_VERBS[{CALLER_ROLE_PROFILE!r}]: {', '.join(sorted(ungated))} writes to the "
             "forge without the task credential's permit"
         )
+    # And every one of them must be held to the install's own work as well: a
+    # write in the role's set and the permit's but not the ownership set would
+    # reach any proposal or branch in a managed repository under the permit.
+    unowned = (table.get(CALLER_ROLE_PROFILE, frozenset()) & vcs_broker.WRITE_VERBS) - owned
+    if unowned:
+        raise ValueError(
+            f"ROLE_VCS_VERBS[{CALLER_ROLE_PROFILE!r}]: {', '.join(sorted(unowned))} writes to the "
+            "forge without the ownership check (PROFILE_OWNERSHIP_GATED_VCS_VERBS)"
+        )
     if not gated <= vcs_broker.WRITE_VERBS:
         raise ValueError(
             f"PROFILE_PERMIT_GATED_VCS_VERBS: {', '.join(sorted(gated - vcs_broker.WRITE_VERBS))} is not a write verb"
@@ -1355,7 +1369,7 @@ def _validate_role_vcs_verbs(
             )
 
 
-_validate_role_vcs_verbs(ROLE_VCS_VERBS, PROFILE_PERMIT_GATED_VCS_VERBS)
+_validate_role_vcs_verbs(ROLE_VCS_VERBS, PROFILE_PERMIT_GATED_VCS_VERBS, PROFILE_OWNERSHIP_GATED_VCS_VERBS)
 
 
 # The kubectl flags a session caller may pass. An allowlist, for the reason
@@ -12713,10 +12727,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     try:
                         self.vcs.require_agent_proposal(verb, payload)
                     except vcs_broker.ProposalNotOurs as exc:
+                        rule = (
+                            RULE_CALLER_VCS_LABELS
+                            if isinstance(exc, vcs_broker.ProfileLabelsRefused)
+                            else RULE_CALLER_VCS_OWNERSHIP
+                        )
                         LOGGER.warning(
                             "vcs write refused for a profile caller verb=%s rule=%s reason=%s",
                             _sanitize_for_logging(verb),
-                            RULE_CALLER_VCS_OWNERSHIP,
+                            rule,
                             _sanitize_for_logging(str(exc), max_length=256),
                         )
                         self._json(
@@ -12725,7 +12744,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                                 "status": "blocked",
                                 "error": str(exc),
                                 "code": exc.fields.get("code"),
-                                "rule": RULE_CALLER_VCS_OWNERSHIP,
+                                "rule": rule,
                             },
                         )
                         return TOOL_STATUS_BLOCKED

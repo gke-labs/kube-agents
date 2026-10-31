@@ -145,6 +145,9 @@ LS_REMOTE_NO_MATCH_EXIT_CODE = 2
 # (VcsBroker.require_agent_proposal): none names a source repository today, and
 # one that did would be a fork source this check had not read.
 PROFILE_PROPOSAL_CREATE_FIELDS = frozenset({"repository", "title", "body", "source", "target", "draft"})
+# The fields a profile caller's proposal-update may carry: which proposal, and
+# its text. No label field (labelsAdd, labelsRemove) and no target.
+PROFILE_PROPOSAL_UPDATE_FIELDS = frozenset({"repository", "number", "title", "body"})
 
 # The namespace every branch this install publishes is named under, and the only
 # one `branch-delete` will touch. Every shipped caller derives its branch as
@@ -383,8 +386,44 @@ class ProposalNotOurs(WorkspaceError):
     a forge fault, which keeps the forge's own status.
     """
 
+    code = "PROPOSAL_NOT_OURS"
+
     def __init__(self, message: str) -> None:
-        super().__init__(message, status=403, code="PROPOSAL_NOT_OURS")
+        super().__init__(message, status=403, code=self.code)
+
+
+class ProfileLabelsRefused(ProposalNotOurs):
+    """A profile caller's proposal-update carries a label edit.
+
+    Refused whoever owns the proposal: labels are where a person holds or
+    approves a change, so a worker that can edit them on its own proposal can
+    lift a hold or add an approval. The HTTP layer answers it under its own
+    rule, apart from the ownership one.
+    """
+
+    code = "PROFILE_LABELS_FORBIDDEN"
+
+
+def _canonical_branch(value: Any, field: str) -> str:
+    """A profile caller's branch name, refused unless it is already the short name.
+
+    `validate_branch` first (so `owner:branch` is refused, a colon being no
+    branch character), then `_short_ref` must leave it unchanged: `publish`
+    pushes `refs/heads/<name>` with the name as given, so a check made on the
+    shortened name would judge one branch and write another.
+    """
+    try:
+        name = validate_branch(value, field)
+    except WorkspaceError as refused:
+        raise ProposalNotOurs(
+            f"{refused} -- a profile task names a branch of this repository, bare."
+        ) from refused
+    if _short_ref(name) != name:
+        raise ProposalNotOurs(
+            f"{field} {name!r} is not a bare branch name; a profile task names "
+            f"{_short_ref(name)!r} as itself."
+        )
+    return name
 
 
 def _padded(size: int, unit: int) -> int:
@@ -2032,6 +2071,15 @@ class VcsBroker:
             The bar `_require_open_proposal` keeps for the shell -- an open
             proposal, the author compared only when the credential can name
             itself -- is weaker on purpose there and is left as it is.
+          * `proposal-update` also carries no label field (`labelsAdd`,
+            `labelsRemove`, or any key naming labels) and nothing beyond
+            PROFILE_PROPOSAL_UPDATE_FIELDS: on an owned proposal it may change
+            the title and body, never add `lgtm` or remove a hold.
+          * Branch names are taken in their one canonical spelling: a `branch`
+            or `source` that `_short_ref` would shorten (`refs/heads/x`,
+            `heads/x`) is refused, because `publish` pushes the name as given
+            and `heads/platform-agent/x` would land as
+            `refs/heads/heads/platform-agent/x`.
           * `proposal-create`: the source must be a branch under
             `AGENT_BRANCH_PREFIX` in this repository. The adapters open a
             proposal from the bound repository's own branch, and
@@ -2052,7 +2100,7 @@ class VcsBroker:
 
         bound = self._bind(payload)
         if verb == "publish":
-            branch = _short_ref(validate_branch(payload.get("branch")))
+            branch = _canonical_branch(payload.get("branch"), "branch")
             if not branch.startswith(AGENT_BRANCH_PREFIX):
                 raise ProposalNotOurs(
                     f"{branch} is not under {AGENT_BRANCH_PREFIX}, the namespace this "
@@ -2102,15 +2150,9 @@ class VcsBroker:
                     f"{', '.join(sorted(PROFILE_PROPOSAL_CREATE_FIELDS))}; {extra[0]!r} is refused, "
                     "since a proposal opens only from this repository's own branch."
                 )
-            try:
-                source = _short_ref(validate_branch(payload.get("source"), "source"))
-            except WorkspaceError as refused:
-                # `owner:branch`, the cross-repository head form, lands here:
-                # a colon is no branch character.
-                raise ProposalNotOurs(
-                    f"{refused} -- a profile task opens a proposal only from a branch of "
-                    "this repository, named bare."
-                ) from refused
+            # `owner:branch`, the cross-repository head form, is refused here:
+            # a colon is no branch character.
+            source = _canonical_branch(payload.get("source"), "source")
             if not source.startswith(AGENT_BRANCH_PREFIX):
                 raise ProposalNotOurs(
                     f"{source} is not under {AGENT_BRANCH_PREFIX}, so a profile task does "
@@ -2118,6 +2160,20 @@ class VcsBroker:
                 )
             return
         if verb == "proposal-update":
+            # Before the proposal is read: no label edit, and no field beyond
+            # the text, whoever owns the proposal (see ProfileLabelsRefused).
+            labelled = sorted(key for key in payload if "label" in str(key).casefold())
+            if labelled:
+                raise ProfileLabelsRefused(
+                    f"a profile task does not edit labels ({labelled[0]!r}); a hold or "
+                    "approval label is a person's call. Update the title or body only."
+                )
+            extra = sorted(set(payload) - PROFILE_PROPOSAL_UPDATE_FIELDS)
+            if extra:
+                raise ProposalNotOurs(
+                    f"proposal-update from a profile task takes only "
+                    f"{', '.join(sorted(PROFILE_PROPOSAL_UPDATE_FIELDS))}; {extra[0]!r} is refused."
+                )
             number = validate_number(payload.get("number"))
             viewer = self._viewer(bound)
             view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number})
@@ -2542,6 +2598,7 @@ __all__ = [
     "VCS_VERBS",
     "AGENT_BRANCH_PREFIX",
     "ProposalNotOurs",
+    "ProfileLabelsRefused",
     "ROLE_CONTEXT",
     "ROLE_MANAGED",
     "ROLE_SELECTED_VERBS",

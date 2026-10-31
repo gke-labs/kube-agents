@@ -1395,6 +1395,24 @@ class ProfileRouteTableTest(unittest.TestCase):
                 )
         credential_proxy._validate_role_vcs_verbs(credential_proxy.ROLE_VCS_VERBS)
 
+    def test_a_profile_write_outside_the_ownership_check_is_refused_at_import(self):
+        # A write added to the profile role and to the permit set, but not to
+        # the ownership set, would reach any proposal in a managed repository.
+        table = {
+            credential_proxy.CALLER_ROLE_PROFILE: credential_proxy.ROLE_VCS_VERBS[credential_proxy.CALLER_ROLE_PROFILE]
+            | {"proposal-close"}
+        }
+        gated = credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS | {"proposal-close"}
+        with self.assertRaisesRegex(ValueError, "without the ownership check"):
+            credential_proxy._validate_role_vcs_verbs(table, gated, credential_proxy.PROFILE_OWNERSHIP_GATED_VCS_VERBS)
+        with self.assertRaisesRegex(ValueError, "without the ownership check"):
+            credential_proxy._validate_role_vcs_verbs(
+                credential_proxy.ROLE_VCS_VERBS,
+                credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS,
+                frozenset({"publish", "proposal-update"}),
+            )
+        credential_proxy._validate_role_vcs_verbs(table, gated, credential_proxy.PROFILE_OWNERSHIP_GATED_VCS_VERBS | {"proposal-close"})
+
     def test_the_shim_and_the_broker_name_one_header(self):
         import credential_proxy_client
 
@@ -1510,8 +1528,12 @@ class ProfileVcsRouteTest(unittest.TestCase):
         "source": "platform-agent/new-change", "target": "main",
     }
 
+    # proposal-update from a profile task carries only which proposal and its
+    # text.
+    UPDATE_PAYLOAD = {"repository": "https://github.com/acme/infra", "number": 7, "title": "t", "body": "b"}
+
     def payload_for(self, verb):
-        return self.CREATE_PAYLOAD if verb == "proposal-create" else self.PAYLOAD
+        return {"proposal-create": self.CREATE_PAYLOAD, "proposal-update": self.UPDATE_PAYLOAD}.get(verb, self.PAYLOAD)
 
     def vcs_post(self, verb, token):
         return self.post(self.payload_for(verb), token=token, path=f"/v1/vcs/{verb}")
@@ -1669,6 +1691,45 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 status, body = self.post_with("publish", branch=branch)
                 self.assert_ownership_refused("publish", status, body)
 
+    def test_publish_is_refused_for_a_ref_spelling_of_a_namespace_branch(self):
+        # publish pushes refs/heads/<branch> as given: heads/platform-agent/x
+        # would pass a check on its short name and land as
+        # refs/heads/heads/platform-agent/x.
+        for branch in ("heads/platform-agent/x", "refs/heads/platform-agent/x", "refs/heads/platform-agent/fix"):
+            with self.subTest(branch=branch):
+                self.reset()
+                status, body = self.post_with("publish", branch=branch)
+                self.assert_ownership_refused("publish", status, body)
+
+    def test_proposal_update_may_not_edit_labels_even_on_the_installs_own_proposal(self):
+        for fields in (
+            {"labelsRemove": ["do-not-merge/hold"]},
+            {"labelsAdd": ["lgtm"]},
+            {"labelsAdd": ["approved"], "labelsRemove": ["do-not-merge/hold"]},
+            {"labels": ["lgtm"]},
+            {"labelsAdd": []},
+        ):
+            with self.subTest(fields=fields):
+                self.reset()
+                status, body = self.post_with("proposal-update", **fields)
+                self.assertEqual(403, status, body)
+                self.assertEqual("PROFILE_LABELS_FORBIDDEN", body.get("code"), body)
+                self.assertEqual(credential_proxy.RULE_CALLER_VCS_LABELS, body["rule"])
+                self.routes["proposal-update"].assert_not_called()
+
+    def test_proposal_update_carries_only_the_text(self):
+        for fields in ({"target": "main"}, {"state": "closed"}, {"draft": False}):
+            with self.subTest(fields=fields):
+                self.reset()
+                status, body = self.post_with("proposal-update", **fields)
+                self.assert_ownership_refused("proposal-update", status, body)
+        for fields in ({"title": "new title"}, {"body": "new body"}):
+            with self.subTest(fields=fields):
+                self.reset()
+                status, body = self.post_with("proposal-update", **fields)
+                self.assertEqual(200, status, body)
+                self.routes["proposal-update"].assert_called_once()
+
     def test_publish_runs_under_the_branch_namespace(self):
         status, body = self.post_with("publish", branch="platform-agent/new-change")
         self.assertEqual(200, status, body)
@@ -1735,15 +1796,16 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 self.assert_ownership_refused("publish", status, body)
 
     def test_proposal_create_runs_from_the_installs_own_branch(self):
-        for source in ("platform-agent/new-change", "refs/heads/platform-agent/new-change"):
-            with self.subTest(source=source):
-                self.reset()
-                status, body = self.post_with("proposal-create", source=source)
-                self.assertEqual(200, status, body)
-                self.routes["proposal-create"].assert_called_once()
+        status, body = self.post_with("proposal-create", source="platform-agent/new-change")
+        self.assertEqual(200, status, body)
+        self.routes["proposal-create"].assert_called_once()
 
     def test_proposal_create_is_refused_off_the_branch_namespace(self):
-        for source in ("fix", "main", "refs/heads/main", "release-1.2", "platform-agentx/fix"):
+        # The ref spellings too: one spelling of a branch, the bare name.
+        for source in (
+            "fix", "main", "refs/heads/main", "release-1.2", "platform-agentx/fix",
+            "refs/heads/platform-agent/new-change", "heads/platform-agent/new-change",
+        ):
             with self.subTest(source=source):
                 self.reset()
                 status, body = self.post_with("proposal-create", source=source)
@@ -1764,6 +1826,8 @@ class ProfileVcsRouteTest(unittest.TestCase):
             {"source_project_id": 42},
             {"sourceProject": "other-owner/infra"},
             {"fork": True},
+            {"labels": ["lgtm"]},
+            {"labelsAdd": ["approved"]},
         ):
             with self.subTest(fields=fields):
                 self.reset()
@@ -1785,6 +1849,11 @@ class ProfileVcsRouteTest(unittest.TestCase):
             ("publish", {"branch": "platform-agent/theirs"}),
             ("proposal-create", {"source": "feature/person"}),
             ("proposal-create", {"source": "platform-agent/x", "sourceRepo": "other-owner/infra"}),
+            ("proposal-create", {"source": "platform-agent/x", "labels": ["lgtm"]}),
+            ("proposal-update", {"number": 8, "labelsAdd": ["lgtm"], "labelsRemove": ["do-not-merge/hold"]}),
+            ("proposal-update", {"number": 7, "target": "main"}),
+            ("publish", {"branch": "heads/platform-agent/x"}),
+            ("publish", {"branch": "refs/heads/platform-agent/x"}),
         ):
             with self.subTest(verb=verb, fields=fields):
                 self.reset()

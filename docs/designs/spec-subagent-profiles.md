@@ -407,8 +407,14 @@ What the operator renders per profile, as built (amended 10/6):
     when every one passes that same test (a full or truncated list is refused, and `advance`
     still needs one open proposal); `proposal-create` only from a bare `platform-agent/` branch
     of this repository, with no field beyond `repository`, `title`, `body`, `source`, `target`
-    and `draft`, so `owner:branch` and any source-repository field are refused. A credential
-    that cannot name its login is refused.
+    and `draft`, so `owner:branch` and any source-repository field are refused. A
+    `proposal-update` carries only `repository`, `number`, `title` and `body`: a label edit
+    (`labelsAdd`, `labelsRemove`, or any key naming labels) is refused even on the install's
+    own proposal, with code `PROFILE_LABELS_FORBIDDEN` under rule `caller.vcs-labels`, since a
+    hold or an approval label is a person's call. A `branch` or `source` must be the bare
+    name: `refs/heads/...` and `heads/...` are refused, because `publish` pushes the name as
+    given. A credential that cannot name its login is refused where a login is compared: on
+    `proposal-update`, and on a `publish` onto a branch that carries open proposals.
     The shell keeps its own, weaker `advance` bar. Every other verb is refused: `snapshot` and
     `capabilities`, which skip the managed list, and every other write, `branch-delete`
     among them. The shim sends the credential on these calls as it does on an exec. Known

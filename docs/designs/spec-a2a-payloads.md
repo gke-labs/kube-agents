@@ -744,6 +744,13 @@ builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`
 to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
 and that check is what makes these message fields authoritative.
 
+The same object may carry `"changeRequested": true`: the requester asked for a change (a pull
+request) rather than an answer. Only the gateway sets it, and only for a turn that arrived as a
+structured confirm action, never from free text or a delegation's arguments. A child task carries
+its parent's value from the gateway's own record and cannot raise it. Absent means false, so a
+submission that asks for no change is byte-identical to one written before the field existed. The
+dispatcher turns it into the `vcs:proposal-create` permit on the task's credential-proxy token.
+
 - A name is a lower-case identifier of at most 63 characters, the persona loader's own rule (`lib.TaskParameterNameRE`). A value is one token of at most 128
   characters, starting with a letter or digit and then letters, digits and `. _ : -`, so it is never
   `.`, `..` or a flag.
