@@ -427,6 +427,32 @@ the organisation or a group is not in that answer, and reading those needs
 verbs the broker's allowlist does not carry. A `custom` set chosen on purpose
 is reported like any other grant, and repeated daily like one.
 
+## `leeway-watch` sweeps topology skew and priority-rank findings daily
+
+The `topology-drift` skill reads a `leeway report` on request and attributes
+the zonal skew it finds. `leeway_watch.py` (`no_agent: true`, `deliver:
+"chat"`, daily at 08:30 UTC) runs `leeway report --topology-tier-c-signals
+--clusters <project>/<location>/<cluster>,…` in `agent-sandbox` across the fleet
+(`LEEWAY_WATCH_CLUSTERS` when set, else `LEEWAY_WATCH_PROJECTS` or the
+management project plus every project a Cluster Agent profile's identity names;
+a project with no Cluster Agent profiles is enumerated with `gcloud container
+clusters list` first, since the sandbox relays that and not the GKE API route
+leeway's own `--clusters-from <project>` would take) and gates notifications
+through `<profile home>/leeway/ledger.json`. The report's topology findings
+(`leeway.contract_violated`, `leeway.placement_drift`,
+`leeway.domain_unavailable`) are keyed by cluster, namespace, subject, topology
+key and kind; its ComputeClass rank findings (`leeway.rank_wedged`,
+`leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`)
+by cluster, class, judging rule and kind. A finding earns a report under
+`<profile home>/leeway/reports/` (`<timestamp>.md` and `<timestamp>.json`, with
+`latest.md` and `latest.json` symlinks) and a chat summary line when it first
+appears, when its `suspectedCause` (a rank finding's `rule`) changes or its
+`severity` escalates, or when its 7-day refresh window
+(`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes of slack) comes round. Resolved
+findings on cleanly scanned (`status: "ok"`) clusters are retired with a single
+resolution line, while clusters whose scan failed retain their ledger entries so
+transient errors do not erase state and re-page tomorrow.
+
 ## `session-retention` gives every profile's history an end
 
 Hermes already prunes session history: `sessions.auto_prune` deletes ended
