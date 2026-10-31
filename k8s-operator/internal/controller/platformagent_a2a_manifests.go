@@ -3704,9 +3704,10 @@ const defaultA2AMaxSessions = 10
 // pod-creator cannot dodge (ResourceQuota scopes select on fields the
 // creator writes), so it must leave room for everything else that
 // legitimately runs here: the rendered stack and its neighbors (operator,
-// agent pod, gateway, NATS, LiteLLM, dashboard), Job pods (provision, seed),
-// rollout surge doubling a Deployment for a moment, and the gateway's
-// count-then-create overshoot. Fifteen covered roughly ten standing pods plus
+// agent pod, gateway, NATS, LiteLLM, dashboard), Job pods (provision, seed,
+// and the scope publisher's, one at a time and only while it runs, since a
+// finished pod counts against no quota), rollout surge doubling a
+// Deployment for a moment, and the gateway's count-then-create overshoot. Fifteen covered roughly ten standing pods plus
 // surge; the console server made it eleven, hence sixteen. If the base
 // install grows again, raise this before anything user-visible starts failing
 // admission.
@@ -4205,7 +4206,7 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 // Namespaced: pods, its own Deployment and its own PlatformAgent, the last two
 // pinned by name. The gateway creates and reaps one pod per delegated task in
 // its own namespace; it reads no Secret, no ConfigMap but the one home-channel record it
-// may patch, and no other namespace.
+// may patch and, under mode next, the resolved scope, and no other namespace.
 //
 // What it does NOT bound, stated because the next reader will otherwise take
 // this rule for a ceiling: `create` on pods is a privilege-escalation
@@ -4223,7 +4224,7 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 // and sets A2A_GATEWAY_POD_POLICY on the operator where it does; elsewhere
 // this grant is as wide as written.
 func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
-	return &rbacv1.Role{
+	role := &rbacv1.Role{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
 		ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "gateway")},
 		Rules: []rbacv1.PolicyRule{
@@ -4269,6 +4270,19 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 			},
 		},
 	}
+	// The resolved scope under mode next, one named ConfigMap, read only:
+	// the scope publisher writes it, for the gateway's admission check to
+	// read under the name in A2A_RESOLVED_SCOPE_CONFIGMAP. Rendered with the
+	// ConfigMap, so the grant never outlives the object it names.
+	if scopePublisherRendered(agent) {
+		role.Rules = append(role.Rules, rbacv1.PolicyRule{
+			APIGroups:     []string{""},
+			Resources:     []string{"configmaps"},
+			ResourceNames: []string{scopeResolvedConfigMapName(agent)},
+			Verbs:         []string{"get"},
+		})
+	}
+	return role
 }
 
 func buildA2AGatewayRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbacv1.RoleBinding {
@@ -4986,6 +5000,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	env = append(env, injectEnv...)
 	env = append(env, clusterViewEnv...)
 	env = append(env, a2aTargetAllowlistEnv(agent)...)
+	if scopePublisherRendered(agent) {
+		env = append(env, corev1.EnvVar{Name: a2aResolvedScopeConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)})
+	}
 
 	return &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -5095,6 +5112,13 @@ type a2aProvisionState struct {
 	// a2aMCPTokenUnownedReason for its token Secret (ensureA2AMCPToken), ""
 	// otherwise. The status writers carry it as a2aMCPIdentityConditionType.
 	mcpNotRendered string
+	// scopeCondition is the ScopeResolved condition reconcileScopePublisher
+	// read off the resolved-scope ConfigMap, nil for a scope with nothing to
+	// resolve; the status writers carry it. scopeRequeue is when the
+	// reconcile has to look again: the next publisher run, or the moment
+	// the document goes stale, whichever is first; zero for no deadline.
+	scopeCondition *metav1.Condition
+	scopeRequeue   time.Duration
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -5385,6 +5409,17 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		}
 		state.mcpNotRendered = a2aMCPIdentityUnownedReason
 	}
+
+	// The scope publisher: its static objects, its Job on schedule, and the
+	// condition read off what the last Job wrote. Ahead of the gateway's
+	// hold, as the MCP server is: a held gateway does not stop resolving
+	// the scope.
+	scopeOutcome, err := r.reconcileScopePublisher(ctx, agent, time.Now())
+	if err != nil {
+		return state, err
+	}
+	state.scopeCondition = scopeOutcome.condition
+	state.scopeRequeue = scopeOutcome.requeue
 
 	// The session-pod quota, the enforcement half of the bound whose
 	// usability half is the gateway's own cap (see buildA2ASessionQuota for
@@ -6462,6 +6497,14 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//
 	// Those uncached reads are the standing cost of this path, which runs on
 	// every reconcile of every today install — see the note on the sweep below.
+
+	// 0. The scope publisher, ahead of everything the early exit reads, so a
+	// pass that dies here leaves every sentinel standing to bring it back.
+	// Its objects are written after the keys Secret, so a render that dies
+	// partway leaves a sentinel too.
+	if err := r.removeScopePublisher(ctx, agent); err != nil {
+		return err
+	}
 
 	// 1. Namespaced objects before the bus (gateway, inject, callout, session identities).
 	// Deleted first so the services built on top of the bus are initiated and stopped

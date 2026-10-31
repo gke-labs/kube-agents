@@ -193,6 +193,19 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 		credentialBrokerName(agent), agent.Namespace, credentialProxyPort)
 }
 
+// brokerCallerOwnership says, for each optional broker caller whose
+// ServiceAccount has a reserved name, whether this PlatformAgent controls the
+// account under that name (a2aMCPIdentityOwned, scopePublisherIdentityOwned).
+// An account somebody else holds is never admitted, whatever its flag says.
+type brokerCallerOwnership struct {
+	mcp   bool
+	scope bool
+}
+
+// allBrokerCallersOwned is the ownership a render with no live reads assumes:
+// every reserved account is this PlatformAgent's or absent.
+var allBrokerCallersOwned = brokerCallerOwnership{mcp: true, scope: true}
+
 // allowedBrokerCallers is the value of CREDENTIAL_PROXY_ALLOWED_CALLERS: the
 // TokenReview usernames the broker will serve.
 //
@@ -209,7 +222,7 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 // says which Pod called; the audience (credentialProxyChatAudience and its
 // siblings) says which role the call is for. The A2A gateway is told apart
 // the same way.
-func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, mcpIdentityOwned bool) string {
+func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCallerOwnership) string {
 	callers := []string{
 		// The gateway Pod, which presents the chat and watcher tokens. The
 		// broker's own ServiceAccount is not a caller: the broker serves these
@@ -236,8 +249,16 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, mcpIdentityOwned b
 	// account (a2aMCPIdentityOwned), never the namespace default it ran as
 	// before. Held to the mcp role by CREDENTIAL_PROXY_MCP_CALLERS, which
 	// a2aMCPBrokerEnv renders beside it, the same way the session caller is.
-	if a2aMCPBrokerEnabled(agent) && mcpIdentityOwned {
+	if a2aMCPBrokerEnabled(agent) && owned.mcp {
 		callers = append(callers, a2aMCPBrokerCaller(agent))
+	}
+	// The scope publisher's ServiceAccount, only while a publisher may run
+	// (scopePublisherMayRun: something to resolve, an account this
+	// PlatformAgent owns, and the scope role conferred), so the broker never
+	// names an account the operator does not hold. Held to the scope role by
+	// CREDENTIAL_PROXY_SCOPE_CALLERS, which scopeBrokerEnv renders beside it.
+	if scopePublisherMayRun(agent, owned.scope) {
+		callers = append(callers, scopePublisherBrokerCaller(agent))
 	}
 	return strings.Join(callers, ",")
 }

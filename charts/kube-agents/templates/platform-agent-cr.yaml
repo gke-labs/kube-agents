@@ -495,7 +495,14 @@ spec:
       carries the override, and nothing says so. `lookup` is empty under
       `helm template`, so the guard fires only against a live install.
     */}}
-    {{- if $proxyQuantities }}
+    {{- /*
+      The exec tier's replica count, forwarded as
+      spec.deployment.credentialProxy.exec.replicas when above 0. Written only
+      then, for the reason the resources block is: 0 is the operator's default,
+      and an empty block on every CR is noise a reader takes for a setting.
+    */}}
+    {{- $execReplicas := dig "exec" "replicas" 0 (.Values.platformAgent.deployment.credentialProxy | default dict) | int }}
+    {{- if or $proxyQuantities (gt $execReplicas 0) }}
     {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
     {{- if $crd }}
     {{- $deploymentProps := dict }}
@@ -504,11 +511,15 @@ spec:
     {{- $deploymentProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "deployment" "properties" (dict) . }}
     {{- end }}
     {{- end }}
-    {{- if not (hasKey $deploymentProps "credentialProxy") }}
+    {{- if and $proxyQuantities (not (hasKey $deploymentProps "credentialProxy")) }}
     {{- fail "platformAgent.deployment.credentialProxy.resources is set, but the installed PlatformAgent CRD predates spec.deployment.credentialProxy and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+    {{- end }}
+    {{- if and (gt $execReplicas 0) (not (hasKey (dig "credentialProxy" "properties" (dict) $deploymentProps) "exec")) }}
+    {{- fail "platformAgent.deployment.credentialProxy.exec.replicas is set, but the installed PlatformAgent CRD predates spec.deployment.credentialProxy.exec and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
     {{- end }}
     {{- end }}
     credentialProxy:
+      {{- if $proxyQuantities }}
       resources:
         {{- range $side := keys $proxyQuantities | sortAlpha }}
         {{ $side }}:
@@ -517,6 +528,11 @@ spec:
           {{ $name }}: {{ index $set $name | quote }}
           {{- end }}
         {{- end }}
+      {{- end }}
+      {{- if gt $execReplicas 0 }}
+      exec:
+        replicas: {{ $execReplicas }}
+      {{- end }}
     {{- end }}
     {{- /*
       The agent-api-auth sidecar's requests and limits, forwarded to the CR as

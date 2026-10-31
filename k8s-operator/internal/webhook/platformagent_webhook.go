@@ -296,6 +296,10 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		apiAuthErrs, apiAuthWarnings := controller.ValidateAgentAPIAuthResources(platformAgent.Spec.Deployment, depPath.Child("agentAPIAuth", "resources"))
 		allErrs = append(allErrs, apiAuthErrs...)
 		warnings = append(warnings, apiAuthWarnings...)
+
+		// 2h. The exec tier's objects are named after the agent, so a name too
+		// long for them is refused while the tier is on.
+		allErrs = append(allErrs, controller.ValidateCredentialProxyExec(platformAgent, field.NewPath("metadata", "name"))...)
 	}
 
 	// 3. Validate Security ServiceAccountName

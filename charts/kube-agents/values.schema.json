@@ -977,6 +977,17 @@
               "properties": {
                 "resources": {
                   "type": "object"
+                },
+                "exec": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "replicas": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 32
+                    }
+                  }
                 }
               }
             },

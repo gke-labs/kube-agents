@@ -233,6 +233,11 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 			for _, e := range a2aTargetAllowlistEnv(tc.agent) {
 				want = append(want, e.Name)
 			}
+			// The resolved scope's ConfigMap, last, under mode next whether
+			// or not Chat is armed.
+			if scopePublisherRendered(tc.agent) {
+				want = append(want, a2aResolvedScopeConfigMapEnvVar)
+			}
 			if strings.Join(names, ",") != strings.Join(want, ",") {
 				t.Errorf("unarmed env order %v, want %v", names, want)
 			}

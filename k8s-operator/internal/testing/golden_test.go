@@ -125,6 +125,28 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
+			// The credential broker's exec tier at 1 replica: the tier's
+			// objects beside platformagent-tagged.yaml's, and nothing else.
+			name:         "PlatformAgentExecTierOneReplica",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-exec-1.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-exec-1.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
+		{
+			// The credential broker's exec tier at 2 replicas: the tier's
+			// objects beside platformagent-tagged.yaml's, and nothing else.
+			name:         "PlatformAgentExecTierTwoReplicas",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-exec-2.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-exec-2.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
+		{
 			// A spec.scope block. Diff this against platformagent-tagged.yaml and the
 			// whole of what phases 1 to 3 of docs/designs/multi-project-scope.md render is
 			// one ConfigMap key, scope.json, sorted regardless of declaration order (projects, folders, organisations, Shared VPC hosts, Metrics Scopes, exclusions);

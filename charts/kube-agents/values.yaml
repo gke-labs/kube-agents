@@ -1153,6 +1153,14 @@ platformAgent:
     # does).
     credentialProxy:
       resources: {}
+      # The exec tier: stateless broker replicas beside the stateful broker that
+      # answer /v1/exec and /v1/gcp/ only, forwarded to the CR as
+      # spec.deployment.credentialProxy.exec.replicas when above 0. 0 renders
+      # none. Each replica requests and is limited to 2 CPU and 2Gi. On an
+      # existing install the chart fails the upgrade when the installed CRD
+      # predates the field; apply crds/ first (upgrade.sh does).
+      exec:
+        replicas: 0
     # The agent-api-auth sidecar's requests and limits, forwarded to the CR as
     # spec.deployment.agentAPIAuth.resources when any key is set. Each key merges
     # over the operator's defaults (150m CPU and 384Mi requests; 1 CPU, 2Gi memory

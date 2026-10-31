@@ -1174,6 +1174,25 @@ spec:
                         CredentialProxy configures the credential-proxy container, the broker that
                         runs every credentialed command on the agent's behalf in a pod of its own.
                       properties:
+                        exec:
+                          description: |-
+                            Exec configures the exec tier: stateless broker replicas beside the
+                            stateful broker that answer /v1/exec and /v1/gcp/ only.
+                          properties:
+                            replicas:
+                              description: |-
+                                Replicas is the number of exec-tier pods. Unset or 0 renders no exec
+                                tier. Each replica requests and is limited to 2 CPU and 2Gi of memory,
+                                with no override. A change between two positive values rewrites the
+                                count the pods read and does not restart them. The operator does not
+                                derive the count from the fleet size. Above 0 the agent's name must be
+                                at most 36 characters, so the tier's objects fit a 63-character name;
+                                a longer one is refused, and the tier is not rendered.
+                              format: int32
+                              maximum: 32
+                              minimum: 0
+                              type: integer
+                          type: object
                         resources:
                           description: |-
                             Resources overrides the credential-proxy container's requests and limits.

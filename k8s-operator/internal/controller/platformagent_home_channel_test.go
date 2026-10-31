@@ -226,8 +226,8 @@ func TestHomeChannelRecordObjectAndRole(t *testing.T) {
 	if cm.Name != a.Name+"-home-channel" || cm.Namespace != a.Namespace || len(cm.Data) != 0 {
 		t.Fatalf("record object = %+v", cm.ObjectMeta)
 	}
-	rules := buildA2AGatewayRole(a).Rules
-	rule := rules[len(rules)-1]
+	// The fourth rule; the resolved scope's read follows it under next.
+	rule := buildA2AGatewayRole(a).Rules[3]
 	if len(rule.Resources) != 1 || rule.Resources[0] != "configmaps" ||
 		len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != cm.Name ||
 		strings.Join(rule.Verbs, ",") != "get,patch" {

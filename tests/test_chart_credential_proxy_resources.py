@@ -61,12 +61,57 @@ class SchemaDeclaresTheKeyTest(unittest.TestCase):
 
     def test_values_yaml_carries_an_empty_default(self):
         values = yaml.safe_load(_VALUES.read_text())
-        self.assertEqual(values["platformAgent"]["deployment"]["credentialProxy"], {"resources": {}})
+        self.assertEqual(values["platformAgent"]["deployment"]["credentialProxy"], {"resources": {}, "exec": {"replicas": 0}})
 
     def test_credential_proxy_is_closed_and_resources_is_an_open_object(self):
         node = _schema_node(("platformAgent", "deployment", "credentialProxy"))
         self.assertIs(node["additionalProperties"], False)
         self.assertEqual(node["properties"]["resources"], {"type": "object"})
+
+
+    def test_exec_replicas_is_a_bounded_integer_in_a_closed_block(self):
+        node = _schema_node(("platformAgent", "deployment", "credentialProxy", "exec"))
+        self.assertIs(node["additionalProperties"], False)
+        self.assertEqual(node["properties"]["replicas"], {"type": "integer", "minimum": 0, "maximum": 32})
+
+
+@unittest.skipUnless(_HELM, "helm is not installed")
+class CredentialProxyExecReplicasRenderTest(unittest.TestCase):
+    """spec.deployment.credentialProxy.exec.replicas is written only above 0."""
+
+    _EXEC = "platformAgent.deployment.credentialProxy.exec.replicas"
+
+    def _render(self, sets):
+        args = [_HELM, "template", "r", str(_CHART), "-s", _CR_TEMPLATE, *_REQUIRED]
+        for item in sets:
+            args += ["--set", item]
+        return subprocess.run(args, capture_output=True, text=True)
+
+    def _cr(self, sets):
+        res = self._render(sets)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        docs = [d for d in yaml.safe_load_all(res.stdout) if d and d.get("kind") == "PlatformAgent"]
+        self.assertEqual(len(docs), 1, res.stdout)
+        return docs[0]
+
+    def test_zero_writes_no_block(self):
+        cr = self._cr([f"{self._EXEC}=0"])
+        self.assertNotIn("credentialProxy", cr["spec"]["deployment"])
+
+    def test_a_positive_count_is_forwarded(self):
+        cr = self._cr([f"{self._EXEC}=2"])
+        self.assertEqual(cr["spec"]["deployment"]["credentialProxy"], {"exec": {"replicas": 2}})
+
+    def test_a_count_beside_a_resources_override_writes_both(self):
+        cr = self._cr([f"{self._EXEC}=3", f"{_VALUE_PATH}.limits.memory=3Gi"])
+        self.assertEqual(cr["spec"]["deployment"]["credentialProxy"],
+                         {"resources": {"limits": {"memory": "3Gi"}}, "exec": {"replicas": 3}})
+
+    def test_the_schema_refuses_a_count_out_of_range(self):
+        for value in ("33", "-1"):
+            res = self._render([f"{self._EXEC}={value}"])
+            self.assertNotEqual(res.returncode, 0, value)
+            self.assertIn("exec/replicas", res.stderr, value)
 
 
 @unittest.skipUnless(_HELM, "helm is not installed")
@@ -395,23 +440,30 @@ class CrdGuardTest(unittest.TestCase):
 
     def setUp(self):
         template = (_CHART / _CR_TEMPLATE).read_text()
-        block = re.search(r"\n(\s*\{\{- if \$proxyQuantities \}\}\n\s*\{\{- \$crd := .*?)\n\s*credentialProxy:\n", template, re.DOTALL)
+        block = re.search(r"\n(\s*\{\{- if or \$proxyQuantities \(gt \$execReplicas 0\) \}\}\n\s*\{\{- \$crd := .*?)\n\s*credentialProxy:\n", template, re.DOTALL)
         self.assertIsNotNone(block, "the credentialProxy block is missing from the CR template")
         self.guard = block.group(1)
 
     def test_a_set_override_looks_up_the_installed_crd(self):
-        gate = re.search(r"\{\{- if \$proxyQuantities \}\}\n\s*\{\{- \$crd := " + re.escape(self._LOOKUP), self.guard)
-        self.assertIsNotNone(gate, "the CRD lookup is not gated on a set override")
+        gate = re.search(r"\{\{- if or \$proxyQuantities \(gt \$execReplicas 0\) \}\}\n\s*\{\{- \$crd := " + re.escape(self._LOOKUP), self.guard)
+        self.assertIsNotNone(gate, "the CRD lookup is not gated on a set override or exec count")
 
     def test_the_guard_reads_the_storage_versions_deployment_properties(self):
         self.assertIn("{{- if .storage }}", self.guard)
         self.assertIn('dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "deployment" "properties" (dict) .', self.guard)
 
     def test_the_guard_fails_naming_the_field_and_the_remedy(self):
-        fail = re.search(r'\{\{- if not \(hasKey \$deploymentProps "credentialProxy"\) \}\}\n\s*\{\{- fail "([^"]*)" \}\}', self.guard)
+        fail = re.search(r'\{\{- if and \$proxyQuantities \(not \(hasKey \$deploymentProps "credentialProxy"\)\) \}\}\n\s*\{\{- fail "([^"]*)" \}\}', self.guard)
         self.assertIsNotNone(fail, "the CRD guard does not fail on a missing key")
         for want in ("predates spec.deployment.credentialProxy", "helm upgrade does not update CRDs",
                      "charts/kube-agents/crds/", "upgrade.sh", "prunes the value silently", "release record keeps it"):
+            self.assertIn(want, fail.group(1))
+
+    def test_the_guard_fails_on_an_exec_count_against_a_crd_without_exec(self):
+        fail = re.search(r'\{\{- if and \(gt \$execReplicas 0\) \(not \(hasKey \(dig "credentialProxy" "properties" \(dict\) \$deploymentProps\) "exec"\)\) \}\}\n\s*\{\{- fail "([^"]*)" \}\}', self.guard)
+        self.assertIsNotNone(fail, "the CRD guard does not fail on a missing exec key")
+        for want in ("predates spec.deployment.credentialProxy.exec", "helm upgrade does not update CRDs",
+                     "charts/kube-agents/crds/", "upgrade.sh", "prunes the value silently"):
             self.assertIn(want, fail.group(1))
 
 

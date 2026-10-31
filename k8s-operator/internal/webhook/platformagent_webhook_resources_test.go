@@ -519,3 +519,30 @@ func TestAgentAPIAuthUnknownResourceNameIsRefusedAtAdmission(t *testing.T) {
 	}))
 	assertFieldError(t, err, "spec.deployment.agentAPIAuth.resources.limits.nvidia.com/gpu")
 }
+
+// With the exec tier on, an agent name past 36 characters is refused at
+// apply, naming the limit; with the tier off it is not.
+func TestAnAgentNameTooLongForTheExecTierIsRefused(t *testing.T) {
+	agentWith := func(nameLen int, replicas int32) *agentv1alpha1.PlatformAgent {
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: strings.Repeat("a", nameLen), Namespace: "default"},
+			Spec: agentv1alpha1.PlatformAgentSpec{AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					CredentialProxy: &agentv1alpha1.CredentialProxySpec{Exec: &agentv1alpha1.CredentialProxyExecSpec{Replicas: &replicas}},
+				},
+			}},
+		}
+	}
+	val := &PlatformAgentCustomValidator{}
+	if _, err := val.ValidateCreate(context.Background(), agentWith(36, 2)); err != nil {
+		t.Errorf("a 36-character name with the tier on is refused: %v", err)
+	}
+	if _, err := val.ValidateCreate(context.Background(), agentWith(37, 0)); err != nil {
+		t.Errorf("a 37-character name with the tier off is refused: %v", err)
+	}
+	_, err := val.ValidateCreate(context.Background(), agentWith(37, 2))
+	msg := fieldErrorMessage(t, err, "metadata.name")
+	if !strings.Contains(msg, "must be at most 36") {
+		t.Errorf("message %q does not name the limit", msg)
+	}
+}

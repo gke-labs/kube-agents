@@ -950,7 +950,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash, agentPlugins, mcpIdentityOwned); err != nil {
+	// And the scope publisher's, for the same reason (scopePublisherIdentityOwned).
+	scopeIdentityOwned, err := r.scopePublisherIdentityOwned(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	owned := brokerCallerOwnership{mcp: mcpIdentityOwned, scope: scopeIdentityOwned}
+	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash, agentPlugins, owned); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1175,6 +1181,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// event — the same pairing rbacDegraded has above. Without this the record
 	// would expire and sit until the fifteen-minute requeue.
 	requeueAfter = min(requeueAfter, r.usageStatusRequeue(instance))
+	// The scope publisher's next run, or the moment its document goes stale:
+	// Jobs are not watched, so the pass that starts the run and the pass
+	// that turns ScopeResolved False have to be asked for.
+	if a2aNext && a2aState.scopeRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.scopeRequeue)
+	}
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
@@ -2989,7 +3001,7 @@ func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key 
 // and the sandbox's wrapped CLIs both dial the Service, and neither has any
 // business knowing where the relays run. credential_proxy_manifests.go carries
 // the reasoning for why the pod is its own.
-func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool) error {
+func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, owned brokerCallerOwnership) error {
 	objs := []client.Object{buildCredentialProxyService(agent)}
 	// The resources override is checked here as well as at admission, because
 	// the chart installs with the webhook off. Rendered, an override under the
@@ -3040,7 +3052,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, mcpIdentityOwned, profiles)
+	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, owned, profiles)
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
@@ -3058,7 +3070,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 			return fmt.Errorf("failed to apply credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
 	}
-	return nil
+	return r.reconcileCredentialProxyExecTier(ctx, agent, proxy, profiles)
 }
 
 // applyCredentialProxyDeployment applies the broker's Deployment, recreating it
@@ -3470,78 +3482,7 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, ag
 		return nil
 	}
 
-	var apiTargets []string
-	if r.APIServerIP != "" {
-		apiTargets = append(apiTargets, r.APIServerIP)
-	}
-
-	var k8sSvc corev1.Service
-	if err := r.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sSvc); err == nil {
-		if ip := strings.TrimSpace(k8sSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
-			apiTargets = append(apiTargets, ip)
-		}
-	} else if !errors.IsNotFound(err) {
-		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Service ClusterIP", "error", err)
-	}
-
-	// Use APIReader (live non-cached reader) for default/kubernetes Endpoints to avoid
-	// starting an unconstrained cluster-wide Endpoints informer / watch cache.
-	endpointsReader := client.Reader(r.Client)
-	if r.APIReader != nil {
-		endpointsReader = r.APIReader
-	}
-
-	var k8sEndpoints corev1.Endpoints
-	if err := endpointsReader.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sEndpoints); err == nil {
-		for _, subset := range k8sEndpoints.Subsets {
-			for _, addr := range subset.Addresses {
-				if addr.IP != "" {
-					apiTargets = append(apiTargets, addr.IP)
-				}
-			}
-		}
-	} else if !errors.IsNotFound(err) {
-		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Endpoints", "error", err)
-	}
-
-	parseCIDRTarget := func(annotationName, raw string) {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			return
-		}
-		// normalizeCIDRTarget, not a local parse: it takes the address family from
-		// the address rather than the mask width, so an IPv4-mapped IPv6 block is
-		// measured against the IPv4 floor it will actually print as.
-		// ::ffff:a00:0/104 used to clear the /48 IPv6 floor here and land in the
-		// list as 10.0.0.0/8; it is now rejected, while ::ffff:a00:0/108 still
-		// passes because /108 is the IPv4 /12 that is exactly the floor.
-		ipNet, ok := normalizeCIDRTarget(raw, true)
-		if !ok {
-			logf.FromContext(ctx).Info("Ignoring CIDR in annotation: unparseable, or broader than the /12 (IPv4) or /48 (IPv6) floor", "annotation", annotationName, "cidr", raw)
-			return
-		}
-		apiTargets = append(apiTargets, ipNet.String())
-	}
-
-	appendCIDRs := func(sourceName, rawList string) {
-		if rawList == "" {
-			return
-		}
-		cidrs := strings.Split(rawList, ",")
-		if len(cidrs) > maxCIDRsPerAnnotation {
-			logf.FromContext(ctx).Info("Truncating CIDR list to max allowed CIDRs", "source", sourceName, "max", maxCIDRsPerAnnotation, "total", len(cidrs))
-			cidrs = cidrs[:maxCIDRsPerAnnotation]
-		}
-		for _, cidr := range cidrs {
-			parseCIDRTarget(sourceName, cidr)
-		}
-	}
-
-	if agent.Annotations != nil {
-		appendCIDRs(AnnotationAPIServerCIDR, agent.Annotations[AnnotationAPIServerCIDR])
-		appendCIDRs(AnnotationCustomEgressCIDRs, agent.Annotations[AnnotationCustomEgressCIDRs])
-	}
-	appendCIDRs("KUBERNETES_API_SERVER_CIDR", r.APIServerCIDROverride)
+	apiTargets := r.apiServerEgressTargets(ctx, agent, true)
 
 	// 1. Reconcile or clean up companion FQDNNetworkPolicy (networking.gke.io/v1alpha1) on GKE Dataplane V2 clusters
 	fqdnEnabled := isFQDNNetworkPolicyEnabled(agent)
@@ -4166,14 +4107,16 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
-		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) {
+		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
+		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) {
 		return nil
 	}
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
 			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live)) &&
-			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered)
+			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
+			scopeResolvedConditionCurrent(live, a2a.scopeCondition)
 	}) {
 		return nil
 	}
@@ -4183,6 +4126,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
+	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	return r.Status().Update(ctx, agent)
 }
 
@@ -4495,6 +4439,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
 	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
 	a2aMCPServerUnchanged := a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered)
+	scopeResolvedUnchanged := scopeResolvedConditionCurrent(agent, a2a.scopeCondition)
 
 	// A data claim its StorageClass cannot expand, from what growDataClaim
 	// recorded on this pass, compared on its message like VolumesDropped.
@@ -4543,7 +4488,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
-		a2aVerifierUnchanged && a2aMCPServerUnchanged &&
+		a2aVerifierUnchanged && a2aMCPServerUnchanged && scopeResolvedUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
@@ -4622,6 +4567,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
+	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
 	if err := r.Status().Update(ctx, agent); err != nil {
@@ -6361,4 +6307,88 @@ func agentProfileWatchPlan(mapErr error, denied []string) (watch, unreadable boo
 		return false, true
 	}
 	return mapErr == nil, false
+}
+
+// apiServerEgressTargets is the Kubernetes API server's addresses for an
+// egress rule: the configured IP, the default/kubernetes Service VIP, its
+// Endpoints, and the API server CIDR annotation and override, in that order.
+// withCustom also takes the custom egress CIDR annotation, between the
+// annotation and the override, which is the agent's own policy's list; the
+// scope publisher's policy asks for the API server alone.
+func (r *PlatformAgentReconciler) apiServerEgressTargets(ctx context.Context, agent *agentv1alpha1.PlatformAgent, withCustom bool) []string {
+	var apiTargets []string
+	if r.APIServerIP != "" {
+		apiTargets = append(apiTargets, r.APIServerIP)
+	}
+
+	var k8sSvc corev1.Service
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sSvc); err == nil {
+		if ip := strings.TrimSpace(k8sSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
+			apiTargets = append(apiTargets, ip)
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Service ClusterIP", "error", err)
+	}
+
+	// Use APIReader (live non-cached reader) for default/kubernetes Endpoints to avoid
+	// starting an unconstrained cluster-wide Endpoints informer / watch cache.
+	endpointsReader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		endpointsReader = r.APIReader
+	}
+
+	var k8sEndpoints corev1.Endpoints
+	if err := endpointsReader.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sEndpoints); err == nil {
+		for _, subset := range k8sEndpoints.Subsets {
+			for _, addr := range subset.Addresses {
+				if addr.IP != "" {
+					apiTargets = append(apiTargets, addr.IP)
+				}
+			}
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Endpoints", "error", err)
+	}
+
+	parseCIDRTarget := func(annotationName, raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		// normalizeCIDRTarget, not a local parse: it takes the address family from
+		// the address rather than the mask width, so an IPv4-mapped IPv6 block is
+		// measured against the IPv4 floor it will actually print as.
+		// ::ffff:a00:0/104 used to clear the /48 IPv6 floor here and land in the
+		// list as 10.0.0.0/8; it is now rejected, while ::ffff:a00:0/108 still
+		// passes because /108 is the IPv4 /12 that is exactly the floor.
+		ipNet, ok := normalizeCIDRTarget(raw, true)
+		if !ok {
+			logf.FromContext(ctx).Info("Ignoring CIDR in annotation: unparseable, or broader than the /12 (IPv4) or /48 (IPv6) floor", "annotation", annotationName, "cidr", raw)
+			return
+		}
+		apiTargets = append(apiTargets, ipNet.String())
+	}
+
+	appendCIDRs := func(sourceName, rawList string) {
+		if rawList == "" {
+			return
+		}
+		cidrs := strings.Split(rawList, ",")
+		if len(cidrs) > maxCIDRsPerAnnotation {
+			logf.FromContext(ctx).Info("Truncating CIDR list to max allowed CIDRs", "source", sourceName, "max", maxCIDRsPerAnnotation, "total", len(cidrs))
+			cidrs = cidrs[:maxCIDRsPerAnnotation]
+		}
+		for _, cidr := range cidrs {
+			parseCIDRTarget(sourceName, cidr)
+		}
+	}
+
+	if agent.Annotations != nil {
+		appendCIDRs(AnnotationAPIServerCIDR, agent.Annotations[AnnotationAPIServerCIDR])
+		if withCustom {
+			appendCIDRs(AnnotationCustomEgressCIDRs, agent.Annotations[AnnotationCustomEgressCIDRs])
+		}
+	}
+	appendCIDRs("KUBERNETES_API_SERVER_CIDR", r.APIServerCIDROverride)
+	return apiTargets
 }
