@@ -136,3 +136,49 @@ resource "google_project_iam_member" "agent_roles" {
   role    = each.value
   member  = "serviceAccount:${google_service_account.agent.email}"
 }
+
+# The one permission the capacity-obtainability skill's future-window probe
+# needs and no viewer role carries, as its own custom role rather than a
+# predefined one: every predefined role that holds compute.advice.calendarMode
+# holds reservation writes beside it. Kept out of local.agent_project_roles on
+# purpose -- that list is the permission set the security reference documents
+# and tests/test_agent_iam_ceiling.py pins, and this is a switch beside it.
+# The role id is fixed, one per project like the service account, and
+# scripts/verify_ci_pool_project.py names a pool project's by this id.
+# The title names what the role grants; the id keeps the kubeAgents prefix
+# because custom role ids share one namespace per project, and a generic id
+# could collide with a role the project already holds.
+locals {
+  calendar_mode_advice_role_id = "kubeAgentsCalendarModeAdvice"
+}
+
+resource "google_project_iam_custom_role" "calendar_mode_advice" {
+  count = var.calendar_mode_advice_enabled ? 1 : 0
+
+  project     = var.project_id
+  role_id     = local.calendar_mode_advice_role_id
+  title       = "Calendar Mode Advice (read-only)"
+  description = "compute.advice.calendarMode alone, to ask the AdviceService for future capacity windows. No reservation writes. The kube-agents platform agent uses it."
+  permissions = ["compute.advice.calendarMode"]
+}
+
+resource "google_project_iam_member" "calendar_mode_advice" {
+  count = var.calendar_mode_advice_enabled ? 1 : 0
+
+  project = var.project_id
+  role    = google_project_iam_custom_role.calendar_mode_advice[0].id
+  member  = "serviceAccount:${google_service_account.agent.email}"
+
+  # The same (project, role, member) binding listed in project_roles as well
+  # would be two state entries for one grant: removing the list entry later
+  # destroys its member, and the provider's member delete removes the grant
+  # whatever the second entry says, so the agent loses the permission until a
+  # further apply recreates it. Refused at plan time instead; the message
+  # names the gap-free path.
+  lifecycle {
+    precondition {
+      condition     = !contains(var.project_roles, "projects/${var.project_id}/roles/${local.calendar_mode_advice_role_id}")
+      error_message = "project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) lists projects/${var.project_id}/roles/${local.calendar_mode_advice_role_id} while calendar_mode_advice_enabled (ENABLE_CALENDAR_MODE_ADVICE) also binds it, which would manage one grant from two places and revoke it for one apply when the list entry goes. Keep one: drop the role from the list (the switch's binding carries it; a drop-then-apply alone revokes it for one apply, so run the apply twice or `terraform state rm` the list's member first), or leave the switch off."
+    }
+  }
+}
