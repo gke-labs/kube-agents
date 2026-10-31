@@ -230,7 +230,7 @@ func newMigrationRig(t *testing.T, leg busMigrationLeg, phase busMigrationPhase,
 // pass runs the resolver and checks the phase and the count it renders.
 func (m *migrationRig) pass(wantPhase busMigrationPhase, wantReplicas int32) {
 	m.t.Helper()
-	if _, err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
 		m.t.Fatal(err)
 	}
 	if got := busMigrationPhase(m.agent.Status.BusMigration.Phase); got != wantPhase {
@@ -381,7 +381,7 @@ func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
 func TestARefusedDigestReportTurnsTheRunBack(t *testing.T) {
 	m := newMigrationRig(t, busMigrationGrow, busMigrationHashing, 1, time.Now().Add(time.Hour))
 	m.finishPod("hash", corev1.PodSucceeded, `{"TASKS":{"data":"x","meta":"y"}}`, "")
-	if _, err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
 		t.Fatal(err)
 	}
 	run := m.agent.Status.BusMigration
@@ -419,7 +419,7 @@ func TestAFailedRestoreRollsBackNamingItsError(t *testing.T) {
 		late := newMigrationRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1, time.Now().Add(time.Hour))
 		late.agent.Status.BusMigration.Abandoning = true
 		late.finishPod("rollback", corev1.PodFailed, msg, "DeadlineExceeded")
-		if _, err := late.r.resolveA2ABusReplicas(context.Background(), late.agent); err != nil {
+		if err := late.r.resolveA2ABusReplicas(context.Background(), late.agent); err != nil {
 			t.Fatal(err)
 		}
 		if c := late.agent.Status.BusMigration.Cause; !strings.Contains(c, "the RollbackRestoring phase was still running at the run's deadline") {
@@ -1243,7 +1243,7 @@ func TestARunsEndCleansUpWhatItMade(t *testing.T) {
 				}
 			}
 			tc.finish(m)
-			if _, err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+			if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
 				t.Fatal(err)
 			}
 			if got := busMigrationPhase(m.agent.Status.BusMigration.Phase); got != tc.end {

@@ -48,6 +48,24 @@ with an `A2ABusConversionRefused` condition and Warning, and the admission webho
 refuses the edit with the same message. #4225 lifts that refusal in the same change that
 adds the migration, so no release can convert without it.
 
+**Amended 10/31 (#4225):** the refusal is gone, and a change between one server and three
+starts a migration that keeps the bus's data. The operator runs it as phases on
+`status.busMigration`, reported by the `A2ABusMigrating` condition, and the webhook refuses
+another `busReplicas` change while one runs.
+
+- **Three to one**, in place: the operator's pin Job moves every stream's leader to server 0
+  and scales it to one replica while the bus is still a cluster, then the bus renders one
+  server. Writes keep flowing.
+- **One to three**, by copy: writes are frozen (only the migration reaches the bus; console
+  and web logins drop, and the gateway and bridge cannot publish), the operator's pods
+  snapshot every stream to a one-pod staging volume, a pod with no bus identity digests the
+  snapshots, the bus renders three servers, and the operator's restore pod restores each
+  stream, checked against the operator's policy for it before and after, and raises it to
+  three replicas.
+- **A failure** turns the run back: before the shrink, the pinned streams go back to three
+  replicas; after the conversion, the bus renders one server again and the same snapshot is
+  restored into it. Only a failed undo stops for a person, and the condition names the step.
+
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than
 any other input.

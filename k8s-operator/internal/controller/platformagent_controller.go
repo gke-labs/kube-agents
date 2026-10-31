@@ -237,11 +237,11 @@ const (
 	// install without one looks healthy while every unprompted post is
 	// dropped (#3320). Written only in that state, like EventWatcher, and it
 	// leaves Ready alone: chat works, and some installs want no posts.
-	// a2aBusConversionRefusedConditionType stands while
-	// spec.harness.tuning.busReplicas asks for a server count other than the
-	// one the existing bus runs (BusConversionRefusedMessage).
+	// a2aBusConversionRefusedConditionType is retired: the operator that
+	// refused a bus conversion wrote it, and this one migrates instead
+	// (A2ABusMigrating). It is only ever removed, from a CR an earlier
+	// operator wrote it to.
 	a2aBusConversionRefusedConditionType = "A2ABusConversionRefused"
-	a2aBusConversionRefusedReason        = "ConversionNotSupported"
 
 	homeChannelUnsetConditionType = "HomeChannelUnset"
 	homeChannelUnsetReason        = "NoHomeChannel"
@@ -452,14 +452,6 @@ type PlatformAgentReconciler struct {
 	// API server prunes does not repeat on every pass (busReplicasStatusCurrent).
 	prunedBusReplicasStatus sync.Map
 
-	// busConversionAllowed lets resolveA2ABusReplicas convert an existing bus
-	// between one server and three. Off in every operator: a conversion
-	// empties the bus (a cluster deletes a standalone server's streams as
-	// orphans, a standalone server refuses a cluster's R3 streams), and the
-	// migration that keeps the data, #4225, lifts this in the same change. No
-	// flag, env var or constructor sets it; only tests do
-	// (TestNothingButTestsAllowsABusConversion).
-	busConversionAllowed bool
 	// prunedNewerFields records, per CR (usagePollKey) and per newer
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
 	// the proposal readings as one (usageNewerFieldReadings),
@@ -4240,12 +4232,11 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	// Degraded still runs a gateway that drops proactive posts, and a bare
 	// helm install parks on ShellSandboxKeysMissing indefinitely (#3320).
 	homeMsg := homeChannelUnsetMessage(agent)
-	conversionMsg := a2aBusConversionRefusedMessage(agent)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
-		a2aBusConversionRefusedConditionCurrent(agent, conversionMsg) &&
+		retiredConversionRefusedAbsent(agent) &&
 		busMigratingConditionCurrent(agent) &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) {
 		return nil
@@ -4255,7 +4246,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
 			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live)) &&
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
-			a2aBusConversionRefusedConditionCurrent(live, conversionMsg) &&
+			retiredConversionRefusedAbsent(live) &&
 			reflect.DeepEqual(live.Status.BusMigration, agent.Status.BusMigration) && busMigratingConditionCurrent(live) &&
 			(r.busReplicasStatusPruned(agent) || live.Status.BusReplicas == agent.Status.BusReplicas)
 	}) {
@@ -4267,7 +4258,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
-	setA2ABusConversionRefusedCondition(agent, conversionMsg, now)
+	meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusConversionRefusedConditionType)
 	setBusMigratingCondition(agent, now)
 	writtenBusReplicas := agent.Status.BusReplicas
 	if err := r.Status().Update(ctx, agent); err != nil {
@@ -4613,10 +4604,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	homeChannelUnsetMsg := homeChannelUnsetMessage(agent)
 	homeChannelUnsetUnchanged := homeChannelUnsetConditionCurrent(agent, homeChannelUnsetMsg)
 
-	// The refused conversion, from the spec and the count this pass resolved:
-	// advisory, so Ready stands on the bus that runs.
-	conversionRefusedMsg := a2aBusConversionRefusedMessage(agent)
-	conversionRefusedUnchanged := a2aBusConversionRefusedConditionCurrent(agent, conversionRefusedMsg)
+	// The retired conversion refusal an earlier operator may have left.
+	conversionRefusedUnchanged := retiredConversionRefusedAbsent(agent)
 	busMigratingUnchanged := busMigratingConditionCurrent(agent)
 
 	// The A2AGateway condition, same class as EventWatcher and for the same
@@ -4765,7 +4754,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	setHomeChannelUnsetCondition(agent, homeChannelUnsetMsg, now)
-	setA2ABusConversionRefusedCondition(agent, conversionRefusedMsg, now)
+	meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusConversionRefusedConditionType)
 	setBusMigratingCondition(agent, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	setReplicasLimitedCondition(agent, replicasLimitedMsg, now)

@@ -887,12 +887,13 @@ type TuningSpec struct {
 	// from before the three-server default stays on one server, and a new bus
 	// gets three (status.busReplicas shows which applies).
 	//
-	// Set, it decides the count of a bus that does not exist yet. An existing
-	// bus keeps the count it runs: NATS cannot carry a single server's streams
-	// into a cluster or a cluster's into a single server, and the migration
-	// that would keep them is not here yet, so a count that differs is refused
-	// (the A2ABusConversionRefused condition; the admission webhook refuses the
-	// edit) rather than emptying the bus (docs/designs/spec-nats-deployment.md).
+	// Set, it decides the count of a bus that does not exist yet. On an
+	// existing bus, a change between 1 and 3 starts a migration that keeps
+	// the bus's data (status.busMigration, the A2ABusMigrating condition):
+	// the bus keeps the count it runs until the migration converts it, and
+	// the admission webhook refuses another change while one runs. One server
+	// to three freezes writes for the window, since it copies the streams
+	// (docs/designs/spec-nats-deployment.md).
 	// +kubebuilder:validation:Enum=1;3
 	// +optional
 	BusReplicas *int `json:"busReplicas,omitempty"`

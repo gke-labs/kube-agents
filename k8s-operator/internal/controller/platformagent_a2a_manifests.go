@@ -3985,13 +3985,11 @@ func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
 // back at their count, or it would convert them). The field decides only for a
 // bus that does not exist yet, and three when it is unset.
 //
-// A field that asks an existing bus for another count is refused unless
-// busConversionAllowed (which #4225 sets with the migration): the bus keeps
-// its count, and the refusal is a Warning once and the
-// A2ABusConversionRefused condition. With the gate open, the pass about to
-// convert the bus says so on the PlatformAgent, since the conversion is what
-// empties it.
-func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (converting bool, err error) {
+// A field that asks an existing bus for the other count starts a migration
+// (platformagent_a2a_bus_migration.go), which keeps the bus's data: the bus
+// keeps its count until the migration's phases convert it, and while one
+// runs it decides the count.
+func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	running := 0
 	recorded := int(agent.Status.BusReplicas)
 	sts := &appsv1.StatefulSet{}
@@ -4018,7 +4016,7 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 					running = ordinal + 1
 				}
 			case !errors.IsNotFound(err):
-				return false, err
+				return err
 			}
 		}
 		if running == 2 {
@@ -4035,7 +4033,7 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 			running = 3
 		}
 	default:
-		return false, err
+		return err
 	}
 	if running != 1 && running != 3 {
 		running = 0
@@ -4048,9 +4046,7 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 	if want == 0 {
 		want = agentv1alpha1.DefaultBusReplicas
 	}
-	converting = running != 0 && want != running
-	migrates := converting && !r.busConversionAllowed
-	if migrates {
+	if running != 0 && want != running {
 		// A change between the counts starts a migration; the bus keeps the
 		// count it runs until the migration's phases convert it.
 		startBusMigration(agent, running, want, metav1.Now())
@@ -4060,22 +4056,19 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		// the StatefulSet read mid-way.
 		n, err := r.advanceBusMigration(ctx, agent, time.Now())
 		if err != nil {
-			return false, err
+			return err
 		}
 		agent.Status.BusReplicas = int32(n) // #nosec G115 -- 1 or 3
-		return false, nil
+		return nil
 	}
-	if migrates {
-		agent.Status.BusReplicas = int32(running) // #nosec G115 -- 1 or 3
-		return false, nil
+	// No migration under way: a new bus takes the field (or three), and an
+	// existing one keeps what it runs, including one whose last migration
+	// ended without converting it.
+	if running == 0 {
+		running = want
 	}
-
-	if converting && int(agent.Status.BusReplicas) != want {
-		r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusConverting,
-			fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d: converting it, which recreates every stream and bucket empty (task history, the topics journal and the KV buckets are lost once)", want, running))
-	}
-	agent.Status.BusReplicas = int32(want) // #nosec G115 -- want is 1 or 3
-	return converting, nil
+	agent.Status.BusReplicas = int32(running) // #nosec G115 -- 1 or 3
+	return nil
 }
 
 // busMigrationRunDeadline bounds a migration run: a phase still unfinished
@@ -4122,67 +4115,10 @@ func a2aNATSRenderedReplicas(sts *appsv1.StatefulSet) int {
 	return 1
 }
 
-// reasonA2ABusConverting is the Warning resolveA2ABusReplicas records when a
-// set busReplicas converts a running bus.
-const reasonA2ABusConverting = "A2ABusConverting"
-
-// BusConversionRefusedMessage says why the bus keeps its count. The operator's
-// condition and Warning and the admission webhook's refusal share it, so the
-// edit refused at apply time reads the same as the one the operator holds.
-func BusConversionRefusedMessage(asked, running int32) string {
-	return fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the A2A bus runs %d. "+
-		"An existing bus's server count cannot change yet: converting it would empty the bus, and the migration "+
-		"that keeps its data is #4225. The bus keeps %d; set busReplicas to %d, or remove it, to clear this.",
-		asked, running, running, running)
-}
-
-// a2aBusConversionRefusedMessage is the A2ABusConversionRefused condition's
-// message for this pass, "" when the field asks for nothing the bus does not
-// run. Read after resolveA2ABusReplicas, whose count is the bus's.
-func a2aBusConversionRefusedMessage(agent *agentv1alpha1.PlatformAgent) string {
-	running := agent.Status.BusReplicas
-	limits := agentTuning(agent)
-	if agent.Status.BusMigration != nil {
-		// A change between the counts starts a migration, which reports
-		// itself; nothing is refused.
-		return ""
-	}
-	if !a2aStackRendering(agent) || limits == nil || limits.BusReplicas == nil || (running != 1 && running != 3) {
-		return ""
-	}
-	asked := *limits.BusReplicas
-	if (asked != 1 && asked != 3) || int32(asked) == running { // #nosec G115 -- 1 or 3
-		return ""
-	}
-	return BusConversionRefusedMessage(int32(asked), running) // #nosec G115 -- 1 or 3
-}
-
-// a2aBusConversionRefusedConditionCurrent reports whether the condition already
-// says msg, where "" means it is to be absent.
-func a2aBusConversionRefusedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
-	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aBusConversionRefusedConditionType)
-	if msg == "" {
-		return existing == nil
-	}
-	return existing != nil && existing.Status == metav1.ConditionTrue &&
-		existing.Reason == a2aBusConversionRefusedReason && existing.Message == msg
-}
-
-// setA2ABusConversionRefusedCondition writes the condition, or removes it when
-// msg is "". The caller does the API write.
-func setA2ABusConversionRefusedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
-	if msg == "" {
-		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusConversionRefusedConditionType)
-		return
-	}
-	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
-		Type:               a2aBusConversionRefusedConditionType,
-		Status:             metav1.ConditionTrue,
-		Reason:             a2aBusConversionRefusedReason,
-		Message:            msg,
-		ObservedGeneration: agent.Generation,
-		LastTransitionTime: now,
-	})
+// retiredConversionRefusedAbsent reports whether the CR carries no
+// A2ABusConversionRefused condition, which only an earlier operator wrote.
+func retiredConversionRefusedAbsent(agent *agentv1alpha1.PlatformAgent) bool {
+	return meta.FindStatusCondition(agent.Status.Conditions, a2aBusConversionRefusedConditionType) == nil
 }
 
 // a2aStreamReplicas is the replica count every JetStream stream and bucket
@@ -5811,18 +5747,15 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// First: everything below renders from the server count, and a count
 	// read before this would be last pass's, or the default.
 	state.busReplicasPersisted = agent.Status.BusReplicas
-	converting, err := r.resolveA2ABusReplicas(ctx, agent)
-	if err != nil {
+	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 		return state, fmt.Errorf("resolving the A2A bus's server count: %w", err)
 	}
-	// A conversion empties the bus once the last server restarts into the new
-	// shape, so the provisioned-once record no longer describes it. Dropping
-	// it makes the provision Job count toward Ready again until the new one,
-	// held until the bus has rolled out, completes. A persisted count other
-	// than the resolved one is a conversion whose pass failed after the
-	// StatefulSet apply and before any status write: the StatefulSet already
-	// runs the new count, so only the record still says the drop is owed.
-	if converting || (state.busReplicasPersisted != 0 && state.busReplicasPersisted != agent.Status.BusReplicas) {
+	// A count change (a migration's phase moving the bus between one server
+	// and three) leaves streams that are not there until the migration puts
+	// them back, so the provisioned-once record no longer describes the
+	// bus. Dropping it makes the provision Job count toward Ready again until
+	// the one after the migration, held until it ends, completes.
+	if state.busReplicasPersisted != 0 && state.busReplicasPersisted != agent.Status.BusReplicas {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
 	}
 
