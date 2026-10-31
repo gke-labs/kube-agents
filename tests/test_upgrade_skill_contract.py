@@ -33,12 +33,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL = REPO_ROOT / ".agents/skills/upgrade-kube-agents/SKILL.md"
 SECTION_HEADING = "## Report confirmed upgrade bugs"
 TRACKER = "gke-labs/kube-agents"
-# What ends a sentence: a period, question mark or exclamation mark, then any
-# closing punctuation -- a paren, bracket, quote or emphasis marker
-# (`... are fine.)`, `"... fine."`, `**... fine.**`) -- then whitespace or the
-# end of the text, so the period inside `install.env` or a version number does
-# not end one.
-SENTENCE_END = r"[.?!][)\]\"'*_`]*(?=\s|$)"
+# What ends a sentence: a terminator (`.`, `?`, `!` or `…`), then any run of
+# punctuation, whatever closes it (a paren, bracket, straight or curly quote,
+# or emphasis marker; `_` too, which regex counts as a word character), then
+# whitespace or the end of the text. The closers are not listed, so a new one
+# cannot reopen a span. The period inside `install.env` or a version number is
+# followed by a word character, so it does not end one.
+SENTENCE_END = r"[.?!…](?:[^\w\s]|_)*(?=\s|$)"
 # The body of one sentence: lazily, characters that contain no sentence end.
 # An opener that recurs in the section ("Remove ..." opens a labels sentence
 # as well as the strip sentence) otherwise matches from its first occurrence
@@ -212,7 +213,9 @@ class ReaderTest(unittest.TestCase):
         # A sentence ends at its period even with a closer after it, so a
         # "Remove" that opens a parenthesised, quoted or emphasised sentence
         # cannot stretch the strip group across the boundary.
-        for opener, closer in (("(", ")"), ('("', '")'), ("[", "]"), ("**", "**"), ("_", "_"), ("`", "`"), ("'", "'")):
+        for opener, closer in (
+            ("(", ")"), ('("', '")'), ("[", "]"), ("**", "**"), ("_", "_"), ("`", "`"), ("'", "'"), ("(\u201c", "\u201d)"), ("\u2018", "\u2019"),
+        ):
             with self.subTest(closer=closer):
                 text = (
                     f"Remove nothing the diagnosis needs {opener}placeholders are fine.{closer} "
@@ -221,7 +224,7 @@ class ReaderTest(unittest.TestCase):
                 self.assertEqual("credentials and tokens", STRIP_SENTENCE.search(text).group("classes"))
 
     def test_a_question_or_exclamation_ends_a_sentence(self) -> None:
-        for terminator in ("?", "!"):
+        for terminator in ("?", "!", "\u2026"):
             with self.subTest(terminator=terminator):
                 text = f"Remove what, exactly{terminator} Remove credentials and tokens and other client-specific details. Next."
                 self.assertEqual("credentials and tokens", STRIP_SENTENCE.search(text).group("classes"))
