@@ -438,6 +438,8 @@ class ForgeScriptTest(unittest.TestCase):
         # Gitaly's readiness gates the seeding: the sign-in page answers before the storage does.
         self.assertLess(startup.index("mark gitlab-ready"), startup.index("mark gitaly-ready"))
         self.assertLess(startup.index("mark gitaly-ready"), startup.index('"$API/projects"'))
+        for marker in ("/opt/gitlab/embedded/bin/curl", "FORGE gitaly-wait code=", "no-curl-in-container"):
+            self.assertIn(marker, startup)
         self.assertNotIn("python3", startup, "Container-Optimized OS has no python")
         self.assertNotIn("agent-header", startup, "the bot's token is never used on the VM; root's own token seeds")
         self.assertLess(startup.index("mark seeded"), startup.index("mark ready"), "ready is printed only once the project and the file exist")
