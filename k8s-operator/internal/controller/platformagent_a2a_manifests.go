@@ -4020,20 +4020,50 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 	}
 	converting = running != 0 && want != running
 	if converting && !r.busConversionAllowed {
-		// The bus keeps the count it runs: converting it would empty it, and
-		// the migration that keeps the data is #4225. Said once, on the pass
-		// that first sees the ask; the condition carries it after.
-		if msg := BusConversionRefusedMessage(int32(want), int32(running)); !a2aBusConversionRefusedConditionCurrent(agent, msg) { // #nosec G115 -- 1 or 3
-			r.recordEvent(agent, corev1.EventTypeWarning, a2aBusConversionRefusedReason, msg)
-		}
-		want, converting = running, false
+		// The bus keeps the count it runs until its migration converts it
+		// (Shrinking or Converting renders the new count); this pass only
+		// starts one, or leaves a running one to its phases.
+		startBusMigration(agent, running, want, metav1.Now())
+		agent.Status.BusReplicas = int32(running) // #nosec G115 -- 1 or 3
+		return false, nil
 	}
+
 	if converting && int(agent.Status.BusReplicas) != want {
 		r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusConverting,
 			fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d: converting it, which recreates every stream and bucket empty (task history, the topics journal and the KV buckets are lost once)", want, running))
 	}
 	agent.Status.BusReplicas = int32(want) // #nosec G115 -- want is 1 or 3
 	return converting, nil
+}
+
+// busMigrationRunDeadline bounds a migration run: a phase still unfinished
+// then counts as failed, and the run's bus credentials stop working.
+const busMigrationRunDeadline = 2 * time.Hour
+
+// startBusMigration starts a migration from running to want servers, unless
+// one is under way, or the last one ended without converting at this same
+// generation (it would only fail or abandon again until the spec changes).
+func startBusMigration(agent *agentv1alpha1.PlatformAgent, running, want int, now metav1.Time) {
+	if run := agent.Status.BusMigration; run != nil {
+		if !busMigrationTerminal(busMigrationPhase(run.Phase)) {
+			return
+		}
+		if run.ObservedGeneration == agent.Generation {
+			return
+		}
+	}
+	leg, first := busMigrationGrow, busMigrationFreezing
+	if want < running {
+		leg, first = busMigrationShrink, busMigrationPinning
+	}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{
+		Leg:                string(leg),
+		RunID:              fmt.Sprintf("%d-%d", agent.Generation, now.Unix()),
+		Phase:              string(first),
+		StartedAt:          now,
+		Deadline:           metav1.NewTime(now.Add(busMigrationRunDeadline)),
+		ObservedGeneration: agent.Generation,
+	}
 }
 
 // a2aNATSRenderedReplicas is the server count a NATS StatefulSet's template
@@ -4070,6 +4100,11 @@ func BusConversionRefusedMessage(asked, running int32) string {
 func a2aBusConversionRefusedMessage(agent *agentv1alpha1.PlatformAgent) string {
 	running := agent.Status.BusReplicas
 	limits := agentTuning(agent)
+	if agent.Status.BusMigration != nil {
+		// A change between the counts starts a migration, which reports
+		// itself; nothing is refused.
+		return ""
+	}
 	if !a2aStackRendering(agent) || limits == nil || limits.BusReplicas == nil || (running != 1 && running != 3) {
 		return ""
 	}

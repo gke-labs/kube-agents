@@ -11550,6 +11550,13 @@ spec:
                     message:
                       description: Message is the manual step a Failed migration names.
                       type: string
+                    observedGeneration:
+                      description: |-
+                        ObservedGeneration is the PlatformAgent generation that started this
+                        migration. A migration that ended without converting is not started
+                        again until the spec changes.
+                      format: int64
+                      type: integer
                     phase:
                       description: |-
                         Phase is where the migration is. Done converted the bus with its data;
@@ -11568,6 +11575,7 @@ spec:
                   required:
                     - deadline
                     - leg
+                    - observedGeneration
                     - phase
                     - runID
                     - startedAt

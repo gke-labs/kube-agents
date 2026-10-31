@@ -11,7 +11,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"net"
 	"os"
 	"path/filepath"
@@ -1240,13 +1239,12 @@ func TestAFailedConvertingPassStillDropsBusProvisionedOnTheRetry(t *testing.T) {
 	}
 }
 
-// Converting an existing bus empties it, and the migration that keeps the
-// data is #4225, which lifts the gate in the same change. Until then a set
-// busReplicas that disagrees with the bus is refused in both directions,
-// whether the bus is read from its StatefulSet or from the claims a deleted
-// one left: the count stays, a Warning says so once, and the field still
-// decides for a bus that does not exist yet.
-func TestAnExistingBusRefusesAConversion(t *testing.T) {
+// Setting busReplicas to the other count on an existing bus starts a
+// migration in that direction, read from the StatefulSet or from the claims
+// a deleted one left; the bus keeps the count it runs until the migration's
+// phases convert it, and the field still decides for a bus that does not
+// exist yet.
+func TestAFieldChangeStartsAMigration(t *testing.T) {
 	ctx := context.Background()
 	claim := func(agent *agentv1alpha1.PlatformAgent, ordinal int) *corev1.PersistentVolumeClaim {
 		return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
@@ -1264,57 +1262,64 @@ func TestAnExistingBusRefusesAConversion(t *testing.T) {
 		spec    int
 		objects func(*agentv1alpha1.PlatformAgent) []client.Object
 		want    int32
-		refused bool
+		leg     busMigrationLeg
 	}{
-		{"one to three", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 1, true},
-		{"three to one", 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, true},
+		{"one to three", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 1, busMigrationGrow},
+		{"three to one", 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, busMigrationShrink},
 		{"three to one over a deleted cluster's claims", 1, func(a *agentv1alpha1.PlatformAgent) []client.Object {
 			return []client.Object{claim(a, 0), claim(a, 1)}
-		}, 3, true},
-		{"one to three over a deleted single server's claim", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0)} }, 1, true},
-		{"the count it runs", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, false},
-		{"a new bus takes the field", 1, func(*agentv1alpha1.PlatformAgent) []client.Object { return nil }, 1, false},
+		}, 3, busMigrationShrink},
+		{"one to three over a deleted single server's claim", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0)} }, 1, busMigrationGrow},
+		{"the count it runs", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, ""},
+		{"a new bus takes the field", 1, func(*agentv1alpha1.PlatformAgent) []client.Object { return nil }, 1, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := a2aTestAgent()
+			agent.Generation = 4
 			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.spec)}}
-			rec := record.NewFakeRecorder(8)
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: rec}
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
 			converting, err := r.resolveA2ABusReplicas(ctx, agent)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if converting {
-				t.Error("resolveA2ABusReplicas reports a conversion with the gate shut")
+				t.Error("resolveA2ABusReplicas converts directly; a migration's phases do")
 			}
-			if agent.Status.BusReplicas != tc.want || a2aNATSReplicas(agent) != int(tc.want) || int(*buildA2ANATSStatefulSet(agent, "h").Spec.Replicas) != int(tc.want) {
-				t.Errorf("status %d, a2aNATSReplicas %d, rendered %d; want %d throughout", agent.Status.BusReplicas, a2aNATSReplicas(agent), *buildA2ANATSStatefulSet(agent, "h").Spec.Replicas, tc.want)
+			if agent.Status.BusReplicas != tc.want || int(*buildA2ANATSStatefulSet(agent, "h").Spec.Replicas) != int(tc.want) {
+				t.Errorf("status %d, rendered %d; want %d until the migration converts it", agent.Status.BusReplicas, *buildA2ANATSStatefulSet(agent, "h").Spec.Replicas, tc.want)
 			}
-			msg := a2aBusConversionRefusedMessage(agent)
-			if tc.refused != (msg != "") {
-				t.Errorf("condition message %q, want present = %v", msg, tc.refused)
-			}
-			var events []string
-			for len(rec.Events) > 0 {
-				events = append(events, <-rec.Events)
-			}
-			if tc.refused != (len(events) == 1 && strings.Contains(events[0], a2aBusConversionRefusedReason)) {
-				t.Errorf("events %q, want one %s = %v", events, a2aBusConversionRefusedReason, tc.refused)
-			}
-			if tc.refused && !strings.Contains(msg, "#4225") {
-				t.Errorf("the refusal does not name the migration it waits for: %q", msg)
-			}
-			// Said once: with the condition standing, the next pass is quiet.
-			if tc.refused {
-				setA2ABusConversionRefusedCondition(agent, msg, metav1.Now())
-				if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
-					t.Fatal(err)
-				}
-				if len(rec.Events) != 0 {
-					t.Errorf("a standing refusal is re-announced on every pass: %q", <-rec.Events)
-				}
+			run := agent.Status.BusMigration
+			switch {
+			case tc.leg == "" && run != nil:
+				t.Errorf("no migration wanted, started %+v", run)
+			case tc.leg != "" && (run == nil || run.Leg != string(tc.leg) || run.ObservedGeneration != 4 || run.Deadline.Sub(run.StartedAt.Time) != busMigrationRunDeadline):
+				t.Errorf("migration %+v, want leg %s at generation 4 with the run deadline", run, tc.leg)
 			}
 		})
+	}
+}
+
+// A migration under way is not restarted, and one that ended without
+// converting is not started again until the spec changes.
+func TestAMigrationStartsOncePerSpecChange(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Generation = 7
+	now := metav1.Now()
+	startBusMigration(agent, 1, 3, now)
+	first := agent.Status.BusMigration.RunID
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(time.Minute)))
+	if agent.Status.BusMigration.RunID != first {
+		t.Error("a migration under way was restarted")
+	}
+	agent.Status.BusMigration.Phase = string(busMigrationAbandoned)
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(2*time.Minute)))
+	if agent.Status.BusMigration.Phase != string(busMigrationAbandoned) {
+		t.Error("an abandoned migration was started again at the same generation")
+	}
+	agent.Generation = 8
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(3*time.Minute)))
+	if agent.Status.BusMigration.Phase != string(busMigrationFreezing) || agent.Status.BusMigration.ObservedGeneration != 8 {
+		t.Errorf("after a spec change: %+v, want a new run from Freezing", agent.Status.BusMigration)
 	}
 }
 
@@ -1373,45 +1378,6 @@ func TestARefusedConversionRendersNothingTowardTheNewCount(t *testing.T) {
 		if !busProvisioned(agent) {
 			t.Errorf("%d to %d: BusProvisioned dropped although nothing converted", from, to)
 		}
-	}
-}
-
-// The refusal is a condition the status write carries and clears, beside a
-// Ready that stays on the bus that runs.
-func TestARefusedConversionIsAConditionThatClears(t *testing.T) {
-	ctx := context.Background()
-	agent := a2aTestAgent()
-	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
-	running := buildA2ANATSStatefulSet(agent, "h")
-	running.Spec.Replicas = ptr.To(int32(3))
-	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, running).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
-	read := func() *metav1.Condition {
-		t.Helper()
-		live := &agentv1alpha1.PlatformAgent{}
-		if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
-			t.Fatal(err)
-		}
-		return meta.FindStatusCondition(live.Status.Conditions, a2aBusConversionRefusedConditionType)
-	}
-	if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{done: true}); err != nil {
-		t.Fatal(err)
-	}
-	if c := read(); c == nil || c.Status != metav1.ConditionTrue || c.Message != BusConversionRefusedMessage(1, 3) {
-		t.Fatalf("condition after a refused 3 to 1 = %+v, want True with the shared message", c)
-	}
-	agent.Spec.Harness.Tuning.BusReplicas = nil
-	if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{done: true}); err != nil {
-		t.Fatal(err)
-	}
-	if c := read(); c != nil {
-		t.Errorf("condition after removing the field = %+v, want it gone", c)
 	}
 }
 

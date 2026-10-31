@@ -18,7 +18,6 @@ package webhook
 
 import (
 	"context"
-	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 	"reflect"
 	"slices"
 	"strings"
@@ -1288,22 +1287,19 @@ func TestWebhookRejectsForgeCredentialVolumeAndEnvOverrides(t *testing.T) {
 	}
 }
 
-// An edit asking an existing bus for another server count is refused at
-// apply time with the operator's message, in both directions; an edit that
-// leaves the field as it was, a bus with no recorded count, and a create
-// pass, because the operator is the enforcement and this only refuses early.
-func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
-	agent := func(spec *int, running int32) *agentv1alpha1.PlatformAgent {
+// busReplicas cannot change while the bus's migration is under way; before
+// and after one, changing it is how a migration starts, so it passes.
+func TestBusReplicasCannotChangeMidMigration(t *testing.T) {
+	agent := func(spec *int, phase string) *agentv1alpha1.PlatformAgent {
 		pa := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "kubeagents-system"}}
+		pa.Spec.Mode = ptr.To("next")
 		if spec != nil {
 			pa.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: spec}}
 		}
-		pa.Status.BusReplicas = running
-		pa.Spec.Mode = ptr.To("next")
-		return pa
-	}
-	today := func(pa *agentv1alpha1.PlatformAgent) *agentv1alpha1.PlatformAgent {
-		pa.Spec.Mode = ptr.To("today")
+		if phase != "" {
+			pa.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: "OneToThree", Phase: phase}
+		}
+		pa.Status.BusReplicas = 1
 		return pa
 	}
 	for _, tc := range []struct {
@@ -1311,33 +1307,21 @@ func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
 		old, new *agentv1alpha1.PlatformAgent
 		refused  bool
 	}{
-		{"one to three", agent(nil, 1), agent(ptr.To(3), 1), true},
-		{"three to one", agent(nil, 3), agent(ptr.To(1), 3), true},
-		{"three to one, changing a set field", agent(ptr.To(3), 3), agent(ptr.To(1), 3), true},
-		{"the count it runs", agent(nil, 3), agent(ptr.To(3), 3), false},
-		{"removing the field", agent(ptr.To(3), 1), agent(nil, 1), false},
-		{"a field the operator already holds, left as it was", agent(ptr.To(3), 1), agent(ptr.To(3), 1), false},
-		{"no recorded count (pruned, or today)", agent(nil, 0), agent(ptr.To(1), 0), false},
-		{"a create", nil, agent(ptr.To(1), 0), false},
-		{"a flip to today with the field set to the other count", agent(nil, 3), today(agent(ptr.To(1), 3)), false},
-		{"a today CR whose count is not cleared yet", today(agent(nil, 1)), today(agent(ptr.To(3), 1)), false},
+		{"starting a migration", agent(nil, ""), agent(ptr.To(3), ""), false},
+		{"turning a running migration around", agent(ptr.To(3), "Restoring"), agent(ptr.To(1), "Restoring"), true},
+		{"removing the field mid-migration", agent(ptr.To(3), "Hashing"), agent(nil, "Hashing"), true},
+		{"other edits mid-migration", agent(ptr.To(3), "Hashing"), agent(ptr.To(3), "Hashing"), false},
+		{"after a migration ended", agent(ptr.To(3), "Abandoned"), agent(ptr.To(1), "Abandoned"), false},
+		{"a create", nil, agent(ptr.To(3), ""), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			errs := validateBusReplicas(tc.old, tc.new)
 			if tc.refused != (len(errs) == 1) {
 				t.Fatalf("errors %v, want refused = %v", errs, tc.refused)
 			}
-			if tc.refused {
-				want := controller.BusConversionRefusedMessage(int32(*tc.new.Spec.Harness.Tuning.BusReplicas), tc.old.Status.BusReplicas)
-				if !strings.Contains(errs[0].Detail, want) || errs[0].Field != "spec.harness.tuning.busReplicas" {
-					t.Errorf("refusal %s: %q, want the operator's message %q", errs[0].Field, errs[0].Detail, want)
-				}
-			}
 		})
 	}
-	// Wired into the update path.
-	_, err := (&PlatformAgentCustomValidator{}).ValidateUpdate(context.Background(), agent(nil, 3), agent(ptr.To(1), 3))
-	if err == nil || !strings.Contains(err.Error(), "#4225") {
-		t.Errorf("ValidateUpdate of a 3 to 1 edit: %v, want the refusal", err)
+	if _, err := (&PlatformAgentCustomValidator{}).ValidateUpdate(context.Background(), agent(ptr.To(3), "Restoring"), agent(ptr.To(1), "Restoring")); err == nil || !strings.Contains(err.Error(), "migration is under way") {
+		t.Errorf("ValidateUpdate turning a migration around: %v, want the refusal", err)
 	}
 }

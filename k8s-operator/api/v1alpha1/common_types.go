@@ -2346,6 +2346,11 @@ type BusMigrationStatus struct {
 	// Message is the manual step a Failed migration names.
 	// +optional
 	Message string `json:"message,omitempty"`
+
+	// ObservedGeneration is the PlatformAgent generation that started this
+	// migration. A migration that ended without converting is not started
+	// again until the spec changes.
+	ObservedGeneration int64 `json:"observedGeneration"`
 }
 
 type AgentUsageStatus struct {

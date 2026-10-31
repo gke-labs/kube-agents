@@ -218,6 +218,7 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `busMigration.startedAt` | `metav1.Time` | yes |  |  | StartedAt is when the migration began. |
 | `busMigration.deadline` | `metav1.Time` | yes |  |  | Deadline is when an unfinished phase counts as failed, and when the migration's bus credentials stop working. |
 | `busMigration.message` | `string` | no |  |  | Message is the manual step a Failed migration names. |
+| `busMigration.observedGeneration` | `integer` | yes |  |  | ObservedGeneration is the PlatformAgent generation that started this migration. A migration that ended without converting is not started again until the spec changes. |
 | `telemetry` | `object` | no |  |  | Telemetry reports the resolved OpenTelemetry export configuration. |
 | `telemetry.otlpEndpoint` | `string` | no |  |  | OTLPEndpoint is the collector endpoint written into the agent pod. Empty when the source is None, which is the one case where the pod is given no endpoint at all. |
 | `telemetry.otlpEndpointSource` | `string` | no |  |  | OTLPEndpointSource is how the endpoint was chosen: DeploymentEnv, Spec, OperatorEnv, Discovered, Default, or None. None means discovery completed and this cluster has no collector, so the agent runs with OTEL_SDK_DISABLED=true and exports nothing; Default still means the GKE managed collector, and is what an install gets when discovery is switched off or could not complete. |
