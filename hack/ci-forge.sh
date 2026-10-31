@@ -109,9 +109,10 @@ readonly GHES_PROXY_MACHINE_TYPE="e2-small"
 readonly GHES_READY_TIMEOUT_SECONDS="${GHES_READY_TIMEOUT_SECONDS:-300}"
 readonly GHES_READY_PATH="/api/v3/meta"
 # The GitLab CE row: the image (Docker Hub, pinned), the machine and disk it
-# needs, its first boot (6-10 min on a fresh data directory, measured on
-# 2026-10-21, so 20 min to give up), the sign-in page as readiness (the
-# readiness endpoint is whitelist-gated), the bot the eval expects (its login
+# needs, its first boot (6-8 min on a fresh data directory, measured on
+# 2026-10-31, so 30 min to give up), the sign-in page as readiness from the
+# runner (GitLab's own readiness endpoint answers loopback alone, so the VM
+# gates its seeding on that one), the bot the eval expects (its login
 # is re-read from the agent token there) and its two tokens: one day, like the
 # certificates, GitLab's prefix and 20 hex characters, its minimum.
 readonly GITLAB_CE_IMAGE="gitlab/gitlab-ce:19.4.3-ce.0@sha256:483fb4cc5c75237a7a6c7c8b8b2a1832ed790d86e0449ff55e8b6f6d62d2d5f5"
@@ -269,9 +270,13 @@ close_tunnel() {
   local pid context=()
   if [ -s "${FORGE_TUNNEL_PID_FILE}" ]; then
     read -r pid < "${FORGE_TUNNEL_PID_FILE}"
-    # The keeper loop first, then the port-forward it holds, so no restart follows the kill.
-    pkill -P "${pid}" 2>/dev/null || true
+    # The port-forward the keeper holds is read before the keeper is killed, so
+    # no restart follows the kill and a reparented port-forward is still found.
+    local children
+    children="$(pgrep -P "${pid}" 2>/dev/null || true)"
     kill "${pid}" 2>/dev/null && echo "Forge ${ACTION}: port-forward keeper ${pid} stopped" || echo "Forge ${ACTION}: port-forward keeper ${pid} was already gone"
+    # shellcheck disable=SC2086 # one pid per word
+    [ -z "${children}" ] || kill ${children} 2>/dev/null || true
     rm -f "${FORGE_TUNNEL_PID_FILE}"
   fi
   [ ! -s "${FORGE_TUNNEL_CONTEXT_FILE}" ] || context=(--context "$(cat "${FORGE_TUNNEL_CONTEXT_FILE}")")
@@ -677,9 +682,11 @@ open_tunnel() {
   [ -d "${EVAL_FORGE_STATE_DIR}" ] || install -d -m 700 "${EVAL_FORGE_STATE_DIR}"
   kubectl config current-context > "${FORGE_TUNNEL_CONTEXT_FILE}" 2>/dev/null || true
   # A port-forward dies with its API stream (a control-plane roll, the relay's
-  # node); the keeper restarts it for the run's length, and `down` kills both.
-  nohup bash -c 'while :; do kubectl port-forward -n "$1" "pod/$2" --address 127.0.0.1 "$3:$4"; sleep "$5"; done' _ \
+  # node); the keeper restarts it for the run's length, in the recorded
+  # context (a case's stack may move the current one), and `down` kills both.
+  nohup bash -c 'while :; do kubectl --context "$6" port-forward -n "$1" "pod/$2" --address 127.0.0.1 "$3:$4"; sleep "$5"; done' _ \
     "${FORGE_CLUSTER_CHECK_NAMESPACE}" "${FORGE_RELAY_POD}" "${FORGE_TUNNEL_LOCAL_PORT}" "${FORGE_RELAY_PORT}" "${FORGE_TUNNEL_RESTART_SECONDS}" \
+    "$(cat "${FORGE_TUNNEL_CONTEXT_FILE}")" \
     > "${FORGE_TUNNEL_LOG_FILE}" 2>&1 &
   echo "$!" > "${FORGE_TUNNEL_PID_FILE}"
   if ! grep -qxF "$(hosts_entry)" "${FORGE_TUNNEL_HOSTS_FILE}" 2>/dev/null; then
