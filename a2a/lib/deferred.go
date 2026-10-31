@@ -157,8 +157,9 @@ type deferredDelivery struct {
 }
 
 func (dd *deferredDelivery) Sequence() uint64 { return dd.seq }
-func (dd *deferredDelivery) Ack() error       { return dd.settled(dd.heldDelivery.Ack()) }
-func (dd *deferredDelivery) Term() error      { return dd.settled(dd.heldDelivery.Term()) }
+
+func (dd *deferredDelivery) Ack() error  { return dd.settled(dd.heldDelivery.Ack()) }
+func (dd *deferredDelivery) Term() error { return dd.settled(dd.heldDelivery.Term()) }
 
 // Nak gives the delivery back. A nak that doesn't reach the connection still
 // releases it, as the stop's give-back does: with nothing renewing it, the
@@ -172,7 +173,8 @@ func (dd *deferredDelivery) Nak(delay time.Duration) error {
 }
 
 // settled stops tracking the delivery once an Ack or Term reached the
-// connection; a failed one leaves it pending, renewed, for a retry.
+// connection; a failed one leaves it pending, renewed, for the caller to try
+// again.
 func (dd *deferredDelivery) settled(err error) error {
 	if err != nil {
 		return err

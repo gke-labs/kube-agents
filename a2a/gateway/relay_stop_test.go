@@ -2,8 +2,10 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -229,4 +231,39 @@ func TestAGiveBackIsAnErrorOnlyOnTheFirstDelivery(t *testing.T) {
 	if got := firstDeliveryLevel(relayItem{env: first.env}); got != slog.LevelError {
 		t.Errorf("an item off no durable logs at %v, want Error", got)
 	}
+}
+
+// flakyAck fails its first ack and counts every attempt.
+type flakyAck struct {
+	fakeDelivery
+	mu       sync.Mutex
+	attempts int
+}
+
+func (f *flakyAck) Ack() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attempts++
+	if f.attempts == 1 {
+		return errors.New("connection closed")
+	}
+	f.acks++
+	return nil
+}
+
+func (f *flakyAck) acked() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.acks == 1
+}
+
+// TestAFailedAckIsTriedAgain: an ack that fails is retried until it lands,
+// so the delivery is neither renewed for the life of the gateway nor handed
+// back to render again.
+func TestAFailedAckIsTriedAgain(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	waitRunning(t, r)
+	d := &flakyAck{fakeDelivery: fakeDelivery{env: &lib.Envelope{TaskID: "t"}, subj: "s", seq: 1}}
+	r.g.settle(relayItem{env: d.env, d: d})
+	waitFor(t, "the retried ack", d.acked)
 }

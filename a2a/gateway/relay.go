@@ -186,15 +186,40 @@ type relayItem struct {
 }
 
 // settle acks the item's delivery: it was rendered, or it is not one this
-// gateway will ever render. A failed ack leaves it held, renewed, and the
-// stream redelivers it only if this gateway dies; the sequence guard
-// (SessionRecord.relayed) keeps a rendered one from posting twice.
+// gateway will ever render. A failed ack is tried again every requeueDelay
+// until it lands or the gateway stops. The delivery stays held meanwhile, so
+// it isn't redelivered while its heartbeat renews it; released, it would come
+// back after AckWait every time, and render again if the record write failed
+// too. A connection gone longer than AckWait fails the heartbeat with the ack,
+// and then the server redelivers it all the same. A stop gives it back with
+// the rest, and the sequence guard (SessionRecord.relayed) keeps a rendered
+// one from posting twice when its record write landed.
 func (g *Gateway) settle(item relayItem) {
 	if item.d == nil {
 		return
 	}
 	if err := item.d.Ack(); err != nil {
-		g.log.Warn("relay: ack failed", "taskId", item.env.TaskID, "err", err)
+		if g.runCtx.Err() != nil {
+			g.log.Warn("relay: ack failed; left for the stop's give-back", "taskId", item.env.TaskID, "err", err)
+			return
+		}
+		g.log.Warn("relay: ack failed; trying again", "taskId", item.env.TaskID, "err", err)
+		go g.retryAck(item)
+	}
+}
+
+// retryAck tries a failed ack again every requeueDelay until it lands or the
+// gateway stops.
+func (g *Gateway) retryAck(item relayItem) {
+	for {
+		select {
+		case <-g.runCtx.Done():
+			return
+		case <-time.After(requeueDelay):
+		}
+		if err := item.d.Ack(); err == nil {
+			return
+		}
 	}
 }
 
@@ -365,9 +390,11 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 		return
 	}
 
-	// An event a gateway already rendered comes again only if that gateway
-	// died between its record write and its ack; its sequence is on the
-	// record then, and it is acked without rendering twice.
+	// An event a gateway already rendered comes again only if its ack never
+	// landed: the gateway died or stopped between its record write and its
+	// ack, or a connection outage outlasted AckWait while the ack was being
+	// retried. Its sequence is on the record then, and it is acked without
+	// rendering twice.
 	// In stream order: a stop gives deliveries back in order, but redelivery
 	// can still interleave with new events, and the stream sequence is the
 	// order they were written in. Items without one (not off the durable)
@@ -376,14 +403,21 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 		slices.SortStableFunc(batch, func(a, b relayItem) int { return cmp.Compare(a.sequence(), b.sequence()) })
 	}
 	fresh := batch[:0:0]
+	var dupes []relayItem
 	inBatch := map[uint64]bool{}
 	for _, item := range batch {
 		seq := item.sequence()
-		// A redelivery can share a batch with its original (a hold that
-		// outlived AckWait), so a sequence seen earlier in the batch counts
-		// as rendered too.
-		if rec.relayed(item.env.TaskID, seq) || (seq != 0 && inBatch[seq]) {
+		if rec.relayed(item.env.TaskID, seq) {
 			g.settle(item)
+			continue
+		}
+		// A redelivery can share a batch with its original (a hold that
+		// outlived AckWait). It renders once, and is settled with its
+		// original after the record write: acked now, it would take the
+		// original's pending entry with it, and an abandoned batch or a
+		// crash before the render would lose the event.
+		if seq != 0 && inBatch[seq] {
+			dupes = append(dupes, item)
 			continue
 		}
 		if seq != 0 {
@@ -415,6 +449,9 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	// Rendered, so acked whatever the write did: the posts are out, and a
 	// redelivery would make them again.
 	for _, item := range fresh {
+		g.settle(item)
+	}
+	for _, item := range dupes {
 		g.settle(item)
 	}
 }
