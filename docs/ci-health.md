@@ -1412,7 +1412,8 @@ for p in $(sed -n '/^gitops_repo_for_project() {/,/^}/p' hack/ci-deploy.sh \
 done
 ```
 
-Until then every check on the project records `not_checked` with gcloud's words.
+Until then the checks whose reads the missing roles cover record `not_checked` with
+gcloud's words (every check, on a project with none of the roles).
 
 **The condition.** `health.py`'s `pool_drift` is the fleet scan's rule over this
 document: the same finding on the same project in two consecutive scans, or on
