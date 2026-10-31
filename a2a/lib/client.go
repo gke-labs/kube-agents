@@ -124,9 +124,16 @@ func ParseSubmitSubject(subject string) (profile, tier, kind, taskID string, ok 
 	return "", "", "", "", false
 }
 
-// dialTimeout bounds one connection attempt's TCP and auth handshake;
-// reconnect pacing is the jittered backoff below, not this.
-const dialTimeout = 10 * time.Second
+// DialTimeout bounds one connection attempt's TCP and auth handshake;
+// reconnect pacing is the jittered backoff below, not this. nats.go puts
+// the whole handshake under it, first connect and every reconnect alike,
+// and under the auth callout the handshake holds the server's TokenReview
+// round trip, so the library's number rather than nats.go's two-second
+// default. Exported for a caller that opens a raw nats.Conn beside its
+// Client under the callout (the worker adapter's dialBus is one): the two
+// are one principal, and a reconnect at the grant's expiry must be able to
+// re-authenticate on both.
+const DialTimeout = 10 * time.Second
 
 // NR-6 backoff shape: full jitter over an exponential ceiling. Dev defaults;
 // a restart must spread the herd, not synchronize it.
@@ -264,7 +271,7 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 	opts := []nats.Option{
 		nats.Name(c.opts.name),
 		nats.MaxReconnects(-1),
-		nats.Timeout(dialTimeout),
+		nats.Timeout(DialTimeout),
 	}
 	opts = append(opts, TLSOptions()...)
 	opts = append(opts, c.opts.natsOpts...)

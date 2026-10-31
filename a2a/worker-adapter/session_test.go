@@ -641,6 +641,36 @@ sleep 0.5`)
 	}
 }
 
+// The pod's two connections are one principal, and both reconnect at every
+// grant expiry of a reused session pod. nats.go runs each reconnect's whole
+// handshake under the connection's dial timeout, and under the auth callout
+// that handshake holds the server's TokenReview round trip, so the raw
+// connection the session's consumers ride takes the library's dial timeout
+// rather than nats.go's default: with the default, a slow bus left the lib
+// client re-authenticated and the task watcher's connection not, and the
+// next turn was never taken.
+func TestDialBusGivesTheRawConnectionTheLibraryDialTimeout(t *testing.T) {
+	url := startServerNoVerifier(t)
+	cfg := adapterConfig(url, "task-dial", "sess-dial", nil)
+	cfg.applyDefaults()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	b, closeBus, err := dialBus(ctx, cfg)
+	if err != nil {
+		t.Fatalf("dialBus: %v", err)
+	}
+	defer closeBus()
+	if got := b.nc.Opts.Timeout; got != lib.DialTimeout {
+		t.Fatalf("raw connection dial timeout = %s, want the library's %s", got, lib.DialTimeout)
+	}
+	if got := b.c.Conn().Opts.Timeout; got != b.nc.Opts.Timeout {
+		t.Fatalf("lib client dial timeout = %s, raw connection %s: the pod's two connections re-authenticate under one budget", got, b.nc.Opts.Timeout)
+	}
+	if lib.DialTimeout <= nats.DefaultTimeout {
+		t.Fatalf("lib.DialTimeout = %s is not longer than nats.go's default %s", lib.DialTimeout, nats.DefaultTimeout)
+	}
+}
+
 // reapChildren takes every exited child and returns once there are none,
 // without waiting out its bound.
 func TestReapChildrenTakesExitedChildren(t *testing.T) {
