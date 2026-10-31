@@ -213,8 +213,10 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `deploymentStatus.readyReplicas` | `integer` | no |  |  | ReadyReplicas indicates how many replicas are fully ready. |
 | `serviceStatus` | `object` | no |  |  | ServiceStatus holds internal/external endpoints. |
 | `serviceStatus.endpoint` | `string` | no |  |  | Endpoint is the primary URL or IP (including protocol and port) to reach the agent. |
-| `storageStatus` | `object` | no |  |  | StorageStatus tracks PVC binding state. |
+| `storageStatus` | `object` | no |  |  | StorageStatus tracks PVC binding state and the data volume's usage. |
 | `storageStatus.bound` | `boolean` | no |  |  | Bound indicates if the primary PVC has been successfully provisioned. |
+| `storageStatus.capacityBytes` | `integer` | no |  |  | CapacityBytes is the size of the filesystem on the agent's data volume, as the gateway pod's event watcher last read it. Absent when the watcher is disabled or the operator has no current reading from it. |
+| `storageStatus.freeBytes` | `integer` | no |  |  | FreeBytes is the space left on the agent's data volume for the agent's own non-root user, read with CapacityBytes. The DataVolumeNearlyFull condition is computed from the two. |
 | `busReplicas` | `integer` | no |  |  | BusReplicas is the A2A bus's NATS server count under spec.mode: next: the count the bus already runs, which spec.harness.tuning.busReplicas does not change; for a new bus, that field, or 3. Re-derived from the cluster on every reconcile, so it is a reading of the bus rather than a setting. |
 | `telemetry` | `object` | no |  |  | Telemetry reports the resolved OpenTelemetry export configuration. |
 | `telemetry.otlpEndpoint` | `string` | no |  |  | OTLPEndpoint is the collector endpoint written into the agent pod. Empty when the source is None, which is the one case where the pod is given no endpoint at all. |

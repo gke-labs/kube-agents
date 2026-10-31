@@ -161,6 +161,15 @@ const (
 	// (GKE's own per-project quotas keep a fleet far below it) and refused, not
 	// clamped, so a body past it reads as the hostile or broken one it is.
 	usageClusterGaugeCeiling int64 = 10000
+	// dataVolumeSeries is the watcher's reading of the agent's data volume,
+	// one series per dataVolumeKindLabel value: the filesystem's size and the
+	// space a non-root writer has left. Read from the watcher's body beside
+	// the cluster gauge, and projected to status.storageStatus
+	// (usage_storage.go).
+	dataVolumeSeries    = "kubeagents_data_volume_bytes"
+	dataVolumeKindLabel = "kind"
+	dataVolumeKindTotal = "total"
+	dataVolumeKindFree  = "free"
 	// toolInvocationsStatusLabel is the broker's outcome label. The outcomes
 	// toolInvocationsCountedStatuses sums are the broker's success and error:
 	// the commands it ran and the requests it rejected or failed on before
@@ -325,6 +334,16 @@ type usageReading struct {
 	Clusters        *usageClusterGauges
 	Readings        map[string]int64
 	ReadingsPresent map[usageReadingKind]bool
+	// DataVolume is the watcher's data volume reading, nil when the body
+	// carried no complete one: not the watcher's, or a watcher whose statfs
+	// failed, or one built before it exported the series.
+	DataVolume *usageDataVolume
+}
+
+// usageDataVolume is one reading of the agent's data volume, in bytes.
+type usageDataVolume struct {
+	Total int64
+	Free  int64
 }
 
 // usageClusterGauges is the watcher's view of the fleet in one body: the
@@ -445,11 +464,12 @@ func (s *podUsageSource) Scrape(ctx context.Context, addr string, counters []str
 
 // foldUsageBody scans body line by line and keeps none of it: a line that could
 // be a wanted family -- each counter's own, the start-time gauge, and for the
-// watcher's body the per-cluster up gauge, one that contains a wanted name as a
-// substring -- is parsed on its own with expfmt, and a metric expfmt names as
-// one of them is folded as it is read, a counter's into its running sum under
-// its label filter and the up gauge into the cluster counts; every other line
-// is skipped unread. The substring is only a prefilter: the parser,
+// watcher's body the per-cluster up gauge and the data volume pair, one that
+// contains a wanted name as a substring -- is parsed on its own with expfmt,
+// and a metric expfmt names as one of them is folded as it is read, a
+// counter's into its running sum under its label filter, the up gauge into the
+// cluster counts and the volume pair into one reading; every other line is
+// skipped unread. The substring is only a prefilter: the parser,
 // not a hand-read of the line, names the metric, so the name in a comment or a
 // label value adds nothing and a UTF-8 name the parser accepts is not dropped by
 // a stricter hand-read. A candidate line that does not parse, or a sample that
@@ -468,6 +488,8 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 	// each through its own filter: the broker's tool counter is read into
 	// two, over disjoint statuses.
 	var clusters *usageClusterGauges
+	// volume collects the data volume series; a reading needs both kinds.
+	var volume map[string]float64
 	// readsOf is every (counter, filter) pair a family feeds, so a sibling
 	// family takes its own filter, not the one its counter's own family takes.
 	readsOf := make(map[string][]usageRead, len(counters))
@@ -487,7 +509,8 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 		}
 		if family == eventsInjectedSeries {
 			clusters = &usageClusterGauges{}
-			wanted = append(wanted, clusterUpSeries)
+			volume = map[string]float64{}
+			wanted = append(wanted, clusterUpSeries, dataVolumeSeries)
 		}
 	}
 	// The reading slot, for the broker's body alone: a running sum per spec,
@@ -556,6 +579,12 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 						start = &captured
 						continue
 					}
+					if name == dataVolumeSeries {
+						if kind := usageLabelValue(metric, dataVolumeKindLabel); kind == dataVolumeKindTotal || kind == dataVolumeKindFree {
+							volume[kind] = value
+						}
+						continue
+					}
 					if name == clusterUpSeries {
 						clusters.Registered++
 						if clusters.Registered > usageClusterGaugeCeiling {
@@ -588,7 +617,7 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 		}
 		samples[counter] = int64(sum)
 	}
-	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters}
+	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume)}
 	if readings != nil {
 		var ok bool
 		if out.Readings, out.ReadingsPresent, ok = readings.result(); !ok {
@@ -596,6 +625,21 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 		}
 	}
 	return out, nil
+}
+
+// usageDataVolumeReading turns the data volume series a body carried into a
+// reading, or nil when it carried neither kind, only one, or a pair no statfs
+// produces (free past total, or a size past int64). Nil rather than a failed
+// scrape, so such a pair costs the volume fields and not the counters and
+// cluster gauges read from the same body. A NaN or negative sample fails the
+// whole scrape in foldUsageBody's sample check, as it does for any series.
+func usageDataVolumeReading(volume map[string]float64) *usageDataVolume {
+	total, hasTotal := volume[dataVolumeKindTotal]
+	free, hasFree := volume[dataVolumeKindFree]
+	if !hasTotal || !hasFree || total >= float64(math.MaxInt64) || free > total {
+		return nil
+	}
+	return &usageDataVolume{Total: int64(total), Free: int64(free)}
 }
 
 // usageReadingFold is the reading slot's state through one broker body.

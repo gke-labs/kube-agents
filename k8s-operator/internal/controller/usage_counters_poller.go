@@ -271,7 +271,7 @@ func (p *UsageCounterPoller) noteNewerFieldEcho(ctx context.Context, agent *agen
 	fresh := held && p.now().Sub(recorded) < usageStatusReprobeInterval
 	p.r.prunedNewerFields[key][field] = p.now()
 	if !fresh {
-		logf.FromContext(ctx).Info("the served CRD does not serve a status.usage field this operator writes; apply this release's CRD to get it, which is probed again after the interval",
+		logf.FromContext(ctx).Info("the served CRD does not serve a status field this operator writes; apply this release's CRD to get it, which is probed again after the interval",
 			"platformagent", key, "field", field, "reprobeAfter", usageStatusReprobeInterval.String())
 	}
 }
@@ -518,6 +518,9 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 				Clusters:        reading.Clusters,
 				Readings:        reading.Readings,
 				ReadingsPresent: reading.ReadingsPresent,
+				// DataVolume rides with Clusters: both come from the
+				// watcher's body alone.
+				DataVolume: reading.DataVolume,
 			})
 		}
 	}
@@ -530,7 +533,9 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			break
 		}
 	}
-	gauges, gaugesKnown := usageClusterGaugesForPoll(cached, scraped, p.noteGatewayReading(cached, gatewayRead))
+	watcherDown := p.noteGatewayReading(cached, gatewayRead)
+	gauges, gaugesKnown := usageClusterGaugesForPoll(cached, scraped, watcherDown)
+	volume, volumeKnown := usageDataVolumeForPoll(cached, scraped, gatewayRead, watcherDown)
 	readings, readingsKnown := usageReadingsForPoll(scraped, p.noteBrokerReadings(cached, scraped))
 	// The scrape and ConfigMap causes are not recorded here: both are standing
 	// failures that would each spend one of the CR's event-bucket tokens every
@@ -580,7 +585,10 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	if ctx.Err() == nil {
 		p.recordStandingFailures(cached, failing, nil)
 	}
-	return p.projectStatus(ctx, agent, result.Document, gauges, gaugesKnown, readings, readingsKnown)
+	if err := p.projectStatus(ctx, agent, result.Document, gauges, gaugesKnown, readings, readingsKnown); err != nil {
+		return err
+	}
+	return p.projectDataVolume(ctx, agent, volume, volumeKnown)
 }
 
 // usageClusterGaugesForPoll is the fleet reading this poll projects, and
