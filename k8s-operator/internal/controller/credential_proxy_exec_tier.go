@@ -79,8 +79,8 @@ const (
 	// The callers' address for the tier (§12): the sandbox and the session
 	// pods read CREDENTIAL_PROXY_EXEC_URL; the A2A gateway reads its own
 	// name and passes the URL to the session pods it spawns.
-	credentialProxyExecURLEnv    = "CREDENTIAL_PROXY_EXEC_URL"
-	a2aCredentialProxyExecURLEnv = "A2A_CREDENTIAL_PROXY_EXEC_URL"
+	credentialProxyExecURLEnv    = "CREDENTIAL_PROXY_EXEC_URL"     // #nosec G101 -- Environment variable name, not a credential
+	a2aCredentialProxyExecURLEnv = "A2A_CREDENTIAL_PROXY_EXEC_URL" // #nosec G101 -- Environment variable name, not a credential
 )
 
 // credentialProxyExecTierEnvDropped names the broker env the exec tier does
