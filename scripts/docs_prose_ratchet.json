@@ -139,10 +139,5 @@
   "reference/resource-labels.md": {
     "long-paragraph": 3,
     "long-sentence": 7
-  },
-  "reference/security-and-iam.md": {
-    "banned-word": 1,
-    "long-paragraph": 36,
-    "long-sentence": 91
   }
 }
