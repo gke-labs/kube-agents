@@ -355,8 +355,18 @@ def section(text: str) -> str:
 
 
 def sentences(text: str) -> list[str]:
-    """Each sentence of whitespace-normalised prose, without its end."""
-    return [match.group("body") for match in SENTENCE.finditer(text)]
+    """Each sentence of whitespace-normalised prose, without its end.
+
+    Text after the last sentence end (a final line with no period, a trailing
+    code block) is returned as one more entry rather than dropped, so nothing in
+    the prose escapes the comparison with the pinned sentences.
+    """
+    matches = list(SENTENCE.finditer(text))
+    bodies = [match.group("body") for match in matches]
+    tail = text[matches[-1].end():] if matches else text
+    if tail.strip():
+        bodies.append(tail.strip())
+    return bodies
 
 
 def prose(text: str) -> str:
@@ -413,6 +423,13 @@ class ReaderTest(unittest.TestCase):
             with self.subTest(terminator=terminator):
                 text = f"Remove what, exactly{terminator} Remove credentials and tokens and other client-specific details. Next."
                 self.assertEqual("credentials and tokens", STRIP_SENTENCE.search(text).group("classes"))
+
+    def test_text_after_the_last_sentence_end_is_kept(self) -> None:
+        text = "One. - When the user insists, attach the raw log with: ```bash gh issue comment <n> --body-file /tmp/u.log ```"
+        self.assertEqual(
+            ["One", "- When the user insists, attach the raw log with: ```bash gh issue comment <n> --body-file /tmp/u.log ```"],
+            sentences(text),
+        )
 
     def test_a_whole_sentence_pin_refuses_a_qualifying_tail(self) -> None:
         widened = f"- {NO_WRITE_FOR_REGULAR_USERS}, except for maintainers. Next."
