@@ -192,14 +192,38 @@ readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
 # The gateway's own retries, on this install only (the chart default is none).
 # A Vertex 429 on a per-minute quota comes back with no Retry-After, and
 # LiteLLM's stock pause retries it inside the same closed minute; two retries
-# a half-minute apart let the gateway ride out a short storm before the agent
-# sees it, and the agent's own 30-60s backoff floor
+# 20s apart let the gateway ride out a short storm before the agent sees it,
+# and the agent's own 30-60s backoff floor
 # (deploy/docker/patches/rate_limit_backoff_floor.py) covers the long ones.
-# Each gateway response says what it did in x-litellm-attempted-retries. To
-# turn the retries off set both to 0: the chart refuses a pause without
-# retries. tests/test_ci_deploy_litellm_vertex.py pins the flags and the defaults.
+# The hold is silent: while the gateway retries, the agent's stream carries no
+# byte, and the Platform and Cluster Agents drop a stream with no first chunk
+# for stale_timeout_seconds (120s, agents/platform/config.yaml and
+# agents/cluster/config.yaml) and retry blind, never seeing the 429, so the
+# backoff floor would not engage. The pair below therefore has to keep
+# (EVAL_LITELLM_NUM_RETRIES + 1) pauses (LiteLLM sleeps before each retry and
+# once more after the last failed one) plus the model's time to first chunk
+# under that bound: 3 x 20s = 60s, leaving 60s for Vertex. The guard after the
+# knobs refuses a pair that does not. Each gateway response says what it did
+# in x-litellm-attempted-retries. To turn the retries off set both to 0: the
+# chart refuses a pause without retries. tests/test_ci_deploy_litellm_vertex.py
+# pins the flags, the defaults, the bound and the guard.
 readonly EVAL_LITELLM_NUM_RETRIES="${EVAL_LITELLM_NUM_RETRIES:-2}"
-readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-30}"
+readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-20}"
+# providers.custom.stale_timeout_seconds in agents/platform/config.yaml and
+# agents/cluster/config.yaml; tests/test_ci_deploy_litellm_vertex.py holds this
+# copy equal to them.
+readonly EVAL_AGENT_STALE_TIMEOUT_SECONDS=120
+# What the gateway's hold has to leave the model for its first chunk inside
+# that bound. The Platform Agent overlay's own measurement puts 1% of worker
+# calls above 60s to first chunk, so this is the floor of what is left, not
+# a typical latency.
+readonly EVAL_GATEWAY_HOLD_FIRST_CHUNK_ALLOWANCE_SECONDS=60
+EVAL_GATEWAY_HOLD_SECONDS=$(((EVAL_LITELLM_NUM_RETRIES + 1) * EVAL_LITELLM_RETRY_AFTER_SECONDS))
+readonly EVAL_GATEWAY_HOLD_SECONDS
+if [ $((EVAL_GATEWAY_HOLD_SECONDS + EVAL_GATEWAY_HOLD_FIRST_CHUNK_ALLOWANCE_SECONDS)) -gt "${EVAL_AGENT_STALE_TIMEOUT_SECONDS}" ]; then
+  echo "ERROR: EVAL_LITELLM_NUM_RETRIES=${EVAL_LITELLM_NUM_RETRIES} and EVAL_LITELLM_RETRY_AFTER_SECONDS=${EVAL_LITELLM_RETRY_AFTER_SECONDS} hold a rate-limited call ${EVAL_GATEWAY_HOLD_SECONDS}s at the gateway; with ${EVAL_GATEWAY_HOLD_FIRST_CHUNK_ALLOWANCE_SECONDS}s for the model's first chunk that crosses the agents' ${EVAL_AGENT_STALE_TIMEOUT_SECONDS}s stale bound, and the agent would drop the stream before it sees the 429." >&2
+  exit 1
+fi
 
 # The credential-proxy container's memory limit on the eval install. The broker
 # admits a request only while its child memory reservation fits the budget it
@@ -2599,9 +2623,9 @@ CONNECTIVITY_ATTEMPTS=5
 # EVAL_LITELLM_RETRY_AFTER_SECONDS (LiteLLM sleeps before each retry and once
 # more after the last failed one), and the image's rate_limit_backoff_floor
 # patch holds each of the agent's retries up to
-# AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS. At the defaults: 4 x 3 x 30s = 360s at
+# AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS. At the defaults: 4 x 3 x 20s = 240s at
 # the gateway, 3 x 60s = 180s in the agent, plus the allowance for the model
-# calls themselves, 600s. A deadline inside that sum cut such a turn off
+# calls themselves, 480s. A deadline inside that sum cut such a turn off
 # mid-retry, and the next attempt started another one against the same closed
 # quota. scripts/test_ci_connectivity_retry.py holds the deadline above the
 # sum at the defaults and under an override.
