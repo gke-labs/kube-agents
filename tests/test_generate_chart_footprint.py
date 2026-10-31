@@ -141,19 +141,52 @@ def _scale_gateway_deployment(docs):
     doc["spec"]["replicas"] = 2
 
 
-@contextlib.contextmanager
-def _golden_with(mutate):
-    """Run the block against the committed golden with `mutate` applied to its documents."""
-    docs = [doc for doc in yaml.safe_load_all(gcf._GOLDEN_MANIFEST.read_text()) if doc]
-    mutate(docs)
+def _mutated_copy(golden, mutate):
+    docs = [doc for doc in yaml.safe_load_all(golden.read_text()) if doc]
+    if mutate:
+        mutate(docs)
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
         yaml.safe_dump_all(docs, fh)
-        path = pathlib.Path(fh.name)
+        return pathlib.Path(fh.name)
+
+
+@contextlib.contextmanager
+def _goldens_with(today=None, following=None):
+    """Run the block against the committed goldens, each with its mutation applied."""
+    today_path = _mutated_copy(gcf._GOLDEN_MANIFEST, today)
+    next_path = _mutated_copy(gcf._NEXT_GOLDEN_MANIFEST, following)
     try:
-        with unittest.mock.patch.object(gcf, "_GOLDEN_MANIFEST", path):
-            yield path
+        with unittest.mock.patch.object(gcf, "_GOLDEN_MANIFEST", today_path), \
+                unittest.mock.patch.object(gcf, "_NEXT_GOLDEN_MANIFEST", next_path):
+            yield today_path
     finally:
-        path.unlink(missing_ok=True)
+        today_path.unlink(missing_ok=True)
+        next_path.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def _golden_with(mutate):
+    """Run the block against both committed goldens with `mutate` applied to each: the
+    today-mode stack the mutations touch is in both, and has to agree between them."""
+    with _goldens_with(today=mutate, following=mutate) as path:
+        yield path
+
+
+def _scale_callout_deployment(docs):
+    doc = _find_doc(docs, "Deployment", "platformagent-a2a-callout")
+    doc["spec"]["replicas"] = 3
+
+
+def _drop_bridge(docs):
+    spec = _gateway_pod_spec(docs)
+    spec["containers"] = [c for c in spec["containers"] if c["name"] != "hermes-bridge"]
+
+
+def _add_callout_container(docs):
+    doc = _find_doc(docs, "Deployment", "platformagent-a2a-callout")
+    doc["spec"]["template"]["spec"]["containers"].append(
+        _container("callout-metrics", requests={"cpu": "10m", "memory": "16Mi"})
+    )
 
 
 def _container(name="c", requests=None, limits=None):
@@ -454,6 +487,134 @@ class ExtractFootprintTest(unittest.TestCase):
     def test_a_missing_golden_is_an_error(self):
         missing = gcf._GOLDEN_MANIFEST.parent / "does-not-exist.yaml"
         with unittest.mock.patch.object(gcf, "_GOLDEN_MANIFEST", missing):
+            with self.assertRaises(FileNotFoundError):
+                gcf.extract_footprint()
+
+
+class NextModeFootprintTest(unittest.TestCase):
+    """nextMode: what spec.mode: next adds, summed from the next-mode golden."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = gcf.extract_footprint()
+        cls.following = cls.data["nextMode"]
+        cls.docs = [
+            doc for doc in yaml.safe_load_all(gcf._NEXT_GOLDEN_MANIFEST.read_text()) if doc
+        ]
+
+    def test_shape(self):
+        for key in (
+            "agentPod", "a2aNats", "a2aCallout", "a2aVerifier", "a2aConsole", "a2aGateway",
+            "a2aProvision", "storage",
+        ):
+            self.assertIn(key, self.following)
+        self.assertEqual(set(self.following["agentPod"]), {"hermesBridge", "hermesBridgeCli"})
+
+    def test_the_cli_bridge_is_the_agent_containers_size(self):
+        """Under A2A_BRIDGE_EXECUTOR=cli the operator copies the agent container's resources."""
+        (agent,) = [
+            c for c in _gateway_pod_spec(self.docs)["containers"] if c["name"] == "platform-agent"
+        ]
+        cli = self.following["agentPod"]["hermesBridgeCli"]
+        self.assertEqual(cli["pods"], 0)
+        self.assertEqual(cli["cpuMillisRequest"], gcf.parse_cpu_millis(agent["resources"]["requests"]["cpu"]))
+        self.assertEqual(cli["memoryBytesLimit"], gcf.parse_bytes(agent["resources"]["limits"]["memory"]))
+
+    def test_each_workload_is_its_golden_container_times_its_replicas(self):
+        for key, (kind, name, container) in gcf._A2A_WORKLOADS.items():
+            with self.subTest(key=key):
+                doc = _find_doc(self.docs, kind, name)
+                replicas = doc["spec"].get("replicas", 1)
+                (found,) = [
+                    c for c in doc["spec"]["template"]["spec"]["containers"]
+                    if c["name"] == container
+                ]
+                requests = found["resources"]["requests"]
+                entry = self.following[key]
+                self.assertEqual(entry["pods"], replicas)
+                self.assertEqual(
+                    entry["cpuMillisRequest"], gcf.parse_cpu_millis(requests["cpu"]) * replicas
+                )
+                self.assertEqual(
+                    entry["memoryBytesRequest"], gcf.parse_bytes(requests["memory"]) * replicas
+                )
+
+    def test_surges_follows_each_workloads_strategy(self):
+        for key, (kind, name, _) in gcf._A2A_WORKLOADS.items():
+            with self.subTest(key=key):
+                doc = _find_doc(self.docs, kind, name)
+                strategy = (doc["spec"].get("strategy") or {}).get("type")
+                self.assertEqual(
+                    self.following[key]["surges"], kind == "Deployment" and strategy != "Recreate"
+                )
+        self.assertTrue(self.following["a2aCallout"]["surges"])
+        self.assertFalse(self.following["a2aNats"]["surges"])
+
+    def test_a_rolling_update_without_surge_does_not_surge(self):
+        def no_surge(docs):
+            doc = _find_doc(docs, "Deployment", "platformagent-a2a-callout")
+            doc["spec"]["strategy"] = {
+                "type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}
+            }
+        with _goldens_with(following=no_surge):
+            self.assertFalse(gcf.extract_footprint()["nextMode"]["a2aCallout"]["surges"])
+
+    def test_the_bridge_adds_resources_but_no_pod(self):
+        bridge = self.following["agentPod"]["hermesBridge"]
+        self.assertEqual(bridge["pods"], 0)
+        self.assertGreater(bridge["cpuMillisRequest"], 0)
+
+    def test_the_jetstream_claim_is_next_modes_alone(self):
+        storage = self.following["storage"]
+        self.assertEqual(storage["persistentVolumeClaims"], 1)
+        self.assertEqual(storage["storageBytesRequest"], 40 * _GIB)
+        # And operatorRendered.storage is the today-mode figure, not the next-mode total.
+        self.assertEqual(self.data["operatorRendered"]["storage"]["persistentVolumeClaims"], 4)
+
+    def test_the_standing_delta_is_the_documented_figure(self):
+        """The A2A stack's standing requests, provisioning Job aside: 650m and 1152Mi."""
+        standing = [k for k in self.following if k not in ("storage", "a2aProvision")]
+        cpu = sum(
+            self.following[k]["hermesBridge"]["cpuMillisRequest"] if k == "agentPod"
+            else self.following[k]["cpuMillisRequest"]
+            for k in standing
+        )
+        memory = sum(
+            self.following[k]["hermesBridge"]["memoryBytesRequest"] if k == "agentPod"
+            else self.following[k]["memoryBytesRequest"]
+            for k in standing
+        )
+        self.assertEqual((cpu, memory), (650, 1152 * _MIB))
+
+    def test_replicas_scale_a_workload(self):
+        with _goldens_with(following=_scale_callout_deployment):
+            callout = gcf.extract_footprint()["nextMode"]["a2aCallout"]
+        self.assertEqual(callout["pods"], 3)
+        self.assertEqual(callout["cpuMillisRequest"], 3 * 50)
+
+    def test_a_today_stack_that_differs_between_the_goldens_is_an_error(self):
+        """nextMode is stacked on operatorRendered, so the two goldens must agree on it."""
+        with _goldens_with(following=_scale_shell_statefulset):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn("differs from the today-mode golden in shellSandbox", str(caught.exception))
+
+    def test_a_next_golden_without_the_bridge_is_an_error(self):
+        """A first-pass golden has no bridge; it must not pass as a smaller footprint."""
+        with _goldens_with(following=_drop_bridge):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn("RunSettledGoldenTest", str(caught.exception))
+
+    def test_an_unaccounted_a2a_container_is_an_error(self):
+        with _goldens_with(following=_add_callout_container):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn("callout-metrics", str(caught.exception))
+
+    def test_a_missing_next_golden_is_an_error(self):
+        missing = gcf._NEXT_GOLDEN_MANIFEST.parent / "does-not-exist.yaml"
+        with unittest.mock.patch.object(gcf, "_NEXT_GOLDEN_MANIFEST", missing):
             with self.assertRaises(FileNotFoundError):
                 gcf.extract_footprint()
 

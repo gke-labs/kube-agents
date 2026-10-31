@@ -46,7 +46,8 @@ import (
 // ports, nothing else. The conformance suite reads it
 // (tests/conformance, C1) to hold the policies to "the collector and the
 // operator, on the metrics port, and nobody else": the suite cannot run Go, and no golden
-// renders mode next, so this file is the contract between the two.
+// renders mode next with both doors armed (the next-mode golden is the example
+// CR, which arms neither), so this file is the contract between the two.
 //
 // Compared as parsed YAML, as the goldens are, because the file is kept in
 // prettier's style for CI's prettier check and the marshaller's is not.
