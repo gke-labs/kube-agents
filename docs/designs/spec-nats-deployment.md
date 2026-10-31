@@ -65,6 +65,9 @@ another `busReplicas` change while one runs.
 - **A failure** turns the run back: before the shrink, the pinned streams go back to three
   replicas; after the conversion, the bus renders one server again and the same snapshot is
   restored into it. Only a failed undo stops for a person, and the condition names the step.
+  A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
+  it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
+  does neither.
 
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than
