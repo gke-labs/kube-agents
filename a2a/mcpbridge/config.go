@@ -997,9 +997,10 @@ func (s *ConfigStore) SetConversationSessionMode(aliasOrToken string, sessionMod
 }
 
 // ResolveConversation finds the conversation DeleteConversation would delete for aliasOrToken,
-// without changing anything: by alias, then by console token, host conversation ID or session
-// worker ID, then loosely by sanitized alias or subagent role. ambiguous reports that more than
-// one conversation matched at the step that decided, and then ok is false.
+// without changing anything: by exact alias, then by exact console token, host conversation ID
+// or session worker ID. Nothing looser ever matches: a name that is none of these resolves to
+// nothing (ConversationNearMisses lists what it may have meant). ambiguous reports that more
+// than one conversation holds the identifier, and then ok is false.
 func (s *ConfigStore) ResolveConversation(aliasOrToken string) (entry ConversationEntry, ok, ambiguous bool) {
 	if s == nil {
 		return ConversationEntry{}, false, false
@@ -1012,8 +1013,8 @@ func (s *ConfigStore) ResolveConversation(aliasOrToken string) (entry Conversati
 	return s.cfg.Conversations[key], true, false
 }
 
-// resolveConversationKeyLocked is the matching ResolveConversation and DeleteConversation share.
-// It returns "" when nothing, or more than one conversation, matches.
+// resolveConversationKeyLocked is the exact matching ResolveConversation and DeleteConversation
+// share. It returns "" when nothing, or more than one conversation, matches.
 func (s *ConfigStore) resolveConversationKeyLocked(aliasOrToken string) (key string, ambiguous bool) {
 	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), ConsoleConvPrefix)
 	if target == "" {
@@ -1032,39 +1033,54 @@ func (s *ConfigStore) resolveConversationKeyLocked(aliasOrToken string) (key str
 	}
 	switch len(exact) {
 	case 0:
+		return "", false
 	case 1:
 		return exact[0], false
 	default:
 		return "", true
 	}
-	trimmedSessionPrefix := strings.TrimPrefix(target, "session-")
-	var loose []string
-	for alias, entry := range s.cfg.Conversations {
-		roleSlug := SanitizeAliasSlug(entry.SubagentRole)
-		if (trimmedSessionPrefix != target && alias == trimmedSessionPrefix) ||
-			SanitizeAliasSlug(alias) == target ||
-			"session-"+SanitizeAliasSlug(alias) == target ||
-			(roleSlug != "" && (roleSlug == target || "session-"+roleSlug == target || roleSlug == trimmedSessionPrefix)) {
-			loose = append(loose, alias)
-		}
-	}
-	switch len(loose) {
-	case 1:
-		return loose[0], false
-	case 0:
-		return "", false
-	default:
-		return "", true
-	}
 }
 
-// DeleteConversation removes a conversation entry by alias, console token, or session member name.
-//
-// The alias wins, then an exact identifier (console token, host conversation ID or session
-// worker ID) that names one entry. The looser forms (a "session-" prefix, an alias slug, or a subagent role slug) delete only when
-// exactly one entry matches: the store is shared by every bridge process on the machine, and
-// several windows' workers can share a role such as "Session Worker", so an ambiguous match
-// deletes nothing rather than whichever entry map iteration reaches first.
+// maxConversationNearMisses caps the aliases ConversationNearMisses lists.
+const maxConversationNearMisses = 10
+
+// ConversationNearMisses lists, sorted, the saved aliases a name that resolves to no conversation
+// may have meant: equal ignoring case, one containing the other ignoring case, the same alias
+// slug, a "session-" prefix on either, or a subagent role slug. They are only shown to the user
+// to retry with; nothing is ever deleted or selected by them.
+func (s *ConfigStore) ConversationNearMisses(name string) []string {
+	if s == nil {
+		return nil
+	}
+	defer s.lockForRead()()
+	target := strings.TrimPrefix(strings.TrimSpace(name), ConsoleConvPrefix)
+	if target == "" {
+		return nil
+	}
+	lowerTarget := strings.ToLower(target)
+	targetSlug := SanitizeAliasSlug(strings.TrimPrefix(lowerTarget, "session-"))
+	var out []string
+	for alias, entry := range s.cfg.Conversations {
+		lowerAlias := strings.ToLower(alias)
+		aliasSlug := SanitizeAliasSlug(strings.TrimPrefix(lowerAlias, "session-"))
+		roleSlug := SanitizeAliasSlug(entry.SubagentRole)
+		if strings.Contains(lowerAlias, lowerTarget) || strings.Contains(lowerTarget, lowerAlias) ||
+			(targetSlug != "" && (aliasSlug == targetSlug || roleSlug == targetSlug)) {
+			out = append(out, alias)
+		}
+	}
+	sort.Strings(out)
+	if len(out) > maxConversationNearMisses {
+		out = out[:maxConversationNearMisses]
+	}
+	return out
+}
+
+// DeleteConversation removes the conversation saved under exactly aliasOrToken: its alias, or an
+// exact identifier (console token, host conversation ID or session worker ID) that names one
+// entry. A near-miss (another case, an alias slug, a "session-" prefix, a subagent role) deletes
+// nothing: the store is shared by every bridge process on the machine, so a delete names its
+// conversation exactly or is refused.
 func (s *ConfigStore) DeleteConversation(aliasOrToken string) (ConversationEntry, bool) {
 	if s == nil {
 		return ConversationEntry{}, false

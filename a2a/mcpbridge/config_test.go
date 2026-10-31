@@ -277,7 +277,7 @@ func TestEnrichDeploymentVersionStatusSemverAndTargetCommitish(t *testing.T) {
 	}
 }
 
-func TestDeleteConversationRefusesAmbiguousRoleMatch(t *testing.T) {
+func TestDeleteConversationMatchesOnlyAnExactKey(t *testing.T) {
 	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -295,10 +295,15 @@ func TestDeleteConversationRefusesAmbiguousRoleMatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Both windows' workers carry the role "Reviewer"; deleting by its slug must not
-	// pick one of them at random.
-	if deleted, ok := store.DeleteConversation("session-reviewer"); ok {
-		t.Fatalf("ambiguous role match deleted %q; want nothing deleted", deleted.Alias)
+	// Both windows' workers carry the role "Reviewer"; deleting by its slug, or by any other
+	// near-miss of an alias, deletes nothing.
+	for _, name := range []string{"session-reviewer", "reviewer", "SESSION-A", "a"} {
+		if deleted, ok := store.DeleteConversation(name); ok {
+			t.Fatalf("DeleteConversation(%s), a near-miss, deleted %q; want nothing deleted", name, deleted.Alias)
+		}
+	}
+	if got := store.ConversationNearMisses("session-reviewer"); strings.Join(got, ",") != "session-a,session-b" {
+		t.Fatalf("ConversationNearMisses(session-reviewer) = %v; want [session-a session-b]", got)
 	}
 	snap := store.Snapshot()
 	if _, okA := snap.Conversations["session-a"]; !okA {
@@ -313,10 +318,13 @@ func TestDeleteConversationRefusesAmbiguousRoleMatch(t *testing.T) {
 	if !ok || deleted.HostConversationID != workerA {
 		t.Fatalf("DeleteConversation(session-a) = %+v, %v", deleted, ok)
 	}
-	// With one worker left the role slug is unambiguous again.
-	deleted, ok = store.DeleteConversation("session-reviewer")
-	if !ok || deleted.HostConversationID != workerB {
-		t.Fatalf("DeleteConversation(session-reviewer) = %+v, %v; want the remaining worker", deleted, ok)
+	// With one worker left the role slug still deletes nothing; its host conversation ID does.
+	if deleted, ok := store.DeleteConversation("session-reviewer"); ok {
+		t.Fatalf("DeleteConversation(session-reviewer) with one worker left deleted %q; want nothing deleted", deleted.Alias)
+	}
+	deleted, ok = store.DeleteConversation(workerB)
+	if !ok || deleted.Alias != "session-b" {
+		t.Fatalf("DeleteConversation(%s) = %+v, %v; want session-b", workerB, deleted, ok)
 	}
 }
 

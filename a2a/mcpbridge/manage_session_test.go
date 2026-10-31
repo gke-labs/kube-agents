@@ -38,7 +38,7 @@ func putConversations(t *testing.T, srv *Server, entries ...ConversationEntry) {
 	}
 }
 
-func TestManageSessionDeleteRefusesAnAmbiguousNameBeforeTheRemoteDelete(t *testing.T) {
+func TestManageSessionDeleteRefusesARoleNameBeforeTheRemoteDelete(t *testing.T) {
 	gw := startBlockingGateway(t, "")
 	srv := newStdioTestServer(t, gw)
 	putConversations(t, srv,
@@ -46,8 +46,8 @@ func TestManageSessionDeleteRefusesAnAmbiguousNameBeforeTheRemoteDelete(t *testi
 		ConversationEntry{Alias: "session-b", Token: MintConversationToken(), SubagentRole: "Reviewer"},
 	)
 	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"session-reviewer"}`))
-	if !res.IsError || !strings.Contains(res.Content[0].Text, "more than one conversation matches") {
-		t.Fatalf("ambiguous delete: %+v; want it refused as an error", res)
+	if !res.IsError || !strings.Contains(res.Content[0].Text, "`session-a`, `session-b`") {
+		t.Fatalf("delete by role: %+v; want it refused as an error naming session-a and session-b", res)
 	}
 	noCallNamed(t, gw, ToolManageSession, 200*time.Millisecond)
 	for _, alias := range []string{"session-a", "session-b"} {
@@ -71,6 +71,45 @@ func TestManageSessionDeleteSendsTheResolvedAliasUpstream(t *testing.T) {
 	}
 	if _, ok := srv.Store().LookupConversation("c1"); ok {
 		t.Fatal("c1 is still saved after its delete")
+	}
+}
+
+// delete takes only an exact alias or identifier. A near-miss of a saved alias (an alias slug,
+// a "session-" prefix, another case) deletes nothing, here or on the server, and the refusal
+// names the saved aliases to retry with; the exact alias then deletes.
+func TestManageSessionDeleteOfANearMissNameDeletesNothingAndNamesTheCandidates(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	putConversations(t, srv,
+		ConversationEntry{Alias: "kube-agents-prod", Token: MintConversationToken(), SessionMode: true},
+		ConversationEntry{Alias: "triage", Token: MintConversationToken(), SessionMode: true},
+	)
+	for name, candidate := range map[string]string{
+		"prod":             "kube-agents-prod",
+		"session-prod":     "kube-agents-prod",
+		"Kube-Agents-Prod": "kube-agents-prod",
+		"session-triage":   "triage",
+	} {
+		res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"`+name+`"}`))
+		if !res.IsError || !strings.Contains(res.Content[0].Text, "`"+candidate+"`") {
+			t.Fatalf("delete %s: %+v; want it refused as an error naming %s", name, res, candidate)
+		}
+	}
+	noCallNamed(t, gw, ToolManageSession, 200*time.Millisecond)
+	for _, alias := range []string{"kube-agents-prod", "triage"} {
+		if _, ok := srv.Store().LookupConversation(alias); !ok {
+			t.Fatalf("a near-miss delete removed %s", alias)
+		}
+	}
+	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"kube-agents-prod"}`))
+	if res.IsError {
+		t.Fatalf("delete by the exact alias: %+v", res)
+	}
+	if args := nextCallNamed(t, gw, ToolManageSession); args["alias"] != "kube-agents-prod" {
+		t.Fatalf("the exact delete forwarded %v; want alias kube-agents-prod", args)
+	}
+	if _, ok := srv.Store().LookupConversation("kube-agents-prod"); ok {
+		t.Fatal("kube-agents-prod is still saved after its exact delete")
 	}
 }
 

@@ -1472,21 +1472,26 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		return fmt.Sprintf("Terminated `/session` worker mode on **`%s`** (`console:%s`).\n", entry.Alias, entry.Token), "", "", nil
 
 	case actionDelete, actionRemoveAlias:
-		// Resolve the local entry first, with DeleteConversation's own matching, so the remote
-		// delete names the same conversation the local one removes, and an ambiguous name
-		// deletes nothing anywhere.
-		// A name that resolves to nothing, or to several, is refused as an error.
+		// Resolve the local entry first, with DeleteConversation's own exact matching, so the
+		// remote delete names the same conversation the local one removes. An ambiguous
+		// identifier, or a near-miss of a saved alias, deletes nothing anywhere and is refused
+		// as an error that lists the saved aliases to retry with.
 		target := strings.TrimSpace(args.Alias)
 		if target == "" {
 			return "", "", "", errors.New("manage_session delete needs the conversation's alias or console token")
 		}
 		existing, found, ambiguous := s.store.ResolveConversation(target)
 		if ambiguous {
-			return "", "", "", fmt.Errorf("more than one conversation matches %q by name or role; name it by alias or console token", target)
+			return "", "", "", fmt.Errorf("more than one conversation holds %q; name it by alias or console token", target)
 		}
 		if !found {
-			// Not in the local table: the server may still hold the name, and its answer, or its
-			// refusal, is the result.
+			if near := s.store.ConversationNearMisses(target); len(near) > 0 {
+				return "", "", "", fmt.Errorf("no conversation is saved under exactly %q, and delete takes only an exact alias or console token; nothing was deleted. Close matches: `%s`. Retry with one of them",
+					target, strings.Join(near, "`, `"))
+			}
+			// Not in the local table and like none of it: the server may still hold the name,
+			// which it forgets only on an exact match, and its answer, or its refusal, is the
+			// result.
 			sess, err := s.ensureConnected(ctx)
 			if err != nil {
 				return "", "", "", fmt.Errorf("conversation %q is not in this bridge's list, and the in-cluster server could not be asked: %w", target, err)
