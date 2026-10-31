@@ -1023,13 +1023,20 @@ platformAgent:
       # the operator's default applies when it is unset, and "today" ignores it.
       # maxSessions: 10
       # profiles sizes AgentProfile work on a "next" install: ceiling is the most
-      # profile tasks running at once across every profile (default 8), and
-      # warmReplicas the warm workers kept per interactive (profile, tier)
-      # (default 1). The <release namespace>-profiles namespace's pod quota is
-      # the warm workers, a surge pod per warm pool, and the ceiling.
+      # profile tasks running at once across every profile (default: maxInProgress,
+      # 6 unless set), childReserve the share of it kept for child tasks (default
+      # max(1, ceil(ceiling/3)); with the interactive reserve, trimmed to leave a
+      # free slot, so ceilings 1, 2 and 4 warn), and warmReplicas the warm workers kept per
+      # interactive (profile, tier) (default 1). The <release namespace>-profiles
+      # namespace's pod quota is the warm workers, a surge pod per warm pool, and
+      # the ceiling. The dispatcher's intervals: leaseSeconds (90), renewSeconds
+      # (20), restartGraceSeconds (60) and acceptTimeoutSeconds (10); a lease is
+      # at least three renewals and the restart grace at least two.
       # profiles:
-      #   ceiling: 8
+      #   ceiling: 6
       #   warmReplicas: 1
+      #   leaseSeconds: 90
+      #   renewSeconds: 20
       # platform:
       #   apiMaxRetries: 8
       #   maxTurns: 200

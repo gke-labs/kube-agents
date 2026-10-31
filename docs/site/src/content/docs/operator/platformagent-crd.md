@@ -347,8 +347,8 @@ Helm install, set the block in your values file.
 Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
 `maxInProgress`, the mode-next session-pod cap `maxSessions`, and the AgentProfile knobs under
-`profiles` (`ceiling` and `warmReplicas`; see [AgentProfile](./agentprofile-crd.md)). Unset,
-`maxSessions` renders `10`, `profiles.ceiling` `8` and `profiles.warmReplicas` `1`; all three are
+`profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)). Unset,
+`maxSessions` renders `10`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`; all three are
 inert under `mode: today`.
 
 **The per-run limits are opt-in.** The operator pins nothing of its own there: what a fleet needs

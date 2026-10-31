@@ -39,6 +39,7 @@ var consolePublish = []string{
 	"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
 	"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
 	"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+	"$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
 	"chat.console.*.in",
 	"_INBOX.console.>",
 }

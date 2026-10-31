@@ -9881,15 +9881,76 @@ spec:
                             (profile, tier). Until the sizing budget exists these are fixed,
                             conservative defaults.
                           properties:
+                            acceptTimeoutSeconds:
+                              description: |-
+                                AcceptTimeoutSeconds is how long the dispatcher waits for a worker to
+                                accept an offer before treating it as declined. Absent means
+                                DefaultProfileAcceptTimeoutSeconds.
+                              maximum: 120
+                              minimum: 1
+                              type: integer
                             ceiling:
                               description: |-
                                 Ceiling is the most profile tasks running at once across every profile
-                                on the install. The dispatcher enforces it, reserving max(1,
-                                ceil(Ceiling/3)) of it for interactive tiers so unattended work can't
-                                starve people, and the profile namespace's pod quota is derived from it.
-                                Absent means DefaultProfileCeiling.
+                                on the install, of every kind. The dispatcher keeps two disjoint
+                                reserves in it, ChildReserve for child tasks (so waiting parents can't
+                                hold every slot) and max(1, ceil(Ceiling/3)) for interactive tiers (so
+                                unattended work can't starve people), trimmed child first to leave at
+                                least one slot for top-level unattended work. With the default
+                                reserves, ceilings of 1, 2 and 4 can't honour both in full, and the
+                                PlatformAgent warns. The profile namespace's pod quota is derived
+                                from it. Absent means maxInProgress's resolved value, so an install's
+                                footprint doesn't jump while both exist (spec-profiles-dispatch.md).
                               maximum: 1000
                               minimum: 1
+                              type: integer
+                            childReserve:
+                              description: |-
+                                ChildReserve is the share of Ceiling kept for child tasks, which
+                                top-level tasks can't take. A parent holds its slot while its children
+                                run, so without it a ceiling full of waiting parents could never start
+                                their children. Absent means max(1, ceil(Ceiling/3)), trimmed to
+                                Ceiling-1 so one slot stays unreserved (none at a ceiling of 1).
+                              maximum: 999
+                              minimum: 1
+                              type: integer
+                            leaseSeconds:
+                              description: |-
+                                LeaseSeconds is how long a task's liveness lease lasts without a
+                                renewal before the dispatcher fails the task (it is never re-run).
+                                Absent means DefaultProfileLeaseSeconds.
+                              maximum: 3600
+                              minimum: 15
+                              type: integer
+                            maxTaskDeadlineSeconds:
+                              description: |-
+                                MaxTaskDeadlineSeconds caps the deadline any profile task gets: a
+                                profile whose lifecycle.activeDeadlineSeconds is longer has its tasks
+                                clamped to this, with a warning. Once profile tasks get their own bus
+                                credentials it is also the longest a task's credential may live, which the
+                                auth callout enforces, bounding a leaked one; the operator renders it
+                                to the callout already. It may only be lowered from the default.
+                                Absent means DefaultProfileMaxTaskDeadlineSeconds (6h).
+                              maximum: 21600
+                              minimum: 60
+                              type: integer
+                            renewSeconds:
+                              description: |-
+                                RenewSeconds is how often a worker renews each task's lease; the
+                                dispatcher sends it with every offer. Absent means
+                                DefaultProfileRenewSeconds.
+                              maximum: 300
+                              minimum: 5
+                              type: integer
+                            restartGraceSeconds:
+                              description: |-
+                                RestartGraceSeconds is how long a restarted dispatcher waits, from its
+                                own start, for a renewal on each task it re-adopts before failing it.
+                                While the dispatcher is down nobody reads renewals, so this is what
+                                keeps a redeploy from failing every task in flight. Absent means
+                                DefaultProfileRestartGraceSeconds.
+                              maximum: 3600
+                              minimum: 10
                               type: integer
                             warmReplicas:
                               description: |-
@@ -9899,7 +9960,34 @@ spec:
                               minimum: 0
                               type: integer
                           type: object
+                          x-kubernetes-validations:
+                            - message:
+                                leaseSeconds must be at least three renewSeconds
+                                (defaults 90 and 20), so one late renewal doesn't expire
+                                a live task's lease
+                              rule:
+                                "(has(self.leaseSeconds) ? self.leaseSeconds : 90)
+                                >= 3 * (has(self.renewSeconds) ? self.renewSeconds : 20)"
+                            - message:
+                                restartGraceSeconds must be at least two renewSeconds
+                                (defaults 60 and 20), so a live worker renews at least
+                                twice inside a restarted dispatcher's grace
+                              rule:
+                                "(has(self.restartGraceSeconds) ? self.restartGraceSeconds
+                                : 60) >= 2 * (has(self.renewSeconds) ? self.renewSeconds
+                                : 20)"
                       type: object
+                      x-kubernetes-validations:
+                        - message:
+                            "profiles.childReserve must be below the profile ceiling
+                            (profiles.ceiling, or maxInProgress when that is unset, default
+                            6): the reserve is a share of the ceiling that top-level tasks
+                            can't take"
+                          rule:
+                            "!has(self.profiles) || !has(self.profiles.childReserve)
+                            || self.profiles.childReserve < (has(self.profiles.ceiling)
+                            ? self.profiles.ceiling : (has(self.maxInProgress) ? self.maxInProgress
+                            : 6))"
                   required:
                     - clusterName
                     - location

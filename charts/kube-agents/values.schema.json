@@ -891,6 +891,36 @@
                       "type": "integer",
                       "minimum": 0,
                       "maximum": 100
+                    },
+                    "childReserve": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 999
+                    },
+                    "leaseSeconds": {
+                      "type": "integer",
+                      "minimum": 15,
+                      "maximum": 3600
+                    },
+                    "renewSeconds": {
+                      "type": "integer",
+                      "minimum": 5,
+                      "maximum": 300
+                    },
+                    "restartGraceSeconds": {
+                      "type": "integer",
+                      "minimum": 10,
+                      "maximum": 3600
+                    },
+                    "acceptTimeoutSeconds": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 120
+                    },
+                    "maxTaskDeadlineSeconds": {
+                      "type": "integer",
+                      "minimum": 60,
+                      "maximum": 21600
                     }
                   }
                 },
