@@ -595,7 +595,8 @@ var (
 // The selector is never parsed or matched by base name, so saved keys being unique makes it
 // unambiguous. It fails closed: when the deployment is renamed (a cross-context collision
 // re-saves it as "<kubeContext>/<name>") or pruned, the old selector names nothing until it is
-// set to the new key, and the token never moves to another install. With the selector unset,
+// set to the new key. After a prune, a different deployment later saved under that same key does
+// receive the token: update or unset the selector when an install is removed. With the selector unset,
 // the token is the only saved profile's, and is sent nowhere when several are saved.
 //
 // The token is bound to its profile's saved target, not its name: prof gets it only when it

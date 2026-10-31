@@ -1014,15 +1014,32 @@ func (s *ConfigStore) ResolveConversation(aliasOrToken string) (entry Conversati
 // resolveConversationKeyLocked is the exact matching ResolveConversation and DeleteConversation
 // share. It returns "" when nothing, or more than one conversation, matches.
 func (s *ConfigStore) resolveConversationKeyLocked(aliasOrToken string) (key string, ambiguous bool) {
-	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), ConsoleConvPrefix)
+	trimmed := strings.TrimSpace(aliasOrToken)
+	target := strings.TrimPrefix(trimmed, ConsoleConvPrefix)
 	if target == "" {
 		return "", false
 	}
-	if _, ok := s.cfg.Conversations[target]; ok {
-		return target, false
+	if target != trimmed {
+		// "console:<token>" names a token, never an alias that happens to spell it.
+		var byToken []string
+		for alias, entry := range s.cfg.Conversations {
+			if entry.Token == target {
+				byToken = append(byToken, alias)
+			}
+		}
+		if len(byToken) == 1 {
+			return byToken[0], false
+		}
+		return "", len(byToken) > 1
 	}
 	var exact []string
+	if _, ok := s.cfg.Conversations[target]; ok {
+		exact = append(exact, target)
+	}
 	for alias, entry := range s.cfg.Conversations {
+		if alias == target {
+			continue
+		}
 		if entry.Token == target ||
 			strings.TrimSpace(entry.HostConversationID) == target ||
 			strings.TrimSpace(entry.SessionWorkerID) == target {
@@ -1062,7 +1079,9 @@ func (s *ConfigStore) ConversationNearMisses(name string) []string {
 		lowerAlias := strings.ToLower(alias)
 		aliasSlug := SanitizeAliasSlug(strings.TrimPrefix(lowerAlias, "session-"))
 		roleSlug := SanitizeAliasSlug(entry.SubagentRole)
-		if strings.Contains(lowerAlias, lowerTarget) || strings.Contains(lowerTarget, lowerAlias) ||
+		// Equality only (case, slug, role): a substring would refuse a server-only name that
+		// merely contains a local alias such as "default", and never forward its delete.
+		if lowerAlias == lowerTarget ||
 			(targetSlug != "" && (aliasSlug == targetSlug || roleSlug == targetSlug)) {
 			out = append(out, alias)
 		}

@@ -630,3 +630,52 @@ func TestACollidingNamespaceAliasIsQualifiedEvenWhenItLooksQualified(t *testing.
 		t.Fatalf("MarkDeploymentConnected qualified an already-qualified key twice: %v", keysOf(store.Snapshot().Deployments))
 	}
 }
+
+// "console:<token>" names the token's owner, never an alias that spells the token; an unprefixed
+// name that is one entry's alias and another's identifier is ambiguous and deletes nothing.
+func TestDeleteConversationByConsoleTokenNamesTheTokensOwner(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WithUpdateLock(func(cfg *PersistentConfig) bool {
+		now := time.Now().UTC()
+		cfg.Conversations["abc"] = ConversationEntry{Alias: "abc", Token: "tok-x", CreatedAt: now, LastUsedAt: now}
+		cfg.Conversations["mine"] = ConversationEntry{Alias: "mine", Token: "abc", CreatedAt: now, LastUsedAt: now}
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, ok := store.DeleteConversation("abc"); ok {
+		t.Fatalf("DeleteConversation(abc), one alias and another's token, deleted %q; want nothing", deleted.Alias)
+	}
+	deleted, ok := store.DeleteConversation(ConsoleConvPrefix + "abc")
+	if !ok || deleted.Alias != "mine" {
+		t.Fatalf("DeleteConversation(console:abc) = %q, %v; want the token's owner, mine", deleted.Alias, ok)
+	}
+	if _, ok := store.Snapshot().Conversations["abc"]; !ok {
+		t.Fatal("the alias abc was deleted; want it kept")
+	}
+}
+
+// A server-only name that merely contains a local alias is no near miss, so its delete is not
+// refused locally.
+func TestConversationNearMissesIgnoresASubstringOfALocalAlias(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WithUpdateLock(func(cfg *PersistentConfig) bool {
+		now := time.Now().UTC()
+		cfg.Conversations["default"] = ConversationEntry{Alias: "default", Token: MintConversationToken(), CreatedAt: now, LastUsedAt: now}
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.ConversationNearMisses("my-default-old"); len(got) != 0 {
+		t.Fatalf("ConversationNearMisses(my-default-old) = %v; want none", got)
+	}
+	if got := store.ConversationNearMisses("DEFAULT"); strings.Join(got, ",") != "default" {
+		t.Fatalf("ConversationNearMisses(DEFAULT) = %v; want [default]", got)
+	}
+}

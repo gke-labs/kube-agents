@@ -665,3 +665,20 @@ func TestInspectPullRequestNotFoundSaysItMayBeAMissingCredential(t *testing.T) {
 		t.Fatalf("404 with a credential: %v; want the visibility hint without the token", err)
 	}
 }
+
+func TestNormalizeGitHubRepoRefusesDotSegmentsAndOtherHosts(t *testing.T) {
+	for _, raw := range []string{
+		"https://github.com/../..",
+		"https://github.com/%2e%2e/x",
+		"https://github.com/owner/..",
+		"ghe.corp.com/repo",
+		"../repo",
+	} {
+		if got, ok := normalizeGitHubRepo(raw); ok {
+			t.Errorf("normalizeGitHubRepo(%q) = %q, true; want refused", raw, got)
+		}
+	}
+	if got, ok := normalizeGitHubRepo("https://github.com/acme/infra.git"); !ok || got != "acme/infra" {
+		t.Errorf("normalizeGitHubRepo(acme/infra.git URL) = %q, %v; want acme/infra", got, ok)
+	}
+}

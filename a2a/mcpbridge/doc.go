@@ -41,7 +41,9 @@
 //	                               and naming no saved key sends the token
 //	                               nowhere, so after a rename (<context>/<name>)
 //	                               or a prune the old value names nothing
-//	                               until it is updated; unset, the token
+//	                               until it is updated (a different deployment
+//	                               later saved under the same key does get it,
+//	                               so update it when removing an install); unset, the token
 //	                               goes to the only saved deployment, or
 //	                               nowhere with several
 //	GH_TOKEN / GITHUB_TOKEN        GitHub token for inspect_pr; when neither is

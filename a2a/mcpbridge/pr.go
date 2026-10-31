@@ -245,6 +245,12 @@ func normalizeGitHubRepo(raw string) (string, bool) {
 	if !githubRepoSlugRegex.MatchString(path) {
 		return "", false
 	}
+	// "." and ".." would walk the API path, and a GitHub owner never holds a dot, so a dotted
+	// owner is another host written without a scheme (ghe.example.com/repo).
+	owner, repo, _ := strings.Cut(path, "/")
+	if owner == "." || owner == ".." || repo == "." || repo == ".." || strings.Contains(owner, ".") {
+		return "", false
+	}
 	return path, true
 }
 
