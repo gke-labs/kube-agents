@@ -1,6 +1,12 @@
 package controller
 
-import "testing"
+import (
+	"testing"
+	"time"
+
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+)
 
 // walkBusMigration runs a migration from its first phase, failing the phase
 // named failAt (and, when failAgain is set, the first phase of the way back
@@ -99,5 +105,75 @@ func TestABusMigrationWaitsAndThreeToOneNeverFreezes(t *testing.T) {
 		if !busMigrationFrozen(busMigrationGrow, phase) {
 			t.Errorf("one to three not frozen in %s", phase)
 		}
+	}
+}
+
+// The bus renders the old count until the phase that converts it, the new
+// one from there, and the old one again on a rollback.
+func TestTheBusRendersTheCountItsPhaseCalls(t *testing.T) {
+	for _, tc := range []struct {
+		leg        busMigrationLeg
+		phase      busMigrationPhase
+		abandoning bool
+		want       int
+	}{
+		{busMigrationShrink, busMigrationPinning, false, 3},
+		{busMigrationShrink, busMigrationUnpinning, true, 3},
+		{busMigrationShrink, busMigrationShrinking, false, 1},
+		{busMigrationShrink, busMigrationDone, false, 1},
+		{busMigrationShrink, busMigrationAbandoned, true, 3},
+		{busMigrationShrink, busMigrationFailed, false, 1},
+		{busMigrationShrink, busMigrationFailed, true, 3},
+		{busMigrationGrow, busMigrationFreezing, false, 1},
+		{busMigrationGrow, busMigrationSnapshot, false, 1},
+		{busMigrationGrow, busMigrationHashing, false, 1},
+		{busMigrationGrow, busMigrationConverting, false, 3},
+		{busMigrationGrow, busMigrationRestoring, false, 3},
+		{busMigrationGrow, busMigrationRollingBack, true, 1},
+		{busMigrationGrow, busMigrationRollbackRestoring, true, 1},
+		{busMigrationGrow, busMigrationReleasing, false, 3},
+		{busMigrationGrow, busMigrationReleasing, true, 1},
+		{busMigrationGrow, busMigrationDone, false, 3},
+		{busMigrationGrow, busMigrationAbandoned, true, 1},
+		{busMigrationGrow, busMigrationFailed, true, 1},
+	} {
+		if got := busMigrationReplicas(tc.leg, tc.phase, tc.abandoning); got != tc.want {
+			t.Errorf("%s %s (abandoning %v) renders %d, want %d", tc.leg, tc.phase, tc.abandoning, got, tc.want)
+		}
+	}
+}
+
+// A Job's outcome is its Complete or Failed condition; still pending past
+// the run's deadline counts as failed.
+func TestAMigrationJobsOutcomeAndTheDeadline(t *testing.T) {
+	job := func(cond batchv1.JobConditionType, status corev1.ConditionStatus) *batchv1.Job {
+		j := &batchv1.Job{}
+		if cond != "" {
+			j.Status.Conditions = []batchv1.JobCondition{{Type: cond, Status: status}}
+		}
+		return j
+	}
+	for _, tc := range []struct {
+		job  *batchv1.Job
+		want busMigrationOutcome
+	}{
+		{job("", ""), busMigrationPending},
+		{job(batchv1.JobComplete, corev1.ConditionTrue), busMigrationSucceeded},
+		{job(batchv1.JobFailed, corev1.ConditionTrue), busMigrationErred},
+		{job(batchv1.JobComplete, corev1.ConditionFalse), busMigrationPending},
+	} {
+		if got := jobOutcome(tc.job); got != tc.want {
+			t.Errorf("jobOutcome(%+v) = %v, want %v", tc.job.Status.Conditions, got, tc.want)
+		}
+	}
+	now := time.Now()
+	if withDeadline(busMigrationPending, now.Add(-time.Second), now) != busMigrationErred {
+		t.Error("a pending phase past the deadline is not failed")
+	}
+	if withDeadline(busMigrationPending, now.Add(time.Hour), now) != busMigrationPending {
+		t.Error("a pending phase before the deadline was failed")
+	}
+	if withDeadline(busMigrationSucceeded, now.Add(-time.Second), now) != busMigrationSucceeded {
+		t.Error("a finished phase was failed by the deadline")
 	}
 }

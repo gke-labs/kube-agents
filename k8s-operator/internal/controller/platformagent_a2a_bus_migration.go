@@ -1,5 +1,12 @@
 package controller
 
+import (
+	"time"
+
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+)
+
 // The A2A bus migration (#4225): converting an existing bus between one NATS
 // server and three without emptying it. This file holds the run's phases and
 // the one function that moves between them; the reconcile that observes each
@@ -154,4 +161,58 @@ func busMigrationFrozen(leg busMigrationLeg, phase busMigrationPhase) bool {
 // busMigrationTerminal reports a phase no pass moves on from.
 func busMigrationTerminal(phase busMigrationPhase) bool {
 	return phase == busMigrationDone || phase == busMigrationAbandoned || phase == busMigrationFailed
+}
+
+// busMigrationReplicas is the server count the bus renders in a phase. Three
+// to one keeps three until it shrinks; one to three keeps one until it
+// converts, and a rollback renders one again. A run that ended keeps the
+// count it ended on: the new one when Done, the old one when Abandoned or
+// when it failed on its way back.
+func busMigrationReplicas(leg busMigrationLeg, phase busMigrationPhase, abandoning bool) int {
+	from, to := 3, 1
+	if leg == busMigrationGrow {
+		from, to = 1, 3
+	}
+	switch phase {
+	case busMigrationShrinking, busMigrationConverting, busMigrationRestoring, busMigrationDone:
+		return to
+	case busMigrationReleasing:
+		if abandoning {
+			return from
+		}
+		return to
+	case busMigrationFailed:
+		if abandoning || leg == busMigrationGrow {
+			return from
+		}
+		// Three to one failed after the shrink: server 0 alone holds the
+		// streams at R1.
+		return to
+	}
+	return from
+}
+
+// jobOutcome reads a migration Job's outcome from its conditions.
+func jobOutcome(job *batchv1.Job) busMigrationOutcome {
+	for _, c := range job.Status.Conditions {
+		if c.Status != corev1.ConditionTrue {
+			continue
+		}
+		switch c.Type {
+		case batchv1.JobComplete:
+			return busMigrationSucceeded
+		case batchv1.JobFailed:
+			return busMigrationErred
+		}
+	}
+	return busMigrationPending
+}
+
+// withDeadline turns a pending outcome into a failure once the run is past
+// its deadline.
+func withDeadline(outcome busMigrationOutcome, deadline, now time.Time) busMigrationOutcome {
+	if outcome == busMigrationPending && !deadline.IsZero() && now.After(deadline) {
+		return busMigrationErred
+	}
+	return outcome
 }
