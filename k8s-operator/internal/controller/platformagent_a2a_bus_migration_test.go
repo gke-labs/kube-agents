@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -436,5 +438,82 @@ func TestTheStatusWriteCarriesTheMigration(t *testing.T) {
 	}
 	if live.Status.BusMigration == nil || live.Status.BusMigration.Phase != string(busMigrationDone) {
 		t.Errorf("the Done run was not written: %+v", live.Status.BusMigration)
+	}
+}
+
+// A migration step's bus principal has exactly the JetStream API verbs its
+// leg sends, on the provisioned streams by name, subscribes to its own inbox
+// only, and is in the identity map only while its step runs.
+func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
+	want := map[busMigrationPhase][]string{
+		busMigrationPinning:   {"INFO", "LEADER.STEPDOWN", "UPDATE"},
+		busMigrationUnpinning: {"INFO", "UPDATE"},
+		busMigrationSnapshot:  {"INFO", "SNAPSHOT"},
+	}
+	for phase, verbs := range want {
+		leg := busMigrationShrink
+		if phase == busMigrationSnapshot {
+			leg = busMigrationGrow
+		}
+		agent := a2aTestAgent()
+		agent.Spec.Mode = ptr.To("next")
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(leg), RunID: "5-9", Phase: string(phase)}
+		ids := busMigrationIdentities(agent)
+		if len(ids) != 1 {
+			t.Fatalf("%s: %d principals, want 1", phase, len(ids))
+		}
+		id := ids[0]
+		var expected []string
+		for _, s := range a2aProvisionedStreams {
+			for _, v := range verbs {
+				expected = append(expected, "$JS.API.STREAM."+v+"."+s)
+			}
+			if phase == busMigrationSnapshot {
+				expected = append(expected, "$JS.SNAPSHOT.ACK."+s+".>")
+			}
+		}
+		if !slices.Equal(id.publish, expected) {
+			t.Errorf("%s publish:\n got %v\nwant %v", phase, id.publish, expected)
+		}
+		for _, p := range id.publish {
+			if strings.HasSuffix(p, ".*") || strings.Contains(p, "STREAM.>") || p == "$JS.API.>" || strings.HasPrefix(p, "$JS.API.STREAM.*") {
+				t.Errorf("%s: wildcard over stream names: %s", phase, p)
+			}
+			for _, banned := range []string{"RESTORE", "DELETE", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE"} {
+				if strings.Contains(p, "."+banned+".") {
+					t.Errorf("%s grants %s: %s", phase, banned, p)
+				}
+			}
+		}
+		if !slices.Equal(id.subscribe, []string{"_INBOX." + id.user + ".>"}) {
+			t.Errorf("%s subscribe %v, want its own inbox only", phase, id.subscribe)
+		}
+		// The callout refuses a whole map whose user is not one lowercase
+		// DNS-1123 label (it becomes the inbox prefix), so a long run ID
+		// must still fit; the ServiceAccount name must be one too.
+		long := busMigrationPrincipal("snapshot", "9999999-1999999999")
+		for _, name := range []string{id.user, long, busMigrationWorkloadName(agent, "snapshot", "9999999-1999999999")} {
+			if errs := validation.IsDNS1123Label(name); len(errs) != 0 {
+				t.Errorf("%q is not a DNS-1123 label: %v", name, errs)
+			}
+		}
+		if id.auth != a2aAuthCallout || !strings.Contains(id.serviceAccount, "5-9") {
+			t.Errorf("%s: auth %v by %q, want the callout and a ServiceAccount named for the run", phase, id.auth, id.serviceAccount)
+		}
+		found := false
+		for _, all := range a2aIdentities(agent) {
+			found = found || all.user == id.user
+		}
+		if !found {
+			t.Errorf("%s: the principal is not in the identity map", phase)
+		}
+	}
+	// Outside those steps, and after the run, no migration principal.
+	for _, phase := range []busMigrationPhase{busMigrationShrinking, busMigrationFreezing, busMigrationConverting, busMigrationRestoring, busMigrationDone, busMigrationFailed} {
+		agent := a2aTestAgent()
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "5-9", Phase: string(phase)}
+		if ids := busMigrationIdentities(agent); len(ids) != 0 {
+			t.Errorf("%s: %d migration principals, want none", phase, len(ids))
+		}
 	}
 }

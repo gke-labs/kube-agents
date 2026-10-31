@@ -386,3 +386,57 @@ func setBusMigratingCondition(agent *agentv1alpha1.PlatformAgent, now metav1.Tim
 	want.ObservedGeneration, want.LastTransitionTime = agent.Generation, now
 	meta.SetStatusCondition(&agent.Status.Conditions, want)
 }
+
+// busMigrationIdentities are the bus principals the migration run holds in
+// the phase it is in, and none outside it: the callout map names a run's
+// principal only while its Job runs, so a token left behind authenticates
+// nothing once the phase has moved on. Each is its own ServiceAccount, named
+// for the run, and its grants are the JetStream API verbs its leg sends, on
+// the provisioned streams by name and nothing else; it subscribes to its own
+// inbox only. The restore pod's principal is not here yet.
+func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
+	run := agent.Status.BusMigration
+	if run == nil || busMigrationTerminal(busMigrationPhase(run.Phase)) {
+		return nil
+	}
+	var step string
+	var verbs []string
+	var extra func(stream string) []string
+	switch busMigrationPhase(run.Phase) {
+	case busMigrationPinning:
+		step, verbs = "pin", []string{"INFO", "LEADER.STEPDOWN", "UPDATE"}
+	case busMigrationUnpinning:
+		step, verbs = "unpin", []string{"INFO", "UPDATE"}
+	case busMigrationSnapshot:
+		step, verbs = "snapshot", []string{"INFO", "SNAPSHOT"}
+		// A snapshot's chunks arrive on the run's inbox and are acked here.
+		extra = func(stream string) []string { return []string{"$JS.SNAPSHOT.ACK." + stream + ".>"} }
+	default:
+		return nil
+	}
+	user := busMigrationPrincipal(step, run.RunID)
+	var publish []string
+	for _, stream := range a2aProvisionedStreams {
+		for _, verb := range verbs {
+			publish = append(publish, "$JS.API.STREAM."+verb+"."+stream)
+		}
+		if extra != nil {
+			publish = append(publish, extra(stream)...)
+		}
+	}
+	return []a2aIdentity{{
+		user:           user,
+		account:        a2aAccountApp,
+		comment:        "the bus migration's " + step + " step for run " + run.RunID + "; present only while that step runs",
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(agent.Namespace, busMigrationWorkloadName(agent, step, run.RunID)),
+		publish:        publish,
+		subscribe:      []string{"_INBOX." + user + ".>"},
+	}}
+}
+
+// busMigrationPrincipal is a migration step's bus user, which is also its
+// inbox prefix.
+func busMigrationPrincipal(step, runID string) string {
+	return "migrate-" + step + "-" + runID
+}
