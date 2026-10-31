@@ -84,11 +84,23 @@ const (
 		"the description and diff as fenced blocks, with invisible and control characters shown as `<U+XXXX>`.\n\n"
 )
 
+const (
+	// githubRepoSlugPattern is the owner/repo a githubRepo default is reduced to
+	// (normalizeGitHubRepo); githubSCPRemotePattern is the "git@github.com:owner/repo" form.
+	githubRepoSlugPattern  = `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`
+	githubSCPRemotePattern = `^[A-Za-z0-9._-]+@([^:/]+):(.*)$`
+	githubWWWHost          = "www.github.com"
+	gitSuffix              = ".git"
+)
+
 var (
 	prURLPathRegex       = regexp.MustCompile(prURLPathRegexPattern)
 	prShortRefRegex      = regexp.MustCompile(prShortRefRegexPattern)
 	prExactShortRefRegex = regexp.MustCompile(prExactShortRefRegexPattern)
 	prNumberOnlyRegex    = regexp.MustCompile(prNumberOnlyRegexPattern)
+	githubRepoSlugRegex  = regexp.MustCompile(githubRepoSlugPattern)
+	githubSCPRemoteRegex = regexp.MustCompile(githubSCPRemotePattern)
+	githubRepoURLSchemes = map[string]bool{"http": true, "https": true, "ssh": true, "git": true}
 	errInvalidPRRef      = errors.New("invalid pull request reference; provide a GitHub PR URL, owner/repo#number, or PR number")
 )
 
@@ -191,12 +203,49 @@ func ParsePRReference(ref string, defaultRepo string) (string, int, error) {
 		if strings.TrimSpace(defaultRepo) == "" {
 			return "", 0, fmt.Errorf("%w: bare PR number %q requires a repo or connected deployment with githubRepo", errInvalidPRRef, trimmed)
 		}
+		repo, ok := normalizeGitHubRepo(defaultRepo)
+		if !ok {
+			return "", 0, fmt.Errorf("%w: bare PR number %q: the default repo %q (the repo argument, or the deployment's githubRepo) is not an owner/repo on github.com; pass repo as owner/repo, or give the PR as owner/repo#number or its URL",
+				errInvalidPRRef, trimmed, strings.TrimSpace(defaultRepo))
+		}
 		num, err := strconv.Atoi(m[1])
 		if err == nil && num > 0 {
-			return strings.TrimSpace(defaultRepo), num, nil
+			return repo, num, nil
 		}
 	}
 	return "", 0, fmt.Errorf("%w: %q", errInvalidPRRef, trimmed)
+}
+
+// normalizeGitHubRepo reduces a githubRepo value to owner/repo. The CRD and the chart accept
+// owner/repo, an http(s)://, ssh:// or git:// URL, a schemeless github.com/owner/repo, or an scp
+// remote (git@github.com:owner/repo), each with an optional ".git". It reports false for a bare
+// repository name, another host, or a path that is not exactly owner/repo.
+func normalizeGitHubRepo(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	host, path := githubHost, s
+	lower := strings.ToLower(s)
+	switch {
+	case strings.Contains(s, "://"):
+		u, err := url.Parse(s)
+		if err != nil || !githubRepoURLSchemes[strings.ToLower(u.Scheme)] || u.RawQuery != "" || u.Fragment != "" {
+			return "", false
+		}
+		host, path = u.Hostname(), u.Path
+	case githubSCPRemoteRegex.MatchString(s):
+		m := githubSCPRemoteRegex.FindStringSubmatch(s)
+		host, path = m[1], m[2]
+	case strings.HasPrefix(lower, githubHost+"/"), strings.HasPrefix(lower, githubWWWHost+"/"):
+		i := strings.Index(s, "/")
+		host, path = s[:i], s[i+1:]
+	}
+	if !strings.EqualFold(host, githubHost) && !strings.EqualFold(host, githubWWWHost) {
+		return "", false
+	}
+	path = strings.TrimSuffix(strings.Trim(path, "/"), gitSuffix)
+	if !githubRepoSlugRegex.MatchString(path) {
+		return "", false
+	}
+	return path, true
 }
 
 // matchPRURLPath reads `<owner>/<repo>/pull/<number>` at the start of the text following
@@ -234,6 +283,8 @@ func InspectPullRequest(
 	if err != nil {
 		return nil, err
 	}
+	// The same-name retry below compares owner/repo forms; a default that is none is not used.
+	defaultRepo, _ = normalizeGitHubRepo(defaultRepo)
 	if apiBaseURL == "" {
 		apiBaseURL = githubAPIBaseURL
 	}

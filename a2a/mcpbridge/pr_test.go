@@ -436,6 +436,55 @@ func TestParsePRReferenceAcceptsOnlyWholeReferences(t *testing.T) {
 	}
 }
 
+// githubRepo may be a URL, an scp remote or a bare name (the CRD and the chart allow each); a bare
+// PR number resolves against its owner/repo, and a default that names no owner/repo on github.com
+// is refused before any GitHub call.
+func TestParsePRReferenceNormalizesTheDefaultRepo(t *testing.T) {
+	for _, def := range []string{
+		"acme/infra",
+		" acme/infra ",
+		"https://github.com/acme/infra",
+		"https://github.com/acme/infra.git",
+		"https://github.com/acme/infra/",
+		"http://github.com/acme/infra",
+		"https://www.github.com/acme/infra",
+		"ssh://git@github.com/acme/infra.git",
+		"git://github.com/acme/infra.git",
+		"git@github.com:acme/infra.git",
+		"git@github.com:acme/infra",
+		"github.com/acme/infra",
+		"acme/infra.git",
+	} {
+		repo, num, err := ParsePRReference("#5", def)
+		if err != nil || repo != "acme/infra" || num != 5 {
+			t.Errorf("ParsePRReference(#5, %q) = %q, %d, %v; want acme/infra, 5", def, repo, num, err)
+		}
+	}
+	for _, def := range []string{
+		"infra",
+		"https://gitlab.com/acme/infra",
+		"git@gitlab.com:acme/infra.git",
+		"https://github.com/acme",
+		"https://github.com/acme/infra/tree/main",
+		"https://github.com.evil.example/acme/infra",
+		"a/b/c",
+		"acme/in fra",
+	} {
+		repo, num, err := ParsePRReference("#5", def)
+		if err == nil {
+			t.Errorf("ParsePRReference(#5, %q) = %q, %d; want it refused", def, repo, num)
+			continue
+		}
+		if !strings.Contains(err.Error(), "githubRepo") {
+			t.Errorf("ParsePRReference(#5, %q) refused with %q; want the error to name githubRepo", def, err)
+		}
+	}
+	// A full reference does not need the default, so an unusable one does not block it.
+	if repo, num, err := ParsePRReference("o/r#3", "infra"); err != nil || repo != "o/r" || num != 3 {
+		t.Errorf("ParsePRReference(o/r#3, infra) = %q, %d, %v; want o/r, 3", repo, num, err)
+	}
+}
+
 func TestExtractPRReferencesIgnoresTheHostInsideAnotherURL(t *testing.T) {
 	got := ExtractPRReferences("see (https://github.com/o/r/pull/12). Not https://notgithub.com/x/y/pull/3 " +
 		"or xhttps://github.com/x/y/pull/4; also o2/r2#5.")
