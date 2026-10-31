@@ -261,11 +261,15 @@ children for up to that long. The old process also stops counting toward the
 dispatcher's concurrency limits once its claim is released.
 
 A worker whose ``chat()`` returns before any turn runs (credentials
-unresolved, the agent failed to initialise) still exits 0, as upstream's chat
-path does. An exit 1 with no board write there would reach the reaper's burst
-breaker, and those failures are fleet-wide by nature, so every card spawned in
-that tick would give up on its first attempt. Parity with the ``-Q`` branch
-for that case is gke-labs/kube-agents#3505.
+unresolved, the agent failed to initialise) charges its own failure
+(``record_no_turn``) before exiting 1, mirroring the ``-Q`` branch
+(``sys.exit(1)  # credentials or agent init failed``). An exit 1 with no board
+write there would reach the reaper's burst breaker, and those failures are
+fleet-wide by nature, so every card spawned in that tick would give up on its
+first attempt. Charged by the worker with ``NO_TURN_ERROR`` (which
+``check_respawn_guard``'s ``_RESPAWN_BLOCKER_RE`` does not match), the card
+returns to ``ready`` with the failure counted, staying retryable up to its
+retry limit without feeding the breaker (gke-labs/kube-agents#3505).
 
 No board write reaches chat without feeding the guard: ``commented`` is not a
 kind the notifier posts. The ``crashed`` event the charge writes is, and it is
@@ -343,6 +347,7 @@ LAST_API_FAILURE_ATTR = "_kube_last_api_failure"
 TASK_ENV = "HERMES_KANBAN_TASK"
 RUN_ID_ENV = "HERMES_KANBAN_RUN_ID"
 GOAL_MODE_ENV = "HERMES_KANBAN_GOAL_MODE"
+DB_ENV = "HERMES_KANBAN_DB"
 
 #: The value ``_default_spawn`` sets ``HERMES_KANBAN_GOAL_MODE`` to for a
 #: goal-mode card; anything else, including unset, is a normal worker.
@@ -429,6 +434,35 @@ FAILED_TURN_COMMENT_AUTHOR = DETECTOR
 #: The attribute the chat-render site leaves on the CLI object for the
 #: single-query exit in ``cli.py``: the exit code.
 EXIT_CODE_ATTR = "_kube_kanban_exit_code"
+
+#: The exit code a kanban worker leaving before any turn ran exits with.
+#: Matches the -Q branch's exit 1 for agent-init or credential failure.
+NO_TURN_EXIT_CODE = 1
+
+#: Outcome booked for a no-turn exit. Matches FAILED_TURN_OUTCOME.
+NO_TURN_OUTCOME = "crashed"
+
+#: Failure reason recorded in the event payload for a no-turn exit.
+NO_TURN_FAILURE_REASON = "no_turn"
+
+#: The charge's error text for a no-turn worker. Fixed text: check_respawn_guard's
+#: _RESPAWN_BLOCKER_RE must not match it, and it must not contain "protocol violation".
+NO_TURN_ERROR = (
+    "worker exited before any turn ran and the run ended; any comment this run "
+    "left on the card carries details"
+)
+
+#: The comment left on a card when a worker exits before any turn ran.
+NO_TURN_COMMENT = (
+    "Run {run} ended before any turn ran (agent init or runtime credentials "
+    "unresolved). The run counts as a failure toward the card's retry limit, "
+    "and the worker exited with code {code}."
+)
+
+NO_TURN_COMMENT_AUTHOR = DETECTOR
+
+#: The attribute marked on the CLI object when a turn is rendered in chat.
+TURN_SEEN_ATTR = "_kube_kanban_turn_seen"
 
 _HALT_SUFFIX = (
     "\n\n[System: `{tool}` is exhausted for the rest of this run "
@@ -824,7 +858,7 @@ def record_rate_limit_block(
             pass
 
 
-def _default_connect():
+def _default_connect(db_path=None):
     """The board opener: ``hermes_cli.kanban_db_connect.connect`` since the
     v2026.9.14 split of ``kanban_db``, else the pre-split
     ``hermes_cli.kanban_db.connect`` (the split module only forwards that name
@@ -833,6 +867,10 @@ def _default_connect():
         from hermes_cli.kanban_db_connect import connect
     except ImportError:
         from hermes_cli.kanban_db import connect
+    if db_path is not None:
+        from pathlib import Path
+        p = Path(db_path).expanduser()
+        return lambda: connect(p)
     return connect
 
 
@@ -874,7 +912,7 @@ def block_rate_limited_worker(
     ):
         return False
     if connect is None:
-        connect = _default_connect()
+        connect = _default_connect(env.get(DB_ENV))
     if block_task is None:
         from hermes_cli import kanban_db as _kb
 
@@ -945,6 +983,8 @@ def record_failed_turn(
     connect,
     add_comment,
     record_failure,
+    error: str = FAILED_TURN_ERROR,
+    outcome: str = FAILED_TURN_OUTCOME,
 ) -> bool:
     """Charge the failed run to the card, then comment the reason. Returns
     whether the charge landed.
@@ -958,7 +998,7 @@ def record_failed_turn(
     keyword ``apply_kanban_guardrail_exit`` adds), so a card that changed hands
     in between is left to its new worker.
 
-    The charge carries ``FAILED_TURN_ERROR``, fixed text that
+    The charge carries ``FAILED_TURN_ERROR`` (or ``error``), fixed text that
     ``check_respawn_guard`` cannot mistake for an auth or quota blocker. The
     comment carries the reason, ``failure_reason`` and the error Hermes
     summarised, and is written only when ``charge_landed`` confirms the charge,
@@ -976,11 +1016,13 @@ def record_failed_turn(
     one card. The exit falls back to the reaper, as without this patch.
     """
     if run_id is None:
+        turn_kind = "no-turn run" if failure_reason == NO_TURN_FAILURE_REASON else "turn"
         logger.warning(
-            "kanban: task %s's turn failed in a worker with no run id "
+            "kanban: task %s's %s failed in a worker with no run id "
             "(HERMES_KANBAN_RUN_ID unset or unparseable); not charging it, "
             "so the reaper settles the exit",
             task_id,
+            turn_kind,
         )
         return False
     conn = connect()
@@ -990,8 +1032,8 @@ def record_failed_turn(
         record_failure(
             conn,
             task_id,
-            error=FAILED_TURN_ERROR,
-            outcome=FAILED_TURN_OUTCOME,
+            error=error,
+            outcome=outcome,
             release_claim=True,
             end_run=True,
             expected_run_id=run_id,
@@ -1002,13 +1044,14 @@ def record_failed_turn(
             },
         )
         if not charge_landed(
-            conn, task_id, run_id, FAILED_TURN_ERROR, outcome=FAILED_TURN_OUTCOME
+            conn, task_id, run_id, error, outcome=outcome
         ):
             return False
         try:
             add_comment(conn, task_id, author, comment)
         except Exception:
-            logger.debug("failed-turn comment for task %s failed", task_id, exc_info=True)
+            label = "no-turn" if failure_reason == NO_TURN_FAILURE_REASON else "failed-turn"
+            logger.debug("%s comment for task %s failed", label, task_id, exc_info=True)
         return True
     finally:
         try:
@@ -1054,7 +1097,7 @@ def close_failed_chat_turn(
     run_id = worker_run_id(env)
     try:
         if connect is None:
-            connect = _default_connect()
+            connect = _default_connect(env.get(DB_ENV))
         if add_comment is None:
             from hermes_cli import kanban_db as _kb
 
@@ -1092,4 +1135,102 @@ def close_failed_chat_turn(
             )
     except Exception:
         logger.debug("failed-turn charge for task %s failed", env.get(TASK_ENV), exc_info=True)
+    return code
+
+
+def no_turn_comment(*, run_id, exit_code) -> str:
+    """The comment body for a no-turn worker: run, reason, exit code."""
+    return NO_TURN_COMMENT.format(
+        run=run_id if run_id is not None else "?",
+        code=exit_code,
+    )
+
+
+def record_no_turn(
+    *,
+    task_id: str,
+    run_id,
+    comment: str,
+    author: str,
+    connect,
+    add_comment,
+    record_failure,
+) -> bool:
+    """Charge the no-turn exit to the card, then comment the reason. Returns
+    whether the charge landed.
+    """
+    return record_failed_turn(
+        task_id=task_id,
+        run_id=run_id,
+        comment=comment,
+        author=author,
+        failure_reason=NO_TURN_FAILURE_REASON,
+        failure_retryable=True,
+        connect=connect,
+        add_comment=add_comment,
+        record_failure=record_failure,
+        error=NO_TURN_ERROR,
+        outcome=NO_TURN_OUTCOME,
+    )
+
+
+def close_no_turn_chat(
+    *,
+    connect=None,
+    add_comment=None,
+    record_failure=None,
+    environ=None,
+    goal_mode=None,
+    cron_run=None,
+    delegated_child=None,
+):
+    """The single-query exit site: settle a kanban worker whose chat() ran no
+    turn and return the exit code (1). Returns None for non-kanban workers or
+    cards that belong to somebody else.
+    """
+    env = os.environ if environ is None else environ
+    task_id = env.get(TASK_ENV)
+    if not task_id:
+        return None
+    if goal_mode is None:
+        goal_mode = env.get(GOAL_MODE_ENV) == GOAL_MODE_ON
+    if card_is_somebody_elses(
+        goal_mode=goal_mode, cron_run=cron_run, delegated_child=delegated_child
+    ):
+        return None
+    code = NO_TURN_EXIT_CODE
+    run_id = worker_run_id(env)
+    try:
+        if connect is None:
+            connect = _default_connect(env.get(DB_ENV))
+        if add_comment is None:
+            from hermes_cli import kanban_db as _kb
+
+            add_comment = _kb.add_comment
+        if record_failure is None:
+            from hermes_cli.kanban_db_dispatch import _record_task_failure
+
+            record_failure = _record_task_failure
+        landed = record_no_turn(
+            task_id=task_id,
+            run_id=run_id,
+            comment=no_turn_comment(
+                run_id=run_id,
+                exit_code=code,
+            ),
+            author=env.get(PROFILE_ENV) or NO_TURN_COMMENT_AUTHOR,
+            connect=connect,
+            add_comment=add_comment,
+            record_failure=record_failure,
+        )
+        if not landed:
+            logger.info(
+                "kanban task %s run %s: no-turn charge not confirmed on the "
+                "board; exiting %s",
+                task_id,
+                run_id,
+                code,
+            )
+    except Exception:
+        logger.debug("no-turn charge for task %s failed", task_id, exc_info=True)
     return code
