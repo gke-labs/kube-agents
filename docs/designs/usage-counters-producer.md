@@ -1,6 +1,6 @@
 # Producing the PlatformAgent Usage Counters
 
-**Status:** implemented. The facts table below is the tree as read on 2026-10-01, before the poller; the sections after it describe what ships. [`proposal-outcome-readings.md`](proposal-outcome-readings.md) replaced the event-counted `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` rows below on 2026-10-29: both fields are now readings the broker's sweep takes from the forge, outside the counter fold, and they no longer move `lastActiveTime`. The rows here point at that design, which owns them. The same change removed `remediationsAppliedTotal` from the schema.
+**Status:** implemented. The facts table below is the tree as read on 2026-10-01, before the poller; the sections after it describe what ships. [`proposal-outcome-readings.md`](proposal-outcome-readings.md) replaced the event-counted `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` rows below on 2026-10-29: both fields are now readings the broker's sweep takes from the forge, outside the counter fold, and they no longer move `lastActiveTime`. The rows here point at that design, which owns them. The same change removed `remediationsAppliedTotal` from the schema. [`human-interaction-readings.md`](human-interaction-readings.md) (proposed; Workstream 4 of the epic that produced the proposal readings) would add `chatSessionsTotal` and the two people-seen readings, and writes down how a maintainer reads these across installs.
 
 ## Summary
 

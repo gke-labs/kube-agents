@@ -3,7 +3,7 @@
 **Status:** implemented 2026-10-29. Epic: gke-labs/kube-agents#4120, Workstreams 1
 and 2. Owner of the producer side: [`usage-counters-producer.md`](usage-counters-producer.md), which
 this document amends; the rows there for `remediationsMergedTotal` and
-`remediationsClosedUnmergedTotal` point here.
+`remediationsClosedUnmergedTotal` point here. [`human-interaction-readings.md`](human-interaction-readings.md) (proposed) generalises the readings slot of section 6 to a target per reading.
 
 ## 1. Intent
 
