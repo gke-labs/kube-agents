@@ -928,6 +928,18 @@ FIX_PR_LOOKUP_TIMEOUT_S = 8.0
 # reminded that the fix is waiting, so it is reminded at most once per window.
 FIX_PR_REMINDED_AT_KEY = "fix_pr_reminded_at"
 FIX_PR_REMINDER_SEND_TIMEOUT_S = 30.0
+# A human's `apply` (typed, or an option button's text) in an incident's thread,
+# recorded by agents/platform/plugins/incident_context (POST /v1/incidents/apply).
+# The fix it asks for is opened by a card the front door files from the thread,
+# in the front door's own session, so the incident-session read misses it, and
+# reading every card subscribed to the thread would count anything else asked
+# there. What counts instead is the first card assigned to INCIDENT_PR_ASSIGNEE
+# carrying the thread's subscription and created within this many seconds after
+# an `apply`: long enough for a front-door turn under gVisor, short enough that
+# an unrelated later card is not taken for the fix.
+INCIDENT_APPLY_CARD_WINDOW_S = 1800
+# How many of a thread's most recent `apply`s are read for their fix cards.
+INCIDENT_APPLIES_SCANNED = 5
 
 # The `kind` a drift record carries, set by the drift detector
 # (`injectKindDrift` in k8s-operator/cmd/drift-detector/inject.go). It is the
@@ -1331,6 +1343,22 @@ def init_db() -> None:
                 )
                 """
             )
+            # One row per `apply` in an incident's thread (INCIDENT_APPLY_CARD_WINDOW_S).
+            # applied_at is epoch seconds, the unit kanban.db's tasks.created_at
+            # is compared in; created_at is what cleanup_old_records ages.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS incident_applies (
+                    chat_id    TEXT NOT NULL,
+                    thread_id  TEXT NOT NULL,
+                    applied_at REAL NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_incident_applies_thread ON incident_applies (chat_id, thread_id, applied_at)"
+            )
             # Every event the watcher forwards, whether or not it was announced
             # in chat. This is the only durable record of one: the watcher's
             # dedup snapshot is a rolling window of *active* incidents keyed by
@@ -1561,6 +1589,7 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
         if undigested:
             logger.warning(f"Ledger cleanup is removing {undigested} drift backlog row(s) that were never digested")
         conn.execute("DELETE FROM incidents WHERE created_at < datetime('now', ?)", (param,))
+        conn.execute("DELETE FROM incident_applies WHERE created_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM intercepted_events WHERE created_at < datetime('now', ?)", (param,))
         # A row cap beside the TTL, because a time bound alone does not bound
@@ -1778,14 +1807,43 @@ class FixPullRequest(NamedTuple):
     url: str
 
 
-def _incident_pull_request_urls(session_id: str) -> list[str]:
-    """The pull requests cards filed in an incident's own session opened, newest first.
+def _incident_apply_times(session_id: str) -> tuple[str, str, list[float]]:
+    """The incident's thread (chat_id, thread_id) and its most recent `apply` times, newest first.
 
-    The card the front door files in the incident's own session
-    (INCIDENT_TRIAGE_OPEN_PULL_REQUEST; Hermes stamps the filing session on
-    `tasks.session_id`) opens the fix, and a card that opened one has a
-    `pr_opened` event (agents/platform/plugins/pr_opened). Not the cards
-    subscribed to the incident's thread: anything asked for in the thread
+    Empty when the session has no thread or the thread no `apply`.
+    Best-effort, as _incident_pull_request_urls is.
+    """
+    _platform, chat_id, thread_id = _lookup_session_routing(session_id)
+    if not (chat_id and thread_id):
+        return chat_id, thread_id, []
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            rows = conn.execute(
+                "SELECT applied_at FROM incident_applies WHERE chat_id = ? AND thread_id = ? "
+                "ORDER BY applied_at DESC LIMIT ?",
+                (chat_id, thread_id, INCIDENT_APPLIES_SCANNED),
+            ).fetchall()
+    except Exception as exc:
+        logger.warning(f"Could not read session {session_id}'s applies: {exc!r}")
+        return chat_id, thread_id, []
+    return chat_id, thread_id, [float(applied_at) for (applied_at,) in rows]
+
+
+def _incident_pull_request_urls(session_id: str) -> list[str]:
+    """The pull requests an incident's fix cards opened, newest first.
+
+    Two cards open an incident's fix, and a card that opened one has a
+    `pr_opened` event (agents/platform/plugins/pr_opened):
+
+    - the card the front door files in the incident's own session
+      (INCIDENT_TRIAGE_OPEN_PULL_REQUEST; Hermes stamps the filing session on
+      `tasks.session_id`);
+    - the card it files for a human's `apply` in the incident's thread: the
+      first card assigned to INCIDENT_PR_ASSIGNEE that carries the thread's
+      subscription and was created within INCIDENT_APPLY_CARD_WINDOW_S after
+      an `apply` there (_incident_apply_times).
+
+    Not every card subscribed to the thread: anything asked for in the thread
     files one, so a pull request found that way need not be the fix.
     Best-effort: an unreadable board, or one without a table or column these
     read, contributes nothing.
@@ -1794,10 +1852,32 @@ def _incident_pull_request_urls(session_id: str) -> list[str]:
         "SELECT e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
         "WHERE e.kind = ? AND t.session_id = ? ORDER BY e.created_at DESC, e.id DESC"
     )
+    apply_card_sql = (
+        "SELECT t.id FROM tasks t JOIN kanban_notify_subs s ON s.task_id = t.id "
+        "WHERE s.chat_id = ? AND s.thread_id = ? AND t.assignee = ? "
+        "AND t.created_at >= ? AND t.created_at <= ? ORDER BY t.created_at, t.id LIMIT 1"
+    )
+    card_sql = (
+        "SELECT payload FROM task_events WHERE kind = ? AND task_id = ? ORDER BY created_at DESC, id DESC"
+    )
+    chat_id, thread_id, applied = _incident_apply_times(session_id)
     urls: list[str] = []
     try:
         with closing(_read_only(_kanban_db_path())) as conn:
-            for (payload,) in conn.execute(sql, (PR_OPENED_EVENT_KIND, session_id)).fetchall():
+            payloads = [row[0] for row in conn.execute(sql, (PR_OPENED_EVENT_KIND, session_id)).fetchall()]
+            # Its own guard, so a board this read cannot use still answers
+            # with the incident session's cards above.
+            try:
+                for applied_at in applied:
+                    card = conn.execute(
+                        apply_card_sql,
+                        (chat_id, thread_id, INCIDENT_PR_ASSIGNEE, applied_at, applied_at + INCIDENT_APPLY_CARD_WINDOW_S),
+                    ).fetchone()
+                    if card:
+                        payloads += [row[0] for row in conn.execute(card_sql, (PR_OPENED_EVENT_KIND, card[0])).fetchall()]
+            except Exception as exc:
+                logger.warning(f"Could not read the board for session {session_id}'s apply card: {exc!r}")
+            for payload in payloads:
                 try:
                     data = json.loads(payload) if isinstance(payload, str) else payload
                 except ValueError:
@@ -7211,6 +7291,29 @@ def store_incident(body: Dict[str, Any]) -> Dict[str, str]:
             )
             cleanup_old_records(conn)
     return {"status": "stored"}
+
+
+@app.post("/v1/incidents/apply", dependencies=[Depends(verify_api_key)])
+def record_incident_apply(body: Dict[str, Any]) -> Dict[str, str]:
+    """Records a human's `apply` in an incident's thread (INCIDENT_APPLY_CARD_WINDOW_S).
+
+    404 when the thread has no incident: an `apply` anywhere else asks for
+    nothing the recurrence hold could count.
+    """
+    chat_id, thread_id = body.get("chat_id"), body.get("thread_id")
+    if not (chat_id and thread_id):
+        raise HTTPException(status_code=400, detail="chat_id, thread_id required")
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+        with conn:
+            if not conn.execute(
+                "SELECT 1 FROM incidents WHERE chat_id = ? AND thread_id = ?", (chat_id, thread_id)
+            ).fetchone():
+                raise HTTPException(status_code=404, detail="no incident for thread")
+            conn.execute(
+                "INSERT INTO incident_applies (chat_id, thread_id, applied_at) VALUES (?, ?, ?)",
+                (chat_id, thread_id, time.time()),
+            )
+    return {"status": "recorded"}
 
 
 @app.get("/v1/incidents/by-thread", dependencies=[Depends(verify_api_key)])

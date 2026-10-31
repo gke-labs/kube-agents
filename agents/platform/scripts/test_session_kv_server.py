@@ -1266,6 +1266,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/sessions", None),
         ("GET", "/v1/sessions/sess-1/metadata", None),
         ("POST", "/v1/incidents", {"chat_id": "c", "thread_id": "t", "report": "r"}),
+        ("POST", "/v1/incidents/apply", {"chat_id": "c", "thread_id": "t"}),
         ("GET", "/v1/incidents/by-thread?chat_id=c&thread_id=t", None),
         ("GET", "/v1/incidents/recent?chat_id=c", None),
         ("GET", "/v1/alert-quota", None),
@@ -2319,19 +2320,32 @@ class TestWorkloadIncidentFold(unittest.TestCase):
 
     FIX_URL = "https://github.com/acme/fleet/pull/7"
 
-    def _board(self, cards=(), subs=()):
-        """A kanban board with `cards` (task_id, session_id, pr_url or None) and `subs` (task_id, chat_id, thread_id)."""
+    def _board(self, cards=(), subs=(), legacy=False):
+        """A kanban board with `cards` and `subs` (task_id, chat_id, thread_id).
+
+        A card is (task_id, session_id, pr_url or None), optionally followed by
+        its assignee and created_at (epoch seconds). `legacy` builds a tasks
+        table with neither column, as an older board has.
+        """
         import sqlite3
         board = os.path.join(tempfile.mkdtemp(), "kanban.db")
         with sqlite3.connect(board) as conn:
-            conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, session_id TEXT)")
+            if legacy:
+                conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, session_id TEXT)")
+            else:
+                conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, session_id TEXT, assignee TEXT, created_at REAL)")
             conn.execute(
                 "CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, "
                 "payload TEXT, created_at INTEGER)"
             )
             conn.execute("CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT)")
-            for task_id, session_id, url in cards:
-                conn.execute("INSERT INTO tasks VALUES (?, ?)", (task_id, session_id))
+            for card in cards:
+                task_id, session_id, url = card[:3]
+                if legacy:
+                    conn.execute("INSERT INTO tasks VALUES (?, ?)", (task_id, session_id))
+                else:
+                    assignee, created_at = (card[3], card[4]) if len(card) > 3 else ("", 0)
+                    conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?)", (task_id, session_id, assignee, created_at))
                 if url:
                     conn.execute(
                         "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'pr_opened', ?, 1)",
@@ -2383,6 +2397,99 @@ class TestWorkloadIncidentFold(unittest.TestCase):
                 )
             self._board(cards=[("t-label", "a2a-elsewhere", self.FIX_URL)], subs=[("t-label", "C1", "1700.1")])
             self.assertEqual(self._inject("threadfix-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def _apply_in_thread(self, session, thread_id):
+        """Route `session` to Slack thread C1/`thread_id`, store its report and an `apply` there; returns the apply's time."""
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                (session, json.dumps({"platform": "slack", "chat_id": "C1", "thread_id": thread_id})),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO incidents (chat_id, thread_id, report) VALUES ('C1', ?, 'report')", (thread_id,)
+            )
+        self.assertEqual(
+            self.client.post("/v1/incidents/apply", json={"chat_id": "C1", "thread_id": thread_id}).json(),
+            {"status": "recorded"},
+        )
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute(
+                "SELECT MAX(applied_at) FROM incident_applies WHERE chat_id = 'C1' AND thread_id = ?", (thread_id,)
+            ).fetchone()[0]
+
+    def test_the_card_an_apply_in_the_thread_files_holds(self):
+        # The front door files the `apply`'s fix card in its own session, so
+        # only the apply mark ties it to the incident.
+        assignee = session_kv_server.INCIDENT_PR_ASSIGNEE
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request") as remind:
+            anchor_id, session = self._first_incident("applyfix-api-6cfdb6b98b-aaaaa")
+            applied_at = self._apply_in_thread(session, "1700.2")
+            self._board(
+                cards=[("t-apply", "a2a-front-door", self.FIX_URL, assignee, applied_at + 60)],
+                subs=[("t-apply", "C1", "1700.2")],
+            )
+            reply = self._inject("applyfix-api-6cfdb6b98b-bbbbb")
+        self.assertEqual(reply, {"status": "folded", "duplicate_of": str(anchor_id), "pull_request": self.FIX_URL})
+        remind.assert_called_once_with(session, "applyfix-api", "BackOff", self.FIX_URL)
+
+    def test_only_the_first_fix_card_after_an_apply_counts(self):
+        # A later card in the thread is something else asked there.
+        assignee = session_kv_server.INCIDENT_PR_ASSIGNEE
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"):
+            _anchor, session = self._first_incident("firstcard-api-6cfdb6b98b-aaaaa")
+            applied_at = self._apply_in_thread(session, "1700.3")
+            self._board(
+                cards=[
+                    ("t-fix", "a2a-front-door", None, assignee, applied_at + 30),
+                    ("t-later", "a2a-front-door", self.FIX_URL, assignee, applied_at + 90),
+                ],
+                subs=[("t-fix", "C1", "1700.3"), ("t-later", "C1", "1700.3")],
+            )
+            self.assertEqual(self._inject("firstcard-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_a_thread_card_that_is_not_an_applys_fix_card_does_not_hold(self):
+        assignee = session_kv_server.INCIDENT_PR_ASSIGNEE
+        window = session_kv_server.INCIDENT_APPLY_CARD_WINDOW_S
+        # (name, assignee, seconds after the apply, thread the card is subscribed to or None for the apply's)
+        cases = (
+            ("before", assignee, -10, None),
+            ("past", assignee, window + 10, None),
+            ("other", "chat", 30, None),
+            ("elsewhere", assignee, 30, "1700.not-the-incident"),
+        )
+        for name, card_assignee, offset, card_thread in cases:
+            with self.subTest(name), \
+                    patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                    patch.object(session_kv_server, "_proposal_state", return_value="open"):
+                _anchor, session = self._first_incident(f"{name}apply-api-6cfdb6b98b-aaaaa")
+                thread = f"1700.{name}"
+                applied_at = self._apply_in_thread(session, thread)
+                self._board(
+                    cards=[("t-card", "a2a-front-door", self.FIX_URL, card_assignee, applied_at + offset)],
+                    subs=[("t-card", "C1", card_thread or thread)],
+                )
+                self.assertEqual(self._inject(f"{name}apply-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_a_board_the_apply_read_cannot_use_still_finds_the_incident_sessions_fix(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request"):
+            anchor_id, session = self._first_incident("legacyboard-api-6cfdb6b98b-aaaaa")
+            self._apply_in_thread(session, "1700.4")
+            self._board(cards=[("t-pr", session, self.FIX_URL)], legacy=True)
+            reply = self._inject("legacyboard-api-6cfdb6b98b-bbbbb")
+        self.assertEqual(reply, {"status": "folded", "duplicate_of": str(anchor_id), "pull_request": self.FIX_URL})
+
+    def test_an_apply_is_recorded_only_in_an_incidents_thread(self):
+        self.assertEqual(
+            self.client.post("/v1/incidents/apply", json={"chat_id": "C1", "thread_id": "no-incident-here"}).status_code,
+            404,
+        )
+        self.assertEqual(self.client.post("/v1/incidents/apply", json={"chat_id": "C1"}).status_code, 400)
 
     def test_a_merged_or_closed_fix_or_none_starts_a_new_incident(self):
         for state, prefix in (("merged", "mergedfix"), ("closed", "closedfix"), (None, "nofix")):
