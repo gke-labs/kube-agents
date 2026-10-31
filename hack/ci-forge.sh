@@ -93,7 +93,11 @@ readonly FORGE_CLUSTER_CHECK_IMAGE="curlimages/curl:8.11.1@sha256:c1fe1679c34d97
 # The VM takes no project-wide ssh key: with the deny rule on its tag, nothing
 # but 443 from the VPC reaches it, and nothing could log in if it did.
 readonly FORGE_VM_METADATA_SSH="block-project-ssh-keys=TRUE"
-readonly FORGE_CLUSTER_CHECK_TIMEOUT="180s"
+# Long enough for an Autopilot host cluster with no spare node to provision one
+# for the check pod: after the teardown that precedes `up`, the first pod waits
+# on a node (2 to 4 minutes observed on the dev project), and 180 s read as
+# "could not reach" with no output.
+readonly FORGE_CLUSTER_CHECK_TIMEOUT="480s"
 readonly FORGE_CLUSTER_CHECK_NAMESPACE="default"
 # The record `up` leaves beside ca.crt so `down` deletes exactly this run's VM.
 readonly FORGE_STATE_RECORD="forge-vm"
