@@ -166,8 +166,9 @@ resource "google_service_account_iam_member" "fleet_reader_token_creators" {
 # read-only checks against every pool project as the bot itself, so it needs
 # project-level read here: the project and its IAM policy, the service
 # accounts' policies, the service listing, the cluster listing, the
-# repository, the key and its policy, the state bucket's metadata. These
-# roles cover every read those checks make on the project; none writes. The
+# repository, the key and its policy, the state bucket's metadata, the forge
+# pieces' zone, records, addresses and firewall rules. These roles cover
+# every read those checks make on the project; none writes. The
 # warm-cache repository's policy in the Prow project stays unread. They live in this
 # stack, beside the reader's token-creator grant, because this is the one
 # stack every pool project applies: a project provisioned after this landed
@@ -182,6 +183,8 @@ locals {
     "roles/artifactregistry.reader",
     "roles/cloudkms.viewer",
     "roles/storage.bucketViewer",
+    "roles/compute.networkViewer",
+    "roles/dns.reader",
   ]
   pool_state_reader_grants = {
     for pair in setproduct(var.pool_state_readers, local.pool_state_reader_roles) :

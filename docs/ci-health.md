@@ -1387,8 +1387,9 @@ or more calls; `reason` says which.
 
 **The identity and the grant.** Every read runs as the bot itself,
 `eval-dashboard-publisher@kube-agents-prow`, which needs `roles/iam.securityReviewer`,
-`roles/container.clusterViewer`, `roles/artifactregistry.reader`, `roles/cloudkms.viewer`
-and `roles/storage.bucketViewer` on each project (`POOL_STATE_READER_ROLES` in the
+`roles/container.clusterViewer`, `roles/artifactregistry.reader`, `roles/cloudkms.viewer`,
+`roles/storage.bucketViewer`, `roles/compute.networkViewer` and `roles/dns.reader` on each
+project (`POOL_STATE_READER_ROLES` in the
 verifier; together they cover every read the scan's checks make, and none writes;
 the one read outside the project, the warm-cache repository's policy in the Prow
 project, is the verifier's `warm_cache` check, which the scan does not run). `bench/tf/fleet`
@@ -1396,21 +1397,23 @@ grants them (`pool_state_readers`), so a project gets them from its fleet apply 
 the verifier fails one that lacks them (`--report` carries the binding). Grant them
 on the project: the check reads the project's own policy, so a grant on a folder or
 the organisation, or through a group, is not seen and reads as missing on every
-project. Projects applied before that default are one loop, run once by a project
-owner:
+project. Projects applied before that default, or before a role joined the list, are one
+loop, run once by a project owner:
 
 ```bash
 BOT=eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com
 for p in $(sed -n '/^gitops_repo_for_project() {/,/^}/p' hack/ci-deploy.sh \
           | sed -n 's/^[[:space:]]*\(kube-agents-evals[-0-9]*\)).*/\1/p'); do
   for role in roles/iam.securityReviewer roles/container.clusterViewer \
-              roles/artifactregistry.reader roles/cloudkms.viewer roles/storage.bucketViewer; do
+              roles/artifactregistry.reader roles/cloudkms.viewer roles/storage.bucketViewer \
+              roles/compute.networkViewer roles/dns.reader; do
     gcloud projects add-iam-policy-binding "$p" --member "serviceAccount:${BOT}" --role "$role" --quiet >/dev/null
   done
 done
 ```
 
-Until then every check on the project records `not_checked` with gcloud's words.
+Until then the checks whose reads the missing roles cover record `not_checked` with
+gcloud's words (every check, on a project with none of the roles).
 
 **The condition.** `health.py`'s `pool_drift` is the fleet scan's rule over this
 document: the same finding on the same project in two consecutive scans, or on

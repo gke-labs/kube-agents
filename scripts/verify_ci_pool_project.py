@@ -850,6 +850,33 @@ POOL_STATE_READER_ROLES = {
     "roles/artifactregistry.reader",
     "roles/cloudkms.viewer",
     "roles/storage.bucketViewer",
+    # CHECK_FORGE_PIECES reads the forge addresses and firewall rules
+    # (networkViewer) and the private zone and its records (dns.reader);
+    # without them those scan as unchecked (the VM identity still reads).
+    "roles/compute.networkViewer",
+    "roles/dns.reader",
+}
+
+# Each gcloud surface the checks read, and the roles above that read it. The
+# test holds the keys equal to the `"gcloud", "<surface>"` prefixes in this
+# file, so a check on a new API names its role here and in the list above
+# before the pool scan runs it: read without the role, a piece scans as "not
+# checked" at best, and as drift when the API's refusal text is one the
+# denial patterns below have not seen. `auth` reads the local credential
+# store, not the project. `projects describe` needs projects.get, which
+# securityReviewer lacks and clusterViewer carries. The `kms` surface also
+# covers the KMS sign in check_ledger_read_credential, which the scan does not run.
+GCLOUD_SURFACE_READ_ROLES = {
+    "artifacts": ("roles/artifactregistry.reader",),
+    "auth": (),
+    "compute": ("roles/compute.networkViewer",),
+    "container": ("roles/container.clusterViewer",),
+    "dns": ("roles/dns.reader",),
+    "iam": ("roles/iam.securityReviewer",),
+    "kms": ("roles/cloudkms.viewer",),
+    "projects": ("roles/iam.securityReviewer", "roles/container.clusterViewer"),
+    "services": ("roles/iam.securityReviewer",),
+    "storage": ("roles/storage.bucketViewer",),
 }
 
 # What a runner loses without the token-creator grant; the bot's loss is
@@ -1096,6 +1123,10 @@ _DENIAL_PATTERNS = (
     re.compile(r"denied on resource", re.I),
     re.compile(r"does not have (?:permission|\S+ access)", re.I),
     re.compile(r"permission\(s\) for", re.I),
+    # The Compute API's form through gcloud, with no status code: `Required
+    # 'compute.addresses.get' permission for 'projects/p/regions/r/addresses/a'`;
+    # without it a refused read of a forge address or firewall rule reads as missing.
+    re.compile(r"required ['\"][\w.]+['\"] permission for", re.I),
     re.compile(r"is required to perform this operation", re.I),
     re.compile(r"(?:httperror|error|code[=: ])\s*403\b", re.I),
     re.compile(r"403 forbidden", re.I),
