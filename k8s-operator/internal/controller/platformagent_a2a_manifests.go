@@ -2520,7 +2520,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 		podLabels[k] = v
 	}
 
-	return &appsv1.StatefulSet{
+	sts := &appsv1.StatefulSet{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "StatefulSet"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.StatefulSetSpec{
@@ -2633,6 +2633,12 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 			}},
 		},
 	}
+	if busMigrationFreezeConfigured(agent) {
+		// The restart into the bus migration's write freeze, which the
+		// Freezing phase waits for by this annotation.
+		sts.Spec.Template.Annotations[a2aBusFreezeAnnotation] = agent.Status.BusMigration.RunID
+	}
+	return sts
 }
 
 func buildA2ANATSService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {

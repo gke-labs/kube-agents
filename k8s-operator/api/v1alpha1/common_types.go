@@ -2429,6 +2429,12 @@ type BusMigrationStatus struct {
 	// +optional
 	Cause string `json:"cause,omitempty"`
 
+	// FreezeConfirmed is set once every callout replica serves the write
+	// freeze's identity map, and only then does the bus render without its
+	// static application users and restart into the freeze.
+	// +optional
+	FreezeConfirmed bool `json:"freezeConfirmed,omitempty"`
+
 	// Warnings are what the restore found and restored anyway: a stream
 	// lacking a subject a fresh install has, or a field outside the
 	// restore's policy that differs from a fresh install. Each is also

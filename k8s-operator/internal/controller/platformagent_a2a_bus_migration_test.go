@@ -17,6 +17,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -222,6 +223,8 @@ func newMigrationRig(t *testing.T, leg busMigrationLeg, phase busMigrationPhase,
 	agent.Status.BusReplicas = running
 	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(leg), RunID: "3-1", Phase: string(phase),
 		StartedAt: metav1.Now(), Deadline: metav1.NewTime(deadline), ObservedGeneration: 3}
+	// A run past Freezing confirmed its freeze on the way.
+	agent.Status.BusMigration.FreezeConfirmed = busMigrationFreezeActive(agent) && phase != busMigrationFreezing
 	sts := buildA2ANATSStatefulSet(agent, "h")
 	sts.Spec.Replicas = ptr.To(running)
 	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).WithStatusSubresource(&appsv1.StatefulSet{}, &batchv1.Job{}, &corev1.Pod{}).Build()
@@ -274,6 +277,40 @@ func (m *migrationRig) finishPod(name string, phase corev1.PodPhase, message, re
 	}
 }
 
+// calloutPods puts the callout's Deployment (two replicas) and its pods on
+// the rig: n pods, each annotated for the freeze when frozen is set, ready
+// when ready is.
+func (m *migrationRig) calloutPods(n int, frozen, ready bool) {
+	m.t.Helper()
+	ctx := context.Background()
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(m.agent), Namespace: m.agent.Namespace}, Spec: appsv1.DeploymentSpec{Replicas: ptr.To(int32(2))}}
+	if err := m.cl.Create(ctx, dep); err != nil && !apierrors.IsAlreadyExists(err) {
+		m.t.Fatal(err)
+	}
+	old := &corev1.PodList{}
+	_ = m.cl.List(ctx, old, client.InNamespace(m.agent.Namespace), client.MatchingLabels(a2aCalloutPodSelector(m.agent)))
+	for i := range old.Items {
+		_ = m.cl.Delete(ctx, &old.Items[i])
+	}
+	for i := 0; i < n; i++ {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("callout-%d", i), Namespace: m.agent.Namespace, Labels: a2aCalloutPodSelector(m.agent)}}
+		if frozen {
+			pod.Annotations = map[string]string{a2aBusFreezeAnnotation: m.agent.Status.BusMigration.RunID}
+		}
+		if err := m.cl.Create(ctx, pod); err != nil {
+			m.t.Fatal(err)
+		}
+		status := corev1.ConditionFalse
+		if ready {
+			status = corev1.ConditionTrue
+		}
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: status}}
+		if err := m.cl.Status().Update(ctx, pod); err != nil {
+			m.t.Fatal(err)
+		}
+	}
+}
+
 // validDigests is a hashing pod's report for every provisioned stream.
 func validDigests() string {
 	d := map[string]busmigrate.StagedDigest{}
@@ -291,6 +328,15 @@ func (m *migrationRig) rollOut(replicas int32) {
 		m.t.Fatal(err)
 	}
 	sts.Spec.Replicas = ptr.To(replicas)
+	// The template the operator renders now: stamped for the run's freeze
+	// once the bus is rendered for it, and not otherwise.
+	if sts.Spec.Template.Annotations == nil {
+		sts.Spec.Template.Annotations = map[string]string{}
+	}
+	delete(sts.Spec.Template.Annotations, a2aBusFreezeAnnotation)
+	if busMigrationFreezeConfigured(m.agent) {
+		sts.Spec.Template.Annotations[a2aBusFreezeAnnotation] = m.agent.Status.BusMigration.RunID
+	}
 	if err := m.cl.Update(context.Background(), sts); err != nil {
 		m.t.Fatal(err)
 	}
@@ -329,7 +375,9 @@ func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
 	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
 	recorder := record.NewFakeRecorder(16)
 	m.r.Recorder = recorder
-	m.rollOut(1)
+	m.calloutPods(2, true, true)
+	m.pass(busMigrationFreezing, 1) // the callout confirms; the bus renders for the freeze
+	m.rollOut(1)                    // and restarts into it
 	m.pass(busMigrationSnapshot, 1)
 	m.finishPod("snapshot", corev1.PodSucceeded, "", "")
 	m.pass(busMigrationHashing, 1)
@@ -355,6 +403,8 @@ func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
 	m.pass(busMigrationRestoring, 3)
 	m.finishPod("restore", corev1.PodSucceeded, `{"warnings":["stream TOPICS-STATE: subject x is missing; a fresh install has it"]}`, "")
 	m.pass(busMigrationReleasing, 3)
+	m.pass(busMigrationReleasing, 3) // still on the frozen template
+	m.rollOut(3)                     // the restart out of the freeze
 	if w := m.agent.Status.BusMigration.Warnings; len(w) != 1 || !strings.Contains(w[0], "subject x is missing") {
 		t.Errorf("status warnings %v", w)
 	}
@@ -1430,4 +1480,163 @@ func TestNoRenderedPrincipalCanMakeOrBorrowAMigrationIdentity(t *testing.T) {
 	if !strings.Contains(string(policy), `object.spec.serviceAccountName == variables.sessionAccount`) {
 		t.Error("the gateway pod admission policy no longer pins the gateway's pods to the session ServiceAccount")
 	}
+}
+
+// The bad ordering: a bus that restarts before the callout confirmed the
+// freeze (a drain, say) is not the restart into it. Freezing waits, the bus
+// is not rendered for the freeze, and no snapshot starts, however long the
+// rolled-out bus sits there.
+func TestARestartBeforeTheCalloutConfirmsIsNotTheFreeze(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	m.calloutPods(2, false, true) // the old template: not yet serving the frozen map
+	m.rollOut(1)                  // an early restart
+	for i := 0; i < 3; i++ {
+		m.pass(busMigrationFreezing, 1)
+	}
+	if m.agent.Status.BusMigration.FreezeConfirmed || busMigrationFreezeConfigured(m.agent) {
+		t.Fatal("the freeze was confirmed with no callout replica serving its map")
+	}
+	if _, _, ok := m.workload("snapshot"); ok {
+		t.Fatal("a snapshot started before the freeze was confirmed")
+	}
+	// Once confirmed, the same early restart still does not count: only a
+	// restart onto the frozen template does.
+	m.calloutPods(2, true, true)
+	m.pass(busMigrationFreezing, 1)
+	if !m.agent.Status.BusMigration.FreezeConfirmed {
+		t.Fatal("the freeze was not confirmed with every callout replica serving it")
+	}
+	m.pass(busMigrationFreezing, 1)
+	m.rollOut(1)
+	m.pass(busMigrationSnapshot, 1)
+}
+
+// The confirmation wants every callout replica on the frozen map: too few
+// annotated, one not ready, or any pod left from the old template
+// (terminating included) is not enough.
+func TestTheFreezeNeedsEveryCalloutReplica(t *testing.T) {
+	ctx := context.Background()
+	for name, setup := range map[string]func(m *migrationRig){
+		"one of two": func(m *migrationRig) { m.calloutPods(1, true, true) },
+		"not ready":  func(m *migrationRig) { m.calloutPods(2, true, false) },
+		"no callout": func(m *migrationRig) {},
+		"an old pod left": func(m *migrationRig) {
+			m.calloutPods(2, true, true)
+			old := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "callout-old", Namespace: m.agent.Namespace, Labels: a2aCalloutPodSelector(m.agent),
+				Finalizers: []string{"test/keep"}}}
+			if err := m.cl.Create(ctx, old); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.cl.Delete(ctx, old); err != nil { // terminating, held by the finalizer
+				t.Fatal(err)
+			}
+		},
+	} {
+		m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+		setup(m)
+		m.pass(busMigrationFreezing, 1)
+		if m.agent.Status.BusMigration.FreezeConfirmed {
+			t.Errorf("%s: the freeze was confirmed", name)
+		}
+	}
+}
+
+// A callout that never serves the frozen map (refused at start, with no
+// earlier map in a fresh pod, so never ready) does not hang the run: at the
+// deadline Freezing fails into the way back, which releases the freeze with
+// nothing changed, and the cause names the deadline.
+func TestAFreezeTheCalloutNeverServesEndsAtTheDeadline(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(-time.Minute))
+	m.calloutPods(2, true, false)
+	m.pass(busMigrationReleasing, 1)
+	run := m.agent.Status.BusMigration
+	if !run.Abandoning || !strings.Contains(run.Cause, "the Freezing phase was still running at the run's deadline") {
+		t.Errorf("abandoning %v cause %q", run.Abandoning, run.Cause)
+	}
+	m.rollOut(1)
+	m.pass(busMigrationAbandoned, 1)
+}
+
+// The renders on each side of the confirmation. In the freeze, the callout's
+// template carries the run and requires the frozen map's exact version to
+// be ready. Confirmed, nats.conf drops every APP static user, auth_users
+// lists only the callout's user and SYS's, the callout's reserved names do
+// not change, and the bus's template carries the run. Before the
+// confirmation, and in Releasing, none of it.
+func TestTheFreezeRenders(t *testing.T) {
+	keys := a2aTestCalloutKeys(t)
+	agent := a2aTestAgent()
+	normalConf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys).Data["nats.conf"])
+	normalReserved := renderA2AReservedPrincipals(agent)
+	for _, tc := range []struct {
+		phase                     busMigrationPhase
+		confirmed                 bool
+		calloutFrozen, confFrozen bool
+	}{
+		{busMigrationFreezing, false, true, false},
+		{busMigrationFreezing, true, true, true},
+		{busMigrationRestoring, true, true, true},
+		{busMigrationReleasing, true, false, false},
+	} {
+		a := a2aTestAgent()
+		a.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(tc.phase),
+			Deadline: metav1.NewTime(time.Now().Add(time.Hour)), FreezeConfirmed: tc.confirmed}
+		name := fmt.Sprintf("%s confirmed=%v", tc.phase, tc.confirmed)
+
+		dep := buildA2ACalloutDeployment(a, "pub")
+		var env string
+		for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+			if e.Name == a2aCalloutExpectMapVersionEnv {
+				env = e.Value
+			}
+		}
+		frozenVersion, _ := renderA2AAuthMap(a, nil)
+		if got := dep.Spec.Template.Annotations[a2aBusFreezeAnnotation] == "3-1" && env == frozenVersion.Version && env != ""; got != tc.calloutFrozen {
+			t.Errorf("%s: callout frozen %v (annotation %q, expect %q of %q)", name, got, dep.Spec.Template.Annotations[a2aBusFreezeAnnotation], env, frozenVersion.Version)
+		}
+
+		conf := string(buildA2ANATSConfigSecret(a, a2aTestCreds(), keys).Data["nats.conf"])
+		sts := buildA2ANATSStatefulSet(a, "h")
+		if !tc.confFrozen {
+			if conf != normalConf || busNATSFrozenFor(sts) != "" {
+				t.Errorf("%s: the bus is rendered for the freeze", name)
+			}
+			continue
+		}
+		for _, id := range staticIdentities(a) {
+			present := strings.Contains(conf, "user: "+id.user+"\n")
+			if id.account == a2aAccountApp && present {
+				t.Errorf("%s: APP user %s is still in nats.conf", name, id.user)
+			}
+			if id.account != a2aAccountApp && !present {
+				t.Errorf("%s: %s user %s is gone from nats.conf", name, id.account, id.user)
+			}
+		}
+		if !strings.Contains(conf, "user: "+a2aCalloutConfUser+"\n") {
+			t.Errorf("%s: the callout's own user is gone", name)
+		}
+		if !strings.Contains(conf, "auth_users: [ "+a2aCalloutConfUser+a2aAuthUsersSeparator+"sys ]") {
+			t.Errorf("%s: auth_users is not the callout's and SYS's:\n%s", name, conf)
+		}
+		if renderA2AReservedPrincipals(a) != normalReserved {
+			t.Errorf("%s: the callout's reserved names changed", name)
+		}
+		if busNATSFrozenFor(sts) != "3-1" {
+			t.Errorf("%s: the bus template is not stamped for the run", name)
+		}
+	}
+}
+
+// A pass that rendered the frozen bus and then failed before its status
+// write leaves a bus restarted into the freeze with no confirmation on
+// record. If the callout no longer serves the freeze by then, Freezing does
+// not complete on that restart.
+func TestAFrozenRestartWithoutAConfirmationOnRecordWaits(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	m.agent.Status.BusMigration.FreezeConfirmed = true
+	m.rollOut(1) // rendered and restarted into the freeze
+	m.agent.Status.BusMigration.FreezeConfirmed = false
+	m.calloutPods(2, false, true)
+	m.pass(busMigrationFreezing, 1)
 }

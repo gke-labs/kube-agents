@@ -301,10 +301,24 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 		case err != nil:
 			return busMigrationPending, false, err
 		}
-		if busNATSRolledOutAt(sts, int32(busMigrationReplicas(leg, phase, run.Abandoning))) { // #nosec G115 -- 1 or 3
-			return busMigrationSucceeded, false, nil
+		if !busNATSRolledOutAt(sts, int32(busMigrationReplicas(leg, phase, run.Abandoning))) { // #nosec G115 -- 1 or 3
+			return busMigrationPending, false, nil
 		}
-		return busMigrationPending, false, nil
+		// On the one to three leg the rollout must also be the right side
+		// of the freeze: Freezing completes only on a restart into the
+		// freeze, rendered after the callout confirmed it (a restart before
+		// that, a drain say, is not one), the phases inside it keep it, and
+		// Releasing completes only on a restart out of it.
+		if leg == busMigrationGrow {
+			want := run.RunID
+			if phase == busMigrationReleasing {
+				want = ""
+			}
+			if busNATSFrozenFor(sts) != want || (phase == busMigrationFreezing && !run.FreezeConfirmed) {
+				return busMigrationPending, false, nil
+			}
+		}
+		return busMigrationSucceeded, false, nil
 	}
 	return busMigrationPending, false, nil
 }
@@ -343,6 +357,15 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 			return 0, err
 		}
 		outcome := withDeadline(observed, run.Deadline.Time, now)
+		if busMigrationPhase(run.Phase) == busMigrationFreezing && !run.FreezeConfirmed && outcome == busMigrationPending {
+			// The handshake: the bus restarts into the freeze only once
+			// every callout replica serves the frozen map.
+			served, err := r.busMigrationCalloutServesTheFreeze(ctx, agent, run)
+			if err != nil {
+				return 0, err
+			}
+			run.FreezeConfirmed = served
+		}
 		switch phase := busMigrationPhase(run.Phase); {
 		case phase == busMigrationHashing && outcome == busMigrationSucceeded:
 			// The digests go from the hashing pod's termination message into
@@ -1034,4 +1057,101 @@ func busMigrationSentinel(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 // freeze: the migration principal of the phase, if any, and the sentinel.
 func busMigrationFrozenIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	return append(busMigrationIdentities(agent), busMigrationSentinel(agent, agent.Status.BusMigration))
+}
+
+// a2aBusFreezeAnnotation marks a pod template rendered for a run's write
+// freeze, with the run's ID: on the callout, the template whose replicas
+// must all be serving the frozen map before the bus restarts into the
+// freeze; on the bus, the template that restart runs.
+const a2aBusFreezeAnnotation = "kubeagents.x-k8s.io/bus-freeze"
+
+// busMigrationFrozenMapVersion is the version of the freeze's identity map.
+// It takes no profiles (the frozen map has none), so the callout's builder
+// can render it. A render that fails yields a version no map has, so no
+// callout replica becomes ready on it and the freeze fails at the deadline
+// rather than going ahead unconfirmed.
+func busMigrationFrozenMapVersion(agent *agentv1alpha1.PlatformAgent) string {
+	doc, err := renderA2AAuthMap(agent, nil)
+	if err != nil {
+		return "unrenderable"
+	}
+	return doc.Version
+}
+
+// busMigrationFreezeCallout renders the callout for the write freeze: its
+// pod template carries the run's ID, so every replica is replaced, and the
+// frozen map's version as the one its readiness requires
+// (A2A_EXPECT_MAP_VERSION), so a ready replica is one serving the frozen
+// map itself. Outside the freeze it does nothing.
+func busMigrationFreezeCallout(agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment) {
+	if !busMigrationFreezeActive(agent) {
+		return
+	}
+	tmpl := &dep.Spec.Template
+	if tmpl.Annotations == nil {
+		tmpl.Annotations = map[string]string{}
+	}
+	tmpl.Annotations[a2aBusFreezeAnnotation] = agent.Status.BusMigration.RunID
+	for i := range tmpl.Spec.Containers {
+		tmpl.Spec.Containers[i].Env = append(tmpl.Spec.Containers[i].Env,
+			corev1.EnvVar{Name: a2aCalloutExpectMapVersionEnv, Value: busMigrationFrozenMapVersion(agent)})
+	}
+}
+
+// a2aCalloutExpectMapVersionEnv mirrors the callout's EnvExpectMapVersion
+// (a2a/authcallout/status.go); the modules cannot import each other.
+const a2aCalloutExpectMapVersionEnv = "A2A_EXPECT_MAP_VERSION"
+
+// busMigrationCalloutServesTheFreeze reports every callout replica serving
+// the freeze's map: at least the Deployment's desired count of pods carry the
+// run's annotation and are Ready (which, with A2A_EXPECT_MAP_VERSION, means
+// serving the frozen map's exact version), and no pod without it is left,
+// terminating or not, since a pod on the old template may still answer an
+// authorization request from the old map.
+func (r *PlatformAgentReconciler) busMigrationCalloutServesTheFreeze(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (bool, error) {
+	dep := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aCalloutName(agent)}, dep); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	desired := ptr.Deref(dep.Spec.Replicas, 1)
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(a2aCalloutPodSelector(agent))); err != nil {
+		return false, err
+	}
+	var serving int32
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Annotations[a2aBusFreezeAnnotation] != run.RunID {
+			return false, nil
+		}
+		if pod.DeletionTimestamp == nil && podReady(pod) {
+			serving++
+		}
+	}
+	return serving >= desired, nil
+}
+
+// podReady reports a pod's Ready condition true.
+func podReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// busMigrationFreezeConfigured reports the bus rendered for the freeze:
+// the freeze is in force and the callout confirmed serving its map. Only
+// then does nats.conf drop the APP account's static users, and the bus's
+// pod template carry the run's ID, so the restart into the freeze begins
+// after every replica refuses everyone but the migration.
+func busMigrationFreezeConfigured(agent *agentv1alpha1.PlatformAgent) bool {
+	return busMigrationFreezeActive(agent) && agent.Status.BusMigration.FreezeConfirmed
+}
+
+// busNATSFrozenFor reports the bus StatefulSet's template rendered for the
+// run's freeze ("" for one rendered without it).
+func busNATSFrozenFor(sts *appsv1.StatefulSet) string {
+	return sts.Spec.Template.Annotations[a2aBusFreezeAnnotation]
 }

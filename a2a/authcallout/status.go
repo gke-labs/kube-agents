@@ -31,6 +31,10 @@ const (
 	// restart. Restarting it loses the map it did have and cannot make the
 	// API server answer any faster.
 	LivePath = "/livez"
+
+	// EnvExpectMapVersion, when set, is the identity map version this
+	// replica must serve to be ready (StatusHandlerExpecting).
+	EnvExpectMapVersion = "A2A_EXPECT_MAP_VERSION"
 )
 
 // Status is the JSON the status endpoint answers with.
@@ -80,6 +84,16 @@ func StatusOf(s *Store) Status {
 // A nil busAttached means the caller has no connection to report on — the
 // in-process tests of the map surface, and nothing that runs in a cluster.
 func StatusHandler(s *Store, busAttached func() bool) http.Handler {
+	return StatusHandlerExpecting(s, busAttached, "")
+}
+
+// StatusHandlerExpecting is StatusHandler with readiness also requiring the
+// served map to be exactly expectVersion, when that is set. The operator
+// sets it for the bus migration's write freeze (EnvExpectMapVersion), so a
+// ready callout replica is one serving the frozen map itself and never one
+// that has not caught up with it yet: a new pod's first list of the map can
+// come from the API server's watch cache, a moment behind the write.
+func StatusHandlerExpecting(s *Store, busAttached func() bool, expectVersion string) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc(StatusPath, func(w http.ResponseWriter, r *http.Request) {
@@ -107,6 +121,11 @@ func StatusHandler(s *Store, busAttached func() bool) http.Handler {
 				return
 			}
 			_, _ = w.Write([]byte("no identity map\n"))
+			return
+		}
+		if expectVersion != "" && s.Version() != expectVersion {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("serving " + s.Version() + ", not the expected " + expectVersion + "\n"))
 			return
 		}
 		// The version in the readiness body, so `kubectl describe pod` on a

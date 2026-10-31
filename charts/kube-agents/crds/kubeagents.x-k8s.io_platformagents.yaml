@@ -11635,6 +11635,12 @@ spec:
                         before it.
                       format: date-time
                       type: string
+                    freezeConfirmed:
+                      description: |-
+                        FreezeConfirmed is set once every callout replica serves the write
+                        freeze's identity map, and only then does the bus render without its
+                        static application users and restart into the freeze.
+                      type: boolean
                     leg:
                       description: |-
                         Leg is the direction: OneToThree (snapshot and restore, behind a write

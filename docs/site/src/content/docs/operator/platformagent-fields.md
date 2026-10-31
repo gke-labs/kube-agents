@@ -227,6 +227,7 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `busMigration.deadline` | `metav1.Time` | yes |  |  | Deadline is when an unfinished phase counts as failed, and when the migration's bus credentials stop working. Its Jobs stop a few minutes before it. |
 | `busMigration.message` | `string` | no |  |  | Message is the manual step a Failed migration names. |
 | `busMigration.cause` | `string` | no |  |  | Cause is why the run turned back: the phase that failed, and whether it was still running at Deadline. Set at the first failure and kept. |
+| `busMigration.freezeConfirmed` | `boolean` | no |  |  | FreezeConfirmed is set once every callout replica serves the write freeze's identity map, and only then does the bus render without its static application users and restart into the freeze. |
 | `busMigration.warnings` | `[]string` | no |  |  | Warnings are what the restore found and restored anyway: a stream lacking a subject a fresh install has, or a field outside the restore's policy that differs from a fresh install. Each is also reported as one Warning Event. At most 4 KiB of them; the last says how many more there were. |
 | `busMigration.observedGeneration` | `integer` | yes |  |  | ObservedGeneration is the PlatformAgent generation that started this migration. A migration that ended without converting is not started again until the spec changes. |
 | `telemetry` | `object` | no |  |  | Telemetry reports the resolved OpenTelemetry export configuration. |
