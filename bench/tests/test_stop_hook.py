@@ -23,9 +23,21 @@ def test_the_window_can_be_named():
     assert stop_hook.parse(f"{DIRECTIVE} observe=30\nask").observe_seconds == 30.0
 
 
+def test_after_done_and_its_wait_can_be_named():
+    stop = stop_hook.parse(f"{DIRECTIVE} cards=done wait=600 observe=30\nask")
+    assert (stop.cards_done, stop.wait_seconds, stop.observe_seconds) == (True, 600.0, 30.0)
+    assert stop_hook.parse(f"{DIRECTIVE} cards=done\nask").wait_seconds == stop_hook.DEFAULT_WAIT_SECONDS
+    assert stop_hook.parse(f"{DIRECTIVE}\nask").cards_done is False
+
+
 @pytest.mark.parametrize(
     "first",
     [
+        f"{DIRECTIVE} cards=soon",
+        f"{DIRECTIVE} wait=60",
+        f"{DIRECTIVE} cards=done cards=done",
+        f"{DIRECTIVE} cards=done wait=0",
+        f"{DIRECTIVE} cards=done wait=99999",
         f"{DIRECTIVE} observe=0",
         f"{DIRECTIVE} observe=-5",
         f"{DIRECTIVE} observe=99999",
@@ -76,7 +88,7 @@ def _no_pod(monkeypatch):
     monkeypatch.setattr(harness.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
 
 
-def _stop(monkeypatch, reads, send=(True, "stopped"), observe=0.0, session="a2a-ctx-1"):
+def _stop(monkeypatch, reads, send=(True, "stopped"), observe=0.0, session="a2a-ctx-1", cards_done=False, wait=60.0):
     """Run the stop with board reads answered from ``reads`` in order (the
     last repeats). Returns the result and how many times the stop was sent."""
     answers = list(reads)
@@ -95,7 +107,8 @@ def _stop(monkeypatch, reads, send=(True, "stopped"), observe=0.0, session="a2a-
 
     result = AgentResult(output="on it", trajectory=[])
     harness.KubeAgentsHarness()._stop_after_first_card(
-        result, session, stop_hook.Stop(prompt="ask", observe_seconds=observe),
+        result, session,
+        stop_hook.Stop(prompt="ask", observe_seconds=observe, cards_done=cards_done, wait_seconds=wait),
         send_stop=send_stop, poll_interval=0.0,
     )
     return result, len(sent)
@@ -253,3 +266,41 @@ def test_the_case_carries_the_directive_on_its_own_line():
     case = harness.Path(__file__).resolve().parents[1] / "tasks" / "chat-stop-halts-delegated-remediation" / "task.yaml"
     stop = stop_hook.parse(yaml.safe_load(case.read_text(encoding="utf-8"))["prompt"])
     assert stop is not None and "checkout-gateway" in stop.prompt
+
+
+def test_after_done_stops_once_every_filed_card_has_ended(monkeypatch):
+    """The stop waits through a running card and goes once the board shows it
+    done; the window's verdict reads the cards as they ended."""
+    reads = []
+    answers = [_cards({"t_1": "running"}), _cards({"t_1": "running"}), _cards({"t_1": "done"})]
+
+    def read(*a, **k):
+        reads.append(harness.time.monotonic())
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    monkeypatch.setattr(harness.board, "read_session_cards", read)
+    stopped_at = []
+    result = AgentResult(output="on it", trajectory=[])
+    harness.KubeAgentsHarness()._stop_after_first_card(
+        result, "a2a-ctx-1", stop_hook.Stop(prompt="ask", observe_seconds=0.0, cards_done=True, wait_seconds=60.0),
+        send_stop=lambda: stopped_at.append(harness.time.monotonic()) or (True, "stopped"), poll_interval=0.0,
+    )
+    assert len(reads) >= 3 and stopped_at[0] >= reads[2], "the stop went before the card ended"
+    assert result.metadata["stop_card_statuses"] == {"t_1": "done"}
+    assert ARCHIVED == []
+
+
+def test_after_done_stops_anyway_at_the_wait_bound(monkeypatch):
+    result, sent = _stop(monkeypatch, [_cards({"t_1": "running"})], cards_done=True, wait=30.0)
+    assert sent == 1
+    assert harness.time.monotonic() >= 30.0
+    assert ARCHIVED == ["t_1"]
+
+
+def test_the_stop_reply_entry_is_harness_written_and_gradable_with_a_result():
+    from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, _harness_written
+
+    assert stop_hook.STOP_REPLY_ENTRY in HARNESS_WRITTEN_ENTRIES
+    assert _harness_written(
+        {"type": "tool_called", "tool_names": [stop_hook.STOP_REPLY_ENTRY], "result": "already opened"}
+    )

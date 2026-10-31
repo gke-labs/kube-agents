@@ -9997,6 +9997,100 @@ class TestCardStop(unittest.TestCase):
         self.card("t_fanout", "ready", session=self.SESSION, creator="t_parent")
         self.card("t_grand", "todo", session=self.SESSION, parents=["t_fanout"])
 
+    # -- the pull requests the cards opened ---------------------------------
+
+    def opened(self, card_id, number, at=1.0, url=None, raw=None):
+        """The `pr_opened` event agents/platform/plugins/pr_opened appends to a card."""
+        import sqlite3
+
+        payload = raw if raw is not None else json.dumps(
+            {"url": url or f"https://github.com/acme/gitops/pull/{number}", "number": number, "title": "t"}
+        )
+        with sqlite3.connect(self.board) as conn:
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'pr_opened', ?, ?)",
+                (card_id, payload, at),
+            )
+
+    def test_the_answer_names_the_pull_requests_its_cards_opened(self):
+        self.card("t_run", "running", session=self.SESSION)
+        self.card("t_done", "done", session=self.SESSION)
+        self.card("t_other", "running", session="a2a-someone-else")
+        self.opened("t_run", 413, at=2.0)
+        self.opened("t_done", 412, at=1.0)
+        self.opened("t_other", 999)
+        body = self.stop().json()
+        self.assertEqual(
+            [(w["number"], w["verb"], w["card"], w["url"]) for w in body["writes"]],
+            [
+                (412, "opened", "t_done", "https://github.com/acme/gitops/pull/412"),
+                (413, "opened", "t_run", "https://github.com/acme/gitops/pull/413"),
+            ],
+        )
+
+    def test_a_gitlab_merge_request_and_an_enterprise_host_are_named(self):
+        self.card("t_run", "running", session=self.SESSION)
+        self.opened("t_run", 7, at=1.0, url="https://gitlab.example.com/group/sub/proj/-/merge_requests/7")
+        self.opened("t_run", 8, at=2.0, url="https://ghe.example.com:8443/acme/gitops/pull/8")
+        self.assertEqual([w["number"] for w in self.stop().json()["writes"]], [7, 8])
+
+    def test_an_earlier_asks_finished_card_is_not_named(self):
+        now = time.time()
+        self.card("t_old", "done", session=self.SESSION, created=now - 3600)
+        self.card("t_new", "running", session=self.SESSION, created=now)
+        self.opened("t_old", 400)
+        self.opened("t_new", 401)
+        self.assertEqual([w["number"] for w in self.stop().json()["writes"]], [401])
+
+    def test_the_latest_asks_finished_cards_are_named_with_nothing_open(self):
+        now = time.time()
+        self.card("t_old", "done", session=self.SESSION, created=now - 3600)
+        self.card("t_a", "done", session=self.SESSION, created=now - 30)
+        self.card("t_child", "done", session=self.SESSION, creator="t_a", created=now)
+        self.opened("t_old", 400)
+        self.opened("t_a", 402, at=1.0)
+        self.opened("t_child", 403, at=2.0)
+        self.assertEqual([w["number"] for w in self.stop().json()["writes"]], [402, 403])
+
+    def test_one_entry_per_pull_request(self):
+        self.card("t_a", "running", session=self.SESSION)
+        self.card("t_b", "running", session=self.SESSION)
+        self.opened("t_a", 412, at=5.0)
+        self.opened("t_b", 412, at=3.0)
+        [write] = self.stop().json()["writes"]
+        self.assertEqual((write["number"], write["at"]), (412, 3.0))
+
+    def test_a_malformed_event_is_skipped_and_the_stop_still_answers(self):
+        self.card("t_run", "running", session=self.SESSION)
+        self.opened("t_run", 1, url="https://evil.example/a/b/issues/1")
+        self.opened("t_run", 3, url="https://github.com/a/b/pull/3<!here>")
+        self.opened("t_run", 4, url="https://github.com/a/b/pull/4)[x](https://evil.example")
+        self.opened("t_run", 0, raw="not json")
+        self.opened("t_run", 0, raw=json.dumps(["x"]))
+        self.opened("t_run", 5, url="https://github.com/a/b/pull/5")
+        response = self.stop()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual([w["number"] for w in response.json()["writes"]], [5])
+        self.assertEqual(self.status("t_run"), "archived")
+
+    def test_no_event_and_no_board_answer_no_writes(self):
+        self.card("t_run", "running", session=self.SESSION)
+        self.assertEqual(self.stop().json()["writes"], [])
+        self.board.unlink()
+        self.assertEqual(self.stop().json()["writes"], [])
+
+    def test_the_writes_list_is_capped(self):
+        self.card("t_run", "running", session=self.SESSION)
+        for n in range(1, 30):
+            self.opened("t_run", n, at=float(n))
+        writes = self.stop().json()["writes"]
+        self.assertEqual(len(writes), session_kv_server.CARD_STOP_MAX_WRITES)
+        self.assertEqual(writes[0]["number"], 1)
+
+    def test_the_event_kind_is_the_plugins(self):
+        path = Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"
+        self.assertIn(f'PR_OPENED_KIND = "{session_kv_server.CARD_STOP_PR_OPENED_KIND}"', path.read_text())
+
     # -- the tree ----------------------------------------------------------
 
     def test_the_whole_tree_is_archived_and_nothing_is_promoted(self):

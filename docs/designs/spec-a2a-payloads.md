@@ -894,7 +894,14 @@ the stop, for which a worker may still start. `truncated` says more cards were o
 stop takes, `deadline` that the stop ran out of time, and `listsCut` only that a list was
 cut to fit the part. An optional list rides beside them for the Slack Stop button's reply
 (spec-chatops-gateway, the Slack adapter): `notStopped`, the cards the three counts count, by id
-and title. An executor that sends none leaves it out, which reads as none named. A stop that failed carries no part and ends `failed` with
+and title. An executor that sends none leaves it out, which reads as none named. So does
+`writes`, the pull requests the conversation's cards had opened before the stop, oldest first
+and at most 20, each `{"kind":"pull_request","verb":"opened","url","number"}`. session-kv reads
+them off the cards' `pr_opened` events, which the platform profile's `pr_opened` plugin appends
+only once the forge confirms the pull request (`agents/platform/plugins/pr_opened`), for every
+card the stop found open and for the finished cards of the latest ask (filed within 15 minutes
+of the newest card the turns filed themselves, or after the oldest open one). It names what was
+recorded, so an empty list never means nothing was written. A stop that failed carries no part and ends `failed` with
 `reason: card-stop-unavailable` (`card-stop-unsupported` from the `cli` executor). If the
 bus refuses the result with the part, the text goes alone, so a `completed` control can
 arrive with no part. The bridge side is in `a2a/docs/hermes-bridge.md`.
