@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"strings"
 	"testing"
@@ -709,5 +710,50 @@ func TestNoOperatorImageRunsNothing(t *testing.T) {
 	m.pass(busMigrationPinning, 3)
 	if _, _, ok := m.workload("pin"); ok {
 		t.Error("a pin Job with no image")
+	}
+}
+
+const busMigrationMapFixturePath = "../../../a2a/authcallout/testdata/rendered-identity-map-migration.json"
+
+// The map mid-snapshot, as the callout reads it (a2a/authcallout:
+// migration_contract_test.go): the step's principal with its exact grants
+// and the run's deadline as its notAfter. The deadline is far off so the
+// callout's real-server test can still connect as it.
+func TestRenderedBusMigrationFixture(t *testing.T) {
+	agent := authMapTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(busMigrationSnapshot),
+		Deadline: metav1.NewTime(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC))}
+	cm, _, err := buildA2AAuthMapConfigMap(agent, nil)
+	if err != nil {
+		t.Fatalf("buildA2AAuthMapConfigMap: %v", err)
+	}
+	rendered := cm.Data[a2aAuthMapKey]
+	var doc a2aAuthMapDocument
+	if err := json.Unmarshal([]byte(rendered), &doc); err != nil {
+		t.Fatal(err)
+	}
+	var stamped int
+	for _, id := range doc.Identities {
+		switch {
+		case id.User == busMigrationPrincipal("snapshot", "3-1") && id.NotAfter != nil && id.NotAfter.Equal(agent.Status.BusMigration.Deadline.Time):
+			stamped++
+		case id.NotAfter != nil:
+			t.Errorf("%s carries notAfter %v; only the run's principal expires", id.User, id.NotAfter)
+		}
+	}
+	if stamped != 1 {
+		t.Errorf("the snapshot principal is not in the map with notAfter at the run's deadline:\n%s", rendered)
+	}
+	checkFixture(t, busMigrationMapFixturePath, rendered)
+}
+
+// notAfter is refused on a narrowed entry here as the callout refuses it
+// there, so a render that put one there fails the reconcile rather than
+// the callout's parse.
+func TestNotAfterOnANarrowedEntryFailsTheRender(t *testing.T) {
+	deadline := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+	ids := []a2aAuthMapIdentity{{ServiceAccount: "system:serviceaccount:ns:s", User: "session", Account: a2aAccountApp, Narrowing: a2aNarrowingPod, NotAfter: &deadline}}
+	if err := validateA2AAuthMapIdentities(ids); err == nil || !strings.Contains(err.Error(), "notAfter") {
+		t.Errorf("validate error %v, want a refusal naming notAfter", err)
 	}
 }

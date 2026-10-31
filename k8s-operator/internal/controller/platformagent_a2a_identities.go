@@ -18,6 +18,7 @@ package controller
 
 import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"time"
 )
 
 // The bus principals, in one place, as data.
@@ -93,6 +94,12 @@ type a2aIdentity struct {
 	// empty, and the callout refuses the whole map if it does not — see
 	// sessionIdentity for why that is fail-closed rather than fussy.
 	narrowing string
+
+	// notAfter, when set, is the instant the callout stops authenticating
+	// this principal and the latest any JWT minted for it expires. Set on
+	// the bus migration's per-run principals at the run's deadline. Only
+	// for a2aAuthCallout, and never with narrowing.
+	notAfter *time.Time
 
 	publish   []string
 	subscribe []string

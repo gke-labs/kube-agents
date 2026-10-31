@@ -439,6 +439,10 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		serviceAccount: a2aServiceAccountName(agent.Namespace, busMigrationWorkloadName(agent, step, run.RunID)),
 		publish:        publish,
 		subscribe:      []string{"_INBOX." + user + ".>"},
+		// The callout refuses this principal from the run's deadline on and
+		// mints it no JWT that outlives it, so a credential outlasts the run
+		// only if the run ends early, and then the entry leaves the map.
+		notAfter: ptr.To(run.Deadline.UTC()),
 	}}
 }
 
