@@ -857,6 +857,27 @@ POOL_STATE_READER_ROLES = {
     "roles/dns.reader",
 }
 
+# Each gcloud surface the checks read, and the roles above that read it. The
+# test holds the keys equal to the `"gcloud", "<surface>"` prefixes in this
+# file, so a check on a new API names its role here and in the list above
+# before the pool scan runs it: read without the role, a piece scans as "not
+# checked" at best, and as drift when the API's refusal text is one the
+# denial patterns below have not seen. `auth` reads the local credential
+# store, not the project. `projects describe` needs projects.get, which
+# securityReviewer lacks and clusterViewer carries.
+GCLOUD_SURFACE_READ_ROLES = {
+    "artifacts": ("roles/artifactregistry.reader",),
+    "auth": (),
+    "compute": ("roles/compute.networkViewer",),
+    "container": ("roles/container.clusterViewer",),
+    "dns": ("roles/dns.reader",),
+    "iam": ("roles/iam.securityReviewer",),
+    "kms": ("roles/cloudkms.viewer",),
+    "projects": ("roles/iam.securityReviewer", "roles/container.clusterViewer"),
+    "services": ("roles/iam.securityReviewer",),
+    "storage": ("roles/storage.bucketViewer",),
+}
+
 # What a runner loses without the token-creator grant; the bot's loss is
 # different and is spelled out in its own entry below.
 _RUNNER_WITHOUT_TOKEN_CREATOR = (

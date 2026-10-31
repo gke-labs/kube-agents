@@ -80,6 +80,13 @@ class DenialClassifierTest(unittest.TestCase):
         "ERROR: (gcloud.compute.addresses.describe) Could not fetch resource:\n"
         " - Required 'compute.addresses.get' permission for "
         "'projects/kube-agents-evals-6/regions/us-central1/addresses/forge-ghes'",
+        # The DNS API's form, from the same scan.
+        "ERROR: (gcloud.dns.managed-zones.describe) HTTPError 403: Forbidden. This command is "
+        "authenticated as x@y.iam.gserviceaccount.com using the credentials in ...",
+        # The gRPC form the KMS and Service Usage APIs print, as the checks'
+        # own tests below stub it.
+        "ERROR: (gcloud.kms.keys.versions.list) PERMISSION_DENIED: Permission denied on resource",
+        "ERROR: (gcloud.services.list) PERMISSION_DENIED: Permission denied to list services",
         "ERROR: (gcloud.projects.describe) User [x] does not have permission to access projects "
         "instance [y] (or it may not exist)",
         # Observed on 2026-08-27 against an existing SA in kube-agents-evals-6.
@@ -5653,6 +5660,27 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
         block = re.search(r"pool_state_reader_roles\s*=\s*\[(.*?)\]", main, re.S)
         self.assertIsNotNone(block, "pool_state_reader_roles is gone from main.tf")
         self.assertEqual(sorted(re.findall(r'"([^"]+)"', block.group(1))), sorted(checker.POOL_STATE_READER_ROLES))
+
+    def test_every_gcloud_surface_read_names_a_granted_role(self):
+        # The surfaces the checks call, as the argv prefix `"gcloud", "<surface>"`
+        # (every read goes through run_cmd with a list). A new surface fails
+        # here until GCLOUD_SURFACE_READ_ROLES names its role and
+        # POOL_STATE_READER_ROLES carries it; a compute and a dns read landed
+        # without either, and the scan reported the pieces as drift.
+        source = (checker._ROOT / "scripts" / "verify_ci_pool_project.py").read_text()
+        surfaces = set(re.findall(r'"gcloud",\s*"([a-z-]+)"', source))
+        self.assertEqual(surfaces, set(checker.GCLOUD_SURFACE_READ_ROLES))
+        for surface, roles in checker.GCLOUD_SURFACE_READ_ROLES.items():
+            with self.subTest(surface=surface):
+                self.assertTrue(roles or surface == "auth", f"{surface} names no role")
+                self.assertLessEqual(set(roles), checker.POOL_STATE_READER_ROLES)
+                if surface != "auth":
+                    # One observed refusal per API, so the denial patterns are
+                    # checked against that API's wording and not assumed.
+                    self.assertTrue(
+                        any(f"(gcloud.{surface}." in err for err in DenialClassifierTest.REFUSALS),
+                        f"no refusal fixture observed from gcloud {surface}",
+                    )
 
     def test_the_member_matches_the_variable_default(self):
         variables = _without_hcl_comments((checker._ROOT / "bench" / "tf" / "fleet" / "variables.tf").read_text())
