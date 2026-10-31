@@ -405,7 +405,7 @@ func TestShellSandboxPresentsATokenTheBrokerWillAccept(t *testing.T) {
 		}
 	}
 
-	callers := allowedBrokerCallers(agent, true)
+	callers := allowedBrokerCallers(agent, allBrokerCallersOwned)
 	sandboxCaller := "system:serviceaccount:" + agent.Namespace + ":" + shellSandboxServiceAccountName(agent)
 	if !strings.Contains(callers, sandboxCaller) {
 		t.Errorf("the broker must serve the sandbox's identity %q, got %q", sandboxCaller, callers)
