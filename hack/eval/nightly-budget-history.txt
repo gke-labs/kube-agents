@@ -405,3 +405,29 @@
 # it, after the merge of main on 2026-10-23: one hundred and forty-seven
 # cases (441 units) here, of a one-hundred-and-fifty-eight-case, 474-unit
 # matrix with the presubmit file's eleven.
+#
+# 2026-11-06 splits the main part in five (#4238). On gemini-4-argon main-a
+# was cut at its 840m budget on five of the seven nights of 10-31 to 11-06
+# (the other two: 836 and 672 min) while main-b, with the same seventeen
+# stack cases, ran 449-749. The difference is the onboarding chain, five
+# cases under one state lock that only main-a holds: 380-480 min of wall
+# clock on its own, and the early hours' launch rate at 8-16 units an hour
+# against main-b's 20-30 while it and the stack chain take the slots. So
+# main-a now carries the onboarding chain and no other stack case, and
+# nightly-main-b.txt to nightly-main-e.txt deal the thirty other stack
+# cases across four shards (6600s, 6500s, 6600s and 6800s of
+# unit_cost_hint, largest first into the shortest chain); the cases without
+# a stack go five ways by name (cksum shifted right by 3, modulo 5:
+# 32/29/29/25/31). Per shard, roughly: main-a the onboarding chain, 6.5-8 h
+# on the nights measured and the floor no split moves, beside a fifth of the
+# plain cases; main-b to main-e a quarter of the old half's stack chain
+# each, about 3 h on a fast night and 6 h on the slow one, beside a fifth of
+# the plain cases. Five rather than three so a new stack case, 30-45 min on
+# one chain, leaves the 840m budget hours of headroom. The writers part had
+# grown to fourteen cases (42 units) by 11-06 and ran 304-365 min when it
+# finished, was cut at 360m on 10-31 (17 of 27 units finished, median 16.8
+# min a unit, build 2116319475052580864) and on 11-04, so it runs as three
+# thirds, placed by nightly-writers-b.txt and nightly-writers-c.txt at five,
+# five and four cases: about 1.5-2 h a third at the fast nights' pace (7 min
+# a unit on 11-01 and 11-02) and about 4 h at the slow night's, inside 360m.
+# No case or unit count changes.

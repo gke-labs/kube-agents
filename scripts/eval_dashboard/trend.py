@@ -232,7 +232,7 @@ def night_id(record: dict, anchors: dict[str, str] | None = None) -> str:
     """One nightly job's records share its build; a record without one (a
     laptop run, a name outside the layout) stands alone under its stamp.
     ``anchors`` (nightly.night_builds) puts the builds of a night split
-    across jobs (main, main-b, writers) under the one build the report files
+    across jobs (the main shards and the writers thirds) under the one build the report files
     that night by, so the night is one night here too, and a domain's point
     that night pools the cases of all its parts."""
     build = record.get("build")

@@ -138,7 +138,7 @@ const PAGE = {
   nightsListed: 14,
   // A night split across jobs names its parts as the digest does
   // (nightly.py's PART_WORDS).
-  nightPartWords: { main: "main part", "main-b": "main-b part", writers: "writers part" },
+  nightPartWords: { main: "main part", "main-b": "main-b part", "main-c": "main-c part", "main-d": "main-d part", "main-e": "main-e part", writers: "writers part", "writers-b": "writers-b part", "writers-c": "writers-c part" },
   // The chat-turn target the opening turn's p95 is shown beside, as advice
   // only (nightly.py's TURN1_P95_TARGET_S).
   turn1P95TargetS: 10,
@@ -1714,7 +1714,7 @@ function partNotes(night, cut = true) {
   const notes = cut ? nightParts(night).filter((p) => p.truncated).map((p) => `${word(p.part)} cut short after ${p.duration_s != null ? minutesText(p.duration_s * 1000) : "an unknown time"}`) : [];
   return notes.concat(list(night.missing_parts).map((p) => `${word(p)} missing`), list(night.running_parts).map((p) => `${word(p)} still running`));
 }
-// The main half (main or main-b) a night lacks, missing or still running,
+// The main shard (main, or main-b to main-e) a night lacks, missing or still running,
 // or null: its cases were never compared, so no verdict on what is newly
 // failing. nightly.py decides it once (verdict_withheld_by) for the page and
 // the digest alike.
@@ -1725,9 +1725,12 @@ const nightCutSeconds = (night) => {
   const main = nightParts(night).find((p) => p.part === "main");
   return main ? main.duration_s : night.duration_s;
 };
-// A night with a main-b part names each part cut short with its own wall
-// clock, as the digest does, rather than one wall clock for the night.
-const nightHasMainB = (night) => nightParts(night).some((p) => p.part === "main-b");
+// A night with a main shard beside the main part names each part cut short
+// with its own wall clock, as the digest does, rather than one for the night.
+// The shards are the main parts other than "main" itself, read from the one
+// list of part words the pages test pins to nightly.py's.
+const MAIN_SHARD_PARTS = Object.keys(PAGE.nightPartWords).filter((part) => part.startsWith("main-"));
+const nightHasMainShards = (night) => nightParts(night).some((p) => MAIN_SHARD_PARTS.includes(p.part));
 const nightStart = (night) => parseIso(night.started) ?? parseIso(night.finished);
 // The night's headline state, worst first: cut short, failed cases, partial
 // cases, nothing recorded or nothing graded, a pass short of the matrix
@@ -1771,11 +1774,11 @@ function nightlyBriefHtml() {
   if (!night) body = `<p class="mut">No night on record yet. Once <code>${esc(brief.nightly && brief.nightly.job || "the nightly periodic")}</code> has run, last night's report is here and one line of it goes into the 11 AM digest.</p>`;
   else {
     const c = night.counts;
-    // With a main-b part, each half cut short is named with its own wall
+    // With another main shard, each shard cut short is named with its own wall
     // clock (as on the Nightly page and in the digest), not one for the night.
-    const notes = partNotes(night, !night.truncated || nightHasMainB(night)).map((n) => ` · ${esc(n)}`).join("");
+    const notes = partNotes(night, !night.truncated || nightHasMainShards(night)).map((n) => ` · ${esc(n)}`).join("");
     const summary = night.truncated
-      ? `truncated${nightHasMainB(night) ? "" : ` after ${nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "an unknown time"}`}: ${c.recorded} of ${c.expected || "?"} cases recorded${notes}`
+      ? `truncated${nightHasMainShards(night) ? "" : ` after ${nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "an unknown time"}`}: ${c.recorded} of ${c.expected || "?"} cases recorded${notes}`
       : `${plural(c.recorded, "case")} · ${c.passed} passed all reps · ${c.partial} partial · ${c.failed} failed${c.infra ? ` · ${c.infra} infra` : ""}${night.newly_failing.length && !nightWithheldBy(night) ? ` · newly failing: <code>${night.newly_failing.map(esc).join("</code>, <code>")}</code>` : ""}${notes}${night.duration_s != null ? ` · ${minutesText(night.duration_s * 1000)}` : ""}`;
     body = `<p>${nightPill(night)} <b>${esc(nightDay(night))}</b> — ${summary}. <a href="${esc(nightHref(night))}">Read the report →</a></p>`;
   }
@@ -1898,10 +1901,10 @@ function nightlyHtml(link) {
   const took = night.duration_s != null ? minutesText(night.duration_s * 1000) : "unknown wall clock";
   // A split night's own notes (a part cut short, missing or running) lead
   // the sentence; a night of one job reads as it always has.
-  const notes = partNotes(night, !night.truncated || nightHasMainB(night));
+  const notes = partNotes(night, !night.truncated || nightHasMainShards(night));
   const notesText = notes.length ? `${esc(notes.join(" · "))}. ` : "";
   let ledeHow;
-  if (night.truncated) ledeHow = `<b>The night was cut short:</b> ${notesText}Prow ended the job${nightHasMainB(night) ? "" : ` after ${esc(nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "unknown wall clock")}`} with ${c.recorded} of ${c.expected || "?"} cases recorded, so the counts below are not comparable with a full night.`;
+  if (night.truncated) ledeHow = `<b>The night was cut short:</b> ${notesText}Prow ended the job${nightHasMainShards(night) ? "" : ` after ${esc(nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "unknown wall clock")}`} with ${c.recorded} of ${c.expected || "?"} cases recorded, so the counts below are not comparable with a full night.`;
   else if (!night.complete && notes.length) ledeHow = `<b>Incomplete:</b> ${notesText}${c.recorded} of the ${c.expected} cases the nightly matrix on this checkout expects are recorded.`;
   else if (!night.complete) ledeHow = `<b>Incomplete:</b> the job concluded after ${esc(took)} but recorded ${c.recorded} of the ${c.expected} cases the nightly matrix on this checkout expects.`;
   else ledeHow = `The job ran to the end in ${esc(took)}: ${c.recorded} cases recorded${c.expected ? ` of ${c.expected} expected` : ""}.`;
