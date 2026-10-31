@@ -1,0 +1,253 @@
+{
+  "provenance": "Captured 2026-10-31 by running the create lines of the operator's rendered provision script (operator commit 710c74b94, test agent, STREAM_REPLICAS=1) with natscli v0.1.5 (the CLI natsio/nats-box:0.14.5 ships, read from its binary's build info) against nats-server v2.10.29 (the bus image's line), then reading each stream back with STREAM.INFO. Regenerate with the capture tool whenever the provision script, the provision image or the bus image changes. Cross-checked against four /jsz dumps from the ka-next-4 lane (streams created there by the real provision Job, nats-box 0.14.5 against the nats:2.10-alpine bus): every field of the eight streams those dumps hold matched, absent and false read alike, except TOPICS-STATE's subjects, which come from the agent's topics and are policy fields; the two PROFILE streams postdate the dumps.",
+  "streams": {
+    "DIRECTORY": {
+      "name": "DIRECTORY",
+      "subjects": [
+        "a2a.agents.>"
+      ],
+      "retention": "limits",
+      "max_consumers": 64,
+      "max_msgs": -1,
+      "max_bytes": 1073741824,
+      "discard": "old",
+      "max_age": 0,
+      "max_msgs_per_subject": 1,
+      "max_msg_size": -1,
+      "storage": "file",
+      "num_replicas": 1,
+      "duplicate_window": 120000000000,
+      "compression": "none",
+      "allow_direct": true,
+      "mirror_direct": false,
+      "consumer_limits": {},
+      "allow_msg_ttl": false
+    },
+    "KV_PROFILE_LEASES": {
+      "name": "KV_PROFILE_LEASES",
+      "subjects": [
+        "$KV.PROFILE_LEASES.>"
+      ],
+      "retention": "limits",
+      "max_consumers": -1,
+      "max_msgs": -1,
+      "max_bytes": 67108864,
+      "discard": "new",
+      "max_age": 0,
+      "max_msgs_per_subject": 1,
+      "max_msg_size": -1,
+      "storage": "file",
+      "num_replicas": 1,
+      "duplicate_window": 120000000000,
+      "placement": {
+        "cluster": ""
+      },
+      "deny_delete": true,
+      "allow_rollup_hdrs": true,
+      "compression": "none",
+      "allow_direct": true,
+      "mirror_direct": false,
+      "consumer_limits": {},
+      "allow_msg_ttl": false
+    },
+    "KV_cap": {
+      "name": "KV_cap",
+      "subjects": [
+        "$KV.cap.>"
+      ],
+      "retention": "limits",
+      "max_consumers": -1,
+      "max_msgs": -1,
+      "max_bytes": 268435456,
+      "discard": "new",
+      "max_age": 0,
+      "max_msgs_per_subject": 1,
+      "max_msg_size": -1,
+      "storage": "file",
+      "num_replicas": 1,
+      "duplicate_window": 120000000000,
+      "placement": {
+        "cluster": ""
+      },
+      "deny_delete": true,
+      "allow_rollup_hdrs": true,
+      "compression": "none",
+      "allow_direct": true,
+      "mirror_direct": false,
+      "consumer_limits": {},
+      "allow_msg_ttl": false
+    },
+    "KV_feedback": {
+      "name": "KV_feedback",
+      "subjects": [
+        "$KV.feedback.>"
+      ],
+      "retention": "limits",
+      "max_consumers": -1,
+      "max_msgs": -1,
+      "max_bytes": 67108864,
+      "discard": "new",
+      "max_age": 2592000000000000,
+      "max_msgs_per_subject": 1,
+      "max_msg_size": -1,
+      "storage": "file",
+      "num_replicas": 1,
+      "duplicate_window": 120000000000,
+      "placement": {
+        "cluster": ""
+      },
+      "deny_delete": true,
+      "allow_rollup_hdrs": true,
+      "compression": "none",
+      "allow_direct": true,
+      "mirror_direct": false,
+      "consumer_limits": {},
+      "allow_msg_ttl": false
+    },
+    "KV_runtime-state": {
+      "name": "KV_runtime-state",
+      "subjects": [
+        "$KV.runtime-state.>"
+      ],
+      "retention": "limits",
+      "max_consumers": -1,
+      "max_msgs": -1,
+      "max_bytes": 268435456,
+      "discard": "new",
+      "max_age": 0,
+      "max_msgs_per_subject": 1,
+      "max_msg_size": -1,
+      "storage": "file",
+      "num_replicas": 1,
+      "duplicate_window": 120000000000,
+      "placement": {
+        "cluster": ""
+      },
+      "deny_delete": true,
+      "allow_rollup_hdrs": true,
+      "compression": "none",
+      "allow_direct": true,
+      "mirror_direct": false,
+      "consumer_limits": {},
+      "allow_msg_ttl": false
+    },
+    "KV_session-state": {
+      "name": "KV_session-state",
+      "subjects": [
+        "$KV.session-state.>"
+      ],
+      "retention": "limits",
+      "max_consumers": -1,
+      "max_msgs": -1,
+      "max_bytes": 268435456,
+      "discard": "new",
+      "max_age": 0,
+      "max_msgs_per_subject": 1,
+      "max_msg_size": -1,
+      "storage": "file",
+      "num_replicas": 1,
+      "duplicate_window": 120000000000,
+      "placement": {
+        "cluster": ""
+      },
+      "deny_delete": true,
+      "allow_rollup_hdrs": true,
+      "compression": "none",
+      "allow_direct": true,
+      "mirror_direct": false,
+      "consumer_limits": {},
+      "allow_msg_ttl": false
+    },
+    "PROFILE_SUBMITS": {
+      "name": "PROFILE_SUBMITS",
+      "subjects": [
+        "a2a.submit.>"
+      ],
+      "retention": "limits",
+      "max_consumers": 64,
+      "max_msgs": -1,
+      "max_bytes": 1073741824,
+      "discard": "old",
+      "max_age": 259200000000000,
+      "max_msgs_per_subject": 1,
+      "max_msg_size": -1,
+      "storage": "file",
+      "num_replicas": 1,
+      "duplicate_window": 120000000000,
+      "compression": "none",
+      "allow_direct": true,
+      "mirror_direct": false,
+      "consumer_limits": {},
+      "allow_msg_ttl": false
+    },
+    "TASKS": {
+      "name": "TASKS",
+      "subjects": [
+        "a2a.tasks.>"
+      ],
+      "retention": "limits",
+      "max_consumers": 110,
+      "max_msgs": -1,
+      "max_bytes": 21474836480,
+      "discard": "old",
+      "max_age": 259200000000000,
+      "max_msgs_per_subject": 4096,
+      "max_msg_size": -1,
+      "storage": "file",
+      "num_replicas": 1,
+      "duplicate_window": 120000000000,
+      "compression": "none",
+      "allow_direct": true,
+      "mirror_direct": false,
+      "consumer_limits": {},
+      "allow_msg_ttl": false
+    },
+    "TOPICS-JOURNAL": {
+      "name": "TOPICS-JOURNAL",
+      "subjects": [
+        "a2a.topics.shared.annotations"
+      ],
+      "retention": "limits",
+      "max_consumers": 64,
+      "max_msgs": -1,
+      "max_bytes": 5368709120,
+      "discard": "old",
+      "max_age": 2592000000000000,
+      "max_msgs_per_subject": -1,
+      "max_msg_size": -1,
+      "storage": "file",
+      "num_replicas": 1,
+      "duplicate_window": 120000000000,
+      "compression": "none",
+      "allow_direct": true,
+      "mirror_direct": false,
+      "consumer_limits": {},
+      "allow_msg_ttl": false
+    },
+    "TOPICS-STATE": {
+      "name": "TOPICS-STATE",
+      "subjects": [
+        "a2a.topics.agent.platform.upgrade-readiness",
+        "a2a.topics.agent.platform.topology-skew",
+        "a2a.topics.shared.blueprint",
+        "a2a.topics.shared.probe"
+      ],
+      "retention": "limits",
+      "max_consumers": 64,
+      "max_msgs": -1,
+      "max_bytes": 1073741824,
+      "discard": "old",
+      "max_age": 0,
+      "max_msgs_per_subject": 8,
+      "max_msg_size": -1,
+      "storage": "file",
+      "num_replicas": 1,
+      "duplicate_window": 120000000000,
+      "compression": "none",
+      "allow_direct": true,
+      "mirror_direct": false,
+      "consumer_limits": {},
+      "allow_msg_ttl": false
+    }
+  }
+}

@@ -159,8 +159,8 @@ func snapshotAll(ctx context.Context, nc *nats.Conn, streams []string, dir strin
 	return nil
 }
 
-// HashMain runs `bus-hash --dir D --streams S`: the digest of every staged
-// stream's data, as a JSON object, written to --termination-log, which the
+// HashMain runs `bus-hash --dir D --streams S`: the digests of every staged
+// stream's data and metadata, as a JSON object keyed by stream, written to --termination-log, which the
 // operator reads from the pod's status. It touches no bus.
 func HashMain(args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("bus-hash", flag.ContinueOnError)
@@ -193,13 +193,29 @@ func HashMain(args []string, stderr io.Writer) int {
 	return 0
 }
 
-// HashStaged digests every named stream's staged data under dir.
-func HashStaged(dir string, streams []string) (map[string]string, error) {
-	digests := map[string]string{}
+// StagedDigest pins one staged stream: the digest of its data, and of the
+// metadata beside it, whose config and state the restore sends. Both are
+// fixed at hashing time, so neither can change on the staging volume
+// between the snapshot and the restore unnoticed.
+type StagedDigest struct {
+	Data string `json:"data"`
+	Meta string `json:"meta"`
+}
+
+// HashStaged digests every named stream's staged data and metadata under dir.
+func HashStaged(dir string, streams []string) (map[string]StagedDigest, error) {
+	digests := map[string]StagedDigest{}
 	for _, name := range streams {
-		d, err := digestOf(func() (io.ReadCloser, error) { return os.Open(filepath.Join(dir, name, SnapshotDataFile)) })
-		if err != nil {
-			return nil, fmt.Errorf("stream %s: %w", name, err)
+		var d StagedDigest
+		for _, f := range []struct {
+			file string
+			into *string
+		}{{SnapshotDataFile, &d.Data}, {SnapshotMetaFile, &d.Meta}} {
+			sum, err := digestOf(func() (io.ReadCloser, error) { return os.Open(filepath.Join(dir, name, f.file)) })
+			if err != nil {
+				return nil, fmt.Errorf("stream %s: %w", name, err)
+			}
+			*f.into = sum
 		}
 		digests[name] = d
 	}

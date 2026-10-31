@@ -29,7 +29,7 @@ func TestTheSnapshotLegStagesWhatBusHashDigests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got map[string]string
+	var got map[string]StagedDigest
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatal(err)
 	}
@@ -38,11 +38,15 @@ func TestTheSnapshotLegStagesWhatBusHashDigests(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := os.Stat(filepath.Join(dir, n, SnapshotMetaFile)); err != nil {
+		meta, err := os.ReadFile(filepath.Join(dir, n, SnapshotMetaFile))
+		if err != nil {
 			t.Errorf("%s: no metadata staged: %v", n, err)
 		}
-		if got[n] != Digest(data) || len(data) == 0 {
-			t.Errorf("%s: termination-log digest %q, want %q of %d staged bytes", n, got[n], Digest(data), len(data))
+		if got[n].Data != Digest(data) || len(data) == 0 {
+			t.Errorf("%s: termination-log data digest %q, want %q of %d staged bytes", n, got[n].Data, Digest(data), len(data))
+		}
+		if got[n].Meta != Digest(meta) || len(meta) == 0 {
+			t.Errorf("%s: termination-log meta digest %q, want %q of %d staged bytes", n, got[n].Meta, Digest(meta), len(meta))
 		}
 	}
 }
