@@ -1,15 +1,17 @@
 import copy
 import importlib
 import json
+import math
 import os
 import shutil
 import sys
 import tempfile
 import threading
 import time
+from contextlib import ExitStack, nullcontext
 from datetime import datetime, timezone
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from pathlib import Path
 
 # Create a temporary SQLite database for testing and set it in the environment
@@ -3228,6 +3230,55 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
     SESSION = "evt-Prod_us/OOM:42"
     ENV = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
     OFF_FOOTER = "A human reads your options and the agent that holds the GitOps write path opens the Pull Request"
+    ONE_PARENT = "- `parents`: a list holding the one card id call 1 returned, so this card waits for the diagnosis.\n"
+    SIBLING = "t_0a43cf9c"
+
+    def setUp(self):
+        # The front door reads the board for a live same-branch card; by
+        # default the class has none, so every test below starts from the
+        # single-parent prompt and the sibling tests build a board on demand.
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.board = Path(self._tmpdir.name) / "kanban.db"
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.board))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def branch(self):
+        return session_kv_server._incident_branch(self.SESSION, self.PAYLOAD)
+
+    def card(self, task_id, status, *, branch=None, title=None, created_at=1.0, body=None, session_id=None):
+        """A row shaped like Hermes' `tasks` table for a pull-request card."""
+        branch = self.branch() if branch is None else branch
+        if body is None:
+            body = session_kv_server._triage_pr_task_body(self.PAYLOAD, self.SESSION).replace(self.branch(), branch)
+        if title is None:
+            title = "Open GitOps PR for test-ns/Pod/test-pod (OOMKilled) on prod-us-central1"
+        return (task_id, title, body, "platform", status, created_at, session_id)
+
+    def make_board(self, *cards):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY, title TEXT, body TEXT, assignee TEXT, status TEXT,
+                    priority INTEGER, session_id TEXT, created_at REAL, started_at REAL,
+                    completed_at REAL, last_heartbeat_at REAL, result TEXT, last_failure_error TEXT,
+                    worker_pid INTEGER, claim_lock TEXT
+                );
+                CREATE TABLE IF NOT EXISTS task_links (parent_id TEXT, child_id TEXT);
+                """
+            )
+            conn.executemany(
+                "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                cards,
+            )
+
+    def parents_line(self, query):
+        call_2 = query.split("**Call 2 — the Pull Request, after call 1 returns.**", 1)[1]
+        return next(line for line in call_2.splitlines() if line.startswith("- `parents`:")) + "\n"
 
     def query(self, value):
         env = {self.ENV: value} if value is not None else {}
@@ -3381,10 +3432,33 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         )
         self.assertNotIn("ArgoCD", body)
         self.assertNotIn("unapplied Terraform", body)
-        self.assertIn("Never pass `--force` to `prepare` while another `Open GitOps PR` card is `running`", body)
+        # The worker has no `kanban_list` (Hermes registers it for orchestrators
+        # only; deploy/docker/patches/verify_kanban_worker_tools.py pins that),
+        # so the card neither asks it to check the board nor to judge a copy
+        # stale and `--force` past it: the one mention of the flag forbids it.
+        self.assertNotIn("kanban_list", body)
+        self.assertNotIn("re-run `prepare` once with `--force`", body)
+        self.assertNotIn("re-run with --force", body)
+        self.assertEqual(body.count("--force"), 1, body)
+        self.assertIn("do not re-run it and never pass `--force`", body)
+        self.assertIn("Complete this card with the refusal quoted in `result`", body)
+        # The refusal stands: nothing here reaps the copy on the card's behalf
+        # (vcs_client spares the clone's own destination), so the text has the
+        # `result` the operator reads name the action that clears it, verb and
+        # branch, rather than "a person".
+        self.assertIn("Complete this card with the refusal quoted in `result`, and say there what clears it", body)
+        self.assertIn("every later card for this branch meets the same refusal until someone asks the Platform Agent in chat", body)
+        self.assertIn("to publish what is in that copy, or to discard it", body)
+        self.assertIn(f"`discard --branch {expected_branch}`", body)
+        self.assertNotIn("until a person clears the copy", body)
+        self.assertNotIn("is removed by the next `prepare` for this branch", body)
+        # No TTL promise either: a refused `prepare` runs `git status`, which
+        # refreshes the index `_last_touched` reads, so a branch that keeps
+        # drawing cards keeps its copy alive for the reaper.
+        self.assertNotIn("copy TTL", body)
+        self.assertNotIn("reap_stale_copies", body)
         # The refusal is quoted the way vcs_client._refuse_to_discard words it.
         self.assertIn("`there is already a copy at <path> with ...`", body)
-        self.assertIn("`Publish it, or re-run with --force to replace it.`", body)
         self.assertNotIn("with uncommitted work on branch", body)
         import vcs_client
         with tempfile.TemporaryDirectory() as tmp:
@@ -3398,10 +3472,514 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
                     vcs_client._refuse_to_discard(dest, force=False)
         self.assertTrue(str(refused.exception).startswith(f"there is already a copy at {dest} with "))
         self.assertTrue(str(refused.exception).endswith("Publish it, or re-run with --force to replace it."))
-        self.assertIn("`kanban_show` this card's parent", body)
-        self.assertIn("If the parent card has no report (`result` is empty or its `status` is not `done`)", body)
+        self.assertIn("This card has one or more parents; `kanban_show` each", body)
+        self.assertIn("Every other parent, titled `Open GitOps PR for ...`", body)
+        self.assertIn("has already finished or been archived", body)
+        self.assertIn("if one of their `result`s names a Pull Request, that is the one you revise rather than opening a second", body)
+        self.assertNotIn("one or two parents", body)
+        self.assertIn("If the triage parent has no report (`result` is empty or its `status` is not `done`)", body)
         self.assertIn("Never change the live cluster directly", body)
         self.assertIn("open nothing", body)
+
+    def test_without_a_live_sibling_call_2_has_the_one_parent(self):
+        self.assertFalse(self.board.exists())
+        self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
+        self.assertEqual(session_kv_server._live_pull_request_siblings(""), [])
+
+    def test_a_live_sibling_on_the_branch_is_a_second_parent(self):
+        # A pull-request card the dispatcher has not settled (`_parents_satisfied`
+        # promotes a child only once every parent is done or archived) still
+        # owns the branch's checkout, whichever of its live statuses it is in.
+        for status in ("todo", "running", "blocked"):
+            with self.subTest(status=status):
+                if self.board.exists():
+                    self.board.unlink()
+                self.make_board(self.card(self.SIBLING, status))
+                self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [self.SIBLING])
+                query = self.query("true")
+                line = self.parents_line(query)
+                self.assertNotEqual(line, self.ONE_PARENT)
+                self.assertIn("a list of 2 card ids, in this order: the card id call 1 returned", line)
+                self.assertIn(f"then `{self.SIBLING}`, each a card already opening a Pull Request on this incident's branch", line)
+                self.assertIn("starts only after all of them have finished", line)
+                self.assertIn("Name every one of them: a card left out would run beside this one.", line)
+                # The two bodies between the markers are unchanged: only the routing line names the sibling.
+                pr = query.split("--- BEGIN PULL REQUEST TASK BODY (copy verbatim) ---\n", 1)[1]
+                pr = pr.split("\n--- END PULL REQUEST TASK BODY ---", 1)[0]
+                self.assertEqual(pr, session_kv_server._triage_pr_task_body(self.PAYLOAD, self.SESSION))
+                self.assertEqual(query.count(self.SIBLING), 1)
+
+    def test_a_settled_or_unrelated_card_leaves_the_one_parent(self):
+        other_branch = session_kv_server._incident_branch(self.SESSION, {**self.PAYLOAD, "name": "other-pod"})
+        self.make_board(
+            self.card("t_11111111", "done"),
+            self.card("t_22222222", "archived"),
+            self.card("t_33333333", "running", branch=other_branch),
+            self.card("t_44444444", "running", title="Triage test-ns/Pod/test-pod (OOMKilled) on prod-us-central1"),
+            self.card("t_55555555", "running", body=""),
+            ("t_66666666", "Open GitOps PR for x", None, "platform", "running", 9.0, None),
+            # A branch that begins with this one: another incident whose workload
+            # name starts with this workload's name, reason and digest. The body
+            # names its branch between backticks, and the needle carries them.
+            self.card("t_77777777", "running", branch=self.branch() + "-x-r-9e8f7a6b"),
+        )
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
+        self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        self.assertEqual(session_kv_server._live_pull_request_siblings(other_branch), ["t_33333333"])
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch() + "-x-r-9e8f7a6b"), ["t_77777777"])
+        self.assertIn(f"on the branch `{self.branch()}`", session_kv_server._triage_pr_task_body(self.PAYLOAD, self.SESSION))
+
+    def test_every_live_sibling_is_a_parent_oldest_first(self):
+        # All of them, in the order the dispatcher runs them, not the newest:
+        # the new card then waits for each, whichever of them settles first.
+        self.make_board(
+            self.card("t_aaaaaaaa", "running", created_at=10.0),
+            self.card("t_bbbbbbbb", "todo", created_at=20.0),
+            self.card("t_cccccccc", "done", created_at=30.0),
+            self.card("t_dddddddd", "blocked", created_at=15.0),
+        )
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), ["t_aaaaaaaa", "t_dddddddd", "t_bbbbbbbb"])
+        query = self.query("true")
+        line = self.parents_line(query)
+        self.assertIn("a list of 4 card ids, in this order: the card id call 1 returned", line)
+        self.assertIn("then `t_aaaaaaaa`, `t_dddddddd`, `t_bbbbbbbb`, each a card already opening a Pull Request", line)
+        self.assertNotIn("t_cccccccc", query)
+        for card_id in ("t_aaaaaaaa", "t_dddddddd", "t_bbbbbbbb"):
+            self.assertEqual(query.count(card_id), 1, card_id)
+
+    def test_archiving_a_middle_card_leaves_the_earlier_ones_gating(self):
+        # The finding this guards against: with A running, B parented on A and
+        # a new start C, a C parented on B alone is promoted the moment B is
+        # archived (`archived` settles a parent for Hermes' `_parents_satisfied`),
+        # and runs `prepare` on the branch A's worker holds. Parented on every
+        # live card, C still names A once B is gone.
+        self.make_board(
+            self.card("t_aaaaaaaa", "running", created_at=10.0),
+            self.card("t_bbbbbbbb", "todo", created_at=20.0),
+        )
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), ["t_aaaaaaaa", "t_bbbbbbbb"])
+        self._board_write("UPDATE tasks SET status = 'archived' WHERE id = 't_bbbbbbbb'")
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), ["t_aaaaaaaa"])
+        line = self.parents_line(self.query("true"))
+        self.assertIn("a list of 2 card ids", line)
+        self.assertIn("then `t_aaaaaaaa`, each a card", line)
+        self.assertNotIn("t_bbbbbbbb", line)
+        # And the other way round: the running card finishing first leaves the queued one gating.
+        self._board_write("UPDATE tasks SET status = 'todo' WHERE id = 't_bbbbbbbb'")
+        self._board_write("UPDATE tasks SET status = 'done' WHERE id = 't_aaaaaaaa'")
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), ["t_bbbbbbbb"])
+
+    def test_a_malformed_card_id_is_kept_out_of_the_prompt(self):
+        for bad in (
+            "t_../../etc", "T_0A43CF9C", "t_0a43cf9", "x_0a43cf9c", "t_0a43cf9c`; drop", "t_" + "f" * 33,
+            "t_0a43cf9c\n", " t_0a43cf9c", "t_0a43cf9c ",
+        ):
+            with self.subTest(id=bad):
+                if self.board.exists():
+                    self.board.unlink()
+                self.make_board(self.card(bad, "running"))
+                with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+                    self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
+                self.assertTrue(any("INCIDENT_PR_SIBLING_IGNORED" in line for line in logs.output), logs.output)
+                self.assertFalse(any(bad in line for line in logs.output), logs.output)
+                self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        # A malformed id beside a well-formed one drops only itself: the live
+        # card still gates the new one.
+        self.board.unlink()
+        self.make_board(self.card("t_0a43cf9c\n", "running", created_at=10.0), self.card(self.SIBLING, "todo", created_at=20.0))
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [self.SIBLING])
+        self.assertTrue(any("INCIDENT_PR_SIBLING_IGNORED" in line for line in logs.output), logs.output)
+        self.assertEqual(self.query("true").count(self.SIBLING), 1)
+
+    def test_a_card_a_dispatcher_worker_filed_is_neither_a_sibling_nor_the_turns_own_card(self):
+        """The children patch records every create a worker process makes in
+        `kanban_worker_children`, keyed on `HERMES_KANBAN_TASK` in the worker's
+        environment rather than on anything the model passes. A card with a row
+        there is not a sibling and not a turn's own card, whatever its title and
+        body say; a board without the table (the class's default board) takes the
+        query without the clause."""
+        import sqlite3
+
+        table = session_kv_server.KANBAN_WORKER_CHILDREN_TABLE
+        self.assertEqual(table, "kanban_worker_children")
+        self.assertEqual(session_kv_server.CARD_STOP_CHILDREN_TABLE, table)
+        turn_began = 1_700_000_000
+        branch = self.branch()
+
+        def siblings():
+            return session_kv_server._live_pull_request_siblings(branch)
+
+        def own_card(session_id="k8s-evt-a"):
+            return session_kv_server._own_pull_request_card(session_id, branch, turn_began)
+
+        # The class's board has no children table: today's query, the card found.
+        self.make_board(self.card(self.SIBLING, "running", created_at=turn_began + 1, session_id="k8s-evt-a"))
+        with sqlite3.connect(self.board) as conn:
+            self.assertFalse(session_kv_server._has_table(conn, table))
+            self.assertNotIn("NOT EXISTS", session_kv_server._pull_request_card_sql(conn, session_kv_server.INCIDENT_PR_SIBLING_SQL))
+        self.assertEqual(siblings(), [self.SIBLING])
+        self.assertEqual(own_card(), self.SIBLING)
+        # The patch's table, as its DDL creates it, with no row for the card: the same answers.
+        self._board_write(f"CREATE TABLE {table} (child_id TEXT PRIMARY KEY, creator_id TEXT NOT NULL, created_at INTEGER NOT NULL)")
+        self.assertEqual(siblings(), [self.SIBLING])
+        self.assertEqual(own_card(), self.SIBLING)
+        # A row for the card: a worker filed it. Not a sibling, so the new card
+        # is not gated on it; not the turn's own card, so the hold goes on.
+        self._board_write(f"INSERT INTO {table} (child_id, creator_id, created_at) VALUES (?, ?, ?)", (self.SIBLING, "t_00000001", turn_began + 1))
+        self.assertEqual(siblings(), [])
+        self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        self.assertEqual(own_card(), "")
+        # A front door's card beside it (no row) is a sibling, alone, and the turn's own card.
+        self._board_write(
+            "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            self.card("t_bbbbbbbb", "todo", created_at=turn_began + 2, session_id="k8s-evt-a"),
+        )
+        self.assertEqual(siblings(), ["t_bbbbbbbb"])
+        line = self.parents_line(self.query("true"))
+        self.assertIn("a list of 2 card ids", line)
+        self.assertIn("`t_bbbbbbbb`", line)
+        self.assertNotIn(self.SIBLING, line)
+        self.assertEqual(own_card(), "t_bbbbbbbb")
+        # The row gone (a board the patch stopped writing): both cards count again, oldest first.
+        self._board_write(f"DELETE FROM {table} WHERE child_id = ?", (self.SIBLING,))
+        self.assertEqual(siblings(), [self.SIBLING, "t_bbbbbbbb"])
+
+    def test_the_settled_statuses_are_the_card_stop_routes(self):
+        self.assertEqual(session_kv_server.CARD_STOP_SETTLED_STATUSES, frozenset(session_kv_server.KANBAN_SETTLED_STATUSES))
+        self.assertEqual(session_kv_server.KANBAN_SETTLED_STATUSES, ("done", "archived"))
+
+    def test_same_branch_starts_take_one_lock_only_with_the_opt_in_on(self):
+        replica_a = {**self.PAYLOAD, "name": "test-pod-6cfdb6b98b-zwv24"}
+        replica_b = {**self.PAYLOAD, "name": "test-pod-6cfdb6b98b-k8m12"}
+        other = {**self.PAYLOAD, "name": "other-pod"}
+        with patch.dict(os.environ, {self.ENV: "true"}, clear=False):
+            lock_a = session_kv_server._incident_start_lock(replica_a, "k8s-evt-a")
+            lock_b = session_kv_server._incident_start_lock(replica_b, "k8s-evt-b")
+            self.assertIs(lock_a, lock_b)
+            self.assertIsInstance(lock_a, type(threading.Lock()))
+            self.assertIn(lock_a, session_kv_server._INCIDENT_START_LOCKS)
+            self.assertIn(session_kv_server._incident_start_lock(other, "k8s-evt-c"), session_kv_server._INCIDENT_START_LOCKS)
+            for kind in (session_kv_server.INJECT_KIND_DRIFT, session_kv_server.INJECT_KIND_STALL):
+                self.assertIsInstance(session_kv_server._incident_start_lock({"kind": kind}, "s"), nullcontext)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.ENV, None)
+            self.assertIsInstance(session_kv_server._incident_start_lock(replica_a, "k8s-evt-a"), nullcontext)
+
+    def test_same_branch_starts_run_one_after_the_other(self):
+        # The second start's turn, and so its sibling lookup, begins only once
+        # the first start's turn has returned with its cards filed.
+        entered = threading.Event()
+        release = threading.Event()
+        turns = []
+
+        def turn(start):
+            turns.append(start.session_id)
+            entered.set()
+            release.wait(5)
+
+        with patch.dict(os.environ, {self.ENV: "true"}, clear=False), patch.object(
+            session_kv_server, "_attempt_triage_start_unlocked", side_effect=turn
+        ):
+            first = threading.Thread(target=session_kv_server._attempt_triage_start, args=(self._start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"),))
+            second = threading.Thread(target=session_kv_server._attempt_triage_start, args=(self._start("k8s-evt-b", "test-pod-6cfdb6b98b-k8m12"),))
+            first.start()
+            self.assertTrue(entered.wait(5))
+            second.start()
+            second.join(0.3)
+            self.assertTrue(second.is_alive())
+            self.assertEqual(turns, ["k8s-evt-a"])
+            release.set()
+            first.join(5)
+            second.join(5)
+        self.assertEqual(turns, ["k8s-evt-a", "k8s-evt-b"])
+        self.assertFalse(first.is_alive() or second.is_alive())
+
+    def _start(self, session_id, name):
+        return session_kv_server._TriageStart(session_id, {**self.PAYLOAD, "name": name}, None, None, 0.0)
+
+    def _unanswered_turn(self, hold_s):
+        # The first start's `/chat` ends START_UNKNOWN; the hold then reads the
+        # class's board for the card that start's own session filed.
+        turns = []
+
+        def turn(start):
+            turns.append(start.session_id)
+            return session_kv_server.START_UNKNOWN if start.session_id == "k8s-evt-a" else session_kv_server.START_OK
+
+        patches = [
+            patch.dict(os.environ, {self.ENV: "true"}, clear=False),
+            patch.object(session_kv_server, "_attempt_triage_start_unlocked", side_effect=turn),
+            patch.object(session_kv_server, "INCIDENT_START_UNKNOWN_POLL_S", 0.02),
+            patch.object(session_kv_server, "INCIDENT_START_UNKNOWN_HOLD_S", hold_s),
+        ]
+        return turns, patches
+
+    def _board_write(self, sql, params=()):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            conn.execute(sql, params)
+
+    def _assert_still_held(self, first, second, turns):
+        first.join(0.3)
+        second.join(0.3)
+        self.assertTrue(first.is_alive() and second.is_alive())
+        self.assertEqual(turns, ["k8s-evt-a"])
+
+    def test_an_unanswered_turn_holds_the_lock_until_its_card_is_on_the_board(self):
+        # The board the first start's prompt saw: a live same-branch sibling
+        # filed by an earlier session, and the pull-request card the first
+        # start's own session filed in its previous same-branch turn (the
+        # watcher's `--mode=shared` sends every incident into one session),
+        # stamped with the whole second this turn begins in, as Hermes stamps
+        # it when that turn's `/chat` returned and the stripe changed hands
+        # inside one second. It is not this turn's card and must not end the
+        # hold. Every card filed below is stamped the way Hermes stamps one
+        # filed after a model call: in the second after the turn began.
+        this_second = math.floor(time.time())
+        self.make_board(
+            self.card(self.SIBLING, "running", created_at=this_second - 10, session_id="k8s-evt-0"),
+            self.card("t_0a000000", "done", created_at=this_second, session_id="k8s-evt-a"),
+        )
+        turns, patches = self._unanswered_turn(10.0)
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            logs = stack.enter_context(self.assertLogs(session_kv_server.logger, level="INFO"))
+            first = threading.Thread(target=session_kv_server._attempt_triage_start, args=(self._start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"),))
+            second = threading.Thread(target=session_kv_server._attempt_triage_start, args=(self._start("k8s-evt-b", "test-pod-6cfdb6b98b-k8m12"),))
+            first.start()
+            first.join(0.3)
+            # The turn returned START_UNKNOWN and the lock is still held.
+            self.assertTrue(first.is_alive())
+            self.assertEqual(turns, ["k8s-evt-a"])
+            second.start()
+            self._assert_still_held(first, second, turns)
+            # None of these is the turn's own card, so none ends the hold: the
+            # sibling the prompt saw settling, a pull-request card for the
+            # branch filed by some other session, a card the same session filed
+            # during this turn for another branch (a shared session's
+            # concurrent turn), and a poll the board refused.
+            self._board_write("UPDATE tasks SET status = 'done' WHERE id = ?", (self.SIBLING,))
+            self._assert_still_held(first, second, turns)
+            self._board_write(
+                "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                self.card("t_2b000002", "running", created_at=math.floor(time.time()) + 1, session_id="k8s-evt-z"),
+            )
+            self._assert_still_held(first, second, turns)
+            self._board_write(
+                "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                self.card("t_3c000003", "todo", branch=self.branch() + "-other", created_at=math.floor(time.time()) + 1, session_id="k8s-evt-a"),
+            )
+            self._assert_still_held(first, second, turns)
+            with patch.object(session_kv_server, "_read_kanban", side_effect=session_kv_server.HTTPException(503, "locked")):
+                self._assert_still_held(first, second, turns)
+            # The first start's own turn files its Call 2 card.
+            self._board_write(
+                "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                self.card("t_1a000001", "todo", created_at=math.floor(time.time()) + 1, session_id="k8s-evt-a"),
+            )
+            first.join(5)
+            second.join(5)
+        self.assertEqual(turns, ["k8s-evt-a", "k8s-evt-b"])
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertTrue(any("INCIDENT_START_HELD session=k8s-evt-a until=card" in line for line in logs.output), logs.output)
+        self.assertTrue(any("INCIDENT_PR_OWN_CARD_LOOKUP_FAILED session=k8s-evt-a" in line for line in logs.output), logs.output)
+
+    def test_an_unanswered_turn_releases_the_lock_once_the_hold_has_passed(self):
+        # No board at all: the own-card read answers "not yet" until the hold passes.
+        self.assertFalse(self.board.exists())
+        turns, patches = self._unanswered_turn(0.2)
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            logs = stack.enter_context(self.assertLogs(session_kv_server.logger, level="WARNING"))
+            first = threading.Thread(target=session_kv_server._attempt_triage_start, args=(self._start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"),))
+            second = threading.Thread(target=session_kv_server._attempt_triage_start, args=(self._start("k8s-evt-b", "test-pod-6cfdb6b98b-k8m12"),))
+            first.start()
+            second.start()
+            first.join(5)
+            second.join(5)
+        self.assertEqual(turns, ["k8s-evt-a", "k8s-evt-b"])
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertTrue(any("INCIDENT_START_HELD session=k8s-evt-a until=timeout" in line for line in logs.output), logs.output)
+
+    def test_an_answered_turn_releases_the_lock_at_once(self):
+        # START_OK: `/chat` returned, the cards are filed, nothing to wait for
+        # and no board read outside the prompt builder; and with the opt-in off
+        # the start reads no board at all.
+        no_read = [
+            patch.object(session_kv_server, "_own_pull_request_card", side_effect=AssertionError("read")),
+            patch.object(session_kv_server, "_live_pull_request_siblings", side_effect=AssertionError("read")),
+            patch.object(session_kv_server, "_triage_sleep", side_effect=AssertionError("held")),
+        ]
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {self.ENV: "true"}, clear=False))
+            stack.enter_context(patch.object(session_kv_server, "_attempt_triage_start_unlocked", return_value=session_kv_server.START_OK))
+            for item in no_read:
+                stack.enter_context(item)
+            session_kv_server._attempt_triage_start(self._start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"))
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {}, clear=False))
+            os.environ.pop(self.ENV, None)
+            stack.enter_context(patch.object(session_kv_server, "_attempt_triage_start_unlocked", return_value=session_kv_server.START_UNKNOWN))
+            for item in no_read:
+                stack.enter_context(item)
+            session_kv_server._attempt_triage_start(self._start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"))
+
+    def test_the_own_card_read_answers_not_yet_until_the_turn_files_its_pull_request_card(self):
+        import sqlite3
+
+        branch = self.branch()
+        turn_began = 1_700_000_000
+
+        def own_card(session_id="k8s-evt-a", since=turn_began):
+            return session_kv_server._own_pull_request_card(session_id, branch, since)
+
+        # No board, no session, no branch: not yet.
+        self.assertEqual(own_card(), "")
+        self.assertEqual(own_card(""), "")
+        self.assertEqual(session_kv_server._own_pull_request_card("k8s-evt-a", "", turn_began), "")
+        # The session's triage card alone is not the pull-request card; another
+        # session's pull-request card is not this session's; and on a session
+        # that carries more than one turn (`--mode=shared`), a pull-request
+        # card the session filed before this turn began, or for another
+        # branch, is some other turn's.
+        self.make_board(
+            self.card("t_aaaaaaaa", "running", title="Triage test-ns/Pod/test-pod (OOMKilled) on prod-us-central1", created_at=turn_began, session_id="k8s-evt-a"),
+            self.card("t_bbbbbbbb", "running", created_at=turn_began, session_id="k8s-evt-z"),
+            self.card("t_cccccccc", "done", created_at=turn_began - 1, session_id="k8s-evt-a"),
+            self.card("t_dddddddd", "running", branch=branch + "-other", created_at=turn_began + 5, session_id="k8s-evt-a"),
+        )
+        self.assertEqual(own_card(), "")
+        # Once filed it counts in any status, settled included: the question is
+        # whether Call 2 landed, not whether the card is live. A card stamped
+        # with the floor's own second counts: the caller's floor is the second
+        # after the one the turn began in, and Hermes stamps whole seconds.
+        for status in ("todo", "running", "blocked", "done", "archived"):
+            with self.subTest(status=status):
+                self._board_write("DELETE FROM tasks WHERE id = 't_1a000001'")
+                self._board_write(
+                    "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    self.card("t_1a000001", status, created_at=turn_began, session_id="k8s-evt-a"),
+                )
+                self.assertEqual(own_card(), "t_1a000001")
+        # The same board read for a later turn of the same session: not yet.
+        self.assertEqual(own_card(since=turn_began + 1), "")
+        # A board that cannot be read is "not yet" with a log line, never a raise.
+        self.board.unlink()
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("CREATE TABLE other (id TEXT)")
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self.assertEqual(own_card(), "")
+        self.assertTrue(any("INCIDENT_PR_OWN_CARD_LOOKUP_FAILED session=k8s-evt-a" in line for line in logs.output), logs.output)
+        with patch.object(session_kv_server, "_kanban_db_path", side_effect=RuntimeError("no home")):
+            with self.assertLogs(session_kv_server.logger, level="WARNING"):
+                self.assertEqual(own_card(), "")
+
+    def test_an_unreadable_board_fails_open_to_the_one_parent_after_the_retries(self):
+        import sqlite3
+
+        attempts = session_kv_server.INCIDENT_PR_SIBLING_READ_ATTEMPTS
+        retry_s = session_kv_server.INCIDENT_PR_SIBLING_READ_RETRY_S
+        self.assertGreater(attempts, 1)
+        sleep = patch.object(session_kv_server, "_triage_sleep").start()
+        self.addCleanup(patch.stopall)
+        # A board without the tasks table: the read raises on every attempt and
+        # the lookup logs instead of raising, naming the card it files as ungated.
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("CREATE TABLE other (id TEXT)")
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
+        failed = [line for line in logs.output if "INCIDENT_PR_SIBLING_LOOKUP_FAILED" in line]
+        self.assertEqual(len(failed), 1, logs.output)
+        self.assertIn(f"attempts={attempts} ungated=true", failed[0])
+        self.assertEqual(sum("INCIDENT_PR_SIBLING_LOOKUP_RETRY" in line for line in logs.output), attempts - 1, logs.output)
+        self.assertEqual(sleep.call_args_list, [call(retry_s)] * (attempts - 1))
+        with self.assertLogs(session_kv_server.logger, level="WARNING"):
+            self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        # A locked board past the busy timeout, on every attempt.
+        sleep.reset_mock()
+        self.board.unlink()
+        self.make_board(self.card(self.SIBLING, "running"))
+        holder = sqlite3.connect(self.board, isolation_level=None)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN EXCLUSIVE")
+        with patch.object(session_kv_server, "FEED_DB_BUSY_TIMEOUT_SECONDS", 0.05):
+            with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+                self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
+            self.assertTrue(any("ungated=true" in line for line in logs.output), logs.output)
+            self.assertEqual(sleep.call_count, attempts - 1)
+            with self.assertLogs(session_kv_server.logger, level="WARNING"):
+                self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        holder.execute("ROLLBACK")
+        sleep.reset_mock()
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [self.SIBLING])
+        sleep.assert_not_called()
+        # The board path itself cannot be resolved: retried the same way.
+        with patch.object(session_kv_server, "_kanban_db_path", side_effect=RuntimeError("no home")):
+            with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+                self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        self.assertTrue(any("ungated=true error=RuntimeError" in line for line in logs.output), logs.output)
+        self.assertEqual(sleep.call_count, attempts - 1)
+
+    def test_a_refused_board_read_that_clears_on_a_retry_still_gates_the_card(self):
+        """The lookup is the whole of the serialization, so a transient refusal
+        (a lock outlasting the busy timeout) is retried under the stripe before
+        the lookup falls open; a missing board is not a refusal and is not retried."""
+        import sqlite3
+
+        attempts = session_kv_server.INCIDENT_PR_SIBLING_READ_ATTEMPTS
+        retry_s = session_kv_server.INCIDENT_PR_SIBLING_READ_RETRY_S
+        sleep = patch.object(session_kv_server, "_triage_sleep").start()
+        self.addCleanup(patch.stopall)
+        # A lock the holder releases on the lookup's first retry: the sibling is found.
+        self.make_board(self.card(self.SIBLING, "running"))
+        holder = sqlite3.connect(self.board, isolation_level=None)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN EXCLUSIVE")
+        sleep.side_effect = lambda seconds: holder.execute("ROLLBACK") if holder.in_transaction else None
+        with patch.object(session_kv_server, "FEED_DB_BUSY_TIMEOUT_SECONDS", 0.05):
+            with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+                self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [self.SIBLING])
+        self.assertEqual(sleep.call_args_list, [call(retry_s)])
+        self.assertTrue(any("INCIDENT_PR_SIBLING_LOOKUP_RETRY" in line and "attempt=1" in line for line in logs.output), logs.output)
+        self.assertFalse(any("INCIDENT_PR_SIBLING_LOOKUP_FAILED" in line for line in logs.output), logs.output)
+        self.assertFalse(any("ungated" in line for line in logs.output), logs.output)
+        # The same through the prompt builder: the card is gated on the sibling.
+        holder.execute("BEGIN EXCLUSIVE")
+        sleep.reset_mock()
+        with patch.object(session_kv_server, "FEED_DB_BUSY_TIMEOUT_SECONDS", 0.05):
+            with self.assertLogs(session_kv_server.logger, level="WARNING"):
+                line = self.parents_line(self.query("true"))
+        self.assertNotEqual(line, self.ONE_PARENT)
+        self.assertIn(f"`{self.SIBLING}`", line)
+        self.assertEqual(sleep.call_count, 1)
+        # A refusal that clears only on the last attempt is still a found sibling.
+        sleep.reset_mock()
+        sleep.side_effect = None
+        answers = [session_kv_server.HTTPException(503, "locked")] * (attempts - 1) + [[self.SIBLING]]
+        with patch.object(session_kv_server, "_read_kanban", side_effect=answers):
+            with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+                self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [self.SIBLING])
+        self.assertEqual(sleep.call_count, attempts - 1)
+        self.assertFalse(any("INCIDENT_PR_SIBLING_LOOKUP_FAILED" in line for line in logs.output), logs.output)
+        # One refusal more than the budget falls open, once, with the ungated line.
+        sleep.reset_mock()
+        with patch.object(session_kv_server, "_read_kanban", side_effect=session_kv_server.HTTPException(503, "locked")):
+            with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+                self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
+        self.assertEqual(sleep.call_count, attempts - 1)
+        self.assertEqual(sum("INCIDENT_PR_SIBLING_LOOKUP_FAILED" in line for line in logs.output), 1, logs.output)
+        self.assertTrue(any("ungated=true detail=locked" in line for line in logs.output), logs.output)
+        # No board at all is a fresh install, not a refusal: no retry, no sleep, no warning.
+        sleep.reset_mock()
+        self.board.unlink()
+        with self.assertNoLogs(session_kv_server.logger, level="WARNING"):
+            self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
+        sleep.assert_not_called()
 
     def test_the_branch_is_stable_and_one_safe_segment(self):
         first = session_kv_server._incident_branch(self.SESSION, self.PAYLOAD)
@@ -11748,6 +12326,49 @@ class TestTriageStartRetry(unittest.TestCase):
     def test_a_chat_5xx_other_than_503_is_not_sent_again(self):
         urlopen, _ = self._run([_answered(), _http_error(502)])
         self.assertEqual(self._urls(urlopen), ["sessions", "chat"])
+
+    INCIDENT = {"reason": "BackOff", "namespace": "prod", "kind_of_object": "Pod", "name": "api-6cfdb6b98b-zwv24"}
+
+    def _unanswered_chat_with_the_opt_in_on(self, own_card_answers, chat_answer):
+        """The real start body, `/chat` unanswered, the opt-in on: the hold runs
+        on the fake clock, polling the stubbed own-card read."""
+        own_card = MagicMock(side_effect=own_card_answers)
+        with patch.dict(os.environ, {session_kv_server.INCIDENT_TRIAGE_OPEN_PR_ENV: "true"}, clear=False), \
+                patch.object(session_kv_server, "_own_pull_request_card", own_card), \
+                patch.object(session_kv_server, "_live_pull_request_siblings", side_effect=AssertionError("read")):
+            urlopen, logs = self._run([_answered(), chat_answer], payload=dict(self.INCIDENT))
+        self.assertEqual(self._urls(urlopen), ["sessions", "chat"])
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_STARTED)
+        self.assertNotIn("TRIAGE_NOT_STARTED", logs)
+        self.send.assert_not_called()
+        return own_card, logs
+
+    def test_an_unanswered_chat_holds_the_branch_lock_until_its_card_lands(self):
+        """`_attempt_triage_start_unlocked` ends on START_UNKNOWN and says so, and
+        `_attempt_triage_start` holds the stripe on that answer: a body that
+        ended on a bare `return` would skip the hold and log no HELD line."""
+        began = self.clock.now
+        wall_before = math.floor(time.time())
+        own_card, logs = self._unanswered_chat_with_the_opt_in_on(["", "", "t_1a000001"], TimeoutError("timed out"))
+        self.assertEqual(own_card.call_count, 3)
+        # Keyed on this turn: the session, its branch, and the whole second
+        # after the one the turn began in, so a card the session filed earlier
+        # does not count, the previous turn's card stamped in the turn's first
+        # second included.
+        session_id, branch, cards_since = own_card.call_args_list[0].args
+        self.assertEqual(session_id, "k8s-evt-1")
+        self.assertEqual(branch, session_kv_server._incident_branch("k8s-evt-1", dict(self.INCIDENT)))
+        self.assertIsInstance(cards_since, int)
+        self.assertTrue(wall_before + 1 <= cards_since <= math.floor(time.time()) + 1, (wall_before, cards_since))
+        self.assertIn("INCIDENT_START_HELD session=k8s-evt-1 until=card", logs)
+        self.assertAlmostEqual(self.clock.now - began, 2 * session_kv_server.INCIDENT_START_UNKNOWN_POLL_S)
+
+    def test_an_unanswered_chat_releases_the_branch_lock_once_the_hold_has_passed(self):
+        began = self.clock.now
+        own_card, logs = self._unanswered_chat_with_the_opt_in_on(lambda *turn: "", _http_error(502))
+        self.assertIn("INCIDENT_START_HELD session=k8s-evt-1 until=timeout held=300s", logs)
+        self.assertAlmostEqual(self.clock.now - began, session_kv_server.INCIDENT_START_UNKNOWN_HOLD_S)
+        self.assertGreater(own_card.call_count, 1)
 
     def test_a_busy_or_draining_gateway_is_retried_after_its_retry_after(self):
         urlopen, _ = self._run([_answered(), _http_error(503, retry_after=40), _answered()])
