@@ -306,7 +306,7 @@ class OneProfile(unittest.TestCase):
 class RemoveProfile(unittest.TestCase):
     """--remove-profile: a deleted profile's home leaves the sandbox too (#4389)."""
 
-    def drive(self, *extra, profiles=("platform", "cluster-a"), prepare=lambda root: None):
+    def drive(self, *extra, profiles=("platform", "cluster-a"), prepare=lambda root: None, answers=True):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = pathlib.Path(tmp.name)
@@ -324,7 +324,7 @@ class RemoveProfile(unittest.TestCase):
 
         patches = [
             unittest.mock.patch.object(sm, "remote", remote),
-            unittest.mock.patch.object(sm, "wait_for_sandbox", lambda *a, **k: True),
+            unittest.mock.patch.object(sm, "wait_for_sandbox", lambda *a, **k: answers),
             unittest.mock.patch.object(sm, "push_skeleton", lambda ssh, rr, homes: self.pushed.append(homes)),
             unittest.mock.patch.object(sm, "push_cluster_identities", lambda *a, **k: self.pushed.append("identities")),
             unittest.mock.patch.object(sm, "log", self.logged.append),
@@ -375,6 +375,13 @@ class RemoveProfile(unittest.TestCase):
                 code = self.drive("--skeleton-only", "--remove-profile", bad, profiles=("cluster-a",))
                 self.assertEqual(code, sm.EXIT_RETRY)
                 self.assertEqual(self.removals(), [])
+
+    def test_a_sandbox_that_never_answers_is_not_reported_as_removed(self):
+        # No later start redoes a removal: the full push only creates homes the agent
+        # side has. So the delete has to hear that nothing happened.
+        code = self.drive("--skeleton-only", "--remove-profile", "cluster-gone", answers=False)
+        self.assertEqual(code, sm.EXIT_RETRY)
+        self.assertEqual(self.removals(), [])
 
     def test_removal_is_its_own_mode(self):
         for extra in (("--remove-profile", "cluster-gone"),

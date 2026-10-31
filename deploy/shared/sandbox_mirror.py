@@ -26,7 +26,8 @@ them over once.
 **Removal.** ``--remove-profile NAME`` is the layout push's inverse, for a
 profile delete_profile has just removed from the agent pod (#4389): its home
 in the sandbox goes too, and the name is refused while anything of it is left
-on the agent side.
+on the agent side. Unlike the two steps below, no later start redoes a
+removal that missed the sandbox, so it exits non-zero instead.
 
 Neither step is fatal on its own. The sandbox is a separate pod with no ordering
 against this one, so "not up yet" is an ordinary outcome; both steps are
@@ -1149,7 +1150,10 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     if not wait_for_sandbox(ssh, time.monotonic() + args.wait):
-        return EXIT_OK
+        # A start that misses the sandbox is redone by the next start's full push. A
+        # removal is not: that push only creates homes the agent side still has, so
+        # the caller has to hear that nothing was removed.
+        return EXIT_RETRY if removing else EXIT_OK
 
     # The sandbox writes this at the root of its own volume on every start. Its
     # absence means --remote-root does not name that volume, and every write

@@ -438,9 +438,11 @@ def _profile_lock(name: str):
     """Hold this profile name's lock; yield whether it is held.
 
     The reconcile's own lock keeps two reconciles apart, but not a reconcile's
-    PRUNE from a `create` the model runs for the same cluster. A delete that
-    removed the sandbox home after such a create had pushed it would take the
-    kubeconfig the create then fetched into it. Blocking: a scaffold is bounded
+    PRUNE from a `create` or `delete` of the same name run some other way: by
+    hand in the agent pod, or by bench seeding (the model cannot run this script;
+    the sandbox carries a stub at its path). A delete that removed the sandbox
+    home after such a create had pushed it would take the kubeconfig the create
+    then fetched into it. Blocking: a scaffold is bounded
     by its own timeouts, and the other side waits it out rather than racing it.
     An unopenable lock yields False, and the caller decides what that forbids.
     """
