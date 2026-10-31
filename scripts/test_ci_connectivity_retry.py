@@ -252,7 +252,8 @@ class ConnectivityRetryTest(unittest.TestCase):
         self.assertGreater(int(match.group(1)), self._waits(gateway, floor), "the waits fit inside one turn at the defaults")
 
         # The knobs are env overrides; the deadline has to move with them.
-        overridden = {"NUM_RETRIES": 3, "RETRY_AFTER_SECONDS": 45}
+        # A pair the deploy's stale-bound guard accepts: (1 + 1) x 25s = 50s of hold.
+        overridden = {"NUM_RETRIES": 1, "RETRY_AFTER_SECONDS": 25}
         _, tmp = run_check(
             succeed_on=1,
             env_overrides={f"EVAL_LITELLM_{name}": str(value) for name, value in overridden.items()},
