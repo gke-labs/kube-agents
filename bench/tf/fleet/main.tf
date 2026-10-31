@@ -182,6 +182,8 @@ locals {
     "roles/artifactregistry.reader",
     "roles/cloudkms.viewer",
     "roles/storage.bucketViewer",
+    "roles/compute.networkViewer",
+    "roles/dns.reader",
   ]
   pool_state_reader_grants = {
     for pair in setproduct(var.pool_state_readers, local.pool_state_reader_roles) :

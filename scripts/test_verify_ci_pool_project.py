@@ -75,6 +75,11 @@ class DenialClassifierTest(unittest.TestCase):
         '"container.clusters.list" permission(s) for "projects/kube-agents-evals-6".',
         "ERROR: (gcloud.storage.buckets.describe) HTTPError 403: x@google.com does not have "
         "storage.buckets.get access to the Google Cloud Storage bucket.",
+        # The Compute API's form, as the pool scan saw it on every project after
+        # the forge pieces check landed (#4430): no status code, no "denied".
+        "ERROR: (gcloud.compute.addresses.describe) Could not fetch resource:\n"
+        " - Required 'compute.addresses.get' permission for "
+        "'projects/kube-agents-evals-6/regions/us-central1/addresses/forge-ghes'",
         "ERROR: (gcloud.projects.describe) User [x] does not have permission to access projects "
         "instance [y] (or it may not exist)",
         # Observed on 2026-08-27 against an existing SA in kube-agents-evals-6.

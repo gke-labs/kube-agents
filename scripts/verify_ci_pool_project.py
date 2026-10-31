@@ -850,6 +850,11 @@ POOL_STATE_READER_ROLES = {
     "roles/artifactregistry.reader",
     "roles/cloudkms.viewer",
     "roles/storage.bucketViewer",
+    # CHECK_FORGE_PIECES reads the forge addresses and firewall rules
+    # (networkViewer) and the private zone and its records (dns.reader);
+    # without them every forge piece scans as "not checked".
+    "roles/compute.networkViewer",
+    "roles/dns.reader",
 }
 
 # What a runner loses without the token-creator grant; the bot's loss is
@@ -1096,6 +1101,10 @@ _DENIAL_PATTERNS = (
     re.compile(r"denied on resource", re.I),
     re.compile(r"does not have (?:permission|\S+ access)", re.I),
     re.compile(r"permission\(s\) for", re.I),
+    # The Compute API's form through gcloud, with no status code: `Required
+    # 'compute.addresses.get' permission for 'projects/p/regions/r/addresses/a'`;
+    # without it a refused read of a forge address or firewall rule reads as missing.
+    re.compile(r"required ['\"][\w.]+['\"] permission for", re.I),
     re.compile(r"is required to perform this operation", re.I),
     re.compile(r"(?:httperror|error|code[=: ])\s*403\b", re.I),
     re.compile(r"403 forbidden", re.I),
