@@ -113,7 +113,7 @@ readonly GHES_READY_PATH="/api/v3/meta"
 readonly GITLAB_CE_IMAGE="gitlab/gitlab-ce:19.4.3-ce.0@sha256:483fb4cc5c75237a7a6c7c8b8b2a1832ed790d86e0449ff55e8b6f6d62d2d5f5"
 readonly GITLAB_CE_MACHINE_TYPE="e2-standard-4"
 readonly GITLAB_CE_BOOT_DISK="50GB"
-readonly GITLAB_CE_READY_TIMEOUT_SECONDS="${GITLAB_CE_READY_TIMEOUT_SECONDS:-1200}"
+readonly GITLAB_CE_READY_TIMEOUT_SECONDS="${GITLAB_CE_READY_TIMEOUT_SECONDS:-1800}"
 readonly GITLAB_CE_READY_PATH="/users/sign_in"
 readonly GITLAB_CE_BOT_LOGIN="kube-agents-eval-bot"
 readonly GITLAB_CE_BOT_EMAIL="eval-bot@eval.internal"
@@ -465,14 +465,20 @@ done
 # and a project created in between fails with "connections to all backends
 # failing". GitLab's own readiness with all=1 pings every storage and answers
 # 503 until each does; it answers only loopback callers, hence from inside the
-# container, where the private CA is not mounted (-k on a loopback probe that
-# carries nothing).
-for i in $(seq 1 240); do
-  code=$(docker exec gitlab curl -sk --resolve "${HOST}:443:127.0.0.1" --max-time 5 -o /dev/null -w '%{http_code}' "https://${HOST}/-/readiness?all=1" 2>/dev/null)
+# container with the curl the image carries (omnibus embeds its own), where the
+# private CA is not mounted (-k on a loopback probe that carries nothing). The
+# probe's code and body go to the serial console once a minute, so a gate that
+# never opens says why there; the gate is bounded inside the runner's ceiling.
+CCURL=$(docker exec gitlab sh -c 'for c in curl /opt/gitlab/embedded/bin/curl; do command -v "$c" && exit 0; done; exit 1' 2>/dev/null)
+[ -n "$CCURL" ] || { echo "FORGE failed no-curl-in-container"; exit 1; }
+probe() { docker exec gitlab "$CCURL" -sk --resolve "${HOST}:443:127.0.0.1" --max-time 5 "$@" "https://${HOST}/-/readiness?all=1" 2>/dev/null; }
+for i in $(seq 1 120); do
+  code=$(probe -o /dev/null -w '%{http_code}')
   [ "$code" = "200" ] && { mark gitaly-ready; break; }
+  [ $(( i % 12 )) -eq 1 ] && echo "FORGE gitaly-wait code=${code:-none} t=$(( $(date +%s) - T0 ))s $(probe | head -c 300)"
   sleep 5
 done
-[ "${code:-}" = "200" ] || { echo "FORGE failed never-gitaly-ready code=${code:-none}"; docker exec gitlab curl -sk --resolve "${HOST}:443:127.0.0.1" --max-time 5 "https://${HOST}/-/readiness?all=1" 2>/dev/null | head -c 600; echo; exit 1; }
+[ "${code:-}" = "200" ] || { echo "FORGE failed never-gitaly-ready code=${code:-none} $(probe | head -c 600)"; exit 1; }
 if [ ! -e /var/gitlab/private/seeded ]; then
   # One rails call as root makes what only rails can: the bot (a Developer,
   # as on gitlab.com), its two tokens and root's own token set to the values
