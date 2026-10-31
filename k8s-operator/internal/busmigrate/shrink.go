@@ -140,3 +140,26 @@ func updateStream(ctx context.Context, nc *nats.Conn, name string, cfg nats.Stre
 	}
 	return request(ctx, nc, fmt.Sprintf(streamUpdateSubject, name), body, nil)
 }
+
+// UnpinFromServer undoes PinToServer for a three-to-one run that failed
+// before the bus shrank: every named stream left at R1 goes back to replicas
+// through an update that changes only the count, so the cluster does not keep
+// running streams with one copy. A stream already at replicas is left as it
+// is.
+func UnpinFromServer(ctx context.Context, nc *nats.Conn, streams []string, replicas int) error {
+	for _, name := range streams {
+		info, err := streamInfo(ctx, nc, name)
+		if err != nil {
+			return fmt.Errorf("stream %s: %w", name, err)
+		}
+		if info.Config.Replicas == replicas {
+			continue
+		}
+		cfg := info.Config
+		cfg.Replicas = replicas
+		if err := updateStream(ctx, nc, name, cfg); err != nil {
+			return fmt.Errorf("stream %s: %w", name, err)
+		}
+	}
+	return nil
+}

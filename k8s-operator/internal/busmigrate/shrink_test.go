@@ -181,3 +181,37 @@ func TestThreeToOneKeepsTheBus(t *testing.T) {
 		t.Errorf("cap/k on server 0 alone: %v, err %v; want 3 at revision 3", e, err)
 	}
 }
+
+// A three-to-one run that fails before the bus shrinks is undone: streams the
+// run pinned to R1 go back to R3 with three peers, the data intact.
+func TestAFailedThreeToOneRunIsUndone(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	s0 := startServer(t, "a2a-nats-0", filepath.Join(base, "0"), 16251)
+	s1 := startServer(t, "a2a-nats-1", filepath.Join(base, "1"), 16252)
+	s2 := startServer(t, "a2a-nats-2", filepath.Join(base, "2"), 16253)
+	defer shutdown(s2, s1, s0)
+	seedBus(t, s0.ClientURL(), 3)
+	nc, err := nats.Connect(s1.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	// The run got as far as pinning TASKS, then failed.
+	if err := PinToServer(ctx, nc, "a2a-nats-0", []string{"TASKS"}, 500*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := UnpinFromServer(ctx, nc, []string{"TASKS", "KV_cap"}, 3); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; ; i++ {
+		info, err := streamInfo(ctx, nc, "TASKS")
+		if err == nil && info.Config.Replicas == 3 && info.Cluster != nil && len(info.Cluster.Replicas) == 2 && info.State.Msgs == 5 {
+			break
+		}
+		if i > 30 {
+			t.Fatalf("TASKS after the undo: %+v, err %v; want R3 with two followers and 5 msgs", info, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
