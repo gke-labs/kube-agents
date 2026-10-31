@@ -657,7 +657,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 
 ##### 2. Slack Configuration (`SLACK_ENABLED=true`)
 
-[Slack app setup](docs/site/src/content/docs/install/slack-app.md) covers creating the app, its tokens, the allowlist and how to verify, for both `spec.mode` values. Under `spec.mode: next`, unless Google Chat is also enabled (Google Chat then holds the A2A gateway and Slack stays on the Hermes listener, so the steps below apply), the A2A gateway holds Slack and needs a different app manifest from the one below; follow that page instead of steps 1, 3, 4 and 5 here, and skip step 2's home-channel bullet: under `next` the home channel is only `SLACK_HOME_CHANNEL`, a channel ID, and that page's home-channel section says how to set it.
+[Slack app setup](docs/site/src/content/docs/install/slack-app.md) covers creating the app, its tokens, the allowlist and how to verify, for both `spec.mode` values. Under `spec.mode: next`, unless Google Chat is also enabled (Google Chat then holds the A2A gateway and Slack stays on the Hermes listener, so the steps below apply), the A2A gateway holds Slack and needs a different app manifest from the one below; follow that page instead of steps 1, 3, 4 and 5 here, and skip step 2's home-channel bullet: under `next` the home channel is `SLACK_HOME_CHANNEL`, a channel ID, or, under `homeChannelPolicy` auto (the default), the channel of the first top-level mention of the agent; that page's home-channel section says how to set it.
 
 1. **Verify Slack App Settings**:
    - Ensure **Socket Mode** is enabled in your Slack App console.
@@ -680,9 +680,9 @@ If you enabled Google Chat or Slack during the install, perform the following re
      kubectl exec deploy/platform-agent-gateway -n kubeagents-system -- hermes slack manifest
      ```
    - Paste the JSON into the Slack App Console (**Features → App Manifest → Edit**), save, and reinstall when Slack prompts. That manifest replaces the whole app definition, its "Hermes" name included — to keep an app you have already configured, add `--slashes-only` and merge the printed array into the existing `features.slash_commands`.
-   - This adds Slack's autocomplete, not the behaviour: a typed `/hermes <subcommand>` works either way, because the Planning Agent's `legacy_slash_commands` plugin unwraps it before the gateway resolves the command.
+   - This adds Slack's autocomplete, not the behaviour: a typed `/hermes <subcommand>` works either way (except `sethome` under `next` with Slack on the gateway, which the agent answers with a pointer to the Home tab), because the Planning Agent's `legacy_slash_commands` plugin unwraps it before the gateway resolves the command.
 5. **Set or Move the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
-   - If step 2's message was the install's first chat message, it set the home channel to the channel or DM it came from. If Google Chat received the first message instead, Slack has none, and scheduled audits have nowhere to post on Slack. Either way, run `/sethome` (or `/hermes sethome`) from the Slack channel you want. It takes effect immediately and persists across restarts.
+   - If step 2's message was the install's first chat message, it set the home channel to the channel or DM it came from. If Google Chat received the first message instead, Slack has none, and scheduled audits have nowhere to post on Slack. Either way, run `/sethome` (or `/hermes sethome`) from the Slack channel you want. It takes effect immediately and persists across restarts. Under `spec.mode: next` with Slack on the gateway, neither command sets it: pick the channel on the app's Home tab instead.
 
 - Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next` and Google Chat is off, it prints the A2A gateway's checklist from the [Slack app setup](docs/site/src/content/docs/install/slack-app.md) page instead. As for Google Chat, this script takes the mode from `install.env` alone, while the checklist `install.sh` prints after an apply follows the mode it expects after it:
   ```bash

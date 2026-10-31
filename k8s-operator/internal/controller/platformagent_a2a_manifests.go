@@ -4297,8 +4297,9 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 			},
 			// The home-channel record, one named ConfigMap: the gateway's
 			// learn (a2a/gateway/slack_home_channel.go) reads and patches it,
-			// once an A2A_HOME_CHANNEL_LEARN this operator does not yet render
-			// arms it (platformagent_home_channel_record.go).
+			// and the operator reads it into the projected file both pods
+			// mount and the HomeChannelUnset condition
+			// (platformagent_home_channel_record.go).
 			{
 				APIGroups:     []string{""},
 				Resources:     []string{"configmaps"},
@@ -4843,22 +4844,32 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if slack.AnswerFeedback != nil && !*slack.AnswerFeedback {
 			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
 		}
-		// The learned-home contract (platformagent_home_channel_record.go),
-		// for a gateway that learns a home channel from the first admitted
-		// mention: whether it may, the record it would write, and its own
-		// image for the record's writer and reader keys. The gateway reads
-		// them, and learns only once A2A_HOME_CHANNEL_LEARN is rendered true,
-		// which this release does not. The gateway's home env above stays the
-		// CR's: a learned value reaches the gateway through the record, not a
-		// re-render.
+		// The learned-home contract (platformagent_home_channel_record.go):
+		// whether the gateway may learn a home channel from the first
+		// admitted mention, the record it writes, its own image for the
+		// record's writer key, and the switch that arms the learn. The
+		// operator reads the record into the projected file both pods mount
+		// and the HomeChannelUnset condition. The gateway's home env above
+		// stays the CR's: a learned value reaches the gateway through the
+		// file, not a re-render.
 		backendEnv = append(backendEnv,
 			corev1.EnvVar{Name: a2aSlackHomePolicyEnvVar, Value: slackHomeChannelPolicy(agent)},
 			corev1.EnvVar{Name: a2aHomeChannelRecordEnvVar, Value: a2aHomeChannelRecordName(agent)},
 			corev1.EnvVar{Name: a2aGatewaySelfImageEnvVar, Value: a2aGatewayImage()},
+			corev1.EnvVar{Name: a2aHomeChannelLearnEnvVar, Value: a2aHomeChannelLearnEnvValue},
 		)
 	}
 	var chatEnv []corev1.EnvVar
 	var chatMounts []corev1.VolumeMount
+	// The home-channel projection, read by the notify route and the learner
+	// (a2a/gateway/slack_home_channel.go), on a Slack gateway only: a Chat
+	// gateway's home is the CR's, and its template stays as it was.
+	var homeVolumes []corev1.Volume
+	var homeMounts []corev1.VolumeMount
+	if a2aSlackArmed(agent) {
+		homeVolumes = []corev1.Volume{homeChannelProjectionVolume(agent)}
+		homeMounts = []corev1.VolumeMount{homeChannelProjectionMount(a2aGatewayChatHomeDir)}
+	}
 	var chatVolumes []corev1.Volume
 	if a2aChatArmed(agent) {
 		gchat := agent.Spec.Integration.GoogleChat
@@ -5077,10 +5088,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						}),
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
-						}, a2aNATSCABundleMount()}, chatMounts...), injectMounts...),
+						}, a2aNATSCABundleMount()}, append(chatMounts, homeMounts...)...), injectMounts...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent)}, chatVolumes...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent)}, append(chatVolumes, homeVolumes...)...), injectVolumes...),
 				},
 			},
 		},
@@ -5097,6 +5108,12 @@ type a2aProvisionState struct {
 	done    bool
 	failed  bool
 	message string
+
+	// homeRecord is the home-channel record the reconcile read once
+	// (platformagent_home_channel_record.go), carried to the projection and
+	// the status writers so the file and the HomeChannelUnset condition
+	// follow one read; the zero value is no record.
+	homeRecord homeChannelRecord
 
 	// AuthMapVersion is the identity-map version this reconcile rendered.
 	// BusCredentialsReady is the callout confirming it is serving this
@@ -5252,17 +5269,20 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 // refused, say by an admission policy scoped there) is logged and doesn't
 // stop the stack, the status writes or the requeue terms: the namespace is
 // optional (agentprofile_namespace.go, profileNamespaceFailure).
-func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (a2aProvisionState, error) {
+// homeRec is the home-channel record the reconcile read this pass: the
+// projection written with the gateway's identity carries it, and it travels
+// on the state to every status writer after the render.
+func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent, homeRec homeChannelRecord) (a2aProvisionState, error) {
 	var profileErr error
-	state, err := r.reconcileA2AStack(ctx, agent, &profileErr)
+	state, err := r.reconcileA2AStack(ctx, agent, &profileErr, homeRec)
 	if profileErr != nil {
 		r.profileNamespaceFailure(ctx, agent, "render", profileErr)
 	}
 	return state, err
 }
 
-func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profileErr *error) (a2aProvisionState, error) {
-	state := a2aProvisionState{}
+func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profileErr *error, homeRec homeChannelRecord) (a2aProvisionState, error) {
+	state := a2aProvisionState{homeRecord: homeRec}
 
 	creds, err := r.ensureA2ACredsSecret(ctx, agent)
 	if err != nil {
@@ -5620,14 +5640,17 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 
 	// Identity before workload: the gateway pod must not start before the
 	// ServiceAccount its pod spec names exists.
-	// The home-channel record rides with them: the Role above names it, and
-	// the teardown list, which every rendered pass must cover, lists it
-	// whatever chat backend the stack holds (platformagent_home_channel_record.go).
+	// The home-channel record and its projection ride with them: the Role
+	// above names the record, and the teardown list, which every rendered
+	// pass must cover, lists both whatever chat backend the stack holds
+	// (platformagent_home_channel_record.go). The projection carries this
+	// pass's read of the record, so the file and the condition agree.
 	for _, obj := range []client.Object{
 		buildA2AGatewayServiceAccount(agent),
 		buildA2AGatewayRole(agent),
 		buildA2AGatewayRoleBinding(agent),
 		buildHomeChannelRecord(agent),
+		buildHomeChannelProjection(agent, state.homeRecord),
 	} {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return state, err
@@ -6183,6 +6206,7 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelProjectionName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The inject door's four, listed whatever the flag says: a flip to
 		// today has to clean up after an operator that WAS deployed with the
 		// flag, and the reads are cheap (three are Owns() kinds) and find

@@ -83,7 +83,7 @@ func TestA2AProvisionJobNameIsDeterministic(t *testing.T) {
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent) // the Job's creation waits on it
 	for i := 0; i < 3; i++ {
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatalf("reconcileA2A %d: %v", i+1, err)
 		}
 	}
@@ -185,7 +185,7 @@ func TestReconcileA2ACreatesANewProvisionJobWhenThePodSpecChanges(t *testing.T) 
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent) // the Job's creation waits on it
 
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A with the default image: %v", err)
 	}
 	jobs := &batchv1.JobList{}
@@ -215,7 +215,7 @@ func TestReconcileA2ACreatesANewProvisionJobWhenThePodSpecChanges(t *testing.T) 
 
 	const pinned = "example.com/nats-box:pinned"
 	t.Setenv(a2aProvisionImageEnvVar, pinned)
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatalf("reconcileA2A with the image override: %v", err)
 	}

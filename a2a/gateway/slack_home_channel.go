@@ -70,7 +70,7 @@ const (
 
 	// homeLearnedLine is the one line posted in the learning thread. It names
 	// the channel and the field that overrides it, never the member.
-	homeLearnedLine = "<#%s> is now the home channel for alerts and scheduled reports. To move it, set spec.integration.slack.homeChannel on the PlatformAgent."
+	homeLearnedLine = "<#%s> is now the home channel for alerts and scheduled reports. To move it, pick another channel on the app's Home tab, or set spec.integration.slack.homeChannel on the PlatformAgent."
 )
 
 // homeFile reads the operator's projection: the trimmed file, and whether it
@@ -127,6 +127,10 @@ type slackHomeLearn struct {
 	// wg counts the learn goroutines, so Run waits for a write in flight
 	// before the gateway exits.
 	wg sync.WaitGroup
+	// followUp is how long a Home tab move waits for the projected file to
+	// follow before it says the operator has not applied it
+	// (slack_home_pick.go); tests shorten it.
+	followUp time.Duration
 }
 
 // SetHomeLearner hands the adapter what a learn needs: the record, the image
@@ -136,6 +140,7 @@ func (s *SlackAdapter) SetHomeLearner(client kubernetes.Interface, namespace, na
 	s.homeLearn.record = homeRecord{client: client, namespace: namespace, name: name}
 	s.homeLearn.image = image
 	s.homeLearn.file = homeFile{dir: fileDir}
+	s.homeLearn.followUp = slackHomePickPendingTTL
 }
 
 // LearnedHome is the home channel the operator's projection names, and
@@ -272,6 +277,10 @@ func (s *SlackAdapter) checkHomeChannel(ctx context.Context, id string) (refused
 		return "", err
 	}
 	switch {
+	case info.IsIM || info.IsMpIM:
+		// A direct or group direct message: a Home tab pick carries no
+		// channel_type, so the answer itself says what the id is.
+		return homeRefusedMalformed, nil
 	case info.IsExtShared || info.IsPendingExtShared:
 		return homeRefusedShared, nil
 	case info.IsArchived:

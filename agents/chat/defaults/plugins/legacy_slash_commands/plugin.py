@@ -48,6 +48,22 @@ _DISABLED_UNDO_TEXT = "undo"
 # runs the gateway on the chat profile, whose SOUL.md carries the answer.
 _GATEWAY_PROFILE_ENV = "HERMES_GATEWAY_PROFILE"
 _FRONT_DOOR_PROFILE = "platform"
+# Under spec.mode next the A2A gateway holds the chat backend and the home
+# channel lives in the record the operator projects, so Hermes' own
+# ``/sethome`` would write a file nothing reads and answer that the home is
+# set. The operator renders this variable exactly then (chat_notify.py); with
+# it set to ``slack``, ``sethome`` is handed to the agent as a question instead;
+# with Google Chat on the gateway, Slack stays on this listener and its
+# ``/sethome`` still applies.
+_GATEWAY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+_GATEWAY_SLACK = "slack"
+_SETHOME_SUBCOMMAND = "sethome"
+# The question handed to the agent in that case: it carries its own answer,
+# since no persona or skill text names the Home tab.
+_SETHOME_NEXT_QUESTION = (
+    "How do I move the home channel? It moves from the app's Home tab, the Home channel panel; "
+    "the /sethome command no longer sets it."
+)
 
 
 def _subcommand_map() -> Dict[str, str]:
@@ -104,6 +120,10 @@ def rewrite_legacy_hermes_command(text: str) -> Optional[str]:
     if target is None:
         # Not a command at all — treat it as the question the user asked.
         return rest
+    if first_word == _SETHOME_SUBCOMMAND and os.environ.get(_GATEWAY_CONVERSATIONS_ENV, "").strip() == _GATEWAY_SLACK:
+        # The gateway holds the home channel; the agent is handed a question
+        # that names where to move it, rather than Hermes claiming it is set.
+        return _SETHOME_NEXT_QUESTION
 
     return f"{target} {args}".strip()
 

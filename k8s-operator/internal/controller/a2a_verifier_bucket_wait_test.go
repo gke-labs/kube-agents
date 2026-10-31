@@ -262,7 +262,7 @@ func TestAVerifierCrashLoopDuringAProvisionJobReRunIsAFault(t *testing.T) {
 	// does to the Job: a new one is rendered and this pass does not see it
 	// complete.
 	t.Setenv(a2aProvisionImageEnvVar, "example.com/nats-box:rerender")
-	state, err := r.reconcileA2A(ctx, stored)
+	state, err := r.reconcileA2A(ctx, stored, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func TestAVerifierCrashLoopOnAFreshInstallStillReadsProvisioning(t *testing.T) {
 		t.Fatalf("create the verifier pod: %v", err)
 	}
 
-	state, err := r.reconcileA2A(ctx, stored)
+	state, err := r.reconcileA2A(ctx, stored, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +370,7 @@ func TestTheFirstPassThatSeesTheJobCompleteAlreadyTreatsACrashLoopAsAFault(t *te
 		t.Fatalf("create the verifier pod: %v", err)
 	}
 
-	state, err := r.reconcileA2A(ctx, stored)
+	state, err := r.reconcileA2A(ctx, stored, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1520,9 +1520,10 @@ platformAgent:
       # each rating keeps its question and answer (a 👎 its note too) on the install for the feedback bucket's max age (30 days as provisioned).
       # false hides the buttons and keeps nothing.
       answerFeedback: true
-      # "auto" (also empty) or "manual". Accepted and recorded in this release
-      # but with no effect yet: the A2A gateway does not learn a home channel,
-      # so homeChannel alone decides.
+      # "auto" (also empty) or "manual". Under spec.mode next with homeChannel
+      # empty, "auto" lets the A2A gateway make the channel of the first
+      # top-level mention of the agent the home channel; "manual" leaves
+      # homeChannel alone to decide. A set homeChannel wins under either.
       homeChannelPolicy: ""
     teams:
       # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.

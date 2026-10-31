@@ -1165,9 +1165,8 @@ not be silent about it.
   whole budget (`input-required`, say), infrastructure (an executor took it and did not run it);
   `working` at the budget, a graded timeout; and an active
   record whose stream already folds to a terminal, which is the relay's lost record write (the
-  relay acks a terminal once it has rendered it, whether or not the record write after it
-  succeeded, because the posts are out and a redelivery would make them again, and on a key
-  never reused no heal arrives) - graded like a finished run from the fold's result text when the
+  relay acks a terminal before it clears `ActiveTask` and writes the record, and on a key never
+  reused no heal arrives) - graded like a finished run from the fold's result text when the
   terminal is the executor's, infrastructure when it is the supervisor's (an executor that died
   or never ran), and never cancelled. The budget is the harness's own
   (`AGENT_INJECT_TIMEOUT`, 1800 s by default), floored at the grace plus a margin and refused
@@ -1591,13 +1590,20 @@ one platform is ever routed.
 `<agent>-home-channel` with no data, applied beside the gateway Role and torn down with the stack.
 The gateway Role reaches that one name with `get` and `patch`. `spec.integration.slack.homeChannelPolicy`
 (`auto`, also absent, or `manual`) is rendered to the gateway as `A2A_SLACK_HOME_POLICY`, with the
-record's name as `A2A_HOME_CHANNEL_RECORD` and the gateway's own image as `A2A_SELF_IMAGE`. In this
-release the agent's env and the `HomeChannelUnset` condition follow `homeChannel` alone. The change
-that makes the operator render the agent's `SLACK_HOME_CHANNEL` and `A2A_NOTIFY_PLATFORM` from "the
-CR, else the record" and the switch that arms the gateway's learn ship as one, so no release holds a
-signal nothing answers. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
-switch, `A2A_HOME_CHANNEL_LEARN=true`, which only the operator change that admits the record renders;
-that change merges after the gateway code, never before it. The gateway keeps no copy of the home
+record's name as `A2A_HOME_CHANNEL_RECORD`, the gateway's own image as `A2A_SELF_IMAGE` and the switch
+that arms the gateway's learn, `A2A_HOME_CHANNEL_LEARN=true`, whenever Slack is on the gateway. The
+operator reads the record once per reconcile and projects the home channel it stands behind, "the CR,
+else the admitted record", into a second ConfigMap it owns, `<agent>-chat-home`, one key `slack_home`
+always present, mounted as a read-only directory (Optional, no subPath, out of every pod-template hash)
+in the agent pod at `/etc/kube-agents/chat-home` and in the gateway pod at `/etc/a2a/chat-home`; the
+kubelet refreshes the file in place within about a minute, so a learned channel reaches both pods with
+no pod replaced and no copy to drift, and the `HomeChannelUnset` condition comes from the same read.
+The agent's env carries the CR field only, as any CR edit does. The operator admits a recorded channel
+only under policy `auto`, when the value is a channel id of at most 32 runes and no `slack.refused`
+stands beside it; a hand edit of the record carries the trust of the CR field, and the gateway checks
+neither before a post. The projection joins the stack's teardown list, and a hand edit of it is
+rewritten on the next pass. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
+switch, `A2A_HOME_CHANNEL_LEARN=true`. The gateway keeps no copy of the home
 channel. It reads one file, `/etc/a2a/chat-home/slack_home`: the projection of the home channel the
 operator admits (the CR field, else the record), which the operator change that admits the record
 mounts as a directory in the gateway pod; the notify route reads that file once per request, in
@@ -1626,7 +1632,12 @@ or an older gateway's, and a learn that adopts or replaces the channel clears it
 mention may learn; a record another writer filled first, or the record of a learn the file has not
 caught up with, is adopted after the same check with no line posted, or replaced when that check
 refuses it; a group direct message is refused without a call and a direct message is never a
-candidate. The hand-reachable state, `kubectl set env` of the switch on the gateway Deployment, learns
+candidate. The second writer is the Home tab's channel picker (`a2a/gateway/slack_home_pick.go`): a
+`conversations_select` on the admitted Home view, deduped on the member and `action_ts`, admitted by
+`homeAdmitted` after the other-workspace check, checked as a mention is, then one merge patch under the
+read `resourceVersion` with no retry (`moveHome`; a 409 names the winner); the member's view shows the
+move over the projected file for at most two minutes, one line in the new channel names who moved it
+and one in the old says it moved. The hand-reachable state, `kubectl set env` of the switch on the gateway Deployment, learns
 nothing without the operator's projection. `patch` on the object is the RBAC bound; data-only merge
 patches with the read `resourceVersion` as the precondition are the gateway's contract.
 
@@ -2217,7 +2228,8 @@ of changes: a card's plan moving or a mark changing reads the board again, a que
 answered recomputes who is waiting and reads the board only once the snapshot has aged out. At
 most 50 members are republished to. Admission is the inbound allowlist (`slackPrincipal`) and,
 when allow-all is what admits the member, their `users.info` team being the bot's (a failed lookup publishes nothing; a republish goes only to members admitted when they opened the tab and looks nothing up again); anyone else gets one line and no read of the board.
-A board that cannot be read draws Fleet with a line saying so, never an empty fleet.
+A board that cannot be read draws Fleet with a line saying so, never an empty fleet. Under the dashboard, the Home channel panel names where alerts and reports post and carries the picker
+that moves it (`slack_home_pick.go`; the record paragraph above says what a pick writes).
 
 **The board-health card's buttons.** The `kanban-board-health` job's stuck tasks reach Slack as a
 chat message whose rows carry the cards each stands for (`tasks`) and the buttons to draw under it
