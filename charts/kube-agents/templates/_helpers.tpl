@@ -2474,13 +2474,13 @@ The defaults carry no ephemeral-storage request because the operator renders non
          holds the two equal) and rolls it Recreate at one replica, so it is counted once at
          the console's figures and sizes no surge. An entry the chart cannot read -- a
          valueFrom, a non-string value -- counts as on; a literal value other than "true",
-         or none, is what the operator reads as off, and leaves it out. */ -}}
+         or none or null, is what the operator reads as off, and leaves it out. */ -}}
   {{- if $next -}}
     {{- $mcpDoor := false -}}
     {{- range $e := (.Values.operator.extraEnv | default list) -}}
       {{- if eq (toString (index ($e | default dict) "name")) "A2A_MCP_DOOR" -}}
         {{- $v := index $e "value" -}}
-        {{- $mcpDoor = or (hasKey $e "valueFrom") (and (hasKey $e "value") (not (kindIs "string" $v))) (eq (toString $v) "true") -}}
+        {{- $mcpDoor = or (hasKey $e "valueFrom") (and (hasKey $e "value") (not (kindIs "string" $v)) (not (kindIs "invalid" $v))) (eq (toString $v) "true") -}}
       {{- end -}}
     {{- end -}}
     {{- if $mcpDoor -}}

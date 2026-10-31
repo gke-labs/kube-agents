@@ -799,6 +799,7 @@ class PreflightDecisionTest(unittest.TestCase):
             ("false", [{"name": "A2A_MCP_DOOR", "value": "false"}]),
             ("TRUE, which the operator does not take", [{"name": "A2A_MCP_DOOR", "value": "TRUE"}]),
             ("no value", [{"name": "A2A_MCP_DOOR"}]),
+            ("a null value", [{"name": "A2A_MCP_DOOR", "value": None}]),
             ("last of two", [{"name": "A2A_MCP_DOOR", "value": "true"},
                              {"name": "A2A_MCP_DOOR", "value": "false"}]),
         ):
