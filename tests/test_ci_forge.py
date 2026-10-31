@@ -433,8 +433,11 @@ class ForgeScriptTest(unittest.TestCase):
         for marker in ("gitlab-rails runner", "Users::CreateService", "set_token", '"agent" => ["api", "write_repository"]', '"ledger" => ["api"]',
                        "Groups::CreateService.new(admin", "organization_id: org.id", 'root-token', '"$API/projects"', "initialize_with_readme=true",
                        "access_level=30", "repository/files/", "content@/var/gitlab/seed/content",
-                       "gitlab_signup_enabled']=false", "/users/sign_in", 'chown -R "${GIT_UID}:${GIT_UID}" /var/gitlab/private'):
+                       "gitlab_signup_enabled']=false", "/users/sign_in", "/-/readiness?all=1", 'chown -R "${GIT_UID}:${GIT_UID}" /var/gitlab/private'):
             self.assertIn(marker, startup)
+        # Gitaly's readiness gates the seeding: the sign-in page answers before the storage does.
+        self.assertLess(startup.index("mark gitlab-ready"), startup.index("mark gitaly-ready"))
+        self.assertLess(startup.index("mark gitaly-ready"), startup.index('"$API/projects"'))
         self.assertNotIn("python3", startup, "Container-Optimized OS has no python")
         self.assertNotIn("agent-header", startup, "the bot's token is never used on the VM; root's own token seeds")
         self.assertLess(startup.index("mark seeded"), startup.index("mark ready"), "ready is printed only once the project and the file exist")

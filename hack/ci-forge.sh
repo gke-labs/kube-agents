@@ -411,7 +411,8 @@ EOF
 # The GitLab CE VM's startup script (Container-Optimized OS). Certificates,
 # tokens and names come from instance metadata; GitLab runs on 443 as the
 # published host with the private certificate; readiness is the sign-in page
-# through the loopback with the CA; the first boot then makes the bot, sets
+# through the loopback with the CA, then GitLab's own readiness with every
+# storage pinged; the first boot then makes the bot, sets
 # its two tokens to the values given (one rails call), and creates the group
 # and the project through the API, and marks the disk so a reboot skips that.
 # `FORGE ready` is printed only once the project exists.
@@ -460,6 +461,18 @@ for i in $(seq 1 240); do
   sleep 5
 done
 [ "${code:-}" = "200" ] || { echo "FORGE failed never-ready code=${code:-none}"; docker logs gitlab 2>&1 | tail -5; exit 1; }
+# The sign-in page answers before Gitaly, the git storage, accepts connections,
+# and a project created in between fails with "connections to all backends
+# failing". GitLab's own readiness with all=1 pings every storage and answers
+# 503 until each does; it answers only loopback callers, hence from inside the
+# container, where the private CA is not mounted (-k on a loopback probe that
+# carries nothing).
+for i in $(seq 1 240); do
+  code=$(docker exec gitlab curl -sk --resolve "${HOST}:443:127.0.0.1" --max-time 5 -o /dev/null -w '%{http_code}' "https://${HOST}/-/readiness?all=1" 2>/dev/null)
+  [ "$code" = "200" ] && { mark gitaly-ready; break; }
+  sleep 5
+done
+[ "${code:-}" = "200" ] || { echo "FORGE failed never-gitaly-ready code=${code:-none}"; docker exec gitlab curl -sk --resolve "${HOST}:443:127.0.0.1" --max-time 5 "https://${HOST}/-/readiness?all=1" 2>/dev/null | head -c 600; echo; exit 1; }
 if [ ! -e /var/gitlab/private/seeded ]; then
   # One rails call as root makes what only rails can: the bot (a Developer,
   # as on gitlab.com), its two tokens and root's own token set to the values
