@@ -450,6 +450,7 @@ has nobody to retry it, so a transient burst of upstream 503s ends the run. A 42
 waits out the delay Google states in the error body (up to 600 s) rather than a few seconds, so a
 burst shorter than that window is survived; see
 [`deploy/docker/patches/rate_limit_retry_delay.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/rate_limit_retry_delay.py).
+
 A 429 that states no delay at all, as a shared-quota 429 does, waits a jittered 30 to 60 s per
 retry instead, so the three retries outlast a quota minute; the retry count does not change. See
 [`deploy/docker/patches/rate_limit_backoff_floor.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/rate_limit_backoff_floor.py).
