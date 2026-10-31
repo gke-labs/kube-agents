@@ -24,6 +24,21 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+// The detached-leftover stub in TestAReusedPodAsInitKillsWhatLeftTheGroup
+// answers only once its perl has left the harness's process group, since
+// the group kill that follows the answer would otherwise reach a perl that
+// has not called setsid yet. detachPollInterval is how often the stub looks
+// for the marker perl writes after setsid returns; detachWaitBound caps that
+// wait, so a perl that never detaches fails the test instead of hanging it.
+// detachedLeftoverLifetime is how long the leftover sleeps once detached;
+// it has to outlast waitDeadline, or the leftover dies on its own and the
+// pid1=false case reads that as the group kill reaching it.
+const (
+	detachPollInterval       = 50 * time.Millisecond
+	detachWaitBound          = 10 * time.Second
+	detachedLeftoverLifetime = 300 * time.Second
+)
+
 // recordingStub is a harness that writes, per run, its argv and the opening
 // stdin line into dir (argv.<n>, prompt.<n>), reports session id
 // sess-<n> at init unless the file noinit.<n> exists, and answers
@@ -579,11 +594,16 @@ func TestAReusedPodAsInitKillsWhatLeftTheGroup(t *testing.T) {
 			c := testClient(t, url)
 			const session = "chat-ferret-s3d4"
 			dir := t.TempDir()
-			// setsid first, as the Bash tool's detached spawn does, then
-			// let the stub record the pid once the setsid has landed.
-			harness := recordingStub(t, dir, `/usr/bin/env perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "300"' >/dev/null 2>&1 &
+			// setsid first, as the Bash tool's detached spawn does. perl
+			// writes sid.<n> once setsid has returned, and the stub answers
+			// only after that marker holds something: a fixed pause here
+			// let a slow runner's group kill reach a perl still in the
+			// group, which made the leftover die for the wrong reason.
+			harness := recordingStub(t, dir, fmt.Sprintf(`SID_MARK="$dir/sid.$n" /usr/bin/env perl -MPOSIX -e 'POSIX::setsid(); open(my $f, ">", $ENV{SID_MARK}) or die; print $f $$; close($f); exec "sleep", "%d"' >/dev/null 2>&1 &
 echo $! > "$dir/bg.$n"
-sleep 0.5`)
+i=0
+while [ ! -s "$dir/sid.$n" ] && [ "$i" -lt %d ]; do sleep %g; i=$((i+1)); done`,
+				int(detachedLeftoverLifetime.Seconds()), int(detachWaitBound/detachPollInterval), detachPollInterval.Seconds()))
 			var killed, reapedAll atomic.Int32
 			pidOf := func() int {
 				var pid int
@@ -608,6 +628,13 @@ sleep 0.5`)
 			defer cancel()
 			done := runAdapter(ctx, reuseConfig(url, "task-s-1", session, harness))
 			waitState(t, c, session, "task-s-1", lib.StateCompleted)
+			// The stub answers after the marker holds something or its
+			// bound runs out, so by now the marker is final: an empty one
+			// is the stub failing to detach its leftover, not the group
+			// kill reaching a detached one.
+			if readRunIfAny(dir, "sid", 1) == "" {
+				t.Fatal("the stub answered without its leftover detaching; sid.1 is empty")
+			}
 			pid := pidOf()
 			if pid <= 0 {
 				t.Fatal("no background pid recorded")
