@@ -253,16 +253,16 @@ each file into the workspace at its repo-relative path, which is exactly where a
 that file has to end up; fetch it, edit it in place, and name the same path in the finding.
 
 The collectors do not need them. Handed the scratch workspace as `--workspace`, `collect.py` and
-`fleet_waste.py` copy the repository's YAML out of the broker into a private directory and index that,
-so candidates carry `declaration` and `release_declaration` (and, from `collect.py` alone,
-`namespace_directory`) in content mode as they do from a clone. When a collector cannot read the
-tree it logs a `WARNING` naming why and attaches none of those fields. Each file the broker will not
-send (over its size limit, or a symlink) costs less: no `declaration` or `namespace_directory` on a
-cluster whose `clusters/<name>/` tree holds it, and no `release_declaration` or `namespace_directory`
-anywhere. The exception is a too-large non-Kustomization file holding a column-0 `kind` and, by
-the broker's search, no release kind: it loses only its cluster's tree, if that tree holds no release
-and no Kustomization an Application names. Either way the declaration rule's own search is the
-answer for what is missing.
+`fleet_waste.py` copy one revision of the repository out of the broker into a private directory and
+index that, so candidates carry `declaration` and `release_declaration` (and, from `collect.py`
+alone, `namespace_directory`) in content mode as they do from a clone. When a collector cannot read
+the tree it logs a `WARNING` naming why and attaches none of those fields; the size limits count every
+file in the repository, not only its YAML. An entry the broker leaves out of the copy (a link it will
+not follow, or a directory laid out as a bare repository) costs less, and a `WARNING` names each one
+with its reason. Every such entry costs `release_declaration` and `namespace_directory` everywhere. A
+YAML-named one, a bare layout, or a YAML file link that points into a cluster tree the copy dropped
+also costs `declaration` and `namespace_directory` on the cluster whose `clusters/<name>/` tree holds
+it. Either way the declaration rule's own search is the answer for what is missing.
 
 All three print `sha`, the commit of the tree the broker answered from. There is no `git` on this
 side to ask, and the declared-intent record ([`declared_intent_searched`](findings-document.md#declared_intent_searched)) names each repository
