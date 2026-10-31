@@ -479,14 +479,14 @@ func TestARefusedTaskConnectionRunsNothing(t *testing.T) {
 func TestTheWorkerRunsEachTaskWithItsPersonaRendered(t *testing.T) {
 	url := startServer(t)
 	d := newFakeDispatcher(t, url)
-	harness := stub(t, `
+	root := t.TempDir()
+	harness := stub(t, fmt.Sprintf(`
 read first || exit 1
 md=no; [ -f "$CLAUDE_CONFIG_DIR/CLAUDE.md" ] && md=yes
 flags=no; case " $* " in *" --allowedTools "*) flags=yes ;; esac
-echo "$CLAUDE_CONFIG_DIR" > "$(dirname "$CLAUDE_CONFIG_DIR")/seen-dir"
-printf '{"type":"result","subtype":"success","result":"md=%s flags=%s"}\n' "$md" "$flags"
-`)
-	root := t.TempDir()
+echo "$CLAUDE_CONFIG_DIR" > %s/seen-dir
+printf '{"type":"result","subtype":"success","result":"md=%%s flags=%%s"}\n' "$md" "$flags"
+`, root))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cfg := profileWorkerConfig(t, url, harness)
@@ -630,5 +630,34 @@ echo '{"type":"result","subtype":"success","result":"ok"}'
 		if strings.Contains(r, "--resume") {
 			t.Errorf("a harness resumed: %s", r)
 		}
+	}
+}
+
+// A confirm that arrives too late for the task to finish inside its deadline
+// runs nothing: the harness would be killed at once, after spending a turn.
+func TestALateConfirmRunsNothing(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startProfileWorker(t, ctx, profileWorkerConfig(t, url, stub(t, `read first; echo '{"type":"result","subtype":"success","result":"ran"}'`)), false)
+
+	const task = "task-late"
+	raw, _ := json.Marshal(profileSubmission(t, task, "too late", nil))
+	d.send(lib.DispatchMessage{
+		Type: lib.DispatchOffer, TaskID: task, Kind: lib.SubmitKindTop, Envelope: raw,
+		// In time at the offer (the test's margin is 1s), not by the confirm.
+		Deadline: time.Now().Add(1500 * time.Millisecond), LeaseSeconds: 3, RenewSeconds: 1, AcceptSeconds: 5,
+	})
+	if a := d.nextAccept(5 * time.Second); !a.Accepted {
+		t.Fatalf("the offer was declined: %+v", a)
+	}
+	time.Sleep(time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
+	if _, final := drainLeases(d, task, 2*time.Second); final {
+		t.Error("a final renewal for a task that shouldn't have run")
+	}
+	if evs := replayEvents(t, url, pwProfile, task); len(evs) != 0 {
+		t.Errorf("%d events for a task confirmed too late to finish", len(evs))
 	}
 }

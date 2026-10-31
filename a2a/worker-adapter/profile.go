@@ -71,6 +71,9 @@ type ProfileWorkerConfig struct {
 	deadlineMargin time.Duration
 }
 
+// defaultDeadlineMargin is added to the harness's kill grace: the worker's
+// deadline has to leave room for the harness to be stopped and its terminal
+// and final renewal sent before the dispatcher's own deadline.
 const defaultDeadlineMargin = 5 * time.Second
 
 // declineBusy is the reason a worker gives for an offer while it holds a
@@ -96,7 +99,7 @@ func RunProfileWorker(ctx context.Context, cfg Config, pw ProfileWorkerConfig) e
 		return err
 	}
 	if pw.deadlineMargin <= 0 {
-		pw.deadlineMargin = defaultDeadlineMargin
+		pw.deadlineMargin = cfg.KillGrace + defaultDeadlineMargin
 	}
 	b, closeBus, err := dialBus(ctx, cfg)
 	if err != nil {
@@ -328,6 +331,16 @@ func (w *profileWorker) loop(ctx context.Context) error {
 					log.Warn("a confirm for a task this pod isn't waiting on; ignoring it", "task", m.TaskID)
 					continue
 				}
+				if time.Until(cur.offer.Deadline) <= w.pw.deadlineMargin {
+					// Too late to run anything inside the deadline. Dropping
+					// it lets the lease lapse; starting would spend a turn
+					// on a harness killed at once.
+					log.Warn("confirmed past the point the task could finish in time; dropping it", "task", m.TaskID)
+					if release() {
+						return nil
+					}
+					continue
+				}
 				cur.running, acceptTimer = true, nil
 				_ = json.Unmarshal(msg.Data, &cur.creds)
 				taskDone = w.start(ctx, cur)
@@ -344,9 +357,13 @@ func (w *profileWorker) loop(ctx context.Context) error {
 					continue
 				}
 				// The dispatcher writes this task's terminal. Stop the
-				// harness and wait for execute to return without one.
+				// harness and wait for execute to return without one. If the
+				// task finished first, its terminal is out, so the final
+				// renewal still follows.
 				cur.abandon <- m.Reason
-				<-taskDone
+				if out := <-taskDone; !out.res.Abandoned {
+					w.finish(cur, out)
+				}
 				if release() {
 					return nil
 				}
@@ -558,8 +575,10 @@ func (w *profileWorker) serveReadiness(addr string) (func(), error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", func(rw http.ResponseWriter, _ *http.Request) {
-		if !w.ready.Load() {
-			http.Error(rw, "not listening yet", http.StatusServiceUnavailable)
+		// Listening, and still connected: a pod that lost the bus can't
+		// hear an offer, so it stops being Ready until it reconnects.
+		if !w.ready.Load() || !w.b.nc.IsConnected() {
+			http.Error(rw, "not listening", http.StatusServiceUnavailable)
 			return
 		}
 		_, _ = rw.Write([]byte("ok"))
