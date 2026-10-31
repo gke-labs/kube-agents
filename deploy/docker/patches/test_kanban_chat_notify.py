@@ -14,6 +14,7 @@ import sys
 import tempfile
 import types
 import unittest
+from types import SimpleNamespace
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -802,6 +803,18 @@ class FoldsIntoRowTest(unittest.TestCase):
         with mock.patch.object(kanban_notifier, "slack_ux_on", return_value=False):
             self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, self.SUB))
 
+    def test_a_child_beneath_an_open_fan_out_on_google_chat_folds_under_next(self):
+        # The gateway draws the plan on Google Chat under next (kanban_notifier.chat_ux_on),
+        # so a child's answer folds into its row there as on Slack; under today it does not.
+        gsub = {"platform": "google_chat", "chat_id": "spaces/H", "thread_id": "spaces/H/threads/T", "task_id": "t_c1"}
+        self.conn.execute("INSERT INTO kanban_notify_subs VALUES ('t_parent', 'google_chat', ?, ?)", (gsub["chat_id"], gsub["thread_id"]))
+        fake = SimpleNamespace(enabled=lambda: True)
+        modules = {"gateway": SimpleNamespace(slack_ux_reactions=fake), "gateway.slack_ux_reactions": fake}
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}):
+            self.assertTrue(kanban_chat_notify._folds_into_row(self.conn, gsub))
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, gsub))
+
 
 class FoldFanoutTest(unittest.TestCase):
     """A fanned-out child's answer folds into its parent's on the routed path.
@@ -894,8 +907,13 @@ class FoldFanoutTest(unittest.TestCase):
             self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
 
     def test_no_plan_fold_without_the_slack_flag(self):
-        # This class's thread is Google Chat, which has no plan: the hold stands.
+        # This class's thread is Google Chat; with the flag off, or under today where
+        # the gateway serves nothing, it has no plan: the hold stands.
         self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, dict(self.THREAD, task_id="t_child")))
+        fake = SimpleNamespace(enabled=lambda: True)
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_reactions=fake), "gateway.slack_ux_reactions": fake}), \
+                mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "", kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}):
+            self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, dict(self.THREAD, task_id="t_child")))
 
     def test_a_hold_under_the_committed_claim_rewinds(self):
         self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900), committed=True)))

@@ -541,16 +541,20 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertTrue(argv[argv.index("--") + 1].startswith(reshaped.rstrip("\n")))
         self.assertIn("no INVENTORY.items.json", stage_log(self.d))
 
-    def test_a_google_chat_conversation_gets_the_text_and_the_log_says_why(self):
+    def test_a_google_chat_conversation_under_next_gets_the_card(self):
+        # The gateway lays the card out on Google Chat under next, so the conversation
+        # door sends it as a chat message there as it does on Slack.
         conversation = dict(CONVERSATION, platform="google_chat", conversation="google_chat:spaces/A/threads/B")
         (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(conversation), encoding="utf-8")
-        plant_card_files(self.d)
+        card = plant_card_files(self.d)
         with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}):
             self._run()
-        (argv,) = self.calls
-        self.assertNotIn("--chat-file", argv)
-        self.assertTrue(argv[argv.index("--") + 1].startswith(self.REPORT.rstrip("\n")))
-        self.assertIn("the report goes to google_chat, which takes text", stage_log(self.d))
+        argv = self.calls[0]
+        self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "google_chat"])
+        self.assertIn("--chat-file", argv)
+        self.assertEqual(argv[-1], inventory_card.chat(card)[1])
+        self.assertNotIn("which takes text", stage_log(self.d))
+
 
     def test_a_failed_note_after_the_card_keeps_the_report_delivered(self):
         self._answer()
@@ -1649,6 +1653,57 @@ class DeliveryCardTest(unittest.TestCase):
         self.assertEqual(argv[-1], text)
         self.assertEqual(chat["choices"][0]["text"], "Fix the first one")
         self.assertFalse(os.path.exists(argv[argv.index("--chat-file") + 1]))
+
+    def test_a_google_chat_origin_under_next_gets_the_card_through_the_gateway(self):
+        # The home door on Google Chat: the card goes to the gateway with the thread's
+        # resource name as it is, no channel qualifier, and nothing to the Slack relay.
+        origin = dict(self.ORIGIN, platform="google_chat", chat_id="spaces/A", thread_id="spaces/A/threads/B")
+        environ = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM")}
+        environ.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_PLATFORM": "google_chat"})
+        self.notifies = []
+
+        def run(argv, **_kwargs):
+            with open(argv[argv.index("--chat-file") + 1], encoding="utf-8") as handle:
+                self.notifies.append((argv, json.load(handle)))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        out = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(self.sbp, "post") as poster,
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertEqual(out.getvalue(), RUNNING_NOTE + "\n")
+        poster.assert_not_called()
+        ((argv, chat),) = self.notifies
+        self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "google_chat"])
+        self.assertEqual(argv[argv.index("--thread") + 1], "spaces/A/threads/B")
+        self.assertEqual(chat, inventory_card.chat(self.card)[0])
+
+    def test_a_google_chat_origin_with_no_routed_home_gets_the_text_and_the_log_says_why(self):
+        # A conversations-only gateway serves Google Chat, so the card is built, but the
+        # home door has nowhere to send it: the report prints as text and the log says so.
+        origin = dict(self.ORIGIN, platform="google_chat", chat_id="spaces/A", thread_id="spaces/A/threads/B")
+        environ = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM", "A2A_NOTIFY_CONVERSATIONS")}
+        environ.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_CONVERSATIONS": "google_chat"})
+        out = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(self.sbp, "post") as poster,
+            mock.patch.object(bootstrap_delivery.subprocess, "run") as run,
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        poster.assert_not_called()
+        run.assert_not_called()
+        self.assertTrue(out.getvalue().startswith(self.text.rstrip("\n")[:40]))
+        self.assertIn("the gateway routes no home posts to google_chat", stage_log(self.d))
 
     def test_a_skip_goes_out_as_its_own_message_after_the_card(self):
         (self.d / oobe.SCAN_FILED_MARKER).write_text("task_id=t_sweep\n", encoding="utf-8")
