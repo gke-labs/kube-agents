@@ -539,7 +539,7 @@ if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
     echo "ERROR: EVAL_FORGE=${EVAL_FORGE} is a self-managed forge at ${EVAL_FORGE_HOST}, but ${EVAL_FORGE_CA_FILE} (its private CA) is missing or empty; the deploy would have refused the same (kube-agents#3682)." >&2
     exit 1
   fi
-  if ! openssl x509 -noout -text -in "${EVAL_FORGE_CA_FILE}" 2>/dev/null | grep -q 'CA:TRUE'; then
+  if ! grep -q 'CA:TRUE' <<< "$(openssl x509 -noout -text -in "${EVAL_FORGE_CA_FILE}" 2>/dev/null)"; then
     echo "ERROR: ${EVAL_FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh on Linux (kube-agents#3682)." >&2
     exit 1
   fi
@@ -2679,8 +2679,12 @@ gitlab_lane_matrix() { # <tier word, for the log line>
   # which check_case_entries has already proven to be a case path with a
   # directory behind it; the lane picks from the catalogue, it does not
   # register.
+  # A here-string, never `printf ... | grep -q`: grep -q exits at its first
+  # match, and under pipefail a writer still mid-write then dies of SIGPIPE
+  # and fails the pipeline, so a registered case reads as unregistered and
+  # the job stops (#4357). Bash fills the here-string before grep runs.
   for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
-    if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+    if ! grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
       echo "ERROR: ${LANE_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the ${EVAL_FORGE} lane runs registered cases only." >&2
       exit 1
     fi
