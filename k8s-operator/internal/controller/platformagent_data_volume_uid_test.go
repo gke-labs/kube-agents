@@ -93,6 +93,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	a2aGateway := buildA2AGatewayDeployment(agent)
 	a2aCallout := buildA2ACalloutDeployment(agent, "")
 	a2aVerifier := buildA2AVerifierDeployment(agent)
+	a2aDispatcher := buildA2ADispatcherDeployment(agent)
 	a2aConsole := buildA2AConsoleDeployment(agent)
 	a2aMCP := buildA2AMCPDeployment(agent)
 	gatewayStatefulSet := buildStatefulSet(agent, "c", "f", "s", "p", nil, opts)
@@ -107,6 +108,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 		{"buildA2AGatewayDeployment", a2aGateway.Name, a2aGateway.Spec.Template.Spec},
 		{"buildA2ACalloutDeployment", a2aCallout.Name, a2aCallout.Spec.Template.Spec},
 		{"buildA2AVerifierDeployment", a2aVerifier.Name, a2aVerifier.Spec.Template.Spec},
+		{"buildA2ADispatcherDeployment", a2aDispatcher.Name, a2aDispatcher.Spec.Template.Spec},
 		{"buildA2AConsoleDeployment", a2aConsole.Name, a2aConsole.Spec.Template.Spec},
 		{"buildA2AMCPDeployment", a2aMCP.Name, a2aMCP.Spec.Template.Spec},
 		{"buildA2AProvisionJob", provision.Name, provision.Spec.Template.Spec},

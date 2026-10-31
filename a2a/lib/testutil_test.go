@@ -74,6 +74,33 @@ func provisionTasksStream(t *testing.T, url string) {
 	}
 }
 
+// provisionProfileSubmitStream creates PROFILE_SUBMITS as the provision
+// script does: a2a.submit.>, one message per subject.
+func provisionProfileSubmitStream(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:              ProfileSubmitStream,
+		Subjects:          []string{SubmitSubjectPrefix + ">"},
+		Retention:         jetstream.LimitsPolicy,
+		MaxAge:            72 * time.Hour,
+		MaxMsgsPerSubject: 1,
+		AllowDirect:       true,
+	}); err != nil {
+		t.Fatalf("create %s stream: %v", ProfileSubmitStream, err)
+	}
+}
+
 // publishRaw injects arbitrary bytes onto a subject, bypassing the library's
 // emit validation — how a foreign or hostile publisher looks to a consumer.
 func publishRaw(t *testing.T, url, subject string, data []byte) {

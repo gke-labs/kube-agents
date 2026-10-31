@@ -101,7 +101,8 @@ IDENTIFIER_BOUNDARY = r"[A-Za-z0-9_.-]"
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
 #: The instant the template is rendered at to learn its own vocabulary.
 TEMPLATE_EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
-#: ``status.usage`` fields, in the order the block prints them; a missing one prints 0.
+#: ``status.usage`` fields, in the order the block prints them; a missing counter
+#: prints 0, a missing reading (USAGE_READINGS) prints USAGE_NO_READING.
 USAGE_COUNTERS: Tuple[str, ...] = (
     "clustersRegistered",
     "clustersMonitored",
@@ -111,7 +112,24 @@ USAGE_COUNTERS: Tuple[str, ...] = (
     "eventsIngestedTotal",
     "remediationsProposedTotal",
     "remediationsMergedTotal",
+    "proposalsAuthored",
+    "remediationsOpen",
+    "remediationsClosedUnmergedTotal",
+    "proposalHumanTouches",
+    "proposalsMergedUntouched",
 )
+#: The fields the broker reads off the forge rather than counts: absent means it
+#: has no reading yet, which is not 0.
+USAGE_READINGS = frozenset({
+    "remediationsMergedTotal",
+    "proposalsAuthored",
+    "remediationsOpen",
+    "remediationsClosedUnmergedTotal",
+    "proposalHumanTouches",
+    "proposalsMergedUntouched",
+})
+USAGE_NO_READING = "no reading"
+USAGE_READING_SUFFIX = " (as the forge reports)"
 #: Kanban statuses folded into the roll-up's buckets; anything else is "other".
 STATUS_BUCKETS: Mapping[str, str] = {
     "done": "done",
@@ -445,7 +463,12 @@ def render(snapshot: Snapshot) -> str:
     lines.append(f"  interfaces: {', '.join(sorted(str(i) for i in interfaces)) or NONE}")
     lines.append("usage:")
     for counter in USAGE_COUNTERS:
-        lines.append(f"  {counter}: {int(usage.get(counter) or 0)}")
+        value = usage.get(counter)
+        if counter in USAGE_READINGS:
+            shown = USAGE_NO_READING if value is None else int(value)
+            lines.append(f"  {counter}: {shown}{USAGE_READING_SUFFIX}")
+        else:
+            lines.append(f"  {counter}: {int(value or 0)}")
     lines.append(f"  lastActive: {usage.get('lastActiveTime') or NEVER}")
     lines.append("performance:")
     if snapshot.litellm_metrics is not None:
