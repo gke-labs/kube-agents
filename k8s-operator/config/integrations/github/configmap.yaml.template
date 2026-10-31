@@ -24,6 +24,15 @@ data:
           - '${GITHUB_REPO}'
         permissions:
           contents: 'read'
+      platform-agent-sweep-scope:
+        rule:
+          if: "assertion.email in ['${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com']"
+        repositories:
+          - '${GITHUB_REPO}'
+        permissions:
+          contents: 'read'
+          pull_requests: 'read'
+          issues: 'read'
   ${GITHUB_REPO}.yaml: |
     version: 'minty.abcxyz.dev/v2'
     rule:
@@ -45,3 +54,12 @@ data:
           - '${GITHUB_REPO}'
         permissions:
           contents: 'read'
+      platform-agent-sweep-scope:
+        rule:
+          if: "assertion.email in ['${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com']"
+        repositories:
+          - '${GITHUB_REPO}'
+        permissions:
+          contents: 'read'
+          pull_requests: 'read'
+          issues: 'read'

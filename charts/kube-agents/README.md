@@ -449,6 +449,14 @@ helm upgrade --install kube-agents ./charts/kube-agents -n kubeagents-system \
   --set litellm.modelProvider=sap --set litellm.envFromSecret=sap-aicore
 ```
 
+#### Upgrade notes: proposal counters become readings
+
+The operator now exports the proposal fields of `kubeagents_platformagent_usage` as readings of the forge: `remediationsMergedTotal`, `remediationsClosedUnmergedTotal`, `proposalsAuthored`, `remediationsOpen`, `proposalHumanTouches` and `proposalsMergedUntouched`. The first reading after the upgrade replaces a count of what the old process saw with the forge's all-time count. The health rules take a fourteen-day window over these readings, so they read that step as fourteen days of outcomes. For two weeks after the upgrade, `proposals_rejected_ratio_14d` and `proposals_merge_rate_14d` are distorted, and the merge rate can read above one. The same step occurs for two weeks after a repository with proposal history enters the managed list.
+
+A reading can also fall: a repository leaves the managed list, or a proposal is deleted. When `proposalsAuthored` falls inside the window, the rules drop both proposal ratios, and `KubeAgentsProposalsRejected` and `KubeAgentsProposalsUnmerged` cannot fire for the fourteen days the fall stays in the window. A proposal that a person closes and reopens does not cause this. The thresholds keep their names and values; `proposalsProposedMin14d` now counts proposals authored in the window.
+
+`status.usage.remediationsAppliedTotal`, which nothing ever wrote, leaves the CRD schema and the operator's export in this release. `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` keep their names but are absent, not 0, until the first reading lands and whenever two polls in a row read none, so a dashboard that read them as counters sees a gap rather than a zero.
+
 #### Upgrade notes: inference-gateway Service rename
 
 The agent-facing K8s Service was renamed from `litellm` to `inference-gateway` (and `litellm-gateway` to `inference-gateway-upstream` for the upstream gateway). The operator now renders `base_url: http://inference-gateway.<namespace>.svc.cluster.local/v1` into the managed agent config on every reconcile; the managed scope is overlaid on load, so agents cannot retain the old name via a local override.
@@ -648,7 +656,9 @@ the key keeps the rules off; turning them on from such a release needs `--reset-
 defaults and keeps the release's values, or every threshold set; the schema requires the whole
 block and the template says so when it is missing. The rules read the operator's scrape, so
 enabling them with `operator.metrics` off, or where the `PodMonitoring` CRD is absent, fails at
-render with a message.
+render with a message. The two proposal alerts read the forge's proposal readings, and a fall in
+`proposalsAuthored` (a repository leaving the managed list, or a deleted proposal) silences them for two weeks; see
+[Upgrade notes: proposal counters become readings](#upgrade-notes-proposal-counters-become-readings).
 
 ### Turning telemetry off
 
@@ -1169,6 +1179,24 @@ returns nothing for a NotFound and raises a template error for everything else, 
 identity without that permission gets `error calling lookup: resourcequotas is
 forbidden` and no install rather than a quiet pass. Grant the permission, or install with
 `--set quotaPreflight.enabled=false`.
+
+#### Upgrade notes: operator memory floor
+
+`operator.resources.limits.memory` has a floor at its default, 512Mi, and the chart fails the
+render on a smaller limit, naming the key; the preflight, which sums that block, runs the same
+check first, and both skip it when `operator.enabled` is false. Releases up to 0.16.0 shipped
+the Kubebuilder scaffold's 128Mi, and `helm upgrade --reuse-values` renders a new chart against
+the old release's values, defaults included, so an install upgraded that way kept 128Mi and the
+operator was OOM-killed as its cache filled. A hand-run upgrade from such a release uses
+`--reset-then-reuse-values` (Helm 3.14+), which takes the new defaults and keeps the release's
+own overrides; `upgrade.sh` resets the values the same way, so it never meets the floor on the
+old defaults. An explicit limit under 512Mi, in a values file or `extra_helm_values`, fails on
+every path: raise it to 512Mi or more, or drop the key. The operator reads whatever limit is
+rendered through the Downward API and sets its Go soft memory limit to nine tenths of it, so a
+larger cluster raises this one value. On GKE Autopilot the floor still applies. A cluster without
+bursting raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, and sets the limits equal to
+the requests, so the manager runs under at least 512Mi there and the admitted pod differs from the
+rendered manifest. A cluster with bursting admits the manifest as rendered.
 
 ### Optional AgentProfiles (`profiles.tse`)
 

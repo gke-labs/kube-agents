@@ -2002,6 +2002,28 @@ class TestSlackHomeChannelResolution(unittest.TestCase):
         # degrades to "" rather than raising.
         self.assertEqual(session_kv_server._slack_home_channel(), "")
 
+    def test_a_mounted_projection_outranks_the_config_files(self):
+        # Under `next` the operator projects the home channel into a file the
+        # kubelet refreshes in place, and the gateway posts into that value. A
+        # `/sethome` channel left in the data volume by today mode must not
+        # make the agent name a different channel than the gateway, so a
+        # mounted file decides, empty or not; the config files count only
+        # where no file is mounted.
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, chat_notify.HOME_FILE_KEY)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("C0PROJECTED\n")
+            self._point("CONFIG_PATH", "platforms:\n  slack:\n    home_channel: C0FILE\n")
+            with patch.object(chat_notify, "HOME_FILE_DIR", directory), patch.dict(os.environ, {}):
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0PROJECTED")
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("")
+                self.assertEqual(session_kv_server._slack_home_channel(), "")
+                os.environ["SLACK_HOME_CHANNEL"] = "C0ENV"
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0ENV")
+            with patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(directory, "unmounted")):
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0FILE")
+
     def test_a_hostile_config_shape_costs_the_lookup_and_not_the_caller(self):
         self._point("CONFIG_PATH", "platforms: slack\n")
         self.assertEqual(session_kv_server._slack_home_channel(), "")
@@ -3248,6 +3270,21 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(loaded["SAFE_KEY"], "loaded_ok")
         self.assertEqual(loaded["COMMENTED"], "value")
         self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
+
+    def test_a_mirrored_home_channel_yields_to_a_mounted_projection(self):
+        # A today-era /sethome left SLACK_HOME_CHANNEL in the PVC .env. With
+        # the operator's projection mounted the file is the home channel the
+        # gateway posts into, so the mirror is skipped; without it, it loads.
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+                handle.write("")
+            with patch.object(chat_notify, "HOME_FILE_DIR", directory):
+                loaded = self._load_dotenv(b"SLACK_HOME_CHANNEL=C0OLD\nSAFE_KEY=1\n", ("SLACK_HOME_CHANNEL", "SAFE_KEY"))
+            self.assertIsNone(loaded["SLACK_HOME_CHANNEL"])
+            self.assertEqual(loaded["SAFE_KEY"], "1")
+            with patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(directory, "unmounted")):
+                loaded = self._load_dotenv(b"SLACK_HOME_CHANNEL=C0OLD\n", ("SLACK_HOME_CHANNEL",))
+            self.assertEqual(loaded["SLACK_HOME_CHANNEL"], "C0OLD")
 
     def test_an_undecodable_pvc_dotenv_does_not_stop_the_import(self):
         loaded = self._load_dotenv(b"# caf\xe9\nSAFE_KEY=1\n", ("SAFE_KEY",))
@@ -12085,6 +12122,118 @@ class TestTriageStartBurst(unittest.TestCase):
         self.assertEqual(len(started), self.BURST, f"{self.BURST - len(started)} triage starts were lost")
         self.assertEqual(len(self.turns), len(started), "a session got a second /chat turn")
         self.assertEqual(len(probe_timeouts), 0, "the readiness request timed out during the burst")
+
+
+class TestDataVolumeWarning(unittest.TestCase):
+    """The home-channel warning when the data volume fills: once per crossing
+    of DATA_VOLUME_WARN_PERCENT, re-armed below DATA_VOLUME_REARM_PERCENT."""
+
+    TOTAL = 10 * (1 << 30)
+
+    def setUp(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM data_volume_warning")
+        self.used_percent = 0
+        usage = patch.object(
+            session_kv_server,
+            "_data_volume_usage",
+            side_effect=lambda path: (self.TOTAL, self.TOTAL * (100 - self.used_percent) // 100),
+        )
+        usage.start()
+        self.addCleanup(usage.stop)
+        self.post = patch.object(session_kv_server, "_post_initial_alert", return_value="thread-1").start()
+        self.addCleanup(patch.stopall)
+        patch.object(session_kv_server, "enabled_chat_platforms", return_value=["slack"]).start()
+
+    def _check_at(self, percent):
+        self.used_percent = percent
+        session_kv_server.check_data_volume()
+
+    def test_posts_once_per_crossing_and_rearms_below_the_lower_line(self):
+        for percent in (50, 89):
+            self._check_at(percent)
+        self.post.assert_not_called()
+
+        self._check_at(90)
+        self.post.assert_called_once()
+        platform, message = self.post.call_args.args
+        self.assertEqual(platform, "slack")
+        self.assertEqual(
+            message,
+            "The agent's data volume is 90% full (9.0 of 10.0 GiB). "
+            "Remove unused cluster profiles, or ask an admin to raise spec.storage.size on the PlatformAgent.",
+        )
+
+        # Above the lower line it stays quiet, however long it sits there.
+        for percent in (95, 100, 87, 85, 92):
+            self._check_at(percent)
+        self.assertEqual(self.post.call_count, 1)
+
+        # Below it, the warning is re-armed and the next crossing posts again.
+        self._check_at(84)
+        self._check_at(89)
+        self.assertEqual(self.post.call_count, 1)
+        self._check_at(91)
+        self.assertEqual(self.post.call_count, 2)
+
+    def test_a_restart_above_the_line_does_not_post_again(self):
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 1)
+        # The warned flag is on the session database, not in this process.
+        self.assertTrue(session_kv_server._data_volume_warned())
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 1)
+
+    def test_a_refused_post_is_tried_again_at_the_next_check(self):
+        self.post.return_value = None
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self._check_at(95)
+        self.assertTrue(any("not accepted by any enabled chat platform" in line for line in logs.output))
+        self.assertFalse(session_kv_server._data_volume_warned())
+        self.post.return_value = "thread-2"
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 2)
+        self.assertTrue(session_kv_server._data_volume_warned())
+
+    def test_a_post_cut_off_before_it_returns_does_not_silence_the_crossing(self):
+        # A pod roll can kill the process during the send. An exception out of
+        # the send leaves the same state: nothing posted.
+        self.post.side_effect = RuntimeError("killed during the send")
+        with self.assertRaises(RuntimeError):
+            self._check_at(95)
+        self.assertFalse(session_kv_server._data_volume_warned())
+        self.post.side_effect = None
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 2)
+        self.assertTrue(session_kv_server._data_volume_warned())
+
+    def test_no_chat_platform_logs_the_warning_and_stops(self):
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=[session_kv_server.DEFAULT_CHAT_PLATFORM]), \
+                patch.object(session_kv_server, "_chat_platforms_disabled", return_value=True), \
+                self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self._check_at(95)
+            self._check_at(96)
+        self.post.assert_not_called()
+        self.assertEqual(sum("data volume is 95% full" in line for line in logs.output), 1)
+        self.assertTrue(any("in this log and nowhere else" in line for line in logs.output))
+
+    def test_an_unreadable_volume_does_nothing(self):
+        with patch.object(session_kv_server, "_data_volume_usage", return_value=None):
+            session_kv_server.check_data_volume()
+        self.post.assert_not_called()
+        self.assertFalse(session_kv_server._data_volume_warned())
+
+    def test_reads_a_real_filesystem(self):
+        patch.stopall()
+        usage = session_kv_server._data_volume_usage(tempfile.gettempdir())
+        self.assertIsNotNone(usage)
+        total, free = usage
+        self.assertGreater(total, 0)
+        self.assertLessEqual(free, total)
+        self.assertIsNone(session_kv_server._data_volume_usage("/nonexistent/data-volume"))
 
 
 if __name__ == "__main__":

@@ -72,6 +72,14 @@ prompt an ask the harness stops once it has filed a card
 only over the inject transport, so the case needs an entry in
 `hack/eval/api-lane-exclusions.txt`. The harness writes two entries for such a case,
 `harness_stop_sent` and `harness_cards_stopped`, and the case's `tool_called` objectives name them.
+A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
+lines under it, sends the opening as turn one, stores the report for the conversation in the
+agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
+into a Slack or Google Chat gateway conversation, then sends the reply as a second message on the same conversation
+([`bench/kube_agents_bench/pushed_report.py`](../../bench/kube_agents_bench/pushed_report.py));
+the reply turn's answer is the deliverable, and the harness writes `harness_pushed_report_stored`
+for the plant. Inject transport only, so the case is listed in `hack/eval/api-lane-exclusions.txt`
+as well.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
 case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that
@@ -158,7 +166,10 @@ excludes nothing, and loses it only after a reconcile has run under that block: 
 reads a missing block as "keep the last exclusions". The scope it replaced is saved on the CR
 (`bench/kube_agents_bench/scope_exclude.py`), so the EXIT trap and the next lease can restore it
 after a run that died first; the annotation stays until a reconcile has run under the restored scope. A repetition whose exclusion did not take effect is recorded as
-infrastructure. The validator refuses a slot the catalogue does not declare and a list that
+infrastructure. `absent: <n>` beside the slots (at most `MAX_ABSENT` in `scope_exclude.py`) also excludes n clusters that do not
+exist, named like the first slot's cluster with a letter past the catalogue's last slot, in its
+project and location, so a case can exclude as many clusters as the install manages; the
+reconcile prunes nothing for them. The validator refuses a slot the catalogue does not declare and a list that
 excludes every slot. devops-bench ignores the key.
 
 The runner pauses most of the Platform Agent's clock-started audits at lease time and again
@@ -235,7 +246,7 @@ deployment's ready replicas land in a range). A fourth, `fleet_resource_property
 this repository's `resource_property` against the seeded-fleet cluster that carries a
 fixture role, named by `fixture_role:` rather than by cluster.
 
-Fourteen read what the run produced, from this repository
+The run-reading types come from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns`, `required_patterns` and
@@ -273,7 +284,8 @@ lead), `report_times_in_window` (every date and time on a report line one of its
 `max_clock_skew_sec`, and its minute must be one some tool output in the trajectory shows,
 the workers' included; a report that states none passes), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
-published), `pull_request_opened` (the remediation pull request the run opened,
+published), `forge_issue_state` (the state, labels and in-run comments of the issue the reply
+names, read from the forge), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
 repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `changed_paths_only` fails one whose diff changes any path matching none of its listed globs, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds), `github_writes` (every pull request or branch under the agent's
 prefix written to the case's GitOps repository since the repetition started that
@@ -314,7 +326,7 @@ is not checked, and a missing command is
 `status: "error"` when the capture has gaps, the pod withheld the workers' arguments, or the
 trajectory holds no worker terminal call).
 
-Thirteen read the install under test, nine of them from that file. `bootstrap_fanout` compares the
+The remaining types read the install under test, most of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
@@ -571,7 +583,7 @@ compares a known boolean field such as `spec.suspend` to the string `"true"` or 
 `op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts
 nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table, and a path with recursive
 descent or a script expression is not judged), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
-does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters, names a slot
+does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters and an optional `absent` from 1 to `MAX_ABSENT`, names a slot
 `bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
 refuses (a key that overrides one merged in with `<<:` is not a repeat). It

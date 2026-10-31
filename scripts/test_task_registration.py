@@ -786,6 +786,14 @@ class TestTheRulesReject(unittest.TestCase):
     def test_a_declared_scope_exclusion_passes(self):
         self.assertEqual(self._validate(scope_exclude={"slots": ["b", "d"]}), [])
 
+    def test_a_scope_exclusion_with_absent_clusters_passes(self):
+        self.assertEqual(self._validate(scope_exclude={"slots": ["b", "d"], "absent": 1}), [])
+
+    def test_an_absent_count_out_of_range_is_rejected(self):
+        for absent in (0, -1, 9, True, "1"):
+            with self.subTest(absent=absent):
+                self._only("must be {slots:", scope_exclude={"slots": ["b"], "absent": absent})
+
     def test_a_slot_the_catalogue_does_not_declare_is_rejected(self):
         self._only("does not declare", scope_exclude={"slots": ["b", "z"]})
 

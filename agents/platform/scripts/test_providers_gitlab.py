@@ -36,9 +36,11 @@ class Api:
     def __init__(self, *responses):
         self.responses = list(responses)
         self.calls = []
+        self.with_headers = []
 
-    def __call__(self, method, path, *, params=None, body=None, raw=None):
+    def __call__(self, method, path, *, params=None, body=None, raw=None, with_headers=False):
         self.calls.append((method, path, params or {}, body, raw))
+        self.with_headers.append(with_headers)
         answer = self.responses.pop(0)
         if isinstance(answer, WorkspaceError):
             raise answer
@@ -552,6 +554,50 @@ class ProposalTest(unittest.TestCase):
         )
         self.assertEqual(["c101", "c150"], [second["commits"][0]["sha"], second["commits"][-1]["sha"]])
         self.assertFalse(second["truncated"])
+
+    def test_list_by_author_reads_the_total_header(self):
+        bot = {"username": "project_1001_bot_3f2a9c"}
+        api = Api(([mr(4, state="merged", merged_at="2026-10-03T00:00:00Z", author=bot)], {"x-total": "41"}))
+        answer = forge().proposal_list_by_author(
+            api, "acme/infra", {"author": "project_1001_bot_3f2a9c", "authorId": 7, "page": 2, "limit": 1}
+        )
+        self.assertEqual([True], api.with_headers)
+        self.assertEqual(41, answer["total"])
+        self.assertEqual(["merged"], [p["state"] for p in answer["proposals"]])
+        self.assertTrue(answer["proposals"][0]["authorBot"])
+        self.assertTrue(answer["truncated"])
+        self.assertEqual("projects/acme%2Finfra/merge_requests", api.calls[0][1])
+        self.assertEqual(
+            {
+                "author_username": "project_1001_bot_3f2a9c",
+                "state": "all",
+                "order_by": "updated_at",
+                "sort": "desc",
+                "per_page": 1,
+                "page": 2,
+            },
+            api.calls[0][2],
+        )
+        # GitLab leaves the header off past ten thousand rows; that is no count.
+        missing = forge().proposal_list_by_author(
+            Api(([], {})), "acme/infra", {"author": "u", "authorId": 7}
+        )
+        self.assertIsNone(missing["total"])
+
+    def test_tally_reads_one_total_per_state_and_refuses_a_missing_one(self):
+        # Merged, closed and every state together; open is the difference,
+        # since the three counts are separate requests, not one snapshot.
+        api = Api(([], {"x-total": "5"}), ([], {"x-total": "1"}), ([], {"x-total": "8"}))
+        answer = forge().proposal_tally(api, "acme/infra", {"author": "u", "authorId": 7})
+        self.assertEqual({"open": 2, "merged": 5, "closed": 1, "total": 8}, answer)
+        self.assertEqual(["merged", "closed", "all"], [call[2]["state"] for call in api.calls])
+        self.assertEqual({1}, {call[2]["per_page"] for call in api.calls})
+        with self.assertRaises(WorkspaceError):
+            forge().proposal_tally(Api(([], {})), "acme/infra", {"author": "u", "authorId": 7})
+
+    def test_the_closer_of_a_merged_request_is_unknown(self):
+        answer = forge().proposal_closer(Api(mr(3, state="merged", closed_by=None)), "acme/infra", {"number": 3})
+        self.assertEqual({"actor": "", "bot": False}, answer)
 
     def test_any_note_takes_an_award_and_already_awarded_is_fine(self):
         api = Api({"id": 1})

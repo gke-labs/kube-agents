@@ -27,7 +27,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as futures_wait
-from contextlib import ExitStack, closing, nullcontext
+from contextlib import ExitStack, asynccontextmanager, closing, nullcontext
 from pathlib import Path
 
 import logging
@@ -59,6 +59,11 @@ logger = logging.getLogger("session_kv_server")
 # `.env` is agent-writable (`save_env_value`), and `load_dotenv` adds any key the
 # container env lacks, which on an install that did not opt in is exactly these.
 _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST",)
+# The home channel a today-era `/sethome` or first chat mirrored into that
+# `.env` (Hermes' persist_home_channel). Under `next` with the operator's
+# projection mounted, the projected file is the channel the gateway posts
+# into, so the mirror must not fill the key the container env lacks.
+_PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
 
 
 def _load_dotenv_ignoring_operator_switches(path: str) -> None:
@@ -80,6 +85,9 @@ def _load_dotenv_ignoring_operator_switches(path: str) -> None:
         if key in _OPERATOR_ONLY_ENV_KEYS:
             logger.info(f"Ignoring operator-only switch {key} in {path}")
             continue
+        if key in _PROJECTED_HOME_ENV_KEYS and chat_notify.home_file()[1]:
+            logger.info(f"Ignoring {key} in {path}: the operator projects the home channel")
+            continue
         if key not in os.environ:
             os.environ[key] = val
 
@@ -89,10 +97,35 @@ _load_dotenv_ignoring_operator_switches(DOTENV_PATH)
 # The schema is not published: this server has exactly three known callers, all
 # of them inside this pod, and an interactive /docs page on a port that carries
 # chat identifiers is a browsable index of them.
-app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # The data volume check runs on its own thread for the life of the server;
+    # see check_data_volume.
+    threading.Thread(target=_data_volume_monitor, name="data-volume-monitor", daemon=True).start()
+    yield
+
+
+app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None, lifespan=_lifespan)
 
 SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
 CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
+
+# The data volume warning. A full volume fails every kanban and session write
+# with a bare `disk I/O error` and nothing in chat says why, so this server, the
+# one long-running process of the agent's that already posts to the home
+# channel, checks the volume and says so once per crossing: at
+# DATA_VOLUME_WARN_PERCENT used, and not again until usage has dropped below
+# DATA_VOLUME_REARM_PERCENT. The operator reports the same reading on the CR as
+# the DataVolumeNearlyFull condition; this is the half a chat user sees.
+DATA_VOLUME_PATH = os.getenv("PLATFORM_AGENT_HOME", "/opt/data")
+DATA_VOLUME_CHECK_INTERVAL_SECONDS = 300
+DATA_VOLUME_WARN_PERCENT = 90
+DATA_VOLUME_REARM_PERCENT = 85
+DATA_VOLUME_WARNING = (
+    "The agent's data volume is {percent}% full ({used:.1f} of {total:.1f} GiB). "
+    "Remove unused cluster profiles, or ask an admin to raise spec.storage.size on the PlatformAgent."
+)
+BYTES_PER_GIB = 1 << 30
 
 # Bounds on the index `/v1/incidents/recent` returns. Both axes matter because
 # its caller prepends the result to messages that carry no report of their own,
@@ -1457,6 +1490,19 @@ def init_db() -> None:
                 )
                 """
             )
+            # One row: whether the data volume warning has been posted for the
+            # current crossing. On this database rather than in memory so that a
+            # restart while the volume is still full does not post it again, and
+            # on this database rather than the data volume, which is the one that
+            # is full.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS data_volume_warning (
+                    id     INTEGER PRIMARY KEY CHECK (id = 1),
+                    warned INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
             # The fleet-audit run whose report each audit job last posted, so a
             # run's report is posted once and a later run that never reached
             # `finish` gets the not-finished notice instead of it.
@@ -2215,11 +2261,19 @@ def _slack_home_channel() -> str:
 
     Environment first, so an install whose CR sets the channel resolves exactly
     as it did before; the files are consulted only when it is absent, which is
-    the case that was broken.
+    the case that was broken. Under `spec.mode: next` a channel the gateway
+    learned is never rendered into the pod: the operator projects it into a
+    file the kubelet refreshes in place (chat_notify.home_file). A mounted file
+    decides, empty or not, so this answer is the channel the gateway posts
+    into; the config files `/sethome` writes in today mode count only where no
+    file is mounted, since the data volume keeps them across a mode switch.
     """
     env = os.environ.get("SLACK_HOME_CHANNEL", "").strip()
     if env:
         return env
+    projected, mounted = chat_notify.home_file()
+    if mounted:
+        return projected
     for path in (MANAGED_CONFIG_PATH, CONFIG_PATH):
         value = _platform_setting_in(path, "slack", "home_channel")
         if value:
@@ -2252,8 +2306,9 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
-    One thing outranks all three: the platform the operator names in
-    ``A2A_NOTIFY_PLATFORM`` (chat_notify.py). Under ``spec.mode: next`` the
+    One thing outranks all three: the platform ``chat_notify.routed_platform()``
+    names, from ``A2A_NOTIFY_PLATFORM`` or the projected home-channel file. Under
+    ``spec.mode: next`` the
     managed scope says that platform's Hermes consumer is off because the A2A
     gateway holds the backend, and posts to it go through the gateway instead,
     so it is still a platform this install posts to. The operator renders the
@@ -2302,7 +2357,8 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
 
     Checks `chat_notify.routes(name)` first so `spec.mode: next` installs where
     the operator renders `platforms.<p>.enabled: false` into `/etc/hermes/config.yaml`
-    while routing notifications through `A2A_NOTIFY_PLATFORM` resolve that
+    while routing notifications through the gateway (`A2A_NOTIFY_PLATFORM` or the
+    projected home-channel file) resolve that
     platform as enabled in both `enabled_chat_platforms` and `_chat_platforms_disabled`.
     """
     from_managed = _platforms_enabled_in(MANAGED_CONFIG_PATH)
@@ -2339,7 +2395,7 @@ def _chat_platforms_disabled() -> bool:
 
     On a chat-less install (`install.sh` chat choice "None", or a CR with
     `googleChat.enabled: false` and `slack.enabled: false` and no routed
-    `A2A_NOTIFY_PLATFORM`), `renderConfigYAML` emits `enabled: false` for both
+    platform), `renderConfigYAML` emits `enabled: false` for both
     platforms in `/etc/hermes/config.yaml`. `enabled_chat_platforms` falls back
     to `DEFAULT_CHAT_PLATFORM` when nothing resolves so legacy callers never
     address an empty string; this helper uses the same `_resolve_chat_platforms`
@@ -2525,6 +2581,91 @@ def _claim_alert_quota(severity: str) -> tuple[bool, int]:
     except Exception as exc:
         logger.error(f"Alert quota check failed for severity {severity} (allowing the alert through): {exc}")
         return True, 0
+
+
+def _data_volume_usage(path: str) -> Optional[tuple[int, int]]:
+    """The volume holding `path` as (total, free) bytes, free being what a
+    non-root writer can still use; None when it cannot be read."""
+    try:
+        st = os.statvfs(path)
+    except OSError as exc:
+        logger.debug(f"Cannot read the data volume at {path}: {exc}")
+        return None
+    total = st.f_blocks * st.f_frsize
+    if total <= 0:
+        return None
+    return total, st.f_bavail * st.f_frsize
+
+
+def _data_volume_warned() -> bool:
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        row = conn.execute("SELECT warned FROM data_volume_warning WHERE id = 1").fetchone()
+    return bool(row and row[0])
+
+
+def _set_data_volume_warned(warned: bool) -> bool:
+    """Move the flag to `warned`. True only for the caller that changed it."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        with conn:
+            conn.execute("INSERT OR IGNORE INTO data_volume_warning (id, warned) VALUES (1, 0)")
+            cur = conn.execute(
+                "UPDATE data_volume_warning SET warned = ? WHERE id = 1 AND warned != ?",
+                (int(warned), int(warned)),
+            )
+            return cur.rowcount == 1
+
+
+def _post_data_volume_warning(message: str) -> bool:
+    """Post the warning to the home channel. True once it is delivered, or once
+    there is nowhere to deliver it, so the caller stops trying; False when every
+    enabled platform refused, so the next check tries again."""
+    platforms = enabled_chat_platforms()
+    if platforms == [DEFAULT_CHAT_PLATFORM] and _chat_platforms_disabled():
+        logger.warning("No chat platform is enabled, so the data volume warning is in this log and nowhere else")
+        return True
+    for candidate in platforms:
+        if _post_initial_alert(candidate, message):
+            return True
+    logger.warning(
+        "The data volume warning was not accepted by any enabled chat platform; "
+        "check the home channel setting. It is tried again at the next check"
+    )
+    return False
+
+
+def check_data_volume() -> None:
+    """Post the data volume warning if the volume has crossed the line, and
+    re-arm it once usage is back below the lower one."""
+    usage = _data_volume_usage(DATA_VOLUME_PATH)
+    if usage is None:
+        return
+    total, free = usage
+    percent = (total - free) * 100 // total
+    warned = _data_volume_warned()
+    if warned:
+        if percent < DATA_VOLUME_REARM_PERCENT:
+            _set_data_volume_warned(False)
+            logger.info(f"The data volume is back to {percent}% used; the full-volume warning is re-armed")
+        return
+    if percent < DATA_VOLUME_WARN_PERCENT:
+        return
+    message = DATA_VOLUME_WARNING.format(
+        percent=percent, used=(total - free) / BYTES_PER_GIB, total=total / BYTES_PER_GIB
+    )
+    logger.warning(message)
+    # Set only after the post is delivered. A process killed during the send
+    # (a pod roll) then posts at the next check instead of never.
+    if _post_data_volume_warning(message):
+        _set_data_volume_warned(True)
+
+
+def _data_volume_monitor() -> None:
+    while True:
+        try:
+            check_data_volume()
+        except Exception as exc:
+            logger.error(f"Data volume check failed: {exc}")
+        time.sleep(DATA_VOLUME_CHECK_INTERVAL_SECONDS)
 
 
 def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
@@ -5536,8 +5677,9 @@ def relay_cron_report(
         if posted is not None:
             new_thread_id = posted.thread_id or None
         else:
-            # Under next a reply cannot bring the report back, so a failed audit
-            # whose folded card did not post goes out whole.
+            # A failed audit whose folded card did not post goes out whole: under
+            # next the hermes-bridge attaches the stored report to a reply, but
+            # the card was the one place the failure line was readable.
             if headline:
                 leg_message = truncation_notice + headline.text
             elif summary:

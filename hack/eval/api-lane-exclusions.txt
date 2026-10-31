@@ -10,8 +10,8 @@
 # reason is the comment block directly above the id, and it names the issue
 # that decides when the entry goes: scripts/test_eval_rosters.py fails an entry
 # with no reason, with no issue number, or that names no registered case, and
-# fails a registered case whose prompt opens with the stop directive and is not
-# listed here. hack/ci-eval-pr.sh reads this file when it builds the matrix
+# fails a registered case whose prompt opens with the stop directive, or with
+# the reply-under-pushed-report directive, and is not listed here. hack/ci-eval-pr.sh reads this file when it builds the matrix
 # and, only on a transport other than inject, drops the named cases from TASKS
 # before the fan-out and says so in the log; on the inject lane the file
 # changes nothing. An entry here is not a demotion: the rosters are untouched.
@@ -31,3 +31,10 @@ chat-stop-halts-delegated-remediation
 # job runs a nightly case today; the entry keeps one from grading it on that
 # wait. Leaves this list when the api lane's wait reads a paused card's block.
 chat-question-asked-to-choose-pauses
+
+# #4059: the harness stores a pushed report for the conversation and sends the
+# reply as a second message on it (pushed_report.py), which only the inject
+# door can carry; the API server has no conversation the bridge keys the row
+# to. Leaves this list when the api lane can send a second message on the
+# same conversation.
+chat-reply-under-pushed-report

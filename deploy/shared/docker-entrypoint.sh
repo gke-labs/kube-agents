@@ -2316,7 +2316,7 @@ fi
 #
 # The cost is startup latency in the one case that blocks — a sandbox that is
 # slow rather than absent — bounded by --wait at 180s. The startupProbe budget
-# is agentAPIProbe(10, 90), 905s, and progressDeadlineSeconds is 1800, so the
+# is 905s (agentAPIProbeInitialDelaySeconds plus the agentAPIStartupProbe* constants in platformagent_manifests.go), and progressDeadlineSeconds is 1800, so the
 # wait fits with room over. The copy itself runs once: it is guarded by a marker
 # on the sandbox's own volume, so a fresh sandbox PVC gets a fresh copy and every
 # later start skips it and re-pushes only the layout.

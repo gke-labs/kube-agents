@@ -868,6 +868,11 @@ check "nor in a login session" "absent" \
 check "a repository's own hooksPath does not reach the wrapper" "/opt/vcs/share/no-hooks" \
   "$("${SSH[@]}" 'git init -q /tmp/sh && git -C /tmp/sh config core.hooksPath .githooks && git -C /tmp/sh config core.hooksPath' 2>&1)"
 "${SSH[@]}" 'rm -rf /tmp/sh' >/dev/null 2>&1
+# A directory laid out as a bare repository is not opened from inside it, so
+# its `config` is never read: a snapshot's tree can have that layout.
+check "a bare repository is not discovered from its own directory" "safe.bareRepository" \
+  "$("${SSH[@]}" 'git init -q --bare /tmp/sb && cd /tmp/sb && git rev-parse --git-dir' 2>&1)"
+"${SSH[@]}" 'rm -rf /tmp/sb' >/dev/null 2>&1
 check "the local git is a real git" "git version" \
   "$("${SSH[@]}" '/opt/vcs/libexec/git --version' 2>&1)"
 # The message, not the exit status: example.invalid resolves nowhere, so an

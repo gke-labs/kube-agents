@@ -110,9 +110,9 @@ KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconf
 # result: gcloud was not run through it, and the note is the error.
 KUBECONFIG_REFUSED_RC = 1
 DEFAULT_TIMEOUT_S = 60
-# The credential proxy's admitted count at the operator's default limit;
-# collect.py's MAX_WORKERS comment has the reasoning.
-MAX_WORKERS = 4
+# How many clusters a sweep reads at once is broker_admission.sweep_width(),
+# resolved in collect_fleet: what the credential broker admits, less headroom
+# for chat (collect.py's comment above its own collect_fleet has the reasoning).
 
 GEN2_FAMILIES = {"n2", "n2d", "c2"}
 GEN4_HYPERDISK_FAMILIES = {"c4", "n4", "c3"}  # §3.5's list, exactly -- §3.6 lists a different, wider set for its own check
@@ -258,6 +258,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -2454,7 +2455,8 @@ def _only_a_scope_note(entry: dict, project: str | None) -> bool:
     return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE) or entry["error"].startswith(fleet_scope_args.DECLARED_SCOPE_NOTE_PREFIX)
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int | None = None, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     started_at = time.strftime(MANIFEST_TIMESTAMP_FORMAT, time.gmtime())
     # The clock starts before discovery, as `fleet_waste.py`'s does: a slow
     # `projects list` spends the same terminal timeout the reads do.
