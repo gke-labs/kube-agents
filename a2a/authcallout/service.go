@@ -63,14 +63,16 @@ const (
 	// 'PING'" — which names nothing about authorization at all. See handle.
 	authDecisionBudget = 1500 * time.Millisecond
 
-	// taskCredentialSkew is the clock skew a task credential's expiry and
+	// TaskCredentialSkew is the clock skew a task credential's expiry and
 	// issue time are allowed against this callout's clock: the dispatcher
-	// that signed it runs on another node.
-	taskCredentialSkew = 30 * time.Second
+	// that signed it runs on another node. The dispatcher adds the same
+	// allowance to a task's deadline when it mints the credential.
+	TaskCredentialSkew = 30 * time.Second
 
-	// defaultTaskCredentialMaxLifetime bounds how far out a task
-	// credential's expiry may be. See Config.TaskCredentialMaxLifetime.
-	defaultTaskCredentialMaxLifetime = 6 * time.Hour
+	// DefaultTaskCredentialMaxLifetime bounds how far out a task
+	// credential's expiry may be. See Config.TaskCredentialMaxLifetime. The
+	// dispatcher caps the expiries it mints at the same default.
+	DefaultTaskCredentialMaxLifetime = 6 * time.Hour
 
 	// maxTaskCredentialMaxLifetime is the most TaskCredentialMaxLifetime may
 	// be set to; see ParseTaskCredentialMaxLifetime.
@@ -304,7 +306,7 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 	case cfg.TaskCredentialMaxLifetime < 0:
 		svc.taskLifetimeErr = fmt.Errorf("the task credential max lifetime %s is negative", cfg.TaskCredentialMaxLifetime)
 	case cfg.TaskCredentialMaxLifetime == 0:
-		svc.taskMaxLifetime = defaultTaskCredentialMaxLifetime
+		svc.taskMaxLifetime = DefaultTaskCredentialMaxLifetime
 	default:
 		svc.taskMaxLifetime = cfg.TaskCredentialMaxLifetime
 	}
@@ -635,7 +637,7 @@ func (s *Service) verifyTaskCredential(raw string, id Identity, att Attested) (t
 		return taskcred.Claims{}, fmt.Errorf("this callout trusts no task-signing key")
 	}
 	now := s.now()
-	c, err := taskcred.Verify(raw, s.taskKeys, taskcred.AudienceNATS, now, s.taskMaxLifetime, taskCredentialSkew)
+	c, err := taskcred.Verify(raw, s.taskKeys, taskcred.AudienceNATS, now, s.taskMaxLifetime, TaskCredentialSkew)
 	if err != nil {
 		return taskcred.Claims{}, err
 	}

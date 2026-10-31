@@ -107,6 +107,15 @@
       "description": "The one reader of the capability bucket: it answers every executor's capability check over the bus and holds no RBAC (a2a/Dockerfile.verifier)."
     },
     {
+      "name": "a2a-dispatcher",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-dispatcher",
+      "tagPolicy": "release",
+      "override": "A2A_DISPATCHER_IMAGE",
+      "pulledBy": "The AgentProfile dispatcher Deployment the operator renders under spec.mode: next when A2A_DISPATCHER_IMAGE is set, and nothing otherwise: it is off by default until profiles dispatch end to end, so the operator derives nothing for it. Nothing under spec.mode: today.",
+      "description": "The AgentProfile dispatcher: the only reader of the profiles' shared durables, it holds each submission for the life of its task and hands it to a ready worker under a lease (a2a/Dockerfile.dispatcher)."
+    },
+    {
       "name": "hermes-bridge",
       "origin": "first-party",
       "repository": "ghcr.io/gke-labs/kube-agents/hermes-bridge",
@@ -261,7 +270,7 @@
       "repository": "docker.io/library/golang",
       "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages.",
+      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages.",
       "description": "Go toolchain for the operator and k8s-event-watcher builds."
     },
     {
@@ -288,7 +297,7 @@
       "repository": "gcr.io/distroless/static",
       "tag": "nonroot",
       "buildArg": "DISTROLESS_IMAGE",
-      "pulledBy": "k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console and a2a/Dockerfile.console runtime stages.",
+      "pulledBy": "k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console and a2a/Dockerfile.console runtime stages.",
       "description": "Runtime base for the operator image."
     },
     {

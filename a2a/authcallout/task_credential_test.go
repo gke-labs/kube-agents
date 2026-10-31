@@ -123,7 +123,7 @@ func TestATaskCredentialMustBeThisConnections(t *testing.T) {
 		{"another pod UID", taskToken(t, kp, func(c *taskcred.Claims) { c.PodUID = "uid-p2" }), "pod UID"},
 		{"another profile", taskToken(t, kp, func(c *taskcred.Claims) { c.Profile = cluster }), "profile"},
 		{"another tier", taskToken(t, kp, func(c *taskcred.Claims) { c.Tier = "unattended" }), "tier"},
-		{"past the max lifetime", taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = time.Now().Add(defaultTaskCredentialMaxLifetime + time.Hour) }), "ceiling"},
+		{"past the max lifetime", taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = time.Now().Add(DefaultTaskCredentialMaxLifetime + time.Hour) }), "ceiling"},
 		{"an untrusted key", taskToken(t, other, nil), "not a trusted task-signing key"},
 		{"the proxy audience", taskToken(t, kp, func(c *taskcred.Claims) { c.Audience = taskcred.AudienceCredentialProxy }), "credential-proxy"},
 		{"not a credential", "not-a-jwt", "not a JWT"},
@@ -591,7 +591,7 @@ func TestATaskCredentialMayOutliveGrantTTLButTheConnectionMayNot(t *testing.T) {
 	}
 
 	tooLong := taskToken(t, kp, func(c *taskcred.Claims) {
-		c.Expires = time.Now().Add(defaultTaskCredentialMaxLifetime + taskCredentialSkew + time.Minute)
+		c.Expires = time.Now().Add(DefaultTaskCredentialMaxLifetime + TaskCredentialSkew + time.Minute)
 	})
 	if _, err := authorizeWithTask(svc, tokenAuditorPod1, tooLong); err == nil || !strings.Contains(err.Error(), "ceiling") {
 		t.Errorf("a credential past the max lifetime plus skew: %v", err)
