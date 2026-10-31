@@ -4049,11 +4049,23 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		want = agentv1alpha1.DefaultBusReplicas
 	}
 	converting = running != 0 && want != running
-	if converting && !r.busConversionAllowed {
-		// The bus keeps the count it runs until its migration converts it
-		// (Shrinking or Converting renders the new count); this pass only
-		// starts one, or leaves a running one to its phases.
+	migrates := converting && !r.busConversionAllowed
+	if migrates {
+		// A change between the counts starts a migration; the bus keeps the
+		// count it runs until the migration's phases convert it.
 		startBusMigration(agent, running, want, metav1.Now())
+	}
+	if run := agent.Status.BusMigration; run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase)) {
+		// A migration under way decides the count, whatever the field and
+		// the StatefulSet read mid-way.
+		n, err := r.advanceBusMigration(ctx, agent, time.Now())
+		if err != nil {
+			return false, err
+		}
+		agent.Status.BusReplicas = int32(n) // #nosec G115 -- 1 or 3
+		return false, nil
+	}
+	if migrates {
 		agent.Status.BusReplicas = int32(running) // #nosec G115 -- 1 or 3
 		return false, nil
 	}

@@ -1,11 +1,20 @@
 package controller
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 // walkBusMigration runs a migration from its first phase, failing the phase
@@ -176,4 +185,121 @@ func TestAMigrationJobsOutcomeAndTheDeadline(t *testing.T) {
 	if withDeadline(busMigrationSucceeded, now.Add(-time.Second), now) != busMigrationSucceeded {
 		t.Error("a finished phase was failed by the deadline")
 	}
+}
+
+// migrationRig is a CR mid-migration on a fake cluster, with helpers to make
+// the phase's work finish the way the cluster would report it.
+type migrationRig struct {
+	t     *testing.T
+	agent *agentv1alpha1.PlatformAgent
+	cl    client.Client
+	r     *PlatformAgentReconciler
+	sts   *appsv1.StatefulSet
+}
+
+func newMigrationRig(t *testing.T, leg busMigrationLeg, phase busMigrationPhase, running int32, deadline time.Time) *migrationRig {
+	t.Helper()
+	agent := a2aTestAgent()
+	agent.Generation = 3
+	asked := 1
+	if leg == busMigrationGrow {
+		asked = 3
+	}
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(asked)}}
+	agent.Status.BusReplicas = running
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(leg), RunID: "3-1", Phase: string(phase),
+		StartedAt: metav1.Now(), Deadline: metav1.NewTime(deadline), ObservedGeneration: 3}
+	sts := buildA2ANATSStatefulSet(agent, "h")
+	sts.Spec.Replicas = ptr.To(running)
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).WithStatusSubresource(&appsv1.StatefulSet{}, &batchv1.Job{}, &corev1.Pod{}).Build()
+	return &migrationRig{t: t, agent: agent, cl: cl, r: &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(16)}, sts: sts}
+}
+
+// pass runs the resolver and checks the phase and the count it renders.
+func (m *migrationRig) pass(wantPhase busMigrationPhase, wantReplicas int32) {
+	m.t.Helper()
+	if _, err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+		m.t.Fatal(err)
+	}
+	if got := busMigrationPhase(m.agent.Status.BusMigration.Phase); got != wantPhase {
+		m.t.Fatalf("phase %s, want %s", got, wantPhase)
+	}
+	if m.agent.Status.BusReplicas != wantReplicas || int32(a2aNATSReplicas(m.agent)) != wantReplicas {
+		m.t.Fatalf("in %s: status.busReplicas %d, rendered %d; want %d", wantPhase, m.agent.Status.BusReplicas, a2aNATSReplicas(m.agent), wantReplicas)
+	}
+}
+
+func (m *migrationRig) finishJob(step string, cond batchv1.JobConditionType) {
+	m.t.Helper()
+	j := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, step, "3-1"), Namespace: m.agent.Namespace}}
+	if err := m.cl.Create(context.Background(), j); err != nil {
+		m.t.Fatal(err)
+	}
+	j.Status.Conditions = []batchv1.JobCondition{{Type: cond, Status: corev1.ConditionTrue}}
+	if err := m.cl.Status().Update(context.Background(), j); err != nil {
+		m.t.Fatal(err)
+	}
+}
+
+func (m *migrationRig) rollOut(replicas int32) {
+	m.t.Helper()
+	sts := &appsv1.StatefulSet{}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(m.sts), sts); err != nil {
+		m.t.Fatal(err)
+	}
+	sts.Spec.Replicas = ptr.To(replicas)
+	if err := m.cl.Update(context.Background(), sts); err != nil {
+		m.t.Fatal(err)
+	}
+	sts.Status = appsv1.StatefulSetStatus{ObservedGeneration: sts.Generation, Replicas: replicas, ReadyReplicas: replicas, UpdatedReplicas: replicas}
+	if err := m.cl.Status().Update(context.Background(), sts); err != nil {
+		m.t.Fatal(err)
+	}
+}
+
+// Three to one through the pass: the pin Job's completion moves it to
+// Shrinking, which renders one server, and that server rolled out is Done.
+func TestAThreeToOneMigrationRunsThroughThePass(t *testing.T) {
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	m.pass(busMigrationPinning, 3)
+	m.finishJob("pin", batchv1.JobComplete)
+	m.pass(busMigrationShrinking, 1)
+	m.pass(busMigrationShrinking, 1)
+	m.rollOut(1)
+	m.pass(busMigrationDone, 1)
+}
+
+// A failed pin Job, or a pin still running at the deadline, unpins and keeps
+// three servers.
+func TestAFailedOrLatePinUnpins(t *testing.T) {
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	m.finishJob("pin", batchv1.JobFailed)
+	m.pass(busMigrationUnpinning, 3)
+	late := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(-time.Minute))
+	late.pass(busMigrationUnpinning, 3)
+}
+
+// One to three through the pass up to the restore: the freeze rolled out,
+// the snapshot Job, the hashing pod, then three servers rendered and rolled
+// out. A conversion still unfinished at the deadline rolls back to one.
+func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	m.rollOut(1)
+	m.pass(busMigrationSnapshot, 1)
+	m.finishJob("snapshot", batchv1.JobComplete)
+	m.pass(busMigrationHashing, 1)
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, "hash", "3-1"), Namespace: m.agent.Namespace}}
+	if err := m.cl.Create(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.Phase = corev1.PodSucceeded
+	if err := m.cl.Status().Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	m.pass(busMigrationConverting, 3)
+	m.rollOut(3)
+	m.pass(busMigrationRestoring, 3)
+
+	late := newMigrationRig(t, busMigrationGrow, busMigrationConverting, 3, time.Now().Add(-time.Minute))
+	late.pass(busMigrationRollingBack, 1)
 }

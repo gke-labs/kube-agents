@@ -1,10 +1,17 @@
 package controller
 
 import (
+	"context"
+	"fmt"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 // The A2A bus migration (#4225): converting an existing bus between one NATS
@@ -215,4 +222,93 @@ func withDeadline(outcome busMigrationOutcome, deadline, now time.Time) busMigra
 		return busMigrationErred
 	}
 	return outcome
+}
+
+// busMigrationStep names the migration's own workloads: the pin, unpin and
+// snapshot Jobs and the hashing pod, each named for the run.
+func busMigrationWorkloadName(agent *agentv1alpha1.PlatformAgent, step, runID string) string {
+	return fmt.Sprintf("%s-bus-%s-%s", agent.Name, step, runID)
+}
+
+// busNATSRolledOutAt reports the bus StatefulSet rolled out at replicas: the
+// spec asks for that count and every server is updated and Ready, as of the
+// generation the controller observed.
+func busNATSRolledOutAt(sts *appsv1.StatefulSet, replicas int32) bool {
+	return sts.Spec.Replicas != nil && *sts.Spec.Replicas == replicas &&
+		sts.Status.ObservedGeneration >= sts.Generation &&
+		sts.Status.ReadyReplicas == replicas && sts.Status.UpdatedReplicas == replicas
+}
+
+// observeBusMigration reads the current phase's outcome from what runs:
+// the phase's Job, the hashing pod, or the StatefulSet's rollout at the
+// count the phase renders. The restore pod's phases stay pending until it
+// exists.
+func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (busMigrationOutcome, error) {
+	leg, phase := busMigrationLeg(run.Leg), busMigrationPhase(run.Phase)
+	job := func(step string) (busMigrationOutcome, error) {
+		j := &batchv1.Job{}
+		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkloadName(agent, step, run.RunID)}, j); {
+		case errors.IsNotFound(err):
+			return busMigrationPending, nil
+		case err != nil:
+			return busMigrationPending, err
+		}
+		return jobOutcome(j), nil
+	}
+	switch phase {
+	case busMigrationPinning:
+		return job("pin")
+	case busMigrationUnpinning:
+		return job("unpin")
+	case busMigrationSnapshot:
+		return job("snapshot")
+	case busMigrationHashing:
+		pod := &corev1.Pod{}
+		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkloadName(agent, "hash", run.RunID)}, pod); {
+		case errors.IsNotFound(err):
+			return busMigrationPending, nil
+		case err != nil:
+			return busMigrationPending, err
+		}
+		switch pod.Status.Phase {
+		case corev1.PodSucceeded:
+			return busMigrationSucceeded, nil
+		case corev1.PodFailed:
+			return busMigrationErred, nil
+		}
+		return busMigrationPending, nil
+	case busMigrationFreezing, busMigrationShrinking, busMigrationConverting, busMigrationRollingBack, busMigrationReleasing:
+		sts := &appsv1.StatefulSet{}
+		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); {
+		case errors.IsNotFound(err):
+			return busMigrationPending, nil
+		case err != nil:
+			return busMigrationPending, err
+		}
+		if busNATSRolledOutAt(sts, int32(busMigrationReplicas(leg, phase, run.Abandoning))) { // #nosec G115 -- 1 or 3
+			return busMigrationSucceeded, nil
+		}
+		return busMigrationPending, nil
+	}
+	return busMigrationPending, nil
+}
+
+// advanceBusMigration moves a running migration on by what this pass
+// observes, the deadline included, and returns the server count the bus
+// renders in the phase it is in after that.
+func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent *agentv1alpha1.PlatformAgent, now time.Time) (int, error) {
+	run := agent.Status.BusMigration
+	leg := busMigrationLeg(run.Leg)
+	if !busMigrationTerminal(busMigrationPhase(run.Phase)) {
+		outcome, err := r.observeBusMigration(ctx, agent, run)
+		if err != nil {
+			return 0, err
+		}
+		step := nextBusMigrationPhase(leg, busMigrationPhase(run.Phase), run.Abandoning, withDeadline(outcome, run.Deadline.Time, now))
+		run.Phase, run.Abandoning = string(step.next), step.abandoning
+		if step.manual != "" {
+			run.Message = step.manual
+		}
+	}
+	return busMigrationReplicas(leg, busMigrationPhase(run.Phase), run.Abandoning), nil
 }
