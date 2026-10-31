@@ -540,6 +540,34 @@ def _check_completeness(pod_workloads: dict, summed_containers: set) -> None:
         )
 
 
+def _check_limits(pod_workloads: dict, summed_containers: set) -> None:
+    """Fail on a summed container that declares no CPU or memory limit.
+
+    A namespace ResourceQuota on limits.cpu or limits.memory refuses a pod with any
+    container that declares no such limit, unless a LimitRange supplies a default. The
+    preflight sums an undeclared limit as zero, so it can't see the refusal coming: the
+    install passes the render and the pod is then never admitted (#3847, the next-mode
+    console). Every container the footprint counts has to declare both.
+    """
+    missing = []
+    for workload_key, spec in sorted(pod_workloads.items()):
+        for container in _pod_containers(spec):
+            if _container_key(workload_key, container.get(_NAME_FIELD)) not in summed_containers:
+                continue
+            limits = (container.get(_RESOURCES_FIELD) or {}).get(_LIMITS) or {}
+            for key in (_CPU, _MEMORY):
+                if not _declared(limits.get(key)):
+                    missing.append(f"container {container.get(_NAME_FIELD)!r} in {workload_key} declares no {key} limit")
+    if missing:
+        found = "\n".join(f"  - {item}" for item in missing)
+        raise ValueError(
+            "the golden renders containers a limits quota would refuse:\n"
+            f"{found}\n"
+            "Give each a limit in the operator: a namespace ResourceQuota on limits.cpu or"
+            " limits.memory refuses a pod with a container that declares none."
+        )
+
+
 def extract_footprint() -> dict:
     """Extract operator-rendered resource requirements from both goldens."""
     today = _extract(_GOLDEN_MANIFEST, next_mode=False)
@@ -738,6 +766,7 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
                 f"no volumeClaimTemplate on {_A2A_NATS_WORKLOAD} in the next-mode golden"
             )
     _check_completeness(pod_workloads, summed_containers)
+    _check_limits(pod_workloads, summed_containers)
 
     # The agent pod's base is everything always present: the agent, its log shipper, and the
     # agent-api-auth native sidecar (declared as an init container with restartPolicy:

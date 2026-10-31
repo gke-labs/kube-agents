@@ -168,11 +168,11 @@ nextMode:
       memory: 64Mi
       ephemeral-storage: "0"
     limits:
-      cpu: 0m
+      cpu: 500m
       memory: 128Mi
       ephemeral-storage: "0"
     cpuMillisRequest: 50
-    cpuMillisLimit: 0
+    cpuMillisLimit: 500
     memoryBytesRequest: 67108864
     memoryBytesLimit: 134217728
     ephemeralStorageBytesRequest: 0
