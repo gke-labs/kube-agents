@@ -83,6 +83,20 @@ operations:
     runs: 1
     timeout_seconds: 7200
     prompt: Prepare an upgrade readiness report for my whole fleet. Which clusters are behind, what blocks their upgrade, and in what order should they be upgraded?
+  upgrade_report_1:
+    # The report for one named cluster, with AGENT_DELEGATION_TIMEOUT=5400 as for upgrade_report_long:
+    # with the 1- and 10-cluster runs, shows whether the report's time is fixed or grows per cluster.
+    kind: prompt
+    factors: [combined]
+    runs: 2
+    timeout_seconds: 7200
+    prompt: Prepare an upgrade readiness report for the cluster scale-01 only. Is it behind, what blocks its upgrade, and when should it be upgraded?
+  upgrade_report_10:
+    kind: prompt
+    factors: [combined]
+    runs: 2
+    timeout_seconds: 7200
+    prompt: Prepare an upgrade readiness report for the clusters scale-01 to scale-10 only. Which of them are behind, what blocks their upgrade, and in what order should they be upgraded?
   fleet_health:
     kind: prompt
     factors: [combined]
