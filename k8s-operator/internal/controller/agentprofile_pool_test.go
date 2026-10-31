@@ -8,6 +8,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -209,4 +210,66 @@ func initMounts(spec corev1.PodSpec) []corev1.VolumeMount {
 		out = append(out, c.VolumeMounts...)
 	}
 	return out
+}
+
+// One pool the API server refuses doesn't hold up the others, or the sweep
+// of a removed profile's pool; and a failure deleting the dispatcher's RBAC
+// doesn't keep the pools, which nothing else would reclaim, from going.
+func TestOnePoolFailureDoesntStrandTheRest(t *testing.T) {
+	withDispatcher(t)
+	agent := a2aTestAgent()
+	pns := profileNamespaceName(agent)
+	bad := testAgentProfile(agent.Namespace, "bad")
+	good := testAgentProfile(agent.Namespace, "good")
+	gone := testAgentProfile(agent.Namespace, "gone")
+
+	scheme := setupScheme()
+	bundle := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace},
+		Data:       map[string]string{a2aNATSCACertKey: "pem"},
+	}
+	funcs := fakeServerSideApplyInterceptors()
+	apply := funcs.Patch
+	funcs.Patch = func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+		if obj.GetName() == profilePoolName("bad", "read") {
+			return apierrors.NewInvalid(appsv1.SchemeGroupVersion.WithKind("Deployment").GroupKind(), obj.GetName(), nil)
+		}
+		return apply(ctx, cl, obj, patch, opts...)
+	}
+	failRoleDelete := false
+	funcs.Delete = func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+		if _, isRole := obj.(*rbacv1.Role); isRole && failRoleDelete {
+			return apierrors.NewServiceUnavailable("test")
+		}
+		return cl.Delete(ctx, obj, opts...)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(agent, chartProfileNamespace(agent), bundle).WithInterceptorFuncs(funcs).Build()
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+	pool := func(name string) error {
+		return c.Get(ctx, types.NamespacedName{Namespace: pns, Name: profilePoolName(name, "read")}, &appsv1.Deployment{})
+	}
+
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, []agentv1alpha1.AgentProfile{good, gone}, true); err != nil || profileErr != nil {
+		t.Fatalf("setup: %v / %v", err, profileErr)
+	}
+	profileErr, err := r.reconcileA2ADispatcher(ctx, agent, []agentv1alpha1.AgentProfile{bad, good}, true)
+	if err != nil || profileErr == nil {
+		t.Fatalf("a refused pool should surface as a profile-namespace error: %v / %v", err, profileErr)
+	}
+	if err := pool("good"); err != nil {
+		t.Errorf("a refused pool held up another profile's: %v", err)
+	}
+	if err := pool("gone"); !apierrors.IsNotFound(err) {
+		t.Errorf("a refused pool held up the sweep of a removed profile's: %v", err)
+	}
+
+	failRoleDelete = true
+	if err := r.deleteDispatcherPodsRBAC(ctx, agent); err == nil {
+		t.Error("the RBAC delete failure wasn't reported")
+	}
+	if err := pool("good"); !apierrors.IsNotFound(err) {
+		t.Errorf("a pool survived teardown because the RBAC delete failed: %v", err)
+	}
 }

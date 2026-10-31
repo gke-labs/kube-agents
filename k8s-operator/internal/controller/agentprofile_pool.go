@@ -8,6 +8,7 @@ package controller
 
 import (
 	"context"
+	goerrors "errors"
 	"fmt"
 	"strconv"
 
@@ -291,25 +292,31 @@ func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, age
 			}
 		}
 	}
+	if len(pools) == 0 {
+		// Nothing left to mount the bundle copy either.
+		return goerrors.Join(r.deleteProfilePoolsExcept(ctx, agent, nil), r.deleteProfileCABundle(ctx, agent))
+	}
+	// The CA bundle the pools mount, copied before the pools that need it.
+	src := &corev1.ConfigMap{}
+	if err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSCABundleName(agent)}, src); err != nil {
+		return fmt.Errorf("reading the NATS CA bundle to copy into the profile namespace: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, buildProfileCABundle(agent, src.Data)); err != nil {
+		return fmt.Errorf("the profile namespace's NATS CA bundle: %w", err)
+	}
+	// One pool the API server refuses (a profile whose requests exceed its
+	// limits, a webhook) doesn't hold up the others or the sweep: a pool it
+	// failed to apply is still wanted, so the sweep leaves it alone.
 	want := map[string]bool{}
-	if len(pools) > 0 {
-		// The CA bundle the pools mount, copied before the pools that need
-		// it.
-		src := &corev1.ConfigMap{}
-		if err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSCABundleName(agent)}, src); err != nil {
-			return fmt.Errorf("reading the NATS CA bundle to copy into the profile namespace: %w", err)
-		}
-		if err := r.applyManaged(ctx, agent, buildProfileCABundle(agent, src.Data)); err != nil {
-			return fmt.Errorf("the profile namespace's NATS CA bundle: %w", err)
-		}
-		for _, pool := range pools {
-			if err := r.applyManaged(ctx, agent, pool); err != nil {
-				return fmt.Errorf("the warm pool %s: %w", pool.Name, err)
-			}
-			want[pool.Name] = true
+	var errs []error
+	for _, pool := range pools {
+		want[pool.Name] = true
+		if err := r.applyManaged(ctx, agent, pool); err != nil {
+			errs = append(errs, fmt.Errorf("the warm pool %s: %w", pool.Name, err))
 		}
 	}
-	return r.deleteProfilePoolsExcept(ctx, agent, want)
+	errs = append(errs, r.deleteProfilePoolsExcept(ctx, agent, want))
+	return goerrors.Join(errs...)
 }
 
 // deleteProfilePoolsExcept deletes this agent's warm pools in the profile
@@ -338,9 +345,12 @@ func (r *PlatformAgentReconciler) deleteProfilePoolsExcept(ctx context.Context, 
 // bundle's copy, from the profile namespace: the gate turned off, the flip to
 // today, and PlatformAgent deletion (through deleteDispatcherPodsRBAC).
 func (r *PlatformAgentReconciler) deleteProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	if err := r.deleteProfilePoolsExcept(ctx, agent, nil); err != nil {
-		return err
-	}
+	return goerrors.Join(r.deleteProfilePoolsExcept(ctx, agent, nil), r.deleteProfileCABundle(ctx, agent))
+}
+
+// deleteProfileCABundle removes the CA bundle's copy from the profile
+// namespace, if this agent made it.
+func (r *PlatformAgentReconciler) deleteProfileCABundle(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	bundle := &corev1.ConfigMap{}
 	key := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: a2aNATSCABundleName(agent)}
 	if err := r.a2aReader().Get(ctx, key, bundle); err != nil {
