@@ -85,27 +85,33 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 		t.Fatal("the unattended profile has no Job template in the dispatch config")
 	}
 
-	var param corev1.PodTemplate
+	var param agentv1alpha1.DispatchJobTemplate
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "tse"}, &param); err != nil {
 		t.Fatalf("the policy's param for tse: %v", err)
 	}
-	if !apiequality.Semantic.DeepEqual(param.Template, *inConfig) {
-		t.Errorf("the param's template differs from the dispatch config's:\nparam  %+v\nconfig %+v", param.Template, *inConfig)
+	held, ok := dispatchJobParamTemplate(&param)
+	if !ok {
+		t.Fatalf("the param holds no template: %s", param.Spec.Template.Raw)
 	}
-	if param.Template.Spec.RestartPolicy != corev1.RestartPolicyNever {
-		t.Errorf("restartPolicy %q: a PodTemplate defaults it to Always, which a Job pod refuses", param.Template.Spec.RestartPolicy)
+	// The fake client's dry run doesn't default, so the param equals the
+	// config's template here; on a real API server it is that, defaulted.
+	if !apiequality.Semantic.DeepEqual(held, *inConfig) {
+		t.Errorf("the param's template differs from the dispatch config's:\nparam  %+v\nconfig %+v", held, *inConfig)
 	}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "reader"}, &corev1.PodTemplate{}); !apierrors.IsNotFound(err) {
+	if held.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Errorf("restartPolicy %q: a PodTemplate defaults it to Always, which a Job pod refuses", held.Spec.RestartPolicy)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "reader"}, &agentv1alpha1.DispatchJobTemplate{}); !apierrors.IsNotFound(err) {
 		t.Errorf("a read-only profile has a Job template param: %v", err)
 	}
-	var index corev1.PodTemplate
+	var index agentv1alpha1.DispatchJobTemplate
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index); err != nil {
 		t.Fatalf("the policy's index: %v", err)
 	}
-	if got, want := index.Annotations[dispatchJobAccountsAnnotation], inConfig.Spec.ServiceAccountName; got != want || want == "" {
+	if got, want := strings.Join(index.Spec.ServiceAccounts, ","), inConfig.Spec.ServiceAccountName; got != want || want == "" {
 		t.Errorf("the index lists %q, want the template's account %q", got, want)
 	}
-	for _, pt := range []*corev1.PodTemplate{&param, &index} {
+	for _, pt := range []*agentv1alpha1.DispatchJobTemplate{&param, &index} {
 		for k, v := range dispatchJobParamLabels(agent) {
 			if pt.Labels[k] != v {
 				t.Errorf("%s: label %s=%q, want %q (the binding selects params by these)", pt.Name, k, pt.Labels[k], v)
@@ -119,13 +125,13 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
 		t.Fatalf("drop the tier: %v / %v", err, profileErr)
 	}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "tse"}, &corev1.PodTemplate{}); !apierrors.IsNotFound(err) {
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "tse"}, &agentv1alpha1.DispatchJobTemplate{}); !apierrors.IsNotFound(err) {
 		t.Errorf("the param outlived the profile's unattended tier: %v", err)
 	}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index); err != nil {
 		t.Fatal(err)
 	}
-	if got := index.Annotations[dispatchJobAccountsAnnotation]; got != "" {
+	if got := index.Spec.ServiceAccounts; len(got) != 0 {
 		t.Errorf("the index still lists %q", got)
 	}
 }
@@ -135,7 +141,7 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 // (params before the Role).
 func TestAForeignTemplateUnderAParamNameIsRefused(t *testing.T) {
 	agent := a2aTestAgent()
-	foreign := &corev1.PodTemplate{ObjectMeta: metav1.ObjectMeta{
+	foreign := &agentv1alpha1.DispatchJobTemplate{ObjectMeta: metav1.ObjectMeta{
 		Name: dispatchJobTemplatePrefix + "tse", Namespace: profileNamespaceName(agent), Labels: map[string]string{"x": "y"},
 	}}
 	r, c := jobTemplateTestReconciler(t, agent, foreign)
@@ -148,7 +154,7 @@ func TestAForeignTemplateUnderAParamNameIsRefused(t *testing.T) {
 	if !errors.As(profileErr, &refused) {
 		t.Fatalf("profileErr = %v, want the foreign-param refusal", profileErr)
 	}
-	var got corev1.PodTemplate
+	var got agentv1alpha1.DispatchJobTemplate
 	if err := c.Get(ctx, client.ObjectKeyFromObject(foreign), &got); err != nil || got.Labels["x"] != "y" {
 		t.Errorf("the foreign template was touched: %v %v", err, got.Labels)
 	}
@@ -206,8 +212,8 @@ func TestNoJobModeWithoutTheAdmissionPolicy(t *testing.T) {
 		obj  client.Object
 		name string
 	}{
-		{&corev1.PodTemplate{}, dispatchJobTemplatePrefix + "tse"},
-		{&corev1.PodTemplate{}, dispatchJobIndexName},
+		{&agentv1alpha1.DispatchJobTemplate{}, dispatchJobTemplatePrefix + "tse"},
+		{&agentv1alpha1.DispatchJobTemplate{}, dispatchJobIndexName},
 		{&rbacv1.Role{}, a2aDispatcherJobsRoleName(agent)},
 		{&rbacv1.RoleBinding{}, a2aDispatcherJobsRoleName(agent)},
 	}
@@ -284,7 +290,7 @@ func TestTheJobPolicyHoldsAfterEveryOperatorWrite(t *testing.T) {
 		writes++
 		ctx := context.Background()
 		binding := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, &rbacv1.RoleBinding{}) == nil
-		var index corev1.PodTemplate
+		var index agentv1alpha1.DispatchJobTemplate
 		indexed := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index) == nil
 		if binding && !indexed {
 			t.Errorf("after %s %T %s: the Jobs RoleBinding exists with no index, so the templates admit any account none runs as", op, obj, obj.GetName())
@@ -292,18 +298,20 @@ func TestTheJobPolicyHoldsAfterEveryOperatorWrite(t *testing.T) {
 		if !binding || !indexed {
 			return // the dispatcher can't create a Job: nothing to admit
 		}
-		var all corev1.PodTemplateList
+		var all agentv1alpha1.DispatchJobTemplateList
 		if err := c.List(ctx, &all, client.InNamespace(pns)); err != nil {
 			t.Fatal(err)
 		}
 		running := map[string]bool{}
 		for _, pt := range all.Items {
 			if strings.HasPrefix(pt.Name, dispatchJobTemplatePrefix) {
-				running[pt.Template.Spec.ServiceAccountName] = true
+				if held, ok := dispatchJobParamTemplate(&pt); ok {
+					running[held.Spec.ServiceAccountName] = true
+				}
 			}
 		}
-		if listed := index.Annotations[dispatchJobAccountsAnnotation]; listed != "" {
-			for _, sa := range strings.Split(listed, ",") {
+		{
+			for _, sa := range index.Spec.ServiceAccounts {
 				if !running[sa] {
 					t.Errorf("after %s %T %s: the index lists %s, which no template runs as, so a Job as %s is held to nothing", op, obj, obj.GetName(), sa, sa)
 				}
@@ -347,11 +355,11 @@ func TestTheJobPolicyHoldsAfterEveryOperatorWrite(t *testing.T) {
 			want = append(want, tmpl.Spec.ServiceAccountName)
 		}
 		sort.Strings(want)
-		var index corev1.PodTemplate
+		var index agentv1alpha1.DispatchJobTemplate
 		if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index); err != nil {
 			t.Fatalf("%s: the index: %v", step, err)
 		}
-		if got := index.Annotations[dispatchJobAccountsAnnotation]; got != strings.Join(want, ",") {
+		if got := strings.Join(index.Spec.ServiceAccounts, ","); got != strings.Join(want, ",") {
 			t.Errorf("%s: the index lists %q, want %q", step, got, strings.Join(want, ","))
 		}
 	}
@@ -434,6 +442,10 @@ func TestJobModeNeedsThePolicyInPlace(t *testing.T) {
 			p.Spec.FailurePolicy = ptr.To(admissionregistrationv1.Ignore)
 			return true, true
 		},
+		"params of a built-in kind": func(p *admissionregistrationv1.ValidatingAdmissionPolicy, _ *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (bool, bool) {
+			p.Spec.ParamKind = &admissionregistrationv1.ParamKind{APIVersion: "v1", Kind: "PodTemplate"}
+			return true, true
+		},
 		"the binding auditing only": func(_ *admissionregistrationv1.ValidatingAdmissionPolicy, b *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (bool, bool) {
 			b.Spec.ValidationActions = []admissionregistrationv1.ValidationAction{admissionregistrationv1.Audit}
 			return true, true
@@ -491,7 +503,7 @@ func TestJobModeNeedsThePolicyInPlace(t *testing.T) {
 			}{
 				{&rbacv1.RoleBinding{}, a2aDispatcherJobsRoleName(agent)},
 				{&rbacv1.Role{}, a2aDispatcherJobsRoleName(agent)},
-				{&corev1.PodTemplate{}, dispatchJobTemplatePrefix + "tse"},
+				{&agentv1alpha1.DispatchJobTemplate{}, dispatchJobTemplatePrefix + "tse"},
 			} {
 				if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: o.name}, o.obj); !apierrors.IsNotFound(err) {
 					t.Errorf("%T %s survived %s: %v", o.obj, o.name, name, err)

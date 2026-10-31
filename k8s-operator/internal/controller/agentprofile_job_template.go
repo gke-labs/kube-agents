@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"slices"
@@ -30,6 +31,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -42,22 +44,20 @@ import (
 // unattended task as a Job in the profile namespace, from a pod template the
 // operator renders per profile. The same template goes two places: into the
 // dispatch config (a2aDispatchProfile.JobTemplate), which the dispatcher
-// stamps a Job from, and into a PodTemplate in the profile namespace, which
-// the admission policy (config/admission/a2a-dispatcher-job-policy.yaml)
-// holds every dispatcher Job to. An index PodTemplate lists the
-// ServiceAccounts those templates run as, so a Job running as any other is
-// denied. Only the operator writes PodTemplates there.
+// stamps a Job from, and, defaulted by a server-side dry run, into a
+// DispatchJobTemplate in the profile namespace, which the admission policy
+// (config/admission/a2a-dispatcher-job-policy.yaml) holds every dispatcher
+// Job to. An index DispatchJobTemplate lists the ServiceAccounts those
+// templates run as, so a Job running as any other is denied. Only the
+// operator writes DispatchJobTemplates.
 const (
-	// dispatchJobTemplatePrefix names a profile's PodTemplate:
+	// dispatchJobTemplatePrefix names a profile's DispatchJobTemplate:
 	// kube-agents-dispatch-job-profile-<profile>.
 	dispatchJobTemplatePrefix = "kube-agents-dispatch-job-profile-"
-	// dispatchJobIndexName is the index PodTemplate, which the policy tells
+	// dispatchJobIndexName is the index DispatchJobTemplate, which the policy tells
 	// apart by this name. The templates' prefix keeps a profile named
 	// "index" from taking it.
 	dispatchJobIndexName = "kube-agents-dispatch-job-index"
-	// dispatchJobAccountsAnnotation lists, on the index, the ServiceAccounts
-	// the templates run as, comma-separated and sorted.
-	dispatchJobAccountsAnnotation = "kube-agents.dev/dispatch-job-service-accounts"
 	// dispatchJobTemplateLabel and the managed-by label (commonLabels'
 	// labelManagedBy: fieldOwner) are what the policy's binding selects
 	// params by.
@@ -65,10 +65,6 @@ const (
 	// dispatchJobLabel marks a Job the dispatcher created (lib.DispatchJobLabel),
 	// so a teardown can find them.
 	dispatchJobLabel = "kubeagents.x-k8s.io/dispatch-job"
-	// dispatchJobIndexImage is the index's container image. The index is a
-	// PodTemplate only so the policy can read it as a param; nothing ever runs
-	// from it, and the API server requires a container in it.
-	dispatchJobIndexImage = "registry.k8s.io/pause:3.10"
 	// The worker's scratch workspace and its tmpfs for the proxy task token
 	// (contract addendum 8).
 	workerScratchVolume    = "scratch"
@@ -302,20 +298,23 @@ func dispatchJobParamLabels(agent *agentv1alpha1.PlatformAgent) map[string]strin
 	return labels
 }
 
-// buildDispatchJobTemplate is profile's PodTemplate param: its Job template,
-// as the dispatcher stamps it.
-func buildDispatchJobTemplate(agent *agentv1alpha1.PlatformAgent, profile string, tmpl *corev1.PodTemplateSpec) *corev1.PodTemplate {
-	return &corev1.PodTemplate{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "PodTemplate"},
-		ObjectMeta: metav1.ObjectMeta{Name: dispatchJobTemplatePrefix + profile, Namespace: profileNamespaceName(agent), Labels: dispatchJobParamLabels(agent)},
-		Template:   *tmpl.DeepCopy(),
+// buildDispatchJobTemplate is profile's param: its Job template, defaulted
+// as the API server defaults a pod template (defaultedJobTemplate).
+func buildDispatchJobTemplate(agent *agentv1alpha1.PlatformAgent, profile string, defaulted *corev1.PodTemplateSpec) (*agentv1alpha1.DispatchJobTemplate, error) {
+	raw, err := json.Marshal(defaulted)
+	if err != nil {
+		return nil, err
 	}
+	return &agentv1alpha1.DispatchJobTemplate{
+		TypeMeta:   metav1.TypeMeta{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "DispatchJobTemplate"},
+		ObjectMeta: metav1.ObjectMeta{Name: dispatchJobTemplatePrefix + profile, Namespace: profileNamespaceName(agent), Labels: dispatchJobParamLabels(agent)},
+		Spec:       agentv1alpha1.DispatchJobTemplateSpec{Template: runtime.RawExtension{Raw: raw}},
+	}, nil
 }
 
 // buildDispatchJobIndex is the index param: the ServiceAccounts the
-// templates run as. A PodTemplate only so the policy can read it, with an
-// inert container the API server requires and nothing ever runs.
-func buildDispatchJobIndex(agent *agentv1alpha1.PlatformAgent, templates map[string]*corev1.PodTemplateSpec) *corev1.PodTemplate {
+// templates run as.
+func buildDispatchJobIndex(agent *agentv1alpha1.PlatformAgent, templates map[string]*corev1.PodTemplateSpec) *agentv1alpha1.DispatchJobTemplate {
 	var accounts []string
 	for _, t := range templates {
 		accounts = append(accounts, t.Spec.ServiceAccountName)
@@ -324,19 +323,40 @@ func buildDispatchJobIndex(agent *agentv1alpha1.PlatformAgent, templates map[str
 }
 
 // buildDispatchJobIndexFor is the index listing accounts.
-func buildDispatchJobIndexFor(agent *agentv1alpha1.PlatformAgent, accounts []string) *corev1.PodTemplate {
+func buildDispatchJobIndexFor(agent *agentv1alpha1.PlatformAgent, accounts []string) *agentv1alpha1.DispatchJobTemplate {
 	accounts = slices.Clone(accounts)
 	sort.Strings(accounts)
 	accounts = slices.Compact(accounts)
-	return &corev1.PodTemplate{
-		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PodTemplate"},
-		ObjectMeta: metav1.ObjectMeta{Name: dispatchJobIndexName, Namespace: profileNamespaceName(agent), Labels: dispatchJobParamLabels(agent),
-			Annotations: map[string]string{dispatchJobAccountsAnnotation: strings.Join(accounts, ",")}},
-		Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-			AutomountServiceAccountToken: ptr.To(false),
-			Containers:                   []corev1.Container{{Name: "index", Image: dispatchJobIndexImage}},
-		}},
+	return &agentv1alpha1.DispatchJobTemplate{
+		TypeMeta:   metav1.TypeMeta{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "DispatchJobTemplate"},
+		ObjectMeta: metav1.ObjectMeta{Name: dispatchJobIndexName, Namespace: profileNamespaceName(agent), Labels: dispatchJobParamLabels(agent)},
+		Spec:       agentv1alpha1.DispatchJobTemplateSpec{ServiceAccounts: accounts},
 	}
+}
+
+// dispatchJobParamTemplate is the pod template a param holds, or false (the
+// index, or a template that won't decode).
+func dispatchJobParamTemplate(param *agentv1alpha1.DispatchJobTemplate) (corev1.PodTemplateSpec, bool) {
+	var tmpl corev1.PodTemplateSpec
+	if len(param.Spec.Template.Raw) == 0 || json.Unmarshal(param.Spec.Template.Raw, &tmpl) != nil {
+		return tmpl, false
+	}
+	return tmpl, true
+}
+
+// defaultedJobTemplate is tmpl as the API server defaults it, from a
+// server-side dry-run create of a PodTemplate in ns (nothing is stored). The
+// policy compares a Job's defaulted pod template with its param field for
+// field, and the API server doesn't default a DispatchJobTemplate's
+// contents, so the param holds the defaulted form. Run every reconcile, so
+// it follows the API server's defaults across upgrades. The operator's only
+// podtemplate verb is create, for this.
+func (r *PlatformAgentReconciler) defaultedJobTemplate(ctx context.Context, ns, profile string, tmpl *corev1.PodTemplateSpec) (*corev1.PodTemplateSpec, error) {
+	dry := &corev1.PodTemplate{ObjectMeta: metav1.ObjectMeta{Name: dispatchJobTemplatePrefix + profile, Namespace: ns}, Template: *tmpl.DeepCopy()}
+	if err := r.Create(ctx, dry, client.DryRunAll); err != nil {
+		return nil, fmt.Errorf("default the Job template of profile %s (a dry-run PodTemplate): %w", profile, err)
+	}
+	return &dry.Template, nil
 }
 
 // buildA2ADispatcherJobsRole lets the dispatcher run unattended tasks as
@@ -370,13 +390,13 @@ func a2aDispatcherJobsRoleName(agent *agentv1alpha1.PlatformAgent) string {
 	return a2aDispatcherName(agent) + "-jobs"
 }
 
-// errForeignDispatchJobParam is a PodTemplate under a param's name that
+// errForeignDispatchJobParam is a DispatchJobTemplate under a param's name that
 // isn't this agent's: never adopted or overwritten, since the admission
 // policy trusts what it holds.
 type errForeignDispatchJobParam struct{ name string }
 
 func (e errForeignDispatchJobParam) Error() string {
-	return fmt.Sprintf("PodTemplate %s in the profile namespace is not this agent's (it lacks the agent's labels), so it is left alone and the profile's Jobs are not admitted until it is removed", e.name)
+	return fmt.Sprintf("DispatchJobTemplate %s in the profile namespace is not this agent's (it lacks the agent's labels), so it is left alone and the profile's Jobs are not admitted until it is removed", e.name)
 }
 
 // reconcileDispatchJobParams brings the policy's params in line with
@@ -390,11 +410,11 @@ func (e errForeignDispatchJobParam) Error() string {
 //  3. the index lists the accounts they now run as;
 //  4. the templates no longer wanted are deleted.
 //
-// A PodTemplate under a param's name without this agent's labels stops the
-// pass with an error.
+// A DispatchJobTemplate under a param's name without this agent's labels
+// stops the pass with an error.
 func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context, agent *agentv1alpha1.PlatformAgent, templates map[string]*corev1.PodTemplateSpec) error {
 	ns := profileNamespaceName(agent)
-	var existing corev1.PodTemplateList
+	var existing agentv1alpha1.DispatchJobTemplateList
 	if err := r.a2aReader().List(ctx, &existing, client.InNamespace(ns), client.MatchingLabels(dispatchJobParamLabels(agent))); err != nil {
 		return fmt.Errorf("list the dispatcher's Job templates: %w", err)
 	}
@@ -412,7 +432,8 @@ func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context
 		// Kept only where the same profile keeps the account: one moving to
 		// another profile would otherwise be listed while the template that
 		// ran as it is rewritten before its new owner's is written.
-		if sa := pt.Template.Spec.ServiceAccountName; templates[profile] != nil && templates[profile].Spec.ServiceAccountName == sa {
+		held, ok := dispatchJobParamTemplate(pt)
+		if sa := held.Spec.ServiceAccountName; ok && templates[profile] != nil && templates[profile].Spec.ServiceAccountName == sa {
 			both = append(both, sa)
 		}
 	}
@@ -425,7 +446,15 @@ func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if err := r.applyDispatchJobParam(ctx, agent, buildDispatchJobTemplate(agent, name, templates[name])); err != nil {
+		defaulted, err := r.defaultedJobTemplate(ctx, ns, name, templates[name])
+		if err != nil {
+			return err
+		}
+		param, err := buildDispatchJobTemplate(agent, name, defaulted)
+		if err != nil {
+			return err
+		}
+		if err := r.applyDispatchJobParam(ctx, agent, param); err != nil {
 			return err
 		}
 	}
@@ -445,10 +474,10 @@ func (r *PlatformAgentReconciler) reconcileDispatchJobParams(ctx context.Context
 	return nil
 }
 
-// applyDispatchJobParam writes want, unless a PodTemplate of its name is
-// there without this agent's labels.
-func (r *PlatformAgentReconciler) applyDispatchJobParam(ctx context.Context, agent *agentv1alpha1.PlatformAgent, want *corev1.PodTemplate) error {
-	var got corev1.PodTemplate
+// applyDispatchJobParam writes want, unless a DispatchJobTemplate of its name
+// is there without this agent's labels.
+func (r *PlatformAgentReconciler) applyDispatchJobParam(ctx context.Context, agent *agentv1alpha1.PlatformAgent, want *agentv1alpha1.DispatchJobTemplate) error {
+	var got agentv1alpha1.DispatchJobTemplate
 	err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: want.Namespace, Name: want.Name}, &got)
 	switch {
 	case apierrors.IsNotFound(err):
@@ -503,7 +532,7 @@ func (r *PlatformAgentReconciler) deleteDispatcherJobResources(ctx context.Conte
 			return fmt.Errorf("delete the dispatcher's Job %s: %w", jobs.Items[i].Name, err)
 		}
 	}
-	var params corev1.PodTemplateList
+	var params agentv1alpha1.DispatchJobTemplateList
 	if err := r.a2aReader().List(ctx, &params, client.InNamespace(ns), client.MatchingLabels(dispatchJobParamLabels(agent))); err != nil {
 		return fmt.Errorf("list the dispatcher's Job templates: %w", err)
 	}

@@ -36,9 +36,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 // The policy source the chart's copy is generated from, relative to this package.
@@ -52,7 +57,7 @@ var dispatcherJobFixture = filepath.Join("testdata", "a2a-dispatcher-job.json")
 // policy in a real API server against params the operator's own builders
 // render: a Job the dispatcher creates is admitted only as its profile's
 // template, and every way out of it is denied by the rule that names it.
-// Missing params deny; PodTemplates without the operator's labels are not
+// Missing params deny; DispatchJobTemplates without the operator's labels are not
 // params; the dispatcher can't write params; other requesters are not
 // selected.
 func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
@@ -76,12 +81,12 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 
 	tse := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, "tse")), false)
 
-	// Before any operator param: PodTemplates without its labels, one
+	// Before any operator param: DispatchJobTemplates without its labels, one
 	// posing as the index and listing tse's account, one as tse's template.
 	// Neither is selected, so the Job finds no param and is denied.
 	foreignIndex := buildDispatchJobIndex(agent, map[string]*corev1.PodTemplateSpec{"tse": tse})
 	foreignIndex.Labels = map[string]string{"x": "y"}
-	foreignTemplate := buildDispatchJobTemplate(agent, "tse", tse)
+	foreignTemplate := envtestParam(ctx, t, admin, agent, "tse", tse)
 	foreignTemplate.Labels = nil
 	mustCreate(ctx, t, admin, foreignIndex)
 	mustCreate(ctx, t, admin, foreignTemplate)
@@ -91,7 +96,7 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 		err := dispatcher.Create(ctx, dispatcherJob(fmt.Sprintf("activation-%d", n), tse, nil))
 		if apierrors.IsForbidden(err) || apierrors.IsInvalid(err) {
 			if !strings.Contains(err.Error(), "no params found") {
-				t.Errorf("with only unlabelled PodTemplates: refused for %q, want no params found", err)
+				t.Errorf("with only unlabelled DispatchJobTemplates: refused for %q, want no params found", err)
 			}
 			break
 		}
@@ -175,7 +180,7 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 		templates[profile] = tmpl
 	}
 	for profile, tmpl := range templates {
-		mustCreate(ctx, t, admin, buildDispatchJobTemplate(agent, profile, tmpl))
+		mustCreate(ctx, t, admin, envtestParam(ctx, t, admin, agent, profile, tmpl))
 	}
 	mustCreate(ctx, t, admin, buildDispatchJobIndex(agent, templates))
 
@@ -312,10 +317,51 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 		t.Errorf("a Job with no ServiceAccount: %v, want refused as the namespace default", err)
 	}
 
-	// Param custody: the dispatcher can't write a PodTemplate.
-	evil := buildDispatchJobTemplate(agent, "evil", tse)
-	if err := dispatcher.Create(ctx, evil); !apierrors.IsForbidden(err) {
+	// Param custody: the dispatcher can't write a DispatchJobTemplate (nor a
+	// PodTemplate).
+	dispatcherTyped := impersonatedClientWith(t, cfg, scheme, agent.Namespace, a2aDispatcherName(agent))
+	if err := dispatcherTyped.Create(ctx, envtestParam(ctx, t, admin, agent, "evil", tse)); !apierrors.IsForbidden(err) {
+		t.Errorf("the dispatcher creating a DispatchJobTemplate: %v, want Forbidden", err)
+	}
+	if err := dispatcher.Create(ctx, &corev1.PodTemplate{ObjectMeta: metav1.ObjectMeta{Name: "evil", Namespace: pns}, Template: *tse.DeepCopy()}); !apierrors.IsForbidden(err) {
 		t.Errorf("the dispatcher creating a PodTemplate: %v, want Forbidden", err)
+	}
+
+	// The binding deleted and recreated, then a template changed: the
+	// policy holds Jobs to the new template. With a built-in param kind the
+	// API server's param cache would stay frozen at the old one
+	// (kubernetes/kubernetes#141015); a CRD param kind's doesn't.
+	_, shippedBinding := shippedDispatcherJobPolicy(t)
+	if err := admin.Delete(ctx, shippedBinding.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * time.Second)
+	mustCreate(ctx, t, admin, shippedBinding.DeepCopy())
+	v2 := tse.DeepCopy()
+	main(&v2.Spec).Image = "registry.example/worker:v2"
+	var param agentv1alpha1.DispatchJobTemplate
+	if err := admin.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "tse"}, &param); err != nil {
+		t.Fatal(err)
+	}
+	param.Spec = envtestParam(ctx, t, admin, agent, "tse", v2).Spec
+	if err := admin.Update(ctx, &param); err != nil {
+		t.Fatal(err)
+	}
+	// A recreated binding isn't enforced at once: wait until the old
+	// template is refused, then the new one must be admitted.
+	deadline = time.Now().Add(gatewayPodPolicyActivation)
+	for n := 0; ; n++ {
+		err := dispatcher.Create(ctx, dispatcherJob(fmt.Sprintf("v1-after-%d", n), tse, nil))
+		if err != nil && strings.Contains(err.Error(), equality) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after the binding was recreated and the template changed, a Job from the old template: %v, want refused by %q", err, equality)
+		}
+		time.Sleep(time.Second)
+	}
+	if err := dispatcher.Create(ctx, dispatcherJob("v2", v2, nil)); err != nil {
+		t.Errorf("after the binding was recreated, a Job from the changed template was refused: %v", err)
 	}
 
 	// Not selected: a Job in a namespace that isn't a profile namespace,
@@ -355,6 +401,22 @@ func dispatcherJob(name string, tmpl *corev1.PodTemplateSpec, mutate func(*batch
 	return j
 }
 
+// impersonatedClientWith is impersonatedClient with a scheme, for typed
+// kinds the default scheme lacks.
+func impersonatedClientWith(t *testing.T, cfg *rest.Config, scheme *runtime.Scheme, ns, sa string) client.Client {
+	t.Helper()
+	as := rest.CopyConfig(cfg)
+	as.Impersonate = rest.ImpersonationConfig{
+		UserName: "system:serviceaccount:" + ns + ":" + sa,
+		Groups:   []string{"system:serviceaccounts", "system:serviceaccounts:" + ns, "system:authenticated"},
+	}
+	c, err := client.New(as, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
 func applyDispatcherJobPolicy(ctx context.Context, t *testing.T, c client.Client) {
 	t.Helper()
 	raw, err := os.ReadFile(dispatcherJobPolicyFile)
@@ -376,5 +438,119 @@ func applyDispatcherJobPolicy(ctx context.Context, t *testing.T, c client.Client
 		if err := c.Create(ctx, u); err != nil {
 			t.Fatalf("apply %s %s: %v", u.GetKind(), u.GetName(), err)
 		}
+	}
+}
+
+// envtestParam is profile's DispatchJobTemplate as the operator renders it:
+// the template defaulted by a server-side dry run, in the agent's profile
+// namespace.
+func envtestParam(ctx context.Context, t *testing.T, c client.Client, agent *agentv1alpha1.PlatformAgent, profile string, tmpl *corev1.PodTemplateSpec) *agentv1alpha1.DispatchJobTemplate {
+	t.Helper()
+	r := &PlatformAgentReconciler{Client: c}
+	defaulted, err := r.defaultedJobTemplate(ctx, profileNamespaceName(agent), profile, tmpl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	param, err := buildDispatchJobTemplate(agent, profile, defaulted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return param
+}
+
+// A fresh install creates the DispatchJobTemplate CRD and the policy together.
+// An admission policy resolves a CRD param kind through API discovery, which
+// can lag a CRD just established (kubernetes/kubernetes#141368). The policy
+// fails closed meanwhile: from the moment it exists, a Job off its template is
+// never admitted, and the rendered template is admitted once the kind
+// resolves (within the activation window).
+func TestTheDispatcherJobPolicyFailsClosedOnAFreshInstall(t *testing.T) {
+	// Every CRD but DispatchJobTemplate, which this test installs itself.
+	dir := t.TempDir()
+	entries, err := os.ReadDir(envtestCRDDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crdFile string
+	for _, e := range entries {
+		src := filepath.Join(envtestCRDDir, e.Name())
+		if strings.Contains(e.Name(), "dispatchjobtemplates") {
+			crdFile = src
+			continue
+		}
+		raw, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, e.Name()), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if crdFile == "" {
+		t.Fatal("no DispatchJobTemplate CRD in the envtest CRD directory")
+	}
+	cfg, scheme := startEnvtestConfigWithCRDs(t, dir)
+	admin, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	pns := profileNamespaceName(agent)
+	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: agent.Namespace}})
+	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: pns,
+		Labels: map[string]string{profileNamespaceComponentLabel: profileNamespaceComponent}}})
+	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRole(agent))
+	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRoleBinding(agent))
+	dispatcher := impersonatedClient(t, cfg, agent.Namespace, a2aDispatcherName(agent))
+	tse := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, "tse")), false)
+	wrong := tse.DeepCopy()
+	wrong.Spec.Containers[0].Image = "registry.example/evil:1"
+
+	// The CRD and the policy back to back, as one helm install applies them.
+	raw, err := os.ReadFile(crdFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	crd := &unstructured.Unstructured{}
+	if err := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(raw), len(raw)).Decode(&crd.Object); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := admin.Create(ctx, crd); err != nil {
+		t.Fatal(err)
+	}
+	applyDispatcherJobPolicy(ctx, t, admin)
+	// The params as soon as the kind is served.
+	templates := map[string]*corev1.PodTemplateSpec{"tse": tse}
+	for {
+		err := admin.Create(ctx, envtestParam(ctx, t, admin, agent, "tse", tse))
+		if err == nil {
+			break
+		}
+		if time.Since(start) > gatewayPodPolicyActivation {
+			t.Fatalf("the DispatchJobTemplate kind wasn't served within %s: %v", gatewayPodPolicyActivation, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	mustCreate(ctx, t, admin, buildDispatchJobIndex(agent, templates))
+
+	admittedAt := time.Duration(0)
+	for n := 0; time.Since(start) < 2*gatewayPodPolicyActivation; n++ {
+		if err := dispatcher.Create(ctx, dispatcherJob(fmt.Sprintf("fresh-wrong-%d", n), wrong, nil)); err == nil {
+			t.Fatalf("%s after the CRD was created, a Job off its template was admitted: the policy failed open", time.Since(start).Round(time.Millisecond))
+		}
+		if admittedAt == 0 {
+			if err := dispatcher.Create(ctx, dispatcherJob(fmt.Sprintf("fresh-right-%d", n), tse, nil)); err == nil {
+				admittedAt = time.Since(start)
+				t.Logf("the rendered template was first admitted %s after the CRD was created", admittedAt.Round(time.Millisecond))
+			}
+		} else if time.Since(start) > admittedAt+5*time.Second {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if admittedAt == 0 {
+		t.Fatalf("the rendered template was never admitted within %s of a fresh install", 2*gatewayPodPolicyActivation)
 	}
 }

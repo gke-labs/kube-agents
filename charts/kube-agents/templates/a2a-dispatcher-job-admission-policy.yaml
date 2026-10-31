@@ -17,9 +17,11 @@
 # profile's, at another tier), mount anything, schedule anywhere, or run privileged. This policy
 # holds every Job the dispatcher creates to the pod template the operator rendered for its profile.
 #
-# HOW. The operator renders, in `<ns>-profiles`, one core PodTemplate per profile allowing the
-# unattended tier, `kube-agents-dispatch-job-profile-<profile>`, holding exactly the template it gives the
-# dispatcher, and one index PodTemplate, `kube-agents-dispatch-job-index`, whose annotation lists the
+# HOW. The operator renders, in `<ns>-profiles`, one DispatchJobTemplate (kubeagents.x-k8s.io) per
+# profile allowing the unattended tier, `kube-agents-dispatch-job-profile-<profile>`, holding the
+# template it gives the dispatcher as the API server defaults it (a server-side dry run of a
+# PodTemplate, so it compares field for field with a Job's defaulted pod template), and one index
+# DispatchJobTemplate, `kube-agents-dispatch-job-index`, whose spec.serviceAccounts lists the
 # ServiceAccounts those templates run as. Both carry the operator's labels, and the binding selects
 # them by those labels in the Job's own namespace. The API server evaluates the policy against every
 # selected param and admits only if every evaluation passes, so:
@@ -34,8 +36,12 @@
 #
 # The operator writes a template before listing its ServiceAccount in the index, and unlists it
 # before deleting the template, so the index never names a ServiceAccount whose template is missing.
-# Only the operator writes PodTemplates in the profile namespace: the dispatcher's and the workers'
-# Roles there hold no podtemplate verb.
+# Only the operator writes DispatchJobTemplates: no Role it renders grants the kind, and the
+# built-in admin and edit roles don't aggregate it.
+#
+# WHY A CRD. The API server's param cache for a built-in param kind (a PodTemplate, a ConfigMap)
+# freezes once the last binding using it is deleted and recreated, until the API server restarts
+# (kubernetes/kubernetes#141015, unreleased). A CRD param kind's informer is restarted properly.
 #
 # THE STATIC RULES, for every Job the dispatcher creates, whatever the params say: backoffLimit 0 (a
 # task is never re-run) and no podFailurePolicy (whose Ignore would re-run it anyway), one pod, a
@@ -75,8 +81,8 @@ metadata:
 spec:
   failurePolicy: Fail
   paramKind:
-    apiVersion: v1
-    kind: PodTemplate
+    apiVersion: kubeagents.x-k8s.io/v1alpha1
+    kind: DispatchJobTemplate
   matchConstraints:
     resourceRules:
       - apiGroups: ["batch"]
@@ -103,17 +109,15 @@ spec:
       expression: "params.metadata.name == 'kube-agents-dispatch-job-index'"
     - name: listed
       expression: >-
-        has(params.metadata.annotations) &&
-        'kube-agents.dev/dispatch-job-service-accounts' in params.metadata.annotations ?
-        params.metadata.annotations['kube-agents.dev/dispatch-job-service-accounts'].split(',') : []
+        has(params.spec) && has(params.spec.serviceAccounts) ? params.spec.serviceAccounts : []
     - name: templateAccount
-      expression: "has(params.template.spec.serviceAccountName) ? params.template.spec.serviceAccountName : ''"
+      expression: "has(params.spec) && has(params.spec.template) && has(params.spec.template.spec) && has(params.spec.template.spec.serviceAccountName) ? params.spec.template.spec.serviceAccountName : ''"
     - name: templateLabels
-      expression: "has(params.template.metadata) && has(params.template.metadata.labels) ? params.template.metadata.labels : {}"
+      expression: "has(params.spec) && has(params.spec.template) && has(params.spec.template.metadata) && has(params.spec.template.metadata.labels) ? params.spec.template.metadata.labels : {}"
     - name: annotations
       expression: "has(object.spec.template.metadata) && has(object.spec.template.metadata.annotations) ? object.spec.template.metadata.annotations : {}"
     - name: templateAnnotations
-      expression: "has(params.template.metadata) && has(params.template.metadata.annotations) ? params.template.metadata.annotations : {}"
+      expression: "has(params.spec) && has(params.spec.template) && has(params.spec.template.metadata) && has(params.spec.template.metadata.annotations) ? params.spec.template.metadata.annotations : {}"
     # The labels the Job controller adds to a Job's pod template.
     - name: controllerLabels
       expression: "['batch.kubernetes.io/controller-uid', 'batch.kubernetes.io/job-name', 'controller-uid', 'job-name']"
@@ -123,7 +127,7 @@ spec:
       messageExpression: "'a Job the dispatcher creates must run as a profile ServiceAccount the operator rendered a Job template for, not ' + (variables.account == '' ? 'the namespace default' : variables.account)"
       reason: Forbidden
     # Against each template: a Job running as its ServiceAccount is that template, exactly.
-    - expression: "variables.isIndex || variables.account != variables.templateAccount || variables.pod == params.template.spec"
+    - expression: "variables.isIndex || variables.account != variables.templateAccount || variables.pod == params.spec.template.spec"
       messageExpression: "'a Job the dispatcher creates as ' + variables.account + ' must have exactly the pod spec of its operator-rendered template ' + params.metadata.name"
       reason: Forbidden
     - expression: >-

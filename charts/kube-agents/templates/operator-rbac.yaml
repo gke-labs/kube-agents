@@ -65,11 +65,6 @@ rules:
       - podtemplates
     verbs:
       - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
   - apiGroups:
       - ""
     resources:
@@ -216,6 +211,17 @@ rules:
       - agentprofiles/finalizers
       - platformagents/finalizers
     verbs:
+      - update
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - dispatchjobtemplates
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
       - update
   - apiGroups:
       - kubeagents.x-k8s.io

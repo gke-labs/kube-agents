@@ -24,6 +24,8 @@ import (
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 // dispatcherJobPolicyName names the dispatcher Job admission policy and its
@@ -60,8 +62,8 @@ func (r *PlatformAgentReconciler) dispatcherJobPolicyInPlace(ctx context.Context
 	switch {
 	case ps.FailurePolicy == nil || *ps.FailurePolicy != admissionregistrationv1.Fail:
 		return false, "its failurePolicy is not Fail"
-	case ps.ParamKind == nil || ps.ParamKind.APIVersion != "v1" || ps.ParamKind.Kind != "PodTemplate":
-		return false, "its params are not core/v1 PodTemplates"
+	case ps.ParamKind == nil || ps.ParamKind.APIVersion != agentv1alpha1.GroupVersion.String() || ps.ParamKind.Kind != "DispatchJobTemplate":
+		return false, "its params are not the operator's DispatchJobTemplates"
 	}
 	bs := binding.Spec
 	ref := bs.ParamRef

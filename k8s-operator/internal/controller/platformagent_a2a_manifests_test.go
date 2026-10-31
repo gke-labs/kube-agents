@@ -2212,7 +2212,7 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 			t.Fatalf("precondition: the dispatcher's Jobs %T in the profile namespace wasn't rendered: %v", obj, err)
 		}
 	}
-	if err := cl.Get(ctx, types.NamespacedName{Name: dispatchJobIndexName, Namespace: "test-ns-profiles"}, &corev1.PodTemplate{}); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: dispatchJobIndexName, Namespace: "test-ns-profiles"}, &agentv1alpha1.DispatchJobTemplate{}); err != nil {
 		t.Fatalf("precondition: the Job policy's index param wasn't rendered: %v", err)
 	}
 	if err := cl.Create(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
@@ -2297,7 +2297,7 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	}{
 		{&rbacv1.Role{}, "test-agent-a2a-dispatcher-jobs"},
 		{&rbacv1.RoleBinding{}, "test-agent-a2a-dispatcher-jobs"},
-		{&corev1.PodTemplate{}, dispatchJobIndexName},
+		{&agentv1alpha1.DispatchJobTemplate{}, dispatchJobIndexName},
 		{&batchv1.Job{}, "dispatch-1"},
 	} {
 		err := cl.Get(ctx, types.NamespacedName{Name: tc.name, Namespace: "test-ns-profiles"}, tc.obj)
