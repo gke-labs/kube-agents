@@ -84,12 +84,12 @@ Verb names are the version-control concept; the spelling you know is an alias.
 
 - **A repository this install does not manage.** Every verb, `clone` and the
   list/view verbs included, is refused for a repository outside the install's
-  managed list, because the broker refuses every verb but `capabilities` for
-  one. For "how does
+  managed list. For such a repository the broker serves only `capabilities`
+  and `snapshot`, and this skill has no `snapshot` command. For "how does
   upstream implement this", use **inspect-repository**.
 - **A one-off read of a large repository.** `clone` pulls a whole branch's
-  history and there is no shallow option; **inspect-repository** pages a
-  shallow view and is cheaper.
+  history and there is no shallow option; **inspect-repository** takes one
+  revision with no history and is cheaper.
 - **The GitOps write flow that already gave you a workspace.** `fleet-audit`
   and `submit-suggestion` own theirs; do not open a second view.
 

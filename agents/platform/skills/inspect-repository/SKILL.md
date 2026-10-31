@@ -1,17 +1,17 @@
 ---
 name: inspect-repository
-description: Read and analyze the source of any repository on GitHub or on another forge this install serves (GitLab) — public or one this install has a token for — without a local checkout. Clones broker-side and pulls file content back; use it to answer questions about code, not to change it.
+description: Read and analyze the source of any repository on GitHub or on another forge this install serves (GitLab) — public or one this install has a token for — without a local checkout. The broker sends one revision's files; use it to answer questions about code, not to change it.
 ---
 
 # inspect-repository - Read a repository this pod has no checkout of
 
 This pod has no `git` of its own and no `.git` anywhere it can write. To read
-somebody else's code, ask the credential broker to clone it and pull the file
-content back. What lands locally is source without a repository around it: files
-you can open, grep and reason about, and no `.git/config` for anything to
-execute out of.
+somebody else's code, ask the credential broker for a snapshot: the files of one
+revision, sent back as a tar. What lands locally is source without a repository
+around it: files you can open, grep and reason about, and no `.git/config` for
+anything to execute out of.
 
-The script is `/opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py`. Every subcommand prints one JSON
+The script is `/opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py`. It prints one JSON
 object on stdout.
 
 ## When to Use
@@ -20,83 +20,78 @@ object on stdout.
   implement this controller?", "which release added this flag?"
 - **Reading a dependency or an upstream project** named in an issue, a design
   doc, or a user's question.
-- **Reading the GitOps repository for context** when you are not editing it.
+- **Reading the GitOps repository or a context repository** when you are not
+  editing it.
 
 ## When NOT to Use
 
 - **Changing a repository.** Use **submit-suggestion** (a pull request against
-  the GitOps repo) or **fleet-audit** (fixes for its own findings). This skill
-  opens read-only workspaces and the broker refuses to commit from one.
+  the GitOps repo) or **fleet-audit** (fixes for its own findings). A snapshot
+  has no history and cannot be committed from.
 - **Reading a file the GitOps workflow already handed you.** `fleet-audit` gives
   you a leased clone and `submit-suggestion` `prepare` gives you the copy it
-  cloned; read theirs rather than opening a second view of the same repository.
+  cloned; read theirs rather than taking a second copy of the same repository.
 
-## Two shapes, and which to pick
-
-**Copy the tree** when the repository is small enough to read on disk:
+## Copy the tree
 
 ```bash
-python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py clone --repo kubernetes-sigs/kustomize --depth 1
+python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py clone --repo kubernetes-sigs/kustomize
 ```
 
 Copies into `/opt/data/scratch/repos/<owner>__<name>` unless `--into` names
-somewhere else, and prints `written`, `bytes`, `skipped`, `stopped`,
-`complete` and, in content mode, `sha`, the commit the copy was taken from.
-Narrow with `--prefix api` when only part of it matters.
+somewhere else, and prints `written`, `bytes`, `skipped`, `complete` and `sha`,
+the commit the copy was taken from. `--ref` names a branch or a tag; without
+it, the copy is of the branch the broker pins the repository to, else the
+remote's default branch.
 
-**Search first, take what it names** when the repository is large — which is
-most of them:
+**A large repository is refused whole** with `SNAPSHOT_TOO_LARGE`. Name the
+part you need with `--prefix`, a directory or a file, and repeat with `--force`
+into the same `--into` for each further part:
 
 ```bash
-H=$(python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py open --repo kubernetes-sigs/kustomize --depth 1 | jq -r .handle)
-python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py grep --handle "$H" --pattern 'func NewCmdBuild'
-python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py fetch --handle "$H" --into ./src kustomize/commands/build/build.go
-python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py close --handle "$H"
+python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py clone --repo kubernetes-sigs/kustomize --prefix api --into ./src
+python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py clone --repo kubernetes-sigs/kustomize --prefix kustomize/commands/build --into ./src --force
 ```
 
-The handle survives between turns; the shell does not. Keep it, and **close it
-when you are done** — an open handle holds a clone on the broker's volume. The
-broker reclaims a handle nothing has used for 30 minutes, so `no such workspace`
-after a long pause means open again, not that the repository is gone.
-`open` also prints `sha`, the commit the workspace was cloned at; a report
-that has to say which commit it read (the fleet-audit declared-intent record
-names each repository as `owner/name@sha`) takes it from there, since there
-is no `.git` on this side to ask.
+Compare the `sha` of each part. If they differ, the branch moved between the
+copies; take the parts again.
 
 ## Rules
 
-- **`--depth 1` unless you need history.** A full clone of a large repository
-  can exceed the broker's ceiling and be refused outright. A shallow workspace
-  reads identically; it just cannot commit.
-- **Never invent a path.** Fetch only paths that `list` or `grep` returned. A
-  path you inferred is how a read comes back empty for a file that exists under
-  a different name.
-- **Read `truncated` and `stopped` before you conclude anything.** `list` pages:
-  when `truncated` is true, call it again with `--after <next>`. `clone` reports
-  `stopped: maxFiles` or `maxBytes` when a bound bit, and `complete: false`
-  means you are looking at part of a repository. "The repository does not
-  contain X" is not a claim a truncated result supports.
-- **Read `skipped`.** `tooLarge` means that file is never coming through this
-  route; `requestBudget` means ask again for the rest; `symlink` means the file
-  is there and the broker will not follow a link to it, so name the target
-  instead; `notAFile` means no such file in the checkout.
+- **Read a repository only through `clone`.** Do not download its files from
+  the forge's raw, codeload or API hosts (`raw.githubusercontent.com`,
+  `api.github.com`), with `curl` or a script, and do not run `git clone`. A
+  direct download skips the install's host allowlist and the checks `clone`
+  makes on every file, and it can read a different revision than the one you
+  report. If `clone` fails, report its error.
+- **Never invent a path.** Name a `--prefix` that the repository's layout, a
+  README, or an earlier copy showed you. A prefix that names nothing at that
+  commit gives `written: 0` and `missing`; it is not proof that the code does
+  not exist under another name.
+- **Read `complete` and `skipped` before you conclude anything.** `skipped`
+  lists what was not written, each with the reason: a symbolic link (the file it
+  names is not copied; if it is in the repository, take it with its own
+  `--prefix`), or a directory laid out as a bare repository. A copy of one `--prefix`
+  is a copy of part of a repository: "the repository does not contain X" is not
+  a claim it supports.
 - **Do not run `git` against what lands.** There is no repository there, on
   purpose.
-- **Say which repository and which ref** in anything you report, and treat a
-  shallow read as a read of one commit on one branch.
+- **Say which repository, ref and `sha`** in anything you report. A snapshot is
+  one commit on one branch.
 
 ## Reference
 
-| Subcommand | What it does                                                           |
-| ---------- | ---------------------------------------------------------------------- |
-| `clone`    | Copy a repository (or a `--prefix`) into a scratch directory and close |
-| `open`     | Open a broker-side workspace, print a handle and the `sha` it is at    |
-| `list`     | One page of the checkout's paths; page with `--after`                  |
-| `grep`     | Search tracked files; fixed-string unless `--regex`                    |
-| `fetch`    | Copy named paths into `--into`                                         |
-| `close`    | Drop the broker-side clone                                             |
+| Flag                        | What it does                                                      |
+| --------------------------- | ----------------------------------------------------------------- |
+| `--repo`                    | `owner/name` on GitHub, or `<host>/<path>` on another forge       |
+| `--ref`                     | Branch or tag to read                                             |
+| `--prefix`                  | Copy only this directory or file                                  |
+| `--into`                    | Destination directory; must be empty unless `--force`             |
+| `--force`                   | Write into a non-empty directory, adding to what is there         |
+| `--max-files`/`--max-bytes` | Refuse a copy over this many files or bytes; nothing is written   |
+| `--depth`                   | Accepted and not needed: a snapshot is always one revision        |
+| `--lease`                   | Directory mode only: the lease the leased checkout is taken under |
 
-On an install whose broker has not been armed for content-passing, `clone`
+On an install with no broker, `clone`
 reports `"mode": "directory"` and hands back a leased checkout on the shared
-volume; the other subcommands say the broker does not serve them. Read the files
-in that checkout directly and do not commit in it.
+volume. Read the files in that checkout directly and do not commit in it.

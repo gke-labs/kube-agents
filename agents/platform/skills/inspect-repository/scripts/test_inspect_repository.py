@@ -4,13 +4,12 @@ Run:
   python3 -m unittest discover -s agents/platform/skills/inspect-repository/scripts \
       -p 'test_inspect_repository.py' -v
 
-Stdlib only. The broker is stubbed at `credential_proxy_client._workspace_call`,
-the one HTTP hop, with a fake that answers each verb the way the broker's
-`open`, `list`, `read` and `close` routes do; nothing here opens a socket or
-runs `git`.
+Stdlib only. The broker is stubbed at `vcs_client.snapshot`, which writes the
+files a snapshot would have unpacked; nothing here opens a socket or runs
+`git`. `agents/platform/scripts/test_inspect_repository.py` runs the real
+unpack over a real `git archive`.
 """
 
-import base64
 import contextlib
 import io
 import json
@@ -24,45 +23,25 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
-import credential_proxy_client  # noqa: E402
 import inspect_repository  # noqa: E402
+import vcs_client  # noqa: E402
 
 REPO = "acme/terraform-live"
-BASE_SHA = "9f8e7d6c5b4a39281706958473625140abcdef01"
-HANDLE = "ws-1"
+REVISION = "9f8e7d6c5b4a39281706958473625140abcdef01"
+FILES = {"README.md": "# terraform-live\n", "clusters/prod.tf": "replicas = 3\n"}
 
 
-class FakeBroker:
-    """The broker's workspace routes, as far as `open` and `clone` exercise them."""
-
-    def __init__(self):
-        self.verbs: list[str] = []
-        self.files = {"README.md": b"# terraform-live\n", "clusters/prod.tf": b"replicas = 3\n"}
-
-    def __call__(self, endpoint, verb, payload):
-        self.verbs.append(verb)
-        if verb == "open":
-            return {
-                "handle": HANDLE,
-                "repo": payload["repo"],
-                "base": payload.get("base") or "main",
-                "baseSha": BASE_SHA,
-                "shallow": bool(payload.get("depth")),
-            }
-        if verb == "list":
-            entries = [{"path": p, "size": len(b)} for p, b in sorted(self.files.items())]
-            return {"entries": entries, "total": len(entries), "truncated": False}
-        if verb == "read":
-            return {
-                "files": [
-                    {"path": p, "contentBase64": base64.b64encode(self.files[p]).decode()}
-                    for p in payload["paths"]
-                ],
-                "skipped": [],
-            }
-        if verb == "close":
-            return {"closed": True}
-        raise AssertionError(f"unexpected verb {verb}")
+def fake_snapshot(repository, ref=None, paths=None, *, into, max_bytes):
+    for name, text in FILES.items():
+        target = Path(into) / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    return {
+        "forge": "github", "repo": repository, "role": "context", "ref": ref or "main",
+        "revision": REVISION, "path": str(into), "files": len(FILES),
+        "bytes": sum(len(t) for t in FILES.values()), "skipped": [],
+        "archiveBytes": 1024, "history": "none",
+    }
 
 
 class DefaultIntoTest(unittest.TestCase):
@@ -79,12 +58,10 @@ class DefaultIntoTest(unittest.TestCase):
             )
 
 
-class ContentModeTestCase(unittest.TestCase):
+class ContentModeTest(unittest.TestCase):
     def setUp(self):
-        self.broker = FakeBroker()
         for patcher in (
-            patch.object(credential_proxy_client, "_workspace_call", self.broker),
-            patch.object(inspect_repository, "content_mode_available", lambda: True),
+            patch.object(vcs_client, "snapshot", fake_snapshot),
             patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}),
         ):
             patcher.start()
@@ -100,34 +77,25 @@ class ContentModeTestCase(unittest.TestCase):
         self.assertEqual(code, 0)
         return json.loads(out.getvalue().strip())
 
-    def test_open_prints_the_sha_the_tree_was_cloned_at(self):
-        """`owner/name@sha` needs a sha, and this side has no `.git` to ask.
-
-        The fleet-audit declared-intent record names each repository at the
-        commit it was read at; `open` is where a context repository's read
-        starts, so the sha comes back with the handle.
-        """
-        payload = self.run_command(["open", "--repo", REPO, "--depth", "1"])
-        self.assertEqual(payload["mode"], "content")
-        self.assertEqual(payload["handle"], HANDLE)
-        self.assertEqual(payload["repo"], REPO)
-        self.assertEqual(payload["sha"], BASE_SHA)
-        self.assertTrue(payload["shallow"])
-
     def test_a_content_clone_prints_the_sha_beside_the_tree(self):
+        """`owner/name@sha` needs a sha, and this side has no `.git` to ask."""
         into = self.tmp_path / "copy"
         payload = self.run_command(["clone", "--repo", REPO, "--into", str(into)])
         self.assertEqual(payload["mode"], "content")
-        self.assertEqual(payload["sha"], BASE_SHA)
+        self.assertEqual(payload["sha"], REVISION)
         self.assertEqual(payload["repo"], REPO)
+        self.assertEqual(payload["into"], str(into))
         self.assertTrue(payload["complete"])
+        self.assertIsNone(payload["stopped"])
+        self.assertEqual(payload["skipped"], [])
         self.assertEqual(payload["written"], 2)
-        self.assertEqual(
-            (into / "clusters" / "prod.tf").read_text(encoding="utf-8"), "replicas = 3\n"
-        )
-        # The copy is closed behind itself, and the sha was read before that.
-        self.assertEqual(self.broker.verbs[-1], "close")
+        self.assertEqual((into / "clusters" / "prod.tf").read_text(encoding="utf-8"), "replicas = 3\n")
         self.assertFalse((into / ".git").exists())
+
+    def test_the_staging_directory_does_not_outlive_the_clone(self):
+        into = self.tmp_path / "copy"
+        self.run_command(["clone", "--repo", REPO, "--into", str(into)])
+        self.assertEqual([p.name for p in self.tmp_path.iterdir()], ["copy"])
 
 
 if __name__ == "__main__":
