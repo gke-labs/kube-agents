@@ -23,7 +23,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -44,6 +46,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 	agentwebhook "github.com/gke-labs/kube-agents/k8s-operator/internal/webhook"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -64,6 +67,19 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	// The operator image also runs the bus migration's own pods (#4225):
+	// the same binary, so their version contract is the operator's.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "bus-migrate":
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			code := busmigrate.Main(ctx, os.Args[2:], os.Stderr)
+			stop()
+			os.Exit(code)
+		case "bus-hash":
+			os.Exit(busmigrate.HashMain(os.Args[2:], os.Stderr))
+		}
+	}
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
