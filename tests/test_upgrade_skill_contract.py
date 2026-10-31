@@ -161,6 +161,83 @@ P0_SENTENCE = re.compile(rf"Add `priority:p0` only for (?P<conditions>{WITHIN_SE
 P0_CONDITIONS = ("confirmed data loss", "an ongoing outage caused by the defect", "a blocked release")
 P0_IS_NOT_AUTOMATIC = "A failed upgrade with a healthy existing install is not automatically p0"
 
+# (f) Every rule sentence above, whole. The pins above read a list or a phrase
+# out of a sentence and say which promise moved; this pins each sentence they
+# read from exactly, so a qualifying tail (", unless ...", ", but any two
+# together qualify") on any of them fails here even where the phrase it names
+# is still present. A rewrite that keeps the promise updates the sentence here
+# in the same commit.
+RULE_SENTENCES = (
+    'Prepare the report first and show the user what would be posted, whether or not an ask is needed',
+    (
+        'Ask the user once before the first upgrade report is posted to `gke-labs/kube-agents` in a '
+        'session, unless the user has authorized posting upgrade reports there in this session'
+    ),
+    (
+        "Authorization for other GitHub writes (a push to a fork, a comment on the user's own issue, a "
+        "GitOps pull request, a comment or review reply on the user's own pull request in "
+        '`gke-labs/kube-agents`) does not cover it, and an upgrade request alone does not authorize '
+        'publishing installation details'
+    ),
+    'If the user declines, keep the anonymized local draft',
+    (
+        "Before any issue, comment, reopening or label write, verify the requesting user's GitHub "
+        'identity with `gh api user` and tie it to the requester'
+    ),
+    (
+        "Use the official repository's current names as the eligibility source: the paginated GitHub "
+        'contributors list and reviewers/approvers in `OWNERS` from official `main`, expanding '
+        '`OWNERS_ALIASES`'
+    ),
+    (
+        'Fetch these from `gke-labs/kube-agents`, not a fork, release bundle or stale local checkout; do '
+        'not hardcode names'
+    ),
+    (
+        'Qualify a verified contributor or repository reviewer/approver, or a requester whose current '
+        '`repos/gke-labs/kube-agents/collaborators/<LOGIN>/permission` response confirms `write`, '
+        '`maintain` or `admin` access'
+    ),
+    'Read/triage permission, a claimed contribution or organization membership alone is insufficient',
+    'Do not infer requester eligibility from bot, application or shared administrator credentials',
+    (
+        'If identity is unverified, no authoritative source qualifies the requester, or required '
+        'eligibility checks cannot complete, keep an anonymized local draft and explain the restriction'
+    ),
+    (
+        'Regular users must not open or modify issue tickets, even for p0 failures or after approving a '
+        'post'
+    ),
+    (
+        'In each of these cases, hand over the draft with the two places the user can send it: the '
+        'tracker at <https://github.com/gke-labs/kube-agents/issues>, where they open the issue '
+        'themselves, and the feedback form at <https://gke-labs.github.io/kube-agents/feedback>, which '
+        'needs no GitHub account and is the only path for an enterprise-managed account'
+    ),
+    'Use anonymized search terms; do not send raw client diagnostics',
+    'Apply `bug` and `upgrade-failure` to a created or updated defect report',
+    (
+        'Add `priority:p0` only for confirmed data loss, an ongoing outage caused by the defect, or a '
+        'blocked release'
+    ),
+    'A failed upgrade with a healthy existing install is not automatically p0',
+    'Anonymize the title, body, comments and any attachments before posting',
+    (
+        'Remove credentials, tokens, session salts, client/customer and user names, project/cluster/org '
+        'identifiers, custom workload/namespace names, private repository names, URLs, domains, IP/email '
+        'addresses, filesystem paths and other client-specific details'
+    ),
+    'Never attach raw `install.env`, Terraform state, kubeconfig or unfiltered logs',
+    (
+        'Review the complete public payload for client information before sending; if unsure, keep the '
+        'local draft'
+    ),
+    (
+        'Use `gh` with an explicit `--repo gke-labs/kube-agents` for issue and label operations, and '
+        '`--body-file` for issue bodies and comments'
+    ),
+)
+
 
 def section(text: str) -> str:
     """The reporting section: from its heading to the next `## ` heading."""
@@ -363,6 +440,11 @@ class ReportingContractTest(unittest.TestCase):
                 self.assertIn(condition, conditions, f"{condition!r} is no longer a p0 condition")
         self.assert_sentence(P0_IS_NOT_AUTOMATIC, "a failed upgrade over a healthy install may now be p0")
 
+
+    def test_every_rule_sentence_is_pinned_whole(self) -> None:
+        for rule in RULE_SENTENCES:
+            with self.subTest(rule=rule[:60]):
+                self.assert_sentence(rule, "a rule sentence changed or gained a tail; update RULE_SENTENCES with it")
 
 if __name__ == "__main__":
     unittest.main()
