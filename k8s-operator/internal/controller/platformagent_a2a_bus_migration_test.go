@@ -23,6 +23,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
@@ -1178,4 +1179,105 @@ func TestTheSnapshotWritesTheStageAndTheOthersReadIt(t *testing.T) {
 			t.Errorf("%s command %q SA %q", kind, args, spec.ServiceAccountName)
 		}
 	}
+}
+
+// The staging claim is created with the snapshot pod: ReadWriteOncePod,
+// owned by the CR, on the default StorageClass, and big enough for every
+// provisioned stream full to its cap.
+func TestTheSnapshotPhaseCreatesAOnePodStage(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationSnapshot, 1, time.Now().Add(time.Hour))
+	m.pass(busMigrationSnapshot, 1)
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationStageClaim(m.agent, "3-1")}, pvc); err != nil {
+		t.Fatalf("no staging claim: %v", err)
+	}
+	if !slices.Equal(pvc.Spec.AccessModes, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod}) {
+		t.Errorf("access modes %v, want ReadWriteOncePod alone", pvc.Spec.AccessModes)
+	}
+	if pvc.Spec.StorageClassName != nil || !ownedByAgent(pvc.ObjectMeta, m.agent) {
+		t.Errorf("storage class %v owners %v", pvc.Spec.StorageClassName, pvc.OwnerReferences)
+	}
+	var caps int64
+	for _, p := range a2aStreamPolicies(1) {
+		caps += p.MaxBytes
+	}
+	got := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	if got.Value() < caps || got.Value() > caps*12/10 || got.Value()%(1<<30) != 0 {
+		t.Errorf("stage request %s for %d bytes of caps; want at least the caps, within 20%%, in whole GiB", got.String(), caps)
+	}
+	if got.String() != "32Gi" {
+		t.Errorf("stage request %s, want 32Gi for today's caps (28.9 GiB with 10%% headroom)", got.String())
+	}
+}
+
+// When a run ends its ServiceAccounts go; the stage and run Secret go too,
+// unless it Failed, when they stay for the manual step.
+func TestARunsEndCleansUpWhatItMade(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		from      busMigrationPhase
+		running   int32
+		abandon   bool
+		finish    func(m *migrationRig)
+		end       busMigrationPhase
+		keepStage bool
+	}{
+		{"done", busMigrationReleasing, 3, false, func(m *migrationRig) { m.rollOut(3) }, busMigrationDone, false},
+		{"abandoned", busMigrationReleasing, 1, true, func(m *migrationRig) { m.rollOut(1) }, busMigrationAbandoned, false},
+		{"failed", busMigrationRollbackRestoring, 1, true, func(m *migrationRig) { m.finishPod("rollback", corev1.PodFailed, `{"error":"boom"}`, "") }, busMigrationFailed, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMigrationRig(t, busMigrationGrow, tc.from, tc.running, time.Now().Add(time.Hour))
+			m.agent.Status.BusMigration.Abandoning = tc.abandon
+			ns := m.agent.Namespace
+			made := []client.Object{
+				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, busMigrationStreamIdentity, "3-1"), Namespace: ns}},
+				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, "hash", "3-1"), Namespace: ns}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, "3-1"), Namespace: ns}},
+				&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(m.agent, "3-1"), Namespace: ns}},
+			}
+			for _, o := range made {
+				if err := m.cl.Create(context.Background(), o); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tc.finish(m)
+			if _, err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+				t.Fatal(err)
+			}
+			if got := busMigrationPhase(m.agent.Status.BusMigration.Phase); got != tc.end {
+				t.Fatalf("phase %s, want %s", got, tc.end)
+			}
+			for _, o := range made {
+				err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(o), o)
+				_, isSA := o.(*corev1.ServiceAccount)
+				keep := !isSA && tc.keepStage
+				if keep && err != nil {
+					t.Errorf("%T %s was removed from a Failed run", o, o.GetName())
+				}
+				if !keep && err == nil {
+					t.Errorf("%T %s is still there after the run ended %s", o, o.GetName(), tc.end)
+				}
+			}
+		})
+	}
+}
+
+// The operator may not list or watch Secrets, so the run Secret is read
+// uncached (a2aReader): here the cached client refuses any Secret read, and
+// the hashing phase still writes the Secret and moves on.
+func TestTheRunSecretIsReadUncached(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationHashing, 1, time.Now().Add(time.Hour))
+	m.finishPod("hash", corev1.PodSucceeded, validDigests(), "")
+	m.r.APIReader = m.cl
+	m.r.Client = interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Secret); ok {
+				return fmt.Errorf("secrets is forbidden: cannot list or watch")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	m.pass(busMigrationConverting, 3)
 }

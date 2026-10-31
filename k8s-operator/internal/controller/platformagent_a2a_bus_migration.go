@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -372,6 +374,11 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 		}
 		if err := r.ensureBusMigrationWorkload(ctx, agent, run, now); err != nil {
 			return 0, err
+		}
+		if busMigrationTerminal(busMigrationPhase(run.Phase)) {
+			if err := r.cleanupBusMigration(ctx, agent, run); err != nil {
+				return 0, err
+			}
 		}
 	}
 	return busMigrationReplicas(leg, busMigrationPhase(run.Phase), run.Abandoning), nil
@@ -748,6 +755,16 @@ func (r *PlatformAgentReconciler) ensureBusMigrationWorkload(ctx context.Context
 	if work.name == "" || busMigrationImage() == "" {
 		return nil
 	}
+	if work.name == "snapshot" {
+		pvc := buildBusStagePVC(agent, run)
+		if err := ctrl.SetControllerReference(agent, pvc, r.Scheme); err != nil {
+			return err
+		}
+		withCommonLabels(pvc, agent)
+		if err := r.Create(ctx, pvc); err != nil && !errors.IsAlreadyExists(err) {
+			return err
+		}
+	}
 	if err := ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, busMigrationWorkloadName(agent, work.identity, run.RunID), agent.Namespace, nil, commonLabels(agent), fieldOwner); err != nil {
 		return err
 	}
@@ -809,7 +826,8 @@ func a2aStreamPolicies(replicas int) []busmigrate.StreamPolicy {
 // turns back without the Secret.
 func (r *PlatformAgentReconciler) ensureBusRunSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (refused string, err error) {
 	key := client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationRunSecret(agent, run.RunID)}
-	if err := r.Get(ctx, key, &corev1.Secret{}); err == nil {
+	// Read uncached: the operator may not list or watch Secrets.
+	if err := r.a2aReader().Get(ctx, key, &corev1.Secret{}); err == nil {
 		return "", nil
 	} else if !errors.IsNotFound(err) {
 		return "", err
@@ -901,4 +919,67 @@ func (r *PlatformAgentReconciler) recordRestoreReport(ctx context.Context, agent
 		}
 	}
 	return report.Error, nil
+}
+
+// busMigrationStageHeadroom is the staging volume's margin over the streams'
+// caps, for the snapshots' metadata and the filesystem's own overhead.
+const busMigrationStageHeadroom = 1.1
+
+// busMigrationStageSize is the staging volume's request: every provisioned
+// stream full to its max_bytes cap, with headroom, in whole GiB. A snapshot
+// is at most its stream's size, so the stage never runs out before the bus
+// it copies would.
+func busMigrationStageSize() resource.Quantity {
+	var total int64
+	for _, p := range a2aStreamPolicies(1) {
+		total += p.MaxBytes
+	}
+	const gib = 1 << 30
+	n := int64(math.Ceil(float64(total) * busMigrationStageHeadroom / gib))
+	return *resource.NewQuantity(n*gib, resource.BinarySI)
+}
+
+// buildBusStagePVC is the run's staging volume, ReadWriteOncePod so only
+// one pod at a time holds it: the snapshot pod writes it, then the hashing
+// pod reads it, then a restore pod does, and no second pod can open it in
+// between. The cluster's default StorageClass, as the bus's own claims use.
+func buildBusStagePVC(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      busMigrationStageClaim(agent, run.RunID),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "bus-migration"),
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: busMigrationStageSize()},
+			},
+		},
+	}
+}
+
+// cleanupBusMigration removes what a run made once it has ended: every
+// per-run ServiceAccount, and, unless the run Failed, the staging volume
+// and the run Secret. A Failed run keeps those two for the manual step its
+// condition names, which needs the snapshot and its digests; its
+// ServiceAccounts go regardless, since the map no longer names them. Jobs
+// and pods stay, owned by the CR, for their logs; they hold no credential
+// once their ServiceAccount is gone.
+func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) error {
+	var objs []client.Object
+	for _, identity := range []string{"pin", "unpin", "hash", busMigrationStreamIdentity} {
+		objs = append(objs, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(agent, identity, run.RunID), Namespace: agent.Namespace}})
+	}
+	if busMigrationPhase(run.Phase) != busMigrationFailed {
+		objs = append(objs,
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(agent, run.RunID), Namespace: agent.Namespace}},
+			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(agent, run.RunID), Namespace: agent.Namespace}})
+	}
+	for _, obj := range objs {
+		if err := r.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
 }
