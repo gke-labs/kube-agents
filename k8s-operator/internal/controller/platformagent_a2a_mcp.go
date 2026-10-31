@@ -103,9 +103,14 @@ const (
 	a2aMCPStartupFailure = 60
 
 	// Sized like the console: GKE Autopilot raises a CPU request under 50m.
+	// The chart's quota preflight counts this pod at the console's size when
+	// A2A_MCP_DOOR is set (#3869), so the two are held equal by
+	// TestTheMCPPodIsSizedLikeTheConsole. The CPU limit is there because a
+	// namespace ResourceQuota on limits.cpu refuses a container with none.
 	a2aMCPCPURequest    = "50m"
 	a2aMCPMemoryRequest = "64Mi"
 	a2aMCPMemoryLimit   = "128Mi"
+	a2aMCPCPULimit      = "500m"
 )
 
 // a2aMCPGoMemLimit is the MCP container's GOMEMLIMIT: a2aMCPGoMemLimitPercent
@@ -128,6 +133,17 @@ const (
 // flag.
 func a2aMCPDoorEnabled() bool {
 	return os.Getenv(a2aMCPDoorEnvVar) == "true"
+}
+
+// a2aMCPStandingPods is the pods the MCP server adds to the namespace while
+// the flag is on, and none otherwise. The namespace pod quota's headroom
+// counts the standing pods, and no golden renders this one, so the quota adds
+// it on its own (#3869).
+func a2aMCPStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
+	if !a2aMCPDoorEnabled() {
+		return 0
+	}
+	return int64(ptr.Deref(buildA2AMCPDeployment(agent).Spec.Replicas, 1))
 }
 
 func a2aMCPName(agent *agentv1alpha1.PlatformAgent) string {
@@ -249,6 +265,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 								corev1.ResourceMemory: resource.MustParse(a2aMCPMemoryRequest),
 							},
 							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse(a2aMCPCPULimit),
 								corev1.ResourceMemory: resource.MustParse(a2aMCPMemoryLimit),
 							},
 						},

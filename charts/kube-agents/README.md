@@ -1109,6 +1109,22 @@ declare it (or a `LimitRange` to default it), and will reject the pod if omitted
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
 records how many claims follow it (`dataClaims`) and their default size, and each one moves by
 the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.
+With `platformAgent.mode: next` it also counts what that mode adds, from footprint.yaml's
+`nextMode`: NATS and its 40Gi JetStream claim, the two auth callouts, the two capability
+verifiers, the console, the A2A gateway, the provisioning Job (counted although it runs to
+completion, because the operator runs it again whenever its spec changes and about daily once
+its TTL removes it, with the rest of the release standing), and the
+`hermes-bridge` container in each agent pod: at the `api` default, or, when `operator.extraEnv`
+sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less than the agent
+container's size (the operator's fallback under `cli`), raised per key by any readable figure
+in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
+rather than re-implementing it, so it can over-count; it never fails the render on them.
+When `operator.extraEnv` sets `A2A_MCP_DOOR` to `true`, or in a form the chart cannot read (a
+`valueFrom`, a non-string value), the check also counts the MCP server's pod, at the console's
+size, since the operator sizes the two alike. The mode is read from the values, so a mode set
+on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
+The session pods a next install spawns on demand are not counted; the operator caps those with
+a `ResourceQuota` of its own.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.
@@ -1120,7 +1136,10 @@ CPU, memory and ephemeral-storage (requests and limits), `pods` (`count/pods`),
 keys, including `services`, `secrets` and other `count/<resource>` entries, are not
 modelled and are skipped rather than guessed at. **Scoped quotas are skipped entirely** —
 a quota with `scopes` or a `scopeSelector` applies to a subset of pods the template cannot
-identify, so comparing the whole release against it would be wrong either way. Every quota
+identify, so comparing the whole release against it would be wrong either way. So is a quota
+a `PlatformAgent` owns: the operator's next-mode session-pod quota (`pods` of `maxSessions`
+plus a headroom), which it puts back on every reconcile, so a printed patch would not stick;
+raise `spec.harness.tuning.maxSessions` instead. Every quota
 that falls short is reported in one failure, so a namespace with two of them takes one
 patch rather than two rounds.
 
@@ -1321,8 +1340,9 @@ helm uninstall kube-agents -n kubeagents-system
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
-  the operator's **golden manifest**
-  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`),
+  the operator's **golden manifests**
+  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`, and
+  `platformagent-next.yaml` for its `nextMode` section),
   not from `k8s-operator/config/` and not from a live render. Changing the operator's
   resources therefore takes two steps in order — re-bless the goldens
   (`cd k8s-operator && go test ./internal/testing/... -update`), then `make chart-sync`.
