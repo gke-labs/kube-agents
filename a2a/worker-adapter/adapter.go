@@ -163,6 +163,11 @@ type Config struct {
 	// disables the listener, and the harness has no way to delegate.
 	DelegateSocket string
 
+	// TaskStem names the consumers of a profile worker's task connection
+	// (lib.TaskConsumerStem), which the callout grants instead of the pod's.
+	// Empty for every other run.
+	TaskStem string
+
 	Logger *slog.Logger
 }
 
@@ -181,6 +186,9 @@ func (c Config) Addressee() string {
 // (the callout's profile narrowing grants exactly <pod>-<role>). Without a pod
 // name, which is the by-hand static-credential path, it is the addressee.
 func (c Config) consumerStem() string {
+	if c.TaskStem != "" {
+		return c.TaskStem
+	}
 	if c.Session != "" {
 		return c.Session
 	}
@@ -252,6 +260,9 @@ func (c *Config) applyDefaults() {
 type Result struct {
 	State   lib.TaskState
 	Evicted bool
+	// Abandoned is a dispatched task the dispatcher took back: no terminal
+	// was published, because the dispatcher writes it.
+	Abandoned bool
 }
 
 // resultChunkSize bounds one result artifact-update well under the bus max
@@ -365,6 +376,17 @@ type adapter struct {
 	costSeen       float64
 	costKnown      bool
 	resumedSession bool
+
+	// dispatched is a task a profile worker took from the dispatcher
+	// (profile.go). The dispatcher checked the grant at admission
+	// (CheckProfileRun), and a profile pod holds no verify subject, so the
+	// executor's own capability check is skipped for it.
+	dispatched bool
+	// abandon carries the dispatcher's abandon reason to supervise. The
+	// dispatcher writes that task's terminal itself, so supervise stops the
+	// harness and returns without one. Nil, which never fires, for every
+	// other task.
+	abandon <-chan string
 }
 
 // turnCostFrom is one result line's cost from the harness's running total,
@@ -450,6 +472,22 @@ type busConns struct {
 
 // dialBus opens the pod's two bus connections with its credential.
 func dialBus(ctx context.Context, cfg Config) (*busConns, func(), error) {
+	return dialBusWith(ctx, cfg, nil)
+}
+
+// dialTaskBus opens a profile worker's task connections (#3889): the pod's
+// bus token with the dispatcher's task credential, under the task's stem.
+func dialTaskBus(ctx context.Context, cfg Config, credential string) (*busConns, func(), error) {
+	auth, err := lib.TaskCredentialNATSOptions(cfg.BusTokenFile, credential, cfg.PodName, cfg.TaskID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return dialBusWith(ctx, cfg, auth)
+}
+
+// dialBusWith is dialBus with auth replacing the credential cfg names, when
+// it's set.
+func dialBusWith(ctx context.Context, cfg Config, auth []nats.Option) (*busConns, func(), error) {
 	log := cfg.Logger
 	natsOpts := []nats.Option{
 		nats.Name("worker-adapter-" + cfg.Addressee()),
@@ -478,6 +516,8 @@ func dialBus(ctx context.Context, cfg Config) (*busConns, func(), error) {
 		}),
 	}
 	switch {
+	case auth != nil:
+		natsOpts = append(natsOpts, auth...)
 	case cfg.BusTokenFile != "":
 		// The pod-bound credential. The inbox owner is the pod name: for a
 		// session pod validate() has checked it against A2A_SESSION, and a
@@ -620,7 +660,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	// for this task has to permit this executor to execute it, at this
 	// executor's own scope, and the verifier is the only thing that can say
 	// so. Refused is terminal rejected, before any model spend.
-	if reason := a.capabilityRefusal(ctx, a.nc, origin); reason != "" {
+	if reason := a.dispatchedOr(a.capabilityRefusal, ctx, origin); reason != "" {
 		// A SIGTERM that lands inside the verify window is an eviction, not
 		// a refusal. Check wraps this same ctx and turns its cancellation
 		// into "the verifier could not be reached", so without this branch
@@ -738,6 +778,26 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	return turnOutcome{res: res, err: err, launched: true, harnessSession: a.harnessSession}
 }
 
+// evictedReason is the terminal's reason when the pod is stopped mid-task.
+// A profile worker is stopped by a rollout or a scale-down of its pool,
+// which the requester can't see, so its text says so and that the task can
+// be sent again.
+func (a *adapter) evictedReason() string {
+	if a.dispatched {
+		return "reason: worker-evicted - the task was interrupted because its worker restarted (an upgrade or a scale-down); it can be resubmitted"
+	}
+	return "reason: worker-evicted - infrastructure delivered SIGTERM before the task finished"
+}
+
+// dispatchedOr is check's refusal for a task that came through the stream,
+// and "" for a dispatched one, whose grant the dispatcher already checked.
+func (a *adapter) dispatchedOr(check func(context.Context, *nats.Conn, *lib.Envelope) string, ctx context.Context, origin *lib.Envelope) string {
+	if a.dispatched {
+		return ""
+	}
+	return check(ctx, a.nc, origin)
+}
+
 // supervise is the main loop: harness stdout events out, steering in, cancel
 // and eviction and the deadline racing all of it. The terminal decision
 // waits until the harness has exited AND its stdout is fully drained - a
@@ -770,6 +830,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 
 	var (
 		canceled    bool
+		abandoned   bool
 		deadlineHit bool
 		sawResult   bool
 		exited      bool
@@ -912,6 +973,21 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			proc.closeStdin()
 			proc.kill(a.cfg.KillGrace)
 
+		case reason := <-a.abandon:
+			// The dispatcher took the task back (deadline, lease expiry, a
+			// stop) and writes its terminal. Publishing one here too would
+			// put two finals on the task, so the harness is killed and
+			// nothing more goes out. The loop still waits for it to exit and
+			// drain, as cancel does: the worker frees the pod for the next
+			// task when this returns, and nothing of this task's may still be
+			// running then.
+			if abandoned {
+				continue
+			}
+			abandoned = true
+			log.Info("the dispatcher abandoned the task; stopping the harness", "task", a.taskID, "reason", reason)
+			proc.kill(0)
+
 		case <-cancelCh:
 			if canceled {
 				continue
@@ -938,7 +1014,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				return a.completeWith(resultText)
 			}
 			state := lib.StateFailed
-			err := a.finalize(state, "reason: worker-evicted - infrastructure delivered SIGTERM before the task finished", resultText)
+			err := a.finalize(state, a.evictedReason(), resultText)
 			return Result{State: state, Evicted: true}, err
 
 		case reap := <-waitDone:
@@ -953,6 +1029,8 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	// race, legal per the payload spec), then deadline, then cancel, then
 	// failure with evidence.
 	switch {
+	case abandoned:
+		return Result{Abandoned: true}, nil
 	case sawResult && resultErr == "":
 		return a.completeWith(resultText)
 	case sawResult:

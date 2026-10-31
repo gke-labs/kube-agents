@@ -20,6 +20,13 @@
 //
 // Exit codes: 0 completed (or nothing to do), 1 failed, 2 rejected,
 // 3 canceled, 143 evicted (SIGTERM).
+//
+// A2A_PROFILE_WORKER=true is the AgentProfile worker instead (#3655): a pool
+// or Job pod that takes its tasks from the dispatcher (workeradapter.
+// RunProfileWorker). It needs no TASK_ID, and A2A_PROFILE_TIER names its
+// pool. It answers /readyz on lib.ProfileWorkerStatusPort once it's
+// listening. It exits 0 when it stops (at SIGTERM, or after one task with
+// PROFILE_WORKER_ONE_SHOT), and 1 if it can't start.
 package main
 
 import (
@@ -39,6 +46,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
 
@@ -173,6 +181,32 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	if os.Getenv(lib.EnvProfileWorker) == "true" {
+		oneShot := os.Getenv(lib.EnvProfileWorkerOneShot)
+		harness := persona.Harness(os.Getenv(lib.EnvProfileHarness))
+		if harness == "" {
+			harness = persona.ClaudeCode
+		}
+		// The persona supplies the tool flags, so the base argv carries none.
+		cfg.HarnessCommand = profileHarnessCommand()
+		cfg.HarnessCommandNoDelegate = nil
+		pw := workeradapter.ProfileWorkerConfig{
+			Tier:       os.Getenv(lib.EnvProfileTier),
+			OneShot:    oneShot == "1" || oneShot == "true",
+			ReadyAddr:  fmt.Sprintf(":%d", lib.ProfileWorkerStatusPort),
+			PersonaDir: lib.ProfilePersonaDir,
+			Harness:    harness,
+			ConfigRoot: envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
+			// The broker's task-token file (#3889's proxy confinement).
+			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
+		}
+		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
+			log.Error("profile worker failed", "err", err)
+			return 1
+		}
+		return 0
+	}
+
 	res, err := workeradapter.Run(ctx, cfg)
 	if err != nil {
 		log.Error("adapter run failed", "task", cfg.TaskID, "state", string(res.State), "err", err)
@@ -205,8 +239,11 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	taskID := os.Getenv("TASK_ID")
 	profile := os.Getenv("PROFILE")
 	natsURL := os.Getenv("NATS_URL")
-	if taskID == "" || profile == "" || natsURL == "" {
-		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract)")
+	// A profile worker learns each task from the dispatcher's offer, so it
+	// starts with no TASK_ID.
+	profileWorker := os.Getenv(lib.EnvProfileWorker) == "true"
+	if (taskID == "" && !profileWorker) || profile == "" || natsURL == "" {
+		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract); a profile worker needs no TASK_ID")
 		return workeradapter.Config{}, false
 	}
 
@@ -403,6 +440,43 @@ func harnessCommand() []string {
 	return argv
 }
 
+// profileHarnessCommand is a profile worker's base argv: the harness over the
+// headless stream-json contract, the model and the turn budget, and no tool,
+// MCP or settings flags. The worker appends the persona's rendering of those
+// for each task (worker-adapter/profile.go), and a second copy here would
+// leave the harness to pick between two allowlists. A2A_HARNESS_CMD still
+// overrides it whole, for tests.
+func profileHarnessCommand() []string {
+	if cmd := os.Getenv("A2A_HARNESS_CMD"); cmd != "" {
+		return strings.Fields(cmd)
+	}
+	path := os.Getenv("A2A_HARNESS_PATH")
+	if path == "" {
+		path = workeradapter.DefaultHarnessPath
+	}
+	model := os.Getenv("A2A_MODEL")
+	if model == "" {
+		model = defaultModel
+	}
+	maxTurns := os.Getenv("A2A_MAX_TURNS")
+	if maxTurns == "" {
+		maxTurns = defaultMaxTurns
+	}
+	argv := []string{
+		path,
+		"--print",
+		"--output-format", "stream-json",
+		"--input-format", "stream-json",
+		"--verbose",
+		"--model", model,
+		"--max-turns", maxTurns,
+	}
+	if extra := os.Getenv("A2A_HARNESS_EXTRA_ARGS"); extra != "" {
+		argv = append(argv, strings.Fields(extra)...)
+	}
+	return argv
+}
+
 // delegateToolEnabled is the delegate tool's single switch: everything that
 // advertises or starts it (the harness flags below, the Config wiring in
 // configFromEnv, and the socket listener it feeds) reads this and nothing
@@ -582,4 +656,12 @@ func readPrimer(log *slog.Logger) string {
 		return ""
 	}
 	return string(b)
+}
+
+// envOrDefault is the variable's value, or def when it's unset.
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
