@@ -29,6 +29,15 @@ from typing import Any
 DRAFT_PREFIXES = ("WIP:", "[WIP]")
 DRAFT_PREFIX = "WIP: "
 
+# Gitea's review states, as the neutral ones. `PENDING` is a review not yet
+# submitted and `REQUEST_REVIEW` is a request for one, so neither is a review.
+REVIEW_STATES = {
+    "APPROVED": "approved",
+    "REQUEST_CHANGES": "changes_requested",
+    "COMMENT": "commented",
+}
+DISMISSED = "dismissed"
+
 
 def actor(node: dict[str, Any] | None) -> str:
     """A login. Gitea marks nothing onto an automation's login, so it is as sent."""
@@ -138,15 +147,61 @@ def comment(node: dict[str, Any], kind: str = "issue") -> dict[str, Any]:
 
 
 def commit(node: dict[str, Any]) -> dict[str, Any]:
-    """One commit on a proposal's source branch, dated by its committer."""
+    """One commit on a proposal's source branch, dated by its committer.
+
+    `email` is the git author email and `bot` whether the linked account is
+    one of Gitea's own principals, False when no account is linked -- as for
+    the install's own commits, whose address Gitea links to nobody.
+    """
     inner = node.get("commit") or {}
+    git_author = inner.get("author") or {}
     return {
         "sha": node.get("sha") or "",
-        "author": actor(node.get("author")) or ((inner.get("author") or {}).get("name") or ""),
+        "author": actor(node.get("author")) or (git_author.get("name") or ""),
+        "email": git_author.get("email") or "",
+        "bot": is_automation(node.get("author")),
         "committed": ((inner.get("committer") or {}).get("date")) or "",
         "message": inner.get("message") or "",
         "url": node.get("html_url") or "",
     }
+
+
+def authored(node: dict[str, Any]) -> dict[str, Any]:
+    """A pull request as one of an author's proposals."""
+    item = proposal(node)
+    return {
+        "number": item["number"],
+        "state": item["state"],
+        "author": item["author"],
+        "authorBot": is_automation(node.get("user")),
+        "created": item["created"],
+        "updated": item["updated"],
+        "closed": item["closed"],
+    }
+
+
+def review(node: dict[str, Any]) -> dict[str, Any] | None:
+    """A submitted review, body or not; None for a pending one or a request.
+
+    Gitea keeps a dismissed review's state and flags it `dismissed`, where
+    GitHub replaces the state, so the flag decides.
+    """
+    state = REVIEW_STATES.get(str(node.get("state") or "").upper())
+    if state is None:
+        return None
+    return {
+        "id": node.get("id"),
+        "state": DISMISSED if node.get("dismissed") else state,
+        "author": actor(node.get("user")),
+        "bot": is_automation(node.get("user")),
+        "created": node.get("submitted_at") or "",
+    }
+
+
+def closer(node: dict[str, Any] | None) -> dict[str, Any]:
+    """Who posted a timeline event; "" when nobody."""
+    who = (node or {}).get("user")
+    return {"actor": actor(who), "bot": is_automation(who)}
 
 
 def label(node: dict[str, Any]) -> dict[str, Any]:

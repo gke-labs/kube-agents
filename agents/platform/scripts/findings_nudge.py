@@ -22,8 +22,10 @@ formatting and bookkeeping. Each run:
 3. Once a UTC day, on the first run at or after 12:00 UTC, also reminds the
    top pending criticals and names every pending non-critical holding
    additions back, with how to release it. A decision on any id of an item
-   covers every undecided row of the item (`findings_queue.patch_finding`),
-   and the count printed beside the id is that number of objects. Shown rows
+   covers the rows of the item a message has named
+   (`findings_queue.patch_finding`); every row of a line it names is marked
+   below, so the count printed beside the id is that number of objects. A
+   row a sweep adds to the line later stays open until a message names it. Shown rows
    a complete sweep stopped reporting are in that count but not listed, and
    the line says how many of them there are.
 4. Prints, records the day's state (the daily part sent, the items announced
@@ -318,7 +320,8 @@ def compose(plan: fq.PacingPlan, open_count: int, daily: bool) -> str:
                 + [
                     "Reply with the id and the decision: dismiss (won't fix), snooze until a "
                     "date, or accept (being worked on). "
-                    "A decision on an id covers every undecided object in its item."
+                    "A decision on an id covers the objects counted beside it; "
+                    "a finding added to the line later stays open until a message names it."
                 ]
             )
         )

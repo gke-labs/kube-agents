@@ -44,6 +44,7 @@ _FRICTION = {
     "KubeAgentsScrapeBroken",
 }
 _SCRAPE_ALERT = "KubeAgentsScrapeBroken"
+_READING = "kubeagents:platformagent:usage_reading:max"
 
 
 def _render(*extra, api_versions=(_RULES_API, _PODMONITORING_API)):
@@ -64,6 +65,27 @@ def _alerts(rules):
 
 def _records(rules):
     return {r["record"]: r for g in rules["spec"]["groups"] for r in g["rules"] if "record" in r}
+
+
+def _expand(expr, records):
+    """The expression with every recorded series it reads, transitively, appended."""
+    seen, out, todo = set(), [expr], [expr]
+    while todo:
+        cur = todo.pop()
+        for name, rule in records.items():
+            if name in cur and name not in seen:
+                seen.add(name)
+                out.append(rule["expr"])
+                todo.append(rule["expr"])
+    return " ".join(out)
+
+
+def _reading_fields():
+    """The six proposal readings' field names, as usage_gauges.go declares them."""
+    import re
+
+    block = _GAUGES_GO.read_text().split("// The six proposal readings' field names", 1)[1].split("// usageCreatedTimeField", 1)[0]
+    return re.findall(r'usageExport[A-Za-z]+\s*=\s*"([a-zA-Z]+)"', block)
 
 
 @unittest.skipUnless(shutil.which("helm"), "helm not installed")
@@ -91,12 +113,16 @@ class HealthRulesRenderTest(unittest.TestCase):
             self.assertTrue(rule.get("for"), f"{name} fires on one evaluation; every alert has a for")
 
     def test_every_alert_reads_the_operators_gauges_per_agent(self):
-        alerts = _alerts(_rules(_render(*_ON))[0])
+        """Directly, or through the recorded series it reads (a proposal window reads
+        the reading's recorded max, which reads the gauge)."""
+        rules = _rules(_render(*_ON))[0]
+        alerts = _alerts(rules)
+        records = _records(rules)
         for name, rule in alerts.items():
             if name == _SCRAPE_ALERT:
                 self.assertIn("up{", rule["expr"], name)
                 continue
-            self.assertIn(_GAUGE_PREFIX, rule["expr"], name)
+            self.assertIn(_GAUGE_PREFIX, _expand(rule["expr"], records), name)
             self.assertIn(_GROUPING, rule["expr"], f"{name} does not group by the agent's labels")
 
     def test_ratios_are_recorded_once_and_read_by_the_alerts(self):
@@ -105,9 +131,9 @@ class HealthRulesRenderTest(unittest.TestCase):
         self.assertTrue(records, "no recording rules")
         for name in records:
             self.assertTrue(name.startswith("kubeagents:"), name)
-        exprs = " ".join(r["expr"] for r in _alerts(rules).values())
+        exprs = " ".join(_expand(r["expr"], records) for r in _alerts(rules).values())
         for name in records:
-            self.assertIn(name, exprs, f"{name} is recorded but no alert reads it")
+            self.assertIn(name, exprs, f"{name} is recorded but no alert reads it, directly or through another record")
 
     def test_thresholds_and_floors_come_from_values(self):
         docs = _render(
@@ -234,6 +260,82 @@ class HealthRulesRenderTest(unittest.TestCase):
         self.assertEqual(declared, set(thresholds["properties"]), "schema properties differ from values.yaml")
         self.assertEqual(declared, set(thresholds["required"]), "every threshold is required when the rules are on")
         self.assertEqual(read, declared, "the template reads a threshold values.yaml does not declare, or declares one it never reads")
+
+    def test_no_increase_remains_on_a_reading_field(self):
+        """The proposal fields are forge readings that fall on a removal; `increase()`
+        reads a fall as a counter reset and inflates the window."""
+        exprs = [r["expr"] for g in _rules(_render(*_ON))[0]["spec"]["groups"] for r in g["rules"]]
+        readings = _reading_fields()
+        self.assertEqual(6, len(readings), readings)
+        for expr in exprs:
+            self.assertNotRegex(expr, r"increase\(kubeagents:platformagent:usage_reading:max", "increase() over the recorded reading series")
+            for field in readings:
+                self.assertNotRegex(expr, rf'increase\({_GAUGE_PREFIX}usage\{{field="{field}"\}}', f"increase() over the reading {field}")
+
+    def test_deltas_and_resets_run_over_the_recorded_max_series_only(self):
+        """A roll-over splits a reading across two pod series and a `delta()` has
+        no aggregation of its own, so each window reads the `max by` recorded series."""
+        rules = _rules(_render(*_ON))[0]
+        records = _records(rules)
+        self.assertEqual(
+            f'max by ({_GROUPING}, agent, field) ({_GAUGE_PREFIX}usage{{field=~"remediationsMergedTotal|remediationsClosedUnmergedTotal|proposalsAuthored"}})',
+            records[_READING]["expr"],
+        )
+        exprs = [r["expr"] for g in rules["spec"]["groups"] for r in g["rules"]]
+        windows = 0
+        for expr in exprs:
+            for fn in ("delta(", "resets("):
+                for i in [j for j in range(len(expr)) if expr.startswith(fn, j) and (j == 0 or not expr[j - 1].isalnum() and expr[j - 1] != "_")]:
+                    windows += 1
+                    self.assertTrue(expr.startswith(f"{fn}{_READING}{{", i), f"{fn} not over the recorded max series: ...{expr[i:i + 80]}")
+            self.assertNotIn(f"clamp_min(delta({_GAUGE_PREFIX}", expr)
+        self.assertEqual(4, windows, "three window deltas and one fall guard")
+        # Each window is folded to the agent pair: `a / on(...) b` keeps the
+        # left side's labels, so a `field` left on a window would ride onto
+        # both ratios and both alerts as the name of one input.
+        for name, field in (("merged", "remediationsMergedTotal"), ("closed", "remediationsClosedUnmergedTotal"), ("authored", "proposalsAuthored")):
+            self.assertEqual(f'max by ({_GROUPING}, agent) (clamp_min(delta({_READING}{{field="{field}"}}[14d]), 0))', records[f"kubeagents:platformagent:proposals_{name}_14d"]["expr"], name)
+        windows_14d = {name: rule["expr"] for name, rule in records.items() if name.endswith("_14d") and name.split(":")[-1].split("_")[1] in ("merged", "closed", "authored", "fell")}
+        self.assertEqual(4, len(windows_14d), sorted(windows_14d))
+        for name, expr in windows_14d.items():
+            self.assertTrue(expr.startswith(f"max by ({_GROUPING}, agent) (") and expr.endswith(")"), f"{name} is not folded to the agent pair: {expr}")
+
+    def test_the_merge_rate_divides_by_authored_and_the_unmerged_guard_reads_authored(self):
+        """One source only: the merge rate divides a reading by a reading, and the
+        guard's threshold keeps its name and its meaning of proposals opened."""
+        rules = _rules(_render(*_ON, "--set", "platformAgent.healthRules.thresholds.proposalsProposedMin14d=7"))[0]
+        records = _records(rules)
+        on = f"on ({_GROUPING}, agent)"
+        self.assertEqual(
+            f"kubeagents:platformagent:proposals_merged_14d / {on} kubeagents:platformagent:proposals_authored_14d unless {on} kubeagents:platformagent:proposals_fell_14d",
+            records["kubeagents:platformagent:proposals_merge_rate_14d"]["expr"],
+        )
+        self.assertEqual(
+            f"kubeagents:platformagent:proposals_closed_14d / {on} (kubeagents:platformagent:proposals_closed_14d + {on} kubeagents:platformagent:proposals_merged_14d) unless {on} kubeagents:platformagent:proposals_fell_14d",
+            records["kubeagents:platformagent:proposals_rejected_ratio_14d"]["expr"],
+        )
+        alerts = _alerts(rules)
+        self.assertIn(f"and {on} kubeagents:platformagent:proposals_authored_14d >= 7", alerts["KubeAgentsProposalsUnmerged"]["expr"])
+        rejected = alerts["KubeAgentsProposalsRejected"]["expr"]
+        self.assertIn(f"and {on} kubeagents:platformagent:proposals_closed_14d >= 3", rejected)
+        self.assertIn(f"and {on} (kubeagents:platformagent:proposals_closed_14d + {on} kubeagents:platformagent:proposals_merged_14d) >= 4", rejected)
+        for name in ("KubeAgentsProposalsRejected", "KubeAgentsProposalsUnmerged"):
+            self.assertNotIn("remediationsProposedTotal", alerts[name]["expr"], name)
+            self.assertNotIn("increase(", alerts[name]["expr"], name)
+
+    # The fall guard's evaluation cannot run in CI: neither the host nor the CI
+    # image carries promtool, so these tests hold the rule's rendered text. Its
+    # behaviour on a reopen and a removal is verified live, against Managed
+    # Prometheus's recorded series, after an upgrade.
+    def test_a_reopen_does_not_trip_the_fall_guard_and_a_removal_does(self):
+        """A reopen moves closed and open but not their sum, proposalsAuthored; a
+        removal or a deletion lowers it. So the guard reads that series alone, and
+        with `resets()`, which sees a fall a later rise nets out of a `delta()`."""
+        rules = _rules(_render(*_ON))[0]
+        records = _records(rules)
+        self.assertEqual(f'max by ({_GROUPING}, agent) (resets({_READING}{{field="proposalsAuthored"}}[14d]) > 0)', records["kubeagents:platformagent:proposals_fell_14d"]["expr"])
+        exprs = " ".join(r["expr"] for g in rules["spec"]["groups"] for r in g["rules"])
+        self.assertEqual(1, exprs.count("resets("), "the fall guard watches proposalsAuthored and no other field")
 
     def test_compound_durations_are_accepted(self):
         alerts = _alerts(_rules(_render(*_ON, "--set", "platformAgent.healthRules.thresholds.ratiosFor=1h30m"))[0])

@@ -235,7 +235,7 @@ CHAT_BOLD = "*"
 # + window] local time. The job runs every 15 minutes, so a 20-minute window
 # always contains at least one tick and the per-day marker in the state file
 # (the local date) stops the second one from repeating it.
-DEFAULT_DIGEST_HOUR = 9
+DEFAULT_DIGEST_HOUR = 11
 DIGEST_WINDOW = timedelta(minutes=20)
 
 # Inside an OUTAGE the cause grows as more cases collapse. Each growth is

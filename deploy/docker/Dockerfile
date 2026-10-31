@@ -190,7 +190,9 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
 # adapter.py upstream) restores placeholders in insertion order, so a header/bold/link wrapping inline
 # code leaks its \x00GCn\x00 key; reversing the restore fixes nesting (kube-agents #277). (2) The standalone
 # REST send (_standalone_send, used by send_message from cron) posts thread.name without messageReplyOption,
-# which the Chat API ignores by default -- upstream's _create_kwargs docstring says so, SDK path only.
+# which the Chat API ignores by default -- upstream's _create_kwargs docstring says so, SDK path only. With
+# GOOGLE_CHAT_RELAY_URL set, google_chat_relay_patch replaces that sender and sets the option itself, so this
+# edit matters only on an install that sends with its own credential.
 # Both edits are exact-count guarded (c.count(t) == 1) until they become an applier + verifier.
 RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/plugins/platforms/google_chat/cards.py'); c = p.read_text(); t = 'for key, value in placeholders.items():'; r = 'for key, value in reversed(list(placeholders.items())):'; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
     /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/plugins/platforms/google_chat/adapter.py'); c = p.read_text(); t = 'f\"https://chat.googleapis.com/v1/{chat_id}/messages\", json=_thread_body(message, thread_id),'; r = 'f\"https://chat.googleapis.com/v1/{chat_id}/messages\" + (\"?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD\" if thread_id else \"\"), json=_thread_body(message, thread_id),'; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
@@ -2340,8 +2342,9 @@ COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/go
 # reason in step 2a.
 COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hindsight/
 
-# Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
-# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
+# Copy the Cluster Agent profile TEMPLATE (SOUL, config, skills), scaffolded
+# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py,
+# plus persona/, copied but not scaffolded.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
 # Copy the GKE Support Agent (tse) profile TEMPLATE (persona, config, skills),
@@ -2384,9 +2387,15 @@ COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 # real worker process started as the dispatcher starts one; see its module
 # docstring.
 #
+# verify_scheduler_failure_line.py rides along for the same two reasons: the
+# layer budget, and session_kv_server.py. It is the half of
+# verify_chat_relay.py's check 11 that needs the relay and the image's cron
+# roster as well as the scheduler: each failure line the scheduler writes still
+# carries the words the relay matches, and the roster still reads as daily.
+#
 # check_skill_commands.py rides along the same way, with skill_documents.py,
 # which it imports. It runs every shell block in the skill documents of the
-# image's three skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
+# image's four skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
 # copied above this block rather than below it.
 # It scans with the image's pinned tirith (--tirith-bin), the binary that ships.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
@@ -2394,6 +2403,7 @@ COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
      deploy/docker/patches/verify_slack_relay_registry_contract.py \
      deploy/docker/patches/verify_card_stop.py \
+     deploy/docker/plugins/verify_scheduler_failure_line.py \
      deploy/docker/check_skill_commands.py \
      deploy/docker/skill_documents.py \
      /tmp/platform-config/
@@ -2409,10 +2419,12 @@ assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.ma
 assert cfg.get('agent', {}).get('max_turns') == 150, 'worker iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_card_stop.py && \
+    cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_scheduler_failure_line.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \
         --tirith-bin /usr/local/bin/tirith \
         agents/platform/skills=/opt/platform-template/skills \
         agents/cluster/skills=/opt/cluster-template/skills \
+        agents/cluster/persona/skills=/opt/cluster-template/persona/skills \
         agents/tse/skills=/opt/tse-template/skills \
         a2a/persona/platform/skills=/opt/a2a-template/skills && \
     rm -rf /tmp/platform-config

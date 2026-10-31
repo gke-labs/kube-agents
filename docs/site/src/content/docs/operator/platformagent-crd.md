@@ -347,8 +347,8 @@ Helm install, set the block in your values file.
 Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
 `maxInProgress`, the mode-next session-pod cap `maxSessions`, and the AgentProfile knobs under
-`profiles` (`ceiling` and `warmReplicas`; see [AgentProfile](./agentprofile-crd.md)). Unset,
-`maxSessions` renders `10`, `profiles.ceiling` `8` and `profiles.warmReplicas` `1`; all three are
+`profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)). Unset,
+`maxSessions` renders `10`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`; all three are
 inert under `mode: today`.
 
 **The per-run limits are opt-in.** The operator pins nothing of its own there: what a fleet needs
@@ -695,7 +695,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 - `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`. When set, the managed config also carries `database.journal_mode: delete`, and the entrypoint converts Hermes' existing databases out of WAL once at start-up — `state.db`, `kanban.db` and the cron, project, evidence, response, memory and Discord stores Hermes opens through the same journal-mode helper: a sandboxed runtime serves the data volume over a gofer mount that accepts SQLite's WAL mode and then corrupts it. The Session KV store (`session_kv.db` on the `system-metadata` volume) sets WAL itself and is not covered by either. Clearing the field drops the pin, and the databases return to WAL on their next open.
 - `env` — additional container environment variables.
 - `resources` — requests and limits for the agent container, replacing the operator's defaults as a block.
-- `credentialProxy.resources` — requests and limits for the credential-proxy container, the broker that runs every credentialed command in a pod of its own. Merged over the operator's defaults per key, unlike `resources`: a CR that sets only `limits.memory` keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage limit, which bounds the content workspace. The proxy's state and `/tmp` emptyDirs (size limits 5Gi and 2Gi) follow that limit when it is raised above their defaults, so the kubelet does not evict the pod at the smaller figure. The broker sizes how many commands it admits at once from the memory limit, so that is the key to raise when the proxy is OOM-killed under a large fleet. Only `cpu`, `memory` and `ephemeral-storage` are accepted, the quantities the container declares. The operator refuses a memory limit below 672Mi (two commands at once), a `limits.memory` set alone below the 1Gi default request (set `requests.memory` with it), a request above its limit, a negative quantity, a zero limit and `claims`, which the proxy pod has no use for. A refused override, including an edit of one that was valid, renders the proxy Deployment at the operator's defaults rather than at the last accepted override until it is corrected, which restarts the proxy once (its Deployment is `Recreate`), and the agent stays Ready whether or not the webhook is on. The `Degraded` condition carries one reason, and reports `InvalidCredentialProxyResources` when no higher-ranked `Degraded` cause is present. Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply and the running proxy is untouched. Admission also warns when memory per CPU on the requests pair leaves the 1 to 6.5 GiB per vCPU band GKE Autopilot admits unchanged, because Autopilot then raises the smaller request and the chart's quota preflight is short by the difference; Autopilot applies the band to requests only. It warns too for each of `cpu` and `memory` set under `limits` without the same key under `requests`, unless the limit equals the request it would be replaced by: Autopilot without bursting sets the limits equal to the requests, so a CR that sets only `limits.memory: 3Gi` runs at the 1Gi request there. Set the request to the same value, or enable bursting, under which the declared limits stand.
+- `credentialProxy.resources` — requests and limits for the credential-proxy container, the broker that runs every credentialed command in a pod of its own. Merged over the operator's defaults per key, unlike `resources`: a CR that sets only `limits.memory` keeps the default 500m CPU request, 1 CPU limit and 8Gi ephemeral-storage limit, which bounds the content workspace. The proxy's state emptyDir (size limit 5Gi) grows by whatever that limit is raised above the 8Gi default, and its `/tmp` emptyDir keeps its 2Gi, so the kubelet does not evict the pod at the smaller figure. The broker sizes how many commands it admits at once from the memory limit, so that is the key to raise when the proxy is OOM-killed under a large fleet. Only `cpu`, `memory` and `ephemeral-storage` are accepted, the quantities the container declares. The operator refuses a memory limit below 672Mi (two commands at once), a `limits.memory` set alone below the 1Gi default request (set `requests.memory` with it), a request above its limit, a negative quantity, a zero limit and `claims`, which the proxy pod has no use for. A refused override, including an edit of one that was valid, renders the proxy Deployment at the operator's defaults rather than at the last accepted override until it is corrected, which restarts the proxy once (its Deployment is `Recreate`), and the agent stays Ready whether or not the webhook is on. The `Degraded` condition carries one reason, and reports `InvalidCredentialProxyResources` when no higher-ranked `Degraded` cause is present. Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply and the running proxy is untouched. Admission also warns when memory per CPU on the requests pair leaves the 1 to 6.5 GiB per vCPU band GKE Autopilot admits unchanged, because Autopilot then raises the smaller request and the chart's quota preflight is short by the difference; Autopilot applies the band to requests only. It warns too for each of `cpu` and `memory` set under `limits` without the same key under `requests`, unless the limit equals the request it would be replaced by: Autopilot without bursting sets the limits equal to the requests, so a CR that sets only `limits.memory: 3Gi` runs at the 1Gi request there. Set the request to the same value, or enable bursting, under which the declared limits stand.
 - `agentAPIAuth.resources` — requests and limits for the `agent-api-auth` sidecar in the gateway pod, the native container that authenticates the agent's API-server calls and also runs the event watcher and the drift detector. Merged over the operator's defaults per key, like `credentialProxy.resources`: a CR that sets only `limits.memory` keeps the default 150m CPU request, 384Mi memory request, 1 CPU limit and 2Gi ephemeral-storage limit. The event watcher reads the memory limit through the Downward API and sets its Go soft memory limit to half of it, so raise `limits.memory` when the watcher is OOM-killed under a large fleet of watched clusters. Overriding `limits.cpu` also changes the watcher's `GOMAXPROCS`, which the Go runtime derives from the container's CPU limit, so leave `limits.cpu` at the default unless you mean to. Only `cpu`, `memory` and `ephemeral-storage` are accepted. The operator refuses a request above its limit, a negative quantity, a zero limit, `claims`, and any other resource name, whether or not the webhook is on: it ignores the override, renders the sidecar at its defaults, and reports `Degraded` with reason `InvalidAgentAPIAuthResources` when no higher-ranked `Degraded` cause is present, the agent staying Ready. There is no memory floor, unlike the credential proxy, because the watcher derives no admission count from the limit. Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply, and warns on the GKE Autopilot memory-per-vCPU band and on a `cpu` or `memory` limit set without the same key under `requests`, for the reasons `credentialProxy.resources` gives.
 - `initContainers` / `sidecars` — standard init and sidecar containers. A `volumeMounts` entry naming a reserved volume is refused at admission, the same as `extraVolumeMounts`. That is the route that needs no user-authored volume at all, and so the one the name reservation exists for; see [Reconcile behavior](#reconcile-behavior). Under `spec.mode: next` the render also writes two environment variables onto every `sidecars` entry — `POD_NAMESPACE` (downward API) and `A2A_CAPABILITY_REQUIRED` — with different precedence: the operator's `A2A_CAPABILITY_REQUIRED` wins, so a value set for that name in the CR is discarded on every reconcile, while `POD_NAMESPACE` is supplied only as a default and a CR value for it survives. Both are inputs to the A2A capability check the sidecar executor performs, not container configuration; nothing else in the container is rewritten.
 - `extraVolumes` — custom volumes for the main container. Both halves of the reservation apply: a reserved name, and a source that would carry the A2A bus credential, are each refused at admission; see [Reconcile behavior](#reconcile-behavior).
@@ -954,8 +954,8 @@ See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-
 The operator writes observed state to the `status` subresource; [PlatformAgent fields → Status](/kube-agents/operator/platformagent-fields/#status) lists every field with its type. How the `usage` counters are produced, and what each condition reports, follows.
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.remediationsProposedTotal`,
-`usage.remediationsMergedTotal`, `usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`, `usage.remediationsClosedUnmergedTotal`,
-`usage.lastActiveTime`, `usage.lastHumanActiveTime` and the two cluster gauges are produced by the operator, on the leader and off the reconcile path: every five
+`usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`,
+`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the six proposal readings are produced by the operator, on the leader and off the reconcile path: every five
 minutes it reads the credential broker's, the event watcher's, the chat plugin's and, on a `next`
 install, the A2A gateway's metrics listeners over the pod network, folds the counter series into totals it keeps with their per-pod baseline in the
 `<name>-usage-counters` ConfigMap, so the counters stay monotonic across pod, process and operator
@@ -967,10 +967,27 @@ burst past it, or what a process counted after its last read and before it resta
 A `lastActiveTime` that stops advancing while commands plainly run is the symptom of a listener the
 operator cannot reach; the CR's events name the pod. It advances on any brokered command, including
 those a scheduled job runs -- the Controller Stall Watch cron issues some every 30 minutes by
-default -- so a recent `lastActiveTime` is not evidence that a person used the agent; `lastHumanActiveTime` is. A counter nothing writes yet (`usage.remediationsAppliedTotal`) stays absent until a
-series exists for it
-([what lands them](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/usage-counters-producer.md#what-stays-unwritten-and-what-lands-it)).
-The operator also serves every counter, cluster gauge and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port, so a collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
+default -- so a recent `lastActiveTime` is not evidence that a person used the agent; `lastHumanActiveTime` is.
+
+The six proposal fields are readings, not totals. Every 240 seconds the credential broker asks the forge (on GitHub with a read-only token of its own) for the proposals the install authored in each managed
+repository and the human events on them. The operator projects the latest poll's values as they
+stand, outside the ConfigMap.
+
+The outcomes reading (`remediationsMergedTotal`, `remediationsOpen`, `proposalsAuthored`) and the
+details reading (the other three) each have their own miss streak. One poll that cannot read the
+broker, or reads it without a reading, leaves that reading's fields as they were; the second in a
+row clears them to absent. The broker stops serving a reading more than an hour old. A 0 is a
+reading.
+
+A broker restart leaves the details fields (`remediationsClosedUnmergedTotal`,
+`proposalHumanTouches`, `proposalsMergedUntouched`) as they were for one operator poll, and clears
+them when a second poll in a row finds no details reading. The broker keeps what it read of each
+proposal in memory, and after a restart it reads every proposal again within an hourly budget of
+forge calls. A small install is done within the first sweep. An install with a thousand proposals
+takes some hours, and the fields are absent in between. The outcomes fields return on the first
+sweep.
+
+The operator also serves every counter, cluster gauge, proposal reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
 `usage.activeInterfaces` is `dashboard` unless `harness.hermes.dashboardEnabled` is `false`, plus
 `googlechat`, `slack` and `teams` for each `integration` entry with `enabled: true`. It is resolved
@@ -981,13 +998,12 @@ write; the operator notices from the write's echo, stops treating the missing fi
 five minutes at a time, and lands it once this release's CRD is applied: within five minutes on a
 quiet install, at once when the Ready status update next writes for any other reason. The other
 status writers carry the field through as they read it, so a pass that ends `Degraded` lands
-nothing new. `usage.remediationsAppliedTotal` is declared in the
-schema and absent from every status until a series exists for it. The counters the operator does write, and the two times, land
+nothing new. The counters and the two times land
 through the poller above, which consults the same five-minute record: under a served CRD that
 predates `status.usage` they accumulate in the `<name>-usage-counters` ConfigMap and land with the
 first patch after this release's CRD is applied. Under a served CRD at a previous schema, which has
-`status.usage` without the fields added later (the two cluster gauges,
-`remediationsMergedTotal`, `chatMessagesInboundTotal`, `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`, `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `remediationsClosedUnmergedTotal` and `lastHumanActiveTime`), the first-schema counters keep landing and the newer fields are probed
+`status.usage` without the fields added later (the two cluster gauges, the proposal readings,
+`chatMessagesInboundTotal`, `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`, `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal` and `lastHumanActiveTime`), the first-schema counters keep landing and the newer fields are probed
 again every five minutes until this release's CRD is applied.
 
 These condition types appear in `conditions`; only `Ready` is always present:
@@ -1152,7 +1168,7 @@ _and_ beyond the agent's own repair: `model.*`, `platforms.*`, `approvals.cron_m
 `display.platforms`, `kanban.max_in_progress` (the board is shared by every profile, and a burst of
 workers past it is lost to the OOM killer without a restart or an event), `terminal.*` (where the shell runs: one sandbox per Pod, reached the same way by every
 profile), when the agent Pod has a runtime class, `database.journal_mode` (one data volume per Pod, and a
-corrupted database is found only after the sessions in it are unreadable) and, when the A2A bridge is in the
+corrupted database is found only after the sessions in it are unreadable), `sessions.auto_prune` and `sessions.retention_days` (from `spec.harness.retention`: one period for every profile, which no profile can lengthen) and, when the A2A bridge is in the
 Pod, rendered by the operator or declared, and runs the `api` executor, one `hooks.outbound` entry that posts tool calls and model requests to the bridge's loopback activity endpoint (one endpoint per
 Pod, signed with a key from the A2A credentials Secret). A list is one leaf, so while that entry is rendered it
 replaces any `hooks.outbound` list a profile sets in its own `config.yaml`: those hooks do not fire. The reasoning is that as long as a

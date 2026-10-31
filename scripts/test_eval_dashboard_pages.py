@@ -322,6 +322,24 @@ def freshness_badge(html: str) -> tuple[str, str]:
     return match.group(1), match.group(2)
 
 
+CHIP_NAVIGATION_SUFFIX = "-chipnav"
+# Clicks the domain chip `slug` after boot, records the fragment, the
+# section count and the active chips the click produced on
+# <body data-after-chip>, then navigates to the unscoped scenarios view the
+# way the sub-nav does. The final DOM shows what the URL says if the chip
+# wrote the URL and nothing else.
+CHIP_NAVIGATION_SHIM = ('<script>setTimeout(() => {{ document.querySelector(\'button[data-domain="{slug}"]\').click(); '
+                        'setTimeout(() => {{ document.body.dataset.afterChip = location.hash + "|" + document.querySelectorAll(".sec[id^=domain-]").length '
+                        '+ "|" + [...document.querySelectorAll("button[data-domain].on")].map((b) => b.dataset.domain).join(","); '
+                        'location.hash = "view=scenarios"; }}, 300); }}, 300);</script>')
+
+
+def chip_navigation_page(page: pathlib.Path, slug: str) -> pathlib.Path:
+    copy = page.with_name(page.stem + CHIP_NAVIGATION_SUFFIX + page.suffix)
+    copy.write_text(page.read_text().replace("</body>", CHIP_NAVIGATION_SHIM.format(slug=slug) + "</body>", 1))
+    return copy
+
+
 def clock_page(page: pathlib.Path, now_iso: str) -> pathlib.Path:
     """A copy of the rendered page whose wall clock is pinned to
     ``now_iso``, so the badge's age and staleness are the test's, not the
@@ -1929,6 +1947,342 @@ class NotEvaluatedVerdictTest(unittest.TestCase):
         script = PAGES_JS.read_text()
         self.assertIn('run.verdict === "not_evaluated"', script)
         self.assertIn(".runrow.v-not_evaluated", (PAGES_JS.parent / "page.html.tmpl").read_text())
+
+
+# --- the Scenarios page -----------------------------------------------------
+
+SCENARIO_KEY = {"setup_id": "claude-opus-5-5-kubeagents-mcp", "scoring_version": "v1", "judge_model": "gemini-3.1-pro-preview", "fleet": 1, "verifiers": 1, "mode": "next"}
+SCENARIO_OLD_KEY = dict(SCENARIO_KEY, setup_id="gemini-3-1-pro-preview-kubeagents-mcp", mode=None)
+SCENARIO_LEAD_IN = "critical requirements:\n- The reply names the cluster.\n  It cites a live read.\n- It says nothing else.\n"
+# The window's clock in the unit tests: records on Sep 1-10 at 05:00Z, the
+# last seven days before this reach back to Sep 4 14:30Z, so Sep 5-10 are in.
+WINDOW_NOW_MS = render.iso_ms("2026-09-11T14:30:00+00:00")
+
+
+def store_record(case, day, build, runs=3, passes=3, key=SCENARIO_KEY):
+    return {"case": case, "recorded_at": f"2026-09-{day:02d}T05:00:00Z", "commit": "abc1234", "key": dict(key),
+            "runs": runs, "passes": passes, "build": build, "object": f"gs://x/evidence/{case}/{build}.jsonl"}
+
+
+def night_run(build, day, tasks, job="ci-kube-agents-eval-nightly"):
+    return {"build_id": build, "tier": "nightly", "job": job, "pr": None, "started": f"2026-09-{day:02d}T00:00:10+00:00",
+            "finished": f"2026-09-{day:02d}T04:00:00+00:00", "result": "SUCCESS", "tasks": tasks}
+
+
+def night_task(name, *reps):
+    return {"name": name, "result": "pass", "reps": [dict(r) for r in reps]}
+
+
+def task_yaml(root, name, body):
+    path = pathlib.Path(root) / "bench" / "tasks" / name / "task.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+
+
+def scenario_checkout(root):
+    """A checkout with three tasks and a domains.yaml: the proven blocking
+    case, a proving nightly case whose task has no expected_output and a
+    hostile prompt, and a demoted case marked expected_fail."""
+    task_yaml(root, "proven-case", "name: Finds the idle pool\ndomain: cost\nprompt: Which node pool in seeded-b is idle?\nexpected_output: |\n" + "".join(f"  {line}\n" for line in SCENARIO_LEAD_IN.splitlines()))
+    task_yaml(root, "proving-case", "name: Answers with a <script>alert(1)</script> twist\ndomain: cost\nprompt: \"<img src=x onerror=alert(2)> " + "word " * 60 + "\"\n")
+    task_yaml(root, "demoted-case", "name: Drains a node\ndomain: reliability\nprompt: Drain it.\nexpected_output: It drains.\nexpected_fail: true\n")
+    (pathlib.Path(root) / "docs" / "designs").mkdir(parents=True, exist_ok=True)
+    (pathlib.Path(root) / "docs" / "designs" / "domains.yaml").write_text(
+        "domains:\n  - slug: reliability\n    name: Reliability (x)\n    meaning: Checks whether workloads survive maintenance.\n"
+        "  - slug: cost\n    name: Cost\n    meaning: Finds idle resources you are paying for.\n  - slug: upgrades\n    name: Upgrades\n"
+        "allowlist:\n  - slug: upgrades\n")
+
+
+def scenario_data():
+    """The fixture week (NOW is Sep 8 14:30Z) plus the three cases, a
+    historical fourth with no task, and nightly runs for the store's builds:
+    proven-case and demoted-case ran the nights of Sep 1-8 (Sep 1 falls
+    outside the seven-day window, so 7 nights pool: 21 and 14 reps),
+    proving-case one night, Sep 8, with 2 of 3 passing."""
+    data = load_fixture()
+    data["generated_at"] = NOW
+    data["cases"] = [
+        {"name": "proven-case", "domain": "cost", "active": True, "nightly_active": True},
+        {"name": "proving-case", "domain": "cost", "active": False, "nightly_active": True},
+        {"name": "demoted-case", "domain": "reliability", "active": False, "nightly_active": True},
+        {"name": "historical-case", "domain": "unknown", "active": False, "nightly_active": False},
+    ]
+    runs = []
+    for day in range(1, 9):
+        build = f"3000000000000000{day:03d}"
+        runs.append(night_run(build, day, [
+            night_task("proven-case", {"n": 1, "result": "pass", "turn1_s": 5.0 + day, "agent_s": 100.0 + day}, {"n": 2, "result": "pass", "agent_s": 140.0}, {"n": 3, "result": "pass", "agent_s": 160.0}),
+            night_task("demoted-case", {"n": 1, "result": "pass", "agent_s": 10.0}, {"n": 2, "result": "pass", "agent_s": 10.0}),
+        ]))
+    runs.append(night_run("3000000000000000009", 8, [
+        night_task("proving-case", {"n": 1, "result": "pass", "turn1_s": 4.0, "agent_s": 30.0}, {"n": 2, "result": "fail", "agent_s": 50.0}, {"n": 3, "result": "pass", "agent_s": 40.0}),
+    ]))
+    data["runs"].extend(runs)
+    return data
+
+
+def scenario_store():
+    records = [store_record("proven-case", day, f"3000000000000000{day:03d}") for day in range(1, 9)]
+    records += [store_record("demoted-case", day, f"3000000000000000{day:03d}", runs=2, passes=2) for day in range(1, 9)]
+    records.append(store_record("proving-case", 8, "3000000000000000009", runs=3, passes=2))
+    return {"schema_version": 1, "source": "gs://x/evidence", "read_at": NOW, "window_days": 90, "lead_days": 14, "max_objects": 200,
+            "listed": len(records), "fetched": len(records), "truncated": {}, "older": {}, "partial": None, "warnings": [], "error": None, "records": records}
+
+
+class ScenariosDocumentTest(unittest.TestCase):
+    def test_trim_text(self):
+        self.assertIsNone(render.trim_text(None))
+        self.assertIsNone(render.trim_text("  \n "))
+        self.assertIsNone(render.trim_text(12))
+        self.assertEqual(render.trim_text("  two\n  lines "), "two lines")
+        long = "word " * 60
+        cut = render.trim_text(long)
+        self.assertTrue(cut.endswith("…"), cut)
+        self.assertLessEqual(len(cut), render.SUMMARY_MAX_CHARS + 1)
+        self.assertNotIn("wor…", cut, "cut at a word, not inside one")
+        self.assertEqual(render.trim_text("x" * 230), "x" * 220 + "…", "no space inside the limit: a hard cut")
+        exact = " ".join(["word"] * 44)  # 219 characters; a space sits at index 219
+        self.assertEqual(render.trim_text(exact + " more words"), exact + "…", "a word that ends at the limit stays")
+        self.assertEqual(render.trim_text("a" * 219 + " bb"), "a" * 219 + "…", "a space at the limit itself: the word before it stays whole")
+        self.assertEqual(render.trim_text("end with punctuation, " + "x" * 230), "end with punctuation…", "trailing punctuation goes with the cut")
+        self.assertEqual(render.trim_text(SCENARIO_LEAD_IN), "The reply names the cluster. It cites a live read.", "a checklist's first item, continuation lines joined, the lead-in dropped")
+        self.assertEqual(render.trim_text("- first\n- second"), "first")
+        self.assertEqual(render.trim_text("1. first\n2) second"), "first")
+        self.assertEqual(render.trim_text("Prose first.\nMore prose.\n- then a list"), "Prose first. More prose. - then a list", "a list that starts after line two is not a checklist")
+
+    def test_task_summary_reads_the_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            scenario_checkout(root)
+            task_yaml(root, "bad-yaml", "name: [unclosed\n")
+            task_yaml(root, "not-a-map", "- just\n- a list\n")
+            task_yaml(root, "no-name", "prompt: p\nexpected_output: e\n")
+            self.assertEqual(render.task_summary("proven-case", root), {
+                "name": "Finds the idle pool", "prompt": "Which node pool in seeded-b is idle?",
+                "expected_output": "The reply names the cluster. It cites a live read.", "expected_fail": False})
+            proving = render.task_summary("proving-case", root)
+            self.assertIsNone(proving["expected_output"], "a missing field is null, not a crash")
+            self.assertTrue(proving["prompt"].startswith("<img src=x onerror=alert(2)> word"))
+            self.assertTrue(render.task_summary("demoted-case", root)["expected_fail"])
+            self.assertEqual(render.task_summary("no-name", root)["name"], "no-name", "the case id stands in for a missing name")
+            for name in ("historical-case", "bad-yaml", "not-a-map", "../docs/designs/domains.yaml", ""):
+                self.assertIsNone(render.task_summary(name, root), name)
+
+    def test_domain_rows_in_file_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.assertEqual(render.domain_rows(root), [], "no file: no rows")
+            scenario_checkout(root)
+            self.assertEqual(render.domain_rows(root), [
+                {"slug": "reliability", "meaning": "Checks whether workloads survive maintenance."},
+                {"slug": "cost", "meaning": "Finds idle resources you are paying for."},
+                {"slug": "upgrades", "meaning": None},
+            ])
+            (root / "docs" / "designs" / "domains.yaml").write_text("domains: [unclosed\n")
+            self.assertEqual(render.domain_rows(root), [])
+
+    def test_confidence_levels(self):
+        def records(day_passes, key=SCENARIO_KEY, case="c"):
+            return [store_record(case, day, f"3{day:018d}", runs=3, passes=passes, key=key) for day, passes in enumerate(day_passes, start=1)]
+        def level(day_passes, status="blocking", expected_fail=False, key=SCENARIO_KEY, now_ms=WINDOW_NOW_MS):
+            state, _ = render.confidence_window(records(day_passes, key), now_ms)
+            return render.case_confidence(state, status, expected_fail)
+        full_clean = level([3] * 10)
+        self.assertEqual((full_clean["level"], full_clean["runs"], full_clean["passes"], full_clean["full"], full_clean["min_runs"], full_clean["window_days"]), ("proven", 18, 18, True, 6, 7), "the six nights inside the window")
+        self.assertEqual((full_clean["since"], full_clean["as_of"]), ("2026-09-05T05:00:00Z", "2026-09-10T05:00:00Z"), "the window's oldest and newest records")
+        self.assertEqual(level([3] * 4 + [2, 2, 2, 3, 3, 3])["level"], "proving", "15 of the window's 18 is 83%: between the proving floor and the bar")
+        self.assertEqual(level([3] * 4 + [1] * 6)["level"], "in_development", "6 of the window's 18 is under 70%")
+        short = level([3] * 5)
+        self.assertEqual((short["level"], short["runs"], short["passes"], short["full"]), ("proving", 3, 3, False), "one night in the window: short of the minimum")
+        self.assertEqual(level([1] * 5)["level"], "proving", "a short window is proving however it reads so far")
+        stale = level([3, 3])
+        self.assertEqual((stale["level"], stale["runs"], stale["since"]), ("proving", 0, None), "nothing inside the window reads as no record")
+        self.assertEqual(level([3] * 10, status="demoted")["level"], "in_development")
+        self.assertEqual(level([3] * 10, status="held_out")["level"], "in_development")
+        self.assertEqual(level([3] * 10, status="retired")["level"], "in_development")
+        self.assertEqual(level([3] * 10, status="nightly_only")["level"], "proven", "the nightly's own record proves a nightly case")
+        self.assertEqual(level([3] * 10, expected_fail=True)["level"], "in_development")
+        none = render.case_confidence(None, "blocking", False)
+        self.assertEqual((none["level"], none["runs"], none["passes"], none["rate"], none["full"], none["since"], none["as_of"]), ("proving", 0, 0, None, False, None, None))
+        # A key change starts a new window: ten nights at the old key, one at the new.
+        mixed = records([3] * 10, key=SCENARIO_OLD_KEY) + [store_record("c", 20, "3000000000000000020", key=SCENARIO_KEY)]
+        state, builds = render.confidence_window(mixed, render.iso_ms("2026-09-21T14:30:00+00:00"))
+        self.assertEqual((state["runs"], state["full"], state["since"]), (3, False, "2026-09-20T05:00:00Z"))
+        self.assertEqual(builds, ["3000000000000000020"], "the window's builds are the new key's only")
+        state, builds = render.confidence_window(records([3] * 10), WINDOW_NOW_MS)
+        self.assertEqual(builds, [f"3{day:018d}" for day in range(5, 11)], "the window's nights, oldest first")
+        state, _ = render.confidence_window(records([3] * 10), None)
+        self.assertEqual(state["runs"], 30, "no clock: every record at the key")
+        self.assertEqual(render.confidence_window([], WINDOW_NOW_MS), (None, []))
+
+    def test_window_times_last_night_times_and_newest_pass_transcript(self):
+        data = scenario_data()
+        by_build = render.trend.nightly_runs_by_build(data)
+        builds = [f"3000000000000000{day:03d}" for day in range(2, 9)]
+        times = render.window_times("proven-case", builds, by_build)
+        self.assertEqual((times["n_turn1"], times["n_agent"], times["source"]), (7, 21, "window"))
+        self.assertEqual(times["turn1_p50_s"], 10.0, "day 5's rep 1: the median of days 2 to 8")
+        self.assertEqual(times["agent_p50_s"], 140.0)
+        self.assertIsNone(render.window_times("proven-case", ["3000000000000000999"], by_build), "a window whose runs are not on record has no timing")
+        self.assertIsNone(render.window_times("proven-case", [], by_build))
+        self.assertEqual(render.window_times("demoted-case", builds, by_build), {"n_agent": 14, "agent_p50_s": 10.0, "source": "window"}, "no turn 1 recorded: its keys are absent")
+        nightly = render.nightly_runs(data)
+        self.assertEqual(render.last_night_times("proven-case", nightly),
+                         {"n_turn1": 1, "turn1_p50_s": 13.0, "turn1_p95_s": 13.0, "n_agent": 3, "agent_p50_s": 140.0, "source": "last_night", "at": "2026-09-08T04:00:00+00:00"},
+                         "the newest night that timed the case, with its stamp")
+        self.assertIsNone(render.last_night_times("historical-case", nightly))
+        self.assertEqual(render.newest_pass_transcript("proven-case", nightly),
+                         "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly/3000000000000000008/artifacts/eval_proven-case_rep1.log")
+        self.assertIsNone(render.newest_pass_transcript("proving-case", nightly), "one rep failed: not a passing run")
+        self.assertIsNone(render.newest_pass_transcript("historical-case", nightly))
+
+    def test_brief_json_carries_the_scenario_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            scenario_checkout(root)
+            (root / "store.json").write_text(json.dumps(scenario_store()))
+            with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=frozenset({"proven-case"})), \
+                    unittest.mock.patch.object(render, "demotion_dates", return_value={"demoted-case": "2026-09-02"}):
+                out = render_to(root, scenario_data(), extra_args=["--store", str(root / "store.json")])
+                bare = render_to(root / "bare", scenario_data(), extra_args=["--repo-root", str(root)])
+            brief = json.loads((out / "brief.json").read_text())
+            self.assertEqual(brief["domains"], [
+                {"slug": "reliability", "meaning": "Checks whether workloads survive maintenance."},
+                {"slug": "cost", "meaning": "Finds idle resources you are paying for."},
+                {"slug": "upgrades", "meaning": None}])
+            self.assertEqual(brief["confidence_bar"], {"rate": 0.9, "min_runs": 6, "window_days": 7, "proving_min_rate": 0.7})
+            proven = brief["cases"]["proven-case"]
+            self.assertEqual(proven["summary"]["name"], "Finds the idle pool")
+            self.assertEqual(proven["confidence"], {"level": "proven", "runs": 21, "passes": 21, "rate": 1.0, "full": True, "min_runs": 6, "window_days": 7, "since": "2026-09-02T05:00:00Z", "as_of": "2026-09-08T05:00:00Z"})
+            self.assertEqual(proven["times"], {"n_turn1": 7, "turn1_p50_s": 10.0, "turn1_p95_s": 13.0, "n_agent": 21, "agent_p50_s": 140.0, "source": "window"})
+            self.assertTrue(proven["transcript_url"].endswith("/3000000000000000008/artifacts/eval_proven-case_rep1.log"))
+            proving = brief["cases"]["proving-case"]
+            self.assertEqual((proving["confidence"]["level"], proving["confidence"]["runs"], proving["confidence"]["passes"], proving["confidence"]["full"]), ("proving", 3, 2, False))
+            self.assertEqual(proving["times"], {"n_turn1": 1, "turn1_p50_s": 4.0, "turn1_p95_s": 4.0, "n_agent": 3, "agent_p50_s": 40.0, "source": "window"})
+            self.assertIsNone(proving["transcript_url"])
+            demoted = brief["cases"]["demoted-case"]
+            self.assertEqual((demoted["status"], demoted["confidence"]["level"], demoted["confidence"]["runs"], demoted["summary"]["expected_fail"]), ("demoted", "in_development", 14, True))
+            historical = brief["cases"]["historical-case"]
+            self.assertIsNone(historical["summary"])
+            self.assertEqual(historical["confidence"]["level"], "in_development", "retired, and no record")
+            # Without a store every window is empty; the summaries still render.
+            bare_brief = json.loads((bare / "brief.json").read_text())
+            self.assertEqual(bare_brief["cases"]["proven-case"]["confidence"]["level"], "proving")
+            self.assertEqual(bare_brief["cases"]["proven-case"]["confidence"]["runs"], 0)
+            self.assertEqual(bare_brief["cases"]["proven-case"]["times"]["source"], "last_night", "no window: the last recorded night's times, named as such")
+            self.assertEqual(bare_brief["cases"]["proven-case"]["times"]["at"], "2026-09-08T04:00:00+00:00")
+            self.assertIsNone(bare_brief["cases"]["historical-case"]["times"])
+            self.assertEqual(bare_brief["cases"]["proven-case"]["summary"]["name"], "Finds the idle pool")
+            self.assertFalse((out / "scenarios.html").exists(), "the view lives on the Cases page")
+            self.assertNotIn("scenarios.html", render.PAGE_TEMPLATE.read_text())
+
+
+@unittest.skipUnless(chrome(), "headless Chrome not found")
+class ScenariosPageTest(unittest.TestCase):
+    """The Cases page's scenarios view as a browser renders it from the three-case checkout."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(cls.tmp.name)
+        scenario_checkout(root)
+        (root / "store.json").write_text(json.dumps(scenario_store()))
+        with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=frozenset({"proven-case"})), \
+                unittest.mock.patch.object(render, "demotion_dates", return_value={"demoted-case": "2026-09-02"}), \
+                unittest.mock.patch.object(render, "recent_merges", return_value=MERGES):
+            cls.out = render_to(root, scenario_data(), health=health_doc("GREEN"), extra_args=["--store", str(root / "store.json")])
+            data = load_fixture()
+            data["generated_at"] = NOW
+            cls.empty = render_to(root / "empty", data, health=health_doc("GREEN"))
+            # The same checkout without a store: every card's times are the last recorded night's.
+            cls.bare = render_to(root / "bare", scenario_data(), health=health_doc("GREEN"), extra_args=["--repo-root", str(root)])
+        cls.page = cls.out / "cases.html"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_sections_cards_badges_times_and_links(self):
+        app = dom_text(self.page, fragment="#view=scenarios")
+        self.assertIn("<h1>What kube-agents can do</h1>", app)
+        self.assertNotIn("How reliable is each test?", app)
+        self.assertIn('<nav class="subnav"><a href="cases.html#view=reliability">How reliable is each test</a><a href="cases.html#view=scenarios" class="on">What kube-agents can do</a></nav><div class="sec head"><h1>What kube-agents can do</h1>', app)
+        self.assertIn("<li><b>Proven</b>: 90% or better over the scenario's repetitions in the last 7 days at the current build, at least 6 of them. 90% is the same bar that lets a scenario guard every pull request.</li>", app)
+        self.assertIn("<li><b>Proving</b>: fewer than 6 repetitions at the current build in the window, or 70% to 90% over them.", app)
+        self.assertIn("3 scenarios in 2 domains · <b>1</b> proven · <b>1</b> proving · <b>1</b> in development.", app)
+        self.assertNotIn("No scenario reads Proven yet", app)
+        self.assertIn('<div class="ctl">domain <button type="button" data-domain="all" class="on">all · 3</button><button type="button" data-domain="reliability" title="Checks whether workloads survive maintenance.">reliability · 1</button><button type="button" data-domain="cost" title="Finds idle resources you are paying for.">cost · 2</button></div>', app)
+        # domains.yaml order (reliability before cost), the meaning as the lede, one summary line each.
+        self.assertLess(app.find('id="domain-reliability"'), app.find('id="domain-cost"'))
+        self.assertIn('<div class="sec" id="domain-reliability"><h2>reliability</h2><div class="lede">Checks whether workloads survive maintenance.</div><div class="dsum">1 scenario · 0 proven · weakest Drains a node (14/14) · median task time 10 s</div>', app)
+        self.assertIn('<div class="dsum">2 scenarios · 1 proven · weakest Answers with a &lt;script&gt;alert(1)&lt;/script&gt; twist (2/3) · median task time 40 s</div>', app)
+        self.assertNotIn('id="domain-upgrades"', app, "a domain with no case has no section")
+        # The proven card, folded: badge, pill, title and times in the summary; the rest behind it.
+        self.assertIn('<details class="card" id="scenario-proven-case" data-tv="scenario:proven-case"><summary><div class="hd"><span class="lvl proven">Proven</span><span class="st blocking" data-tip="blocking">guards every pull request</span></div><h3>Finds the idle pool</h3>', app)
+        self.assertIn("in development. <span class=\"mut\">Click a card for the situation, what a good answer does, its record and its transcript.</span></p>", app)
+        self.assertIn('<span class="tms"><span data-tip="until the agent\'s first chat message comes back: median of 7 repetitions, p95 13 s">first reply <b>10 s</b></span> · <span data-tip="the whole run, from the request to the final report, delegations included: median of 21 repetitions">task finished <b>2 min 20 s</b></span></span><span class="more"><span class="open">details ▾</span><span class="close">hide ▴</span></span></div></summary>', app)
+        self.assertIn('<p><span class="lbl">The situation</span>Which node pool in seeded-b is idle?</p><p><span class="lbl">What a good answer does</span>The reply names the cluster. It cites a live read.</p>', app)
+        self.assertIn('<div class="rec"><span class="lbl">Record</span><span data-tip="repetitions of the nightly eval at the current build, Sep 2 to Tue 1:00 AM ET; Proven needs 6 of them at 90% or better">21 of 21 nightly repetitions passed in the last 7 days</span></div>', app)
+        self.assertIn('<a href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly/3000000000000000008/artifacts/eval_proven-case_rep1.log">newest passing transcript</a><a href="cases.html#proven-case">history</a><a href="trend.html#cases=proven-case">trend</a>', app)
+        self.assertNotIn('data-tv="scenario:proven-case" open>', app, "cards start folded")
+        # The proving card: a short window, a missing field, hostile text escaped, no passing run.
+        self.assertIn('<span class="lvl proving">Proving</span><span class="st nightly_only" data-tip="nightly only">nightly</span></div><h3>Answers with a &lt;script&gt;alert(1)&lt;/script&gt; twist</h3>', app)
+        self.assertIn('>2 of 3 nightly repetitions passed in the last 7 days · 3 more needed before it can read Proven</span></div>', app)
+        self.assertIn('<span class="lbl">What a good answer does</span><span class="mut">not written in the task yet</span></p>', app)
+        self.assertIn('<span class="mut">no passing run on record</span><a href="cases.html#proving-case">history</a>', app)
+        self.assertNotIn("<img src=x", app)
+        self.assertNotIn("<script>alert", app)
+        # The demoted card: in development by status, expected_fail named, no first reply recorded.
+        self.assertIn('<span class="lvl in_development">In development</span><span class="st demoted" data-tip="demoted from the blocking roster 2026-09-02; the nightly still runs it">in development</span></div><h3>Drains a node</h3>', app)
+        self.assertIn('14 of 14 nightly repetitions passed in the last 7 days · marked expected_fail: a known gap, not yet closed</span></div>', app)
+        self.assertIn('<span class="tms"><span>first reply <span class="hint" data-tip="none of these repetitions recorded a first-reply time">not recorded</span></span> · <span data-tip="the whole run, from the request to the final report, delegations included: median of 14 repetitions">task finished <b>10 s</b></span></span><span class="more">', app)
+        # The glossary folds away under the counts and chips; proven cards sort first; the historical case is counted, not shown.
+        self.assertIn('<details class="gloss" data-tv="gloss"><summary>How to read the cards</summary><ul>', app)
+        self.assertLess(app.find('data-domain="all"'), app.find('<details class="gloss"'))
+        self.assertLess(app.find('id="scenario-proven-case"'), app.find('id="scenario-proving-case"'))
+        self.assertNotIn("historical-case", app.split('<div class="foot block">')[0])
+        self.assertIn("1 historical case with no task on this checkout is not shown.", app)
+        self.assertIn('What kube-agents can do: <a href="cases.html#view=scenarios">scenarios</a>', app)
+
+    def test_view_switch_domain_filter_and_empty_checkout(self):
+        table = dom_text(self.page)
+        self.assertIn("<h1>How reliable is each test?</h1>", table, "the table is the page's default view")
+        self.assertIn('<nav class="subnav"><a href="cases.html#view=reliability" class="on">How reliable is each test</a><a href="cases.html#view=scenarios">What kube-agents can do</a></nav><div class="sec head"><h1>How reliable is each test?</h1>', table)
+        self.assertNotIn('<details class="card"', table)
+        self.assertIn("<h1>How reliable is each test?</h1>", dom_text(self.page, fragment="#view=nonesuch"), "an unknown view is the table")
+        titled = dom_html(self.page, fragment="#view=scenarios")
+        self.assertIn("<title>kube-agents · what it can do</title>", titled)
+        app = dom_text(self.page, fragment="#view=scenarios&domain=cost")
+        self.assertIn('data-domain="cost" class="on"', app, "domain= filters to the one section")
+        self.assertIn('id="domain-cost"', app)
+        self.assertNotIn('id="domain-reliability"', app)
+        self.assertIn("3 scenarios in 2 domains", app, "the totals stay the page's")
+        app = dom_text(self.page, fragment="#view=scenarios&domain=nonesuch")
+        self.assertIn('id="domain-reliability"', app, "an unknown domain shows every section")
+        self.assertIn('data-domain="all" class="on"', app, "and only the all chip is active")
+        # A chip writes the URL and nothing else: after clicking `cost` the
+        # fragment carries domain=cost and one section shows; a later
+        # navigation to the unscoped view shows every section again.
+        html = dom_html(chip_navigation_page(self.page, "cost"), fragment="#view=scenarios")
+        self.assertIn('data-after-chip="#view=scenarios&amp;domain=cost|1|cost"', html, "the fragment, one section, and only the cost chip active")
+        after = html[html.find('<div id="app">'):]
+        self.assertIn('id="domain-reliability"', after, "the chip's choice did not outlive the navigation")
+        self.assertIn('id="domain-cost"', after)
+        self.assertIn('data-domain="all" class="on"', after)
+        bare = dom_text(self.bare / "cases.html", fragment="#view=scenarios")
+        self.assertIn('task finished <b>2 min 20 s</b></span> · <span class="hint" data-tip="from the last recorded night, Tue 12:00 AM ET: no repetition in the current window carries timing yet">older night</span></span><span class="more">', bare)
+        self.assertNotIn("more needed before it can read Proven · marked expected_fail", bare, "a known gap is not told it can read Proven")
+        self.assertIn("no nightly repetition at the current build in the last 7 days · marked expected_fail: a known gap, not yet closed", bare)
+        self.assertIn("no nightly repetition at the current build in the last 7 days · 6 more needed before it can read Proven", bare)
+        self.assertNotIn("No scenario reads Proven yet", bare, "no record at all: nothing to date the sentence by")
+        empty = dom_text(self.empty / "cases.html", fragment="#view=scenarios")
+        self.assertIn("<h1>What kube-agents can do</h1>", empty)
+        self.assertIn("No scenario to show: the checkout this view was rendered from has no <code>bench/tasks</code> for the", empty)
+        self.assertNotIn('<details class="card"', empty)
+        # The other pages carry the footer link and nothing else of the view.
+        index = dom_text(self.out / "index.html")
+        self.assertIn('What kube-agents can do: <a href="cases.html#view=scenarios">scenarios</a>', index)
+        self.assertNotIn('class="scn"', index)
 
 
 if __name__ == "__main__":

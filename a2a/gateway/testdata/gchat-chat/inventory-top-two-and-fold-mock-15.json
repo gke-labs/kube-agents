@@ -1,0 +1,52 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*I scanned 3 clusters and 41 workloads and found 23 things to look at.* Two are worth fixing first:\n\n- `critical` seeded-b and -c admit privileged pods · Any workload can escape to the node; enforce baseline Pod Security.\n- `major` seeded-c is a minor version behind its channel · Upgrade the control plane before the channel's end of support.\n\n*3 more worth a look*\nNo PDB on payments-api\nA node drain takes every replica down at once.\n`minor` Default namespace holds workloads\nMove them into a namespace of their own.\nWorkload Identity is off on one node pool\nPods there use the node's service account.",
+    "widgets": [
+      {
+        "buttonList": {
+          "buttons": [
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "Fix the first one"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "0"
+                    }
+                  ]
+                }
+              },
+              "text": "Fix the first one",
+              "type": "FILLED"
+            },
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "See all 23"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "1"
+                    }
+                  ]
+                }
+              },
+              "text": "See all 23"
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

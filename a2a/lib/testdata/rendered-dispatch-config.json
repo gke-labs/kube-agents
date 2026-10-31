@@ -1,0 +1,49 @@
+{
+  "version": "82a2819dd8f134f1",
+  "namespace": "kubeagents-system",
+  "profileNamespace": "kubeagents-system-profiles",
+  "ceiling": 6,
+  "interactiveReserve": 2,
+  "childReserve": 2,
+  "leaseSeconds": 90,
+  "renewSeconds": 20,
+  "restartGraceSeconds": 60,
+  "acceptTimeoutSeconds": 10,
+  "profiles": [
+    {
+      "name": "tse",
+      "tiers": [
+        "read"
+      ],
+      "concurrency": 2,
+      "queueTimeoutSeconds": 3600,
+      "activeDeadlineSeconds": 1800,
+      "parameters": [
+        {
+          "name": "project",
+          "required": true
+        },
+        {
+          "name": "location",
+          "required": true
+        },
+        {
+          "name": "cluster",
+          "required": true
+        }
+      ],
+      "durables": [
+        {
+          "tier": "read",
+          "kind": "top",
+          "name": "profile-tse-read-top"
+        },
+        {
+          "tier": "read",
+          "kind": "child",
+          "name": "profile-tse-read-child"
+        }
+      ]
+    }
+  ]
+}

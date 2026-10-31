@@ -173,6 +173,7 @@ spec:
 | `lifecycle.ttlSecondsAfterFinished`     | How long a finished Job lingers for `kubectl` inspection before GC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `concurrency`                           | Max simultaneous pods for this profile. Replaces the board-wide `max_in_progress`, per profile instead of global.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `allowedTiers`                          | Optional, default `[read]`. The tiers this profile may run at, `read` and `unattended` (#3660, "Tiers and identity"). A task runs at its requester's tier and the dispatcher refuses one whose tier is not listed; a pinned production profile might allow only `read`. Tier is authority, so it lives on the CR, never in the persona.                                                                                                                                                                                                                                                              |
+| `parameters`                            | Optional. The task parameters the persona declares, `[{name, required}]`, at most 16 (amended 10/28, #3655). The gateway routes cluster work by them and the dispatcher refuses a submission missing a required one, since neither can read the persona image; the worker refuses to run when this list and the persona's differ.                                                                                                                                                                                                                                                                    |
 | `resources`                             | Pod resources. Default is the demo-proven class: 250m/512Mi requests, 1 CPU/2Gi limits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 Everything here is dark content: the dispatcher and the profile CRD render nothing unless
@@ -364,8 +365,11 @@ What the operator renders per profile, as built (amended 10/6):
     credential leaves the caller local-only commands: `gcloud version`,
     `kubectl version --client`, `--help` on a command, and the `kubectl config` reads
     `get-contexts` and `current-context`, the ones the read-only policy admits (`config view` is refused, since
-    `--flatten` prints credentials). A local-only command runs isolated, against no
-    kubeconfig and with no `get-credentials` handling, with or without a credential.
+    `--flatten` prints credentials). The confinement asks the policy rather than
+    mirroring it: `--help` on a command the policy refuses (`kubectl apply --help`,
+    `gcloud init --help`) gets the policy's own refusal. A local-only command runs
+    isolated, against no kubeconfig and with no `get-credentials` handling, with or
+    without a credential, so `get-credentials <cluster> --help` is a help read.
     `gcloud config` and `gcloud auth` are refused whole, since even their reads print the
     broker's own account and default project.
   - With a credential, every call is held to its target (`task_confinement.py`). Every
@@ -771,7 +775,8 @@ Three small items to fold back into the payload spec rather than fork here (fold
   a tooling problem (a push target is seconds), not a second mechanism. Revisit only if
   the iteration friction proves real. **Amended 10/21 (#3656):** what the image carries is
   a harness-neutral persona directory (`persona.yaml`, `instructions.md`, `skills/`,
-  `mcp.yaml`; [`a2a/lib/persona`](../../a2a/lib/persona/README.md)), and an adapter per
+  `mcp.yaml`; [`a2a/lib/persona`](../../a2a/lib/persona/README.md), with the cluster agent as
+  the example in [`agents/cluster/persona`](../../agents/cluster/persona/README.md)), and an adapter per
   harness renders it into that harness's config inside the pod. MCP servers are named on the
   broker's relay only, so a persona cannot route a tool call around the broker's policy.
 - ~~**Per-task bus credentials.**~~ Decided 8/24: lands with the authority work - it is

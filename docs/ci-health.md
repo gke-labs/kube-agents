@@ -20,13 +20,13 @@ In the same way, a `rep N timing:` line under each grading line carries the
 repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages show
 ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
-Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
+Chat — only when the state changes, plus one digest a day at 11 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
 ([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
 are refused a project and one when they stop ([below](#a-backed-up-pool)),
 plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
-([below](#the-watched-periodics)). Once a week, from 9 AM Toronto time on
+([below](#the-watched-periodics)). Once a week, from 11 AM Toronto time on
 Monday, `scripts/eval_dashboard/weekly_chat.py` posts the weekly health
 summary to the same space ([below](#the-weekly-health-email)).
 The digest also carries a section on last night's run of the nightly tier
@@ -112,7 +112,7 @@ Every time a person reads — in a Chat message, the gate comment, the issue
 title — is America/Toronto, written `7:30 AM ET` (`Sun 7:30 AM ET` where the
 day matters), DST included. URL parameters, `health.json`, the state files and
 the history feed stay ISO 8601 UTC. The digest hour is a Toronto hour
-(`--digest-hour 9`, `--digest-tz America/Toronto` by default) and "once a day"
+(`post_health.DEFAULT_DIGEST_HOUR`, 11; `--digest-hour` moves only the digest, the weekly post follows the constant; `--digest-tz` defaults to America/Toronto) and "once a day"
 is a Toronto day: the state file's `last_digest_date` is the local date.
 `--digest-tz` moves only the digest's clock; the times written into messages
 and the `ET` label are fixed to Toronto.
@@ -230,7 +230,7 @@ forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only 
 nightly, `ci-kube-agents-eval-nightly-gitlab`, runs the same list and lands as the
 section's nights, read from its own log prefix), against a pool project's GitLab repository, listed in the Brief's "GitLab
 lane" section with its own counts and links, and in no gate number, case
-history or digest line.
+history or digest line. The GHES lane (`pull-kube-agents-smoke-test-ghes`, its two nightlies; `docs/ci-pool-projects.md` 5.8) is not collected yet: its runs show in Prow only until the dashboard reads a lane per forge.
 
 ## Hysteresis
 
@@ -910,7 +910,7 @@ against any `data.json`; `--live` writes.
 
 ## The nightly section
 
-The 9 AM digest's nightly section lists what last night changed, from
+The 11 AM digest's nightly section lists what last night changed, from
 `data.json` and the open `nightly-red` issues, by the rules [Nightly
 bugs](#nightly-bugs) files by: a case's verdict for a night is the bug filer's
 (a part cut off at the deadline, a case with no graded repetition, and a night
@@ -1061,7 +1061,7 @@ later gap. For a domain whose start date is not recorded, a close in the last
 left `domains.yaml` without a roster case covering it is left open, with a
 warning in the job log.
 
-The 9 AM digest carries one line per uncovered domain, after the nightly part:
+The 11 AM digest carries one line per uncovered domain, after the nightly part:
 the domain, days uncovered, "exception expired N days ago" once its record has
 expired, the owner (as text, not a mention), and the best
 candidate with its record and the store's verdict when the store was read
@@ -1100,10 +1100,24 @@ counted in the closing note.
 The page carries the robot from the docs site, a one-paragraph intro, three
 tiles (pass rate and its change, scenarios compared, the median `agent_s` of
 the compared scenarios' graded repetitions with its 90th percentile, "the
-slowest 10%"), a "Needs attention" box, one row per area with
+slowest 10%"), and a fourth when the week has token counts (the median tokens
+per graded repetition and, when the week has a trend, its change from last
+week on the same scenarios, which the text says because it is not measured
+against that median), a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
+
+A repetition's tokens are its record's `total`
+([`SCHEMA.md`](../scripts/eval_dashboard/SCHEMA.md), `reps[].tokens`). With no
+`total`, input plus output stands in, but that sum misses what the workers
+billed, so it counts as partial like a record marked `partial`. Partial counts
+are left out of the median and their number is shown. The change compares
+the two weeks' figures over the scenarios with a full count in both weeks.
+Each such scenario's median is taken over its full counts in each week, and a
+week's figure is the median of those per-scenario medians, so every scenario
+weighs the same and its partial counts do not move it. The tokens tile and the Chat line are
+left out when no repetition the week compared carries a count.
 
 The page is written only when every check passes; otherwise the script prints
 each reason and exits 1, the step logs a warning, and the last published copy
@@ -1143,7 +1157,7 @@ why the rest were left out), the "Needs attention" areas with their open-bug
 counts and a button to each area's open bugs (the section is left out when no
 area needs attention), every area's pass rate as a ten-step bar, best first
 (collapsed to the first three), the task time (the median, the 90th percentile
-and the area with the slowest median), buttons to the page, the dashboard and
+and the area with the slowest median) and the tile's tokens line, buttons to the page, the dashboard and
 all open nightly bugs, and the models the week ran. The message carries the
 same week in a few lines of text, without Chat's markup, as the card's
 fallback for notifications; that text also names the three strongest areas and
@@ -1153,7 +1167,7 @@ The
 render step writes both (`--chat-out`) only when the page passes, from the
 numbers the page printed, so the two cannot disagree and a refused week posts
 nothing. The next step, `scripts/eval_dashboard/weekly_chat.py`, posts it on
-the first tick at or after 9 AM Toronto time on the Monday after the week ends,
+the first tick at or after 11 AM Toronto time on the Monday after the week ends,
 through the poster's app identity and token, and records the week in
 `weekly-chat-state.json` beside `data.json`, so later ticks and re-runs post
 nothing more for that week. The week is recorded before the post, so it goes
@@ -1272,7 +1286,7 @@ other: one Chat message naming the roles and how many projects, that a red on
 a case depending on them from a run in those projects is the fixture and not
 the code, that a retest waits for the re-apply, and `Tracking
 #NNN`; the gate comment's health box carries the same sentence on a red run
-while the condition lasts; the 9 AM digest always carries one line on the
+while the condition lasts; the 11 AM digest always carries one line on the
 latest scan (`🧭 Seeded fleet: 30 of 30 pool projects checked at 8:00 AM ET,
 every fixture in its designed state`, or how many fixtures are absent on how
 many projects and how many roles it could not read, or the drifted projects and roles, or
@@ -1327,11 +1341,11 @@ first shows up as a 403 in an agent transcript on whichever pull request leased
 the project (#1927: a role missing on all 30 projects for two weeks). The
 `fixture-state-scan` job runs the verifier on a clock instead. After the fleet
 scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
-`verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,gitops_default_branch,token_minter_kms --report`
+`verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,forge_pieces,gitops_default_branch,token_minter_kms --report`
 against every pool project, eight at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
-`gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
+`forge_pieces` reads the once-per-project pieces a self-managed forge VM needs (the private zone, the two reserved addresses and their records, the 443 allow rule and the deny rule on the tag, each held to its shape, the VM identity; `docs/ci-pool-projects.md` 5.8); its findings pass every leased run on the public lanes, so the bot's pool-drift advice does not blame them. `gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
 
 The secret is a fine-grained personal access token: resource owner `gke-agentic`, repository access the pool's `*-infra` repositories picked one by one (a fine-grained token has no wildcard, so a new pool project's repository is added to the token's list before the project is registered, as `docs/ci-pool-projects.md` 5.4 does for the ledger App's installation), permission Repository -> Metadata: read-only and nothing else, expiry one year at most. Whoever creates it records their name and the expiry date here: held by _(unset)_, expires _(unset)_. Its expiry is silent by design: the check goes "not checked" on every project and the hourly digest reads "35 checks not read in full", with no alert and no issue, so the owner puts the renewal on a calendar. The durable form is the one 5.4 chose for the ledger read, a third App holding Metadata: read-only on the selected repositories, its PEM as the repository secret and `actions/create-github-app-token` in the step exporting `GH_TOKEN`; the verifier reads only `GH_TOKEN`, so that swap is a workflow-step and docs change.
 Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks
