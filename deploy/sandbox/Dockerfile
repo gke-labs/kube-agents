@@ -523,12 +523,13 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          managed-repository config (`get_managed_github_repos`,
 #                          `is_valid_repo_slug`, `validate_repo_org`), which every
 #                          skill checks a `--repo` against before it acts. Its
-#                          leased clone is still used from here by the two skills
-#                          that read a whole tree — inspect-repository and
-#                          fleet-upgrade-verification's api_deprecation_scan, both
-#                          `ensure_workspace(..., lease=...)` — and by fleet-audit's
+#                          leased clone is still used from here by the skill
+#                          that reads a whole tree, inspect-repository
+#                          (`ensure_workspace(..., lease=...)`), by fleet-audit's
 #                          audit_report, whose directory-mode fallback still
-#                          reaches for it; the content mode it runs in does not.
+#                          reaches for it (the content mode it runs in does not),
+#                          and by fleet-upgrade-verification's api_deprecation_scan
+#                          only when CREDENTIAL_PROXY_URL is not set.
 #                          Every working copy that *proposes* a change goes
 #                          through `vcs_client`
 #   gitops_preflight.py    the one-line answer a PR-writing skill or SOUL.md is to run
@@ -563,12 +564,12 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          imports it at load
 #   vcs_client.py          the client half of the verb surface: it composes a
 #                          request, sends it over the line above, and raises on a
-#                          refusal. `vcs.py`, `forge.py` and submit-suggestion all
+#                          refusal. `vcs.py`, `forge.py`, submit-suggestion and
+#                          fleet-upgrade-verification's api_deprecation_scan all
 #                          go through it, and it is the only thing in this image
 #                          that composes a `/v1/vcs/<verb>` request. Other scripts
 #                          here -- github_token_refresh, gke_endpoint,
-#                          inspect-repository, fleet-audit,
-#                          fleet-upgrade-verification -- do reach the proxy
+#                          inspect-repository, fleet-audit -- do reach the proxy
 #                          directly, for its other routes, not for a forge verb
 #   workspace_paths.py     the workspace protocol's path validator, imported by
 #                          inspect-repository to re-check every name at the point

@@ -5,7 +5,7 @@ read from the manifests the linked GitOps repositories declare.
 
 An upgrade to a version that removes an API breaks every workload still declaring it.
 This script reads what Git declares before the target is chosen: every `*.yaml`, `*.yml`
-and `*.json` in each managed repository, the top-level `apiVersion`/`kind`/`metadata.name`
+and `*.json` in each repository it reads, the top-level `apiVersion`/`kind`/`metadata.name`
 of every document in it, matched against `removed_apis.json` beside this file. A hit is an
 apiVersion removed after the fleet's current version and no later than the target.
 
@@ -13,13 +13,17 @@ The fleet's current version comes from Phase 1's table (`fleet_upgrade_report.py
 or from `--current-version`; the floor is the lowest control-plane minor, because the API
 server is what stops serving a removed version — node pools do not enter into it.
 
-Read-only against every repository. It opens each one through the credential broker's
-content workspaces (a shallow read-only clone the broker owns) and, on an install whose
-broker is not armed for content-passing, through a leased checkout on the shared volume,
-the way `inspect_repository.py clone` does — under a lease of its own, so the reset that
-positions that checkout on the base branch never touches the session's working tree, the
-one `submit_suggestion.py prepare` hands the agent to edit. It runs no `gcloud`. Live client usage of deprecated
-APIs is a different question, answered by GKE Deprecation Insights; the footer says where.
+Read-only against every repository. It reads one revision of each through the credential
+broker's `/v1/vcs/snapshot` into a temporary directory of its own, with no history, and
+deletes it after the read. The broker chooses the credential by the repository's role, so
+a managed, a context and a public repository are all read. The broker refuses a whole
+tree over its snapshot ceiling, and that repository is listed under errors. When
+CREDENTIAL_PROXY_URL is not set (a run outside the pod), it reads GitHub repositories
+through a leased checkout on the shared volume, under a lease of its own, so the reset
+that positions that checkout on the base branch never touches the session's working tree,
+the one `submit_suggestion.py prepare` hands the agent to edit. It runs no `gcloud`. Live
+client usage of deprecated APIs is a different question, answered by GKE Deprecation
+Insights; the footer says where.
 
 A file that does not parse (a Helm template, a Kustomize patch with anchors the loader
 refuses) is listed as skipped with the reason, never a crash, and a section reads clean
@@ -31,10 +35,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -48,8 +56,8 @@ sys.path.append("/opt/defaults/scripts")
 sys.path.append("/opt/data/scripts")
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
-import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+import vcs_client  # noqa: E402
 
 # The lease owner name written beside a directory-mode checkout, so a stale
 # lease names the skill that took it, and the prefix that makes the scan's lease
@@ -74,14 +82,21 @@ JSON_SUFFIX = ".json"
 # Directories never walked in a checkout or a local tree.
 SKIPPED_DIRS = frozenset({".git"})
 
-# Under the broker's own per-request ceilings (256 paths, 8 MiB), with room to
-# spare, the same two numbers inspect_repository.py batches with.
-BATCH_PATHS = 100
-BATCH_BYTES = 6 << 20
+# The temporary directory a broker read goes into, under the copies root that
+# `vcs_client` already uses: the agent volume, not the size-limited `/tmp`. The
+# reaper there acts only on copies with a session record, and this one has none,
+# so a run that was killed before its cleanup leaves the directory behind. The
+# next run deletes such directories once they are older than the reaper's TTL.
+# The snapshot unpacks into a subdirectory, because it stages its files beside
+# the directory it is given: inside this one, the sweep removes those too.
+CLONE_DIR_PREFIX = ".api-deprecation-scan-"
+SNAPSHOT_TREE_NAME = "tree"
+SECONDS_PER_HOUR = 3600.0
 
-# Bounds on one repository, so a repository nobody sized cannot fill the agent's
-# volume or its context. Both are reported when they bite; a capped scan is a
-# partial scan and the section says so.
+# Bounds on what the scan reads from one repository, so a repository nobody sized
+# cannot fill its context. Both are reported when they bite; a capped scan is a
+# partial scan and the section says so. Through the broker, its snapshot ceiling
+# applies first, to the whole tree: a repository over it is not scanned at all.
 DEFAULT_MAX_FILES = 5000
 DEFAULT_MAX_BYTES = 64 << 20
 STOPPED_MAX_FILES = "maxFiles"
@@ -105,11 +120,6 @@ NAME_KEY = "name"
 ITEMS_KEY = "items"
 LIST_KIND = "List"
 
-# The broker's `read` answers the tail of a batch that crossed its per-request
-# byte budget with this reason, which `Workspace.read_many` documents as "ask
-# again for the rest"; the other reasons (`tooLarge`, `symlink`) are final.
-REASON_REQUEST_BUDGET = "requestBudget"
-
 # Skip reasons. A Go-template marker in a file that fails to parse is the
 # commonest cause, and the reason says what to do about it.
 TEMPLATE_MARKER = "{{"
@@ -117,6 +127,7 @@ REASON_TEMPLATE = "Go template (Helm chart?); render it and scan the output"
 REASON_YAML = "YAML did not parse: {error}"
 REASON_JSON = "JSON did not parse: {error}"
 REASON_ENCODING = "not UTF-8 text"
+REASON_SYMLINK = "symlink"
 
 # Source lines. The clean section states its source; the issue's acceptance
 # criterion quotes the first form verbatim.
@@ -310,81 +321,52 @@ def proxy_endpoint() -> str:
     return os.environ.get("CREDENTIAL_PROXY_URL", "").strip()
 
 
-def content_mode_available(endpoint: str | None = None) -> bool:
-    """Asked of the broker, as inspect_repository.py asks: the switch is not here.
+def remove_stale_scan_copies() -> None:
+    """Delete scan directories under the copies root that are older than the reaper's TTL.
 
-    A broker client without the workspace routes at all (an image built before
-    content-passing landed, observed on a live install) is a broker that is not
-    armed, and reads as such rather than as an AttributeError.
+    Best effort, and only directories with this script's prefix, never through
+    a link. A TTL of zero or less turns this off, as it turns off the reaper, and
+    so does one that is not a finite number, which no cutoff can be taken from.
     """
-    endpoint = proxy_endpoint() if endpoint is None else endpoint
-    if not endpoint:
-        return False
-    probe = getattr(credential_proxy_client, "workspaces_available", None)
-    if probe is None:
-        return False
-    return probe(endpoint)
+    ttl = vcs_client.COPY_TTL_HOURS
+    if not (math.isfinite(ttl) and ttl > 0):
+        return
+    cutoff = time.time() - ttl * SECONDS_PER_HOUR
+    for path in vcs_client.ROOT.glob(CLONE_DIR_PREFIX + "*"):
+        try:
+            if path.is_symlink() or not path.is_dir() or path.stat().st_mtime >= cutoff:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def read_repo_content(
     repo: str,
-    endpoint: str,
     max_files: int = DEFAULT_MAX_FILES,
     max_bytes: int = DEFAULT_MAX_BYTES,
-    open_workspace: Callable | None = None,
+    snapshot: Callable | None = None,
 ) -> Snapshot:
-    """Content mode: page the listing, keep the manifest paths, batch the reads."""
-    open_workspace = open_workspace or credential_proxy_client.Workspace.open
-    total_bytes = 0
-    snapshot = Snapshot(source="", sha=None)
-    with open_workspace(endpoint, repo, depth=1) as workspace:
-        snapshot.sha = workspace.base_sha or None
-        cursor: str | None = None
-        batch: list[str] = []
-        batch_bytes = 0
+    """Broker mode: one revision from the broker's snapshot, read as a local tree.
 
-        def flush() -> None:
-            nonlocal batch, batch_bytes
-            pending = batch
-            batch = []
-            batch_bytes = 0
-            while pending:
-                files, missed = workspace.read_many(pending)
-                snapshot.files.update(files)
-                deferred = [m for m in missed if m.get("reason") == REASON_REQUEST_BUDGET]
-                snapshot.skipped.extend(m for m in missed if m.get("reason") != REASON_REQUEST_BUDGET)
-                if deferred and not files:
-                    # Nothing fit, so asking again would loop: the deferral is final.
-                    snapshot.skipped.extend(deferred)
-                    break
-                pending = [m["path"] for m in deferred]
-
-        while snapshot.stopped is None:
-            listing = workspace.list(after=cursor)
-            if not listing:
-                break
-            for entry in listing:
-                path = entry.get("path", "")
-                if not is_manifest_path(path):
-                    continue
-                size = int(entry.get("size", 0) or 0)
-                if len(snapshot.files) + len(batch) >= max_files:
-                    snapshot.stopped = STOPPED_MAX_FILES
-                    break
-                if total_bytes + size > max_bytes:
-                    snapshot.stopped = STOPPED_MAX_BYTES
-                    break
-                total_bytes += size
-                batch.append(path)
-                batch_bytes += size
-                if len(batch) >= BATCH_PATHS or batch_bytes >= BATCH_BYTES:
-                    flush()
-            flush()
-            if not listing.truncated:
-                break
-            cursor = listing[-1]["path"]
-    snapshot.source = SOURCE_REPO.format(sha=snapshot.sha or SHA_UNKNOWN)
-    return snapshot
+    Every entry the snapshot left out (a link out of the tree, a bare
+    repository layout) is listed as skipped with its reason. The snapshot does
+    not say whether a link was to a file or to a directory of manifests, and
+    a dotted name proves neither, so none is hidden.
+    """
+    snapshot = snapshot or vcs_client.snapshot
+    vcs_client.ROOT.mkdir(parents=True, exist_ok=True)
+    remove_stale_scan_copies()
+    with tempfile.TemporaryDirectory(prefix=CLONE_DIR_PREFIX, dir=vcs_client.ROOT) as scratch:
+        tree = Path(scratch) / SNAPSHOT_TREE_NAME
+        answer = snapshot(repo, into=tree)
+        sha = answer.get("revision") or None
+        # A tree that is gone would read as a clean section with nothing in it.
+        if not tree.is_dir():
+            raise FileNotFoundError(f"the snapshot of {repo} is not at {tree}")
+        read = read_tree(tree, SOURCE_REPO.format(sha=sha or SHA_UNKNOWN), sha, max_files, max_bytes, skip_links=True)
+    read.skipped = list(answer.get("skipped") or []) + read.skipped
+    return read
 
 
 def _runner(cmd: list, *, cwd=None, check: bool = True):
@@ -399,8 +381,14 @@ def read_tree(
     sha: str | None,
     max_files: int = DEFAULT_MAX_FILES,
     max_bytes: int = DEFAULT_MAX_BYTES,
+    skip_links: bool = False,
 ) -> Snapshot:
-    """Every manifest-shaped file under `root`, in sorted order, within the caps."""
+    """Every manifest-shaped file under `root`, in sorted order, within the caps.
+
+    `skip_links` lists a symbolic link as skipped instead of reading its target.
+    The broker read sets it: a link in the repository can point at any file in
+    the sandbox.
+    """
     snapshot = Snapshot(source=source, sha=sha)
     total_bytes = 0
     paths: list[Path] = []
@@ -414,6 +402,9 @@ def read_tree(
             snapshot.stopped = STOPPED_MAX_FILES
             break
         relative = str(path.relative_to(root))
+        if skip_links and path.is_symlink():
+            snapshot.skipped.append({"path": relative, "reason": REASON_SYMLINK})
+            continue
         try:
             size = path.stat().st_size
         except OSError as e:
@@ -739,8 +730,8 @@ def scan_lease(explicit: str | None) -> str:
     return gitops_workspace.sanitize_lease(SCAN_LEASE_PREFIX + gitops_workspace.lease_id(None))
 
 
-def build_readers(args, endpoint: str, content_mode: bool) -> list[tuple[str, Callable[[], Snapshot]]]:
-    """One (name, reader) per source: local trees, then repositories in the mode the broker allows."""
+def build_readers(args, broker_mode: bool) -> list[tuple[str, Callable[[], Snapshot]]]:
+    """One (name, reader) per source: local trees, then repositories through the broker, or leased checkouts without one."""
     readers: list[tuple[str, Callable[[], Snapshot]]] = []
     for path in args.manifests_dir or []:
         readers.append((path, lambda p=path: read_local_directory(p, args.max_files, args.max_bytes)))
@@ -751,10 +742,10 @@ def build_readers(args, endpoint: str, content_mode: bool) -> list[tuple[str, Ca
         # Directory mode cannot clone one (`ensure_workspace` refuses it up
         # front), so there it lands under errors rather than out of the report.
         repos = gitops_workspace.get_managed_repos()
-    lease = scan_lease(args.lease) if repos and not content_mode else None
+    lease = scan_lease(args.lease) if repos and not broker_mode else None
     for repo in repos:
-        if content_mode:
-            readers.append((repo, lambda r=repo: read_repo_content(r, endpoint, args.max_files, args.max_bytes)))
+        if broker_mode:
+            readers.append((repo, lambda r=repo: read_repo_content(r, args.max_files, args.max_bytes)))
         else:
             readers.append((repo, lambda r=repo: read_repo_directory(r, lease, _runner, args.max_files, args.max_bytes)))
     return readers
@@ -768,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target-version", help="Target GKE version, e.g. 1.27.3-gke.100 or 1.27. Defaults to the --versions file's target_version.")
     parser.add_argument("--versions", help="fleet_upgrade_report.py --output JSON; the floor is its lowest control-plane minor.")
     parser.add_argument("--current-version", help="The fleet's current version when there is no --versions file.")
-    parser.add_argument("--repo", action="append", help="Repository to scan, as the managed list names it (owner/name, or host/path on another forge); repeatable. Default: every managed_repos entry.")
+    parser.add_argument("--repo", action="append", help="Repository to scan: owner/name, or host/path on another forge; a managed or context repository, or a public one. Repeatable. Default: every managed_repos entry.")
     parser.add_argument("--manifests-dir", action="append", help="Local directory to scan instead of, or as well as, repositories; repeatable.")
     parser.add_argument("--lease", help="Directory mode only: the workspace lease to check the repository out under. Default: a scan-private lease derived from the session's.")
     parser.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES, help="Manifest files read per source before the scan stops and says so.")
@@ -840,12 +831,11 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"--repo {repo!r} is not a repository name (owner/name, or host/path on another forge)\n")
             return EXIT_USAGE
 
-    endpoint = proxy_endpoint()
-    # The broker is asked only when a repository will be read: a --manifests-dir
-    # run on a workstation has no broker to ask.
+    # The mode follows CREDENTIAL_PROXY_URL: no request goes to the broker to
+    # choose it. A --manifests-dir run on a workstation has no broker at all.
     reads_repos = bool(args.repo) or not args.manifests_dir
-    content_mode = reads_repos and content_mode_available(endpoint)
-    readers = build_readers(args, endpoint, content_mode)
+    broker_mode = reads_repos and bool(proxy_endpoint())
+    readers = build_readers(args, broker_mode)
     report = build_report(table, floor, target, members, readers)
     print(render_report(report))
 
