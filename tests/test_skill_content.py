@@ -10,10 +10,12 @@ scripts/sync-upstream-skills.py; the platform skills' routing descriptions
 are pinned here too.
 """
 
+import importlib.util
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+WORKLOAD_TRIAGE_SCRIPT = REPO_ROOT / "agents/platform/scripts/workload_triage.py"
 CLUSTER_WORKLOAD_SECURITY = REPO_ROOT / "agents/cluster/skills/gke-workload-security/SKILL.md"
 # gke-manifest-generation's routing patch sends Config Connector manifests here.
 CONFIG_CONNECTOR_SKILL = REPO_ROOT / "agents/platform/skills/gcp-config-connector/SKILL.md"
@@ -84,6 +86,236 @@ class TerraformNewClusterDefaultsTest(unittest.TestCase):
         """gke-basics' Terraform example set it false "for testing" (#3727)."""
         example = (REPO_ROOT / "agents/platform/skills/gke-basics/references/iac-usage.md").read_text(encoding="utf-8")
         self.assertNotRegex(example, r'deletion_protection\s*=\s*"?false')
+
+
+class SessionShippedWorkloadSkillsTest(unittest.TestCase):
+    # a2a/cmd/session-persona replaces any section that names a kanban tool
+    # with a one-line note, so a kanban call written into a workflow step would
+    # silently remove that whole workflow from the session copy. The reporting
+    # contract lives in workload-triage-scan/references/reporting.md instead.
+    SKILLS = (
+        "workload-triage-scan",
+        "pod-crashloop-oom",
+        "pod-pending-scheduling",
+        "pod-container-creating",
+        "service-connectivity",
+        "gke-workload-troubleshooting",
+    )
+
+    def test_workflow_skills_name_no_kanban_tool(self):
+        for name in self.SKILLS:
+            body = (REPO_ROOT / "agents/cluster/skills" / name / "SKILL.md").read_text(encoding="utf-8")
+            self.assertNotIn("kanban_", body, name)
+
+    def test_the_shared_reporting_contract_names_the_kanban_tools(self):
+        reference = REPO_ROOT / "agents/cluster/skills/workload-triage-scan/references/reporting.md"
+        text = reference.read_text(encoding="utf-8")
+        self.assertIn("kanban_complete(", text)
+        self.assertIn('kanban_block(kind="needs_input"', text)
+        self.assertIn("<warning-event rows, if any>", text)
+        for consumer in (*self.SKILLS, "gke-stall-detection", "gke-load-bearing-change", "topology-drift"):
+            self.assertIn(f"`{consumer}`", text)
+
+    def test_all_reporting_consumers_point_to_the_shared_reference(self):
+        cluster_skills = REPO_ROOT / "agents/cluster/skills"
+        for skill_md in sorted(cluster_skills.glob("*/SKILL.md")):
+            body = skill_md.read_text(encoding="utf-8")
+            self.assertNotIn(
+                "follow the shape in `gke-workload-troubleshooting`",
+                body,
+                skill_md.parent.name,
+            )
+        for consumer in ("gke-load-bearing-change", "gke-stall-detection", "topology-drift"):
+            body = (cluster_skills / consumer / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("workload-triage-scan/references/reporting.md", body, consumer)
+
+    def test_service_connectivity_blocks_on_failed_live_reads(self):
+        connectivity = (
+            REPO_ROOT / "agents/cluster/skills/service-connectivity/SKILL.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("needs_input", connectivity)
+        self.assertNotIn("manifests in your workspace", connectivity)
+        creating = (
+            REPO_ROOT / "agents/cluster/skills/pod-container-creating/SKILL.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("you have no GitOps repository", creating)
+        self.assertNotIn("repository is in your workspace", creating)
+        self.assertNotIn("git log", creating)
+
+    def test_triage_scan_prose_matches_script_and_healthy_exit_contract(self):
+        spec = importlib.util.spec_from_file_location("workload_triage", WORKLOAD_TRIAGE_SCRIPT)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        wt = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wt)
+
+        scan = (
+            REPO_ROOT / "agents/cluster/skills/workload-triage-scan/SKILL.md"
+        ).read_text(encoding="utf-8")
+        for expected in (
+            "deletionTimestamp",
+            f"`{wt.TERMINATING_REASON}`",
+            f"`{wt.SCHEDULING_GATED_REASON}`",
+            "now - creationTimestamp",
+            f"under {wt.DEFAULT_INIT_GRACE_MINUTES} minutes",
+            f"at least {wt.DEFAULT_INIT_GRACE_MINUTES} minutes",
+            f"in the last {wt.DEFAULT_EVENTS_MINUTES} minutes",
+            f"more than {wt.DEFAULT_EVENTS_MINUTES} minutes ago",
+            f"from the last {wt.DEFAULT_EVENTS_MINUTES} minutes",
+            f"Exit code {wt.EXIT_READ_FAILED} means",
+            *(f"`{prefix}*`" for prefix in wt.SYSTEM_NAMESPACE_PREFIXES),
+            *(f"`*{suffix}`" for suffix in wt.SYSTEM_NAMESPACE_SUFFIXES),
+            *(f"`{kind}`" for kind in wt.REPLACING_OWNER_KINDS),
+            *(f"`{kind}`" for kind in wt.CONTROLLER_KINDS),
+            *(
+                f"`{reason}`"
+                for group in (
+                    wt.CRASH_WAITING_REASONS,
+                    wt.IMAGE_WAITING_REASONS,
+                    wt.CONFIG_WAITING_REASONS,
+                    wt.STARTING_WAITING_REASONS,
+                )
+                for reason in group
+            ),
+            *(
+                f"`{state}`"
+                for state in (
+                    wt.EVENT_STATE_GONE,
+                    wt.EVENT_STATE_OTHER,
+                    wt.EVENT_STATE_HEALTHY,
+                    wt.EVENT_STATE_INITIALIZING,
+                    wt.EVENT_STATE_STALE_FAILED,
+                )
+            ),
+            "condition `Failed=True`",
+            "failed: <reason>",
+            "`Evicted`/`Failed`",
+            "LAST EXIT",
+            "owning `Job` has completed",
+            "any `WARNING EVENTS` rows",
+            "`system unhealthy: 0`",
+            "never run a second scan with `--include-system` after `unhealthy: 0`",
+            "omit any `[next: ...]` line",
+            '"check if there are any failing workloads"',
+        ):
+            self.assertIn(expected, scan)
+        self.assertNotIn("asks for restart counts and a system line ends with", scan)
+
+    def test_orphan_warning_handoff_skips_step_one_pod_read(self):
+        scan = (
+            REPO_ROOT / "agents/cluster/skills/workload-triage-scan/SKILL.md"
+        ).read_text(encoding="utf-8")
+        pending = (
+            REPO_ROOT / "agents/cluster/skills/pod-pending-scheduling/SKILL.md"
+        ).read_text(encoding="utf-8")
+        creating = (
+            REPO_ROOT / "agents/cluster/skills/pod-container-creating/SKILL.md"
+        ).read_text(encoding="utf-8")
+        reporting = (
+            REPO_ROOT / "agents/cluster/skills/workload-triage-scan/references/reporting.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("skip the target skill's step 1 `kubectl get pod`", scan)
+        self.assertIn("involvedObject.name", scan)
+        self.assertIn("every routed `gone`/`-` warning row was confirmed recovered", reporting)
+        self.assertIn('use `metadata={"unhealthy": 0, "system_unhealthy": 0}` with no `proposed_patch`', reporting)
+        self.assertIn("`system unhealthy: 0`", reporting)
+        for focused in (pending, creating):
+            self.assertIn("skip step 1 (`kubectl get pod`)", focused)
+            self.assertIn("`gone`", focused)
+            self.assertIn("`-`", focused)
+            self.assertIn("report the confirming evidence with no proposed patch", focused)
+
+    def test_router_and_crashloop_skill_project_and_route_init_container_failures(self):
+        spec = importlib.util.spec_from_file_location("workload_triage", WORKLOAD_TRIAGE_SCRIPT)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        wt = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wt)
+
+        router = (
+            REPO_ROOT / "agents/cluster/skills/gke-workload-troubleshooting/SKILL.md"
+        ).read_text(encoding="utf-8")
+        for expected in (
+            "REASON:.status.reason",
+            "TERM:.status.containerStatuses[*].state.terminated.reason",
+            "TERM_EXIT:.status.containerStatuses[*].state.terminated.exitCode",
+            "INIT:.status.initContainerStatuses[*].state.waiting.reason",
+            "INIT_TERM:.status.initContainerStatuses[*].state.terminated.reason",
+            "INIT_LAST:.status.initContainerStatuses[*].lastState.terminated.reason",
+            "INIT_EXIT:.status.initContainerStatuses[*].lastState.terminated.exitCode",
+            "`PHASE=Failed`",
+            "`REASON=Evicted`",
+            "`TERM` set to a failure reason (other than `Completed`)",
+            "`PHASE=Succeeded`",
+            "`PodInitializing`",
+            "non-zero `INIT_EXIT`",
+            "Any other non-healthy pod or controller state not matched above",
+            *(
+                f"`{reason}`"
+                for group in (
+                    wt.CRASH_WAITING_REASONS,
+                    wt.IMAGE_WAITING_REASONS,
+                    wt.CONFIG_WAITING_REASONS,
+                    wt.STARTING_WAITING_REASONS,
+                )
+                for reason in group
+            ),
+        ):
+            self.assertIn(expected, router)
+        self.assertNotIn("`TERM` or non-zero `TERM_EXIT`", router)
+
+        crashloop = (
+            REPO_ROOT / "agents/cluster/skills/pod-crashloop-oom/SKILL.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(".spec.initContainers[]?", crashloop)
+        self.assertIn(".status.initContainerStatuses[]?", crashloop)
+
+    def test_router_and_triage_scan_guard_podless_or_replica_failure_controllers(self):
+        router = (
+            REPO_ROOT / "agents/cluster/skills/gke-workload-troubleshooting/SKILL.md"
+        ).read_text(encoding="utf-8")
+        for expected in (
+            "specReplicas={.spec.replicas}",
+            "readyReplicas={.status.readyReplicas}",
+            "conditions={.status.conditions}",
+            "no pods returned",
+            "ReplicaFailure=True",
+            "readyReplicas < specReplicas",
+            "specReplicas == 0",
+            "reason=FailedCreate",
+            "at least one pod is returned",
+            "`specReplicas > 0`",
+            "`readyReplicas == specReplicas`",
+        ):
+            self.assertIn(expected, router)
+        self.assertNotIn(
+            "If every pod is Running and Ready with no recent restarts, the reported fault is not there",
+            router,
+        )
+
+        scan = (
+            REPO_ROOT / "agents/cluster/skills/workload-triage-scan/SKILL.md"
+        ).read_text(encoding="utf-8")
+        step7 = scan[scan.index("7. For a `Job/<name>`") : scan.index("8. Record the result")]
+        for expected in (
+            "FailedCreate",
+            ".status.conditions",
+            "ReplicaFailure",
+            "reason=FailedCreate",
+            "only when no creation failure exists",
+        ):
+            self.assertIn(expected, step7)
+        self.assertNotIn(
+            "Any other controller in `CONTROLLERS BELOW DESIRED` with no unhealthy pod row is still rolling out",
+            step7,
+        )
+
+    def test_cluster_soul_skill_discovery_routes_health_checks_to_triage_scan(self):
+        soul = (REPO_ROOT / "agents/cluster/SOUL.md").read_text(encoding="utf-8")
+        section = soul[soul.index("## 3. Skill Discovery") : soul.index("## 4.")]
+        self.assertIn("`workload-triage-scan`", section)
+        self.assertIn('"check if there are any failing workloads"', section)
+        self.assertNotIn("workload_triage.py", section)
 
 
 class RoutedSkillsExistTest(unittest.TestCase):

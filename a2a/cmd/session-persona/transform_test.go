@@ -18,12 +18,13 @@ const (
 	repoSkillsDir = "../../../agents/cluster/skills"
 	// repoPersonaSkillsDir is the cluster agent's persona (#3656): the same
 	// skills, read by the profile worker, under the same read-only rule.
-	repoPersonaSkillsDir = "../../../agents/cluster/persona/skills"
-	repoPersona          = "../../persona/session/persona.md"
-	repoDockerfile       = "../../Dockerfile.worker"
-	harnessHomeEnv       = "CLAUDE_CONFIG_DIR"
-	buildOutFlag         = "-out"
-	sessionToolPath      = "./cmd/session-persona"
+	repoPersonaSkillsDir  = "../../../agents/cluster/persona/skills"
+	repoPlatformSkillsDir = "../../../agents/platform/skills"
+	repoPersona           = "../../persona/session/persona.md"
+	repoDockerfile        = "../../Dockerfile.worker"
+	harnessHomeEnv        = "CLAUDE_CONFIG_DIR"
+	buildOutFlag          = "-out"
+	sessionToolPath       = "./cmd/session-persona"
 )
 
 // writeCommandRE finds a command that changes a cluster or a project. It is a
@@ -40,11 +41,13 @@ var writeCommandRE = regexp.MustCompile(
 // shippedFileArg so the check does not move with the constant.
 var otherProgramRE = regexp.MustCompile(`^\s*(\$\s+)?(\./|python3?\s|git\s|jq\s|bash\s|sh\s|<file not in this session>)`)
 
-// unshippedRefRE finds a reference to a file the session does not ship: a
-// scripts/ or assets/ path, the cluster agent's /opt/data tree or its
-// settings file, starting a word. Written independently of filePathRE. A
-// path inside a URL is documentation and is not a reference.
-var unshippedRefRE = regexp.MustCompile("(^|[\\s(`\"'=,])((\\./)?(assets|scripts)/|/opt/data/|SETTINGS\\.md)")
+// unshippedRefRE finds a reference to a file the session does not ship (or a
+// SKILL.md path the session must load via the Skill tool instead of reading):
+// a scripts/, assets/, references/ or SKILL.md path (same-skill or cross-skill),
+// the cluster agent's /opt/data tree or its settings file, starting a word.
+// Written independently of filePathRE. A path inside a URL is documentation
+// and is not a reference.
+var unshippedRefRE = regexp.MustCompile("(^|[\\s(`\"'=,])((\\./|\\.\\./[a-z0-9-]+/|[a-z0-9-]+/)?(assets|scripts|references)/|(\\./|\\.\\./[a-z0-9-]+/|[a-z0-9-]+/)?SKILL\\.md|/opt/data/|SETTINGS\\.md)")
 
 // The shipped-tree check has to see the shapes the rewrite handles, or a
 // path the rewrite missed would ship with the check green.
@@ -53,9 +56,23 @@ func TestUnshippedRefRESeesAttachedAndListedPaths(t *testing.T) {
 		"kubectl apply --filename=assets/x.yaml",
 		"kubectl apply -f=./assets/x.yaml",
 		"kubectl apply -f <file not in this session>,assets/b.yaml",
+		"Record as [`references/reporting.md`](references/reporting.md) describes.",
+		"Record as [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md) describes.",
+		"Follow `workload-triage-scan/references/reporting.md`.",
+		"Routed through [`workload-triage-scan`](../workload-triage-scan/SKILL.md).",
+		"Read ../workload-triage-scan/SKILL.md first.",
 	} {
 		if !unshippedRefRE.MatchString(l) {
 			t.Errorf("unshippedRefRE misses %q", l)
+		}
+	}
+	for _, url := range []string{
+		"See https://cloud.google.com/kubernetes-engine/docs/tutorials/scripts/setup.sh for more.",
+		"See https://example.com/references/reporting.md for more.",
+		"See https://example.com/skills/workload-triage-scan/SKILL.md for more.",
+	} {
+		if unshippedRefRE.MatchString(url) {
+			t.Errorf("unshippedRefRE matched URL %q", url)
 		}
 	}
 }
@@ -144,9 +161,15 @@ func TestShippedTreeIsLoadableByClaudeCode(t *testing.T) {
 			if check && unshippedRefRE.MatchString(l) {
 				t.Errorf("%s:%d: still points at a file that is not shipped: %s", name, i+1, strings.TrimSpace(l))
 			}
+			if check && strings.Contains(l, shippedFileProse+" describes") {
+				t.Errorf("%s:%d: unrewritten reporting hand-off fell through to file-reference prose: %s", name, i+1, strings.TrimSpace(l))
+			}
 		}
 		if !strings.Contains(string(rest), sessionPreamble) {
 			t.Errorf("%s: no session preamble", name)
+		}
+		for _, unshipped := range unshippedPersonaSkills(string(rest), repoSkillNames(t), sessionSkills) {
+			t.Errorf("%s: names unshipped skill %s", name, unshipped)
 		}
 		// A literal, not clusterAgentOnlyMarker: the check must not move
 		// with the constant it checks.
@@ -215,6 +238,79 @@ func precedingNote(lines []string, fence int) string {
 	return ""
 }
 
+// repoSkillNames returns every skill directory name under agents/cluster/skills
+// and agents/platform/skills so the persona check does not depend on a gke-
+// name prefix.
+func repoSkillNames(t *testing.T) map[string]bool {
+	t.Helper()
+	names := make(map[string]bool)
+	for _, root := range []string{repoSkillsDir, repoPlatformSkillsDir} {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			t.Fatalf("read %s: %v", root, err)
+		}
+		dirCount := 0
+		for _, e := range entries {
+			if e.IsDir() {
+				names[e.Name()] = true
+				dirCount++
+			}
+		}
+		if dirCount == 0 {
+			t.Fatalf("%s holds no skill directories", root)
+		}
+	}
+	return names
+}
+
+// unshippedPersonaSkills returns backticked skill names in persona that are not
+// in shipped: any backticked token anywhere in the file that matches a skill
+// directory in knownSkills (or starts with "gke-"), plus any backticked token
+// inside the "## Skills" bullet list regardless of whether a directory exists.
+func unshippedPersonaSkills(persona string, knownSkills map[string]bool, shipped []string) []string {
+	backtickRE := regexp.MustCompile("`([a-z0-9-]+)`")
+	var unshipped []string
+	add := func(name string) {
+		if !slices.Contains(shipped, name) && !slices.Contains(unshipped, name) {
+			unshipped = append(unshipped, name)
+		}
+	}
+	for _, m := range backtickRE.FindAllStringSubmatch(persona, -1) {
+		if knownSkills[m[1]] || strings.HasPrefix(m[1], "gke-") {
+			add(m[1])
+		}
+	}
+	inSkillsSection := false
+	inBullet := false
+	for _, line := range strings.Split(persona, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "## ") {
+			inSkillsSection = trimmed == "## Skills"
+			inBullet = false
+			continue
+		}
+		if !inSkillsSection {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "- "):
+			inBullet = true
+		case trimmed == "":
+			inBullet = false
+		case inBullet && (strings.HasPrefix(line, "  ") || strings.HasPrefix(line, "\t")):
+			// wrapped continuation of a bullet under ## Skills
+		default:
+			inBullet = false
+		}
+		if inBullet {
+			for _, m := range backtickRE.FindAllStringSubmatch(line, -1) {
+				add(m[1])
+			}
+		}
+	}
+	return unshipped
+}
+
 // The persona names the skills the image ships, no more and no fewer, and
 // says nothing that points the model at files: vamp-49's no-view check
 // (gke-labs#2831) expects no Read, Glob or Grep on a cluster question, and
@@ -225,21 +321,51 @@ func TestPersonaNamesTheShippedSkillsAndNoFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := string(persona)
+	known := repoSkillNames(t)
 	for _, name := range sessionSkills {
+		if !known[name] {
+			t.Errorf("sessionSkills entry %s has no skill directory", name)
+		}
 		if !strings.Contains(p, "`"+name+"`") {
 			t.Errorf("persona does not name %s", name)
 		}
 	}
-	for _, m := range regexp.MustCompile("`(gke-[a-z-]+)`").FindAllStringSubmatch(p, -1) {
-		if !slices.Contains(sessionSkills, m[1]) {
-			t.Errorf("persona names %s, which the image does not ship", m[1])
-		}
+	for _, name := range unshippedPersonaSkills(p, known, sessionSkills) {
+		t.Errorf("persona names %s, which the image does not ship", name)
 	}
 	for _, path := range []string{"SKILL.md", ".claude", "/home/node", "skills/"} {
 		if strings.Contains(p, path) {
 			t.Errorf("persona names a file path (%q); skills load through the Skill tool", path)
 		}
 	}
+
+	t.Run("catches unshipped non-gke skills", func(t *testing.T) {
+		withSyntheticClusterSkill := make(map[string]bool, len(known)+1)
+		for k, v := range known {
+			withSyntheticClusterSkill[k] = v
+		}
+		withSyntheticClusterSkill["pod-image-pull"] = true
+
+		for _, tc := range []struct {
+			desc  string
+			extra string
+			want  string
+		}{
+			{"unshipped gke cluster skill in prose", "\nSee `gke-rightsizing-checks`.\n", "gke-rightsizing-checks"},
+			{"unshipped non-gke cluster skill dir in prose", "\nSee `pod-image-pull`.\n", "pod-image-pull"},
+			{"unshipped non-gke platform skill dir in prose", "\nSee `workload-rebalancing`.\n", "workload-rebalancing"},
+			{"unknown non-gke bullet under Skills", "", "workload-troubleshooting"},
+		} {
+			doc := p + tc.extra
+			if tc.want == "workload-troubleshooting" {
+				doc = strings.Replace(p, "## Skills\n\n", "## Skills\n\n- unknown bullet: `workload-troubleshooting`\n", 1)
+			}
+			got := unshippedPersonaSkills(doc, withSyntheticClusterSkill, sessionSkills)
+			if !slices.Contains(got, tc.want) {
+				t.Errorf("%s: unshippedPersonaSkills = %v, want %q", tc.desc, got, tc.want)
+			}
+		}
+	})
 }
 
 // The image builds the tree with this tool and copies it to the directory
@@ -616,10 +742,134 @@ func TestReplaceFileReferences(t *testing.T) {
 		{"url in a bash block",
 			"```bash\ncurl -O https://example.com/scripts/x.sh\n```",
 			"```bash\ncurl -O https://example.com/scripts/x.sh\n```"},
+		{"same-skill reference link",
+			"See [`references/reporting.md`](references/reporting.md).",
+			"See " + shippedFileProse + "."},
+		{"cross-skill reference link",
+			"See [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md).",
+			"See " + shippedFileProse + "."},
+		{"inline code reference path",
+			"Follow `workload-triage-scan/references/reporting.md`.",
+			"Follow " + shippedFileProse + "."},
+		{"cross-skill SKILL.md link with backticks",
+			"Routed through [`workload-triage-scan`](../workload-triage-scan/SKILL.md), see step 3.",
+			"Routed through `workload-triage-scan`, see step 3."},
+		{"cross-skill SKILL.md link without backticks",
+			"Load [pod-crashloop-oom](../pod-crashloop-oom/SKILL.md) next.",
+			"Load `pod-crashloop-oom` next."},
+		{"cross-skill SKILL.md link with prose label or partial backticks uses target slug",
+			"See [the triage scan](../workload-triage-scan/SKILL.md) and [`workload-triage-scan` step 3](../workload-triage-scan/SKILL.md#workflow).",
+			"See `workload-triage-scan` and `workload-triage-scan`."},
+		{"cross-skill SKILL.md link to unshipped skill becomes shippedFileProse",
+			"See [`topology-drift`](../topology-drift/SKILL.md) next.",
+			"See " + shippedFileProse + " next."},
+		{"same-skill SKILL.md anchor link keeps anchor",
+			"See [the table above](./SKILL.md#signatures).",
+			"See [the table above](#signatures)."},
 	} {
 		got := strings.Join(replaceFileReferences(strings.Split(tc.in, "\n")), "\n")
 		if got != tc.want {
 			t.Errorf("%s:\n got %q\nwant %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Every session skill whose source delegates reporting to references/reporting.md
+// (discovered dynamically across sessionSkills, not only the six initial workload
+// skills) must receive sessionReportNote and carry no reporting.md pointer or
+// cluster-only card/needs_input instructions.
+func TestShippedWorkloadSkillsCarrySessionReportNote(t *testing.T) {
+	out := buildShipped(t)
+	var delegated []string
+	for _, name := range sessionSkills {
+		src, err := os.ReadFile(filepath.Join(repoSkillsDir, name, skillFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, srcBody, err := splitFrontmatter(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cleaned := strings.Join(replaceClusterAgentSections(strings.Split(string(srcBody), "\n")), "\n")
+		if strings.Contains(cleaned, "references/reporting.md") {
+			delegated = append(delegated, name)
+		}
+	}
+	for _, want := range []string{
+		"workload-triage-scan",
+		"pod-crashloop-oom",
+		"pod-pending-scheduling",
+		"pod-container-creating",
+		"service-connectivity",
+		"gke-workload-troubleshooting",
+	} {
+		if !slices.Contains(delegated, want) {
+			t.Fatalf("delegated reporting skills %v missing expected %q", delegated, want)
+		}
+	}
+	for _, name := range delegated {
+		body, err := os.ReadFile(filepath.Join(out, skillsDir, name, skillFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(body)
+		if !strings.Contains(text, sessionReportNote) {
+			t.Errorf("%s: missing sessionReportNote", name)
+		}
+		for _, forbidden := range []string{
+			"reporting.md",
+			"needs_input",
+			"block the card",
+			"the card",
+			"a card",
+			"card is completed",
+			"the reference's",
+			"Cannot proceed",
+			shippedFileProse,
+			"SKILL.md",
+		} {
+			if strings.Contains(text, forbidden) {
+				t.Errorf("%s: still contains cluster-only %q:\n%s", name, forbidden, text)
+			}
+		}
+	}
+	for _, skill := range []string{"workload-triage-scan", "service-connectivity"} {
+		body, err := os.ReadFile(filepath.Join(out, skillsDir, skill, skillFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), sessionCannotProceedClause) {
+			t.Errorf("%s: missing sessionCannotProceedClause", skill)
+		}
+	}
+	for _, sample := range []struct {
+		in   string
+		want string
+	}{
+		{
+			"Report the finding as [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md) describes.",
+			sessionReportNote,
+		},
+		{
+			"Finally, record the finding as [`references/reporting.md`](references/reporting.md) describes.",
+			sessionReportNote,
+		},
+		{
+			"Check events, finally report it as [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md) describes.",
+			"Check events. " + sessionReportNote,
+		},
+		{
+			"Match the evidence and record the finding as [`references/reporting.md`](references/reporting.md) describes.",
+			"Match the evidence. " + sessionReportNote,
+		},
+		{
+			"Check events, and finally, record the finding as [`references/reporting.md`](references/reporting.md) describes.",
+			"Check events. " + sessionReportNote,
+		},
+	} {
+		rewritten := strings.Join(replaceFileReferences(replaceReportingSteps([]string{sample.in})), "\n")
+		if rewritten != sample.want {
+			t.Errorf("sample %q:\n got %q\nwant %q", sample.in, rewritten, sample.want)
 		}
 	}
 }

@@ -6261,6 +6261,36 @@
           desc: "Systematic pod and controller triage: CrashLoopBackOff, ImagePullBackOff, OOMKilled, probe and config failures.",
         },
         {
+          name: "workload-triage-scan",
+          cat: "troubleshoot",
+          agent: "cluster",
+          desc: "One-pass read-only scan of pods, controllers and Warning events across a cluster.",
+        },
+        {
+          name: "pod-crashloop-oom",
+          cat: "troubleshoot",
+          agent: "cluster",
+          desc: "Diagnoses CrashLoopBackOff, OOMKilled (exit 137), failing probes and repeated restarts on a workload.",
+        },
+        {
+          name: "pod-pending-scheduling",
+          cat: "troubleshoot",
+          agent: "cluster",
+          desc: "Diagnoses Pending pods: FailedScheduling, insufficient CPU/memory, taints, node affinity and unbound PVCs.",
+        },
+        {
+          name: "pod-container-creating",
+          cat: "troubleshoot",
+          agent: "cluster",
+          desc: "Diagnoses ContainerCreating, ImagePullBackOff, ErrImagePull, CreateContainerConfigError and volume mounts.",
+        },
+        {
+          name: "service-connectivity",
+          cat: "troubleshoot",
+          agent: "cluster",
+          desc: "Diagnoses in-cluster connection timeouts, connection refused, empty Service endpoints and NetworkPolicies.",
+        },
+        {
           name: "gke-stall-detection",
           cat: "troubleshoot",
           agent: "cluster",

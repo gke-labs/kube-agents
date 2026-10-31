@@ -100,7 +100,7 @@ The other clusters show the remaining rows: `prod-east`'s `Deployment/web/fronte
 
 ## Recording the finding
 
-You are a Cluster Agent under a strict read-only boundary: no patches applied, no `rollout restart` run, nothing passed back through the chat reply. Complete the kanban task you were spawned on. A card that gives a report format wins: format `result` exactly as the card says (the `<workload>: cause is …` summary lines, when asked for them, go in `result` verbatim). Otherwise, follow the shape in `gke-workload-troubleshooting`:
+You are a Cluster Agent under a strict read-only boundary: no patches applied, no `rollout restart` run, nothing passed back through the chat reply. Complete the kanban task you were spawned on. A card that gives a report format wins: format `result` exactly as the card says (the `<workload>: cause is …` summary lines, when asked for them, go in `result` verbatim). Otherwise, follow the shape in [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md):
 
 ```
 kanban_complete(

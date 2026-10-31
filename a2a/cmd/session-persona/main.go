@@ -49,6 +49,11 @@ var sessionSkills = []string{
 	"gke-workload-scaling",
 	"gke-workload-security",
 	"gke-workload-troubleshooting",
+	"pod-container-creating",
+	"pod-crashloop-oom",
+	"pod-pending-scheduling",
+	"service-connectivity",
+	"workload-triage-scan",
 }
 
 func main() {

@@ -667,6 +667,11 @@ var knownPlatformSkills = []string{
 	"upgrade-readiness-brief",
 	"support-escalation-bundle",
 	"topology-drift",
+	"pod-container-creating",
+	"pod-crashloop-oom",
+	"pod-pending-scheduling",
+	"service-connectivity",
+	"workload-triage-scan",
 }
 
 var (

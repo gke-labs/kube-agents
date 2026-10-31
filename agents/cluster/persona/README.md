@@ -18,11 +18,12 @@ The profile worker sets `PROFILE_TASK_PROJECT`, `PROFILE_TASK_LOCATION` and
 `PROFILE_TASK_CLUSTER` from the task's parameters; the instructions' first step
 reads the target from them.
 
-Each skill's `SKILL.md` is its `agents/cluster/skills` source with only the
-edits `a2a/lib/persona/claudecode/cluster_persona_test.go` lists. Every other
-file is a byte-identical copy: the assets of the same path under
-`agents/cluster/skills`, and the two scripts of
-`agents/platform/scripts/stall_report.py` and
+Each skill's `SKILL.md` (and `workload-triage-scan/references/reporting.md`) is
+its `agents/cluster/skills` source with only the edits
+`a2a/lib/persona/claudecode/cluster_persona_test.go` lists. Every other file is
+a byte-identical copy: the assets of the same path under `agents/cluster/skills`,
+and the three scripts of `agents/platform/scripts/stall_report.py`,
+`agents/platform/scripts/workload_triage.py` and
 `agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh`. The
 same test checks both. The skills run their scripts by skill-relative paths
 (`scripts/...`), from the skill's directory.
@@ -41,8 +42,13 @@ What it holds:
   [`gke-stall-detection`](skills/gke-stall-detection/SKILL.md),
   [`gke-storage`](skills/gke-storage/SKILL.md),
   [`gke-workload-scaling`](skills/gke-workload-scaling/SKILL.md),
-  [`gke-workload-security`](skills/gke-workload-security/SKILL.md) and
-  [`gke-workload-troubleshooting`](skills/gke-workload-troubleshooting/SKILL.md).
+  [`gke-workload-security`](skills/gke-workload-security/SKILL.md),
+  [`gke-workload-troubleshooting`](skills/gke-workload-troubleshooting/SKILL.md),
+  [`pod-container-creating`](skills/pod-container-creating/SKILL.md),
+  [`pod-crashloop-oom`](skills/pod-crashloop-oom/SKILL.md),
+  [`pod-pending-scheduling`](skills/pod-pending-scheduling/SKILL.md),
+  [`service-connectivity`](skills/service-connectivity/SKILL.md) and
+  [`workload-triage-scan`](skills/workload-triage-scan/SKILL.md).
 
 Check it from `a2a/`:
 

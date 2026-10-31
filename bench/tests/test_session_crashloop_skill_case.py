@@ -20,8 +20,9 @@ check is written to pass on an api record: the positive checks behind a
 Claude Code tool names a Hermes trajectory never carries. Nor does an inject
 record say whether the session cluster view was on, so the case branches on
 the one behavioural marker, a Bash call (the worker adapter allows Bash only
-with the view): with one, the view-on rules apply (a gke- skill, kubectl, no
-delegation); without, the skill check skips and the answer alone grades.
+with the view): with one, the view-on rules apply (a shipped gke- or
+workload-symptom skill, kubectl, no delegation); without, the skill check
+skips and the answer alone grades.
 These tests run the case's own entries through devops-bench's runner against
 an api run, main's and the branch's sessions with the view on, a delegated
 run with the view off (whose final trace is the wake turn's), and the ways
@@ -129,6 +130,12 @@ def test_the_branch_is_green():
 
 def test_the_older_skill_key_counts():
     record = _inject(_call("Skill", {"command": "gke-stall-detection"}), KUBECTL)
+    assert _status(SKILL, ANSWER, record) == "pass"
+
+
+@pytest.mark.parametrize("skill", ["pod-crashloop-oom", "pod-pending-scheduling", "pod-container-creating", "service-connectivity"])
+def test_the_symptom_skills_count(skill: str):
+    record = _inject(_call("Skill", {"skill": skill}), KUBECTL)
     assert _status(SKILL, ANSWER, record) == "pass"
 
 

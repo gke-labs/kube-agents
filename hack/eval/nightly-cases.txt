@@ -967,6 +967,15 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# A cluster-wide "what is failing?" question across the seeded fleet: every
+# Cluster Agent runs workload_triage.py once, healthy clusters finish without
+# polling or exploring system namespaces, and the crashloop-workload role's
+# payments-api is still named OOMKilled (#3181). deployer: noop, one fan-out
+# round trip; reads the seeded fleet's crashloop-workload role.
+# `validated: false` until its first observed nightly runs; presubmit admission
+# awaits its nightly pass record.
+./tasks/cluster-agent-fleet-health-triage/task.yaml
+
 # The silence case for a deliberate scale to zero (#4098): an in-cluster
 # gateway whose proxy and backend are both at replicas 0 reports
 # Programmed=False, and the stall check must not report it. Reads the
