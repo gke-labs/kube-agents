@@ -1084,7 +1084,7 @@ not be silent about it.
   a Discord message - the text is routed the way any text is, the gateway's literal affordances
   included, so a prompt whose first word is `delegate` or `stop` reaches those paths rather than
   the persona. The harness sends none of them as a prompt, and a case whose prompt opens with
-  one is the case's defect; a stopped ask's `stop`, sent after the opening turn, is the one it
+  one is the case's defect; a stopped ask's `stop`, sent during or after the opening turn, is the one it
   sends itself. The reply carries the task id, so the caller can await a named task rather
   than guessing which post belongs to its submission, and the gateway's first-event grace, so the
   caller can set its own deadline above the window the gateway already owns.

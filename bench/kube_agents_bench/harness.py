@@ -292,6 +292,10 @@ _QUESTION_SECTION = "Question from delegated task {tid}:\n{text}"
 # Appended to the opening turn's message id for the stop a stopped ask sends
 # (stop_hook), so the door's dedupe never answers it with the opening task.
 _INJECT_STOP_SUFFIX = "/stop"
+# The longest a read of the opening exchange blocks while a mid-turn stop is
+# still to go (stop_hook.MID_TURN_DIRECTIVE), so the stop leaves within about
+# this much of its delay.
+_MID_TURN_POLL_SECONDS = 1.0
 # A pushed-report reply the door absorbed as a steer (the relay's record
 # still held the opening task) is sent again, under a fresh message id, this
 # many times in all, this long apart.
@@ -1941,7 +1945,8 @@ class KubeAgentsHarness(AgentHarness):
             return result
         if stop_hook.is_stopped_ask(prompt):
             return AgentResult.errored(
-                f"{stop_hook.STOP_DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+                f"a stopped ask ({stop_hook.STOP_DIRECTIVE} or {stop_hook.MID_TURN_DIRECTIVE}) "
+                f"needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
         if pushed_report.is_reply_under_pushed_report(prompt):
             return AgentResult.errored(
@@ -2508,7 +2513,13 @@ class KubeAgentsHarness(AgentHarness):
         opening_accepted: list[float] = []
         opening_post_lost: list[bool] = []
 
-        def _exchange(task: inject.InjectTask, budget: float, *, opening: bool) -> inject.Exchange:
+        def _exchange(
+            task: inject.InjectTask,
+            budget: float,
+            *,
+            opening: bool,
+            on_poll: Callable[[inject.Fold], float | None] | None = None,
+        ) -> inject.Exchange:
             """One task to its terminal, through the transport retry.
 
             ``budget`` is this exchange's own: the task timeout for the
@@ -2569,7 +2580,7 @@ class KubeAgentsHarness(AgentHarness):
                             f"{task.conversation}: {task.note}",
                             retryable=False,
                         )
-                    return task.await_terminal(task_id, deadline=deadline)
+                    return task.await_terminal(task_id, deadline=deadline, on_poll=on_poll)
                 except inject.InjectUnavailable as exc:
                     if opening and deadline is None and task.unanswered_post:
                         opening_post_lost.append(True)
@@ -2717,10 +2728,86 @@ class KubeAgentsHarness(AgentHarness):
             author=author,
             message_id=message_id,
         )
+
+        # A stopped ask waits on nothing it filed: the stop is the point. Sent
+        # after the opening turn ends, or, for a mid-turn stop, while it runs,
+        # on the door's own key for the conversation, which the opening task
+        # holds once its POST is answered.
+        def _send_stop() -> tuple[bool, str]:
+            stopper = inject.InjectTask(
+                base_url=base_url,
+                conversation=task.conversation,
+                prompt=stop_hook.STOP_WORD,
+                token=token,
+                author=author,
+                message_id=f"{message_id}{_INJECT_STOP_SUFFIX}",
+            )
+            failures = 0
+            while True:
+                try:
+                    started = stopper.submit()
+                    break
+                except inject.InjectUnavailable as exc:
+                    # Retried as the opening exchange is; the door
+                    # dedupes on the message id, so a repeat of a POST
+                    # it took gets the first answer.
+                    failures += 1
+                    _log.warning(
+                        "inject: stop on %s failed in transport (%d/%d): %s",
+                        task.conversation,
+                        failures,
+                        _MAX_TRANSPORT_FAILURES,
+                        exc,
+                    )
+                    if not exc.retryable or failures >= _MAX_TRANSPORT_FAILURES:
+                        # The door, not the agent: infrastructure, never graded.
+                        raise _TransportError(
+                            f"the stop could not reach the gateway: {exc}"
+                        ) from exc
+                    try:
+                        _tunnel(reset=True)
+                    except RuntimeError as pf_exc:
+                        _log.warning("inject: port-forward respawn failed before retry: %s", pf_exc)
+            if started:
+                # A task means the gateway read the word as an ask, not a
+                # stop; bound it like any stray.
+                stopper.cancel(started, settle=0)
+                return False, f"the gateway started task {started} for the stop instead of stopping"
+            if stopper.refusal != inject.REFUSAL_NO_TASK:
+                return False, f"{inject.refusal_detail(stopper.refusal)}: {stopper.note}"
+            return True, stopper.note
+
+        # A mid-turn stop goes from the opening exchange's own polls, once the
+        # task has been working for the directive's delay; what it said (or
+        # the transport error it raised) is kept for the stop below. Until it
+        # goes, each read is capped at a second, so the delay is not a long
+        # poll's 30 s.
+        mid_turn_sent: list[tuple[bool, str, _TransportError | None]] = []
+        working_since: list[float] = []
+
+        def _stop_mid_turn(fold: inject.Fold) -> float | None:
+            if stop is None or stop.mid_turn_after is None or mid_turn_sent or fold.final:
+                return None
+            if inject.STATE_WORKING not in fold.executor_states:
+                return _MID_TURN_POLL_SECONDS
+            if not working_since:
+                working_since.append(time.monotonic())
+            if time.monotonic() - working_since[0] < stop.mid_turn_after:
+                return _MID_TURN_POLL_SECONDS
+            try:
+                sent, detail = _send_stop()
+            except _TransportError as exc:
+                mid_turn_sent.append((False, str(exc), exc))
+                return None
+            _log.info("inject: mid-turn stop sent %.1fs after the task was first seen working",
+                      time.monotonic() - working_since[0])
+            mid_turn_sent.append((sent, detail, None))
+            return None
+
         try:
             # A follow-up is a status turn's kind of exchange: a door that
             # absorbs it as a steer answers no-task, which the caller retries.
-            exchange = _exchange(task, timeout, opening=follow_up is None)
+            exchange = _exchange(task, timeout, opening=follow_up is None, on_poll=_stop_mid_turn)
             opening_ended = time.monotonic()
         except inject.BudgetBelowFloor as exc:
             # Configuration, refused before the POST: the same class as a
@@ -2872,58 +2959,23 @@ class KubeAgentsHarness(AgentHarness):
             )
 
         if stop is not None:
-            # A stopped ask waits on nothing it filed: the stop is the point.
-            def _send_stop() -> tuple[bool, str]:
-                stopper = inject.InjectTask(
-                    base_url=base_url,
-                    conversation=exchange.conversation,
-                    prompt=stop_hook.STOP_WORD,
-                    token=token,
-                    author=author,
-                    message_id=f"{message_id}{_INJECT_STOP_SUFFIX}",
-                )
-                failures = 0
-                while True:
-                    try:
-                        started = stopper.submit()
-                        break
-                    except inject.InjectUnavailable as exc:
-                        # Retried as the opening exchange is; the door
-                        # dedupes on the message id, so a repeat of a POST
-                        # it took gets the first answer.
-                        failures += 1
-                        _log.warning(
-                            "inject: stop on %s failed in transport (%d/%d): %s",
-                            exchange.conversation,
-                            failures,
-                            _MAX_TRANSPORT_FAILURES,
-                            exc,
-                        )
-                        if not exc.retryable or failures >= _MAX_TRANSPORT_FAILURES:
-                            # The door, not the agent: infrastructure, never graded.
-                            raise _TransportError(
-                                f"the stop could not reach the gateway: {exc}"
-                            ) from exc
-                        try:
-                            _tunnel(reset=True)
-                        except RuntimeError as pf_exc:
-                            _log.warning("inject: port-forward respawn failed before retry: %s", pf_exc)
-                if started:
-                    # A task means the gateway read the word as an ask, not a
-                    # stop; bound it like any stray.
-                    stopper.cancel(started, settle=0)
-                    return False, f"the gateway started task {started} for the stop instead of stopping"
-                if stopper.refusal != inject.REFUSAL_NO_TASK:
-                    return False, f"{inject.refusal_detail(stopper.refusal)}: {stopper.note}"
-                return True, stopper.note
+            def _sent_mid_turn() -> tuple[bool, str]:
+                """What the mid-turn stop said, sent from the opening exchange's polls."""
+                if not mid_turn_sent:
+                    return False, "the opening turn ended before the stop could land while it ran"
+                sent, detail, unreachable = mid_turn_sent[0]
+                if unreachable is not None:
+                    raise unreachable
+                return sent, detail
 
+            send = _send_stop if stop.mid_turn_after is None else _sent_mid_turn
             context_id = exchange.probe.context_id if exchange.probe else ""
             try:
                 self._stop_after_first_card(
                     result,
                     board.api_session_id(context_id) if context_id else "",
                     stop,
-                    send_stop=_send_stop,
+                    send_stop=send,
                     poll_interval=poll_interval,
                 )
             except _TransportError as exc:
@@ -3042,7 +3094,8 @@ class KubeAgentsHarness(AgentHarness):
         """Stop the work a stopped ask filed, then watch it for the window (:mod:`stop_hook`).
 
         The opening turn has ended. ``send_stop`` sends ``stop`` on the
-        conversation first: the gateway finds the conversation's cards
+        conversation first, or, for a mid-turn stop, reports the ``stop``
+        already sent while that turn ran: the gateway finds the conversation's cards
         itself, so the stop needs no card ids and reaches a card the turn
         saved a moment late. A stop the gateway took is then watched for the
         observation window with no further turn, polling the board, and graded
@@ -3054,7 +3107,8 @@ class KubeAgentsHarness(AgentHarness):
         store does not know, or a stop that never reached the gateway makes
         the run infrastructure. :data:`stop_hook.STOP_ENTRY` goes on the
         trajectory either way, ``completed`` only when a card was filed and
-        the gateway took the word as a stop.
+        the gateway took the word as a stop; for a mid-turn stop, a stop that
+        landed on a turn that then filed no card completes both entries.
         """
         entry: dict[str, Any] = {"name": stop_hook.STOP_ENTRY, "args": {"session": session_id}}
         result.trajectory.append(entry)
@@ -3135,6 +3189,19 @@ class KubeAgentsHarness(AgentHarness):
                 why = "the session is not in the store"
             entry.update(status="error", result=f"{why}; stop sent: {sent} ({detail})")
             raise _TransportError(f"{stop_hook.STOP_ENTRY}: {why}; stop sent: {sent} ({detail})")
+        if not cards and stop.mid_turn_after is not None and sent:
+            # Stopped before it filed one: the stop working, not a miss.
+            result.trajectory.append({
+                "name": stop_hook.CARDS_STOPPED_ENTRY,
+                "args": {"statuses": {}},
+                "status": "completed",
+                "result": "the stopped turn filed no card",
+            })
+            return
+        if not cards and stop.mid_turn_after is not None:
+            # The stop never landed while the turn ran: its reason is the miss.
+            result.errors.append(f"{stop_hook.STOP_ENTRY}: {detail}")
+            return
         if not cards:
             # The session is known and filed nothing: the agent's miss, graded.
             entry.update(status="error", result="nothing was stopped: the turn filed no card")
