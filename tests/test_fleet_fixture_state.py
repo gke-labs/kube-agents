@@ -61,16 +61,25 @@ ffs = _load_module()
 
 
 class _SteppedClock:
-    """A stand-in for the script's `time`: monotonic() moves only by sleep()."""
+    """A stand-in for the script's `time`: monotonic() moves only by sleep().
 
-    def __init__(self) -> None:
+    `between_passes` runs at every sleep, so a test can assert what the script
+    has not done yet. A sleep that does not move the clock, or one past a
+    hundred, fails rather than looping forever on a clock that never runs out.
+    """
+
+    def __init__(self, between_passes=lambda: None) -> None:
         self.now = 0.0
         self.sleeps: list[float] = []
+        self.between_passes = between_passes
 
     def monotonic(self) -> float:
         return self.now
 
     def sleep(self, seconds: float) -> None:
+        assert seconds > 0, f"sleep({seconds}) does not move the clock; the loop would never reach its deadline"
+        assert len(self.sleeps) < 100, "a hundred sleeps without reaching the deadline"
+        self.between_passes()
         self.sleeps.append(seconds)
         self.now += seconds
 
@@ -836,16 +845,21 @@ class PassTest(_Harness):
         world["kubectl"]["pod?app=payments-api"] = _pods(_pod(restarts=0, last_reason=None, phase="Pending"))
         # In-process on a clock that moves only when the script sleeps, so the
         # passes are counted rather than raced against the wall clock (#4415):
-        # with --wait 1 --interval 0.25 the loop reads at 0, 0.25, 0.5, 0.75
-        # and 1.0, five passes on any machine, and only then records the drift.
-        clock = _SteppedClock()
+        # with --wait 1.125 --interval 0.25 the loop reads at 0, 0.25, 0.5,
+        # 0.75, 1.0 and 1.125 (the last sleep cut to what was left), six passes
+        # on any machine, with no drift file written until the last.
+        def nothing_recorded_yet():
+            assert self.drift_files() == {}, "drift recorded before the deadline"
+
+        clock = _SteppedClock(nothing_recorded_yet)
         self.world.write_text(json.dumps(world))
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "STUB_LOG": str(self.log), "STUB_WORLD": str(self.world)}
-        with mock.patch.object(ffs, "time", clock), mock.patch.dict(os.environ, env), contextlib.redirect_stderr(io.StringIO()):
-            assert ffs.run(self.fleet, _CATALOG, None, wait=1.0, interval=0.25) == 0
-        assert clock.sleeps == [0.25] * 4
-        assert set(self.drift_files()) == {"crashloop-workload"}
-        assert self.log.read_text().count("get pod -l app=payments-api") == 5
+        stderr = io.StringIO()
+        with mock.patch.object(ffs, "time", clock), mock.patch.dict(os.environ, env), contextlib.redirect_stderr(stderr):
+            assert ffs.run(self.fleet, _CATALOG, None, wait=1.125, interval=0.25) == 0, stderr.getvalue()
+        assert clock.sleeps == [0.25] * 4 + [0.125], stderr.getvalue()
+        assert set(self.drift_files()) == {"crashloop-workload"}, stderr.getvalue()
+        assert self.log.read_text().count("get pod -l app=payments-api") == 6
 
     def test_an_unreadable_subject_is_not_checked_and_leaves_no_drift_file(self):
         world = _healthy_world()
