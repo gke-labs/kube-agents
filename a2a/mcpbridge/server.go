@@ -1486,7 +1486,7 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		}
 		if !found {
 			if near := s.store.ConversationNearMisses(target); len(near) > 0 {
-				return "", "", "", fmt.Errorf("no conversation is saved under exactly %q, and delete takes only an exact alias or console token; nothing was deleted. Close matches: `%s`. Retry with one of them",
+				return "", "", "", fmt.Errorf("no conversation is saved under exactly %q, and delete takes only an exact alias or console token; nothing was deleted. Close matches: `%s`. Retry with one of them, or call list for the exact aliases",
 					target, strings.Join(near, "`, `"))
 			}
 			// Not in the local table and like none of it: the server may still hold the name,
@@ -1499,7 +1499,8 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 			fwd, _ := json.Marshal(map[string]any{"action": actionDelete, "alias": target})
 			txt, title, md, rErr := sess.callRemoteTool(ctx, ToolManageSession, fwd, meta, s.store.Snapshot(), nil)
 			if rErr != nil {
-				return txt, title, md, rErr
+				// delete never guesses: point the model at list for the exact aliases.
+				return txt, title, md, fmt.Errorf("%w (nothing was deleted: delete takes one exact alias; call manage_session list for the exact aliases, then delete each one)", rErr)
 			}
 			return FirstNonEmptyStr(txt, fmt.Sprintf("Deleted conversation **`%s`** on the in-cluster server.\n", target)), title, md, nil
 		}

@@ -331,3 +331,48 @@ func TestManageSessionSwitchRefusesADedicatedSubagentConversation(t *testing.T) 
 		t.Fatalf("switch c2: %+v, active %q", res, srv.Store().Snapshot().ActiveConversation)
 	}
 }
+
+// The tic-tac-toe demo's "delete both players": delete never guesses which conversations a
+// description means. A description deletes nothing and tells the model to list first; the model
+// then deletes each exact alias the list shows.
+func TestManageSessionDeleteByADescriptionPointsToListThenExactDeletesWork(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	putConversations(t, srv,
+		ConversationEntry{Alias: "player-x", Token: MintConversationToken()},
+		ConversationEntry{Alias: "player-o", Token: MintConversationToken()},
+	)
+	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"both players"}`))
+	if !res.IsError || !strings.Contains(res.Content[0].Text, "list") {
+		t.Fatalf("delete \"both players\": %+v; want it refused as an error that points to list", res)
+	}
+	for _, alias := range []string{"player-x", "player-o"} {
+		if _, ok := srv.Store().LookupConversation(alias); !ok {
+			t.Fatalf("a delete by description removed %s", alias)
+		}
+	}
+	for _, alias := range []string{"player-x", "player-o"} {
+		res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"`+alias+`"}`))
+		if res.IsError {
+			t.Fatalf("delete %s by its exact alias: %+v", alias, res)
+		}
+		if _, ok := srv.Store().LookupConversation(alias); ok {
+			t.Fatalf("%s is still saved after its exact delete", alias)
+		}
+	}
+}
+
+func TestManageSessionDescriptionSaysListThenDeleteExactAliases(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	for _, tool := range srv.toolDefinitions() {
+		if tool.Name != ToolManageSession {
+			continue
+		}
+		if !strings.Contains(tool.Description, "list first") || !strings.Contains(tool.Description, "exact alias") {
+			t.Fatalf("manage_session description %q; want it to say to list first and delete exact aliases", tool.Description)
+		}
+		return
+	}
+	t.Fatal("manage_session is not advertised")
+}

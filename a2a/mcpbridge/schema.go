@@ -69,6 +69,11 @@ func (s *Server) resourceDefinitions() []Resource {
 	return defs
 }
 
+// manageSessionDeleteGuidance tells the model how a delete by description works: delete never
+// guesses which conversations a phrase like "both players" means, so the model lists first and
+// deletes each exact alias.
+const manageSessionDeleteGuidance = "delete removes exactly one conversation per call and never guesses: to delete by a description (\"both players\", \"the old triage sessions\"), call list first, then delete each exact alias it shows. A name that is not an exact alias or console token deletes nothing and returns close matches, if any."
+
 func (s *Server) toolDefinitions() []ToolDefinition {
 	defs := []ToolDefinition{
 		{
@@ -238,11 +243,11 @@ func manageSessionDefinition() ToolDefinition {
 	}
 	props["alias"] = map[string]any{
 		"type":        "string",
-		"description": "Conversation alias (e.g. 'upgrade-triage', 'default') for " + aliasFor + ".",
+		"description": "Conversation alias (e.g. 'upgrade-triage', 'default') for " + aliasFor + ". For delete, one exact alias or console token as list shows it.",
 	}
 	return ToolDefinition{
 		Name:        ToolManageSession,
-		Description: description,
+		Description: description + " " + manageSessionDeleteGuidance,
 		InputSchema: map[string]any{
 			"type":       "object",
 			"properties": props,
