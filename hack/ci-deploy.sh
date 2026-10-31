@@ -334,7 +334,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next ci-kube-agents-eval-nightly-gitlab-ce-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it

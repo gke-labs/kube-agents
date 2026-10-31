@@ -329,6 +329,14 @@ class GitLabLaneTest(unittest.TestCase):
         self.assertNotIn("TASK ", result.stdout)
         self.assertIn("EVAL_FORGE=ghes runs the lane list eval/ghes-cases.txt, which this checkout does not have", result.stderr)
 
+    def test_gitlab_ce_runs_the_gitlab_lanes_list(self):
+        """gitlab-ce maps to eval/gitlab-cases.txt, the gitlab.com lane's list:
+        the cases grade the forge and not where it is."""
+        result = load_matrix({"EVAL_FORGE": "gitlab-ce"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("EVAL_FORGE=gitlab-ce: the gitlab-ce lane runs", result.stdout + result.stderr)
+        self.assertIn("(eval/gitlab-cases.txt)", result.stdout + result.stderr)
+
     def test_a_ghes_list_in_the_checkout_runs_as_the_ghes_lane(self):
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
