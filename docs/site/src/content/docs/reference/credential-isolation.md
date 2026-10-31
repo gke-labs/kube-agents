@@ -79,6 +79,7 @@ The sandbox image contains **wrapper binaries** only for `gcloud` and `kubectl`.
 | `kubeagents-credential-proxy-a2a-chat` | The A2A gateway, when it consumes Google Chat under `mode: next`.                                                                                                                                                                                                                                 |
 | `kubeagents-credential-proxy-session`  | The session pods, under the operator's [`A2A_SESSION_CLUSTER_VIEW` flag](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md#switches-inside-next) (set on the operator as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes). |
 | `kubeagents-credential-proxy-profile`  | Each profile tier's ServiceAccount, under `mode: next` with an `AgentProfile` bound.                                                                                                                                                                                                              |
+| `kubeagents-credential-proxy-mcp`      | The [A2A MCP server](/kube-agents/reference/a2a-mcp/)'s pod, under `mode: next` with that server on. It reaches `/v1/vcs/` alone, and only its `proposal-view` verb.                                                                                                                              |
 
 Every path on the credentialed listener except `/healthz` requires it, and an unidentified caller gets an undifferentiated `401`. The metrics-only listener on 8766 is unauthenticated, like `/healthz`: its readers, the managed-Prometheus collector and the operator's usage poller, hold no caller token, and the broker's NetworkPolicy is what bounds who reaches the port. It serves counters with static labels and holds no route, credential or policy.
 
@@ -189,6 +190,7 @@ Pod-wide `automountServiceAccountToken` is `false` on every pod of today's stack
 
 | Holder                     | Token                                                            | Where, and when                                                                                                                                                                                         |
 | -------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The sandbox                | Broker token, audience `kubeagents-credential-proxy`             | Always; the token every proxied `kubectl` and `gcloud` presents.                                                                                                                                        |
 | The broker                 | Its own, audience `kubeagents-credential-proxy`                  | Always.                                                                                                                                                                                                 |
 | The gateway                | Broker token, audience `kubeagents-credential-proxy-chat`        | Always.                                                                                                                                                                                                 |
 | The A2A gateway            | Broker token, audience `kubeagents-credential-proxy-a2a-chat`    | `/var/run/secrets/a2a-chat-relay/token`, under `mode: next` with Google Chat enabled.                                                                                                                   |
@@ -198,7 +200,7 @@ Pod-wide `automountServiceAccountToken` is `false` on every pod of today's stack
 | Each session pod           | Broker token, audience `kubeagents-credential-proxy-session`     | Under the operator's [`A2A_SESSION_CLUSTER_VIEW` flag](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md#switches-inside-next).                                        |
 | The operator's manager pod | Audience `a2a-bus`                                               | `/var/run/secrets/a2a-bus/token`, in every mode. It authenticates to nothing until a `mode: next` identity map carries the operator's entry, which publishes `AgentProfile` cards on the A2A directory. |
 
-None is mounted in the sandbox or the dashboard.
+None is mounted in the dashboard.
 
 ## Request paths
 
