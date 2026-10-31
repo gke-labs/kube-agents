@@ -37,6 +37,7 @@ _SCHEMA = _CHART / "values.schema.json"
 _PREFLIGHT_TPL = _CHART / "templates" / "quota-preflight.yaml"
 _HELPERS = _CHART / "templates" / "_helpers.tpl"
 _SPAWN_GO = _ROOT / "a2a" / "gateway" / "spawn.go"
+_COMMON_TYPES = _ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _A2A_MANIFESTS = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
 _A2A_BRIDGE = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_bridge.go"
 _A2A_CONSOLE = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_console.go"
@@ -1670,12 +1671,13 @@ class DocumentedFootprintTest(unittest.TestCase):
         nats_mem = self._extract_match(
             r'a2aNATSMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aNATSMemoryRequest"
         )
+        # The bus's default server count (spec.harness.tuning.busReplicas
+        # unset), which the StatefulSet renders through a2aNATSReplicas.
         nats_replicas = int(
             self._extract_match(
-                r'buildA2ANATSStatefulSet.*?Replicas:\s*ptr\.To\(int32\((\d+)\)\)',
-                manifests_src,
-                "NATS replicas",
-                flags=re.DOTALL,
+                r'DefaultBusReplicas\s*=\s*(\d+)',
+                _COMMON_TYPES.read_text(),
+                "DefaultBusReplicas",
             )
         )
         gateway_cpu = self._extract_match(
@@ -1808,7 +1810,11 @@ class DocumentedFootprintTest(unittest.TestCase):
         standing_mem_gib = math.floor((standing_mem_bytes / gib) * 10 + 0.5) / 10
 
         # Assert individual workload clauses:
-        self.assertIn(f"NATS ({nats_cpu} CPU, {nats_mem} memory)", page)
+        number_words = {1: "one", 2: "two", 3: "three"}
+        self.assertIn(
+            f"NATS ({number_words[nats_replicas]} servers by default, {nats_cpu} CPU and {nats_mem} memory each",
+            page,
+        )
         self.assertIn(
             f"two auth callout replicas ({callout_cpu} CPU, {callout_mem} memory each)",
             page,
@@ -1855,7 +1861,7 @@ class DocumentedFootprintTest(unittest.TestCase):
         nats_claim_prose = (
             f"a {jetstream_gib} GiB JetStream persistent volume claim"
             if nats_replicas == 1
-            else f"{nats_replicas} {jetstream_gib} GiB JetStream persistent volume claims"
+            else f"{number_words[nats_replicas]} {jetstream_gib} GiB JetStream persistent volume claims"
         )
         self.assertIn(nats_claim_prose, page)
 
@@ -1875,7 +1881,8 @@ class DocumentedFootprintTest(unittest.TestCase):
         # Assert namespace-wide ResourceQuota capping pods:
         quota_clause = (
             rf"renders a namespace-wide `ResourceQuota` on `pods` of "
-            rf"`maxSessions \+ {headroom}` \({max_sessions + headroom} pods by default"
+            rf"`maxSessions \+ {headroom}`, plus one for each NATS server past the first "
+            rf"\({max_sessions + headroom + nats_replicas - 1} pods by default"
         )
         self.assertRegex(page, quota_clause)
 

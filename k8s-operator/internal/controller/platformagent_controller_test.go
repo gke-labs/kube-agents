@@ -761,6 +761,9 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 				"app": "test-agent-unschedulable-gateway",
 			},
 		},
+		// As the agent pod renders it: the CR's RuntimeClass on the pod,
+		// which is what lets the scan blame the RuntimeClass.
+		Spec: corev1.PodSpec{RuntimeClassName: ptr.To("gvisor")},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodPending,
 			Conditions: []corev1.PodCondition{

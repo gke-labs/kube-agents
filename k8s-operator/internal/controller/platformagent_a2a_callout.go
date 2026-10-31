@@ -881,9 +881,10 @@ func buildA2ACalloutPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisrupt
 			MaxUnavailable: ptr.To(intstr.FromInt32(a2aCalloutPDBMaxUnavailable)),
 			Selector:       &metav1.LabelSelector{MatchLabels: a2aCalloutPodSelector(agent)},
 			// AlwaysAllow rather than the IfHealthyBudget default, for the
-			// verifier's reason. /readyz needs the bus connection, and the
-			// bus is a one-replica StatefulSet, so while it is down, or its
-			// PVC is Pending, BOTH callouts are Running and NotReady. Under
+			// verifier's reason. /readyz needs the bus connection, so while
+			// the bus is down (a single-server bus restarting, or every
+			// server of a cluster gone), or its PVC is Pending, BOTH
+			// callouts are Running and NotReady. Under
 			// the default that is currentHealthy 0 against desiredHealthy
 			// 1, zero disruptions allowed, and every eviction of either pod
 			// refused until the bus returns: a budget holding a node's drain

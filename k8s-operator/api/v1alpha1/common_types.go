@@ -875,6 +875,28 @@ type TuningSpec struct {
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
 
+	// BusReplicas is how many NATS servers run the A2A bus under mode: next,
+	// and so how many copies JetStream keeps of every stream and bucket: 3
+	// runs a cluster with R3 streams, which keeps the bus up through a node
+	// drain, upgrade or eviction that moves one server; 1 runs a single
+	// server with R1 streams, which is down for as long as its pod restarts.
+	// 1 is for a throwaway, single-node or cost-bound install that accepts
+	// that outage; it saves two NATS pods and two 40Gi volumes.
+	//
+	// Unset, an install keeps the count its bus already runs, so an install
+	// from before the three-server default stays on one server, and a new bus
+	// gets three (status.busReplicas shows which applies).
+	//
+	// Set, it decides the count of a bus that does not exist yet. An existing
+	// bus keeps the count it runs: NATS cannot carry a single server's streams
+	// into a cluster or a cluster's into a single server, and the migration
+	// that would keep them is not here yet, so a count that differs is refused
+	// (the A2ABusConversionRefused condition; the admission webhook refuses the
+	// edit) rather than emptying the bus (docs/designs/spec-nats-deployment.md).
+	// +kubebuilder:validation:Enum=1;3
+	// +optional
+	BusReplicas *int `json:"busReplicas,omitempty"`
+
 	// Profiles sizes AgentProfile work (#3655): the install-wide ceiling on
 	// concurrent profile tasks and the warm workers kept per interactive
 	// (profile, tier). Until the sizing budget exists these are fixed,
@@ -968,6 +990,11 @@ type ProfileTuning struct {
 	// +optional
 	WarmReplicas *int `json:"warmReplicas,omitempty"`
 }
+
+// DefaultBusReplicas is the NATS server count of a new bus when
+// spec.harness.tuning.busReplicas is absent: a three-server cluster with R3
+// streams. An existing bus keeps its own count.
+const DefaultBusReplicas = 3
 
 // MaxProfileCeiling is ProfileTuning.Ceiling's maximum, which the ceiling
 // also holds to when it defaults to maxInProgress.
@@ -2311,6 +2338,14 @@ type AgentStatus struct {
 	// StorageStatus tracks PVC binding state and the data volume's usage.
 	// +optional
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
+
+	// BusReplicas is the A2A bus's NATS server count under spec.mode: next:
+	// the count the bus already runs, which spec.harness.tuning.busReplicas
+	// does not change; for a new bus, that field, or 3. Re-derived from the
+	// cluster on every reconcile, so it is a reading of the bus rather than a
+	// setting.
+	// +optional
+	BusReplicas int32 `json:"busReplicas,omitempty"`
 
 	// Note, deliberately not a doc comment — the blank line below keeps it out of the
 	// CRD description that `kubectl explain` prints. As on the three status structs

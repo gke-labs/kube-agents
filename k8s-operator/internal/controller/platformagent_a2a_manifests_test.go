@@ -285,8 +285,8 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	if sts.Name != "test-agent-a2a-nats" {
 		t.Errorf("statefulset name = %q", sts.Name)
 	}
-	if got := *sts.Spec.Replicas; got != 1 {
-		t.Errorf("replicas = %d, want 1 (single node R1 is the dev posture)", got)
+	if got := *sts.Spec.Replicas; got != int32(agentv1alpha1.DefaultBusReplicas) {
+		t.Errorf("replicas = %d, want %d (a three-server cluster is the default)", got, agentv1alpha1.DefaultBusReplicas)
 	}
 	if len(sts.Spec.VolumeClaimTemplates) != 1 {
 		t.Fatalf("expected one volumeClaimTemplate (JetStream file store on a PV), got %d", len(sts.Spec.VolumeClaimTemplates))
@@ -1051,8 +1051,11 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		t.Errorf("policy types = %v, want ingress only", np.Spec.PolicyTypes)
 	}
 
-	if len(np.Spec.Ingress) != 2 {
-		t.Fatalf("expected exactly two ingress rules (4222 for bus clients, 9222 for the console server), got %d: %+v",
+	// 4222 for bus clients, 9222 for the console server, and 6222 between the
+	// servers of the default three-server bus (TestTheBusFenceAdmitsRoutes
+	// FromItsOwnServersOnly has the third).
+	if len(np.Spec.Ingress) != 3 {
+		t.Fatalf("expected exactly three ingress rules (4222 for bus clients, 9222 for the console server, 6222 for routes), got %d: %+v",
 			len(np.Spec.Ingress), np.Spec.Ingress)
 	}
 	rule := np.Spec.Ingress[0]
@@ -1550,16 +1553,25 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 		t.Fatalf("quota does not bound pods: %v", hard)
 	}
 	// Default gateway cap 10 + the fixed headroom for the rest of the
-	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 26 {
-		t.Fatalf("default quota = %d, want 26 (cap 10 + headroom 16)", pods.Value())
+	// namespace (base stack, rollout surge, race overshoot), which counts one
+	// NATS server, + the default bus's other two.
+	if pods.Value() != 28 {
+		t.Fatalf("default quota = %d, want 28 (cap 10 + headroom 16 + 2 more NATS servers)", pods.Value())
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
+	if pods.Value() != 20 {
+		t.Fatalf("tuned quota = %d, want 20 (cap 2 + headroom 16 + 2 more NATS servers)", pods.Value())
+	}
+
+	// A single-server bus adds no servers on top of the headroom.
+	one := 1
+	agent.Spec.Harness.Tuning.BusReplicas = &one
+	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
 	if pods.Value() != 18 {
-		t.Fatalf("tuned quota = %d, want 18 (cap 2 + headroom 16)", pods.Value())
+		t.Fatalf("single-server quota = %d, want 18 (cap 2 + headroom 16)", pods.Value())
 	}
 }
 
@@ -5931,7 +5943,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	// callout issues exactly the callout rows.
 	wantUsers := append(slices.Clone(staticRows), a2aCalloutConfUser, sysUser)
 	slices.Sort(wantUsers)
-	gotUsers := a2aConfUserNames(conf)
+	// Users only: the cluster block renders none (routes authenticate by
+	// certificate, TestTheRoutesAuthenticateByCertificateOnly), and it is cut
+	// out so a stray "user:" in it would not pass for an account user.
+	gotUsers := a2aConfUserNames(a2aClusterBlockRe.ReplaceAllString(conf, ""))
 	slices.Sort(gotUsers)
 	if !slices.Equal(gotUsers, wantUsers) {
 		t.Fatalf("nats.conf users = %v, want %v; a new user needs a row in this test's table before it ships, and a row with no user is stale", gotUsers, wantUsers)
@@ -7384,8 +7399,10 @@ func TestTheProvisionJobRunsOnAnOldTemplateReplica(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Two pods, one ready, none on the current template: a roll in progress
-	// or wedged at maxUnavailable 0.
+	// or wedged at maxUnavailable 0. The bus is up; this test is about the
+	// callout gate alone.
 	reportCalloutStatus(t, ctx, cl, agent, 2, 1, 0)
+	reportBusRolledOut(t, ctx, cl, agent)
 	state, err := r.reconcileA2A(ctx, agent)
 	if err != nil {
 		t.Fatal(err)

@@ -24,10 +24,12 @@
 # (k8s-operator/internal/controller/platformagent_a2a_manifests.go, cleanupA2A
 # and the a2aPreBusTeardown and a2aBusTeardown lists it walks, neither of
 # which names either object):
-#   - the JetStream PVC data-<cr>-a2a-nats-0. The NATS StatefulSet's
+#   - the JetStream PVC data-<cr>-a2a-nats-0 (a three-server bus keeps -1 and
+#     -2 the same way; this run checks -0, which every bus has). The NATS StatefulSet's
 #     volumeClaimTemplate (a2aNATSDataClaim, "data") stamps it out, so it has
-#     no owner reference, and the StatefulSet sets no PVC retention policy,
-#     whose default keeps the claim when the StatefulSet goes. The flip
+#     no owner reference, and the StatefulSet's PVC retention policy keeps
+#     claims when the StatefulSet itself is deleted (WhenDeleted: Retain; a
+#     scale-down deletes the claims it removes, which a flip never does). The flip
 #     forward renders the same template under the same StatefulSet name, and
 #     the StatefulSet controller binds the claim of that name that is already
 #     there.

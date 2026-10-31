@@ -337,6 +337,10 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	allErrs = append(allErrs, storageErrs...)
 	warnings = append(warnings, storageWarnings...)
 
+	// 6. The bus's server count, on an update: an edit asking an existing bus
+	// for another count is refused here as the operator refuses it.
+	allErrs = append(allErrs, validateBusReplicas(oldObj, platformAgent)...)
+
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
 			schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
@@ -346,6 +350,42 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	}
 
 	return warnings, nil
+}
+
+// validateBusReplicas refuses an update that sets
+// spec.harness.tuning.busReplicas to a count other than the one the existing
+// bus runs, with the operator's own message (controller.BusConversionRefusedMessage):
+// converting a bus empties it until #4225 brings the migration. Best effort:
+// the running count is the stored object's status.busReplicas, which an older
+// CRD prunes and a flip to today clears, so the operator's refusal on every
+// pass is the enforcement and this only refuses the edit early. An update that
+// leaves the field as it was is let through, so a CR the operator already
+// holds to its count can still be edited otherwise.
+func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
+	// Under today the field is inert and the bus is torn down, so an edit
+	// that flips to today, or edits a today CR whose count is not yet
+	// cleared, converts nothing.
+	if oldObj == nil || platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != "next" {
+		return nil
+	}
+	running := oldObj.Status.BusReplicas
+	asked := busReplicasField(platformAgent)
+	if (running != 1 && running != 3) || asked == nil || int32(*asked) == running { // #nosec G115 -- the CRD admits 1 or 3
+		return nil
+	}
+	if previous := busReplicasField(oldObj); previous != nil && *previous == *asked {
+		return nil
+	}
+	return field.ErrorList{field.Forbidden(field.NewPath("spec", "harness", "tuning", "busReplicas"),
+		controller.BusConversionRefusedMessage(int32(*asked), running)+ // #nosec G115 -- the CRD admits 1 or 3
+			" (The operator holds the bus to its count on every pass; this admission check only refuses the edit early.)")}
+}
+
+func busReplicasField(pa *agentv1alpha1.PlatformAgent) *int {
+	if pa.Spec.Harness == nil || pa.Spec.Harness.Tuning == nil {
+		return nil
+	}
+	return pa.Spec.Harness.Tuning.BusReplicas
 }
 
 // validateStorageSize refuses a spec.storage.size of zero or less or above
