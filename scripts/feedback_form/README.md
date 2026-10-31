@@ -123,7 +123,9 @@ that lost Issues: write (422 minting the token), and a GitHub outage.
   from `agents/chat/SOUL.md`; ship the `feedback-prompt` cron job with `enabled: false`
   (the retirement path in `agents/platform/cron/README.md`), since
   `agents/platform/scripts/feedback_prompt.py` posts the link once to every install, and
-  remove `FORM_URL` from that script; then delete `tests/test_feedback_reference.py`, which
+  remove `FORM_URL` from that script; drop the feedback form from the refused requester's
+  hand-over in `.agents/skills/upgrade-kube-agents/SKILL.md` and from its pin in
+  `tests/test_upgrade_skill_contract.py`; then delete `tests/test_feedback_reference.py`, which
   fails until the rest of that is done. Running installs keep answering with the link until
   they take an image built after the change. If this directory goes too, drop its mention
   from the tree at the top of `docs/README.md`.
