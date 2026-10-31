@@ -2,12 +2,14 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
@@ -352,5 +354,87 @@ func TestAMigrationHoldsTheProvisionJob(t *testing.T) {
 	done.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Phase: string(busMigrationDone)}
 	if busMigrationHoldsProvision(done) {
 		t.Error("a finished migration still holds the provision Job")
+	}
+}
+
+// The condition says what the run is doing: True while it runs (with the
+// freeze named when writes are frozen), False when it ended without
+// converting or stopped for a person (with the step), absent once Done.
+func TestTheBusMigratingConditionFollowsTheRun(t *testing.T) {
+	for _, tc := range []struct {
+		leg        busMigrationLeg
+		phase      busMigrationPhase
+		abandoning bool
+		message    string
+		present    bool
+		status     metav1.ConditionStatus
+		reason     string
+		contains   []string
+	}{
+		{busMigrationGrow, busMigrationSnapshot, false, "", true, metav1.ConditionTrue, "InProgress", []string{"from 1 NATS servers to 3", "Snapshotting", "writes are frozen"}},
+		{busMigrationShrink, busMigrationPinning, false, "", true, metav1.ConditionTrue, "InProgress", []string{"from 3 NATS servers to 1", "Pinning"}},
+		{busMigrationGrow, busMigrationRollingBack, true, "", true, metav1.ConditionTrue, "InProgress", []string{"undoing", "writes are frozen"}},
+		{busMigrationGrow, busMigrationAbandoned, true, "", true, metav1.ConditionFalse, "Abandoned", []string{"runs 1 servers with its data"}},
+		{busMigrationGrow, busMigrationFailed, true, "restore it by hand", true, metav1.ConditionFalse, "Failed", []string{"restore it by hand"}},
+		{busMigrationGrow, busMigrationDone, false, "", false, "", "", nil},
+	} {
+		agent := a2aTestAgent()
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(tc.leg), Phase: string(tc.phase), Abandoning: tc.abandoning, Message: tc.message}
+		cond, ok := busMigratingCondition(agent)
+		if ok != tc.present {
+			t.Errorf("%s %s: present %v, want %v", tc.leg, tc.phase, ok, tc.present)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if cond.Status != tc.status || cond.Reason != tc.reason {
+			t.Errorf("%s %s: %s/%s, want %s/%s", tc.leg, tc.phase, cond.Status, cond.Reason, tc.status, tc.reason)
+		}
+		for _, s := range tc.contains {
+			if !strings.Contains(cond.Message, s) {
+				t.Errorf("%s %s: message %q lacks %q", tc.leg, tc.phase, cond.Message, s)
+			}
+		}
+		if tc.leg == busMigrationShrink && strings.Contains(cond.Message, "frozen") {
+			t.Errorf("three to one reports a freeze: %q", cond.Message)
+		}
+	}
+}
+
+// The status write carries the run and its condition, and drops the
+// condition once the run converted the bus.
+func TestTheStatusWriteCarriesTheMigration(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "1-1", Phase: string(busMigrationHashing), ObservedGeneration: 1}
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{done: true}); err != nil {
+		t.Fatal(err)
+	}
+	live := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+		t.Fatal(err)
+	}
+	if live.Status.BusMigration == nil || live.Status.BusMigration.Phase != string(busMigrationHashing) {
+		t.Fatalf("status.busMigration after the write: %+v", live.Status.BusMigration)
+	}
+	if c := meta.FindStatusCondition(live.Status.Conditions, a2aBusMigratingConditionType); c == nil || c.Status != metav1.ConditionTrue {
+		t.Fatalf("condition after the write: %+v", c)
+	}
+	agent = live
+	agent.Status.BusMigration.Phase = string(busMigrationDone)
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{done: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+		t.Fatal(err)
+	}
+	if c := meta.FindStatusCondition(live.Status.Conditions, a2aBusMigratingConditionType); c != nil {
+		t.Errorf("condition after a Done run: %+v, want it gone", c)
+	}
+	if live.Status.BusMigration == nil || live.Status.BusMigration.Phase != string(busMigrationDone) {
+		t.Errorf("the Done run was not written: %+v", live.Status.BusMigration)
 	}
 }

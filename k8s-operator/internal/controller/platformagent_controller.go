@@ -22,6 +22,7 @@ import (
 	goerrors "errors"
 	"fmt"
 	"net"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -4245,6 +4246,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
 		a2aBusConversionRefusedConditionCurrent(agent, conversionMsg) &&
+		busMigratingConditionCurrent(agent) &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) {
 		return nil
 	}
@@ -4254,6 +4256,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live)) &&
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
 			a2aBusConversionRefusedConditionCurrent(live, conversionMsg) &&
+			reflect.DeepEqual(live.Status.BusMigration, agent.Status.BusMigration) && busMigratingConditionCurrent(live) &&
 			(r.busReplicasStatusPruned(agent) || live.Status.BusReplicas == agent.Status.BusReplicas)
 	}) {
 		return nil
@@ -4265,6 +4268,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ABusConversionRefusedCondition(agent, conversionMsg, now)
+	setBusMigratingCondition(agent, now)
 	writtenBusReplicas := agent.Status.BusReplicas
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return err
@@ -4613,6 +4617,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// advisory, so Ready stands on the bus that runs.
 	conversionRefusedMsg := a2aBusConversionRefusedMessage(agent)
 	conversionRefusedUnchanged := a2aBusConversionRefusedConditionCurrent(agent, conversionRefusedMsg)
+	busMigratingUnchanged := busMigratingConditionCurrent(agent)
 
 	// The A2AGateway condition, same class as EventWatcher and for the same
 	// reason it needs its own term: on an upgraded install, the way back
@@ -4682,6 +4687,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		eventWatcherUnchanged &&
 		homeChannelUnsetUnchanged &&
 		conversionRefusedUnchanged &&
+		busMigratingUnchanged &&
 		hostPathDroppedUnchanged &&
 		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
@@ -4760,6 +4766,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	setHomeChannelUnsetCondition(agent, homeChannelUnsetMsg, now)
 	setA2ABusConversionRefusedCondition(agent, conversionRefusedMsg, now)
+	setBusMigratingCondition(agent, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 

@@ -9,6 +9,8 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -322,4 +324,65 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 func busMigrationHoldsProvision(agent *agentv1alpha1.PlatformAgent) bool {
 	run := agent.Status.BusMigration
 	return run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase))
+}
+
+// a2aBusMigratingConditionType reports the bus's migration: True while one
+// runs, False when the last one ended without converting (Abandoned) or
+// stopped for a person (Failed), and absent once one converted the bus or
+// none has run.
+const a2aBusMigratingConditionType = "A2ABusMigrating"
+
+// busMigratingCondition is the condition this pass's run calls for; ok is
+// false when it is to be absent.
+func busMigratingCondition(agent *agentv1alpha1.PlatformAgent) (cond metav1.Condition, ok bool) {
+	run := agent.Status.BusMigration
+	if run == nil || !a2aStackRendering(agent) {
+		return metav1.Condition{}, false
+	}
+	leg, phase := busMigrationLeg(run.Leg), busMigrationPhase(run.Phase)
+	from, to := 3, 1
+	if leg == busMigrationGrow {
+		from, to = 1, 3
+	}
+	switch phase {
+	case busMigrationDone:
+		return metav1.Condition{}, false
+	case busMigrationAbandoned:
+		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Abandoned",
+			Message: fmt.Sprintf("the migration from %d NATS servers to %d did not complete and was undone; the bus runs %d servers with its data. Change the spec to try again.", from, to, from)}, true
+	case busMigrationFailed:
+		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Failed",
+			Message: fmt.Sprintf("the migration from %d NATS servers to %d stopped: %s", from, to, run.Message)}, true
+	}
+	msg := fmt.Sprintf("migrating the A2A bus from %d NATS servers to %d (phase %s)", from, to, phase)
+	if run.Abandoning {
+		msg = fmt.Sprintf("undoing the A2A bus migration from %d NATS servers to %d (phase %s)", from, to, phase)
+	}
+	if busMigrationFrozen(leg, phase) {
+		msg += "; writes are frozen: only the migration reaches the bus, and the console and web logins are off until it ends"
+	}
+	return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionTrue, Reason: "InProgress", Message: msg}, true
+}
+
+// busMigratingConditionCurrent reports whether the CR already carries the
+// condition this pass calls for.
+func busMigratingConditionCurrent(agent *agentv1alpha1.PlatformAgent) bool {
+	want, ok := busMigratingCondition(agent)
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aBusMigratingConditionType)
+	if !ok {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == want.Status && existing.Reason == want.Reason && existing.Message == want.Message
+}
+
+// setBusMigratingCondition writes the condition this pass calls for, or
+// removes it. The caller does the API write.
+func setBusMigratingCondition(agent *agentv1alpha1.PlatformAgent, now metav1.Time) {
+	want, ok := busMigratingCondition(agent)
+	if !ok {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusMigratingConditionType)
+		return
+	}
+	want.ObservedGeneration, want.LastTransitionTime = agent.Generation, now
+	meta.SetStatusCondition(&agent.Status.Conditions, want)
 }
