@@ -1,5 +1,5 @@
 {
-  "version": "b17ed800b590a1ea",
+  "version": "e04947f6b7cd0b07",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -137,7 +137,7 @@
           "_INBOX.migrate-snapshot-3-1.>"
         ]
       },
-      "notAfter": "2099-01-01T00:10:00Z"
+      "notAfter": "2099-01-01T00:00:00Z"
     }
   ]
 }

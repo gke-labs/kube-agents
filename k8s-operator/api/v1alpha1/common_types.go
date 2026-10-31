@@ -2414,8 +2414,9 @@ type BusMigrationStatus struct {
 	// StartedAt is when the migration began.
 	StartedAt metav1.Time `json:"startedAt"`
 
-	// Deadline is when an unfinished phase counts as failed. The
-	// migration's bus credentials stop working ten minutes after it.
+	// Deadline is when an unfinished phase counts as failed, and when the
+	// migration's bus credentials stop working. Its Jobs stop a few minutes
+	// before it.
 	Deadline metav1.Time `json:"deadline"`
 
 	// Message is the manual step a Failed migration names.

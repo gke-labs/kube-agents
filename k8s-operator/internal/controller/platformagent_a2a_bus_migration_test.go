@@ -629,8 +629,8 @@ func TestAPhaseCreatesItsJobAndIdentity(t *testing.T) {
 	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: name}, j); err != nil {
 		t.Fatal(err)
 	}
-	if d := j.Spec.ActiveDeadlineSeconds; d == nil || *d > 3600 || *d < 3500 {
-		t.Errorf("activeDeadlineSeconds %v, want the hour left", d)
+	if d := j.Spec.ActiveDeadlineSeconds; d == nil || *d > 3300 || *d < 3200 {
+		t.Errorf("activeDeadlineSeconds %v, want the hour left less the margin", d)
 	}
 }
 
@@ -717,8 +717,8 @@ const busMigrationMapFixturePath = "../../../a2a/authcallout/testdata/rendered-i
 
 // The map mid-snapshot, as the callout reads it (a2a/authcallout:
 // migration_contract_test.go): the step's principal with its exact grants
-// and a grace period past the run's deadline as its notAfter. The deadline
-// is far off so the callout's real-server test can still connect as it.
+// and the run's deadline as its notAfter. The deadline is far off so the
+// callout's real-server test can still connect as it.
 func TestRenderedBusMigrationFixture(t *testing.T) {
 	agent := authMapTestAgent()
 	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(busMigrationSnapshot),
@@ -735,14 +735,14 @@ func TestRenderedBusMigrationFixture(t *testing.T) {
 	var stamped int
 	for _, id := range doc.Identities {
 		switch {
-		case id.User == busMigrationPrincipal("snapshot", "3-1") && id.NotAfter != nil && id.NotAfter.Equal(agent.Status.BusMigration.Deadline.Add(busMigrationCredentialGrace)):
+		case id.User == busMigrationPrincipal("snapshot", "3-1") && id.NotAfter != nil && id.NotAfter.Equal(agent.Status.BusMigration.Deadline.Time):
 			stamped++
 		case id.NotAfter != nil:
 			t.Errorf("%s carries notAfter %v; only the run's principal expires", id.User, id.NotAfter)
 		}
 	}
 	if stamped != 1 {
-		t.Errorf("the snapshot principal is not in the map with notAfter a grace period past the run's deadline:\n%s", rendered)
+		t.Errorf("the snapshot principal is not in the map with notAfter at the run's deadline:\n%s", rendered)
 	}
 	checkFixture(t, busMigrationMapFixturePath, rendered)
 }
@@ -807,11 +807,11 @@ func TestATurnedBackRunNamesItsCause(t *testing.T) {
 	}
 }
 
-// The credential outlives the work: a step's Job is stopped at the run's
-// deadline, and its principal stops authenticating only a grace period
-// later, so the failure a slow step reports is the deadline, not an
+// Nothing valid outlives the run's deadline, and the work stops first: a
+// step's principal expires at the deadline, and its Job is stopped minutes
+// before it, so a slow step fails on its own time limit, not on an
 // authorization error halfway through a stream.
-func TestTheCredentialOutlivesTheJobsDeadline(t *testing.T) {
+func TestAStepsJobStopsBeforeItsCredentialExpires(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	agent := a2aTestAgent()
 	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "3-1", Phase: string(busMigrationPinning),
@@ -822,7 +822,10 @@ func TestTheCredentialOutlivesTheJobsDeadline(t *testing.T) {
 	if len(ids) != 1 || ids[0].notAfter == nil {
 		t.Fatalf("identities %+v", ids)
 	}
+	if !ids[0].notAfter.Equal(agent.Status.BusMigration.Deadline.Time) {
+		t.Errorf("the principal expires at %v; want the run's deadline %v", ids[0].notAfter, agent.Status.BusMigration.Deadline.Time)
+	}
 	if gap := ids[0].notAfter.Sub(jobEnd); gap < 5*time.Minute {
-		t.Errorf("the principal expires %v after the Job's deadline; want a margin of minutes", gap)
+		t.Errorf("the Job stops %v before its principal expires; want a margin of minutes", gap)
 	}
 }

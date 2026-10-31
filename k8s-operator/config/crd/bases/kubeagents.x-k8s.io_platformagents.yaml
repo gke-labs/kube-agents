@@ -11629,8 +11629,9 @@ spec:
                       type: string
                     deadline:
                       description: |-
-                        Deadline is when an unfinished phase counts as failed. The
-                        migration's bus credentials stop working ten minutes after it.
+                        Deadline is when an unfinished phase counts as failed, and when the
+                        migration's bus credentials stop working. Its Jobs stop a few minutes
+                        before it.
                       format: date-time
                       type: string
                     leg:

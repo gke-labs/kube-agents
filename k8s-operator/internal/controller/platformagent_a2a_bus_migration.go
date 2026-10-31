@@ -464,11 +464,12 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		serviceAccount: a2aServiceAccountName(agent.Namespace, busMigrationWorkloadName(agent, step, run.RunID)),
 		publish:        publish,
 		subscribe:      []string{"_INBOX." + user + ".>"},
-		// The callout refuses this principal a grace period after the run's
-		// deadline and mints it no JWT that outlives that. The grace keeps
-		// the credential from being what stops a slow run: the Job's own
-		// deadline and the operator's fire first, and say so in Cause.
-		notAfter: ptr.To(run.Deadline.Add(busMigrationCredentialGrace).UTC()),
+		// The callout refuses this principal from the run's deadline on and
+		// mints it no JWT that outlives it, so nothing valid outlasts the
+		// run. The step's Job stops busMigrationJobMargin earlier (see
+		// buildBusMigrationJob), so a slow step fails on its own time limit,
+		// which Cause names, before its credential does.
+		notAfter: ptr.To(run.Deadline.UTC()),
 	}}
 }
 
@@ -479,9 +480,10 @@ func busMigrationPrincipal(step, runID string) string {
 }
 
 const (
-	// busMigrationCredentialGrace is how long a run's principals outlive its
-	// deadline.
-	busMigrationCredentialGrace = 10 * time.Minute
+	// busMigrationJobMargin is how long before the run's deadline a step's
+	// Job is stopped, so it fails on its own time limit while its credential
+	// still works, never on an authorization error mid-stream.
+	busMigrationJobMargin = 5 * time.Minute
 	// busMigrationStageMount is where the staging volume is mounted in the
 	// snapshot Job and the hashing pod.
 	busMigrationStageMount = "/stage"
@@ -557,7 +559,7 @@ func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 		}})
 		mounts = append(mounts, corev1.VolumeMount{Name: busMigrationStageVolume, MountPath: busMigrationStageMount})
 	}
-	deadline := int64(run.Deadline.Sub(now).Seconds())
+	deadline := int64(run.Deadline.Add(-busMigrationJobMargin).Sub(now).Seconds())
 	if deadline < 1 {
 		deadline = 1
 	}
