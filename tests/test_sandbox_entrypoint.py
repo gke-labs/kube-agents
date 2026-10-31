@@ -640,6 +640,9 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
         names = set(match.group(1).split())
         required = {
             "CREDENTIAL_PROXY_URL",
+            # The exec tier's URL: without it a session always falls back on
+            # the stateful broker, and nothing says so.
+            "CREDENTIAL_PROXY_EXEC_URL",
             "CREDENTIAL_PROXY_TOKEN_FILE",
             "KUBE_CONTEXT_NAME",
             "GKE_PROJECT_ID",
