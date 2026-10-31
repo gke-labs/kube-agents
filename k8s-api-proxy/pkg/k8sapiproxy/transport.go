@@ -13,7 +13,8 @@ type CallerIdentity struct {
 }
 
 // CallerAuthenticator identifies the caller of a request, returning an error when it is not
-// an authorized sandbox. The caller gets a fixed 401, never the error's text.
+// an authorized sandbox. The caller gets a fixed 401, or a fixed 503 when the package's
+// TokenReview authenticator could not complete the review, never the error's text.
 type CallerAuthenticator interface {
 	AuthenticateRequest(r *http.Request) (*CallerIdentity, error)
 }

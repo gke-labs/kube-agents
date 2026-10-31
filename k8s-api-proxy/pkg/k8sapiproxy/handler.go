@@ -13,9 +13,10 @@ import (
 )
 
 const (
-	authFailedMessage   = messagePrefix + "caller authentication failed"
-	unclassifiedMessage = messagePrefix + "the request path could not be classified"
-	upstreamFailed      = "kube-proxy could not reach cluster %q"
+	authFailedMessage      = messagePrefix + "caller authentication failed"
+	authUnavailableMessage = messagePrefix + "caller authentication is unavailable; retry"
+	unclassifiedMessage    = messagePrefix + "the request path could not be classified"
+	upstreamFailed         = "kube-proxy could not reach cluster %q"
 
 	// flushImmediately streams each upstream write to the caller, which watch and log
 	// follow need.
@@ -102,9 +103,15 @@ func NewHandler(cfg Config) (http.Handler, error) {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	caller, err := h.authenticator.AuthenticateRequest(r)
+	if errors.Is(err, errAuthenticationUnavailable) {
+		// The cause can name the host API server; it is not the caller's to read.
+		writeStatus(w, http.StatusServiceUnavailable, metav1.StatusReasonServiceUnavailable, authUnavailableMessage)
+		return
+	}
 	// The authenticator's error is not echoed, as the transport's is not: it can describe the
 	// proxy's own authentication setup.
-	if caller, err := h.authenticator.AuthenticateRequest(r); err != nil || caller == nil {
+	if err != nil || caller == nil {
 		writeStatus(w, http.StatusUnauthorized, metav1.StatusReasonUnauthorized, authFailedMessage)
 		return
 	}
