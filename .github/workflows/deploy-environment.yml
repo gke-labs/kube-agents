@@ -91,17 +91,20 @@ jobs:
     concurrency:
       group: ${{ inputs.github_environment }}-environment
       cancel-in-progress: false
-    # Sized to provision_environment.sh's stockout retry, not to one install.
-    # The long case is a stockout on the first two attempts and a success on
-    # the third: about five minutes of setup, a teardown of whatever last
-    # night left (ten), two failed creates that each take about ten minutes
-    # to be refused, two ten-minute waits, two teardowns of the half-built
-    # environment (ten each), and one full install (forty) -- about 115
-    # minutes, so 150 with margin. `next` adds the mode switch's wait on
-    # top: the agent rolls again, and Ready waits on the bus, the callout and
-    # the provisioning Job. A job stopped here reports `cancelled`, not
-    # `failure`, which the promotion pipeline's teardown condition names.
-    timeout-minutes: ${{ inputs.mode == 'next' && 180 || 150 }}
+    # Sized to provision_environment.sh's stockout retry and to
+    # teardown_common.sh's second run of a failed uninstall.sh, not to one
+    # install. The long case is a stockout on the first two attempts and a
+    # success on the third, with every teardown failing once: about five
+    # minutes of setup, a teardown of whatever last night left (ten, plus
+    # eleven for its second run), two failed creates that each take about ten
+    # minutes to be refused, two ten-minute waits, two teardowns of the
+    # half-built environment (ten each, plus eleven for each second run), and
+    # one full install (forty) -- about 150 minutes, so 170 with margin.
+    # `next` adds the mode switch's wait on top: the agent rolls again, and
+    # Ready waits on the bus, the callout and the provisioning Job. A job
+    # stopped here reports `cancelled`, not `failure`, which the promotion
+    # pipeline's teardown condition names.
+    timeout-minutes: ${{ inputs.mode == 'next' && 200 || 170 }}
     permissions:
       contents: read
       id-token: write

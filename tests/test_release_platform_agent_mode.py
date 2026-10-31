@@ -400,10 +400,10 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
         )
 
     def test_today_gives_the_deploy_job_the_stockout_retry_budget(self):
-        """150 for three provision attempts with teardowns and waits between
-        them (deploy-environment.yml says the sum); `next` adds the gate."""
+        """170 for three provision attempts with teardowns, their second runs and
+        waits between them (deploy-environment.yml says the sum); `next` adds the gate."""
         job = _workflow("deploy-environment.yml")["jobs"]["deploy-environment"]
-        self.assertEqual(job["timeout-minutes"], "${{ inputs.mode == 'next' && 180 || 150 }}")
+        self.assertEqual(job["timeout-minutes"], "${{ inputs.mode == 'next' && 200 || 170 }}")
 
     def test_next_buys_the_deploy_job_the_whole_gate(self):
         """The 30 extra minutes are the gate's single budget, which runs after the install."""
