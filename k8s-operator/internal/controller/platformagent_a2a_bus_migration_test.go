@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"slices"
 	"strconv"
@@ -253,6 +254,34 @@ func (m *migrationRig) finishJob(step string, cond batchv1.JobConditionType) {
 	}
 }
 
+// finishPod ends one of the run's pods as the kubelet would report it, with
+// its termination message, and reason (DeadlineExceeded for a pod stopped at
+// activeDeadlineSeconds).
+func (m *migrationRig) finishPod(name string, phase corev1.PodPhase, message, reason string) {
+	m.t.Helper()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, name, "3-1"), Namespace: m.agent.Namespace}}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		if err := m.cl.Create(context.Background(), pod); err != nil {
+			m.t.Fatal(err)
+		}
+	}
+	pod.Status.Phase, pod.Status.Reason = phase, reason
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "bus-" + name, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: message}}}}
+	if err := m.cl.Status().Update(context.Background(), pod); err != nil {
+		m.t.Fatal(err)
+	}
+}
+
+// validDigests is a hashing pod's report for every provisioned stream.
+func validDigests() string {
+	d := map[string]busmigrate.StagedDigest{}
+	for i, n := range a2aProvisionedStreams {
+		d[n] = busmigrate.StagedDigest{Data: fmt.Sprintf("%064x", i+1), Meta: fmt.Sprintf("%064x", i+100)}
+	}
+	b, _ := json.Marshal(d)
+	return string(b)
+}
+
 func (m *migrationRig) rollOut(replicas int32) {
 	m.t.Helper()
 	sts := &appsv1.StatefulSet{}
@@ -296,24 +325,164 @@ func TestAFailedOrLatePinUnpins(t *testing.T) {
 // out. A conversion still unfinished at the deadline rolls back to one.
 func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
 	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	recorder := record.NewFakeRecorder(16)
+	m.r.Recorder = recorder
 	m.rollOut(1)
 	m.pass(busMigrationSnapshot, 1)
-	m.finishJob("snapshot", batchv1.JobComplete)
+	m.finishPod("snapshot", corev1.PodSucceeded, "", "")
 	m.pass(busMigrationHashing, 1)
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, "hash", "3-1"), Namespace: m.agent.Namespace}}
-	if err := m.cl.Create(context.Background(), pod); err != nil {
-		t.Fatal(err)
-	}
-	pod.Status.Phase = corev1.PodSucceeded
-	if err := m.cl.Status().Update(context.Background(), pod); err != nil {
-		t.Fatal(err)
-	}
+	m.finishPod("hash", corev1.PodSucceeded, validDigests(), "")
 	m.pass(busMigrationConverting, 3)
+
+	// The run Secret holds the hashing pod's digests and the operator's
+	// policies, at one replica, owned by the CR.
+	secret := &corev1.Secret{}
+	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationRunSecret(m.agent, "3-1")}, secret); err != nil {
+		t.Fatalf("no run Secret after hashing: %v", err)
+	}
+	var run busmigrate.RunFile
+	if err := json.Unmarshal(secret.Data[busMigrationRunKey], &run); err != nil {
+		t.Fatal(err)
+	}
+	wantDigests, _ := parseBusDigests(validDigests())
+	if !reflect.DeepEqual(run.Digests, wantDigests) || !reflect.DeepEqual(run.Policies, a2aStreamPolicies(1)) || !ownedByAgent(secret.ObjectMeta, m.agent) {
+		t.Errorf("run Secret %+v, owners %v", run, secret.OwnerReferences)
+	}
+
 	m.rollOut(3)
 	m.pass(busMigrationRestoring, 3)
+	m.finishPod("restore", corev1.PodSucceeded, `{"warnings":["stream TOPICS-STATE: subject x is missing; a fresh install has it"]}`, "")
+	m.pass(busMigrationReleasing, 3)
+	if w := m.agent.Status.BusMigration.Warnings; len(w) != 1 || !strings.Contains(w[0], "subject x is missing") {
+		t.Errorf("status warnings %v", w)
+	}
+	select {
+	case e := <-recorder.Events:
+		if !strings.Contains(e, "Warning BusMigrationDrift") || !strings.Contains(e, "subject x is missing") {
+			t.Errorf("event %q", e)
+		}
+	default:
+		t.Error("no Warning Event for the restore's warnings")
+	}
+	m.pass(busMigrationDone, 3)
+	select {
+	case e := <-recorder.Events:
+		t.Errorf("a second event for the same warnings: %q", e)
+	default:
+	}
 
 	late := newMigrationRig(t, busMigrationGrow, busMigrationConverting, 3, time.Now().Add(-time.Minute))
 	late.pass(busMigrationRollingBack, 1)
+}
+
+// A hashing pod whose report is not exactly the provisioned streams' digest
+// pairs writes no run Secret, and the run turns back naming why.
+func TestARefusedDigestReportTurnsTheRunBack(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationHashing, 1, time.Now().Add(time.Hour))
+	m.finishPod("hash", corev1.PodSucceeded, `{"TASKS":{"data":"x","meta":"y"}}`, "")
+	if _, err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+		t.Fatal(err)
+	}
+	run := m.agent.Status.BusMigration
+	if !run.Abandoning || !strings.Contains(run.Cause, "the hashing pod's report was refused") {
+		t.Errorf("phase %s abandoning %v cause %q", run.Phase, run.Abandoning, run.Cause)
+	}
+	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationRunSecret(m.agent, "3-1")}, &corev1.Secret{}); err == nil {
+		t.Error("a run Secret from a refused report")
+	}
+}
+
+// A restore pod that fails rolls back, and the cause carries its report's
+// error; a pod stopped at its deadline names the deadline; warnings the
+// rollback repeats are recorded once.
+func TestAFailedRestoreRollsBackNamingItsError(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	m.finishPod("restore", corev1.PodFailed, `{"error":"stream TASKS: config is outside the operator's policy: subjects: \"a2a.>\" is not one of [a2a.tasks.>]"}`, "")
+	m.pass(busMigrationRollingBack, 1)
+	if c := m.agent.Status.BusMigration.Cause; !strings.Contains(c, "the Restoring phase failed: stream TASKS: config is outside the operator's policy") {
+		t.Errorf("cause %q", c)
+	}
+
+	// Killed with no report and no deadline (evicted): the phase failed,
+	// with no word about a report it never wrote.
+	evicted := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	evicted.finishPod("restore", corev1.PodFailed, "", "Evicted")
+	evicted.pass(busMigrationRollingBack, 1)
+	if c := evicted.agent.Status.BusMigration.Cause; c != "the Restoring phase failed" {
+		t.Errorf("evicted restore cause %q", c)
+	}
+
+	// Killed at its deadline: whatever it reported, or nothing, the cause
+	// is the deadline.
+	for _, msg := range []string{"", `{"error":"context canceled"}`} {
+		late := newMigrationRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1, time.Now().Add(time.Hour))
+		late.agent.Status.BusMigration.Abandoning = true
+		late.finishPod("rollback", corev1.PodFailed, msg, "DeadlineExceeded")
+		if _, err := late.r.resolveA2ABusReplicas(context.Background(), late.agent); err != nil {
+			t.Fatal(err)
+		}
+		if c := late.agent.Status.BusMigration.Cause; !strings.Contains(c, "the RollbackRestoring phase was still running at the run's deadline") {
+			t.Errorf("rollback stopped at its deadline (report %q): cause %q", msg, c)
+		}
+	}
+
+	// The rollback restores the same snapshot, so it reports the same
+	// warnings: they are recorded once, with one Event.
+	twice := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	recorder := record.NewFakeRecorder(16)
+	twice.r.Recorder = recorder
+	const warned = `{"warnings":["stream TASKS: max_consumers is -1; a fresh install has 110"],"error":"stream KV_cap: finishing: boom"}`
+	twice.finishPod("restore", corev1.PodFailed, warned, "")
+	twice.pass(busMigrationRollingBack, 1)
+	twice.rollOut(1)
+	twice.pass(busMigrationRollbackRestoring, 1)
+	twice.finishPod("rollback", corev1.PodSucceeded, `{"warnings":["stream TASKS: max_consumers is -1; a fresh install has 110"]}`, "")
+	twice.pass(busMigrationReleasing, 1)
+	if n := len(recorder.Events); n != 1 {
+		t.Errorf("%d Events for one set of warnings, want 1", n)
+	}
+	if w := twice.agent.Status.BusMigration.Warnings; len(w) != 1 {
+		t.Errorf("warnings %v", w)
+	}
+}
+
+func TestTheHashingReportIsReadStrictly(t *testing.T) {
+	good, refused := parseBusDigests(validDigests())
+	if refused != "" || len(good) != len(a2aProvisionedStreams) {
+		t.Fatalf("a valid report refused: %s", refused)
+	}
+	var pairs map[string]busmigrate.StagedDigest
+	_ = json.Unmarshal([]byte(validDigests()), &pairs)
+	edit := func(f func(map[string]busmigrate.StagedDigest)) string {
+		c := map[string]busmigrate.StagedDigest{}
+		for k, v := range pairs {
+			c[k] = v
+		}
+		f(c)
+		b, _ := json.Marshal(c)
+		return string(b)
+	}
+	for name, msg := range map[string]string{
+		"not JSON":       "TASKS deadbeef",
+		"a stream short": edit(func(c map[string]busmigrate.StagedDigest) { delete(c, "TASKS") }),
+		"an extra":       edit(func(c map[string]busmigrate.StagedDigest) { c["OTHER"] = c["TASKS"] }),
+		"a renamed":      edit(func(c map[string]busmigrate.StagedDigest) { c["OTHER"] = c["TASKS"]; delete(c, "TASKS") }),
+		"short hex": edit(func(c map[string]busmigrate.StagedDigest) {
+			c["TASKS"] = busmigrate.StagedDigest{Data: "abc", Meta: c["TASKS"].Meta}
+		}),
+		"uppercase hex": edit(func(c map[string]busmigrate.StagedDigest) {
+			d := c["KV_cap"]
+			d.Meta = strings.ToUpper(d.Meta)
+			c["KV_cap"] = d
+		}),
+		"no meta": edit(func(c map[string]busmigrate.StagedDigest) {
+			c["TASKS"] = busmigrate.StagedDigest{Data: c["TASKS"].Data}
+		}),
+	} {
+		if _, refused := parseBusDigests(msg); refused == "" {
+			t.Errorf("%s: accepted", name)
+		}
+	}
 }
 
 // No provision Job is created while a migration runs: on one to three it
@@ -453,19 +622,27 @@ func TestTheStatusWriteCarriesTheMigration(t *testing.T) {
 // leg sends, on the provisioned streams by name, subscribes to its own inbox
 // only, and is in the identity map only while its step runs.
 func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
-	want := map[busMigrationPhase][]string{
-		busMigrationPinning:   {"INFO", "LEADER.STEPDOWN", "UPDATE"},
-		busMigrationUnpinning: {"INFO", "UPDATE"},
-		busMigrationSnapshot:  {"INFO", "SNAPSHOT"},
+	type grant struct {
+		leg    busMigrationLeg
+		verbs  []string
+		extra  []string // per stream, after the verbs; %s is the stream
+		banned []string
 	}
-	for phase, verbs := range want {
-		leg := busMigrationShrink
-		if phase == busMigrationSnapshot {
-			leg = busMigrationGrow
-		}
+	shrinkBanned := []string{"SNAPSHOT", "RESTORE", "DELETE", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE"}
+	stream := grant{busMigrationGrow, []string{"INFO", "SNAPSHOT", "RESTORE", "UPDATE", "DELETE"},
+		[]string{"$JS.SNAPSHOT.ACK.%s.>", "$JS.SNAPSHOT.RESTORE.%s.>"}, []string{"PURGE", "CREATE", "CONSUMER", "MSG.DELETE", "LEADER.STEPDOWN"}}
+	want := map[busMigrationPhase]grant{
+		busMigrationPinning:           {busMigrationShrink, []string{"INFO", "LEADER.STEPDOWN", "UPDATE"}, nil, shrinkBanned},
+		busMigrationUnpinning:         {busMigrationShrink, []string{"INFO", "UPDATE"}, nil, shrinkBanned},
+		busMigrationSnapshot:          stream,
+		busMigrationRestoring:         stream,
+		busMigrationRollbackRestoring: stream,
+	}
+	streamUsers := map[string]bool{}
+	for phase, g := range want {
 		agent := a2aTestAgent()
 		agent.Spec.Mode = ptr.To("next")
-		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(leg), RunID: "5-9", Phase: string(phase)}
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(g.leg), RunID: "5-9", Phase: string(phase)}
 		ids := busMigrationIdentities(agent)
 		if len(ids) != 1 {
 			t.Fatalf("%s: %d principals, want 1", phase, len(ids))
@@ -473,21 +650,22 @@ func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
 		id := ids[0]
 		var expected []string
 		for _, s := range a2aProvisionedStreams {
-			for _, v := range verbs {
+			for _, v := range g.verbs {
 				expected = append(expected, "$JS.API.STREAM."+v+"."+s)
 			}
-			if phase == busMigrationSnapshot {
-				expected = append(expected, "$JS.SNAPSHOT.ACK."+s+".>")
+			for _, e := range g.extra {
+				expected = append(expected, fmt.Sprintf(e, s))
 			}
 		}
 		if !slices.Equal(id.publish, expected) {
 			t.Errorf("%s publish:\n got %v\nwant %v", phase, id.publish, expected)
 		}
 		for _, p := range id.publish {
-			if strings.HasSuffix(p, ".*") || strings.Contains(p, "STREAM.>") || p == "$JS.API.>" || strings.HasPrefix(p, "$JS.API.STREAM.*") {
+			if strings.HasSuffix(p, ".*") || strings.Contains(p, "STREAM.>") || p == "$JS.API.>" || strings.HasPrefix(p, "$JS.API.STREAM.*") ||
+				p == "$JS.SNAPSHOT.RESTORE.>" || p == "$JS.SNAPSHOT.ACK.>" || p == "$JS.SNAPSHOT.>" {
 				t.Errorf("%s: wildcard over stream names: %s", phase, p)
 			}
-			for _, banned := range []string{"RESTORE", "DELETE", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE"} {
+			for _, banned := range g.banned {
 				if strings.Contains(p, "."+banned+".") {
 					t.Errorf("%s grants %s: %s", phase, banned, p)
 				}
@@ -496,11 +674,14 @@ func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
 		if !slices.Equal(id.subscribe, []string{"_INBOX." + id.user + ".>"}) {
 			t.Errorf("%s subscribe %v, want its own inbox only", phase, id.subscribe)
 		}
+		if g.leg == busMigrationGrow {
+			streamUsers[id.user+" "+id.serviceAccount] = true
+		}
 		// The callout refuses a whole map whose user is not one lowercase
 		// DNS-1123 label (it becomes the inbox prefix), so a long run ID
-		// must still fit; the ServiceAccount name must be one too.
-		long := busMigrationPrincipal("snapshot", "9999999-1999999999")
-		for _, name := range []string{id.user, long, busMigrationWorkloadName(agent, "snapshot", "9999999-1999999999")} {
+		// must still fit; the ServiceAccount and pod names must be one too.
+		long := "9999999-1999999999"
+		for _, name := range []string{id.user, busMigrationPrincipal(busMigrationStreamIdentity, long), busMigrationWorkloadName(agent, "rollback", long), busMigrationRunSecret(agent, long)} {
 			if errs := validation.IsDNS1123Label(name); len(errs) != 0 {
 				t.Errorf("%q is not a DNS-1123 label: %v", name, errs)
 			}
@@ -516,8 +697,14 @@ func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
 			t.Errorf("%s: the principal is not in the identity map", phase)
 		}
 	}
-	// Outside those steps, and after the run, no migration principal.
-	for _, phase := range []busMigrationPhase{busMigrationShrinking, busMigrationFreezing, busMigrationConverting, busMigrationRestoring, busMigrationDone, busMigrationFailed} {
+	// The snapshot, restore and rollback pods hold one identity.
+	if len(streamUsers) != 1 {
+		t.Errorf("the one to three leg's phases hold %d identities, want one: %v", len(streamUsers), streamUsers)
+	}
+	// Outside those phases, the hashing pod's included, and after the run,
+	// no migration principal.
+	for _, phase := range []busMigrationPhase{busMigrationShrinking, busMigrationFreezing, busMigrationHashing, busMigrationConverting,
+		busMigrationRollingBack, busMigrationReleasing, busMigrationDone, busMigrationAbandoned, busMigrationFailed} {
 		agent := a2aTestAgent()
 		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "5-9", Phase: string(phase)}
 		if ids := busMigrationIdentities(agent); len(ids) != 0 {
@@ -530,7 +717,7 @@ func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
 func (m *migrationRig) workload(step string) (corev1.PodSpec, metav1.ObjectMeta, bool) {
 	m.t.Helper()
 	key := client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationWorkloadName(m.agent, step, "3-1")}
-	if step == "hash" {
+	if step != "pin" && step != "unpin" {
 		pod := &corev1.Pod{}
 		if err := m.cl.Get(context.Background(), key, pod); err != nil {
 			return corev1.PodSpec{}, metav1.ObjectMeta{}, false
@@ -655,58 +842,6 @@ func TestATransitionCreatesTheNextPhasesJob(t *testing.T) {
 	}
 }
 
-// The snapshot Job writes the staging claim; the hashing pod reads it
-// read-only and holds no bus credential, no token and no API access.
-func TestTheSnapshotWritesTheStageAndTheHashReadsIt(t *testing.T) {
-	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
-	m := newMigrationRig(t, busMigrationGrow, busMigrationSnapshot, 1, time.Now().Add(time.Hour))
-	m.pass(busMigrationSnapshot, 1)
-	stage := func(spec corev1.PodSpec) (claim *corev1.PersistentVolumeClaimVolumeSource, mount *corev1.VolumeMount) {
-		for i := range spec.Volumes {
-			if spec.Volumes[i].PersistentVolumeClaim != nil {
-				claim = spec.Volumes[i].PersistentVolumeClaim
-				for j := range spec.Containers[0].VolumeMounts {
-					if spec.Containers[0].VolumeMounts[j].Name == spec.Volumes[i].Name {
-						mount = &spec.Containers[0].VolumeMounts[j]
-					}
-				}
-			}
-		}
-		return claim, mount
-	}
-	snap, _, ok := m.workload("snapshot")
-	if !ok {
-		t.Fatal("no snapshot Job")
-	}
-	claim, mount := stage(snap)
-	if claim == nil || claim.ClaimName != busMigrationStageClaim(m.agent, "3-1") || claim.ReadOnly || mount == nil || mount.ReadOnly {
-		t.Errorf("snapshot stage claim %+v mount %+v, want %s read-write", claim, mount, busMigrationStageClaim(m.agent, "3-1"))
-	}
-	if args := strings.Join(snap.Containers[0].Command, " "); !strings.Contains(args, "bus-migrate snapshot ") || !strings.Contains(args, "--dir "+busMigrationStageMount) {
-		t.Errorf("snapshot command %q", args)
-	}
-
-	m.finishJob("snapshot", batchv1.JobComplete)
-	m.pass(busMigrationHashing, 1)
-	hash, meta, ok := m.workload("hash")
-	if !ok {
-		t.Fatal("no hashing pod")
-	}
-	if !ownedByAgent(meta, m.agent) {
-		t.Errorf("hashing pod owners %v", meta.OwnerReferences)
-	}
-	claim, mount = stage(hash)
-	if claim == nil || !claim.ReadOnly || mount == nil || !mount.ReadOnly {
-		t.Errorf("hashing stage claim %+v mount %+v, want read-only", claim, mount)
-	}
-	if len(hash.Volumes) != 1 || len(hash.Containers[0].Env) != 0 || *hash.AutomountServiceAccountToken {
-		t.Errorf("hashing pod carries more than the stage: volumes %v env %v", hash.Volumes, hash.Containers[0].Env)
-	}
-	if args := strings.Join(hash.Containers[0].Command, " "); !strings.HasPrefix(args, "/manager bus-hash --dir "+busMigrationStageMount) || strings.Contains(args, "--token-file") {
-		t.Errorf("hash command %q", args)
-	}
-}
-
 // Without OPERATOR_IMAGE nothing runs, and the phase waits out the deadline.
 func TestNoOperatorImageRunsNothing(t *testing.T) {
 	t.Setenv(operatorImageEnvVar, "")
@@ -720,7 +855,7 @@ func TestNoOperatorImageRunsNothing(t *testing.T) {
 const busMigrationMapFixturePath = "../../../a2a/authcallout/testdata/rendered-identity-map-migration.json"
 
 // The map mid-snapshot, as the callout reads it (a2a/authcallout:
-// migration_contract_test.go): the step's principal with its exact grants
+// migration_contract_test.go): the stream identity with its exact grants
 // and the run's deadline as its notAfter. The deadline is far off so the
 // callout's real-server test can still connect as it.
 func TestRenderedBusMigrationFixture(t *testing.T) {
@@ -739,14 +874,14 @@ func TestRenderedBusMigrationFixture(t *testing.T) {
 	var stamped int
 	for _, id := range doc.Identities {
 		switch {
-		case id.User == busMigrationPrincipal("snapshot", "3-1") && id.NotAfter != nil && id.NotAfter.Equal(agent.Status.BusMigration.Deadline.Time):
+		case id.User == busMigrationPrincipal(busMigrationStreamIdentity, "3-1") && id.NotAfter != nil && id.NotAfter.Equal(agent.Status.BusMigration.Deadline.Time):
 			stamped++
 		case id.NotAfter != nil:
 			t.Errorf("%s carries notAfter %v; only the run's principal expires", id.User, id.NotAfter)
 		}
 	}
 	if stamped != 1 {
-		t.Errorf("the snapshot principal is not in the map with notAfter at the run's deadline:\n%s", rendered)
+		t.Errorf("the stream identity is not in the map with notAfter at the run's deadline:\n%s", rendered)
 	}
 	checkFixture(t, busMigrationMapFixturePath, rendered)
 }
@@ -950,6 +1085,97 @@ func TestTheStreamPoliciesMatchAFreshInstall(t *testing.T) {
 		}
 		if d := p.Check(ref); len(d) != 0 {
 			t.Errorf("%s: a fresh install differs from the policy: %v", p.Name, d)
+		}
+	}
+}
+
+// The snapshot pod writes the staging claim as the stream identity; the
+// hashing pod reads it read-only and holds no bus credential, no token and
+// no API access; the restore and rollback pods read it read-only as the
+// stream identity, with the run Secret, ending at three and one replicas.
+func TestTheSnapshotWritesTheStageAndTheOthersReadIt(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	stage := func(spec corev1.PodSpec) (claim *corev1.PersistentVolumeClaimVolumeSource, mount *corev1.VolumeMount) {
+		for i := range spec.Volumes {
+			if spec.Volumes[i].PersistentVolumeClaim != nil {
+				claim = spec.Volumes[i].PersistentVolumeClaim
+				for j := range spec.Containers[0].VolumeMounts {
+					if spec.Containers[0].VolumeMounts[j].Name == spec.Volumes[i].Name {
+						mount = &spec.Containers[0].VolumeMounts[j]
+					}
+				}
+			}
+		}
+		return claim, mount
+	}
+	streamSA := busMigrationWorkloadName(a2aTestAgent(), busMigrationStreamIdentity, "3-1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationSnapshot, 1, time.Now().Add(time.Hour))
+	m.pass(busMigrationSnapshot, 1)
+	snap, meta, ok := m.workload("snapshot")
+	if !ok {
+		t.Fatal("no snapshot pod")
+	}
+	claim, mount := stage(snap)
+	if claim == nil || claim.ClaimName != busMigrationStageClaim(m.agent, "3-1") || claim.ReadOnly || mount == nil || mount.ReadOnly {
+		t.Errorf("snapshot stage claim %+v mount %+v, want %s read-write", claim, mount, busMigrationStageClaim(m.agent, "3-1"))
+	}
+	if args := strings.Join(snap.Containers[0].Command, " "); !strings.Contains(args, "bus-migrate snapshot ") || !strings.Contains(args, "--dir "+busMigrationStageMount) ||
+		!strings.Contains(args, "--user "+busMigrationPrincipal(busMigrationStreamIdentity, "3-1")) {
+		t.Errorf("snapshot command %q", args)
+	}
+	if snap.ServiceAccountName != streamSA || !ownedByAgent(meta, m.agent) || snap.ActiveDeadlineSeconds == nil || *snap.ActiveDeadlineSeconds > 3300 {
+		t.Errorf("snapshot pod SA %q owners %v deadline %v", snap.ServiceAccountName, meta.OwnerReferences, snap.ActiveDeadlineSeconds)
+	}
+
+	m.finishPod("snapshot", corev1.PodSucceeded, "", "")
+	m.pass(busMigrationHashing, 1)
+	hash, meta, ok := m.workload("hash")
+	if !ok {
+		t.Fatal("no hashing pod")
+	}
+	if !ownedByAgent(meta, m.agent) {
+		t.Errorf("hashing pod owners %v", meta.OwnerReferences)
+	}
+	claim, mount = stage(hash)
+	if claim == nil || !claim.ReadOnly || mount == nil || !mount.ReadOnly {
+		t.Errorf("hashing stage claim %+v mount %+v, want read-only", claim, mount)
+	}
+	if len(hash.Volumes) != 1 || len(hash.Containers[0].Env) != 0 || *hash.AutomountServiceAccountToken || hash.ServiceAccountName == streamSA {
+		t.Errorf("hashing pod carries more than the stage: SA %q volumes %v env %v", hash.ServiceAccountName, hash.Volumes, hash.Containers[0].Env)
+	}
+	if args := strings.Join(hash.Containers[0].Command, " "); !strings.HasPrefix(args, "/manager bus-hash --dir "+busMigrationStageMount) || strings.Contains(args, "--token-file") {
+		t.Errorf("hash command %q", args)
+	}
+
+	for kind, replicas := range map[string]string{"restore": "3", "rollback": "1"} {
+		phase, running := busMigrationRestoring, int32(3)
+		if kind == "rollback" {
+			phase, running = busMigrationRollbackRestoring, 1
+		}
+		r := newMigrationRig(t, busMigrationGrow, phase, running, time.Now().Add(time.Hour))
+		r.agent.Status.BusMigration.Abandoning = kind == "rollback"
+		r.pass(phase, running)
+		spec, _, ok := r.workload(kind)
+		if !ok {
+			t.Fatalf("no %s pod", kind)
+		}
+		claim, mount := stage(spec)
+		if claim == nil || !claim.ReadOnly || mount == nil || !mount.ReadOnly {
+			t.Errorf("%s stage claim %+v mount %+v, want read-only", kind, claim, mount)
+		}
+		var secret *corev1.SecretVolumeSource
+		for _, v := range spec.Volumes {
+			if v.Secret != nil {
+				secret = v.Secret
+			}
+		}
+		if secret == nil || secret.SecretName != busMigrationRunSecret(r.agent, "3-1") || secret.DefaultMode == nil || *secret.DefaultMode != 0o440 {
+			t.Errorf("%s run Secret volume %+v", kind, secret)
+		}
+		args := strings.Join(spec.Containers[0].Command, " ")
+		if !strings.Contains(args, "bus-migrate restore ") || !strings.Contains(args, "--run-file "+busMigrationRunMount+"/"+busMigrationRunKey) ||
+			!strings.Contains(args, "--replicas "+replicas) || spec.ServiceAccountName != streamSA {
+			t.Errorf("%s command %q SA %q", kind, args, spec.ServiceAccountName)
 		}
 	}
 }

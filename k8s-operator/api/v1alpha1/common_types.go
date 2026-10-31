@@ -2428,6 +2428,14 @@ type BusMigrationStatus struct {
 	// +optional
 	Cause string `json:"cause,omitempty"`
 
+	// Warnings are what the restore found and restored anyway: a stream
+	// lacking a subject a fresh install has, or a field outside the
+	// restore's policy that differs from a fresh install. Each is also
+	// reported as one Warning Event. At most 4 KiB of them; the last says
+	// how many more there were.
+	// +optional
+	Warnings []string `json:"warnings,omitempty"`
+
 	// ObservedGeneration is the PlatformAgent generation that started this
 	// migration. A migration that ended without converting is not started
 	// again until the spec changes.

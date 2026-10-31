@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -259,9 +260,8 @@ func busNATSRolledOutAt(sts *appsv1.StatefulSet, replicas int32) bool {
 }
 
 // observeBusMigration reads the current phase's outcome from what runs:
-// the phase's Job, the hashing pod, or the StatefulSet's rollout at the
-// count the phase renders. The restore pod's phases stay pending until it
-// exists.
+// the phase's Job or pod, or the StatefulSet's rollout at the count the
+// phase renders. late reports a Job or pod stopped at its deadline.
 func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (busMigrationOutcome, bool, error) {
 	leg, phase := busMigrationLeg(run.Leg), busMigrationPhase(run.Phase)
 	job := func(step string) (busMigrationOutcome, bool, error) {
@@ -274,28 +274,23 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 		}
 		return jobOutcome(j), jobDeadlineExceeded(j), nil
 	}
-	switch phase {
-	case busMigrationPinning:
-		return job("pin")
-	case busMigrationUnpinning:
-		return job("unpin")
-	case busMigrationSnapshot:
-		return job("snapshot")
-	case busMigrationHashing:
-		pod := &corev1.Pod{}
-		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkloadName(agent, "hash", run.RunID)}, pod); {
-		case errors.IsNotFound(err):
-			return busMigrationPending, false, nil
-		case err != nil:
+	if work := busMigrationPhaseWorkload(phase); work.name != "" {
+		if !work.pod {
+			return job(work.name)
+		}
+		pod, err := r.busMigrationPod(ctx, agent, run, work.name)
+		if pod == nil || err != nil {
 			return busMigrationPending, false, err
 		}
 		switch pod.Status.Phase {
 		case corev1.PodSucceeded:
 			return busMigrationSucceeded, false, nil
 		case corev1.PodFailed:
-			return busMigrationErred, false, nil
+			return busMigrationErred, pod.Status.Reason == "DeadlineExceeded", nil
 		}
 		return busMigrationPending, false, nil
+	}
+	switch phase {
 	case busMigrationFreezing, busMigrationShrinking, busMigrationConverting, busMigrationRollingBack, busMigrationReleasing:
 		sts := &appsv1.StatefulSet{}
 		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); {
@@ -312,6 +307,28 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 	return busMigrationPending, false, nil
 }
 
+// busMigrationPod reads one of the run's pods, nil when it is not there.
+func (r *PlatformAgentReconciler) busMigrationPod(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, name string) (*corev1.Pod, error) {
+	pod := &corev1.Pod{}
+	switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkloadName(agent, name, run.RunID)}, pod); {
+	case errors.IsNotFound(err):
+		return nil, nil
+	case err != nil:
+		return nil, err
+	}
+	return pod, nil
+}
+
+// terminationMessage is a pod's first container's termination message.
+func terminationMessage(pod *corev1.Pod) string {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Terminated != nil {
+			return cs.State.Terminated.Message
+		}
+	}
+	return ""
+}
+
 // advanceBusMigration moves a running migration on by what this pass
 // observes, the deadline included, and returns the server count the bus
 // renders in the phase it is in after that.
@@ -324,6 +341,27 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 			return 0, err
 		}
 		outcome := withDeadline(observed, run.Deadline.Time, now)
+		switch phase := busMigrationPhase(run.Phase); {
+		case phase == busMigrationHashing && outcome == busMigrationSucceeded:
+			// The digests go from the hashing pod's termination message into
+			// the operator's own Secret, beside its policy; the restore pods
+			// read them from there and never from the staging volume.
+			refused, err := r.ensureBusRunSecret(ctx, agent, run)
+			if err != nil {
+				return 0, err
+			}
+			if refused != "" {
+				outcome, run.Cause = busMigrationErred, "the hashing pod's report was refused: "+refused
+			}
+		case (phase == busMigrationRestoring || phase == busMigrationRollbackRestoring) && observed != busMigrationPending:
+			if failure, err := r.recordRestoreReport(ctx, agent, run); err != nil {
+				return 0, err
+			} else if failure != "" && outcome == busMigrationErred && run.Cause == "" && !late {
+				// A pod stopped at its deadline is named for the deadline
+				// below, whatever it managed to report.
+				run.Cause = fmt.Sprintf("the %s phase failed: %s", run.Phase, failure)
+			}
+		}
 		if outcome == busMigrationErred && run.Cause == "" {
 			run.Cause = busMigrationCause(run, late || observed == busMigrationPending)
 		}
@@ -423,11 +461,20 @@ func setBusMigratingCondition(agent *agentv1alpha1.PlatformAgent, now metav1.Tim
 
 // busMigrationIdentities are the bus principals the migration run holds in
 // the phase it is in, and none outside it: the callout map names a run's
-// principal only while its Job runs, so a token left behind authenticates
-// nothing once the phase has moved on. Each is its own ServiceAccount, named
-// for the run, and its grants are the JetStream API verbs its leg sends, on
-// the provisioned streams by name and nothing else; it subscribes to its own
-// inbox only. The restore pod's principal is not here yet.
+// principal only while its Job or pod runs, so a token left behind
+// authenticates nothing once the phase has moved on. Each is its own
+// ServiceAccount, named for the run, and its grants are the JetStream API
+// verbs its work sends, on the provisioned streams by name and nothing else;
+// it subscribes to its own inbox only.
+//
+// Two kinds. The three to one leg's pin Job (and its undo, unpin) moves
+// stream leaders and replica counts. The one to three leg's stream identity
+// is the operator's own pods, which take the snapshot, restore it and roll
+// it back: the only principal holding SNAPSHOT, RESTORE or DELETE, each per
+// stream name, its chunk subjects per name too (a RESTORE API request names
+// its stream in the config, not only in the subject; the chunk subject is
+// the one the server derives from the config, and that is what bounds it).
+// The hashing pod between them has no bus identity at all.
 func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	run := agent.Status.BusMigration
 	if run == nil || busMigrationTerminal(busMigrationPhase(run.Phase)) {
@@ -441,10 +488,13 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		step, verbs = "pin", []string{"INFO", "LEADER.STEPDOWN", "UPDATE"}
 	case busMigrationUnpinning:
 		step, verbs = "unpin", []string{"INFO", "UPDATE"}
-	case busMigrationSnapshot:
-		step, verbs = "snapshot", []string{"INFO", "SNAPSHOT"}
-		// A snapshot's chunks arrive on the run's inbox and are acked here.
-		extra = func(stream string) []string { return []string{"$JS.SNAPSHOT.ACK." + stream + ".>"} }
+	case busMigrationSnapshot, busMigrationRestoring, busMigrationRollbackRestoring:
+		step, verbs = busMigrationStreamIdentity, []string{"INFO", "SNAPSHOT", "RESTORE", "UPDATE", "DELETE"}
+		// A snapshot's chunks arrive on the identity's inbox and are acked
+		// on the first; a restore's are sent on the second.
+		extra = func(stream string) []string {
+			return []string{"$JS.SNAPSHOT.ACK." + stream + ".>", "$JS.SNAPSHOT.RESTORE." + stream + ".>"}
+		}
 	default:
 		return nil
 	}
@@ -461,16 +511,16 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	return []a2aIdentity{{
 		user:           user,
 		account:        a2aAccountApp,
-		comment:        "the bus migration's " + step + " step for run " + run.RunID + "; present only while that step runs",
+		comment:        "the bus migration's " + step + " identity for run " + run.RunID + "; present only while its work runs",
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(agent.Namespace, busMigrationWorkloadName(agent, step, run.RunID)),
 		publish:        publish,
 		subscribe:      []string{"_INBOX." + user + ".>"},
 		// The callout refuses this principal from the run's deadline on and
 		// mints it no JWT that outlives it, so nothing valid outlasts the
-		// run. The step's Job stops busMigrationJobMargin earlier (see
-		// buildBusMigrationJob), so a slow step fails on its own time limit,
-		// which Cause names, before its credential does.
+		// run. The step's Job or pod stops busMigrationJobMargin earlier, so
+		// a slow step fails on its own time limit, which Cause names, before
+		// its credential does.
 		notAfter: ptr.To(run.Deadline.UTC()),
 	}}
 }
@@ -512,9 +562,9 @@ func busMigrationImage() string {
 // ServiceAccount with no token mounted (the bus token is projected
 // separately and only where a pod connects), the hardened pod and container
 // security, and no restarts, so a failure is the phase's failure.
-func busMigrationPodSpec(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, step string, command []string, volumes []corev1.Volume, mounts []corev1.VolumeMount) corev1.PodSpec {
+func busMigrationPodSpec(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, step, identity string, command []string, volumes []corev1.Volume, mounts []corev1.VolumeMount) corev1.PodSpec {
 	return corev1.PodSpec{
-		ServiceAccountName:           busMigrationWorkloadName(agent, step, run.RunID),
+		ServiceAccountName:           busMigrationWorkloadName(agent, identity, run.RunID),
 		AutomountServiceAccountToken: ptr.To(false),
 		RestartPolicy:                corev1.RestartPolicyNever,
 		SecurityContext: &corev1.PodSecurityContext{
@@ -536,7 +586,7 @@ func busMigrationPodSpec(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.
 	}
 }
 
-// buildBusMigrationJob is a run's pin, unpin or snapshot Job: bus-migrate
+// buildBusMigrationJob is a run's pin or unpin Job: bus-migrate
 // connecting as the step's own principal with its projected bus token, over
 // TLS verified against the bus CA, bounded by the run's deadline.
 func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, step string, now time.Time) *batchv1.Job {
@@ -554,16 +604,6 @@ func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 		command = append(command, "--target", a2aNATSName(agent)+"-0")
 	case "unpin":
 		command = append(command, "--replicas", "3")
-	case "snapshot":
-		command = append(command, "--dir", busMigrationStageMount)
-		volumes = append(volumes, corev1.Volume{Name: busMigrationStageVolume, VolumeSource: corev1.VolumeSource{
-			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: busMigrationStageClaim(agent, run.RunID)},
-		}})
-		mounts = append(mounts, corev1.VolumeMount{Name: busMigrationStageVolume, MountPath: busMigrationStageMount})
-	}
-	deadline := int64(run.Deadline.Add(-busMigrationJobMargin).Sub(now).Seconds())
-	if deadline < 1 {
-		deadline = 1
 	}
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -573,11 +613,11 @@ func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptr.To(int32(2)),
-			ActiveDeadlineSeconds:   ptr.To(deadline),
+			ActiveDeadlineSeconds:   ptr.To(busMigrationActiveDeadline(run, now)),
 			TTLSecondsAfterFinished: ptr.To(int32(86400)),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: a2aLabels(agent, "bus-migration")},
-				Spec:       busMigrationPodSpec(agent, run, step, command, volumes, mounts),
+				Spec:       busMigrationPodSpec(agent, run, step, step, command, volumes, mounts),
 			},
 		},
 	}
@@ -598,25 +638,104 @@ func buildBusHashPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusM
 			Namespace: agent.Namespace,
 			Labels:    a2aLabels(agent, "bus-migration"),
 		},
-		Spec: busMigrationPodSpec(agent, run, "hash", command, volumes, mounts),
+		Spec: busMigrationPodSpec(agent, run, "hash", "hash", command, volumes, mounts),
 	}
 }
 
-// busMigrationPhaseWorkload names the workload a phase runs, "" for the
-// phases that run none of their own (rollouts, and the restore pod's, which
-// is on hold).
-func busMigrationPhaseWorkload(phase busMigrationPhase) string {
+// busMigrationActiveDeadline is a Job's or pod's activeDeadlineSeconds: the
+// time left on the run less busMigrationJobMargin, so the work stops while
+// its credential still works.
+func busMigrationActiveDeadline(run *agentv1alpha1.BusMigrationStatus, now time.Time) int64 {
+	return max(int64(run.Deadline.Add(-busMigrationJobMargin).Sub(now).Seconds()), 1)
+}
+
+// busMigrationStreamIdentity names the one to three leg's bus identity:
+// its ServiceAccount, its principal, and the pods that hold it.
+const busMigrationStreamIdentity = "stream"
+
+const (
+	// busMigrationRunMount is where the restore pods read the run Secret.
+	busMigrationRunMount = "/run/bus-migration"
+	// busMigrationRunKey is the run Secret's one key (busmigrate.RunFile).
+	busMigrationRunKey = "run.json"
+)
+
+// busMigrationRunSecret is the run's Secret: the hashing pod's digests and
+// the operator's stream policies, which the restore pods read.
+func busMigrationRunSecret(agent *agentv1alpha1.PlatformAgent, runID string) string {
+	return busMigrationWorkloadName(agent, "run", runID)
+}
+
+// buildBusStreamPod is one of the one to three leg's pods, all holding the
+// stream identity: "snapshot" stages every stream to the staging volume,
+// mounted read-write; "restore" restores them into three servers and
+// raises each to R3; "rollback" restores the same snapshot into one server.
+// The two restores mount the staging volume read-only and take the digests
+// and policies from the run Secret. Each is bounded by the run's deadline
+// less the margin.
+func buildBusStreamPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, kind string, now time.Time) *corev1.Pod {
+	leg := map[string]string{"snapshot": "snapshot", "restore": "restore", "rollback": "restore"}[kind]
+	command := []string{busMigrationBinary, "bus-migrate", leg,
+		"--server", a2aNATSTLSScheme + a2aNATSAddress(agent),
+		"--ca-file", a2aNATSCAFile(),
+		"--user", busMigrationPrincipal(busMigrationStreamIdentity, run.RunID),
+		"--token-file", a2aBusTokenPath + "/" + a2aBusTokenFile,
+		"--streams", strings.Join(a2aProvisionedStreams, ","),
+		"--dir", busMigrationStageMount,
+	}
+	readOnly := kind != "snapshot"
+	volumes := []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), {Name: busMigrationStageVolume, VolumeSource: corev1.VolumeSource{
+		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: busMigrationStageClaim(agent, run.RunID), ReadOnly: readOnly},
+	}}}
+	mounts := []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount(), {Name: busMigrationStageVolume, MountPath: busMigrationStageMount, ReadOnly: readOnly}}
+	if leg == "restore" {
+		replicas := "3"
+		if kind == "rollback" {
+			replicas = "1"
+		}
+		command = append(command, "--run-file", busMigrationRunMount+"/"+busMigrationRunKey, "--replicas", replicas)
+		volumes = append(volumes, corev1.Volume{Name: "run", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+			SecretName: busMigrationRunSecret(agent, run.RunID), DefaultMode: ptr.To(int32(0o440)),
+		}}})
+		mounts = append(mounts, corev1.VolumeMount{Name: "run", MountPath: busMigrationRunMount, ReadOnly: true})
+	}
+	spec := busMigrationPodSpec(agent, run, kind, busMigrationStreamIdentity, command, volumes, mounts)
+	spec.ActiveDeadlineSeconds = ptr.To(busMigrationActiveDeadline(run, now))
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      busMigrationWorkloadName(agent, kind, run.RunID),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "bus-migration"),
+		},
+		Spec: spec,
+	}
+}
+
+// busMigrationWork is what a phase runs: the Job or pod's name in the run,
+// the identity (ServiceAccount) it holds, and whether it is a bare pod.
+type busMigrationWork struct {
+	name, identity string
+	pod            bool
+}
+
+// busMigrationPhaseWorkload is the work a phase runs, zero for the phases
+// that run none of their own (rollouts).
+func busMigrationPhaseWorkload(phase busMigrationPhase) busMigrationWork {
 	switch phase {
 	case busMigrationPinning:
-		return "pin"
+		return busMigrationWork{name: "pin", identity: "pin"}
 	case busMigrationUnpinning:
-		return "unpin"
+		return busMigrationWork{name: "unpin", identity: "unpin"}
 	case busMigrationSnapshot:
-		return "snapshot"
+		return busMigrationWork{name: "snapshot", identity: busMigrationStreamIdentity, pod: true}
 	case busMigrationHashing:
-		return "hash"
+		return busMigrationWork{name: "hash", identity: "hash", pod: true}
+	case busMigrationRestoring:
+		return busMigrationWork{name: "restore", identity: busMigrationStreamIdentity, pod: true}
+	case busMigrationRollbackRestoring:
+		return busMigrationWork{name: "rollback", identity: busMigrationStreamIdentity, pod: true}
 	}
-	return ""
+	return busMigrationWork{}
 }
 
 // ensureBusMigrationWorkload creates the current phase's ServiceAccount and
@@ -625,19 +744,21 @@ func busMigrationPhaseWorkload(phase busMigrationPhase) string {
 // it comes first; it holds no RBAC. Nothing is created without
 // OPERATOR_IMAGE, and the phase then waits out the run's deadline.
 func (r *PlatformAgentReconciler) ensureBusMigrationWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, now time.Time) error {
-	step := busMigrationPhaseWorkload(busMigrationPhase(run.Phase))
-	if step == "" || busMigrationImage() == "" {
+	work := busMigrationPhaseWorkload(busMigrationPhase(run.Phase))
+	if work.name == "" || busMigrationImage() == "" {
 		return nil
 	}
-	name := busMigrationWorkloadName(agent, step, run.RunID)
-	if err := ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, name, agent.Namespace, nil, commonLabels(agent), fieldOwner); err != nil {
+	if err := ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, busMigrationWorkloadName(agent, work.identity, run.RunID), agent.Namespace, nil, commonLabels(agent), fieldOwner); err != nil {
 		return err
 	}
 	var obj client.Object
-	if step == "hash" {
+	switch {
+	case work.name == "hash":
 		obj = buildBusHashPod(agent, run)
-	} else {
-		obj = buildBusMigrationJob(agent, run, step, now)
+	case work.pod:
+		obj = buildBusStreamPod(agent, run, work.name, now)
+	default:
+		obj = buildBusMigrationJob(agent, run, work.name, now)
 	}
 	if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 		return err
@@ -678,4 +799,106 @@ func a2aStreamPolicies(replicas int) []busmigrate.StreamPolicy {
 		kv("PROFILE_LEASES", 67108864, 0),
 		stream("PROFILE_SUBMITS", []string{"a2a.submit.>"}, 3*day, 1073741824, 1),
 	}
+}
+
+// ensureBusRunSecret writes the run Secret once the hashing pod has
+// succeeded: its digests, read from its termination message, beside the
+// operator's stream policies at one replica (each stream is restored at R1,
+// then raised). A report that is not exactly one well-formed digest pair
+// per provisioned stream is refused, and refused says why; the run then
+// turns back without the Secret.
+func (r *PlatformAgentReconciler) ensureBusRunSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (refused string, err error) {
+	key := client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationRunSecret(agent, run.RunID)}
+	if err := r.Get(ctx, key, &corev1.Secret{}); err == nil {
+		return "", nil
+	} else if !errors.IsNotFound(err) {
+		return "", err
+	}
+	pod, err := r.busMigrationPod(ctx, agent, run, "hash")
+	if err != nil {
+		return "", err
+	}
+	if pod == nil {
+		return "the hashing pod is gone", nil
+	}
+	digests, refused := parseBusDigests(terminationMessage(pod))
+	if refused != "" {
+		return refused, nil
+	}
+	body, err := json.Marshal(busmigrate.RunFile{Digests: digests, Policies: a2aStreamPolicies(1)})
+	if err != nil {
+		return "", err
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, Labels: a2aLabels(agent, "bus-migration")},
+		Data:       map[string][]byte{busMigrationRunKey: body},
+	}
+	if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
+		return "", err
+	}
+	withCommonLabels(secret, agent)
+	if err := r.Create(ctx, secret); err != nil && !errors.IsAlreadyExists(err) {
+		return "", err
+	}
+	return "", nil
+}
+
+// parseBusDigests reads the hashing pod's report: exactly the provisioned
+// streams, each with a data and a metadata digest of 64 lowercase hex.
+func parseBusDigests(msg string) (map[string]busmigrate.StagedDigest, string) {
+	var digests map[string]busmigrate.StagedDigest
+	if err := json.Unmarshal([]byte(msg), &digests); err != nil {
+		return nil, "it is not a digest report"
+	}
+	hex64 := func(s string) bool {
+		return len(s) == 64 && strings.Trim(s, "0123456789abcdef") == ""
+	}
+	if len(digests) != len(a2aProvisionedStreams) {
+		return nil, fmt.Sprintf("it names %d streams, not the %d provisioned", len(digests), len(a2aProvisionedStreams))
+	}
+	for _, name := range a2aProvisionedStreams {
+		d, ok := digests[name]
+		if !ok {
+			return nil, "it has no digest for " + name
+		}
+		if !hex64(d.Data) || !hex64(d.Meta) {
+			return nil, "its digests for " + name + " are not SHA-256 hex"
+		}
+	}
+	return digests, ""
+}
+
+// busMigrationEventLimit bounds the warnings Event's message.
+const busMigrationEventLimit = 1024
+
+// recordRestoreReport reads a finished restore pod's report. Its warnings
+// go onto the run's status, once, with one Warning Event, so nothing the
+// restore accepted outside its policy goes unreported; its error, when it
+// failed, is returned for the run's cause.
+func (r *PlatformAgentReconciler) recordRestoreReport(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (failure string, err error) {
+	pod, err := r.busMigrationPod(ctx, agent, run, busMigrationPhaseWorkload(busMigrationPhase(run.Phase)).name)
+	if err != nil || pod == nil {
+		return "", err
+	}
+	msg := terminationMessage(pod)
+	if msg == "" {
+		// Killed before it wrote one: at its deadline, or evicted.
+		return "", nil
+	}
+	var report busmigrate.Report
+	if err := json.Unmarshal([]byte(msg), &report); err != nil {
+		return "its report could not be read", nil
+	}
+	if len(report.Warnings) > 0 && run.Warnings == nil {
+		run.Warnings = report.Warnings
+		if r.Recorder != nil {
+			msg := fmt.Sprintf("the A2A bus migration restored streams that differ from a fresh install (%d): %s",
+				len(report.Warnings), strings.Join(report.Warnings, "; "))
+			if len(msg) > busMigrationEventLimit {
+				msg = msg[:busMigrationEventLimit-3] + "..."
+			}
+			r.Recorder.Event(agent, corev1.EventTypeWarning, "BusMigrationDrift", msg)
+		}
+	}
+	return report.Error, nil
 }
