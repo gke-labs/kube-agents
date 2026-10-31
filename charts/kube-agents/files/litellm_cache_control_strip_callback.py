@@ -101,10 +101,11 @@ def routes_to_gemini(model_name: str, router: Any) -> bool:
         return False
     models = [(d.get(DEPLOYMENT_PARAMS_KEY) or {}).get(DEPLOYMENT_MODEL_KEY, "") for d in deployments]
     if not models or not any(models):
-        # The proxy only asks about names it serves, so an alias with no
-        # deployments, or deployments with no model string, is a shape this
-        # hook no longer reads.
-        _warn_blind(f"the router returned no deployment model for {model_name!r}")
+        # No deployments is what the router answers for an alias it does not
+        # serve, which the proxy refuses right after this hook: not this hook's
+        # concern and not a sign it is blind, so no warning (it would spend
+        # the one-shot warning on a client's typo).
+        logger.debug("no deployment model for %r; request left as sent", model_name)
         return False
     return all(is_gemini_model(m) for m in models)
 

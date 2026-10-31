@@ -196,6 +196,23 @@ class TestHook(unittest.TestCase):
         expected["model"] = "claude"
         self.assertEqual(claude, expected)
 
+    def test_an_unknown_alias_is_left_alone_and_does_not_spend_the_blind_warning(self):
+        router = _Router({"model-default": ["vertex_ai/gemini-4-argon"]})
+        self.hook._router = lambda: router
+        self.hook._blind_warned = False
+        request = _claude_code_request()
+        request["model"] = "gpt-4"
+        with self.assertNoLogs("kube_agents.litellm_cache_control_strip", level="WARNING"):
+            asyncio.run(self.hook.proxy_handler_instance.async_pre_call_hook(None, None, request, "anthropic_messages"))
+        expected = _claude_code_request()
+        expected["model"] = "gpt-4"
+        self.assertEqual(request, expected)
+        self.assertFalse(self.hook._blind_warned)
+        # The warning is still available for a router the hook cannot read.
+        self.hook._router = lambda: None
+        with self.assertLogs("kube_agents.litellm_cache_control_strip", level="WARNING"):
+            asyncio.run(self.hook.proxy_handler_instance.async_pre_call_hook(None, None, _claude_code_request(), "anthropic_messages"))
+
     def test_a_blind_hook_leaves_the_request_alone_and_says_so_once(self):
         self.hook._router = lambda: None
         self.hook._blind_warned = False
