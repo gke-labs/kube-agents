@@ -293,7 +293,7 @@ Cost is part of the scalability answer, so each step also gives what it cost:
 ## Output
 
 - The records in `bench/scale/harness-limits.json`, beside Phases 1 to 4.
-- A report: for each step, safe or not, and why, with the numbers.
+- A report: for each step, safe or not, and why, with the numbers: [`real-install-results.md`](real-install-results.md).
 - The design doc's answer for the L container size, confirmed or corrected.
 - For the red test: whether the S size broke where the forecast said it would.
 - The cost of each step, of one install per hour and per day, and of the XL fleet's installs: GKE
