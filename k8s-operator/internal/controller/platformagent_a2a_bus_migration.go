@@ -118,7 +118,7 @@ func nextBusMigrationPhase(leg busMigrationLeg, phase busMigrationPhase, abandon
 			if ok {
 				return busMigrationStep{next: busMigrationAbandoned, abandoning: true}
 			}
-			return busMigrationStep{next: busMigrationFailed, abandoning: true, manual: "streams pinned to R1 on server 0 could not be raised back to R3; the bus is three servers with some single-copy streams: raise them with the bus-migrate unpin leg"}
+			return busMigrationStep{next: busMigrationFailed, abandoning: true, manual: "streams pinned to R1 on server 0 could not be raised back to R3; the bus is three servers with some single-copy streams"}
 		}
 	case busMigrationGrow:
 		switch phase {
@@ -391,6 +391,9 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 			run.Cause = busMigrationCause(run, late || observed == busMigrationPending)
 		}
 		step := nextBusMigrationPhase(leg, busMigrationPhase(run.Phase), run.Abandoning, outcome)
+		if step.next == busMigrationFailed && busMigrationPhase(run.Phase) != busMigrationFailed {
+			run.FailedIn = run.Phase
+		}
 		run.Phase, run.Abandoning = string(step.next), step.abandoning
 		if step.manual != "" {
 			run.Message = step.manual
@@ -425,7 +428,9 @@ func busMigrationCause(run *agentv1alpha1.BusMigrationStatus, late bool) string 
 // and finds every stream there.
 func busMigrationHoldsProvision(agent *agentv1alpha1.PlatformAgent) bool {
 	run := agent.Status.BusMigration
-	return run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase))
+	// A Failed run holding its freeze holds the Job too: streams it would
+	// create empty would take the names a retried restore needs.
+	return run != nil && (!busMigrationTerminal(busMigrationPhase(run.Phase)) || busMigrationFreezeActive(agent))
 }
 
 // a2aBusMigratingConditionType reports the bus's migration: True while one
@@ -454,7 +459,7 @@ func busMigratingCondition(agent *agentv1alpha1.PlatformAgent) (cond metav1.Cond
 			Message: fmt.Sprintf("the migration from %d NATS servers to %d did not complete and was undone (%s); the bus runs %d servers with its data. Change the spec to try again.", from, to, run.Cause, from)}, true
 	case busMigrationFailed:
 		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Failed",
-			Message: fmt.Sprintf("the migration from %d NATS servers to %d stopped (%s): %s", from, to, run.Cause, run.Message)}, true
+			Message: fmt.Sprintf("the migration from %d NATS servers to %d stopped (%s): %s.%s", from, to, run.Cause, run.Message, busMigrationFailedActions(agent))}, true
 	}
 	msg := fmt.Sprintf("migrating the A2A bus from %d NATS servers to %d (phase %s)", from, to, phase)
 	if run.Abandoning {
@@ -992,9 +997,9 @@ func buildBusStagePVC(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bus
 }
 
 // cleanupBusMigration removes what a run made once it has ended: every
-// per-run ServiceAccount, and, unless the run Failed, the staging volume
-// and the run Secret. A Failed run keeps those two for the manual step its
-// condition names, which needs the snapshot and its digests; its
+// per-run ServiceAccount, and, unless the run Failed and was not given up,
+// the staging volume and the run Secret. A Failed run keeps those two for a
+// retry, which needs the snapshot and its digests; its
 // ServiceAccounts go regardless, since the map no longer names them. Jobs
 // and pods stay, owned by the CR, for their logs; they hold no credential
 // once their ServiceAccount is gone.
@@ -1003,7 +1008,7 @@ func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent
 	for _, identity := range []string{"pin", "unpin", "hash", busMigrationStreamIdentity} {
 		objs = append(objs, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(agent, identity, run.RunID), Namespace: agent.Namespace}})
 	}
-	if busMigrationPhase(run.Phase) != busMigrationFailed {
+	if busMigrationPhase(run.Phase) != busMigrationFailed || run.GivenUp {
 		objs = append(objs,
 			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(agent, run.RunID), Namespace: agent.Namespace}},
 			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(agent, run.RunID), Namespace: agent.Namespace}})
@@ -1027,6 +1032,16 @@ func busMigrationFreezeActive(agent *agentv1alpha1.PlatformAgent) bool {
 		return false
 	}
 	phase := busMigrationPhase(run.Phase)
+	if phase == busMigrationFailed {
+		// A run that failed inside the freeze keeps it, over a bus whose
+		// streams were not all put back and the snapshot that can, until a
+		// person retries or gives it up (busMigrationActOnFailed). An
+		// unrelated spec change does not lift it.
+		if run.GivenUp || run.FailedIn == "" {
+			return false
+		}
+		phase = busMigrationPhase(run.FailedIn)
+	}
 	return busMigrationFrozen(busMigrationLeg(run.Leg), phase) && phase != busMigrationReleasing && !busMigrationTerminal(phase)
 }
 
@@ -1154,4 +1169,87 @@ func busMigrationFreezeConfigured(agent *agentv1alpha1.PlatformAgent) bool {
 // run's freeze ("" for one rendered without it).
 func busNATSFrozenFor(sts *appsv1.StatefulSet) string {
 	return sts.Spec.Template.Annotations[a2aBusFreezeAnnotation]
+}
+
+const (
+	// a2aBusMigrationRetryAnnotation, set on the PlatformAgent to
+	// "<run>-<attempt>", retries a Failed run: the way back it failed on
+	// (RollingBack, from the start of it, or Unpinning) runs again with a
+	// fresh deadline, with the same identity, snapshot and digests. The value
+	// names the attempt, so each retry is its own deliberate act and an
+	// annotation left in place never retries twice.
+	a2aBusMigrationRetryAnnotation = "kubeagents.x-k8s.io/bus-migration-retry"
+	// a2aBusMigrationAbandonAnnotation, set to the run's ID, gives a Failed
+	// run up: its freeze lifts, and streams it did not put back are
+	// recreated empty by the provision Job.
+	a2aBusMigrationAbandonAnnotation = "kubeagents.x-k8s.io/bus-migration-abandon"
+	// busMigrationMaxRetries bounds the retries of one run.
+	busMigrationMaxRetries = 3
+)
+
+// busMigrationRetryPhase is where a retry of a run that failed in failedIn
+// starts, "" when that failure has no retry: the two ways back, from their
+// start.
+func busMigrationRetryPhase(failedIn busMigrationPhase) busMigrationPhase {
+	switch failedIn {
+	case busMigrationRollingBack, busMigrationRollbackRestoring:
+		return busMigrationRollingBack
+	case busMigrationUnpinning:
+		return busMigrationUnpinning
+	}
+	return ""
+}
+
+// busMigrationRetryValue is the retry annotation's value for a Failed run's
+// next attempt.
+func busMigrationRetryValue(run *agentv1alpha1.BusMigrationStatus) string {
+	return fmt.Sprintf("%s-%d", run.RunID, len(run.Retries)+1)
+}
+
+// busMigrationActOnFailed applies a person's decision on a Failed run, read
+// from the PlatformAgent's annotations: a retry naming its next attempt, while
+// attempts remain, puts it back on its way back with a fresh deadline; an
+// abandon naming the run gives it up. Anything else, an annotation naming
+// another run or attempt included, is ignored. gaveUp reports a run given up
+// on this call, whose stage and run Secret are then no longer kept.
+func busMigrationActOnFailed(agent *agentv1alpha1.PlatformAgent, now metav1.Time) (gaveUp bool) {
+	run := agent.Status.BusMigration
+	if run == nil || busMigrationPhase(run.Phase) != busMigrationFailed || run.GivenUp {
+		return false
+	}
+	if agent.Annotations[a2aBusMigrationAbandonAnnotation] == run.RunID {
+		run.GivenUp = true
+		return true
+	}
+	retry := busMigrationRetryPhase(busMigrationPhase(run.FailedIn))
+	if retry == "" || len(run.Retries) >= busMigrationMaxRetries || agent.Annotations[a2aBusMigrationRetryAnnotation] != busMigrationRetryValue(run) {
+		return false
+	}
+	run.Retries = append(run.Retries, agentv1alpha1.BusMigrationRetry{At: now, FailedIn: run.FailedIn, Cause: run.Cause})
+	run.Phase, run.FailedIn, run.Cause, run.Message = string(retry), "", "", ""
+	run.Deadline = metav1.NewTime(now.Add(busMigrationRunDeadline))
+	return false
+}
+
+// busMigrationFailedActions is what the Failed condition tells a person
+// they can do, with the exact annotations.
+func busMigrationFailedActions(agent *agentv1alpha1.PlatformAgent) string {
+	run := agent.Status.BusMigration
+	if run.GivenUp {
+		return " It was given up: the freeze is lifted, and streams it did not put back are recreated empty."
+	}
+	var b strings.Builder
+	if busMigrationRetryPhase(busMigrationPhase(run.FailedIn)) != "" {
+		if left := busMigrationMaxRetries - len(run.Retries); left > 0 {
+			fmt.Fprintf(&b, " To retry (%d of %d left): annotate the PlatformAgent %s=%s.", left, busMigrationMaxRetries, a2aBusMigrationRetryAnnotation, busMigrationRetryValue(run))
+		} else {
+			b.WriteString(" No retries are left.")
+		}
+	}
+	fmt.Fprintf(&b, " To give it up: annotate the PlatformAgent %s=%s", a2aBusMigrationAbandonAnnotation, run.RunID)
+	if busMigrationFreezeActive(agent) {
+		b.WriteString(", which lifts the write freeze and recreates every stream the run did not put back, empty")
+	}
+	b.WriteString(". Until then no other migration starts, and spec changes leave the bus as it is.")
+	return b.String()
 }

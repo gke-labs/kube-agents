@@ -4052,6 +4052,11 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 	if want == 0 {
 		want = agentv1alpha1.DefaultBusReplicas
 	}
+	if busMigrationActOnFailed(agent, metav1.Now()) {
+		if err := r.cleanupBusMigration(ctx, agent, agent.Status.BusMigration); err != nil {
+			return err
+		}
+	}
 	if running != 0 && want != running {
 		// A change between the counts starts a migration; the bus keeps the
 		// count it runs until the migration's phases convert it.
@@ -4087,6 +4092,10 @@ const busMigrationRunDeadline = 2 * time.Hour
 func startBusMigration(agent *agentv1alpha1.PlatformAgent, running, want int, now metav1.Time) {
 	if run := agent.Status.BusMigration; run != nil {
 		if !busMigrationTerminal(busMigrationPhase(run.Phase)) {
+			return
+		}
+		if busMigrationPhase(run.Phase) == busMigrationFailed && !run.GivenUp {
+			// A Failed run waits for a person to retry or give it up.
 			return
 		}
 		if run.ObservedGeneration == agent.Generation {

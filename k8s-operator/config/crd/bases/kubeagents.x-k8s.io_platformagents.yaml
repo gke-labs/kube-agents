@@ -11635,11 +11635,25 @@ spec:
                         before it.
                       format: date-time
                       type: string
+                    failedIn:
+                      description: |-
+                        FailedIn is the phase a Failed run failed in. A run that failed inside
+                        the one to three leg's write freeze keeps the freeze, with its
+                        snapshot, until a person retries it or gives it up, each with an
+                        annotation on the PlatformAgent naming this run (the A2ABusMigrating
+                        condition says which). A Failed run blocks any new migration until
+                        then.
+                      type: string
                     freezeConfirmed:
                       description: |-
                         FreezeConfirmed is set once every callout replica serves the write
                         freeze's identity map, and only then does the bus render without its
                         static application users and restart into the freeze.
+                      type: boolean
+                    givenUp:
+                      description: |-
+                        GivenUp is set when a person gave a Failed run up: its freeze is
+                        lifted, and streams it did not put back are recreated empty.
                       type: boolean
                     leg:
                       description: |-
@@ -11665,6 +11679,28 @@ spec:
                         Abandoned left it at its old count with its data; Failed stopped where
                         a person has to act, and Message says what.
                       type: string
+                    retries:
+                      description: |-
+                        Retries records each retry of a Failed run, oldest first, at most
+                        three.
+                      items:
+                        description: |-
+                          BusMigrationRetry is one retry of a Failed bus migration run: when it was
+                          asked for, and the failure it retried.
+                        properties:
+                          at:
+                            format: date-time
+                            type: string
+                          cause:
+                            type: string
+                          failedIn:
+                            type: string
+                        required:
+                          - at
+                          - failedIn
+                        type: object
+                      maxItems: 3
+                      type: array
                     runID:
                       description: |-
                         RunID names this migration's own Jobs, pods, ServiceAccounts and bus

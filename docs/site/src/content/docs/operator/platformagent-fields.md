@@ -227,6 +227,12 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `busMigration.deadline` | `metav1.Time` | yes |  |  | Deadline is when an unfinished phase counts as failed, and when the migration's bus credentials stop working. Its Jobs stop a few minutes before it. |
 | `busMigration.message` | `string` | no |  |  | Message is the manual step a Failed migration names. |
 | `busMigration.cause` | `string` | no |  |  | Cause is why the run turned back: the phase that failed, and whether it was still running at Deadline. Set at the first failure and kept. |
+| `busMigration.failedIn` | `string` | no |  |  | FailedIn is the phase a Failed run failed in. A run that failed inside the one to three leg's write freeze keeps the freeze, with its snapshot, until a person retries it or gives it up, each with an annotation on the PlatformAgent naming this run (the A2ABusMigrating condition says which). A Failed run blocks any new migration until then. |
+| `busMigration.retries` | `[]object` | no |  | max items `3` | Retries records each retry of a Failed run, oldest first, at most three. |
+| `busMigration.retries[].at` | `metav1.Time` | yes |  |  |  |
+| `busMigration.retries[].failedIn` | `string` | yes |  |  |  |
+| `busMigration.retries[].cause` | `string` | no |  |  |  |
+| `busMigration.givenUp` | `boolean` | no |  |  | GivenUp is set when a person gave a Failed run up: its freeze is lifted, and streams it did not put back are recreated empty. |
 | `busMigration.freezeConfirmed` | `boolean` | no |  |  | FreezeConfirmed is set once every callout replica serves the write freeze's identity map, and only then does the bus render without its static application users and restart into the freeze. |
 | `busMigration.warnings` | `[]string` | no |  |  | Warnings are what the restore found and restored anyway: a stream lacking a subject a fresh install has, or a field outside the restore's policy that differs from a fresh install. Each is also reported as one Warning Event. At most 4 KiB of them; the last says how many more there were. |
 | `busMigration.observedGeneration` | `integer` | yes |  |  | ObservedGeneration is the PlatformAgent generation that started this migration. A migration that ended without converting is not started again until the spec changes. |

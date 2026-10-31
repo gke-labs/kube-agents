@@ -946,10 +946,14 @@ func TestRenderedBusMigrationFixture(t *testing.T) {
 // map is the install's own.
 func TestTheFreezeMapsOnlyTheMigration(t *testing.T) {
 	frozen := []busMigrationPhase{busMigrationFreezing, busMigrationSnapshot, busMigrationHashing, busMigrationConverting,
-		busMigrationRestoring, busMigrationRollingBack, busMigrationRollbackRestoring}
+		busMigrationRestoring, busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationFailed}
 	for _, phase := range frozen {
 		agent := authMapTestAgent()
 		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(phase), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+		if phase == busMigrationFailed {
+			// Failed in the rollback: the freeze holds.
+			agent.Status.BusMigration.FailedIn = string(busMigrationRollbackRestoring)
+		}
 		doc, err := renderA2AAuthMap(agent, nil)
 		if err != nil {
 			t.Fatalf("%s: %v", phase, err)
@@ -977,13 +981,18 @@ func TestTheFreezeMapsOnlyTheMigration(t *testing.T) {
 		}
 	}
 	thawed := []struct {
-		leg   busMigrationLeg
-		phase busMigrationPhase
-	}{{busMigrationGrow, busMigrationReleasing}, {busMigrationGrow, busMigrationDone}, {busMigrationGrow, busMigrationAbandoned},
-		{busMigrationGrow, busMigrationFailed}, {busMigrationShrink, busMigrationPinning}, {busMigrationShrink, busMigrationShrinking}}
+		leg      busMigrationLeg
+		phase    busMigrationPhase
+		failedIn busMigrationPhase
+		givenUp  bool
+	}{{busMigrationGrow, busMigrationReleasing, "", false}, {busMigrationGrow, busMigrationDone, "", false}, {busMigrationGrow, busMigrationAbandoned, "", false},
+		{busMigrationGrow, busMigrationFailed, busMigrationReleasing, false}, {busMigrationGrow, busMigrationFailed, busMigrationRollbackRestoring, true},
+		{busMigrationGrow, busMigrationFailed, "", false},
+		{busMigrationShrink, busMigrationPinning, "", false}, {busMigrationShrink, busMigrationShrinking, "", false}, {busMigrationShrink, busMigrationFailed, busMigrationUnpinning, false}}
 	for _, tc := range thawed {
 		agent := authMapTestAgent()
-		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(tc.leg), RunID: "3-1", Phase: string(tc.phase), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(tc.leg), RunID: "3-1", Phase: string(tc.phase), Deadline: metav1.NewTime(time.Now().Add(time.Hour)),
+			FailedIn: string(tc.failedIn), GivenUp: tc.givenUp}
 		doc, err := renderA2AAuthMap(agent, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -1396,6 +1405,9 @@ func TestARunsEndCleansUpWhatItMade(t *testing.T) {
 			if got := busMigrationPhase(m.agent.Status.BusMigration.Phase); got != tc.end {
 				t.Fatalf("phase %s, want %s", got, tc.end)
 			}
+			if tc.end == busMigrationFailed && (m.agent.Status.BusMigration.FailedIn != string(tc.from) || !busMigrationFreezeActive(m.agent)) {
+				t.Errorf("failed in %q, frozen %v; want %s and the freeze held", m.agent.Status.BusMigration.FailedIn, busMigrationFreezeActive(m.agent), tc.from)
+			}
 			for _, o := range made {
 				err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(o), o)
 				_, isSA := o.(*corev1.ServiceAccount)
@@ -1639,4 +1651,162 @@ func TestAFrozenRestartWithoutAConfirmationOnRecordWaits(t *testing.T) {
 	m.agent.Status.BusMigration.FreezeConfirmed = false
 	m.calloutPods(2, false, true)
 	m.pass(busMigrationFreezing, 1)
+}
+
+// failedRig is a run Failed in failedIn, a while ago (its deadline passed).
+func failedRig(t *testing.T, leg busMigrationLeg, failedIn busMigrationPhase, running int32) *migrationRig {
+	t.Helper()
+	m := newMigrationRig(t, leg, busMigrationFailed, running, time.Now().Add(-time.Hour))
+	run := m.agent.Status.BusMigration
+	run.FailedIn, run.Abandoning, run.Cause = string(failedIn), true, "the "+string(failedIn)+" phase failed"
+	run.FreezeConfirmed = leg == busMigrationGrow
+	return m
+}
+
+// A retry annotation naming the run's next attempt puts the run back on the
+// way it failed on, from its start, with a fresh deadline its identity
+// expires at, and records the attempt; the same value never retries twice;
+// at most three attempts; a value naming another run or attempt is ignored.
+func TestARetryRerunsTheWayBack(t *testing.T) {
+	for _, tc := range []struct {
+		leg      busMigrationLeg
+		failedIn busMigrationPhase
+		running  int32
+		back     busMigrationPhase
+	}{
+		{busMigrationGrow, busMigrationRollbackRestoring, 1, busMigrationRollingBack},
+		{busMigrationGrow, busMigrationRollingBack, 1, busMigrationRollingBack},
+		{busMigrationShrink, busMigrationUnpinning, 3, busMigrationUnpinning},
+	} {
+		name := fmt.Sprintf("%s from %s", tc.leg, tc.failedIn)
+		m := failedRig(t, tc.leg, tc.failedIn, tc.running)
+		for _, wrong := range []string{"9-9-1", "3-1-2", "3-1", ""} {
+			m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: wrong}
+			m.pass(busMigrationFailed, tc.running)
+		}
+		before := time.Now()
+		m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: "3-1-1"}
+		m.pass(tc.back, tc.running)
+		run := m.agent.Status.BusMigration
+		if len(run.Retries) != 1 || run.Retries[0].FailedIn != string(tc.failedIn) || run.Retries[0].Cause == "" || run.FailedIn != "" || run.Cause != "" {
+			t.Errorf("%s: after the retry: %+v", name, run)
+		}
+		if run.Deadline.Time.Before(before.Add(busMigrationRunDeadline - time.Minute)) {
+			t.Errorf("%s: deadline %v, want a fresh one", name, run.Deadline)
+		}
+		if ids := busMigrationIdentities(m.agent); tc.back == busMigrationUnpinning && (len(ids) != 1 || !ids[0].notAfter.Equal(run.Deadline.Time)) {
+			t.Errorf("%s: the identity's notAfter does not follow the new deadline: %+v", name, ids)
+		}
+		// It fails again: the same annotation, still set, does not retry.
+		run.Phase, run.FailedIn, run.Cause = string(busMigrationFailed), string(tc.failedIn), "again"
+		m.pass(busMigrationFailed, tc.running)
+		// Up to three attempts, each its own value; then none.
+		for attempt := 2; attempt <= 4; attempt++ {
+			m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: fmt.Sprintf("3-1-%d", attempt)}
+			if attempt == 4 {
+				m.pass(busMigrationFailed, tc.running)
+				break
+			}
+			m.pass(tc.back, tc.running)
+			m.agent.Status.BusMigration.Phase, m.agent.Status.BusMigration.FailedIn = string(busMigrationFailed), string(tc.failedIn)
+		}
+		if n := len(m.agent.Status.BusMigration.Retries); n != busMigrationMaxRetries {
+			t.Errorf("%s: %d retries recorded, want the cap of %d", name, n, busMigrationMaxRetries)
+		}
+	}
+	// A failure with no way back to retry is not retried.
+	m := failedRig(t, busMigrationGrow, busMigrationReleasing, 3)
+	m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: "3-1-1"}
+	m.pass(busMigrationFailed, 3)
+}
+
+// A failed rollback keeps the freeze, holds the provision Job and blocks any
+// new migration through unrelated spec changes; only the abandon annotation
+// naming the run gives it up, lifting the freeze and the hold.
+func TestOnlyAnAbandonNamingTheRunLiftsAFailedFreeze(t *testing.T) {
+	m := failedRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1)
+	frozen := func() bool { return busMigrationFreezeActive(m.agent) && busMigrationHoldsProvision(m.agent) }
+	m.pass(busMigrationFailed, 1)
+	if !frozen() {
+		t.Fatal("a failed rollback lifted the freeze")
+	}
+	// An unrelated spec change, and one asking for a count: nothing lifts,
+	// nothing starts.
+	m.agent.Generation++
+	m.agent.Spec.Harness.Tuning.BusReplicas = ptr.To(3)
+	m.pass(busMigrationFailed, 1)
+	if !frozen() || m.agent.Status.BusMigration.RunID != "3-1" {
+		t.Fatalf("a spec change lifted the freeze or started run %s", m.agent.Status.BusMigration.RunID)
+	}
+	m.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "9-9"}
+	m.pass(busMigrationFailed, 1)
+	if !frozen() {
+		t.Fatal("an abandon naming another run lifted the freeze")
+	}
+	// Given up while the spec asks for three: the run is let go and the
+	// migration the spec asks for starts, as a new run.
+	m.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
+	m.pass(busMigrationFreezing, 1)
+	if m.agent.Status.BusMigration.RunID == "3-1" {
+		t.Error("no new run after giving the failed one up")
+	}
+
+	// Given up with nothing more asked: the freeze and the hold lift, and
+	// the map is the install's again.
+	g := failedRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1)
+	g.agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
+	kept := []client.Object{
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(g.agent, "3-1"), Namespace: g.agent.Namespace}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(g.agent, "3-1"), Namespace: g.agent.Namespace}},
+	}
+	for _, o := range kept {
+		if err := g.cl.Create(context.Background(), o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
+	g.pass(busMigrationFailed, 1)
+	for _, o := range kept {
+		if err := g.cl.Get(context.Background(), client.ObjectKeyFromObject(o), o); err == nil {
+			t.Errorf("%T %s kept after the run was given up", o, o.GetName())
+		}
+	}
+	if !g.agent.Status.BusMigration.GivenUp || busMigrationFreezeActive(g.agent) || busMigrationHoldsProvision(g.agent) {
+		t.Errorf("after the abandon: %+v", g.agent.Status.BusMigration)
+	}
+	doc, err := renderA2AAuthMap(g.agent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gateway bool
+	for _, id := range doc.Identities {
+		gateway = gateway || id.User == "gateway" || id.User == a2aAgentBusUser
+	}
+	if !gateway {
+		t.Error("the map after giving up is not the install's")
+	}
+}
+
+// The Failed condition names both annotations with their exact values, what
+// giving up loses, and the retries left.
+func TestTheFailedConditionNamesTheWayOut(t *testing.T) {
+	m := failedRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1)
+	cond, _ := busMigratingCondition(m.agent)
+	for _, want := range []string{
+		a2aBusMigrationRetryAnnotation + "=3-1-1", "3 of 3 left",
+		a2aBusMigrationAbandonAnnotation + "=3-1", "lifts the write freeze and recreates every stream the run did not put back, empty",
+		"no other migration starts",
+	} {
+		if !strings.Contains(cond.Message, want) {
+			t.Errorf("Failed condition %q lacks %q", cond.Message, want)
+		}
+	}
+	m.agent.Status.BusMigration.Retries = make([]agentv1alpha1.BusMigrationRetry, busMigrationMaxRetries)
+	if cond, _ := busMigratingCondition(m.agent); !strings.Contains(cond.Message, "No retries are left") || strings.Contains(cond.Message, a2aBusMigrationRetryAnnotation) {
+		t.Errorf("retries exhausted: %q", cond.Message)
+	}
+	m.agent.Status.BusMigration.GivenUp = true
+	if cond, _ := busMigratingCondition(m.agent); !strings.Contains(cond.Message, "given up") {
+		t.Errorf("given up: %q", cond.Message)
+	}
 }

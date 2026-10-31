@@ -2390,6 +2390,15 @@ type AgentStatus struct {
 	Usage AgentUsageStatus `json:"usage,omitempty"`
 }
 
+// BusMigrationRetry is one retry of a Failed bus migration run: when it was
+// asked for, and the failure it retried.
+type BusMigrationRetry struct {
+	At       metav1.Time `json:"at"`
+	FailedIn string      `json:"failedIn"`
+	// +optional
+	Cause string `json:"cause,omitempty"`
+}
+
 // BusMigrationStatus is one migration of the A2A bus between one NATS server
 // and three.
 type BusMigrationStatus struct {
@@ -2428,6 +2437,26 @@ type BusMigrationStatus struct {
 	// it was still running at Deadline. Set at the first failure and kept.
 	// +optional
 	Cause string `json:"cause,omitempty"`
+
+	// FailedIn is the phase a Failed run failed in. A run that failed inside
+	// the one to three leg's write freeze keeps the freeze, with its
+	// snapshot, until a person retries it or gives it up, each with an
+	// annotation on the PlatformAgent naming this run (the A2ABusMigrating
+	// condition says which). A Failed run blocks any new migration until
+	// then.
+	// +optional
+	FailedIn string `json:"failedIn,omitempty"`
+
+	// Retries records each retry of a Failed run, oldest first, at most
+	// three.
+	// +optional
+	// +kubebuilder:validation:MaxItems=3
+	Retries []BusMigrationRetry `json:"retries,omitempty"`
+
+	// GivenUp is set when a person gave a Failed run up: its freeze is
+	// lifted, and streams it did not put back are recreated empty.
+	// +optional
+	GivenUp bool `json:"givenUp,omitempty"`
 
 	// FreezeConfirmed is set once every callout replica serves the write
 	// freeze's identity map, and only then does the bus render without its
