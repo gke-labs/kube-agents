@@ -422,7 +422,7 @@ class ForgeScriptTest(unittest.TestCase):
             "--machine-type=e2-standard-4", "--boot-disk-size=50GB", f"--private-network-ip={FORGE_IP}",
             "--labels=kube-agents-forge=gitlab-ce,kube-agents-build=1234", "host=gitlab.eval.internal",
             "image=gitlab/gitlab-ce:19.4.3-ce.0@sha256:483fb4cc5c75237a7a6c7c8b8b2a1832ed790d86e0449ff55e8b6f6d62d2d5f5",
-            "group=gke-agentic", f"project={PROJECT}-infra", "bot-login=kube-agents-eval-bot", "token-days=1",
+            "group=gke-agentic", f"project={PROJECT}-infra", "bot-login=kube-agents-eval-bot", "token-days=2",
             "block-project-ssh-keys=TRUE", "tls-key=", "agent-token=", "ledger-token=", "manifest-path=", "manifest-message=", "manifest-content=",
         ):
             self.assertIn(flag, create)
@@ -459,7 +459,9 @@ class ForgeScriptTest(unittest.TestCase):
         os.kill(pid, 0)  # the keeper is alive after up returns: the deploy and the eval use its port-forward
         self.assertEqual((self.state_dir / "forge-tunnel-context").read_text().strip(), "host-ctx", "the context the relay lives in, for down")
         self.assertIn("127.0.0.1 gitlab.eval.internal", self.hosts.read_text())
-        self.assertTrue(any("--resolve gitlab.eval.internal:443:127.0.0.1" in c and "https://gitlab.eval.internal/users/sign_in" in c for c in self.calls_of("curl ")))
+        tunnel_checks = [c for c in self.calls_of("curl ") if "https://gitlab.eval.internal/users/sign_in" in c]
+        self.assertTrue(tunnel_checks)
+        self.assertFalse(any("--resolve" in c for c in tunnel_checks), "the check dials the bare name, through the hosts entry, as the consumers do")
         # The state directory: the CA, the two tokens (private), the record; no token in the output.
         for name in ("agent-token", "ledger-token"):
             token = (self.state_dir / name).read_text().strip()
@@ -527,12 +529,20 @@ class ForgeScriptTest(unittest.TestCase):
 
     def test_up_on_gitlab_ce_refuses_a_hosts_file_it_cannot_write(self):
         self.provision()
-        self.hosts.chmod(0o444)
-        proc = self.run_forge("up", forge="gitlab-ce")
-        self.hosts.chmod(0o644)
+        # A path under a missing directory, which `-w` refuses for root too (root ignores mode bits).
+        proc = self.run_forge("up", forge="gitlab-ce", FORGE_TUNNEL_HOSTS_FILE=str(self.dir / "no-such-dir" / "hosts"))
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("is not writable, so gitlab.eval.internal cannot point at the tunnel", proc.stderr)
         self.assertTrue(self.calls_of("compute instances delete forge-gitlab-ce"))
+
+    def test_down_on_gitlab_ce_removes_an_entry_that_was_the_hosts_files_only_line(self):
+        self.provision()
+        self.assertEqual(self.run_forge("up", forge="gitlab-ce").returncode, 0)
+        self.hosts.write_text("127.0.0.1 gitlab.eval.internal\n")
+        proc = self.run_forge("down", forge="gitlab-ce")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.hosts.read_text(), "", "grep -v selecting nothing is still a removal")
+        self.assertIn("hosts entry for gitlab.eval.internal removed", proc.stdout)
 
     # ── down ──────────────────────────────────────────────────────────────────
 

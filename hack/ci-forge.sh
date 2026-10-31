@@ -113,8 +113,11 @@ readonly GHES_READY_PATH="/api/v3/meta"
 # 2026-10-31, so 30 min to give up), the sign-in page as readiness from the
 # runner (GitLab's own readiness endpoint answers loopback alone, so the VM
 # gates its seeding on that one), the bot the eval expects (its login
-# is re-read from the agent token there) and its two tokens: one day, like the
-# certificates, GitLab's prefix and 20 hex characters, its minimum.
+# is re-read from the agent token there) and its two tokens: GitLab's prefix
+# and 20 hex characters, its minimum, dated two days out, since GitLab stores
+# a token's expiry as a date and expires it at 00:00 UTC on that date, so one
+# day would leave a run started late in the UTC day minutes, not the day the
+# certificates get.
 readonly GITLAB_CE_IMAGE="gitlab/gitlab-ce:19.4.3-ce.0@sha256:483fb4cc5c75237a7a6c7c8b8b2a1832ed790d86e0449ff55e8b6f6d62d2d5f5"
 readonly GITLAB_CE_MACHINE_TYPE="e2-standard-4"
 readonly GITLAB_CE_BOOT_DISK="50GB"
@@ -122,7 +125,7 @@ readonly GITLAB_CE_READY_TIMEOUT_SECONDS="${GITLAB_CE_READY_TIMEOUT_SECONDS:-180
 readonly GITLAB_CE_READY_PATH="/users/sign_in"
 readonly GITLAB_CE_BOT_LOGIN="kube-agents-eval-bot"
 readonly GITLAB_CE_BOT_EMAIL="eval-bot@eval.internal"
-readonly GITLAB_CE_TOKEN_DAYS=1
+readonly GITLAB_CE_TOKEN_DAYS=2
 readonly GITLAB_CE_TOKEN_PREFIX="glpat-"
 readonly GITLAB_CE_TOKEN_RANDOM_BYTES=10
 # The manifest the remediation cases read rides to the VM in metadata (public
@@ -281,7 +284,8 @@ close_tunnel() {
   fi
   [ ! -s "${FORGE_TUNNEL_CONTEXT_FILE}" ] || context=(--context "$(cat "${FORGE_TUNNEL_CONTEXT_FILE}")")
   if [ -w "${FORGE_TUNNEL_HOSTS_FILE}" ] && grep -qxF "$(hosts_entry)" "${FORGE_TUNNEL_HOSTS_FILE}"; then
-    grep -vxF "$(hosts_entry)" "${FORGE_TUNNEL_HOSTS_FILE}" > "${FORGE_TUNNEL_HOSTS_FILE}.forge" && cat "${FORGE_TUNNEL_HOSTS_FILE}.forge" > "${FORGE_TUNNEL_HOSTS_FILE}"
+    # grep -v exits 1 when nothing is left, which is still a removal.
+    { grep -vxF "$(hosts_entry)" "${FORGE_TUNNEL_HOSTS_FILE}" || [ $? -eq 1 ]; } > "${FORGE_TUNNEL_HOSTS_FILE}.forge" && cat "${FORGE_TUNNEL_HOSTS_FILE}.forge" > "${FORGE_TUNNEL_HOSTS_FILE}"
     rm -f "${FORGE_TUNNEL_HOSTS_FILE}.forge"
     echo "Forge ${ACTION}: hosts entry for ${EVAL_FORGE_HOST} removed"
   fi
@@ -698,7 +702,8 @@ open_tunnel() {
   fi
   deadline=$(( SECONDS + FORGE_TUNNEL_READY_SECONDS ))
   while [ "${SECONDS}" -lt "${deadline}" ]; do
-    code="$(curl -sS --cacert "${FORGE_CERT_DIR}/ca.crt" --resolve "${EVAL_FORGE_HOST}:${FORGE_TUNNEL_LOCAL_PORT}:127.0.0.1" --max-time "${FORGE_TUNNEL_CHECK_MAX_TIME}" -o /dev/null -w '%{http_code}' \
+    # The bare name, as every consumer dials it: name, hosts entry, loopback, relay.
+    code="$(curl -sS --cacert "${FORGE_CERT_DIR}/ca.crt" --max-time "${FORGE_TUNNEL_CHECK_MAX_TIME}" -o /dev/null -w '%{http_code}' \
       "https://${EVAL_FORGE_HOST}${FORGE_ROW_READY_PATH}" 2>/dev/null)" || true
     [ "${code}" = "200" ] && break
     sleep "${FORGE_TUNNEL_POLL_SECONDS}"
