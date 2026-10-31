@@ -191,16 +191,17 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Volumes: []corev1.Volume{{
-						// The console password and nothing else from the creds
-						// Secret. Not optional, unlike the console's: without
-						// it the server cannot reach the bus and refuses to
-						// start, which is the honest failure.
+						// The MCP server's own bus password and nothing else
+						// from the creds Secret. Not optional, unlike the
+						// console's: without it the server cannot reach the
+						// bus and refuses to start, which is the honest
+						// failure.
 						Name: a2aMCPBusKeyVolume,
 						VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 							SecretName: a2aCredsSecretName(agent),
 							Items: []corev1.KeyToPath{{
-								Key:  a2aConsolePasswordKey,
-								Path: a2aConsolePasswordKey,
+								Key:  a2aConsoleMCPPasswordKey,
+								Path: a2aConsoleMCPPasswordKey,
 								Mode: ptr.To(a2aConsoleCredsFileMode),
 							}},
 						}},
@@ -224,8 +225,8 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 						Env: []corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							a2aNATSCAFileEnvVar(),
-							{Name: a2aMCPEnvBusUser, Value: a2aConsoleConfUser},
-							{Name: a2aMCPEnvPasswordFile, Value: path.Join(a2aMCPBusKeyMountDir, a2aConsolePasswordKey)},
+							{Name: a2aMCPEnvBusUser, Value: a2aConsoleMCPUser},
+							{Name: a2aMCPEnvPasswordFile, Value: path.Join(a2aMCPBusKeyMountDir, a2aConsoleMCPPasswordKey)},
 							{Name: a2aMCPEnvAccessFile, Value: path.Join(a2aMCPAccessMountDir, a2aMCPAccessKey)},
 							{Name: a2aMCPEnvListen, Value: fmt.Sprintf(":%d", a2aMCPPort)},
 							{Name: a2aMCPEnvAgent, Value: agent.Name},

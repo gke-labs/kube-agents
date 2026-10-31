@@ -61,7 +61,7 @@ const twoIdentityMap = `{
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-gateway",
       "user": "gateway",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": ["a2a.tasks.>", "_INBOX.gateway.>"],
         "subscribe": ["a2a.tasks.>", "_INBOX.gateway.>"]
@@ -625,27 +625,35 @@ func TestANarrowedMapDoesNotReachAnEstablishedConnection(t *testing.T) {
 func TestIssuedUsersLandInTheAccountTheirMapEntryNames(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 	h.connectAs(t, "gateway", gatewayToken)
+	h.connectAs(t, "agent", agentToken)
 
 	z, err := h.server.Connz(&natsserver.ConnzOptions{Username: true})
 	if err != nil {
 		t.Fatalf("Connz: %v", err)
 	}
 
-	var found bool
+	wantAccounts := map[string]string{
+		"gateway": AccountControl,
+		"agent":   AccountApp,
+	}
+	seen := map[string]bool{}
 	for _, c := range z.Conns {
-		if c.Name != "gateway" {
+		wantAcct, ok := wantAccounts[c.Name]
+		if !ok {
 			continue
 		}
-		found = true
-		if c.Account != "APP" {
-			t.Errorf("gateway landed in account %q, want APP", c.Account)
+		seen[c.Name] = true
+		if c.Account != wantAcct {
+			t.Errorf("%s landed in account %q, want %s", c.Name, c.Account, wantAcct)
 		}
-		if c.AuthorizedUser != "gateway" {
-			t.Errorf("gateway authorized as %q, want the mapped user name", c.AuthorizedUser)
+		if c.AuthorizedUser != c.Name {
+			t.Errorf("%s authorized as %q, want the mapped user name", c.Name, c.AuthorizedUser)
 		}
 	}
-	if !found {
-		t.Fatal("the gateway connection was not visible to Connz")
+	for name := range wantAccounts {
+		if !seen[name] {
+			t.Fatalf("the %s connection was not visible to Connz", name)
+		}
 	}
 }
 

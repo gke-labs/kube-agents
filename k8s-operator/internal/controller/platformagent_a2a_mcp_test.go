@@ -121,8 +121,8 @@ func TestBuildA2AMCPDeployment(t *testing.T) {
 	if env[a2aNATSCAFileEnv] != a2aNATSCAFile() {
 		t.Errorf("%s = %q, want %q", a2aNATSCAFileEnv, env[a2aNATSCAFileEnv], a2aNATSCAFile())
 	}
-	if env[a2aMCPEnvBusUser] != a2aConsoleConfUser {
-		t.Errorf("bus user = %q, want the console principal", env[a2aMCPEnvBusUser])
+	if env[a2aMCPEnvBusUser] != a2aConsoleMCPUser {
+		t.Errorf("bus user = %q, want the console-mcp principal", env[a2aMCPEnvBusUser])
 	}
 
 	// Every file the server reads sits in a mount of this pod.
@@ -175,7 +175,7 @@ func TestTheMCPPodHoldsTheConsolePasswordAndItsOwnTokenOnly(t *testing.T) {
 			if len(secrets) != 2 {
 				t.Fatalf("secret volumes = %v, want the creds Secret and the token Secret", secrets)
 			}
-			for name, key := range map[string]string{a2aCredsSecretName(agent): a2aConsolePasswordKey, a2aMCPAccessName(agent): a2aMCPAccessKey} {
+			for name, key := range map[string]string{a2aCredsSecretName(agent): a2aConsoleMCPPasswordKey, a2aMCPAccessName(agent): a2aMCPAccessKey} {
 				src := secrets[name]
 				if src == nil {
 					t.Errorf("no volume from Secret %s", name)

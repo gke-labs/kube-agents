@@ -340,6 +340,12 @@ Layout:
   radius container. Stage 1 exercises exactly one; the multi-scope split (and any
   cross-account exports) is designed but deliberately unexercised until a second scope
   exists.
+  Amended 11/3: within a scope, the application side is three accounts, joined only by
+  explicit exports and imports, so control-plane writers are isolated from worker
+  credentials. `TRUSTED` holds the control-plane services (the gateway, provision, the
+  verifier, the operator, seed and the dispatcher) and the JetStream store. `CONSOLE` holds
+  the web console and its MCP server (`console-mcp`). `APP` holds agent and session workers
+  and the read-only principals.
 - **One user per agent identity** inside the account. Permissions are exact subject lists,
   deny by default: publish only to the subjects its role emits on, subscribe only to its own
   addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the shared topics it

@@ -1,12 +1,12 @@
 {
-  "version": "2f554691847a4d72",
+  "version": "b864e92c886f1f64",
   "shard": 0,
   "shards": 1,
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
       "user": "provision",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.topics.agent.platform.upgrade-readiness",
@@ -83,7 +83,7 @@
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-verifier",
       "user": "verifier",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.cap.reply.>",
@@ -101,7 +101,7 @@
     {
       "serviceAccount": "system:serviceaccount:kubeagents-operator:kubeagents-controller-manager",
       "user": "operator",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.agents.*",

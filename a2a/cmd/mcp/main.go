@@ -40,8 +40,8 @@ const (
 
 	defaultListen       = ":8089"
 	defaultTokenFile    = "/var/run/secrets/a2a-mcp/token"
-	defaultBusUser      = "console"
-	defaultPasswordFile = "/var/run/secrets/a2a-mcp-bus/console-password" // #nosec G101 -- a path, not a credential
+	defaultBusUser      = "console-mcp"
+	defaultPasswordFile = "/var/run/secrets/a2a-mcp-bus/console-mcp-password" // #nosec G101 -- a path, not a credential
 
 	networkTCP = "tcp"
 	busScheme  = "tls://"

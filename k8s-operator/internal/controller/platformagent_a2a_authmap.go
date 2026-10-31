@@ -471,8 +471,11 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 		if !isDNS1123LabelToken(id.User) {
 			return fmt.Errorf("identity %d: user %q must be a single lowercase DNS-1123 label, because it becomes the _INBOX.<user>.> prefix", i, id.User)
 		}
-		if id.Account != a2aAccountApp {
-			return fmt.Errorf("identity %d: user %q names account %q, which the callout will not mint into (only %q is mintable)", i, id.User, id.Account, a2aAccountApp)
+		if id.Account != a2aAccountApp && id.Account != a2aAccountControl {
+			return fmt.Errorf("identity %d: user %q names account %q, which the callout will not mint into (allowed: [%s %s])", i, id.User, id.Account, a2aAccountControl, a2aAccountApp)
+		}
+		if id.Narrowing != "" && id.Account != a2aAccountApp {
+			return fmt.Errorf("identity %d: user %q narrows on %q and must land in account %q, not %q", i, id.User, id.Narrowing, a2aAccountApp, id.Account)
 		}
 		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
 		if id.Narrowing != a2aNarrowingProfile && (id.Profile != "" || id.Topics != nil) {

@@ -494,9 +494,10 @@ const (
 	a2aGatewayPasswordKey = "gateway-password" // #nosec G101 -- Secret key name, not a credential
 	a2aBridgePasswordKey  = "bridge-password"  // #nosec G101 -- Secret key name, not a credential
 	a2aSeedPasswordKey    = "seed-password"    // #nosec G101 -- Secret key name, not a credential
-	a2aWebPasswordKey     = "web-password"     // #nosec G101 -- Secret key name, not a credential
-	a2aConsolePasswordKey = "console-password" // #nosec G101 -- Secret key name, not a credential
-	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
+	a2aWebPasswordKey        = "web-password"         // #nosec G101 -- Secret key name, not a credential
+	a2aConsolePasswordKey    = "console-password"     // #nosec G101 -- Secret key name, not a credential
+	a2aConsoleMCPPasswordKey = "console-mcp-password" // #nosec G101 -- Secret key name, not a credential
+	a2aSysPasswordKey        = "sys-password"         // #nosec G101 -- Secret key name, not a credential
 	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
 	// a2aBridgeActivityKey signs the gateway's tool-call deliveries to the
 	// bridge's activity door when the bridge runs tasks through the pod's API
@@ -1598,7 +1599,7 @@ func randomA2APassword() (string, error) {
 // still has a credential.
 var a2aCredsKeys = []string{
 	a2aGatewayPasswordKey, a2aBridgePasswordKey, a2aSeedPasswordKey,
-	a2aWebPasswordKey, a2aConsolePasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
+	a2aWebPasswordKey, a2aConsolePasswordKey, a2aConsoleMCPPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
 	a2aBridgeActivityKey,
 }
 
@@ -2238,8 +2239,113 @@ accounts {
       }
     ]
   }
-  APP {
+  # TRUSTED: control-plane writers (gateway, provision, verifier, operator,
+  # seed, dispatcher) and the JetStream file store. Separating the control
+  # plane's account from APP and CONSOLE scopes cross-account traffic to the
+  # explicit stream and service exports declared below.
+  TRUSTED {
     jetstream: enabled
+    exports [
+      { service: "$JS.API.INFO", accounts: [ APP, CONSOLE ] }
+      { service: "$JS.API.STREAM.INFO.*", accounts: [ APP, CONSOLE ] }
+      { service: "$JS.API.CONSUMER.CREATE.>", accounts: [ APP, CONSOLE ] }
+      { service: "$JS.API.CONSUMER.INFO.>", accounts: [ APP, CONSOLE ] }
+      { service: "$JS.API.CONSUMER.MSG.NEXT.>", accounts: [ APP, CONSOLE ] }
+      { service: "$JS.API.CONSUMER.DELETE.>", accounts: [ APP, CONSOLE ] }
+      { service: "$JS.API.DIRECT.GET.>", accounts: [ APP, CONSOLE ] }
+      { service: "$JS.ACK.TASKS.>", accounts: [ APP ] }
+      { service: "$JS.FC.>", accounts: [ APP ] }
+      { service: "a2a.tasks.*.*.events", accounts: [ APP ] }
+      { service: "a2a.topics.>", accounts: [ APP ] }
+      { service: "$KV.runtime-state.>", accounts: [ APP ] }
+      { stream: "a2a.tasks.>", accounts: [ APP, CONSOLE ] }
+      { stream: "a2a.agents.>", accounts: [ APP, CONSOLE ] }
+      { stream: "a2a.topics.>", accounts: [ APP, CONSOLE ] }
+      { stream: "$KV.runtime-state.>", accounts: [ APP ] }
+      { stream: "a2a.dispatch.*.*.*", accounts: [ APP ] }
+      { stream: "a2a.cap.reply.>", accounts: [ APP ] }
+      { stream: "chat.notify.reply.agent.>", accounts: [ APP ] }
+      { stream: "chat.board", accounts: [ APP ] }
+      { stream: "_INBOX.bridge.>", accounts: [ APP ] }
+      { stream: "_INBOX.web.>", accounts: [ APP ] }
+      { stream: "chat.console.*.out", accounts: [ CONSOLE ] }
+      { stream: "_INBOX.console.>", accounts: [ CONSOLE ] }
+      { stream: "_INBOX.console-mcp.>", accounts: [ CONSOLE ] }
+    ]
+    imports [
+      { stream: { account: CONSOLE, subject: "chat.console.*.in" } }
+      { stream: { account: CONSOLE, subject: "chat.console.*.confirm" } }
+      { stream: { account: APP, subject: "a2a.dispatch.*.*.*.accept" } }
+      { stream: { account: APP, subject: "a2a.dispatch.*.*.*.lease" } }
+      { stream: { account: APP, subject: "a2a.cap.verify.*" } }
+      { stream: { account: APP, subject: "chat.notify.gchat" } }
+      { stream: { account: APP, subject: "chat.notify.slack" } }
+      { stream: { account: APP, subject: "chat.notify.console" } }
+      { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
+    ]
+    users [
+` + renderA2AStaticUsers(agent, pw, a2aAccountControl) + `    ]
+  }
+  # CONSOLE: the web console and MCP server, isolated from both TRUSTED and
+  # APP so that neither can reach chat.console.*.in or chat.console.*.confirm.
+  CONSOLE {
+    exports [
+      { stream: "chat.console.*.in", accounts: [ TRUSTED ] }
+      { stream: "chat.console.*.confirm", accounts: [ TRUSTED ] }
+    ]
+    imports [
+      { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
+      { service: { account: TRUSTED, subject: "$JS.API.STREAM.INFO.*" } }
+      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.DELETE.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.DIRECT.GET.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.tasks.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.agents.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.topics.>" } }
+      { stream: { account: TRUSTED, subject: "chat.console.*.out" } }
+      { stream: { account: TRUSTED, subject: "_INBOX.console.>" } }
+      { stream: { account: TRUSTED, subject: "_INBOX.console-mcp.>" } }
+    ]
+    users [
+` + renderA2AStaticUsers(agent, pw, a2aAccountConsole) + `    ]
+  }
+  # APP: runtime executors and readers (session, agent, bridge, web, profile-*).
+  APP {
+    exports [
+      { stream: "a2a.dispatch.*.*.*.accept", accounts: [ TRUSTED ] }
+      { stream: "a2a.dispatch.*.*.*.lease", accounts: [ TRUSTED ] }
+      { stream: "a2a.cap.verify.*", accounts: [ TRUSTED ] }
+      { stream: "chat.notify.gchat", accounts: [ TRUSTED ] }
+      { stream: "chat.notify.slack", accounts: [ TRUSTED ] }
+      { stream: "chat.notify.console", accounts: [ TRUSTED ] }
+      { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
+    ]
+    imports [
+      { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
+      { service: { account: TRUSTED, subject: "$JS.API.STREAM.INFO.*" } }
+      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.DELETE.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.DIRECT.GET.>" } }
+      { service: { account: TRUSTED, subject: "$JS.ACK.TASKS.>" } }
+      { service: { account: TRUSTED, subject: "$JS.FC.>" } }
+      { service: { account: TRUSTED, subject: "a2a.tasks.*.*.events" } }
+      { service: { account: TRUSTED, subject: "a2a.topics.>" } }
+      { service: { account: TRUSTED, subject: "$KV.runtime-state.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.tasks.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.agents.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.topics.>" } }
+      { stream: { account: TRUSTED, subject: "$KV.runtime-state.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.dispatch.*.*.*" } }
+      { stream: { account: TRUSTED, subject: "a2a.cap.reply.>" } }
+      { stream: { account: TRUSTED, subject: "chat.notify.reply.agent.>" } }
+      { stream: { account: TRUSTED, subject: "chat.board" } }
+      { stream: { account: TRUSTED, subject: "_INBOX.bridge.>" } }
+      { stream: { account: TRUSTED, subject: "_INBOX.web.>" } }
+    ]
     users [
 ` + renderA2AStaticUsers(agent, pw, a2aAccountApp) + `    ]
   }
@@ -2396,7 +2502,16 @@ func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secr
 // controller stamps out is "<this>-<sts>-0", which handleDeletion reaps by name --
 // so a rename here that is not matched there turns the reap into a silent no-op
 // and leaks the PV on every CR deletion. One spelling, both sites.
-const a2aNATSDataClaim = "data"
+const (
+	a2aNATSDataClaim = "data"
+	// a2aNATSStartupScript migrates an existing single-node (R1) JetStream store
+	// directory from /data/jetstream/APP to /data/jetstream/TRUSTED on upgrade
+	// before starting nats-server, preserving streams and KV buckets across the
+	// account split. On a single-node server, stream and consumer metadata live
+	// under <store>/jetstream/<account>/streams/ with no SYS/_js_/ Raft metadata
+	// group, so moving the account directory relocates the store cleanly.
+	a2aNATSStartupScript = "if [ -d /data/jetstream/APP ] && [ ! -e /data/jetstream/TRUSTED ]; then mv /data/jetstream/APP /data/jetstream/TRUSTED; fi && exec nats-server -c /etc/nats/nats.conf"
+)
 
 // a2aProvisionResources adds the provision container's ephemeral-storage
 // request and equal limit, for the tmp emptyDir it writes
@@ -2454,9 +2569,9 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Containers: []corev1.Container{{
-						Name:  "nats",
-						Image: a2aNATSImage(),
-						Args:  []string{"-c", "/etc/nats/nats.conf"},
+						Name:    "nats",
+						Image:   a2aNATSImage(),
+						Command: []string{"/bin/sh", "-c", a2aNATSStartupScript},
 						Ports: []corev1.ContainerPort{
 							{Name: "client", ContainerPort: a2aNATSClientPort},
 							{Name: "monitor", ContainerPort: a2aNATSMonitorPort},

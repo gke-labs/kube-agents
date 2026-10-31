@@ -186,11 +186,15 @@ const a2aCapBucket = "cap"
 // each other, so the shared fixture is what keeps them honest.
 const a2aNarrowingPod = "pod"
 
-// Account names. One application account per scope; $SYS for operators and
+// Account names. Control-plane writers and the JetStream file store live in
+// TRUSTED; the web console and MCP server live in CONSOLE; untrusted and
+// narrowed runtime workloads live in APP; $SYS is for operators and
 // monitoring, which no agent ever authenticates into.
 const (
-	a2aAccountApp = "APP"
-	a2aAccountSys = "SYS"
+	a2aAccountControl = "TRUSTED"
+	a2aAccountConsole = "CONSOLE"
+	a2aAccountApp     = "APP"
+	a2aAccountSys     = "SYS"
 )
 
 // The two principal names A5 split `worker` into. They are spelled once here
@@ -237,6 +241,16 @@ const (
 	// It lives in this file because tests/conformance resolves each
 	// identity's user name out of this file and no other.
 	a2aConsoleConfUser = "console"
+
+	// a2aConsoleMCPUser is the static user the MCP server (a2a/cmd/mcp)
+	// logs in as, separated from console so its inbox prefix and
+	// confirmation surface are distinct from the browser's.
+	a2aConsoleMCPUser = "console-mcp"
+
+	// a2aConsoleConfirmSubject is the console confirmation subject
+	// (a2a/gateway/console.go): published by console alone and subscribed
+	// by gateway alone.
+	a2aConsoleConfirmSubject = "chat.console.*.confirm"
 
 	// a2aBusUserEnv carries a2aAgentBusUser into the agent container. Not a
 	// credential: it selects the inbox prefix the client pins, and the grants
@@ -321,7 +335,7 @@ func operatorIdentity() (a2aIdentity, bool) {
 	ns, sa, ok := operatorBusPrincipal()
 	id := a2aIdentity{
 		user:           a2aOperatorBusUser,
-		account:        a2aAccountApp,
+		account:        a2aAccountControl,
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(ns, sa),
 		comment: "the operator. Publishes each AgentProfile's agent card and its tombstone\n" +
@@ -384,6 +398,7 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		seedIdentity(),
 		webIdentity(),
 		consoleIdentity(),
+		consoleMCPIdentity(),
 		sysIdentity(),
 	)
 }
@@ -463,7 +478,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 
 	return a2aIdentity{
 		user:    "gateway",
-		account: a2aAccountApp,
+		account: a2aAccountControl,
 		comment: "task requester, chat-session supervisor, session-registry owner.\n" +
 			"STATIC, and this one is a sequencing fact rather than a property of\n" +
 			"the gateway. It has a ServiceAccount and could authenticate with it\n" +
@@ -505,6 +520,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"$KV.session-state.>",
 			"$KV.feedback.>",
 			"chat.console.*.in",
+			a2aConsoleConfirmSubject,
 			// Proactive posts from the agent to the home channel, and a
 			// card's report back to its conversation, one subject per backend.
 			a2aNotifySubjectGchat,
@@ -563,7 +579,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	return a2aIdentity{
 		user:           "provision",
-		account:        a2aAccountApp,
+		account:        a2aAccountControl,
 		comment:        "creates the streams, buckets and starter topics; nothing on the task plane",
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(ns, a2aProvisionServiceAccountName(agent)),
@@ -691,7 +707,7 @@ func sessionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 func verifierIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	return a2aIdentity{
 		user:    a2aVerifierUser,
-		account: a2aAccountApp,
+		account: a2aAccountControl,
 		comment: "answers whether a capability permits a verb; the only principal with read on " +
 			"the cap bucket (09 §4). No consumer surface: a consumer on KV_cap would be a " +
 			"live feed of every capability in flight.",
@@ -954,7 +970,7 @@ func seedIdentity() a2aIdentity {
 
 	return a2aIdentity{
 		user:     "seed",
-		account:  a2aAccountApp,
+		account:  a2aAccountControl,
 		auth:     a2aAuthStatic,
 		credsKey: a2aSeedPasswordKey,
 		comment: "hand-applied seed tooling. STATIC because it is applied rather than\n" +
@@ -1053,13 +1069,11 @@ func webIdentity() a2aIdentity {
 		//
 		// Denying the whole `a2a.cap.>` namespace rather than the verify
 		// subject alone also takes away the reply traffic, which this
-		// credential had no reason to see either.
-		//
-		// TODO(#3889): deny `a2a.dispatch.>` here and on console when the
-		// dispatch subjects land. Neither reads offers, and an offer will
-		// carry a task credential (bound to its pod, so useless copied, but
-		// no reason to hand it to a browser).
-		denySubscribe: []string{"a2a.cap.>"},
+		// credential had no reason to see either. `a2a.dispatch.>` is
+		// denied for the same reason: neither web nor console reads
+		// dispatch offers, and an offer carries a pod-bound task
+		// credential and per-offer nonce.
+		denySubscribe: []string{"a2a.cap.>", "a2a.dispatch.>"},
 	}
 }
 
@@ -1089,10 +1103,10 @@ func webIdentity() a2aIdentity {
 func consoleIdentity() a2aIdentity {
 	return a2aIdentity{
 		user:    a2aConsoleConfUser,
-		account: a2aAccountApp,
-		comment: "the web console: web's read surface plus one publish, chat.console.*.in,\n" +
-			"which is the gateway's console adapter's inbound subject. STATIC for\n" +
-			"web's reason. No JetStream verb on any KV_* stream: STREAM.INFO's\n" +
+		account: a2aAccountConsole,
+		comment: "the web console: web's read surface plus chat.console.*.in and\n" +
+			"chat.console.*.confirm, the gateway's console adapter's inbound subjects.\n" +
+			"STATIC for web's reason. No JetStream verb on any KV_* stream: STREAM.INFO's\n" +
 			"subjects_filter would list every key.",
 		auth:     a2aAuthStatic,
 		credsKey: a2aConsolePasswordKey,
@@ -1116,6 +1130,7 @@ func consoleIdentity() a2aIdentity {
 			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
 			"$JS.API.DIRECT.GET." + a2aProfileSubmitStream + ".>",
 			"chat.console.*.in",
+			a2aConsoleConfirmSubject,
 			"_INBOX.console.>",
 		},
 		subscribe: []string{
@@ -1127,7 +1142,51 @@ func consoleIdentity() a2aIdentity {
 		// verifier's request subject, and any subscriber may join its
 		// queue group and swallow a share of every verify request. This
 		// password is handed to a browser too (console.go's /config.json).
-		denySubscribe: []string{"a2a.cap.>"},
+		denySubscribe: []string{"a2a.cap.>", "a2a.dispatch.>"},
+	}
+}
+
+// console-mcp: the MCP server's bus principal (a2a/cmd/mcp).
+//
+// Separated from console so that its inbox prefix (_INBOX.console-mcp.>) and
+// its publish surface are distinct from the browser's: it holds the console
+// read surface and chat.console.*.in, and does not hold chat.console.*.confirm.
+func consoleMCPIdentity() a2aIdentity {
+	return a2aIdentity{
+		user:    a2aConsoleMCPUser,
+		account: a2aAccountConsole,
+		comment: "the MCP server (a2a/cmd/mcp): console's read surface and chat.console.*.in,\n" +
+			"without chat.console.*.confirm, on its own password and inbox prefix.",
+		auth:     a2aAuthStatic,
+		credsKey: a2aConsoleMCPPasswordKey,
+		publish: []string{
+			"$JS.API.INFO",
+			"$JS.API.STREAM.INFO.TASKS",
+			"$JS.API.STREAM.INFO.DIRECTORY",
+			"$JS.API.STREAM.INFO.TOPICS-STATE",
+			"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+			"$JS.API.CONSUMER.CREATE.TASKS.>",
+			"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+			"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+			"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+			"$JS.API.CONSUMER.INFO.TASKS.*",
+			"$JS.API.CONSUMER.INFO.DIRECTORY.*",
+			"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+			"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+			"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+			"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+			"$JS.API.DIRECT.GET." + a2aProfileSubmitStream + ".>",
+			"chat.console.*.in",
+			"_INBOX." + a2aConsoleMCPUser + ".>",
+		},
+		subscribe: []string{
+			"a2a.>",
+			"chat.console.*.out",
+			"_INBOX." + a2aConsoleMCPUser + ".>",
+		},
+		denySubscribe: []string{"a2a.cap.>", "a2a.dispatch.>"},
 	}
 }
 
