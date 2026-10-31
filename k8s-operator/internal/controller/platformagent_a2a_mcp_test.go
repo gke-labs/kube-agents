@@ -695,3 +695,17 @@ func TestTheMCPPodIsSizedLikeTheConsole(t *testing.T) {
 		t.Errorf("MCP declares no CPU limit; a namespace ResourceQuota on limits.cpu refuses it")
 	}
 }
+
+// The namespace pod quota counts the MCP server's pods only while its flag is
+// on (#3869); a derived headroom absorbs this helper as one more standing part.
+func TestA2AMCPStandingPodsFollowTheFlag(t *testing.T) {
+	agent := a2aTestAgent()
+	t.Setenv(a2aMCPDoorEnvVar, "")
+	if got := a2aMCPStandingPods(agent); got != 0 {
+		t.Errorf("flag off: %d MCP pods, want 0", got)
+	}
+	t.Setenv(a2aMCPDoorEnvVar, "true")
+	if got := a2aMCPStandingPods(agent); got != 1 {
+		t.Errorf("flag on: %d MCP pods, want 1, the Deployment's replicas", got)
+	}
+}

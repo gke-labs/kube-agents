@@ -135,6 +135,17 @@ func a2aMCPDoorEnabled() bool {
 	return os.Getenv(a2aMCPDoorEnvVar) == "true"
 }
 
+// a2aMCPStandingPods is the pods the MCP server adds to the namespace while
+// the flag is on, and none otherwise. The namespace pod quota's headroom
+// counts the standing pods, and no golden renders this one, so the quota adds
+// it on its own (#3869).
+func a2aMCPStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
+	if !a2aMCPDoorEnabled() {
+		return 0
+	}
+	return int64(ptr.Deref(buildA2AMCPDeployment(agent).Spec.Replicas, 1))
+}
+
 func a2aMCPName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + a2aMCPNameSuffix
 }
