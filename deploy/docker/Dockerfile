@@ -2052,9 +2052,19 @@ COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
 # to 1`), and an unpinned tip broke every cache-cold build (#1817). Bumping
 # the ref means checking the installer's supported manifest version first.
 ARG HERMES_OTEL_REF=b7ece46a5c883a619686b6c698b0316d9fd50962
+# root_span_ttl_ms is the plugin's orphan sweep: a turn whose root span is
+# still open past it is closed as `timed_out` and its later spans lose their
+# parent. The plugin's 10-minute default sat under a fleet audit's length, so
+# Cloud Trace showed live runs "cut" at 600 s (#3220). Nothing bounds a turn's
+# wall clock in this pod, so 4 h is a chosen ceiling, far above the longest
+# turn observed (1552 s), not a limit derived from anything; it keeps the sweep
+# off live runs while still closing a span whose turn never ends.
+# otel_config.py carries this file into every profile's copy at start.
+ARG HERMES_OTEL_ROOT_SPAN_TTL_MS=14400000
 RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install --ref "${HERMES_OTEL_REF}" briancaffey/hermes-otel/hermes_otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
-    /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
+    /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; c['root_span_ttl_ms'] = int('${HERMES_OTEL_ROOT_SPAN_TTL_MS}'); p.write_text(yaml.safe_dump(c))" && \
+    grep -q "^root_span_ttl_ms: ${HERMES_OTEL_ROOT_SPAN_TTL_MS}$" /opt/defaults/plugins/hermes_otel/config.yaml
 
 # The two files that name the speaking profile to the shell sandbox on every
 # connection Hermes' backend opens: the ssh client drop-in, and the wrapper that
