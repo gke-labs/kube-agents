@@ -921,6 +921,19 @@ def _gcloud_surface(words: list[str]) -> str | None:
     return None
 
 
+def _gcloud_help_token(token: str) -> bool:
+    """Is token a help request: a bare --help/-h, or one valued true?
+
+    Any other value, empty included, is not a help request. The empty value is
+    excluded here, unlike the kubectl reading, because "" in
+    _BOOLEAN_TRUE_SPELLINGS stands for the bare flag there.
+    """
+    name, separator, value = token.partition("=")
+    if name not in _GCLOUD_HELP_FLAGS:
+        return False
+    return not separator or (value != "" and value.lower() in _BOOLEAN_TRUE_SPELLINGS)
+
+
 def _gcloud_asks_for_help(argv: list[str]) -> bool:
     """Does argv carry --help or -h in flag position?
 
@@ -946,7 +959,10 @@ def _gcloud_asks_for_help(argv: list[str]) -> bool:
             continue
         name, separator, _ = token.partition("=")
         if name in _GCLOUD_HELP_FLAGS:
-            return True
+            if _gcloud_help_token(token):
+                return True
+            index += 1
+            continue
         if name in _GCLOUD_BOOLEAN_FLAGS:
             index += 1
             continue
@@ -1365,7 +1381,7 @@ def _gcloud_prefix_write(argv: list[str]) -> bool:
     if not words:
         return False
     if _gcloud_asks_for_help(argv[:index]) or any(
-        token.partition("=")[0] in _GCLOUD_HELP_FLAGS for token in argv[index:]
+        _gcloud_help_token(token) for token in argv[index:]
     ):
         return False
     return not any(
