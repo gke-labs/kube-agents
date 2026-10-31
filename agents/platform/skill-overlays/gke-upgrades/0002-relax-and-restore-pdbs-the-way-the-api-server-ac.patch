@@ -1,0 +1,87 @@
+Subject: Relax and restore PDBs the way the API server accepts
+
+Why: the runbook template relaxes a blocking PDB by merging maxUnavailable into it, which the API server rejects on a PDB that sets minAvailable, and restores it by re-applying a dump the API server answers with a 409 conflict. The patch clears minAvailable in the relax step, restores the PDB as a numbered, verified step, and aligns SKILL.md's rule and troubleshooting.md §1 with it.
+Local-Issue: none (#2353)
+Upstream-Issue: none filed yet
+Retire-When: upstream's runbook relaxes and restores PDBs the way the API server accepts
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -173,7 +173,7 @@ Produce checklists as copyable markdown with checkboxes. See [`references/checkl
+ 
+ Produce step-by-step runbooks with actual `gcloud` and `kubectl` commands. See `references/runbook-template.md` for the standard command sequences.
+ 
+-**Any runbook that relaxes a safety control must restore it in the same runbook.** This applies above all to PDBs during a node-pool migration or rollback: back the PDBs up before draining, and make re-applying them a numbered step with its own verification, not a closing remark. A runbook that patches `maxUnavailable: 100%` to unblock a drain and never reverts it leaves the cluster without disruption protection, and the gap is invisible until the next voluntary eviction. The same rule covers maintenance exclusions, cordons, and autoscaler `minNodes` overrides added to get through the procedure.
++**Any runbook that relaxes a safety control must restore it in the same runbook.** This applies above all to PDBs during a node-pool migration or rollback: back the PDBs up before draining, and make restoring them by patch a numbered step with its own verification, not a closing remark. A runbook that patches `maxUnavailable: 100%` to unblock a drain and never reverts it leaves the cluster without disruption protection, and the gap is invisible until the next voluntary eviction. The same rule covers maintenance exclusions, cordons, and autoscaler `minNodes` overrides added to get through the procedure.
+ 
+ ## Maintenance Window Pauses
+ 
+diff --git a/references/runbook-template.md b/references/runbook-template.md
+--- a/references/runbook-template.md
++++ b/references/runbook-template.md
+@@ -161,14 +161,21 @@ step of the same runbook — never as a follow-up someone may forget:
+ # 1. Relax the blocking PDB (only after confirming the replacement pool is
+ #    Ready and can accept the workload)
+ kubectl patch pdb PDB_NAME -n NAMESPACE \
+-  --type merge -p '{"spec":{"maxUnavailable":"100%"}}'
++  --type merge -p '{"spec":{"minAvailable":null,"maxUnavailable":"100%"}}'
+ 
+ # 2. Drain, then verify workloads are Running on the replacement pool
+ kubectl get pods -o wide --field-selector spec.nodeName!='' -A | grep NODE_POOL_NAME-rollback
+ 
+-# 3. RESTORE the original PDB — mandatory, not optional. Re-apply from the
+-#    backup rather than retyping the values.
+-kubectl apply -f /tmp/pdb-backup-TIMESTAMP.yaml
++# 3. RESTORE the original PDB — mandatory, not optional. Patch back the value
++#    the backup records for PDB_NAME and clear the field step 1 set. Do not
++#    `kubectl apply` the backup: its stale resourceVersion is rejected with a
++#    conflict. If the PDB originally set minAvailable:
++kubectl patch pdb PDB_NAME -n NAMESPACE \
++  --type merge -p '{"spec":{"maxUnavailable":null,"minAvailable":ORIGINAL_MIN_AVAILABLE}}'
++#    If it originally set maxUnavailable:
++kubectl patch pdb PDB_NAME -n NAMESPACE \
++  --type merge -p '{"spec":{"maxUnavailable":ORIGINAL_MAX_UNAVAILABLE}}'
++#    (an integer as-is, a percentage quoted, e.g. "50%")
+ 
+ # 4. Confirm the restore took effect
+ kubectl get pdb -A   # ALLOWED DISRUPTIONS should match the pre-drain values
+diff --git a/references/troubleshooting.md b/references/troubleshooting.md
+--- a/references/troubleshooting.md
++++ b/references/troubleshooting.md
+@@ -29,19 +29,26 @@ kubectl get pdb -A -o wide
+ kubectl describe pdb PDB_NAME -n NAMESPACE
+ ```
+ 
+-**Fix — temporarily relax the PDB:**
++**Fix — temporarily relax the PDB, and restore it in the same procedure:**
+ ```bash
+-# Option A: Allow all disruptions temporarily
++# 1. Record the original values before touching anything
++kubectl get pdb PDB_NAME -n NAMESPACE -o yaml > pdb-backup.yaml
++
++# 2. Allow all disruptions temporarily
+ kubectl patch pdb PDB_NAME -n NAMESPACE \
+-  -p '{"spec":{"minAvailable":null,"maxUnavailable":"100%"}}'
++  --type merge -p '{"spec":{"minAvailable":null,"maxUnavailable":"100%"}}'
+ 
+-# Option B: Back up and edit
+-kubectl get pdb PDB_NAME -n NAMESPACE -o yaml > pdb-backup.yaml
+-# Edit minAvailable/maxUnavailable, then:
+-kubectl apply -f pdb-backup.yaml
+-```
++# 3. Once the upgrade completes, RESTORE (mandatory): patch back the value
++#    pdb-backup.yaml records and clear the other field. If it set minAvailable:
++kubectl patch pdb PDB_NAME -n NAMESPACE \
++  --type merge -p '{"spec":{"maxUnavailable":null,"minAvailable":ORIGINAL_MIN_AVAILABLE}}'
++#    If it set maxUnavailable:
++kubectl patch pdb PDB_NAME -n NAMESPACE \
++  --type merge -p '{"spec":{"maxUnavailable":ORIGINAL_MAX_UNAVAILABLE}}'
+ 
+-Restore original PDB after upgrade completes.
++# 4. Verify the restore: the spec matches pdb-backup.yaml again
++kubectl get pdb PDB_NAME -n NAMESPACE -o yaml | grep -E 'minAvailable|maxUnavailable'
++```
+ 
+ ## 2. Resource constraints (no room for pods)
+ 

@@ -1,13 +1,14 @@
 # First-Time Environment Discovery & Inventory Scan (`bootstrap-inventory-scan`)
 
 **Purpose:** The fleet half of first-time GKE environment discovery: enumerate the fleet, audit any
-cluster that has no Cluster Agent, and complete.
+cluster that has no Cluster Agent or is past the first-run cap, and complete.
 
 You do not fan out and you do not write the report. The onboarding gate (`bootstrap_scan_gate.py`
-and `bootstrap_handoff.py`, scripts) files one audit card per Cluster Agent itself, and once those
-cards settle it writes their structured `metadata`, with yours, into `/opt/data/INVENTORY.raw.md`
-and files the card that ranks it into the report delivered to chat as `/opt/data/INVENTORY.md`. Your
-job is the fleet list, the clusters no Cluster Agent covers, and the gaps.
+and `bootstrap_handoff.py`, scripts) files the audit cards itself, one per Cluster Agent up to the
+first-run cap; your card names any cluster past the cap, and you audit those. Once the cards settle
+it writes their structured `metadata`, with yours, into `/opt/data/INVENTORY.raw.md` and files the
+card that ranks it into the report delivered to chat as `/opt/data/INVENTORY.md`. Your job is the
+fleet list, the clusters no Cluster Agent card covers, and the gaps.
 
 ---
 
@@ -17,6 +18,7 @@ Use native Google Cloud CLI (`gcloud`) and Kubernetes (`kubectl`) read-only comm
 
 1. **Identify GCP Project & Fleet Bounds:**
    - Run `gcloud config get-value project` and `gcloud container clusters list --project=<project-id>` to enumerate every active and stopped GKE cluster in the project.
+   - Drop every cluster the install excludes (`spec.scope.exclude.clusters`) before you go on: the ones your card names, or, on a run that did not come from the onboarding card, the ones the platform_control `fleet_scope` tool lists in `excluded_clusters`. An excluded cluster is outside the scope: it is not in `fleet`, not audited in Step 3, not a gap, and not in the report.
 2. **Inspect Cluster Control Planes & Topologies:**
    - For every running GKE cluster discovered (`e.g., kage-mgmt, platform-agent-host`), inspect its configuration: Kubernetes version, control plane region/zone, node pools (`machine types, node counts, autoscaling boundaries`), network configuration (`VPC-native, Dataplane V2 / eBPF`), and enabled GKE features (`Workload Identity, Managed Prometheus, OpenTelemetry collection`).
 3. **Verify Access & Tenancy Boundaries:**
@@ -43,13 +45,14 @@ reach it, an entry in `gaps` saying so.
 ## Step 3: Audit the clusters the list does not cover
 
 **A cluster with no Cluster Agent has no card, and you audit it here yourself.** Those are the
-clusters Step 1 listed that the list on your card does not name: all of them when the card
+clusters Step 1 kept, after dropping the excluded ones, that the list on your card does not name: all of them when the card
 lists none, and usually none otherwise, because the reconcile gives every listed cluster a profile.
-Take the set from the card's list, not from a roster you look up. Follow Steps 2 to 4 of
+The card can also name clusters past the first-run cap: they have a Cluster Agent but no card this sweep. Audit them here too, and do not report them as lacking an agent. Take the set from the card's list, not from a roster you look up. Follow Steps 2 to 4 of
 `cluster_inventory_audit_sop.md` for each, and record what you find in that SOP's Step 5 `metadata`
-shape: Step 2 is the control-plane topology, and Steps 3 and 4 are the probes, requests/limits and
-QoS, HPA, security context, namespace governance, addons, observability and hardening checks the
-Cluster Agents run.
+shape: Step 2 is the control-plane topology, and Steps 3 and 4 are the workload list, startup
+probe, read-only root filesystem, added capabilities, namespace quota, addons, observability and
+hardening checks the Cluster Agents run. Checks the first-run audits own (liveness and readiness probes, requests and
+limits, HPA, NetworkPolicy and pod security among them) are not part of this scan.
 
 **Pin `kubectl` to each cluster before you run a single command against it.** That SOP is written
 for a Cluster Agent whose `KUBECONFIG` already points at one cluster; yours does not. Bare
@@ -57,7 +60,7 @@ for a Cluster Agent whose `KUBECONFIG` already points at one cluster; yours does
 — so an audit run unpinned files the management cluster's workloads under someone else's name, and
 nothing downstream catches it. Use the per-target recipe under **Cluster Credentials** in `AGENTS.md`
 in your own profile home, and build the MCP `projects/…/clusters/…` parent from the row you got out
-of `gcloud container clusters list` — that SOP says to take it from `USER.md`, which describes a
+of `gcloud container clusters list` — that SOP says to take it from `SOUL.md`, which describes a
 Cluster Agent's own cluster and not one you are auditing on its behalf. A cluster is very often
 uncovered precisely because credentials for it could not be minted; if that happens to you too,
 record it as unaudited and why, and audit nothing on it.
@@ -89,8 +92,8 @@ audited) and this `metadata`:
 ```
 
 `fleet` is every cluster Step 1 listed: the hand-off names any of them that no audit reported on, so
-a silent gap does not read as a clean cluster. `clusters` is an empty list when every cluster had an
-agent. `telemetry` is the collector the agents export to: read `.status.telemetry` on the PlatformAgent
+a silent gap does not read as a clean cluster. `clusters` is an empty list only when no cluster
+lacked a Cluster Agent and none was past the first-run cap. `telemetry` is the collector the agents export to: read `.status.telemetry` on the PlatformAgent
 once and summarise it. A Cluster Agent cannot see that resource, so the report shows it beside their
 observability findings. A cluster you could not reach goes in `gaps`, not silently out of `fleet`. If you could not
 list the clusters at all, say so in `gaps` and complete anyway — onboarding runs once.

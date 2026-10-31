@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 from collections.abc import Callable, Collection
@@ -50,12 +51,15 @@ __all__ = [
     "PRIORITIZE_KEY",
     "RAW_FILE",
     "REPORT_FILE",
+    "SCORES_FILE",
     "agent_shell",
     "read_delivery_runs",
     "read_files",
     "read_handoff_board",
     "read_items",
     "read_raw_block",
+    "read_raw_coverage",
+    "read_scored_report",
     "sandbox_pod",
     "sandbox_shell",
 ]
@@ -92,11 +96,11 @@ FILES_READ = "__ONBOARDING_FILES_READ__"
 FILE_PRESENT = "present"
 FILE_ABSENT = "absent"
 
-# The scheduler's record of each run of the delivery job (bootstrap_delivery.py:
-# DELIVERY_JOB_ID), which Hermes keeps in the agent pod's cron store. Read with
+# The scheduler's record of each run of the job whose delivery stage posts the report
+# (bootstrap_delivery.py: OOBE_JOB_ID), which Hermes keeps in the agent pod's cron store. Read with
 # the agent's own interpreter, falling back to python3 as the other reads do:
 # the agent image ships no sqlite3 binary.
-DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
+DELIVERY_JOB_ID = "oobe"
 EXECUTIONS_DB = f"{DATA_ROOT}/cron/executions.db"
 RUNS_READ = "__ONBOARDING_RUNS_READ__"
 # The job ticks every minute, so this reaches back several hours from the
@@ -157,6 +161,79 @@ SANDBOX_PYTHON = "python3"
 RAW_READ = "__ONBOARDING_RAW_BLOCK__"
 # Parser errors carried into the verdict; the rest are counted.
 MAX_PARSER_ERRORS = 5
+
+# The raw report's own text, for the sections the parser does not read: the
+# Coverage table, one row per audit the hand-off compiled with the card that
+# reported it, and the Gaps list. bootstrap_handoff.compose writes both; the
+# phrases below are its gap lines for a cluster the sweep audited itself and
+# for a fleet cluster no audit reported on. The read stops one byte past
+# MAX_RAW_BYTES; a Coverage table that does not end inside it is a failed read.
+RAW_TEXT_PRESENT = "__ONBOARDING_RAW_TEXT_PRESENT__"
+RAW_TEXT_ABSENT = "__ONBOARDING_RAW_TEXT_ABSENT__"
+MAX_RAW_BYTES = 1 << 22
+COVERAGE_HEADING = "## Coverage"
+GAPS_HEADING = "## Gaps"
+COVERAGE_COLUMNS = ("Cluster", "Project", "Location", "Card")
+SWEEP_AUDITED_RE = r"^- (?P<cluster>[^()]+?) \((?P<project>[^()]+?)\): no Cluster Agent card, so the sweep audited it itself$"
+UNREPORTED_RE = r"^- (?P<cluster>[^()]+?) \((?P<project>[^(),]+?), [^()]*\): listed in the fleet but no audit reported on it$"
+
+# The worker's scores (inventory_findings.py: DEFAULT_SCORES_PATH) and the report
+# it wrote, read together so a check can tell which of the batch's findings the
+# worker scored critical and which of them the report lists. The sandbox's own
+# `build_payloads` and `fq.validate_finding` score the batch, as `register`
+# would, so the severities are the queue's for the same vectors.
+SCORES_FILE = f"{DATA_ROOT}/INVENTORY.scores.json"
+SCORED_READ = "__ONBOARDING_SCORED_REPORT__"
+# Far above the SOP's 4000-character ceiling; the read stops here.
+MAX_REPORT_BYTES = 1 << 16
+SCORED_ROW_FIELDS = ("check_slug", "project", "cluster", "namespace", "object", "severity")
+
+# Runs in the sandbox. Prints the report, delivered copy first, and every row of
+# the batch with the severity the sandbox's scorer gives it, the line it is
+# gathered into (`fq.item_key`) and whether it is rolled up (`fq.rolled_up`), as
+# `select` decides them, or why the batch could not be scored. A scorer that
+# cannot be imported is printed as "error".
+_SCORED_SCRIPT = """
+import json, os, sys
+items_path, scores_path, delivered, report, parser_dir, module, max_bytes, max_errors, sentinel, fields = sys.argv[1:11]
+out = {"report": "absent", "text": None, "rows": None, "errors": None, "error": None}
+for state, path in (("delivered", delivered), ("written", report)):
+    if os.path.lexists(path):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                out["text"] = fh.read(int(max_bytes))
+            out["report"] = state
+        except OSError as exc:
+            out["report"] = "unreadable"
+            out["text"] = str(exc)
+        break
+sys.path.insert(0, parser_dir)
+try:
+    scorer = __import__(module)
+except Exception as exc:
+    out["error"] = "cannot import %s from %s: %s" % (module, parser_dir, exc)
+else:
+    try:
+        with open(items_path, encoding="utf-8") as fh:
+            items = json.load(fh)["items"]
+        with open(scores_path, encoding="utf-8") as fh:
+            scores = json.load(fh)["scores"]
+        payloads = scorer.build_payloads(items, scores)
+        out["rows"] = [
+            dict(
+                {k: row.get(k) for k in fields.split(",")},
+                item_key=list(scorer.fq.item_key(row)),
+                rolled_up=scorer.fq.rolled_up(row),
+            )
+            for row in (scorer.fq.validate_finding(p) for p in payloads)
+        ]
+    except scorer.Failure as exc:
+        out["errors"] = exc.errors[: int(max_errors)]
+    except Exception as exc:
+        out["errors"] = ["%s: %s" % (type(exc).__name__, exc)]
+print(sentinel)
+print(json.dumps(out))
+"""
 
 # bootstrap_scan_gate.py: PRIORITIZE_IDEMPOTENCY_KEY and SCAN_ASSIGNEE, and the
 # word the ranking card title bootstrap_handoff.py files carries.
@@ -241,9 +318,10 @@ def writer():
 
 try:
     with open(os.path.join(root, marker)) as fh:
-        ids = [m.group(1) for m in (re.search(r"(?:^|\\s)task_id\\s*=\\s*(\\S+)", line) for line in fh) if m]
+        lines = fh.readlines()
 except OSError as exc:
     done("no discovery sweep has been filed: %s" % exc)
+ids = [m.group(1) for m in (re.search(r"(?:^|\\s)task_id\\s*=\\s*(\\S+)", line) for line in lines) if m]
 if not ids or not ids[0]:
     done("%s names no task_id" % marker)
 try:
@@ -467,6 +545,83 @@ def read_raw_block(shell: Callable[[str, float], str], timeout: float) -> dict[s
     return _payload(shell(raw_command(), timeout), RAW_READ)
 
 
+def raw_text_command() -> str:
+    """The ``sh -c`` line that prints a sentinel, then the raw report's text if there is one."""
+    return (
+        f'f={shlex.quote(RAW_FILE)}; if [ -e "$f" ] || [ -L "$f" ]; then echo {RAW_TEXT_PRESENT}; '
+        f'head -c {MAX_RAW_BYTES + 1} "$f"; else echo {RAW_TEXT_ABSENT}; fi'
+    )
+
+
+def _section(lines: list[str], heading: str) -> list[str] | None:
+    """The lines under ``heading`` up to the next ``## `` heading, or ``None`` when it is
+    absent or does not end inside the read."""
+    start = next((i for i, line in enumerate(lines) if line.strip() == heading), None)
+    if start is None:
+        return None
+    for end in range(start + 1, len(lines)):
+        if lines[end].startswith("## "):
+            return lines[start + 1 : end]
+    return None
+
+
+def parse_raw_coverage(text: str, truncated: bool = False) -> dict[str, Any]:
+    """The Coverage rows and the per-cluster gap lines of a raw report.
+
+    ``"rows"`` is each Coverage row's cluster, project, location and card, or
+    ``None`` with ``"error"`` when the table is missing, malformed, or (for a
+    ``truncated`` read) does not end inside the text. ``"sweep_audited"`` and
+    ``"unreported"`` are the ``[cluster, project]`` pairs the Gaps list names
+    as audited by the sweep itself and as never reported on.
+    """
+    lines = text.splitlines()
+    out: dict[str, Any] = {"rows": None, "sweep_audited": [], "unreported": [], "error": None}
+    coverage = _section(lines, COVERAGE_HEADING)
+    if coverage is None:
+        if truncated:
+            out["error"] = f"the read stopped at {MAX_RAW_BYTES} bytes before the {COVERAGE_HEADING!r} table ended"
+        else:
+            out["error"] = f"there is no {COVERAGE_HEADING!r} section ending in a further heading"
+        return out
+    table = [[c.strip() for c in line.strip().strip("|").split("|")] for line in coverage if line.strip().startswith("|")]
+    if len(table) < 2 or any(col not in table[0] for col in COVERAGE_COLUMNS):
+        out["error"] = f"the {COVERAGE_HEADING!r} table has no header naming {list(COVERAGE_COLUMNS)}"
+        return out
+    at = {col: table[0].index(col) for col in COVERAGE_COLUMNS}
+    rows = []
+    for cells in table[2:]:
+        if len(cells) != len(table[0]):
+            out["error"] = f"a {COVERAGE_HEADING!r} row has {len(cells)} cells, not {len(table[0])}: {cells}"
+            return out
+        rows.append({col.lower(): cells[i] for col, i in at.items()})
+    out["rows"] = rows
+    gaps = _section(lines, GAPS_HEADING) or []
+    for line in gaps:
+        for field, pattern in (("sweep_audited", SWEEP_AUDITED_RE), ("unreported", UNREPORTED_RE)):
+            m = re.match(pattern, line.strip())
+            if m:
+                out[field].append([m.group("cluster"), m.group("project")])
+    return out
+
+
+def read_raw_coverage(shell: Callable[[str, float], str], timeout: float) -> dict[str, Any] | None:
+    """The raw report's Coverage rows and per-cluster gap lines, or ``None`` if the read failed.
+
+    ``"raw"`` is ``absent`` or ``present``; a present file carries what
+    :func:`parse_raw_coverage` makes of it. ``shell`` is :func:`sandbox_shell`,
+    a parameter so the tests can run it locally.
+    """
+    reply = shell(raw_text_command(), timeout)
+    marker = reply.find(RAW_TEXT_PRESENT)
+    if marker < 0:
+        if reply.strip() == RAW_TEXT_ABSENT:
+            return {"raw": "absent", "rows": None, "sweep_audited": [], "unreported": [], "error": None}
+        return None
+    text = reply[marker + len(RAW_TEXT_PRESENT) :].lstrip("\n")
+    truncated = len(text.encode("utf-8", errors="replace")) > MAX_RAW_BYTES
+    return {"raw": "present", **parse_raw_coverage(text, truncated)}
+
+
 def handoff_command() -> str:
     """The ``sh -c`` line that reads the sweep's hand-off off the agent's board."""
     args = " ".join(
@@ -499,5 +654,42 @@ def read_handoff_board(shell: Callable[[str, float], str], timeout: float) -> di
     """
     parsed = _payload(shell(handoff_command(), timeout), HANDOFF_READ)
     if parsed is None or not isinstance(parsed.get("clusters"), list):
+        return None
+    return parsed
+
+
+def scored_command() -> str:
+    """The ``sh -c`` line that reads the report and scores the batch in the sandbox."""
+    args = " ".join(
+        shlex.quote(a)
+        for a in [
+            ITEMS_FILE,
+            SCORES_FILE,
+            DELIVERED_FILE,
+            REPORT_FILE,
+            PARSER_DIR,
+            PARSER_MODULE,
+            str(MAX_REPORT_BYTES),
+            str(MAX_PARSER_ERRORS),
+            SCORED_READ,
+            ",".join(SCORED_ROW_FIELDS),
+        ]
+    )
+    return f"{SANDBOX_PYTHON} -c {shlex.quote(_SCORED_SCRIPT)} {args}"
+
+
+def read_scored_report(shell: Callable[[str, float], str], timeout: float) -> dict[str, Any] | None:
+    """The report and the batch's scored rows, or ``None`` if the read failed.
+
+    ``"report"`` is ``delivered``, ``written`` (not yet delivered), ``absent``
+    or ``unreadable``, with its text in ``"text"``. ``"rows"`` holds each
+    finding's identity and severity, with its ``"item_key"`` and
+    ``"rolled_up"`` from the sandbox's queue module, or is ``None`` with ``"errors"`` saying
+    why the batch could not be scored. An ``"error"`` is a scorer that could
+    not be imported. ``shell`` is :func:`sandbox_shell`, a parameter so the
+    tests can run it locally.
+    """
+    parsed = _payload(shell(scored_command(), timeout), SCORED_READ)
+    if parsed is None or "rows" not in parsed:
         return None
     return parsed

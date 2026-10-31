@@ -1,0 +1,82 @@
+Subject: Propose changes as a pull request instead of naming write tools
+
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; the gke MCP server offers read tools only (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
+Local-Issue: #3185
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; kube-agents proposes every change as a pull request
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -1,7 +1,7 @@
+ ---
+ name: gke-tpu-dynamic-slices-monitoring
+ description: >-
+-  Monitors, troubleshoots, and manages GKE TPU Dynamic Slices custom resources. Use when checking TPU slice lifecycle states, troubleshooting slice provisioning failures, validating single-slice or multi-slice (JobSet) workload manifests, or safely patching stuck finalizers and disabling the slice controller. Don't use for generic GKE cluster node pool creation or standard non-TPU workload management (use gke-basics or gke-cluster-creation instead).
++  Monitors, troubleshoots, and manages GKE TPU Dynamic Slices custom resources. Use when checking TPU slice lifecycle states, troubleshooting slice provisioning failures, validating single-slice or multi-slice (JobSet) workload manifests, or diagnosing stuck finalizers and the slice controller for the platform operator to clear. Don't use for generic GKE cluster node pool creation or standard non-TPU workload management (use gke-basics or gke-cluster-creation instead).
+ metadata:
+   category: Containers
+ ---
+@@ -9,7 +9,9 @@ metadata:
+ # GKE TPU Dynamic Slices Monitoring & Management
+ 
+ Monitors the status of TPU Slice custom resources, troubleshoots provisioning
+-failures, validates workload manifests on dynamic slices, and performs cleanups.
++failures, validates workload manifests on dynamic slices, and hands cleanups to the platform operator.
++
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+ 
+ ## Prerequisites
+ 
+@@ -140,14 +142,10 @@ If deploying a multi-slice JobSet, verify:
+ If a slice is stuck in `DEACTIVATING` or deletion hangs indefinitely due to stuck finalizers:
+ 
+ 1. **Identify Cause**: Explain that finalizers on the slice resource (`metadata.finalizers`) are preventing Kubernetes from completing resource deletion.
+-2. **Propose Resolution**: Propose removing finalizers from the metadata path (`/metadata/finalizers`) using a JSON patch operation:
+-
+-    ```bash
+-    kubectl patch slice {slice_name} --type json -p='[{"op": "remove", "path": "/metadata/finalizers"}]'
+-    ```
++2. **Propose Resolution**: Propose removing finalizers from the metadata path (`/metadata/finalizers`) of slice `{slice_name}`. This is a write to a live object with no pull request form, and the broker refuses `kubectl` writes, so it is a step for the platform operator, not one to run from here.
+ 
+ 3. **Provide Warning**: Explicitly warn the user that removing finalizers bypasses standard controller dismantling and may leave underlying VM, network, or accelerator resources uncleaned or orphaned.
+-4. **CRITICAL SAFETY MANDATE**: The response MUST explicitly ask the user for confirmation (e.g. *"Removing finalizers on `/metadata/finalizers` via JSON patch is a high-risk operation that may leave orphaned resources. Do you confirm you want to apply this patch to slice `{slice_name}`?"*) and pause for user confirmation before applying or executing the patch.
++4. **CRITICAL SAFETY MANDATE**: The response MUST explicitly ask the user for confirmation (e.g. *"Removing finalizers on `/metadata/finalizers` via JSON patch is a high-risk operation that may leave orphaned resources. Do you confirm you want to apply this patch to slice `{slice_name}`?"*) and pause for user confirmation before handing the step on.
+ 
+ --------------------------------------------------------------------------------
+ 
+@@ -163,26 +161,13 @@ If dynamic slicing needs to be disabled:
+ 
+     Ensure all slices are deleted before disabling the controller.
+ 
+-2.  **Disable Slice Controller via gcloud**:
+-
+-    ```bash
+-    gcloud container clusters update {cluster_name} \
+-        --location={location} \
+-        --no-enable-slice-controller
+-    ```
+-
+-3.  **Delete the Slice CRD**:
+-
+-    ```bash
+-    kubectl delete crd slices.accelerator.gke.io
+-    ```
++2.  **Disable Slice Controller**: this cluster setting has no declarative path in a Config Connector repository (the KCC v1.158.0 schema has no field for it), so the agent blocks rather than inventing a field.
+ 
+-4.  **Clean up Node Labels**: Remove GKE TPU Slice labels from all nodes in the
+-    cluster:
+-
+-    ```bash
+-    kubectl label nodes --all cloud.google.com/gke-tpu-slice- cloud.google.com/gke-tpu-slice-topology-
+-    ```
++3.  **Delete the Slice CRD** (`slices.accelerator.gke.io`) and **clean up node
++    labels** (`cloud.google.com/gke-tpu-slice` and
++    `cloud.google.com/gke-tpu-slice-topology` on every node): these have no pull
++    request form and the broker refuses `kubectl` writes, so they are steps for the
++    platform operator.
+ 
+--   **Safety Rule**: Propose the exact commands and confirm before executing
+-    disabling or destructive cleanup steps.
++-   **Safety Rule**: Propose each step and confirm before handing on disabling or
++    destructive cleanup steps.

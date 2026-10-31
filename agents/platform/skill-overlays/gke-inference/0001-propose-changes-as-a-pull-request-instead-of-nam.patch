@@ -1,0 +1,51 @@
+Subject: Propose changes as a pull request instead of naming write tools
+
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; each profile's config offers only the gke MCP server's read tools (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
+Local-Issue: #3185
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; kube-agents proposes every change as a pull request
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -14,9 +14,11 @@ metadata:
+ This reference covers deploying AI/ML inference workloads on GKE using Google's
+ Inference Quickstart (GIQ) and best practices for LLM serving.
+ 
+-> **MCP Tools:** `apply_k8s_manifest`, `get_k8s_resource`, `get_k8s_logs`,
+-> `get_k8s_rollout_status`, `describe_k8s_resource`, `list_k8s_events`.
++> **MCP Tools:** `get_k8s_resource`, `get_k8s_logs`, `get_k8s_rollout_status`,
++> `describe_k8s_resource`, `list_k8s_events`.
+ > **CLI-only:** `gcloud container ai profiles *`
++>
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+ 
+ ## When to Use
+ 
+@@ -78,20 +80,17 @@ gcloud container ai profiles manifests create \
+ 
+ ### 3. Review and Deploy
+ 
+-```bash
+-# Review for placeholders (HF tokens, PVCs)
+-cat inference.yaml
+-
+-# Deploy
+-kubectl apply -f inference.yaml
++Review `inference.yaml` for placeholders (HF tokens, PVCs), then propose it as a pull request
++through `submit-suggestion`. Once the GitOps repository applies it, monitor:
+ 
+-# Monitor
++```bash
+ kubectl get pods -w
+ kubectl logs -f <POD_NAME>
+ ```
+ 
+-> Some models require Hugging Face tokens. Create a Kubernetes Secret and
+-> reference it in the manifest.
++> Some models require Hugging Face tokens. The user creates the Kubernetes
++> Secret themselves, and the proposed manifest only references it by name, so
++> the token never enters the GitOps pull request.
+ 
+ ## GPU ComputeClass for Inference
+ 

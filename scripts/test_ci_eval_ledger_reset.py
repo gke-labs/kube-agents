@@ -45,17 +45,21 @@ REPO = "gke-agentic/kube-agents-evals-2-infra"
 PROJECT = "kube-agents-evals-2"
 BOT = "kube-agents-evals-token-minter[bot]"
 
-# The ten ledger-writing cases and the audit id each grades under; a case
+# The fourteen ledger-writing cases and the audit id each grades under; a case
 # that writes no ledger has none.
 AUDIT_IDS = {
     "ai-security-planted-model-audit": "ai-security-audit",
     "compliance-rbac-overgrant": "compliance-audit",
     "consistency-drift-outlier": "fleet-consistency-drift",
     "consistency-no-environment-label": "fleet-consistency-drift",
+    "fleet-audit-unread-target-keeps-finding": "fleet-consistency-drift",
+    "fleet-audit-clean-close-reads-clean": "ai-security-audit",
+    "fleet-audit-unchanged-finding-keeps-wording": "fleet-consistency-drift",
     "fleet-cost-idle-pool": "fleet-wide-cost-analysis",
     "obtainability-planted-pdb": "obtainability-audit",
     "obtainability-planted-orphan-service": "obtainability-audit",
     "stockout-pinned-pool": "stockout-prevention",
+    "upgrades-audit-reports-upgrade-blocked": "security-patch-orchestrator",
     "upgrades-master-behind-offered-elsewhere": "security-patch-orchestrator",
     "upgrade-readiness-lagging-cluster": "security-patch-orchestrator",
 }
@@ -627,11 +631,11 @@ class CallSiteTest(unittest.TestCase):
         self.assertLess(wait, unit.index('lock_acquire "${STATE_DIR}/lock-infra"'))
         # A failed acquisition gives back the streams already held.
         self.assertIn('release_streams "${held}"', unit)
-        # Released on the infra-lock path and after the run here, and on the
-        # mint-failure and repository-reset paths through skip_unit, which
-        # both hand it the streams.
-        self.assertEqual(unit.count('release_streams "${streams}"'), 2)
-        self.assertEqual(unit.count('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"'), 2)
+        # Released on the gone-gateway, state-lock and infra-lock paths and
+        # after the run here, and on the mint-failure, repository-reset and
+        # kubeconfig-copy paths through skip_unit, which all hand it the streams.
+        self.assertEqual(unit.count('release_streams "${streams}"'), 4)
+        self.assertEqual(unit.count('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"'), 3)
         self.assertIn('release_streams "${streams}"', lifted("skip_unit"))
         # Before the infra lock: a stack-bearing unit waiting on its stream
         # must not hold the one tofu lane while it waits.
@@ -657,8 +661,8 @@ class CallSiteTest(unittest.TestCase):
         self.assertIn("lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))", unit[stack_term:task_lock])
 
     def test_the_lock_deadline_scales_by_the_cases_that_share_a_stream(self):
-        # Against the real task files: the two consistency cases share
-        # fleet-consistency-drift, the two patch cases share
+        # Against the real task files: the four drift cases share
+        # fleet-consistency-drift, the three patch cases share
         # security-patch-orchestrator, every other stream has one case, and a
         # case that writes no ledger (or an empty id) keeps the single-unit
         # figure.
@@ -677,7 +681,7 @@ class CallSiteTest(unittest.TestCase):
         )
         result = run_bash(body)
         got = dict(line.split("=", 1) for line in result.stdout.splitlines())
-        self.assertEqual(got, {"drift": "2", "compliance": "1", "patch": "2", "none": "1", "unknown": "1"}, result.stderr)
+        self.assertEqual(got, {"drift": "4", "compliance": "1", "patch": "3", "none": "1", "unknown": "1"}, result.stderr)
         self.assertEqual(result.stderr, "")
 
     def test_a_stream_deadline_covers_its_stack_bearing_cases_infra_queue(self):
@@ -709,7 +713,7 @@ class CallSiteTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
 
     def test_a_case_holds_the_streams_it_declares(self):
-        # oobe-first-run-audits grades no ledger, but its stack starts four real
+        # oobe-first-run-audits grades no ledger, but its stack starts five real
         # audit runs; it holds their streams, sorted, and is counted on each, so
         # an audit case waiting behind it on one of them waits long enough.
         tasks = (
@@ -739,7 +743,7 @@ class CallSiteTest(unittest.TestCase):
         self.assertEqual(
             got,
             {
-                "oobe": "compliance-audit fleet-wide-cost-analysis obtainability-audit stockout-prevention",
+                "oobe": "compliance-audit fleet-wide-cost-analysis obtainability-audit stockout-prevention upgrade-retrospective",
                 "compliance_case": "compliance-audit",
                 "probe": "",
                 "compliance_count": "2",

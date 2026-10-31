@@ -16,7 +16,7 @@ it was told to open and carries on without it. The failure is a *worse* answer,
 not an error, so it does not page anyone -- it just makes the fleet report
 slightly less true, indefinitely.
 
-Six checks, all offline and standard library only:
+Seven checks, all offline and standard library only:
 
 ``asset-path``
     Every path reference in an instruction file resolves to a real file.
@@ -34,6 +34,9 @@ Six checks, all offline and standard library only:
 ``cron-risk``
     Every cron job declares a risk tier (``low`` or ``high``) the runtime
     approval gate can key its command policy off.
+``cron-max-turns``
+    Every model-run cron job declares a positive integer ``max_turns``, and
+    no ``no_agent`` job carries one.
 
 Scope is deliberately narrow, because a lint the team switches off protects
 nothing:
@@ -49,8 +52,10 @@ nothing:
   ``manifests/vendor/x.yaml`` out of the report without an allowlist anyone has
   to maintain;
 * ``/opt/data/**`` is runtime state that exists only in a live pod, and is
-  skipped. So is any reference holding a shell variable or an obvious
-  placeholder;
+  skipped, except the platform profile home ``/opt/data/profiles/platform/``,
+  which skills and SOPs name in full for a kanban worker and which is resolved
+  against what that home is given (``PROFILE_HOME_ITEMS``). Any reference
+  holding a shell variable or an obvious placeholder is skipped too;
 * nothing resolves against the repository root. A checkout is not mounted into
   any agent, so ``agents/platform/skills/x/y.md`` -- which names a real file
   here, and survives every review a human gives it -- is a finding: that tree
@@ -90,8 +95,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 
 # The profile source trees. `chat` is the Chat Agent (the `default` profile),
-# `cluster` is the per-cluster template the Platform Agent scaffolds at runtime.
-PROFILES = ("platform", "chat", "cluster")
+# `cluster` is the per-cluster template the Platform Agent scaffolds at runtime,
+# and `tse` is the GKE Support Agent (Customer-Side Technical Solutions Engineer).
+PROFILES = ("platform", "chat", "cluster", "tse")
 
 # Extensions an asset reference can end in. Anything else -- `.admin`,
 # `.global-static-ip-name`, `.conf` -- is a GCP role, an annotation key or an
@@ -135,19 +141,20 @@ OPT_DEFAULTS: tuple[tuple[str, str], ...] = (
 # What a specialist profile home actually contains, which is not the whole of
 # its source tree and is not /opt/defaults either. Each is built from its
 # template by an explicit item list: `profile_scaffold.py --items` in
-# docker-entrypoint.sh for platform, OVERLAY_ITEMS in cluster_agent_profile.py
-# for a cluster. A path whose first segment is outside that list is absent at
-# runtime however plainly it exists in the checkout.
+# docker-entrypoint.sh for platform and tse, OVERLAY_ITEMS in
+# cluster_agent_profile.py for a cluster. A path whose first segment is outside
+# that list is absent at runtime however plainly it exists in the checkout.
 #
 # agents/platform/docs is the live case: the Dockerfile copies it to
 # /opt/defaults/docs and nowhere else, so it reaches the default profile and no
-# specialist. `scripts` is here because the entrypoint makes it the one
-# exception, symlinking $TARGET_DIR/scripts into profiles/platform (line 538)
-# -- a link it would not need if that layer reached the profile on its own.
+# specialist. `scripts` is here because the entrypoint makes it the exception
+# for platform and tse, symlinking $TARGET_DIR/scripts into profiles/platform
+# and profiles/tse -- links they would not need if that layer reached those
+# profiles on its own.
 #
 # `chat` is deliberately absent: it *is* the default profile, so its home is
 # $TARGET_DIR and the /opt/defaults layer resolves there in full.
-# `test_profile_home_items_match_the_entrypoint` re-derives both lists.
+# `test_profile_home_items_match_the_entrypoint` re-derives all three lists.
 PROFILE_HOME_ITEMS: dict[str, frozenset[str]] = {
     "platform": frozenset(
         {
@@ -165,7 +172,16 @@ PROFILE_HOME_ITEMS: dict[str, frozenset[str]] = {
     "cluster": frozenset(
         {"SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills"}
     ),
+    "tse": frozenset(
+        {"SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills", "scripts"}
+    ),
 }
+
+# The platform profile's home in a running pod, and a file in the platform
+# tree (relative to REPO, which the tests repoint) that selects that home's
+# item list in `_resolves_in_home`.
+PLATFORM_PROFILE_HOME = "/opt/data/profiles/platform/"
+PLATFORM_HOME_ANCHOR = "agents/platform/SOUL.md"
 
 # The profile templates the entrypoint scaffolds from. Unlike /opt/defaults
 # these are plain directory copies, so the mapping is one line each.
@@ -173,6 +189,7 @@ OPT_TEMPLATES: tuple[tuple[str, str], ...] = (
     ("/opt/platform-template/", "agents/platform"),
     ("/opt/cluster-template/", "agents/cluster"),
     ("/opt/chat-template/", "agents/chat"),
+    ("/opt/tse-template/", "agents/tse"),
 )
 
 # Top-level repository directories. These make a token count as a *path* --
@@ -249,7 +266,7 @@ CRON_PROMPT_PATH = re.compile(
 #
 # `chat` is this repository's own platform, not a synonym for Google Chat:
 # `deploy/docker/plugins/chat/` relays the report to the Session KV server,
-# which runs one Chat Agent turn over it and posts the result. It is enabled
+# which posts it as written. It is enabled
 # only inside a cron child, because `profile_cron_tick.py` is the sole setter of
 # its `CHAT_HOME_CHANNEL`, so probing for it anywhere else -- a `kubectl exec`,
 # the gateway process -- finds it unset and reads like a dead value. It is not.
@@ -264,9 +281,26 @@ CRON_DELIVER_DEFAULT = "local"
 CRON_DELIVER_EXACT_CASE = frozenset({"local", "origin"})
 
 
+# The same file kinds, spelled absolutely under the platform profile home. A
+# cron run starts in a directory of its own (cron/runs/), so a prompt names
+# its SOP and collector this way; the reference is kept whole and resolved
+# against the platform profile (_cron_ref_resolves).
+CRON_PROMPT_ABS_PATH = re.compile(
+    "(" + re.escape(PLATFORM_PROFILE_HOME) + r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:md|json|py|sh))"
+    r"(?=[.,;:!?)\]]*(?:\Z|[\s'\"`]))"
+)
+
+
 def cron_prompt_refs(prompt: str) -> set[str]:
-    """Every repository-relative asset path a cron prompt names."""
-    return set(CRON_PROMPT_PATH.findall(prompt))
+    """Every asset path a cron prompt names: profile-relative, or absolute under the platform home."""
+    return set(CRON_PROMPT_PATH.findall(prompt)) | set(CRON_PROMPT_ABS_PATH.findall(prompt))
+
+
+def _cron_ref_resolves(ref: str, roster: Path) -> bool:
+    """A profile-relative ref against the roster's profile; an absolute one against the platform's."""
+    if ref.startswith(PLATFORM_PROFILE_HOME):
+        return _resolves_in_home(ref[len(PLATFORM_PROFILE_HOME):], REPO / PLATFORM_HOME_ANCHOR)
+    return _resolves_in_home(ref, roster)
 
 FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 FRONTMATTER_NAME = re.compile(r"^name:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
@@ -288,6 +322,13 @@ FRONTMATTER_DESCRIPTION = re.compile(
 
 # The valid risk tiers a cron job can declare (SKILL-002).
 ALLOWED_CRON_RISK = frozenset({"low", "high"})
+# The smallest iteration budget a model-run cron job may declare. Hermes'
+# `resolve_turn_limit` reads 0, a negative number, a bool and a non-numeric
+# string as unlimited; the image's scheduler patch ignores such a roster value
+# and runs the job at the profile's budget instead, so a roster that carried
+# one would say one thing and run another. A numeric string would parse, and
+# is refused here only to keep the roster one type.
+CRON_MAX_TURNS_MIN = 1
 
 
 @dataclass(frozen=True)
@@ -330,11 +371,21 @@ def _is_placeholder(ref: str) -> bool:
     absent from a checkout. The rest are references written as templates --
     `$HERMES_HOME/...`, `memory/YYYY-MM-DD.md`, `<cluster>/kustomization.yaml`.
     """
-    if ref.startswith("/opt/data/"):
-        return True
     if any(ch in ref for ch in "$<>{}*?"):
         return True
     if "..." in ref or "YYYY" in ref:
+        return True
+    if ref.startswith(PLATFORM_PROFILE_HOME):
+        # The items the image gives that home are checked, and so is a path the
+        # checkout has under agents/platform but does not ship (docs/); anything
+        # else under it (SETTINGS.md, memories/) is runtime state, as the rest of
+        # /opt/data is.
+        rest = ref[len(PLATFORM_PROFILE_HOME) :]
+        head = rest.split("/", 1)[0]
+        if head in PROFILE_HOME_ITEMS["platform"]:
+            return False
+        return not (REPO / PLATFORM_HOME_ANCHOR).parent.joinpath(head).exists()
+    if ref.startswith("/opt/data/"):
         return True
     # Absolute paths that are neither image layout nor repository content:
     # /var/run/docker.sock, /run/containerd/containerd.sock, /etc/...
@@ -475,6 +526,10 @@ def _looks_like_reference(ref: str, roots: list[Path]) -> bool:
 
 
 def _resolves(ref: str, path: Path, roots: list[Path]) -> bool:
+    if ref.startswith(PLATFORM_PROFILE_HOME):
+        # Named in full for a kanban worker, which starts in its card's
+        # workspace; judged against what the platform home is given.
+        return _resolves_in_home(ref[len(PLATFORM_PROFILE_HOME) :], REPO / PLATFORM_HOME_ANCHOR)
     if ref.startswith("/opt/defaults/"):
         return _resolve_opt(ref[len("/opt/defaults/") :]) is not None
     for prefix, source in OPT_TEMPLATES:
@@ -490,9 +545,7 @@ def _resolves(ref: str, path: Path, roots: list[Path]) -> bool:
         # the profile home for a persona or an SOP and the bundle for a skill --
         # not the directory the sentence happens to be written in. A skill's
         # reference page says `./assets/x.sh` for an asset one level up from
-        # itself, and the fleet-audit SKILL.md says
-        # `./skills/fleet-audit/scripts/audit_report.py` for its own script.
-        # Both are right, and both are wrong if `./` is read literally.
+        # itself: right, and wrong if `./` is read literally.
         bare = ref[2:]
         if (path.parent / bare).exists():
             return True
@@ -784,7 +837,7 @@ def check_cron_assets() -> list[Finding]:
                 # against the whole of agents/<profile>/ instead was how this rule
                 # came to accept `docs/glossary.md` from the platform roster --
                 # the one class the message it prints claims to be about.
-                if _resolves_in_home(ref, path):
+                if _cron_ref_resolves(ref, path):
                     continue
                 findings.append(
                     Finding(
@@ -916,6 +969,56 @@ def check_cron_risk() -> list[Finding]:
     return findings
 
 
+def check_cron_max_turns() -> list[Finding]:
+    """Every model-run cron job declares its own iteration budget (#1947).
+
+    The image's scheduler reads a roster entry's ``max_turns`` ahead of the
+    profile's ``agent.max_turns`` (deploy/docker/patches/apply_cron_job_max_turns.py),
+    so the fleet audits can carry the budget they need while the profile default
+    bounds the kanban workers. An entry without one silently runs under the
+    worker budget; one with 0, a negative number, a bool or a non-numeric string
+    is a value Hermes would read as unlimited and the image's patch therefore
+    ignores, so the entry would run at the profile's budget while saying
+    otherwise; a numeric string is refused only to keep the roster one type. A ``no_agent`` job runs no model turn and must not carry one,
+    or the roster reads as if the key bounded the script.
+    """
+    findings = []
+    for path, jobs in cron_rosters():
+        rel = path.relative_to(REPO)
+        for job in jobs:
+            declared = "max_turns" in job
+            value = job.get("max_turns")
+            if job.get("no_agent"):
+                if declared:
+                    findings.append(
+                        Finding(
+                            "cron-max-turns",
+                            str(rel),
+                            f"job {job['id']!r} is no_agent and carries max_turns={value!r}; "
+                            "a script job runs no model turn, so the key bounds nothing",
+                        )
+                    )
+                continue
+            valid = (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= CRON_MAX_TURNS_MIN
+            )
+            if not valid:
+                findings.append(
+                    Finding(
+                        "cron-max-turns",
+                        str(rel),
+                        f"job {job['id']!r} has max_turns={value!r}; a model-run job must "
+                        f"declare an integer of at least {CRON_MAX_TURNS_MIN} — an absent key "
+                        "runs the job under the profile's worker budget, and 0, a negative "
+                        "number, a bool or a non-numeric string is ignored by the scheduler "
+                        "patch and runs it there too, while reading as something else",
+                    )
+                )
+    return findings
+
+
 def _nearest(name: str, owned: dict[str, Path]) -> str | None:
     """The closest real skill name, for the common single-character slips."""
     matches = difflib.get_close_matches(name, sorted(owned), n=1, cutoff=0.85)
@@ -972,6 +1075,7 @@ def main(argv: list[str] | None = None) -> int:
         + check_cron_assets()
         + check_cron_delivery()
         + check_cron_risk()
+        + check_cron_max_turns()
     )
     if findings:
         print(

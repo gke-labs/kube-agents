@@ -29,7 +29,7 @@
 #      ConfigMap key profile-default.overlay.yaml), merged INTO the PVC copy by
 #      entrypoint step 2.7 at startup. It carries the operator settings that stay
 #      mutable afterwards — an untargeted AgentPlugin's enablement and its
-#      non-gateway config, and spec.harness.tuning;
+#      non-gateway config, and spec.harness.tuning's default limits;
 #   4. the operator's render (k8s-operator renderConfigYAML), mounted read-only
 #      at /etc/hermes/config.yaml as Hermes' MANAGED SCOPE and overlaid, per leaf
 #      key, on top of 1+2+3 at every load.
@@ -48,11 +48,14 @@
 # /etc/hermes is MACHINE-GLOBAL — one file
 # for every profile in the pod, not just this one — so it carries only what is
 # identical for every profile AND beyond the agent's own repair: `model`,
-# `platforms`, `approvals.cron_mode`, `display.platforms`. Everything
-# profile-shaped below — toolsets, plugins.enabled, mcp_servers, kanban, memory —
-# is this file's alone. Do not add any of it to renderConfigYAML: the merge is
-# per leaf key and lists REPLACE rather than union, so a list pinned there would
-# hand the platform specialist the front door's tools and vice versa.
+# `platforms`, `approvals.cron_mode`, `display.platforms`, and
+# `kanban.max_in_progress`, the board's worker cap (the board is shared by every
+# profile; spec.harness.tuning.maxInProgress, else defaultKanbanMaxInProgress).
+# Everything profile-shaped below — toolsets, plugins.enabled, mcp_servers,
+# memory, and every `kanban` key except max_in_progress — is this file's alone.
+# Do not add any of that to renderConfigYAML: the merge is per leaf key and lists
+# REPLACE rather than union, so a list pinned there would hand the platform
+# specialist the front door's tools and vice versa.
 #
 # TOOL LOCKDOWN — the Chat Agent's job is to analyze a message, choose the best
 # specialist, delegate, and proxy the chat session. It has NO runtime tools of its
@@ -90,6 +93,28 @@ model:
   # key so `/model … --global` cannot persist a different one.
   api_mode: chat_completions
 
+# Model-call deadlines for the gateway above. Hermes reads them per provider
+# (hermes_cli/timeouts.py). stale_timeout_seconds is the base of both stale
+# detectors: a stream with no first chunk, or no chunk for that long, and a
+# non-streamed call with no answer; then Hermes drops the stream and retries.
+# It is 600s because Gemini thinks in silence on this path: with the request
+# shape Hermes sends, no reasoning deltas stream, and a hard prompt measured
+# 140-210s before its first chunk, so a shorter bound would cut off healthy
+# long thinks, and every retry would repeat the same think. That was measured
+# before the chart's gateway asked Gemini for its thoughts; thought summaries
+# may now arrive as reasoning deltas before the answer, which has not been
+# measured, so the bound stays.
+# request_timeout_seconds is the per-read socket timeout (and the stream read
+# timeout), not a cap on a whole call; the chart's LiteLLM sets no timeout of
+# its own. A call that stalls is retried inside each of Hermes' 3 attempts
+# (agent.api_max_retries) until five stale kills in a row trip its breaker, so
+# a persistent stall costs five or six 600s windows before the turn fails; a
+# one-off stall recovers at the first 600s kill.
+providers:
+  custom:
+    stale_timeout_seconds: 600
+    request_timeout_seconds: 900
+
 # MCP Servers configuration. Routing/relay surface only.
 #
 # `args` is a ${HERMES_HOME} placeholder rather than a path because this file is
@@ -112,6 +137,16 @@ mcp_servers:
       - "${HERMES_HOME}/scripts/router_server.py"
     env:
       HERMES_HOME: "${HERMES_HOME}"
+      # For list_agents' Host Cluster Identity and GCP Projects in Scope
+      # sections (agent_roster.py), so the tool renders what the injected block
+      # renders. The operator sets the GKE_* and GCP_PROJECT_ID values outside
+      # kind only; an unset one arrives here as the literal "${...}"
+      # placeholder, which agent_roster.py treats as unset.
+      GKE_CLUSTER_NAME: "${GKE_CLUSTER_NAME}"
+      GKE_PROJECT_ID: "${GKE_PROJECT_ID}"
+      GKE_LOCATION: "${GKE_LOCATION}"
+      GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
+      KUBEAGENTS_SCOPE_FILE: "${KUBEAGENTS_SCOPE_FILE}"
 
 # Explicitly list platform_toolsets (reserved Hermes key). ONLY the router MCP —
 # no base tool bundle. `mcp-<name>` here maps to `mcp_servers.<name>` above.
@@ -156,6 +191,12 @@ platform_toolsets:
     - mcp-router
     - kanban
     - memory
+  # Microsoft Teams ingress resolves under the `teams` platform key; pin
+  # it to the delegation surface too so it never falls back to a full base bundle.
+  teams:
+    - mcp-router
+    - kanban
+    - memory
 
 # Second gate for the kanban orchestrator surface (kanban_create/list/…): the
 # kanban tools' check_fn reads this top-level key, distinct from platform_toolsets.
@@ -179,7 +220,7 @@ kanban:
   # the image patches that key in (deploy/docker/patches/kanban_notifier.py).
   #
   # `completed` is deliberately absent. The notifier has already delivered the
-  # worker's own status line and its full `result` to the thread by the time it
+  # worker's full `result` to the thread by the time it
   # wakes anyone, so the woken turn just re-reads the card and paraphrases a
   # message the user is looking at — 5.9s and 32,460 input tokens on task
   # t_c31a1f00, for nothing. Worse than nothing, now: the answer the notifier
@@ -205,12 +246,14 @@ kanban:
   # of cards spawns processes until the cgroup OOM killer takes them, which kills a
   # child rather than the container and so produces no restart and no event.
   #
-  # This line is the default on every install. The operator does not pin it: its
-  # managed scope is machine-global and this is a front-door setting. An operator
-  # that wants a different cap sets spec.harness.tuning.maxInProgress, which the
-  # operator writes into profile-default.overlay.yaml and the entrypoint merges
-  # over this key at startup — so keep this value in step with
-  # defaultKanbanMaxInProgress in platformagent_manifests.go.
+  # On an operator install this line is NOT what applies. The operator pins
+  # kanban.max_in_progress in its managed scope (/etc/hermes), which Hermes
+  # overlays on this file at every load: spec.harness.tuning.maxInProgress, or
+  # defaultKanbanMaxInProgress in platformagent_manifests.go when the CR does not
+  # set it. The CR field is the knob. Editing this line, or the value the agent's
+  # own config.yaml holds, changes nothing there. This line applies only to an
+  # install that runs the image without the operator, so keep it in step with
+  # defaultKanbanMaxInProgress (TestChatConfigCapsTheBoardAndWakesOnFailuresOnly).
   #
   # One slot is guaranteed to each class of card: background work (event
   # triage, cron report relays) may hold every slot but one, and so may user
@@ -315,6 +358,13 @@ platforms:
       # its input. Teaching an agent to emit Slack mrkdwn directly would defeat
       # both this renderer and format_message.
       rich_blocks: true
+  # Microsoft Teams egress presentation. `enabled` is the operator's to set, from the CR's
+  # spec.integration.teams.
+  teams:
+    typing_status_text: "Kage is thinking…"
+    extra:
+      # Render outbound messages as Adaptive Cards v1.5 JSON when enabled.
+      adaptive_cards: true
 
 # Memory. The built-in MEMORY.md/USER.md store stays off; the
 # `kube_agents_memory` provider (agents/chat/plugins/memory/kube_agents_memory/)
@@ -406,10 +456,20 @@ plugins:
     - incident_context
     - bootstrap_onboarding
     - legacy_slash_commands
+    # Counts every inbound message on pre_gateway_dispatch, the failed turns the
+    # gateway patch reports, the board's cards that gave up and the thumbs-downs the
+    # chat_feedback_reactions hook reports from Hermes' reaction:added event, and
+    # serves them on the listener the operator reads into
+    # status.usage.chatMessagesInboundTotal, chatTurnsErroredTotal,
+    # backgroundTasksGaveUpTotal and negativeFeedbackTotal.
+    # Rewrites nothing, so its place in the order does not matter.
+    - chat_metrics
     # Injects the routable-specialist roster into every turn, so choosing an
     # `assignee` costs no tool call. See defaults/plugins/agent_roster/README.md.
-    # The operator writes the deployed copy of this list; keep the two in sync
-    # (k8s-operator/internal/controller/platformagent_manifests.go).
+    # This list is the deployed list: the image seeds it onto a fresh volume
+    # and the entrypoint back-fills an existing one from it. The operator's
+    # DefaultBuiltInPlugins (platformagent_manifests.go) is only the roster an
+    # AgentPlugin may not shadow; keep the two in step.
     - agent_roster
 
 # Per-file character cap on context files (SOUL.md, AGENTS.md) in the system

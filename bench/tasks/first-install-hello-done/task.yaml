@@ -5,9 +5,19 @@ name: The first-install hello, scan already done, is short, read-only and asks o
 # The greeting a new user gets on their first chat turn after install, once the
 # first-look scan has finished and its summary is in the chat. The sibling of
 # first-install-hello-running; the differences are where the results are, the
-# closing question, and that it must not place the summary "above" or "below"
-# (the report may arrive either side of the greeting). See that case for the
+# closing question, that it must not place the summary "above" or "below"
+# (the report normally follows the greeting, but a greeting that outlives the
+# delivery hold does not), and that it must not say
+# scheduled reports come to this chat. See that case for the
 # seam this stack arms.
+#
+# Unlike that case, this one does not fix the greeting in the seam. Variant
+# from_report has the plugin pick it with the opening turn's own report check
+# (#2143): with the shell sandbox on, an ssh read from the gateway of the
+# sandbox's data volume, where the ranking worker writes the report. The stack
+# plants INVENTORY.bench-done.md there and the request names it, so the check
+# reads a file nothing in onboarding reads. A check that reads the wrong place,
+# or fails, gives the in-progress greeting and fails the checks below.
 
 fixtures: []
 
@@ -18,7 +28,7 @@ infrastructure:
   teardown: true
   variables:
     case_suffix: "done"
-    variant: "completed"
+    variant: "from_report"
     # A substring of the prompt below and of no other case's prompt.
     phrase: "set you up earlier today"
 
@@ -27,6 +37,10 @@ validated: false
 domain: chat-and-routing
 
 owner: jayantid
+
+# A greeting needs no tool call, so rung 3 takes the reply, not the
+# trajectory, as the evidence the agent ran (docs/designs/bench-case-format.md).
+tool_calls_optional: true
 
 prompt: "hi! priya here, set you up earlier today"
 
@@ -100,6 +114,22 @@ verification_spec:
       type: report_contains
       any_of_phrases: ["in this chat", "in the chat", "posted"]
 
+  # The in-progress greeting's two points: it is still looking, and it will
+  # post what it finds later. "In this chat" alone cannot tell the greetings
+  # apart, since the in-progress one may say it too.
+  - name: does-not-say-the-scan-is-running
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - "when (it'?s|it is|i'?m|i am) (done|finished)"
+        - "once (it'?s|it is|i'?m|i am) (done|finished)"
+        - "when it finishes"
+        - "\\b(i'?ll|i will|will) (post|share|send) (what|the (results|findings|summary))"
+        - "\\b(i'?m|i am) taking"
+        - "still (running|looking|scanning)"
+
   - name: asks-one-question-and-ends-on-it
     role: objective
     mode: assert
@@ -110,6 +140,16 @@ verification_spec:
         - '\?[\s\S]*\?'
         # The last character is not a question mark.
         - '[^?\s]\s*\Z'
+
+  # This case's request has home_channel_set false, so the plugin adds no
+  # sentence about scheduled reports. A greeting that says it anyway tells the user
+  # something the install did not do.
+  - name: no-scheduled-report-claim
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ["scheduled report"]
 
   - name: at-most-sixty-words
     role: objective

@@ -204,6 +204,28 @@ const (
 	// modules cannot see each other.
 	a2aAgentBusUser = "agent"
 
+	// The chat.notify route (a2a/gateway/notify.go, a2a/lib/notify.go, which
+	// spell the same two subjects - the modules cannot import each other).
+	// The agent publishes the first and reads the second; the gateway reads
+	// the first and publishes the second; no other principal holds either.
+	// Spelled whole rather than built from a2aAgentBusUser: tests/conformance
+	// reads grants out of this file's source and resolves a literal, not an
+	// expression.
+	a2aNotifySubjectGchat   = "chat.notify.gchat"
+	a2aNotifySubjectSlack   = "chat.notify.slack"
+	a2aNotifySubjectConsole = "chat.notify.console"
+	a2aNotifyReplySubjects  = "chat.notify.reply.agent.>"
+
+	// The board route (a2a/gateway/board.go, a2a/hermes-bridge/board.go,
+	// a2a/lib/board.go): the Slack Home tab's read of the agent pod's board.
+	// The gateway publishes the first and reads the second; the bridge reads
+	// the first and publishes the second; no other principal holds either.
+	// The reply has a namespace of its own for the notify reply's reason: a
+	// bridge grant reaching the gateway's _INBOX could forge its JetStream
+	// replies.
+	a2aBoardSubject       = "chat.board"
+	a2aBoardReplySubjects = "chat.board.reply.gateway.>"
+
 	// a2aBridgeUser is the Hermes bridge sidecar's principal. Static, not
 	// callout — see bridgeIdentity for why a token cannot separate it from
 	// the container above.
@@ -272,6 +294,62 @@ const (
 // publish for an addressee this grant does not name.
 const a2aBridgeAddressee = "platform"
 
+// The operator's own bus principal: its NATS user and inbox owner, and the
+// directory it writes AgentProfile cards to (agentprofile_card.go).
+const (
+	a2aOperatorBusUser        = "operator"
+	a2aDirectoryStream        = "DIRECTORY"
+	a2aDirectorySubjectPrefix = "a2a.agents."
+)
+
+// operatorIdentity is the operator as a bus principal: publish a card or a
+// tombstone on a2a.agents.<profile>, read one back, and its own inbox. The
+// subject is a wildcard over the profile token because a callout grant is
+// fixed for the life of a connection: a profile created after the operator
+// connected must still be publishable without a reconnect. Nothing else: no
+// task plane, no topics, no stream verb beyond the one direct read.
+//
+// The read is DIRECT.GET by subject, which nats.go spells as the subject's
+// trailing tokens, so it is scoped to the directory's own subjects; it is how
+// reconcile tells a missing or stale card from a current one without holding
+// STREAM.INFO.
+//
+// ok is false when the manager's own namespace and ServiceAccount are missing
+// from the environment or malformed (agentprofile_identities.go); the caller
+// renders no entry then rather than guessing a name.
+func operatorIdentity() (a2aIdentity, bool) {
+	ns, sa, ok := operatorBusPrincipal()
+	id := a2aIdentity{
+		user:           a2aOperatorBusUser,
+		account:        a2aAccountApp,
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(ns, sa),
+		comment: "the operator. Publishes each AgentProfile's agent card and its tombstone\n" +
+			"on the directory, and reads one back to tell a missing card from a current\n" +
+			"one. Nothing on the task plane or the blackboard.",
+		publish: []string{
+			a2aDirectorySubjectPrefix + "*",
+			"$JS.API.DIRECT.GET." + a2aDirectoryStream + "." + a2aDirectorySubjectPrefix + "*",
+		},
+		subscribe: []string{"_INBOX." + a2aOperatorBusUser + ".>"},
+	}
+	// With a dispatcher, the operator also makes and removes the profiles'
+	// shared durables on PROFILE_SUBMITS (agentprofile_durables.go), and it
+	// is the only principal that can: nothing else holds a consumer verb on
+	// that stream, so no one else can pull a profile's submissions or edit
+	// its durable. Create carries the durable's filter in its subject, so it
+	// is held to submission subjects. INFO and DELETE carry only the name;
+	// the operator deletes only consumers carrying its held-delivery mark.
+	if a2aDispatcherEnabled() {
+		id.publish = append(id.publish,
+			"$JS.API.CONSUMER.CREATE."+a2aProfileSubmitStream+".*."+a2aProfileSubmitPrefix+"*.*.*.*",
+			"$JS.API.CONSUMER.INFO."+a2aProfileSubmitStream+".*",
+			"$JS.API.CONSUMER.DELETE."+a2aProfileSubmitStream+".*",
+		)
+	}
+	return id, ok
+}
+
 // a2aServiceAccountName spells a KSA the way the Kubernetes TokenReview API
 // reports it, which is how the callout's map is keyed. Built here rather than
 // in the map renderer so the operator and the callout cannot disagree about the
@@ -287,18 +365,27 @@ func a2aServiceAccountName(namespace, name string) string {
 // iteration.
 func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	ns := agent.Namespace
-	return []a2aIdentity{
+	ids := []a2aIdentity{
 		gatewayIdentity(agent, ns),
 		provisionIdentity(agent, ns),
 		sessionIdentity(agent, ns),
 		agentIdentity(agent, ns),
 		bridgeIdentity(),
 		verifierIdentity(agent, ns),
+	}
+	// The operator, when the manager was deployed knowing its own
+	// ServiceAccount (agentprofile_identities.go). An install whose manager
+	// lacks the downward-API variables renders no entry and publishes no
+	// cards, rather than guessing a name.
+	if op, ok := operatorIdentity(); ok {
+		ids = append(ids, op)
+	}
+	return append(ids,
 		seedIdentity(),
 		webIdentity(),
 		consoleIdentity(),
 		sysIdentity(),
-	}
+	)
 }
 
 // gateway: task requester, chat-session supervisor, session-registry owner.
@@ -333,9 +420,19 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// name different buckets is an authorization failure at runtime with
 		// a green suite.
 		"$KV.session-state.>",
+		// The kept 👍 and 👎 ratings (a2a/gateway/feedback.go), the bucket's
+		// data plane; its JetStream grants are a2aGatewayJetStreamGrants'.
+		"$KV.feedback.>",
 		// The console adapter's notices (spec-chatops-gateway.md, "The
 		// console adapter"): core NATS, one subject per conversation.
 		"chat.console.*.out",
+		// The answer to a chat.notify request (a2a/gateway/notify.go): the
+		// first message posted and its thread, so the agent's next notify
+		// can reply on it. A namespace of its own rather than the agent's
+		// _INBOX, for the reason the verifier answers on a2a.cap.reply.>:
+		// the agent reads its JetStream replies on that inbox, and a grant
+		// reaching it would let the gateway forge them.
+		a2aNotifyReplySubjects,
 		// The capability the gateway mints for each task. One token after
 		// `root`, which is the request id, so this is the whole minting
 		// authority in one subject.
@@ -350,6 +447,12 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// never binds the bucket, precisely so this grant does not have to
 		// include a STREAM.INFO read.
 		"$KV.cap.root.*",
+		// The Home tab's board request (a2aBoardSubject): an empty body,
+		// answered by the bridge on a2aBoardReplySubjects; or, with a body, a
+		// board-health row's Retry or Drop, which the bridge relays to
+		// session-kv. This grant being the gateway's alone is what keeps any
+		// other principal from asking the bridge to act.
+		a2aBoardSubject,
 	}
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
 	publish = append(publish,
@@ -371,7 +474,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"Its $JS.API grant is scoped to what it emits, by name and by verb\n" +
 			"(#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on\n" +
 			"TASKS, and INFO, DIRECT.GET and consumer create/delete on\n" +
-			"KV_session-state, its own registry. So no STREAM.DELETE, PURGE,\n" +
+			"KV_session-state, its own registry, and on KV_feedback, the kept\n" +
+			"answer ratings. So no STREAM.DELETE, PURGE,\n" +
 			"UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here\n" +
 			"used to destroy every task's history and the five consumers on it -\n" +
 			"no CONSUMER.DELETE on TASKS, and nothing at all on DIRECTORY, the\n" +
@@ -399,7 +503,15 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"a2a.agents.>",
 			"agents.hb.>",
 			"$KV.session-state.>",
+			"$KV.feedback.>",
 			"chat.console.*.in",
+			// Proactive posts from the agent to the home channel, and a
+			// card's report back to its conversation, one subject per backend.
+			a2aNotifySubjectGchat,
+			a2aNotifySubjectSlack,
+			a2aNotifySubjectConsole,
+			// The bridge's answer to a board request.
+			a2aBoardReplySubjects,
 			"_INBOX.gateway.>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was
@@ -459,8 +571,8 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		// a2aJetStreamSurfaceRationale above: $JS.API.> would let this
 		// principal create a
 		// consumer that delivers TASKS into its own inbox, and delete any
-		// stream on the bus. It provisions - it creates the four streams
-		// and three buckets, idempotently, with an info-then-add - so it
+		// stream on the bus. It provisions - it creates the five streams
+		// and five buckets, idempotently, with an info-then-add - so it
 		// needs CREATE and INFO on exactly those and nothing else. A KV
 		// bucket is a stream named KV_<bucket>, which is why those appear
 		// in stream form.
@@ -470,6 +582,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		// is a provisioner that can destroy the audit substrate.
 		publish: []string{
 			"a2a.topics.agent.platform.upgrade-readiness",
+			"a2a.topics.agent.platform.topology-skew",
 			"a2a.topics.shared.blueprint",
 			"a2a.topics.shared.annotations",
 			"$JS.API.INFO",
@@ -491,6 +604,9 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.CREATE.KV_runtime-state",
 			"$JS.API.STREAM.CREATE.KV_session-state",
 			"$JS.API.STREAM.CREATE.KV_cap",
+			"$JS.API.STREAM.CREATE.KV_feedback",
+			"$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
+			"$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
 			"$JS.API.STREAM.INFO.TASKS",
 			"$JS.API.STREAM.INFO.DIRECTORY",
 			"$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -498,6 +614,9 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.INFO.KV_runtime-state",
 			"$JS.API.STREAM.INFO.KV_session-state",
 			"$JS.API.STREAM.INFO.KV_cap",
+			"$JS.API.STREAM.INFO.KV_feedback",
+			"$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+			"$JS.API.STREAM.INFO.PROFILE_SUBMITS",
 			"_INBOX.provision.>",
 		},
 		subscribe: []string{
@@ -620,34 +739,39 @@ const a2aVerifierUser = "verifier"
 // another agent asks the gateway, which is a task the gateway authors; it does
 // not write another addressee's event stream itself.
 //
-// Keyed on agentServiceAccountName, which spec.security.serviceAccountName can
-// override. Two consequences worth naming. The map entry follows the override
-// (the operator renders both from the same call, so they cannot drift). And an
-// override that collides with another principal's ServiceAccount would put two
-// entries under one key, which validateA2AAuthMapIdentities refuses by returning
-// "duplicate serviceAccount" — buildA2AAuthMapConfigMap fails, and with it the
-// reconcile. Note where that refusal is NOT: the webhook validates
-// spec.security.serviceAccountName against restrictedServiceAccounts only, so
-// the CR is admitted and the operator then wedges on
-// "failed to render the A2A identity map" rather than the apply being
-// rejected. Fail-closed, but the diagnosis is a controller log rather than an
-// admission error. TestPrincipalsAreDistinct holds the default
-// render; TestAnOverriddenServiceAccountThatCollidesIsRefused holds this path.
+// Keyed on gatewayServiceAccountName: the gateway Pod's own ServiceAccount, which
+// the agent container holding the bus token runs as, and which the operator
+// names. spec.security.serviceAccountName names the broker's identity, the one
+// with the cloud binding, so an override there does not reach this map.
+// validateA2AAuthMapIdentities still refuses two entries under one key
+// ("duplicate serviceAccount"). TestPrincipalsAreDistinct holds the default
+// render; TestAnOverriddenServiceAccountCannotMoveTheBusPrincipal holds the
+// override.
 func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	publish := []string{
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 	}
 	publish = append(publish, a2aAgentJetStreamGrants()...)
+	// Proactive posts (alerts, cron findings, audit reports) to the chat home
+	// channel, and a kanban card's report back to the conversation it was
+	// filed in, through the gateway that holds the chat credential. Not the
+	// task plane: a notify mints no capability and starts no executor, and
+	// the gateway posts it to the home channel or to a conversation it holds a
+	// live session record for, and nowhere else.
+	publish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)
 	publish = append(publish, "_INBOX."+a2aAgentBusUser+".>")
 
 	return a2aIdentity{
-		user:           a2aAgentBusUser,
-		account:        a2aAccountApp,
-		auth:           a2aAuthCallout,
-		serviceAccount: a2aServiceAccountName(ns, agentServiceAccountName(agent)),
-		comment: "the platform agent container. Reads the whole blackboard and writes three\n" +
+		user:    a2aAgentBusUser,
+		account: a2aAccountApp,
+		auth:    a2aAuthCallout,
+		// The gateway Pod's ServiceAccount: the agent container that holds the
+		// bus token runs as it. Same grant as before the split, new principal.
+		serviceAccount: a2aServiceAccountName(ns, gatewayServiceAccountName(agent)),
+		comment: "the platform agent container. Reads the whole blackboard and writes four\n" +
 			"topics on it. Beyond that, exactly two things: STREAM.INFO and DIRECT.GET on\n" +
 			"the two TOPICS streams, which carry the blackboard and nothing else, and its\n" +
 			"own reply inbox. No task plane either way, and no JetStream consumer verb\n" +
@@ -656,6 +780,8 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 		publish: publish,
 		subscribe: []string{
 			"a2a.topics.>",
+			// The gateway's answers to its notifies.
+			a2aNotifyReplySubjects,
 			"_INBOX." + a2aAgentBusUser + ".>",
 		},
 	}
@@ -745,6 +871,15 @@ func bridgeIdentity() a2aIdentity {
 	// granted it: `$KV.cap.hop.<...>.*`. This executor never attenuates,
 	// because it never delegates onward.
 	publish = append(publish, "a2a.cap.verify."+a2aBridgeAddressee)
+	// The answer to the gateway's board request (a2aBoardSubject), relayed
+	// from session-kv's GET /v1/board, or its answer to a board-health
+	// Retry or Drop (POST /v1/board/actions). The bridge
+	// answers rather than the agent container because it already holds
+	// session-kv's bearer. The trust boundary is the pod's, as for every
+	// grant here: the agent's terminal can reach this password, so a board
+	// it forged would show on the Home tab to the members the gateway admits,
+	// and an outcome it forged on a tapped row; it cannot ask for a tap.
+	publish = append(publish, a2aBoardReplySubjects)
 
 	return a2aIdentity{
 		user:     a2aBridgeUser,
@@ -765,6 +900,8 @@ func bridgeIdentity() a2aIdentity {
 			"a2a.tasks." + a2aBridgeAddressee + ".*.in",
 			"$KV.runtime-state.>",
 			"a2a.cap.reply." + a2aBridgeAddressee + ".>",
+			// The gateway's board request.
+			a2aBoardSubject,
 			"_INBOX." + a2aBridgeUser + ".>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was
@@ -808,6 +945,7 @@ func seedIdentity() a2aIdentity {
 	// TestSeedHoldsNoWholesaleJetStreamAPI pins the rendered result.
 	publish := []string{
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 	}
@@ -916,6 +1054,11 @@ func webIdentity() a2aIdentity {
 		// Denying the whole `a2a.cap.>` namespace rather than the verify
 		// subject alone also takes away the reply traffic, which this
 		// credential had no reason to see either.
+		//
+		// TODO(#3889): deny `a2a.dispatch.>` here and on console when the
+		// dispatch subjects land. Neither reads offers, and an offer will
+		// carry a task credential (bound to its pod, so useless copied, but
+		// no reason to hand it to a browser).
 		denySubscribe: []string{"a2a.cap.>"},
 	}
 }
@@ -937,6 +1080,12 @@ func webIdentity() a2aIdentity {
 // KV_session-state lists every key, which is every conversation and task id.
 // There is no sizes-only route to grant, so the capacity tiles that wanted
 // bucket sizes wait for one.
+//
+// On PROFILE_SUBMITS, the AgentProfile submissions, it holds DIRECT.GET and
+// nothing else, so it can show a profile task's prompt by subject. No
+// STREAM.INFO, for the subjects_filter reason above, and no consumer verb:
+// the operator is the only principal that makes consumers there, so nothing
+// a browser holds can pull a profile's queue.
 func consoleIdentity() a2aIdentity {
 	return a2aIdentity{
 		user:    a2aConsoleConfUser,
@@ -965,6 +1114,7 @@ func consoleIdentity() a2aIdentity {
 			"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
 			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
 			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+			"$JS.API.DIRECT.GET." + a2aProfileSubmitStream + ".>",
 			"chat.console.*.in",
 			"_INBOX.console.>",
 		},
@@ -973,6 +1123,11 @@ func consoleIdentity() a2aIdentity {
 			"chat.console.*.out",
 			"_INBOX.console.>",
 		},
+		// web's subtraction, for web's reason: `a2a.>` covers the
+		// verifier's request subject, and any subscriber may join its
+		// queue group and swallow a share of every verify request. This
+		// password is handed to a browser too (console.go's /config.json).
+		denySubscribe: []string{"a2a.cap.>"},
 	}
 }
 

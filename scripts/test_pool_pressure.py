@@ -10,7 +10,9 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+import urllib.error
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +28,121 @@ QUIET_DIR = os.path.join(TESTDATA, "quiet")
 # with --as-of set to the following midnight so the window covers exactly it.
 BREACH_AS_OF = datetime(2026, 8, 27, tzinfo=timezone.utc)
 QUIET_AS_OF = datetime(2026, 8, 28, tzinfo=timezone.utc)
+# saturated is the afternoon of 2026-10-08, when the pool had nothing free and
+# runs failed at the Boskos acquire; read at a moment that puts the failures
+# inside the recent window (#2747).
+SATURATED_DIR = os.path.join(TESTDATA, "saturated")
+SATURATED_AS_OF = datetime(2026, 10, 8, 18, 30, tzinfo=timezone.utc)
+
+
+RESOURCES_DOC = {"items": [
+    {"metadata": {"name": "kube-agents-evals-3"}, "status": {"state": "reconciling", "owner": "fleet-reconcile", "lastUpdate": "2026-10-27T08:31:00Z"}},
+    {"metadata": {"name": "kube-agents-evals-4"}, "status": {"state": "busy", "owner": "pull-kube-agents-smoke-test-2115", "lastUpdate": "2026-10-27T08:40:00Z"}},
+    {"metadata": {"name": "kube-agents-evals-5"}, "status": {"state": "free", "owner": "", "lastUpdate": "2026-10-27T08:00:00Z"}},
+    "not an object",
+    {"metadata": {}, "status": {"owner": "x"}},
+]}
+
+
+class HeldProjectsTest(unittest.TestCase):
+    def test_the_held_map_names_each_holders_project(self):
+        self.assertEqual(pp._held_from(RESOURCES_DOC), {
+            "kube-agents-evals-3": {"owner": "fleet-reconcile", "state": "reconciling", "since": "2026-10-27T08:31:00Z"},
+            "kube-agents-evals-4": {"owner": "pull-kube-agents-smoke-test-2115", "state": "busy", "since": "2026-10-27T08:40:00Z"},
+        })
+
+    def test_from_dir_reads_the_resources_file_or_says_it_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx", from_dir=tmp).ok)
+            with open(os.path.join(tmp, pp.BOSKOS_RESOURCES_FILE), "w") as fh:
+                json.dump(RESOURCES_DOC, fh)
+            source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx", from_dir=tmp)
+            self.assertTrue(source.ok)
+            self.assertEqual(sorted(source.value), ["kube-agents-evals-3", "kube-agents-evals-4"])
+            # A capture that is not an object (`jq .items`) is an error line, not a traceback.
+            Path(tmp, pp.BOSKOS_RESOURCES_FILE).write_text("[]")
+            shape = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx", from_dir=tmp)
+        self.assertFalse(shape.ok)
+        self.assertIn("not a JSON object", shape.error)
+
+    def test_the_kubectl_path_lists_the_resource_objects(self):
+        calls = []
+        def fake_run(cmd, timeout=0):
+            calls.append((list(cmd), timeout))
+            return 0, json.dumps(RESOURCES_DOC), ""
+        with unittest.mock.patch.object(pp, "run_cmd", fake_run), unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/kubectl"):
+            source = pp.fetch_held(pp.BOSKOS_VIA_KUBECTL, "my-ctx")
+        self.assertTrue(source.ok)
+        self.assertEqual(calls, [(["kubectl", "--context", "my-ctx", "-n", "boskos", "get", "resources.boskos.k8s.io", "-o", "json"], pp.BOSKOS_TIMEOUT_SECONDS)], "the Boskos timeout, like the other Boskos reads")
+        with unittest.mock.patch.object(pp, "run_cmd", lambda cmd, timeout=0: (0, "[]", "")), unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/kubectl"):
+            self.assertIn("not a JSON object", pp.fetch_held(pp.BOSKOS_VIA_KUBECTL, "my-ctx").error)
+        with unittest.mock.patch.object(pp, "run_cmd", lambda cmd, timeout=0: (1, "", "Error from server (Forbidden)")), unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/kubectl"):
+            denied = pp.fetch_held(pp.BOSKOS_VIA_KUBECTL, "my-ctx")
+        self.assertFalse(denied.ok)
+        self.assertIn("Forbidden", denied.error)
+
+    def test_the_in_cluster_path_needs_the_pods_environment(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx")
+        self.assertFalse(source.ok)
+        self.assertIn("not running in a cluster", source.error)
+        self.assertFalse(pp.fetch_held(pp.BOSKOS_VIA_NONE, "ctx").ok)
+
+    def test_the_in_cluster_path_reads_as_the_pod(self):
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        seen = {}
+        def fake_urlopen(request, timeout=None, context=None):
+            seen.update(url=request.full_url, auth=request.get_header("Authorization"), timeout=timeout)
+            if seen.get("code"):
+                raise urllib.error.HTTPError(request.full_url, seen["code"], "nope", {}, None)
+            return Response(json.dumps(seen.get("body", RESOURCES_DOC)).encode("utf-8"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            token, ca = Path(tmp, "token"), Path(tmp, "ca.crt")
+            token.write_text("pod-token\n")
+            ca.write_text("not read: the TLS context is stubbed")
+            env = {pp.IN_CLUSTER_HOST_ENV: "10.0.0.1", pp.IN_CLUSTER_PORT_ENV: "443"}
+            with unittest.mock.patch.dict(os.environ, env), \
+                    unittest.mock.patch.object(pp, "IN_CLUSTER_TOKEN_FILE", str(token)), \
+                    unittest.mock.patch.object(pp, "IN_CLUSTER_CA_FILE", str(ca)), \
+                    unittest.mock.patch.object(pp.ssl, "create_default_context", lambda cafile=None: cafile), \
+                    unittest.mock.patch.object(pp.urllib.request, "urlopen", fake_urlopen):
+                source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx")
+                self.assertTrue(source.ok, source.error)
+                self.assertEqual(sorted(source.value), ["kube-agents-evals-3", "kube-agents-evals-4"])
+                self.assertEqual((seen["url"], seen["auth"], seen["timeout"]), (f"https://10.0.0.1:443{pp.BOSKOS_RESOURCES_API_PATH}", "Bearer pod-token", pp.BOSKOS_TIMEOUT_SECONDS))
+                # The answer the periodic gets until the RoleBinding exists.
+                seen["code"] = 403
+                denied = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx")
+                self.assertFalse(denied.ok)
+                self.assertIn("HTTP 403", denied.error)
+                self.assertIn("boskos-crd-reader", denied.error)
+                seen["code"], seen["body"] = None, []
+                self.assertIn("not a JSON object", pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx").error)
+                token.unlink()
+                self.assertIn("no service-account token", pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx").error)
+
+    def test_measure_publishes_held_and_its_error(self):
+        code, out = run(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1, as_json=True)
+        summary = json.loads(out)
+        self.assertIn("held", summary)
+        self.assertIsNone(summary["held"])
+        self.assertIn(pp.BOSKOS_RESOURCES_FILE, summary["held_error"])
+        # With the file beside the other artifacts the map is published as read.
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in os.listdir(BREACH_DIR):
+                os.symlink(os.path.join(BREACH_DIR, name), os.path.join(tmp, name))
+            with open(os.path.join(tmp, pp.BOSKOS_RESOURCES_FILE), "w") as fh:
+                json.dump(RESOURCES_DOC, fh)
+            code, out = run(from_dir=tmp, as_of=BREACH_AS_OF, window_days=1, as_json=True)
+        summary = json.loads(out)
+        self.assertEqual((summary["held"], summary["held_error"]), (pp._held_from(RESOURCES_DOC), None))
 
 
 def run(**kwargs):
@@ -103,11 +220,12 @@ class Percentile(unittest.TestCase):
 
 
 class Banners(unittest.TestCase):
-    """The one thing this check reads out of another repository.
+    """The two things this check reads out of other repositories.
 
     kube-agents-presubmits.yaml prints these lines and nobody editing it knows
     they are parsed here, so the grammar is what is pinned and the wording is
-    not.
+    not. The refusal is boskosctl's own last line, and that one is pinned by
+    wording: it is the only sign the acquire gave up.
     """
 
     LOG = "\n".join((
@@ -144,6 +262,36 @@ class Banners(unittest.TestCase):
         requested, acquired = pp.lease_window(head)
         self.assertIsNotNone(requested)
         self.assertIsNone(acquired)
+
+    FAILED = "\n".join((
+        "=== [2026-10-08T17:34:26Z] Leasing GCP Project from Boskos ===",
+        "failed to acquire a resource: resources not found",
+    ))
+
+    def test_a_failed_acquire_is_recognised_by_boskosctls_last_line(self):
+        """Nothing follows the failure line, so without this the run has no
+        lease segment and scores as a fast one (#2747)."""
+        self.assertTrue(pp.lease_failed(self.FAILED))
+        self.assertEqual(
+            (pp.parse_rfc3339("2026-10-08T17:34:26Z"), None), pp.lease_window(self.FAILED)
+        )
+
+    def test_a_log_that_stops_at_the_lease_is_not_a_failed_acquire(self):
+        """A run killed inside the acquire has the same no-successor shape, so
+        silence stays unmeasured rather than becoming a failure."""
+        self.assertFalse(pp.lease_failed("\n".join(self.LOG.split("\n")[:2])))
+
+    def test_the_failure_line_counts_only_between_the_lease_banner_and_the_next(self):
+        self.assertFalse(pp.lease_failed(self.LOG + "\n" + self.FAILED.split("\n")[1]))
+        self.assertFalse(pp.lease_failed(self.FAILED.split("\n")[1] + "\n" + self.LOG))
+
+    def test_an_acquire_that_could_not_reach_boskos_is_not_a_refusal(self):
+        """boskosctl's prefix is the same; only the not-found tail says the
+        pool was empty. A dial error is an acquire nobody could read."""
+        down = self.FAILED.split("\n")[0] + (
+            '\nfailed to acquire a resource: Post "http://boskos/acquire": dial tcp: connection refused'
+        )
+        self.assertFalse(pp.lease_failed(down))
 
     def test_rewording_that_keeps_the_keyword_still_matches(self):
         log = "\n".join((
@@ -242,6 +390,19 @@ class WaitFromProwjob(unittest.TestCase):
         self.assertEqual({"queue", "pod", "setup", "lease"}, set(wait.segments))
         self.assertEqual(1800.0, wait.total_seconds)
 
+    def test_a_failed_acquire_is_flagged_and_measures_no_lease(self):
+        source = pp._collect_waits_from_dir(
+            SATURATED_DIR, SATURATED_AS_OF - timedelta(days=1), SATURATED_AS_OF
+        )
+        by_build = {w.build_id: w for w in source.value.waits}
+        failed = by_build[2108249555685347328]
+        self.assertTrue(failed.lease_failed)
+        self.assertIsNone(failed.lease_seconds)
+        self.assertEqual(pp.parse_rfc3339("2026-10-08T17:34:26Z"), failed.lease_requested)
+        slow = by_build[2108236254767222784]
+        self.assertFalse(slow.lease_failed)
+        self.assertAlmostEqual(559.0, slow.lease_seconds)
+
     def test_every_captured_fixture_parses(self):
         root = os.path.join(BREACH_DIR, "prowjobs")
         for name in os.listdir(root):
@@ -275,6 +436,37 @@ class LiveQueueFromDeck(unittest.TestCase):
         minutes = [w.minutes for w in queue.waiting]
         self.assertEqual(sorted(minutes, reverse=True), minutes)
         self.assertEqual(4, len(minutes))
+
+    def test_every_running_job_is_collected_for_the_leak_cross_reference(self):
+        """Every job in the pool leases, so a periodic's lease compared against
+        the smoke runs alone reads as leaked (#2747). The smoke set stays for
+        the cap confirmation."""
+        queue = self._queue(SATURATED_DIR, SATURATED_AS_OF)
+        self.assertEqual({"2108236254767222784"}, queue.running_build_ids)
+        self.assertEqual(
+            {"2108236254767222784", "2108256000000000000"}, queue.all_running_build_ids
+        )
+
+    def test_a_job_completed_inside_the_grace_is_releasing_and_an_old_one_is_not(self):
+        now = pp.parse_rfc3339("2026-10-13T14:23:51Z")
+        def item(build, completed):
+            return {"metadata": {"creationTimestamp": "2026-10-13T14:00:00Z"},
+                    "spec": {"job": pp.JOB_NAME},
+                    "status": {"build_id": build, "pendingTime": "2026-10-13T14:01:00Z",
+                               "completionTime": completed, "state": "aborted"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "deck.json"), "w") as fh:
+                json.dump({"items": [
+                    item("2110013283170783232", "2026-10-13T14:22:30Z"),  # 81 s ago
+                    item("2110000000000000000", "2026-10-13T12:00:00Z"),  # hours ago
+                    # Deck writes start + 30:00 on an abort, which can sit in
+                    # the future; that is still "finished just now".
+                    item("2110000000000000001", "2026-10-13T14:31:00Z"),
+                ]}, fh)
+            queue = self._queue(tmp, now)
+        self.assertEqual({"2110013283170783232", "2110000000000000001"}, queue.releasing_build_ids)
+        self.assertEqual(set(), queue.all_running_build_ids)
+        self.assertEqual(timedelta(minutes=15), pp.RELEASE_GRACE)
 
     def test_another_tenants_job_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -310,6 +502,43 @@ class PoolStateFields(unittest.TestCase):
                             {pp.BOSKOS_NO_OWNER: 4, "pull-kube-agents-smoke-test-111": 1})
         self.assertEqual(["pull-kube-agents-smoke-test-111"], pool.lease_holders())
 
+    def test_an_owner_without_a_build_id_is_reported_as_such(self):
+        pool = pp.PoolState(
+            {"busy": 1, "rebuilding": 2},
+            {"": 0, "pull-kube-agents-smoke-test-2108236254767222784": 1, "hangdng-rebuild": 2},
+        )
+        self.assertEqual({"hangdng-rebuild": 2}, pool.no_build_id())
+        self.assertEqual({}, pool.held_by_job())
+
+    def test_a_build_id_anywhere_in_the_owner_makes_it_a_prow_run(self):
+        """The pull sweep's GitLab pass leases as `<job>-<build>-gitlab`, and a
+        future lane may put anything after the build. The invariant is that a
+        run's owner contains its build ID, not that it ends with it (#2929)."""
+        self.assertEqual("2110017758350544896",
+                         pp.build_of("ci-kube-agents-pull-sweep-2110017758350544896-gitlab"))
+        self.assertEqual("2108236254767222784",
+                         pp.build_of("pull-kube-agents-smoke-test-2108236254767222784"))
+        self.assertIsNone(pp.build_of("hangdng-rebuild"))
+        self.assertIsNone(pp.build_of("fleet-reconcile"))
+        # Twenty digits are not a snowflake with a digit glued on, and a number
+        # glued into a word is not a build either: a run's owner joins the
+        # build to the job name with a dash.
+        self.assertIsNone(pp.build_of("x-21100177583505448961"))
+        self.assertIsNone(pp.build_of("repair2110017758350544896x"))
+        # Nineteen digits in another script are not a build Deck could name.
+        self.assertIsNone(pp.build_of("repair-１２３４５６７８９０１２３４５６７８９"))
+        pool = pp.PoolState({"busy": 1}, {"ci-kube-agents-pull-sweep-2110017758350544896-gitlab": 1})
+        self.assertEqual({}, pool.no_build_id())
+
+    def test_a_jobs_fixed_owner_is_held_by_a_job_not_by_hand(self):
+        """hack/fleet_reconcile.py leases four projects under `fleet-reconcile`
+        on every merge and every morning; a row that calls those a person's
+        would be wrong twice a day."""
+        pool = pp.PoolState({"busy": 5}, {"fleet-reconcile": 4, "hangdng-rebuild": 1})
+        self.assertEqual({"fleet-reconcile": 4}, pool.held_by_job())
+        self.assertEqual({"hangdng-rebuild": 1}, pool.no_build_id())
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), set())))
+
     def test_a_third_state_is_counted_as_neither_leased_nor_available(self):
         """`cleaning` and `dirty` are projects nothing can lease right now. Read
         as free they make a pool that is out of projects look like it has some.
@@ -327,16 +556,46 @@ class LeakedLeases(unittest.TestCase):
         return pp.PoolState({"busy": len(holders)},
                             {f"pull-kube-agents-smoke-test-{b}": 1 for b in holders})
 
+    ONE = "2108236254767222784"
+    TWO = "2108256000000000000"
+
     def test_a_lease_held_by_a_running_job_is_not_a_leak(self):
-        queue = pp.LiveQueue([], {"111", "222"})
-        self.assertEqual([], pp.leaked_leases(self._pool(["111", "222"]), queue))
+        queue = pp.LiveQueue([], {self.ONE, self.TWO})
+        self.assertEqual([], pp.leaked_leases(self._pool([self.ONE, self.TWO]), queue))
 
     def test_a_lease_no_running_job_accounts_for_is_reported(self):
-        queue = pp.LiveQueue([], {"111"})
+        queue = pp.LiveQueue([], {self.ONE})
         self.assertEqual(
-            ["pull-kube-agents-smoke-test-222"],
-            pp.leaked_leases(self._pool(["111", "222"]), queue),
+            [f"pull-kube-agents-smoke-test-{self.TWO}"],
+            pp.leaked_leases(self._pool([self.ONE, self.TWO]), queue),
         )
+
+    def test_a_lease_held_by_a_running_periodic_is_not_a_leak(self):
+        pool = pp.PoolState({"busy": 1}, {f"ci-kube-agents-eval-next-{self.TWO}": 1})
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), {self.TWO})))
+
+    def test_a_lane_suffix_after_the_build_id_still_matches_the_running_build(self):
+        pool = pp.PoolState({"busy": 1}, {f"ci-kube-agents-pull-sweep-{self.TWO}-gitlab": 1})
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), {self.TWO})))
+        self.assertEqual([f"ci-kube-agents-pull-sweep-{self.TWO}-gitlab"],
+                         pp.leaked_leases(pool, pp.LiveQueue([], set(), set())))
+
+    def test_a_lease_whose_run_just_finished_is_releasing_not_leaked(self):
+        """Deck marks an aborted job complete at the abort; the pod's teardown
+        runs on and the wrapper releases the project after it. For those
+        minutes the lease is releasing, and calling it leaked sends someone to
+        repair a project that frees itself (#2929)."""
+        pool = pp.PoolState({"busy": 1}, {f"pull-kube-agents-smoke-test-{self.ONE}": 1})
+        queue = pp.LiveQueue([], set(), set(), releasing_build_ids={self.ONE})
+        self.assertEqual([], pp.leaked_leases(pool, queue))
+        self.assertEqual([f"pull-kube-agents-smoke-test-{self.ONE}"], pp.releasing_leases(pool, queue))
+
+    def test_a_hand_hold_is_not_a_leak(self):
+        """An owner with no build ID is a person's or a job's that forgot the
+        convention; Deck can vouch for neither, so it is reported by name,
+        never as leaked."""
+        pool = pp.PoolState({"rebuilding": 2}, {"hangdng-rebuild": 2})
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], set(), set())))
 
     def test_the_unowned_placeholder_is_not_a_leak(self):
         """Boskos files free resources under the empty-string owner.
@@ -344,13 +603,15 @@ class LeakedLeases(unittest.TestCase):
         It is a count of nobody. Treated as a holder it would make every idle
         pool report a mystery lease.
         """
-        pool = pp.PoolState({"busy": 1, "free": 4}, {"": 4, "pull-kube-agents-smoke-test-111": 1})
-        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], {"111"})))
+        pool = pp.PoolState(
+            {"busy": 1, "free": 4}, {"": 4, f"pull-kube-agents-smoke-test-{self.ONE}": 1}
+        )
+        self.assertEqual([], pp.leaked_leases(pool, pp.LiveQueue([], {self.ONE})))
 
     def test_nothing_is_reported_when_either_source_is_missing(self):
         """With no list of running jobs, every holder looks orphaned."""
-        self.assertEqual([], pp.leaked_leases(self._pool(["111"]), None))
-        self.assertEqual([], pp.leaked_leases(None, pp.LiveQueue([], {"111"})))
+        self.assertEqual([], pp.leaked_leases(self._pool([self.ONE]), None))
+        self.assertEqual([], pp.leaked_leases(None, pp.LiveQueue([], {self.ONE})))
 
 
 class LatestMaxConcurrency(unittest.TestCase):
@@ -386,6 +647,46 @@ class Cause(unittest.TestCase):
         label, text = pp.cause(self._pool(15, 0), pp.LiveQueue([], set()), 15)
         self.assertEqual(pp.CAUSE_CAPACITY, label)
         self.assertIn("Onboard the next project", " ".join(text))
+
+    def test_lease_failures_are_capacity_and_name_what_holds_the_pool(self):
+        """A refusal is Boskos saying nothing was free for the whole acquire,
+        so the label is CAPACITY; the text says what the projects are doing,
+        because the remedy differs when two of them are a repair or a leak."""
+        pool = pp.PoolState(
+            {"busy": 3, "rebuilding": 2},
+            {"pull-kube-agents-smoke-test-2108236254767222784": 1, "hangdng-rebuild": 2},
+        )
+        label, text = pp.cause(
+            pool, pp.LiveQueue([], set()), 35, lease_failures=2,
+            leaked=["pull-kube-agents-smoke-test-2108220000000000000"],
+        )
+        self.assertEqual(pp.CAUSE_CAPACITY, label)
+        joined = "\n".join(text)
+        self.assertIn("2 run(s)", joined)
+        self.assertIn("3 leased, 0 free, 5 total", joined)
+        self.assertIn("out of rotation: rebuilding 2", joined)
+        self.assertIn("no build ID in the owner: hangdng-rebuild (2)", joined)
+        self.assertIn("1 lease(s) leaked", joined)
+
+    def test_lease_failures_with_projects_free_now_are_still_capacity(self):
+        label, text = pp.cause(self._pool(30, 5), pp.LiveQueue([], set()), 35, lease_failures=1)
+        self.assertEqual(pp.CAUSE_CAPACITY, label)
+        self.assertIn("30 leased, 5 free, 35 total", "\n".join(text))
+
+    def test_a_live_backlog_over_free_projects_outranks_a_stale_refusal(self):
+        """A refusal is evidence about the moment of the ask. A run queued past
+        the limit while projects sit free is the #2666 shape right now, and
+        that diagnosis must not wait three hours for the refusal to age out."""
+        label, text = pp.cause(
+            self._pool(18, 12), pp.LiveQueue([], set()), None, lease_failures=1, live_backlog=True
+        )
+        self.assertEqual(pp.CAUSE_CONTROL_PLANE, label)
+        self.assertIn("1 run(s) in the last 3h", text[0], "the refusal still leads the text")
+
+    def test_lease_failures_with_an_unreadable_pool_stay_unknown(self):
+        label, text = pp.cause(None, None, None, lease_failures=1)
+        self.assertEqual(pp.CAUSE_UNKNOWN, label)
+        self.assertIn("1 run(s)", "\n".join(text))
 
     def test_free_projects_below_the_cap_is_the_cap(self):
         label, text = pp.cause(
@@ -471,6 +772,17 @@ class DailyRows(unittest.TestCase):
         self.assertFalse(row.breached(15, 45))
         self.assertEqual(600.0, row.worst)
 
+    def test_a_failed_acquire_is_counted_but_not_measured(self):
+        """Its wait is a lower bound on a run that never got a project, and it
+        would pull the day's percentiles down (#2747)."""
+        created = pp.parse_rfc3339("2026-10-08T12:00:00Z")
+        failed = pp.Wait(9, "1", created, created + timedelta(minutes=1), 35,
+                         lease_requested=created + timedelta(minutes=2), lease_failed=True)
+        row = pp.DayRow("2026-10-08", self._waits("2026-10-08", [20, 21, 22, 23, 24]) + [failed])
+        self.assertEqual((5, 1), (row.count, row.lease_failures))
+        self.assertEqual(22.0, row.p50)
+        self.assertEqual(24.0, row.worst)
+
     def test_the_highest_cap_seen_that_day_is_reported(self):
         created = pp.parse_rfc3339("2026-08-27T12:00:00Z")
         waits = [pp.Wait(1, "1", created, created, 6), pp.Wait(2, "2", created, created, 10)]
@@ -479,8 +791,9 @@ class DailyRows(unittest.TestCase):
 
 class RecentRow(unittest.TestCase):
     """The stretch the chat alert quotes, so its numbers and its remedy share
-    a clock. Evidence only: `breached` stays on the daily rows and the live
-    queue, so TestGrid's row does not move with it."""
+    a clock. Its percentiles are evidence only -- `breached` stays on the daily
+    rows, the live queue and the refusal count, so TestGrid's row does not
+    move with them; its `lease_failures` is that third trigger."""
 
     END = pp.parse_rfc3339("2026-08-27T12:00:00Z")
 
@@ -497,6 +810,27 @@ class RecentRow(unittest.TestCase):
         self.assertTrue(row["judged"])
         self.assertEqual(row["p50_minutes"], 20.0)
         self.assertEqual(row["window_start"], "2026-08-27T09:00:00Z")
+
+    def test_failed_acquires_are_counted_by_when_they_asked_and_left_out_of_the_percentiles(self):
+        """A run can queue an hour before it asks, so the ask dates the failure."""
+        def failed(n, created_back, asked_back):
+            return pp.Wait(n, "1", self.END - timedelta(minutes=created_back),
+                           self.END - timedelta(minutes=created_back - 1), 35,
+                           lease_requested=self.END - timedelta(minutes=asked_back),
+                           lease_failed=True)
+        inside = failed(8, created_back=200, asked_back=100)
+        outside = failed(9, created_back=400, asked_back=300)
+        # Created inside the window too: the one that reaches the
+        # `not w.lease_failed` filter rather than the creation filter.
+        fresh = failed(10, created_back=100, asked_back=50)
+        # Created before a replay's instant, asked after it: not yet refused.
+        later = failed(11, created_back=5, asked_back=-4)
+        row = pp.recent_row(
+            self._waits([30, 60, 90, 120, 150]) + [inside, outside, fresh, later], self.END
+        )
+        self.assertEqual(row["runs"], 5, "a refused run is not a sample, whenever it was created")
+        self.assertEqual(row["lease_failures"], 2)
+        self.assertEqual(row["p50_minutes"], 20.0)
 
     def test_a_stretch_under_the_sample_floor_withholds_its_percentiles(self):
         # Two samples put any number at p95, the same reason a day's row is
@@ -516,9 +850,9 @@ class RecentRow(unittest.TestCase):
         self.assertIsNone(row["p50_minutes"])
 
     def test_a_terrible_recent_stretch_does_not_breach_on_its_own(self):
-        # Evidence, not a verdict. `breached` is breached_days or the live
-        # queue; wiring this block into it would move TestGrid's row and the
-        # JUnit exit code with a three-hour reading. Six 200-minute waits
+        # Evidence, not a verdict. `breached` is breached_days, the live queue
+        # or a refusal; wiring these percentiles into it would move TestGrid's
+        # row and the JUnit exit code with a three-hour reading. Six 200-minute waits
         # straddling midnight: enough to judge the stretch, three a side and so
         # too few to judge either day.
         end = pp.parse_rfc3339("2026-08-27T01:00:00Z")
@@ -617,6 +951,34 @@ class Percentiles(unittest.TestCase):
         self.assertEqual([51.0], [w.minutes for w in over])
 
 
+class LiveClock(unittest.TestCase):
+    def test_a_live_run_reads_deck_against_the_clock_after_the_sweep(self):
+        """The sweep can take minutes; the release grace and the live waits
+        are measured against the moment Deck is read, not the moment the run
+        began, or the grace is fifteen minutes plus the sweep."""
+        calls = []
+        with unittest.mock.patch.object(pp, "collect_waits", return_value=pp.Source(error="not read")), \
+                unittest.mock.patch.object(pp, "fetch_pool_state", return_value=pp.Source(error="not read")), \
+                unittest.mock.patch.object(pp, "fetch_held", return_value=pp.Source(error="not read")), \
+                unittest.mock.patch.object(pp, "fetch_live_queue",
+                                           side_effect=lambda now, from_dir=None: calls.append(now) or pp.Source(error="not read")):
+            with contextlib.redirect_stdout(io.StringIO()):
+                pp.measure()
+        self.assertEqual([None], calls, "a live read picks its own clock")
+
+    def test_fetch_live_queue_takes_its_own_clock_when_given_none(self):
+        before = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "deck.json"), "w") as fh:
+                json.dump({"items": [{
+                    "metadata": {"creationTimestamp": before.strftime("%Y-%m-%dT%H:%M:%SZ")},
+                    "spec": {"job": pp.JOB_NAME, "refs": {"pulls": [{"number": 1}]}},
+                    "status": {"state": "triggered"},
+                }]}, fh)
+            queue = pp.fetch_live_queue(None, from_dir=tmp).value
+        self.assertLess(queue.waiting[0].seconds, 60)
+
+
 class SweepDeadline(unittest.TestCase):
     """The sweep stops itself rather than being killed by the job timeout.
 
@@ -637,7 +999,7 @@ class SweepDeadline(unittest.TestCase):
     STRADDLING_BUILD = 2092904488661684225
     STRADDLING_CREATED = datetime(2026, 8, 26, 22, 0, tzinfo=timezone.utc)
 
-    def _sweep(self, clock):
+    def _sweep(self, clock, vanished=()):
         """collect_waits over two days, with monotonic() reading from `clock`."""
         builds = (self.OLD_BUILD, self.NEW_BUILD, self.STRADDLING_BUILD)
         entries = {build: str(build) for build in builds}
@@ -652,12 +1014,37 @@ class SweepDeadline(unittest.TestCase):
 
         with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
                 unittest.mock.patch.object(pp, "_index_entries_from_gcs",
-                                           return_value=(entries, None)), \
+                                           return_value=(entries, None, list(vanished))), \
                 unittest.mock.patch.object(pp, "_wait_from_gcs", side_effect=wait_for), \
                 unittest.mock.patch.object(pp.time, "monotonic", side_effect=clock):
             return pp.collect_waits(
                 self.AS_OF - timedelta(days=2), self.AS_OF, deadline_seconds=10
             )
+
+    def test_a_vanished_pointer_on_an_unread_day_is_not_named(self):
+        """The report says the days the deadline cut are missing, not empty;
+        a pointer that vanished on one of them is not listed beside the
+        builds from the days that were read."""
+        # Four pointers. The first two are on the cut day (08-26), the second
+        # within the six hours a window slack would admit: both dropped,
+        # because the ID encodes the end of the wait, so a build below the
+        # measured start was created below it too, and no slack applies on
+        # that side. The last two are on the day that was read (08-27), the
+        # fourth after that day's last landed build: both kept, because the
+        # window the sweep covered is the bound, not the builds it read.
+        def at(moment):
+            return str(int(moment.timestamp() * 1000 - pp.SNOWFLAKE_EPOCH_MS)
+                       << pp.SNOWFLAKE_TIMESTAMP_SHIFT)
+        day = datetime(2026, 8, 27, tzinfo=timezone.utc)
+        gone = [{"build_id": str(self.OLD_BUILD + 1), "error": pp.INDEX_POINTER_VANISHED},
+                {"build_id": at(day - timedelta(hours=5)), "error": pp.INDEX_POINTER_VANISHED},
+                {"build_id": str(self.NEW_BUILD + 2), "error": pp.INDEX_POINTER_VANISHED},
+                {"build_id": at(day + timedelta(hours=20)), "error": pp.INDEX_POINTER_VANISHED}]
+        full = self._sweep([0, 0, 0, 5], gone).value
+        self.assertEqual(gone, full.unreadable)
+        cut = self._sweep([0, 0, 99, 99], gone).value
+        self.assertTrue(cut.truncated)
+        self.assertEqual(gone[2:], cut.unreadable)
 
     def test_a_sweep_inside_the_deadline_covers_the_window_it_was_asked_for(self):
         sweep = self._sweep([0, 0, 0, 5]).value
@@ -690,6 +1077,169 @@ class SweepDeadline(unittest.TestCase):
         self.assertTrue(summary["trend"]["truncated"])
         self.assertEqual("2026-08-27", summary["trend"]["window_start"][:10])
         self.assertIn("ran out of time", pp.render(summary))
+
+
+class IndexCopy(unittest.TestCase):
+    def test_only_build_files_are_copied_from_the_index(self):
+        """`latest-build.txt` sits under the same prefix, and Prow rewrites it
+        at every smoke start. A bulk copy that includes it can 404 mid-copy and
+        turn the hour UNMEASURED, so the pattern is pinned as a literal."""
+        with unittest.mock.patch.object(pp, "run_cmd", return_value=(0, "", "")) as cmd, \
+                tempfile.TemporaryDirectory() as tmp:
+            pp._index_entries_from_gcs(tmp)
+        argv = cmd.call_args.args[0]
+        self.assertEqual(["gcloud", "storage", "cp"], argv[:3])
+        self.assertEqual(
+            "gs://kube-agents-prow/pr-logs/directory/pull-kube-agents-smoke-test/[0-9]*.txt",
+            argv[3],
+        )
+        # Parallel copies already carry on past one failed object; the flag
+        # makes a sequential one do the same, so a vanished pointer never
+        # stops the rest of the index from landing.
+        self.assertIn("--continue-on-error", argv)
+
+    # Prow rewrites a build's pointer while the build runs and again when it
+    # finishes, so any pointer can be replaced between the copy's listing and
+    # its fetch. gcloud then exits 1 after copying the rest, with this line
+    # (the object name comes back percent-encoded) among the `Copying` ones:
+    # builds 2110421170670014464 and 2110451369931444224 on 2026-10-14.
+    VANISHED = (
+        "ERROR: gs://kube-agents-prow/pr-logs%2Fdirectory%2Fpull-kube-agents-smoke-test"
+        "%2F2110431553740869632.txt not found: 404."
+    )
+
+    def _copy(self, rc, stderr, landed=("2110451366894768128",)):
+        """Run the index copy with gcloud stubbed to exit `rc` after writing
+        the `landed` pointers, as a real partial copy leaves them."""
+        def fake_cp(cmd, timeout=0):
+            dest = cmd[4]  # gcloud storage cp <glob> <dest> ...
+            for build in landed:
+                Path(dest, f"{build}.txt").write_text(f"gs://b/{build}", encoding="utf-8")
+            return rc, "", stderr
+        with unittest.mock.patch.object(pp, "run_cmd", side_effect=fake_cp), \
+                tempfile.TemporaryDirectory() as tmp:
+            return pp._index_entries_from_gcs(tmp)
+
+    def test_a_pointer_that_vanished_mid_copy_is_unreadable_not_the_whole_hour(self):
+        stderr = "Copying gs://b/2110451366894768128.txt to file:///tmp/x\n" + self.VANISHED + "\n..\n"
+        entries, err, vanished = self._copy(1, stderr)
+        self.assertIsNone(err)
+        self.assertEqual({2110451366894768128: "gs://b/2110451366894768128"}, entries)
+        self.assertEqual([{"build_id": "2110431553740869632",
+                           "error": pp.INDEX_POINTER_VANISHED}], vanished)
+
+    def test_progress_dots_glued_to_the_error_line_do_not_hide_it(self):
+        # gcloud's progress dots land at the start of about one line in
+        # eighty, the error line included.
+        entries, err, vanished = self._copy(1, "....." + self.VANISHED + "\n")
+        self.assertIsNone(err)
+        self.assertEqual(["2110431553740869632"], [v["build_id"] for v in vanished])
+
+    def test_a_stem_int_refuses_is_not_a_build(self):
+        # isdigit() admits a superscript that int() refuses; the sweep must
+        # not reach int() on it (the periodic died with no artifact).
+        odd = self.VANISHED.replace("2110431553740869632", "1%C2%B2")
+        entries, err, vanished = self._copy(1, odd)
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        self.assertEqual([], vanished)
+        self.assertIsNone(pp._build_id_of("1².txt"))
+        self.assertEqual(2110431553740869632, pp._build_id_of("2110431553740869632.txt"))
+        # A decimal stem of another length is not a snowflake: 22 digits would
+        # take snowflake_time past year 9999 at the window filter.
+        long_stem = self.VANISHED.replace("2110431553740869632", "1057500000000000000000")
+        entries, err, vanished = self._copy(1, long_stem)
+        self.assertEqual({}, entries)
+        self.assertEqual([], vanished)
+        self.assertIsNone(pp._build_id_of("1057500000000000000000.txt"))
+        self.assertIsNone(pp._build_id_of("211043155374086963.txt"))
+
+    def test_an_exit_other_than_a_partial_failure_still_fails(self):
+        # A copy killed by a signal after a pointer 404'd prints no further
+        # error line; the exit status is what says it did not finish.
+        entries, err, vanished = self._copy(-9, self.VANISHED)
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        # The message says what decided it, not only the 404 the hour survives.
+        self.assertIn("exit -9", err)
+        # With no error line, the last line of stderr stands in, not all of it.
+        _, err, _ = self._copy(-9, "Copying a\nCopying b\nCopying c\n")
+        self.assertIn("exit -9", err)
+        self.assertEqual(1, err.count("Copying"))
+
+    def test_more_vanished_pointers_than_the_limit_fail_the_copy(self):
+        lines = [self.VANISHED.replace("2110431553740869632", f"21104315537408696{i:02d}")
+                 for i in range(pp.VANISHED_POINTER_LIMIT + 1)]
+        entries, err, vanished = self._copy(1, "\n".join(lines))
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        self.assertIn(f"{pp.VANISHED_POINTER_LIMIT + 1} vanished pointers, over the ceiling", err)
+        # The message quotes a few of the lines, not one per vanished object.
+        self.assertEqual(pp.REFUSAL_ERROR_LINES, err.count("not found: 404"))
+        self.assertIn(f"and {pp.VANISHED_POINTER_LIMIT + 1 - pp.REFUSAL_ERROR_LINES} more", err)
+        entries, err, vanished = self._copy(1, "\n".join(lines[:-1]))
+        self.assertIsNone(err)
+        self.assertEqual(pp.VANISHED_POINTER_LIMIT, len(vanished))
+
+    def test_any_other_error_still_fails_the_copy(self):
+        denied = "ERROR: (gcloud.storage.cp) HTTPError 403: caller does not have storage.objects.get"
+        entries, err, vanished = self._copy(1, self.VANISHED + "\n" + denied + "\n")
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        self.assertIn("403", err)
+        # The error names what went wrong, not the thousands of Copying lines.
+        self.assertNotIn("Copying", err)
+        self.assertEqual([], vanished)
+        # The line that decided the refusal is quoted first, however many
+        # tolerated 404 lines came before it.
+        many = [self.VANISHED.replace("2110431553740869632", f"211043155374086963{i}") for i in range(4)]
+        _, err, _ = self._copy(1, "\n".join(many + [denied]))
+        self.assertIn("1 error(s) other than a vanished pointer", err)
+        self.assertLess(err.index("403"), err.index("not found: 404"))
+
+    def test_a_404_outside_the_index_is_not_a_vanished_pointer(self):
+        other = "ERROR: gs://kube-agents-prow/pr-logs%2Fdirectory%2Fother-job%2F2110431553740869632.txt not found: 404."
+        entries, err, vanished = self._copy(1, other)
+        self.assertEqual({}, entries)
+        self.assertIn("other-job", err)
+
+    def test_a_failed_exit_with_nothing_copied_still_fails(self):
+        entries, err, vanished = self._copy(1, self.VANISHED, landed=())
+        self.assertEqual({}, entries)
+        self.assertIn("could not read the build index", err)
+        self.assertIn("nothing landed", err)
+
+    def test_a_failed_exit_with_no_error_line_still_fails(self):
+        entries, err, vanished = self._copy(124, "timed out after 300s: gcloud storage cp")
+        self.assertEqual({}, entries)
+        self.assertIn("timed out", err)
+
+    def test_a_vanished_pointer_is_named_with_the_unreadable_builds(self):
+        build = 2110451366894768128
+        gone = {"build_id": "2110431553740869632", "error": pp.INDEX_POINTER_VANISHED}
+        as_of = pp.snowflake_time(build) + timedelta(hours=1)
+        wait = pp.Wait(build, "1", pp.snowflake_time(build), pp.snowflake_time(build), 15)
+        with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
+                unittest.mock.patch.object(pp, "_index_entries_from_gcs",
+                                           return_value=({build: "p"}, None, [gone])), \
+                unittest.mock.patch.object(pp, "_wait_from_gcs", return_value=wait):
+            source = pp.collect_waits(as_of - timedelta(days=1), as_of)
+        self.assertIsNone(source.error)
+        self.assertEqual([gone], source.value.unreadable)
+        self.assertEqual([build], [w.build_id for w in source.value.waits])
+        summary = pp.summarise(as_of - timedelta(days=1), as_of, 15, 45, 45, source,
+                               pp.Source(error="not read"), pp.Source(error="not read"))
+        self.assertEqual([gone], summary["trend"]["unreadable"])
+        self.assertIn("2110431553740869632", pp.render(summary))
+        # A replay of a past window does not report a pointer that vanished
+        # today: the build was never in the window it describes.
+        past = as_of - timedelta(days=30)
+        with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
+                unittest.mock.patch.object(pp, "_index_entries_from_gcs",
+                                           return_value=({build: "p"}, None, [gone])), \
+                unittest.mock.patch.object(pp, "_wait_from_gcs", return_value=wait):
+            replay = pp.collect_waits(past - timedelta(days=1), past)
+        self.assertEqual([], replay.value.unreadable)
 
 
 class LogHead(unittest.TestCase):
@@ -777,7 +1327,7 @@ class SweepUnreadable(unittest.TestCase):
 
         with unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/gcloud"), \
                 unittest.mock.patch.object(pp, "_index_entries_from_gcs",
-                                           return_value=(entries, None)), \
+                                           return_value=(entries, None, [])), \
                 unittest.mock.patch.object(pp, "_wait_from_gcs", side_effect=wait_for):
             return pp.collect_waits(self.AS_OF - timedelta(days=days), self.AS_OF)
 
@@ -938,11 +1488,94 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("queue 175.2", out)
         self.assertIn("CAPACITY", out)
 
+    def test_a_failed_acquire_in_the_last_three_hours_breaches_on_its_own(self):
+        """The requirement from #2747: runs refused a project on an afternoon
+        whose percentiles never moved, and the check said OK. Real artifacts
+        of two of them, with a Boskos map built to that afternoon's shape: full,
+        two projects under a hand owner for a repair, one lease nobody is running."""
+        code, out = run(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertIn("LEASE FAILED: 2 run(s)", out)
+        self.assertIn("PR 2703    build 2108249555685347328", out)
+        self.assertIn("CAPACITY", out)
+        self.assertIn("out of rotation: rebuilding 2", out)
+        self.assertIn("held by a job without a run ID: fleet-reconcile (1)", out)
+        self.assertIn("2 project(s) leased with no build ID in the owner: hangdng-rebuild (2)", out)
+        # The refused runs leave the segment medians: the one leased run's
+        # acquire, alone, not withheld under a 1-of-3 coverage.
+        self.assertIn("9.3 min   (1 of 1)", out)
+
+    def test_refused_runs_are_not_outliers_and_not_in_the_window_percentiles(self):
+        """The two refused runs waited about seven minutes from creation to
+        the ask; over a five-minute line they would be outliers, and in the
+        window percentiles they would halve the median."""
+        code, out = run(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1,
+                        outlier_limit=5)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertIn("Individual runs that waited over 5.0 minutes: 1", out)
+        self.assertIn("build 2108236254767222784", out.split("Individual runs")[1])
+        leaks = out.split("held by runs Deck does not show running")[1].split("\n\n")[0]
+        self.assertIn("pull-kube-agents-smoke-test-2108220000000000000", leaks)
+        self.assertNotIn("ci-kube-agents-eval-next", leaks, "a running periodic is not a leak")
+        self.assertNotIn("hangdng-rebuild", leaks, "a hand hold is not a leak")
+
+    def test_a_failed_acquire_older_than_three_hours_is_history_not_a_breach(self):
+        code, out = run(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF + timedelta(hours=3),
+                        window_days=1)
+        self.assertEqual(pp.EXIT_OK, code)
+        self.assertIn("WITHIN THRESHOLD", out)
+        self.assertNotIn("LEASE FAILED", out)
+
+    def test_a_run_queued_past_p50_over_free_projects_outranks_a_refusal(self):
+        """The round-trip of the override: a refusal in the window, the pool
+        drained, and a run queued twenty minutes with projects free is the
+        control-plane shape, at the p50 bar the chat bot calls a backlog."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("prowjobs", "started", "logs"):
+                os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
+            created = SATURATED_AS_OF - timedelta(minutes=20)
+            with open(os.path.join(tmp, "deck.json"), "w") as fh:
+                json.dump({"items": [{
+                    "metadata": {"creationTimestamp": created.strftime("%Y-%m-%dT%H:%M:%SZ")},
+                    "spec": {"job": pp.JOB_NAME, "refs": {"pulls": [{"number": 2700}]}},
+                    "status": {"state": "triggered"},
+                }]}, fh)
+            with open(os.path.join(tmp, "boskos.json"), "w") as fh:
+                json.dump({"current": {"busy": 20, "free": 15}, "owner": {}}, fh)
+            code, out = run(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertIn("CONTROL PLANE, not capacity. 15 project(s) were free", out)
+        self.assertIn("2 run(s) in the last 3h asked Boskos", out, "the refusal still leads")
+
+    def test_a_lease_of_a_run_that_just_finished_is_reported_releasing_not_leaked(self):
+        """Deck to report: the saturated day's leaked smoke lease, with a Deck
+        item that says its run completed two minutes before the reading."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("prowjobs", "started", "logs", "boskos.json"):
+                os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
+            with open(os.path.join(SATURATED_DIR, "deck.json")) as fh:
+                deck = json.load(fh)
+            completed = (SATURATED_AS_OF - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            deck["items"].append({
+                "metadata": {"creationTimestamp": "2026-10-08T18:00:00Z"},
+                "spec": {"job": pp.JOB_NAME, "refs": {"pulls": [{"number": 2777}]}},
+                "status": {"build_id": "2108220000000000000", "pendingTime": "2026-10-08T18:01:00Z",
+                           "completionTime": completed, "state": "aborted"},
+            })
+            with open(os.path.join(tmp, "deck.json"), "w") as fh:
+                json.dump(deck, fh)
+            code, out = run(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertNotIn("held by runs Deck does not show running", out)
+        self.assertIn("1 lease(s) held by runs whose Deck completion stamp is inside the last 15 min", out)
+        self.assertIn("pull-kube-agents-smoke-test-2108220000000000000", out.split("tearing down")[1])
+        self.assertIn("1 lease(s) releasing, their run's Deck stamp inside the grace", out)
+
     def test_a_quiet_day_is_green_and_reports_no_leaks(self):
         code, out = run(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)
         self.assertEqual(pp.EXIT_OK, code)
         self.assertIn("WITHIN THRESHOLD", out)
-        self.assertNotIn("lease(s) held by runs Deck does not know about", out)
+        self.assertNotIn("lease(s) held by runs Deck does not show running", out)
 
     def test_raising_the_thresholds_clears_the_breach(self):
         """Proves the verdict follows the thresholds rather than the fixture."""
@@ -1055,11 +1688,52 @@ class JsonOutput(unittest.TestCase):
         payload = self._payload(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
         self.assertEqual(
             set(payload["recent"]),
-            {"hours", "window_start", "runs", "judged", "p50_minutes", "p95_minutes", "worst_minutes"},
+            {"hours", "window_start", "runs", "lease_failures", "judged",
+             "p50_minutes", "p95_minutes", "worst_minutes"},
         )
         self.assertEqual(payload["recent"]["hours"], pp.RECENT_WINDOW_HOURS)
         self.assertFalse(payload["recent"]["judged"], "nothing ran in the fixture's last three hours")
         self.assertIn("last 3h", payload["report"])
+
+    def test_lease_failures_hand_holds_and_states_reach_the_payload(self):
+        # The health bot reads `no_build_id` and the recent count; the day
+        # rows carry the failures so the trend keeps them.
+        payload = self._payload(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertEqual(
+            [("2108249555685347328", "2703", "2026-10-08T17:34:26Z", True),
+             ("2108248670569762816", "2712", "2026-10-08T17:30:56Z", True)],
+            [(f["build_id"], f["pull"], f["lease_requested"], f["recent"])
+             for f in payload["lease_failures"]],
+        )
+        self.assertEqual({"hangdng-rebuild": 2}, payload["no_build_id"])
+        self.assertEqual({"fleet-reconcile": 1}, payload["held_by_job"])
+        self.assertEqual([], payload["releasing_leases"])
+        self.assertEqual({"busy": 4, "rebuilding": 2}, payload["states"])
+        self.assertEqual(2, payload["recent"]["lease_failures"])
+        self.assertEqual(2, payload["trend"]["lease_failures"])
+        # The window percentiles are the one leased run's, not pulled down by
+        # the two refused runs' one-minute waits.
+        self.assertEqual((1, 22.6, 22.6), (payload["trend"]["runs"],
+                                            payload["trend"]["p50_minutes"],
+                                            payload["trend"]["p95_minutes"]))
+        self.assertEqual((1, 2), (payload["trend"]["days"][0]["runs"],
+                                  payload["trend"]["days"][0]["lease_failures"]))
+        self.assertEqual(["pull-kube-agents-smoke-test-2108220000000000000"],
+                         payload["leaked_leases"])
+        self.assertEqual(pp.CAUSE_CAPACITY, payload["cause"])
+        # The queue block carries the clock its waits were measured against:
+        # a live read's is the Deck read, after the sweep, not window_end.
+        self.assertEqual("2026-10-08T18:30:00Z", payload["queue"]["read_at"])
+
+    def test_an_unread_pool_leaves_the_holds_and_states_null(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("prowjobs", "started", "logs"):
+                os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
+            payload = self._payload(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
+        self.assertIsNone(payload["no_build_id"])
+        self.assertIsNone(payload["held_by_job"])
+        self.assertIsNone(payload["states"])
+        self.assertEqual(pp.CAUSE_UNKNOWN, payload["cause"])
 
     def test_a_quiet_payload_says_so_without_a_cause_of_capacity(self):
         payload = self._payload(from_dir=QUIET_DIR, as_of=QUIET_AS_OF, window_days=1)
@@ -1177,13 +1851,68 @@ class JunitOutput(unittest.TestCase):
         prop = case.find(f"properties/property[@name='{pp.JUNIT_METRIC_PROPERTY}']")
         return None if prop is None else prop.get("value")
 
-    def test_the_file_is_a_testsuite_of_the_five_rows_in_order(self):
+    def test_the_file_is_a_testsuite_of_the_eight_rows_in_order(self):
         _, root = self._junit(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
         self.assertEqual("testsuite", root.tag)
         self.assertEqual(pp.JUNIT_SUITE_NAME, root.get("name"))
         self.assertEqual(list(pp.JUNIT_ROW_NAMES),
                          [case.get("name") for case in root.findall("testcase")])
-        self.assertEqual("5", root.get("tests"))
+        self.assertEqual("8", root.get("tests"))
+
+    def test_the_lease_failure_hold_and_rotation_rows_carry_their_counts(self):
+        code, root = self._junit(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
+        rows = self._rows(root)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]))
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_NO_BUILD_ID]))
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_OUT_OF_ROTATION]))
+        self.assertIn("2 run(s)", rows[pp.JUNIT_ROW_VERDICT].find("failure").text)
+
+    def test_a_window_where_every_run_was_refused_says_so_on_the_setup_rows(self):
+        """Runs were created; none leased. "No runs were created" beside a
+        lease-failures row that may read 0 (the refusals older than three
+        hours) would make a refused morning look like a quiet one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for sub in ("prowjobs", "started", "logs"):
+                os.mkdir(os.path.join(tmp, sub))
+                for name in os.listdir(os.path.join(SATURATED_DIR, sub)):
+                    if name.startswith("lease-failed"):
+                        os.symlink(os.path.join(SATURATED_DIR, sub, name), os.path.join(tmp, sub, name))
+            _, root = self._junit(from_dir=tmp, as_of=SATURATED_AS_OF + timedelta(hours=4),
+                                  window_days=1)
+        rows = self._rows(root)
+        for name in (pp.JUNIT_ROW_P50, pp.JUNIT_ROW_P95):
+            self.assertEqual("every run in the window was refused a project",
+                             rows[name].find("skipped").get("message"), name)
+        self.assertEqual("0", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]),
+                         "the refusals are older than the recent window")
+
+    def test_the_lease_failures_row_is_skipped_when_the_cut_fell_inside_its_window(self):
+        """Between 00:00 and 03:00 UTC a truncated sweep can start after the
+        recent window does; a count over the remainder would graph as zero."""
+        payload = self._payload(from_dir=SATURATED_DIR, as_of=SATURATED_AS_OF, window_days=1)
+        payload["trend"]["truncated"] = True
+        payload["trend"]["window_start"] = "2026-10-08T17:00:00Z"  # after 15:30Z
+        rows = self._rows(ET.fromstring(pp.junit_report(payload)))
+        skipped = rows[pp.JUNIT_ROW_LEASE_FAILURES].find("skipped")
+        self.assertIsNotNone(skipped)
+        self.assertIn("ran out of time", skipped.get("message"))
+        # A cut before the window leaves the count whole.
+        payload["trend"]["window_start"] = "2026-10-08T00:00:00Z"
+        rows = self._rows(ET.fromstring(pp.junit_report(payload)))
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]))
+
+    def test_the_two_pool_rows_are_skipped_when_boskos_was_not_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("prowjobs", "started", "logs"):
+                os.symlink(os.path.join(SATURATED_DIR, name), os.path.join(tmp, name))
+            _, root = self._junit(from_dir=tmp, as_of=SATURATED_AS_OF, window_days=1)
+        rows = self._rows(root)
+        self.assertEqual("2", self._value(rows[pp.JUNIT_ROW_LEASE_FAILURES]),
+                         "the failures come from the trend, which was read")
+        for name in (pp.JUNIT_ROW_NO_BUILD_ID, pp.JUNIT_ROW_OUT_OF_ROTATION):
+            self.assertIsNotNone(rows[name].find("skipped"), name)
+            self.assertIsNone(self._value(rows[name]), name)
 
     def test_a_breach_fails_the_verdict_row_and_carries_the_numbers(self):
         code, root = self._junit(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1)
@@ -1261,7 +1990,7 @@ class JunitOutput(unittest.TestCase):
         self.assertIn("boskos.json", pool_skip.get("message"))
         self.assertIsNone(self._value(rows[pp.JUNIT_ROW_QUEUE]))
         self.assertIsNone(self._value(rows[pp.JUNIT_ROW_FREE]))
-        self.assertEqual("2", root.get("skipped"))
+        self.assertEqual("4", root.get("skipped"), "the queue row and the three pool rows")
         self.assertEqual("BREACH (UNKNOWN)",
                          rows[pp.JUNIT_ROW_VERDICT].find("failure").get("message"))
 
@@ -1493,9 +2222,13 @@ class PublishedInterface(unittest.TestCase):
         self.assertEqual("setup p95 minutes", pp.JUNIT_ROW_P95)
         self.assertEqual("longest live queue minutes", pp.JUNIT_ROW_QUEUE)
         self.assertEqual("free pool projects", pp.JUNIT_ROW_FREE)
+        self.assertEqual("recent lease failures", pp.JUNIT_ROW_LEASE_FAILURES)
+        self.assertEqual("leases with no build ID in the owner", pp.JUNIT_ROW_NO_BUILD_ID)
+        self.assertEqual("projects out of rotation", pp.JUNIT_ROW_OUT_OF_ROTATION)
         self.assertEqual(
             ("pool pressure within threshold", "setup p50 minutes", "setup p95 minutes",
-             "longest live queue minutes", "free pool projects"),
+             "longest live queue minutes", "free pool projects", "recent lease failures",
+             "leases with no build ID in the owner", "projects out of rotation"),
             pp.JUNIT_ROW_NAMES,
         )
 

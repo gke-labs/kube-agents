@@ -1,0 +1,7 @@
+Checking if OpenTofu is installed correctly...
+OpenTofu v1.13.1
+on linux_amd64
+Installation complete.
+✓ boskosctl v0.0.0-20260730151943-11fb0c84248b restored from GCS
+=== [2026-10-08T17:30:56Z] Leasing GCP Project from Boskos ===
+failed to acquire a resource: resources not found

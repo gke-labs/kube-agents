@@ -1,6 +1,6 @@
 # An Opt-In Multi-Project Scope for the Platform Agent
 
-> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Step 3's runtime half is implemented too: `sharedVpcHosts` and `metricsScopes` on the CR, their two lookups and allowlist entries, the naming of monitored projects by number, their rows in `containers` and the freeze through them. Steps 1 and 2's IAM bindings, installer paths and the chart's rendering of `spec.scope` are implemented too: the `kube-agents-iam` module's `scope` input binding `scope_roles` per explicit project and `scope_roles` plus `roles/cloudasset.viewer` on each folder and organisation, the composition's `scope` variable feeding the module and the chart from one value and enabling `cloudasset.googleapis.com` when a container is declared, the installer's `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` keys, and the pre-apply preflight for container IAM and the Asset API under organisation policy. Step 3's IAM bindings and installer path are implemented too: the composition resolves `shared_vpc_hosts` and `metrics_scopes` at plan time through the `kube-agents-scope-resolver` module, with the provider's own token (`data "http"` against the Compute, Monitoring and Resource Manager APIs), and `kube-agents-iam` binds `scope_roles` in every project resolved and in each scoping project, and `roles/compute.viewer` alone in a host not otherwise in scope, a failed read failing the plan; the composition and the installer's `SCOPE_SHARED_VPC_HOSTS` and `SCOPE_METRICS_SCOPES` keys carry both to the module and the chart from one value, and the pre-apply scope check weighs them. The declared resolved-set cap (`spec.scope.maxProjects`, the phase 2 follow-up) is implemented: the CRD field, the operator's render of it into the declaration, the reconcile's scaled listing and parallel prune, the gate's ceiling, the composition's `scope.max_projects` through both modules and the chart, and `SCOPE_MAX_PROJECTS` on the installer path. The scoped service account pool is keyed per project (§6): `spec.security.scopedServiceAccountPool` with `enabled` and derived `serviceAccounts` rows replaces the hand-listed `scopedServiceAccounts`, the `kube-agents-iam` module derives the members from the host project, `scope.projects` and the selectors' members and arms nothing unless `scoped_pool_enabled` is set, the composition and `SCOPED_SA_POOL_ENABLED` carry the switch, and the broker keys on the project; while the pool is armed the plan lists each declared folder's and organisation's members through the `kube-agents-scope-resolver` module's Cloud Asset Inventory search and gives them pool accounts on that apply, with the container's grant and discovery untouched, and `install.sh` enables the Asset API before such a plan. Step 5's architecture edits (§9) and site edits (§8) are in. Step 1's `platform_mcp_server.py` change does not ship yet; of step 4, the drift detector's join registers every project's profile, while the per-project audit-log sinks and the fleet-audit SOPs and cost skills iterating the snapshot do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
+> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Step 3's runtime half is implemented too: `sharedVpcHosts` and `metricsScopes` on the CR, their two lookups and allowlist entries, the naming of monitored projects by number, their rows in `containers` and the freeze through them. Steps 1 and 2's IAM bindings, installer paths and the chart's rendering of `spec.scope` are implemented too: the `kube-agents-iam` module's `scope` input binding `scope_roles` per explicit project and `scope_roles` plus `roles/cloudasset.viewer` on each folder and organisation, the composition's `scope` variable feeding the module and the chart from one value and enabling `cloudasset.googleapis.com` when a container is declared, the installer's `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` keys, and the pre-apply preflight for container IAM and the Asset API under organisation policy. Step 3's IAM bindings and installer path are implemented too: the composition resolves `shared_vpc_hosts` and `metrics_scopes` at plan time through the `kube-agents-scope-resolver` module, with the provider's own token (`data "http"` against the Compute, Monitoring and Resource Manager APIs), and `kube-agents-iam` binds `scope_roles` in every project resolved and in each scoping project, and `roles/compute.viewer` alone in a host not otherwise in scope, a failed read failing the plan; the composition and the installer's `SCOPE_SHARED_VPC_HOSTS` and `SCOPE_METRICS_SCOPES` keys carry both to the module and the chart from one value, and the pre-apply scope check weighs them. The declared resolved-set cap (`spec.scope.maxProjects`, the phase 2 follow-up) is implemented: the CRD field, the operator's render of it into the declaration, the reconcile's scaled listing and parallel prune, the gate's ceiling, the composition's `scope.max_projects` through both modules and the chart, and `SCOPE_MAX_PROJECTS` on the installer path. The scoped service account pool is keyed per project (§6): `spec.security.scopedServiceAccountPool` with `enabled` and derived `serviceAccounts` rows replaces the hand-listed `scopedServiceAccounts`, the `kube-agents-iam` module derives the members from the host project, `scope.projects` and the selectors' members and arms nothing unless `scoped_pool_enabled` is set, the composition and `SCOPED_SA_POOL_ENABLED` carry the switch, and the broker keys on the project; while the pool is armed the plan lists each declared folder's and organisation's members through the `kube-agents-scope-resolver` module's Cloud Asset Inventory search and gives them pool accounts on that apply, with the container's grant and discovery untouched, and `install.sh` enables the Asset API before such a plan. Step 5's architecture edits (§9) and site edits (§8) are in. Step 1's `platform_mcp_server.py` change does not ship yet; of step 4, the drift detector's join registers every project's profile, the fleet-audit SOPs sweep the declared scope, read from the snapshot by the platform MCP server's `fleet_scope` tool and handed to the collectors (listing every visible project only on an install that declares none), and the drift ingress follows the scope (the `drift-pubsub` module's `source_projects`, fed from `kube-agents-iam`'s `scope_export_projects`: one sink per project the declaration lists, `scope.projects` and the selectors' members, into the host topic, less a project an `exclude.projects` glob matches and less the composition's `drift_pubsub_source_exclude_projects`; never a container's Asset-Inventory members, whose listing has no grace and would churn the sink; the installer probes `logging.sinks.create` in each `SCOPE_PROJECTS` entry the sinks will cover before the apply, and warns rather than refuses where the state already holds the project's sink), while the cost skills iterating the snapshot do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
 > architecture documents defined it as one agent per project until step 5 moved them to the declared
 > scope (§9). This document records replacing that single project with a declared scope, and the order
 > the change landed in. Each section
@@ -173,6 +173,17 @@ Rules:
   `custom` role set to exclude the management cluster by that variable; a scope that silently
   ended the exclusion would recreate the one profile they were told to prevent. The places that
   name the variable as the opt-out (§8) change with it.
+- **`exclude.clusters` bounds fleet answers and the per-cluster audits, not only the roster.** Decided 2026-10-15
+  (#3081). An excluded cluster gets no Cluster Agent. The platform MCP server's `fleet_scope` tool
+  lists it under `excluded_clusters` and hands the collectors `--scope-exclude-clusters`, which
+  drop it from their listing before reading anything. It is not a coverage gap, because the
+  operator left it out on purpose. The onboarding sweep card names it so Step 3 does not audit it
+  by hand, and the Platform Agent's fan-out gives it no card. Among what still covers it is the
+  daily upgrade-readiness watch (#3026): it runs the report with `--project` flags and no
+  exclusion, so its report covers excluded clusters on purpose. The same report script run by the
+  agent gets the exclusion with `fleet_scope`'s arguments and leaves them out. The networking audit still counts its subnet usage (its pods hold real IPs) and the GCE audit
+  still lists its node VMs. Output from the third-party `gke` MCP server's `list_clusters` is not filtered.
+  Per-tool result filtering would belong in a brokered MCP relay (#2940).
 - **Resolution is deterministic.** The resolved project set is sorted by ID before it is written
   anywhere (listing follows the fill order above), so two runs against an unchanged fleet produce byte-identical snapshots (§5) and an
   unchanged roster.
@@ -190,8 +201,11 @@ per-project outcome. It runs inside the existing reconcile job under the agent's
 the credential broker, because that is the only process in the install that talks to GCP on a
 schedule and the operator deliberately holds no GCP credential.
 
-**Explicit projects** use the call the script makes today, once per project:
-`gcloud container clusters list --project <P> --format=value(name,location)`.
+**Explicit projects** are listed once per project. Since #3703 this is the GKE API's
+`projects.locations.clusters` list (`v1/projects/<P>/locations/-/clusters`), read through the
+broker's Cloud API relay, with
+`gcloud container clusters list --project <P> --format=value(name,location)` as the fallback
+when the relay cannot be used. PRUNE's describes take the same path, through the relay's get route.
 
 **Folders and organisations** use Cloud Asset Inventory rather than walking the tree:
 
@@ -291,10 +305,14 @@ profiles, on the data PVC, in a snapshot the reconcile run rewrites every hour:
 ```json
 {
   "resolvedAt": "2026-09-03T14:11:07Z",
+  "present": true,
+  "readable": true,
+  "boundary": true,
   "declared": { "projects": [...], "folders": [...], "organizations": [...], "sharedVpcHosts": [...], "metricsScopes": [...], "exclude": {...} },
   "maxProjects": 100,
   "resolver": "asset-inventory",
   "ignoredExcludes": [{ "project": "ops-mgmt", "pattern": "ops-*" }],
+  "excludedProjects": ["legacy"],
   "numbers": { "111222333444": "team-a" },
   "containers": [
     { "id": "folders/123456789012", "outcome": "ok", "projects": 3 }
@@ -316,11 +334,11 @@ profiles, on the data PVC, in a snapshot the reconcile run rewrites every hour:
 }
 ```
 
-`maxProjects` is the resolved-set cap the run listed under, `spec.scope.maxProjects` or its default (§3), so a reader of an `over-cap` outcome sees the number it crossed. `resolver` names how containers were resolved: `explicit` when no container is declared, which is
+`present` is whether the CR carried a `spec.scope` block this run: a present block with empty lists is the host-only boundary, which the audits' `fleet_scope` tool reads as a declared scope, and an absent block declares nothing. `boundary` is the reconcile's own answer to whether a declaration is in force: the block was read this run, or the render could not be read and the last run that could had one; it is false for a readable render with no block (an operator who removed the scope) and for an install that never declared one, whatever lists the reconcile still carries. The `fleet_scope` tool keys on `boundary` first; a snapshot from before it is read by its lists. With no snapshot that answers, the tool reads the operator's render: a present block is the management project alone (nothing, when the pod knows the host by number only) and a run that is partial by construction (a fixed unresolved row, plus every project the render names), until the next tick writes the resolved set; a named render the tool cannot read is an error answer, never "no scope". On a readable tick the tool also reads `containers`: a folder, organisation or selector lookup recorded with any outcome but `ok` makes the sweep partial by construction, since the members the lookup never returned have no rows. The operator also sets `KUBEAGENTS_SCOPE_DECLARED` on the shell sandbox container from the same fact, so a collector run there without the tool's `collector_args` reports that and lists nothing, rather than sweeping every project the identity can see. The composition always passes the block, so every installer-made install declares a scope and its audits sweep the host project alone until `SCOPE_PROJECTS` names more; a role granted by hand no longer widens them, as it did while the audits listed every visible project. `maxProjects` is the resolved-set cap the run listed under, `spec.scope.maxProjects` or its default (§3), so a reader of an `over-cap` outcome sees the number it crossed. `resolver` names how containers were resolved: `explicit` when no container is declared, which is
 the only value phase 1 writes, `asset-inventory` once a folder or organisation is, and a fallback resolver,
 if one is ever built, names itself here. It says nothing about the other selectors: each project's
 `via` carries its source, and the phase 3 selectors record theirs there (§10). The management project's `via` is `["management"]`; an explicit project's is `["explicit"]`;
-a project a container produced names the container. `containers` lists every selector the run resolved at runtime, with its outcome and member count: the declared folders and organisations, and each `sharedVpcHosts/<host>` and `metricsScopes/<scope>` entry under its `via` name, so that a failed lookup of any of them is visible where the freeze rule (§4) and §7's second condition read it. `ignoredExcludes` records the first `exclude.projects` entry that matched the management project and was not applied (§3), with the project and the pattern, so an
+a project a container produced names the container. `containers` lists every selector the run resolved at runtime, with its outcome and member count: the declared folders and organisations, and each `sharedVpcHosts/<host>` and `metricsScopes/<scope>` entry under its `via` name, so that a failed lookup of any of them is visible where the freeze rule (§4) and §7's second condition read it. `excludedProjects` lists the explicit projects an `exclude.projects` entry dropped this run, by id or by the number a Metrics Scope named them by, so the `fleet_scope` tool skips them rather than carrying a declared project with no row as unresolved; a carried tick repeats the last readable tick's list. `ignoredExcludes` records the first `exclude.projects` entry that matched the management project and was not applied (§3), with the project and the pattern, so an
 exclusion the run declined to honour is visible in the snapshot rather than only in a log line.
 `profiles` maps every profile on the volume to its project as the run read it, or as the last run
 that could read it did: a profile whose `cluster_identity` cannot be read this run is attributed
@@ -350,6 +368,28 @@ mounted file rather than an environment variable: the lists are unbounded and th
 carries `spec.deployment.env` (`common_types.go:368-372`) only as a generic passthrough. The
 rendered file's hash joins the ConfigMap hash that rolls the agent workload, so editing the scope
 takes effect at the next pod start and the next reconcile tick, whichever is later.
+
+Under `spec.mode: next` the A2A gateway also needs the membership, to check a delegated task's
+target cluster before it mints a grant, and it cannot read this volume. The design adds a
+separate publisher for it. `scope_publisher.py` ships in the agent image: it runs the reconcile's
+own lookups, exclusion rules and cap with a runner that sends each gcloud command to the
+credential broker, probes each container and selector member with `container clusters list`, and
+merge-patches the result into the `<name>-resolved-scope` ConfigMap as one compact JSON document.
+The document holds the schema version, `resolvedAt` (the last run in which at least one source
+lookup answered), a `memberHash` of the declaration's membership fields (so a reader can tell a
+document resolved for an older declaration), a `state` (`ok`; `too-large` past 900 KiB; `error`
+when the declaration cannot be read, or when every source lookup failed and no earlier run
+resolved), the members an `exclude.projects` entry dropped, and one row per container or selector
+member with its `via`, its probe `outcome`, and `confirmedAt`, the last run in which a source
+listed it and its probe answered `ok`. Explicit projects and the management project have no rows.
+A failed source carries its members' rows forward with their outcome and `confirmedAt`, and two
+fields the gateway does not read carry the rest of what the reconcile's own snapshot carries: the
+number-to-ID memo and the members counted against the cap that have no row. The operator starts
+it as a Job every 15 minutes, when the membership fields change, and at creation. Two parts do not
+ship yet: the broker's `scope` caller role, whose only commands are the lookups' five argv
+shapes; and the gateway's check of the document, which admits explicit projects and the
+management project from the declaration and its own environment. The reconcile, its snapshot and
+today-mode installs do not change.
 
 Whether the snapshot should also be lifted into `.status` is open (§11). It would make `kubectl get
 platformagent -o yaml` answer "which projects does this install manage" without a pod exec, but the
@@ -399,7 +439,7 @@ follow the selector type:
 `scope_roles` is a fixed allowlist of read roles intersected with `project_roles`, never
 `project_roles` itself, and it is what every grant outside the host project carries, whether the
 project was named or reached through a container. The allowlist is `container.clusterViewer`,
-`container.viewer`, `compute.viewer`, `monitoring.viewer`, `logging.viewer`, and
+`container.viewer`, `compute.viewer`, `monitoring.viewer`, `logging.viewer`, `gkehub.viewer` and
 `iam.securityReviewer`: the read roles in the list the composition binds, `local.read_only_roles`
 in `terraform/examples/full-install/main.tf`, which the module default (`variable "project_roles"`
 in `terraform/modules/kube-agents-iam/variables.tf`) mirrors. The intersection matters on the
@@ -415,7 +455,14 @@ plan when `scope.projects`, `scope.folders`, `scope.organizations`, `scope.share
 but cannot get, so a project bound with it alone would read `ok` and fail every profile create.
 
 The default roles outside the allowlist are outside it by design, and so is any role a later
-change adds to the default list that is not a read role. `roles/iam.serviceAccountUser` is
+change adds to the default list that is not a read role. `roles/cloudtrace.user` is the case in
+point: Google's Trace User role carries create, delete and update on analysis-report tasks and
+trace scopes beside `traces.get` and `traces.list`, no predefined Trace role grants the two reads
+alone, and the observability helpers that need the reads look at the host project's own traces
+through the broker's `GET`-only relay, so the role is bound at home and nowhere else (a token minted
+on the annotated ServiceAccount itself, which the gateway Pod and an `AgentPlugin` can do, carries
+its console permissions in the host project with every other role on the identity).
+`roles/iam.serviceAccountUser` is
 `iam.serviceAccounts.actAs`, held so the agent can run jobs as service accounts in its own project;
 inherited across a folder it would let the one agent identity act as every service account in every
 project beneath, including ones created tomorrow. `roles/mcp.toolUser` lets the agent call the GKE
@@ -436,6 +483,16 @@ Prerequisites the design has to state and the installer has to preflight:
   project-level IAM admin. The installer's preflight reports which containers it cannot bind rather
   than failing on the first, and makes the IAM probe as the credentials Terraform applies with, read
   the way the google provider reads them, rather than as gcloud's active account.
+- The identity running Terraform needs `logging.sinks.create`, `resourcemanager.projects.get` and
+  the Service Usage call that mints the Logging service agent in each project the declaration
+  lists, for the drift audit-log sink the apply creates there (step 4; the `drift-pubsub` module's
+  README). The installer's preflight probes the first in each `SCOPE_PROJECTS` entry the sinks
+  will cover, beside the container probe and as the same identity, and refuses the apply naming
+  the project, the role and the `drift_pubsub_source_exclude_projects` lever, or warns when the
+  install's state already holds that project's sink, since an apply that leaves it as it is needs
+  only `logging.sinks.get` while one that changes, recreates or removes it still fails there; the
+  other two, and a
+  selector's members, are left to the plan or the apply, as the module's README sets out.
 - A project in scope with `container.googleapis.com` disabled reads `api-disabled` (§4: its
   profiles kept, CREATE skipped); Terraform must not enable the API in other people's projects.
 - For a Shared VPC host or a Metrics Scope, the identity running Terraform needs
@@ -510,9 +567,10 @@ retire it on that reading alone, because the index lags a move by minutes and a 
 would otherwise retire a project that merely moved: the member is kept, with `absentSince` stamped on
 its row, for a day (`INDEX_LAG_GRACE_SECONDS`), and only after that does it retire over the ordinary
 two clean runs; the declaration speaking, an `exclude.projects` entry or the container removed from
-the CR, retires it sooner, on the ordinary two runs. PRUNE's per-profile `describe --project=<P>`
-meanwhile returns a 403, because the folder binding no longer covers it, which `_cluster_exists`
-classifies as unknown and keeps. Moved to a different declared folder: no change, because resolution
+the CR, retires it sooner, on the ordinary two runs. PRUNE's per-profile lookup in `<P>` (the relayed
+`clusters.get`, or `describe --project=<P>` on the gcloud fallback) meanwhile returns a 403, because
+the folder binding no longer covers it, which `_read_get` or `_cluster_exists` classifies as unknown
+and keeps. Moved to a different declared folder: no change, because resolution
 is by project; the `via` field records the new path and any placement clears the stamp, including a
 placement during the lag by the folder the project left. Dropped from `projects`, or from a folder the same edit removes, in the edit that
 declares the folder it moved into, a project is held the same day, since the index may not place it yet
@@ -527,27 +585,31 @@ Discovery and IAM are the mechanism; these are the places that will read wrong o
 works. Each is listed with whether it blocks the first phase or follows it: `1` is phase 1 of §10,
 `2` means after it, `docs` means the documents step, and `done` means `main` already carries the change; the column is not §10's step numbering.
 
-| Where                                                                                                                                                                            | What it assumes                                                                                                                                                                                                                        | Phase |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
-| `agents/platform/scripts/session_kv_server.py:1386`                                                                                                                              | `GCP_PROJECT_ID` was the project for every event's console links; the link now takes the event's project first, the env as fallback                                                                                                    | done  |
-| `agents/platform/scripts/platform_mcp_server.py:275-300`                                                                                                                         | `get_project_id()` reads one `project:` line from `USER.md`                                                                                                                                                                            | 1     |
-| `agents/platform/skills/cluster-agent-lifecycle/SKILL.md`                                                                                                                        | Delegation needs `--project` from the requester; #953 asks for enumeration first                                                                                                                                                       | 1     |
-| `k8s-operator/cmd/drift-detector`                                                                                                                                                | The `managedFields` join dropped every Cluster Agent profile whose cluster was outside `--project`; it now registers every profile, so a cross-project fleet's clusters are joined once their projects' records reach the subscription | done  |
-| `terraform/modules/drift-pubsub`                                                                                                                                                 | One log sink in `var.project_id`; other projects' audit logs need a sink each into the host topic                                                                                                                                      | 2     |
-| Fleet-audit SOPs and the cost, recommender, and compliance skills                                                                                                                | Query "the project" for quotas, recommendations, and IAM; need to iterate the snapshot                                                                                                                                                 | 2     |
-| `docs/site/src/content/docs/concepts/cluster-agents.md:24`                                                                                                                       | "sweeps the project"; now "sweeps every project in scope"                                                                                                                                                                              | done  |
-| `docs/site/src/content/docs/reference/security-and-iam.md:80`                                                                                                                    | "reads Kubernetes objects in **every** cluster in the project" becomes "in every cluster in the scope"                                                                                                                                 | done  |
-| `docs/site/src/content/docs/reference/credential-isolation.md:205`                                                                                                               | Described the metadata lookup, with `RECONCILE_PROJECT` as its override, as how the script finds its one project; the page now says the override is pinned empty in the managed `.env`                                                 | done  |
-| `docs/site/src/content/docs/reference/security-and-iam.md:28`, `agents/platform/skills/manage-cluster/SKILL.md:41`, `agents/platform/skills/cluster-agent-lifecycle/SKILL.md:80` | Named `RECONCILE_EXCLUDE`, a bare cluster name matched project-blind, as the opt-out; each now names `spec.scope.exclude.clusters` with the variable as the one-release fallback                                                       | done  |
-| `agents/platform/scripts/stall_watch.py`                                                                                                                                         | Listed one project's clusters (`STALL_WATCH_PROJECT`, else `GCP_PROJECT_ID`); it now also lists every project a Cluster Agent profile's identity names                                                                                 | done  |
+| Where                                                                                                                                                                            | What it assumes                                                                                                                                                                                                                                                                                                                   | Phase |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| `agents/platform/scripts/session_kv_server.py:1572`                                                                                                                              | `GCP_PROJECT_ID` was the project for every event's console links; the link now takes the event's project first, the env as fallback                                                                                                                                                                                               | done  |
+| `agents/platform/scripts/platform_mcp_server.py:290-312`                                                                                                                         | `get_project_id()` reads one `project:` line from `USER.md` (the default project of `verify_gke_cluster` and `audit_log_searcher`); the server's `fleet_scope` tool now serves the resolved scope from the reconcile's snapshot, which the audits cannot read from the shell sandbox, so the audits no longer depend on that line | 1     |
+| `agents/platform/skills/cluster-agent-lifecycle/SKILL.md`                                                                                                                        | Delegation needs `--project` from the requester; #953 asks for enumeration first                                                                                                                                                                                                                                                  | 1     |
+| `k8s-operator/cmd/drift-detector`                                                                                                                                                | The `managedFields` join dropped every Cluster Agent profile whose cluster was outside `--project`; it now registers every profile, so a cross-project fleet's clusters are joined once their projects' records reach the subscription                                                                                            | done  |
+| `terraform/modules/drift-pubsub`                                                                                                                                                 | One log sink in `var.project_id`; other projects' audit logs needed a sink each into the host topic, which `source_projects` now creates for every project the declaration lists (`scope_export_projects`: `scope.projects` and the selectors' members, never a container's Asset-Inventory members)                              | done  |
+| Fleet-audit SOPs (the `gke-cost-*` skills take the project from their caller)                                                                                                    | Queried "the project" for quotas, recommendations, and IAM, then every project the identity could list; the SOPs now call the platform MCP server's `fleet_scope` tool first and pass its resolved set to the collectors (the `--scope-*` flags, cluster exclusions included), listing only on an install that declares none      | done  |
+| `docs/site/src/content/docs/concepts/cluster-agents.md:24`                                                                                                                       | "sweeps the project"; now "sweeps every project in scope"                                                                                                                                                                                                                                                                         | done  |
+| `docs/site/src/content/docs/reference/security-and-iam.md:80`                                                                                                                    | "reads Kubernetes objects in **every** cluster in the project" becomes "in every cluster in the scope"                                                                                                                                                                                                                            | done  |
+| `docs/site/src/content/docs/reference/credential-isolation.md:205`                                                                                                               | Described the metadata lookup, with `RECONCILE_PROJECT` as its override, as how the script finds its one project; the page now says the override is pinned empty in the managed `.env`                                                                                                                                            | done  |
+| `docs/site/src/content/docs/reference/security-and-iam.md:28`, `agents/platform/skills/manage-cluster/SKILL.md:41`, `agents/platform/skills/cluster-agent-lifecycle/SKILL.md:81` | Named `RECONCILE_EXCLUDE`, a bare cluster name matched project-blind, as the opt-out; each now names `spec.scope.exclude.clusters` with the variable as the one-release fallback                                                                                                                                                  | done  |
+| `agents/platform/scripts/stall_watch.py`                                                                                                                                         | Listed one project's clusters (`STALL_WATCH_PROJECT`, else `GCP_PROJECT_ID`); it now also lists every project a Cluster Agent profile's identity names                                                                                                                                                                            | done  |
+| `agents/platform/scripts/upgrade_readiness_watch.py`                                                                                                                             | Ran the readiness report script with a bare `--project` per project, which a scoped sandbox refuses; on a declared install it now hands the script the resolved scope (`--scope-projects`, `--scope-unread`, from `fleet_scope_targets`) beside each `--project`, read inside the scope and refused outside it                    | done  |
 
 Event delivery from other projects is the largest of these. The event watcher watches through each
 profile's kubeconfig and already labels every metric with `project` and `location`, so Kubernetes
 events fan in as soon as profiles exist. Reaching a private cluster in another VPC needs the DNS
 endpoint, which `create_profile()` already selects per cluster; that is why cross-project reach
 works, not an assumption that breaks. Cloud audit-log drift,
-which `drift-pubsub` exports through a log sink, is per project by construction; a Shared VPC or a
-folder-level aggregated sink can replace N per-project sinks, and that is its own design.
+which `drift-pubsub` exports through a log sink, is per project by construction, so the module
+creates one sink per project the declaration lists, each in its project and routed into the
+host topic (`source_projects`, fed from `scope_export_projects` and never from a container's
+Asset-Inventory members, whose listing has no grace); a folder-level aggregated sink could cover
+a container's members, and that is its own design.
 
 ## 9. The boundary changes, and what does not
 
@@ -565,8 +627,8 @@ The architecture documents move from "its one project" to "its declared scope":
 
 What does not change: read-only stays read-only. Every grant outside the host project carries the
 `scope_roles` allowlist of §6 and nothing else; the non-viewer roles in `project_roles`
-(`iam.serviceAccountUser`, `mcp.toolUser`, and whatever a `custom` set adds) stay in the host
-project, and nothing here grants a write anywhere. What does change is how much one credential can
+(`iam.serviceAccountUser`, `mcp.toolUser`, `cloudtrace.user`, and whatever a `custom` set adds)
+stay in the host project, and nothing here grants a write anywhere. What does change is how much one credential can
 read. The
 agent's service account carries `roles/container.viewer`, which "lets an identity read Kubernetes
 objects in every cluster in the project" (`kube-agents-iam/main.tf:30-31`); bound on a folder it
@@ -662,10 +724,13 @@ into a second project the tester controls.
    could not name and no run has named holds the scope prune like a frozen container, because
    the bare number could be any project, the one the same edit dropped from `projects` included,
    and §7's prune never runs on a guess; naming it once, or excluding the number, releases it.
-4. **Downstream consumers.** The rows §8 marks 2: audit-log sinks per project or an aggregated
-   sink, and the fleet-audit SOPs and cost skills iterating the snapshot. The drift detector's
-   join already registers every project's profile (§8, done); what it joins is bounded by which
-   projects' records the sinks export.
+4. **Downstream consumers.** The row §8 marks 2: the cost skills iterating the snapshot. The
+   drift detector's join registers every project's profile, the fleet-audit SOPs sweep the
+   declared scope the `fleet_scope` tool reads from the snapshot, and the drift ingress exports
+   each project the declaration lists into the host topic, with the installer probing
+   `logging.sinks.create` in each listed project the sinks will cover before the apply (§8, all done); what the join joins is
+   bounded by which projects' records the sinks export, and an aggregated sink for a container's
+   members is its own design.
 5. **Documents.** The architecture edits in §9 and the site pages in §8, in one PR once
    phase 1 has merged, so the documents describe what runs.
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -16,6 +17,11 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
+
+// relayedSeqCap bounds TaskRef.RelayedSeqs. Only an event rendered and not
+// yet acked can come again, and those are a task's most recent batch's, which
+// a burst of progress events can make long.
+const relayedSeqCap = 256
 
 // ActiveTask is the task currently serializing a session's conversation.
 type ActiveTask struct {
@@ -73,12 +79,23 @@ type SessionRecord struct {
 	Addressee    string    `json:"addressee"`
 	Kind         string    `json:"kind"`
 	LastActivity time.Time `json:"lastActivity"`
+	// LastUserMessage is when someone in the conversation last wrote to it:
+	// every verified turn, and nothing an executor or the gateway does. It
+	// is the idle clock the reap and the cap eviction read (idleSince),
+	// which the design of record counts from the last user message; zero on
+	// records written before the field existed.
+	LastUserMessage time.Time `json:"lastUserMessage,omitzero"`
+	// PodReuse marks PodName as a pod spawned to serve every turn of the
+	// conversation (Config.SessionReuse at spawn). Only such a pod is
+	// handed a later task, and only such a pod's running task is held to
+	// the reap scan's overdue bound; a one-task pod has its own deadline.
+	PodReuse bool `json:"podReuse,omitempty"`
 	// LastTaskActivity is when a task last started or, from an executor's
 	// terminal, ended in this session. It is what the Slack adapter's
 	// session-thread rule bounds on (Gateway.hasSession), separately from
 	// LastActivity, which every verified turn moves: a "@bot stop" with
-	// nothing running is activity for the reap but must not re-admit a
-	// thread whose last task ended hours ago. Zero on records written before
+	// nothing running is activity (and, for the reap, a user message) but
+	// must not re-admit a thread whose last task ended hours ago. Zero on records written before
 	// the field existed, which reads as "no task activity": such a thread
 	// needs a fresh mention after the upgrade, once.
 	LastTaskActivity time.Time   `json:"lastTaskActivity,omitempty"`
@@ -111,6 +128,28 @@ type SessionRecord struct {
 	SessionAuthorsFor     string          `json:"sessionAuthorsFor,omitempty"`
 	SessionAuthorsUnknown bool            `json:"sessionAuthorsUnknown,omitempty"`
 	SessionAuthorsSince   time.Time       `json:"sessionAuthorsSince,omitzero"`
+	// CardStop is the card-stop control in flight on this conversation, nil
+	// when there is none (cardstop.go). Not ActiveTask and not in Tasks: the
+	// control is the gateway's own errand for a stop, not a turn, so it
+	// serializes nothing, steers nothing, is no status ask's subject, and
+	// never counts as a task the conversation ran.
+	CardStop *CardStopRun `json:"cardStop,omitempty"`
+	// RetiredCardStops are the last controls that ended, newest last, at most
+	// cardStopRetiredKept, kept so a late event for one is dropped even when
+	// its task index outlived the route's retirement (a failed DropTask):
+	// read as an ordinary task, its terminal would post the executor's raw
+	// text. More than one, because a follow-up ends seconds after the control
+	// it follows.
+	RetiredCardStops []string `json:"retiredCardStops,omitempty"`
+}
+
+// idleSince is when the conversation went quiet: its last user message, or,
+// on a record from before that was kept, its last activity.
+func (rec *SessionRecord) idleSince() time.Time {
+	if !rec.LastUserMessage.IsZero() {
+		return rec.LastUserMessage
+	}
+	return rec.LastActivity
 }
 
 // sessionAuthorCap bounds SessionRecord.SessionAuthors. It holds a turn's
@@ -215,6 +254,11 @@ type TaskRequester struct {
 type TaskRef struct {
 	ID        string `json:"id"`
 	Addressee string `json:"addressee"`
+	// RelayedSeqs are the stream sequences of this task's most recent
+	// events the relay rendered (at most relayedSeqCap), written with the
+	// render. A redelivered event found here was rendered by a gateway that
+	// died before acking it, and is not rendered again.
+	RelayedSeqs []uint64 `json:"relayedSeqs,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.
@@ -232,6 +276,15 @@ type TaskRef struct {
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	Canceled bool `json:"canceled,omitempty"`
+	// QuietCancel marks a cancel the Slack Stop button sent
+	// (cancelTaskVoiced): the stop answers with one reply of its own, so the
+	// relay posts no "canceled" line for the task's terminal.
+	QuietCancel bool `json:"quietCancel,omitempty"`
+	// TerminalObserved marks that observeTaskTerminal has already been called
+	// for this task (e.g. by healActiveTask when recovering a stale terminal
+	// from the stream), so a queued or redelivered relayTerminal does not
+	// double-count in task_terminals_total.
+	TerminalObserved bool `json:"terminalObserved,omitempty"`
 	// Requester, Attribution and StartedAt are what a child task minted on
 	// this turn's behalf, or the wake-up turn after it, inherits: the
 	// allowlist is checked against Requester, the child's authority block is
@@ -305,6 +358,30 @@ type TaskRef struct {
 	// observer the turn ends failed with this reason and delivers nothing
 	// (handOffEnd), and the read route reports the same. Empty otherwise.
 	DelegationEnd string `json:"delegationEnd,omitempty"`
+	// CardsAnswer, on a chain's root entry, records that a task of the chain
+	// handed the ask to kanban cards (cardsPending or handedOff at its
+	// terminal): a card's report answers the ask, so no relay answer in the
+	// chain, the wake's included, carries rating controls (answer feedback).
+	CardsAnswer bool `json:"cardsAnswer,omitempty"`
+	// AskMessageID is the backend id of the human message that started the
+	// chain, on its root entry only: the message the chain's mark is drawn
+	// on (spec-a2a-payloads.md, "mark"). Mark is the reaction state last
+	// drawn there, so the next mark draws only the difference, across a
+	// restart too. Both empty on a child, a wake, an entry written before
+	// they existed, and a chain whose root was evicted from the history cap
+	// (whose marks then draw nothing).
+	AskMessageID string     `json:"askMessageId,omitempty"`
+	Mark         *MarkState `json:"mark,omitempty"`
+	// NotifyKeys are the update keys of the conversation notifies whose
+	// marks belong to this chain, on its root entry only: a key is bound to
+	// the conversation's latest chain the first time a notify carrying it
+	// and a mark arrives, and every later mark with that key marks this
+	// chain's ask, whatever chain has started since (applyNotifyMark). At
+	// most notifyUpdateKeysMax, the least recently used dropped first, as
+	// the notifier keeps its keys. MarkedAt is when Mark was last drawn,
+	// what bounds an older ask's hold on the Agent Session (sessionMark).
+	NotifyKeys []string  `json:"notifyKeys,omitempty"`
+	MarkedAt   time.Time `json:"markedAt,omitzero"`
 }
 
 // handOffEnd is the one rule for a session turn's own end when it asked to
@@ -407,6 +484,28 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 	}
 }
 
+// markQuietCancel records that taskID's cancel came from the Slack Stop
+// button (TaskRef.QuietCancel).
+func (rec *SessionRecord) markQuietCancel(taskID string) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].QuietCancel = true
+			return
+		}
+	}
+}
+
+// MarkTerminalObserved records that observeTaskTerminal has been called
+// for the task, preventing double-counting if a queued relay terminal follows.
+func (rec *SessionRecord) MarkTerminalObserved(taskID string) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].TerminalObserved = true
+			return
+		}
+	}
+}
+
 // TaskRefFor returns the history entry for a task this conversation has
 // held, active or not.
 func (rec *SessionRecord) TaskRefFor(taskID string) (TaskRef, bool) {
@@ -500,9 +599,10 @@ func (rec *SessionRecord) TaskCanceled(taskID string) bool {
 // rather than a fixed executor — true on the standing session route AND
 // during a one-shot Delegate from a fixed-route conversation, which is why
 // it is not the SessionRouted field: the two executors differ on steers
-// (refused by the fixed executor, absorbed by a session worker), so the
-// status matcher's width bias and the steer acknowledgement condition on
-// where the task actually runs, not on the standing route.
+// (the fixed executor queues and answers them as further turns, a session
+// worker absorbs them at its next turn boundary), so the steer
+// acknowledgement conditions on where the task actually runs, not on the
+// standing route.
 func (rec *SessionRecord) AddressedToOwnSession() bool {
 	return rec.BusSession != "" && rec.Addressee == rec.BusSession
 }
@@ -759,4 +859,35 @@ func (r *Registry) Sessions(ctx context.Context) ([]*SessionRecord, error) {
 		return nil, err
 	}
 	return recs, nil
+}
+
+// relayed reports whether taskID's event at stream sequence seq was already
+// rendered. A sequence of 0 (no metadata) is never taken as rendered.
+func (rec *SessionRecord) relayed(taskID string, seq uint64) bool {
+	if seq == 0 {
+		return false
+	}
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			return slices.Contains(rec.Tasks[i].RelayedSeqs, seq)
+		}
+	}
+	return false
+}
+
+// markRelayed records that taskID's event at seq was rendered.
+func (rec *SessionRecord) markRelayed(taskID string, seq uint64) {
+	if seq == 0 {
+		return
+	}
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			seqs := append(rec.Tasks[i].RelayedSeqs, seq)
+			if len(seqs) > relayedSeqCap {
+				seqs = seqs[len(seqs)-relayedSeqCap:]
+			}
+			rec.Tasks[i].RelayedSeqs = seqs
+			return
+		}
+	}
 }

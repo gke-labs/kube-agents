@@ -75,7 +75,7 @@ func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedWithTheNumbers(t *testi
 }
 
 // A limit under the floor is refused once. It also sits under the default
-// 512Mi request, and is set without requests.memory; neither restates it,
+// 1Gi request, and is set without requests.memory; neither restates it,
 // because raising requests.memory cannot make it valid and the
 // limit-without-request note is advice about a quantity already refused.
 func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedOnce(t *testing.T) {
@@ -110,24 +110,48 @@ func TestCredentialProxyCrossedMemoryPairIsRefusedWithoutABandWarning(t *testing
 	}
 }
 
-// A limit exactly at the floor is admitted. Set without requests.memory it
-// draws the Autopilot clamp note, and nothing else.
+// A limit exactly at the floor is admitted, with the request lowered to meet
+// it. The pair is equal, so no Autopilot clamp note, and 672Mi per 500m is
+// inside the band, so no band warning either.
 func TestCredentialProxyMemoryLimitAtTheFloorIsAdmitted(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
 	}))
 	if err != nil {
 		t.Fatalf("a limit exactly at the floor was refused: %v", err)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "limits.memory is set without requests.memory") {
-		t.Errorf("expected the limits.memory clamp note alone, got %v", warnings)
+	if len(warnings) != 0 {
+		t.Errorf("expected no warnings on an equal pair inside the band, got %v", warnings)
+	}
+}
+
+// A limit at the floor set alone is under the operator's 1Gi default request,
+// which the override does not lower, so it is refused by name of that request
+// rather than rendered as a pod the API server would reject.
+func TestCredentialProxyMemoryLimitUnderTheDefaultRequestIsRefused(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
+	}))
+	if err == nil {
+		t.Fatal("a 672Mi limit under the 1Gi default request was admitted")
+	}
+	for _, want := range []string{
+		"spec.deployment.credentialProxy.resources.limits.memory",
+		"is below the operator's default 1Gi memory request",
+		"set requests.memory as well",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not say %q", err.Error(), want)
+		}
 	}
 }
 
 // The case the field exists for (#2324): the limit raised past the 2Gi default
 // and nothing else. Admitted, with one note: GKE Autopilot without bursting sets
-// the limit equal to the 512Mi default request, so there the raise has no effect.
+// the limit equal to the 1Gi default request, so there the raise has no effect.
 func TestCredentialProxyRaisedLimitIsAdmittedWithTheLimitWithoutRequestNote(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
@@ -142,7 +166,7 @@ func TestCredentialProxyRaisedLimitIsAdmittedWithTheLimitWithoutRequestNote(t *t
 	for _, want := range []string{
 		"spec.deployment.credentialProxy.resources.limits.memory is set without requests.memory",
 		"GKE Autopilot without bursting sets a container's limits equal to its requests",
-		"runs at the 512Mi request and this limit has no effect",
+		"runs at the 1Gi request and this limit has no effect",
 		"set requests.memory to the same value, or enable bursting",
 	} {
 		if !strings.Contains(warnings[0], want) {
@@ -279,8 +303,8 @@ func TestCredentialProxyRequestPairOutsideTheAutopilotBandWarns(t *testing.T) {
 	}
 }
 
-// The default 512Mi request against a 2-CPU request is 0.25 GiB per vCPU,
-// below the band's lower edge.
+// The default 1Gi request against a 2-CPU request is 0.5 GiB per vCPU, below
+// the band's lower edge.
 func TestCredentialProxyBelowTheAutopilotBandWarns(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
@@ -290,8 +314,8 @@ func TestCredentialProxyBelowTheAutopilotBandWarns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected admission, got: %v", err)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "resources.requests") || !strings.Contains(warnings[0], "0.25 GiB per vCPU") {
-		t.Errorf("expected one requests-pair warning at 0.25 GiB per vCPU, got %v", warnings)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "resources.requests") || !strings.Contains(warnings[0], "0.50 GiB per vCPU") {
+		t.Errorf("expected one requests-pair warning at 0.50 GiB per vCPU, got %v", warnings)
 	}
 }
 
@@ -458,4 +482,40 @@ func TestCredentialProxyLongResourceNameKeepsTheReason(t *testing.T) {
 			t.Errorf("the refusal does not say %q: %q", want, msg)
 		}
 	}
+}
+
+func apiAuthResourcesAgent(override *corev1.ResourceRequirements) *agentv1alpha1.PlatformAgent {
+	return &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+		Spec: agentv1alpha1.PlatformAgentSpec{AgentSpec: agentv1alpha1.AgentSpec{
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				AgentAPIAuth: &agentv1alpha1.AgentAPIAuthSpec{Resources: override},
+			},
+		}},
+	}
+}
+
+// The webhook refuses a spec.deployment.agentAPIAuth.resources override at apply,
+// on the field the override crossed, so a webhook-on install is told at admission
+// what the reconciler would otherwise only report as Degraded a moment later.
+func TestAgentAPIAuthCrossedPairIsRefusedAtAdmission(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), apiAuthResourcesAgent(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("5Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+	}))
+	msg := fieldErrorMessage(t, err, "spec.deployment.agentAPIAuth.resources.requests.memory")
+	if !strings.Contains(msg, "exceeds the 4Gi memory limit set beside it") {
+		t.Errorf("message %q does not name the crossed limit", msg)
+	}
+}
+
+// An unknown resource name under the sidecar override is refused at admission too,
+// naming the agentAPIAuth field path rather than the credential proxy's.
+func TestAgentAPIAuthUnknownResourceNameIsRefusedAtAdmission(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), apiAuthResourcesAgent(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+	}))
+	assertFieldError(t, err, "spec.deployment.agentAPIAuth.resources.limits.nvidia.com/gpu")
 }

@@ -72,8 +72,10 @@ SANDBOX_PRINCIPAL = "hermes"
 # line rather than a second credential, and the separation the module docstring
 # describes is the only thing keeping them apart.
 #
-# Four writers pass it, all for the same reason: they have to write inside a
-# tree that is `agent:agent` to the leaves, which uid 1001 cannot do.
+# Five writers pass it, all for the same reason: they have to write inside a
+# tree that is `agent:agent` to the leaves, which uid 1001 cannot do
+# (`upgrade_readiness_review.py` places the weekly report's copy under the
+# sandbox's agent-owned /opt/data, where the agent reads it on request).
 # `kanban_workspace_gc.py` unlinks scratch workspaces; `cluster_agent_profile.py`
 # writes one profile's kubeconfig; `bootstrap_delivery.py` renames the delivered
 # onboarding report; `bootstrap_handoff.py` writes the raw onboarding report. The alternative in any case — loosening the modes so a
@@ -85,6 +87,10 @@ SANDBOX_PRINCIPAL = "hermes"
 # command's output as a fact about the cluster, and a `.bashrc` that hijacked
 # one would be doing to uid 1000's own files what uid 1000 can already do. A
 # caller that reads a command's output and believes it must use the default.
+# One reader bends that rule knowingly: `cluster_agent_profile.py`'s
+# connectivity probe runs `kubectl version` as this login because the
+# kubeconfig it reads is the 0600 file the writer above just made, and what it
+# believes drives one log line and nothing else; its comment argues the case.
 #
 # `read_bytes` is the exception, and it is this module's own default rather than
 # an argument any caller passes. It does consume the output — but as the bytes
@@ -392,7 +398,8 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
         cwd: str | None = None, timeout: float | None = None,
         check: bool = False, path: str | None = None,
         stdin: str | None = None,
-        principal: str = SANDBOX_PRINCIPAL) -> subprocess.CompletedProcess:
+        principal: str = SANDBOX_PRINCIPAL,
+        errors: str | None = None) -> subprocess.CompletedProcess:
     """Run `argv` in the sandbox and return the finished process.
 
     `principal` selects the sandbox login and should be left alone; see
@@ -424,6 +431,10 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
 
     Raises SandboxUnavailable when ssh itself could not connect.
 
+    `errors` is the decode error handler for the output, strict by default.  A
+    caller listing a directory the model owns passes ``surrogateescape``, so one
+    file name that isn't UTF-8 can't make the whole listing unreadable.
+
     The output is buffered whole, with no ceiling. `timeout` bounds how long a
     command may run but not how much it may print, so a command that writes
     faster than it runs long — or a shell startup file in the sandbox that
@@ -447,13 +458,14 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
     if not sandbox_enabled(path):
         base = local_env if local_env is not None else {**os.environ, "HOME": "/tmp"}
         return subprocess.run(argv, capture_output=True, text=True, check=check,
-                              timeout=timeout, cwd=cwd,
+                              errors=errors, timeout=timeout, cwd=cwd,
                               env={**base, **(remote_env or {})}, **stdin_kwargs)
 
     command = ssh_argv(argv, remote_env=remote_env, cwd=cwd, path=path,
                        principal=principal)
     completed = subprocess.run(command, capture_output=True, text=True,
-                               timeout=timeout, env=_client_env(), **stdin_kwargs)
+                               errors=errors, timeout=timeout, env=_client_env(),
+                               **stdin_kwargs)
     if completed.returncode == _SSH_FAILURE_EXIT and _SSH_LEVEL_ERRORS.search(completed.stderr or ""):
         raise SandboxUnavailable(
             f"could not reach the shell sandbox: {(completed.stderr or '').strip()}"
@@ -484,6 +496,12 @@ def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL
     the cap is applied by `head` on the far side, so a caller asking for 32 KiB
     of a 2 GB core dump moves 32 KiB. Pass one byte more than the real ceiling
     to tell "at the limit" from "over it", the way a local capped read does.
+
+    `path` is rendered into the script through `shlex.quote`, which is the
+    right escaping for the remote shell and not a sanitizer CodeQL's
+    `py/command-line-injection` query recognises. A caller whose path derives
+    from a request body passes an allowlisted copy of the value instead, as
+    `session_kv_server._shipped_audit_job` does.
 
     `principal` defaults to `TERMINAL_PRINCIPAL`, which is NOT this module's
     default and is deliberate. The other callers that name it pass it to

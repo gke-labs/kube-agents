@@ -75,6 +75,7 @@ from kanban_notifier import (
     suppressed_kinds,
     tell_unexplained,
     unstructured_result,
+    wake_handoff_with_result,
     wake_kinds_for,
 )
 
@@ -248,10 +249,84 @@ class HandoffWithResultTest(unittest.TestCase):
         for delivered in (None, ""):
             self.assertIn("cron-job-1", handoff_with_result(delivered, _Task(INCIDENT_RESULT)))
 
-    def test_the_summary_branch_keeps_the_status_line_and_adds_the_report(self):
+    def test_the_summary_branch_sends_the_report_without_the_status_line(self):
+        # The status line and the report's bold lead are one verdict said twice.
         tail = notifier_tail(INCIDENT_SUMMARY, _Task(INCIDENT_RESULT))
-        self.assertIn(INCIDENT_SUMMARY, tail)
+        self.assertNotIn(INCIDENT_SUMMARY, tail)
         self.assertEqual(tail.count(INCIDENT_RESULT), 1)
+
+    def test_a_status_line_the_result_already_holds_is_kept(self):
+        status = "\nAll 3 nodes ready."
+        self.assertEqual(handoff_with_result(status, _Task("All 3 nodes ready.")), status)
+
+
+class WakeHandoffWithResultTest(unittest.TestCase):
+    """On no-send paths (`api_server` and `delivery_mode="wake"`), `wake_handoff` carries the report."""
+
+    def test_a_push_adapter_with_passive_delivery_keeps_the_short_clip(self):
+        tail = notifier_tail(INCIDENT_SUMMARY, _Task(INCIDENT_RESULT))
+        n = types.SimpleNamespace(send_passive=True, wake_agent=True, is_push_adapter=True)
+        self.assertEqual(
+            wake_handoff_with_result(INCIDENT_SUMMARY, tail, n),
+            INCIDENT_SUMMARY,
+        )
+
+    def test_a_non_push_adapter_promotes_the_full_report_into_wake_handoff(self):
+        tail = notifier_tail(INCIDENT_SUMMARY, _Task(INCIDENT_RESULT))
+        n = types.SimpleNamespace(send_passive=True, wake_agent=True, is_push_adapter=False)
+        promoted = wake_handoff_with_result(INCIDENT_SUMMARY, tail, n)
+        self.assertEqual(promoted, INCIDENT_RESULT)
+        self.assertNotIn(INCIDENT_SUMMARY, promoted)
+
+    def test_a_non_push_adapter_resolved_via_adapter_attribute_promotes_the_report(self):
+        tail = notifier_tail(INCIDENT_SUMMARY, _Task(INCIDENT_RESULT))
+        api_adapter = types.SimpleNamespace(supports_async_delivery=False)
+        n = types.SimpleNamespace(send_passive=True, wake_agent=True, adapter=api_adapter)
+        self.assertEqual(
+            wake_handoff_with_result(INCIDENT_SUMMARY, tail, n),
+            INCIDENT_RESULT,
+        )
+
+    def test_an_api_server_platform_fallback_promotes_the_report(self):
+        tail = notifier_tail(INCIDENT_SUMMARY, _Task(INCIDENT_RESULT))
+        n = types.SimpleNamespace(send_passive=True, wake_agent=True, platform_str="api_server")
+        self.assertEqual(
+            wake_handoff_with_result(INCIDENT_SUMMARY, tail, n),
+            INCIDENT_RESULT,
+        )
+
+    def test_a_wake_only_subscription_promotes_the_full_report_on_push_adapters(self):
+        tail = notifier_tail(INCIDENT_SUMMARY, _Task(INCIDENT_RESULT))
+        n = types.SimpleNamespace(send_passive=False, wake_agent=True, is_push_adapter=True)
+        self.assertEqual(
+            wake_handoff_with_result(INCIDENT_SUMMARY, tail, n),
+            INCIDENT_RESULT,
+        )
+
+    def test_a_notify_only_subscription_leaves_wake_handoff_alone(self):
+        tail = notifier_tail(INCIDENT_SUMMARY, _Task(INCIDENT_RESULT))
+        n = types.SimpleNamespace(send_passive=True, wake_agent=False, is_push_adapter=False)
+        self.assertEqual(
+            wake_handoff_with_result(INCIDENT_SUMMARY, tail, n),
+            INCIDENT_SUMMARY,
+        )
+
+    def test_an_empty_handoff_falls_back_to_wake_handoff(self):
+        n = types.SimpleNamespace(send_passive=False, wake_agent=True, is_push_adapter=False)
+        self.assertEqual(wake_handoff_with_result("summary only", "", n), "summary only")
+        self.assertIsNone(wake_handoff_with_result(None, "", n))
+
+    def test_a_raising_notification_cannot_wedge_the_notifier(self):
+        class ExplodingNotification:
+            @property
+            def send_passive(self):
+                raise RuntimeError("boom")
+
+        self.assertEqual(
+            wake_handoff_with_result("summary", "\n\nreport", ExplodingNotification()),
+            "summary",
+        )
+
 
 
 #: Card ``t_3ba2166a`` as it actually closed on 2026-08-09: a report that meant
@@ -533,16 +608,16 @@ class ClipBoundaryTest(unittest.TestCase):
             with self.subTest(length=length):
                 body = report_of_length(length)
                 tail = notifier_tail(INCIDENT_SUMMARY, _Task(body))
-                self.assertIn(INCIDENT_SUMMARY, tail)
+                self.assertNotIn(INCIDENT_SUMMARY, tail)
                 self.assert_delivered_once(tail, body)
 
-    def test_a_status_line_that_is_not_the_report_is_never_dropped(self):
-        # The distinction the fix turns on: a clipped prefix of the report is
-        # redundant, a summary that happens to be long is not.
+    def test_a_status_line_that_is_not_the_report_gives_way_to_it_too(self):
+        # A clipped prefix of the report and a separate summary are both a
+        # second copy of the verdict the report opens on.
         summary = report_of_length(DEFAULT_LIMIT * 2).replace("cron-job", "audit-step")
         body = report_of_length(DEFAULT_LIMIT * 4)
         tail = notifier_tail(summary, _Task(body))
-        self.assertIn("audit-step-1 ", tail)
+        self.assertNotIn("audit-step-1 ", tail)
         self.assert_delivered_once(tail, body)
 
 
@@ -1587,6 +1662,19 @@ class CompletionTextTest(unittest.TestCase):
         self.assertEqual(completion_text(HEAD, TITLE, HANDOFF, "google_chat"),
                          upstream_completion(HEAD, TITLE, HANDOFF))
 
+    def test_a_platform_no_presenter_reads_gets_no_step_line(self):
+        # The [next: ...] line is plumbing: Google Chat, and Slack with the flag off, show the report alone.
+        stepped = HANDOFF + "\n\n[next: check seeded-a]"
+        # In the image slack_moments sits beside the gateway; here the scripts directory stands in.
+        scripts = mock.patch.object(sys, "path", [str(Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts"), *sys.path])
+        scripts.start()
+        self.addCleanup(scripts.stop)
+        for flag, platform in ((True, "google_chat"), (False, "slack")):
+            with self.subTest(platform=platform, flag=flag):
+                _SlackUxFlag(self, flag)
+                self.assertEqual(completion_text(HEAD, TITLE, stepped, platform),
+                                 upstream_completion(HEAD, TITLE, HANDOFF).rstrip())
+
     def test_flag_on_slack_drops_the_head_line(self):
         _SlackUxFlag(self, True)
         text = completion_text(HEAD, TITLE, HANDOFF, "slack")
@@ -1847,6 +1935,8 @@ class _KanbanNotification:
         self.sub = sub = d["sub"]
         self.task = d["task"]
         self.board_slug = d.get("board")
+        self.adapter = None
+        self.is_push_adapter = True
         mode = sub.get("delivery_mode") or "notify"
         self.wake_agent = mode in ("notify+wake", "wake")
         self.send_passive = mode != "wake"
@@ -2004,8 +2094,11 @@ class ApplyTest(unittest.TestCase):
         patched = patch_tree(UPSTREAM_NOTIFIER)
         clip = patched.rindex("wake_handoff = _clip_handoff(n.task.result)")
         hook = patched.index("handoff = _kanban_handoff_with_result(handoff, n.task)")
+        wake_hook = patched.index(
+            "wake_handoff = _kanban_wake_handoff_with_result(wake_handoff, handoff, n)"
+        )
         message = patched.index(COMPLETION_CALL)
-        self.assertTrue(clip < hook < message)
+        self.assertTrue(clip < hook < wake_hook < message)
 
     def test_the_hook_replaces_the_handoff_rather_than_appending_to_it(self):
         patched = patch_tree(UPSTREAM_NOTIFIER)
@@ -2021,6 +2114,7 @@ class ApplyTest(unittest.TestCase):
             "note_suppressed_completion as _kanban_note_suppressed",
             "store_incident_report as _kanban_store_incident",
             "tell_unexplained as _kanban_tell_unexplained",
+            "wake_handoff_with_result as _kanban_wake_handoff_with_result",
             "wake_kinds_for as _wake_kinds_for",
         ):
             self.assertIn(name, patched)
@@ -2595,6 +2689,52 @@ class DeliverEndToEndTest(unittest.TestCase):
                     (ours.wakes, ours.rewinds, ours.advanced), (up.wakes, up.rewinds, up.advanced),
                 )
                 self.assertFalse(getattr(ours.runner, HELD_ATTR, None))
+
+    def test_patched_fmt_completed_promotes_wake_handoff_only_when_no_passive_ping_is_sent(self):
+        ns = {
+            "__name__": "kanban_watchers_notifier_fixture",
+            "_payload": lambda ev, key: (ev.payload or {}).get(key),
+        }
+        exec(compile(patch_tree(UPSTREAM_NOTIFIER), "kanban_watchers_notifier.py", "exec"), ns)
+        fmt_completed = ns["_fmt_completed"]
+        ev = _Ev(9, "completed", {"summary": INCIDENT_SUMMARY})
+
+        push_n = types.SimpleNamespace(
+            head="[default] Kanban t_9",
+            title="Inspect cron jobs",
+            task=_Task(INCIDENT_RESULT),
+            platform_str="slack",
+            send_passive=True,
+            wake_agent=True,
+            is_push_adapter=True,
+        )
+        _, push_wake_handoff, _ = fmt_completed(ev, push_n)
+        self.assertEqual(push_wake_handoff, INCIDENT_SUMMARY)
+
+        api_n = types.SimpleNamespace(
+            head="[default] Kanban t_9",
+            title="Inspect cron jobs",
+            task=_Task(INCIDENT_RESULT),
+            platform_str="api_server",
+            send_passive=True,
+            wake_agent=True,
+            is_push_adapter=False,
+        )
+        _, api_wake_handoff, _ = fmt_completed(ev, api_n)
+        self.assertEqual(api_wake_handoff, INCIDENT_RESULT)
+
+        wake_only_n = types.SimpleNamespace(
+            head="[default] Kanban t_9",
+            title="Inspect cron jobs",
+            task=_Task(INCIDENT_RESULT),
+            platform_str="slack",
+            send_passive=False,
+            wake_agent=True,
+            is_push_adapter=True,
+        )
+        _, wake_only_handoff, _ = fmt_completed(ev, wake_only_n)
+        self.assertEqual(wake_only_handoff, INCIDENT_RESULT)
+
 
 
 class VerifierSendAnchorTest(unittest.TestCase):

@@ -15,7 +15,8 @@ variable that carries the limit.
 **Does not own:** the per-request slot cap and output cap, which
 [`docs/credential-isolation-design.md`](../credential-isolation-design.md) describes and which
 this budget sits beside; the size of a single `kubectl` child (#2045); the Controller Stall
-Watch's own schedule and sweep budget (#2325).
+Watch's own schedule and sweep budget (#2325); whether the broker runs wider than one pod
+([`credential-proxy-single-pod.md`](credential-proxy-single-pod.md)).
 
 ## 1. What was true on `main` before this change
 
@@ -81,12 +82,12 @@ route reach `refresh_forge_credential`, whose helper (`github_token_refresh.py`)
 federation is tried first and spawns nothing, so on a federated broker, where the operator sets
 the credential-file variables to the federation file it lays down, no `gcloud` runs; on an
 unfederated one it runs when a credential file is set or the metadata server yields no token.
-The content-workspace `open` and `commit` reach the same helper through `mint_read_credential`
-with its read-only flag, which prints a minted token and returns before any `gh`: at most that
+The content-workspace `open` and `commit`, and a vcs `snapshot` of a context repository, reach
+the same helper through `mint_read_credential` with its read-only flag, which prints a minted token and returns before any `gh`: at most that
 one `gcloud`, under the same conditions, and nothing else. Either way the vcs route can run a
 Python helper, a `gcloud` and a `gh` behind one `git`, which is what the single reserve has to
-hold; the mint path is lighter, and §2.1 below takes it out of the per-request budget on other
-grounds. The reserve is sized for the
+hold; the mint path is lighter, and §2.1 below takes the workspace's call out of the
+per-request budget on other grounds; a `snapshot`'s call runs under that request's reservation. The reserve is sized for the
 tree a request spawns, not for one process: `gcloud` starts short-lived `gcloud` children of its
 own, which is why the sampler saw twelve processes for eight requests, and the figure that
 matters is the 102 MiB per request the eight listings summed to. The margin to 128 MiB covers
@@ -139,6 +140,7 @@ Where each route reserves, and why there:
   request, the function runs under that request's reservation and takes none; it reads the
   coalesce cache without the lock, and otherwise waits for the lock as long as it takes; from the
   content-workspace `open` and `commit`, through `mint_read_credential`, it runs under the store's fixed term.
+  `mint_read_credential` called from a vcs `snapshot` runs under that request's reservation.
 - The content-workspace verbs take no reservation at all. The store serves one verb at a time
   under its single lock, across every open workspace, so at most one of its process trees exists
   at any moment, whatever the load; that is a fixed quantity, and the budget carries it as a
@@ -201,7 +203,11 @@ lets the budget admit more, up to the slot cap, and lowering it cannot OOM while
 such a limit at reconcile, and the webhook refuses it at apply where it is enabled. The output term is
 the worst case, a request holding its full capped output, which a listing never does; charging
 captured bytes instead of the cap would roughly double the concurrency and is the refinement to
-measure first if four proves tight.
+measure first if four proves tight. One install in this repository does raise it: the smoke
+pipeline's (`hack/ci-deploy.sh`, `EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT`), whose lanes of Platform
+Agents fanning Cluster Agents out over the seeded fleet queued behind four slots to median
+waits of 8 to 22 s and a longest wait inside the refusal bound, so it runs the proxy at 2Gi,
+where the budget admits nine and the slot cap binds again.
 
 ### 2.3 Waiting, refusing, and the degenerate case
 
@@ -211,6 +217,10 @@ slot freed, polled every `COMMAND_SLOT_POLL_SECONDS` with the same check that a 
 hung up while queued is dropped before anything starts, and bounded by the same
 `COMMAND_SLOT_WAIT_SECONDS` (60). A request still queued at the bound raises
 `CommandSlotUnavailable` with a message that names the memory budget rather than the slot count.
+Both the wait and the refusal are measured on the broker's metrics listener: every admission
+is observed in a histogram by the bound that held it, every busy answer counted by bound, and
+the slots and bytes in use are gauges beside their caps, with the budget gauge absent while the
+budget is off (the site's observability page names the series).
 On the exec and vcs routes the exception is raised where a slot refusal is raised, before any
 command has run and, on the vcs route, before the body is read, so each route's existing handler
 and the vcs route's body drain apply unchanged and answer `503 CREDENTIAL_PROXY_BUSY`. The
@@ -242,11 +252,15 @@ A budget that would admit fewer than `BUDGET_MINIMUM_ADMITTED_REQUESTS` (two) re
 treated as absent: the broker logs one WARNING at startup naming the limit it read and the floor,
 `child_memory_budget_floor_bytes` (672 MiB at the 8 MiB output cap: the two fixed reserves plus two
 requests' cost), and admits by slot alone. The case is real. GKE Autopilot without bursting sets a
-container's limits equal to its requests, so the proxy's limit there is its 512Mi request, under
-which the budget would admit one request and serialise every brokered command; a listing phase
-that cannot run two at once costs more than the out-of-memory exposure the budget prevents. The
-operator's sizing test holds its own limit to the same floor
-(`credentialProxyMinimumAdmittedRequests`).
+container's limits equal to its requests, so the proxy's limit there is its memory request. At
+the 512Mi the operator first declared, the budget would admit one request and serialise every
+brokered command; a listing phase that cannot run two at once costs more than the out-of-memory
+exposure the budget prevents. The operator now declares the request at 1Gi, above the floor, so
+that the budget engages on Autopilot without bursting as well, admitting four there; the floor
+still applies to a CR override whose `requests.memory` is smaller, and a `limits.memory` set
+alone under 1Gi is refused as crossing the default request. The operator's sizing test
+holds its own limit to the same floor (`credentialProxyMinimumAdmittedRequests`) and its request
+to it too (`TestCredentialProxyBudgetArithmeticAtTheDefaults`).
 
 ### 2.4 Where the limit comes from
 
@@ -275,7 +289,7 @@ The resident reserve assumes the layout this operator deploys, the `broker` role
 container holds the broker and Envoy alone. The image's default role is `combined`, which also
 runs the event watcher and drift detector, and it is the compatibility arrangement for an image
 paired with an older operator, the pairing the cgroup fallback serves. There the reserve omits
-the watcher's informer caches, so the budget is generous by that amount: a budget that is too
+the watcher's memos and initial lists, so the budget is generous by that amount: a budget that is too
 large by a known term for one transitional pairing, where before this change there was none.
 
 The operator reserves the variable's name in `mergeCredentialProxyEnv` by setting it in the base
@@ -284,7 +298,7 @@ env list, as it does the two caps: a CR that could set it would detach the budge
 ### 2.5 The sizing test's child term
 
 `TestCredentialProxyOutputCapClearsTheLargestFleetDump` asserts
-`request + output_burst(all slots) <= limit`, with the container's 512Mi memory request as the
+`request + output_burst(all slots) <= limit`, with the container's 1Gi memory request as the
 resting term, upstream's statement of what the pod holds with nothing in flight. It also makes a second assertion in the broker's own terms, with the broker's fixed reserves as the
 resting term, because those are the numbers the broker subtracts and so the budget the children
 see. A slot in use is a request holding a reservation, so the slot count and the reservation
@@ -319,7 +333,9 @@ The slot cap and output cap, their values and their reservation. The sandbox shi
 requests at once the eight-wide burst of both listing pools coinciding waits one listing, so no
 retry is added here. (Those are the 1Gi figures; at the 2Gi default the budget admits nine and
 the slot cap of eight binds.) The proxy container's requests and limits, and so the
-chart's generated footprint and quota preflight. No agent-visible behaviour: no eval case.
+chart's generated footprint and quota preflight (the request has since moved to 1Gi so that
+the budget runs on Autopilot without bursting, §2.3; the footprint moved with it). No
+agent-visible behaviour: no eval case.
 
 The reconciler's and the stall watch's listing pools are the caller settings the change moved.
 The reconciler's had been eight at the default `maxProjects` cap and up to sixteen when the cap
@@ -373,7 +389,13 @@ does not move with the limit.
 counts reclaimable page cache, eight threads can pass the check before any child has grown, and
 the behaviour cannot be asserted in a unit test. The reservation model is deterministic and
 testable; a live reading could be layered on later as a second check if the constants prove
-wrong.
+wrong. Since #4315 the broker exports the live reading without admitting on it: the cgroup's
+`memory.current`, `memory.peak`, `memory.max`, `memory.stat` and `memory.events`, its own and
+Envoy's `VmRSS`/`VmHWM`, and the children's `ru_maxrss` after each reap, as series
+(`kubeagents_credential_proxy_cgroup_memory_bytes`, `…_cgroup_memory_events_total`,
+`…_process_memory_bytes`, `…_child_peak_rss_bytes`) and as `memory high-water` log lines. That is
+the measurement §1 was made by hand, kept running: it says on any fleet whether the constants
+hold, which the second check would need to know first.
 
 ## 4. Testing
 
@@ -407,6 +429,8 @@ produces no second wave, so the broker log shows budget waits only when the hour
 stall-watch tick coincide or long execs hold the budget; every listing completes (no `CREDENTIAL_PROXY_BUSY` in the
 stall-watch output), the container's cgroup `memory.peak` stays under the limit, the container
 does not restart, and the tick's wall time is within a minute of what it was before the change.
+The broker now reads `memory.peak` itself (§3), so on any install this check is its
+`kubeagents_credential_proxy_cgroup_memory_bytes{kind="peak"}` series against `kind="limit"`.
 
 ## 5. Sequencing
 

@@ -45,8 +45,30 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 	agentwebhook "github.com/gke-labs/kube-agents/k8s-operator/internal/webhook"
+	"k8s.io/apimachinery/pkg/api/meta"
 	// +kubebuilder:scaffold:imports
+)
+
+const (
+	// operatorMemoryLimitEnv carries the manager container's memory limit in
+	// bytes. Both install paths set it through the Downward API from the
+	// container's own limits.memory (charts/kube-agents/templates/
+	// operator-deployment.yaml and config/manager/manager.yaml;
+	// tests/test_operator_memory_limit_env.py holds the three together), so
+	// the soft limit follows whatever limit the cluster admitted, an Autopilot
+	// clamp included, with no second number to keep in step with
+	// operator.resources.
+	operatorMemoryLimitEnv = "OPERATOR_MEMORY_LIMIT_BYTES"
+	// operatorMemoryLimitFraction is the share of the container limit the
+	// manager takes as its soft limit. The manager is alone in its container,
+	// so the tenth left over is headroom for what the cgroup counts and the
+	// heap does not: goroutine stacks, the runtime's own structures, and the
+	// kernel's accounting. The event watcher takes half, because it shares
+	// its container; a soft limit makes the collector work harder as the heap
+	// approaches it, it does not cap live heap.
+	operatorMemoryLimitFraction = 0.9
 )
 
 var (
@@ -114,6 +136,18 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Before the manager and its cache exist: the soft limit paces the
+	// collector against the container's limit from the first informer sync,
+	// which is where a cache sized for a larger cluster than the limit was
+	// previously OOM-killed with the default pacing (GOGC=100 lets the heap
+	// double between collections, whatever the cgroup says).
+	if limitBytes, applied, reason := memlimit.Apply(operatorMemoryLimitEnv, operatorMemoryLimitFraction); applied {
+		setupLog.Info("Go soft memory limit set from the container's memory limit",
+			"bytes", limitBytes, "source", operatorMemoryLimitEnv, "fraction", operatorMemoryLimitFraction)
+	} else {
+		setupLog.Info("Go soft memory limit not derived; the runtime default applies", "reason", reason)
+	}
 
 	// Reject an out-of-range --webhook-port rather than letting controller-runtime
 	// silently substitute its own default: webhook.Options.Port <= 0 falls back to 9443
@@ -204,6 +238,10 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "c5a0294c.kubeagents.x-k8s.io",
+		// What this process holds in memory; controller.ManagerCacheOptions
+		// says what is in the cache, what is kept out of it, and why.
+		Cache:  controller.ManagerCacheOptions(),
+		Client: controller.ManagerClientOptions(),
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
@@ -323,6 +361,37 @@ func main() {
 			setupLog.Error(err, "Failed to add the usage counters poller to the manager")
 			os.Exit(1)
 		}
+	}
+
+	// The AgentProfile reconciler, when the CRD is installed. An operator
+	// upgraded ahead of its CRDs keeps running everything else. Only a real
+	// "no such kind" skips it: any other discovery error (an API server
+	// timeout during a control-plane upgrade, say) exits, so the restart
+	// tries again instead of running without the controller until the next
+	// one.
+	profileGVK := agentv1alpha1.GroupVersion.WithKind("AgentProfile")
+	_, mapErr := mgr.GetRESTMapper().RESTMapping(profileGVK.GroupKind(), profileGVK.Version)
+	profileDenied := controller.AgentProfileAccessDenied(rbacChecker)
+	switch {
+	case mapErr == nil && len(profileDenied) > 0:
+		// An informer the role cannot list never syncs, and a cache that
+		// fails to sync stops the manager, so registering it would crashloop
+		// the whole operator on an image deployed ahead of its ClusterRole.
+		setupLog.Error(nil, "The operator's role cannot read AgentProfiles; skipping the AgentProfile controller. Restart the operator after applying the current ClusterRole.", "denied", profileDenied)
+	case mapErr == nil:
+		if err := (&controller.AgentProfileReconciler{
+			Client:    mgr.GetClient(),
+			Scheme:    mgr.GetScheme(),
+			APIReader: mgr.GetAPIReader(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "agentprofile")
+			os.Exit(1)
+		}
+	case meta.IsNoMatchError(mapErr):
+		setupLog.Info("AgentProfile CRD is not installed on cluster; skipping the AgentProfile controller. Restart the operator after installing the CRD to enable it.")
+	default:
+		setupLog.Error(mapErr, "Failed to discover the AgentProfile kind")
+		os.Exit(1)
 	}
 
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {

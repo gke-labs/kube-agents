@@ -7,21 +7,44 @@ sidebar:
 
 A **Cluster Agent** is a read-only SRE scoped to exactly one GKE cluster. It is a Hermes profile (`cluster-<project>-<cluster>-<location>`, sanitized to 63 characters) that the [Platform Agent](/kube-agents/concepts/platform-agent/) scaffolds at runtime inside its own pod — one per managed cluster, persisting on the data volume until that cluster is deleted. `SOUL.md §6` makes delegation the default: work scoped to a single cluster's live runtime (crash loops, OOMs, scheduling failures, mount errors, connectivity, autoscaling, storage, observability gaps) belongs to that cluster's Cluster Agent, while fleet-wide audits, provisioning, and the GitOps write path stay with the Platform Agent.
 
+That profile is a directory under `$HERMES_HOME/profiles` in the `<name>-gateway` pod, not an [`AgentProfile`](/kube-agents/operator/agentprofile-crd/) resource (`apr`), which describes a separate agent pod on the `spec.mode: next` bus; `kubectl get apr` lists no Cluster Agents.
+
 ## Scoped by construction
 
 Each profile is stamped from the [`agents/cluster/`](https://github.com/gke-labs/kube-agents/tree/main/agents/cluster) template (baked into the image at `/opt/cluster-template`) by [`cluster_agent_profile.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/cluster_agent_profile.py):
 
-- **One cluster only.** A `KUBECONFIG` pinned to the target cluster is written into the profile's `.env`, and the cluster's project/name/location are recorded as a `cluster_identity` block in its config.
+- **One cluster only.** A `KUBECONFIG` pinned to the target cluster is written into the profile's `.env`, and the cluster's project/name/location are recorded as a `cluster_identity` block in its config and stamped directly into its `SOUL.md` so the worker has its identity in the system prompt on turn 1.
 - **Read-only toolset.** The template config exposes only the `gke` and `developer_knowledge` MCP servers — no `platform_control` (provisioning), no GitOps write path. A Cluster Agent diagnoses; it never mutates cluster state and never opens pull requests. For GKE facts and error codes, it consults `developer_knowledge` first (`search_documents`, never the 50-a-day `answer_query`), falling back to DuckDuckGo web search only for third-party or open-source signatures.
-- **Its own skills.** The single-cluster runtime-debugging skills ship in [`agents/cluster/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/cluster/skills) (observability, reliability, stall detection, storage, workload scaling, workload security, workload troubleshooting) — listed under their own heading in the [skill catalog](/kube-agents/skills/).
+- **Its own skills.** The single-cluster runtime-debugging skills ship in [`agents/cluster/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/cluster/skills) (load-bearing change, observability, reliability, stall detection, storage, workload scaling, workload security, workload troubleshooting) — listed under their own heading in the [skill catalog](/kube-agents/skills/).
 
 ## Lifecycle
 
 A managed cluster and its Cluster Agent profile are created together and deleted together (`SOUL.md §6`). Three paths maintain that invariant:
 
-1. **Onboarding.** When the Platform Agent provisions a cluster (`gke-cluster-creation`) or first brings one under management, the `cluster-agent-lifecycle` skill creates the profile.
-2. **On request.** "Manage my cluster `X` in `Y`" invokes the `manage-cluster` skill, which verifies the cluster exists and creates its profile (idempotent).
-3. **Reconciliation.** The hourly `cluster-agent-reconcile` job (a `no_agent` script job on the Planning Agent profile's [cron file](/kube-agents/reference/cron-jobs/)) sweeps every project in scope (the management project alone unless `spec.scope` says otherwise): it creates a profile for every cluster that lacks one — including the management cluster kube-agents itself runs on, whose own workloads fail like any other cluster's — and prunes a profile only when its cluster is _definitively_ gone (a NotFound from `gcloud container clusters describe`), when the cluster is named in [`spec.scope.exclude.clusters`](/kube-agents/operator/platformagent-crd/#specscope) (or, for one more release, in `RECONCILE_EXCLUDE`), or when its project has left the scope, over two runs that could each trust every lookup they made (the first marks the project `retiring` in `fleet_scope.json`, the next such run prunes; a management project that changes identity is marked on the run the change is seen, once the new project has listed its own clusters; [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope) states the conditions). Ambiguous errors (auth, network, quota) never trigger deletion.
+1. **Onboarding.** When a merged change has produced a new cluster (`gke-cluster-creation` proposes it as a pull request) or the Platform Agent first brings one under management, the `cluster-agent-lifecycle` skill creates the profile.
+2. **On request.** "Manage my cluster `X` in `Y`" invokes the `manage-cluster` skill, which verifies the cluster exists and creates its profile (idempotent); "stop managing" goes through the same skill, which routes the exclusion to where the install declares its scope.
+3. **Reconciliation.** The hourly `cluster-agent-reconcile` job (a `no_agent` script job on the Planning Agent profile's [cron file](/kube-agents/reference/cron-jobs/)) sweeps every project in scope (the management project alone unless `spec.scope` says otherwise): it creates a profile for every cluster that lacks one — including the management cluster kube-agents itself runs on, whose own workloads fail like any other cluster's — and prunes a profile only when its cluster is _definitively_ gone (a NotFound from the GKE API when the cluster is looked up), when the cluster is named in [`spec.scope.exclude.clusters`](/kube-agents/operator/platformagent-crd/#specscope) (or, for one more release, in `RECONCILE_EXCLUDE`), or when its project has left the scope, over two runs that could each trust every lookup they made (the first marks the project `retiring` in `fleet_scope.json`, the next such run prunes; a management project that changes identity is marked on the run the change is seen, once the new project has listed its own clusters; [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope) states the conditions). Ambiguous errors (auth, network, quota) never trigger deletion.
+
+### Which control-plane endpoint the profile uses
+
+Scaffolding pins a kubeconfig scoped to the cluster, and which endpoint that kubeconfig names
+is decided per cluster. The DNS endpoint wins when it accepts external traffic. A cluster on
+the agent cluster's VPC whose public endpoint is absent or gated by authorized networks, and
+whose DNS endpoint is closed, is reached over its private endpoint
+(`privateClusterConfig.privateEndpoint`) when that endpoint is in the agent cluster's region
+or has control-plane global access, and when it admits the agent: no authorized-network list
+is enabled, or the list explicitly does not gate the private endpoint
+(`masterAuthorizedNetworksConfig.privateEndpointEnforcementEnabled: false`), or the two
+clusters share a subnet, or the agent cluster's Pod range (`clusterIpv4Cidr`) lies inside a
+listed range. Otherwise the kubeconfig names the endpoint `gcloud` writes by default. The
+scaffold records the endpoint it chose, when one was decided, in the profile's `USER.md`,
+probes the cluster once,
+and when the connection fails the onboarding log and the Cluster Agent's preflight repeat that
+record and name what would open the cluster: the Pod range to add when the private endpoint's
+list is the block, the agent's egress address when the public endpoint's is, control-plane
+global access when the region is, and the DNS endpoint when the VPC is.
+[`private-endpoint-selection.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/private-endpoint-selection.md)
+has the full rule.
 
 ## How delegation works
 
@@ -32,7 +55,7 @@ Delegation runs on the shared kanban board — agents never pass context to each
 3. The worker completes the card with the grounded root-cause analysis in `result` — the field the gateway posts into the requesting chat thread verbatim — and the machine-readable form of it, including the proposed manifest patch, in `metadata`.
 4. The Platform Agent reads the result and, if you asked for the fix, submits it through the [declarative workflow](/kube-agents/concepts/declarative-workflow/) (`submit-suggestion`); if you asked for a diagnosis, the root cause and the proposed patch come back in the reply. The write path never moves to the cluster side.
 
-For multi-cluster work the Platform Agent fans out one card per cluster, keeps its own card open while they run, and completes it with the synthesized answer once every per-cluster card has finished — the image refuses a completion that would hand back a dispatch receipt while they are still running (`deploy/docker/patches/kanban_children_settled.py`). See the `workload-rebalancing` skill for the pattern.
+For multi-cluster work the Platform Agent fans out one card per cluster, up to ten. A question over more clusters is answered from one fleet-wide read first, and a general health question ("are my clusters healthy?") is one sweep of every cluster's status, node readiness, restarting containers, Pending pods and Deployments or StatefulSets short of ready replicas; it files per-cluster cards only for the clusters that sweep flags, and only when the question also asks why. The Platform Agent keeps its own card open while the per-cluster cards run, and completes it with the synthesized answer once every per-cluster card has finished — the image refuses a completion that would hand back a dispatch receipt while they are still running (`deploy/docker/patches/kanban_children_settled.py`). A per-cluster card asked whether its cluster has something reports "not here" and completes (a card that needed the target blocks as a failure instead), and one still running after 30 minutes is stopped and settled as not finished on that cluster (`deploy/docker/patches/kanban_fanout_reaper.py`). See the `workload-rebalancing` skill for the pattern.
 
 ## Event triage
 
@@ -40,7 +63,7 @@ A Kubernetes event alert arrives as a card like any other. The [event watcher](h
 
 The Cluster Agent finishes it with `kanban_complete` and nothing else, passing the whole report as `result`. Every card carries a subscription to the session it was filed from, and the notifier posts a subscribed card's `result` to chat when the card turns terminal — so completing the card is the delivery, threaded under the alert it answers.
 
-The report ends by inviting a reply — `To authorize: reply 'apply'`, and where it proposes more than one remediation option, `apply Option B` to name one directly. That reply is ordinary chat ingress and lands on the Planning Agent, which did not do the investigation and cannot see the card. What makes it resolve is a row the notifier writes in the same step that posts the report, keyed to the thread it posted into: a `pre_gateway_dispatch` hook finds it and prepends the report to the user's words, so `apply Option B` reaches an agent that knows what Option B was. Acting on it is still the Platform Agent's job through `submit-suggestion` — the fix ships as a Pull Request, and nothing is written to the live cluster.
+When the report proposes a fix, it ends by inviting a reply — `To authorize: reply 'apply'`, and where it proposes more than one remediation option, `apply Option B` to name one directly. That reply is ordinary chat ingress and lands on the Planning Agent, which did not do the investigation and cannot see the card. What makes it resolve is a row the notifier writes in the same step that posts the report, keyed to the thread it posted into: a `pre_gateway_dispatch` hook finds it and prepends the report to the user's words, so `apply Option B` reaches an agent that knows what Option B was. Acting on it is still the Platform Agent's job through `submit-suggestion` — the fix ships as a Pull Request, and nothing is written to the live cluster. An install that sets [`INCIDENT_TRIAGE_OPEN_PULL_REQUEST`](/kube-agents/concepts/chatops/#opening-the-pull-request-without-a-reply) skips the wait: a Platform Agent card queued behind the triage card opens the recommended fix as a Pull Request once the report is complete. A report that finds no manifest change warranted says so under `What to do` and invites no reply.
 
 ## Security posture
 

@@ -1,9 +1,10 @@
 # PARKED — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
 # (#1865), in no roster file under hack/eval/ until its fixture exists.
 #
-# What this case grades: the networking fabric audit sweeps every project the
-# agent's identity can read, not just the host project. The SOP's §1 resolves
-# the scope as the host project plus `gcloud projects list` and runs every
+# What this case grades: the networking fabric audit sweeps every project in
+# the install's scope, not just the host project. The SOP's §1 resolves the
+# scope from the platform_control `fleet_scope` tool when the install declares
+# one, else as the host project plus `gcloud projects list`, and runs every
 # check once per project with `--project`; before that, §1 listed subnets in
 # the ambient project, so a defect in a second readable project never reached
 # the ledger and the run still read as a full sweep.
@@ -15,8 +16,8 @@
 # second project holding the defect below.
 #
 # Domain: fleet-audits.
-# Journey: an audit asked for on demand covers every project the install can
-# read and files a finding in a project other than the host.
+# Journey: an audit asked for on demand covers every project in the install's
+# scope and files a finding in a project other than the host.
 #
 # Planted defect required: in the second project, a VPC with an internal TCP
 # load balancer, a PSC NAT subnet and a service attachment
@@ -35,8 +36,9 @@ prompt: >-
   Run the GCP networking fabric and VPC IPAM audit, following the
   gcp-networking-fabric-audit SOP.
 expected_output: >-
-  The audit enumerates the host project and every project gcloud projects
-  list returns, runs its checks in each with an explicit --project, and the
+  The audit enumerates the install's scope (the fleet_scope tool's projects
+  when one is declared, else the host project and every project gcloud
+  projects list returns), runs its checks in each with an explicit --project, and the
   ledger issue carries a psc-routing-deadlock finding on the forwarding rule
   bench-psc-rejected-endpoint in the second project, whose PSC connection to
   its service attachment is REJECTED. The closing response is the SOP's one
@@ -47,9 +49,6 @@ validated: false
 
 # Slug per docs/designs/domains.yaml.
 domain: fleet-audits
-
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
 
 # No fixture role exists for a second project yet (see the header and #1865).
 fixtures: []

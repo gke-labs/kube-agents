@@ -1,0 +1,26 @@
+Subject: Count every `kube_*` series as a kube-state-metrics series
+
+Why: Every kube_* series the references name (kube_node_status_condition, kube_node_spec_taint, kube_pod_container_status_restarts_total) comes from kube-state-metrics, but upstream's tier rule and reference columns place some in Tier 1; without this the agent proposes alerts on series a Tier 1 install never scrapes.
+Local-Issue: #2692
+Upstream-Issue: none filed yet
+Retire-When: upstream classifies every kube_* series as Tier 2
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -88,8 +88,13 @@ metrics while minimizing alert noise.
+         every response where you generate or recommend an alerting policy, you
+         **must explicitly state its classification tier and cost impact**:
+         *   **Tier 1 native or standard metric** (GKE built-in metrics, cAdvisor
+-            `container_*`, kubelet volume stats, kubelet node conditions, and
+-            control-plane metrics; see
++            `container_*`, kubelet volume stats, native
++            `kubernetes.io/node/status_condition`, and control-plane metrics.
++            Every `kube_*` series the references name
++            (`kube_node_status_condition`, `kube_node_spec_taint` and
++            `kube_pod_container_status_restarts_total` among them) is a
++            kube-state-metrics series and therefore Tier 2, whatever the
++            KSM-required or tier columns in the references say; see
+             [metrics_and_alerts_catalog.md](references/metrics_and_alerts_catalog.md)):
+             State that it is a **Tier 1 native or standard metric with zero KSM
+             cost surcharge**.

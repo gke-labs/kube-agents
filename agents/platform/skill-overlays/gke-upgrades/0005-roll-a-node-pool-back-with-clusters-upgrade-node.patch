@@ -1,0 +1,24 @@
+Subject: Roll a node pool back with clusters upgrade --node-pool
+
+Why: the troubleshooting reference rolls a node pool back with `gcloud container node-pools upgrade`, a command that does not exist; node pools upgrade through `clusters upgrade --node-pool`, as the skill's own runbook template says. The patch also adds the Standard-only qualifier.
+Local-Issue: none (#2353)
+Upstream-Issue: none filed yet
+Retire-When: upstream's rollback uses `clusters upgrade --node-pool`
+
+diff --git a/references/troubleshooting.md b/references/troubleshooting.md
+--- a/references/troubleshooting.md
++++ b/references/troubleshooting.md
+@@ -193,10 +193,10 @@ GPU nodes upgrade successfully, but ML pods are stuck in `CrashLoopBackOff` with
+      --accelerator type=GPU_TYPE,count=COUNT,gpu-driver-version=DRIVER_VERSION
+    ```
+ 2. **Update Workload Dependencies**: Rebuild container images with a CUDA version compatible with the new driver.
+-3. **Rollback Node Pool**: If production is blocked, roll back the node pool to the previous GKE version:
++3. **Rollback Node Pool (Standard clusters only)**: If production is blocked, roll back the node pool to the previous GKE version:
+    ```bash
+-   gcloud container node-pools upgrade NODE_POOL_NAME \
+-     --cluster CLUSTER_NAME \
++   gcloud container clusters upgrade CLUSTER_NAME \
++     --node-pool NODE_POOL_NAME \
+      --zone ZONE \
+      --cluster-version PREVIOUS_VERSION
+    ```

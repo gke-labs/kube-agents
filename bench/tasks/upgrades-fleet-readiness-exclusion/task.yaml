@@ -69,8 +69,9 @@ prompt: >-
 expected_output: >-
   The per-cluster version table and, after it, a readiness table read during
   this run: per cluster a verdict (ready, blocked or unknown), its
-  drain-blocking PodDisruptionBudgets, its maintenance exclusions and window,
-  and its node-pool skew against the target. seeded-b is reported as blocked,
+  drain-blocking PodDisruptionBudgets, its fail-closed webhooks with an unreachable
+  backend, its maintenance exclusions and window, and its node-pool skew
+  against the target. seeded-b is reported as blocked,
   naming its maintenance exclusion hold-the-minor-lag with scope
   NO_MINOR_UPGRADES and its end time, and stating that the exclusion holds
   back the automatic minor upgrade to its REGULAR channel default (a manual
@@ -89,9 +90,6 @@ validated: false
 
 # Slug per docs/designs/domains.yaml.
 domain: upgrades
-
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
 
 # Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
 # docs/designs/bench-fleet-catalog.md is the rule.

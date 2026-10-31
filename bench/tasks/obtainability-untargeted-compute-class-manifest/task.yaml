@@ -37,8 +37,6 @@ validated: false
 
 domain: reliability
 
-owner: maintainers
-
 fixtures:
   - untargeted-compute-class-workload
 

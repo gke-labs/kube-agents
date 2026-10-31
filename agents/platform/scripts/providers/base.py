@@ -48,15 +48,26 @@ from .credentials import Credential, NoCredential
 from .errors import Override
 from .validate import repo_segments
 
+# The key a `proposal_tally` answer carries the forge's one count of every state
+# under, where the forge counts the states in separate queries.
+TALLY_TOTAL = "total"
+
 # Re-exported so a forge package can refuse a request without importing outside
 # the shared contract. `WorkspaceError` is the broker's "the caller sent
 # something wrong" with an HTTP status attached; a forge raises it for anything
 # specific to its own request shapes that the shared validators cannot know.
+
 __all__ = [
     "BROKER_VERBS",
+    "TALLY_TOTAL",
+    "tally_with_open",
     "COLLABORATION_VERBS",
+    "ISSUE_VERBS",
+    "LABEL_FIELDS",
     "Forge",
     "ForgeUnsupported",
+    "IdentityUnknown",
+    "LabelsUnsupported",
     "StubForge",
     "WorkspaceError",
     "listing",
@@ -89,19 +100,91 @@ COLLABORATION_VERBS: tuple[str, ...] = (
     "label-ensure",
 )
 
-# `branch-view` and `branch-delete` are the broker's rather than a forge's for the
-# reason `publish` is: which refs a remote holds, and removing one, is git
-# against a URL on every forge.
-BROKER_VERBS: tuple[str, ...] = (
-    "capabilities", "clone", "publish", "identity", "branch-view", "branch-delete",
+# The issue verbs as one group. A forge with no issue tracker omits all of them,
+# and a caller that keeps a ledger in issues reads their absence from
+# `capabilities` to keep it somewhere else.
+ISSUE_VERBS: tuple[str, ...] = tuple(
+    verb for verb in COLLABORATION_VERBS if verb.startswith("issue-")
 )
 
+# The payload fields that carry labels. They are fields of other verbs, not
+# verbs, so `verbs` cannot say that a forge has no labels: the `labels`
+# capability says it, and the broker refuses these fields by name on a forge
+# that declares none (`Forge.refuse_labels`).
+LABEL_FIELDS: tuple[str, ...] = ("labels", "labelsAdd", "labelsRemove", "excludeLabels")
+
+# `branch-view` and `branch-delete` are the broker's rather than a forge's for the
+# reason `publish` is: which refs a remote holds, and removing one, is git
+# against a URL on every forge. `snapshot` is git against a URL too.
+BROKER_VERBS: tuple[str, ...] = (
+    "capabilities", "clone", "snapshot", "publish", "identity", "branch-view", "branch-delete",
+)
+# Served to library callers only (`vcs_client.snapshot`), so `capabilities` does
+# not advertise them: no `vcs.py` command runs them, and an advertised verb sends
+# the agent to a command that does not exist.
+LIBRARY_VERBS: frozenset[str] = frozenset({"snapshot"})
+
+
+
+def tally_with_open(tally: dict[str, Any]) -> dict[str, Any]:
+    """`tally` with `open` as the remainder of its one count less merged and closed.
+
+    The three counts are separate requests, not one snapshot, so a proposal
+    that changes state between two of them is counted twice or not at all;
+    the remainder keeps the sum at the forge's one count. Clamped at zero, so
+    a count that straddled a merge never publishes a negative gauge.
+    """
+    tally["open"] = max(tally[TALLY_TOTAL] - tally["merged"] - tally["closed"], 0)
+    return tally
 
 class ForgeUnsupported(WorkspaceError):
     """This host is not one this install has a credential and a client for."""
 
     def __init__(self, message: str) -> None:
         super().__init__(message, status=501, code="FORGE_UNSUPPORTED")
+
+
+class LabelsUnsupported(ForgeUnsupported):
+    """The forge has no labels, and the request sent one.
+
+    A code of its own, not `FORGE_UNSUPPORTED`: a caller reads that code as
+    "this host has no forge here", and the host is served. A label filter that
+    the forge ignores would answer a different set of items, and a label write
+    that it drops would look done, so the field is refused, not ignored.
+    """
+
+    def __init__(self, forge: str, field: str) -> None:
+        WorkspaceError.__init__(
+            self,
+            f"{forge} has no labels, so `{field}` cannot be used here. "
+            "`capabilities` says `labels: false`. Find your own proposals by "
+            "their branch prefix and a marker in their body instead.",
+            status=501,
+            code="LABELS_UNSUPPORTED",
+        )
+
+
+class IdentityUnknown(WorkspaceError):
+    """The forge must name the account its credential acts as, and cannot.
+
+    Not `ForgeUnsupported`: the broker reads that as "this forge has nowhere to
+    ask", which turns the ownership checks off. A forge that declares
+    `identity_required` has an account behind its credential, so an unknown
+    login is a fault to report, and the checks refuse, not skip. Its own code,
+    so that no client retries it as a transient failure.
+    """
+
+    def __init__(self, forge: str) -> None:
+        super().__init__(
+            f"{forge} cannot say which account this install's credential acts "
+            "as: its API has no current-user call for this token, or refused it, "
+            "and no identity is configured for the forge. Every check that tells "
+            "this install's own proposals and comments from another person's is "
+            "refused until it can. Configure the forge's identity, or use a "
+            "token that can read its own account.",
+            status=502,
+            code="FORGE_IDENTITY_UNKNOWN",
+        )
 
 
 def listing(
@@ -141,6 +224,9 @@ class Forge:
     # CLI-backed forge grants no forge CLI.
     transport = "http"
     cli = ""
+    scheme = "https"
+    schemes: tuple[str, ...] = ("https",)
+    accepts_port = False
     # The second half of an "http" declaration: the API root every path is
     # relative to, per instance because one package serves several hosts, and
     # the "current user" route with the field that names the login (None when
@@ -148,6 +234,18 @@ class Forge:
     # the transport; nothing here makes a call.
     api_url = ""
     whoami_route: tuple[str, str] | None = None
+    # A GraphQL endpoint on the forge's host that answers `viewer { login }`,
+    # for a forge whose REST current-user route refuses its credential. Empty
+    # means `whoami_route` is the route.
+    whoami_graphql = ""
+    # PEM CA certificates this forge's own host is trusted under, beside the
+    # system bundle: a self-managed instance whose certificate a private CA
+    # signed. Empty for every public forge. The broker reads it for both of
+    # its clients, scoped to this forge's hosts.
+    ca_file = ""
+    # Where `ca_file` comes from, as the answer for a missing file names it:
+    # "the Secret <name> or its key <key>". Empty when nothing says.
+    ca_source = ""
     # The well-known host this forge answers for when an install has not
     # configured it, and what is missing then. The registry turns them into a
     # named gap -- "no credential is configured for <host>" -- rather than a
@@ -162,6 +260,26 @@ class Forge:
     # comments, and a caller that assumed one would either crash there or
     # silently skip it. Read back from `capabilities`.
     acknowledges = False
+    # Whether proposals and issues carry labels here. A capability for the
+    # same reason: Bitbucket has no labels at all, and label fields ride on
+    # other verbs, so `verbs` cannot say it. A forge that declares none gets
+    # every label field refused by name (`refuse_labels`), and its callers
+    # find their own items by branch prefix and body marker. Off by default,
+    # so a new forge that forgets it refuses a label instead of dropping one.
+    labels = False
+    # The routes that spend a separate, smaller search quota, which the
+    # readings sweep paces (`vcs_readings.VCS_READINGS_SEARCH_CALLS_PER_MINUTE`).
+    search_routes: frozenset[str] = frozenset()
+    # The login this install's credential acts as, when the forge cannot ask:
+    # a token whose API has no current-user call, or refuses the call. A
+    # provider package sets it from its forge configuration. Empty means ask
+    # the transport. `whoami` reads it.
+    identity = ""
+    # Whether an empty login is a fault here. False keeps "" as "cannot say",
+    # which the broker reads as "do not compare". True says the credential
+    # always belongs to an account, so "" raises `IdentityUnknown` and the
+    # ownership checks refuse, not skip.
+    identity_required = False
 
     def __init__(self) -> None:
         self.credential: Credential = NoCredential()
@@ -176,6 +294,35 @@ class Forge:
         nothing to report.
         """
         return None
+
+    def whoami(self, api: Callable) -> str | None:
+        """The login this credential acts as, by the forge's own lookup.
+
+        None means "ask the transport", which reads `whoami_route` or
+        `whoami_graphql`. The default answers the configured `identity`, and
+        None when there is none. A forge whose token cannot call the
+        current-user route overrides this: it asks its API in its own way
+        (`api` is the transport's call, with the credential made current), or
+        it answers the configured identity. "" says the forge asked and got no
+        login; with `identity_required`, the broker refuses that.
+        """
+        return self.identity.strip() or None
+
+    def refuse_labels(self, verb: str, payload: Mapping[str, Any]) -> None:
+        """Refuse a label field on a forge that has no labels. No call is made.
+
+        The broker asks this before every collaboration verb, so a forge
+        package never sees a label it cannot store. An empty field is no
+        label, and passes. `label-ensure` is refused here too, under the same
+        code, so the caller learns the reason and not only the verb.
+        """
+        if self.labels:
+            return
+        if verb == "label-ensure":
+            raise LabelsUnsupported(self.name, verb)
+        for field in LABEL_FIELDS:
+            if payload.get(field):
+                raise LabelsUnsupported(self.name, field)
 
     def read_credential(self, repo: str) -> Credential:
         """A credential that can only read `repo`, for one clone of it.
@@ -222,14 +369,33 @@ class Forge:
         """
         raise NotImplementedError
 
+    def file_url(self, repo: str) -> str | None:
+        """The web address of a file in `repo`, with `{ref}` and `{path}` to fill.
+
+        Composed from the validated repository and this forge's own host, as
+        `clone_url` is, so it needs no credential and no network. The caller
+        percent-encodes `{ref}` and `{path}` and keeps their `/` separators
+        (`quote(value, safe="/")`): a branch name may hold `#` or `%`, which
+        would break the link. A link that must outlive the branch uses a
+        commit SHA as `{ref}`. None when the forge has no such page.
+        """
+        return None
+
     def capabilities(self, repo: str) -> dict[str, Any]:
         """What this install can do here, before anything is spent.
 
         No credential, no network. A caller that discovers the gap by failing
         halfway through a publish has already written the revision it cannot
         deliver.
+
+        `fileUrl` is the web address of a file, from `file_url`. It is in the
+        answer only when the forge gives one, so that a link in an issue or a
+        proposal opens the file on this forge, not a path relative to the page.
+
+        `labels` says whether label fields work here. Without it a caller
+        finds its own proposals by branch prefix and body marker.
         """
-        return {
+        answer = {
             "forge": self.name,
             "repo": repo,
             "proposalNoun": self.proposal_noun,
@@ -239,11 +405,17 @@ class Forge:
             # send a caller to a refusal it could have seen here.
             "verbs": sorted(
                 {*BROKER_VERBS, *self.verbs}
+                - LIBRARY_VERBS
                 - (set() if "proposal-list" in self.verbs else {"branch-delete"})
             ),
             "acknowledge": self.acknowledges,
+            "labels": self.labels,
             "missing": [],
         }
+        url = self.file_url(repo)
+        if url:
+            answer["fileUrl"] = url
+        return answer
 
     def can_write(
         self, api: Callable, repo: str, login: str, bot: bool = False
@@ -322,6 +494,43 @@ class Forge:
     def proposal_acknowledge(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         return self._unsupported("proposal-acknowledge")
 
+    # -- the readings sweep's calls -------------------------------------------
+    #
+    # Not verbs: no route serves them and no forge lists them in `verbs`. The
+    # broker's own sweep calls them through a binding's `api`, to count the
+    # install's proposals by outcome and who touched them. A forge that
+    # cannot answer one inherits the same named refusal, and the sweep reads
+    # it as "no reading from this forge".
+
+    def proposal_list_by_author(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """A page of the proposals `payload["author"]` opened, newest activity first.
+
+        Filtered by the forge, never here. Each item is `number`, `state`,
+        `author`, `authorBot`, `created`, `updated` and `closed`; beside
+        `count` and `truncated` is `total`, the forge's own count for the
+        query, or None when it gives none. A page the forge itself says is
+        incomplete also carries `incomplete: True`, and is `truncated`.
+        """
+        return self._unsupported("proposal-list-by-author")
+
+    def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """How many proposals `payload["author"]` has open, merged and closed.
+
+        None for a count the forge cannot split out. A forge whose counts are
+        separate queries also answers `TALLY_TOTAL`, its one count of every
+        state together, and derives `open` from it: the states are not one
+        snapshot, and the sum is what the sweep publishes.
+        """
+        return self._unsupported("proposal-tally")
+
+    def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """A proposal's reviews, a bodiless approval included."""
+        return self._unsupported("proposal-reviews")
+
+    def proposal_closer(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """Who closed a proposal: `actor`, "" when the forge does not say, and `bot`."""
+        return self._unsupported("proposal-closer")
+
     def issue_update(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         return self._unsupported("issue-update")
 
@@ -387,8 +596,15 @@ class StubForge(Forge):
             "proposalNoun": self.proposal_noun,
             "verbs": [],
             "acknowledge": False,
+            "labels": False,
             "missing": list(self.missing),
         }
+
+    def refuse_labels(self, verb: str, payload: Mapping[str, Any]) -> None:
+        # A stub refuses every verb with what this install is missing. Saying
+        # "no labels" first would name a gap the forge does not have, and hide
+        # the one this install does.
+        return None
 
     def _refuse(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
         raise ForgeUnsupported(f"{self.name}: {self.missing[-1]}")
@@ -397,3 +613,4 @@ class StubForge(Forge):
     proposal_update = proposal_close = proposal_commits = proposal_acknowledge = _refuse
     issue_create = issue_list = issue_view = issue_comment = _refuse
     issue_update = issue_close = label_ensure = _refuse
+    proposal_list_by_author = proposal_tally = proposal_reviews = proposal_closer = _refuse

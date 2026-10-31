@@ -410,6 +410,25 @@ var nonDeclarativeSubresources = map[string]bool{
 	"token":               true,
 }
 
+// coordinationConfigMaps are ConfigMap names used strictly for runtime
+// coordination that are never declared in a GitOps repository.
+//
+// The primary case is "live-test-lease", which scripts/live_test_lease.py
+// creates and updates under contributor credentials during live validation
+// (docs/designs/live-test-lease.md). Because contributors authenticate as
+// humans, these writes are classified as TierHuman, but they represent
+// developer locking rather than GitOps drift.
+var coordinationConfigMaps = map[string]bool{
+	"live-test-lease": true,
+}
+
+// isCoordinationResource reports whether ref names an in-cluster coordination
+// object that is managed dynamically at runtime rather than declared in Git.
+func isCoordinationResource(ref ResourceRef) bool {
+	// The live-test lease ConfigMap in any namespace (normally kubeagents-system).
+	return ref.Group == "" && ref.Resource == "configmaps" && coordinationConfigMaps[ref.Name]
+}
+
 // TierCounts is the per-tier tally, plus the records dropped before a tier
 // could act on them.
 type TierCounts struct {
@@ -428,7 +447,8 @@ type TierCounts struct {
 	Actionable int
 
 	// NonDeclarative counts successful human calls dropped for naming a
-	// subresource in nonDeclarativeSubresources. Counted rather than dropped
+	// subresource in nonDeclarativeSubresources or an ephemeral coordination
+	// ConfigMap in coordinationConfigMaps. Counted rather than dropped
 	// silently: these are real actions by real people, and an operator
 	// wondering why their kubectl exec raised nothing should find a number
 	// saying so instead of an absence.
@@ -634,13 +654,22 @@ func (d *driftFilter) tally(ctx context.Context, record AuditRecord) {
 		return
 	}
 
-	// Last, because it is the narrowest test and the only one that has to run
-	// on the human path alone. Everything above drops ~98% of the stream, so a
-	// map lookup here is paid for by almost nothing.
+	// Non-declarative filters (subresources and coordination objects) run last,
+	// because they are the narrowest tests and only run on the human path.
+	// Everything above drops ~98% of the stream, so these lookups are paid for
+	// by almost nothing.
 	if nonDeclarativeSubresources[record.Resource.Subresource] {
 		d.counts.NonDeclarative++
 		if d.logDropped {
 			logDroppedRecord(record, tier, fmt.Sprintf("subresource %q changes no declarative state", record.Resource.Subresource))
+		}
+		return
+	}
+
+	if isCoordinationResource(record.Resource) {
+		d.counts.NonDeclarative++
+		if d.logDropped {
+			logDroppedRecord(record, tier, fmt.Sprintf("resource %q is a coordination object that changes no declarative state", record.Resource.String()))
 		}
 		return
 	}

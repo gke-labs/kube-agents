@@ -18,6 +18,20 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(__file__))
 import fleet_drift as fd  # noqa: E402
 
+# Every resolver asks the operator's answer when a run passes neither scope flag:
+# the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
+# that carries either (the sandbox session, a developer reproducing the guard)
+# would turn this suite's listing tests into refusals. The suite is about the
+# collector, not the host it runs on, so both are neutralised at import.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URL unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+import fleet_scope_args as _fleet_scope_args  # noqa: E402
+
+_fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
+
 NOW = datetime(2026, 8, 1, tzinfo=timezone.utc)
 
 
@@ -247,6 +261,18 @@ class EnumerateProjectClustersTest(unittest.TestCase):
         clusters, record, error = fd.enumerate_project_clusters("acme", run=lambda a: run_of(0, clusters_json))
         self.assertEqual(clusters[0]["_project"], "acme")
         self.assertIsNotNone(record)
+        self.assertIsNone(error)
+
+
+    def test_a_cluster_the_scope_excludes_is_dropped_from_the_listing(self):
+        # #3081: spec.scope.exclude.clusters bounds every fleet read, so an
+        # excluded cluster in a swept project is neither audited nor recorded.
+        fd.declared_scope.set("acme", None, "acme/us-central1/lane-b")
+        self.addCleanup(fd.declared_scope.set, None, None)
+        clusters_json = json.dumps([{"name": "ka-today", "location": "us-central1"}, {"name": "lane-b", "location": "us-central1"}])
+        with mock.patch("sys.stderr"):
+            clusters, _, error = fd.enumerate_project_clusters("acme", run=lambda a: run_of(0, clusters_json))
+        self.assertEqual([c["name"] for c in clusters], ["ka-today"])
         self.assertIsNone(error)
 
     def test_failed_list_returns_empty_with_no_record_and_says_why(self):
@@ -2626,6 +2652,139 @@ class CandidateSummaryTest(unittest.TestCase):
                 rc = fd.main([])
         self.assertEqual(rc, 1)
         self.assertNotIn("candidate(s) to report", err.getvalue())
+
+
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    def setUp(self):
+        # The variable half of the operator's answer, per test as well as at
+        # import; the file half is pointed at a path that does not exist above.
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        fd.declared_scope.set(None, None)
+
+    def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        fd.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        def run(argv, **kwargs):
+            raise AssertionError(f"the declared scope is the sweep; nothing should be listed: {argv}")
+
+        fd.declared_scope.set("ops-mgmt,payments-prod", "payments-staging=denied")
+        discovery = fd.discover_fleet(None, run=run)
+        self.assertEqual(discovery.projects, ["ops-mgmt", "payments-prod"])
+        self.assertIsNone(discovery.error)
+        self.assertIn("payments-staging (denied)", discovery.partial)
+        self.assertIn("fleet_scope tool", discovery.partial)
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        fd.declared_scope.set("ops-mgmt payments-prod", "")
+        discovery = fd.discover_fleet(None, run=lambda *a, **k: run_of(1))
+        self.assertEqual((discovery.projects, discovery.partial), (["ops-mgmt", "payments-prod"], None))
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"]:
+                return run_of(0, "acme\n")
+            return run_of(0, "acme\nother\n")
+
+        fd.declared_scope.set(None, None)
+        self.assertEqual(fd.discover_fleet(None, run=run).projects, ["acme", "other"])
+
+    def test_a_project_override_inside_the_declared_scope_wins_and_one_outside_is_refused(self):
+        # With a declared scope the override is still a single-project run, but
+        # it cannot name a project the scope does not list, and it cannot run
+        # at all on a scoped sandbox without the tool's flags.
+        fd.declared_scope.set("ops-mgmt,payments-prod", None)
+        self.assertEqual(fd.discover_fleet("payments-prod", run=lambda *a, **k: run_of(1)).projects, ["payments-prod"])
+        outside = fd.discover_fleet("acme-only", run=lambda *a, **k: run_of(1))
+        self.assertEqual(outside.projects, [])
+        self.assertIn("declared scope does not list", outside.error)
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_SCOPE_DECLARED": "true"}):
+            fd.declared_scope.set(None, None)
+            self.assertIn("got no collector_args", fd.discover_fleet("ops-mgmt", run=lambda *a, **k: run_of(1)).error)
+        fd.declared_scope.set(None, None)
+        self.assertEqual(fd.discover_fleet("acme-only", run=lambda *a, **k: run_of(1)).projects, ["acme-only"])
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the three flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with mock.patch.object(fd.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            fd.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied", "--scope-exclude-clusters", "ops-mgmt/us-central1/lane-b"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied", "ops-mgmt/us-central1/lane-b")
+
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to the listing.
+        fd.declared_scope.set(None, "payments-staging=denied")
+        discovery = fd.discover_fleet(None, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed")))
+        self.assertEqual(discovery.projects, [])
+        self.assertIn("no project this install could read", discovery.error)
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, fd.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
+
+class DefaultRunTimeoutTest(unittest.TestCase):
+    """`TimeoutExpired` carries the child's output as bytes even under `text=True`;
+    every reader of `Run` matches markers against a str, so the timeout arm
+    must hand back text, as the other collectors' `default_run` copies do."""
+
+    TIMED_OUT = subprocess.TimeoutExpired(["gcloud"], 1, output=b"partial", stderr=b"WARNING: zone did not respond")
+
+    def test_a_timeout_that_wrote_output_returns_text(self):
+        with mock.patch.object(fd.subprocess, "run", side_effect=self.TIMED_OUT):
+            result = fd.default_run(["gcloud"])
+        self.assertEqual(result.rc, fd.TIMEOUT_RC)
+        self.assertEqual((result.stdout, result.stderr), ("partial", "WARNING: zone did not respond"))
+
+    def test_a_timeout_that_wrote_nothing_returns_empty_text(self):
+        with mock.patch.object(fd.subprocess, "run", side_effect=subprocess.TimeoutExpired(["gcloud"], 1)):
+            result = fd.default_run(["gcloud"])
+        self.assertEqual((result.rc, result.stdout, result.stderr), (fd.TIMEOUT_RC, "", ""))
+
+    def test_a_completed_run_passes_its_text_through(self):
+        done = subprocess.CompletedProcess(["gcloud"], 0, stdout="[]", stderr="")
+        with mock.patch.object(fd.subprocess, "run", return_value=done):
+            result = fd.default_run(["gcloud"])
+        self.assertEqual((result.rc, result.stdout, result.stderr), (0, "[]", ""))
+
+    def test_a_timed_out_clusters_list_reads_as_a_gate_failure_in_gclouds_words(self):
+        with mock.patch.object(fd.subprocess, "run", side_effect=self.TIMED_OUT):
+            timed_out = fd.default_run(["gcloud"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            clusters, record, error = fd.enumerate_project_clusters("proj-a", run=lambda argv, **kw: timed_out)
+        self.assertEqual((clusters, record), ([], None))
+        self.assertEqual(error, f"clusters list rc={fd.TIMEOUT_RC}: WARNING: zone did not respond")
+
+    def test_a_timed_out_projects_list_is_quoted_as_text_not_as_a_bytes_repr(self):
+        """`discover_fleet` formats the listing's stderr into the manifest's
+        partial note with an f-string, which renders bytes as `b'...'` without
+        raising; the note must carry gcloud's words."""
+        with mock.patch.object(fd.subprocess, "run", side_effect=self.TIMED_OUT):
+            timed_out = fd.default_run(["gcloud"])
+
+        def run(argv, **_):
+            if argv[:3] == ["gcloud", "config", "get-value"]:
+                return fd.Run(argv, 0, "acme\n", "", 0.0)
+            return timed_out
+
+        fd.declared_scope.set(None, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            discovery = fd.discover_fleet(None, run=run)
+        self.assertEqual(discovery.projects, ["acme"])
+        self.assertIn(f"`gcloud projects list` rc={fd.TIMEOUT_RC}: WARNING: zone did not respond. The scope", discovery.partial)
 
 
 if __name__ == "__main__":

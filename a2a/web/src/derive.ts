@@ -16,7 +16,7 @@ import {
   type TaskView,
   type UiState,
 } from "./model.ts";
-import { STREAMS, TERMINAL_STATES } from "./protocol.ts";
+import { STREAMS, TERMINAL_STATES, usageTotal, type Usage } from "./protocol.ts";
 
 /** A capacity fraction at or past this turns the tile amber. */
 export const CAPACITY_WARN = 0.8;
@@ -27,8 +27,13 @@ export const LIVENESS_STALE_POLLS = 5;
 /** `LIVENESS_STALE_POLLS` * the poller's own interval. */
 export const LIVENESS_STALE_MS = LIVENESS_STALE_POLLS * POLL_MS;
 
-export const SPEND_TBD_REASON =
-  "tbd: the worker adapter parses the harness result line and drops usage, total_cost_usd and duration_ms (a2a/worker-adapter/harness.go), so tokens, cost, model and duration never reach the bus";
+/** What the spend tile and panel say before any task has reported a turn's usage. */
+export const SPEND_EMPTY_REASON =
+  "no task has reported usage yet: each executor publishes a usage artifact when a turn finishes (the worker adapter from the harness result line, the hermes-bridge from the API turn's answer); the bridge's CLI executor reports duration alone, and cost is carried only by a harness that prices its own turns";
+/** The tasks table's cost cell for a task whose turns reported nothing, and its title. */
+export const SPEND_NONE = "—";
+export const SPEND_TASK_NONE_REASON =
+  "this task's turns reported no usage: its executor published no usage artifact, or none of its parts carried a figure";
 export const KV_TBD_REASON =
   "tbd: the only KV size read (STREAM.INFO on the KV_ streams) also lists every key, so the console identity doesn't have it";
 
@@ -177,6 +182,112 @@ export function taskTimes(t: TaskView): string {
   return [q !== undefined ? `queued ${fmtDuration(q)}` : "", d !== undefined ? `ran ${fmtDuration(d)}` : ""]
     .filter(Boolean)
     .join(", ");
+}
+
+const THOUSAND = 1000;
+const MILLION = 1_000_000;
+/** Cents matter under a dollar, so a sub-dollar cost keeps four places. */
+const COST_SMALL_DECIMALS = 4;
+const COST_DECIMALS = 2;
+
+/** One decimal, rounded first, so a value that rounds up to the next band is printed in it (999,950 is 1M, not 1000k). */
+function oneDecimal(v: number): string {
+  return (Math.round(v * 10) / 10).toFixed(1).replace(/\.0$/, "");
+}
+
+export function fmtTokens(n: number): string {
+  if (Math.round(n) < THOUSAND) return `${Math.round(n)}`;
+  const k = oneDecimal(n / THOUSAND);
+  if (Number(k) < THOUSAND) return `${k}k`;
+  return `${oneDecimal(n / MILLION)}M`;
+}
+
+/** The smallest cost the four-place form prints; a positive cost below it is shown as under that, never as $0.0000. */
+const COST_FLOOR = 10 ** -COST_SMALL_DECIMALS;
+
+export function fmtCost(usd: number): string {
+  if (usd > 0 && usd < COST_FLOOR / 2) return `<$${COST_FLOOR.toFixed(COST_SMALL_DECIMALS)}`;
+  return `$${usd.toFixed(usd >= 1 ? COST_DECIMALS : COST_SMALL_DECIMALS)}`;
+}
+
+/** The token counts a usage has: "1.2k in / 80 out", "80 out", or "" when it has neither. */
+export function fmtTokenCounts(u: Usage): string {
+  return [
+    u.inputTokens !== undefined ? `${fmtTokens(u.inputTokens)} in` : "",
+    u.outputTokens !== undefined ? `${fmtTokens(u.outputTokens)} out` : "",
+  ]
+    .filter(Boolean)
+    .join(" / ");
+}
+
+/** One line for a usage: the figures it has, in a fixed order, nothing for the ones it lacks. */
+export function fmtUsage(u: Usage): string {
+  const parts: string[] = [];
+  const counts = fmtTokenCounts(u);
+  if (counts !== "") parts.push(counts);
+  if (u.costUsd !== undefined) parts.push(fmtCost(u.costUsd));
+  if (u.durationMs !== undefined) parts.push(fmtDuration(u.durationMs));
+  if (u.model) parts.push(u.model);
+  return parts.join(", ");
+}
+
+/** The tasks table's cost cell: what the task's turns reported, or a dash. */
+export function taskSpend(t: TaskView): string {
+  return t.usage ? fmtUsage(t.usage) : SPEND_NONE;
+}
+
+export interface Spend {
+  /** Tasks whose turns reported usage. */
+  reported: number;
+  /** Of those, the tasks whose turns carried a cost; the cost sum covers these alone. */
+  priced: number;
+  /** Of those, the tasks whose turns carried token counts; the token sums cover these alone. */
+  counted: number;
+  /**
+   * The distinct models the reporting tasks named, in first-seen order. A
+   * task's own fold keeps the last model its turns named; across tasks the
+   * sums cover every model, so the panel names them all rather than one.
+   */
+  models: string[];
+  /** Their figures summed; absent until one reports. It names no model: the sum covers every task, so `models` holds them. */
+  total?: Usage;
+}
+
+export function spendOf(state: UiState): Spend {
+  const usages = [...state.tasks.values()].flatMap((t) => (t.usage ? [t.usage] : []));
+  const total = usageTotal(usages);
+  return {
+    reported: usages.length,
+    priced: usages.filter((u) => u.costUsd !== undefined).length,
+    counted: usages.filter((u) => u.inputTokens !== undefined || u.outputTokens !== undefined).length,
+    models: [...new Set(usages.flatMap((u) => (u.model ? [u.model] : [])))],
+    total: total === undefined ? undefined : { ...total, model: undefined },
+  };
+}
+
+/** "over 1 of 3 tasks" when a sum covers fewer tasks than reported, else "". */
+export function spendCoverage(part: number, reported: number): string {
+  return part < reported ? ` over ${part} of ${reported} tasks` : "";
+}
+
+/**
+ * The strip's spend tile: the cost when any task priced a turn, the tokens
+ * when any counted them, the time when that is all there is, and why it is
+ * empty before any of that. A sum that covers fewer tasks than reported says
+ * so, since an unpriced task adds nothing rather than zero.
+ */
+export function spendTile(state: UiState): { text: string; title: string } {
+  const { reported, priced, counted, total } = spendOf(state);
+  if (total === undefined) return { text: "none yet", title: SPEND_EMPTY_REASON };
+  const tasks = `${reported} task${reported === 1 ? "" : "s"} reported usage`;
+  if (total.costUsd !== undefined) {
+    return { text: fmtCost(total.costUsd), title: `${tasks}: ${fmtCost(total.costUsd)}${spendCoverage(priced, reported)}` };
+  }
+  if (total.inputTokens !== undefined || total.outputTokens !== undefined) {
+    const tok = `${fmtTokens((total.inputTokens ?? 0) + (total.outputTokens ?? 0))} tok`;
+    return { text: tok, title: `${tasks}: ${tok}${spendCoverage(counted, reported)}` };
+  }
+  return { text: fmtDuration(total.durationMs ?? 0), title: `${tasks}: ${fmtUsage(total)}` };
 }
 
 export type LivenessKind = "live" | "quiet" | "gone" | "idle" | "unknown" | "error" | "finished" | "stale";

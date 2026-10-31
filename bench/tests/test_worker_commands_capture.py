@@ -181,8 +181,172 @@ def test_each_stalled_card_is_archived_in_its_own_exec(monkeypatch):
     calls = []
     monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: calls.append(script) or "")
     harness._archive_stalled_cards(["t_a", "t_b"], 5.0)
-    assert ["'t_a'" in s for s in calls] == [True, False]
-    assert ["'t_b'" in s for s in calls] == [False, True]
+    archives = [s for s in calls if "kanban archive" in s]
+    assert ["'t_a'" in s for s in archives] == [True, False]
+    assert ["'t_b'" in s for s in archives] == [False, True]
+
+
+def _fanout_board(path):
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, created_at INTEGER);"
+        "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER);"
+    )
+    # #2978's shape: platform card t_aa fanned out to four clusters; seeded-a's
+    # card finished, the other three are still waiting, and one of them (t_b3)
+    # fanned out a card of its own.
+    rows = [("t_aa", "archived", 100), ("t_b1", "done", 101), ("t_b2", "running", 102),
+            ("t_b3", "running", 103), ("t_b4", "blocked", 104), ("t_c1", "running", 105),
+            # A card someone else filed before the stalled card, that a worker's
+            # idempotent create handed back and so got attributed to it.
+            ("t_old", "running", 50),
+            # ...which fanned out a card of its own after the stalled card.
+            ("t_old_c1", "running", 110)]
+    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?)", rows)
+    conn.executemany("INSERT INTO kanban_worker_children VALUES (?, ?, ?)",
+                     [("t_b1", "t_aa", 1), ("t_b2", "t_aa", 2), ("t_b3", "t_aa", 3),
+                      ("t_b4", "t_aa", 4), ("t_c1", "t_b3", 5), ("t_old", "t_aa", 6),
+                      ("t_old_c1", "t_old", 7)])
+    conn.commit()
+    conn.close()
+
+
+def test_the_descendants_script_lists_unsettled_fanout_children_recursively(tmp_path):
+    import subprocess
+    import sys
+
+    _fanout_board(str(tmp_path / "kanban.db"))
+    out = subprocess.run(
+        [sys.executable, "-c", harness._DESCENDANTS_SCRIPT, str(tmp_path), "32", "t_aa"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    assert out == ["t_b2", "t_b3", "t_b4", "t_c1", "listed"]
+
+
+def test_the_descendants_script_respects_its_cap(tmp_path):
+    import subprocess
+    import sys
+
+    _fanout_board(str(tmp_path / "kanban.db"))
+    out = subprocess.run(
+        [sys.executable, "-c", harness._DESCENDANTS_SCRIPT, str(tmp_path), "2", "t_aa"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    # One past the cap, so the settle can tell the cap was hit.
+    assert out == ["t_b2", "t_b3", "t_b4", "listed"]
+
+
+def test_a_board_without_the_attribution_table_lists_nothing(tmp_path):
+    import sqlite3
+    import subprocess
+    import sys
+
+    sqlite3.connect(str(tmp_path / "kanban.db")).execute("CREATE TABLE tasks (id TEXT, created_at INTEGER)")
+    out = subprocess.run(
+        [sys.executable, "-c", harness._DESCENDANTS_SCRIPT, str(tmp_path), "32", "t_aa"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert out.strip() == "listed"
+
+
+def test_a_card_filed_before_the_stalled_card_is_not_archived(tmp_path):
+    import subprocess
+    import sys
+
+    _fanout_board(str(tmp_path / "kanban.db"))
+    out = subprocess.run(
+        [sys.executable, "-c", harness._DESCENDANTS_SCRIPT, str(tmp_path), "32", "t_aa"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    assert "t_old" not in out
+    assert "t_old_c1" not in out, "the earlier card's own children were walked"
+
+
+def test_a_listing_that_did_not_finish_is_a_warning(monkeypatch, caplog):
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        assert harness._stalled_descendants(["t_aa"], 5.0) == []
+    assert "could not list the fan-out children of stalled cards t_aa" in caplog.text
+
+
+def _archive_names(calls):
+    return [s.split("archive ")[1].split(" ")[0].strip("'") for s in calls if "kanban archive" in s]
+
+
+def test_the_cap_bounds_the_whole_settle_and_warns_once(monkeypatch, caplog):
+    many = ["t_%02x" % i for i in range(70)]
+    calls = []
+
+    def fake_shell(script, timeout):
+        calls.append(script)
+        if "kanban_worker_children" in script:
+            done = set(_archive_names(calls))
+            fresh = [t for t in many if t not in done]
+            return "\n".join(fresh[: harness._MAX_ARCHIVED_DESCENDANTS + 1]) + "\nlisted\n"
+        return "Archived " + script.split("archive ")[1].split(" ")[0].strip("'")
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._archive_stalled_cards(["t_aa"], 5.0)
+    children = [n for n in _archive_names(calls) if n != "t_aa"]
+    assert len(children) == harness._MAX_ARCHIVED_DESCENDANTS
+    assert caplog.text.count("fanned out more than") == 1
+    assert "32 were archived" in caplog.text
+
+
+def test_running_out_of_passes_is_a_warning(monkeypatch, caplog):
+    passes = iter(["t_b1\nlisted\n", "t_c1\nlisted\n", "t_d1\nlisted\n"])
+    calls = []
+
+    def fake_shell(script, timeout):
+        calls.append(script)
+        if "kanban_worker_children" in script:
+            return next(passes)
+        return "Archived x"
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._archive_stalled_cards(["t_aa"], 5.0)
+    assert "after 3 passes" in caplog.text
+
+
+def test_an_empty_pass_ends_quietly(monkeypatch, caplog):
+    passes = iter(["t_b1\nlisted\n", "listed\n"])
+
+    def fake_shell(script, timeout):
+        if "kanban_worker_children" in script:
+            return next(passes)
+        return "Archived x"
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._archive_stalled_cards(["t_aa"], 5.0)
+    assert "passes" not in caplog.text
+
+
+def test_a_stalled_cards_fanout_children_are_archived_too(monkeypatch, caplog):
+    calls = []
+
+    listings = iter(["t_b2\nt_b3\nnot-an-id\nlisted\n", "t_c1\nlisted\n", "listed\n"])
+
+    def fake_shell(script, timeout):
+        calls.append(script)
+        if "kanban_worker_children" in script:
+            return next(listings)
+        return "Archived " + script.split("archive ")[1].split(" ")[0].strip("'")
+
+    monkeypatch.setattr(harness, "_agent_shell", fake_shell)
+    with caplog.at_level("INFO", logger="kube_agents_bench.harness"):
+        harness._archive_stalled_cards(["t_aa"], 5.0)
+    archives = [s for s in calls if "kanban archive" in s]
+    ids = [next(t for t in ("t_aa", "t_b2", "t_b3", "t_c1") if f"'{t}'" in s) for s in archives]
+    # The stalled card first, before anything is listed, then each pass's new ids.
+    assert ids == ["t_aa", "t_b2", "t_b3", "t_c1"]
+    assert "kanban archive" in calls[0], "the stalled card is archived before the first listing"
+    assert "archived fan-out child of a stalled card t_b2" in caplog.text
+    assert not any("not-an-id" in s for s in archives)
 
 
 def test_an_archive_that_fails_is_a_warning_naming_the_card(monkeypatch, caplog):
@@ -207,7 +371,8 @@ def test_a_refused_archive_warns_with_hermes_reason(monkeypatch, caplog):
     monkeypatch.setattr(harness, "_agent_shell", fake_shell)
     with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
         harness._archive_stalled_cards(["t_gone"], 5.0)
-    assert scripts[0].endswith("2>&1 || true")
+    archive = next(s for s in scripts if "kanban archive" in s)
+    assert archive.endswith("2>&1 || true")
     assert "could not archive stalled card t_gone" in caplog.text
     assert "task t_gone not found" in caplog.text
 

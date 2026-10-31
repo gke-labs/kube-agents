@@ -11,11 +11,14 @@ directory cases below are that regression, not a formality.
 """
 
 import io
+import fcntl
 import shutil
 import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 from contextlib import redirect_stderr
@@ -216,6 +219,141 @@ class CronStoreMergeTest(unittest.TestCase):
         custom = next(j for j in merged if j["id"] == "legacy-custom")
         self.assertEqual("low", custom.get("risk"))
         self.assertNotIn("risk", legacy, "the merge must not mutate caller input in-place")
+
+    def test_cron_jobs_lock_held_during_overlay(self):
+        """Issue #3179: Hermes' .jobs.lock must be held exclusively while merging jobs.json."""
+        write(self.template / "cron" / "jobs.json", json.dumps({"jobs": [job("audit")]}))
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", last_run="yesterday")]}))
+
+        lock_held = False
+        lock_file = self.home / "cron" / ".jobs.lock"
+
+        orig_merge = ps.merge_cron_store
+
+        def probe_merge(*args, **kwargs):
+            nonlocal lock_held
+            self.assertTrue(lock_file.is_file(), ".jobs.lock must exist while merge runs")
+            with open(lock_file, "r") as f:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    lock_held = False
+                except (BlockingIOError, OSError):
+                    lock_held = True
+            return orig_merge(*args, **kwargs)
+
+        with unittest.mock.patch.object(ps, "merge_cron_store", side_effect=probe_merge):
+            ps.overlay_template(self.home, self.template, None, ("cron",))
+
+        self.assertTrue(lock_held, ".jobs.lock was NOT held exclusively during overlay")
+
+    def test_cron_pause_during_overlay_not_lost(self):
+        """Issue #3179: A cron pause landing while gateway starts must survive the merge."""
+        write(self.template / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", prompt="image prompt")]}))
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", prompt="old prompt", state="running")]}))
+
+        lock_file = self.home / "cron" / ".jobs.lock"
+        jobs_path = self.home / "cron" / "jobs.json"
+        orig_merge = ps._merge_after_overlay
+        pause_thread = None
+        about_to_lock = threading.Event()
+
+        def pause_worker():
+            fd = open(lock_file, "a+", encoding="utf-8")
+            try:
+                about_to_lock.set()
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    data = json.loads(jobs_path.read_text(encoding="utf-8"))
+                    data["jobs"][0]["state"] = "paused"
+                    data["jobs"][0]["paused_at"] = "2026-10-15T07:23:22Z"
+                    jobs_path.write_text(json.dumps(data), encoding="utf-8")
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                fd.close()
+
+        def inject_pause_mid_merge(*args, **kwargs):
+            nonlocal pause_thread
+            pause_thread = threading.Thread(target=pause_worker)
+            pause_thread.start()
+            self.assertTrue(about_to_lock.wait(timeout=5.0))
+            # If overlay_template holds .jobs.lock, pause_worker blocks in flock(LOCK_EX), so join times out.
+            # If overlay_template does NOT hold .jobs.lock, pause_worker finishes immediately, writing mid-merge
+            # before orig_merge runs, which orig_merge's os.replace clobbers.
+            pause_thread.join(timeout=0.05)
+            return orig_merge(*args, **kwargs)
+
+        with unittest.mock.patch.object(ps, "_merge_after_overlay", side_effect=inject_pause_mid_merge):
+            ps.overlay_template(self.home, self.template, None, ("cron",))
+
+        if pause_thread:
+            pause_thread.join()
+
+        merged = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+        self.assertEqual(merged[0]["state"], "paused", "pause state was lost during startup merge")
+        self.assertEqual(merged[0]["paused_at"], "2026-10-15T07:23:22Z")
+        self.assertEqual(merged[0]["prompt"], "image prompt", "image prompt was not updated")
+
+    def test_overlay_template_copies_non_cron_outside_lock(self):
+        """Non-cron template items (skills, governance) must be copied outside .jobs.lock."""
+        write(self.template / "skills" / "foo.md", "skill content")
+        write(self.template / "cron" / "jobs.json", json.dumps({"jobs": [job("audit")]}))
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("audit")]}))
+
+        lock_path = self.home / "cron" / ".jobs.lock"
+        copied_skills_during_lock = False
+        orig_copytree = shutil.copytree
+
+        def probe_copytree(src, dst, *args, **kwargs):
+            nonlocal copied_skills_during_lock
+            if "skills" in str(src):
+                if lock_path.is_file():
+                    try:
+                        with open(lock_path, "a+") as probe_fd:
+                            try:
+                                fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                fcntl.flock(probe_fd, fcntl.LOCK_UN)
+                            except (BlockingIOError, OSError):
+                                copied_skills_during_lock = True
+                    except OSError:
+                        pass
+            return orig_copytree(src, dst, *args, **kwargs)
+
+        with unittest.mock.patch("shutil.copytree", side_effect=probe_copytree):
+            ps.overlay_template(self.home, self.template, None, ("skills", "cron"))
+
+        self.assertFalse(copied_skills_during_lock, "shutil.copytree on skills was called while .jobs.lock was held")
+
+    def test_cron_jobs_lock_non_contention_oserror_fails_open_immediately(self):
+        """Non-BlockingIOError OSError (e.g. ENOLCK/EOPNOTSUPP) fails open immediately without 15s wait."""
+        import errno
+        lock_dir = self.home / "cron"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.monotonic()
+        with unittest.mock.patch("fcntl.flock", side_effect=OSError(errno.ENOLCK, "No record locks available")):
+            with ps.cron_jobs_lock(lock_dir, timeout=5.0):
+                pass
+        duration = time.monotonic() - t0
+        self.assertLess(duration, 1.0, f"lock waited {duration}s on permanent OSError instead of failing open immediately")
+
+    def test_cron_jobs_lock_timeout_fallback(self):
+        """When .jobs.lock is held and times out, overlay_template still completes."""
+        write(self.template / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", prompt="new")]}))
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", prompt="old")]}))
+
+        lock_file = self.home / "cron" / ".jobs.lock"
+        (self.home / "cron").mkdir(parents=True, exist_ok=True)
+        lock_fd = open(lock_file, "a+")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            with unittest.mock.patch.object(ps, "DEFAULT_JOBS_LOCK_TIMEOUT_SECONDS", 0.05):
+                ps.overlay_template(self.home, self.template, None, ("cron",))
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+        merged = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+        self.assertEqual(merged[0]["prompt"], "new")
 
     def test_an_operator_job_with_explicit_risk_is_preserved(self):
         custom_high = {"id": "custom-high", "schedule": {"kind": "cron", "expr": "* * * * *"}, "risk": "high"}
@@ -430,6 +568,216 @@ class EnsureProfileTest(unittest.TestCase):
         self.assertTrue(ps.is_scaffolded(self.home))
 
 
+class NpmCacheTest(unittest.TestCase):
+    """Every profile's npm uses one cache under $HERMES_HOME (gke-labs#3376).
+
+    A profile's processes run with HOME at <profile>/home, so without a ~/.npm link
+    npm keeps a separate ~100 MiB cache per profile.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.real_run = ps.subprocess.run
+        self.addCleanup(setattr, ps.subprocess, "run", self.real_run)
+        ps.subprocess.run = self.fake_run
+
+    def fake_run(self, cmd, **kwargs):
+        """Stand in for `hermes profile create`, which also makes the profile's home/."""
+        home = Path(kwargs["env"]["HERMES_HOME"]) / "profiles" / cmd[3]
+        (home / "home").mkdir(parents=True, exist_ok=True)
+        (home / "profile.yaml").write_text(f"name: {cmd[3]}\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def scaffold(self, hermes_home, name="cluster-a"):
+        with redirect_stderr(io.StringIO()):
+            return ps.ensure_profile(name, "desc", hermes_home) / "home"
+
+    def share(self, process_home, hermes_home, reclaim=False):
+        with redirect_stderr(io.StringIO()) as err:
+            ps.share_npm_cache(process_home, hermes_home, reclaim=reclaim)
+        return err.getvalue()
+
+    def npm_cache(self, process_home):
+        """`npm config get cache` as a process with HOME=process_home sees it."""
+        cwd = self.tmp / "cwd"
+        cwd.mkdir(exist_ok=True)
+        proc = self.real_run(
+            ["npm", "config", "get", "cache"],
+            capture_output=True, text=True, timeout=60, cwd=cwd,
+            env={"PATH": ps.os.environ["PATH"], "HOME": str(process_home)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip()
+
+    def old_cache(self, process_home):
+        """A per-profile cache as npm left it before this change."""
+        old = process_home / ".npm" / "_cacache"
+        old.mkdir(parents=True)
+        (old / "index").write_bytes(b"x" * 10)
+        return process_home / ".npm"
+
+    def test_a_scaffolded_profile_uses_the_shared_cache(self):
+        """Hermes looks for npx packages at ~/.npm/_npx, so that path leads to the shared cache too."""
+        for hermes_home in (self.tmp / "opt" / "data", self.tmp / "srv" / "agent-home"):
+            with self.subTest(hermes_home=hermes_home):
+                process_home = self.scaffold(hermes_home)
+                shared = hermes_home / ".cache" / "npm"
+                self.assertTrue((process_home / ".npm").is_symlink())
+                self.assertEqual((process_home / ".npm").resolve(), shared)
+                if shutil.which("npm"):
+                    self.assertEqual(Path(self.npm_cache(process_home)).resolve(), shared)
+
+    @unittest.skipUnless(shutil.which("npm"), "npm is not installed")
+    def test_without_the_link_npm_uses_a_cache_per_home(self):
+        """The control for the test above: the cache follows HOME when nothing points it elsewhere."""
+        process_home = self.tmp / "profiles" / "cluster-a" / "home"
+        process_home.mkdir(parents=True)
+        self.assertEqual(self.npm_cache(process_home), f"{process_home}/.npm")
+
+    @unittest.skipUnless(shutil.which("npm"), "npm is not installed")
+    def test_a_cache_line_a_user_wrote_still_wins(self):
+        process_home = self.scaffold(self.tmp)
+        (process_home / ".npmrc").write_text("cache=/elsewhere/npm\n", encoding="utf-8")
+        self.assertEqual(self.npm_cache(process_home), "/elsewhere/npm")
+
+    def test_an_existing_symlink_stays(self):
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        (process_home / ".npm").symlink_to("/elsewhere/npm")
+
+        self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertEqual(ps.os.readlink(process_home / ".npm"), "/elsewhere/npm")
+
+    def test_the_scaffolder_leaves_an_old_cache_in_place(self):
+        """A process of the profile can be using it; only the start-up sweep removes it."""
+        process_home = self.tmp / "profiles" / "cluster-a" / "home"
+        process_home.mkdir(parents=True)
+        old = self.old_cache(process_home)
+
+        self.scaffold(self.tmp)
+
+        self.assertFalse(old.is_symlink())
+        self.assertTrue((old / "_cacache" / "index").is_file())
+
+    def test_the_sweep_replaces_an_old_cache(self):
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        old = self.old_cache(process_home)
+
+        err = self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertEqual(old.resolve(), self.tmp / ".cache" / "npm")
+        self.assertIn(f"reclaimed the per-profile npm cache {process_home / ps.NPM_RECLAIM_NAME} (10 bytes)", err)
+
+    def test_a_failed_delete_still_leaves_the_link(self):
+        # The old cache is moved aside before the link goes in, so a delete that
+        # fails (another replica writing into it) leaves an orphan directory,
+        # never a home with no link until the next start.
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        old = self.old_cache(process_home)
+        real_rmtree = ps.shutil.rmtree
+        self.addCleanup(setattr, ps.shutil, "rmtree", real_rmtree)
+
+        def fail(path, *args, **kwargs):
+            raise OSError(39, "Directory not empty", str(path))
+
+        ps.shutil.rmtree = fail
+        err = self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertTrue(old.is_symlink())
+        self.assertEqual(old.resolve(), self.tmp / ".cache" / "npm")
+        self.assertTrue((process_home / ps.NPM_RECLAIM_NAME).is_dir())
+        self.assertIn(f"could not delete the old per-profile npm cache {process_home / ps.NPM_RECLAIM_NAME}", err)
+        self.assertNotIn("could not point npm", err)
+
+        # The next start-up sweep deletes the orphan.
+        ps.shutil.rmtree = real_rmtree
+        err = self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertFalse((process_home / ps.NPM_RECLAIM_NAME).exists())
+        self.assertIn("reclaimed the per-profile npm cache", err)
+        self.assertTrue(old.is_symlink())
+
+    def test_an_orphan_does_not_block_the_next_reclaim(self):
+        # A start-up stopped between the move and the link: an orphan and no
+        # link. A process then made a new real cache. The sweep removes both.
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        old = self.old_cache(process_home)
+        orphan = process_home / ps.NPM_RECLAIM_NAME
+        (orphan / "_cacache").mkdir(parents=True)
+        (orphan / "_cacache" / "index").write_text("x" * 7, encoding="utf-8")
+
+        err = self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertEqual(old.resolve(), self.tmp / ".cache" / "npm")
+        self.assertFalse(orphan.exists())
+        self.assertNotIn("WARN", err)
+
+    def test_the_scaffolder_leaves_an_orphan_alone(self):
+        """Only the start-up sweep deletes, because a process can be using the directory."""
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        orphan = process_home / ps.NPM_RECLAIM_NAME
+        orphan.mkdir()
+
+        self.share(process_home, self.tmp)
+
+        self.assertTrue(orphan.is_dir())
+
+    def test_a_second_run_changes_nothing(self):
+        process_home = self.scaffold(self.tmp)
+        before = ps.os.readlink(process_home / ".npm")
+
+        self.assertEqual(self.share(process_home, self.tmp, reclaim=True), "")
+        self.assertEqual(ps.os.readlink(process_home / ".npm"), before)
+
+    def test_the_link_follows_a_moved_agent_home(self):
+        """An absolute link would point npm at the old mount path."""
+        old_home, new_home = self.tmp / "opt" / "data", self.tmp / "srv" / "agent-home"
+        self.scaffold(old_home)
+        new_home.parent.mkdir(parents=True)
+        old_home.rename(new_home)
+
+        link = new_home / "profiles" / "cluster-a" / "home" / ".npm"
+        self.assertEqual(link.resolve(), new_home / ".cache" / "npm")
+
+    def test_a_removed_shared_cache_is_made_again(self):
+        """npm fails on every command when its cache is a dangling link."""
+        process_home = self.scaffold(self.tmp)
+        (self.tmp / ".cache" / "npm").rmdir()
+
+        self.scaffold(self.tmp)
+
+        self.assertTrue((process_home / ".npm").resolve().is_dir())
+
+    def test_a_missing_home_is_not_created(self):
+        """Hermes uses <profile>/home as HOME only when it exists; creating it would move HOME."""
+        process_home = self.tmp / "profiles" / "cluster-a" / "home"
+        self.share(process_home, self.tmp)
+        self.assertFalse(process_home.exists())
+
+    def test_the_sweep_reaches_the_default_home_and_every_profile(self):
+        homes = [self.tmp / "home", self.tmp / "profiles" / "a" / "home", self.tmp / "profiles" / "b" / "home"]
+        for home in homes:
+            home.mkdir(parents=True)
+        self.old_cache(homes[1])
+        bare = self.tmp / "profiles" / "c"
+        bare.mkdir()
+
+        with unittest.mock.patch.object(sys, "argv", ["profile_scaffold.py", "--share-npm-cache"]), \
+                unittest.mock.patch.dict(ps.os.environ, {"HERMES_HOME": str(self.tmp)}), \
+                redirect_stderr(io.StringIO()):
+            ps.main()
+
+        for home in homes:
+            self.assertEqual((home / ".npm").resolve(), self.tmp / ".cache" / "npm")
+        self.assertFalse((bare / "home").exists())
+
+
 class BackfillCronStoreTest(unittest.TestCase):
     """Tests for standalone cron store backfill helpers (for cluster profiles and runtime stores)."""
 
@@ -481,6 +829,32 @@ class BackfillCronStoreTest(unittest.TestCase):
 
     def test_backfill_cron_file_handles_nonexistent_file(self):
         self.assertFalse(ps.backfill_cron_file(self.root / "absent.json"))
+
+    def test_backfill_cron_file_holds_cron_jobs_lock(self):
+        cron_file = self.root / "jobs.json"
+        cron_file.write_text(json.dumps({"jobs": [{"id": "job1"}]}))
+        lock_held = False
+        orig_backfill = ps.backfill_cron_store
+
+        def probe_backfill(*args, **kwargs):
+            nonlocal lock_held
+            lock_path = self.root / ".jobs.lock"
+            if lock_path.is_file():
+                try:
+                    with open(lock_path, "a+") as probe_fd:
+                        try:
+                            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            fcntl.flock(probe_fd, fcntl.LOCK_UN)
+                        except (BlockingIOError, OSError):
+                            lock_held = True
+                except OSError:
+                    pass
+            return orig_backfill(*args, **kwargs)
+
+        with unittest.mock.patch.object(ps, "backfill_cron_store", side_effect=probe_backfill):
+            ps.backfill_cron_file(cron_file)
+
+        self.assertTrue(lock_held, ".jobs.lock was NOT held exclusively during backfill_cron_file")
 
 
 if __name__ == "__main__":

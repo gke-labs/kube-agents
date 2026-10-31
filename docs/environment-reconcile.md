@@ -1,22 +1,22 @@
 # Reconciling the long-lived environments
 
 A maintainer runbook for the environments **kube-agents itself** runs its CI
-against — `autopush`, `staging`, `rc` and `nightly`. Nothing here is something a
-user configures on their own install. It covers how `autopush` and `staging` are
-kept in step with `terraform/examples/full-install`, what each one has to be
+against — `autopush`, `autopush-next`, `staging`, `rc` and `nightly`. Nothing
+here is something a user configures on their own install. It covers how the
+long-lived ones are kept in step with `terraform/examples/full-install`, what each one has to be
 configured with, and what to do when a drift report opens.
 [`scripts/release/README.md`](../scripts/release/README.md) documents the
 scripts these workflows run; [`ci-pool-projects.md`](ci-pool-projects.md) is the
 runbook for the presubmit's project pool.
 
-`autopush` and `staging` are long-lived: they are installed once and then kept
-running, and people live-test pull requests against them. `rc` and `nightly` are
+`autopush`, `autopush-next` and `staging` are long-lived: they are installed
+once and then kept running, and people live-test pull requests against them. `rc` and `nightly` are
 the opposite — every pipeline run destroys them and builds them again from
 `terraform/examples/full-install`, so they always run today's composition.
 
 Automated deployments to long-lived environments do not use isolated `helm upgrade`
-shortcuts. Instead, `Autopush: Deploy` (`autopush-deploy.yml`) and `Staging: Deploy`
-(`staging-deploy.yml`) drive unified, atomic reconciliations via `reconcile-environment.yml`
+shortcuts. Instead, `Autopush: Deploy` (`autopush-deploy.yml`), `Autopush-Next: Deploy`
+(`autopush-next-deploy.yml`) and `Staging: Deploy` (`staging-deploy.yml`) drive unified, atomic reconciliations via `reconcile-environment.yml`
 (`upgrade.sh --upgrade-mode=full`). Each deployment updates the Terraform composition,
 IAM bindings, Pub/Sub topics, and Helm release together from the candidate commit, and
 records the deployed image tag directly in Terraform state.
@@ -34,7 +34,9 @@ no lease.
 One issue per environment, edited in place while the drift lasts and closed
 automatically by the first clean plan. A plan that fails to run leaves whatever
 is open exactly as it is — a failure is not evidence either way, and the red job
-is the signal.
+is the signal. `autopush-next` is the exception while it is being provisioned:
+until its GitHub environment exists with a `GCP_PROJECT_ID`, its plan posts a
+notice and is skipped rather than failing.
 
 The plan pins no image tag. It holds the tag at whatever the last apply
 recorded, read out of Terraform state (`image_tag: ""`), so the daily report
@@ -55,6 +57,7 @@ Long-lived environments are reconciled and deployed atomically using `./upgrade.
 
 - **staging** is deployed by `Staging: Deploy` (`staging-deploy.yml`), which triggers when the staging promotion pipeline pushes a `staging_*` tag. It pushes that tag only after two gates: its full E2E test matrix passes on a fresh nightly cluster, and the release-candidate eval returns GREEN on the `evalcand_*` tag it pushes first. The workflow reconciles the Terraform composition, Helm release, and container images together atomically from that validated candidate commit.
 - **autopush** is deployed by `Autopush: Deploy` (`autopush-deploy.yml`), which triggers whenever candidate container images are successfully published to GHCR from `main`.
+- **autopush-next** is deployed by `Autopush-Next: Deploy` (`autopush-next-deploy.yml`), on the same trigger and resolving the same commit, from its own GitHub environment and GCP project, which set `PLATFORM_AGENT_MODE=next`. It is a separate workflow so that each lane holds its own workflow-level concurrency group: a run holds the group from creation, so resolve and deploy are serialized together and an older publish never lands after a newer one, and a failure or a held lease on one environment does not hold up the other. Its `REGISTRY_PREFIX` has to match `autopush`'s, because its resolve job checks the candidate images bound to `autopush`, so that it never binds, and so creates, an unprovisioned `autopush-next`. Until its GitHub environment exists with a `GCP_PROJECT_ID`, its deploy posts a notice and reports `skipped`. The installer reads that variable, so the reconcile renders `spec.mode: next` and the environment runs `next`; what a rebuild does with it is under [`PLATFORM_AGENT_MODE`](#what-each-environment-has-to-be-configured-with) below. `Autopush-Next: Google Chat E2E` (`autopush-next-e2e-gchat.yml`) reads `E2E_GCP_SERVICE_ACCOUNT`, `E2E_GCP_WORKLOAD_IDENTITY_PROVIDER` and `E2E_CHAT_SPACE_ID` from the same environment and skips until all three are set ([`tests/e2e/README.md`](../tests/e2e/README.md#against-autopush-next)).
 
 A deploy takes the live-test lease before it applies anything (see
 [`designs/live-test-lease.md`](designs/live-test-lease.md)).
@@ -62,7 +65,11 @@ Because automated release deploys must not silently drop candidate releases or r
 success on an unapplied commit, lease contention fails loudly (`lease_policy: fail`)
 rather than deferring silently.
 
-Run one by hand with `Shared: Reconcile Environment` (`mode: apply`). Locally,
+Run one by hand with `Shared: Reconcile Environment` (`mode: apply`). An apply to an older
+`image_tag` stops when the move leaves behind a commit marked as a breaking change, and names each
+one; set `allow_breaking_downgrade` on that dispatch, or on the `image_tag` dispatch of
+`Autopush: Deploy`, `Autopush-Next: Deploy` or `Staging: Deploy`, to roll the environment back
+anyway. Locally,
 `./upgrade.sh --plan` against any install shows what a reconcile would change;
 [`terraform/examples/full-install/README.md`](../terraform/examples/full-install/README.md#asking-what-an-apply-would-change)
 documents it.
@@ -70,10 +77,29 @@ documents it.
 ## The rebuild button
 
 When an in-place apply cannot converge, `Shared: Deploy Environment` takes
-`autopush` and `staging` as well as `rc` and `nightly`. It **destroys the
+the long-lived environments as well as `rc` and `nightly`. It **destroys the
 cluster** and builds it again, so it asks you to type the environment's name
 into `confirm_destroy`, and it refuses unless the live-test lease reads back
 as free.
+
+A project with no cluster yet passes that check: there is no cluster to hold a
+lease and nothing to tear down, and the install builds the environment from
+nothing. That is how a long-lived environment is first created, once the
+project setup has enabled the Kubernetes Engine API (the WIF setup script
+does). The in-place reconcile cannot create one, because it connects to the
+cluster before it plans or applies, so between the GitHub environment gaining
+its `GCP_PROJECT_ID` and that first dispatch, the environment's deploy lane
+and its daily drift plan go red. Only a genuine NOT_FOUND passes, and then
+only when the project has no cluster under any name, since each long-lived
+environment owns its project and a cluster there under another name means
+`GKE_CLUSTER_NAME` is wrong, and when the install's Terraform state agrees: none, or state that records
+no cluster or records this cluster at the configured location, is an earlier
+attempt or a cluster that is gone, and the teardown clears what is left. State
+that records this cluster at another location means the coordinates are wrong
+and the cluster is probably alive, and state that records any other cluster,
+with or without this one, would lose that cluster to the teardown, so the
+rebuild refuses in both cases. Any other failure to read either refuses too,
+because a cluster that could not be read has not answered "absent".
 
 Read [what a teardown does not preserve](#what-a-rebuild-does-not-preserve)
 before using it.
@@ -105,20 +131,28 @@ on any install, keyed on the `install.env` names in the table's second column;
 [`scripts/installer/README.md`](../scripts/installer/README.md#the-install-configuration-installenv)
 states it for users.
 
-`ENABLE_DRIFT_DETECTOR` is the exception to the paragraph above, and the only one:
-its shipped default is `true`, so an omission provisions rather than destroys — a
-Log Router sink exporting every GKE cluster in the project, a Pub/Sub topic and a
-subscription that retains a copy of those records for 31 days. Nothing is lost by
-leaving it unset, and an environment that wants the detector need not set it. It is
-in the table because it is the only way to say no: the reconcile regenerates
-`install.env` from these variables on every run, so the `ENABLE_DRIFT_DETECTOR=false`
-line that is the opt-out everywhere else does not survive to the next one here.
+`ENABLE_DRIFT_DETECTOR` and `VERTEX_MANAGE_SERVING_PROJECT` are the exceptions to the
+paragraph above. Their shipped defaults are `true`, so an omission provisions rather
+than destroys. For `ENABLE_DRIFT_DETECTOR` that is a
+Log Router sink exporting every GKE cluster in the project (one more per project a declared scope lists), a Pub/Sub topic and a
+subscription that retains a copy of those records for 31 days. For
+`VERTEX_MANAGE_SERVING_PROJECT`, on an install whose `MODEL_PROVIDER` is `vertex_ai`,
+it is the Vertex AI API enabled and the gateway's role granted on the serving
+project, which can be a project the installing identity does not administer.
+Leaving either unset destroys nothing. They are in the table because it is the
+only way to say no: the reconcile regenerates `install.env` from these variables on
+every run, so a `false` line written into that file does not survive to the next one.
+Setting `VERTEX_MANAGE_SERVING_PROJECT` to `false` on an environment whose earlier
+applies made the grant destroys it on the next reconcile, and the gateway's model
+calls fail until it is made by hand; remove both resources from state first, as the
+[composition README](../terraform/examples/full-install/README.md#what-it-provisions)
+shows under its `vertex_ai` entry.
 
 Required for a **plan** as much as for an apply: the reconcile renders `--strict`
 before it branches on the mode, so until an environment carries all twelve required
 settings the daily drift report goes red on it rather than reporting no drift.
-`ENABLE_DRIFT_DETECTOR` is not among the twelve — a strict render does not ask for
-it, for the reason in the paragraph above.
+Neither exception is among the twelve — a strict render does not ask for them, for
+the reason in the paragraph above.
 
 | GitHub variable                 | install.env key                 | Notes                                                                                                                                               |
 | ------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -134,7 +168,8 @@ it, for the reason in the paragraph above.
 | `ENABLE_GKE_BACKUP_PLAN`        | `ENABLE_GKE_BACKUP_PLAN`        | Absent destroys the backup plan                                                                                                                     |
 | `ENABLE_PUBSUB_PLATFORM`        | `ENABLE_PUBSUB_PLATFORM`        | Absent removes the adapter plugin unless `ENABLE_STOCKOUT_INVESTIGATOR` keeps it; the Pub/Sub API it enabled stays on and nothing else is destroyed |
 | `ENABLE_STOCKOUT_INVESTIGATOR`  | `ENABLE_STOCKOUT_INVESTIGATOR`  | Absent destroys log sink and stockout alerts topic/sub                                                                                              |
-| `ENABLE_DRIFT_DETECTOR`         | `ENABLE_DRIFT_DETECTOR`         | The one that runs the other way: absent **provisions** the drift Log Router sink, topic and subscription, because the shipped default is `true`     |
+| `ENABLE_DRIFT_DETECTOR`         | `ENABLE_DRIFT_DETECTOR`         | Runs the other way: absent **provisions** the drift Log Router sink, topic and subscription, because the shipped default is `true`                  |
+| `VERTEX_MANAGE_SERVING_PROJECT` | `VERTEX_MANAGE_SERVING_PROJECT` | Also runs the other way on a `vertex_ai` install: absent **enables** the Vertex AI API and grants the gateway's role on the serving project         |
 
 Required when the integration they belong to is switched on, because an empty
 allowlist is not "no opinion" — the operator reads an absent list as allow-all,
@@ -167,9 +202,11 @@ the `secrets: inherit` gap
 [`scripts/release/README.md`](../scripts/release/README.md) describes for
 `GH_APP_ID`, which drops every secret the same way.
 
-`ENABLE_GKE_BACKUP_PLAN`, `ENABLE_GVISOR`, and `HERMES_DASHBOARD_ENABLED` are checked
-there too, for spelling rather than presence. All three reach `install.sh` as
-`--enable-*` flags, whose validator takes `true` or `false` and nothing else, while
+`ENABLE_GKE_BACKUP_PLAN`, `ENABLE_GVISOR`, `HERMES_DASHBOARD_ENABLED`, `WEB_CONSOLE_ENABLED`,
+`ENABLE_DRIFT_DETECTOR`, and `VERTEX_MANAGE_SERVING_PROJECT` are checked there too,
+for spelling rather than presence. All six reach `install.sh` as boolean flags
+(`--enable-*`, `--vertex-manage-serving-project`), whose validators take `true` or
+`false` and nothing else, while
 the same values travelling through `install.env` reach `is_truthy`, which also takes
 `True`/`yes`/`y`/`1`/`on`. `provision_environment.sh` folds the second list into
 the first, so an environment that deployed on `True` keeps deploying; a spelling
@@ -182,7 +219,7 @@ environment with the feature off and nothing in the log saying so.
 Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `GOOGLE_CHAT_MODE`, `GOOGLE_CHAT_HOME_CHANNEL`,
 `CHAT_TOPIC_NAME`, `CHAT_SUB_NAME`, `SLACK_ENABLED`, `SLACK_HOME_CHANNEL`,
-`SLACK_HOME_CHANNEL_NAME`, `PLATFORM_AGENT_CUSTOM_ROLES`,
+`SLACK_HOME_CHANNEL_NAME`, `SLACK_HOME_CHANNEL_POLICY`, `PLATFORM_AGENT_CUSTOM_ROLES`,
 `REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`,
 `KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`, `PLATFORM_AGENT_MODE`. Secrets: `GH_APP_ID`,
 `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`,
@@ -190,15 +227,15 @@ Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 
 `PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`; the
 renderer refuses anything else and writes `today` as no key, because an absent
-`spec.mode` is `today` to the CRD. The installer does not read the key, so on this
-path it changes nothing on the cluster, and `install.env.example` has no entry for it:
-it is a release-path key until the installer reads it. A rebuild through
-`deploy-environment.yml` takes the mode as its `mode` input instead and applies `next`
-to the `PlatformAgent` itself after the install, on `rc` and `nightly` only. Both that
-workflow and `provision_environment.sh` refuse `next` on `autopush` and `staging`:
-there the patched mode would outlive the run, since the chart renders no `spec.mode`
-and nothing this page describes (reconcile, upgrade, drift report) reads it back, and
-Google Chat would stay on the A2A gateway until a `today` rebuild.
+`spec.mode` is `today` to the CRD. The installer reads the key (`install.sh --mode`
+records it in `install.env`), so on this path a full upgrade renders the mode into the
+chart, and a key edited since the last apply switches the install. A rebuild through
+`deploy-environment.yml` takes the mode as its `mode` input instead; on `rc` and
+`nightly` it hands that to `install.sh` and gates on what the operator renders for it.
+Both that workflow and `provision_environment.sh` refuse `next` on `autopush`,
+`autopush-next` and `staging` and pass no mode for them, so a rebuild of a long-lived
+environment installs `today`. One whose variable says `next` moves back to `next` on
+its next reconcile, and the drift plan shows the difference in between.
 
 Two naming details that are easy to trip over:
 
@@ -245,8 +282,8 @@ cluster and everything on it.
 
 ## Applying repeatedly against an environment that exists
 
-The in-place reconcile — the daily plan and the applies `Autopush: Deploy` and
-`Staging: Deploy` drive through `reconcile-environment.yml` — is the only thing in
+The in-place reconcile — the daily plan and the applies `Autopush: Deploy`,
+`Autopush-Next: Deploy` and `Staging: Deploy` drive through `reconcile-environment.yml` — is the only thing in
 this project that applies to the same environment over and over; `rc` and
 `nightly` destroy theirs first and so never exercise it. Two properties of the composition matter only on that path, and
 both are covered by comments in the source rather than restated here:

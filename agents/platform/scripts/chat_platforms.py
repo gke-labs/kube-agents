@@ -3,7 +3,7 @@
 #
 # One question, answered separately in several files, which is why the Cluster Agent
 # reconcile summary reached Google Chat and nothing else on every install (#989). The
-# other answers, and where each stands:
+# other answers, the callers that have converged on this one, and where each stands:
 #
 #   - `session_kv_server.enabled_chat_platforms` — the same three-source, per-platform
 #     resolution as this module, landed by #1111 for the cron report relay. It is the
@@ -11,8 +11,13 @@
 #     precedence; `get_active_platform` is now a single-destination reader on top of
 #     it, for the alert path, which needs exactly one platform because a thread
 #     belongs to one.
-#   - `platform_mcp_server.get_enabled_platforms` — still keyed on SLACK_BOT_TOKEN;
-#     #742/#743 record the defect and PR #735 is open against it.
+#   - `platform_mcp_server.send_notification` — a caller since #743, not an answer.
+#     It used to answer the question locally off CONFIG_PATH and then
+#     `SLACK_BOT_TOKEN or SLACK_HOME_CHANNEL` / `GOOGLE_CHAT_PROJECT_ID or
+#     GOOGLE_CHAT_HOME_CHANNEL`, never reading the managed scope. Under the
+#     credential proxy the token half is unsatisfiable and the home channel is
+#     rendered regardless, so on a managed pod it resolved off the environment and
+#     could disagree with the alert half of its own pipeline.
 #   - `profile_cron_tick.home_target_env` / `HOME_TARGET_ENV_KEYS` — a different
 #     question (which home *target* a cron child gets, re-read from config.yaml
 #     because the environment cannot carry it) but the same per-platform table.
@@ -30,6 +35,8 @@
 
 import os
 import sys
+
+import chat_notify
 
 # The platforms this harness ships an egress path for, in the order a message is
 # posted to them. Google Chat leads because it is where every one of these messages
@@ -70,8 +77,9 @@ CONFIG_PATH = os.environ.get("PLATFORM_AGENT_CONFIG_PATH", "/opt/data/config.yam
 # consumer, so it answers the question being asked rather than approximating it
 # (platformagent_manifests.go, the `integration.GoogleChat` / `integration.Slack` blocks
 # in buildPodTemplateSpec). Under `mode: next` Google Chat moves to the A2A gateway and
-# the variable is not set here, which this list correctly reads as Chat not being this
-# pod's to post to.
+# the variable is not set here, so this list does not count it; the platform
+# `chat_notify.routed_platform()` names, from `A2A_NOTIFY_PLATFORM` or the projected
+# home-channel file, is counted through the gateway's notify route.
 #
 # In a deployed pod the relay URL is not merely first, it is the only one of these
 # that arrives. A bot token is a credential, so it lives in the credential-proxy
@@ -96,6 +104,20 @@ _ENV_SIGNALS = {
 # caller had before this module existed, so an install this function cannot read is
 # no worse off than it was.
 DEFAULT_PLATFORM = "google_chat"
+
+# The suffix on the variable naming a platform's home channel — where a notification
+# goes when it has no session thread to reply under. Derived from the platform name
+# rather than tabulated against it, as `deploy/docker/plugins/chat/adapter.py` already
+# does, so that a platform added to CHAT_PLATFORMS cannot silently miss an entry. A
+# platform whose variable is unset is addressed by bare name: `hermes send` resolves
+# the channel from Hermes' own config, which is what an install that enables a
+# platform without rendering a home channel relies on.
+#
+# Here rather than beside its one reader in `platform_mcp_server`, because the guard
+# that holds the `platform_control` allowlist in step with CHAT_PLATFORMS has to pair
+# the two, and this module is the one of the pair a test can import without the
+# FastMCP dependency this file's header refuses to make callers pay for.
+HOME_CHANNEL_ENV_SUFFIX = "_HOME_CHANNEL"
 
 
 def _mapping(value: object) -> dict:
@@ -175,7 +197,12 @@ def enabled_chat_platforms() -> list[str]:
     An explicit `enabled: false` therefore wins over an environment signal, in either
     file: that combination is an operator or an admin turning a platform off on a pod
     that still has the variables rendered on it, and the file is the more specific
-    statement.
+    statement. The one exception is the platform `chat_notify.routed_platform()`
+    names, from `A2A_NOTIFY_PLATFORM` or the projected home-channel file: under
+    `next` the managed scope turns that platform's Hermes consumer off because the
+    A2A gateway holds the backend, and posts reach it through the gateway, so it
+    counts as enabled whatever the files say. The operator renders the variable
+    and the file only then, and reserves the variable.
 
     Never returns an empty list: an install that resolves to nothing gets
     DEFAULT_PLATFORM, which is what every caller did unconditionally before.
@@ -185,7 +212,13 @@ def enabled_chat_platforms() -> list[str]:
 
     resolved = []
     for name in CHAT_PLATFORMS:
-        if name in from_managed:
+        # Under next the managed scope says the Hermes platform is off, because
+        # the A2A gateway holds the backend; posts to it go through the
+        # gateway's chat.notify route instead (chat_notify.py), so it is
+        # still a platform this install posts to.
+        if chat_notify.routes(name):
+            enabled = True
+        elif name in from_managed:
             enabled = from_managed[name]
         elif name in from_profile:
             enabled = from_profile[name]

@@ -74,6 +74,9 @@ jobs:
     with:
       github_environment: "rc"
       rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
+      # The gating leg installs the mode a new install gets, which is next
+      # (#2007). The today leg after step 5 keeps the rollback mode covered.
+      mode: "next"
     secrets: inherit
 
   step-3-run-e2e-tests:
@@ -95,6 +98,10 @@ jobs:
     with:
       github_environment: "rc"
       commit_sha: ${{ needs.step-1-create-tag.outputs.commit_sha }}
+      mode: "next"
+      # The default plus the readiness gate `next` adds (e2e-run.yml's `mode`
+      # input). SiblingGatewayRolloutGatesTest holds the floor.
+      timeout_minutes: 125
       # The Chat gate blocks the candidate; the cluster and fleet-audit suite is
       # coverage that must not. Their scenario and stream filters are declared in
       # the `rc` suite's `env_vars` in e2e_config.yaml.
@@ -137,6 +144,93 @@ jobs:
         step-3-run-e2e-tests,
         step-4-tag-validated,
       ]
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-create-tag.outputs.skip_rc != 'true'
+    uses: ./.github/workflows/teardown-environment.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      github_environment: "rc"
+      rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
+
+  # ---------------------------------------------------------------------------
+  # The today leg: the same E2E suites against a `spec.mode: today` install,
+  # so the mode an existing install keeps, and the one a rollback from next
+  # lands on, stays exercised now that the gating leg (steps 2 and 3) installs
+  # next. It reuses the `rc` environment rather than a second one: it starts
+  # only after step 5 has destroyed the next install, so the two never share
+  # the cluster, and it needs no project, variables or secrets the gating leg
+  # does not already use. `nightly` is the other ephemeral environment, and the
+  # staging promotion pipeline drives it end to end once a day, so a
+  # three-hourly caller would rebuild it out from under that run.
+  #
+  # NON-GATING. Step 4 has already tagged the candidate validated and nothing
+  # depends on these jobs, so a today-only failure reds this run without
+  # holding back a release. The run's own conclusion is therefore the worse of
+  # the two legs; the `Today mode` job names say which. The leg does delay the
+  # next candidate: the workflow-level concurrency group holds a newer
+  # dispatch until step 8 ends, roughly doubling a run. It goes when today is
+  # removed (#2007).
+  #
+  # `mode: "today"` is written out rather than left to the inputs' default. On
+  # its own that does not pin the install: platform_agent_mode.sh resolves an
+  # explicit `today` to "no key", so the pin holds only while
+  # provision_environment.sh hands install.sh `--mode` explicitly rather than
+  # leaving the mode to install.sh's default. Drop that and this leg installs
+  # whatever new installs get.
+  #
+  # Hung off step 5 and inheriting its success() gate, so the leg runs only for
+  # a candidate that passed on next, and only once the next cluster is gone.
+  # A next failure leaves that cluster standing for diagnosis, and deploying
+  # today here would destroy it. The same rule holds within the leg: step 8
+  # tears down only after steps 6 and 7 passed, and a today failure stays up
+  # until the next run's step 2 replaces it.
+  # ---------------------------------------------------------------------------
+  step-6-deploy-today-env:
+    name: Today mode (non-gating) - Step 6 - Provision RC Environment
+    needs: [step-1-create-tag, step-5-teardown-env]
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-create-tag.outputs.skip_rc != 'true'
+    # `inherit` for the reason step 2 records.
+    uses: ./.github/workflows/deploy-environment.yml # zizmor: ignore[secrets-inherit]
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      github_environment: "rc"
+      rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
+      mode: "today"
+    secrets: inherit
+
+  step-7-run-e2e-today:
+    name: Today mode (non-gating) - Step 7 - Run E2E Tests
+    needs: [step-1-create-tag, step-6-deploy-today-env]
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-create-tag.outputs.skip_rc != 'true'
+    # `inherit` for the reason step 3 records.
+    uses: ./.github/workflows/e2e-run.yml # zizmor: ignore[secrets-inherit]
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      github_environment: "rc"
+      commit_sha: ${{ needs.step-1-create-tag.outputs.commit_sha }}
+      mode: "today"
+      # The suites step 3 runs, split the same way, so the two legs' results
+      # read side by side. `gchat` fails this job; `rc` is reported and
+      # tolerated, as it is on next.
+      blocking_suite: "gchat"
+      optional_suites: "rc"
+    secrets: inherit
+
+  step-8-teardown-today-env:
+    name: Today mode (non-gating) - Step 8 - Tear Down RC Environment
+    # Every job of the leg, for the reason step 5 records.
+    needs: [step-1-create-tag, step-6-deploy-today-env, step-7-run-e2e-today]
     if: |
       github.repository == 'gke-labs/kube-agents' &&
       needs.step-1-create-tag.outputs.skip_rc != 'true'

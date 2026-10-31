@@ -10,7 +10,6 @@ deployments continue to use the direct path.
 import argparse
 import email.message
 import http.client
-import io
 import json
 import os
 import re
@@ -64,18 +63,34 @@ GH_TIMEOUT_RC = 124
 #: resolves there and is the one refresh_git_credentials forwards to.
 SANDBOX_REFRESH_SCRIPT = "/opt/data/scripts/github_token_refresh.py"
 
-#: The two Minty scopes the rule ConfigMap declares (charts/kube-agents/templates/
+#: The three Minty scopes the rule ConfigMap declares (charts/kube-agents/templates/
 #: github-minter.yaml). The write scope is what every managed repository rides;
 #: the read scope grants `contents: read` alone and is minted per clone of a
-#: context repository, by the broker, for its own git and nothing else.
+#: context repository, by the broker, for its own git and nothing else; the
+#: sweep scope reads contents, pull requests and issues of one managed
+#: repository, for the broker's read of the agent's own proposals.
 MINTY_WRITE_SCOPE = "platform-agent-scope"
 MINTY_READ_SCOPE = "platform-agent-read-scope"
+MINTY_SWEEP_SCOPE = "platform-agent-sweep-scope"
 
 #: The flag that selects the read-only mint. `credential_proxy.CommandExecutor`
 #: spells the same flag when it runs this script; it cannot import this module
 #: for the constant without also importing the CLI side, so the two copies are
 #: kept in step by `test_credential_proxy.py`.
 READ_ONLY_FLAG = "--read-only"
+
+#: The flag that selects the sweep mint: a token in the sweep scope for one
+#: managed repository, printed bare on stdout, nothing installed.
+#: `credential_proxy.FORGE_SWEEP_FLAG` is the same string, kept in step by
+#: `test_credential_proxy.py`.
+SWEEP_FLAG = "--sweep"
+
+#: The flags that select the write mint for a GitHub Enterprise Server host:
+#: the token and the repositories it covers are printed as JSON, and nothing is
+#: installed. `credential_proxy.FORGE_WRITE_MINT_FLAG` and `FORGE_HOST_FLAG` are
+#: the same strings, kept in step by `test_credential_proxy.py`.
+PRINT_WRITE_FLAG = "--print-write-token"
+HOST_FLAG = "--host"
 
 #: How long one Minty request may take, how long the CLI may take to install
 #: what Minty returned, and how long gcloud may take to print an identity token.
@@ -686,6 +701,69 @@ def mint_read_only_token(target_repo: str | None) -> str:
     return token
 
 
+def mint_sweep_token(target_repo: str | None) -> str:
+    """A sweep-scope installation token for one managed repository, and nothing else.
+
+    Reads contents, pull requests and issues, and writes nothing: what the
+    broker presents to the forge API when it reads the outcome of the agent's
+    own proposals. Like `mint_read_only_token` it goes straight to Minty for
+    this one repository and installs nothing; the broker admits managed
+    repositories only before it runs this.
+    """
+    repository = target_repo.strip().strip("/") if target_repo else ""
+    if not repo_ref.is_github_slug(repository):
+        raise RuntimeError(
+            f"Could not identify target repository '{repository}'. Must be in 'owner/repo' format."
+        )
+    org_name, repo_name = repository.split("/", 1)
+    token = request_minty_token(
+        broker_oidc_token(), org_name, [repo_name], MINTY_SWEEP_SCOPE
+    )
+    log(f"Minted a sweep installation token for repository: {repository}")
+    return token
+
+
+def mint_write_token(target_repo: str | None, host: str) -> dict:
+    """A write installation token for one repository on a GitHub Enterprise Server host.
+
+    `{"token": ..., "repositories": [...]}`: the token, and every repository
+    its scope covers as `owner/name`. What the broker presents for a managed
+    repository on a GitHub forge with no CLI behind it (`MintedWriteCredential`).
+    It differs from `refresh_git_credentials` in one way, on purpose: it touches
+    nothing. There is no CLI login, no credential helper and no file; the
+    token goes back to the broker, which keeps it in memory.
+
+    The scope is widened to every managed repository of the same organisation
+    on the same host, as the write refresh widens it, so one token serves the
+    managed repositories a verb run may touch. Repositories on another host are
+    never in it.
+    """
+    repository = target_repo.strip().strip("/") if target_repo else ""
+    if not repo_ref.is_github_slug(repository):
+        raise RuntimeError(
+            f"Could not identify target repository '{repository}'. Must be in 'owner/repo' format."
+        )
+    host = (host or "").strip().lower()
+    if not host or host in repo_ref.GITHUB_HOSTS:
+        raise RuntimeError(f"{PRINT_WRITE_FLAG} mints for a GitHub Enterprise Server host, not {host or 'no host'}")
+    org_name, repo_name = repository.split("/", 1)
+    repositories = [repo_name]
+    try:
+        from gitops_workspace import get_managed_repo_keys
+
+        prefix = f"github:{host}/{org_name.lower()}/"
+        for key in get_managed_repo_keys():
+            if key.startswith(prefix):
+                name = key[len(prefix):]
+                if "/" not in name and name not in {r.lower() for r in repositories}:
+                    repositories.append(name)
+    except Exception as e:
+        log(f"WARNING: Could not expand managed repositories for token scoping: {e}")
+    token = request_minty_token(broker_oidc_token(), org_name, repositories, MINTY_WRITE_SCOPE)
+    log(f"Minted a write installation token for repository {repository} on {host}")
+    return {"token": token, "repositories": [f"{org_name}/{r}".lower() for r in repositories]}
+
+
 class RefreshToken(str):
     """An installation token that carries the repositories it was scoped for."""
 
@@ -752,12 +830,21 @@ def refresh_git_credentials(
         # forge refuses a name without a host. `/v1/github/refresh` is kept on
         # the broker as an alias for agent images older than this.
         url = proxy_url.rstrip("/") + "/v1/forge/refresh"
+        # On the install's GitHub host: github.com, or the GitHub Enterprise
+        # Server host the repository lists name, which the broker serves
+        # instead of github.com.
+        try:
+            from gitops_workspace import github_host
+
+            host = github_host()
+        except Exception:  # noqa: BLE001 - github.com, as before
+            host = repo_ref.GITHUB_CANONICAL_HOST
         request = urllib.request.Request(
             url,
             data=json.dumps(
                 {
                     "provider": "github",
-                    "repository": f"https://{repo_ref.GITHUB_CANONICAL_HOST}/{repository}",
+                    "repository": f"https://{host}/{repository}",
                 }
             ).encode("utf-8"),
             # Empty in the sidecar deployment; carries the caller's projected
@@ -932,8 +1019,28 @@ def main():
         help="print a contents:read installation token for the repository on "
         "stdout, installing nothing; the broker's clone of a context repository",
     )
+    parser.add_argument(
+        SWEEP_FLAG,
+        action="store_true",
+        help="print a contents, pull-request and issue read installation token "
+        "for the repository on stdout, installing nothing; the broker's read of "
+        "the agent's own proposals in a managed repository",
+    )
+    parser.add_argument(
+        PRINT_WRITE_FLAG,
+        action="store_true",
+        help="print a write installation token for the repository on a GitHub "
+        "Enterprise Server host, as JSON, installing nothing; the broker keeps it in memory",
+    )
+    parser.add_argument(HOST_FLAG, default="", help="the GitHub Enterprise Server host to mint for")
     args = parser.parse_args()
     try:
+        if args.print_write_token:
+            print(json.dumps(mint_write_token(args.repository, args.host)), end="")
+            return
+        if args.sweep:
+            print(mint_sweep_token(args.repository), end="")
+            return
         if args.read_only:
             print(mint_read_only_token(args.repository), end="")
             return

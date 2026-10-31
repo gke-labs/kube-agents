@@ -1,0 +1,40 @@
+Subject: Reconcile the `flexStart` placement rule with the AI/ML ladder
+
+Why: The synced rule said to put `flexStart: true` at the very end of `priorities[]`, while the CRITICAL AI/ML RULE, the Inference pattern and its asset put Spot after DWS; the rule now says to make Flex the last non-preemptible tier, which keeps its queue-wait reason and agrees with the ladder, and names Prod Training as the case that accepts the wait above On-Demand; the Prod Training row's rationale now says the same instead of calling its DWS-above-OD order "Flex at bottom".
+Local-Issue: #2692
+Upstream-Issue: none filed yet
+Retire-When: when upstream states one `flexStart` placement across SKILL.md and the prioritization reference
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -225,7 +225,7 @@ not block the user's initial request.** If asked for YAML/recommendations:
+     -   *Safety*: `maxUnavailable: 0` does not block pod creation (Pod Create API) or rollback (Pod Delete API). Involuntary VM loss (Spot preemption) bypasses PDBs and ReplicaSet spawns replacements immediately.
+ -   **Fallback Ladder & Standby Headroom Best Practices (`machineFamily` vs `nodepools` & `CapacityBuffer`):**
+     -   *Prefer `machineFamily` over `priorities[].nodepools`*: Rules referencing manual node pools do not benefit from ComputeClass cooldown prolongation and rely solely on standard 5-minute GCE MIG backoffs. Sprawling manual pool lists (>6–8 pools) cause early MIG backoffs to expire before lower rungs are evaluated, bouncing the autoscaler back to the top in an infinite loop. Use `machineFamily` with `nodePoolAutoCreation.enabled: true`.
+-    -   *Place `flexStart: true` at the very end*: Dynamic Workload Scheduler (DWS) queuing takes 3–15+ minutes to return stockout signals; placing `flexStart` higher in the ladder allows earlier backoffs to expire during the wait and resets the autoscaler to the top.
++    -   *Place `flexStart: true` below the reservation and On-Demand rungs*: Dynamic Workload Scheduler (DWS) queuing takes 3–15+ minutes to return stockout signals; placing `flexStart` higher in the ladder allows earlier backoffs to expire during the wait and resets the autoscaler to the top. Make it the last non-preemptible tier (`Reservations -> On-Demand -> DWS FlexStart -> Spot`, per the CRITICAL AI/ML RULE); Spot may follow it.
+     -   *Avoid `min-nodes` on fallback pools (Scheduler Bypass)*: `kube-scheduler` assigns incoming pods to idle nodes held by `min-nodes` *before* Cluster Autoscaler evaluates ComputeClass priorities. If fallback pools have `min-nodes > 0`, pods land on fallback hardware permanently, bypassing preferred tiers. Set `min-nodes: 0` and use `CapacityBuffer` (`autoscaling.x-k8s.io`, with `provisioningStrategy: buffer.x-k8s.io/active-capacity`).
+     -   *GKE 1.36+ Synchronous Obtainability*: Starting in GKE 1.36, Cluster Autoscaler checks internal capacity obtainability synchronously in memory before creating VMs, skipping exhausted families without tripping GCE API errors or backoff cooldowns. Note: `gcloud beta compute advice capacity` is a discrete Spot/Flex heuristic (0.1, 0.5, 0.9); Google does not expose public real-time on-demand APIs.
+ -   **Stateful PV StorageClass — recommend `dynamic-rwo`:** GKE
+diff --git a/references/compute-class-prioritization.md b/references/compute-class-prioritization.md
+--- a/references/compute-class-prioritization.md
++++ b/references/compute-class-prioritization.md
+@@ -27,7 +27,7 @@
+ -   **`flexStart` Ordering Rule**:
+     -   DWS Flex Start priorities use queued capacity provisioning, which takes 3–15+ minutes to return a stockout signal.
+     -   If placed high or middle in `priorities[]`, higher-tier backoffs expire during the queue wait, resetting Cluster Autoscaler to the top of the ladder.
+-    -   *Best Practice*: Always place `flexStart: true` at the **very end** of `priorities[]`.
++    -   *Best Practice*: Place `flexStart: true` below every reservation and On-Demand rung, so it is the last non-preemptible tier (`Res -> OD -> DWS -> Spot`, as the CRITICAL AI/ML RULE and the Inference pattern below give); Spot may follow it. Keep the rungs above it few, and do not put it above On-Demand unless the queue wait is acceptable, as in the Prod Training pattern.
+ -   **`min-nodes` Interaction with Scheduler**:
+     -   `kube-scheduler` places incoming pods on existing idle capacity (held warm by `min-nodes`) *before* Cluster Autoscaler evaluates ComputeClass priorities.
+     -   If lower-priority manual pools have idle capacity due to high `min-nodes`, pods immediately schedule onto those lower-priority nodes, bypassing preferred ComputeClass tiers entirely.
+@@ -44,7 +44,7 @@
+ Pattern        | Priority Order           | Rationale                                                                                   | Asset
+ -------------- | ------------------------ | ------------------------------------------------------------------------------------------- | -----
+ Inference      | Res -> OD -> DWS -> Spot | Accelerator node startup is slow. Avoid Spot preemption risk for latency-sensitive serving. | `genai-inference-g4-compute-class.yaml`
+-Prod Training  | Res -> DWS -> OD -> Spot | DWS wait acceptable. Spot preemption disruptive. Put DWS before Spot; Flex at bottom of non-preemptible tiers. | `tpu-v5e-training-compute-class.yaml`
++Prod Training  | Res -> DWS -> OD -> Spot | DWS wait acceptable. Spot preemption disruptive. Put DWS before Spot; here DWS deliberately sits above OD, the exception to the Flex-last rule. | `tpu-v5e-training-compute-class.yaml`
+ Dev Training   | Spot -> OD               | Spot for cost; OD floor unblocks dev.                                                       |
+ Cost Batch     | Spot -> OD               | Use `priorityScore` to pick cheapest Spot family.                                           | `spot-cost-tiebreak-compute-class.yaml`
+ Latency Hybrid | Manual -> Auto-creation  | Skip auto-creation delay by hitting warm pools (limit manual pools to ≤6–8).                | `manual-pool-tiebreak-compute-class.yaml`

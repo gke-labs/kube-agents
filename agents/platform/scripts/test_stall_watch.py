@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import stall_report  # noqa: E402
 import stall_watch  # noqa: E402
 
 REAL_SESSION_KV = stall_watch.session_kv
@@ -67,6 +68,21 @@ DEPLOYMENT_ROW = finding(
 #: A row that clears on the first scan without it, for tests about other things.
 DEADLINE_ROW = finding("checkout", "Deployment/checkout-api", "stale-condition", "Progressing=False ProgressDeadlineExceeded")
 TIMEOUT = subprocess.TimeoutExpired("gcloud", stall_watch.GET_CREDENTIALS_TIMEOUT_SECONDS)
+#: What the shim prints when the per-cluster stub is gone (KubeconfigUnreadable).
+STUB_LOST = "credential proxy: kubeconfig is unreadable: /home/hermes/.kube/stall-watch/c.yaml: [Errno 2] No such file or directory"
+#: kubectl 1.36 prints its discovery error before the reason, in the shape
+#: below, so on a GKE endpoint the reason starts past STDERR_EXCERPT_CHARS.
+DISCOVERY_ERROR = 'E1009 13:21:49.702947 97623 memcache.go:265] "Unhandled Error" err="couldn\'t get current server API group list: Get \\"https://34.118.224.1:443/api?timeout=5s\\": '
+#: What kubectl prints against a recreated cluster whose certificate changed.
+CERT_CHANGED = DISCOVERY_ERROR + 'tls: failed to verify certificate: x509: certificate signed by unknown authority"\nUnable to connect to the server: tls: failed to verify certificate: x509: certificate signed by unknown authority'
+#: What kubectl prints against a recreated cluster whose old endpoint refuses connections.
+REFUSED = DISCOVERY_ERROR + 'dial tcp 34.118.224.1:443: connect: connection refused"\nUnable to connect to the server: dial tcp 34.118.224.1:443: connect: connection refused'
+#: What kubectl prints, in about 30 s under the proxy's request timeout, against
+#: a cluster whose control plane does not answer: no reason that names the
+#: kubeconfig.
+DARK = DISCOVERY_ERROR + 'dial tcp 34.118.224.1:443: i/o timeout"\nUnable to connect to the server: dial tcp 34.118.224.1:443: i/o timeout'
+#: What the shim prints when the proxy refused the command at its admission bound.
+PROXY_BUSY = "the credential proxy is at its limit of 8 concurrent commands and this request waited 60s without reaching a free slot; retry shortly"
 #: What `kubectl api-resources -o name` prints for the default kinds on a cluster that serves them all.
 SERVED_DEFAULT = ["deployments.apps", "statefulsets.apps", "daemonsets.apps", "jobs.batch", "gateways.gateway.networking.k8s.io", "httproutes.gateway.networking.k8s.io", "certificates.cert-manager.io", "pods", "configmaps"]
 NOT_SCANNED = "warning: deployments in checkout not scanned; its objects are missing from the count: kubectl exited 1\n"
@@ -102,10 +118,23 @@ class FakeFleet:
     `project:name` or `project:name@location` in another project. A project
     in `listing_fails` cannot be listed; `listing_stderr` is a string for
     every project or a {project: stderr} map. A project in `listing_hangs`
-    does not answer its listing until its Event is set."""
+    does not answer its listing until its Event is set. `annotations` maps a
+    namespace to the annotations its listing carries. `namespaces_listing`
+    maps a cluster name to the (stdout, stderr) its namespace listing returns
+    with exit 0. `object_annotations` maps (namespace, Kind/name) to the
+    exempt annotation's value a `kubectl get` of that object prints; an object
+    not in it prints nothing, as a deleted one does."""
 
-    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, listing_fails=(), listing_hangs=None):
+    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, namespaces_fail_once=(), listing_fails=(), listing_hangs=None, fetch_fails=(), annotations=None, namespaces_listing=None, object_annotations=None):
+        self.annotations = annotations or {}
+        self.object_annotations = object_annotations or {}
+        self.namespaces_listing = namespaces_listing or {}
         self.api_resources_rc_one = api_resources_rc_one
+        # Names whose `get-credentials` the proxy refuses at its admission bound.
+        self.fetch_fails = set(fetch_fails)
+        # Names whose first `kubectl get namespaces` exits 1 with the lost-stub
+        # text, or a {name: stderr} map for another refusal text.
+        self.namespaces_fail_once = dict(namespaces_fail_once) if isinstance(namespaces_fail_once, dict) else {n: STUB_LOST for n in namespaces_fail_once}
         self.listing_hangs = listing_hangs or {}
         self.listing_stderr = listing_stderr
         self.listing_fails = set(listing_fails)
@@ -143,11 +172,30 @@ class FakeFleet:
             _, namespaces = self.fleet[(project, name, location)]
             if isinstance(namespaces, Exception):
                 raise namespaces
+            if name in self.fetch_fails:
+                return completed(argv, "", returncode=1, stderr=PROXY_BUSY)
             return completed(argv)
         _, namespaces = self.fleet[self._cluster_from(kubeconfig)]
+        if isinstance(namespaces, Exception):
+            # An unreachable cluster fails whatever is asked of it, a reused
+            # kubeconfig included, not only the fetch.
+            raise namespaces
         if argv[:3] == ["kubectl", "get", "namespaces"]:
+            name = self._cluster_from(kubeconfig)[1]
+            if name in self.namespaces_fail_once:
+                return completed(argv, "", returncode=1, stderr=self.namespaces_fail_once.pop(name))
+            if name in self.namespaces_listing:
+                stdout, stderr = self.namespaces_listing[name]
+                return completed(argv, stdout, stderr=stderr)
             names = list(namespaces) + self.namespaces_extra
-            return completed(argv, "".join(f"namespace/{n}\n" for n in names))
+            # The jsonpath listing: every name, the marker, the names whose
+            # exempt annotation is exactly the value, and the marker.
+            marker = stall_watch.NAMESPACE_LIST_MARKER
+            exempt = [n for n in names if self.annotations.get(n, {}).get(stall_watch.EXEMPT_ANNOTATION) == stall_watch.EXEMPT_VALUE]
+            return completed(argv, "".join(f"{line}\n" for line in [*names, marker, *exempt, marker]))
+        if argv[:2] == list(stall_watch.EXEMPT_READ_ARGV) and argv[-len(stall_watch.EXEMPT_READ_FLAGS):] == list(stall_watch.EXEMPT_READ_FLAGS):
+            namespace = argv[argv.index("-n") + 1]
+            return completed(argv, self.object_annotations.get((namespace, argv[2]), ""))
         if argv[:2] == ["kubectl", "api-resources"]:
             if isinstance(self.served, Exception):
                 raise self.served
@@ -300,7 +348,7 @@ class Base(unittest.TestCase):
         conn.executescript(BOARD_SCHEMA)
         conn.close()
         env = {stall_watch.PROJECT_ENVS[0]: PROJECT, "PLATFORM_AGENT_HOME": self.tmp.name}
-        for var in (stall_watch.KINDS_ENV, stall_watch.REPORT_SCRIPT_ENV, stall_watch.STATE_PATH_ENV, *stall_watch.PROJECT_ENVS[1:]):
+        for var in (stall_watch.KINDS_ENV, stall_watch.EXCLUDE_NAMESPACES_ENV, stall_watch.MIN_AGE_ENV, stall_watch.REPORT_SCRIPT_ENV, stall_watch.STATE_PATH_ENV, *stall_watch.PROJECT_ENVS[1:]):
             env[var] = ""
         patcher = patch.dict(os.environ, env)
         patcher.start()
@@ -1287,8 +1335,12 @@ class Unreadable(Base):
         with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, over] + [over] * 8):
             lines, fake = self.run_tick(fleet)
         self.assertEqual(fake.scanned(), ["ns"])
-        self.assertEqual(lines, [], "c was listed but never read; its row is unknown, not gone")
-        self.assertIn("exhausted after 1 clusters and 1 namespaces", self.ledger()["unreadable"][stall_watch.BUDGET_SCOPE])
+        self.assertEqual(
+            [l for l in lines if not l.startswith(stall_watch.COVERAGE_EXHAUSTED_PREFIX)],
+            [],
+            "c was listed but never read; its row is unknown, not gone",
+        )
+        self.assertIn("read 1 of 3 clusters (1 namespaces)", self.ledger()["unreadable"][stall_watch.BUDGET_SCOPE])
         self.assertEqual(len(self.ledger()["stalls"]), 1)
 
     def test_an_exhausted_sweep_resumes_where_it_stopped(self):
@@ -1306,6 +1358,402 @@ class Unreadable(Base):
         self.assertEqual(fake.scanned(), ["n4", "n1", "n2", "n3"])
         self.assertIsNone(self.ledger()[stall_watch.CURSOR_KEY])
         self.assertEqual(len(self.last_alerts), 1)
+
+
+class Credentials(Base):
+    """The per-cluster kubeconfig outlives the tick, so credentials are fetched
+    once and reused: a `get-credentials` through the shim is a real gcloud run
+    at the broker every time, and the broker serves kubectl from its own
+    managed kubeconfig regardless."""
+
+    def credential_fetches(self, fake):
+        return [argv[4] for argv, _, _ in fake.calls if argv[:4] == ["gcloud", "container", "clusters", "get-credentials"]]
+
+    def test_credentials_are_fetched_on_the_first_tick_and_reused_on_the_next(self):
+        fleet = {"a": {"ns": []}, "b": {"ns": []}}
+        _, first = self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        self.assertEqual(sorted(self.credential_fetches(first)), ["a", "b"])
+        records = self.ledger()[stall_watch.CREDENTIALS_KEY]
+        self.assertEqual(records, {stall_watch.cluster_id(PROJECT, "a", LOCATION): "2026-10-08T10:00:00+00:00", stall_watch.cluster_id(PROJECT, "b", LOCATION): "2026-10-08T10:00:00+00:00"})
+        _, second = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00")
+        self.assertEqual(self.credential_fetches(second), [])
+        self.assertEqual(second.scanned(), ["ns", "ns"], "both clusters were still read, on the reused kubeconfigs")
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY], records, "a reused record keeps its fetch time")
+
+    def test_a_record_older_than_the_refresh_interval_is_fetched_again(self):
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        stale = stall_watch.CREDENTIALS_REFRESH_SECONDS + 60
+        later = (stall_watch.datetime.fromisoformat("2026-10-08T10:00:00+00:00") + stall_watch.timedelta(seconds=stale)).isoformat()
+        _, fake = self.run_tick(fleet, now=later)
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], later)
+
+    def test_a_cluster_whose_first_read_fails_on_a_reused_kubeconfig_is_fetched_again_and_read(self):
+        # The sandbox pod restarted and the stub file is gone, or the cluster
+        # was recreated: the shim refuses the kubeconfig, the watch fetches
+        # once more and retries that one call, and the cluster is read.
+        fleet = {"a": {"ns": [dict(DEPLOYMENT_ROW, namespace="ns")]}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        lines, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once=("a",))
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertEqual(fake.scanned(), ["ns"])
+        self.assertNotIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:30:00+00:00")
+
+    def test_a_cluster_whose_read_fails_after_a_fresh_fetch_is_unreadable_without_a_second_fetch(self):
+        fleet = {"a": {"ns": []}}
+        _, fake = self.run_tick(fleet, namespaces_fail_once=("a",))
+        self.assertEqual(self.credential_fetches(fake), ["a"], "a fetch this tick is not repeated for the same failure")
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertNotIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()[stall_watch.CREDENTIALS_KEY], "a cluster the fetch did not make readable keeps no record")
+
+    def test_the_refetch_signals_are_read_past_the_ledgers_excerpt(self):
+        # The reason follows kubectl's discovery error, and on a GKE endpoint
+        # the refused connection lands past the 200 characters the ledger
+        # keeps: matched on the excerpt alone it would never fetch. `tls:`
+        # ends just inside the excerpt and survives either way.
+        self.assertGreater(len(REFUSED), stall_watch.STDERR_EXCERPT_CHARS)
+        self.assertFalse(any(sig in stall_watch.stderr_excerpt(REFUSED) for sig in stall_watch.REFETCH_SIGNALS))
+        for stderr in (REFUSED, CERT_CHANGED):
+            self.assertTrue(stall_watch.refetch_repairs(stall_watch.ReadFailed("kubectl get namespaces exited 1: " + stall_watch.stderr_excerpt(stderr), stderr)))
+        self.assertFalse(stall_watch.refetch_repairs(stall_watch.ReadFailed("kubectl get namespaces exited 1: " + stall_watch.stderr_excerpt(DARK), DARK)))
+
+    def test_a_recreated_clusters_refused_connection_is_fetched_again_and_read(self):
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once={"a": REFUSED})
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertEqual(fake.scanned(), ["ns"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:30:00+00:00")
+
+    def test_a_recreated_clusters_certificate_refusal_is_fetched_again_and_read(self):
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once={"a": CERT_CHANGED})
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertEqual(fake.scanned(), ["ns"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:30:00+00:00")
+
+    def test_a_proxy_refusal_on_a_reused_kubeconfig_is_not_fetched_again_and_keeps_the_record(self):
+        # The proxy said busy: a fetch would be one more gcloud at the proxy
+        # that just refused, and would not repair anything. The cluster is
+        # unread this tick, its record stays, and the next tick reads on it.
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once={"a": PROXY_BUSY})
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual(fake.scanned(), [])
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T11:00:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual(fake.scanned(), ["ns"])
+
+    def test_a_dark_clusters_connection_failure_is_not_fetched_again_and_keeps_the_record(self):
+        # kubectl's generic prefix on an unanswered control plane, which the
+        # proxy's request timeout turns into an exit 1: no fetch repairs it,
+        # so no fetch, one wait, and the record stays for when it answers.
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once={"a": DARK})
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual([argv[:3] for argv, _, _ in fake.calls if argv[:1] == ["kubectl"]], [["kubectl", "get", "namespaces"]], "one read, no retry")
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T11:00:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual(fake.scanned(), ["ns"])
+
+    def test_a_repair_fetch_that_fails_leaves_no_record_so_the_next_tick_fetches_first(self):
+        # The stub is gone and the proxy refuses the repair fetch: the record
+        # for a kubeconfig the read just found unusable does not survive the
+        # tick, so the next tick fetches first rather than failing the same
+        # read on the same stub again.
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once=("a",), fetch_fails=("a",))
+        self.assertEqual(self.credential_fetches(fake), ["a"], "the repair fetch was tried once")
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertNotIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()[stall_watch.CREDENTIALS_KEY])
+        _, fake = self.run_tick(fleet, now="2026-10-08T11:00:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertEqual([argv[:3] for argv, _, _ in fake.calls if argv[:3] == ["kubectl", "get", "namespaces"]], [["kubectl", "get", "namespaces"]], "fetch first, one read, no failed read on the old stub")
+        self.assertEqual(fake.scanned(), ["ns"])
+
+    def test_a_fetch_whose_discovery_times_out_keeps_its_record_and_the_next_tick_does_not_fetch(self):
+        # First tick: the fetch succeeded and its kubeconfig listed the
+        # namespaces, then `kubectl api-resources` timed out. The kubeconfig is
+        # proven; the record stays, and the next tick reads on it.
+        fleet = {"a": {"ns": []}}
+        discovery_timeout = subprocess.TimeoutExpired("kubectl", stall_watch.API_RESOURCES_TIMEOUT_SECONDS)
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:00:00+00:00", served=discovery_timeout)
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual(fake.scanned(), ["ns"])
+
+    def test_a_repair_fetch_whose_discovery_times_out_still_records_the_new_kubeconfig(self):
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        discovery_timeout = subprocess.TimeoutExpired("kubectl", stall_watch.API_RESOURCES_TIMEOUT_SECONDS)
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once=("a",), served=discovery_timeout)
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:30:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T11:00:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), [])
+
+    def test_a_cluster_dark_on_its_fetch_tick_is_recorded_so_the_next_tick_does_not_fetch_again(self):
+        # First tick: gcloud wrote the kubeconfig, then the read met a control
+        # plane that does not answer. Nothing indicted the kubeconfig, so the
+        # record is written as if the read had succeeded; the next tick reads
+        # on it, and a cluster that stays dark pays no fetch per tick.
+        fleet = {"a": {"ns": []}}
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:00:00+00:00", namespaces_fail_once={"a": DARK})
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once={"a": DARK})
+        self.assertEqual(self.credential_fetches(fake), [], "still dark: no fetch")
+        _, fake = self.run_tick(fleet, now="2026-10-08T11:00:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual(fake.scanned(), ["ns"])
+
+    def test_a_timeout_on_a_reused_kubeconfig_costs_no_fetch_and_no_second_wait(self):
+        # A cluster that has gone dark times out once, not twice around a
+        # fetch, and keeps its record for when it answers again.
+        self.run_tick({"a": {"ns": []}}, now="2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick({"a": TIMEOUT}, now="2026-10-08T10:30:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual([argv[:3] for argv, _, _ in fake.calls if argv[:1] == ["kubectl"]], [["kubectl", "get", "namespaces"]], "one read, one timeout")
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()[stall_watch.CREDENTIALS_KEY])
+
+    def test_records_of_clusters_that_left_the_listing_are_dropped(self):
+        self.run_tick({"a": {"ns": []}, "b": {"ns": []}})
+        self.run_tick({"a": {"ns": []}})
+        self.assertEqual(list(self.ledger()[stall_watch.CREDENTIALS_KEY]), [stall_watch.cluster_id(PROJECT, "a", LOCATION)])
+
+    def test_a_project_whose_listing_failed_keeps_its_clusters_records_as_it_keeps_their_rows(self):
+        # One transient listing failure must not cost a whole project its
+        # fetches on the next tick: the ledger holds the project's rows as
+        # unknown, and holds its records the same way.
+        other = "other-proj"
+        fleet = {"c": {"ns": []}, f"{other}:d": {"ns": []}}
+        self.run_tick(fleet)
+        self.run_tick(fleet, listing_fails=[other])
+        self.assertIn(stall_watch.cluster_id(other, "d", LOCATION), self.ledger()[stall_watch.CREDENTIALS_KEY])
+        _, fake = self.run_tick(fleet)
+        self.assertEqual(self.credential_fetches(fake), [], "the listing came back and nothing was fetched again")
+
+    def test_a_profile_whose_identity_cannot_be_read_keeps_its_record_as_it_keeps_its_rows(self):
+        # The reconciler is mid-write on d's config.yaml, and nothing else names
+        # its project: the project is not listed this tick, d's rows are held
+        # as unknown (`verdict`), and d's record is held the same way, so the
+        # next tick reads d on the kubeconfig it has.
+        other = "other-proj"
+        fleet = {"c": {"ns": []}, f"{other}:d": {"ns": []}}
+        self.run_tick(fleet)
+        (self.profile_dir("d", project=other) / "config.yaml").write_text("{}\n")
+        self.run_tick({"c": {"ns": []}})
+        self.assertIn(stall_watch.cluster_id(other, "d", LOCATION), self.ledger()[stall_watch.CREDENTIALS_KEY])
+        _, fake = self.run_tick(fleet)
+        self.assertEqual(self.credential_fetches(fake), [], "the identity reads again and nothing was fetched again")
+        self.assertEqual(fake.scanned(), ["ns", "ns"])
+
+    def test_an_older_ledger_without_records_fetches_every_cluster_once(self):
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet)
+        ledger = self.ledger()
+        del ledger[stall_watch.CREDENTIALS_KEY]
+        self.state.write_text(json.dumps(ledger))
+        _, fake = self.run_tick(fleet)
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+
+
+class Coverage(Base):
+    """A tick that runs out of budget says what it covered, in the ledger and
+    once in chat, and says when the fleet fits in one tick again."""
+
+    def exhausted_ticks(self, fleet, over_after):
+        over = stall_watch.TICK_BUDGET_SECONDS + 1
+        with patch.object(stall_watch.time, "monotonic", side_effect=list(range(over_after)) + [over] * 12):
+            return self.run_tick(fleet)
+
+    def test_an_exhausted_sweep_reports_its_coverage_and_the_resume_point(self):
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}}
+        self.run_tick(fleet)
+        lines, _ = self.exhausted_ticks(fleet, over_after=3)
+        budget = self.ledger()["unreadable"][stall_watch.BUDGET_SCOPE]
+        self.assertIn("read 1 of 3 clusters", budget)
+        self.assertIn("(1 namespaces)", budget)
+        self.assertNotIn("could not be read", budget)
+        self.assertIn(stall_watch.cluster_label(stall_watch.cluster_id(PROJECT, "b", LOCATION)), budget)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith(stall_watch.COVERAGE_EXHAUSTED_PREFIX), lines[0])
+        self.assertIn("read 1 of 3 clusters", lines[0])
+        self.assertIn("next tick resumes at", lines[0])
+        self.assertTrue(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+
+    def test_the_coverage_counts_only_clusters_the_sweep_could_read_and_names_the_failed_ones(self):
+        # A STOPPED cluster was never in play and a cluster that timed out was
+        # tried and failed; neither counts as unread work for the next tick.
+        fleet = {"a": {"ns": []}, "stopped": Unlisted("STOPPED"), "down": TIMEOUT, "b": {"ns": []}, "c": {"ns": []}}
+        self.run_tick(fleet)
+        over = stall_watch.TICK_BUDGET_SECONDS + 1
+        # a read, down tried and failed, b's namespaces listed, then the budget
+        # runs out before b's first namespace: b counts as read, with the
+        # resume point inside it.
+        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, 3, 4, over] + [over] * 12):
+            lines, _ = self.run_tick(fleet)
+        budget = self.ledger()["unreadable"][stall_watch.BUDGET_SCOPE]
+        self.assertIn("read 2 of 4 clusters (1 namespaces)", budget, budget)
+        self.assertIn("1 could not be read", budget)
+        self.assertIn(f"{stall_watch.cluster_label(stall_watch.cluster_id(PROJECT, 'b', LOCATION))} at namespace `ns`", budget)
+        self.assertNotIn("stopped", budget)
+
+    def test_a_tick_that_fits_only_because_a_listing_failed_posts_no_recovery_and_keeps_the_flag(self):
+        # Tick N exhausted; tick N+1 fits the budget, but one project's
+        # listing failed, so the fleet was not shown to fit: no recovery line,
+        # the flag stays, and the exhausted line is not repeated on tick N+2.
+        # Recovery posts on the first full sweep after that.
+        other = "other-proj"
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}, f"{other}:d": {"ns": []}}
+        self.run_tick(fleet)
+        exhausted, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(exhausted), 1)
+        partial, _ = self.run_tick(fleet, listing_fails=[other])
+        self.assertEqual(partial, [], "a tick with a failed listing says nothing about the fit")
+        self.assertTrue(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+        again, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(again, [], "still exhausted: the line is not repeated")
+        recovered, _ = self.run_tick(fleet)
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
+        self.assertFalse(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+
+    def test_a_project_that_can_never_be_listed_does_not_hold_the_flag_up_for_good(self):
+        # The exhausting sweep already lacked the project. A later sweep that
+        # fits with as many clusters in play has shown the fleet fits, whatever
+        # is still unlisted; recovery posts, and the next exhaustion is heard.
+        other = "other-proj"
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}, f"{other}:d": {"ns": []}}
+        self.run_tick(fleet)
+        exhausted, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(exhausted), 1)
+        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, stall_watch.TICK_BUDGET_SECONDS + 1] + [stall_watch.TICK_BUDGET_SECONDS + 1] * 12):
+            still, _ = self.run_tick(fleet, listing_fails=[other])
+        self.assertEqual(still, [], "exhausted again, with the project gone from the listing: no repeated line")
+        self.assertEqual(self.ledger()[stall_watch.BUDGET_EXHAUSTED_VIEW_KEY], {PROJECT: 3})
+        recovered, _ = self.run_tick(fleet, listing_fails=[other])
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE], "fits with every project the exhausting sweep listed")
+        self.assertFalse(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+        self.assertIsNone(self.ledger()[stall_watch.BUDGET_EXHAUSTED_VIEW_KEY])
+        again, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(again), 1, "the next exhaustion is heard")
+
+    def test_a_tick_that_fits_only_because_an_identity_could_not_be_read_posts_no_recovery(self):
+        # A reconciler rewrite left d's config.yaml without its identity and
+        # nothing else names its project: the project is not listed, the sweep
+        # fits with one cluster fewer than the sweep that exhausted, and that
+        # shows nothing about the fit. Recovery waits for a sweep with the
+        # fleet in view.
+        other = "other-proj"
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}, f"{other}:d": {"ns": []}}
+        self.run_tick(fleet)
+        exhausted, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(exhausted), 1)
+        (self.profile_dir("d", project=other) / "config.yaml").write_text("{}\n")
+        partial, _ = self.run_tick({"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}})
+        self.assertEqual(partial, [], "a tick with an unread identity says nothing about the fit")
+        self.assertTrue(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+        again, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(again, [], "still exhausted: the line is not repeated")
+        recovered, _ = self.run_tick(fleet)
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
+
+    def test_a_fleet_that_shrinks_under_a_standing_listing_failure_recovers_after_the_hold(self):
+        # The exhausting sweep listed the project; then its grant is revoked
+        # and the rest of the fleet shrinks until it fits. The first fitting
+        # ticks hold the flag and say so in the ledger; the third counts the
+        # missing project as a standing fault, recovery posts, and the next
+        # exhaustion is heard.
+        other = "other-proj"
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}, "d": {"ns": []}, f"{other}:e": {"ns": []}}
+        self.run_tick(fleet)
+        exhausted, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(exhausted), 1)
+        self.assertEqual(self.ledger()[stall_watch.BUDGET_EXHAUSTED_VIEW_KEY], {PROJECT: 4, other: 1})
+        shrunk = {"a": {"ns": []}, "b": {"ns": []}, f"{other}:e": {"ns": []}}
+        for held in (1, 2):
+            lines, _ = self.run_tick(shrunk, listing_fails=[other])
+            self.assertEqual(lines, [], f"held tick {held}: no line")
+            self.assertTrue(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+            budget = self.ledger()["unreadable"][stall_watch.BUDGET_SCOPE]
+            self.assertIn(other, budget)
+            self.assertIn(f"tick {held} of {stall_watch.BUDGET_HOLD_TICKS}", budget)
+        recovered, _ = self.run_tick(shrunk, listing_fails=[other])
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
+        self.assertFalse(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+        self.assertEqual(self.ledger()[stall_watch.BUDGET_HELD_TICKS_KEY], 0)
+        self.assertNotIn(stall_watch.BUDGET_SCOPE, self.ledger()["unreadable"])
+        again, _ = self.exhausted_ticks(shrunk, over_after=2)
+        self.assertEqual(len(again), 1, "the next exhaustion is heard")
+
+    def test_an_exhaustion_between_held_ticks_resets_the_hold(self):
+        other = "other-proj"
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}, f"{other}:d": {"ns": []}}
+        self.run_tick(fleet)
+        self.exhausted_ticks(fleet, over_after=3)
+        self.run_tick(fleet, listing_fails=[other])
+        self.assertEqual(self.ledger()[stall_watch.BUDGET_HELD_TICKS_KEY], 1)
+        self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(self.ledger()[stall_watch.BUDGET_HELD_TICKS_KEY], 0, "a sweep that exhausted with the project listed starts the count over")
+
+    def test_a_tick_that_fits_only_because_a_listing_was_incomplete_posts_no_recovery(self):
+        # gcloud listed one of the three clusters and said the results may be
+        # incomplete: the one it listed is swept, but the project is out of
+        # view, and the fit says nothing. Recovery waits for a full listing.
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}}
+        self.run_tick(fleet)
+        exhausted, _ = self.exhausted_ticks(fleet, over_after=2)
+        self.assertEqual(len(exhausted), 1)
+        partial = "WARNING: The following zones did not respond: us-central1-a. List results may be incomplete."
+        lines, fake = self.run_tick(fleet, listing_stderr={PROJECT: partial}, hidden=["b", "c"])
+        self.assertEqual(fake.scanned(), ["ns"], "the listed cluster was swept")
+        self.assertEqual(lines, [], "an incomplete listing says nothing about the fit")
+        self.assertTrue(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+        recovered, _ = self.run_tick(fleet)
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
+
+    def test_the_view_leaves_out_the_clusters_of_an_incompletely_listed_project(self):
+        sweep = stall_watch.Sweep({"p", "q"})
+        sweep.unlisted_projects.add("p")
+        sweep.sweepable_clusters.update({stall_watch.cluster_id("p", "a", LOCATION), stall_watch.cluster_id("q", "b", LOCATION)})
+        self.assertEqual(sweep.view(), {"q": 1})
+
+    def test_a_fleet_that_shrank_and_fits_with_everything_in_view_recovers(self):
+        # Two clusters deleted: fewer in play than the exhausting sweep, but
+        # every project listed and every identity read, so the fit is real.
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}, "d": {"ns": []}}
+        self.run_tick(fleet)
+        exhausted, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(exhausted), 1)
+        recovered, _ = self.run_tick({"a": {"ns": []}, "b": {"ns": []}})
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
+
+    def test_the_coverage_line_posts_on_entering_exhaustion_not_every_tick_and_a_full_sweep_recovers(self):
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}}
+        self.run_tick(fleet)
+        first, _ = self.exhausted_ticks(fleet, over_after=3)
+        second, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [], "still exhausted: the ledger says so, chat heard it last tick")
+        recovered, _ = self.run_tick(fleet)
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
+        self.assertFalse(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+        self.assertNotIn(stall_watch.BUDGET_SCOPE, self.ledger()["unreadable"])
 
 
 class Scope(Base):
@@ -1573,6 +2021,344 @@ class Projects(Base):
     def test_a_domain_scoped_project_splits_back_out_of_its_key(self):
         project = "example.com:proj"
         self.assertEqual(stall_watch.split_cluster_id(stall_watch.cluster_id(project, "c", LOCATION)), (project, "c", LOCATION))
+
+
+class Knobs(Base):
+    """spec.harness.stallWatch, as the operator pins it in the managed .env, and
+    the exempt annotation."""
+
+    EXEMPT = {stall_watch.EXEMPT_ANNOTATION: stall_watch.EXEMPT_VALUE}
+
+    def test_a_namespace_the_list_excludes_is_not_read(self):
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: " payments, ,load-test,"}):
+            _, fake = self.run_tick({"c": {"payments": [DEPLOYMENT_ROW | {"namespace": "payments"}], "load-test": [], "checkout": [DEPLOYMENT_ROW]}})
+        self.assertEqual(fake.scanned(), ["checkout"])
+        self.assertEqual([a["namespace"] for a in self.kv.alerts], ["checkout"])
+        self.assertEqual({e["namespace"] for e in self.ledger()["stalls"].values()}, {"checkout"})
+
+    def test_the_namespace_listing_is_one_compact_line_per_namespace(self):
+        # A JSON listing carries every label and annotation and can pass the
+        # credential proxy's output cap on a large cluster; the jsonpath form
+        # is the name and the one annotation the watch needs.
+        argv = list(stall_watch.NAMESPACES_ARGV)
+        self.assertEqual(argv[:4], ["kubectl", "get", "namespaces", "-o"])
+        self.assertTrue(argv[4].startswith("jsonpath="), argv[4])
+        self.assertIn(stall_watch.EXEMPT_ANNOTATION.replace(".", "\\."), argv[4])
+
+    def test_a_namespace_with_the_exempt_annotation_is_not_read(self):
+        annotations = {"payments": self.EXEMPT, "checkout": {stall_watch.EXEMPT_ANNOTATION: "no"}}
+        _, fake = self.run_tick({"c": {"payments": [DEPLOYMENT_ROW | {"namespace": "payments"}], "checkout": [DEPLOYMENT_ROW]}}, annotations=annotations)
+        self.assertEqual(fake.scanned(), ["checkout"], "only the exact value exempts a namespace")
+        self.assertEqual([a["namespace"] for a in self.kv.alerts], ["checkout"])
+
+    def test_an_exempt_objects_rows_raise_no_alert(self):
+        exempt = DEPLOYMENT_ROW | {stall_watch.EXEMPT_FIELD: True}
+        other = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1") | {stall_watch.EXEMPT_FIELD: False}
+        self.run_tick({"c": {"checkout": [exempt, other], "billing": [DEPLOYMENT_ROW | {"namespace": "billing", stall_watch.EXEMPT_FIELD: True}]}})
+        self.assertEqual([a["namespace"] for a in self.kv.alerts], ["checkout"])
+        self.assertEqual([o["object"] for o in self.kv.alerts[0]["objects"]], ["Deployment/cart-api"])
+        self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], ["Deployment/cart-api"])
+
+    def test_a_young_stall_is_held_and_raises_once_old_enough(self):
+        young = DEPLOYMENT_ROW | {"stalled_seconds": 600}
+        with patch.dict(os.environ, {stall_watch.MIN_AGE_ENV: "30"}):
+            lines, _ = self.run_tick({"c": {"checkout": [young]}}, now="2026-10-02T12:00:00+00:00")
+            self.assertEqual((lines, self.kv.alerts), ([], []), "a held stall says nothing, not even a held line")
+            self.assertEqual([e["stalled_seconds"] for e in self.ledger()["stalls"].values()], [600], "the row is ledgered with its own age")
+            lines, _ = self.run_tick({"c": {"checkout": [young]}}, now="2026-10-02T12:15:00+00:00")
+            self.assertEqual((lines, self.kv.alerts), ([], []))
+            self.run_tick({"c": {"checkout": [young]}}, now="2026-10-02T12:30:00+00:00")
+        self.assertEqual(len(self.kv.alerts), 1, "thirty minutes in the ledger is old enough")
+        self.assertEqual(self.kv.alerts[0]["first_seen"], "2026-10-02T12:00:00+00:00")
+
+    def test_a_stall_already_older_than_the_minimum_raises_at_once(self):
+        with patch.dict(os.environ, {stall_watch.MIN_AGE_ENV: "30"}):
+            self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW | {"stalled_seconds": 3600}]}})
+        self.assertEqual(len(self.kv.alerts), 1)
+
+    def test_a_dry_run_holds_a_young_stall_too(self):
+        self.scaffold("c")
+        fake = FakeFleet({"c": {"checkout": [DEPLOYMENT_ROW | {"stalled_seconds": 60}]}})
+        with patch.dict(os.environ, {stall_watch.MIN_AGE_ENV: "30"}), patch.object(stall_watch, "run_sandbox", fake):
+            lines = stall_watch.tick(self.state, dry_run=True)
+        self.assertEqual(lines, [])
+
+    def test_an_object_joining_an_open_alert_is_not_held(self):
+        with patch.dict(os.environ, {stall_watch.MIN_AGE_ENV: "30"}):
+            self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW | {"stalled_seconds": 3600}]}})
+            joined = finding("checkout", "Deployment/cart-api", "generation-lag", "generation 2 observed 1", stalled_seconds=60)
+            self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW | {"stalled_seconds": 3600}, joined]}})
+        self.assertEqual(len(self.kv.alerts), 1)
+        self.assertIn("Deployment/cart-api", self.board.cards[self.card_of("checkout")]["comments"][0])
+
+    def test_a_namespace_excluded_by_list_closes_its_open_card_as_excluded(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW], "catalog": []}}
+        self.run_tick(fleet)
+        tid = self.card_of("checkout")
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "checkout"}):
+            lines, _ = self.run_tick(fleet, now="2026-10-02T12:30:00+00:00")
+        self.assertEqual(self.ledger()["stalls"], {})
+        self.assertNotIn(f"{cid('c')}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+        card = self.board.cards[tid]
+        self.assertEqual(card["status"], "done")
+        self.assertEqual(card["comments"], ["The namespace `checkout` was excluded from the watch; the watch no longer reads it, as of 2026-10-02T12:30:00+00:00."])
+        self.assertIn("was excluded from the watch", card["result"])
+        self.assertNotIn("cleared at", card["result"])
+        self.assertEqual(lines, [f"{stall_watch.CLEARED_PREFIX} in {label('c')} / `checkout`: the namespace was excluded from the watch; card `{tid}` closed"])
+
+    def test_a_namespace_exempted_by_annotation_closes_its_open_card_as_excluded(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet)
+        lines, _ = self.run_tick(fleet, annotations={"checkout": self.EXEMPT})
+        self.assertEqual(len(self.cleared(lines)), 1)
+        self.assertIn("the namespace was excluded from the watch", lines[0])
+        self.assertEqual(len(self.kv.alerts), 1)
+
+    def test_an_excluded_namespace_whose_card_was_running_completes_as_excluded_when_the_cluster_is_unreadable(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet)
+        tid = self.card_of("checkout")
+        self.board.cards[tid]["status"] = "running"
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "checkout"}):
+            self.assertEqual(self.run_tick(fleet)[0], [])
+            self.assertEqual(len(self.board.cards[tid]["comments"]), 1)
+            self.board.cards[tid]["status"] = "ready"
+            lines, _ = self.run_tick({"c": TIMEOUT})
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertIn("was excluded from the watch", self.board.cards[tid]["result"])
+        self.assertNotIn("cleared at", self.board.cards[tid]["result"])
+        self.assertEqual(self.cleared(lines), [f"{stall_watch.CLEARED_PREFIX} in {label('c')} / `checkout`: the namespace was excluded from the watch; card `{tid}` closed"])
+
+    def test_an_object_that_becomes_exempt_closes_its_card_as_exempt_at_once(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet)
+        tid = self.card_of("checkout")
+        lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW | {stall_watch.EXEMPT_FIELD: True}]}}, now="2026-10-02T12:30:00+00:00")
+        self.assertEqual(self.ledger()["stalls"], {})
+        card = self.board.cards[tid]
+        self.assertEqual(card["status"], "done")
+        self.assertEqual(card["comments"], [f"The watch no longer alerts on Deployment/checkout-api in `checkout`: marked `{stall_watch.EXEMPT_ANNOTATION}: exempt`, as of 2026-10-02T12:30:00+00:00."])
+        self.assertNotIn("cleared at", card["result"])
+        self.assertEqual(lines, [f"{stall_watch.CLEARED_PREFIX} in {label('c')} / `checkout`: Deployment/checkout-api exempted from the watch; card `{tid}` closed"])
+
+    def test_an_exempt_close_retried_after_a_failed_comment_still_says_exempt(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet)
+        tid = self.card_of("checkout")
+        self.board.fail_comment_once = True
+        exempt = {"c": {"checkout": [DEPLOYMENT_ROW | {stall_watch.EXEMPT_FIELD: True}]}}
+        self.run_tick(exempt)
+        self.assertEqual(self.board.cards[tid]["comments"], [], "the first close failed on the board")
+        lines, _ = self.run_tick(exempt)
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertIn("marked `kubeagents.x-k8s.io/stall-watch: exempt`", self.board.cards[tid]["result"])
+        self.assertNotIn("cleared at", self.board.cards[tid]["result"])
+        self.assertIn("exempted from the watch", self.cleared(lines)[0])
+
+    def test_a_reverted_exclusion_lets_the_next_close_say_cleared(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet)
+        tid = self.card_of("checkout")
+        self.board.cards[tid]["status"] = "running"
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "checkout"}):
+            self.run_tick(fleet)
+        self.assertIn("was excluded from the watch", self.board.cards[tid]["comments"][0])
+        self.run_tick(fleet)
+        episode = self.ledger()[stall_watch.EPISODES_KEY][f"{cid('c')}/checkout"]
+        self.assertNotIn(stall_watch.CLEAR_REASON_KEY, episode, "the scope has rows again")
+        self.assertNotIn("cleared_at", episode)
+        self.board.cards[tid]["status"] = "ready"
+        self.run_tick({"c": {"checkout": []}})
+        self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertIn("cleared at", self.board.cards[tid]["result"])
+        self.assertNotIn("excluded", self.board.cards[tid]["result"])
+
+    def test_a_reverted_exclusion_whose_stall_also_cleared_closes_as_cleared(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet)
+        tid = self.card_of("checkout")
+        self.board.cards[tid]["status"] = "running"
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "checkout"}):
+            self.run_tick(fleet)
+        self.assertIn("was excluded from the watch", self.board.cards[tid]["comments"][0])
+        self.board.cards[tid]["status"] = "ready"
+        lines, _ = self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertNotIn("excluded", self.board.cards[tid]["result"])
+        self.assertNotIn("excluded", self.cleared(lines)[0])
+
+    def test_a_spec_written_more_often_than_the_minimum_age_still_raises(self):
+        # Each spec write gives a generation-lag row a new detail, so a new
+        # ledger key, and stall_report's own age restarts at the write.
+        with patch.dict(os.environ, {stall_watch.MIN_AGE_ENV: "60"}):
+            for generation, now in ((2, "12:00"), (3, "12:30"), (4, "13:00")):
+                row = finding("checkout", "Deployment/checkout-api", "generation-lag", f"generation {generation} observed {generation - 1}", stalled_seconds=600)
+                self.run_tick({"c": {"checkout": [row]}}, now=f"2026-10-02T{now}:00+00:00")
+        self.assertEqual(len(self.kv.alerts), 1, "sixty minutes since the object's first sighting")
+        self.assertEqual(self.kv.alerts[0]["first_seen"], "2026-10-02T12:00:00+00:00")
+
+    def test_a_spec_write_that_hides_the_stall_from_every_other_tick_still_raises(self):
+        # Writes every 20 minutes, ticks every 30: generation lag is reported
+        # only 10 minutes after a write, so the ticks alternate in and out of
+        # that window.
+        seen = [(2, "12:00"), (None, "12:30"), (5, "13:00"), (None, "13:30"), (8, "14:00")]
+        with patch.dict(os.environ, {stall_watch.MIN_AGE_ENV: "60"}):
+            for generation, now in seen:
+                rows = [] if generation is None else [finding("checkout", "Deployment/checkout-api", "generation-lag", f"generation {generation} observed 1", stalled_seconds=600)]
+                self.run_tick({"c": {"checkout": rows}}, now=f"2026-10-02T{now}:00+00:00")
+        self.assertEqual(len(self.kv.alerts), 1, "sixty minutes since the object's first sighting")
+        self.assertEqual(self.kv.alerts[0]["first_seen"], "2026-10-02T12:00:00+00:00")
+
+    def exempt_reads(self, fake):
+        return [argv for argv, _, _ in fake.calls if argv[-len(stall_watch.EXEMPT_READ_FLAGS):] == list(stall_watch.EXEMPT_READ_FLAGS)]
+
+    def exempt_close_pending(self):
+        """An alert whose object turned exempt while its card was running: the
+        watch commented, and the card waits for its close."""
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
+        tid = self.card_of("checkout")
+        self.board.cards[tid]["status"] = "running"
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW | {stall_watch.EXEMPT_FIELD: True}]}})
+        self.assertIn("marked `kubeagents.x-k8s.io/stall-watch: exempt`", self.board.cards[tid]["comments"][0])
+        self.assertEqual(self.episode(f"{cid('c')}/checkout")[stall_watch.EXEMPT_OBJECTS_KEY], ["Deployment/checkout-api"])
+        self.board.cards[tid]["status"] = "ready"
+        return tid
+
+    def test_an_exempt_close_whose_annotation_was_removed_closes_as_cleared(self):
+        tid = self.exempt_close_pending()
+        lines, fake = self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertIn("cleared at", self.board.cards[tid]["result"])
+        self.assertNotIn("exempt", self.board.cards[tid]["result"])
+        self.assertNotIn("exempted", self.cleared(lines)[0])
+        self.assertEqual([argv[2:5] for argv in self.exempt_reads(fake)], [["Deployment/checkout-api", "-n", "checkout"]])
+
+    def test_an_exempt_close_whose_object_still_carries_the_annotation_stays_exempt(self):
+        tid = self.exempt_close_pending()
+        self.run_tick({"c": {"checkout": []}}, object_annotations={("checkout", "Deployment/checkout-api"): stall_watch.EXEMPT_VALUE})
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertIn("marked `kubeagents.x-k8s.io/stall-watch: exempt`", self.board.cards[tid]["result"])
+        self.assertNotIn("cleared at", self.board.cards[tid]["result"])
+
+    def test_an_exempt_close_is_not_rechecked_on_a_tick_that_did_not_read_the_namespace(self):
+        tid = self.exempt_close_pending()
+        _, fake = self.run_tick({"c": TIMEOUT})
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertIn("marked `kubeagents.x-k8s.io/stall-watch: exempt`", self.board.cards[tid]["result"])
+        self.assertEqual(self.exempt_reads(fake), [])
+
+    def test_a_roster_close_whose_cluster_came_back_closes_as_cleared(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet)
+        tid = self.card_of("checkout")
+        self.board.cards[tid]["status"] = "running"
+        self.run_tick(fleet, unmanaged=("c",))
+        self.assertIn("left the Cluster Agent roster", self.board.cards[tid]["comments"][0])
+        self.board.cards[tid]["status"] = "ready"
+        lines, _ = self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertIn("cleared at", self.board.cards[tid]["result"])
+        self.assertNotIn("roster", self.board.cards[tid]["result"])
+
+    def test_a_lifted_exclusion_is_not_judged_on_a_partial_read(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet)
+        tid = self.card_of("checkout")
+        self.board.cards[tid]["status"] = "running"
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "checkout"}):
+            self.run_tick(fleet)
+        self.board.cards[tid]["status"] = "ready"
+        lines, _ = self.run_tick({"c": {"checkout": ([], NOT_SCANNED)}})
+        self.assertEqual(self.board.cards[tid]["status"], "ready", "deployments were not read, so the stall may still be there")
+        self.assertEqual(self.cleared(lines), [])
+        self.run_tick({"c": {"checkout": []}})
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertIn("cleared at", self.board.cards[tid]["result"])
+
+    def test_a_lifted_exclusion_is_judged_on_a_cluster_without_an_optional_crd(self):
+        # cert-manager's Certificates are on the default list; a cluster that
+        # does not serve them skips them on every tick, and that skip holds
+        # no Deployment.
+        served = [n for n in SERVED_DEFAULT if "cert-manager" not in n]
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet, served=served)
+        tid = self.card_of("checkout")
+        self.board.cards[tid]["status"] = "running"
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "checkout"}):
+            self.run_tick(fleet, served=served)
+        self.board.cards[tid]["status"] = "ready"
+        self.run_tick({"c": {"checkout": []}}, served=served)
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertIn("cleared at", self.board.cards[tid]["result"])
+
+    def test_a_cut_namespace_listing_leaves_the_cluster_unread(self):
+        marker = stall_watch.NAMESPACE_LIST_MARKER
+        cut_listings = {
+            "no closing marker": ("checkout\ncatalog\n" + marker + "\n", ""),
+            "cut mid-name": ("checkout\ncata", ""),
+            "proxy says truncated": (f"checkout\n{marker}\n{marker}\n", stall_watch.PROXY_TRUNCATED_TEXT + "\n"),
+        }
+        for case, listing in cut_listings.items():
+            with self.subTest(case):
+                self.setUp()
+                self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW], "catalog": [DEPLOYMENT_ROW | {"namespace": "catalog"}]}})
+                lines, fake = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}}, namespaces_listing={"c": listing})
+                self.assertEqual(fake.scanned(), [])
+                self.assertEqual(self.cleared(lines), [], "no namespace past the cut reads as deleted")
+                self.assertEqual({e["namespace"] for e in self.ledger()["stalls"].values()}, {"checkout", "catalog"})
+                self.assertIn("incomplete listing", self.ledger()["unreadable"][cid("c")])
+
+    def test_the_listing_selects_exempt_namespaces_by_the_exact_value(self):
+        # The annotation's value is matched by the jsonpath filter and never
+        # printed, so " exempt " does not exempt and a newline in a value adds
+        # no line.
+        jsonpath = stall_watch.NAMESPACES_ARGV[4]
+        self.assertIn('?(@.metadata.annotations.kubeagents\\.x-k8s\\.io/stall-watch=="exempt")', jsonpath)
+        self.assertNotIn("{.metadata.annotations", jsonpath)
+
+    def test_an_exempt_repeating_warning_goes_without_waiting_out_its_missed_scans(self):
+        warning = finding("checkout", "Deployment/checkout-api", "repeating-warnings", "BackOff x9: restarting")
+        self.run_tick({"c": {"checkout": [warning]}})
+        self.run_tick({"c": {"checkout": [warning | {stall_watch.EXEMPT_FIELD: True}]}})
+        self.assertEqual(self.ledger()["stalls"], {})
+        self.assertNotIn(f"{cid('c')}/checkout", self.ledger()[stall_watch.EPISODES_KEY])
+
+    def test_a_deleted_namespace_still_closes_as_cleared(self):
+        self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW], "catalog": []}})
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "catalog"}):
+            lines, _ = self.run_tick({"c": {"catalog": []}})
+        self.assertEqual(len(self.cleared(lines)), 1)
+        self.assertNotIn("excluded", lines[0])
+
+    def test_env_values_are_parsed_tolerantly(self):
+        cases = {
+            "": ",".join(stall_watch.DEFAULT_KINDS),
+            " , ,": ",".join(stall_watch.DEFAULT_KINDS),
+            " deployments , jobs ,": "deployments,jobs",
+            "ALL": None,
+            " all ": None,
+            "deployments,secrets,Secret/token,cm": "deployments",
+            "leases,endpointslices,controllerrevisions,jobs": "jobs",
+            "leases.coordination.k8s.io,controllerrevisions.apps,deployments": "deployments",
+            "secrets": ",".join(stall_watch.DEFAULT_KINDS),
+        }
+        for raw, want in cases.items():
+            with self.subTest(kinds=raw), patch.dict(os.environ, {stall_watch.KINDS_ENV: raw}):
+                self.assertEqual(stall_watch.kinds_argument(), want)
+        for raw, want in {"": frozenset(), " a, ,b ,,": frozenset({"a", "b"})}.items():
+            with self.subTest(namespaces=raw), patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: raw}):
+                self.assertEqual(stall_watch.excluded_namespaces(), want)
+        for raw, want, logged in (("", 0, False), (" 45 ", 2700, False), ("0", 0, False), ("abc", 0, True), ("-5", 0, True), ("1.5", 0, True)):
+            with self.subTest(min_age=raw), patch.dict(os.environ, {stall_watch.MIN_AGE_ENV: raw}), patch.object(sys, "stderr", io.StringIO()) as err:
+                self.assertEqual(stall_watch.min_age_seconds(), want)
+                self.assertEqual(len(err.getvalue().splitlines()), 1 if logged else 0, err.getvalue())
+
+    def test_the_annotation_is_the_one_stall_report_marks(self):
+        self.assertEqual(
+            (stall_watch.EXEMPT_ANNOTATION, stall_watch.EXEMPT_VALUE, stall_watch.EXEMPT_FIELD),
+            (stall_report.EXEMPT_ANNOTATION, stall_report.EXEMPT_VALUE, stall_report.EXEMPT_FIELD),
+        )
 
 
 class Output(Base):

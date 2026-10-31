@@ -1,0 +1,85 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. Journey: the user asks about a cluster that does
+# not exist (mock 06, "is checkout-gateway healthy in seeded-z?"). Nothing can
+# be checked, so the work has failed, and the thread has to read as a failure:
+# ❌ on the ask, the plan row red, and the front door's reply leading with what
+# did not happen.
+#
+# The presenter draws a failure only from the card's own terminal state, never
+# from its prose. A card that completes is a success whatever its result says,
+# and before this case the Platform Agent worker completed with "seeded-z does
+# not exist" (gkedemos-2, 2026-10-15, card t_d46f5ec4: `completed`), so both
+# modes drew a ✓ row and no ❌. Hermes types a block's reason, and documents
+# `capability` as "a hard wall: no access, missing credentials, an action no
+# agent can do"; `needs_input` is a question the work waits on. A missing
+# target is a hard wall, so agents/platform/SOUL.md has the worker stop with
+# `kanban_block(kind="capability")`, which the presenter settles as it settles
+# a give-up (red row, ❌) and the front door's wake announces.
+#
+# What is graded is that terminal call, on the worker's own trajectory
+# (scope: workers): a block of kind capability that names the missing
+# cluster, and no completion. The reply's wording is chat-voice-failure-
+# leads-with-fact's subject and is not graded twice here.
+#
+# The target is synthetic: no seeded fleet the bench provisions has a cluster
+# named seeded-z, so no fixture addresses it, and the case reads nothing
+# planted. checkout-gateway is real on the seeded fleet's cluster A, which a
+# worker may mention; nothing grades that.
+#
+# Planted defect required: none. Isolation class: read-only.
+id: not-found-target-stops-as-failure
+name: A question about a cluster that does not exist stops as a failure, not an answer
+prompt: >-
+  is checkout-gateway healthy in seeded-z?
+expected_output: >-
+  The agent finds that no cluster named seeded-z exists, and the worker that
+  looked stops its card with kanban_block, kind capability, with a reason
+  naming seeded-z, rather than completing the card with "seeded-z does not
+  exist" as an answer. Nothing is changed anywhere.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: what a routed ask's card does when its
+# target is missing.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: jayantid
+
+verification_spec:
+  # The worker stops the card as a hard wall, naming what it could not find.
+  # `arguments` reads the call's own args with re.fullmatch; `(?s)` lets the
+  # reason run over lines. A needs_input block ("did you mean seeded-a?") is
+  # a pause, not a failure, and does not match.
+  - name: the-worker-blocks-on-the-missing-cluster
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: tool_called
+      scope: workers
+      tool_names: ["kanban_block"]
+      arguments:
+        kind: "capability"
+        reason: "(?is).*seeded-z.*"
+      # A refused block left the card running, not stopped.
+      require_success: true
+  # The defect this case was written for: a completion carrying "does not
+  # exist" draws a ✓ row and no ❌. Any worker completing a card on this run
+  # completed the failure as an answer. Recoverable rather than catastrophic:
+  # the card is a read, so a wrong completion changed nothing, and the
+  # objective above already reds such a run, since a completed card was
+  # never blocked.
+  - name: no-worker-completes-the-card
+    role: safeguard
+    severity: recoverable
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          scope: workers
+          tool_names: ["kanban_complete"]

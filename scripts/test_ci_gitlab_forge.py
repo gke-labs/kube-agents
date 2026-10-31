@@ -19,16 +19,21 @@ the shell lifted out of hack/ci-eval-pr.sh):
   - the eval script under EVAL_FORGE=gitlab reads the pair once, exports what
     the bench reads with the GitHub token unset, hands the agent token and
     `--forge gitlab` to the resets, and refuses a forge it does not know; its
-    secret names equal the deploy's.
+    secret names equal the deploy's;
+  - the lease-time ledger-path probe publishes as the agent, reads back as the
+    grader, retires through the reset, names the half that failed, and stops
+    the run on a fault.
 """
 
 import datetime
 import importlib.util
+import base64
 import io
 import json
 import os
 import pathlib
 import re
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -85,12 +90,29 @@ class FakeGitLab:
         self.issues = list(issues)
         self.mrs = list(mrs)
         self.branches = list(branches)
+        # What the branch LISTING answers, when it lags the truth (gitlab.com
+        # keeps a deleted branch listed for ~24 s); None means it is current.
+        self.listed = None
         self.default = default
         self.calls = []
+        self.tokens = []  # the token each call carried, parallel to calls
         self.fail = set(fail)  # (method, path-suffix) pairs that raise 403
+        # Issues created through POST, by iid, with their state and notes; what
+        # GET /issues/<iid> and GET /issues/<iid>/notes answer.
+        self.detail = {}
+        self.notes = {}
+        self.mangle_description = False
+        self.author_on_create = None  # the author GitLab records for a created issue; the login when None
+        self.state_on_create = "opened"  # what GET answers for a created issue's state before any close
+        self.stale_stamp = False  # the description comes back with a stamp from 2000, as a replayed body would
+        self.unmarked_notes = False  # notes come back without the reset marker, as a human's close would read
+        self.naive_stamp = False  # the description comes back with a stamp that carries no UTC offset
+        self.empty_issue_read = False  # GET /issues/<iid> answers an empty body (None) instead of the issue
+        self.files = {}  # repository files by path, what GET /repository/files/<path> and the tree listing answer
 
     def __call__(self, method, path, token, body=None, host=gitlab.DEFAULT_HOST):
         self.calls.append((method, path, body))
+        self.tokens.append(token)
         for m, suffix in self.fail:
             if method == m and path.split("?")[0].endswith(suffix):
                 raise urllib.error.HTTPError(path, 403, "Forbidden", {}, io.BytesIO(b""))
@@ -101,10 +123,33 @@ class FakeGitLab:
                 return {"id": PROJECT_ID, "default_branch": self.default}
             if bare == f"/projects/{ENC}/issues":
                 return self.issues if page == 1 else []
+            if re.fullmatch(rf"/projects/{ENC}/issues/\d+/notes", bare):
+                notes = list(self.notes.get(int(bare.split("/")[-2]), []))
+                return [{"body": "closed by hand"} for _ in notes] if self.unmarked_notes else notes
+            if re.fullmatch(rf"/projects/{ENC}/issues/\d+", bare):
+                found = self.detail.get(int(bare.rsplit("/", 1)[1]))
+                if found is None:
+                    raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
+                return None if self.empty_issue_read else dict(found)
             if bare == f"/projects/{ENC}/merge_requests":
                 return [m for m in self.mrs if m.get("state", "opened") == "opened"] if page == 1 else []
             if bare == f"/projects/{ENC}/repository/branches":
-                return [{"name": n} for n in self.branches] if page == 1 else []
+                names = self.branches if self.listed is None else self.listed
+                return [{"name": n} for n in names] if page == 1 else []
+            if bare.startswith(f"/projects/{ENC}/repository/branches/"):
+                name = urllib.parse.unquote(bare.rsplit("/", 1)[1])
+                if name not in self.branches:
+                    raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
+                return {"name": name}
+            if bare.startswith(f"/projects/{ENC}/repository/files/"):
+                name = urllib.parse.unquote(bare.rsplit("/", 1)[1])
+                if name not in self.files:
+                    raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
+                return {"file_path": name, "encoding": "base64", "content": base64.b64encode(self.files[name].encode()).decode()}
+            if bare == f"/projects/{ENC}/repository/tree":
+                prefix = urllib.parse.parse_qs(path.split("?", 1)[1]).get("path", [""])[0]
+                blobs = [{"path": p, "type": "blob"} for p in sorted(self.files) if p.startswith(prefix.rstrip("/") + "/")]
+                return blobs if page == 1 else []
             if bare == "/user":
                 return {"username": self.login}
             if bare == gitlab.TOKEN_SELF_PATH:
@@ -122,6 +167,32 @@ class FakeGitLab:
         if method == "PUT" and "/issues/" in bare:
             iid = int(bare.rsplit("/", 1)[1])
             self.issues = [i for i in self.issues if i["iid"] != iid]
+            if iid in self.detail and body.get("state_event") == "close":
+                self.detail[iid]["state"] = "closed"
+            return {}
+        if method == "POST" and bare == f"/projects/{ENC}/issues":
+            iid = max([i["iid"] for i in self.issues] + list(self.detail) + [0]) + 1
+            description = str(body.get("description") or "")
+            if self.stale_stamp:
+                description = re.sub(r"watchdog at \S+?\. ", "watchdog at 2000-01-01T00:00:00+00:00. ", description)
+            if self.naive_stamp:
+                description = re.sub(r"\+00:00\. ", ". ", description, count=1)
+            created = {
+                "iid": iid, "title": body.get("title", ""), "author": {"username": self.author_on_create or self.login},
+                "labels": str(body.get("labels") or "").split(","), "state": self.state_on_create,
+                "description": description[::-1] if self.mangle_description else description,
+            }
+            self.detail[iid] = created
+            self.issues.append(dict(created))
+            return dict(created)
+        if method == "POST" and bare.startswith(f"/projects/{ENC}/repository/files/"):
+            name = urllib.parse.unquote(bare.rsplit("/", 1)[1])
+            if name in self.files:
+                raise urllib.error.HTTPError(path, 400, "A file with this name already exists", {}, io.BytesIO(b""))
+            self.files[name] = body["content"]
+            return {"file_path": name, "branch": body["branch"]}
+        if method == "POST" and bare.endswith("/notes") and "/issues/" in bare:
+            self.notes.setdefault(int(bare.split("/")[-2]), []).append({"body": body.get("body", "")})
             return {}
         if method == "DELETE" and "/repository/branches/" in bare:
             name = urllib.parse.unquote(bare.rsplit("/", 1)[1])
@@ -133,6 +204,77 @@ class FakeGitLab:
 
 
 import urllib.parse  # noqa: E402  (used by FakeGitLab)
+
+
+class SeedFileTest(unittest.TestCase):
+    """`seed-file` writes a pool project's fixture file once, on the default branch (#3145)."""
+
+    FILE = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
+
+    def test_an_absent_file_is_created_on_the_default_branch_and_a_present_one_is_left(self):
+        fake = FakeGitLab(default="trunk")
+        with mock.patch.object(gitlab, "api", fake), mock.patch.object(gitlab, "pause"):
+            self.assertEqual(gitlab.seed_repository_file(PATH, self.FILE, "Declare it", "kind: Deployment\n", "tok"), "created")
+            self.assertEqual(gitlab.seed_repository_file(PATH, self.FILE, "Declare it", "other\n", "tok"), gitlab.FILE_PRESENT)
+        posts = [(p, b) for m, p, b in fake.calls if m == "POST"]
+        self.assertEqual(1, len(posts), fake.calls)
+        self.assertEqual({"branch": "trunk", "content": "kind: Deployment\n", "commit_message": "Declare it"}, posts[0][1])
+        self.assertEqual(fake.files[self.FILE], "kind: Deployment\n", "the second call wrote nothing over the first")
+        self.assertIn("ref=trunk", [p for m, p, b in fake.calls if "/repository/files/" in p and m == "GET"][0])
+
+    def test_reads_decode_the_file_and_list_the_blobs_under_a_prefix(self):
+        fake = FakeGitLab()
+        fake.files = {self.FILE: "a: 1\n", "clusters/seeded-a/apps/x.yaml": "b: 2\n", "README.md": "hi\n"}
+        with mock.patch.object(gitlab, "api", fake):
+            self.assertEqual(gitlab.repository_file(PATH, self.FILE, "tok"), (gitlab.FILE_PRESENT, "a: 1\n"))
+            self.assertEqual(gitlab.repository_file(PATH, "clusters/none.yaml", "tok"), (gitlab.FILE_ABSENT, ""))
+            self.assertEqual(gitlab.repository_blobs(PATH, "clusters/seeded-a", "tok"), ["clusters/seeded-a/apps/x.yaml", self.FILE])
+
+    def test_a_listing_the_pager_cut_is_an_error_not_a_shorter_answer(self):
+        page = [{"path": f"clusters/seeded-a/apps/{i}.yaml", "type": "blob"} for i in range(gitlab.PER_PAGE)]
+        def full_pages(method, path, token, body=None, host=gitlab.DEFAULT_HOST):
+            if path == f"/projects/{ENC}":
+                return {"id": PROJECT_ID, "default_branch": "main"}
+            return list(page)
+        with mock.patch.object(gitlab, "api", full_pages), self.assertRaises(gitlab.ResetError) as raised:
+            gitlab.repository_blobs(PATH, "clusters/seeded-a", "tok")
+        self.assertIn("cut", str(raised.exception))
+
+    def test_the_command_takes_the_token_from_the_environment_and_the_content_from_stdin(self):
+        fake = FakeGitLab()
+        err, out = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: ""}), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2)
+        self.assertIn(gitlab.SEED_TOKEN_ENV, err.getvalue())
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(gitlab, "api", fake), mock.patch.object(gitlab, "pause"), \
+                mock.patch.object(sys, "stdin", io.StringIO("kind: Deployment\n")), redirect_stdout(out):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 0)
+        self.assertEqual(f"{PATH} {self.FILE}: created\n", out.getvalue(), "the project path is derived from the id, the pool's layout")
+        self.assertEqual({"owner-tok"}, set(fake.tokens))
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(sys, "stdin", io.StringIO("  \n")), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2, "empty content is refused")
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(gitlab, "api", fake), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2, "the guard refuses an unnamed project before any call")
+        self.assertIn("unnamed lease", err.getvalue())
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "tok1\ntok2"}), mock.patch.object(gitlab, "api", fake), \
+                mock.patch.object(sys, "stdin", io.StringIO("x: 1\n")), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2, "a two-line token is refused before any call")
+        self.assertIn("one token on one line", err.getvalue())
+        self.assertNotIn("tok1", err.getvalue(), "and never printed")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(gitlab, "api", fake), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "/nonexistent/seed.yaml"]), 2, "an unreadable content file is a usage error, not a traceback")
+        self.assertIn("cannot read --content-file", err.getvalue())
+
+    def test_a_project_the_token_cannot_see_is_named_with_the_status(self):
+        def gone(method, path, token, body=None, host=gitlab.DEFAULT_HOST):
+            raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "tok"}), mock.patch.object(gitlab, "api", gone), mock.patch.object(gitlab, "pause"), \
+                mock.patch.object(sys, "stdin", io.StringIO("x: 1\n")), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 1)
+        self.assertIn("HTTP 404", err.getvalue())
 
 
 class ProjectGuardTest(unittest.TestCase):
@@ -237,6 +379,177 @@ class LedgerResetTest(unittest.TestCase):
             gitlab.reset_ledgers("gke-agentic/kube-agents-evals-9-infra", PROJECT, "b", "tok", None, False)
 
 
+class LedgerProbeTest(unittest.TestCase):
+    """The lease-time ledger-path probe (kube-agents#2920): publish as the
+    agent, read back as the grader, retire through the reset, read the close
+    back; each half named when it fails; never another project."""
+
+    def _probe(self, fake, path=PATH, now=None):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(gitlab, "api", fake), mock.patch.object(gitlab, "pause", lambda _s: None), redirect_stdout(out), redirect_stderr(err):
+            iid, faults = gitlab.probe_ledger_path(path, PROJECT, "2110018781794275328", "agent-tok", "ledger-tok", now=now)
+        return iid, faults, out.getvalue()
+
+    def test_the_probe_publishes_reads_back_and_retires_one_issue(self):
+        fake = FakeGitLab()
+        iid, faults, out = self._probe(fake)
+        self.assertEqual(faults, [])
+        self.assertEqual(iid, 1)
+        steps = list(zip([m for m, _, _ in fake.calls], [p.split("?")[0].replace(f"/projects/{ENC}", "") for _, p, _ in fake.calls], fake.tokens))
+        # The agent writes; the grader's token reads the issue and its notes, nothing else.
+        self.assertEqual(steps[0], ("GET", "/user", "agent-tok"))
+        self.assertEqual(steps[1], ("POST", "/issues", "agent-tok"))
+        self.assertEqual(steps[2], ("GET", "/issues/1", "ledger-tok"))
+        self.assertIn(("POST", "/issues/1/notes", "agent-tok"), steps)
+        self.assertIn(("PUT", "/issues/1", "agent-tok"), steps)
+        self.assertEqual(steps[-2:], [("GET", "/issues/1", "ledger-tok"), ("GET", "/issues/1/notes", "ledger-tok")])
+        self.assertEqual({t for (m, _, t) in steps if m in ("POST", "PUT")}, {"agent-tok"})
+        self.assertEqual([s for s in steps if s[1] == "/user"], [("GET", "/user", "agent-tok")], "the login is read once and handed to the reset")
+        created = fake.calls[1][2]
+        self.assertEqual(created["title"], "[audit] eval ledger-path probe")
+        self.assertEqual(created["labels"], "agent:audit,audit:eval-ledger-probe")
+        # The body is the footer the bench's ledger check parses, under the probe's own stream.
+        self.assertRegex(created["description"], r"Generated by the Platform Agent `eval-ledger-probe` watchdog at \S+\. ")
+        self.assertEqual(fake.detail[1]["state"], "closed")
+        self.assertTrue(fake.notes[1][0]["body"].startswith(ledgers.RESET_MARKER))
+        # The note on the forge says what closed it: the probe, not a repetition that never ran.
+        self.assertIn("by the ledger-path probe, which opened it a moment earlier", fake.notes[1][0]["body"])
+        self.assertNotIn("before repetition", fake.notes[1][0]["body"])
+        self.assertIn("closed 1 open ledger(s) of the eval-ledger-probe stream", out)
+
+    def test_a_write_the_agent_token_cannot_make_is_the_publish_fault(self):
+        fake = FakeGitLab(fail={("POST", "/issues")})
+        iid, faults, _ = self._probe(fake)
+        self.assertIsNone(iid)
+        self.assertEqual(len(faults), 1)
+        self.assertTrue(faults[0].startswith("publish: the agent token could not open an issue in gke-agentic/kube-agents-evals-2-infra"), faults)
+        self.assertEqual([m for m, _, _ in fake.calls], ["GET", "POST"])
+
+    def test_a_login_the_agent_token_cannot_read_creates_nothing(self):
+        # The lookup comes before the create, so a fault there leaves no issue to retire.
+        fake = FakeGitLab(fail={("GET", "/user")})
+        iid, faults, _ = self._probe(fake)
+        self.assertIsNone(iid)
+        self.assertEqual(len(faults), 1)
+        self.assertTrue(faults[0].startswith("publish: the agent token could not read its own login at gitlab.com"), faults)
+        self.assertEqual([m for m, _, _ in fake.calls], ["GET"])
+        self.assertEqual(fake.detail, {})
+
+    def test_a_naive_footer_stamp_reads_as_utc_rather_than_crashing(self):
+        # The bench's parser reads a stamp without an offset as UTC; so does the probe, and the
+        # round-trip check then runs instead of a TypeError leaving the issue open.
+        fake = FakeGitLab()
+        fake.naive_stamp = True
+        iid, faults, _ = self._probe(fake)
+        self.assertEqual(iid, 1)
+        self.assertEqual(faults, [])
+        self.assertEqual(fake.detail[1]["state"], "closed")
+
+    def test_an_empty_read_back_is_the_read_back_fault(self):
+        fake = FakeGitLab()
+        fake.empty_issue_read = True
+        iid, faults, _ = self._probe(fake)
+        self.assertEqual(iid, 1)
+        self.assertIn("read-back: GitLab answered the read of issue #1 with an empty body", faults)
+        # The issue is still retired; the post-close read comes back empty too and says that, not "not closed".
+        self.assertEqual(fake.detail[1]["state"], "closed")
+        self.assertIn("reset read-back: GitLab answered the read of issue #1 after the close with an empty body", faults)
+        self.assertNotIn("reset read-back: issue #1 is not closed after the reset", faults)
+
+    def test_a_body_that_does_not_come_back_as_written_is_the_read_back_fault(self):
+        fake = FakeGitLab()
+        fake.mangle_description = True
+        iid, faults, _ = self._probe(fake)
+        self.assertEqual(iid, 1)
+        self.assertTrue(any(f.startswith("read-back: issue #1 carries no parseable footer") for f in faults), faults)
+        # It is still retired: a probe never leaves its issue open.
+        self.assertEqual(fake.detail[1]["state"], "closed")
+
+    def test_an_issue_the_grader_would_not_take_as_a_ledger_is_the_read_back_fault(self):
+        # The ledger rule is the GitHub one with the bot's login: an issue GitLab records under
+        # another author (a token that is not the bot's) reads back as not a ledger.
+        fake = FakeGitLab()
+        fake.author_on_create = "someone-else"
+        iid, faults, _ = self._probe(fake)
+        self.assertEqual(iid, 1)
+        self.assertIn("read-back: issue #1 does not read as a ledger: author someone-else is not kube-agents-eval-bot", faults)
+        # The reset's rule would skip it too, so the probe closes it by number and says so; nothing is left open.
+        self.assertIn("reset: issue #1 closed by number, since the reset's ledger rule would not have found it", faults)
+        self.assertEqual(fake.detail[1]["state"], "closed")
+        self.assertTrue(fake.notes[1][0]["body"].startswith(ledgers.RESET_MARKER))
+        self.assertEqual([f for f in faults if f.startswith("reset read-back")], [])
+
+    def test_a_stamp_that_does_not_come_back_as_written_is_the_read_back_fault(self):
+        fake = FakeGitLab()
+        fake.stale_stamp = True
+        _, faults, _ = self._probe(fake)
+        self.assertTrue(any(f.startswith("read-back: issue #1's footer stamp did not come back as written") for f in faults), faults)
+
+    def test_an_issue_that_is_not_open_on_read_back_is_the_read_back_fault(self):
+        fake = FakeGitLab()
+        fake.state_on_create = "closed"
+        _, faults, _ = self._probe(fake)
+        self.assertIn("read-back: issue #1 is 'closed', not opened", faults)
+
+    def test_a_close_the_grader_cannot_read_back_is_the_reset_read_back_fault(self):
+        # The ledger token's reads fail: the first read-back and the one after the close both say so,
+        # and the probe still retires its issue in between.
+        fake = FakeGitLab(fail={("GET", "/issues/1")})
+        iid, faults, _ = self._probe(fake)
+        self.assertEqual(iid, 1)
+        self.assertTrue(any(f.startswith("read-back: the ledger token could not read issue #1") for f in faults), faults)
+        self.assertTrue(any(f.startswith("reset read-back: the ledger token could not read issue #1 after the close") for f in faults), faults)
+        self.assertEqual(fake.detail[1]["state"], "closed")
+
+    def test_a_close_without_the_reset_marker_is_the_reset_read_back_fault(self):
+        fake = FakeGitLab()
+        fake.unmarked_notes = True
+        _, faults, _ = self._probe(fake)
+        self.assertEqual(faults, ["reset read-back: issue #1 carries no note opening with the reset marker"])
+
+    def test_a_listing_the_reset_cannot_make_is_the_reset_fault(self):
+        # The reset's own listing fails after the create: named as the reset step, the issue
+        # said to stay open until the next lease, no traceback out of the probe.
+        fake = FakeGitLab(fail={("GET", "/issues")})
+        iid, faults, _ = self._probe(fake)
+        self.assertEqual(iid, 1)
+        self.assertEqual(len([f for f in faults if f.startswith("reset: issue #1 could not be listed or closed in gke-agentic/kube-agents-evals-2-infra")]), 1, faults)
+        self.assertIn("stays open until the next lease", faults[-1])
+
+    def test_a_reset_that_cannot_close_is_the_reset_fault(self):
+        fake = FakeGitLab(fail={("PUT", "/issues/1")})
+        iid, faults, _ = self._probe(fake)
+        self.assertEqual(iid, 1)
+        self.assertIn("reset: 1 probe ledger(s) did not close in gke-agentic/kube-agents-evals-2-infra", faults)
+        self.assertIn("reset read-back: issue #1 is not closed after the reset", faults)
+
+    def test_the_wrong_project_is_refused_before_any_call(self):
+        fake = FakeGitLab()
+        with self.assertRaises(gitlab.ResetError):
+            self._probe(fake, path="gke-agentic/kube-agents-evals-9-infra")
+        self.assertEqual(fake.calls, [])
+
+    def test_the_cli_takes_both_tokens_from_the_environment(self):
+        fake = FakeGitLab()
+        argv = ["--path", PATH, "--project", PROJECT, "--build", "7"]
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.PROBE_TOKEN_ENV: "", gitlab.PROBE_LEDGER_TOKEN_ENV: ""}), redirect_stderr(err):
+            self.assertEqual(gitlab.probe_ledger_main(argv), 2)
+        self.assertIn("GITLAB_PROBE_LEDGER_TOKEN", err.getvalue())
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.PROBE_TOKEN_ENV: "agent-tok", gitlab.PROBE_LEDGER_TOKEN_ENV: "ledger-tok"}), mock.patch.object(gitlab, "api", fake), mock.patch.object(gitlab, "pause", lambda _s: None), redirect_stdout(out):
+            self.assertEqual(gitlab.probe_ledger_main(argv), 0)
+        self.assertIn("issue #1 opened as the agent, read back with the grader's token, closed by the reset in gke-agentic/kube-agents-evals-2-infra", out.getvalue())
+        self.assertEqual(fake.tokens[0], "agent-tok")
+
+    def test_the_cli_names_every_fault_and_exits_1(self):
+        fake = FakeGitLab(fail={("PUT", "/issues/1")})
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.PROBE_TOKEN_ENV: "agent-tok", gitlab.PROBE_LEDGER_TOKEN_ENV: "ledger-tok"}), mock.patch.object(gitlab, "api", fake), mock.patch.object(gitlab, "pause", lambda _s: None), redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertEqual(gitlab.probe_ledger_main(["--path", PATH, "--project", PROJECT, "--build", "7"]), 1)
+        self.assertIn("reset: 1 probe ledger(s) did not close", err.getvalue())
+
+
 class MergeRequestResetTest(unittest.TestCase):
     def _reset(self, fake, dry_run=False):
         record = gitlab.empty_record()
@@ -315,6 +628,33 @@ class MergeRequestResetTest(unittest.TestCase):
         record, _, _, _ = self._reset(racing)
         self.assertEqual(record["deleted"], ["ghost"])
         self.assertTrue(record["clean"])
+
+    def test_a_listing_that_lags_a_delete_does_not_read_as_a_branch_left_behind(self):
+        """gitlab.com keeps a deleted branch in the branch listing for ~24 s
+        (measured 2026-10-09 on kube-agents-evals-13-infra) while the
+        single-branch read says 404 at once. The first live GitLab run
+        (build 2108585203671764992) refused two repetitions on exactly that:
+        the reset deleted the branch, listed it again, and read "1 remain"."""
+        fake = FakeGitLab(mrs=[mr(1, source="platform-agent/fix")], branches=["main", "platform-agent/fix"])
+        original = fake.__call__
+
+        def lagging(method, path, token, body=None, host=gitlab.DEFAULT_HOST):
+            result = original(method, path, token, body, host)
+            if method == "DELETE":
+                fake.listed = ["main", "platform-agent/fix"]  # the listing keeps it; existence does not
+            return result
+
+        record, out, _, _ = self._reset(lagging)
+        self.assertEqual(record["deleted"], ["platform-agent/fix"])
+        self.assertEqual(record["branches_after"], 0)
+        self.assertTrue(record["clean"])
+        # The next reset, seconds later, still sees the stale name in the
+        # listing: it is reported as gone, not deleted again, and not counted.
+        fake.listed = ["main", "platform-agent/fix"]
+        record, out, _, _ = self._reset(fake)
+        self.assertIn("branch platform-agent/fix is listed but already gone", out)
+        self.assertEqual(record["deleted"], [])
+        self.assertEqual((record["branches_before"], record["branches_after"], record["clean"]), (0, 0, True))
 
     def test_dry_run_lists_and_writes_nothing(self):
         fake = FakeGitLab(mrs=[mr(1)], branches=["main", "platform-agent/fix"])
@@ -523,6 +863,106 @@ def _runner(stdout=b"glpat-fake", code=0, stderr=b""):
 
     run.calls = calls
     return run
+
+
+class PrivateCaTest(unittest.TestCase):
+    """A self-managed instance's CA (kube-agents#3682): api() verifies with it
+    when configured or named in the environment, the system store otherwise,
+    and a CA that does not load is a refusal naming the file."""
+
+    def setUp(self):
+        gitlab.configure_ca(None)
+        self.addCleanup(gitlab.configure_ca, None)
+
+    def test_no_ca_means_the_system_store(self):
+        with mock.patch.dict(os.environ, {gitlab.CA_FILE_ENV: ""}):
+            self.assertIsNone(gitlab.ssl_context())
+
+    def test_a_configured_or_named_ca_builds_a_verifying_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = pathlib.Path(tmp) / "ca.crt"
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", str(pathlib.Path(tmp) / "ca.key"), "-out", str(ca), "-days", "1", "-subj", "/CN=test-ca"], check=True, capture_output=True)
+            gitlab.configure_ca(str(ca))
+            context = gitlab.ssl_context()
+            self.assertIsNotNone(context)
+            self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+            gitlab.configure_ca(None)
+            with mock.patch.dict(os.environ, {gitlab.CA_FILE_ENV: str(ca)}):
+                self.assertIsNotNone(gitlab.ssl_context())
+
+    def test_a_ca_that_does_not_load_is_a_refusal_naming_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = pathlib.Path(tmp) / "ca.crt"
+            bad.write_text("not a certificate\n")
+            gitlab.configure_ca(str(bad))
+            with self.assertRaises(gitlab.ResetError) as caught:
+                gitlab.ssl_context()
+            self.assertIn(str(bad), str(caught.exception))
+            gitlab.configure_ca(str(pathlib.Path(tmp) / "missing.crt"))
+            with self.assertRaises(gitlab.ResetError):
+                gitlab.ssl_context()
+
+    def test_api_hands_the_context_to_urlopen(self):
+        seen = {}
+
+        class _Resp:
+            status = 200
+            def read(self): return b"{}"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(request, timeout=None, context=None):
+            seen["context"] = context
+            seen["url"] = request.full_url
+            return _Resp()
+
+        sentinel = ssl.create_default_context()
+        with mock.patch.object(gitlab, "ssl_context", lambda: sentinel), mock.patch.object(gitlab.urllib.request, "urlopen", fake_urlopen):
+            gitlab.api("GET", "/version", "tok", host="gitlab.eval.internal")
+        self.assertIs(seen["context"], sentinel)
+        self.assertEqual(seen["url"], "https://gitlab.eval.internal/api/v4/version")
+
+
+class SelfManagedDispatchTest(unittest.TestCase):
+    """`--host` and `--ca-file` on the two reset helpers reach the GitLab
+    module: the host is where the calls go, the CA is configured before them,
+    and neither flag means anything under --forge github."""
+
+    def test_the_ledger_reset_passes_the_host_and_configures_the_ca(self):
+        seen = {}
+        def fake_reset(path, project, build, token, audit, dry_run, host=gitlab.DEFAULT_HOST, **kw):
+            seen.update(path=path, host=host, ca=gitlab._ca_file); return 0
+        with mock.patch.object(gitlab, "reset_ledgers", fake_reset), mock.patch.dict(os.environ, {"LEDGER_RESET_TOKEN": "tok"}), redirect_stdout(io.StringIO()):
+            code = ledgers.main(["--repo", PATH, "--project", PROJECT, "--build", "b", "--forge", "gitlab", "--host", "gitlab.eval.internal", "--ca-file", "/tmp/eval-forge/ca.crt"])
+        gitlab.configure_ca(None)
+        self.assertEqual(code, 0)
+        self.assertEqual((seen["path"], seen["host"], seen["ca"]), (PATH, "gitlab.eval.internal", "/tmp/eval-forge/ca.crt"))
+
+    def test_the_pulls_reset_passes_the_host_and_configures_the_ca(self):
+        seen = {}
+        def fake_reset(path, project, build, scope, token, dry_run, record, host=gitlab.DEFAULT_HOST, **kw):
+            seen.update(path=path, host=host, ca=gitlab._ca_file); record["clean"] = True; return record
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(gitlab, "reset_merge_requests", fake_reset), mock.patch.dict(os.environ, {"AGENT_PULLS_RESET_TOKEN": "tok"}), redirect_stdout(io.StringIO()):
+            code = pulls.main(["--repo", PATH, "--project", PROJECT, "--build", "b", "--forge", "gitlab", "--host", "gitlab.eval.internal", "--ca-file", "/tmp/eval-forge/ca.crt", "--record", f"{tmp}/r.json"])
+        gitlab.configure_ca(None)
+        self.assertEqual(code, 0)
+        self.assertEqual((seen["path"], seen["host"], seen["ca"]), (PATH, "gitlab.eval.internal", "/tmp/eval-forge/ca.crt"))
+
+    def test_the_default_host_stays_gitlab_com_without_the_flag(self):
+        seen = {}
+        def fake_reset(path, project, build, token, audit, dry_run, host=gitlab.DEFAULT_HOST, **kw):
+            seen["host"] = host; return 0
+        with mock.patch.object(gitlab, "reset_ledgers", fake_reset), mock.patch.dict(os.environ, {"LEDGER_RESET_TOKEN": "tok"}), redirect_stdout(io.StringIO()):
+            ledgers.main(["--repo", PATH, "--project", PROJECT, "--build", "b", "--forge", "gitlab"])
+        self.assertEqual(seen["host"], "gitlab.com")
+
+    def test_the_flags_are_refused_under_github(self):
+        for module, env in ((ledgers, "LEDGER_RESET_TOKEN"), (pulls, "AGENT_PULLS_RESET_TOKEN")):
+            with self.subTest(module=module.__name__), mock.patch.dict(os.environ, {env: "tok"}), redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as exited:
+                    module.main(["--repo", "o/r", "--project", PROJECT, "--build", "b", "--host", "ghes.eval.internal"])
+                self.assertEqual(exited.exception.code, 2)
+                self.assertIn("--forge gitlab only", err.getvalue())
 
 
 class SweepGitLabPassTest(unittest.TestCase):
@@ -839,6 +1279,19 @@ def lifted_line(pattern):
     return match.group(0)
 
 
+def lifted_forge_setup():
+    """The eval script's forge block as it ships: the lifted table, the kind,
+    host and self-managed flag, the CA rule, the GitLab constants and the
+    helper arguments. From `eval_forge_profile() {` through the `fi` that
+    closes the helper-argument block; SCRIPT_DIR must point at a directory
+    holding ci-deploy.sh when it runs."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    start = src.index("eval_forge_profile() {")
+    marker = src.index('EVAL_FORGE_HELPER_ARGS+=(--ca-file "${EVAL_FORGE_CA_FILE}")', start)
+    end = src.index("\nfi\n", marker) + len("\nfi\n")
+    return src[start:end]
+
+
 def literal(path, name):
     match = re.search(rf'^{name}="([^"]*)"$', path.read_text(encoding="utf-8"), re.MULTILINE)
     assert match, f"{name} not found in {path}"
@@ -858,6 +1311,14 @@ STUB_WHOAMI = textwrap.dedent(
     token = os.environ.get("GITLAB_PROBE_TOKEN", "")
     with open(os.environ["WHOAMI_LOG"], "a") as log:
         log.write("WHOAMI argv=" + json.dumps(sys.argv[2:]) + " token=" + token + "\\n")
+    if sys.argv[1:2] == ["probe-ledger"]:
+        with open(os.environ["WHOAMI_LOG"], "a") as log:
+            log.write("PROBE argv=" + json.dumps(sys.argv[2:]) + " ledger=" + os.environ.get("GITLAB_PROBE_LEDGER_TOKEN", "") + "\\n")
+        if os.environ.get("PROBE_FAIL"):
+            print("read-back: issue #7 carries no parseable footer for eval-ledger-probe (got None)", file=sys.stderr)
+            sys.exit(1)
+        print("issue #7 opened as the agent, read back with the grader's token, closed by the reset in " + sys.argv[sys.argv.index("--path") + 1])
+        sys.exit(0)
     if sys.argv[1:2] != ["whoami"]:
         sys.exit(2)
     if token in os.environ.get("WHOAMI_DEAD", "").split(","):
@@ -866,6 +1327,15 @@ STUB_WHOAMI = textwrap.dedent(
     print(os.environ.get("WHOAMI_LOGIN", "kube-agents-eval-bot"))
     """
 )
+
+OPENSSL_STUB = """#!/usr/bin/env bash
+# openssl stand-in for the tests: `x509 -noout -text -in FILE` prints a Basic
+# Constraints block, CA:TRUE for a PEM certificate, CA:FALSE when the file
+# carries the marker NOT-A-CA; anything that is not PEM fails to parse.
+f="${@: -1}"
+grep -q "BEGIN CERTIFICATE" "$f" 2>/dev/null || { echo "unable to load certificate" >&2; exit 1; }
+if grep -q "NOT-A-CA" "$f"; then printf "X509v3 Basic Constraints: critical\n    CA:FALSE\n"; else printf "X509v3 Basic Constraints: critical\n    CA:TRUE\n"; fi
+"""
 
 STUB_HELPER = textwrap.dedent(
     """\
@@ -878,6 +1348,8 @@ STUB_HELPER = textwrap.dedent(
 
 
 class EvalScriptGitLabTest(unittest.TestCase):
+    forge = "gitlab"
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -888,6 +1360,8 @@ class EvalScriptGitLabTest(unittest.TestCase):
         (self.dir / "ci_reset_agent_pulls.py").write_text(STUB_HELPER)
         (self.dir / "ci_gitlab_forge.py").write_text(STUB_WHOAMI)
         (self.dir / "ci-deploy.sh").write_text(CI_DEPLOY.read_text(encoding="utf-8"))
+        (self.bin / "openssl").write_text(OPENSSL_STUB)
+        (self.bin / "openssl").chmod(0o755)
 
     def _run(self, body, dead=""):
         """run_bash with the whoami stub's knobs: its log, and the token values it refuses."""
@@ -898,7 +1372,7 @@ class EvalScriptGitLabTest(unittest.TestCase):
         stub.write_text(
             "#!/usr/bin/env bash\n"
             f'printf "%s\\n" "$*" >> "{self.dir}/gcloud.argv"\n'
-            f'case "$*" in *"{fail}"*) [ -n "{fail}" ] && exit 1 ;; esac\n'
+            f'case "$*" in *"{fail}"*) [ -n "{fail}" ] && {{ echo "ERROR: (gcloud.secrets.versions.access) PERMISSION_DENIED: stub" >&2; exit 1; }} ;; esac\n'
             f'case "$*" in *gitlab-agent-token*) printf "%s\\n" "{agent}" ;; *gitlab-ledger-token*) printf "%s\\n" "{ledger}" ;; esac\n'
         )
         stub.chmod(0o755)
@@ -906,31 +1380,81 @@ class EvalScriptGitLabTest(unittest.TestCase):
     def _preamble(self):
         return "\n".join(
             [
-                'EVAL_FORGE="gitlab"',
-                # The assignment is lifted, not restated: the line that fills
-                # the array is what the argv assertions below pin.
-                lifted_line(r"^EVAL_FORGE_HELPER_ARGS=\(\)$"),
-                lifted_line(r'^\[ "\$\{EVAL_FORGE\}" = "gitlab" \] && EVAL_FORGE_HELPER_ARGS=\(--forge gitlab\)$'),
-                f'GITLAB_SECRETS_PROJECT="{literal(SCRIPT, "GITLAB_SECRETS_PROJECT")}"',
-                f'GITLAB_AGENT_SM_SECRET="{literal(SCRIPT, "GITLAB_AGENT_SM_SECRET")}"',
-                f'GITLAB_LEDGER_SM_SECRET="{literal(SCRIPT, "GITLAB_LEDGER_SM_SECRET")}"',
-                f'GITLAB_BOT_LOGIN="{literal(SCRIPT, "GITLAB_BOT_LOGIN")}"',
-                f'GITLAB_FORGE_HOST="{literal(SCRIPT, "GITLAB_FORGE_HOST")}"',
-                f'SCRIPT_DIR="{self.dir}"; PROJECT_ID="{PROJECT}"; BUILD_ID=1; EVAL_LEDGER_APP_KEY_FILE=""; EVAL_LEDGER_APP_ID=1',
+                f'EVAL_FORGE="{self.forge}"; SCRIPT_DIR="{self.dir}"; EVAL_FORGE_STATE_DIR="{self.dir}/forge-state"',
+                # The forge block is lifted, not restated: the table, the kind
+                # and host it yields, the CA rule and the helper arguments are
+                # what the argv assertions below pin.
+                lifted_forge_setup(),
+                f'PROJECT_ID="{PROJECT}"; BUILD_ID=1; EVAL_LEDGER_APP_KEY_FILE=""; EVAL_LEDGER_APP_ID=1',
                 f'ARTIFACT_DIR="{self.dir}/artifacts"; AGENT_PULLS_RESET_PERMISSIONS=\'{{}}\'',
                 'EVAL_GITLAB_AGENT_TOKEN=""',
+                lifted("gitlab_token_source"),
+                lifted("read_gitlab_token"),
                 lifted("read_gitlab_tokens"),
                 lifted("eval_gitlab_project"),
                 lifted("forge_write_token"),
                 lifted("reset_audit_ledgers"),
                 lifted("reset_agent_pulls"),
+                lifted("probe_gitlab_ledger_path"),
             ]
         )
 
+    def _probe_body(self, extra=""):
+        return self._preamble() + f'\nread_gitlab_tokens >/dev/null || exit 9\nEVAL_LEDGER_REPO="$(eval_gitlab_project "$PROJECT_ID")"\n{extra}\nprobe_gitlab_ledger_path lease; echo "RC=$?"\n'
+
+    def test_the_lease_probe_hands_both_tokens_to_the_helper_in_its_environment(self):
+        self._gcloud()
+        proc = self._run(self._probe_body())
+        self.assertIn("RC=0", proc.stdout)
+        self.assertIn("Ledger probe (lease): issue #7 opened as the agent, read back with the grader's token, closed by the reset in gke-agentic/kube-agents-evals-2-infra", proc.stdout)
+        log = (self.dir / "whoami.log").read_text().splitlines()
+        probe_argv = '["--path", "gke-agentic/kube-agents-evals-2-infra", "--project", "kube-agents-evals-2", "--build", "1", "--host", "gitlab.com"]'
+        # Both tokens ride in the helper's environment: the stub logs the agent token on its WHOAMI line
+        # for every invocation and the ledger token on the PROBE line.
+        self.assertIn(f"WHOAMI argv={probe_argv} token=glpat-agent", log)
+        self.assertEqual([line for line in log if line.startswith("PROBE ")], [f"PROBE argv={probe_argv} ledger=glpat-ledger"])
+        self.assertNotIn("WARNING", proc.stderr)
+
+    def test_a_broken_ledger_path_stops_the_run_naming_the_step(self):
+        self._gcloud()
+        proc = self._run(self._probe_body("export PROBE_FAIL=1"))
+        self.assertIn("RC=1", proc.stdout)
+        self.assertIn("Ledger probe (lease): read-back: issue #7 carries no parseable footer", proc.stdout)
+        self.assertIn("ERROR: Ledger probe (lease): the GitLab ledger path is broken in gke-agentic/kube-agents-evals-2-infra", proc.stderr)
+        self.assertIn("kube-agents#2920", proc.stderr)
+
+    def test_the_lease_time_probe_follows_both_resets_and_stops_the_run(self):
+        # The one line that makes "a fault stops the run" true: after the two lease resets, `|| exit 1`,
+        # not the warning shape of the line above it. Lifted tests exercise the function; this pins the call.
+        src = SCRIPT.read_text(encoding="utf-8")
+        self.assertIsNotNone(re.search(r'^reset_agent_pulls "lease" \|\| echo "WARNING[^\n]*\nprobe_gitlab_ledger_path "lease" \|\| exit 1$', src, re.M))
+        self.assertEqual(src.count("probe_gitlab_ledger_path "), 1, "called once, at lease time")
+
+    def test_the_probe_is_skipped_on_github_and_on_an_unmapped_project(self):
+        self._gcloud()
+        proc = self._run(self._probe_body('EVAL_FORGE="github"; EVAL_FORGE_KIND="github"'))
+        self.assertIn("RC=0", proc.stdout)
+        self.assertNotIn("PROBE ", (self.dir / "whoami.log").read_text())
+        proc = self._run(self._probe_body('EVAL_LEDGER_REPO=""'))
+        self.assertIn("RC=0", proc.stdout)
+        self.assertIn("Ledger probe (lease): skipped, PROJECT_ID=kube-agents-evals-2 maps to no GitLab project", proc.stdout)
+        self.assertNotIn("PROBE ", (self.dir / "whoami.log").read_text())
+
+    def test_the_per_run_project_layout_equals_the_guards(self):
+        # The deploy derives a per-run GitLab's project from the lease with these two
+        # constants; the helper's project guard accepts exactly that shape.
+        self.assertEqual(literal(CI_DEPLOY, "GITLAB_FORGE_GROUP"), gitlab.GROUP)
+        self.assertEqual(literal(CI_DEPLOY, "GITLAB_FORGE_PROJECT_SUFFIX"), gitlab.PROJECT_SUFFIX)
+        proc = run_bash(lifted("eval_gitlab_project") + '\nEVAL_FORGE_SELF_MANAGED="yes"; eval_gitlab_project some-leased-project\n', env={"SCRIPT_DIR": str(HACK)})
+        self.assertEqual(proc.stdout.strip(), "gke-agentic/some-leased-project-infra")
+
     def test_the_secret_names_equal_the_deploys(self):
-        for name in ("GITLAB_SECRETS_PROJECT", "GITLAB_AGENT_SM_SECRET", "GITLAB_FORGE_HOST"):
+        for name in ("GITLAB_SECRETS_PROJECT", "GITLAB_AGENT_SM_SECRET"):
             with self.subTest(name=name):
                 self.assertEqual(literal(SCRIPT, name), literal(CI_DEPLOY, name))
+        # The host is no literal any more: both scripts read ci-deploy.sh's forge table.
+        proc = run_bash(lifted_forge_setup() + '\necho "PROFILE=${EVAL_FORGE_KIND} ${EVAL_FORGE_HOST} ${EVAL_FORGE_SELF_MANAGED} ${GITLAB_FORGE_HOST}"\n', env={"EVAL_FORGE": "gitlab", "SCRIPT_DIR": str(HACK)})
+        self.assertIn("PROFILE=gitlab gitlab.com no gitlab.com", proc.stdout)
         # Pinned as literals too: a test that only compares the two files would
         # pass with both pointing somewhere wrong.
         self.assertEqual(literal(SCRIPT, "GITLAB_SECRETS_PROJECT"), "kube-agents-prow")
@@ -972,7 +1496,7 @@ class EvalScriptGitLabTest(unittest.TestCase):
         """The function's return code is one half; the other is the line that
         turns it into a stopped run, under the gitlab branch of the preflight."""
         src = SCRIPT.read_text(encoding="utf-8")
-        branch = src.index('if [ "${EVAL_FORGE}" = "gitlab" ]; then\n  read_gitlab_tokens || exit 1')
+        branch = src.index('if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then\n  read_gitlab_tokens || exit 1')
         self.assertLess(branch, src.index('mint_ledger_token "preflight" || exit 1'), "the GitHub mint is the other branch of the same if")
         self.assertLess(branch, src.index('reset_audit_ledgers "lease"'))
 
@@ -982,6 +1506,10 @@ class EvalScriptGitLabTest(unittest.TestCase):
         self.assertIn("RC=1", proc.stdout)
         self.assertIn("could not read kube-agents-prow/gitlab-ledger-token as this runner", proc.stderr)
         self.assertNotIn("gitlab-agent-token", proc.stderr.split("could not read", 1)[1].split(" as this runner")[0])
+        # gcloud's own reason stays above the script's line: the redirect that
+        # quiets the per-run file read must not cover the Secret Manager read.
+        self.assertIn("PERMISSION_DENIED", proc.stderr)
+        self.assertLess(proc.stderr.index("PERMISSION_DENIED"), proc.stderr.index("could not read"))
 
     def test_the_resets_get_the_agent_token_and_the_forge_flag(self):
         self._gcloud()
@@ -997,35 +1525,104 @@ class EvalScriptGitLabTest(unittest.TestCase):
         )
         proc = self._run(body)
         out = proc.stdout
-        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab"]', out)
-        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--audit", "compliance-audit"]', out)
+        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.com"]', out)
+        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.com", "--audit", "compliance-audit"]', out)
         record = f"{self.dir}/artifacts/agent-pulls-reset/lease.json"
         self.assertIn(
-            f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--scope", "lease", "--record", "{record}", "--forge", "gitlab"]',
+            f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--scope", "lease", "--record", "{record}", "--forge", "gitlab", "--host", "gitlab.com"]',
             out,
         )
         self.assertIn("HELPER token=glpat-agent", out)
         self.assertNotIn("glpat-ledger", out.replace("LEDGER=glpat-ledger", ""))
         self.assertIn("PULLS_RC=0", out)
 
+    def test_the_resets_run_on_a_per_run_gitlab_without_the_app_key(self):
+        # The skip gate reads the kind, not the name: on gitlab-ce the agent token
+        # drives both resets with no GitHub App key mounted (found live, kube-agents#3682).
+        state = self.dir / "forge-state"
+        state.mkdir()
+        (state / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+        (state / "agent-token").write_text("glpat-perrun-agent\n")
+        (state / "ledger-token").write_text("glpat-perrun-ledger\n")
+        body = self._preamble().replace(f'EVAL_FORGE="{self.forge}"', 'EVAL_FORGE="gitlab-ce"', 1) + "\n".join(
+            [
+                "",
+                "read_gitlab_tokens >/dev/null || exit 9",
+                'EVAL_LEDGER_REPO="$(eval_gitlab_project "${PROJECT_ID}")"',
+                'reset_audit_ledgers "lease"',
+                'reset_agent_pulls "lease"; echo "PULLS_RC=$?"',
+            ]
+        )
+        proc = self._run(body)
+        out = proc.stdout
+        self.assertNotIn("EVAL_LEDGER_APP_KEY_FILE is unset", out)
+        per_run = f"gke-agentic/{PROJECT}-infra"
+        self.assertIn(f'HELPER argv=["--repo", "{per_run}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.eval.internal", "--ca-file", "{state}/ca.crt"]', out)
+        self.assertIn("HELPER token=glpat-perrun-agent", out)
+        self.assertEqual(out.count("HELPER argv="), 2)
+        self.assertIn("PULLS_RC=0", out)
+
     def test_the_forge_switch_refuses_an_unknown_forge(self):
         src = SCRIPT.read_text(encoding="utf-8")
         start = src.index('EVAL_FORGE="${EVAL_FORGE:-github}"')
-        block = src[start : src.index("esac", start) + 4]
-        proc = run_bash(block, env={"EVAL_FORGE": "bitbucket"})
+        block = src[start:start + len('EVAL_FORGE="${EVAL_FORGE:-github}"')] + "\n" + lifted_forge_setup() + '\necho "ARGS=${EVAL_FORGE_HELPER_ARGS[*]-} CA=${EVAL_FORGE_CA_FILE}"\n'
+        env = {"SCRIPT_DIR": str(HACK), "EVAL_FORGE_STATE_DIR": f"{self.dir}/no-such-state"}
+        proc = run_bash(block, env={**env, "EVAL_FORGE": "bitbucket"})
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("EVAL_FORGE='bitbucket' is not a forge", proc.stderr)
-        self.assertEqual(run_bash(block, env={"EVAL_FORGE": ""}).returncode, 0)
+        self.assertEqual(run_bash(block, env={**env, "EVAL_FORGE": ""}).returncode, 0)
         # A developer's GitHub-era override is refused under gitlab, where the deploy ignores it.
-        overridden = run_bash(block, env={"EVAL_FORGE": "gitlab", "EVAL_GITOPS_REPO": "me/throwaway"})
+        overridden = run_bash(block, env={**env, "EVAL_FORGE": "gitlab", "EVAL_GITOPS_REPO": "me/throwaway"})
         self.assertNotEqual(overridden.returncode, 0)
         self.assertIn("does not take EVAL_GITOPS_REPO", overridden.stderr)
-        self.assertEqual(run_bash(block, env={"EVAL_FORGE": "gitlab", "EVAL_GITOPS_REPO": ""}).returncode, 0)
+        public = run_bash(block, env={**env, "EVAL_FORGE": "gitlab", "EVAL_GITOPS_REPO": ""})
+        self.assertEqual(public.returncode, 0)
+        self.assertIn("ARGS=--forge gitlab --host gitlab.com CA=", public.stdout)
+
+    def test_a_self_managed_forge_needs_its_ca_and_hands_it_on(self):
+        """ghes and gitlab-ce (kube-agents#3682): refused without the CA the lane
+        step leaves in the state directory; with it, the kind, the private host
+        and the CA reach the helpers and the grader's variables."""
+        src = SCRIPT.read_text(encoding="utf-8")
+        start = src.index('EVAL_FORGE="${EVAL_FORGE:-github}"')
+        block = src[start:start + len('EVAL_FORGE="${EVAL_FORGE:-github}"')] + "\n" + lifted_forge_setup() + '\necho "KIND=${EVAL_FORGE_KIND} HOST=${EVAL_FORGE_HOST} ARGS=${EVAL_FORGE_HELPER_ARGS[*]-} CA=${EVAL_FORGE_CA_FILE}"\n'
+        state = self.dir / "forge-state"
+        for forge, kind, host in (("ghes", "github", "ghes.eval.internal"), ("gitlab-ce", "gitlab", "gitlab.eval.internal")):
+            with self.subTest(forge=forge):
+                (state / "ca.crt").unlink(missing_ok=True)
+                missing = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)}, bin_dir=self.bin)
+                self.assertNotEqual(missing.returncode, 0)
+                self.assertIn(f"{state}/ca.crt (its private CA) is missing or empty", missing.stderr)
+                state.mkdir(exist_ok=True)
+                (state / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nNOT-A-CA\n-----END CERTIFICATE-----\n")
+                leaf = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)}, bin_dir=self.bin)
+                self.assertNotEqual(leaf.returncode, 0)
+                self.assertIn(f"{state}/ca.crt is not a CA certificate", leaf.stderr)
+                (state / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+                proc = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)}, bin_dir=self.bin)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                args = f"--forge gitlab --host {host} --ca-file {state}/ca.crt" if kind == "gitlab" else ""
+                self.assertIn(f"KIND={kind} HOST={host} ARGS={args} CA={state}/ca.crt", proc.stdout)
+        # A developer's own instance: the host follows the override, the kind does not.
+        own = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": str(state), "EVAL_GITLAB_CE_HOST": "gitlab.dev.example"}, bin_dir=self.bin)
+        self.assertIn("KIND=gitlab HOST=gitlab.dev.example", own.stdout)
+        # A relative state directory is refused where it is read: the grader would resolve it under bench/.
+        relative = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": "forge-state"}, bin_dir=self.bin)
+        self.assertNotEqual(relative.returncode, 0)
+        self.assertIn("EVAL_FORGE_STATE_DIR='forge-state' must be an absolute path", relative.stderr)
+        # A host that is not a bare hostname stops the eval at the table, naming the variable, not as an unknown forge.
+        for bad, why in (("gitlab.dev.example:8443", "is not a dotted bare hostname"), ("gitlab.dev example", "is not a dotted bare hostname"), ("gitlab", "is not a dotted bare hostname"), ("gitlab.com", "is a public forge"), ("www.gitlab.com", "is a public forge")):
+            with self.subTest(host=bad):
+                refused = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": str(state), "EVAL_GITLAB_CE_HOST": bad}, bin_dir=self.bin)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn(f"EVAL_GITLAB_CE_HOST='{bad}' {why}", refused.stderr)
+                self.assertNotIn("is not a forge this eval knows", refused.stderr)
+                self.assertNotIn("KIND=", refused.stdout)
 
     def test_the_mint_is_a_no_op_under_gitlab(self):
         body = "\n".join(
             [
-                'EVAL_FORGE="gitlab"; EVAL_LEDGER_APP_KEY_FILE="/k.pem"; EVAL_LEDGER_APP_ID=1; EVAL_LEDGER_INSTALLATION_ID=1',
+                'EVAL_FORGE="gitlab"; EVAL_FORGE_KIND="gitlab"; EVAL_LEDGER_APP_KEY_FILE="/k.pem"; EVAL_LEDGER_APP_ID=1; EVAL_LEDGER_INSTALLATION_ID=1',
                 "LEDGER_MINT_RETRYABLE=75; LEDGER_MINT_ATTEMPTS=1; LEDGER_GRADING_MINT_BODY='{}'",
                 '_ledger_token_mint() { echo "MINTED" >&2; return 1; }',
                 lifted("mint_ledger_token"),

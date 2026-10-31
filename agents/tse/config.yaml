@@ -1,0 +1,113 @@
+# GKE Support Agent (tse) profile config (self-contained template).
+#
+# This file is the config.yaml for a GKE Support Agent (TSE) Hermes profile.
+# Like the Cluster Agent config, it is self-contained and exposes only the
+# read-only `gke` MCP + `developer_knowledge` diagnostic surfaces.
+#
+# Scoping vs the Platform Agent:
+#   - Only the read-only `gke` MCP + `developer_knowledge` are exposed.
+#   - The `platform_control` (provisioning/Config-Connector) MCP server is
+#     intentionally omitted — the GKE Support Agent diagnoses L1 GKE support
+#     issues using customer-side evidence and returns either a grounded Root
+#     Cause Analysis with a proposed GitOps fix or a Google Cloud Support
+#     escalation bundle.
+
+model:
+  provider: custom
+  model: model-default
+  default: model-default
+  base_url: http://inference-gateway.kubeagents-system.svc.cluster.local/v1
+  api_key: none
+
+providers:
+  custom:
+    stale_timeout_seconds: 120
+    request_timeout_seconds: 900
+
+# MCP Servers configuration. Read-only diagnostics surface only.
+mcp_servers:
+  developer_knowledge:
+    command: "node"
+    args:
+      - "/opt/mcp-remote/dist/proxy.js"
+      - "--header"
+      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/developer_knowledge"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
+    lazy: true
+    connect_timeout: 30
+    timeout: 60
+  gke:
+    command: "node"
+    args:
+      - "/opt/mcp-remote/dist/proxy.js"
+      - "--header"
+      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/gke"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
+    lazy: true
+    connect_timeout: 30
+    timeout: 60
+    tools:
+      include:
+        - check_k8s_auth
+        - describe_k8s_resource
+        - get_cluster
+        - get_k8s_cluster_info
+        - get_k8s_logs
+        - get_k8s_resource
+        - get_k8s_rollout_status
+        - get_k8s_version
+        - get_node_pool
+        - get_operation
+        - list_clusters
+        - list_k8s_api_resources
+        - list_k8s_events
+        - list_node_pools
+        - list_operations
+
+platform_toolsets:
+  cli:
+    - hermes-cli
+    - mcp-developer_knowledge
+    - mcp-gke
+  api_server:
+    - hermes-api-server
+    - mcp-developer_knowledge
+    - mcp-gke
+
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+
+web:
+  backend: "ddgs"
+
+plugins:
+  enabled:
+    - hermes_otel
+    - tool_call_audit
+
+agent:
+  environment_probe: false
+  disabled_toolsets:
+    - browser
+    - computer_use
+    - cronjob
+    - image_gen
+    - tts
+    - vision
+
+context_file_max_chars: 100000
+
+auxiliary:
+  title_generation:
+    enabled: false

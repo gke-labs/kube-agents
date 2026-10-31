@@ -50,6 +50,8 @@ def run_trap(exit_code: int) -> subprocess.CompletedProcess:
             "report_partial_verdict() { echo 'called report_partial_verdict'; }",
             "collect_gateway_log() { echo 'called collect_gateway_log'; }",
             "collect_agent_pod_diagnostics() { echo 'called collect_agent_pod_diagnostics'; }",
+            "collect_litellm_log() { echo 'called collect_litellm_log'; }",
+            "collect_credential_proxy_evidence() { echo 'called collect_credential_proxy_evidence'; }",
             "profile_report() { echo \"called profile_report $1\"; }",
             "dump_prow_artifacts_on_failure() { echo \"called dumper with $?\"; }",
             trap_body(),
@@ -95,6 +97,26 @@ class ExitTrapTest(unittest.TestCase):
             self.assertIn("called collect_agent_pod_diagnostics", out)
             self.assertLess(out.index("called collect_gateway_log"), out.index("called collect_agent_pod_diagnostics"))
             self.assertLess(out.index("called collect_agent_pod_diagnostics"), out.index("called profile_report"))
+
+    def test_the_litellm_log_is_collected_on_every_exit(self):
+        """The thinking-replay hook's per-request line is in the LiteLLM log
+        alone; a green run that kept none cannot say whether the hook touched
+        its traffic. Taken ahead of the dumper, which calls it again on red."""
+        for code in (0, 7):
+            out = run_trap(code).stdout
+            self.assertIn("called collect_litellm_log", out)
+            self.assertLess(out.index("called collect_agent_pod_diagnostics"), out.index("called collect_litellm_log"))
+            self.assertLess(out.index("called collect_litellm_log"), out.index("called dumper"))
+
+    def test_the_credential_proxy_evidence_is_collected_on_every_exit(self):
+        """The broker's admission queue is in its log and its metrics alone,
+        and a green run that kept neither cannot say whether the queue came
+        back. Taken ahead of the dumper, which calls it again on red."""
+        for code in (0, 7):
+            out = run_trap(code).stdout
+            self.assertIn("called collect_credential_proxy_evidence", out)
+            self.assertLess(out.index("called collect_litellm_log"), out.index("called collect_credential_proxy_evidence"))
+            self.assertLess(out.index("called collect_credential_proxy_evidence"), out.index("called dumper"))
 
 
 class EvalLifetimeHeartbeatTest(unittest.TestCase):
@@ -179,6 +201,8 @@ class EvalLifetimeHeartbeatTest(unittest.TestCase):
                 "report_partial_verdict() { :; }",
                 "collect_gateway_log() { :; }",
                 "collect_agent_pod_diagnostics() { :; }",
+                "collect_litellm_log() { :; }",
+                "collect_credential_proxy_evidence() { :; }",
                 "profile_report() { :; }",
                 "dump_prow_artifacts_on_failure() { echo 'called dumper'; }",
                 unguarded,

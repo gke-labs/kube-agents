@@ -24,7 +24,10 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -36,6 +39,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/oauth2"
 	container "google.golang.org/api/container/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
 )
@@ -207,9 +211,10 @@ func writeNonClusterProfile(t *testing.T, base, profile string) {
 	}
 }
 
-// clusterprofiles.Discoverer owns the scan itself and is tested there; these
-// cover what discoverClusterProfiles adds on top of it — a Kubernetes client
-// per cluster, and a skipped profile becoming a log line and a metric.
+// clusterprofiles.DiscoverAndBuild owns the scan, the skip policy and the skip
+// log lines, and is tested there; these cover what discoverClusterProfiles adds
+// on top of it — a Kubernetes client per cluster, and a skipped profile
+// becoming a metric.
 
 func TestDiscoverClusterProfiles_BuildsAClientPerCluster(t *testing.T) {
 	stubGKE(t)
@@ -629,6 +634,19 @@ func TestValidate_ProfilesDirFlagRules(t *testing.T) {
 			wantErr: "",
 		},
 		{
+			// Shared mode sends the operator's id on every inject, where the
+			// same pattern would refuse it one alert at a time with nothing
+			// said at startup.
+			name: "shared mode refuses a target-session the daemon could not have issued",
+			f: flags{
+				mode:          "shared",
+				dryRun:        true,
+				targetSession: "gateway:conv@1",
+				dedupWindow:   1,
+			},
+			wantErr: "--target-session \"gateway:conv@1\" is not a session id the daemon issues",
+		},
+		{
 			name: "dry-run still validates dedup-window",
 			f: flags{
 				mode:        "per-incident",
@@ -692,42 +710,11 @@ func clusterNames(clusters []targetCluster) []string {
 	return out
 }
 
-// The soft memory limit is half of what the operator reports as the container's
-// limit, and only when nothing else has already set one.
-func TestDeriveMemoryLimit(t *testing.T) {
-	tests := []struct {
-		name           string
-		goMemLimit     string
-		containerLimit string
-		wantApply      bool
-		wantBytes      int64
-		wantReason     string
-	}{
-		{name: "container limit set", containerLimit: "2147483648", wantApply: true, wantBytes: 1073741824},
-		{name: "explicit GOMEMLIMIT wins", goMemLimit: "512MiB", containerLimit: "2147483648", wantReason: "GOMEMLIMIT=512MiB is set and takes precedence"},
-		{name: "nothing set", wantReason: "EVENT_WATCHER_MEMORY_LIMIT_BYTES is not set"},
-		{name: "garbage", containerLimit: "2Gi", wantReason: `EVENT_WATCHER_MEMORY_LIMIT_BYTES="2Gi" is not a positive byte count`},
-		{name: "zero", containerLimit: "0", wantReason: `EVENT_WATCHER_MEMORY_LIMIT_BYTES="0" is not a positive byte count`},
-		{name: "negative", containerLimit: "-5", wantReason: `EVENT_WATCHER_MEMORY_LIMIT_BYTES="-5" is not a positive byte count`},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotBytes, gotApply, gotReason := deriveMemoryLimit(tt.goMemLimit, tt.containerLimit)
-			if gotApply != tt.wantApply {
-				t.Fatalf("apply = %v, want %v (reason %q)", gotApply, tt.wantApply, gotReason)
-			}
-			if gotBytes != tt.wantBytes {
-				t.Errorf("bytes = %d, want %d", gotBytes, tt.wantBytes)
-			}
-			if !strings.Contains(gotReason, tt.wantReason) {
-				t.Errorf("reason = %q, want it to contain %q", gotReason, tt.wantReason)
-			}
-		})
-	}
-}
-
-// applyMemoryLimit turns the derived value into the runtime's soft limit —
-// the same setting GOMEMLIMIT controls — and leaves it alone otherwise.
+// applyMemoryLimit sets the runtime's soft limit, the same setting GOMEMLIMIT
+// controls, to half of what the operator reports as the container's limit, and
+// leaves it alone when something else has already set one. The derivation's
+// input classes are internal/memlimit's tests; what is pinned here is that the
+// watcher hands it its own variable and its own share.
 func TestApplyMemoryLimit_SetsTheRuntimeSoftLimit(t *testing.T) {
 	// SetMemoryLimit(-1) reads the current limit without changing it.
 	prev := debug.SetMemoryLimit(-1)
@@ -770,5 +757,62 @@ func TestRealMain_AppliesTheMemoryLimitBeforeStarting(t *testing.T) {
 	}
 	if got := debug.SetMemoryLimit(-1); got != 1073741824 {
 		t.Errorf("runtime soft limit after realMain = %d, want 1073741824", got)
+	}
+}
+
+// With the credential proxy named in the environment, the zero discovery seam
+// describes through the proxy and the client it builds reads events on the
+// proxy's route for the cluster, all with the projected token -- and never
+// reaches Application Default Credentials, pointed at a missing file here.
+func TestDiscoverClusterProfiles_ThroughTheBroker(t *testing.T) {
+	saved := discovery
+	t.Cleanup(func() { discovery = saved })
+	discovery = clusterprofiles.Discoverer{}
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path+" "+r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/v1/watcher/gcp/container.googleapis.com/") {
+			// Usable addressing, as a real describe carries: discovery checks it,
+			// and the broker's config ignores it.
+			fmt.Fprint(w, `{"name":"prod","endpoint":"10.0.0.1","controlPlaneEndpointsConfig":{"dnsEndpointConfig":{"allowExternalTraffic":true,"endpoint":"prod.example.internal"}}}`)
+			return
+		}
+		fmt.Fprint(w, `{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[]}`)
+	}))
+	defer srv.Close()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("sa-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "no-such-adc.json"))
+	t.Setenv(clusterprofiles.BrokerURLEnv, srv.URL)
+	t.Setenv(clusterprofiles.BrokerTokenFileEnv, tokenFile)
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
+
+	clusters, err := discoverClusterProfiles(context.Background(), dir, newMetrics())
+	if err != nil {
+		t.Fatalf("discoverClusterProfiles: %v", err)
+	}
+	if len(clusters) != 1 {
+		t.Fatalf("got %d clusters, want 1", len(clusters))
+	}
+	if _, err := clusters[0].Client.CoreV1().Events("").List(context.Background(), metav1.ListOptions{}); err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	want := []string{
+		"GET /v1/watcher/gcp/container.googleapis.com/v1/projects/projA/locations/us-central1/clusters/prod Bearer sa-token",
+		"GET /v1/k8s/projA/us-central1/prod/api/v1/events Bearer sa-token",
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(requests, "\n") != strings.Join(want, "\n") {
+		t.Errorf("requests:\n%s\nwant:\n%s", strings.Join(requests, "\n"), strings.Join(want, "\n"))
 	}
 }

@@ -760,10 +760,11 @@ func TestTheSecretAndRBACReprobeIntervalsStayDistinguishable(t *testing.T) {
 	}
 }
 
-// reconcileWorkload renders a StatefulSet instead of a Deployment above one
-// replica with RWO storage, and stamps it from a second call site. Without this
-// the Deployment test alone passes with that call reverted, and a multi-replica
-// install keeps the old key.
+// reconcileWorkload rendered a StatefulSet instead of a Deployment above one
+// replica with RWO storage. The replica cap (supportedGatewayReplicas) keeps
+// that spec on the single-replica Deployment, so the upgrade from a release
+// that rendered the StatefulSet has to delete the live one and stamp the
+// Deployment that replaces it.
 func TestTheStatefulSetGatewayIsStampedToo(t *testing.T) {
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{
@@ -780,16 +781,17 @@ func TestTheStatefulSetGatewayIsStampedToo(t *testing.T) {
 			},
 		},
 	}
-	if !useStatefulSet(agent) {
-		t.Fatal("this fixture no longer renders a StatefulSet, so it does not reach the second call site")
+	if useStatefulSet(agent) {
+		t.Fatal("this fixture still renders a StatefulSet past the replica cap")
 	}
+	legacy := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gateway", Namespace: "test-ns"}}
 	secret := secretHashTestSecret("platform-agent-secrets", map[string][]byte{
 		"API_SERVER_KEY":     []byte("before-rotation"),
 		"SESSION_KV_API_KEY": []byte("session-key"),
 	})
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, secret).
+		WithObjects(agent, secret, legacy).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -806,12 +808,15 @@ func TestTheStatefulSetGatewayIsStampedToo(t *testing.T) {
 	}
 
 	gatewayKey := types.NamespacedName{Name: "test-agent-gateway", Namespace: "test-ns"}
-	sts := &appsv1.StatefulSet{}
-	if err := cl.Get(ctx, gatewayKey, sts); err != nil {
-		t.Fatalf("read the gateway StatefulSet: %v", err)
+	if err := cl.Get(ctx, gatewayKey, &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the legacy gateway StatefulSet is still there after the capped render (err=%v)", err)
 	}
-	if sts.Spec.Template.Annotations[secretEnvHashAnnotation] == "" {
-		t.Fatalf("the rendered StatefulSet carries no %s; nothing would roll it", secretEnvHashAnnotation)
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, gatewayKey, dep); err != nil {
+		t.Fatalf("read the gateway Deployment: %v", err)
+	}
+	if dep.Spec.Template.Annotations[secretEnvHashAnnotation] == "" {
+		t.Fatalf("the rendered Deployment carries no %s; nothing would roll it", secretEnvHashAnnotation)
 	}
 }
 

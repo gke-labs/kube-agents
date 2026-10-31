@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -38,13 +39,15 @@ REDACTED = "[REDACTED_SECRET]"
 REDACTOR = (
     Path(__file__).resolve().parents[2] / "agents" / "chat" / "defaults" / "plugins" / "common"
 ) / "redactor.py"
+# The shared transcript rules the pod loads from the image, at their source path here.
+SUPPLEMENT = Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts" / "worker_transcript.py"
 
 _BOARD_DDL = (
     "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT, status TEXT,"
     " created_by TEXT, created_at INTEGER)",
     "CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT,"
     " profile TEXT, status TEXT, started_at INTEGER, ended_at INTEGER, summary TEXT,"
-    " metadata TEXT)",
+    " metadata TEXT, outcome TEXT, error TEXT)",
     "CREATE TABLE task_links (parent_id TEXT, child_id TEXT, PRIMARY KEY (parent_id, child_id))",
 )
 _CHILDREN_DDL = (
@@ -240,6 +243,7 @@ def _run_script(
     max_calls: int = 2000,
     max_result: int = 2000,
     redactor: Path = REDACTOR,
+    supplement: Path = SUPPLEMENT,
 ) -> str:
     """The in-pod script under the test interpreter, with the caps the harness passes."""
     if not REDACTOR.exists():
@@ -252,6 +256,7 @@ def _run_script(
             str(root),
             worker_trajectory.CAPTURE_PRESENT,
             str(redactor),
+            str(supplement),
             str(max_cards),
             str(max_calls),
             str(max_result),
@@ -316,6 +321,60 @@ def test_the_read_walks_from_the_front_card_to_the_cluster_agent(data_root: Path
     ]
     assert payload["errors"] == []
     assert payload["truncated"] is False
+
+
+def test_parents_maps_each_fanned_out_card_to_the_card_that_filed_it(data_root: Path) -> None:
+    payload = _payload(_run_script(data_root, [FRONT]))
+    assert worker_trajectory.parents(payload) == {CHILD: FRONT}
+    assert worker_trajectory.parents(None) is None
+    assert worker_trajectory.parents({"cards": []}) == {}
+
+
+def test_parents_ignores_a_predecessor_link_when_the_creator_table_is_there(data_root: Path) -> None:
+    # A card gated on another by task_links was not necessarily filed by it:
+    # the walk still follows the link, the lineage does not.
+    with sqlite3.connect(data_root / "kanban.db") as conn:
+        conn.execute("DELETE FROM kanban_worker_children")
+        conn.execute("INSERT INTO task_links VALUES (?, ?)", (FRONT, CHILD))
+    payload = _payload(_run_script(data_root, [FRONT]))
+    cards = {c["task"]: c for c in payload["cards"]}
+    assert cards[FRONT]["children"] == [CHILD] and cards[FRONT]["fanned_out"] == []
+    assert worker_trajectory.parents(payload) == {}
+
+
+def test_each_run_comes_back_with_how_it_ended(data_root: Path) -> None:
+    # A retry that ran out of its turn budget: the dispatcher closes the run
+    # timed_out with the cap in its error, and that is what a budget check reads.
+    exhausted = "Iteration budget exhausted (90/90) — task could not complete within the allowed iterations"
+    with sqlite3.connect(data_root / "kanban.db") as conn:
+        conn.execute(
+            "UPDATE task_runs SET status = 'timed_out', outcome = 'timed_out', error = ? WHERE task_id = ?",
+            (exhausted, CHILD),
+        )
+    summary = _payload(_run_script(data_root, [FRONT]))
+    by_task = {c["task"]: c for c in summary["cards"]}
+    assert by_task[FRONT]["run_outcomes"] == [
+        {"profile": "platform", "status": "done", "outcome": None, "error": None}
+    ]
+    assert by_task[CHILD]["run_outcomes"] == [
+        {"profile": "cluster-abc", "status": "timed_out", "outcome": "timed_out", "error": exhausted}
+    ]
+    rows = worker_trajectory.runs(summary)
+    assert [(r["task"], r["outcome"]) for r in rows] == [(FRONT, None), (CHILD, "timed_out")]
+    assert rows[1]["error"] == exhausted
+
+
+def test_runs_is_none_when_the_read_did_not_run() -> None:
+    assert worker_trajectory.runs(None) is None
+    # The inject transport's summary lists card ids, not card records: no rows.
+    assert worker_trajectory.runs({"cards": ["t_1", "t_2"]}) == []
+
+
+def test_parents_reads_only_the_fanned_out_edges() -> None:
+    assert worker_trajectory.parents({"cards": [{"task": "t_a", "children": ["t_b"], "fanned_out": []}]}) == {}
+    assert worker_trajectory.parents({"cards": [{"task": "t_a", "children": ["t_b"], "fanned_out": ["t_b"]}]}) == {"t_b": "t_a"}
+    # The inject transport's summary lists card ids, not records.
+    assert worker_trajectory.parents({"cards": ["t_a", "t_b"]}) == {}
 
 
 def test_each_call_is_paired_with_its_result_and_tagged(data_root: Path) -> None:
@@ -619,7 +678,8 @@ def test_a_secrets_yaml_block_is_blanked_including_block_scalars(data_root: Path
     for gone in ("TFMwdExT", "SUPER_SECRET", "ANOTHER_LINE", "first line"):
         assert gone not in out
     assert f"  tls.key: {REDACTED}\n" in out
-    assert f"  config.txt: {REDACTED}\n    {REDACTED}\n    {REDACTED}\n    {REDACTED}\n" in out
+    # The shared block-scalar rule masks the body as one marker line, as the feed does.
+    assert f"  config.txt: {REDACTED}\n    {REDACTED}\ntype:" in out
     assert "namespace: shop" in out and "type: kubernetes.io/tls" in out
 
 
@@ -783,6 +843,122 @@ def test_a_manifest_inside_an_argument_is_scrubbed_with_its_newlines(data_root: 
 def test_ordinary_output_is_left_alone(data_root: Path) -> None:
     text = "NAME READY STATUS\ncheckout-7d9f 0/1 CrashLoopBackOff\nservice token-refresher ok"
     assert _read_result(data_root, text)["result"] == text
+
+
+def test_a_curl_basic_auth_password_is_masked_as_the_feed_masks_it(data_root: Path) -> None:
+    """``AuditRedactor`` leaves ``-u user:pass`` alone; the shared supplement does not,
+    so the record and the session-kv feed mask the same credential."""
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute(
+            "UPDATE messages SET tool_calls = ?"
+            " WHERE role = 'assistant' AND tool_calls LIKE '%get pods%'",
+            (
+                json.dumps(
+                    [
+                        {
+                            "name": "terminal",
+                            "arguments": json.dumps({"command": "curl -u admin:hunter2 https://x/"}),
+                        }
+                    ]
+                ),
+            ),
+        )
+    reply = _run_script(data_root, [FRONT])
+    assert "hunter2" not in reply
+    captured = worker_trajectory.capture(lambda s, t: reply, [FRONT], 5.0)
+    first = captured.entries[0]
+    assert first["args"]["command"] == f"curl -u admin:{REDACTED} https://x/"
+
+
+def test_a_secret_read_calls_result_is_withheld_as_the_feed_withholds_it(data_root: Path) -> None:
+    """The shared detector: a call that prints a secret's value gets the placeholder,
+    not a scrub of the value; the verdict is still the raw result's."""
+    command = "kubectl get secret db -o go-template='{{.data.password}}' | base64 -d"
+    value = "Tr0ub4dor&3"
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ? AND role != 'user'", (PLATFORM_SESSION,)
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, tool_calls, timestamp)"
+            " VALUES (?, 'assistant', ?, 2)",
+            (
+                PLATFORM_SESSION,
+                json.dumps([{"id": "c1", "name": "terminal", "arguments": json.dumps({"command": command})}]),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_call_id, timestamp)"
+            " VALUES (?, 'tool', ?, 'c1', 3)",
+            (PLATFORM_SESSION, value),
+        )
+    reply = _run_script(data_root, [FRONT])
+    assert value not in reply
+    entry = next(c for c in _payload(reply)["calls"] if c["task"] == FRONT)
+    assert entry["result"] == worker_trajectory.WITHHELD_READ_RESULT
+    assert entry["result"].startswith("[REDACTED_")
+    assert worker_trajectory.WITHHELD not in reply
+    assert entry["failed"] is False
+    assert "get secret db" in entry["args"]
+
+
+def test_a_result_row_with_null_content_stays_called(data_root: Path) -> None:
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ? AND role != 'user'", (PLATFORM_SESSION,)
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, tool_calls, timestamp)"
+            " VALUES (?, 'assistant', ?, 2)",
+            (PLATFORM_SESSION, json.dumps([{"id": "c1", "name": "terminal", "arguments": "{}"}])),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_call_id, timestamp)"
+            " VALUES (?, 'tool', NULL, 'c1', 3)",
+            (PLATFORM_SESSION,),
+        )
+    reply = _run_script(data_root, [FRONT])
+    entry = next(c for c in _payload(reply)["calls"] if c["task"] == FRONT)
+    assert entry["result"] is None
+    captured = worker_trajectory.capture(lambda s, t: reply, [FRONT], 5.0)
+    assert [e["status"] for e in captured.entries if e["task"] == FRONT] == ["called"]
+
+
+def test_a_pod_without_the_shared_rules_withholds_content_and_names_the_path(data_root: Path) -> None:
+    """Fail closed as for the redactor: nothing a worker said leaves the pod, and the
+    error names the module path; the mapping is the module's too, so no store is read."""
+    missing = data_root / "no-such-worker-transcript.py"
+    reply = _run_script(data_root, [FRONT], supplement=missing)
+    payload = _payload(reply)
+    assert any(str(missing) in e and "no session read" in e for e in payload["errors"])
+    assert TOKEN not in reply and "CrashLoopBackOff" not in reply
+    assert payload["calls"] == []
+    assert all(c["sessions"] == [] for c in payload["cards"])
+    # One note per card, and no "no session found": no store was opened.
+    assert payload["unread"] == [
+        f"card {card}: transcript rules unavailable; sessions not read" for card in (FRONT, CHILD)
+    ]
+
+
+def test_a_pod_without_the_redactor_withholds_a_credential_read_as_everything_else(data_root: Path) -> None:
+    """The read placeholder says one result was recorded; in a capture nothing of
+    which is readable, that call is withheld as the rest are."""
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute(
+            "UPDATE messages SET tool_calls = ?"
+            " WHERE role = 'assistant' AND tool_calls LIKE '%get pods%'",
+            (
+                json.dumps(
+                    [{"name": "terminal", "arguments": json.dumps({"command": "kubectl get secret db -o yaml"})}]
+                ),
+            ),
+        )
+    reply = _run_script(data_root, [FRONT], redactor=data_root / "no-such-redactor.py")
+    assert worker_trajectory.WITHHELD_READ_RESULT not in reply
+    assert "[REDACTED_" not in reply
+    calls = _payload(reply)["calls"]
+    assert all(c["result"] == worker_trajectory.WITHHELD for c in calls if c["result"] is not None)
+    assert any("get secret db" not in json.dumps(c["args"]) for c in calls)  # the arguments are withheld too
 
 
 def test_a_pod_without_the_redactor_withholds_content_and_says_so(data_root: Path) -> None:
@@ -1137,3 +1313,60 @@ def test_tool_called_keeps_counting_only_the_routers_calls() -> None:
     assert router_only.verify(5.0).raw == {"matching_calls": 0}
     board_read = ToolCalledVerifier(type="tool_called", tool_names=["kanban_list"])
     assert board_read.verify(5.0).status == "pass"
+
+
+# Wraps the in-pod script's stdout so a test can see how the reply was written:
+# the largest single write after the sentinel line and whether the last write
+# was flushed. Reported on stderr, which the reply never uses.
+_WRITE_RECORDER = """
+import atexit as _atexit, sys as _sys
+class _Recorder:
+    def __init__(self, inner):
+        self.inner, self.sizes, self.flushed, self.armed = inner, [], True, False
+    def write(self, s):
+        if self.armed:
+            self.sizes.append(len(s))
+        elif s == "\\n":
+            self.armed = True
+        self.flushed = False
+        return self.inner.write(s)
+    def flush(self):
+        self.flushed = True
+        self.inner.flush()
+_sys.stdout = _Recorder(_sys.stdout)
+_atexit.register(lambda: _sys.stderr.write("LARGEST_WRITE=%d LAST_FLUSHED=%s\\n" % (max(_sys.stdout.sizes or [0]), _sys.stdout.flushed)))
+"""
+
+
+def _run_recorded_script(root: Path, script: str) -> tuple[str, int, bool]:
+    """The script's stdout, its largest post-sentinel write, and whether its last write was flushed."""
+    if not REDACTOR.exists():
+        pytest.skip(f"{REDACTOR} is not beside this checkout")
+    proc = subprocess.run(
+        [sys.executable, "-c", _WRITE_RECORDER + script, str(root), worker_trajectory.CAPTURE_PRESENT, str(REDACTOR), str(SUPPLEMENT), "32", "2000", "2000", "2000", FRONT],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    match = re.search(r"LARGEST_WRITE=(\d+) LAST_FLUSHED=(True|False)", proc.stderr)
+    assert match, proc.stderr
+    return proc.stdout, int(match.group(1)), match.group(2) == "True"
+
+
+def test_the_reply_is_written_in_pieces_and_reassembles(data_root: Path) -> None:
+    # Under GKE Sandbox one write above 64 KiB to the exec stdout is cut, so the
+    # script emits the JSON in flushed pieces no larger than WRITE_CHUNK. A tiny
+    # piece size forces many boundaries: every write after the sentinel must be
+    # at most that size, the last one flushed, and the reassembled reply must
+    # parse to what one write gives. A single write of the reply, or a dropped
+    # flush, fails here.
+    assert "WRITE_CHUNK = 32768\n" in worker_trajectory._IN_POD_SCRIPT
+    whole = _payload(_run_script(data_root, [FRONT]))
+    assert len(json.dumps(whole)) > 7
+    tiny = worker_trajectory._IN_POD_SCRIPT.replace("WRITE_CHUNK = 32768\n", "WRITE_CHUNK = 7\n")
+    pieces, largest, flushed = _run_recorded_script(data_root, tiny)
+    assert pieces.endswith("}\n")
+    assert _payload(pieces) == whole
+    assert largest <= 7
+    assert flushed

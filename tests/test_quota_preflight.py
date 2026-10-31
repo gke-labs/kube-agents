@@ -17,6 +17,7 @@ first two directly, which is what lets them assert the arithmetic and the pass/f
 decision rather than only that the templates exist.
 """
 
+import contextlib
 import json
 import math
 import pathlib
@@ -35,6 +36,12 @@ _FOOTPRINT = _CHART / "files" / "footprint.yaml"
 _SCHEMA = _CHART / "values.schema.json"
 _PREFLIGHT_TPL = _CHART / "templates" / "quota-preflight.yaml"
 _HELPERS = _CHART / "templates" / "_helpers.tpl"
+_SPAWN_GO = _ROOT / "a2a" / "gateway" / "spawn.go"
+_A2A_MANIFESTS = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
+_A2A_BRIDGE = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_bridge.go"
+_A2A_CONSOLE = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_console.go"
+_A2A_CALLOUT = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_callout.go"
+_A2A_VERIFIER = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_verifier.go"
 
 _HELM = shutil.which("helm")
 
@@ -60,15 +67,20 @@ data:
 # are the same numbers the install prerequisites table quotes, so a change that moves one
 # without updating the other fails here.
 _DEFAULT_PODS = 7
-_DEFAULT_REQUESTS_CPU_MILLIS = 2466
+_DEFAULT_REQUESTS_CPU_MILLIS = 2506
 _DEFAULT_LIMITS_CPU_MILLIS = 10200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 8320 * 1024**2
-_DEFAULT_LIMITS_MEMORY_BYTES = 23040 * 1024**2
-_DEFAULT_REQUESTS_EPHEMERAL_BYTES = 5 * 1024**3
-_DEFAULT_LIMITS_EPHEMERAL_BYTES = 5 * 1024**3
+_DEFAULT_REQUESTS_MEMORY_BYTES = 8896 * 1024**2
+_DEFAULT_LIMITS_MEMORY_BYTES = 23424 * 1024**2
+# Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
+# proxy's 8Gi), LiteLLM's 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two
+# replicas, and the cleanup hook's 1088Mi.
+_LITELLM_EPHEMERAL_REQUEST_BYTES = 1280 * 1024**2
+_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (11 * 1024 + 2 * 1280 + 1088) * 1024**2
+# The same three additions, because each sets its limit equal to its request.
+_DEFAULT_LIMITS_EPHEMERAL_BYTES = _DEFAULT_REQUESTS_EPHEMERAL_BYTES
 # Cleanup hook Job: 50m requested / 200m limit, 64Mi requested / 128Mi limit, 1 pod.
 _CLEANUP_HOOK_REQUEST_MILLIS = 50
 _CLEANUP_HOOK_LIMIT_MILLIS = 200
@@ -90,11 +102,15 @@ _HA_REPLICAS = 2
 # The largest pod that rolls with a surge Pod at defaults: LiteLLM, at a 100m CPU request.
 # The agent pod is larger but rolls with Recreate at the default single replica.
 _LARGEST_SURGING_REQUEST_MILLIS = 100
-# The operator's own request.
-_OPERATOR_REQUEST_MILLIS = 10
+# The operator's own request: the smallest GKE Autopilot admits unchanged beside 128Mi.
+_OPERATOR_REQUEST_MILLIS = 50
 # Two operator-rendered claims plus two from the shell StatefulSet's volumeClaimTemplates.
 _OPERATOR_PVC_COUNT = 4
-_OPERATOR_STORAGE_BYTES = 22 * 1024**3
+_OPERATOR_STORAGE_BYTES = 102 * 1024**3
+# The two claims platformAgent.storage.size sizes (the agent's data claim and the shell
+# sandbox's), at the operator default each.
+_DATA_CLAIMS = 2
+_DATA_CLAIM_DEFAULT_BYTES = 50 * 1024**3
 # hindsight.postgresql.storage, the volumeClaimTemplate the StatefulSet renders.
 _HINDSIGHT_STORAGE_BYTES = 8 * 1024**3
 # A memory quota written in decimal SI. 1G is 1,000,000,000 bytes, which is a whole number
@@ -105,31 +121,50 @@ _DECIMAL_SI_HARD_BYTES = 1000000000
 _LITELLM_REPLICAS = 2
 _LITELLM_CPU_LIMIT_MILLIS = 500 * _LITELLM_REPLICAS
 _LITELLM_CPU_REQUEST_MILLIS = 100 * _LITELLM_REPLICAS
-# An ephemeral-storage request no chart workload sets by default, so the totals move by
-# exactly this much when one does.
+# An ephemeral-storage request set on LiteLLM in place of its 1280Mi default, so the
+# totals move by the difference, per replica.
 _EPHEMERAL_SET_GIB = 3
 # What the shell StatefulSet leaves behind: persistentVolumeClaimRetentionPolicy is
 # Retain/Retain, so these two claims survive `helm uninstall` and are in `used` on the
 # next install, to be reused by name rather than created again.
 _RETAINED_PVC_COUNT = 2
-_RETAINED_STORAGE_GIB = 11
+_RETAINED_STORAGE_GIB = 51
 _MILLICORES_PER_CORE = 1000
 # The credential proxy's footprint.yaml entry (the operator's defaults), and an override
 # of the one key an install raises (#2324). The preflight merges the override over the
 # entry per key, as the operator does, so only the overridden number moves.
 _PROXY_MEMORY_LIMIT_BYTES = 2 * 1024**3
-_PROXY_MEMORY_REQUEST_BYTES = 512 * 1024**2
+_PROXY_MEMORY_REQUEST_BYTES = 1024**3
 _PROXY_CPU_LIMIT_MILLIS = 1000
 _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES = 3 * 1024**3
 _PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 2000
 _PROXY_FLOAT_CPU_LIMIT = 1.5
 _PROXY_FLOAT_CPU_LIMIT_MILLIS = 1500
 # The operator renders no ephemeral-storage request on the proxy, so the API server sets it
-# to the limit: footprint.yaml's 2Gi request is that defaulting, and it follows an override
+# to the limit: footprint.yaml's 8Gi request is that defaulting, and it follows an override
 # of the limit alone.
-_PROXY_EPHEMERAL_LIMIT_BYTES = 2 * 1024**3
+_PROXY_EPHEMERAL_LIMIT_BYTES = 8 * 1024**3
 _PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _PROXY_VALUE = "platformAgent.deployment.credentialProxy.resources"
+
+# The agent-api-auth sidecar's defaults (agentAPIAuth* in platformagent_manifests.go);
+# it is one container of the agent pod, so these are already in agentPod.base and an
+# override moves the pod total by the delta. Its ephemeral request is defaulted to its
+# 2Gi limit, as the proxy's is.
+_AA_MEMORY_REQUEST_BYTES = 384 * 1024**2
+_AA_MEMORY_LIMIT_BYTES = 2 * 1024**3
+_AA_CPU_LIMIT_MILLIS = 1000
+_AA_CPU_REQUEST_MILLIS = 150
+_AA_EPHEMERAL_LIMIT_BYTES = 2 * 1024**3
+_AA_OVERRIDE_MEMORY_LIMIT_BYTES = 4 * 1024**3
+_AA_OVERRIDE_CPU_LIMIT_MILLIS = 2000
+_AA_OVERRIDE_CPU_REQUEST_MILLIS = 500
+_AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
+_AA_VALUE = "platformAgent.deployment.agentAPIAuth.resources"
+# The operator's own resources block, which the preflight sums and holds to its memory floor.
+_OPERATOR_VALUE = "operator.resources"
+# What releases up to 0.16.0 shipped for the manager's memory limit, under the 512Mi floor.
+_OPERATOR_LEGACY_MEMORY_LIMIT = "128Mi"
 
 
 def _parse_gib_or_mib(quantity: str) -> int:
@@ -212,6 +247,50 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(req["requestsEphemeral"], _DEFAULT_REQUESTS_EPHEMERAL_BYTES)
         self.assertEqual(req["limitsEphemeral"], _DEFAULT_LIMITS_EPHEMERAL_BYTES)
 
+    def test_a_data_volume_size_moves_both_data_claims(self) -> None:
+        """platformAgent.storage.size resizes two claims, so each GiB counts twice.
+
+        80Gi is 30Gi over the default on each claim: 102Gi + 2 x 30Gi = 162Gi. A size
+        below the default lowers the total the same way, and no claim is added.
+        """
+        base = self._requirements()
+        self.assertEqual(base["requestsStorage"], _OPERATOR_STORAGE_BYTES)
+        totals = {}
+        for size, size_bytes in (("80Gi", 80 * 1024**3), ("20Gi", 20 * 1024**3),
+                                 ("50Gi", _DATA_CLAIM_DEFAULT_BYTES), ("1Ti", 1024**4)):
+            with self.subTest(size=size):
+                req = self._requirements([f"platformAgent.storage.size={size}"])
+                totals[size] = req["requestsStorage"]
+                self.assertEqual(
+                    req["requestsStorage"],
+                    _OPERATOR_STORAGE_BYTES + _DATA_CLAIMS * (size_bytes - _DATA_CLAIM_DEFAULT_BYTES),
+                )
+                self.assertEqual(req["persistentVolumeClaims"], base["persistentVolumeClaims"])
+        self.assertEqual(totals["80Gi"], 162 * 1024**3)
+
+    def test_a_data_volume_size_that_does_not_fit_the_quota_fails_the_render(self) -> None:
+        # The default fits a 102Gi requests.storage quota exactly; 80Gi does not.
+        quota = [{
+            "metadata": {"name": "storage-quota"},
+            "spec": {"hard": {"requests.storage": "102Gi"}},
+            "status": {"hard": {"requests.storage": "102Gi"}, "used": {"requests.storage": "0"}},
+        }]
+        fits = self._render({"probe": {"quotas": quota}})
+        self.assertEqual(fits.returncode, 0, fits.stderr)
+        refused = self._render({"probe": {"quotas": quota}}, ["platformAgent.storage.size=80Gi"])
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("requests.storage", refused.stderr)
+
+    def test_an_oversized_data_volume_size_saturates_rather_than_wraps(self) -> None:
+        """`9Ei` parses to MaxInt64, and two claims of it wrapped the total negative.
+
+        The CR template refuses a size above 64Ti first, so this renders a copy
+        without it, to reach the preflight's own arithmetic.
+        """
+        with self._chart_without("platform-agent-cr.yaml"):
+            req = self._requirements(["platformAgent.storage.size=9Ei"])
+        self.assertEqual(req["requestsStorage"], 2**63 - 1)
+
     def test_credential_proxy_memory_limit_override_moves_only_that_total(self) -> None:
         """The one key an install raises moves limits.memory by its difference and nothing else.
 
@@ -278,7 +357,7 @@ class PreflightDecisionTest(unittest.TestCase):
         """An override of limits.ephemeral-storage alone is counted as a request of the same size.
 
         The operator renders no ephemeral-storage request, so the API server defaults it to
-        the limit; counting the footprint's 2Gi against a 10Gi limit passes a quota with 2
+        the limit; counting the footprint's 8Gi against a 10Gi limit passes a quota with 8
         to 10Gi of request headroom that then refuses the pod.
         """
         base = self._requirements()
@@ -300,26 +379,204 @@ class PreflightDecisionTest(unittest.TestCase):
         nulled = self._requirements([f"{_PROXY_VALUE}.limits.memory=null"])
         self.assertEqual(nulled, base)
 
+    def test_agent_api_auth_memory_limit_override_moves_only_that_total(self) -> None:
+        """The field's use case (#2648): raising the sidecar's memory limit is counted,
+        so a namespace ResourceQuota sized to the preflight is not passed and then
+        overrun by the Recreate rollout."""
+        base = self._requirements()
+        raised = self._requirements([f"{_AA_VALUE}.limits.memory={_AA_OVERRIDE_MEMORY_LIMIT_BYTES}"])
+        self.assertEqual(
+            raised["limitsMemory"] - base["limitsMemory"],
+            _AA_OVERRIDE_MEMORY_LIMIT_BYTES - _AA_MEMORY_LIMIT_BYTES,
+        )
+        for key in ("pods", "requestsCpu", "limitsCpu", "requestsMemory",
+                    "requestsEphemeral", "limitsEphemeral", "persistentVolumeClaims"):
+            self.assertEqual(raised[key], base[key], key)
+
+    def test_agent_api_auth_request_and_cpu_overrides_are_each_counted(self) -> None:
+        base = self._requirements()
+        raised = self._requirements([
+            f"{_AA_VALUE}.requests.memory={_AA_MEMORY_LIMIT_BYTES}",
+            f"{_AA_VALUE}.limits.cpu={_AA_OVERRIDE_CPU_LIMIT_MILLIS}m",
+            f"{_AA_VALUE}.requests.cpu={_AA_OVERRIDE_CPU_REQUEST_MILLIS}m",
+        ])
+        self.assertEqual(
+            raised["requestsMemory"] - base["requestsMemory"],
+            _AA_MEMORY_LIMIT_BYTES - _AA_MEMORY_REQUEST_BYTES,
+        )
+        self.assertEqual(
+            raised["limitsCpu"] - base["limitsCpu"],
+            _AA_OVERRIDE_CPU_LIMIT_MILLIS - _AA_CPU_LIMIT_MILLIS,
+        )
+        self.assertEqual(
+            raised["requestsCpu"] - base["requestsCpu"],
+            _AA_OVERRIDE_CPU_REQUEST_MILLIS - _AA_CPU_REQUEST_MILLIS,
+        )
+        # A requests.memory override must not leak into the limits total.
+        self.assertEqual(raised["limitsMemory"], base["limitsMemory"])
+
+    def test_agent_api_auth_ephemeral_override_moves_both_sides_with_defaulting(self) -> None:
+        base = self._requirements()
+        raised = self._requirements([f"{_AA_VALUE}.limits.ephemeral-storage={_AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES}"])
+        moved = _AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES - _AA_EPHEMERAL_LIMIT_BYTES
+        self.assertEqual(raised["limitsEphemeral"] - base["limitsEphemeral"], moved)
+        self.assertEqual(raised["requestsEphemeral"] - base["requestsEphemeral"], moved)
+        explicit = self._requirements([
+            f"{_AA_VALUE}.limits.ephemeral-storage={_AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES}",
+            f"{_AA_VALUE}.requests.ephemeral-storage=4Gi",
+        ])
+        self.assertEqual(explicit["requestsEphemeral"] - base["requestsEphemeral"],
+                         4 * 1024**3 - _AA_EPHEMERAL_LIMIT_BYTES)
+
+    def test_agent_api_auth_null_override_key_keeps_the_default(self) -> None:
+        base = self._requirements()
+        nulled = self._requirements([f"{_AA_VALUE}.limits.memory=null"])
+        self.assertEqual(nulled, base)
+
     def test_credential_proxy_override_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
         # Helm renders quota-preflight.yaml before the CR template, so the preflight's own
         # read of the override is the first to see it. The CR template is removed from this
         # copy, so the message can only come from kube-agents.credentialProxyFootprint.
+        with self._chart_without("platform-agent-cr.yaml"):
+            for value in ("-1Gi", "abc", "2GB"):
+                res = self._render({"probe": {"emitRequirements": True}},
+                                   [f"{_PROXY_VALUE}.limits.memory={value}"])
+                self.assertNotEqual(res.returncode, 0, res.stdout)
+                self.assertIn(f"{_PROXY_VALUE}.limits.memory is", res.stderr)
+                self.assertNotIn("cannot parse quantity", res.stderr)
+            res = self._render({"probe": {"emitRequirements": True}}, [f"{_PROXY_VALUE}.limits=2Gi"])
+            self.assertIn(f"{_PROXY_VALUE}.limits is 2Gi, which is not a map", res.stderr)
+
+    @contextlib.contextmanager
+    def _chart_without(self, template: str):
+        """Point self.chart at a copy of the chart with one template removed, so a message
+        about a value that template also reads can only come from the preflight's own read."""
         with tempfile.TemporaryDirectory() as tmp:
             chart = pathlib.Path(tmp) / "kube-agents"
             shutil.copytree(self.chart, chart)
-            (chart / "templates" / "platform-agent-cr.yaml").unlink()
+            (chart / "templates" / template).unlink()
             original, self.chart = self.chart, chart
             try:
-                for value in ("-1Gi", "abc", "2GB"):
-                    res = self._render({"probe": {"emitRequirements": True}},
-                                       [f"{_PROXY_VALUE}.limits.memory={value}"])
-                    self.assertNotEqual(res.returncode, 0, res.stdout)
-                    self.assertIn(f"{_PROXY_VALUE}.limits.memory is", res.stderr)
-                    self.assertNotIn("cannot parse quantity", res.stderr)
-                res = self._render({"probe": {"emitRequirements": True}}, [f"{_PROXY_VALUE}.limits=2Gi"])
-                self.assertIn(f"{_PROXY_VALUE}.limits is 2Gi, which is not a map", res.stderr)
+                yield
             finally:
                 self.chart = original
+
+    def _render_without_operator_template(self, sets: list[str]):
+        """Render the probe with templates/operator-deployment.yaml removed, so a message
+        about operator.resources can only come from the preflight's own read of it."""
+        with self._chart_without("operator-deployment.yaml"):
+            return self._render({"probe": {"emitRequirements": True}}, sets)
+
+    def test_operator_memory_limit_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
+        # Helm renders quota-preflight.yaml before operator-deployment.yaml, so the
+        # preflight's read of operator.resources is the first to see it; without its own
+        # call to kube-agents.operatorResourcesCheck, parseBytes refuses a bad value with
+        # "please report it" and never names the key.
+        res = self._render_without_operator_template([f"{_OPERATOR_VALUE}.limits.memory=lots"])
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertIn(f'{_OPERATOR_VALUE}.limits.memory is "lots", which is not a Kubernetes quantity', res.stderr)
+        self.assertNotIn("cannot parse quantity", res.stderr)
+
+    def test_operator_memory_limit_under_the_floor_fails_in_the_preflight(self) -> None:
+        # The legacy limit parses, so parseBytes would have summed it quietly; the floor
+        # check in the preflight is what refuses it before the operator template could.
+        res = self._render_without_operator_template(
+            [f"{_OPERATOR_VALUE}.limits.memory={_OPERATOR_LEGACY_MEMORY_LIMIT}"]
+        )
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertIn(
+            f"{_OPERATOR_VALUE}.limits.memory is {_OPERATOR_LEGACY_MEMORY_LIMIT}, under the 512Mi floor",
+            res.stderr,
+        )
+
+    def test_operator_disabled_leaves_a_bad_operator_memory_limit_alone(self) -> None:
+        # No manager is rendered, so there is no limit to hold to the floor: a release that
+        # brings its own operator (operator.enabled=false) with a legacy block in its reused
+        # values renders, as the workload loop and the operator template skip it too.
+        req = self._requirements(
+            [
+                "operator.enabled=false",
+                f"{_OPERATOR_VALUE}.limits.memory={_OPERATOR_LEGACY_MEMORY_LIMIT}",
+            ]
+        )
+        self.assertEqual(req["pods"], _DEFAULT_PODS - 1)
+
+    def test_agent_api_auth_refused_override_counts_defaults(self) -> None:
+        """An override the operator refuses is rendered at defaults, Degraded, so the
+        preflight must count the defaults, not the override's delta. A zero limit, a
+        limit below the default request, and a request above the default limit are the
+        refusals agentAPIAuthResourcesCheck does not catch (they stay the operator's)."""
+        base = self._requirements()
+        for override in (
+            [f"{_AA_VALUE}.limits.memory=0"],
+            [f"{_AA_VALUE}.limits.memory=256Mi"],
+            [f"{_AA_VALUE}.limits.cpu=0"],
+            [f"{_AA_VALUE}.requests.memory=5Gi"],
+            [f"{_AA_VALUE}.requests.cpu=2"],
+        ):
+            got = self._requirements(override)
+            self.assertEqual(got, base, f"a refused override {override} moved the footprint; it must count defaults")
+
+    def test_agent_api_auth_refused_override_at_rounding_boundary_counts_defaults(self) -> None:
+        """The operator compares the exact resource.Quantity (request.Cmp(limit)); the
+        preflight must decide "would the operator render this?" on the same exact figures,
+        not on parseBytes/parseCpuMillis which ceil an m-suffixed quantity. An override a
+        rounding step under a default crosses the pair for the operator while the rounded
+        value lands back on the default, so a gate on the rounded integers counts it as
+        rendered and moves the footprint under the quota the operator never asks for."""
+        base = self._requirements()
+        # 402653183500m = 402653183.5 bytes, half a byte under the 384Mi default request;
+        # the operator refuses (limit < default request) and renders at 2Gi, Degraded.
+        # 149.5m = 0.1495 cores, under the 150m default request; same refusal.
+        for override in (
+            [f"{_AA_VALUE}.limits.memory=402653183500m"],
+            [f"{_AA_VALUE}.limits.cpu=149.5m"],
+        ):
+            got = self._requirements(override)
+            self.assertEqual(got, base, f"a boundary refusal {override} moved the footprint; it must count defaults")
+
+    def test_agent_api_auth_oversized_limit_does_not_wrap_the_requirement_negative(self) -> None:
+        """A sidecar limit the validator admits (any byte count under 2^63) must not carry
+        the replica-multiplied pod sum or the base add past int64 and wrap the requirement
+        negative, which would pass every quota. The preflight saturates to the int64
+        ceiling instead, which no real quota satisfies."""
+        # Two replicas, 5 exabytes: 5E is under 2^63 but doubles over it at the multiply.
+        two_rep = {"platformAgent": {"deployment": {
+            "availability": {"replicas": 2},
+            "agentAPIAuth": {"resources": {"limits": {"memory": "5E"}}},
+        }}}
+        got = self._requirements(values=two_rep)
+        self.assertGreater(got["limitsMemory"], 0,
+                           "limitsMemory wrapped negative; the replica multiply overflowed int64")
+        # One replica, ~8.9GB below 2^63: the base add alone carries it past int64.
+        one_rep = {"platformAgent": {"deployment": {
+            "agentAPIAuth": {"resources": {"limits": {"memory": "9.22337203e18"}}},
+        }}}
+        got1 = self._requirements(values=one_rep)
+        self.assertGreater(got1["limitsMemory"], 0,
+                           "limitsMemory wrapped negative at one replica; the base add overflowed int64")
+
+        # The proxy override flows through the same workload-loop add (one replica, no
+        # multiply -- the narrower window the reviewer tied to the same clamp).
+        proxy = {"platformAgent": {"deployment": {
+            "credentialProxy": {"resources": {"limits": {"memory": "9.22337203e18"}}},
+        }}}
+        gotp = self._requirements(values=proxy)
+        self.assertGreater(gotp["limitsMemory"], 0,
+                           "limitsMemory wrapped negative for a proxy override; the workload-loop add overflowed int64")
+
+    def test_agent_api_auth_override_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
+        # The footprint path reads the override too; with the CR template removed, a bad
+        # quantity or a non-map side can only be caught by kube-agents.agentAPIAuthResourcesCheck
+        # in the preflight, naming the key rather than reaching parseBytes as garbage.
+        with self._chart_without("platform-agent-cr.yaml"):
+            for value in ("-1Gi", "abc", "2GB"):
+                res = self._render({"probe": {"emitRequirements": True}},
+                                   [f"{_AA_VALUE}.limits.memory={value}"])
+                self.assertNotEqual(res.returncode, 0, res.stdout)
+                self.assertIn(f"{_AA_VALUE}.limits.memory is", res.stderr)
+            res = self._render({"probe": {"emitRequirements": True}}, [f"{_AA_VALUE}.limits=4Gi"])
+            self.assertIn(f"{_AA_VALUE}.limits is 4Gi, which is not a map", res.stderr)
 
     def test_disabling_the_dashboard_drops_it_from_the_total(self) -> None:
         """The flag is harness.hermes.dashboardEnabled, one level deeper than harness.
@@ -676,6 +933,14 @@ class PreflightDecisionTest(unittest.TestCase):
             base["requestsStorage"] + _HINDSIGHT_STORAGE_BYTES,
         )
 
+    def test_web_console_adds_its_pod_and_resources_to_the_totals(self) -> None:
+        """Enabling webConsole adds its one replica and resource requests."""
+        base = self._requirements()
+        with_console = self._requirements(["webConsole.enabled=true"])
+        self.assertEqual(with_console["pods"], base["pods"] + 1)
+        self.assertEqual(with_console["requestsCpu"], base["requestsCpu"] + 50)
+        self.assertEqual(with_console["requestsMemory"], base["requestsMemory"] + 32 * 1024**2)
+
     def test_a_workload_scaled_to_zero_is_not_charged(self) -> None:
         """`replicas | default 1` read a falsy 0 as absent and charged a full replica.
 
@@ -717,7 +982,7 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(without_requests["requestsCpu"], base["requestsCpu"] + diff_millis)
 
     def test_chart_workload_ephemeral_storage_is_counted(self) -> None:
-        """Only the footprint contributed ephemeral storage, so a chart-set value was free."""
+        """A chart-set value replaces LiteLLM's default request, per replica, in the sum."""
         base = self._requirements()
         with_ephemeral = self._requirements(
             [f"litellm.resources.requests.ephemeral-storage={_EPHEMERAL_SET_GIB}Gi"]
@@ -725,7 +990,7 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(
             with_ephemeral["requestsEphemeral"],
             base["requestsEphemeral"]
-            + _EPHEMERAL_SET_GIB * 1024**3 * _LITELLM_REPLICAS,
+            + (_EPHEMERAL_SET_GIB * 1024**3 - _LITELLM_EPHEMERAL_REQUEST_BYTES) * _LITELLM_REPLICAS,
         )
 
     def test_an_empty_hindsight_storage_key_fails_loudly(self) -> None:
@@ -949,7 +1214,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"26112Mi"', res.stderr)
+        self.assertIn('"limits.memory":"26496Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -960,7 +1225,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small limits.ephemeral-storage quota must fail"
         )
         self.assertIn("  - limits.ephemeral-storage:", res.stderr)
-        self.assertIn('"limits.ephemeral-storage":"5Gi"', res.stderr)
+        # The release's 14912Mi plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"limits.ephemeral-storage":"16192Mi"', res.stderr)
 
     def test_shorthand_cpu_spelling_is_enforced(self) -> None:
         """`cpu` is the shorthand spelling for `requests.cpu` and must be checked."""
@@ -969,7 +1235,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        self.assertIn('"cpu":"2566m"', res.stderr)
+        # The release's 2506m plus one LiteLLM surge Pod's 100m.
+        self.assertIn('"cpu":"2606m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -978,7 +1245,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        self.assertIn('"memory":"10368Mi"', res.stderr)
+        self.assertIn('"memory":"10944Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -989,7 +1256,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small ephemeral-storage shorthand quota must fail"
         )
         self.assertIn("  - ephemeral-storage:", res.stderr)
-        self.assertIn('"ephemeral-storage":"5Gi"', res.stderr)
+        # The release's 14912Mi plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"ephemeral-storage":"16192Mi"', res.stderr)
 
     def test_shorthand_storage_spelling_is_enforced(self) -> None:
         """`storage` is the shorthand spelling for `requests.storage`."""
@@ -998,7 +1266,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small storage shorthand quota must fail")
         self.assertIn("  - storage:", res.stderr)
-        self.assertIn('"storage":"22Gi"', res.stderr)
+        self.assertIn('"storage":"102Gi"', res.stderr)
 
     def test_the_install_patch_for_claims_does_not_double_count_retained_used(self) -> None:
         """Retained claims sitting in `used` on install must not double the suggested patch."""
@@ -1064,13 +1332,13 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["dashboard"]["ephemeralStorageBytesLimit"], 0)
         self.assertEqual(op["shellSandbox"]["ephemeralStorageBytesLimit"], 0)
         self.assertEqual(
-            op["credentialProxy"]["ephemeralStorageBytesLimit"], 2 * 1024**3
+            op["credentialProxy"]["ephemeralStorageBytesLimit"], 8 * 1024**3
         )
         self.assertEqual(op["agentPod"]["base"]["ephemeralStorageBytesRequest"], 3 * 1024**3)
         self.assertEqual(op["agentPod"]["dashboard"]["ephemeralStorageBytesRequest"], 0)
         self.assertEqual(op["shellSandbox"]["ephemeralStorageBytesRequest"], 0)
         self.assertEqual(
-            op["credentialProxy"]["ephemeralStorageBytesRequest"], 2 * 1024**3
+            op["credentialProxy"]["ephemeralStorageBytesRequest"], 8 * 1024**3
         )
 
         self.assertEqual(op["storage"]["persistentVolumeClaims"], _OPERATOR_PVC_COUNT)
@@ -1240,7 +1508,8 @@ class DocumentedFootprintTest(unittest.TestCase):
     """The install prerequisites page quotes figures derived from values and footprint.
 
     Nothing regenerated them, and the row that preceded this one was stale within a
-    release. These recompute each figure and look for it on the page, so a change that
+    release. These recompute each footprint figure from source definitions and look
+    for it on the page, and verify required IAM role declarations, so a change that
     moves a total fails here rather than in a reader's namespace.
     """
 
@@ -1287,7 +1556,7 @@ class DocumentedFootprintTest(unittest.TestCase):
         gib = 1024**3
         # Check that the quota summary sentence quotes the exact current totals without stale figures.
         m_sentence = re.search(
-            r"(\d+)\s+pods,\s+(\d+)\s+persistent volume claims totalling\s+(\d+)\s+GiB of `requests\.storage`,\s+and\s+(\d+)\s+GiB of ephemeral-storage requests against\s+(\d+)\s+GiB of limits\.",
+            r"(\d+)\s+pods,\s+(\d+)\s+persistent volume claims totalling\s+(\d+)\s+GiB of `requests\.storage`,\s+and\s+([\d,]+)\s+MiB of ephemeral-storage requests against\s+([\d,]+)\s+MiB of limits\.",
             page,
         )
         self.assertIsNotNone(
@@ -1304,14 +1573,16 @@ class DocumentedFootprintTest(unittest.TestCase):
             required["requestsStorage"] // gib,
             "stale claim storage",
         )
+        # In MiB: the chart workloads' requests are not whole GiB, and a floor to
+        # GiB would understate what a quota has to hold.
         self.assertEqual(
-            int(m_sentence.group(4)),
-            required["requestsEphemeral"] // gib,
+            int(m_sentence.group(4).replace(",", "")),
+            required["requestsEphemeral"] // 1024**2,
             "stale ephemeral-storage requests",
         )
         self.assertEqual(
-            int(m_sentence.group(5)),
-            required["limitsEphemeral"] // gib,
+            int(m_sentence.group(5).replace(",", "")),
+            required["limitsEphemeral"] // 1024**2,
             "stale ephemeral-storage limits",
         )
 
@@ -1351,6 +1622,274 @@ class DocumentedFootprintTest(unittest.TestCase):
             float(m_limits.group(2)),
             math.floor((required["limitsMemory"] / gib) * 10 + 0.5) / 10,
         )
+
+    def _extract_match(
+        self, pattern: str, text: str, description: str, flags: int = 0
+    ) -> str:
+        m = re.search(pattern, text, flags)
+        self.assertIsNotNone(m, f"failed to find {description}")
+        assert m is not None
+        return m.group(1)
+
+    def test_the_prerequisites_page_documents_mode_next_footprint(self) -> None:
+        def parse_cpu_m(cpu_str: str) -> int:
+            if cpu_str.endswith("m"):
+                return int(cpu_str[:-1])
+            return int(float(cpu_str) * 1000)
+
+        def parse_mem_bytes(mem_str: str) -> int:
+            if mem_str.endswith("Mi"):
+                return int(mem_str[:-2]) * 1024 * 1024
+            if mem_str.endswith("Gi"):
+                return int(mem_str[:-2]) * 1024 * 1024 * 1024
+            if mem_str.endswith("Ki"):
+                return int(mem_str[:-2]) * 1024
+            return int(mem_str)
+
+        spawn_src = _SPAWN_GO.read_text()
+        worker_cpu = self._extract_match(
+            r'workerCPURequest\s*=\s*"([^"]+)"', spawn_src, "workerCPURequest"
+        )
+        worker_mem = self._extract_match(
+            r'workerMemoryRequest\s*=\s*"([^"]+)"', spawn_src, "workerMemoryRequest"
+        )
+        worker_cpu_limit = self._extract_match(
+            r'workerCPULimit\s*=\s*"([^"]+)"', spawn_src, "workerCPULimit"
+        )
+        worker_ephemeral = self._extract_match(
+            r'workerEphemeralStorageRequest\s*=\s*"([^"]+)"', spawn_src, "workerEphemeralStorageRequest"
+        )
+        worker_mem_limit = self._extract_match(
+            r'workerMemoryLimit\s*=\s*"([^"]+)"', spawn_src, "workerMemoryLimit"
+        )
+
+        manifests_src = _A2A_MANIFESTS.read_text()
+        nats_cpu = self._extract_match(
+            r'a2aNATSCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aNATSCPURequest"
+        )
+        nats_mem = self._extract_match(
+            r'a2aNATSMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aNATSMemoryRequest"
+        )
+        nats_replicas = int(
+            self._extract_match(
+                r'buildA2ANATSStatefulSet.*?Replicas:\s*ptr\.To\(int32\((\d+)\)\)',
+                manifests_src,
+                "NATS replicas",
+                flags=re.DOTALL,
+            )
+        )
+        gateway_cpu = self._extract_match(
+            r'a2aGatewayCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aGatewayCPURequest"
+        )
+        gateway_mem = self._extract_match(
+            r'a2aGatewayMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aGatewayMemoryRequest"
+        )
+        gateway_replicas = int(
+            self._extract_match(
+                r'buildA2AGatewayDeployment.*?Replicas:\s*ptr\.To\(int32\((\d+)\)\)',
+                manifests_src,
+                "gateway replicas",
+                flags=re.DOTALL,
+            )
+        )
+        verifier_cpu = self._extract_match(
+            r'a2aVerifierCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aVerifierCPURequest"
+        )
+        verifier_mem = self._extract_match(
+            r'a2aVerifierMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aVerifierMemoryRequest"
+        )
+        provision_cpu = self._extract_match(
+            r'a2aProvisionCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aProvisionCPURequest"
+        )
+        provision_mem = self._extract_match(
+            r'a2aProvisionMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aProvisionMemoryRequest"
+        )
+        jetstream_gib = int(
+            self._extract_match(
+                r'a2aNATSDataClaim.*?resource\.MustParse\("(\d+)Gi"\)',
+                manifests_src,
+                "JetStream PVC storage request",
+                flags=re.DOTALL,
+            )
+        )
+        max_sessions = int(
+            self._extract_match(
+                r'defaultA2AMaxSessions\s*=\s*(\d+)',
+                manifests_src,
+                "defaultA2AMaxSessions",
+            )
+        )
+        headroom = int(
+            self._extract_match(
+                r'a2aQuotaHeadroom\s*=\s*(\d+)', manifests_src, "a2aQuotaHeadroom"
+            )
+        )
+
+        console_src = _A2A_CONSOLE.read_text()
+        console_replicas = int(
+            self._extract_match(
+                r'Replicas:\s*ptr\.To\(int32\((\d+)\)\)', console_src, "console replicas"
+            )
+        )
+        console_cpu = self._extract_match(
+            r'a2aConsoleCPURequest\s*=\s*"([^"]+)"', console_src, "a2aConsoleCPURequest"
+        )
+        console_mem = self._extract_match(
+            r'a2aConsoleMemoryRequest\s*=\s*"([^"]+)"', console_src, "a2aConsoleMemoryRequest"
+        )
+
+        callout_src = _A2A_CALLOUT.read_text()
+        callout_replicas = int(
+            self._extract_match(
+                r'Replicas:\s*ptr\.To\(int32\((\d+)\)\)', callout_src, "callout replicas"
+            )
+        )
+        callout_cpu = self._extract_match(
+            r'Requests:\s*corev1\.ResourceList\{[^}]*ResourceCPU:\s*resource\.MustParse\("([^"]+)"\)',
+            callout_src,
+            "callout CPU request",
+            flags=re.DOTALL,
+        )
+        callout_mem = self._extract_match(
+            r'Requests:\s*corev1\.ResourceList\{[^}]*ResourceMemory:\s*resource\.MustParse\("([^"]+)"\)',
+            callout_src,
+            "callout memory request",
+            flags=re.DOTALL,
+        )
+
+        verifier_src = _A2A_VERIFIER.read_text()
+        verifier_replicas = int(
+            self._extract_match(
+                r'Replicas:\s*ptr\.To\(int32\((\d+)\)\)', verifier_src, "verifier replicas"
+            )
+        )
+
+        bridge_src = _A2A_BRIDGE.read_text()
+        bridge_cpu = self._extract_match(
+            r'corev1\.ResourceCPU:\s*resource\.MustParse\("([^"]+)"\)',
+            bridge_src,
+            "bridge CPU request",
+        )
+        bridge_mem = self._extract_match(
+            r'corev1\.ResourceMemory:\s*resource\.MustParse\("([^"]+)"\)',
+            bridge_src,
+            "bridge memory request",
+        )
+
+        page = " ".join(self._PREREQUISITES.read_text().split())
+        gib = 1024**3
+
+        # Compute standing delta across additional pods:
+        # NATS + callout + verifier + gateway + console
+        additional_pods = (
+            nats_replicas
+            + callout_replicas
+            + verifier_replicas
+            + gateway_replicas
+            + console_replicas
+        )
+        standing_cpu_m = (
+            nats_replicas * parse_cpu_m(nats_cpu)
+            + callout_replicas * parse_cpu_m(callout_cpu)
+            + verifier_replicas * parse_cpu_m(verifier_cpu)
+            + gateway_replicas * parse_cpu_m(gateway_cpu)
+            + console_replicas * parse_cpu_m(console_cpu)
+            + parse_cpu_m(bridge_cpu)
+        )
+        standing_mem_bytes = (
+            nats_replicas * parse_mem_bytes(nats_mem)
+            + callout_replicas * parse_mem_bytes(callout_mem)
+            + verifier_replicas * parse_mem_bytes(verifier_mem)
+            + gateway_replicas * parse_mem_bytes(gateway_mem)
+            + console_replicas * parse_mem_bytes(console_mem)
+            + parse_mem_bytes(bridge_mem)
+        )
+        standing_cpu_vcpu = math.floor((standing_cpu_m / 1000) * 10 + 0.5) / 10
+        standing_mem_gib = math.floor((standing_mem_bytes / gib) * 10 + 0.5) / 10
+
+        # Assert individual workload clauses:
+        self.assertIn(f"NATS ({nats_cpu} CPU, {nats_mem} memory)", page)
+        self.assertIn(
+            f"two auth callout replicas ({callout_cpu} CPU, {callout_mem} memory each)",
+            page,
+        )
+        self.assertIn(
+            f"two capability verifier replicas ({verifier_cpu} CPU, {verifier_mem} memory each)",
+            page,
+        )
+        self.assertIn(f"the A2A gateway ({gateway_cpu} CPU, {gateway_mem} memory)", page)
+        self.assertIn(f"the console ({console_cpu} CPU, {console_mem} memory)", page)
+        self.assertIn(
+            f"`hermes-bridge` container in the agent pod ({bridge_cpu} CPU, {bridge_mem} memory under the default `api` executor",
+            page,
+        )
+        self.assertIn(
+            f"one-time {provision_cpu} CPU / {provision_mem} memory provisioning Job",
+            page,
+        )
+
+        # Assert standing delta totals:
+        standing_delta_pattern = (
+            rf"standing delta of ~{standing_cpu_vcpu}\s+vCPU and ~{standing_mem_gib}\s+GiB "
+            rf"across {additional_pods}\s+additional pods plus the bridge container"
+        )
+        self.assertRegex(page, standing_delta_pattern)
+
+        # Assert a2a-worker session pod requests, limits, and what spawns one (a delegate:,
+        # or a /session conversation, which keeps its pod across turns):
+        worker_mem_limit_prose = worker_mem_limit.replace("Gi", " GiB")
+        worker_clause = (
+            rf"each `delegate:` from chat, and each conversation moved to `/session` "
+            rf"\(one pod for the whole conversation, kept until it has been idle 30 minutes "
+            rf"or for 4 hours at most\), spawns an "
+            rf"`a2a-worker` session pod requesting {re.escape(worker_cpu)} CPU, "
+            rf"{re.escape(worker_mem)} memory and {re.escape(worker_ephemeral)} ephemeral storage "
+            rf"\(limits {re.escape(worker_cpu_limit)} CPU, "
+            rf"(?:{re.escape(worker_mem_limit)}|{re.escape(worker_mem_limit_prose)}), "
+            rf"{re.escape(worker_ephemeral)}\), "
+            rf"up to `maxSessions` at once"
+        )
+        self.assertRegex(page, worker_clause)
+
+        # Assert JetStream persistent volume claim:
+        nats_claim_prose = (
+            f"a {jetstream_gib} GiB JetStream persistent volume claim"
+            if nats_replicas == 1
+            else f"{nats_replicas} {jetstream_gib} GiB JetStream persistent volume claims"
+        )
+        self.assertIn(nats_claim_prose, page)
+
+        # Mode-next PVC total: the stock claims from the chart footprint plus the
+        # JetStream claims (one per NATS StatefulSet replica stamped by VolumeClaimTemplates),
+        # so the expected figure does not come from the page itself.
+        storage = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]["storage"]
+        stock_claims = int(storage["persistentVolumeClaims"])
+        stock_gib = int(storage["storageBytesRequest"]) // gib
+        next_total_claims = stock_claims + nats_replicas
+        next_total_gib = stock_gib + (nats_replicas * jetstream_gib)
+        self.assertIn(
+            f"{next_total_claims} claims totalling {next_total_gib} GiB of `requests.storage`",
+            page,
+        )
+
+        # Assert namespace-wide ResourceQuota capping pods:
+        quota_clause = (
+            rf"renders a namespace-wide `ResourceQuota` on `pods` of "
+            rf"`maxSessions \+ {headroom}` \({max_sessions + headroom} pods by default"
+        )
+        self.assertRegex(page, quota_clause)
+
+    def test_the_prerequisites_page_names_the_iam_roles(self) -> None:
+        """Verifies the prerequisites page names the minimum required GCP IAM roles and permissions."""
+        page = self._PREREQUISITES.read_text()
+        self.assertIn("`google_project_iam_member`", page)
+        self.assertIn("`google_service_account_iam_member`", page)
+        self.assertIn("resourcemanager.projects.setIamPolicy", page)
+        self.assertIn("iam.serviceAccounts.setIamPolicy", page)
+        self.assertIn("roles/resourcemanager.projectIamAdmin", page)
+        self.assertIn("roles/iam.serviceAccountAdmin", page)
+        self.assertIn("roles/owner", page)
+        self.assertIn("roles/editor", page)
 
 
 

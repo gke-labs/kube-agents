@@ -237,6 +237,12 @@ done
 check "every file in the staged trees is root's and writable by nobody else" "all root, go-w" \
   "$(docker exec "$NAME" sh -c 'out=$(find "$@" \( ! -user root -o -perm /022 \) 2>&1) &&
     [ -z "$out" ] && echo "all root, go-w" || echo "$out"' _ "${staged_trees[@]}" 2>&1)"
+# A root exec (what `kubectl exec` is) that imports from the reference tree
+# leaves no bytecode cache there, or the read-only copies stop matching it and
+# sandbox_tree_matches_image reads the cache as an edit (#3047).
+check "a root import from /opt/defaults/scripts writes no __pycache__" "no cache" \
+  "$(docker exec "$NAME" sh -c 'python3 -c "import sys; sys.path.insert(0, \"/opt/defaults/scripts\"); import workspace_paths" &&
+    out=$(find /opt/defaults -name __pycache__ 2>&1) && [ -z "$out" ] && echo "no cache" || echo "$out"' 2>&1)"
 
 echo
 echo "== 3. who may log in =="
@@ -417,6 +423,15 @@ check "python3 exists (execute_code probes for it)" "python3" \
   "$("${SSH[@]}" 'command -v python3' 2>&1)"
 check "tar exists (file sync is tar over ssh, not sftp)" "tar" \
   "$("${SSH[@]}" 'command -v tar' 2>&1)"
+check "leeway exists (topology drift CLI)" "v0.1.3" \
+  "$("${SSH[@]}" 'leeway version' 2>&1)"
+# tar run as root keeps the owner an archive records unless told
+# --no-same-owner, and the helm and leeway archives both record uid 1001, which
+# is hermes here. -L tests what a link resolves to, so a tool put on PATH by a
+# symlink is held to its target; only a dangling link skips the mode test.
+check "every file in /usr/local/bin is root's and writable by nobody else" "all root, go-w" \
+  "$(docker exec "$NAME" sh -c 'out=$(find -L /usr/local/bin \( ! -user root -o \( ! -type l -perm /022 \) \) 2>&1) &&
+    [ -z "$out" ] && echo "all root, go-w" || echo "$out"' 2>&1)"
 # Not SSH_OPTS: sftp spells the port -P, and -p means something else entirely.
 check "no sftp subsystem is advertised" "subsystem request failed" \
   "$(sftp -i "$WORK/id" -P "$PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
@@ -825,6 +840,8 @@ check "CREDENTIAL_PROXY_TOKEN_FILE crosses too" "/var/run/secrets/kubeagents/cre
   "$("${SSH[@]}" 'echo "$CREDENTIAL_PROXY_TOKEN_FILE"' 2>&1)"
 check "the wrapper dispatches rather than refusing to start" "credential proxy" \
   "$("${SSH[@]}" 'kubectl version 2>&1' 2>&1)"
+check "leeway report dispatches cluster reads through the kubectl wrapper" "credential proxy" \
+  "$("${SSH[@]}" 'leeway report --clusters p/l/c' 2>&1)"
 check "the wrappers are on PATH" "/opt/credential-proxy/bin:" \
   "$("${SSH[@]}" 'echo "$PATH"' 2>&1)"
 # A login shell runs /etc/profile, which overwrites PATH wholesale; profile.d is
@@ -851,6 +868,11 @@ check "nor in a login session" "absent" \
 check "a repository's own hooksPath does not reach the wrapper" "/opt/vcs/share/no-hooks" \
   "$("${SSH[@]}" 'git init -q /tmp/sh && git -C /tmp/sh config core.hooksPath .githooks && git -C /tmp/sh config core.hooksPath' 2>&1)"
 "${SSH[@]}" 'rm -rf /tmp/sh' >/dev/null 2>&1
+# A directory laid out as a bare repository is not opened from inside it, so
+# its `config` is never read: a snapshot's tree can have that layout.
+check "a bare repository is not discovered from its own directory" "safe.bareRepository" \
+  "$("${SSH[@]}" 'git init -q --bare /tmp/sb && cd /tmp/sb && git rev-parse --git-dir' 2>&1)"
+"${SSH[@]}" 'rm -rf /tmp/sb' >/dev/null 2>&1
 check "the local git is a real git" "git version" \
   "$("${SSH[@]}" '/opt/vcs/libexec/git --version' 2>&1)"
 # The message, not the exit status: example.invalid resolves nowhere, so an

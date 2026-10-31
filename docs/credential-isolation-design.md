@@ -21,9 +21,12 @@ The **gateway Pod** holds the harness and nothing credentialed:
 1. `platform-agent`: the untrusted agent sandbox.
 2. `platform-agent-dashboard`: the optional local dashboard.
 3. `fluent-bit`: log forwarding.
-4. `agent-api-auth`: the PlatformAgent API authenticator and the
+4. `agent-api-auth`: the PlatformAgent API authenticator, the
    `k8s-event-watcher`, which forwards cluster events using a non-secret
-   internal key. It holds no credential path.
+   internal key, and, where enabled, the drift detector. Neither calls Google
+   on the pod's own identity: both make their Google calls through the
+   broker's watcher routes with a token for the `watcher` audience, which is
+   mounted here and in no other container.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
 durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a
@@ -112,8 +115,13 @@ checkout the credential holder runs `git` in.
 `spec.deployment.env` is applied to the credential runtime because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
 OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, the
-`FEEDBACK_PROMPT_*` switch and delay, and the `KAGE_SLACK_UX` flag —
-but only as literal values; all `valueFrom` sources are rejected. A name earns a
+`FEEDBACK_PROMPT_*` switch and delay, the four findings pacing limits
+(`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
+`FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), the `INCIDENT_WORKLOAD_DEDUP_SECONDS`
+window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch, and the `KAGE_SLACK_UX` flag —
+but only as literal values; all `valueFrom` sources are rejected. One name goes to the shell Pod
+instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
+operator normalises to `true` or `false` before it reaches that Pod. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
@@ -129,15 +137,12 @@ operator's managed values.
 
 ### Limitation
 
-The gateway Pod keeps a cloud identity. It and the broker Pod both run as
-`kubeagents-platform-agent`, whose KSA carries the `iam.gke.io/gcp-service-account`
-annotation, so anything with execution in the gateway can mint the Google service
-account's token from `169.254.169.254`. The Pod that runs code the model wrote cannot,
-which is the property this design is about; what is left is trusted code holding more
-than it needs. Two ways to close it: configure
-`spec.security.workloadIdentityFederation`, which gives the broker a credential source
-that is a file in its own Pod, or give the broker a ServiceAccount of its own and take
-the annotation off the gateway's. Neither ships today.
+Closed: the gateway Pod no longer keeps a cloud identity. The broker runs as the
+annotated ServiceAccount (`kubeagents-platform-agent` by default) and the gateway runs
+as `<agent>-gateway-agent`, which carries no annotation; its NetworkPolicy opens no
+metadata path, and everything in it that called Google goes through the broker.
+`spec.security.workloadIdentityFederation` remains optional hardening for the broker's
+own credential source.
 
 `spec.security.egressPolicy: Allowlist` renders a default-deny egress NetworkPolicy on
 the gateway Pod that leaves the metadata server's credential API off its allowlist — the
@@ -182,8 +187,6 @@ and the route table it feeds
 - Preventing an approved credentialed command from deliberately copying a
   credential into content it returns. Such credential disclosure and tool side
   effects require a separate approval/policy design.
-- Preventing the gateway Pod from reaching the Pod identity it still shares with
-  the broker, or the metadata server behind it.
 - Arbitrary user-supplied init containers, sidecars, volumes, and mounts. These
   are trusted configuration and may intentionally weaken isolation.
 - General data-exfiltration prevention.
@@ -215,7 +218,7 @@ Envoy is the only listener for credentialed tool and chat requests. The
 credential runtime listens on a Unix socket mounted only in its own Pod, so no
 caller can bypass Envoy by reaching the runtime directly. The runtime's one TCP
 listener is the metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
-set by the operator): it serves Prometheus counters whose label values are
+set by the operator): it serves Prometheus series whose label values are
 static enums and closed vocabularies, holds no route, credential or policy,
 answers at most sixteen connections at a time and cuts each off ten seconds
 after it opened whatever the peer sends (the credentialed handler shares the
@@ -223,18 +226,23 @@ process, so a peer that reaches the port cannot spend its threads), and is
 the one port the broker's NetworkPolicy opens to the `gke-gmp-system`
 namespace, where the managed-Prometheus collector runs, and to the operator's own
 pods, which read the counters into the `PlatformAgent`'s `status.usage`
-([usage counters](designs/usage-counters-producer.md)); no other peer reaches it by selector, and the site's security reference states the one residual above one replica.
+([usage counters](designs/usage-counters-producer.md)); no other peer reaches it by selector, and the site's security reference states the one residual above one replica, a shape the operator does not render today.
 Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per
-pod, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
-the gateway and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
+caller, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
+the gateway, `kubeagents-credential-proxy-watcher` for the gateway's `agent-api-auth` container
+alone (the event watcher and drift detector, whose fleet and Pub/Sub calls go through the
+broker's watcher routes) and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
 for the A2A gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
 consumes Google Chat, and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
 pods' (bound to the audience `kubeagents-credential-proxy-session`; see
-[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and does not vary on
+[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and, under `mode: next`
+with an `AgentProfile` bound, each profile tier's (bound to the audience
+`kubeagents-credential-proxy-profile`; see
+[spec-subagent-profiles.md](designs/spec-subagent-profiles.md)), and does not vary on
 which one presented the token — the audience and the route table it feeds do — so the
 allowlist itself keeps other workloads out rather than telling those callers apart. The token
 crosses the cluster network in cleartext;
@@ -255,17 +263,17 @@ than in the Pod's status.
 
 ## Credential Placement
 
-| Data                             | Sandbox                | Credential runtime          |
-| -------------------------------- | ---------------------- | --------------------------- |
-| `spec.deployment.env`            | No                     | Yes                         |
-| Slack tokens                     | No                     | Yes, Secret-backed env      |
-| PlatformAgent external API key   | No                     | Yes, Secret-backed env      |
-| Session KV API key and HMAC salt | Yes, Secret-backed env | Yes, API key only           |
-| Automatic KSA token mount        | Disabled               | Disabled                    |
-| Explicit projected KSA token     | Broker audience only   | Read-only, one-hour token   |
-| gcloud/kubectl configuration     | No                     | Private `emptyDir`          |
-| GitHub installation token/cache  | No                     | Private `emptyDir`          |
-| Agent workspace                  | Yes                    | No, the broker owns its own |
+| Data                             | Sandbox                                                    | Credential runtime          |
+| -------------------------------- | ---------------------------------------------------------- | --------------------------- |
+| `spec.deployment.env`            | `KUBEAGENTS_AUDIT_AUTO_PROMOTE` only, as `true` or `false` | Yes                         |
+| Slack tokens                     | No                                                         | Yes, Secret-backed env      |
+| PlatformAgent external API key   | No                                                         | Yes, Secret-backed env      |
+| Session KV API key and HMAC salt | Yes, Secret-backed env                                     | Yes, API key only           |
+| Automatic KSA token mount        | Disabled                                                   | Disabled                    |
+| Explicit projected KSA token     | Broker audience only                                       | Read-only, one-hour token   |
+| gcloud/kubectl configuration     | No                                                         | Private `emptyDir`          |
+| GitHub installation token/cache  | No                                                         | Private `emptyDir`          |
+| Agent workspace                  | Yes                                                        | No, the broker owns its own |
 
 ### The loopback-only exception
 
@@ -312,10 +320,13 @@ read-only in the `platform-agent` container, because that is how the agent
 authenticates to a broker that is not on loopback and how the broker knows it is the
 gateway calling. The event watcher has a separate one-hour token with the Kubernetes
 API's default audience, plus the cluster CA and Pod namespace, mounted at the
-conventional in-cluster path in `agent-api-auth`. Two differently audienced tokens
-therefore sit side by side in the gateway Pod: the broker-audience one, which the
-Kubernetes API will not accept, and the watcher's, which it will. Neither is
-shared with the sandbox or dashboard.
+conventional in-cluster path in `agent-api-auth`, and a third, for the broker's
+`kubeagents-credential-proxy-watcher` audience, mounted in `agent-api-auth` alone: the
+event watcher and drift detector present it to the broker's watcher routes for their
+Google calls. Three differently audienced tokens therefore sit in the gateway Pod: the
+two broker-audience ones, which the Kubernetes API will not accept, and the event
+watcher's Kubernetes token, which it will. None is shared with the sandbox or
+dashboard, and the model's container holds only the chat one.
 Deleting a default token during startup is intentionally not used: projected
 tokens rotate, and mount-time exclusion is reliable.
 
@@ -509,13 +520,13 @@ conservative than git. The cost is a refusal the argument's position would
 otherwise excuse — a commit message that is the bare word `foreach` or `help`,
 or `git clean -x` — which is the direction this is meant to fail in.
 
-Matching the subcommand by position instead would remove that last cost, and it
-is deliberately not done. Resolving the subcommand slot means knowing which of
-git's global options take a separated value, and the list is not one this
-runtime can keep complete: `git --attr-source HEAD help -m <page>` runs the
-configured viewer while a position-aware reading of the same argument vector
-sees the subcommand as `HEAD`. Scanning every argument cannot disagree with git
-about where the subcommand is.
+For the refused subcommand tokens and flags above, the check scans every
+argument rather than only the global-option or subcommand slot so that a flag
+or subcommand token cannot slip past a parser disagreement (`--attr-source`,
+`--config-env`, and `--shallow-file` are also included in
+`_GIT_GLOBAL_WITH_VALUE` and refused outright, so `_git_plan` and
+`git_argument_violation` resolve the subcommand slot after global value options
+and enforce `ALLOWED_GIT_SUBCOMMANDS` and `_git_config_violation` on that slot).
 
 Refusals are reported as `SECURITY_POLICY_BLOCKED` with rule
 `git.argument.refused`. No shipped skill uses any of them; every skill clone,
@@ -602,10 +613,14 @@ layer and reinstating the runtime's own helper immediately after it discards a
 repository's helper while leaving authenticated push working — but that couples
 the runtime to the value `gh auth setup-git` writes, and it has not been done.
 
-The refused-subcommand list is likewise a denylist over a set that is not closed:
-git holds a command in configuration for several tools, and a future release may
-add another. Allowlisting the subcommands the product issues, and failing closed
-on the rest, is the structurally correct form and is the recommended follow-up.
+As a latent defence-in-depth layer behind `/v1/exec` (which currently refuses
+`git` at `EXEC_ROUTE_EXECUTABLES`, while broker-internal git uses
+`WORKSPACE_GIT_SUBCOMMANDS` and `VCS_GIT_SUBCOMMANDS`), `git_argument_violation`
+enforces an explicit allowlist of subcommands (`ALLOWED_GIT_SUBCOMMANDS`)
+alongside the denylist, failing closed on unknown or custom verbs if `git` is
+ever re-admitted to `/v1/exec`. Writing configuration via repository-local
+`git config` on that path is restricted to author identity keys (`user.name`,
+`user.email`), with non-query mutations to other keys refused.
 
 Reducing both is the motivation for having the runtime receive file content from
 the sandbox rather than operate inside a directory the sandbox controls. The
@@ -731,7 +746,9 @@ get-credentials`, which already runs in the broker. The proxy reads exactly one
 string out of the caller's file — `current-context` — accepts it only if it is a
 well-formed `gke_<project>_<location>_<cluster>` name, and regenerates the
 kubeconfig itself into a directory backed by a broker-only `emptyDir`. That
-regenerated file is what every proxied command runs against. No field the
+regenerated file is what every proxied `kubectl` command runs against. A gcloud
+call gets an empty per-call file instead (get-credentials fetches into its own
+scratch file). No field the
 sandbox wrote is ever interpreted, and there is no check-then-open window,
 because the sandbox never had a handle on the document that is opened.
 
@@ -756,13 +773,21 @@ Consequences:
   `current-context`, a non-GKE context name, or a merged `path1:path2` list — is
   rejected with `400` rather than honored.
 - A cache miss costs one `get-credentials`, preceded by one
-  `clusters describe` to decide whether the control plane should be reached
-  over its DNS endpoint. The common paths warm the cache themselves, since
-  profile scaffolding and context switching both begin with that command. That
-  describe is memoised per cluster for a minute rather than for the life of the
-  broker: the endpoint can be opened or closed on a running cluster, and the
-  proxy is a daemon that would otherwise keep acting on the configuration it
-  first saw.
+  `clusters describe` to decide which control-plane endpoint to reach (DNS,
+  private, or gcloud's default), plus a describe of the agent's own cluster
+  when the private endpoint is a candidate. A caller's
+  own `get-credentials` that names no endpoint flag, and names its cluster
+  and location (the project may come from the broker's own), gets the same
+  decision spliced in, since its output
+  becomes the managed kubeconfig for that cluster;
+  `docs/designs/private-endpoint-selection.md` has the rule. The common paths
+  warm the cache themselves, since profile scaffolding and context switching
+  both begin with that command. The target describe is memoised per cluster
+  for a minute rather than for the life of the broker: the endpoint can be
+  opened or closed on a running cluster, and the proxy is a daemon that would
+  otherwise keep acting on the configuration it first saw. The own-cluster
+  describe is kept for the life of the broker once it has answered, because
+  the install's VPC does not move; a failed one is retried after a minute.
 - `current-context` is read with a real YAML parser, so a valid kubeconfig in
   any legal spelling is recognized, but deliberately with PyYAML's pure-Python
   `safe_load`. The C loader recurses in C and terminates the broker with
@@ -818,6 +843,14 @@ Consequences:
   `${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
   and prints the `export KUBECONFIG=` and `--context` lines that reach that
   cluster from later commands.
+- A `kubectl` read that names no cluster that way and comes back empty or with
+  a server NotFound says where it looked. For `get`, `describe`, `events`,
+  `logs` and `top`, the broker appends one `[credential-proxy]` line to stderr
+  naming the host cluster and saying `--context <name>` reads another one.
+  Without it, a worker read a namespace on the host, got NotFound, and
+  reported it missing from the fleet (#3375). stdout and the exit code are
+  unchanged, any other result comes back as it was, and the line avoids the
+  words the refusal stop reads, so it's never counted as a refusal.
 - Proxied `kubectl` reads get `--request-timeout=30s` and a 60-second deadline,
   so an unreachable control plane fails in seconds rather than holding a broker
   worker for `kubectl`'s 300-second client default. Commands that are meant to
@@ -853,9 +886,11 @@ Consequences:
   operator's, because a CR override of a cap would detach it from the limit. A limit under which the budget would admit fewer than two
   requests at once (672 MiB at the 8 MiB output cap) is treated as no budget, with a
   startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
-  sets limits equal to requests, so the proxy's limit there is its 512Mi request, and a
+  sets limits equal to requests, so the proxy's limit there is its memory request, and a
   budget that serialised every command would cost more than the out-of-memory exposure
-  it prevents.
+  it prevents. The operator declares that request at 1Gi, above the floor, so that the
+  budget engages there too, admitting four; the floor remains for a CR override that
+  sets a smaller request.
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the
   exec route's body (at most 1 MiB) is read before.
@@ -909,7 +944,8 @@ host, method and path against the code allowlist in
 `agents/platform/scripts/api_policy.py`, forwards it on its own identity with
 only its own `Authorization` and `Accept` headers and the credential-substituting
 query keys removed, and returns the upstream status, `Content-Type` and body
-unchanged under a response cap and a deadline. The shell role alone may call it;
+unchanged under a response cap and a deadline (a route with a projection, the GKE
+cluster list and get, returns its 2xx body cut down to the fields it names). The shell role alone may call it;
 token-issuing hosts are refused before the table, redirects are not followed, and
 a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull request.
 [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md) is canonical.
@@ -930,6 +966,10 @@ key and replaces it with the fixed, non-secret sentinel before forwarding to por
 Existing API clients retain bearer-key authentication without placing the real
 key in the sandbox.
 
+A proposed route allowlist for this door, owned by kube-agents and part of the
+harness contract, is in the draft
+[`designs/agent-api-door-allowlist.md`](designs/agent-api-door-allowlist.md).
+
 ### GitHub and Minty
 
 The credential broker obtains a Google OIDC identity token and calls Minty.
@@ -948,12 +988,13 @@ file and never a `.git` it can write into.
 
 - The broker Pod uses the configured PlatformAgent KSA — `spec.security.serviceAccountName`,
   defaulting to the agent's name — for its Workload Identity. The gateway Pod
-  runs under the same one, which is the boundary's remaining gap; the sandbox Pod
-  runs under `<agent>-shell`, annotated with nothing.
+  runs under `<agent>-gateway-agent` and the sandbox Pod under `<agent>-shell`,
+  both annotated with nothing.
 - `automountServiceAccountToken: false` applies to the Pod.
 - The event watcher's projected ServiceAccount token is mounted only by
-  `agent-api-auth`. The `platform-agent` container mounts one of its own — the
-  broker-audience token it presents to the broker Service — and the dashboard
+  `agent-api-auth`, and so is the watchers' broker token (audience
+  `kubeagents-credential-proxy-watcher`). The `platform-agent` container mounts one of its own — the
+  chat-audience token it presents to the broker Service — and the dashboard
   mounts none.
 - Secret and credential-state volumes are mounted only in the broker Pod.
 - Every container runs non-root, drops all Linux capabilities, disallows
@@ -1090,7 +1131,8 @@ needs the same treatment.
 
 CI and deployment tests should assert that:
 
-1. the sandbox has no `spec.deployment.env`, secret volume, credential-state
+1. the sandbox has no `spec.deployment.env` (bar `KUBEAGENTS_AUDIT_AUTO_PROMOTE`,
+   normalised to `true` or `false`), secret volume, credential-state
    volume, and no Secret-backed env other than the two pod-scoped Session KV
    values named above — the assertion enumerates them, so a third one cannot
    be added without amending this list. The `platform-agent` container and the

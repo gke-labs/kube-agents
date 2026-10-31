@@ -58,6 +58,12 @@
 #                     inert wherever it runs.
 #   RC_TAG            pin a candidate instead of resolving the newest one.
 #                     Passed through to resolve-rc-target.sh.
+#   EVAL_MODE_NEXT    the Prow job config sets it to 1, so the candidate is
+#                     graded under spec.mode: next, the mode a new install
+#                     gets. Read by the candidate's ci-deploy.sh and
+#                     ci-eval-pr.sh, not here. A candidate whose ci-deploy.sh
+#                     does not list this job in EVAL_MODE_NEXT_JOB_NAMES
+#                     refuses the flag at second zero, which reports NOT RUN.
 #   PULL_NUMBER       Prow's. Set = a pull request, which never measures a
 #                     release candidate; skip.
 #   ARTIFACTS         Prow's. When set, receives rc-target.env and the
@@ -95,23 +101,39 @@ set -euo pipefail
 # pool, and in the week to 2026-09-23 its two runs that finished took 357 and
 # 401 minutes while four were killed at its own 480-minute deadline.
 #
-# The 36-unit matrix does fit, and that is measured rather than derived. The
+# The 36-unit matrix does fit, and that is measured rather than derived (45
+# units since 2026-10-26; `python3 scripts/eval_rosters.py --summary`). The
 # presubmit runs it on the same pool at the same repetition count, so its
 # fan-out is the same work this lane does: three runs that reached a verdict on
 # 2026-09-24 spent 83, 110 and 143 minutes in it. Add the ~20 minutes of lease,
 # build and deploy this lane pays before grading starts and the poller keeps
-# real headroom under 330 even on the slow end. What that does not cover is a
+# real headroom under 330 even on the slow end. Under EVAL_MODE_NEXT=1 the
+# deploy also runs ci-deploy.sh's step 6b, the flip to next and its gates,
+# which the next-mode presubmit pays in front of the same matrix; its waits
+# are bounded there (MODE_NEXT_*_TIMEOUT), and ci-eval-pr.sh skips the
+# report-only rollback round trip on this lane so nothing runs after the
+# verdict. What that does not cover is a
 # run whose cases stall rather than run: #1840's delegation block costs 45
 # minutes per repetition, and enough of those exceed any budget. That failure
 # is unsettled, so it withdraws the nomination and the next night asks again.
 # The held-out canary (#2013) adds three repetitions serialized on its task
 # lock, a ~50 minute chain at its 1002 s median and ~150 minutes if all three
 # reach the 3000 s delegation ceiling, run beside the other cases; the
-# held-out pdb-remediation-pr (#2016) adds three more on its own task lock, a
-# ~62 minute chain at its 1250 s hint and ~96 minutes at its measured
-# maximum. A graded miss on either leaves the verdict alone, since neither
-# is admitted; an erroring check on either (rungs 1-3) turns the verdict RED
-# like any case's.
+# pdb-remediation-pr (#2016; held out until its roster line on 2026-10-14)
+# added three more on its own task lock, a ~62 minute chain at its 1250 s hint
+# and ~96 minutes at its measured maximum, until its demotion to the nightly
+# on 2026-10-17 (#3120) took it out of this lane's matrix. vcs-spent-branch-reuse
+# (roster since 2026-10-23) adds three serial units in the fan-out's second
+# phase, after every other unit and each after the reset and a 120 s settle:
+# ~15 minutes at its 173 s median, ~56 at its 1000 s hint. pdb-remediation-pr,
+# back on the roster since 2026-10-26, adds three more to that phase: ~15
+# minutes at its 172 s median since #3145, ~69 at its 1250 s hint.
+# consistency-drift-outlier (roster since 2026-10-26) adds three units in the
+# first phase, beside the other cases and serialized on its task lock: a ~10
+# minute chain at its 198 s median on the claude-opus-5-5 nightlies, ~30 at
+# its 600 s hint. A graded miss on the
+# canary leaves the verdict alone, since it is not admitted; an erroring check
+# (rungs 1-3) turns the verdict RED like any case's.
 #
 # This read `nightly` from #1230 until now, under a comment saying #1175's
 # switch was not on main so nothing read the export. That was true when it was

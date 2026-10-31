@@ -42,7 +42,7 @@
       "no_agent": true,
       "script": "bootstrap_scan_gate.py",
       "risk": "low",
-      "enabled": true,
+      "enabled": false,
       "deliver": "local"
     },
     {
@@ -57,7 +57,7 @@
       "no_agent": true,
       "script": "bootstrap_delivery.py",
       "risk": "low",
-      "enabled": true,
+      "enabled": false,
       "deliver": "local"
     },
     {

@@ -7,10 +7,13 @@ dump, a truncated one, one cluster's get-credentials failing under
 parallelism, and both never reading as a shorter candidate list.
 """
 
+import errno
 import hashlib
+import importlib
 import inspect
 import io
 import json
+import os
 import re
 import shlex
 import shutil
@@ -18,6 +21,9 @@ import subprocess
 import sys
 import textwrap
 import unittest
+import os
+from contextlib import contextmanager, redirect_stderr
+from unittest import mock
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -25,6 +31,20 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import collect  # noqa: E402
+
+# Every resolver asks the operator's answer when a run passes neither scope flag:
+# the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
+# that carries either (the sandbox session, a developer reproducing the guard)
+# would turn this suite's listing tests into refusals. The suite is about the
+# collector, not the host it runs on, so both are neutralised at import.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URL unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+import fleet_scope_args as _fleet_scope_args  # noqa: E402
+
+_fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 from collect import Run  # noqa: E402
 
 
@@ -146,7 +166,7 @@ class TestReconcilerOf(unittest.TestCase):
     All three markers are written at apply time and sit in the dump every check
     already runs on, so naming the reconciler costs no extra call. The phrase
     ends up in the remediation note of any `manual` finding on the object --
-    `audit_report.disclose_reconciled_manual_remediations` -- which is why each
+    `audit_report.disclose_manual_remediation_routes` -- which is why each
     one names the release or Application rather than saying "something".
     """
 
@@ -409,6 +429,61 @@ def context_of(dump=None, **overrides):
         # else -- pass it outright.
         base["pod_namespaces"] = {wl["ns"] for wl in base["workloads"] if wl["kind"] == "Pod"}
     return base
+
+
+class TestSweepPool(unittest.TestCase):
+    # Every check a sweep runs is a command the credential broker executes, and
+    # the broker admits its slot cap or what its child memory budget fits at the
+    # container's effective limit (8 at the default 2Gi, 4 on Autopilot without
+    # bursting). Only the broker sees that limit, so each collector reads its
+    # width from it through broker_admission.sweep_width() rather than carrying a
+    # constant (broker_admission.py has the formula and the fallback).
+
+    def test_collector_pools_resolve_the_broker_width(self):
+        here = Path(__file__).resolve().parent
+        # Every module in this directory that runs a worker pool is a sweep
+        # collector and must be pinned. Discovered by the pool it runs
+        # (ThreadPoolExecutor), not by a constant name the diff happens to use, so
+        # a collector added under any name fails this test rather than slipping
+        # through unpinned.
+        pooled = sorted(
+            path
+            for path in here.glob("*.py")
+            if not path.name.startswith("test_") and "ThreadPoolExecutor(" in path.read_text()
+        )
+        self.assertTrue(pooled, "no pooled collector modules discovered -- did the scan break?")
+        for path in pooled:
+            with self.subTest(collector=path.name):
+                assert_resolves_the_broker_width(self, importlib.import_module(path.stem), path.name)
+
+
+class _WidthAsked(Exception):
+    """Raised by a patched broker_admission.sweep_width, to show it was asked."""
+
+
+def assert_resolves_the_broker_width(case, mod, name):
+    """``mod``'s pool width is the broker's: ``collect_fleet(max_workers=None)``
+    resolves it through broker_admission, and no constant stands in for it."""
+    case.assertTrue(hasattr(mod, "collect_fleet"), f"{name} runs a worker pool but exposes no collect_fleet to pin")
+    case.assertIsNone(
+        inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
+        f"{name}: collect_fleet's max_workers must default to None, resolved from the broker",
+    )
+    case.assertIn("broker_admission", vars(mod), f"{name} doesn't import broker_admission")
+    case.assertFalse(hasattr(mod, "MAX_WORKERS"), f"{name} still carries a MAX_WORKERS constant")
+    # By behaviour, not by the line's spelling: with max_workers unset,
+    # collect_fleet asks the broker before anything else. The patched
+    # sweep_width raises, so nothing past that point runs, and the required
+    # arguments it never reaches can be placeholders.
+    required = [
+        param
+        for param in inspect.signature(mod.collect_fleet).parameters.values()
+        if param.default is inspect.Parameter.empty
+        and param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    with mock.patch.object(mod.broker_admission, "sweep_width", side_effect=_WidthAsked):
+        with case.assertRaises(_WidthAsked, msg=f"{name}: collect_fleet doesn't ask broker_admission.sweep_width() for its width"):
+            mod.collect_fleet(*[None] * len(required))
 
 
 class TestNoRequests(unittest.TestCase):
@@ -4160,6 +4235,26 @@ class TestCollectCluster(unittest.TestCase):
         self.assertIn("PROVISIONING", not_running[0]["error"])
         self.assertIsNone(error)
 
+
+    def test_a_cluster_the_scope_excludes_is_dropped_from_the_listing(self):
+        # #3081: spec.scope.exclude.clusters bounds every fleet read, so an
+        # excluded cluster in a swept project is neither audited nor recorded.
+        collect.declared_scope.set("acme", None, "acme/us-central1/lane-b")
+        self.addCleanup(collect.declared_scope.set, None, None)
+        listing = json.dumps(
+            [
+                {"name": "ka-today", "location": "us-central1", "status": "RUNNING"},
+                {"name": "lane-b", "location": "us-central1", "status": "RUNNING"},
+                {"name": "lane-b", "location": "us-east1", "status": "RUNNING"},
+            ]
+        )
+        with mock.patch("sys.stderr"):
+            clusters, not_running, error = collect.enumerate_clusters(
+                "acme", run=lambda argv, **kw: collect.Run(argv, 0, listing, "", 0.0)
+            )
+        self.assertEqual([c["target"] for c in clusters], ["acme/us-central1/ka-today", "acme/us-east1/lane-b"])
+        self.assertEqual((not_running, error), ([], None))
+
     def test_autopilot_downgrades_no_requests_and_no_memory_limit(self):
         cluster = {**self.CLUSTER, "autopilot": True}
         calls = []
@@ -4669,6 +4764,11 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
                 # inapplicable, and the full roster this test asserts against
                 # would then rightly be rejected for naming a check nothing ran.
                 return Run(argv, 0, json.dumps(dump_of(kcc_object("ComputeFirewall", "allow-ssh"))), "", 0.1)
+            if argv[:2] == ["kubectl", "get"] and argv[2] in collect.CONFIGSYNC_SYNC_KINDS:
+                # One healthy RootSync, for the reason the `gcp` read above
+                # answers with one healthy object: served and empty would
+                # declare `configsync-reconciler-stalled` inapplicable.
+                return Run(argv, 0, json.dumps(dump_of(configsync_object("RootSync", "root-sync"))), "", 0.1)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
             if argv[:3] == ["gcloud", "container", "clusters"]:
@@ -4771,6 +4871,31 @@ def kcc_object(kind, name, ns="kubeagents-system", ready="True", reason="UpToDat
         if message is not None:
             condition["message"] = message
         doc["status"]["conditions"] = [condition]
+    return doc
+
+
+def configsync_object(kind, name, ns="config-management-system", stalled="False", syncing_refs=(), syncing_message="Sync Completed",
+                      reconciling="False", stage_errors=None):
+    """A Config Sync RootSync or RepoSync as `kubectl get <kind> -A -o json` returns it.
+
+    `stalled=None` omits every condition, which is what a just-applied object
+    carries. `syncing_refs` are the `errorSourceRefs` of the `Syncing`
+    condition; `stage_errors` is `{"source": [{"code": ..., "errorMessage": ...}]}`
+    and lands under `status.<stage>.errors`.
+    """
+    doc = {"kind": kind, "metadata": {"namespace": ns, "name": name}, "status": {}}
+    if stalled is None:
+        return doc
+    syncing = {"type": "Syncing", "status": "False", "reason": "Sync", "message": syncing_message}
+    if syncing_refs:
+        syncing["errorSourceRefs"] = list(syncing_refs)
+    doc["status"]["conditions"] = [
+        {"type": "Reconciling", "status": reconciling, "reason": "Deployment", "message": "Reconciler deployment was created"},
+        {"type": "Stalled", "status": stalled, "reason": "Deployment" if stalled == "True" else "", "message": "Reconciler deployment failed" if stalled == "True" else ""},
+        syncing,
+    ]
+    for stage, errors in (stage_errors or {}).items():
+        doc["status"][stage] = {"errors": errors, "errorSummary": {"totalCount": len(errors)}}
     return doc
 
 
@@ -7424,6 +7549,111 @@ def lb_service(
     return svc
 
 
+
+class TestConfigSyncReconcilerStalled(unittest.TestCase):
+    """§2.17. The twin of §2.12 for the controller that writes cluster state."""
+
+    SOURCE_ERROR = (
+        "KNV2004: error in the git-sync container: {\"Msg\":\"error running command\","
+        "\"Err\":\"fatal: could not read Username for 'https://github.com': terminal prompts disabled\"}"
+    )
+
+    def run_on(self, *objects):
+        return collect.check_configsync_reconciler_stalled({"configsync_objects": list(objects)})
+
+    def test_healthy_objects_report_nothing(self):
+        self.assertEqual(
+            self.run_on(configsync_object("RootSync", "root-sync"), configsync_object("RepoSync", "team-a", ns="team-a")),
+            [],
+        )
+
+    def test_no_conditions_yet_is_not_a_finding(self):
+        self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync", stalled=None)), [])
+
+    def test_reconciling_alone_is_not_a_finding(self):
+        """The state of every first sync; a large repository holds it for a
+        long time, and no threshold this check could pick is defensible."""
+        self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync", reconciling="True")), [])
+
+    def test_stalled_is_one_critical_naming_the_object(self):
+        hits = self.run_on(configsync_object("RootSync", "root-sync", stalled="True"))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "RootSync/root-sync")
+        self.assertEqual(hits[0]["namespace"], "config-management-system")
+        self.assertIn("Deployment: Reconciler deployment failed", hits[0]["excerpt"])
+        self.assertNotIn("severity", hits[0])  # the CheckSpec's `critical` stands
+
+    def test_syncing_errors_name_the_stage_and_its_first_error(self):
+        hits = self.run_on(
+            configsync_object(
+                "RepoSync", "team-a", ns="team-a",
+                syncing_refs=["status.source.errors"], syncing_message="Source error",
+                stage_errors={"source": [{"code": "2004", "errorMessage": self.SOURCE_ERROR}]},
+            )
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "RepoSync/team-a")
+        self.assertIn("could not read Username", hits[0]["excerpt"])
+        self.assertIn("errors in status.source.errors", hits[0]["excerpt"])
+
+    def test_a_stale_stage_counter_without_a_syncing_ref_is_not_a_finding(self):
+        """The stage summaries keep the previous commit's errors until the next
+        stage overwrites them. The `Syncing` condition is scoped to the current
+        commit, and it is the one that decides."""
+        hits = self.run_on(
+            configsync_object(
+                "RootSync", "root-sync",
+                stage_errors={"sync": [{"code": "2009", "errorMessage": "failed to apply"}]},
+            )
+        )
+        self.assertEqual(hits, [])
+
+    def test_a_render_in_progress_is_not_a_finding(self):
+        hits = self.run_on(
+            configsync_object(
+                "RootSync", "root-sync",
+                syncing_refs=["status.rendering.errors"], syncing_message="Rendering in progress",
+                stage_errors={"rendering": [{"code": "2016", "errorMessage": "The rendering is still in progress"}]},
+            )
+        )
+        self.assertEqual(hits, [])
+
+    def test_a_mixed_stage_quotes_the_real_error_not_the_transient_one(self):
+        """A render in flight writes KNV2016 beside a real error. The check
+        fires on the real one, and the excerpt must quote it, not the
+        transient line that clears by itself."""
+        hits = self.run_on(
+            configsync_object(
+                "RootSync", "root-sync",
+                syncing_refs=["status.rendering.errors", "status.source.errors"], syncing_message="Source error",
+                stage_errors={
+                    "rendering": [{"code": "2016", "errorMessage": "The rendering is still in progress"}],
+                    "source": [{"code": "2004", "errorMessage": self.SOURCE_ERROR}],
+                },
+            )
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("could not read Username", hits[0]["excerpt"])
+        self.assertNotIn("still in progress", hits[0]["excerpt"])
+
+    def test_an_empty_error_source_ref_falls_back_to_the_condition_without_a_stage_list(self):
+        hits = self.run_on(configsync_object("RootSync", "root-sync", syncing_refs=[""], syncing_message="Sync error"))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Sync error", hits[0]["excerpt"])
+        self.assertNotIn("errors in", hits[0]["excerpt"])
+
+    def test_a_syncing_ref_with_no_readable_error_still_counts_and_quotes_the_condition(self):
+        hits = self.run_on(configsync_object("RootSync", "root-sync", syncing_refs=["status.sync.errors"], syncing_message="Sync error"))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Sync error", hits[0]["excerpt"])
+
+    def test_hits_are_sorted_and_the_message_is_cut(self):
+        long = configsync_object("RootSync", "root-sync", syncing_refs=["status.source.errors"],
+                                 stage_errors={"source": [{"code": "2004", "errorMessage": "x" * 1000}]})
+        hits = self.run_on(long, configsync_object("RepoSync", "b", ns="b", stalled="True"), configsync_object("RepoSync", "a", ns="a", stalled="True"))
+        self.assertEqual([h["object"] for h in hits], ["RepoSync/a", "RepoSync/b", "RootSync/root-sync"])
+        self.assertLess(len(hits[2]["excerpt"]), collect.MAX_CONFIGSYNC_MESSAGE_CHARS + 120)
+
 class TestLbWorldOpen(unittest.TestCase):
     def run_on(self, *services):
         return collect.check_lb_world_open({"services": list(services)})
@@ -7555,7 +7785,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         }
         return pod
 
-    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=()):
+    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None):
         workload_items = [self.benign_pod()] if workload_items is None else workload_items
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
@@ -7595,6 +7825,17 @@ class TestComplianceCollectCluster(unittest.TestCase):
                     if callable(kcc_items):
                         return kcc_items(argv, **kwargs)
                     return Run(argv, 0, json.dumps(dump_of(*kcc_items)), "", 0.05)
+                if kinds in collect.CONFIGSYNC_SYNC_KINDS:
+                    if callable(configsync_items):
+                        return configsync_items(argv, **kwargs)
+                    if configsync_items is None or kinds != collect.CONFIGSYNC_SYNC_KINDS[0]:
+                        # A cluster without Config Sync, which is most of a
+                        # fleet and the default here. A list answers the
+                        # RootSync read alone: a cluster can serve RootSync
+                        # without RepoSync, and the mix is the shape §2.17's
+                        # "one served, one unserved" arm has to accept.
+                        return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{kinds.split(".")[0]}" in group "configsync.gke.io"', 0.05)
+                    return Run(argv, 0, json.dumps(dump_of(*configsync_items)), "", 0.05)
                 if kinds in collect.AUTOPILOT_ALLOWLIST_KINDS:
                     if callable(allowlist_items):
                         return allowlist_items(argv, **kwargs)
@@ -7733,13 +7974,13 @@ class TestComplianceCollectCluster(unittest.TestCase):
             # Config Connector does. It is declared by the collector rather
             # than by the Autopilot table, so it is not part of what this test
             # is about -- see `test_a_cluster_without_config_connector_...`.
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
         )
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertFalse(not_applicable_slugs & command_slugs)
         # Every reason is the SOP's own canonical text, not a placeholder.
         for entry in result["checks_not_applicable"]:
-            if entry["check"] == "kcc-object-wedged":
+            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled"):
                 continue
             self.assertIn("Autopilot", entry["reason"])
 
@@ -7757,7 +7998,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             # wrote it: an unfalsifiable claim is the defect, not Autopilot's
             # phrasing of one.
             self.assertNotIn("cannot exist", entry["reason"])
-            if entry["check"] == "kcc-object-wedged":
+            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled"):
                 continue
             # Scoped to the workloads the audit can see, and to the admission
             # policy holding -- both halves, on every Autopilot reason.
@@ -7775,7 +8016,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             allowlist_items=[{"kind": "WorkloadAllowlist", "metadata": {"name": "vendor-agent"}}],
         )
         self.assertEqual(
-            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged"}
+            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"}
         )
         # And they report as what they are: checks that ran and found nothing.
         command_slugs = {c["check"] for c in result["commands"]}
@@ -7794,7 +8035,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(
             {e["check"] for e in result["checks_not_applicable"]},
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
         )
 
     def test_a_standard_cluster_never_reads_for_allowlists(self):
@@ -7815,7 +8056,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
         self.assertEqual(result["outcome"], "collected")
-        self.assertEqual({e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged"})
+        self.assertEqual({e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"})
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"},
             {c["check"] for c in result["commands"]},
@@ -7833,7 +8074,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
         self.assertEqual(
             {e["check"] for e in result["checks_not_applicable"]},
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
         )
 
     def test_standard_cluster_declares_only_the_config_connector_check(self):
@@ -7847,7 +8088,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         and just as good at teaching a reader to ignore the column."""
         result = self.run_with()
         self.assertEqual(
-            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged"}
+            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"}
         )
 
     def kcc_reason(self, result):
@@ -7989,7 +8230,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         # Nor are the other two, though they found nothing: all three rest on
         # one admission rule, and a privileged pod says it is not holding on
         # this cluster, so a hostPath or host-namespace pod could be there too.
-        self.assertEqual(not_applicable, {"kcc-object-wedged"})
+        self.assertEqual(not_applicable, {"kcc-object-wedged", "configsync-reconciler-stalled"})
         self.assertLessEqual({"host-namespace", "hostpath-mount"}, {c["check"] for c in result["commands"]})
 
     def test_autopilot_collects_rather_than_gate_failing_on_a_read_the_api_refuses(self):
@@ -8037,15 +8278,15 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Sixteen checks minus the three Autopilot rules out and the one no
-        cluster without Config Connector can run is twelve, each with a command
-        behind it, and the four dispositioned rather than silently absent --
+        Seventeen checks minus the three Autopilot rules out and the two no
+        cluster without Config Connector or Config Sync can run is twelve, each
+        with a command behind it, and the five dispositioned rather than silently absent --
         absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
         self.assertEqual(len(command_slugs), 12)
-        self.assertEqual(len(na_slugs), 4)
+        self.assertEqual(len(na_slugs), 5)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
 
@@ -8215,6 +8456,8 @@ class TestIsAiWorkload(unittest.TestCase):
             "GEMINI_API_KEY",
             "COHERE_API_KEY",
             "MISTRAL_API_KEY",
+            # LiteLLM's hosted_vllm handler: the gateway's only key under openai_compatible.
+            "HOSTED_VLLM_API_KEY",
             "HF_TOKEN",
             "HUGGING_FACE_HUB_TOKEN",
             "REPLICATE_API_TOKEN",
@@ -9272,6 +9515,53 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
             with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
                 return collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
 
+    def test_the_reconciled_model_plant_files_one_manual_candidate_with_its_reconciler(self):
+        """The object `bench/tf/prebuilt/ai-reconciled-model` plants, as the
+        dump reads it: a zero-replica model server on a floating tag with the
+        two Helm release annotations. It must give exactly one candidate,
+        `model-image-floating-tag`, carrying the reconciler that
+        `audit_report.disclose_manual_remediation_routes` names. Change the
+        stack and change this test."""
+        planted = {
+            "kind": "Deployment",
+            "metadata": {
+                "name": "eval-reconciled-model",
+                "namespace": "eval-ai-reconciled",
+                "labels": {"app": "eval-reconciled-model"},
+                "annotations": {
+                    "meta.helm.sh/release-name": "eval-model-release",
+                    "meta.helm.sh/release-namespace": "eval-ai-reconciled",
+                },
+            },
+            "spec": {
+                "replicas": 0,
+                "selector": {"matchLabels": {"app": "eval-reconciled-model"}},
+                "template": {
+                    "metadata": {"labels": {"app": "eval-reconciled-model"}},
+                    "spec": {
+                        "automountServiceAccountToken": False,
+                        "containers": [
+                            {
+                                "name": "server",
+                                "image": "registry.invalid/vllm/vllm-openai:latest",
+                                "resources": {
+                                    "requests": {"cpu": "10m", "memory": "16Mi"},
+                                    "limits": {"memory": "32Mi"},
+                                },
+                            }
+                        ],
+                    },
+                },
+            },
+        }
+        result = self.run_with(workload_items=[planted])
+        self.assertEqual(result["outcome"], "collected")
+        self.assertEqual([c["check"] for c in result["candidates"]], ["model-image-floating-tag"])
+        candidate = result["candidates"][0]
+        self.assertEqual(candidate["object"], "Deployment/eval-reconciled-model")
+        self.assertEqual(candidate["reconciler"], "the Helm release `eval-model-release` in eval-ai-reconciled")
+        self.assertNotIn("declaration", candidate)
+
     def test_a_cluster_with_no_ai_workloads_still_runs_every_check(self):
         """The one stream where an empty scope is *not* declared inapplicable.
 
@@ -9305,7 +9595,7 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
         self.assertEqual(endpoint[0]["reconciler"], ARGO_PHRASE)
 
     def test_an_unreconciled_endpoint_omits_the_key_rather_than_carrying_none(self):
-        """`disclose_reconciled_manual_remediations` reads the field with a
+        """`disclose_manual_remediation_routes` reads the field with a
         truth test, but the candidate is also what `derive_finding_id` and the
         ledger diff hash over: a `reconciler: null` key on every unmanaged
         object is churn in the stored manifest for no reader's benefit."""
@@ -11509,7 +11799,7 @@ class TestKustomizeOverlayDeclarations(unittest.TestCase):
 class TestReleaseDeclarationsSurviveMalformedDocuments(unittest.TestCase):
     """One malformed file in the clone must not crash the run before the
     manifest prints: each is skipped and the well-formed release indexes.
-    `fleet_waste.py` carries a copy of this function and the same test."""
+    `fleet_waste.py` imports this function and runs the same test."""
 
     GOOD = (
         "kind: HelmRelease\nmetadata: {name: web, namespace: apps}\n"
@@ -11895,8 +12185,11 @@ class TestNamespaceDirectories(unittest.TestCase):
 
     def test_the_excluded_root_still_answers_for_its_own_namespace(self):
         """The exclusion is scoped to the cluster arm's count. The namespace
-        the overlay renders into still resolves to it, which is what
-        `audit_report.wire_kustomize_additions` then wires.
+        the overlay renders into still resolves to it. A new object there
+        renders only if the overlay's kustomization lists its file, and a
+        remediation carries one file. So the SOPs make that fix `manual`, and
+        `audit_report.degrade_unlisted_kustomize_additions` makes a `manifest`
+        fix that adds an unlisted file `manual` too.
         """
         found = self.resolve(
             self.overlaid(
@@ -12207,6 +12500,74 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         self.assertIn("kcc-object-wedged", {e["check"] for e in result["checks_not_applicable"]})
         self.assertNotIn("checks_unevaluated", result)
 
+    # §2.17's two reads, folded into one disposition.
+    def configsync_reason(self, result):
+        for entry in (result.get("checks_not_applicable") or []) + (result.get("checks_unevaluated") or []):
+            if entry["check"] == "configsync-reconciler-stalled":
+                return entry["reason"]
+        return None
+
+    def test_a_cluster_without_config_sync_is_inapplicable_and_records_no_command(self):
+        """The no-op: both kinds unserved on most of a fleet, with no
+        exception, no command and no `checks_unevaluated`."""
+        result = self.compliance()
+        self.assertIn("not installed", self.configsync_reason(result))
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["commands"]})
+        self.assertNotIn("checks_unevaluated", result)
+
+    def test_rootsync_served_without_reposync_counts_as_run_over_the_served_kind(self):
+        result = self.compliance(configsync_items=[configsync_object("RootSync", "root-sync", stalled="True")])
+        self.assertIsNone(self.configsync_reason(result))
+        command = next(c for c in result["commands"] if c["check"] == "configsync-reconciler-stalled")
+        self.assertIn("rootsyncs.configsync.gke.io", command["command"])
+        self.assertNotIn("reposyncs", command["command"])
+        self.assertEqual(command["rc"], 0)
+        candidate = next(c for c in result["candidates"] if c["check"] == "configsync-reconciler-stalled")
+        self.assertEqual(candidate["object"], "RootSync/root-sync")
+        self.assertEqual(candidate["severity"], "critical")
+        self.assertEqual(candidate["namespace"], "config-management-system")
+
+    def test_both_kinds_served_record_one_pasteable_command(self):
+        def both(argv, **kw):
+            return Run(argv, 0, json.dumps(dump_of(configsync_object("RootSync", "root-sync"))), "", 0.05)
+        result = self.compliance(configsync_items=both)
+        command = next(c for c in result["commands"] if c["check"] == "configsync-reconciler-stalled")
+        self.assertIn("rootsyncs.configsync.gke.io -A -o json; KUBECONFIG=", command["command"])
+        self.assertIn("reposyncs.configsync.gke.io", command["command"])
+
+    def test_served_but_empty_is_inapplicable_not_clean(self):
+        result = self.compliance(configsync_items=[])
+        self.assertIn("declares no RootSync or RepoSync", self.configsync_reason(result))
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["commands"]})
+
+    def test_a_forbidden_config_sync_read_is_undetermined_not_absence(self):
+        result = self.compliance(
+            configsync_items=lambda argv, **kw: Run(argv, 1, "", "Error from server (Forbidden): rootsyncs.configsync.gke.io is forbidden", 0.1)
+        )
+        reason = self.configsync_reason(result)
+        self.assertIn("Undetermined", reason)
+        self.assertIn("Forbidden", reason)
+        self.assertNotIn("not installed", reason)
+        self.assertIn("configsync-reconciler-stalled", {e["check"] for e in result["checks_unevaluated"]})
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["commands"]})
+
+    def test_a_timed_out_config_sync_read_is_undetermined_even_when_the_other_kind_answered(self):
+        def one_slow(argv, **kw):
+            if argv[2] == collect.CONFIGSYNC_SYNC_KINDS[0]:
+                return Run(argv, 0, json.dumps(dump_of(configsync_object("RootSync", "root-sync", stalled="True"))), "", 0.05)
+            return Run(argv, collect.TIMEOUT_RC, "", "", 60.0)
+        result = self.compliance(configsync_items=one_slow)
+        reason = self.configsync_reason(result)
+        self.assertIn("Undetermined", reason)
+        self.assertIn("did not finish", reason)
+        # Its candidate rests on a read that did not finish; it is dropped with the check.
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["candidates"]})
+        self.assertNotIn("configsync-reconciler-stalled", {e["check"] for e in result.get("checks_not_applicable") or []})
+
+    def test_an_unparseable_config_sync_read_is_undetermined(self):
+        result = self.compliance(configsync_items=lambda argv, **kw: Run(argv, 0, "{not json", "", 0.1))
+        self.assertIn("could not read", self.configsync_reason(result))
+
     # Any ccnp failure read as "no cluster-wide policies".
     def test_a_forbidden_ccnp_read_leaves_netpol_missing_unevaluated(self):
         forbidden = Run(["kubectl"], 1, "", "Error from server (Forbidden): ccnp is forbidden", 0.05)
@@ -12353,6 +12714,402 @@ class TestDefaultRun(unittest.TestCase):
         self.assertEqual(result.rc, collect.TIMEOUT_RC)
         self.assertIsInstance(result.stdout, str)
         self.assertIsInstance(result.stderr, str)
+
+class CredentialsNoteTest(unittest.TestCase):
+    def test_a_refused_directory_is_the_failed_credentials_and_gcloud_is_not_run(self):
+        # `prepare_kubeconfig`'s note is the `get-credentials` result: gcloud is not run through a
+        # directory this run may not write (a root run would otherwise write a kubeconfig wherever a
+        # planted symlink points), and the entry built from the result names the owner or the link.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            owner = kc.parent.stat().st_uid
+            other = owner + 1
+            calls = []
+
+            def recording(argv, env=None, **kwargs):
+                calls.append(argv)
+                return run_of(0)
+
+            with patch.object(collect, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                _, result = collect.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls), (collect.KUBECONFIG_REFUSED_RC, []))
+            self.assertTrue(result.stderr.startswith(f"{kc.parent} is owned by uid {owner} and this run is uid {other}; it could not be moved aside"), result.stderr)
+            # A symlink planted at the directory's name: refused the same way, nothing run through it,
+            # the target left empty.
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o700)
+            linked = Path(tmp) / "linked" / "kubeconfig_p_c_l.yaml"
+            linked.parent.symlink_to(elsewhere)
+            with patch.object(collect, "KUBECONFIG_DIR", linked.parent):
+                _, result = collect.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls, sorted(p.name for p in elsewhere.iterdir())), (collect.KUBECONFIG_REFUSED_RC, [], []))
+            self.assertIn("is a symbolic link", result.stderr)
+            # With the directory usable, gcloud runs and its result is returned as is.
+            with patch.object(collect, "KUBECONFIG_DIR", kc.parent):
+                _, ok = collect.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((ok.rc, ok.stderr, len(calls)), (0, "", 1))
+
+@contextmanager
+def owned_by(path, uid):
+    """`Path.stat` and `os.fstat` reporting `uid` as `path`'s owner -- on the path, and on a descriptor
+    opened on it (matched by device and inode) -- the test's own fact rather than the runner's uid, real
+    for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real_stat, real_fstat = Path.stat, os.fstat
+    try:
+        identity = os.lstat(path)
+        same = (identity.st_dev, identity.st_ino)
+    except FileNotFoundError:
+        same = None
+
+    def rewrite(result):
+        return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
+
+    def fake(self, *args, **kwargs):
+        result = real_stat(self, *args, **kwargs)
+        return rewrite(result) if self == path else result
+
+    def fake_fstat(fd):
+        result = real_fstat(fd)
+        return rewrite(result) if same is not None and (result.st_dev, result.st_ino) == same else result
+
+    with patch.object(Path, "stat", fake), patch.object(os, "fstat", fake_fstat):
+        yield
+
+
+class PrepareKubeconfigTest(unittest.TestCase):
+    """The shared `.kubeconfigs` after a hand run as another uid, in either
+    order: root first, or uid 1000 first."""
+
+    def mode(self, path):
+        return path.stat().st_mode & collect.KUBECONFIG_DIR_MODE_MASK
+
+    def test_a_fresh_directory_is_sticky_and_world_writable_whatever_the_umask(self):
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / "home" / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            mask = os.umask(0o077)
+            try:
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            finally:
+                os.umask(mask)
+            # The leaf is the shared directory, chmodded rather than made through a cleared umask (the
+            # umask is process-wide and would race the worker threads); its missing ancestor keeps the
+            # caller's umask.
+            self.assertEqual((self.mode(kc.parent), self.mode(kc.parent.parent)), (collect.KUBECONFIG_DIR_MODE, 0o700))
+
+    def test_this_uids_directory_at_another_mode_is_brought_to_the_mode(self):
+        # uid 1000 first: a 0700 a narrow umask left, or a 0777 or 01777 an operator or an earlier rule
+        # left open to other uids, is brought to 0755, this uid's alone; one already there is left as is.
+        for mode in (0o700, 0o777, 0o1777, 0o755):
+            with self.subTest(mode=oct(mode)), TemporaryDirectory() as tmp:
+                kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+                kc.parent.mkdir()
+                kc.parent.chmod(mode)
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+                self.assertEqual(self.mode(kc.parent), collect.KUBECONFIG_DIR_MODE)
+
+    def test_this_uids_private_directory_whose_mode_cannot_change_is_kept(self):
+        # A filesystem that refuses the chmod (mode bits it does not carry, a read-only mount): a
+        # directory this uid owns, writable and searchable by it and by no other uid, is the one the
+        # old `mkdir` used, and the sticky bit would guard against no other uid there; it is kept at
+        # its mode and the keep is said, so the tick reads its clusters rather than refusing every
+        # one. A mode another uid can write under, one this uid cannot write under, and another
+        # uid's directory from root's side stay the note.
+        refused = OSError(errno.EPERM, "Operation not permitted")
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir()
+            kc.parent.chmod(0o700)
+            # The directory's owner is the test's own fact, this run's euid on the path and on the
+            # opened descriptor alike, so the keep is the branch taken whoever runs the suite.
+            with owned_by(kc.parent, os.geteuid()), patch.object(os, "fchmod", side_effect=refused), redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual(self.mode(kc.parent), 0o700)
+            self.assertIn(collect.KUBECONFIG_MODE_KEPT_FORMAT.format(directory=kc.parent, mode="0o700", wanted=oct(collect.KUBECONFIG_DIR_MODE), error=refused), err.getvalue())
+            for mode in (0o777, 0o555):
+                with self.subTest(mode=oct(mode)):
+                    kc.parent.chmod(mode)
+                    with owned_by(kc.parent, os.geteuid()), patch.object(os, "fchmod", side_effect=refused):
+                        note = collect.prepare_kubeconfig(kc)
+                    self.assertEqual(note, f"{kc.parent} is at mode {oct(mode)}, not {oct(collect.KUBECONFIG_DIR_MODE)}, and could not be changed ({refused})")
+            kc.parent.chmod(0o700)
+            with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1), patch.object(os, "fchmod", side_effect=refused):
+                note = collect.prepare_kubeconfig(kc)
+            self.assertEqual(note, f"{kc.parent} is at mode 0o700, not {oct(collect.KUBECONFIG_DIR_MODE)}, and could not be changed ({refused})")
+
+    def test_another_uids_directory_is_moved_aside_and_remade(self):
+        # root first: a 0755 directory a root hand run made, with root's 0600 kubeconfig in it, cannot
+        # hold this uid's files; it is renamed in the parent, which is this uid's, and a fresh one made.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("root's")
+            other = kc.parent.stat().st_uid + 1
+            with patch.object(os, "geteuid", return_value=other):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((self.mode(kc.parent), kc.exists()), (collect.KUBECONFIG_DIR_MODE, False))
+            [aside] = [p for p in Path(tmp).iterdir() if p.name.startswith(".kubeconfigs.unusable-")]
+            self.assertTrue((aside / kc.name).exists())
+            # When the parent refuses the move, the note names the owner instead.
+            with patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                note = collect.prepare_kubeconfig(kc)
+            self.assertIn("could not be moved aside", note)
+            self.assertIn(f"this run is uid {other}", note)
+
+    def test_a_root_run_keeps_another_uids_directory(self):
+        # uid 1000 first, then a root hand run over `kubectl exec`: from root's side the directory is
+        # another uid's, and root keeps it rather than moving it aside, since root can write into it;
+        # the tick's stale file in it is another uid's from root's side too, replaced by a fresh one
+        # rather than written through. Mocked root shows both branches.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("the tick's")
+            # The directory's owner is the test's own fact (uid 1), so the keep branch is the one
+            # exercised whoever runs the suite, root included; the log shows no move-aside.
+            with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1), owned_by(kc, collect.ROOT_UID + 1), redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertNotIn("moved aside", err.getvalue())
+            self.assertEqual((self.mode(kc.parent), kc.exists(), [p.name for p in Path(tmp).iterdir()]), (collect.KUBECONFIG_DIR_MODE, False, [".kubeconfigs"]))
+
+    def test_an_entry_planted_at_the_kubeconfig_name_is_never_used(self):
+        # The names are public and fixed; only this uid's own writable regular file may stand at one.
+        # A directory planted there (the shim's rename over it would fail on every tick) is moved aside
+        # under the directory's aside name and said, never entered; when it cannot be moved the note is
+        # the credentials result and gcloud is not run. Another uid's regular file is removed, not
+        # written through; this uid's own is kept for gcloud to overwrite; a link to a directory is
+        # removed with its target untouched.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            kc.mkdir(0o777)
+            (kc / "inside").write_text("planted")
+            with redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            [aside] = [p for p in kc.parent.iterdir() if p.name.startswith(kc.name + ".unusable-")]
+            self.assertEqual((os.path.lexists(kc), (aside / "inside").read_text()), (False, "planted"))
+            self.assertIn(collect.KUBECONFIG_NOT_A_FILE_MOVED_FORMAT.format(path=kc, aside=aside.name), err.getvalue())
+            kc.mkdir(0o777)
+            calls = []
+
+            def recording(argv, env=None, **kwargs):
+                calls.append(argv)
+                return run_of(0)
+
+            with patch.object(collect, "KUBECONFIG_DIR", kc.parent), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                _, result = collect.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls, result.stderr), (collect.KUBECONFIG_REFUSED_RC, [], collect.KUBECONFIG_NOT_A_FILE_FORMAT.format(path=kc, error="[Errno 13] Permission denied")))
+            kc.rmdir()
+            kc.write_text("another's")
+            kc.chmod(0o666)
+            with owned_by(kc, os.geteuid() + 1):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertFalse(kc.exists())
+            kc.write_text("mine")
+            with owned_by(kc, os.geteuid()):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual(kc.read_text(), "mine")
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o700)
+            kc.unlink()
+            kc.symlink_to(elsewhere)
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((os.path.lexists(kc), elsewhere.is_dir(), self.mode(elsewhere)), (False, True, 0o700))
+
+    def test_a_symlink_at_the_kubeconfig_file_name_is_removed_not_written_through(self):
+        # The directory is the tick's and 01777, so its account can plant a link at the file's name;
+        # `exists()` follows it and root's `os.access` would keep it, and gcloud would then write a
+        # root-owned kubeconfig wherever it points. The rule removes the link (an lstat, before the
+        # access test) so gcloud writes a fresh file; the target is untouched, for the tick and for a
+        # root run over a directory another uid owns.
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target"
+            target.write_text("root's secret")
+            target.chmod(0o600)
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            kc.symlink_to(target)
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((os.path.lexists(kc), target.read_text(), target.stat().st_mode & 0o7777), (False, "root's secret", 0o600))
+            kc.symlink_to(target)
+            with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((os.path.lexists(kc), target.read_text(), target.stat().st_mode & 0o7777), (False, "root's secret", 0o600))
+
+    def test_a_rename_another_thread_won_is_already_moved_not_a_refusal(self):
+        # The first wave's threads start at once on a directory another uid left: each stats it, one
+        # rename wins, and the others' rename finds the source gone (or, across two runs in the same
+        # second, the aside already holding it). The loser reads what stands there now, the winner's
+        # fresh directory, and reports no refusal, so its cluster is read this run.
+        real_rename = Path.rename
+        for errno_lost, reason in ((errno.ENOENT, "No such file or directory"), (errno.ENOTEMPTY, "Directory not empty")):
+            with self.subTest(errno=errno_lost), TemporaryDirectory() as tmp:
+                kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+                kc.parent.mkdir(0o755)
+                kc.write_text("root's")
+                other = kc.parent.stat().st_uid + 1
+
+                def winner_first(path, target, _errno=errno_lost, _reason=reason):
+                    # The winner moved the directory and remade it between this thread's stat and rename.
+                    real_rename(path, target)
+                    path.mkdir(0o755)
+                    raise OSError(_errno, _reason)
+
+                with patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", winner_first), redirect_stderr(io.StringIO()) as err:
+                    self.assertIsNone(collect.prepare_kubeconfig(kc))
+                self.assertNotIn("could not be moved aside", err.getvalue())
+                [aside] = [p for p in Path(tmp).iterdir() if p.name.startswith(".kubeconfigs.unusable-")]
+                self.assertEqual(((aside / kc.name).read_text(), self.mode(kc.parent), kc.exists()), ("root's", collect.KUBECONFIG_DIR_MODE, False))
+                # Any other failure of the rename is still the refusal, naming the owner.
+                with patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                    self.assertIn("could not be moved aside", collect.prepare_kubeconfig(kc) or "")
+
+    def test_a_symlink_at_the_shared_directory_is_refused_not_followed(self):
+        # The agent's own account can plant `.kubeconfigs` as a symlink; a root hand run must not
+        # chmod or write into whatever it points at. The rule reads the name without following and
+        # refuses it with a note, for root as for the tick; the target is untouched.
+        with TemporaryDirectory() as tmp:
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o700)
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.symlink_to(elsewhere)
+            for euid in (os.geteuid(), collect.ROOT_UID):
+                with self.subTest(euid=euid), patch.object(os, "geteuid", return_value=euid):
+                    note = collect.prepare_kubeconfig(kc)
+                self.assertEqual(note, collect.KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=kc.parent))
+                self.assertEqual((self.mode(elsewhere), kc.parent.is_symlink()), (0o700, True))
+
+    def test_a_directory_this_uid_cannot_stat_is_a_note_not_a_raise(self):
+        # A parent this uid cannot search, or a file where the directory should be: the note the
+        # callers log or report, as for every other refusal; the retrospective's boundary would
+        # otherwise catch it, the readiness reporter's copy has none.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            with patch.object(Path, "stat", side_effect=PermissionError(13, "Permission denied")):
+                note = collect.prepare_kubeconfig(kc)
+            self.assertEqual(note, f"{kc.parent} could not be read ([Errno 13] Permission denied)")
+
+    def test_a_directory_this_uid_cannot_make_is_a_note_not_a_raise(self):
+        # A `$HERMES_HOME` this uid cannot create in: the note, as the reporter's copy of the rule
+        # makes it, rather than a PermissionError out of the collectors' credentials step.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / "home" / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            with patch.object(Path, "mkdir", side_effect=PermissionError(13, "Permission denied")):
+                note = collect.prepare_kubeconfig(kc)
+            self.assertEqual(note, f"{kc.parent} could not be made ([Errno 13] Permission denied)")
+
+    def test_a_stale_kubeconfig_this_uid_cannot_write_is_removed_before_gcloud(self):
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            kc.write_text("stale")
+            kc.chmod(0o400)
+            # The keep follows `os.access`, which root alone answers true for a 0400 file: stated as
+            # that answer rather than as the runner's uid, so a mocked euid does not decide it.
+            kept = os.access(kc, os.W_OK)
+            with patch.object(collect, "KUBECONFIG_DIR", kc.parent):
+                path, _ = collect.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
+            self.assertEqual((path, kc.exists()), (kc, kept))
+
+
+def run_of(rc: int, stdout: str = "", stderr: str = "") -> collect.Run:
+    return collect.Run(argv=[], rc=rc, stdout=stdout, stderr=stderr, duration_s=0.0)
+
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    def setUp(self):
+        # The variable half of the operator's answer, per test as well as at
+        # import; the file half is pointed at a path that does not exist above.
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        collect.declared_scope.set(None, None)
+
+    def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        collect.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        def run(argv, **kwargs):
+            raise AssertionError(f"the declared scope is the sweep; nothing should be listed: {argv}")
+
+        collect.declared_scope.set("ops-mgmt,payments-prod", "payments-staging=denied")
+        discovery = collect.discover_fleet(None, run=run)
+        self.assertEqual(discovery.projects, ["ops-mgmt", "payments-prod"])
+        self.assertIsNone(discovery.error)
+        self.assertIn("payments-staging (denied)", discovery.partial)
+        self.assertIn("fleet_scope tool", discovery.partial)
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        collect.declared_scope.set("ops-mgmt payments-prod", "")
+        discovery = collect.discover_fleet(None, run=lambda *a, **k: run_of(1))
+        self.assertEqual((discovery.projects, discovery.partial), (["ops-mgmt", "payments-prod"], None))
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"]:
+                return run_of(0, "acme\n")
+            return run_of(0, "acme\nother\n")
+
+        collect.declared_scope.set(None, None)
+        self.assertEqual(collect.discover_fleet(None, run=run).projects, ["acme", "other"])
+
+    def test_a_project_override_inside_the_declared_scope_wins_and_one_outside_is_refused(self):
+        # With a declared scope the override is still a single-project run, but
+        # it cannot name a project the scope does not list, and it cannot run
+        # at all on a scoped sandbox without the tool's flags.
+        collect.declared_scope.set("ops-mgmt,payments-prod", None)
+        self.assertEqual(collect.discover_fleet("payments-prod", run=lambda *a, **k: run_of(1)).projects, ["payments-prod"])
+        outside = collect.discover_fleet("acme-only", run=lambda *a, **k: run_of(1))
+        self.assertEqual(outside.projects, [])
+        self.assertIn("declared scope does not list", outside.error)
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_SCOPE_DECLARED": "true"}):
+            collect.declared_scope.set(None, None)
+            self.assertIn("got no collector_args", collect.discover_fleet("ops-mgmt", run=lambda *a, **k: run_of(1)).error)
+        collect.declared_scope.set(None, None)
+        self.assertEqual(collect.discover_fleet("acme-only", run=lambda *a, **k: run_of(1)).projects, ["acme-only"])
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the three flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with mock.patch.object(collect.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            collect.main(["compliance-audit", "--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied", "--scope-exclude-clusters", "ops-mgmt/us-central1/lane-b"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied", "ops-mgmt/us-central1/lane-b")
+
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to the listing.
+        collect.declared_scope.set("", "payments-staging=denied")
+        discovery = collect.discover_fleet(None, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed")))
+        self.assertEqual(discovery.projects, [])
+        self.assertIn("no project this install could read", discovery.error)
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, collect.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
+
+class DefaultRunFailureTest(unittest.TestCase):
+    """`default_run` turns a child that could not start into a failed `Run`, so
+    project discovery records the failure instead of ending the run with a
+    traceback and no manifest."""
+
+    def test_a_missing_gcloud_is_a_recorded_discovery_error_not_a_raise(self):
+        collect.declared_scope.set(None, None)
+        missing = FileNotFoundError(2, "No such file or directory", "gcloud")
+        with mock.patch.object(collect.subprocess, "run", side_effect=missing), redirect_stderr(io.StringIO()):
+            discovery = collect.discover_fleet(None)
+        self.assertEqual(discovery.projects, [])
+        self.assertIn("rc=-1", discovery.error)
+        self.assertIn("No such file or directory", discovery.error)
 
 
 if __name__ == "__main__":

@@ -143,8 +143,9 @@ and touches disjoint rows. (It has the same claim-before-deliver defect with
 *no* rewind anywhere, which is why the claim helper stays in
 ``kanban_db_notify.py``.)
 
-Setting ``availability.replicas: 2`` would make duplicate Slack posts reachable
-and would additionally require ``advance_notify_cursor`` to become monotonic
+The operator caps ``availability.replicas`` at one gateway replica today, so
+setting it to 2 renders one. Lifting that cap would make duplicate Slack posts
+reachable and would additionally require ``advance_notify_cursor`` to become monotonic
 (``AND last_event_id < ?``). Treat that as a correctness change, not a scaling
 knob.
 
@@ -324,9 +325,9 @@ def read_unclaimed(
     ``advance_notify_cursor`` — ``hermes_cli.kanban_db_notify`` at v2026.9.14.
 
     ``old_cursor`` comes from the subscription row rather than a second query —
-    ``list_notify_subs`` is ``SELECT *``. It is returned only because the call
-    site stores it in the delivery dict; nothing consumes it any more, now that
-    the rewind is a no-op.
+    ``list_notify_subs`` is ``SELECT *``. The rewind no longer needs it, but
+    kanban_chat_notify's ``fold_fanout`` does: it is the cursor a fold's drop
+    advances from when nothing is left to deliver.
 
     The returned cursor is recomputed from the events that survive the
     high-water filter, so the durable cursor can never be advanced past an event

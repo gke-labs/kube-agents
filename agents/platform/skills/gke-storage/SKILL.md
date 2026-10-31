@@ -14,8 +14,9 @@ metadata:
 This reference covers storage configuration for GKE clusters including
 persistent disks, file storage, and cloud storage integration.
 
-> **MCP Tools:** `apply_k8s_manifest`, `get_k8s_resource`,
-> `describe_k8s_resource`, `get_cluster`
+> **MCP Tools:** `get_k8s_resource`, `describe_k8s_resource`, `get_cluster`
+>
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
 ## Golden Path Storage Defaults
 
@@ -129,18 +130,14 @@ spec:
 
 ## Volume Expansion
 
-If `allowVolumeExpansion: true` is set on the StorageClass, resize by updating
-the PVC:
+If `allowVolumeExpansion: true` is set on the StorageClass, resize by raising the
+request in the PVC's manifest, proposed as a pull request through `submit-suggestion`:
 
-```bash
-# kubectl
-kubectl patch pvc <PVC_NAME> -p '{"spec":{"resources":{"requests":{"storage":"200Gi"}}}}'
-```
-
-```
-# MCP (preferred)
-patch_k8s_resource(parent="...", resourceType="persistentvolumeclaim", name="<PVC_NAME>",
-  patch='{"spec":{"resources":{"requests":{"storage":"200Gi"}}}}')
+```yaml
+spec:
+  resources:
+    requests:
+      storage: 200Gi
 ```
 
 Kubernetes automatically resizes the filesystem.

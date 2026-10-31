@@ -1,0 +1,16 @@
+# domains.yaml for nightly_bugs.py's tests.
+infra_owner: ivan
+infra_backup: iris
+domains:
+  - slug: capacity
+    name: Capacity
+    owner: carol
+    backup: dave
+    meaning: Checks whether node pools can take more load.
+    journey: unused here
+  - slug: security
+    name: Security
+    owner: sam
+    backup: alice
+    meaning: Finds risky access.
+    journey: unused here

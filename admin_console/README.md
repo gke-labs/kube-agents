@@ -258,9 +258,19 @@ share one connection-gate component that directs the user to Connection;
 provider-backed content becomes available after connecting to a verified
 kube-agents host.
 
-Task Kanban reads the canonical installation's live shared board. The page summarizes
-open, attention, and completed work, filters by status and assignee, and uses a
-25-row selectable table with URL-persisted pagination. Selecting a row keeps
+Task Kanban, Scheduled Cron, Chat History, and the Connection check read the
+agent runtime through `kubectl exec` into the gateway pod.
+A read that completes carries a length header, and the in-pod script writes its
+answer in 64 KiB pieces. A large read into a pod on GKE Sandbox (gVisor) can
+lose its end in transit; when the bytes that arrive fall short of the header,
+the console reports "Agent runtime read was cut short: received X of N bytes"
+instead of "returned invalid data". Retry the read.
+
+Task Kanban reads the canonical installation's live shared board. The page counts
+active cards, cards that wait on input, cards that failed after all attempts,
+and done cards. A caption shows how many done cards have a pull request. It
+filters by status and assignee, and uses a 25-row selectable table with
+URL-persisted pagination. Selecting a row keeps
 the task in the URL and renders its details below the table. Task inspection
 includes the request, assignee, priority, current state, timestamps, linked chat
 session, parent and child tasks, delivery subscription health, attachments,

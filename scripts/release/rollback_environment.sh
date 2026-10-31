@@ -6,7 +6,8 @@
 # This is the rollback runbook (docs/site/src/content/docs/deploy/rollback.md)
 # run by a machine: from a clean checkout of the GA tag, `upgrade.sh
 # --upgrade-mode=operator` then `--upgrade-mode=harness`, both `--image-tag`
-# that GA, and --drop-undeclared-values where the GA's script takes it. The
+# that GA, and --drop-undeclared-values and --allow-breaking-downgrade where
+# the GA's script takes them. The
 # roll-forward is the same pair from the candidate checkout, so one run
 # exercises both directions between N-1 and N and leaves the environment on
 # the candidate's images. A value the rollback dropped is not restored: the
@@ -55,6 +56,11 @@ readonly OPERATOR_SCALE_TIMEOUT_SECONDS=120
 # The upgrade.sh flag that drops the recorded values the target chart's schema
 # does not declare. Releases from before it neither take it nor drop anything.
 readonly DROP_UNDECLARED_VALUES_FLAG="--drop-undeclared-values"
+# The upgrade.sh flag that lets a rollback cross a commit marked as a breaking
+# change. Most GA pairs carry one, and the leg exists to prove the move back
+# works, so it passes the flag; the refusal itself is tested where upgrade.sh
+# is. Releases from before it neither take it nor refuse.
+readonly ALLOW_BREAKING_DOWNGRADE_FLAG="--allow-breaking-downgrade"
 # The last GA whose chart renders litellm-policy itself; from the next one on
 # the operator creates and owns it (#1195, #1488). The chart text is no guide:
 # the current template still names the object under a condition that is false
@@ -287,15 +293,22 @@ checkout_at() {
 
 # drop=true on the rollback leg only: there the keys N recorded that N-1 does
 # not declare are expected, while on the roll-forward a key the candidate no
-# longer declares is a rename the refusal has to surface.
+# longer declares is a rename the refusal has to surface. The same leg passes
+# the breaking-change bypass. A roll-forward leaves behind only the GA's
+# release-line commits, which carry a breaking change only when one was
+# released by hand there (calculate_next_version.sh refuses it otherwise);
+# such a line would red the roll-forward until the next minor GA.
 run_upgrade() {
-  local dir="$1" tag="$2" mode="$3" drop="${4:-false}" drop_flag=""
+  local dir="$1" tag="$2" mode="$3" drop="${4:-false}" drop_flag="" allow_flag=""
   local log="${DIAGNOSTICS_DIR}/upgrade-${mode}-${tag}.log"
   if [ "${drop}" = "true" ] && grep -qF -- "${DROP_UNDECLARED_VALUES_FLAG}" "${dir}/upgrade.sh"; then
     drop_flag="${DROP_UNDECLARED_VALUES_FLAG}"
   fi
-  echo "==> ${dir##*/}: ./upgrade.sh --non-interactive --upgrade-mode=${mode} --image-tag ${tag}${drop_flag:+ ${drop_flag}}"
-  (cd "${dir}" && ./upgrade.sh --non-interactive --upgrade-mode="${mode}" --image-tag "${tag}" ${drop_flag:+"${drop_flag}"}) 2>&1 | tee "${log}"
+  if [ "${drop}" = "true" ] && grep -qF -- "${ALLOW_BREAKING_DOWNGRADE_FLAG}" "${dir}/upgrade.sh"; then
+    allow_flag="${ALLOW_BREAKING_DOWNGRADE_FLAG}"
+  fi
+  echo "==> ${dir##*/}: ./upgrade.sh --non-interactive --upgrade-mode=${mode} --image-tag ${tag}${drop_flag:+ ${drop_flag}}${allow_flag:+ ${allow_flag}}"
+  (cd "${dir}" && ./upgrade.sh --non-interactive --upgrade-mode="${mode}" --image-tag "${tag}" ${drop_flag:+"${drop_flag}"} ${allow_flag:+"${allow_flag}"}) 2>&1 | tee "${log}"
   return "${PIPESTATUS[0]}"
 }
 

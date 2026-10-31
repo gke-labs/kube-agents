@@ -33,7 +33,7 @@ for the agent bound on each member as a resource (never at project level). A con
 are the [`kube-agents-scope-resolver`](../kube-agents-scope-resolver/README.md) module's
 `container_members` output: listed at plan time with the reconcile's own Cloud Asset Inventory
 search while the pool is armed, and not read while it is off. A member gets a pool account on that
-apply and nothing else -- no per-project binding, because the container's grant is inherited, and
+apply and nothing else from this module, and no drift audit-log sink from the composition (which projects get one is the drift-pubsub README's "Exporting the scope's other projects") -- no per-project binding, because the container's grant is inherited, and
 no place in the `scope.max_projects` count -- so pool membership under a container lags where the
 grant and discovery do not: a project created beneath a declared folder since the last apply is
 refused by the broker until the next apply lists it. With the pool armed, every declared container
@@ -62,9 +62,12 @@ default, which the whole-set precondition in `main.tf` tests the counted set aga
 `exclude.clusters`, with the same caps and patterns the CRD enforces, checked at plan time. Each
 project in `projects` other than `project_id` gets the read allowlist in `scope.tf`
 (`roles/container.clusterViewer`, `roles/container.viewer`, `roles/compute.viewer`,
-`roles/monitoring.viewer`, `roles/logging.viewer`, `roles/iam.securityReviewer`) intersected with
+`roles/monitoring.viewer`, `roles/logging.viewer`, `roles/gkehub.viewer`, `roles/iam.securityReviewer`)
+intersected with
 `project_roles`, never `project_roles` itself, so a `custom` list that carries an admin role at
-home carries none of it elsewhere; the plan is refused when the intersection leaves no role that
+home carries none of it elsewhere, and `roles/cloudtrace.user` stays at home with the other
+host-only roles (its Trace-console writes travel with the trace reads, and the helpers that need
+the reads look at the host project's own traces); the plan is refused when the intersection leaves no role that
 lists and gets clusters (`roles/container.clusterViewer` or `roles/container.viewer`;
 `roles/iam.securityReviewer` lists but cannot get). `exclude` binds nothing and revokes nothing: it
 travels in the object so the composition renders the CR from the same value, and a project named
@@ -98,7 +101,7 @@ credentials before it can match the entry, and without the grant the member is r
 as unnamed and holds the scope prune on every tick. Removing an entry revokes its bindings on the next apply, and
 `terraform destroy` revokes them all. The `scope_projects`, `scope_folders`,
 `scope_organizations`, `scope_shared_vpc_hosts`, `scope_metrics_scopes`, `scope_bound_projects`, `scope_lookup_only_hosts`,
-`scope_roles` and `scope_container_roles` outputs surface what was bound. An organisation binding
+`scope_roles` and `scope_container_roles` outputs surface what was bound; `scope_discovered_projects` is the projects beyond the host the plan lists in the scope, the pool's set less the host; `scope_export_projects` is the same without a container's Asset-Inventory members, which the composition feeds to the drift-pubsub module's `source_projects` (the output's description says why the two differ). An organisation binding
 is wide; the design is
 [`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6, §9 and
 §10 step 3.
@@ -131,4 +134,4 @@ module "kube_agents_iam" {
 }
 ```
 
-See the [Release versioning & promotion guide](../../../docs/site/src/content/docs/deploy/release-versioning.md) for SemVer pinning instructions.
+See the [Release versioning guide](../../../docs/site/src/content/docs/deploy/release-versioning.md) for SemVer pinning instructions.

@@ -246,6 +246,124 @@ class PrOpenedTest(unittest.TestCase):
         self.assertNotIn("<!channel>", text)
 
 
+class ProposalEventTest(unittest.TestCase):
+    """:func:`m.proposal_ref` and :func:`m.evidence_line`, which the ``pr_opened`` event path reads."""
+
+    PR9 = "https://github.com/acme/fleet/pull/9"
+
+    def test_proposal_ref_reads_a_github_pr_and_a_managed_merge_request(self):
+        self.assertEqual(m.proposal_ref(PR + "/files"), (PR, "fleet-config", "412"))
+        self.assertEqual(m.proposal_ref(MR), (MR, "infra", "12"))
+        self.assertIsNone(m.proposal_ref(SELF_MANAGED_MR))
+        self.assertEqual(m.proposal_ref(SELF_MANAGED_MR, {"gitlab.example.com"}), (SELF_MANAGED_MR, "infra", "7"))
+        for url in ("https://github.example.com/acme/fleet/pull/3", "https://github.com/acme/fleet/issues/3", ""):
+            self.assertIsNone(m.proposal_ref(url), url)
+        ghe = "https://github.example.com/acme/fleet/pull/3"
+        self.assertEqual(m.proposal_ref(ghe, github_host="github.example.com"), (ghe, "fleet", "3"))
+
+    def test_evidence_is_the_first_line_naming_the_pr_by_url_or_number(self):
+        text = "Checked seeded-a.\nBoth fixes are up for review in PR #9\nDone."
+        self.assertEqual(m.evidence_line(text, self.PR9, "9"), "Both fixes are up for review in PR #9")
+        self.assertEqual(m.evidence_line(f"Review it at {self.PR9}/files", self.PR9, "9"), f"Review it at {self.PR9}/files")
+        self.assertEqual(m.evidence_line("Waiting on review of MR !12.", MR, "12"), "Waiting on review of MR !12.")
+        self.assertEqual(m.evidence_line("Checked seeded-a.", self.PR9, "9"), "")
+
+    def test_another_pr_whose_number_extends_this_ones_is_not_its_evidence(self):
+        line = "Rebased on https://github.com/acme/fleet/pull/91, which bob opened; see #91 and #900."
+        self.assertEqual(m.evidence_line(line, self.PR9, "9"), "")
+
+    def test_the_url_of_another_pr_is_not_folded_into_this_ones_reference(self):
+        line = f"Opened {self.PR9}, after https://github.com/acme/fleet/pull/91."
+        blocks, _ = m.pr_opened(self.PR9, "fleet", "9", line)
+        self.assertEqual(_contexts(blocks), ["Opened PR #9, after https://github.com/acme/fleet/pull/91."])
+
+
+MR = "https://gitlab.com/acme/platform/infra/-/merge_requests/12"
+SELF_MANAGED_MR = "https://gitlab.example.com/acme/infra/-/merge_requests/7"
+
+
+class OpenedMergeRequestTest(unittest.TestCase):
+    def test_finds_a_gitlab_com_merge_request_with_subgroups(self):
+        text = f"Checked the limits.\nOpened {MR} for review."
+        self.assertEqual(m.opened_pr(text), (MR, "infra", "12", f"Opened {MR} for review."))
+
+    def test_a_tail_after_the_number_is_left_out_of_the_url(self):
+        for tail in ("/diffs", "#note_1", "/diffs?view=parallel"):
+            self.assertEqual(m.opened_pr(f"Opened {MR}{tail}")[:3], (MR, "infra", "12"), tail)
+
+    def test_mr_or_merge_request_between_the_verb_and_the_url(self):
+        for line in (
+            f"Opened MR !12: {MR}", f"Opened merge request {MR}", f"Created a new MR {MR}",
+            f"Opened MR !12 in platform/infra: {MR}", f"MR opened: {MR}", f"Opened [MR !12]({MR})",
+        ):
+            self.assertEqual(m.opened_pr(line)[0], MR, line)
+
+    def test_another_merge_request_number_or_a_pr_noun_is_not_this_one(self):
+        self.assertIsNone(m.opened_pr(f"Opened MR !13 in platform/infra: {MR}"))
+        self.assertIsNone(m.opened_pr(f"Opened PR {MR}"))
+        self.assertIsNone(m.opened_pr(f"Opened MR {PR}"))
+
+    def test_a_negated_verb_is_not_an_opened_merge_request(self):
+        for lead in ("I have not opened", "Never opened", "I haven't yet opened an MR:", "didn't create"):
+            self.assertIsNone(m.opened_pr(f"{lead} {MR}"), lead)
+
+    def test_someone_else_as_the_subject_is_not_ours(self):
+        for line in (
+            f"Renovate opened {MR}", f"Dependabot: opened {MR}", f"regression came from {MR}, opened by bob",
+            f"Checked with Bob and he then opened {MR}", f"Bob's MR opened: {MR}",
+        ):
+            self.assertIsNone(m.opened_pr(line), line)
+
+    def test_a_self_managed_host_counts_only_when_the_caller_names_it(self):
+        line = f"Opened {SELF_MANAGED_MR}"
+        self.assertIsNone(m.opened_pr(line))
+        self.assertIsNone(m.opened_pr(line, {"gitlab.other.example"}))
+        self.assertEqual(m.opened_pr(line, {"gitlab.example.com"})[:3], (SELF_MANAGED_MR, "infra", "7"))
+        self.assertEqual(m.opened_pr(line, {"GitLab.Example.com"})[0], SELF_MANAGED_MR)
+        with_port = "https://gitlab.example.com:8443/acme/infra/-/merge_requests/3"
+        self.assertEqual(m.opened_pr(f"Opened {with_port}", {"gitlab.example.com"})[:3], (with_port, "infra", "3"))
+
+    def test_a_lookalike_host_or_plain_http_is_not_announced(self):
+        for url in (
+            "https://gitlab.com.evil.example/acme/infra/-/merge_requests/1",
+            "https://evilgitlab.com/acme/infra/-/merge_requests/1",
+            "https://user@gitlab.com/acme/infra/-/merge_requests/1",
+            "http://gitlab.com/acme/infra/-/merge_requests/1",
+            "https://gitlab.com/acme/-/merge_requests/1",
+        ):
+            self.assertIsNone(m.opened_pr(f"Opened {url}", {"gitlab.example.com"}), url)
+
+    def test_prs_and_merge_requests_are_found_in_order(self):
+        found = list(m.opened_prs(f"- Opened {MR} and opened {PR}\n- Opened {PR}"))
+        self.assertEqual([f[0] for f in found], [MR, PR, PR])
+
+
+class MergeRequestOpenedTest(unittest.TestCase):
+    def test_headline_evidence_and_two_url_buttons(self):
+        blocks, text = m.pr_opened(MR, "infra", "12", f"Opened MR !12: {MR}/diffs raising the limit")
+        self.assertEqual(
+            blocks[0]["text"]["text"], "*I opened merge request !12 in infra. It's yours to review.*"
+        )
+        self.assertEqual(_contexts(blocks), ["Opened MR !12 raising the limit"])
+        buttons = _buttons(blocks)
+        self.assertEqual([b["text"]["text"] for b in buttons], ["Open MR ↗", "Files changed ↗"])
+        self.assertEqual([b["url"] for b in buttons], [MR, MR + "/diffs"])
+        self.assertEqual(text.split("\n")[1], "Opened MR !12 raising the limit")
+
+    def test_merge_request_and_its_number_before_the_url_are_not_repeated(self):
+        for line in (f"Opened merge request {MR}", f"Opened merge request !12: {MR}", f"Opened MR ({MR})", f"Opened {MR}"):
+            blocks, _ = m.pr_opened(MR, "infra", "12", line)
+            self.assertEqual(_contexts(blocks), ["Opened MR !12"], line)
+        for line, shown in (
+            (f"I opened a merge request: {MR}", "I opened an MR !12"),
+            (f"A merge request !12: {MR}", "An MR !12"),
+            (f"Opened a new merge request {MR}", "Opened a new MR !12"),
+            (f"Opened an MR {MR}", "Opened an MR !12"),
+        ):
+            blocks, _ = m.pr_opened(MR, "infra", "12", line)
+            self.assertEqual(_contexts(blocks), [shown], line)
+
+
 class NeedsYouTest(unittest.TestCase):
     def test_listed_options_become_choice_buttons(self):
         reason = "Which checkout-gateway did you mean?\nTwo clusters run one. Which?\n- seeded-reliability\n2) seeded-debug"
@@ -454,28 +572,191 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(_buttons(blocks), [])
         self.assertIn(long, _contexts(blocks)[0])
 
-    def test_a_headline_with_a_link_keeps_the_url_on_the_line_below(self):
+    def test_a_headline_with_a_link_keeps_the_link_alone_on_the_line_below(self):
         url = "https://example.com/" + "a" * 150
         blocks, _ = m.needs_you(f"Check the [runbook]({url}) first. Which?\n- seeded-a\n- seeded-b")
         self.assertIn("Check the runbook first. Which?", blocks[0]["text"]["text"])
-        self.assertEqual(_contexts(blocks)[0], f"Check the <{url}|runbook> first. Which?")
+        self.assertEqual(_contexts(blocks)[0], f"<{url}|runbook>")
         self.assertEqual([b["value"] for b in _buttons(blocks)], ["seeded-a", "seeded-b"])
 
-    def test_a_short_headline_with_a_link_keeps_the_url_on_the_line_below(self):
+    def test_a_short_headline_with_a_link_keeps_the_link_alone_on_the_line_below(self):
         url = "https://github.com/acme/x/pull/412"
         blocks, _ = m.needs_you(f"Should I merge [PR #412]({url})?\n- Yes\n- No")
-        self.assertEqual(_contexts(blocks)[0], f"Should I merge <{url}|PR #412>?")
+        self.assertEqual(_contexts(blocks)[0], f"<{url}|PR #412>")
         self.assertEqual([b["value"] for b in _buttons(blocks)], ["Yes", "No"])
+
+    def test_a_long_question_with_a_link_shows_its_words_once(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        question = (
+            f"Should I merge [PR #412]({url}), which raises the memory limit of checkout-gateway in "
+            "seeded-reliability to 512Mi, or close it and open one that rolls back the image instead?"
+        )
+        blocks, _ = m.needs_you(question)
+        headline, detail = blocks[0]["text"]["text"].strip("*"), _contexts(blocks)[0]
+        self.assertTrue(headline.endswith(p.ELLIPSIS), headline)
+        self.assertTrue(detail.startswith(f"<{url}|PR #412>\n{p.ELLIPSIS}"), detail)
+        self.assertNotIn(headline.removesuffix(p.ELLIPSIS), detail)
+
+    def test_a_headline_link_is_on_its_own_line_above_the_next_sentence(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        after = (
+            "The pipeline has been red since the image bump and the on-call engineer asked for a decision "
+            "before the end of the current shift."
+        )
+        head, rest, _ = m._question(f"Should I merge [PR #412]({url})? {after}", True)
+        self.assertEqual(head, f"Should I merge [PR #412]({url})?")
+        self.assertEqual(rest, [f"[PR #412]({url})\n{after}"])
+
+    def test_a_headline_link_the_rest_of_the_line_repeats_is_not_added_again(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        after = (
+            f"The pipeline on [PR #412]({url}) has been red since the image bump and the on-call engineer "
+            "asked for a decision before the end of the shift."
+        )
+        _head, rest, _ = m._question(f"Should I merge [PR #412]({url})? {after}", True)
+        self.assertEqual(rest, [after])
+
+    def test_a_long_question_is_never_cut_inside_an_italic_run(self):
+        question = (
+            "Should I roll back the payments-api deployment in the prod-east cluster to its previous revision "
+            "_while the on-call engineer reads the crash loop logs and the recent change history_ or wait?"
+        )
+        head, rest, _ = m._question(question, True)
+        self.assertEqual(head.count("_") % 2, 0, head)
+        self.assertTrue(rest[0].startswith(p.ELLIPSIS), rest)
+
+    def test_the_continuation_comes_before_a_fenced_block_above_the_question(self):
+        question = (
+            "Should I roll back the payments-api deployment in the prod-east cluster to its previous revision, "
+            "or leave it running while the on-call engineer reads the crash loop's logs and the recent change history?"
+        )
+        head, rest, _ = m._question(f"```\nlog line\n```\n{question}", True)
+        self.assertTrue(head.endswith(p.ELLIPSIS))
+        self.assertTrue(rest[0].startswith(p.ELLIPSIS), rest)
+        self.assertEqual(rest[1:], ["```", "log line", "```"])
+
+    def test_a_cut_across_a_code_span_closes_it_and_keeps_later_markup(self):
+        question = (
+            f"Should I scale `{'x' * 150}` with its sidecar, or set `resources.limits.memory` and roll "
+            "[it](https://example.com/back) back?"
+        )
+        head, rest, _ = m._question(question, True)
+        self.assertGreaterEqual(len(head), m.WORD_CUT_MIN)
+        self.assertEqual(head.count("`"), 2, head)
+        self.assertTrue(rest[0].startswith(f"{p.ELLIPSIS}`"), rest)
+        self.assertIn("`resources.limits.memory`", rest[0])
+        self.assertIn("roll [it](https://example.com/back) back?", rest[0])
+        self.assertIn(" with its sidecar", rest[0])
+
+    def test_a_long_question_with_a_code_span_is_cut_outside_it_and_shown_once(self):
+        question = (
+            "Should I scale `checkout-gateway` in `seeded-reliability` down to zero replicas while I read the "
+            "OOMKill events and the `resources.limits.memory` set on each of its containers?"
+        )
+        head, rest, _ = m._question(question, True)
+        self.assertTrue(head.endswith(p.ELLIPSIS) and rest[0].startswith(p.ELLIPSIS), (head, rest))
+        self.assertEqual(head.count("`") % 2, 0)
+        self.assertEqual(head.removesuffix(p.ELLIPSIS) + " " + rest[0].removeprefix(p.ELLIPSIS), question)
+
+    def test_a_run_across_the_limit_leaves_a_full_headline_not_a_stub(self):
+        for run in (f"`{'x' * 150}`", f"**{'bold ' * 29}bold**", f"[{'label ' * 25}](https://example.com/a)"):
+            question = f"Should I scale {run} now or wait until the on-call engineer has read the logs?"
+            with self.subTest(run=run[:8]):
+                head, rest, _ = m._question(question, True)
+                self.assertGreaterEqual(len(head), m.WORD_CUT_MIN, head)
+                if run.startswith("**"):
+                    self.assertTrue(head.endswith(f"**{p.ELLIPSIS}") and rest[0].startswith(f"{p.ELLIPSIS}**"), (head, rest))
+                self.assertTrue(head.endswith(p.ELLIPSIS) and rest[0].lstrip("[").find(p.ELLIPSIS) >= 0, (head, rest))
+
+    def test_an_in_word_double_star_is_text_not_a_bold_run_to_close(self):
+        question = (
+            "Should I raise the memory limit of checkout-gateway in seeded-reliability to 2**30 bytes, or leave it and "
+            "scale the deployment down to zero replicas while I read the OOMKill events and the limits on each container?"
+        )
+        head, rest, _ = m._question(question, True)
+        self.assertEqual((head + rest[0]).count("**"), 1, (head, rest))
+
+    def test_an_italic_run_across_the_limit_is_closed_and_reopened(self):
+        question = f"Should I keep _{'the long italic run here ' * 7}for good_ or not?"
+        head, rest, _ = m._question(question, True)
+        self.assertGreaterEqual(len(head), m.WORD_CUT_MIN, head)
+        self.assertTrue(head.endswith(f"_{p.ELLIPSIS}") and rest[0].startswith(f"{p.ELLIPSIS}_"), (head, rest))
+
+    def test_a_sentence_end_inside_a_link_label_does_not_split_the_link(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        question = (
+            f"Should I merge [Raise checkout-gateway memory limit. Part 2]({url}) before the freeze, given that the "
+            "pipeline has been red since the image bump and the on-call engineer asked for a decision?"
+        )
+        link = f"[Raise checkout-gateway memory limit. Part 2]({url})"
+        head, rest, _ = m._question(question, True)
+        self.assertTrue(head.startswith(f"Should I merge {link} before the freeze") and head.endswith(p.ELLIPSIS), head)
+        self.assertEqual(rest[0].split("\n")[0], link)
+
+    def test_a_headline_link_the_cut_rest_repeats_is_not_added_again(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        question = (
+            f"Should I merge [PR #412]({url}) now, since the pipeline has been red since the image bump and the on-call "
+            f"engineer asked for a decision today, or close [PR #412]({url}) and reopen it later?"
+        )
+        _head, rest, _ = m._question(question, True)
+        self.assertEqual(rest[0].count(f"[PR #412]({url})"), 1, rest)
+
+    def test_a_headline_link_opens_the_detail_once(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        blocks, _ = m.needs_you(f"Should I merge [PR #412]({url}) or [PR #412]({url})?")
+        self.assertEqual(_contexts(blocks)[0], f"<{url}|PR #412>")
+
+    def test_a_link_after_a_character_cut_stays_where_it_was_written(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        question = f"Should I scale {'x' * 150} now that PR #412 is green, or merge [PR #412]({url}) first?"
+        head, rest, _ = m._question(question, True)
+        self.assertNotIn("PR #412", head)
+        self.assertTrue(rest[0].endswith(f"x now that PR #412 is green, or merge [PR #412]({url}) first?"), rest)
+        self.assertEqual(head.count("x") + rest[0].count("x"), 150)
 
     def test_a_short_headline_without_a_link_is_not_repeated_below(self):
         blocks, _ = m.needs_you("Which cluster?\n- seeded-a\n- seeded-b")
         self.assertEqual([b for b in blocks if b["type"] == "context" and b.get("block_id") != p.WAITING_BLOCK_ID], [])
 
-    def test_a_long_first_line_is_repeated_whole_below_the_clipped_headline(self):
+    def test_a_long_first_line_shows_its_question_once(self):
+        question = "Which GitOps repository should I open the pull request against to revert the ConfigMap change?"
+        rest = "The GitOps state ConfigMap currently lists no managed repositories, so I cannot tell which one."
+        blocks, text = m.needs_you(f"{question} {rest}")
+        self.assertEqual(blocks[0]["text"]["text"], f"*{question}*")
+        self.assertEqual(_contexts(blocks), [rest, m.WAITING])
+        self.assertEqual(text.count(question), 1)
+
+    def test_a_long_question_is_cut_at_a_word_and_never_ends_in_a_stop(self):
+        question = (
+            "Should I roll back the payments-api deployment in the prod-east cluster to its previous revision, "
+            "or leave it running while the on-call engineer reads the crash loop's logs and the recent change history?"
+        )
+        blocks, _ = m.needs_you(question)
+        headline, detail = blocks[0]["text"]["text"].strip("*"), _contexts(blocks)[0]
+        self.assertTrue(headline.endswith(p.ELLIPSIS) and detail.startswith(p.ELLIPSIS), (headline, detail))
+        self.assertEqual(headline[: -len(p.ELLIPSIS)] + " " + detail[len(p.ELLIPSIS) :], question)
+
+    def test_a_long_statement_is_cut_at_a_clause_and_the_rest_opens_the_detail(self):
+        head = "I found two deployments named checkout-gateway on seeded-a, one in seeded-reliability and one in seeded-debug"
+        tail = "and both restart every few minutes after an OOMKill."
+        blocks, _ = m.needs_you(f"{head}, {tail} Which one did you mean?")
+        self.assertEqual(blocks[0]["text"]["text"], f"*{head}.*")
+        self.assertEqual(_contexts(blocks)[0], f"{tail[:1].upper() + tail[1:]} Which one did you mean?")
+
+    def test_a_long_first_line_with_no_place_to_cut_resumes_below_the_clipped_headline(self):
         first = "why " * 60
         blocks, _ = m.needs_you(first)
-        self.assertLessEqual(len(blocks[0]["text"]["text"]), p.HEADLINE_MAX + 2)
-        self.assertEqual(_contexts(blocks)[0], first.strip())
+        headline, detail = blocks[0]["text"]["text"].strip("*"), _contexts(blocks)[0]
+        self.assertLessEqual(len(headline), p.HEADLINE_MAX)
+        self.assertTrue(headline.endswith(p.ELLIPSIS) and detail.startswith(p.ELLIPSIS))
+        self.assertEqual(headline[: -len(p.ELLIPSIS)] + " " + detail[len(p.ELLIPSIS) :], first.strip())
+
+    def test_a_long_first_line_of_bold_runs_is_cut_between_them_and_shown_once(self):
+        first = "**why** " * 40
+        head, rest, _ = m._question(first, True)
+        self.assertEqual(head.count("**") % 2, 0)
+        self.assertEqual(head.count("why") + rest[0].count("why"), first.count("why"))
 
     def test_detail_is_clipped(self):
         blocks, _ = m.needs_you("Question\n" + "y" * (m.DETAIL_MAX * 2))
@@ -511,6 +792,187 @@ class NeedsYouTest(unittest.TestCase):
         choice = {"type": "button", "action_id": "kage_needs.choice.0"}
         settled = m.needs_you_settled([{"type": "actions", "elements": [choice, link]}])
         self.assertEqual(settled, [{"type": "actions", "elements": [link]}])
+
+
+class AnswerChoicesTest(unittest.TestCase):
+    """A finished answer's closing question over its options: the needs-you rules, both orders."""
+
+    OPTIONS = (
+        "1. **Option 1 (Recommended): Fix the command**\n   Change it to `sleep infinity`. It uses no memory.\n"
+        "2. **Option 2: Raise the limit**\n   Give it 512Mi."
+    )
+
+    def test_options_then_a_closing_question(self):
+        shown, folded, question, options = m.answer_choices(
+            f"It restarted 14 times.\n\n## Root cause\nThe command fills memory.\n\n{self.OPTIONS}\n\nWhich one?"
+        )
+        self.assertEqual(options, [("Fix the command", True), ("Raise the limit", False)])
+        self.assertEqual(question, "Which one?")
+        self.assertEqual(
+            shown,
+            "It restarted 14 times.\n\n1. **Fix the command** — Change it to `sleep infinity`.\n"
+            "2. **Raise the limit** — Give it 512Mi.",
+        )
+        self.assertEqual(folded, f"## Root cause\nThe command fills memory.\n\n{self.OPTIONS}")
+
+    def test_a_question_then_the_options_ending_the_answer(self):
+        shown, folded, question, options = m.answer_choices("It runs twice.\n\nWhich should I check?\n- seeded-a\n- seeded-b")
+        self.assertEqual(options, [("seeded-a", False), ("seeded-b", False)])
+        self.assertEqual((shown, folded, question), ("It runs twice.", "", "Which should I check?"))
+
+    def test_a_yes_no_question_offers_no_choice(self):
+        for question in ("Want me to scale it?", "Shall I proceed?", "Should I go ahead?", "Does this look good?"):
+            with self.subTest(question=question):
+                self.assertIsNone(m.answer_choices(f"{self.OPTIONS}\n\n{question}"))
+        self.assertIsNotNone(m.answer_choices(f"{self.OPTIONS}\n\nShall I fix the command or raise the limit?"))
+        self.assertIsNotNone(m.answer_choices(f"{self.OPTIONS}\n\nHow would you like to proceed?"))
+
+    def test_only_two_to_five_options_that_each_make_a_label(self):
+        six = "\n".join(f"{i}. **Do {i}**" for i in range(1, 7))
+        self.assertIsNone(m.answer_choices(f"{six}\n\nWhich one?"))
+        self.assertIsNone(m.answer_choices("1. **Raise it**\n\nWhich one?"))
+        self.assertIsNone(m.answer_choices("1. **Raise it**\n2. **raise it**: again\n\nWhich one?"), "a label twice")
+        self.assertIsNone(m.answer_choices("Which?\n- " + "x" * (p.BUTTON_TEXT_MAX + 1) + "\n- short"))
+        self.assertIsNone(m.answer_choices("1. **Raise it**\n2. **Fix it**"), "no question")
+
+    def test_a_long_bold_lead_is_clipped_to_a_button(self):
+        lead = "word " * 30
+        _shown, _folded, _question, options = m.answer_choices(f"- **{lead}**\n- **short**\n\nWhich one?")
+        self.assertLessEqual(len(options[0][0]), p.BUTTON_TEXT_MAX)
+        self.assertTrue(options[0][0].endswith(p.ELLIPSIS))
+
+    def test_option_lines_show_only_when_each_says_more_than_its_label(self):
+        options = "- **Roll back**\n- **Fix forward**: patch it."
+        shown, folded, _question, _options = m.answer_choices(f"Two ways.\n\n{options}\n\nWhich?")
+        self.assertEqual(shown, "Two ways.")
+        self.assertEqual(folded, options, "what the hidden lines say folds")
+
+    def test_what_a_shown_line_leaves_out_folds(self):
+        options = "- **A**: Do x. Then also y.\n- **B**: Do z."
+        shown, folded, _question, _options = m.answer_choices(f"{options}\n\nWhich?")
+        self.assertEqual(shown, "- **A** — Do x.\n- **B** — Do z.")
+        self.assertEqual(folded, options)
+        _shown, folded, _question, _options = m.answer_choices("- **A**: Do x.\n- **B**: Do z.\n\nWhich?")
+        self.assertEqual(folded, "", "every line in sight whole: nothing to fold")
+
+    def test_a_closing_question_asking_no_choice_offers_none(self):
+        findings = "- pod-a is OOMKilled\n- pod-b is Pending"
+        for question in ("Anything else you want me to look at?", "Need anything else?", "Any questions?"):
+            with self.subTest(question=question):
+                self.assertIsNone(m.answer_choices(f"{findings}\n\n{question}"))
+        self.assertIsNotNone(m.answer_choices(f"{findings}\n\nWhich should I fix first?"))
+        self.assertIsNotNone(m.answer_choices(f"{findings}\n\nWhat would you prefer?"))
+
+    def test_recommended_after_the_bold_lead_is_primary_and_leaves_the_line(self):
+        shown, _folded, _question, options = m.answer_choices(
+            "1. **Fix it** (Recommended): use sleep.\n2. **Raise it**: give it 512Mi.\n\nWhich?"
+        )
+        self.assertEqual(options, [("Fix it", True), ("Raise it", False)])
+        self.assertEqual(shown, "1. **Fix it** — use sleep.\n2. **Raise it** — give it 512Mi.")
+
+    def test_without_buttons_the_options_stay_in_sight_as_written(self):
+        options = "1. **Restart the pod**\n2. **Raise the limit**"
+        shown, folded, question, labels = m.answer_choices(
+            f"It is OOMKilled.\n\n## Why\nThe limit is low.\n\n{options}\n\nWhich would you prefer?", buttons=False
+        )
+        self.assertEqual(shown, f"It is OOMKilled.\n\n{options}")
+        self.assertEqual(folded, "## Why\nThe limit is low.")
+        self.assertEqual(question, "Which would you prefer?")
+        self.assertEqual([label for label, _primary in labels], ["Restart the pod", "Raise the limit"])
+
+    def test_only_the_first_recommended_is_primary(self):
+        _s, _f, _q, options = m.answer_choices("- **A (recommended)**\n- **B (Recommended)**\n\nWhich one?")
+        self.assertEqual(options, [("A", True), ("B", False)])
+
+    def test_a_long_list_stays_fast(self):
+        m.answer_choices("- x\n" * 20000 + "\nWhich one?")
+
+
+class NextStepTest(unittest.TestCase):
+    def test_the_last_line_declares_the_step(self):
+        self.assertEqual(
+            m.next_step("I couldn't find seeded-z. Check it there?\n\n[next: check seeded-a]\n"),
+            ("I couldn't find seeded-z. Check it there?", "check seeded-a"),
+        )
+
+    def test_the_word_and_the_spacing_are_forgiven(self):
+        self.assertEqual(m.next_step("Up.\n  [Next:   upgrade plan for\tseeded-c ]  "), ("Up.", "upgrade plan for seeded-c"))
+
+    def test_anything_else_declares_none_and_keeps_the_text(self):
+        for text in (
+            "Up.",
+            "Up.\n[next: check seeded-a]\nAnything else?",  # not the last line
+            "Up. [next: check seeded-a]",  # not a line of its own
+            "Up.\n[next: check seeded-b]\n[next: check seeded-a]",  # two steps
+            "Up.\n[next: ]",
+            "Up.\n[next: " + "x" * (p.BUTTON_TEXT_MAX + 1) + "]",
+            "Up.\n[next: ask <@U1>]",
+            "Up.\n[next: open <https://x.example|x>]",
+            "Up.\n[next: **]",
+            "Up.\n[next: [x] check]",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(m.next_step(text), (text, ""))
+
+    def test_a_label_sheds_its_bold_and_backticks(self):
+        # The report format asks for ids in backticks; a button shows them as typed, so they go.
+        self.assertEqual(m.next_step("Up.\n[next: check `seeded-a`]"), ("Up.", "check seeded-a"))
+        self.assertEqual(m.next_step("Up.\n[next: **check seeded-a**]"), ("Up.", "check seeded-a"))
+        self.assertEqual(m.next_step("Up.\n[next: scale my_app]"), ("Up.", "scale my_app"))
+        # A glob's lone star is the user's words, not markup.
+        self.assertEqual(m.next_step("Up.\n[next: scale app=web-* to 3]"), ("Up.", "scale app=web-* to 3"))
+
+    def test_a_refused_step_is_still_set_aside_by_its_shape(self):
+        long = "Up.\n\n[next: " + "x" * (p.BUTTON_TEXT_MAX + 1) + "]"
+        self.assertEqual(m.next_step(long), (long, ""))
+        self.assertEqual(m.step_line(long), ("Up.", long.split("\n")[-1]))
+        self.assertEqual(m.step_line("Up. Want me to?"), ("Up. Want me to?", ""))
+
+    def test_visible_text_takes_every_step_shaped_line_off_the_end(self):
+        too_long = "Up.\n\n[next: " + "x" * (p.BUTTON_TEXT_MAX + 5) + "]"
+        for text, want in (
+            ("Up.\n\n[next: check seeded-a]", "Up."),
+            ("Up.\n[next: a]\n[next: b]\n", "Up."),
+            (too_long, "Up."),
+            ("Up. [next: inline]", "Up. [next: inline]"),
+            ("Up.", "Up."),
+            ("[next: check]", ""),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(m.visible_text(text), want)
+
+    def test_any_whitespace_around_a_step_line_reads_as_none(self):
+        two = "Up.\n[next: a]\x0c\n[next: b]"
+        self.assertEqual(m.next_step(two), (two, ""), "a form feed hides no second step")
+        self.assertEqual(m.visible_text(two), "Up.")
+        self.assertEqual(m.visible_text("Up.\n\u00a0[next: b]"), "Up.", "a leading NBSP is still a step line")
+
+    def test_a_long_blank_run_in_a_broken_step_line_does_not_backtrack(self):
+        import time
+        for line in ("[next:" + " " * 5000 + "x", "[next:" + " " * 5000 + "x]."):
+            started = time.monotonic()
+            m.visible_text("Up.\n" + line)
+            m.next_step("Up.\n" + line)
+            self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_visible_text_is_one_pass(self):
+        import time
+        many = "Up.\n" + "[next: x]\n" * 20000
+        started = time.monotonic()
+        self.assertEqual(m.visible_text(many), "Up.")
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_a_crlf_answer_reads_as_an_lf_one(self):
+        self.assertEqual(m.next_step("Up.\r\n\r\n[next: check seeded-a]\r\n"), ("Up.", "check seeded-a"))
+        two = "Up.\r\n[next: check seeded-b]\r\n[next: check seeded-a]\r\n"
+        self.assertEqual(m.next_step(two), (two, ""))
+
+    def test_a_label_at_the_button_cap_is_kept(self):
+        label = "x" * p.BUTTON_TEXT_MAX
+        self.assertEqual(m.next_step(f"Up.\n[next: {label}]"), ("Up.", label))
+
+    def test_an_answer_that_is_only_the_step(self):
+        self.assertEqual(m.next_step("[next: check seeded-a]"), ("", "check seeded-a"))
 
 
 if __name__ == "__main__":

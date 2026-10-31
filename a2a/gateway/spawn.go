@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -95,6 +97,23 @@ const (
 	workerMemoryRequest = "512Mi"
 	workerCPULimit      = "2"
 	workerMemoryLimit   = "2Gi"
+	// The scratch emptyDir is the harness's working directory (the worker
+	// adapter's defaultWorkdir), so files the model writes land there, as
+	// do the delegate socket and, with SessionClusterView, HERMES_HOME's
+	// kubeconfig files. No clone can: the image carries no git, and the
+	// agent SDK keeps its transcripts under $HOME, in the writable layer.
+	// Sessions measured on dev lanes over seven days (2026-10-22, 30-40
+	// minutes each) left it at 4 KiB. 1Gi is the floor for a workspace an
+	// agent writes into, and Autopilot's default ephemeral-storage request
+	// per container, so it bounds a Standard node at the figure Autopilot
+	// already enforces there. The request is the volume plus 64Mi for the
+	// container's own logs and writable layer (2.2 MiB measured), and the
+	// limit equals it: a namespace ResourceQuota on
+	// requests.ephemeral-storage refuses a pod without a request, and a
+	// LimitRange defaulting a smaller limit would refuse a request with no
+	// limit of its own.
+	workerScratchSizeLimit        = "1Gi"
+	workerEphemeralStorageRequest = "1088Mi"
 	// sessionNameHexWidth suffixes minted session names — wide enough that
 	// two conversations can't plausibly collide onto one addressee.
 	// supervisorCorrHexWidth suffixes the fallback correlation id a
@@ -131,6 +150,39 @@ const (
 	annoAddr    = "a2a.kubeagents.dev/addressee"
 	annoConvo   = "a2a.kubeagents.dev/session-key"
 	annoPrimer  = "a2a.kubeagents.dev/rehydration-primer"
+	// annoReuse marks a pod spawned to serve every turn of its
+	// conversation (lib.EnvSessionReuse). The gateway hands a second task
+	// only to a pod carrying it, read off the pod itself, so a pod an older
+	// gateway spawned, whose adapter exits after one task, is never sent one.
+	annoReuse  = "a2a.kubeagents.dev/session-reuse"
+	reuseValue = "true"
+	// annoBusTransport stamps a pod with the bus transport it was spawned
+	// with: a digest of the NATS URL and the CA file it was told to trust
+	// (busTransport). Reuse needs a pod that can still reach the bus, and a
+	// pod spawned before the bus moved to TLS keeps its nats:// URL and no
+	// CA, and retries forever without ever reconnecting, while still reading
+	// as running. So a pod is reused only when its stamp matches the
+	// gateway's, and a pod with no stamp at all is from before there was one.
+	// The CA's bytes are not in it: the pod mounts the bundle ConfigMap as a
+	// directory and reads it on every handshake, so a CA change reaches a
+	// running pod within the kubelet's sync, and abandoning every reusable
+	// pod for it would cost more than it saves.
+	annoBusTransport = "a2a.kubeagents.dev/bus-transport"
+	// busTransportLength is how much of the digest the stamp carries.
+	busTransportLength = 16
+	// natsCAVolume is the session pod's mount of the gateway's CA bundle.
+	natsCAVolume = "nats-ca"
+	// workerContainer is the session pod's one container, the adapter's.
+	workerContainer = "worker"
+	// delegateToolOn is lib.EnvDelegateTool's value for a pod whose adapter
+	// decides the tool per task (delegateToolEnv).
+	delegateToolOn = "on"
+
+	// primerVolume, primerMountPath and primerFileName place the primer
+	// annotation in the worker container as a file.
+	primerVolume    = "rehydration-primer"
+	primerMountPath = "/etc/a2a-primer"
+	primerFileName  = "primer"
 )
 
 // sessionNameAnimals seeds minted session names. W5 owns the canonical
@@ -154,9 +206,33 @@ type spawner interface {
 	// TerminalOrphans lists pods in a terminal phase, with the task identity
 	// their annotations carry (sweep's scan).
 	TerminalOrphans(ctx context.Context) ([]orphanPod, error)
-	// LiveSessions counts session pods not yet in a terminal phase - the
-	// session cap's denominator.
+	// LiveSessions counts session pods not yet in a terminal phase and not
+	// being deleted - the session cap's denominator, over the same pods
+	// SessionPods offers the cap's eviction.
 	LiveSessions(ctx context.Context) (int, error)
+	// Reusable reports whether a pod can take its conversation's next task:
+	// spawned for reuse, running, not being deleted, its worker not exited,
+	// and with room left in its lifetime for a whole task. A pod that is
+	// gone is not reusable and not an error.
+	Reusable(ctx context.Context, podName string) (bool, error)
+	// SessionPods lists the session pods that are live and not being
+	// deleted, with the conversation each belongs to: the cap eviction's
+	// candidates.
+	SessionPods(ctx context.Context) ([]sessionPod, error)
+	// PodStarted is the pod's status.startTime, when the kubelet took it
+	// (before the image pull), which is where activeDeadlineSeconds counts
+	// from. Zero for a pod not yet started or gone; neither is an error.
+	PodStarted(ctx context.Context, podName string) (time.Time, error)
+}
+
+// sessionPod is one live session pod as the cap eviction and the untracked
+// sweep see it.
+type sessionPod struct {
+	PodName    string
+	SessionKey string
+	// Reuse is the pod's own reuse annotation: it serves every turn, and so
+	// never exits on its own.
+	Reuse bool
 }
 
 type orphanPod struct {
@@ -299,10 +375,11 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				annoCorr:    activeCorrelation(rec),
 				annoAddr:    rec.Addressee,
 				annoConvo:   rec.Key,
-				// The rehydration primer rides the pod until W4's adapter
-				// grows a first-input path for it; bounded well under the
-				// object annotation budget.
-				annoPrimer: truncateRunes(primer, primerCap),
+				// The rehydration primer, mounted for the worker as a file
+				// (primerVolume); bounded well under the object annotation
+				// budget.
+				annoPrimer:       truncateRunes(primer, primerCap),
+				annoBusTransport: s.busTransport(),
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -323,15 +400,18 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			// contract, and podDeadlineGrace's comment): a healthy adapter
 			// always publishes the terminal and exits first, so this fires
 			// only for a wedged adapter — the one end Session lifecycle
-			// used to name as unowned.
-			ActiveDeadlineSeconds: ptr.To(int64((s.cfg.TaskDeadline + podDeadlineGrace) / time.Second)),
+			// used to name as unowned. A reused pod serves many tasks, so
+			// its bound is the session's maximum lifetime instead
+			// (podLifetime), with the reap scan's overdue check bounding
+			// each task inside it.
+			ActiveDeadlineSeconds: ptr.To(int64(podLifetime(s.cfg, s.cfg.reusePod(rec)) / time.Second)),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot:   ptr.To(true),
 				RunAsUser:      ptr.To(int64(workerRunAsUser)),
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			Containers: []corev1.Container{{
-				Name:  "worker",
+				Name:  workerContainer,
 				Image: s.cfg.WorkerImage,
 				Env: []corev1.EnvVar{
 					// The worker env contract (launch-card constants):
@@ -344,6 +424,8 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					{Name: "PROFILE", Value: rec.Profile},
 					{Name: "NATS_URL", Value: s.cfg.NATSURL},
 					{Name: "A2A_SESSION", Value: rec.BusSession},
+					{Name: lib.EnvPrimerFile, Value: primerMountPath + "/" + primerFileName},
+					{Name: lib.EnvDelegateTool, Value: s.delegateToolEnv(rec, taskID)},
 					// The pod's own name, from the kubelet rather than from
 					// us. It equals A2A_SESSION by construction above, and
 					// the adapter checks that rather than trusting either:
@@ -392,17 +474,20 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse(workerCPURequest),
-						corev1.ResourceMemory: resource.MustParse(workerMemoryRequest),
+						corev1.ResourceCPU:              resource.MustParse(workerCPURequest),
+						corev1.ResourceMemory:           resource.MustParse(workerMemoryRequest),
+						corev1.ResourceEphemeralStorage: resource.MustParse(workerEphemeralStorageRequest),
 					},
 					Limits: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse(workerCPULimit),
-						corev1.ResourceMemory: resource.MustParse(workerMemoryLimit),
+						corev1.ResourceCPU:              resource.MustParse(workerCPULimit),
+						corev1.ResourceMemory:           resource.MustParse(workerMemoryLimit),
+						corev1.ResourceEphemeralStorage: resource.MustParse(workerEphemeralStorageRequest),
 					},
 				},
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: "scratch", MountPath: "/scratch"},
 					{Name: "bus-token", MountPath: path.Dir(lib.BusTokenPath), ReadOnly: true},
+					{Name: primerVolume, MountPath: primerMountPath, ReadOnly: true},
 				},
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: ptr.To(false),
@@ -413,7 +498,20 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			Volumes: []corev1.Volume{
 				{
 					Name:         "scratch",
-					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(workerScratchSizeLimit))}},
+				},
+				// The transcript primer, read by the worker before its
+				// first turn (lib.EnvPrimerFile). The annotation is the
+				// pod's own, so the file is written once at start and the
+				// kubelet needs no API access to produce it.
+				{
+					Name: primerVolume,
+					VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{
+						Items: []corev1.DownwardAPIVolumeFile{{
+							Path:     primerFileName,
+							FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['" + annoPrimer + "']"},
+						}},
+					}},
 				},
 				// The bus credential, as a pod-bound token rather than a
 				// shared password.
@@ -445,6 +543,27 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				},
 			},
 		},
+	}
+	// The bus's CA, from the ConfigMap the gateway mounts it from, at the
+	// same path, so the worker's lib.TLSOptions trusts what the gateway does.
+	// The URL above is tls:// on a rendered install, and without the CA the
+	// worker cannot verify the bus and connects to nothing.
+	if s.cfg.NATSCAFile != "" && s.cfg.NATSCAConfigMap != "" {
+		c := &pod.Spec.Containers[0]
+		c.Env = append(c.Env, corev1.EnvVar{Name: lib.EnvNATSCAFile, Value: s.cfg.NATSCAFile})
+		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: natsCAVolume, MountPath: path.Dir(s.cfg.NATSCAFile), ReadOnly: true})
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: natsCAVolume,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: s.cfg.NATSCAConfigMap},
+				Items:                []corev1.KeyToPath{{Key: path.Base(s.cfg.NATSCAFile), Path: path.Base(s.cfg.NATSCAFile)}},
+			}},
+		})
+	}
+	if s.cfg.reusePod(rec) {
+		pod.Annotations[annoReuse] = reuseValue
+		c := &pod.Spec.Containers[0]
+		c.Env = append(c.Env, corev1.EnvVar{Name: lib.EnvSessionReuse, Value: reuseValue})
 	}
 	if s.cfg.SessionClusterView {
 		c := &pod.Spec.Containers[0]
@@ -490,6 +609,13 @@ func (s *podSpawner) Delete(ctx context.Context, podName string) error {
 // orphans the registry has forgotten. Terminal pods are sweep's inventory,
 // not load, so they don't count - matching what a `pods` ResourceQuota
 // counts, which is the layer that backstops this number.
+//
+// A pod being deleted does not count either, though the quota still does
+// until it is gone: its slot is already freeing, and the cap's eviction
+// cannot choose it (SessionPods skips it too), so counting it would evict
+// some other conversation's live pod for a slot nobody needs. The count and
+// the candidates agree, and the overlap while it terminates is the same one
+// a successful eviction already leaves, which the quota headroom absorbs.
 func (s *podSpawner) LiveSessions(ctx context.Context) (int, error) {
 	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
@@ -499,12 +625,134 @@ func (s *podSpawner) LiveSessions(ctx context.Context) (int, error) {
 	}
 	n := 0
 	for _, p := range pods.Items {
-		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil {
 			continue
 		}
 		n++
 	}
 	return n, nil
+}
+
+// reusePod reports whether a pod spawned for rec serves every turn of its
+// conversation: reuse is on and the conversation is on the session route.
+// A one-shot Delegate from a fixed-route conversation is not: the next plain
+// ask goes back to the fixed addressee, nothing would ever route to the pod
+// again, and a pod that did not exit after its task would idle until the
+// reap.
+func (c *Config) reusePod(rec *SessionRecord) bool {
+	return c.SessionReuse && rec.SessionRouted
+}
+
+// podLifetime is a session pod's activeDeadlineSeconds: the task deadline
+// plus its grace for a pod that serves one task, and the session's maximum
+// lifetime for one that serves its conversation (never less than a task's
+// own bound, whatever the config says).
+func podLifetime(cfg *Config, reuse bool) time.Duration {
+	one := cfg.TaskDeadline + podDeadlineGrace
+	if !reuse {
+		return one
+	}
+	lifetime := cfg.SessionMaxLifetime
+	if lifetime <= 0 {
+		lifetime = defaultSessionMaxLifetime
+	}
+	return max(lifetime, cfg.TaskDeadline+2*podDeadlineGrace)
+}
+
+// delegateToolEnv is the pod's delegate tool setting. A one-task pod gets
+// the setting for the task it is started for (delegateToolFor). A reused pod
+// runs human turns and wakes alike, so it gets the tool, and its adapter
+// turns it off for each task that is a wake, from the submission's own
+// authority block (workeradapter.delegateOffForTask): the wake's `via`.
+func (s *podSpawner) delegateToolEnv(rec *SessionRecord, taskID string) string {
+	if s.cfg.reusePod(rec) {
+		return delegateToolOn
+	}
+	return delegateToolFor(rec, taskID)
+}
+
+func (s *podSpawner) PodStarted(ctx context.Context, podName string) (time.Time, error) {
+	p, err := s.client.CoreV1().Pods(s.cfg.Namespace).Get(ctx, podName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	if p.Status.StartTime == nil {
+		return time.Time{}, nil
+	}
+	return p.Status.StartTime.Time, nil
+}
+
+// Reusable reads the pod itself rather than the session record: only the API
+// knows whether the worker has exited or the kubelet is about to end it.
+// Running only, not Pending: a pod that has not started yet has no task
+// behind it to have proved it can, and the heal that released its first task
+// may have done so because it never will.
+func (s *podSpawner) Reusable(ctx context.Context, podName string) (bool, error) {
+	p, err := s.client.CoreV1().Pods(s.cfg.Namespace).Get(ctx, podName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return podReusable(p, s.busTransport(), s.cfg.TaskDeadline, time.Now()), nil
+}
+
+// busTransport is the stamp annoBusTransport carries: a digest of the NATS
+// URL and the CA file path the spawner hands a pod, which is what changes when
+// the bus moves to TLS.
+func (s *podSpawner) busTransport() string {
+	sum := sha256.Sum256([]byte(s.cfg.NATSURL + "\n" + s.cfg.NATSCAFile))
+	return hex.EncodeToString(sum[:])[:busTransportLength]
+}
+
+// podReusable is Reusable's judgement on a pod already read. The lifetime
+// check keeps a task off a pod the kubelet will end before the task's own
+// bound: the pod's age plus the task deadline and twice its grace (the
+// overdue check's point and a margin past it) has to fit in what is left.
+func podReusable(p *corev1.Pod, transport string, taskDeadline time.Duration, now time.Time) bool {
+	if p.Annotations[annoReuse] != reuseValue || p.DeletionTimestamp != nil || p.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	if p.Annotations[annoBusTransport] != transport {
+		return false
+	}
+	running := false
+	for _, cs := range p.Status.ContainerStatuses {
+		if cs.Name == workerContainer {
+			running = cs.State.Running != nil
+		}
+	}
+	if !running {
+		return false
+	}
+	if p.Spec.ActiveDeadlineSeconds != nil && p.Status.StartTime != nil {
+		end := p.Status.StartTime.Add(time.Duration(*p.Spec.ActiveDeadlineSeconds) * time.Second)
+		if now.Add(taskDeadline + 2*podDeadlineGrace).After(end) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *podSpawner) SessionPods(ctx context.Context) ([]sessionPod, error) {
+	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
+	})
+	if err != nil {
+		return nil, err
+	}
+	var out []sessionPod
+	for _, p := range pods.Items {
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil {
+			continue
+		}
+		out = append(out, sessionPod{PodName: p.Name, SessionKey: p.Annotations[annoConvo], Reuse: p.Annotations[annoReuse] == reuseValue})
+	}
+	return out, nil
 }
 
 func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
@@ -532,13 +780,15 @@ func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 }
 
 // refuseAtSessionCap is the usability half of the session-pod bound, checked
-// before any route mutation that will need a fresh pod. At the cap the turn
-// is refused with a reply naming the numbers - never silently queued, never
-// dropped. replacing marks a turn that retires its previous incarnation in
+// before any route mutation that will need a fresh pod. At the cap the pod
+// that has been idle longest makes room (evictIdleSession), and its
+// conversation is told; with no idle pod the turn is refused with a reply
+// naming the numbers - never silently queued, never dropped. replacing marks a turn that retires its previous incarnation in
 // the same breath: the doomed pod is usually still live at count time, so
 // it hands its slot to its successor rather than double-counting - and if
-// it already went terminal, the extra slot is a transient overshoot the
-// quota headroom absorbs.
+// it already went terminal or is already being deleted (LiveSessions counts
+// neither), the extra slot is a transient overshoot the quota headroom
+// absorbs.
 //
 // The count-then-create race is real, and wider than one: conversations run
 // on distinct queue workers, so every delegation in flight inside the
@@ -570,6 +820,15 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 	if live < limit {
 		return false
 	}
+	// Full, but a pod at the cap may only be holding a conversation nobody
+	// is in right now. Evicting the longest-idle one makes room for one that
+	// is; its conversation is told, and resumes cold with the primer. A
+	// successful eviction is the slot; the count is not read again. A pod
+	// already being deleted is not counted above (LiveSessions), so its
+	// freeing slot never costs another conversation its pod.
+	if g.evictIdleSession(ctx, rec) {
+		return false
+	}
 	workers := fmt.Sprintf("%d session workers are", live)
 	if live == 1 {
 		workers = "1 session worker is"
@@ -587,7 +846,10 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 	if rec.PodName != "" {
 		return
 	}
-	primer := g.buildRehydrationPrimer(ctx, rec)
+	primer, authors, unknown, since := g.buildRehydrationPrimer(ctx, rec, taskID)
+	// The pod reads the earlier turns, so their people count for a
+	// delegation from it, as the delegating turn's own do.
+	rec.seedSessionAuthors(authors, unknown, since)
 	podName, err := g.spawner.Spawn(ctx, rec, taskID, primer, originSeq)
 	if err != nil {
 		g.log.Error("session pod spawn failed", "session", rec.Key, "err", err)
@@ -611,7 +873,8 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 		return
 	}
 	rec.PodName = podName
-	g.log.Info("spawned session pod", "session", rec.Key, "pod", podName, "task", taskID)
+	rec.PodReuse = g.cfg.reusePod(rec)
+	g.log.Info("spawned session pod", "session", rec.Key, "pod", podName, "task", taskID, "reuse", rec.PodReuse)
 }
 
 // sweepLoop is the gateway's half of the orphaned-task answer: it is the
@@ -651,6 +914,9 @@ func isTaskNotFound(err error) bool {
 func (g *Gateway) sweepOnce(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, sweepPassTimeout)
 	defer cancel()
+	// The untracked pass runs whatever the orphan list does: it lists for
+	// itself, and an API blip there must not hold up the other.
+	defer g.sweepUntracked(ctx)
 	orphans, err := g.spawner.TerminalOrphans(ctx)
 	if err != nil {
 		g.log.Error("sweep: pod list failed", "err", err)
@@ -663,46 +929,140 @@ func (g *Gateway) sweepOnce(ctx context.Context) {
 			g.releaseIncarnation(ctx, o)
 			continue
 		}
-		task, err := g.client.TasksGet(ctx, o.Addressee, o.TaskID)
-		if err == nil && task.Final {
-			_ = g.spawner.Delete(ctx, o.PodName) // clean exit; nothing owed
-			g.releaseIncarnation(ctx, o)
-			continue
-		}
-		if err != nil && !isTaskNotFound(err) {
-			// TaskNotFound says "no events", which is the orphan shape.
-			// Anything else is the stream not answering — and a terminal we
-			// cannot rule out is a reason to wait a cycle, not to author
-			// what could be the second final (assertion 10).
-			g.log.Error("sweep: replay failed; retrying next cycle", "task", o.TaskID, "err", err)
-			continue
-		}
-		// The supervisor writes what happened: `canceled` if a cancel for
-		// this task is on the stream (the session record's task history
-		// carries that mark durably — ActiveTask may long since have moved
-		// on), `failed` otherwise. A record we cannot read right now is a
-		// reason to wait a cycle, not to guess a state.
-		state := lib.StateFailed
-		note := "session pod exited without a terminal event; declared failed by its supervisor"
+		// The record says which task the pod was on when it died, and
+		// whether a stop is on the stream for it (the history carries that
+		// mark durably; ActiveTask may long since have moved on). A record
+		// we cannot read right now is a reason to wait a cycle, not to
+		// guess.
+		var rec *SessionRecord
 		if o.SessionKey != "" {
-			rec, err := g.reg.Get(ctx, o.SessionKey)
+			rec, err = g.reg.Get(ctx, o.SessionKey)
 			if err != nil {
 				g.log.Error("sweep: record read failed; retrying next cycle", "session", o.SessionKey, "err", err)
 				continue
 			}
-			if rec != nil && rec.TaskCanceled(o.TaskID) {
-				state = lib.StateCanceled
-				note = "the requester's stop, completed by the supervisor: the worker exited without publishing its terminal"
+		}
+		settled := true
+		for _, t := range sweepTasks(o, rec) {
+			if !g.sweepTask(ctx, o, rec, t) {
+				settled = false
 			}
 		}
-		if err := g.publishSupervisorTerminal(ctx, o.Addressee, o.TaskID, o.ContextID, o.CorrelationID, state, note); err != nil {
-			g.log.Error("sweep: supervisor terminal publish failed", "task", o.TaskID, "err", err)
-			continue // keep the pod as evidence until the event lands
+		if !settled {
+			continue // keep the pod as evidence until every terminal lands
 		}
-		g.log.Warn("sweep: closed orphaned task", "task", o.TaskID, "state", state, "pod", o.PodName)
 		_ = g.spawner.Delete(ctx, o.PodName)
 		g.releaseIncarnation(ctx, o)
 	}
+}
+
+// sweepUntracked deletes live reused pods that their conversation no longer
+// names. A retirement whose delete failed clears the record's PodName anyway
+// (retireIncarnation), and before reuse the pod it left exited after its task
+// and reached the terminal phase the sweep above watches. A reused pod waits
+// for its next task instead, so nothing would route to it, reap it or sweep
+// it, and it would hold its credential and a cap slot until its lifetime
+// ends. The check runs under the conversation's lock, only tried, the way the
+// cap eviction does it (evictSession): every spawn and record write for that
+// conversation holds the lock, so a pod its record does not name there is
+// untracked rather than one whose spawn is still being written down.
+func (g *Gateway) sweepUntracked(ctx context.Context) {
+	pods, err := g.spawner.SessionPods(ctx)
+	if err != nil {
+		g.log.Error("sweep: live pod list failed", "err", err)
+		return
+	}
+	for _, p := range pods {
+		if !p.Reuse || p.SessionKey == "" {
+			continue
+		}
+		g.deleteIfUntracked(ctx, p)
+	}
+}
+
+// deleteIfUntracked deletes one pod if its conversation's record, read under
+// that conversation's lock, names it neither as its pod nor as the session of
+// a task still running. It reports whether it did.
+//
+// The session counts as well as the pod because the two reach the store
+// separately: startTaskWith writes the record with the new session and its
+// task before ensureSessionPod spawns, and PodName lands only in the turn's
+// final write. A record whose final write failed names the session, with the
+// task running on that pod, and no PodName; deleting there would kill the
+// task with no terminal. It counts only while a task is active: once that
+// task has ended, a record with no PodName can never route to the pod again
+// (reuseLivePod requires PodName), the reap cannot find it, and sparing it
+// here would leave it holding its credential and a cap slot until its
+// lifetime ends.
+func (g *Gateway) deleteIfUntracked(ctx context.Context, p sessionPod) bool {
+	l := g.lockSession(p.SessionKey)
+	if !l.TryLock() {
+		return false
+	}
+	defer l.Unlock()
+	rec, err := g.reg.Get(ctx, p.SessionKey)
+	if err != nil || (rec != nil && (rec.PodName == p.PodName || (rec.BusSession == p.PodName && rec.ActiveTask != nil))) {
+		return false
+	}
+	if err := g.spawner.Delete(ctx, p.PodName); err != nil {
+		g.log.Error("untracked session pod delete failed", "pod", p.PodName, "err", err)
+		return false
+	}
+	g.log.Info("deleted an untracked session pod", "conversation", p.SessionKey, "pod", p.PodName)
+	return true
+}
+
+// sweptTask is one task a dead pod may owe a terminal for.
+type sweptTask struct {
+	ID, ContextID, CorrelationID string
+}
+
+// sweepTasks lists the tasks a dead pod may have left without a terminal: the
+// one its annotation names, which is the task it was spawned for, and the
+// task its conversation's record holds as active when that task ran on this
+// pod. The second is the one that matters for a reused pod, which serves many
+// tasks under an annotation naming only its first: a pod that dies on turn N
+// has to close turn N. The pod's annotations cannot be updated to follow it
+// (the gateway holds no patch on pods), and they do not need to be: every
+// earlier turn reached its terminal before the next one was routed here.
+func sweepTasks(o orphanPod, rec *SessionRecord) []sweptTask {
+	tasks := []sweptTask{{ID: o.TaskID, ContextID: o.ContextID, CorrelationID: o.CorrelationID}}
+	if rec == nil || rec.ActiveTask == nil || rec.ActiveTask.TaskID == o.TaskID ||
+		rec.AddresseeFor(rec.ActiveTask.TaskID) != o.Addressee {
+		return tasks
+	}
+	return append(tasks, sweptTask{ID: rec.ActiveTask.TaskID, ContextID: rec.ContextID, CorrelationID: rec.ActiveTask.CorrelationID})
+}
+
+// sweepTask closes one task a dead pod left without a terminal, and reports
+// whether the task is settled: final on the stream already, or closed now.
+// The supervisor writes what happened: `canceled` if a cancel for this task
+// is on the stream, `failed` otherwise.
+func (g *Gateway) sweepTask(ctx context.Context, o orphanPod, rec *SessionRecord, t sweptTask) bool {
+	task, err := g.client.TasksGet(ctx, o.Addressee, t.ID)
+	if err == nil && task.Final {
+		return true // clean exit; nothing owed
+	}
+	if err != nil && !isTaskNotFound(err) {
+		// TaskNotFound says "no events", which is the orphan shape.
+		// Anything else is the stream not answering — and a terminal we
+		// cannot rule out is a reason to wait a cycle, not to author what
+		// could be the second final (assertion 10).
+		g.log.Error("sweep: replay failed; retrying next cycle", "task", t.ID, "err", err)
+		return false
+	}
+	state := lib.StateFailed
+	note := "session pod exited without a terminal event; declared failed by its supervisor"
+	if rec != nil && rec.TaskCanceled(t.ID) {
+		state = lib.StateCanceled
+		note = "the requester's stop, completed by the supervisor: the worker exited without publishing its terminal"
+	}
+	if err := g.publishSupervisorTerminal(ctx, o.Addressee, t.ID, t.ContextID, t.CorrelationID, state, note); err != nil {
+		g.log.Error("sweep: supervisor terminal publish failed", "task", t.ID, "err", err)
+		return false
+	}
+	g.log.Warn("sweep: closed orphaned task", "task", t.ID, "state", state, "pod", o.PodName)
+	return true
 }
 
 // closeDetachedBeforeDelete is the one rule for every pod the gateway
@@ -812,4 +1172,21 @@ func (g *Gateway) publishSupervisorTerminal(ctx context.Context, addressee, task
 		return err
 	}
 	return g.client.Publish(ctx, lib.TaskSupervisorSubject(addressee, taskID), env)
+}
+
+// delegateToolFor is the session's delegate tool setting for the task a pod
+// is started for: off on a wake turn, on otherwise. A wake reports what a
+// delegation came back with. Given the tool, a wake that reads an interim
+// answer ("still checking, the results will post here") asks again, each
+// ask wakes another pod, and the chain ends at the depth bound with nothing
+// answered. Without it the wake can only answer. A message the person sends
+// while the wake runs is a steer into the wake, so it is answered without
+// the tool too; one sent after the wake ends is a new human turn and has it.
+func delegateToolFor(rec *SessionRecord, taskID string) string {
+	for _, ref := range rec.Tasks {
+		if ref.ID == taskID && ref.Role == taskRoleWake {
+			return "off"
+		}
+	}
+	return "on"
 }

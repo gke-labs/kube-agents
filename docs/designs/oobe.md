@@ -5,11 +5,11 @@ until the scheduled audits run: 06:20 UTC the next morning for security, the nex
 This design adds `oobe`, one no-model cron job on the Planning Agent's roster that owns everything
 an install does once, on first boot. Its first stage starts the fleet audits as soon as the
 inventory scan finishes, so an operator sees cost, security, reliability and capacity findings
-within about two hours of install. Later it takes over the two bootstrap jobs, so first-run work
-lives in one place.
+within about two hours of install. It also runs the inventory scan and the report delivery that two bootstrap jobs ran before,
+so first-run work lives in one place.
 
-> **Status:** §4, the first-run audits, is implemented, with the entrypoint's `--assume-retired` entry
-> from §5. The rest of §5, folding in the bootstrap jobs, is not. §8 is the build order.
+> **Status:** §4, the first-run audits, and §5, the fold of the bootstrap jobs, are implemented. §8 is
+> the build order; its step 3 is what remains.
 
 ## 1. Why
 
@@ -27,9 +27,10 @@ the "wow moment that justifies the installation". What they get today:
 
 The gap between the report and the first audit is up to a day, and up to a week for cost. The
 only way to close it today is to know to start an audit by hand inside the pod
-(`agents/platform/AGENTS.md`, "Run the `<x>` cron job now"). The inventory report covers most of
-what the compliance and reliability audits check (`inventory-findings-queue.md` §10), but nothing
-on day one covers cost or capacity, and no pull request opens until the first audit.
+(`agents/platform/AGENTS.md`, "Run the `<x>` cron job now"). Before `oobe`, the inventory report
+covered most of what the compliance and reliability audits check (`inventory-findings-queue.md`
+§10), but cost and capacity waited for the schedule, and no pull request opened until the first
+audit. With `oobe` running the audits, the scan leaves their workload checks to them (`cluster_inventory_audit_sop.md`, Step 5).
 
 ## 2. What `oobe` is
 
@@ -41,33 +42,43 @@ Chat Agent's home, and a job on another profile would gate itself on a different
 
 | Stage                                                           | Done when                                    | Marker                                                     | Built in    |
 | --------------------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------- | ----------- |
+| Delivery: post the report to the first chat                     | Report claimed                               | `.bootstrap_completed` (kept)                              | Step 2 (§5) |
 | Inventory scan: file the sweep, hand off, file the ranking card | Ranking card filed                           | `.bootstrap_scan_filed`, `.bootstrap_handoff_filed` (kept) | Step 2 (§5) |
 | First-run audits                                                | All audits started, or skipped with a reason | `.oobe_audits_fired` (new)                                 | Step 1 (§4) |
-| Delivery: post the report to the first chat                     | Report claimed                               | `.bootstrap_completed` (kept)                              | Step 2 (§5) |
 
 Stages this job takes over keep their `.bootstrap_*` markers, so an install upgraded mid-onboarding
-carries on from where it was. New stages use `.oobe_*`. The `bootstrap_onboarding` plugin keeps the
-first message: it greets, and links the delivery to that chat.
+carries on from where it was. One whose `oobe` an earlier image already removed carries on through
+the old jobs, which the sync leaves enabled while no `oobe` job exists. New stages use `.oobe_*`. The `bootstrap_onboarding` plugin keeps the
+first message: it greets, links the delivery to that chat, and holds delivery until the greeting turn
+ends (`.bootstrap_greeting_pending.<turn>`, dropped by delivery itself after `GREETING_WAIT_SECONDS`),
+so the report follows the greeting.
 
-Order within a tick: scan, then audits, then delivery. The audits wait for the scan rather than
+Order within a tick: delivery, then the scan, then the audits (§5 says why delivery is first). The
+audits wait for the scan rather than
 starting at boot for two reasons. The report is the operator's first result and should not compete
 for the model quota with four audits at once: on an API-key install, three workers running
 together have been enough to hit per-minute 429s. And the report should land before the audit
 summaries, which assume a fleet the operator has already seen.
 
-## 3. Today's onboarding, for reference
+## 3. Onboarding before the fold, for reference
+
+§5 moved this flow into `oobe`'s scan and delivery stages; the scripts and markers are the same.
 
 `bootstrap-inventory-scan` (`bootstrap_scan_gate.py`) files the sweep card to `platform`, which
 lists the fleet, and records it in `.bootstrap_scan_filed`. On the same job's ticks the hand-off
-(`bootstrap_handoff.py`) files one card per Cluster Agent and, once those settle or its deadline of
-an hour plus five minutes per cluster card passes (`deadline`), files the ranking card, key
+(`bootstrap_handoff.py`) files one card per Cluster Agent up to the first-run cap
+(`.first_run_cluster_cards`, default 6; the sweep audits the rest) and, once those settle or its
+deadline of an hour plus five minutes per cluster, carded or left to the sweep, passes
+(`deadline`), files the ranking card, key
 `bootstrap-inventory-prioritize`, recorded in `.bootstrap_handoff_filed`. It files one ranking card
 per sweep, and Hermes retries that card in place; a re-run by hand uses a suffixed key
 (`bootstrap_onboarding/README.md`). When no cluster was audited the hand-off writes the
 report itself and files no ranking card. The ranking worker writes `/opt/data/INVENTORY.md`, on the
 sandbox's volume when the shell sandbox is on. `bootstrap-inventory-delivery`
-(`bootstrap_delivery.py`) posts it once a human has spoken (`.user_aligned`) and claims
-`.bootstrap_completed` with `O_CREAT | O_EXCL`; a run five minutes later removes both jobs.
+(`bootstrap_delivery.py`) posts it once a human has spoken (`.user_aligned`, or under `spec.mode: next`
+`.user_aligned_conversation`) and claims
+`.bootstrap_completed` with `O_CREAT | O_EXCL`; a run `RETIRE_AFTER_SECONDS` (about 16 minutes)
+later removes both jobs.
 
 ## 4. First-run audits
 
@@ -114,8 +125,8 @@ reason it records says what it knows: the scan had settled (`SKIP_NOT_NEW`) or h
 ### 4.2 Which audits
 
 The four audits [#1866](https://github.com/gke-labs/kube-agents/issues/1866) names, in the order it
-chains them (cost, security, reliability, capacity), by their job ids in
-`agents/platform/cron/jobs.json`:
+chains them (cost, security, reliability, capacity), then the upgrade retrospective, by their job
+ids in `agents/platform/cron/jobs.json`:
 
 | Order | Job id                     | Audit                            | Normal schedule (UTC) |
 | ----- | -------------------------- | -------------------------------- | --------------------- |
@@ -123,7 +134,11 @@ chains them (cost, security, reliability, capacity), by their job ids in
 | 2     | `compliance-audit`         | Security and RBAC posture        | Daily 06:20           |
 | 3     | `obtainability-audit`      | Workload reliability             | Daily 06:50           |
 | 4     | `stockout-prevention`      | Stockout prevention and capacity | Daily 09:20           |
+| 5     | `upgrade-retrospective`    | Upgrade retrospective            | Sundays 18:00         |
 
+The upgrade retrospective is chained after the four, so they keep #1866's order and the review of
+every cluster's last upgrade follows the audits whose findings it cites; its first run is the
+baseline of every cluster the install manages ([`upgrade-retrospective.md`](upgrade-retrospective.md)).
 The other five governance jobs keep their schedules.
 
 ### 4.3 Firing
@@ -133,7 +148,7 @@ has ended, whatever its outcome. The shipped schedule staggers the audits for th
 (`autonomous-watchdogs.md`: "Stagger start minutes so two audits never contend for the same
 session"). Four started in the same minute put a fresh CI install's gateway pod under memory
 pressure for the best part of an hour and broke the cluster reads of a case running beside them.
-For the same reason the chain waits while any of the four has a run going, whatever started it,
+For the same reason the chain waits while any of the five has a run going, whatever started it,
 before the first mark and between marks; a mark that finds its audit already running counts that
 run as its own, and one the store skipped for any other reason counts as not claimed.
 A mark the scheduler has not claimed after `START_LIMIT_SECONDS` (10 minutes) is made again, as a
@@ -171,19 +186,15 @@ that stays unreadable therefore keeps the job ticking without effect until it ca
 
 ### 4.4 No GitOps repository
 
-Every audit opens its run against the GitOps repository before it reads anything
-(`audit_report.py start`, `resolve_repo`), so on an install with none configured all four fail
-(INSTALL.md: "every run fails before it audits anything"). `oobe.py` reads the managed repositories
-from `/etc/gitops/managed_repos`, which the operator mounts into the gateway container
-(`platformagent_manifests.go`, `gitopsStateDir`), through `gitops_workspace.get_managed_github_repos`.
-With none, it writes the marker with the reason and starts nothing.
+`oobe.py` reads no repository list: it starts the four audits on every install. An audit on an
+install with no GitOps repository runs without a forge: it keeps its findings in the report store
+and, when the run changed something, posts a chat summary, with no ledger issue and no pull request
+(the `fleet-audit` skill's "No forge configured"). The installer's "GitOps repository connection skipped" line says the same.
 
-It does not exit non-zero. No repository is a configuration the installer offers, not a fault, and
-a failing per-minute job repeats until something changes. The operator is told instead: the
-interactive installer's "GitOps repository connection skipped" line says the scheduled audits fail
-without one,
-and once delivery is a stage of `oobe` (§5) the delivered report is to carry one line saying the
-first-run audits did not run and why.
+A `managed_repos` value the audits cannot use (one that does not parse, or names a forge type the
+image does not serve), or one that cannot be read at all, is not checked here either. Each audit's
+`start` refuses it and says why, as on a scheduled run, and the chain moves on to the next audit:
+the stage does not wait for a list it no longer reads.
 
 ### 4.5 What the operator sees
 
@@ -192,14 +203,17 @@ repository, a one-line summary in the home channel when one is set, and remediat
 for the findings that auto-promote, at most five per audit run (`audit_report.py`,
 `AUTO_PROMOTION_CAP`): critical findings whose fix is a manifest, and major ones on the checks the
 collector vouches for (`MAJOR_SWEEP_CHECKS`). Each audit's SOP lists its own in §5. A scheduled run with nothing new is silent
-(same section), so the morning after brings no second burst. The four run one after another
-(§4.3), so the last starts once the first three have ended (§9, chain length); each
-takes 9–15 minutes on its own, most of it inside the SOP
+(same section), so the morning after brings no second burst. The five run one after another
+(§4.3), so the last, the retrospective, starts once the first four have ended (§9, chain length);
+each takes 9–15 minutes on its own, most of it inside the SOP
 ([#985 "Fleet audit SOPs cost 9–15 min per run"](https://github.com/gke-labs/kube-agents/issues/985)).
 
 ## 5. Folding in the bootstrap jobs
 
-The second step moves the scan and delivery into `oobe` as stages, behind the audits.
+The second step moves the scan and delivery into `oobe` as stages. Delivery runs first in each
+tick: the scheduler snapshots a job's `deliver`/`origin` when the run starts, so the report must be
+claimed within seconds of that, as the old delivery job's was. Behind the scan and the audits stage
+(whose trigger subprocess can take 30 s), a chat linked in between would be missed.
 
 - **Code.** `bootstrap_scan_gate.py` and `bootstrap_delivery.py` stay as modules `oobe.py` calls;
   their markers and claim logic do not change.
@@ -210,14 +224,27 @@ The second step moves the scan and delivery into `oobe` as stages, behind the au
 - **The chat link.** The plugin links `oobe` to the first chat instead of
   `bootstrap-inventory-delivery`. An install upgraded after its first message has the link on the
   old job only, and the plugin will not run again, so `cron_jobs_sync.py` copies `deliver` and
-  `origin` from the old delivery job to `oobe` when `oobe` is first added. Without that, the report
-  goes out with `deliver: local` and reaches nobody.
+  `origin` from the old delivery job to `oobe` on any boot where `oobe` has no `origin` of its own.
+  Without that, the report goes out with `deliver: local` and reaches nobody. The plugin binds
+  every delivery job present, the old one included, so a rollback to an image from before the fold
+  finds the link where that image looks for it. Under `spec.mode: next` the link is not a job origin:
+  the plugin records the conversation in `onboarding_conversation.json`, the jobs stay
+  `deliver: local`, and delivery posts into that conversation through the gateway itself.
+- **An install with no `oobe`.** An image from before the fold removed `oobe` as soon as its
+  audits stage was done, without waiting for a human, so an install can arrive mid-onboarding with
+  `oobe` gone. While no `oobe` job exists, the sync leaves the two old jobs enabled, and they
+  finish onboarding as they did.
 - **Scan output stays out of chat.** Once linked, anything `oobe` prints is posted to the operator,
-  and a non-zero exit is posted as a failure. The scan stage writes to stderr only, including its
-  subprocesses (fd 1 redirected for the stage), and an exception in it is caught so it neither
-  posts nor blocks delivery.
-- **Removal.** Five minutes after `.bootstrap_completed`, `oobe` removes itself and the two disabled
-  entries, as `bootstrap_delivery._retire_jobs` does today.
+  and a failed run is posted with its stderr. The scan and audits stages write to
+  `logs/oobe.log` in the Chat Agent's home, their subprocesses included (fd 1 and fd 2 redirected
+  for the stage), so a failed delivery posts only delivery's own error; an exception in either is
+  caught so it neither posts nor blocks delivery. The plugin triggers only the first job it binds,
+  because `trigger_job` also enables a job and the old delivery entry ships disabled.
+- **Removal.** `RETIRE_AFTER_SECONDS` (about 16 minutes) after the report is claimed
+  (`.bootstrap_completed`), and, when the report goes to a recorded conversation, only once its post recorded an outcome
+  (`.bootstrap_conversation_done`), the delivery stage removes the two disabled entries (`bootstrap_delivery._retire_jobs`). Once the first-run
+  audits stage is also done, `oobe` removes itself.
+  On an install nobody speaks to, the report is never claimed and `oobe` stays, doing nothing.
 - **Finished installs.** Already in step 1: the entrypoint passes `oobe` in `--assume-retired`
   when `.bootstrap_completed` exists, beside the two bootstrap ids, so an install that onboarded
   before the job existed never gets it.
@@ -227,15 +254,15 @@ times. It rides with the audits stage, whose eval case covers both.
 
 ## 6. Failure modes
 
-| Situation              | What the operator sees                                                                                   | Recovery                                                                                              |
-| ---------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them      | None needed                                                                                           |
-| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                       | Automatic                                                                                             |
-| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat | As today                                                                                              |
-| No GitOps repository   | One line in the interactive installer's output, later one line in the report                             | Re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md), then wait for the schedule |
-| No home channel        | Ledger issues and pull requests appear in the repository with no chat summary                            | Set one (`/sethome`)                                                                                  |
-| Sweep stuck            | Audits start at the fallback                                                                             | As today for the report                                                                               |
-| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                     | As today for the report                                                                               |
+| Situation              | What the operator sees                                                                                                  | Recovery                                                                                              |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them                     | None needed                                                                                           |
+| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                                      | Automatic                                                                                             |
+| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat                | As today                                                                                              |
+| No GitOps repository   | Reports stay in the report store; a run that changed something posts a summary saying no GitOps repository is connected | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
+| No home channel        | Ledger issues and PRs in the repository; the first report names each unposted audit (see §7)                            | Set one (`/sethome`)                                                                                  |
+| Sweep stuck            | Audits start at the fallback                                                                                            | As today for the report                                                                               |
+| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                                    | As today for the report                                                                               |
 
 ## 7. Not in this design
 
@@ -245,24 +272,27 @@ times. It rides with the audits stage, whose eval case covers both.
 - **[#1866](https://github.com/gke-labs/kube-agents/issues/1866)'s 30, 45 and 60 minute targets for cost, security and reliability findings.** The
   chain starts at scan completion in #1866's order, so each audit lands as soon as the ones before
   it end; nothing holds a finding back to meet a target.
-- **Reaching an install with no home channel.** Audit summaries go to the home channel only.
-  Posting the report there at T+0 when one is set is a separate change.
-- **Audits without a GitOps repository.** They would need a chat-only mode in the shared fleet-audit
-  script.
+- **Reaching an install with no home channel.** Audit summaries go to the home channel only. An
+  audit that finishes before anyone opens the chat posts nothing, and nothing posts it later; the
+  onboarding report, sent on the first message, names every shipped fleet audit that ran since the
+  sweep was filed and whose summary was not posted, whether the stage started it, held it, gave up on
+  it or skipped the chain, with a request that fetches those reports (`bootstrap_delivery._lost_audits`).
+  Posting the summaries themselves after the report is a separate change.
 - **An install self-check.** Not asked for by any issue.
-- **A "first audits are running" line in the report.** A small follow-up once delivery is a stage.
 
 ## 8. Build order and evaluation
 
 1. **First-run audits stage**, with `oobe` running beside the two bootstrap jobs, and the
    entrypoint entry that keeps it off finished installs. This covers the
    part of [#1866](https://github.com/gke-labs/kube-agents/issues/1866) that removes the wait; §7 lists what it leaves.
-2. **The fold** (§5), in a later change.
-3. **Later:** drop the disabled ids; the report line for a skipped audit; T+0 delivery to the home
-   channel.
+2. **The fold** (§5): the scan and delivery run as `oobe` stages, delivery first in each tick
+   (the scheduler snapshots the destination when a run starts, so delivery must claim the report
+   within seconds of that), and the old entries ship disabled. The bench stacks for the
+   onboarding cases drive `oobe`.
+3. **Later:** drop the disabled ids; T+0 delivery to the home channel.
 
-Eval case `oobe-first-run-audits` (domain `fleet-audits`, in `hack/eval/nightly-cases.txt`: each
-repetition waits for the previous one's four audits to finish). The stack
+Eval case `oobe-first-run-audits` (domain `fleet-audits`; nightly, in `hack/eval/nightly-cases.txt`,
+off the infra lock; each repetition waits for the previous one's five audits to finish). The stack
 (`bench/tf/prebuilt/oobe-first-run-audits`) first waits for the install's own first-run stage to
 finish, so it never cuts across a fresh install's real scan, then re-arms the stage: it files an
 archived stand-in sweep card and an archived ranking card after it, points `.bootstrap_scan_filed`
@@ -270,9 +300,9 @@ at the sweep and the hand-off's `.bootstrap_handoff_filed` at the ranking card, 
 `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one; the teardown restores
 the markers and the job as it found them.
 The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
-passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that got going (running, completed, or ended after its start) (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. An audit the stage recorded as adopted (a run completed since the sweep) counts as had, and stays out of that order; at least one audit must be the stage's own. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
-an image without the job, no audit runs. Green: four, in three repetitions. The case's runs are
-real audit runs on four streams, so it declares them (`audit_streams`) and the runner holds their
+passes when the stage's `.oobe_audits_fired` lists all five audits as marked due and each has a run claimed since the stage marked it that got going (running, completed, or ended after its start) (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. An audit the stage recorded as adopted (a run completed since the sweep) counts as had, and stays out of that order; at least one audit must be the stage's own. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
+an image without the job, no audit runs. Green, from the verifier on a dev install: four, in three repetitions, before the retrospective joined the stage; the five-audit stage's green is the case's nightly record, not this document's. The case's runs are
+real audit runs on five streams, so it declares them (`audit_streams`) and the runner holds their
 locks for the unit. Every unit on an audit stream first waits, up to two hours, while the install
 has a run of that audit claimed, running or marked due, a stage under way is to mark it next, or a
 stage this case armed and could not disarm has still to run it (`wait_platform_runs` in
@@ -282,18 +312,19 @@ last run ends. A fresh install's chain is waited on only once it has started, an
 it marks next, which costs a case at most about two audit runs (the one before it, then its own): an audit the chain reaches later, after the case's run holds the
 stream's in-flight note, has its `start` refused, and only between two repositories of a run can
 the install's run take the stream and leave the case's run partial. Waiting out the whole chain
-would hold every audit case on those streams for most of an hour on every CI run. The no-repository skip is unit-tested,
-not evaluated: the shared install has a repository, and removing it mid-run would break concurrent
-cases.
+would hold every audit case on those streams for most of an hour on every CI run. The start with no
+repository is unit-tested, and the case covers it only when run by hand against an install with no
+forge: the shared install has a repository, and removing it mid-run would break concurrent cases.
 
 ## 9. Open questions
 
 - **Chain length.** Each audit took one to eight minutes on a four-cluster install with
-  `gemini-3.1-flash-lite`, so the chain ends within about half an hour of the scan there. On a large
-  fleet the last audit may land an hour or more after the scan.
+  `gemini-3.1-flash-lite`, so with the retrospective fifth the stage is done, the four audits ended
+  and the fifth started, within about forty minutes of the scan there, inside the eval stack's
+  hour-long wait. On a large fleet the last audit may land an hour or more after the scan.
 - **Output volume.** How many pull requests and chat lines a first run produces on a real fleet. If
-  it reads as noise, day one narrows to cost and capacity, the two audits the inventory report does
-  not overlap.
+  it reads as noise, day one narrows to fewer audits. The inventory report no longer duplicates any
+  of the four (#2386), so the choice is about volume, not overlap.
 - **CI installs.** A fresh CI install runs the chain during an eval run, beside the audit cases
   that start the same audits on demand. The first smoke run with all four started together showed
   the cost; the chain keeps it to one audit at a time, as on a scheduled morning.

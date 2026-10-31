@@ -1,5 +1,7 @@
 # CLI & Tool Reference for GKE
 
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+
 ## Tool Preference
 
 Tool usage follows two distinct, domain-specific preference hierarchies:
@@ -30,41 +32,57 @@ Default preference order:
 
 ### When to use each (Cluster Operations)
 
-| Interface         | When to Use                                                                                                                                                                                            | Examples                                                                                            |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| **GKE MCP Tools** | Default for all cluster and K8s operations when MCP server is available. Structured I/O, supports dry-run, no shell/kubeconfig needed.                                                                 | `create_cluster`, `get_cluster`, `get_k8s_resource`, `apply_k8s_manifest`, `get_k8s_logs`           |
-| **`gcloud` CLI**  | No MCP equivalent, or user explicitly requested CLI. Required for: GIQ model discovery, available K8s versions, maintenance windows, monitoring components, IAM/SA setup, Cloud Logging queries.       | `gcloud container ai profiles`, `gcloud container get-server-config`, `gcloud iam service-accounts` |
-| **`kubectl`**     | Neither MCP nor `gcloud` covers the operation, or user explicitly prefers kubectl. Required for: `kubectl top`, `kubectl scale`, `kubectl exec`, `kubectl port-forward`, Helm, custom CRDs not in MCP. | `kubectl top pods`, `kubectl scale deployment`, `helm install`                                      |
+| Interface         | When to Use                | Examples                    |
+| ----------------- | -------------------------- | --------------------------- |
+| **GKE MCP Tools** | Default for all cluster    | `get_cluster`,              |
+:                   : and K8s reads when MCP     : `get_k8s_resource`,         :
+:                   : server is available.       : `get_k8s_logs`              :
+:                   : Structured I/O, no         :                             :
+:                   : shell/kubeconfig needed.   :                             :
+| **`gcloud` CLI**  | No MCP equivalent, or user | `gcloud container ai        |
+:                   : explicitly requested CLI.  : profiles`, `gcloud          :
+:                   : Required for\: GIQ model   : container                   :
+:                   : discovery, available K8s   : get-server-config`, `gcloud :
+:                   : versions, Cloud Logging    : logging read`               :
+:                   : queries.                   :                             :
+| **`kubectl`**     | Neither MCP nor `gcloud`   | `kubectl top pods`,         |
+:                   : covers the operation, or   : `kubectl top nodes`         :
+:                   : user explicitly prefers    :                             :
+:                   : kubectl. Required for\:    :                             :
+:                   : `kubectl top`, custom CRDs :                             :
+:                   : not in MCP.                :                             :
 
 ### User preference override
 
 If the user states a preference, respect it for the session:
 
-- **"Use gcloud" / "Use CLI"** → `gcloud` for cluster ops, `kubectl` for K8s
-  resource ops. Skip MCP.
-- **"Use kubectl"** → `kubectl` for all K8s resource ops, `gcloud` for
-  cluster-level ops. Skip MCP.
-- **"Use MCP"** / no preference → Default. Use MCP for everything it supports.
+-   **"Use gcloud" / "Use CLI"** → `gcloud` for cluster ops, `kubectl` for K8s
+    resource ops. Skip MCP.
+-   **"Use kubectl"** → `kubectl` for all K8s resource ops, `gcloud` for
+    cluster-level ops. Skip MCP.
+-   **"Use MCP"** / no preference → Default. Use MCP for everything it supports.
 
 Even with an override, fall back through the chain for unsupported operations
-(e.g., cluster creation always requires `gcloud` or MCP).
+(e.g., available Kubernetes versions always require `gcloud`).
 
----
+--------------------------------------------------------------------------------
 
 > All MCP tools use hierarchical resource paths — see
 > [`parent` format](#parent--name-format-quick-reference) at the bottom.
 
 ## Cluster Operations
 
-| Operation           | MCP Tool         | CLI Fallback                                | Mode        |
-| ------------------- | ---------------- | ------------------------------------------- | ----------- |
-| List clusters       | `list_clusters`  | `gcloud container clusters list`            | READ        |
-| Get cluster details | `get_cluster`    | `gcloud container clusters describe`        | READ        |
-| Create cluster      | `create_cluster` | `gcloud container clusters create-auto`     | MUTATE      |
-| Update cluster      | `update_cluster` | `gcloud container clusters update`          | DESTRUCTIVE |
-| Get K8s versions    | —                | `gcloud container get-server-config`        | READ        |
-| Get credentials     | —                | `gcloud container clusters get-credentials` | READ        |
-| Delete cluster      | —                | `gcloud container clusters delete`          | DESTRUCTIVE |
+| Operation           | MCP Tool         | CLI Fallback       | Mode        |
+| ------------------- | ---------------- | ------------------ | ----------- |
+| List clusters       | `list_clusters`  | `gcloud container  | READ        |
+:                     :                  : clusters list`     :             :
+| Get cluster details | `get_cluster`    | `gcloud container  | READ        |
+:                     :                  : clusters describe` :             :
+| Get K8s versions    | —                | `gcloud container  | READ        |
+:                     :                  : get-server-config` :             :
+| Get credentials     | —                | `gcloud container  | READ        |
+:                     :                  : clusters           :             :
+:                     :                  : get-credentials`   :             :
 
 ```
 # List clusters in a project (all regions)
@@ -72,25 +90,11 @@ list_clusters(parent="projects/<PROJECT_ID>/locations/-")
 
 # Get cluster details (all fields)
 get_cluster(name="projects/<PROJECT_ID>/locations/<REGION>/clusters/<CLUSTER_NAME>", readMask="*")
-
-# Create golden path Autopilot cluster
-create_cluster(
-  parent="projects/<PROJECT_ID>/locations/<REGION>",
-  cluster='{"name":"<CLUSTER_NAME>","autopilot":{"enabled":true},"privateClusterConfig":{"enablePrivateNodes":true},...}'
-)
 ```
 
 ```bash
 # Get available Kubernetes versions (CLI-only)
 gcloud container get-server-config --region <REGION> --format="yaml(channels)" --quiet
-
-# Create golden path Autopilot cluster (see gke-cluster-creation.md for full templates)
-gcloud container clusters create-auto <CLUSTER_NAME> \
-  --region <REGION> --project <PROJECT_ID> \
-  --enable-private-nodes --enable-master-authorized-networks \
-  --enable-dns-access --release-channel regular \
-  --enable-secret-manager --scoped-rbs-bindings \
-  --quiet
 
 # Get credentials (CLI-only)
 gcloud container clusters get-credentials <CLUSTER_NAME> --region <REGION> --project <PROJECT_ID> --quiet
@@ -98,56 +102,37 @@ gcloud container clusters get-credentials <CLUSTER_NAME> --region <REGION> --pro
 
 ## Node Pool Operations
 
-| Operation        | MCP Tool           | CLI Fallback                           | Mode        |
-| ---------------- | ------------------ | -------------------------------------- | ----------- |
-| List node pools  | `list_node_pools`  | `gcloud container node-pools list`     | READ        |
-| Get node pool    | `get_node_pool`    | `gcloud container node-pools describe` | READ        |
-| Create node pool | `create_node_pool` | `gcloud container node-pools create`   | MUTATE      |
-| Update node pool | `update_node_pool` | `gcloud container node-pools update`   | DESTRUCTIVE |
+| Operation        | MCP Tool           | CLI Fallback         | Mode        |
+| ---------------- | ------------------ | -------------------- | ----------- |
+| List node pools  | `list_node_pools`  | `gcloud container    | READ        |
+:                  :                    : node-pools list`     :             :
+| Get node pool    | `get_node_pool`    | `gcloud container    | READ        |
+:                  :                    : node-pools describe` :             :
 
 ```
 list_node_pools(parent="projects/<PROJECT_ID>/locations/<REGION>/clusters/<CLUSTER_NAME>")
-
-create_node_pool(
-  parent="projects/<PROJECT_ID>/locations/<REGION>/clusters/<CLUSTER_NAME>",
-  nodePool='{"name":"<POOL_NAME>","config":{"machineType":"e2-standard-4"},"initialNodeCount":3,...}'
-)
 ```
 
 ## Cluster Updates
 
-| Operation               | MCP Tool         | CLI Fallback                                              | Mode        |
-| ----------------------- | ---------------- | --------------------------------------------------------- | ----------- |
-| Update cluster settings | `update_cluster` | `gcloud container clusters update`                        | DESTRUCTIVE |
-| Update monitoring       | —                | `gcloud container clusters update --monitoring=...`       | DESTRUCTIVE |
-| Set maintenance window  | —                | `gcloud container clusters update --maintenance-window-*` | DESTRUCTIVE |
-
-```
-# Enable VPA via MCP
-update_cluster(
-  name="projects/<PROJECT_ID>/locations/<REGION>/clusters/<CLUSTER_NAME>",
-  update='{"desiredVerticalPodAutoscaling":{"enabled":true}}'
-)
-```
-
-```bash
-# Update monitoring components (CLI-only)
-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
-  --monitoring=SYSTEM,API_SERVER,SCHEDULER,CONTROLLER_MANAGER,STORAGE,POD,DEPLOYMENT,STATEFULSET,DAEMONSET,HPA \
-  --quiet
-```
+Cluster settings such as Vertical Pod Autoscaling (`spec.verticalPodAutoscaling.enabled`),
+monitoring components (`spec.monitoringConfig.enableComponents`) and maintenance windows
+(`spec.maintenancePolicy`) are changed as Config Connector YAML on the cluster's
+`ContainerCluster` through `gcp-config-connector`; node pools likewise as a
+`ContainerNodePool`.
 
 ## Kubernetes Resource Operations
 
-| Operation          | MCP Tool                 | CLI Fallback            | Mode        |
-| ------------------ | ------------------------ | ----------------------- | ----------- |
-| Get/list resources | `get_k8s_resource`       | `kubectl get`           | READ        |
-| Describe resource  | `describe_k8s_resource`  | `kubectl describe`      | READ        |
-| Apply manifest     | `apply_k8s_manifest`     | `kubectl apply`         | DESTRUCTIVE |
-| Patch resource     | `patch_k8s_resource`     | `kubectl patch`         | DESTRUCTIVE |
-| Delete resource    | `delete_k8s_resource`    | `kubectl delete`        | DESTRUCTIVE |
-| List API resources | `list_k8s_api_resources` | `kubectl api-resources` | READ        |
-| Check auth         | `check_k8s_auth`         | `kubectl auth can-i`    | READ        |
+| Operation       | MCP Tool                 | CLI Fallback     | Mode        |
+| --------------- | ------------------------ | ---------------- | ----------- |
+| Get/list        | `get_k8s_resource`       | `kubectl get`    | READ        |
+: resources       :                          :                  :             :
+| Describe        | `describe_k8s_resource`  | `kubectl         | READ        |
+: resource        :                          : describe`        :             :
+| List API        | `list_k8s_api_resources` | `kubectl         | READ        |
+: resources       :                          : api-resources`   :             :
+| Check auth      | `check_k8s_auth`         | `kubectl auth    | READ        |
+:                 :                          : can-i`           :             :
 
 ```
 # List all deployments in a namespace
@@ -156,30 +141,20 @@ get_k8s_resource(
   resourceType="deployment", namespace="<NAMESPACE>"
 )
 
-# Apply a manifest (with dry-run)
-apply_k8s_manifest(parent="...", yamlManifest="...", dryRun=true)
-
-# Patch deployment resources for rightsizing
-patch_k8s_resource(
-  parent="projects/<PROJECT_ID>/locations/<REGION>/clusters/<CLUSTER_NAME>",
-  resourceType="deployment", name="<DEPLOYMENT>", namespace="<NAMESPACE>",
-  patch='{"spec":{"template":{"spec":{"containers":[{"name":"app","resources":{"requests":{"cpu":"200m","memory":"256Mi"}}}]}}}}'
-)
-
 # Check RBAC permissions
 check_k8s_auth(parent="...", verb="create", resourceType="deployments", namespace="<NAMESPACE>")
 ```
 
 ## Diagnostics & Observability
 
-| Operation           | MCP Tool                 | CLI Fallback             | Mode |
-| ------------------- | ------------------------ | ------------------------ | ---- |
-| List events         | `list_k8s_events`        | `kubectl events`         | READ |
-| Get container logs  | `get_k8s_logs`           | `kubectl logs`           | READ |
-| Cluster info        | `get_k8s_cluster_info`   | `kubectl cluster-info`   | READ |
-| K8s version         | `get_k8s_version`        | `kubectl version`        | READ |
-| Rollout status      | `get_k8s_rollout_status` | `kubectl rollout status` | READ |
-| Query Cloud Logging | —                        | `gcloud logging read`    | READ |
+Operation           | MCP Tool                 | CLI Fallback             | Mode
+------------------- | ------------------------ | ------------------------ | ----
+List events         | `list_k8s_events`        | `kubectl events`         | READ
+Get container logs  | `get_k8s_logs`           | `kubectl logs`           | READ
+Cluster info        | `get_k8s_cluster_info`   | `kubectl cluster-info`   | READ
+K8s version         | `get_k8s_version`        | `kubectl version`        | READ
+Rollout status      | `get_k8s_rollout_status` | `kubectl rollout status` | READ
+Query Cloud Logging | —                        | `gcloud logging read`    | READ
 
 ```
 # Get recent events across all namespaces
@@ -195,11 +170,12 @@ get_k8s_rollout_status(parent="...", resourceType="deployment", name="<DEPLOY>",
 
 ## Operations Tracking
 
-| Operation        | MCP Tool           | CLI Fallback                           | Mode        |
-| ---------------- | ------------------ | -------------------------------------- | ----------- |
-| List operations  | `list_operations`  | `gcloud container operations list`     | READ        |
-| Get operation    | `get_operation`    | `gcloud container operations describe` | READ        |
-| Cancel operation | `cancel_operation` | `gcloud container operations cancel`   | DESTRUCTIVE |
+| Operation        | MCP Tool           | CLI Fallback         | Mode        |
+| ---------------- | ------------------ | -------------------- | ----------- |
+| List operations  | `list_operations`  | `gcloud container    | READ        |
+:                  :                    : operations list`     :             :
+| Get operation    | `get_operation`    | `gcloud container    | READ        |
+:                  :                    : operations describe` :             :
 
 ```
 list_operations(parent="projects/<PROJECT_ID>/locations/<REGION>")
@@ -215,10 +191,9 @@ gcloud container ai profiles manifests create \
   --model=<MODEL_NAME> --model-server=<SERVER> \
   --accelerator-type=<ACCELERATOR> \
   --target-ntpot-milliseconds=<NTPOT> --quiet > inference.yaml
-
-# Deploy generated manifest via MCP
-apply_k8s_manifest(parent="...", yamlManifest="<contents of inference.yaml>")
 ```
+
+The generated `inference.yaml` is proposed as a pull request through `submit-suggestion`.
 
 ## kubectl-Only Operations
 
@@ -227,15 +202,14 @@ No MCP or `gcloud` equivalent:
 ```bash
 kubectl top pods --all-namespaces --sort-by=cpu
 kubectl top nodes
-kubectl scale deployment <DEPLOYMENT> --replicas=<N> -n <NAMESPACE>
-kubectl exec -it <POD_NAME> -n <NAMESPACE> -- /bin/sh
-kubectl port-forward svc/<SERVICE> <LOCAL_PORT>:<REMOTE_PORT> -n <NAMESPACE>
-kubectl cp <NAMESPACE>/<POD>:<PATH> <LOCAL_PATH>
-kubectl run debug --rm -it --image=busybox -- /bin/sh
-kubectl drain <NODE_NAME> --ignore-daemonsets --delete-emptydir-data
-helm install <RELEASE> <CHART> -n <NAMESPACE>
-helm upgrade <RELEASE> <CHART> -n <NAMESPACE>
 ```
+
+`kubectl exec`, `kubectl port-forward` and `kubectl cp` reach into a running pod, and the
+broker refuses them; when a task needs one, give the user the command to run.
+
+Scaling a Deployment (its `replicas`) is a manifest change, proposed as a pull request
+through `submit-suggestion`. A Helm chart is never installed or upgraded with `helm`:
+declare it in the GitOps repository with the `gitops-helm-chart` skill.
 
 ## `parent` / `name` Format Quick Reference
 
@@ -250,12 +224,12 @@ Use `locations/-` to match all regions/zones when listing.
 
 ## Error Handling
 
-| Error / Symptom                       | Likely Cause                                 | Remediation                                                                        |
-| ------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `PERMISSION_DENIED` on cluster create | Missing `container.clusters.create` IAM role | Grant `roles/container.admin` or `roles/container.clusterAdmin`                    |
-| Quota exceeded                        | Regional vCPU, GPU, or IP address limits     | Request quota increase or select a different region                                |
-| IP exhaustion / CIDR conflict         | Pod subnet too small or overlapping ranges   | Re-plan IP ranges; may require cluster recreation (Day-0)                          |
-| Workload Identity not working         | Missing OIDC issuer or federated credential  | Verify `workloadIdentityConfig.workloadPool`; configure federated identity binding |
-| Private cluster unreachable           | No authorized networks or DNS endpoint       | Enable `dnsEndpointConfig.allowExternalTraffic` or add authorized networks         |
-| Secret Manager rotation failing       | SA missing `secretmanager.versions.access`   | Grant Secret Manager accessor role to workload's GSA                               |
-| Control-plane metrics missing         | Monitoring components not configured         | Enable APISERVER, SCHEDULER, CONTROLLER_MANAGER in `monitoringConfig`              |
+Error / Symptom                       | Likely Cause                                 | Remediation
+------------------------------------- | -------------------------------------------- | -----------
+`PERMISSION_DENIED` on cluster create | Missing `container.clusters.create` IAM role | Grant `roles/container.admin` or `roles/container.clusterAdmin`
+Quota exceeded                        | Regional vCPU, GPU, or IP address limits     | Request quota increase or select a different region
+IP exhaustion / CIDR conflict         | Pod subnet too small or overlapping ranges   | Re-plan IP ranges; may require cluster recreation (Day-0)
+Workload Identity not working         | Missing OIDC issuer or federated credential  | Verify `workloadIdentityConfig.workloadPool`; configure federated identity binding
+Private cluster unreachable           | No authorized networks or DNS endpoint       | Enable `dnsEndpointConfig.allowExternalTraffic` or add authorized networks
+Secret Manager rotation failing       | SA missing `secretmanager.versions.access`   | Grant Secret Manager accessor role to workload's GSA
+Control-plane metrics missing         | Monitoring components not configured         | Enable APISERVER, SCHEDULER, CONTROLLER_MANAGER in `monitoringConfig`

@@ -46,17 +46,24 @@ class A1AuthorityIsNotObtainableThroughUs(unittest.TestCase):
         ["gcloud", "container", "clusters", "delete", MARKER],
         ["gcloud", f"--flags-file=/workspace/{MARKER}.yaml", "info"],
         ["gcloud", "info", f"--account={MARKER}@example.com"],
+        # The gcloud refused-retry refusals (#2979) name no verb at all, and
+        # the kubectl entry keeps main's invitation. Neither repeats a caller byte.
+        ["kubectl", "delete", "pod", MARKER, f"--token={MARKER}"],
+        ["gcloud", "container", "clusters", "update", MARKER, f"--account={MARKER}@example.com"],
+        ["gcloud", "container", "clusters", "update", MARKER, f"--{MARKER}=x"],
     )
 
     def test_A1_a_refusal_names_no_caller_supplied_value(self) -> None:
-        """The body the caller receives carries no byte the caller supplied.
+        """The refusal's rule id and message carry no byte the caller supplied.
 
         Historical shape: A1 requires a denial to be bounded, because "you lack
         access to tenant-b/payments" is an existence oracle over another
-        tenant's namespace names. The refusal body is a fixed rule id and a
-        fixed message, and this asserts it stays that way -- interpolating the
-        offending value into the message is the obvious, helpful-looking change
-        that would break it.
+        tenant's namespace names. The rule id and the message are fixed, and
+        this asserts they stay that way -- interpolating the offending value
+        into the message is the obvious, helpful-looking change that would
+        break it. The body's ``verb`` field (kubectl's own verb words; gcloud's
+        surface words, a two-word surface's positional among them) is the
+        sanitised, length-capped value D1 covers.
         """
         for argv in self.HOSTILE_ARGVS:
             with self.subTest(argv=argv):
@@ -65,11 +72,61 @@ class A1AuthorityIsNotObtainableThroughUs(unittest.TestCase):
                     decision.allowed,
                     f"{argv} was allowed; this corpus is meant to be entirely refusals",
                 )
-                # The caller receives rule_id and message. verb_tuple and
-                # offending_flag are log-side and are covered by
-                # test_D_accountability.py.
+                # The caller receives rule_id and message, and for a kubectl
+                # refusal the verb and, when the second word is one of kubectl's
+                # own subcommands, that word (credential_proxy._KUBECTL_SUBCOMMANDS);
+                # a gcloud refusal's body carries the surface words the log does,
+                # which D1 covers. offending_flag is log-side.
                 self.assertNotIn(MARKER, decision.rule_id)
                 self.assertNotIn(MARKER, decision.message)
+
+    def test_A1_a_refusal_invites_no_retry_it_would_refuse(self) -> None:
+        """A refusal is not a path to try next.
+
+        A flag refusal used to invite a retry without the flag whatever the
+        command, and the gcloud unreadable refusal said "re-run without the
+        flag". On a write, the agent took the invitation and ran the bare
+        write, refused again, and treated each refusal as a step to work
+        through (#2979). A gcloud refusal invites a flagless retry only when
+        that retry would be allowed: for each argv below, which is a write with
+        a refused or unknown flag, the message invites nothing, and the retry
+        it used to invite is refused as a write.
+
+        kubectl is the exception, and keeps the invitation: the runtime stop
+        halts a turn on a `kubernetes.read-only` refusal of a write and does
+        not count a flag refusal, so the flagless retry is how a kubectl write
+        refused for a flag reaches the halt (#3380).
+        """
+        invitations = ("without the flag", "Re-run without", "Remove ", "Drop the flag")
+        for argv, retry in (
+            (["gcloud", "container", "clusters", "update", "prod", "--account", "a@example.com"],
+             ["gcloud", "container", "clusters", "update", "prod"]),
+            (["gcloud", "container", "clusters", "update", "prod",
+              "--binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE"],
+             ["gcloud", "container", "clusters", "update", "prod"]),
+            (["gcloud", "container", "--new-flag=1", "clusters", "update", "prod"],
+             ["gcloud", "container", "clusters", "update", "prod"]),
+        ):
+            with self.subTest(argv=argv):
+                decision = command_policy.evaluate(argv)
+                self.assertFalse(decision.allowed)
+                for invitation in invitations:
+                    self.assertNotIn(invitation, decision.message, "a write's refusal invites a retry")
+                self.assertIn(command_policy.evaluate(retry).rule_id, ("kubernetes.read-only", "gcp.read-only"))
+        # Bounded the other way: on a read, the flagless retry is allowed, and
+        # the refusal still says so.
+        read = command_policy.evaluate(["kubectl", "get", "pods", "--token", "t"])
+        self.assertIn("without the flag", read.message)
+        self.assertTrue(command_policy.evaluate(["kubectl", "get", "pods"]).allowed)
+        # And the kubectl exception: the write keeps the invitation, and the
+        # retry it invites is the refused write the runtime halts on.
+        for argv in (["kubectl", "delete", "pod", "web-0", "--token", "t"],
+                     ["kubectl", "--as=system:admin", "delete", "pod", "web-0"]):
+            with self.subTest(argv=argv):
+                self.assertIn("without the flag", command_policy.evaluate(argv).message)
+                retry = command_policy.evaluate(["kubectl", "delete", "pod", "web-0"])
+                self.assertEqual("kubernetes.read-only", retry.rule_id)
+                self.assertEqual(("delete",), retry.verb_tuple[:1])
 
     def test_A1_a_refusal_names_the_rule_that_fired(self) -> None:
         """Bounded is not the same as opaque.
@@ -377,6 +434,47 @@ class A3TheEvalDoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
         )
 
 
+class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
+    """A3: a profile worker's cluster and project come from its signed task credential.
+
+    The broker's `profile` role (#3889) runs model output from an AgentProfile
+    worker. The cluster and project a call reaches are the ones in the
+    dispatcher's task credential, bound to the attested pod, never ones the
+    caller names; with no credential, nothing credentialed runs at all.
+    """
+
+    TARGET = h.task_confinement.ClusterTarget(project="proj-a", location="us-central1", cluster="cluster-a")
+
+    def test_A3_a_profile_call_outside_its_tasks_target_is_refused(self) -> None:
+        refusal = h.task_confinement.ConfinementRefusal
+        for argv in (
+            ["kubectl", "get", "secrets", "--context=gke_proj-b_us-central1_cluster-b"],
+            ["kubectl", "get", "secrets", "--server=https://127.0.0.1:8443"],
+            ["gcloud", "container", "clusters", "list", "--project=proj-b"],
+            ["gcloud", "projects", "list"],
+            ["gcloud", "config", "set", "project", "proj-b"],
+            ["kubectl", "config", "use-context", "gke_proj-b_us-central1_cluster-b"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(refusal):
+                    h.task_confinement.confine(argv, None, self.TARGET)
+        # And naming nothing reaches the target, not the broker's host.
+        confined = h.task_confinement.confine(["kubectl", "get", "pods"], None, self.TARGET)
+        self.assertEqual(self.TARGET.context_name, confined.kubeconfig_context)
+
+    def test_A3_a_profile_caller_without_a_task_credential_reaches_no_cluster(self) -> None:
+        for argv in (["kubectl", "get", "pods"], ["gcloud", "container", "clusters", "list"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(h.task_confinement.ConfinementRefusal):
+                    h.task_confinement.confine(argv, None, None)
+        self.assertTrue(h.task_confinement.confine(["kubectl", "version", "--client"], None, None).isolated)
+
+    def test_A3_the_profile_role_reaches_the_exec_route_alone(self) -> None:
+        profile = h.credential_proxy.CALLER_ROLE_PROFILE
+        reached = [prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles]
+        self.assertEqual(["/v1/exec"], reached)
+
+
 class A3TheA2ADoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
     """A3 on the A2A door: the inject door's sibling for an agent caller, held
     to the same two properties by the same two seams.
@@ -528,8 +626,10 @@ class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
     map joins to the member id, or the member id Slack asserted, qualified
     `slack:`.  The map is an override and not a gate, so three things carry
     the invariant: a member of another workspace (a Slack Connect guest) is
-    not a turn at all, so admission never reaches past the install's own
-    workspace; an unlisted sender resolves to nothing whatever the map says;
+    not a turn unless the allowlist names that member of that workspace as
+    `T…:U…`, so admission never reaches past the install's own workspace
+    without an entry that says so (allow-all names nobody); an unlisted
+    sender resolves to nothing whatever the map says;
     and the map cannot assert the reserved prefix, so a principal that claims
     to be a bare member id always is one.
     """
@@ -544,17 +644,29 @@ class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
 
     def test_A3_another_workspaces_member_is_not_a_turn(self) -> None:
         source = h.text("a2a_slack_ingress")
-        inbound = h.go_function_body(source, "inbound")
+        # inbound is a wrapper; the event pump and it both reach inboundEvent,
+        # which carries the admission rule (gke-labs/kube-agents#3246).
+        self.assertIn('return s.inboundEvent(ctx, m, "")', h.go_function_body(source, "inbound"))
+        inbound = h.go_function_body(source, "inboundEvent")
         self.assertRegex(
             inbound,
-            r"if s\.foreignSender\(m\) \{\s*return InboundMessage\{\}, false",
+            r"refused, author := s\.foreignSender\(m\)\s*if refused \{\s*return InboundMessage\{\}, false",
             "the Slack ingress no longer refuses a member of another workspace before admission",
         )
         foreign = h.go_function_body(source, "foreignSender")
-        self.assertIn(
-            "if !s.otherWorkspace(m.UserTeam) && (m.Message == nil || !s.otherWorkspace(m.Message.Team)) {",
+        self.assertIn("if !s.otherWorkspace(m.UserTeam) && !s.otherWorkspace(messageTeam) {", foreign)
+        self.assertRegex(
             foreign,
+            r"if guest, ok := s\.admitGuest\(m\.UserTeam, messageTeam, m\.User\); ok \{\s*return false, guest",
+            "a member of another workspace is admitted by something other than an allowlist entry naming them",
         )
+        # Only an entry that names the member of that workspace admits them;
+        # two workspace fields that disagree match nothing.
+        admit = h.go_function_body(source, "admitGuest")
+        self.assertIn("return entry, s.guests[entry]", admit)
+        self.assertIn('if !ok || team == "" || user == "" {', admit)
+        workspace = h.go_function_body(source, "senderWorkspace")
+        self.assertIn('if userTeam != "" && otherTeam != "" && userTeam != otherTeam {', workspace)
         other = h.go_function_body(source, "otherWorkspace")
         self.assertIn('return team != "" && (s.teamID == "" || team != s.teamID)', other)
 
@@ -907,11 +1019,37 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
 
     @classmethod
     def _session_publish_derivation(cls) -> str:
-        """The literal Publish list `sessionGrants` starts from, as Go source."""
-        body = h.go_function_body(h.text("a2a_session_grants"), "sessionGrants")
+        """Every executor publish grant the callout derives, as Go source.
+
+        That is the Publish literal `executorTaskGrants` starts both
+        narrowings from (session pods, through `executorGrants`, and
+        AgentProfile pods' task connections), plus the bodies of
+        `sessionGrants`, `profileTaskGrants`, `profileWorkerGrants` and
+        `profileGrants`, which append to it or stand beside it. The literal
+        alone, not all of `executorTaskGrants`: its consumer filters name
+        `…in` as a READ, which is what the assertions here distinguish. Each
+        executor narrowing is required to call it (the session through
+        `executorGrants`), so one that stopped would not silently fall out of
+        what is read. A profile pod's own connection (`profileWorkerGrants`,
+        through `profileGrants`) keeps its profile-wide task plane until
+        #3889's worker PR removes it; it is read too, so a task-plane publish
+        added there is caught.
+        """
+        sessions = h.text("a2a_session_grants")
+        body = h.go_function_body(sessions, "executorTaskGrants")
         block = re.search(r"Publish:\s*\[\]string\{(.*?)\n\t*\},", body, re.DOTALL)
-        assert block is not None, "sessionGrants no longer starts from a Publish literal"
-        return block.group(1)
+        assert block is not None, "executorTaskGrants no longer starts from a Publish literal"
+        assert "executorTaskGrants(" in h.go_function_body(sessions, "executorGrants"), (
+            "executorGrants no longer derives from executorTaskGrants"
+        )
+        session = h.go_function_body(sessions, "sessionGrants")
+        task = h.go_function_body(h.text("a2a_profile_grants"), "profileTaskGrants")
+        worker = h.go_function_body(h.text("a2a_profile_grants"), "profileWorkerGrants")
+        profile = h.go_function_body(h.text("a2a_profile_grants"), "profileGrants")
+        assert "executorGrants(" in session, "sessionGrants no longer starts from executorGrants"
+        assert "executorTaskGrants(" in task, "profileTaskGrants no longer starts from executorTaskGrants"
+        assert "profileWorkerGrants(" in profile, "profileGrants no longer starts from profileWorkerGrants"
+        return block.group(1) + "\n".join((session, task, worker, profile))
 
     def test_A3_precondition_the_bus_principals_are_still_rendered_as_data(self) -> None:
         """The principals the writer-set tests iterate, so a moved one is loud.
@@ -981,6 +1119,68 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             "have the record read as infrastructure",
         )
 
+    NOTIFY_PROBE = "chat.notify.gchat"
+    NOTIFY_SLACK_PROBE = "chat.notify.slack"
+    NOTIFY_CONSOLE_PROBE = "chat.notify.console"
+    NOTIFY_REPLY_PROBE = "chat.notify.reply.agent.r1"
+
+    def test_A3_a_notify_has_one_writer_and_its_answer_has_one(self) -> None:
+        """The chat.notify route: only the agent asks, only the gateway answers.
+
+        The gateway posts what arrives on `chat.notify.gchat` (or, on a
+        Slack-armed gateway, `chat.notify.slack`) to the home channel as the
+        install's bot, and what arrives on `chat.notify.console` into a console
+        conversation, so a second writer there is a second
+        principal that can make the bot speak; and the agent takes the answer
+        as the gateway's word on where the post landed, so a second writer on
+        the reply namespace -- the agent itself included -- can forge it. The
+        session pods' grants are derived per connection and must not reach
+        either subject.
+        """
+        grants = self._rendered_publish_grants()
+        for probe, want in (
+            (self.NOTIFY_PROBE, ["agent"]),
+            (self.NOTIFY_SLACK_PROBE, ["agent"]),
+            (self.NOTIFY_CONSOLE_PROBE, ["agent"]),
+            (self.NOTIFY_REPLY_PROBE, ["gateway"]),
+        ):
+            writers = sorted(
+                builder for builder, allow in grants.items() if any(self._subject_matches(g, probe) for g in allow)
+            )
+            self.assertEqual(want, writers, f"principals whose publish grants reach {probe}")
+        # Matched on the subject and on the Go names a grant would be spelled
+        # with (lib.NotifySubjectGchat, lib.NotifyReplyPrefix): sessionGrants
+        # builds its list from lib constants, never from subject literals.
+        self.assertNotRegex(
+            self._session_publish_derivation(),
+            r"chat\.notify|Notify(Subject|Reply)",
+            "the callout derives a session a publish grant on the notify route",
+        )
+
+    BOARD_PROBE = "chat.board"
+    BOARD_REPLY_PROBE = "chat.board.reply.gateway.r1"
+
+    def test_A3_a_board_request_has_one_writer_and_its_answer_has_one(self) -> None:
+        """The board route: only the gateway asks, only the bridge answers.
+
+        The gateway draws the Slack Home tab from the answer, so a second
+        writer on the reply namespace can put words on it; a second writer on
+        the request can make the bridge read session-kv on its behalf. The
+        session pods' grants are derived per connection and must not reach
+        either subject.
+        """
+        grants = self._rendered_publish_grants()
+        for probe, want in ((self.BOARD_PROBE, ["gateway"]), (self.BOARD_REPLY_PROBE, ["bridge"])):
+            writers = sorted(
+                builder for builder, allow in grants.items() if any(self._subject_matches(g, probe) for g in allow)
+            )
+            self.assertEqual(want, writers, f"principals whose publish grants reach {probe}")
+        self.assertNotRegex(
+            self._session_publish_derivation(),
+            r"chat\.board|Board(Subject|Reply)",
+            "the callout derives a session a publish grant on the board route",
+        )
+
     def test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject(self) -> None:
         """The executor's subject has one writer class, and it is not the supervisor.
 
@@ -1009,7 +1209,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         distinguishes.
         """
         publish = self._session_publish_derivation()
-        self.assertIn("lib.TaskEventsSubject(pod", publish)
+        self.assertIn("lib.TaskEventsSubject(addressee", publish)
         self.assertNotIn("TaskInSubject", publish, "the session's Publish literal reaches its own in subject")
         self.assertNotIn(
             "a2a.tasks.", publish,
@@ -1042,15 +1242,36 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         read filter, built the same way as the publish grants around it),
         must name `pod`, the session's own attested name, and nothing else.
         """
-        body = h.go_function_body(h.text("a2a_session_grants"), "sessionGrants")
-        calls = re.findall(r"TaskInSubject\(\s*([^,]+),", body)
-        self.assertTrue(calls, "sessionGrants calls TaskInSubject nowhere; the probe below is vacuous")
-        for arg in calls:
+        src = h.text("a2a_session_grants")
+        body = h.go_function_body(src, "sessionGrants")
+        for arg in re.findall(r"TaskInSubject\(\s*([^,]+),", body):
             self.assertEqual(
                 "pod",
                 arg.strip(),
                 f"sessionGrants calls TaskInSubject({arg.strip()}, ...): a literal "
                 f"addressee here grants the session a publish on another "
+                f"addressee's in subject",
+            )
+        # The task-plane half, the per-session consumer's read filter among
+        # it, is built by executorTaskGrants, which AgentProfile pods share
+        # (gke-labs#2469, and the task connection since #3889). The session
+        # reaches it only as executorGrants(pod, pod), a wrapper passing "*"
+        # for the task, and inside executorTaskGrants every TaskInSubject
+        # names the addressee argument, so the session's calls still name pod.
+        self.assertEqual(
+            ["pod, pod"],
+            [a.strip() for a in re.findall(r"executorGrants\(([^)]*)\)", body)],
+            "sessionGrants no longer derives its task-plane grants as executorGrants(pod, pod)",
+        )
+        executor = h.go_function_body(src, "executorTaskGrants")
+        calls = re.findall(r"TaskInSubject\(\s*([^,]+),", executor)
+        self.assertTrue(calls, "executorTaskGrants calls TaskInSubject nowhere; the probe above is vacuous")
+        for arg in calls:
+            self.assertEqual(
+                "addressee",
+                arg.strip(),
+                f"executorTaskGrants calls TaskInSubject({arg.strip()}, ...): every "
+                f"executor, sessions included, would hold a grant on that "
                 f"addressee's in subject",
             )
 

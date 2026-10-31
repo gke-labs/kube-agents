@@ -25,6 +25,7 @@ jobs:
   docs-check:
     name: Documentation Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout code
@@ -54,9 +55,22 @@ jobs:
       - name: Site pages carry no maintainer identifier
         run: make docs-check-audience
 
+      # Site prose stays within its recorded per-page ceilings for banned
+      # filler words, "is not a X, it is Y" epigrams, and paragraph, table-cell
+      # and sentence lengths (.agents/rules/documentation.md, "Write it straight").
+      - name: Site prose stays within its ratchet
+        run: make docs-check-prose
+
       # AGENTS.md and CLAUDE.md are loaded into every agent session before the
       # first prompt, so their size is a cost paid by every task here. Nothing
       # about that is visible in a diff, and the file quietly tripled in nine
       # days before anyone noticed.
       - name: Agent instruction files fit the context budget
         run: make docs-check-context-budget
+
+      # A template section that says "otherwise delete this section" draws a
+      # description thread on every pull request that obeys it, because the
+      # readers hold a body to every heading (.agents/rules/pre_pr_review.md).
+      # A conditional section names the one-line answer the rest write instead.
+      - name: Every pull-request template section is answerable
+        run: make docs-check-pr-template

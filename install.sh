@@ -81,7 +81,7 @@ readonly NETWORK_POLICY_REPORT_FIELD="network_policy_enforcement"
 NETWORK_POLICY_ENFORCEMENT=""
 # Whether note_stale_network_policy_acceptance has spoken this run.
 NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="false"
-# How check_flag_against_install_env compares a typed chat flag with the key
+# How check_flag_against_install_env compares a typed chat flag or --mode with the key
 # install.env records: a boolean read through is_truthy, a literal string, a
 # list read through hcl_csv_list (the form write_tfvars_from_state renders), or
 # a credential, whose value is never printed and whose home is the live Secret
@@ -96,13 +96,24 @@ readonly INSTALL_ENV_FLAG_KIND_CREDENTIAL="credential"
 # about, and not SLACK_ENABLED: the panel turns Slack on without asking for
 # the tokens, and its apply does not check for them.
 readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="GOOGLE_CHAT_ENABLED ALLOWED_USERS GOOGLE_CHAT_HOME_CHANNEL"
-# The chat flags this run typed, one KEY|FLAG|KIND|PARAM|DEFAULT_VAR line each,
+# The flags held to install.env that this run typed (the chat flags and
+# --mode), one KEY|FLAG|KIND|PARAM|DEFAULT_VAR line each,
 # noted by parse_args; and the keys among them that install.env does not
 # assign, for record_flags_into_install_env to append once the run commits.
 INSTALL_ENV_FLAGS_TYPED=""
 INSTALL_ENV_KEYS_TO_RECORD=""
 # Those keys with their companions, toggles last (resolve_install_env_record_keys).
 INSTALL_ENV_RECORD_KEYS=""
+# The keys of the GitLab token Secret, and the server-side-apply field manager
+# that writes each one. The write token is "token" (ForgeCredentialsTokenKey
+# in gitspec.go). The optional read-only token, for context repositories, is
+# "read-token". Each key has its own manager: an apply that leaves out a field
+# its manager applied before deletes that field. So a run without
+# GITLAB_READ_TOKEN_FILE never deletes the read token.
+readonly GITLAB_TOKEN_SECRET_KEY="token"
+readonly GITLAB_READ_TOKEN_SECRET_KEY="read-token"
+readonly GITLAB_TOKEN_FIELD_MANAGER="kube-agents-installer"
+readonly GITLAB_READ_TOKEN_FIELD_MANAGER="kube-agents-installer-read-token"
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -163,11 +174,22 @@ on_error() {
   # function it was in, or this script and `main` at top level. $LINENO alone
   # counts from the top of whichever file the command sat in, so a bare line
   # number sent the reader to that line of install.sh instead. Piped through
-  # stdin, bash labels this script's frames `main` or not at all, and $0 is
-  # `bash`; both read as the script by name.
+  # stdin, bash labels this script's frames `main` (bash 5.2), after $0 (bash
+  # 5.3, measured: `bash` for the documented one-liner, `/bin/bash` when the
+  # interpreter is invoked by path, `sh` where that is bash), or not at all
+  # (bash 3.2); all read as the script by name. The $0 of a stdin or -c
+  # script is the shell as invoked, and resolves to the running interpreter,
+  # $BASH; a frame run from a file (`bash ./install.sh`) is labelled $0 on
+  # every bash too, and that $0 is the script, not $BASH, which keeps its
+  # path. A sourced file is never $0, whatever it is named.
   local source_file="${BASH_SOURCE[1]:-}"
   case "$source_file" in
     ""|main) source_file="$INSTALL_SCRIPT_NAME" ;;
+    "$0")
+      if [ "$(command -v -- "$0" 2>/dev/null || true)" = "$BASH" ]; then
+        source_file="$INSTALL_SCRIPT_NAME"
+      fi
+      ;;
   esac
   local func_name="${FUNCNAME[1]:-main}"
   echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
@@ -264,6 +286,12 @@ INSTALL_ENV_FILE="${KUBE_AGENTS_INSTALL_ENV:-}"
 INSTALL_ENV_EXPLICIT="false"
 if [ -n "$INSTALL_ENV_FILE" ]; then
   INSTALL_ENV_EXPLICIT="true"
+  # Absolute now, while the directory is the operator's: a run with no
+  # checkout clones one and cds into it before anything reads or writes this.
+  case "$INSTALL_ENV_FILE" in
+    /*) ;;
+    *) INSTALL_ENV_FILE="$(pwd)/${INSTALL_ENV_FILE}" ;;
+  esac
 else
   _install_env_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
   # An install.env the operator actually put beside the script, or in the
@@ -322,10 +350,19 @@ bootstrap_install_env() {
   # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
   # accounts the next run from a clean shell deletes again.
   unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
+  # The PlatformAgent's mode too: an inherited PLATFORM_AGENT_MODE=next would
+  # switch the install's component stack for one run, and the next run from a
+  # clean shell would switch it back. --mode is refused for the same reason
+  # when it disagrees with this file (check_flags_against_install_env).
+  unset PLATFORM_AGENT_MODE
+  # The data volume size too: an inherited PLATFORM_AGENT_STORAGE_SIZE would
+  # grow both data claims for one run, and the next run from a clean shell
+  # would drop the field again, leaving claims larger than the CR says.
+  unset PLATFORM_AGENT_STORAGE_SIZE
   # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
   # switch a recorded GitHub install's forge for this run. --gitops-forge is
   # the per-run way in.
-  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -363,6 +400,20 @@ bootstrap_install_env() {
   # shellcheck disable=SC1090
   . "$file"
   set +a
+  # Whether the file records a GitHub App: the App belongs to the GitHub host
+  # the file records, so validate_github_forge_flags refuses to carry it to
+  # another host. Read from the file, not the variable, which the shell can
+  # also set.
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_APP_ID=[\"']?[0-9]" "$file" 2>/dev/null; then
+    INSTALL_ENV_RECORDS_GITHUB_APP="true"
+  fi
+  # The same for the App's private key path. The file is sourced after the
+  # shell's environment, so GITHUB_PEM_PATH is the file's value when the file
+  # assigns it; when it does not, the value is one the shell exported for this
+  # run, which counts as given, like --github-pem-path.
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_PEM_PATH=" "$file" 2>/dev/null; then
+    INSTALL_ENV_RECORDS_GITHUB_PEM_PATH="true"
+  fi
   # stderr, not stdout. This runs at source time, before main(), so anything on
   # stdout here lands in front of whatever the caller went on to capture --
   # including a function's echoed return value when the test suite sources this
@@ -417,6 +468,18 @@ PARAM_VERTEX_MANAGE_SERVING_PROJECT="${VERTEX_MANAGE_SERVING_PROJECT:-}"
 PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+# openai_compatible: the server's base URL, the server pod's port (an
+# in-cluster Service), the private ranges it is reached at (anything else),
+# the Secret holding a CA that signs its certificate, and its optional key.
+PARAM_OPENAI_COMPATIBLE_API_BASE="${OPENAI_COMPATIBLE_API_BASE:-}"
+PARAM_OPENAI_COMPATIBLE_TARGET_PORT="${OPENAI_COMPATIBLE_TARGET_PORT:-}"
+PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS="${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
+PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME="${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
+PARAM_OPENAI_COMPATIBLE_API_KEY="${OPENAI_COMPATIBLE_API_KEY:-}"
+# A Secret the operator creates and the gateway reads whole as environment
+# variables: the SAP AI Core service key, another LiteLLM provider's
+# variables, or an openai_compatible gateway's OAuth2 client credentials.
+PARAM_LITELLM_ENV_SECRET_NAME="${LITELLM_ENV_SECRET_NAME:-}"
 PARAM_GITOPS_ORG="${GITOPS_ORG:-${GITHUB_ORG:-}}"
 PARAM_GITOPS_REPO="${GITOPS_REPO:-${GITHUB_REPO:-}}"
 PARAM_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
@@ -430,11 +493,46 @@ PARAM_GITOPS_FORGE="${GITOPS_FORGE:-}"
 PARAM_GITOPS_HOST="${GITOPS_HOST:-}"
 PARAM_GITLAB_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
 PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
+# An optional FILE with a read-only GitLab token. The broker presents it only
+# to clone context repositories. Like the token file, it is never recorded.
+PARAM_GITLAB_READ_TOKEN_FILE="${GITLAB_READ_TOKEN_FILE:-}"
+# A self-managed GitLab behind a private CA: a FILE the CA is read from, and
+# the Secret it goes into, which install.env records. The file's path is
+# never recorded. GITOPS_CA_FILE in the environment counts as an interview
+# answer, not as the flag (see PARAM_GITOPS_CA_FILE_FROM_FLAG).
+PARAM_GITOPS_CA_FILE="${GITOPS_CA_FILE:-}"
+PARAM_GITOPS_CA_SECRET="${GITOPS_CA_SECRET:-}"
+# Whether the CA file came from --gitops-ca-file rather than the interview: a
+# flag with gitlab.com is refused, an interview answer is cleared.
+PARAM_GITOPS_CA_FILE_FROM_FLAG="false"
 # Whether a value came from a flag rather than install.env: a switch of forge
 # by flag drops what the file recorded for the other forge, but refuses a flag
 # that contradicts it.
 PARAM_GITOPS_HOST_FROM_FLAG="false"
 PARAM_GITHUB_APP_FROM_FLAG="false"
+# The forge and host install.env records, before any flag changes them. A
+# GitHub Enterprise Server host is recorded with GITOPS_FORGE=github, a
+# self-managed GitLab host with GITOPS_FORGE=gitlab, so a host is kept only
+# for the forge that recorded it. The GitHub App and its KMS key belong to one
+# GitHub host too: validate_github_forge_flags refuses a change of host that
+# keeps the recorded App or key (INSTALL_ENV_RECORDS_GITHUB_APP).
+PARAM_GITOPS_RECORDED_FORGE="${GITOPS_FORGE:-}"
+PARAM_GITOPS_RECORDED_HOST="${GITOPS_HOST:-}"
+PARAM_RECORDED_KMS_KEYRING="${KMS_KEYRING:-}"
+PARAM_RECORDED_KMS_KEY="${KMS_KEY:-}"
+# The App ID install.env records, for the same check: a move of GitHub host
+# needs another App ID, given by --github-app-id (PARAM_GITHUB_APP_ID_FROM_FLAG,
+# which --github-pem-path does not set).
+PARAM_RECORDED_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
+# The private key path install.env records, and whether --github-pem-path gave
+# this run's: on a move of GitHub host the recorded path is the old App's key.
+# Only a path the file records (INSTALL_ENV_RECORDS_GITHUB_PEM_PATH): a path
+# exported in the shell is this run's.
+PARAM_RECORDED_GITHUB_PEM_PATH=""
+if [ "${INSTALL_ENV_RECORDS_GITHUB_PEM_PATH:-false}" = "true" ]; then
+  PARAM_RECORDED_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
+fi
+PARAM_GITHUB_PEM_PATH_FROM_FLAG="false"
 # Left empty where installer_common.sh owns the default, the way
 # PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the
 # helpers are sourced, so no default is spelled twice.
@@ -504,6 +602,8 @@ fi
 # the second. The same asymmetry applies to MEMORY / MEMORY_PROVIDER below and
 # to GOOGLE_CHAT_ENABLED below.
 PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-${HERMES_DASHBOARD_ENABLED:-}}"
+# WEB_CONSOLE_ENABLED is both the input and the recorded spelling.
+PARAM_ENABLE_WEB_CONSOLE="${WEB_CONSOLE_ENABLED:-}"
 # MEMORY is the input spelling (file | hindsight | off). MEMORY_PROVIDER is what
 # the install records, so translate it back when that is all there is.
 memory_mode_from_provider() {
@@ -547,8 +647,33 @@ PARAM_CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
 PARAM_CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
 CLI_CHAT_SUB_NAME=""
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
+# Empty takes PLATFORM_AGENT_MODE_FALLBACK. Seeded from install.env, so a re-run
+# without --mode keeps the mode the file records.
+PARAM_PLATFORM_AGENT_MODE="${PLATFORM_AGENT_MODE:-}"
+PARAM_PLATFORM_AGENT_MODE_PASSED="false"
+# What an empty mode resolves to. It starts as a first install's,
+# DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE, and adopt_live_platform_agent_mode
+# moves it to the live install's once the target cluster is known: whether this
+# is a first install is the cluster's to say, not install.env's. A target tree
+# from before that default has only DEFAULT_PLATFORM_AGENT_MODE, today there.
+# Run here and again by resolve_shared_defaults: under curl | bash the
+# defaults are only in scope after the workspace step sources them. The file's
+# presence is taken here, before a first install writes one.
+INSTALL_ENV_FOUND_AT_START="false"
+if [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
+  INSTALL_ENV_FOUND_AT_START="true"
+fi
+resolve_platform_agent_mode_fallback() {
+  PLATFORM_AGENT_MODE_FALLBACK="${DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}"
+}
+resolve_platform_agent_mode_fallback
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
+# Whether --model-default-name was typed: a switch to openai_compatible does not
+# carry over a model install.env pinned for another provider.
+PARAM_MODEL_DEFAULT_NAME_PASSED="false"
+# The interview answer that clears a recorded optional openai_compatible value.
+readonly OPENAI_COMPATIBLE_CLEAR_ANSWER="-"
 # Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
 # as an empty MODEL_DEFAULT_NAME takes the provider's default model.
 PARAM_MODEL_MAX_TOKENS="${MODEL_MAX_TOKENS:-}"
@@ -573,6 +698,7 @@ PARAM_SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
 PARAM_SLACK_ALLOWED_USERS="${SLACK_ALLOWED_USERS:-}"
 PARAM_SLACK_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}"
 PARAM_SLACK_HOME_CHANNEL_NAME="${SLACK_HOME_CHANNEL_NAME:-}"
+PARAM_SLACK_HOME_CHANNEL_POLICY="${SLACK_HOME_CHANNEL_POLICY:-}"
 # bootstrap_install_env clears NAMESPACE before reading
 # install.env, so this seeds from the file alone; --agent-namespace is the
 # other way in.
@@ -603,11 +729,28 @@ Flags for AI Agents & Automation:
                                 unset at a zonal --gcp-region builds Standard instead.
                                 Ignored when installing onto a cluster that already
                                 exists — its live shape wins.
+  --mode=MODE                   The PlatformAgent's spec.mode: next | today. next renders
+                                the NATS bus and the A2A gateway in front of the agent;
+                                today is the previous stack, kept as a rollback.
+                                Recorded in install.env as PLATFORM_AGENT_MODE when
+                                the file sets none; one that sets it differently refuses
+                                the flag, so change that key instead
+                                (a mode switch: the upgrade guide's
+                                "Switching spec.mode" section)
+                                (default when install.env sets none: on a cluster that
+                                already runs kube-agents, the mode it runs; on a first
+                                install, DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE,
+                                currently next, or today when it mirrors its third-party
+                                images with --third-party-registry-prefix)
   --agent-namespace=NAMESPACE   Kubernetes namespace the release installs into
                                 (default: DEFAULT_NAMESPACE, currently kubeagents-system).
                                 The chart wires the agent's model-gateway endpoint to this
                                 namespace, so changing it is for CI and second installs
-  --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai
+  --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai |
+                                openai_compatible (a server speaking the OpenAI chat
+                                completions API: vLLM, TGI, an internal gateway) |
+                                sap (SAP AI Core) | any other LiteLLM provider slug, with
+                                --model-default-name and --litellm-env-secret
                                 (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
   --model-max-tokens=N          Output tokens the gateway asks the provider for on a
@@ -638,19 +781,60 @@ Flags for AI Agents & Automation:
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
-  --gitops-org=ORG              GitHub Org for GitOps repo
-  --gitops-repo=REPO            GitOps IaC Repository Name (default: DEFAULT_GITOPS_REPO,
-                                currently gke-fleet-iac)
+  --openai-compatible-api-base=URL
+                                openai_compatible only: the server's base URL including
+                                /v1. Required, as is --model-default-name: no defaults
+  --openai-compatible-target-port=N
+                                openai_compatible only: the server pod's port, required
+                                when the URL names an in-cluster Service (<svc>,
+                                <svc>.<namespace>.svc, <svc>.<namespace>.svc.cluster.local);
+                                the gateway's NetworkPolicy matches it, not the Service port
+  --openai-compatible-egress-cidrs=LIST
+                                openai_compatible only: comma-separated private ranges the
+                                server is reached at, required when the URL is not an
+                                in-cluster Service, unless it is a public endpoint on 443
+  --openai-compatible-ca-secret-name=NAME
+                                openai_compatible only: Secret in the agent's namespace
+                                holding the PEM CA that signs the server's certificate,
+                                under the key ca.crt; trusted for this server only
+  --openai-compatible-api-key=KEY
+                                openai_compatible only: the server's API key (optional)
+  --litellm-env-secret=NAME     Secret in the agent's namespace the gateway reads whole as
+                                environment variables; you create it, the install only
+                                names it. Carries the SAP AI Core service key for
+                                --model-provider=sap (AICORE_SERVICE_KEY,
+                                AICORE_RESOURCE_GROUP), another LiteLLM provider's
+                                variables (any slug with --model-default-name), or the
+                                OAuth2 client credentials of an openai_compatible gateway
+                                (OPENAI_COMPATIBLE_OAUTH_TOKEN_URL, _CLIENT_ID, _CLIENT_SECRET)
+  --gitops-org=ORG              GitHub organization of the GitOps repo (GitHub only)
+  --gitops-repo=REPO            GitOps IaC repository: on GitHub its name (default:
+                                DEFAULT_GITOPS_REPO, currently gke-fleet-iac); on GitLab the
+                                project's full path (required, no default)
   --gitops-forge=FORGE          Forge holding the GitOps repo: github or gitlab (default: github).
                                 For gitlab, --gitops-repo is the project's full path
                                 (group/subgroup/project) and --gitops-org is not used
-  --gitops-host=HOST            Self-managed GitLab hostname (default: gitlab.com)
+  --gitops-host=HOST            The forge's hostname. With github: a GitHub Enterprise Server
+                                hostname (default: github.com). --gitops-org and --gitops-repo
+                                are then on that host, and the GitHub App must be created
+                                there. github.com itself switches a recorded GitHub
+                                Enterprise Server install back to github.com. A host under
+                                github.com, githubusercontent.com, ghe.com or another
+                                domain that GitHub operates is refused. With gitlab: a
+                                self-managed GitLab hostname (default: gitlab.com)
   --gitlab-token-file=PATH      File holding the GitLab access token (scopes: api,
                                 write_repository); read into the Kubernetes Secret after the
                                 apply and never stored. Without it the installer prompts, or,
                                 non-interactively, leaves the Secret for you to create
   --gitlab-token-secret=NAME    Kubernetes Secret holding the GitLab token
                                 (default: gitlab-forge-token)
+  --gitops-ca-file=PATH         PEM CA that signed the certificate of a self-managed GitLab or a
+                                GitHub Enterprise Server (a private CA); needs --gitops-host.
+                                Read after the apply into Secret gitlab-forge-ca (GitLab) or
+                                github-forge-ca (GitHub Enterprise Server). The credential
+                                broker trusts it for that host only. On GitHub Enterprise
+                                Server the token minter trusts it too, for all of its calls,
+                                and the installer restarts the minter so it reads the CA
   --github-app-id=ID            Numeric GitHub App ID for GitOps token minter
   --github-pem-path=PATH        Local path to downloaded GitHub App private key (.pem)
   --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default: DEFAULT_KMS_KEYRING,
@@ -679,7 +863,9 @@ Flags for AI Agents & Automation:
   --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
                                 unmanaged
   --scope-exclude-clusters=TRIPLES
-                                Clusters to leave unmanaged, each as project/location/cluster
+                                Clusters to leave unmanaged and out of fleet answers and
+                                the per-cluster audits, each as
+                                project/location/cluster
   --scoped-sa-pool-enabled[=BOOL]
                                 Arm the scoped service account pool: one reader service
                                 account per project in scope, which the credential broker
@@ -695,6 +881,12 @@ Flags for AI Agents & Automation:
   --enable-hermes-dashboard[=true|false]
                                 Enable Hermes Web UI port 9119 dashboard
                                 (default: DEFAULT_ENABLE_WEBUI, currently false)
+  --enable-web-console[=true|false]
+                                Deploy the in-cluster web console, a browser chat
+                                page for the agent reached by kubectl port-forward.
+                                Requires NetworkPolicy enforcement on the cluster
+                                (cannot be combined with --accept-no-network-policy)
+                                (default: DEFAULT_ENABLE_WEB_CONSOLE, currently false)
   --enable-gke-backup-plan[=true|false]
                                 Provision a GKE Backup Plan for the cluster
                                 (default: DEFAULT_ENABLE_GKE_BACKUP_PLAN, currently false)
@@ -766,13 +958,19 @@ Flags for AI Agents & Automation:
                                 Google Chat space ID for unsolicited alerts/messages (e.g. spaces/AAAA...)
   --slack-bot-token=TOKENS      Comma-separated Slack bot tokens (xoxb-...), one per
                                 workspace the agent serves. The relay keys each one by
-                                the team it authenticates as
+                                the team it authenticates as. Under --mode=next the
+                                A2A gateway serves one workspace: pass one token
   --slack-app-token=TOKEN       Slack socket-mode app-level token (xapp-...)
-  --slack-allowed-users=USERS   Comma-separated Slack user IDs allowed to talk to the
-                                agent. Empty allows all users
+  --slack-allowed-users=USERS   Comma-separated Slack member IDs (e.g. U0123ABCD; not
+                                emails) allowed to talk to the agent. Empty allows
+                                every workspace member
   --slack-home-channel=CHANNEL  Slack channel ID for unsolicited alerts/messages (e.g. C01234567)
   --slack-home-channel-name=NAME
                                 Display name of that channel (e.g. #gke-alerts)
+  --slack-home-channel-policy=POLICY
+                                auto (the default, also empty) or manual: sets
+                                spec.integration.slack.homeChannelPolicy on the PlatformAgent;
+                                the CRD reference describes the field
   --migrate-node-pools          Authorize migrating an existing cluster's legacy node pools to
                                 GKE_METADATA. Recreates those nodes and restarts every workload on
                                 them, kube-agents' or not. Without it a cluster with legacy pools is
@@ -781,10 +979,13 @@ Flags for AI Agents & Automation:
   --enable-network-policy       Authorize enabling the legacy Calico NetworkPolicy addon and
                                 enforcement on an existing GKE Standard cluster that has neither it
                                 nor Dataplane V2. May recreate nodes and restart workloads. One of
-                                two answers for such a cluster; the other is below, and without
+                                two answers for such a cluster (or the only answer when
+                                --enable-web-console is on); the other is below, and without
                                 either the cluster is refused unchanged (REFUSED_MISSING_NETWORK_POLICY).
                                 The cluster's owner decides this.
-  --accept-no-network-policy    Install onto such a cluster without modifying it. Every NetworkPolicy
+  --accept-no-network-policy    Install onto such a cluster without modifying it (unavailable when
+                                --enable-web-console / WEB_CONSOLE_ENABLED=true is enabled, as the
+                                web console requires NetworkPolicy enforcement). Every NetworkPolicy
                                 kube-agents ships is then inert, including the ones that confine the
                                 agent's shell sandbox; the choice is recorded in the install report
                                 and on the PlatformAgent. Mutually exclusive with the flag above.
@@ -795,8 +996,8 @@ Configuration file:
   install.env beside this script (override with KUBE_AGENTS_INSTALL_ENV) is
   loaded first, and a flag beats it. It is sourced with 'set -a', so a key it
   carries also beats an exported variable of the same name -- a flag is what
-  overrides a recorded value for one run, except the chat flags, which must
-  agree with it (see --enable-slack). Start from install.env.example.
+  overrides a recorded value for one run, except the chat flags and --mode,
+  which must agree with it (see --enable-slack and --mode). Start from install.env.example.
   Anything it sets is inherited by later runs, so a re-run that omits a flag
   keeps the value rather than reverting it to the default above.
 EOF
@@ -816,6 +1017,15 @@ flag_bool_value() {
   case "${1:-}" in
     *=*) printf '%s' "${1#*=}" ;;
     *) printf 'true' ;;
+  esac
+}
+
+is_truthy() {
+  local val="${1:-}"
+  val="${val//[[:space:]]/}"
+  case "$val" in
+    [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Yy] | 1 | [Oo][Nn]) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -899,6 +1109,18 @@ require_scope_flag_value() {
   exit 1
 }
 
+# --mode= given nothing is refused like an empty toggle: it cannot mean "keep
+# the recorded mode" (omitting the flag does that), and read as the default it
+# would switch a next install to today for this run. The value itself is
+# checked in main, against the CRD's enum and against install.env, once the
+# shared helpers are loaded.
+require_mode_flag_value() {
+  [ -n "${1:-}" ] && return 0
+  print_error "--mode= was given an empty value."
+  print_info "Pass --mode=today or --mode=next; to keep the mode install.env records, omit the flag."
+  exit 1
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -910,9 +1132,16 @@ parse_args() {
       --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
       --gke-cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
       --gke-cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
+      --mode=*)
+        PARAM_PLATFORM_AGENT_MODE="${1#*=}"; PARAM_PLATFORM_AGENT_MODE_PASSED="true"
+        require_mode_flag_value "$PARAM_PLATFORM_AGENT_MODE"
+        # Held to install.env as the chat flags are: the run after a one-run
+        # switch, and every upgrade.sh, would read the file and switch back.
+        note_install_env_flag PLATFORM_AGENT_MODE "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_PLATFORM_AGENT_MODE DEFAULT_PLATFORM_AGENT_MODE
+        shift ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
-      --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
+      --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; PARAM_MODEL_DEFAULT_NAME_PASSED="true"; shift ;;
       --model-max-tokens=*) PARAM_MODEL_MAX_TOKENS="${1#*=}"; shift ;;
       --litellm-redaction|--litellm-redaction=*)
         PARAM_LITELLM_REDACTION_ENABLED="$(flag_bool_value "$1")"
@@ -929,14 +1158,21 @@ parse_args() {
       --gemini-api-key=*) PARAM_GEMINI_API_KEY="${1#*=}"; shift ;;
       --openai-api-key=*) PARAM_OPENAI_API_KEY="${1#*=}"; shift ;;
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
+      --openai-compatible-api-base=*) PARAM_OPENAI_COMPATIBLE_API_BASE="${1#*=}"; shift ;;
+      --openai-compatible-target-port=*) PARAM_OPENAI_COMPATIBLE_TARGET_PORT="${1#*=}"; shift ;;
+      --openai-compatible-egress-cidrs=*) PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS="${1#*=}"; shift ;;
+      --openai-compatible-ca-secret-name=*) PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME="${1#*=}"; shift ;;
+      --openai-compatible-api-key=*) PARAM_OPENAI_COMPATIBLE_API_KEY="${1#*=}"; shift ;;
+      --litellm-env-secret=*) PARAM_LITELLM_ENV_SECRET_NAME="${1#*=}"; shift ;;
       --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
       --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
       --gitops-forge=*) PARAM_GITOPS_FORGE="${1#*=}"; shift ;;
       --gitops-host=*) PARAM_GITOPS_HOST="${1#*=}"; PARAM_GITOPS_HOST_FROM_FLAG="true"; shift ;;
       --gitlab-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
       --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
-      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
-      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
+      --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
+      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_APP_ID_FROM_FLAG="true"; shift ;;
+      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_PEM_PATH_FROM_FLAG="true"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
@@ -986,6 +1222,9 @@ parse_args() {
       --enable-hermes-dashboard|--enable-hermes-dashboard=*)
         PARAM_ENABLE_WEBUI="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_WEBUI"; shift ;;
+      --enable-web-console|--enable-web-console=*)
+        PARAM_ENABLE_WEB_CONSOLE="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_WEB_CONSOLE"; shift ;;
       --user-profile-enabled=*) PARAM_USER_PROFILE_ENABLED="${1#*=}"; shift ;;
       --enable-gke-backup-plan|--enable-gke-backup-plan=*)
         PARAM_ENABLE_GKE_BACKUP_PLAN="$(flag_bool_value "$1")"
@@ -1054,6 +1293,10 @@ parse_args() {
       --slack-home-channel-name=*)
         PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"
         note_install_env_flag SLACK_HOME_CHANNEL_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_NAME
+        shift ;;
+      --slack-home-channel-policy=*)
+        PARAM_SLACK_HOME_CHANNEL_POLICY="${1#*=}"
+        note_install_env_flag SLACK_HOME_CHANNEL_POLICY "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_POLICY
         shift ;;
       --chat-topic-name=*)
         PARAM_CHAT_TOPIC_NAME="${1#*=}"
@@ -1249,6 +1492,17 @@ require_creatable_cluster_mode() {
     print_info "For a zonal cluster, pass --gke-cluster-mode=standard."
     exit 1
   fi
+}
+
+# How to open the web console. It is reached only by port-forward: its Service
+# is ClusterIP behind a deny-all NetworkPolicy, and it answers only on
+# localhost. The console pod is not sandboxed, so port-forward reaches it even
+# when the agent runs under gVisor.
+print_web_console_access() {
+  local namespace=$1
+  echo -e "  • ${C_CYAN}Web Console:${C_RESET} ${C_GREEN}Enabled${C_RESET}"
+  echo -e "    ${C_YELLOW}Workstation Access Command:${C_RESET} kubectl port-forward svc/${WEB_CONSOLE_SERVICE} -n ${namespace} ${WEB_CONSOLE_PORT}:${WEB_CONSOLE_PORT}"
+  echo -e "    ${C_YELLOW}Browser URL:${C_RESET} ${C_UNDERLINE}http://localhost:${WEB_CONSOLE_PORT}${C_RESET}"
 }
 
 # How GKE writes the shape. bash 3.2, still macOS's /bin/bash, has no ${var^}.
@@ -1709,23 +1963,26 @@ install_env_records_key() {
 # Say so when an interactive answer changed something the file still records
 # differently.
 #
-# install.env is an input: install.sh creates one when there is none and never
-# rewrites a line of it. The interview, though, still runs in full on every interactive
+# install.env is an input: install.sh creates one when there is none and writes
+# to it only as scripts/installer/README.md ("install.env") lists. The interview, though, still runs in full on every interactive
 # invocation, and its answers go straight into the environment
 # write_tfvars_from_state reads. So an operator who answers "None" at the chat
 # menu gets the Pub/Sub topic destroyed by this apply and re-created by the
 # next run, because the file still says the integration is on. Nothing else
 # tells them: "Kept your install configuration" reads as reassurance, and the
-# Day-2 menu's Save & Apply is the only path that writes a changed key back.
+# Day-2 menu's Save & Apply is the path that writes a changed key back (the
+# GitOps keys aside: see scripts/installer/README.md, "install.env").
 #
 # A warning rather than a write, deliberately. Making install.sh persist here
 # would contradict the contract stated in install.env.example, INSTALL.md and
 # the chart's CI story -- #1117 renders this file on an ephemeral runner and
 # needs the installer not to rewrite it. Naming the drift costs nothing
-# and leaves the decision where it belongs. The one write install.sh does make
-# is narrower: a chat key the file does not assign, appended from a chat flag
-# with the settings a toggle recorded true brings (record_flags_into_install_env);
-# it never changes a key the file sets.
+# and leaves the decision where it belongs. The writes install.sh does make
+# are narrower: a chat key or PLATFORM_AGENT_MODE the file does not assign,
+# appended from a chat flag or --mode, with the settings a chat toggle recorded
+# true brings (record_flags_into_install_env); and the GitOps keys
+# (record_gitops_forge_keys, record_github_gitops_keys). It changes no other key
+# the file sets.
 #
 # The list is the interview's own settings, not everything the file holds:
 # IMAGE_TAG and the recovered secrets legitimately differ on a normal run and
@@ -1766,25 +2023,50 @@ warn_unrecorded_interview_answers() {
   local interview_keys=(GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
-    PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET)
+    OPENAI_COMPATIBLE_API_BASE OPENAI_COMPATIBLE_TARGET_PORT OPENAI_COMPATIBLE_EGRESS_CIDRS OPENAI_COMPATIBLE_CA_SECRET_NAME
+    LITELLM_ENV_SECRET_NAME PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
+    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
   read_recorded_install_env_values "$file" "${interview_keys[@]}"
+  # A file written for another provider never records the OPENAI_COMPATIBLE_*
+  # keys (bootstrap_install_env_file writes them for openai_compatible only),
+  # so a switch to it must name them anyway: without them the next run stops in
+  # validate_openai_compatible_inputs, contradicting the remedy printed here.
+  local switched_to_openai_compatible=false
+  if [ "${MODEL_PROVIDER:-}" = "openai_compatible" ] && install_env_records_key "$file" MODEL_PROVIDER &&
+    [ "$(recorded_install_env_value "$file" MODEL_PROVIDER)" != "openai_compatible" ]; then
+    switched_to_openai_compatible=true
+  fi
   for key in "${interview_keys[@]}"; do
-    install_env_records_key "$file" "$key" || continue
+    if ! install_env_records_key "$file" "$key"; then
+      if [ "$switched_to_openai_compatible" = "true" ] && [[ "$key" == OPENAI_COMPATIBLE_* ]]; then
+        drifted="${drifted}${drifted:+ }${key}"
+      fi
+      continue
+    fi
     recorded="$(recorded_install_env_value "$file" "$key")"
     case "$key" in
       MEMORY) current="${PARAM_MEMORY:-}" ;;
       *) current="${!key:-}" ;;
     esac
     [ "$recorded" != "$current" ] || continue
+    # The GitHub GitOps keys follow the answer when the run commits
+    # (record_github_gitops_keys), so they are not drift to report.
+    case "$key" in
+      GITOPS_ORG | GITOPS_REPO | GITHUB_APP_ID)
+        if [ "${GITOPS_FORGE:-github}" = "github" ] && [ -n "${GITOPS_ORG:-}" ] &&
+          [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
+          continue
+        fi
+        ;;
+    esac
     drifted="${drifted}${drifted:+ }${key}"
   done
   [ -n "$drifted" ] || return 0
 
   print_warning "This run applied answers that ${file} does not record."
-  print_info "install.env is an input: install.sh reads it and never changes a key it sets, except its GitOps forge keys when an applied run changes them."
+  print_info "install.env is an input: install.sh changes only the keys scripts/installer/README.md (\"install.env\") lists, and these are not among them."
   print_info "The next run -- or upgrade.sh, or the Day-2 menu -- regenerates from"
   print_info "the file, which will revert what you just changed. Update these keys:"
   for key in $drifted; do
@@ -1942,12 +2224,63 @@ warn_flag_beats_unrecorded_file_value() {
   print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${repeat_flag} on ${repeat_on}."
 }
 
-# The one exception to "an existing install.env is never rewritten": the
-# GitOps forge. upgrade.sh and the Day-2 menu render from the file alone, so a
-# forge this run chose and the file does not record would be reverted to
-# GitHub by the next of them -- the alias back in the CR, the GitLab forge
-# gone, nothing saying why. So when the file's forge differs from this run's,
-# or this run's is GitLab, the forge keys and the repository coordinates they
+# The GitHub GitOps keys this run applies and install.env does not assign:
+# appended when the run commits to the apply, as record_flags_into_install_env
+# appends a chat flag's key. upgrade.sh renders from the file alone, so GitOps
+# configured with --gitops-org, --gitops-repo and --github-app-id and never
+# recorded was rendered off by the next full upgrade, which planned to
+# destroy the token minter (#3075). A key the file lacks is appended, and one
+# it records with a different value is replaced (that line only), since this
+# apply is about to use the new value and the next upgrade would otherwise put
+# the old one back. --github-pem-path never is (the key lives in Cloud KMS once
+# imported). Run where the run commits: the apply, and the --generate-only
+# handoff, whose lifecycle.sh apply renders these keys. A declined run leaves
+# the file as it was. (record_gitops_forge_keys stays apply-only: a forge
+# switch is previewed with --generate-only before it is made.)
+record_github_gitops_keys() {
+  local file="$1" key value
+  [ -f "$file" ] || return 0
+  [ "${PARAM_DRY_RUN:-false}" = "true" ] && return 0
+  [ "${GITOPS_FORGE:-github}" = "github" ] || return 0
+  [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] || return 0
+  local tmp
+  for key in GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
+    value="${!key}"
+    # Read afresh for each key: a rewrite below drops a whole line, and a line
+    # that assigned two of these keys takes both with it.
+    RECORDED_INSTALL_ENV_FILE=""
+    if install_env_records_key "$file" "$key"; then
+      [ "$(recorded_install_env_value "$file" "$key")" != "$value" ] || continue
+      tmp="${file}.tmp.$$"
+      ( umask 077; : >"$tmp" )
+      grep -E -v "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" >"$tmp" || true
+      write_env_var "$tmp" "$key" "$value"
+      chmod 600 "$tmp" 2>/dev/null || true
+      mv "$tmp" "$file"
+      print_info "Updated ${key}=$(printf '%q' "$value") in ${file} to the value this run applies, so upgrade.sh keeps it."
+    else
+      # A last line with no newline would run into the appended assignment.
+      if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
+        printf '\n' >> "$file"
+      fi
+      write_env_var "$file" "$key" "$value"
+      print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so upgrade.sh keeps GitOps on."
+    fi
+  done
+  # The cache read_recorded_install_env_values keeps is keyed by path, and the
+  # file just changed under it.
+  RECORDED_INSTALL_ENV_FILE=""
+}
+
+# One of the two GitOps exceptions to "an existing install.env is never
+# rewritten" (record_github_gitops_keys above is the other): the GitOps forge.
+# upgrade.sh and the Day-2 menu render from the file alone, so a forge this
+# run chose and the file does not record would be reverted by the next of
+# them -- the alias back in the CR, the GitLab or GitHub Enterprise Server
+# forge gone, nothing saying why. A GitHub Enterprise Server is a forge of its
+# own here: the github forge at a host. So when the file's forge or GitHub
+# host differs from this run's, or this run's forge is GitLab, or the CA
+# Secret changed, the forge keys and the repository coordinates they
 # qualify are rewritten in place (those lines only; every other line is kept
 # as written). The token and its source are never among them.
 record_gitops_forge_keys() {
@@ -1955,39 +2288,72 @@ record_gitops_forge_keys() {
   [ -f "$file" ] || return 0
   [ "${PARAM_DRY_RUN:-false}" = "true" ] && return 0
   local current="${GITOPS_FORGE:-github}" recorded=""
-  read_recorded_install_env_values "$file" GITOPS_FORGE
+  read_recorded_install_env_values "$file" GITOPS_FORGE GITOPS_HOST GITOPS_CA_SECRET
   if install_env_records_key "$file" GITOPS_FORGE; then
     recorded="$(recorded_install_env_value "$file" GITOPS_FORGE)"
   fi
   [ -z "$recorded" ] && recorded="github"
-  [ "$current" = "gitlab" ] || [ "$recorded" != "$current" ] || return 0
+  # The GitHub host: empty for github.com, which records no forge keys.
+  local current_host="" recorded_host=""
+  [ "$current" = "github" ] && current_host="${GITOPS_HOST:-}"
+  [ "$recorded" = "github" ] && recorded_host="$(recorded_install_env_value "$file" GITOPS_HOST)"
+  if [ "$current" = "github" ] && [ "$recorded" = "github" ]; then
+    [ "$current_host" = "$recorded_host" ] &&
+      [ "$(recorded_install_env_value "$file" GITOPS_CA_SECRET)" = "${GITOPS_CA_SECRET:-}" ] &&
+      return 0
+  fi
   if [ "$recorded" = "gitlab" ] && [ "$current" = "gitlab" ]; then
-    read_recorded_install_env_values "$file" GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_REPO
+    read_recorded_install_env_values "$file" GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_REPO GITOPS_CA_SECRET
     if [ "$(recorded_install_env_value "$file" GITOPS_HOST)" = "${GITOPS_HOST:-}" ] &&
       [ "$(recorded_install_env_value "$file" GITLAB_TOKEN_SECRET)" = "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}" ] &&
-      [ "$(recorded_install_env_value "$file" GITOPS_REPO)" = "${GITOPS_REPO:-}" ]; then
+      [ "$(recorded_install_env_value "$file" GITOPS_REPO)" = "${GITOPS_REPO:-}" ] &&
+      [ "$(recorded_install_env_value "$file" GITOPS_CA_SECRET)" = "${GITOPS_CA_SECRET:-}" ]; then
       return 0
     fi
   fi
   # GITHUB_APP_ID with them: left in a file that now records GitLab, the next
-  # run's validator would refuse the pair.
-  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
+  # run's validator would refuse the pair. GITHUB_PEM_PATH too: a GitLab
+  # install has no App. The GitHub branch below writes it back.
+  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
+  # The App's KMS key too, on GitHub: an App belongs to one GitHub host, so a
+  # switch of host names the new App's key (--kms-key), and the next
+  # upgrade.sh must render that key and not the old App's.
+  [ "$current" = "github" ] && keys+=(KMS_KEYRING KMS_KEY)
   local tmp="${file}.tmp.$$"
   ( umask 077; : >"$tmp" )
   grep -E -v "^[[:space:]]*(export[[:space:]]+)?($(IFS='|'; echo "${keys[*]}"))=" "$file" >"$tmp" || true
+  local label="$current"
   if [ "$current" = "gitlab" ]; then
     write_env_var "$tmp" GITOPS_FORGE "gitlab"
     write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
     write_env_var "$tmp" GITLAB_TOKEN_SECRET "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
+    write_env_var "$tmp" GITOPS_CA_SECRET "${GITOPS_CA_SECRET:-}"
     write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   else
+    if [ -n "$current_host" ]; then
+      label="GitHub Enterprise Server ${current_host}"
+      write_env_var "$tmp" GITOPS_FORGE "github"
+      write_env_var "$tmp" GITOPS_HOST "$current_host"
+      write_env_var "$tmp" GITOPS_CA_SECRET "${GITOPS_CA_SECRET:-}"
+    fi
     write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
     write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
     write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
+    write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
+    write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
+    # The path of the App's private key, never the key: the path this run
+    # uses (--github-pem-path, the PEM prompt, or the path install.env
+    # recorded). A rewrite of the forge keys must not drop a key the operator
+    # keeps: a later run reads the path from here when it must import the key
+    # again, for example after the KMS key version is disabled. Written only
+    # when set, so a file that recorded none gets no empty line.
+    if [ -n "${GITHUB_PEM_PATH:-}" ]; then
+      write_env_var "$tmp" GITHUB_PEM_PATH "$GITHUB_PEM_PATH"
+    fi
   fi
   chmod 600 "$tmp" 2>/dev/null || true
   mv "$tmp" "$file"
-  print_info "Recorded the GitOps forge (${current}) and its repository in ${file}, so upgrade.sh renders the same forge."
+  print_info "Recorded the GitOps forge (${label}) and its repository in ${file}, so upgrade.sh renders the same forge."
   # The recorded-value cache read the file before this rewrite.
   RECORDED_INSTALL_ENV_FILE=""
 }
@@ -1996,7 +2362,9 @@ record_gitops_forge_keys() {
 # configures something upgrade.sh renders from the file alone, and upgrade.sh
 # takes none of them, so one that beat the file for a single run would be undone
 # by the next upgrade with no one told: a Slack relay switched off, a home
-# channel or an allowlist put back. So against an existing install.env:
+# channel or an allowlist put back. --mode is held the same way, for the same
+# reason (validate_platform_agent_mode); it is not a chat key and brings no
+# companions. So against an existing install.env:
 #
 #   - a flag that disagrees with the key the file assigns is refused before
 #     anything is applied, naming the file and the key;
@@ -2029,13 +2397,13 @@ record_gitops_forge_keys() {
 # running install reads from Terraform state.
 install_env_toggle_companions() {
   case "${1:-}" in
-    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME" ;;
+    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME SLACK_HOME_CHANNEL_POLICY" ;;
     GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_MODE" ;;
     *) ;;
   esac
 }
 
-# A chat flag this run typed, noted for check_flags_against_install_env. Its
+# A chat flag or --mode this run typed, noted for check_flags_against_install_env. Its
 # value is read from the PARAM_* at check time, so a flag given twice is checked
 # at the value that won.
 note_install_env_flag() {
@@ -2108,7 +2476,7 @@ check_flag_against_install_env() {
       ;;
   esac
   print_error "${flag}=$(printf '%q' "$value") disagrees with the install configuration, so it would hold for this run only: ${file} records ${recorded_shown}."
-  print_info "The next install.sh run without the flag, and every upgrade.sh, renders from the file and goes back to it. install.sh records a chat flag only where install.env assigns no such key; it does not change a key the file assigns."
+  print_info "The next install.sh run without the flag, and every upgrade.sh, renders from the file and goes back to it. install.sh records ${flag} only where install.env assigns no ${key}; it does not change a key the file assigns."
   local remedy
   remedy="Set ${key}=$(printf '%q' "$value") in ${file}"
   case " ${INSTALL_ENV_KEYS_THE_MENU_SAVES} " in
@@ -2118,11 +2486,14 @@ check_flag_against_install_env() {
   if [ "$key" = "SLACK_ENABLED" ] && is_truthy "$value"; then
     remedy="${remedy}, passing --slack-bot-token and --slack-app-token (or answering their prompts on an interactive run)"
   fi
+  if [ "$key" = "PLATFORM_AGENT_MODE" ]; then
+    remedy="${remedy}. On a running install that is a mode switch: ${PLATFORM_AGENT_MODE_SWITCH_DOC}"
+  fi
   print_info "${remedy}."
   return 1
 }
 
-# Every chat flag this run typed, against an existing install.env. Each
+# Every chat flag and --mode this run typed, against an existing install.env. Each
 # disagreement is named before the run stops, so one run lists them all.
 check_flags_against_install_env() {
   local file="${INSTALL_ENV_FILE:-}" entry key flag kind param default_var default refused="false"
@@ -2250,7 +2621,7 @@ bootstrap_install_env_file() {
   [ -n "$destination" ] || return 0
   if [ -f "$destination" ]; then
     print_info "Kept your install configuration: ${destination}"
-    # The chat flags check_flags_against_install_env queued: written only once
+    # The flags check_flags_against_install_env queued: written only once
     # this run goes on to the apply or the handoff (record_flags_into_install_env).
     if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ]; then
       print_info "${destination} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }: the values this run applies to them are recorded there if it goes on to the apply or the handoff."
@@ -2258,9 +2629,10 @@ bootstrap_install_env_file() {
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
     # The flags that override a recorded value for one run. This function
-    # never rewrites an existing file (record_gitops_forge_keys, after the
-    # apply is chosen, is the one writer of an existing file), so only a
-    # first install can record any of them on the operator's behalf.
+    # never rewrites an existing file (record_gitops_forge_keys and
+    # record_github_gitops_keys, once the run commits, are the writers of an
+    # existing file, for the GitOps keys only), so only a first install can
+    # record any of them on the operator's behalf.
     warn_flag_beats_unrecorded_file_value "$destination" NAMESPACE --agent-namespace \
       "${PARAM_AGENT_NAMESPACE:-}" \
       "A later run without it resolves the default namespace, renders tfvars for that one, looks for the recovered Secret there, and is refused by lifecycle.sh's guard_release_namespace." \
@@ -2269,6 +2641,11 @@ bootstrap_install_env_file() {
     warn_flag_beats_unrecorded_file_value "$destination" ENABLE_GKE_BACKUP_PLAN --enable-gke-backup-plan \
       "${PARAM_ENABLE_GKE_BACKUP_PLAN:-}" \
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
+      true \
+      "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" WEB_CONSOLE_ENABLED --enable-web-console \
+      "${PARAM_ENABLE_WEB_CONSOLE:-}" \
+      "A later run without it renders the web console from what the file records; upgrade.sh and --menu take no --enable-web-console, so the next of either puts the console back to the recorded or default state." \
       true \
       "every later install.sh run"
     # Five consequence strings, unlike every other call here, which take one.
@@ -2500,7 +2877,7 @@ bootstrap_install_env_file() {
   local tmp="${destination}.tmp"
   {
     printf '%s\n' "# kube-agents install configuration, created by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
-    printf '%s\n' "# This file is yours now: install.sh reads it and never changes a line of it, except the GitOps forge keys when an applied run changes them."
+    printf '%s\n' "# This file is yours now: install.sh reads it and writes to it only as scripts/installer/README.md (\"install.env\") lists."
     printf '%s\n' "# Edit it and re-run the installer to change the install."
     printf '%s\n' "# See install.env.example for every supported key and what it does."
     printf '%s\n' "#"
@@ -2512,6 +2889,20 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" CLUSTER_NAME "${CLUSTER_NAME:-}"
   write_env_var "$tmp" REGION "${REGION:-}"
   write_env_var "$tmp" CLUSTER_MODE "${CLUSTER_MODE:-}"
+  # Recorded on every first install, the default included: the file is the one
+  # place a later run, and every upgrade.sh, reads the mode from, and a --mode
+  # that disagrees with it is refused (check_flags_against_install_env).
+  # Except a mode guessed because the cluster could not be read
+  # (adopt_live_platform_agent_mode): the next run that can read it settles it.
+  if [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" != "true" ] || [ -n "${PARAM_PLATFORM_AGENT_MODE:-}" ]; then
+    write_env_var "$tmp" PLATFORM_AGENT_MODE "${PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
+  fi
+  # Only when set: a first install that inherits a size records it, because
+  # every later run reads the file alone, and a size missing there would read
+  # as the lower default. Unset, later runs follow the default.
+  if [ -n "${PLATFORM_AGENT_STORAGE_SIZE:-}" ]; then
+    write_env_var "$tmp" PLATFORM_AGENT_STORAGE_SIZE "$PLATFORM_AGENT_STORAGE_SIZE"
+  fi
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
   write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
@@ -2522,9 +2913,25 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
+  # The daily alert ceilings, recorded even when empty. An empty key keeps the
+  # image default, and the line shows where to set the ceiling. A value that
+  # was exported only for this run then also applies on the next upgrade.sh.
+  local alert_key
+  for alert_key in $ALERT_DAILY_LIMIT_KEYS; do
+    write_env_var "$tmp" "$alert_key" "${!alert_key:-}"
+  done
   write_secret_env_var "$tmp" GEMINI_API_KEY "${GEMINI_API_KEY:-}"
   write_secret_env_var "$tmp" OPENAI_API_KEY "${OPENAI_API_KEY:-}"
   write_secret_env_var "$tmp" ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY:-}"
+  # Only for this provider, so every other install's file stays as it was.
+  if [ "${MODEL_PROVIDER:-}" = "openai_compatible" ]; then
+    write_env_var "$tmp" OPENAI_COMPATIBLE_API_BASE "${OPENAI_COMPATIBLE_API_BASE:-}"
+    write_env_var "$tmp" OPENAI_COMPATIBLE_TARGET_PORT "${OPENAI_COMPATIBLE_TARGET_PORT:-}"
+    write_env_var "$tmp" OPENAI_COMPATIBLE_EGRESS_CIDRS "${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
+    write_env_var "$tmp" OPENAI_COMPATIBLE_CA_SECRET_NAME "${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
+    write_secret_env_var "$tmp" OPENAI_COMPATIBLE_API_KEY "${OPENAI_COMPATIBLE_API_KEY:-}"
+  fi
+  write_env_var "$tmp" LITELLM_ENV_SECRET_NAME "${LITELLM_ENV_SECRET_NAME:-}"
   write_env_var "$tmp" ALLOWED_USERS "${ALLOWED_USERS:-}"
   write_env_var "$tmp" CHAT_TOPIC_NAME "${CHAT_TOPIC_NAME:-}"
   write_env_var "$tmp" CHAT_SUB_NAME "${CHAT_SUB_NAME:-}"
@@ -2537,6 +2944,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" SLACK_ALLOWED_USERS "${SLACK_ALLOWED_USERS:-}"
   write_env_var "$tmp" SLACK_HOME_CHANNEL "${SLACK_HOME_CHANNEL:-}"
   write_env_var "$tmp" SLACK_HOME_CHANNEL_NAME "${SLACK_HOME_CHANNEL_NAME:-}"
+  write_env_var "$tmp" SLACK_HOME_CHANNEL_POLICY "${SLACK_HOME_CHANNEL_POLICY:-}"
   write_secret_env_var "$tmp" API_SERVER_KEY "${API_SERVER_KEY:-}"
   write_env_var "$tmp" PLATFORM_AGENT_PERMISSION_SET "${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
@@ -2565,12 +2973,20 @@ bootstrap_install_env_file() {
     write_env_var "$tmp" GITOPS_FORGE "gitlab"
     write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
     write_env_var "$tmp" GITLAB_TOKEN_SECRET "${GITLAB_TOKEN_SECRET:-}"
+    write_env_var "$tmp" GITOPS_CA_SECRET "${GITOPS_CA_SECRET:-}"
+  elif [ -n "${GITOPS_HOST:-}" ]; then
+    # A GitHub Enterprise Server: the forge, its host and the CA Secret's
+    # name. A github.com install records none of them, as before.
+    write_env_var "$tmp" GITOPS_FORGE "github"
+    write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST}"
+    write_env_var "$tmp" GITOPS_CA_SECRET "${GITOPS_CA_SECRET:-}"
   fi
   write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
   write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
   write_env_var "$tmp" MEMORY "$PARAM_MEMORY"
   write_env_var "$tmp" USER_PROFILE_ENABLED "${USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}"
   write_env_var "$tmp" HERMES_DASHBOARD_ENABLED "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}"
+  write_env_var "$tmp" WEB_CONSOLE_ENABLED "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}"
   write_env_var "$tmp" ENABLE_GVISOR "${ENABLE_GVISOR:-$DEFAULT_ENABLE_GVISOR}"
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
@@ -2908,6 +3324,7 @@ source_provisioning_helpers() {
 # cannot be: this runs in step 2, before the interview.
 resolve_shared_defaults() {
   normalize_gitops_repo_vars
+  resolve_platform_agent_mode_fallback
   PARAM_MODEL_PROVIDER="${PARAM_MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   PARAM_REGISTRY_PREFIX="${PARAM_REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}"
   PARAM_PERMISSION_SET="${PARAM_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
@@ -2915,6 +3332,9 @@ resolve_shared_defaults() {
   # that has to survive to the validator rather than being read as the default.
   PARAM_ENABLE_GVISOR="${PARAM_ENABLE_GVISOR-$DEFAULT_ENABLE_GVISOR}"
   PARAM_ENABLE_WEBUI="${PARAM_ENABLE_WEBUI:-$DEFAULT_ENABLE_WEBUI}"
+  # No PARAM_ENABLE_WEB_CONSOLE, for the reason given below for
+  # PARAM_ENABLE_DRIFT_DETECTOR: empty means "this run did not say", which is
+  # what lets bootstrap_install_env_file warn only about a flag that was given.
   PARAM_USER_PROFILE_ENABLED="${PARAM_USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}"
   PARAM_MEMORY="${PARAM_MEMORY:-$DEFAULT_MEMORY}"
   PARAM_ENABLE_GOOGLE_CHAT="${PARAM_ENABLE_GOOGLE_CHAT:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
@@ -2925,10 +3345,14 @@ resolve_shared_defaults() {
   # install.env that records a GitHub org or App -- so the interview asks only
   # when nothing has said. A re-run of a GitHub install sees no new question.
   PARAM_GITOPS_FORGE_GIVEN="false"
-  if [ -n "${PARAM_GITOPS_FORGE:-}" ] || [ -n "${PARAM_GITOPS_ORG:-}" ] || [ -n "${PARAM_GITHUB_APP_ID:-}" ]; then
+  if [ -n "${PARAM_GITOPS_FORGE:-}" ] || [ -n "${PARAM_GITOPS_ORG:-}" ] || [ -n "${PARAM_GITHUB_APP_ID:-}" ] ||
+    [ "${PARAM_GITOPS_HOST_FROM_FLAG:-false}" = "true" ]; then
     PARAM_GITOPS_FORGE_GIVEN="true"
   fi
   PARAM_GITOPS_FORGE="${PARAM_GITOPS_FORGE:-$DEFAULT_GITOPS_FORGE}"
+  # Set by ask_gitops_forge when the operator answers that there is no GitOps
+  # repository; main's step 8 then skips the repository menu.
+  GITOPS_INTERVIEW_DECLINED="false"
   PARAM_GITLAB_TOKEN_SECRET="${PARAM_GITLAB_TOKEN_SECRET:-$DEFAULT_GITLAB_TOKEN_SECRET}"
   # DEFAULT_GITOPS_REPO is a GitHub repository name; a GitLab project has no
   # default path, so the validator asks for one instead of inventing it.
@@ -3213,6 +3637,9 @@ prompt_menu() {
     [ "$default_choice" -lt 1 ] || [ "$default_choice" -gt "${#options[@]}" ]; then
     default_choice=1
   fi
+  # Canonical digits on this exit too, so a preset "04" and a typed "04"
+  # store the same answer.
+  default_choice=$((10#$default_choice))
 
   if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
     printf -v "$var_name" '%s' "$default_choice"
@@ -3236,7 +3663,9 @@ prompt_menu() {
   while true; do
     prompt_read "Select an option (1-${#options[@]})" choice "$default_choice"
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
-      printf -v "$var_name" '%s' "$choice"
+      # Canonical digits: callers compare the answer as a string (`case`,
+      # `=`), and "04" is within bounds but is not "4".
+      printf -v "$var_name" '%s' "$((10#$choice))"
       break
     else
       print_error "Invalid selection. Please enter a number between 1 and ${#options[@]}." >/dev/tty
@@ -3434,7 +3863,7 @@ write_json_report() {
   if [ "${GITOPS_FORGE:-github}" = "gitlab" ] && [ -n "${GITOPS_REPO:-}" ]; then
     report_gitops_repo="$(gitlab_repo_url)"
   elif [ -n "${github_org:-}" ] && [ -n "${github_repo:-}" ]; then
-    report_gitops_repo="https://github.com/${github_org}/${github_repo}"
+    report_gitops_repo="https://${GITOPS_HOST:-github.com}/${github_org}/${github_repo}"
   fi
 
   cat << EOF > "$report_file"
@@ -3579,7 +4008,22 @@ print_generate_only_handoff() {
   echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
   echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
+  # A GitHub Enterprise Server's private CA: a run that applies writes the
+  # Secret and restarts the minter after the apply; this route does neither.
+  local step=4
+  if [ "${GITOPS_FORGE:-github}" != "gitlab" ] && [ -n "${GITOPS_HOST:-}" ] && [ -n "${GITOPS_CA_SECRET:-}" ]; then
+    local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+    echo -e "${C_BOLD}${step}. After the apply, the GitHub Enterprise Server CA (any cluster):${C_RESET}"
+    echo -e "    kubectl create secret generic ${GITOPS_CA_SECRET} -n ${ns} --from-file=ca.crt=<path-to-ca.pem> --dry-run=client -o yaml | kubectl apply --server-side -f -"
+    echo -e "    kubectl rollout restart deployment/${GITHUB_MINTER_DEPLOYMENT} -n ${ns}"
+    step=$((step + 1))
+  fi
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-}" || is_truthy "${SLACK_ENABLED:-}"; then
+    echo -e "${C_BOLD}${step}. After the apply, the chat app's setup checklist (settings no apply can make):${C_RESET}"
+    print_chat_checklist_commands
+  fi
 }
+
 
 # Runs lifecycle.sh apply against the generated terraform.tfvars. Reads the
 # install coordinates from the environment (load install.env first).
@@ -3630,16 +4074,25 @@ ensure_existing_cluster_cmek() {
   local key_resource="projects/${project_id}/locations/${kms_location}/keyRings/${keyring}/cryptoKeys/${key}"
   print_info "Enabling CMEK database encryption on existing cluster '$cluster_name' (key: $key_resource)..."
   gcloud services enable cloudkms.googleapis.com --project="$project_id"
-  gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" 2>/dev/null || true
-  gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
-    --purpose="encryption" --project="$project_id" 2>/dev/null || true
+  local kr_err="" k_err=""
+  kr_err="$(trap - ERR; retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id")" || true
+  if printf '%s\n' "$kr_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    print_error "Cloud KMS keyring create failed after propagation retries: $kr_err"
+    return 1
+  fi
+  k_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+    --purpose="encryption" --project="$project_id")" || true
+  if printf '%s\n' "$k_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    print_error "Cloud KMS key create failed after propagation retries: $k_err"
+    return 1
+  fi
   local project_number service_agent
   project_number=$(gcloud projects describe "$project_id" --format="value(projectNumber)")
   service_agent="service-${project_number}@container-engine-robot.iam.gserviceaccount.com"
   gcloud beta services identity create --service=container.googleapis.com --project="$project_id" 2>/dev/null || true
-  gcloud kms keys add-iam-policy-binding "$key" --keyring="$keyring" --location="$kms_location" \
+  retry_kms_create gcloud kms keys add-iam-policy-binding "$key" --keyring="$keyring" --location="$kms_location" \
     --member="serviceAccount:${service_agent}" \
-    --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" --project="$project_id" --quiet >/dev/null
+    --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" --project="$project_id" --quiet --format=none
   print_info "Updating the live cluster control plane; this can take several minutes..."
   gcloud container clusters update "$cluster_name" --location "$region" \
     --database-encryption-key="$key_resource" --project "$project_id" --quiet
@@ -3919,22 +4372,44 @@ print_no_network_policy_consequences() {
   print_info "Every NetworkPolicy this install ships is accepted by the API server and enforced by nothing:"
   print_info "  • the agent pod's ingress restriction and egress confinement (otherwise port 443 outside private ranges, and named in-cluster peers)"
   print_info "  • the shell sandbox's deny-all policy, which otherwise allows only cluster DNS and the credential proxy"
-  print_info "  • the LiteLLM gateway, GitHub token minter and Hindsight policies"
+  print_info "  • the LiteLLM gateway, GitHub token minter, Hindsight and web console policies"
   print_info "What is lost is the confinement of kube-agents' own workloads, not of yours: the sandbox that runs model-authored commands can reach anything routable in this VPC. Trusting the workloads already in this cluster is a different decision."
   print_info "Recorded as ${NETWORK_POLICY_REPORT_FIELD}=${NP_ENFORCEMENT_ABSENT_ACCEPTED} in the install report and as the ${NETWORK_POLICY_ENFORCEMENT_ANNOTATION} annotation on the PlatformAgent. To confine it later, enable Dataplane V2 or the Calico addon on the cluster and re-run the installer."
 }
 
 # The interactive fork for an adopted cluster that enforces no NetworkPolicy.
-# Three answers, and the default is the one that changes nothing: enable
-# Calico (a control-plane update that may recreate nodes), install without
-# enforcement (the cluster is untouched; print_no_network_policy_consequences
-# says what that costs), or stop. Sets the two PARAM_ variables; the caller
-# acts on them. Never reached without a controlling TTY: an agent-driven run
-# has to pass one of the two flags, and the skill tells it to ask first.
+# Three answers when the web console is off, and the default is the one that
+# changes nothing: enable Calico (a control-plane update that may recreate
+# nodes), install without enforcement (the cluster is untouched;
+# print_no_network_policy_consequences says what that costs), or stop. When
+# the web console is on (--enable-web-console / WEB_CONSOLE_ENABLED=true),
+# installing without enforcement is not offered: the operator either enables
+# Calico or stops (writing REFUSED_MISSING_NETWORK_POLICY before install.env
+# is created). Sets the two PARAM_ variables; the caller acts on them. Never
+# reached without a controlling TTY: an agent-driven run has to pass one of
+# the applicable flags, and the skill tells it to ask first.
 prompt_network_policy_choice() {
   local cluster_name="$1"
   local np_choice=""
   print_warning "Existing cluster '$cluster_name' enforces no NetworkPolicy (neither Dataplane V2 nor the legacy Calico addon)."
+  if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+    print_info "The web console (--enable-web-console) requires NetworkPolicy enforcement, so installing without enforcement is not available on this run."
+    print_info "  e) enable the legacy Calico addon and enforcement now: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents"
+    print_info "  n) stop here, changing nothing"
+    prompt_read "Choose (e/N)" np_choice "n"
+    case "$np_choice" in
+      [Ee])
+        PARAM_ENABLE_NETWORK_POLICY="true"
+        PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+        ;;
+      *)
+        print_info "Stopping without modifying the cluster or writing install.env."
+        write_json_report "REFUSED_MISSING_NETWORK_POLICY"
+        exit 1
+        ;;
+    esac
+    return 0
+  fi
   print_info "  e) enable the legacy Calico addon and enforcement now: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents"
   print_info "  a) install without NetworkPolicy enforcement: the cluster is not modified, and every policy kube-agents ships stays inert, including the ones confining the agent's shell sandbox"
   print_info "  n) stop here, changing nothing"
@@ -3963,11 +4438,15 @@ prompt_network_policy_choice() {
 # Clusters created by this repository's gke-cluster module have Dataplane V2;
 # clusters created by other Terraform configurations or pre-existing Standard
 # clusters may have neither Dataplane V2 nor Calico. Such a cluster has three
-# outcomes, and the operator picks: enable the legacy Calico addon
-# (--enable-network-policy, a control-plane update), install without
-# enforcement (--accept-no-network-policy, the cluster untouched and the
-# choice on record), or refuse. The gke-cluster module's postcondition
-# backstops bare-Terraform installs, relaxed by the same variable.
+# outcomes when the web console is off, and the operator picks: enable the
+# legacy Calico addon (--enable-network-policy, a control-plane update),
+# install without enforcement (--accept-no-network-policy, the cluster
+# untouched and the choice on record), or refuse. When the web console is on
+# (--enable-web-console / WEB_CONSOLE_ENABLED=true), installing without
+# enforcement is refused by the preflight and by the composition's
+# precondition, leaving only Calico enablement or refusal. The gke-cluster
+# module's postcondition backstops bare-Terraform installs, relaxed by the
+# same variable when the console is off.
 ensure_existing_cluster_network_policy() {
   local project_id="$1" cluster_name="$2" region="$3"
   local cluster_info
@@ -4010,7 +4489,11 @@ ensure_existing_cluster_network_policy() {
   if ! is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
     print_error "Existing cluster '$cluster_name' has neither Dataplane V2 nor legacy Calico NetworkPolicy."
     print_info "Enabling Calico may recreate nodes and restart workloads; installing without enforcement leaves the agent sandbox unconfined on the network. The cluster's owner decides which."
-    print_info "Explicit opt-in was not provided (--enable-network-policy or --accept-no-network-policy). Refusing to proceed."
+    if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+      print_info "The web console requires NetworkPolicy enforcement; pass --enable-network-policy (or disable the web console with --enable-web-console=false). Refusing to proceed."
+    else
+      print_info "Explicit opt-in was not provided (--enable-network-policy or --accept-no-network-policy). Refusing to proceed."
+    fi
     return 1
   fi
 
@@ -4111,6 +4594,17 @@ prompt_existing_cluster_opt_ins() {
 # and prints it; this only settles it before the bootstrap writes the file.
 settle_network_policy_acceptance() {
   local project_id="$1" cluster_name="$2" region="$3" tfvars_file="$4" image_tag="$5"
+  # When the web console is on, check_existing_cluster_network_policy_preflight
+  # runs here (before bootstrap_install_env_file writes install.env) so a
+  # refused non-interactive or no-TTY first install does not leave a stale
+  # install.env with WEB_CONSOLE_ENABLED=true on disk, while an enforcing
+  # cluster sets NETWORK_POLICY_ENFORCEMENT=enforced and proceeds.
+  if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+    if [ "${PARAM_DRY_RUN:-false}" != "true" ]; then
+      check_existing_cluster_network_policy_preflight "$1" "$2" "$3"
+    fi
+    return 0
+  fi
   if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}" && ! is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}"; then
     export ACCEPT_NO_NETWORK_POLICY="true"
     KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
@@ -4180,26 +4674,6 @@ check_existing_cluster_node_pools_preflight() {
   fi
 }
 
-is_existing_cluster_network_policy_satisfied() {
-  local project_id="$1" cluster_name="$2" region="$3"
-  [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ] || return 0
-
-  local cluster_info
-  cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
-    --location="$region" --project="$project_id" \
-    --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
-  local status="" dp_provider="" legacy_np=""
-  if [ -n "$cluster_info" ]; then
-    IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
-  fi
-  if [ -z "$status" ]; then
-    return 2
-  fi
-  [ "$dp_provider" != "ADVANCED_DATAPATH" ] || return 0
-  [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ] || return 1
-  return 0
-}
-
 check_existing_cluster_network_policy_preflight() {
   local project_id="$1" cluster_name="$2" region="$3"
   # A cluster this run creates comes up on Dataplane V2.
@@ -4224,8 +4698,17 @@ check_existing_cluster_network_policy_preflight() {
 
   # The third answer: install anyway, on record, without touching the cluster.
   # The generated tfvars carry accept_no_network_policy = true, which is what
-  # gets the plan past the module's postcondition.
+  # gets the plan past the module's postcondition. Refused when the web
+  # console is on: the console holds the Platform Agent's API key with no login
+  # of its own, and its deny-all-ingress NetworkPolicy is the only thing
+  # keeping other pods in the cluster from reaching it.
   if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+    if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+      print_error "Existing cluster '$cluster_name' enforces no NetworkPolicy, and the web console (--enable-web-console / WEB_CONSOLE_ENABLED=true) requires NetworkPolicy enforcement."
+      print_info "The web console holds the Platform Agent's API key with no login of its own; without NetworkPolicy enforcement, any pod in the cluster can reach it. Enable NetworkPolicy (--enable-network-policy, and remove ACCEPT_NO_NETWORK_POLICY=true from install.env) or disable the web console (--enable-web-console=false / WEB_CONSOLE_ENABLED=false)."
+      write_json_report "REFUSED_WEB_CONSOLE_WITHOUT_NETWORK_POLICY"
+      exit 1
+    fi
     print_no_network_policy_consequences "$cluster_name"
     NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
     # The settle step and this preflight each describe the cluster once. If
@@ -4239,9 +4722,15 @@ check_existing_cluster_network_policy_preflight() {
   if ! is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
     print_error "Existing cluster '$cluster_name' enforces no NetworkPolicy (neither Dataplane V2 nor legacy Calico)."
     print_info "kube-agents ships NetworkPolicies that isolate the agent's execution sandbox; on this cluster they would be accepted and inert, and the Terraform apply refuses the plan."
-    print_info "Two ways forward, and the cluster's owner chooses:"
-    print_info "  --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents."
-    print_info "  --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement: the cluster is not modified, and the agent sandbox is unconfined on the network. Recorded in the report and on the PlatformAgent."
+    if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+      print_info "The web console (--enable-web-console / WEB_CONSOLE_ENABLED=true) requires NetworkPolicy enforcement, so --accept-no-network-policy cannot be used:"
+      print_info "  --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents."
+      print_info "  Or pass --enable-web-console=false (WEB_CONSOLE_ENABLED=false) to disable the web console."
+    else
+      print_info "Two ways forward, and the cluster's owner chooses:"
+      print_info "  --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents."
+      print_info "  --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement: the cluster is not modified, and the agent sandbox is unconfined on the network. Recorded in the report and on the PlatformAgent."
+    fi
     print_info "Neither was given. Aborting before making any cluster changes."
     write_json_report "REFUSED_MISSING_NETWORK_POLICY"
     exit 1
@@ -4272,6 +4761,310 @@ validate_litellm_redaction_ip_action() {
   fi
 }
 
+# --mode, or the PLATFORM_AGENT_MODE install.env records: one of the CRD's
+# spec.mode values, named by whichever carried it. Checked before
+# check_flags_against_install_env, so a misspelt --mode is refused as one
+# rather than as a disagreement with the file. Against an existing
+# install.env, --mode is then held to the file like the chat flags
+# (note_install_env_flag in parse_args): every other flag that overrides the
+# file applies for one run and is warned about
+# (warn_flag_beats_unrecorded_file_value); this one is refused, because the
+# run after it reads the file again and switches back, and upgrade.sh takes no
+# --mode to stop it: a next install would lose its A2A stack on the next
+# upgrade, a today install gain one for a single run. Switching is an edit to
+# the file, which every later run then keeps, and the apply that carries it
+# says so (announce_platform_agent_mode_switch). A file that assigns no
+# PLATFORM_AGENT_MODE has the --mode recorded into it when the run commits
+# (record_flags_into_install_env). Needs installer_common.sh sourced.
+validate_platform_agent_mode() {
+  local value="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
+  is_valid_platform_agent_mode "$value" && return 0
+  if [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ]; then
+    print_error "--mode must be today or next, got '${value}'."
+  elif [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
+    print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix it in ${INSTALL_ENV_FILE}."
+  else
+    # No file yet: a first install seeds the key from the environment.
+    print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix the PLATFORM_AGENT_MODE this shell exports."
+  fi
+  return 1
+}
+
+# Whether this run is a first install is the target cluster's to say, not
+# install.env's. A new checkout, another machine, or an install.env copied from
+# install.env.example has no mode recorded, and the first-install default
+# (DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE) would switch a live today install
+# to next, without a prompt under -y. So when
+# nothing chose a mode (no --mode, no exported PLATFORM_AGENT_MODE, no key in
+# install.env, all of which win) and the cluster exists, the cluster decides:
+# a PlatformAgent's spec.mode (absent is today), or, with the CR gone but the
+# kube-agents release still installed, the mode the release records (absent
+# is today), since the next apply recreates the CR from it. A cluster with
+# neither is a first install.
+#
+# The read uses a kubeconfig of its own, so the operator's kubeconfig and its
+# current context are left as they were: --dry-run and --generate-only stay
+# free of side effects. Only gcloud's NOT_FOUND is no cluster, as the tfvars
+# generator reads it (gke_describe_error_is_not_found). A cluster that cannot
+# be described or read is not guessed at as a first install, because a wrong
+# guess is a mode switch: an install.env that records no mode keeps today, as
+# it did before the cluster was asked; with no install.env, --dry-run and
+# --generate-only fall back to today with a warning, and an applying run is
+# refused. Returns 1 to refuse.
+# Needs installer_common.sh sourced and PROJECT_ID, REGION and CLUSTER_NAME
+# exported.
+adopt_live_platform_agent_mode() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" live="" holder="" kubeconfig_dir
+  [ -n "${PARAM_PLATFORM_AGENT_MODE:-}" ] && return 0
+  # A key assigned empty is today to every front door (write_tfvars_from_state),
+  # and nothing can be recorded over it, so it is not the cluster's to decide.
+  if [ "$INSTALL_ENV_FOUND_AT_START" = "true" ] && install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
+    PLATFORM_AGENT_MODE_SETTLED="true"
+    PLATFORM_AGENT_MODE_FALLBACK="$DEFAULT_PLATFORM_AGENT_MODE"
+    return 0
+  fi
+  local describe_err="" seen="exists" why="" remedy_next="pass --mode=next" remedy_switch="Pass --mode=${PLATFORM_AGENT_MODE_FALLBACK}" remedy_choose="Pass --mode=today or --mode=next"
+  # The menu takes no --mode: its remedy is the key it applies.
+  if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
+    remedy_next="set PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
+    remedy_switch="Set PLATFORM_AGENT_MODE=${PLATFORM_AGENT_MODE_FALLBACK} in ${INSTALL_ENV_FILE}"
+    remedy_choose="Set PLATFORM_AGENT_MODE=today or PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
+  fi
+  # Only a NOT_FOUND is no cluster, as the tfvars generator reads it; any
+  # other failure is a cluster that could not be read.
+  if describe_err="$(trap - ERR; gcloud container clusters describe "$CLUSTER_NAME" --location "$REGION" \
+    --project "$PROJECT_ID" --format="value(name)" 2>&1 >/dev/null)"; then
+    kubeconfig_dir="$(mktemp -d)"
+    local -x KUBECONFIG="${kubeconfig_dir}/kubeconfig"
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID" || true
+    # shellcheck disable=SC2086
+    gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" \
+      --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+    read_platform_agent_install_state "$namespace"
+    rm -rf "$kubeconfig_dir"
+    # Not held for the mode notice: it was read through this function's own
+    # kubeconfig. Read by take_platform_agent_install_state.
+    # shellcheck disable=SC2034
+    PLATFORM_AGENT_READS_HELD_FOR=""
+    case "$PLATFORM_AGENT_CR_READ" in
+      "$PLATFORM_AGENT_READ_OK")
+        live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
+        holder="its PlatformAgent"
+        if [ -z "$live" ]; then
+          case "$PLATFORM_AGENT_RECORD_READ" in
+            "$PLATFORM_AGENT_READ_NONE") return 0 ;;
+            "$PLATFORM_AGENT_READ_OK")
+              live="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
+              holder="its kube-agents release: the PlatformAgent is gone, and the next apply recreates it from the release"
+              ;;
+          esac
+        fi
+        ;;
+      "$PLATFORM_AGENT_READ_NONE") return 0 ;;
+    esac
+    why="the kubeconfig has no context '$(gke_context_name)'"
+    [ -n "${PLATFORM_AGENT_READ_ERROR:-}" ] && why="the read failed (${PLATFORM_AGENT_READ_ERROR})"
+  else
+    gke_describe_error_is_not_found "$describe_err" && return 0
+    seen="may exist"
+    why="gcloud could not describe it (${describe_err:-unknown gcloud failure})"
+  fi
+  if [ -z "$live" ]; then
+    PLATFORM_AGENT_MODE_SETTLED="true"
+    # Not recorded in install.env (queue_unrecorded_platform_agent_mode,
+    # bootstrap_install_env_file): the next run that can read the cluster
+    # settles it from there instead.
+    PLATFORM_AGENT_MODE_GUESSED="true"
+    if [ "$INSTALL_ENV_FOUND_AT_START" = "true" ]; then
+      print_warning "Cluster '${CLUSTER_NAME}' ${seen}, but whether it already runs kube-agents, and on which spec.mode, could not be read: ${why}. ${INSTALL_ENV_FILE} records no PLATFORM_AGENT_MODE, so this run renders spec.mode ${DEFAULT_PLATFORM_AGENT_MODE}, as upgrade.sh reads that file, and records nothing. If the install runs next, stop and ${remedy_next}."
+      PLATFORM_AGENT_MODE_FALLBACK="$DEFAULT_PLATFORM_AGENT_MODE"
+      return 0
+    fi
+    if [ "$PARAM_DRY_RUN" = "true" ] || [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+      print_warning "Cluster '${CLUSTER_NAME}' ${seen} and there is no install.env, but whether it already runs kube-agents, and on which spec.mode, could not be read: ${why}. This run renders spec.mode ${DEFAULT_PLATFORM_AGENT_MODE} and records no mode in install.env; applying it would switch an install that runs next. ${remedy_choose} to say which mode this install runs. An applying run would be refused."
+      PLATFORM_AGENT_MODE_FALLBACK="$DEFAULT_PLATFORM_AGENT_MODE"
+      return 0
+    fi
+    print_error "Cluster '${CLUSTER_NAME}' ${seen} and there is no install.env, but whether it already runs kube-agents, and on which spec.mode, could not be read: ${why}."
+    print_info "${remedy_choose} to say which mode this install runs, or restore access to the cluster and run again. Guessing would switch a running install's mode."
+    return 1
+  fi
+  live="$(effective_platform_agent_mode "$live")"
+  PLATFORM_AGENT_MODE_SETTLED="true"
+  [ "$live" = "$PLATFORM_AGENT_MODE_FALLBACK" ] && return 0
+  print_info "Nothing chose a spec.mode for this run (no --mode, and install.env records none), and cluster '${CLUSTER_NAME}' already runs kube-agents on spec.mode ${live} (from ${holder}), so this run keeps ${live} rather than a first install's ${PLATFORM_AGENT_MODE_FALLBACK}. ${remedy_switch} to switch it (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
+  PLATFORM_AGENT_MODE_FALLBACK="$live"
+}
+
+# A first install that mirrors its third-party images ($1, the prefix)
+# defaults to today. next's NATS bus runs two images (nats, nats-box) that
+# are the operator's compiled defaults, which neither this installer nor the
+# chart points at a mirror, so on a cluster that pulls only from the mirror
+# the bus would sit in ImagePullBackOff. Only the fallback moves: --mode, an
+# exported PLATFORM_AGENT_MODE, a recorded key and the cluster's live mode all win.
+mirrored_first_install_mode() {
+  [ -n "${1:-}" ] || return 0
+  [ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ] || return 0
+  [ "${PLATFORM_AGENT_MODE_SETTLED:-false}" = "true" ] && return 0
+  [ "$PLATFORM_AGENT_MODE_FALLBACK" = "next" ] || return 0
+  local remedy="Pass --mode=next"
+  [ "${PARAM_MENU_MODE:-false}" = "true" ] && remedy="Set PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
+  print_info "This first install mirrors its third-party images (${1}), so it installs spec.mode today rather than next: next's NATS bus pulls nats and nats-box from Docker Hub, and nothing in this install points them at the mirror. ${remedy} to install next anyway."
+  PLATFORM_AGENT_MODE_FALLBACK="today"
+}
+
+# An install.env that records no PLATFORM_AGENT_MODE gets the mode this run
+# settled on, queued for record_flags_into_install_env like a typed --mode:
+# upgrade.sh reads such a file as today, so a next install it does not record
+# would be switched back by the next upgrade. A file this run cannot write is
+# named instead. A mode guessed because the cluster could not be read is not
+# recorded.
+queue_unrecorded_platform_agent_mode() {
+  local file="${INSTALL_ENV_FILE:-}"
+  [ "$INSTALL_ENV_FOUND_AT_START" = "true" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  [ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ] || return 0
+  [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" = "true" ] && return 0
+  install_env_records_key "$file" PLATFORM_AGENT_MODE && return 0
+  if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
+    print_info "${file} assigns no PLATFORM_AGENT_MODE; a run without --dry-run records the one it applies (${PLATFORM_AGENT_MODE_FALLBACK}) there."
+    return 0
+  fi
+  if [ ! -w "$file" ]; then
+    print_warning "${file} assigns no PLATFORM_AGENT_MODE and is not writable, so this run cannot record spec.mode ${PLATFORM_AGENT_MODE_FALLBACK} there; upgrade.sh reads a file with no key as ${DEFAULT_PLATFORM_AGENT_MODE}. Add PLATFORM_AGENT_MODE=${PLATFORM_AGENT_MODE_FALLBACK} to it."
+    return 0
+  fi
+  case " ${INSTALL_ENV_KEYS_TO_RECORD} " in
+    *" PLATFORM_AGENT_MODE "*) ;;
+    *) INSTALL_ENV_KEYS_TO_RECORD="${INSTALL_ENV_KEYS_TO_RECORD}${INSTALL_ENV_KEYS_TO_RECORD:+ }PLATFORM_AGENT_MODE" ;;
+  esac
+}
+
+# The openai_compatible questions, shared by step 7 and the Day-2 menu: the
+# model, the base URL, then the server pod's port or the CIDRs, whichever the
+# URL needs, and the optional key and CA Secret. Each argument names the
+# variable that holds an answer; its current value is the prompt's default.
+# validate_openai_compatible_inputs judges the answers afterwards.
+# The model name step 7 starts from. A model install.env pinned for another
+# provider is not this server's, so on a switch to openai_compatible with no
+# --model-default-name it starts empty and the check that follows stops the
+# run instead of asking the server for the old provider's model. Only a
+# recorded other provider counts: with none, a MODEL_DEFAULT_NAME given in the
+# environment is this run's own answer.
+# $1 the provider, $2 the model so far, $3 whether --model-default-name was
+# typed, $4 the recorded MODEL_PROVIDER.
+# The same holds for any other provider with no default model (a LiteLLM
+# provider slug outside the table): the recorded model belongs to the old
+# provider, and validate_model_provider_inputs then asks for one.
+openai_compatible_model_for_run() {
+  local provider="${1:-}" model="${2:-}" passed="${3:-false}" recorded="${4:-}"
+  # Which providers have no default: openai_compatible always, and a slug
+  # outside the table once installer_common.sh (sourced at step 2) can say so.
+  local no_default=false
+  if [ "$provider" = "openai_compatible" ]; then
+    no_default=true
+  elif declare -F is_table_model_provider >/dev/null && ! is_table_model_provider "$provider"; then
+    no_default=true
+  fi
+  if [ "$no_default" = "true" ] && [ -n "$recorded" ] &&
+    [ "$recorded" != "$provider" ] && [ "$passed" != "true" ]; then
+    model=""
+  fi
+  printf '%s\n' "$model"
+}
+
+# The sixth provider entry: SAP AI Core or any other LiteLLM provider slug,
+# with its credentials in a Secret the operator creates. Asks the slug, the
+# model (prefilled with the slug's default when there is one, or with the
+# model already pinned for that same slug) and the Secret's name. A typo is
+# asked again only while someone can answer: without a controlling tty, or
+# under --non-interactive, prompt_read answers with the default every time,
+# so the function returns 1 instead of waiting for a better answer that
+# cannot come, and the caller stops or goes back to its menu. $1..$3 the
+# names of the caller's provider, model and Secret-name variables.
+prompt_litellm_env_secret_provider() {
+  local provider_var="$1" model_var="$2" secret_name_var="$3"
+  local provider_was="${!provider_var}" model_was="${!model_var}" provider="" model=""
+  local can_retry=true
+  if [ "${PARAM_NON_INTERACTIVE:-false}" = "true" ] || ! has_controlling_tty; then
+    can_retry=false
+  fi
+  # A table provider other than sap is not this entry's: start at sap.
+  provider="$provider_was"
+  if is_table_model_provider "$provider" && [ "$provider" != "sap" ]; then
+    provider="sap"
+  fi
+  while :; do
+    prompt_read "LiteLLM provider slug (sap, azure, bedrock, databricks, ...)" provider "$provider"
+    if is_valid_model_provider "$provider" && { [ "$provider" = "sap" ] || ! is_table_model_provider "$provider"; }; then
+      break
+    fi
+    # The other table providers have their own entries, with their own
+    # credential prompts; accepting them here would skip those.
+    if is_table_model_provider "$provider"; then
+      print_error "'${provider}' has its own entry in the provider menu; this entry is for sap and any other LiteLLM provider slug."
+    elif [ "$provider" = "chatgpt" ]; then
+      print_error "'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store the chart does not ship. Use openai with an API key."
+    else
+      print_error "'${provider}' is not a LiteLLM provider slug (lowercase letters, digits and underscores)."
+    fi
+    [ "$can_retry" = "true" ] || return 1
+  done
+  model="$(default_model_for_provider "$provider")"
+  if [ "$provider" = "$provider_was" ] && [ -n "$model_was" ]; then
+    model="$model_was"
+  fi
+  while :; do
+    prompt_read "Model name the provider serves" model "$model"
+    [ -z "$model" ] || break
+    print_error "A model name is required: the installer has no default for ${provider}."
+    [ "$can_retry" = "true" ] || return 1
+  done
+  local secret_name="${!secret_name_var}"
+  while :; do
+    prompt_read "Secret in the agent's namespace holding the provider's credentials (you create it)" secret_name "$secret_name"
+    validate_litellm_env_secret_name "$secret_name" && break
+    [ "$can_retry" = "true" ] || return 1
+  done
+  printf -v "$provider_var" '%s' "$provider"
+  printf -v "$model_var" '%s' "$model"
+  printf -v "$secret_name_var" '%s' "$secret_name"
+}
+
+prompt_openai_compatible_settings() {
+  local model_var="$1" api_base_var="$2" target_port_var="$3" egress_cidrs_var="$4"
+  local api_key_var="$5" ca_name_var="$6" host_port="" host=""
+  prompt_read "Model name the server serves (no default)" "$model_var" "${!model_var:-}"
+  prompt_read "Server base URL including /v1 (e.g. http://<svc>.<namespace>.svc.cluster.local/v1)" "$api_base_var" "${!api_base_var:-}"
+  if host_port="$(openai_compatible_url_host_port "${!api_base_var:-}")"; then
+    host="${host_port% *}"
+  fi
+  # Each URL shape reads one of the two egress values and ignores the other.
+  # Clear the one it does not ask for, so a value kept from an earlier URL
+  # cannot fail validation behind a prompt that is never shown.
+  if [ -n "$host" ] && [ -n "$(openai_compatible_service_namespace "$host")" ]; then
+    printf -v "$egress_cidrs_var" '%s' ""
+    prompt_read "Server pod port (the gateway's NetworkPolicy matches it, not the Service port)" "$target_port_var" "${!target_port_var:-}"
+  elif [ -n "$host" ]; then
+    printf -v "$target_port_var" '%s' ""
+    prompt_read "Private ranges the server is reached at, comma-separated CIDRs (empty only for a public endpoint on 443; ${OPENAI_COMPATIBLE_CLEAR_ANSWER} clears a recorded value)" "$egress_cidrs_var" "${!egress_cidrs_var:-}"
+  fi
+  # The label keeps a recorded key off the screen.
+  # No clear answer for the key: write_tfvars_from_state recovers an empty key
+  # from the live Secret, so clearing it here would not stick. A key a server
+  # no longer checks is harmless; remove it from the Secret to drop it.
+  prompt_read "Server API key (optional)" "$api_key_var" "${!api_key_var:-}" true "${!api_key_var:+the current key}"
+  prompt_read "Secret holding a CA, under ca.crt, that signs the server's certificate (optional; ${OPENAI_COMPATIBLE_CLEAR_ANSWER} clears a recorded name)" "$ca_name_var" "${!ca_name_var:-}"
+  # prompt_read keeps a recorded value on an empty answer, so an endpoint that
+  # no longer needs one of these optional values says so with the clear answer.
+  local optional_var
+  for optional_var in "$egress_cidrs_var" "$ca_name_var"; do
+    if [ "${!optional_var:-}" = "$OPENAI_COMPATIBLE_CLEAR_ANSWER" ]; then
+      printf -v "$optional_var" '%s' ""
+    fi
+  done
+}
+
 # Validates explicit values for existing-cluster opt-in flags (loud like --enable-gvisor)
 validate_existing_cluster_opt_in_flags() {
   if { [ "${PARAM_MIGRATE_NODE_POOLS_PASSED:-false}" = "true" ] || [ -n "${PARAM_MIGRATE_NODE_POOLS:-}" ]; } && \
@@ -4299,14 +5092,32 @@ validate_existing_cluster_opt_in_flags() {
     if [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" = "true" ] && [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" != "true" ]; then
       print_info "--enable-network-policy overrides the ACCEPT_NO_NETWORK_POLICY=true your install configuration records, for this run. Remove that line once Calico is on, or every later upgrade waives the enforcement check."
       PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+      export ACCEPT_NO_NETWORK_POLICY="false"
     elif [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" = "true" ] && [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" != "true" ]; then
       print_info "--accept-no-network-policy overrides the ENABLE_NETWORK_POLICY=true your install configuration records, for this run."
       PARAM_ENABLE_NETWORK_POLICY="false"
+      export ENABLE_NETWORK_POLICY="false"
     else
       print_error "--enable-network-policy and --accept-no-network-policy are two answers to one question; pass one (as flags, or as ENABLE_NETWORK_POLICY / ACCEPT_NO_NETWORK_POLICY in install.env)."
       print_info "The first enables the legacy Calico addon on the cluster (may recreate nodes); the second installs without NetworkPolicy enforcement and changes nothing."
       exit 1
     fi
+  fi
+  # Refuse up front only when --accept-no-network-policy was passed on the
+  # command line. When ACCEPT_NO_NETWORK_POLICY=true was only inherited from
+  # install.env, check_existing_cluster_network_policy_preflight probes the
+  # live cluster first: if the cluster still enforces nothing it refuses with
+  # REFUSED_WEB_CONSOLE_WITHOUT_NETWORK_POLICY, and if the cluster has since
+  # enabled Dataplane V2 or Calico (the "confine it later" path) it proceeds
+  # and note_stale_network_policy_acceptance tells the operator to remove the
+  # stale line from install.env.
+  if [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" = "true" ] && \
+     is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}" && \
+     is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+    print_error "--enable-web-console (WEB_CONSOLE_ENABLED=true) cannot be combined with --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true)."
+    print_info "The web console holds the Platform Agent's API key with no login of its own, and its NetworkPolicy is what keeps other pods in the cluster from reaching it. Enable NetworkPolicy enforcement (--enable-network-policy or Dataplane V2, and remove any stale ACCEPT_NO_NETWORK_POLICY=true from install.env if the cluster already enforces it), or leave the web console off (--enable-web-console=false)."
+    write_json_report "REFUSED_WEB_CONSOLE_WITHOUT_NETWORK_POLICY"
+    exit 1
   fi
 }
 
@@ -4371,7 +5182,8 @@ gitlab_repo_url() {
   printf 'https://%s/%s' "${GITOPS_HOST:-gitlab.com}" "${GITOPS_REPO:-}"
 }
 
-# Checks the GitLab inputs, and that a GitHub install was given none of them.
+# Checks the forge inputs: the GitLab ones, the GitHub Enterprise Server ones,
+# and that each forge was given none of the other's.
 validate_gitops_forge_flags() {
   case "${PARAM_GITOPS_FORGE:-github}" in
     github|gitlab) ;;
@@ -4380,30 +5192,42 @@ validate_gitops_forge_flags() {
       return 1
       ;;
   esac
-  if [ "${PARAM_GITOPS_FORGE:-github}" != "gitlab" ]; then
-    # A host install.env recorded for a GitLab install is that install's, not
-    # this run's: a switch back to GitHub drops it.
-    if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ "${PARAM_GITOPS_HOST_FROM_FLAG:-false}" != "true" ]; then
-      print_info "Dropping the recorded GitLab host '${PARAM_GITOPS_HOST}': this run's GitOps forge is GitHub."
+  local forge="${PARAM_GITOPS_FORGE:-github}"
+  # A host and a CA Secret that install.env recorded for the other forge are
+  # that install's, not this run's: a switch of forge drops them. A host given
+  # by flag is this run's and is judged below.
+  # Only a forge the file names: a file with no GITOPS_FORGE records no host,
+  # and a host the interview just asked for is this run's.
+  local recorded_forge="${PARAM_GITOPS_RECORDED_FORGE:-}"
+  if [ -n "$recorded_forge" ] && [ "$recorded_forge" != "$forge" ]; then
+    local recorded_label="GitLab" forge_label="GitLab"
+    [ "$recorded_forge" = "gitlab" ] || recorded_label="GitHub Enterprise Server"
+    [ "$forge" = "gitlab" ] || forge_label="GitHub"
+    if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ "${PARAM_GITOPS_HOST_FROM_FLAG:-false}" != "true" ] &&
+      [ "$PARAM_GITOPS_HOST" = "${PARAM_GITOPS_RECORDED_HOST:-}" ]; then
+      print_info "Dropping the recorded ${recorded_label} host '${PARAM_GITOPS_HOST}': this run's GitOps forge is ${forge_label}."
       PARAM_GITOPS_HOST=""
     fi
-    if [ -n "${PARAM_GITOPS_HOST:-}" ] || [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
-      print_error "--gitops-host and --gitlab-token-file apply only with --gitops-forge=gitlab."
-      return 1
+    if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+      print_info "Dropping the recorded ${recorded_label} CA Secret '${PARAM_GITOPS_CA_SECRET}': this run's GitOps forge is ${forge_label}."
+      PARAM_GITOPS_CA_SECRET=""
     fi
-    return 0
+  fi
+  if [ "$forge" != "gitlab" ]; then
+    validate_github_forge_flags
+    return
   fi
   if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
     if ! [[ "$PARAM_GITOPS_HOST" =~ $GITLAB_HOST_RE ]]; then
       print_error "--gitops-host must be a bare lowercase hostname, with no scheme, path or port (got '${PARAM_GITOPS_HOST}')."
       return 1
     fi
-    case "$PARAM_GITOPS_HOST" in
-      github.com|*.github.com|githubusercontent.com|*.githubusercontent.com)
-        print_error "'${PARAM_GITOPS_HOST}' is a GitHub host, not a GitLab one."
-        return 1
-        ;;
-    esac
+    # Every domain where GitHub runs its own services, as the operator's
+    # gitlab provider refuses them (the github provider's ReservedDomains).
+    if [[ "$PARAM_GITOPS_HOST" =~ $GITHUB_RESERVED_HOST_RE ]]; then
+      print_error "'${PARAM_GITOPS_HOST}' is a GitHub host, not a GitLab one."
+      return 1
+    fi
   fi
   if [ -n "${PARAM_GITHUB_APP_ID:-}" ] || [ -n "${PARAM_GITHUB_PEM_PATH:-}" ]; then
     if [ "${PARAM_GITHUB_APP_FROM_FLAG:-false}" = "true" ]; then
@@ -4450,15 +5274,245 @@ validate_gitops_forge_flags() {
     case "$PARAM_GITLAB_TOKEN_FILE" in
       \~/*) PARAM_GITLAB_TOKEN_FILE="${HOME}/${PARAM_GITLAB_TOKEN_FILE#\~/}" ;;
     esac
-    if [ ! -r "$PARAM_GITLAB_TOKEN_FILE" ] || [ -d "$PARAM_GITLAB_TOKEN_FILE" ]; then
-      print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is not readable."
+    check_gitlab_token_source "--gitlab-token-file" "$PARAM_GITLAB_TOKEN_FILE" || return 1
+  fi
+  if [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
+    case "$PARAM_GITLAB_READ_TOKEN_FILE" in
+      \~/*) PARAM_GITLAB_READ_TOKEN_FILE="${HOME}/${PARAM_GITLAB_READ_TOKEN_FILE#\~/}" ;;
+    esac
+    check_gitlab_token_source "GITLAB_READ_TOKEN_FILE" "$PARAM_GITLAB_READ_TOKEN_FILE" || return 1
+    # One source for both tokens is refused. A stream such as /dev/stdin
+    # cannot carry two tokens, and one file would store the write token as the
+    # read token. -ef also catches a second name for the same file or stream.
+    if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ] && {
+      [ "$PARAM_GITLAB_TOKEN_FILE" = "$PARAM_GITLAB_READ_TOKEN_FILE" ] ||
+        [ "$PARAM_GITLAB_TOKEN_FILE" -ef "$PARAM_GITLAB_READ_TOKEN_FILE" ] || {
+        gitlab_token_source_is_stdin "$PARAM_GITLAB_TOKEN_FILE" &&
+          gitlab_token_source_is_stdin "$PARAM_GITLAB_READ_TOKEN_FILE"
+      }
+    }; then
+      print_error "--gitlab-token-file ('${PARAM_GITLAB_TOKEN_FILE}') and GITLAB_READ_TOKEN_FILE ('${PARAM_GITLAB_READ_TOKEN_FILE}') name the same source. Give each token its own file or stream."
       return 1
     fi
+  fi
+  # A private CA is for a self-managed host only: gitlab.com presents a
+  # certificate the public CAs sign, and a private CA must never vouch for it.
+  if ! gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}"; then
+    if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+      # An interview answer for an earlier host: the user went back and chose
+      # gitlab.com, so the file is not theirs to keep. Refusing it would
+      # repeat on every pass, with no prompt left to clear it.
+      print_info "Dropping the CA file from the earlier answer: gitlab.com uses the public CAs."
+      PARAM_GITOPS_CA_FILE=""
+    fi
+    if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+      print_error "--gitops-ca-file is for a self-managed GitLab: give its hostname with --gitops-host. gitlab.com uses the public CAs."
+      return 1
+    fi
+    if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+      print_info "Dropping the recorded GitLab CA Secret '${PARAM_GITOPS_CA_SECRET}': this run's GitLab host is gitlab.com, which uses the public CAs."
+      PARAM_GITOPS_CA_SECRET=""
+    fi
+  fi
+  validate_gitops_ca_inputs "${DEFAULT_GITOPS_CA_SECRET:-gitlab-forge-ca}"
+}
+
+# True when PATH is one of the literal names of this process's standard input.
+# Two such names are one stream even where -ef cannot tell (a pipe on stdin).
+gitlab_token_source_is_stdin() {
+  case "$1" in
+    /dev/stdin | /dev/fd/0 | /proc/self/fd/0) return 0 ;;
+  esac
+  return 1
+}
+
+# Checks the GitLab token source PATH, which messages call LABEL: it must be
+# readable and not a directory. A regular file can be read now and again after
+# the apply, so an empty one stops the run here, before anything is built. A
+# one-shot source (/dev/stdin, /dev/fd/N, a process substitution) is not read
+# here: a read can use it up, so the Secret's writer checks it after the apply.
+check_gitlab_token_source() {
+  local label="$1" path="$2"
+  if [ ! -r "$path" ] || [ -d "$path" ]; then
+    print_error "${label} '${path}' is not readable."
+    return 1
+  fi
+  if gitops_source_is_rereadable "$path"; then
+    local early_token=""
+    IFS= read -r -d '' early_token <"$path" || true
+    early_token="$(gitlab_token_strip "$early_token")"
+    if [ -z "$early_token" ]; then
+      print_error "${label} '${path}' is empty."
+      return 1
+    fi
+    early_token=""
+  fi
+}
+
+# The checks a private CA's inputs get on either forge: the CA file is
+# readable and, when it can be read twice, holds a certificate and no private
+# key; the Secret's name defaults to DEFAULT_NAME and is a Kubernetes name. Run
+# only for a host that may have a private CA.
+validate_gitops_ca_inputs() {
+  local default_name="$1"
+  if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+    case "$PARAM_GITOPS_CA_FILE" in
+      \~/*) PARAM_GITOPS_CA_FILE="${HOME}/${PARAM_GITOPS_CA_FILE#\~/}" ;;
+    esac
+    if [ ! -r "$PARAM_GITOPS_CA_FILE" ] || [ -d "$PARAM_GITOPS_CA_FILE" ]; then
+      print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' is not readable."
+      # An interview answer is cleared, so the next pass can answer "none":
+      # its prompt offers no default.
+      [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ] || PARAM_GITOPS_CA_FILE=""
+      return 1
+    fi
+    # A regular file is checked now, before the apply records the Secret's
+    # name in install.env, the tfvars and the CR. /dev/stdin, /dev/fd/N and a
+    # process substitution can be read only once, so they are checked when
+    # they are read, after the apply.
+    if gitops_source_is_rereadable "$PARAM_GITOPS_CA_FILE"; then
+      local pem_problem
+      pem_problem="$(gitops_ca_pem_problem "$(cat "$PARAM_GITOPS_CA_FILE")")"
+      if [ -n "$pem_problem" ]; then
+        print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' ${pem_problem}"
+        [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ] || PARAM_GITOPS_CA_FILE=""
+        return 1
+      fi
+    fi
+    PARAM_GITOPS_CA_SECRET="${PARAM_GITOPS_CA_SECRET:-$default_name}"
+  fi
+  # A name from install.env or the environment is held to the rule the CRD,
+  # the chart and Terraform hold it to, here, where the message names the key.
+  if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ] &&
+    { [ "${#PARAM_GITOPS_CA_SECRET}" -gt 253 ] ||
+      ! [[ "$PARAM_GITOPS_CA_SECRET" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; }; then
+    print_error "GITOPS_CA_SECRET must be a valid Kubernetes Secret name (got '${PARAM_GITOPS_CA_SECRET}')."
+    return 1
   fi
   return 0
 }
 
-# Writes the token on stdin into Secret NAME, key `token`. Server-side apply,
+# The domains where GitHub runs its own services, which are never a GitHub
+# Enterprise Server: the github provider's ReservedDomains
+# (k8s-operator/api/v1alpha1/gitprovider.go), as the chart mirrors them.
+GITHUB_RESERVED_HOST_RE='(^|\.)(github\.com|githubusercontent\.com|githubassets\.com|githubapp\.com|github\.io|github\.dev|ghe\.com)$'
+
+# The GitHub inputs: no GitLab token, and, with --gitops-host, a GitHub
+# Enterprise Server host, its optional private CA, and an organization and a
+# repository name on it. A github.com spelling is the default host, so it
+# clears the host: that is how a recorded GitHub Enterprise Server install
+# switches back to github.com.
+validate_github_forge_flags() {
+  if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
+    print_error "--gitlab-token-file applies only with --gitops-forge=gitlab."
+    return 1
+  fi
+  if [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
+    print_error "GITLAB_READ_TOKEN_FILE applies only with --gitops-forge=gitlab."
+    return 1
+  fi
+  case "${PARAM_GITOPS_HOST:-}" in
+    github.com|www.github.com|ssh.github.com)
+      print_info "'${PARAM_GITOPS_HOST}' is github.com, the default GitHub host: this run's GitOps forge is github.com."
+      PARAM_GITOPS_HOST=""
+      ;;
+  esac
+  local host="${PARAM_GITOPS_HOST:-}"
+  # The App was created on the GitHub host install.env records, and its KMS
+  # key holds that App's private key. On another host the minter would sign
+  # as an App the host does not know, and install.sh imports a key only into
+  # a key with no ENABLED version, so a move of host needs the new host's App
+  # and a new key.
+  if [ "${INSTALL_ENV_RECORDS_GITHUB_APP:-false}" = "true" ] && [ "${PARAM_GITOPS_RECORDED_FORGE:-github}" = "github" ]; then
+    local recorded_host="${PARAM_GITOPS_RECORDED_HOST:-}"
+    local default_ring="${DEFAULT_KMS_KEYRING:-github-token-minter-keyring}" default_key="${DEFAULT_KMS_KEY:-github-token-minter-key}"
+    # The new host's App: an App ID that --github-app-id gives and that is not
+    # the recorded one (a PEM alone, or the recorded ID given again, keeps the
+    # old App), and a KMS key other than the recorded one.
+    if [ "$host" != "$recorded_host" ] &&
+      { [ "${PARAM_GITHUB_APP_ID_FROM_FLAG:-false}" != "true" ] ||
+        [ "${PARAM_GITHUB_APP_ID:-}" = "${PARAM_RECORDED_GITHUB_APP_ID:-}" ] ||
+        [ "${PARAM_KMS_KEYRING:-$default_ring}/${PARAM_KMS_KEY:-$default_key}" = "${PARAM_RECORDED_KMS_KEYRING:-$default_ring}/${PARAM_RECORDED_KMS_KEY:-$default_key}" ]; }; then
+      print_error "This install's GitHub App was created on ${recorded_host:-github.com}, and an App belongs to one GitHub host. To move the install to ${host:-github.com}, give the App on that host with --github-app-id (its App ID, not the recorded one) and --github-pem-path, and a new Cloud KMS key for its private key with --kms-key (INSTALL.md, \"Switch between github.com and a GitHub Enterprise Server\")."
+      return 1
+    fi
+    # The recorded private key path is the old App's key. Imported into the
+    # new key, it would sign as the old App, so a move that gives no
+    # --github-pem-path imports nothing and records no path.
+    if [ "$host" != "$recorded_host" ] && [ "${PARAM_GITHUB_PEM_PATH_FROM_FLAG:-false}" != "true" ] &&
+      [ -n "${PARAM_GITHUB_PEM_PATH:-}" ] && [ "$PARAM_GITHUB_PEM_PATH" = "${PARAM_RECORDED_GITHUB_PEM_PATH:-}" ]; then
+      print_info "Dropping the recorded GITHUB_PEM_PATH: it is the private key of the App on ${recorded_host:-github.com}. Give the new App's key with --github-pem-path."
+      PARAM_GITHUB_PEM_PATH=""
+    fi
+  fi
+  if [ -z "$host" ]; then
+    # github.com presents a certificate that the public CAs sign, and a
+    # private CA must never vouch for it.
+    if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+      print_error "--gitops-ca-file is for a GitHub Enterprise Server or a self-managed GitLab: give its hostname with --gitops-host. github.com uses the public CAs."
+      return 1
+    fi
+    if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+      print_info "Dropping the recorded CA Secret '${PARAM_GITOPS_CA_SECRET}': this run's GitHub host is github.com, which uses the public CAs."
+      PARAM_GITOPS_CA_SECRET=""
+    fi
+    return 0
+  fi
+  if ! [[ "$host" =~ $GITLAB_HOST_RE ]] || [ "${#host}" -gt 253 ]; then
+    print_error "--gitops-host must be a bare lowercase hostname, with no scheme, path or port (got '${host}')."
+    return 1
+  fi
+  if [[ "$host" =~ $GITHUB_RESERVED_HOST_RE ]]; then
+    print_error "'${host}' is a host that GitHub operates, not a GitHub Enterprise Server. For github.com, leave --gitops-host unset."
+    return 1
+  fi
+  if [[ "$host" =~ (^|\.)gitlab\.com$ ]]; then
+    print_error "'${host}' is a GitLab host, not a GitHub Enterprise Server. For GitLab, pass --gitops-forge=gitlab."
+    return 1
+  fi
+  # The repository is named by its organization and name on the instance, as
+  # on github.com: the composition declares the forge with the organization
+  # as its namespace, and the chart holds it to GitHub's owner grammar.
+  if [ -n "${PARAM_GITOPS_ORG:-}" ] && ! [[ "$PARAM_GITOPS_ORG" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; then
+    print_error "--gitops-org must be a GitHub organization name on ${host} (got '${PARAM_GITOPS_ORG}')."
+    return 1
+  fi
+  if [ -n "${PARAM_GITOPS_REPO:-}" ] &&
+    { ! [[ "$PARAM_GITOPS_REPO" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$PARAM_GITOPS_REPO" = "." ] || [ "$PARAM_GITOPS_REPO" = ".." ]; }; then
+    print_error "--gitops-repo must be the repository's name on ${host}, with the organization in --gitops-org (got '${PARAM_GITOPS_REPO}')."
+    return 1
+  fi
+  if [ "${PARAM_NON_INTERACTIVE:-false}" = "true" ] && [ -z "${PARAM_GITOPS_ORG:-}" ]; then
+    print_error "A GitHub Enterprise Server install needs --gitops-org: the organization that owns the GitOps repository on ${host}."
+    return 1
+  fi
+  validate_gitops_ca_inputs "${DEFAULT_GITHUB_CA_SECRET:-github-forge-ca}"
+}
+
+# True when HOST is a self-managed GitLab: not empty and not gitlab.com in
+# either spelling. The one definition the interview and the validator share.
+gitlab_host_is_self_managed() {
+  case "${1:-}" in
+    ""|gitlab.com|www.gitlab.com) return 1 ;;
+  esac
+  return 0
+}
+
+# Why PEM text cannot be stored as a forge's CA, or "" when it can: it holds
+# no certificate, or it holds a private key. A CA's private key never goes in
+# the CA Secret: anyone who can read that Secret could sign with it.
+gitops_ca_pem_problem() {
+  local pem="$1"
+  if [[ "$pem" != *"-----BEGIN CERTIFICATE-----"* ]]; then
+    printf '%s' "holds no PEM certificate (-----BEGIN CERTIFICATE-----); nothing was stored."
+  elif [[ "$pem" == *"PRIVATE KEY"* ]]; then
+    printf '%s' "holds a private key. Give the CA certificate alone; nothing was stored."
+  fi
+}
+
+# Writes the token on stdin into Secret NAME, under KEY, as field manager
+# MANAGER. The object sent holds KEY alone, so the apply leaves the other key
+# as it is (see GITLAB_TOKEN_FIELD_MANAGER). Server-side apply,
 # because a client-side apply copies the whole object, token included, into
 # the kubectl.kubernetes.io/last-applied-configuration annotation, where
 # anyone who can read the Secret's metadata reads it again. Both kubectl
@@ -4466,16 +5520,177 @@ validate_gitops_forge_flags() {
 # was sent, and that object carries the token. A failure prints a fixed
 # message and kubectl's exit codes, never kubectl's text.
 apply_gitlab_token_secret() {
-  local name="$1" namespace="$2" context="$3"
+  local name="$1" namespace="$2" context="$3" key="$4" manager="$5"
   kubectl create secret generic "$name" -n "$namespace" --context "$context" \
-    --from-file=token=/dev/stdin --dry-run=client -o yaml 2>/dev/null |
-    kubectl apply --server-side --force-conflicts --field-manager=kube-agents-installer \
+    --from-file="${key}=/dev/stdin" --dry-run=client -o yaml 2>/dev/null |
+    kubectl apply --server-side --force-conflicts --field-manager="$manager" \
       -n "$namespace" --context "$context" -f - >/dev/null 2>&1
   local rcs=("${PIPESTATUS[@]}")
   if [ "${rcs[0]}" -ne 0 ] || [ "${rcs[1]}" -ne 0 ]; then
-    print_error "Could not write the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
+    print_error "Could not write key '${key}' of the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
     return 1
   fi
+}
+
+# github.com presents a certificate the public CAs sign, and the later flag
+# check refuses a CA file with no host. Called by the forge menu's github.com
+# and no-repository answers: an exported GITOPS_CA_FILE is dropped without a
+# word, as the GitLab validator drops one for gitlab.com (a CA file typed for
+# an Enterprise Server host never reaches here: the validator's refusal puts
+# the entry value back); one given by flag is dropped with a line, since
+# refusing it after the whole interview would be the alternative. The CA
+# Secret name goes with it: a recorded forge, org, App or host flag settles
+# the forge before the menu, so the only name here is the default the early
+# flag check derived from an exported host and CA file (a refused attempt
+# at the menu derives none: the validator names the Secret only after it
+# accepts the file), and the later flag check would otherwise report it
+# dropped as a recorded one.
+drop_gitops_ca_file_for_github_com() {
+  if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ]; then
+    print_info "Dropping --gitops-ca-file '${PARAM_GITOPS_CA_FILE}': this run's GitOps forge is github.com, which uses the public CAs."
+  fi
+  PARAM_GITOPS_CA_FILE=""
+  PARAM_GITOPS_CA_SECRET=""
+}
+
+# The forge question, asked only when nothing has settled the forge: github.com,
+# a GitHub Enterprise Server (its host and an optional CA file, asked until
+# the validator accepts them), GitLab, whose own questions follow in main, or
+# no repository at all. The last answer sets GITOPS_INTERVIEW_DECLINED, and
+# main then takes the same arm as "Skip for now" in the repository menu, so
+# an operator who wants no GitOps repository is not made to name a forge
+# first. An empty Enterprise Server hostname comes back to this menu rather
+# than asking for the hostname again: before this, an operator who picked
+# option 2 by mistake could only leave with Ctrl-C.
+ask_gitops_forge() {
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || [ "${PARAM_GITOPS_FORGE_GIVEN:-false}" = "true" ]; then
+    return 0
+  fi
+  local forge_choice="1"
+  [ "$PARAM_GITOPS_FORGE" = "github" ] && [ -n "${PARAM_GITOPS_HOST:-}" ] && forge_choice="2"
+  [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="3"
+  # What the menu was first shown over. An option 2 attempt the validator
+  # refuses puts these back, so the next answer -- option 2 again, github.com
+  # or no repository -- starts from here and not from the refused host and
+  # CA file. The hostname prompt's default is the host the menu was shown
+  # over on the first attempt and nothing after a refusal: prompt_read
+  # substitutes a default for an empty answer, so a refused host offered
+  # again would make enter resubmit it instead of returning to the menu.
+  local host_on_entry="${PARAM_GITOPS_HOST:-}" ca_file_on_entry="${PARAM_GITOPS_CA_FILE:-}"
+  local ghes_host="${PARAM_GITOPS_HOST:-}"
+  while true; do
+    prompt_menu "Where does the GitOps repository live?" \
+      "GitHub (github.com)" \
+      "GitHub Enterprise Server (a GitHub host that you run)" \
+      "GitLab (gitlab.com or self-managed)" \
+      "Nowhere yet: install without a GitOps repository (you can connect one later)" \
+      forge_choice
+    case "$forge_choice" in
+      4)
+        # The same install as option 1, with the repository menu declined:
+        # github.com, no host, and no CA file.
+        PARAM_GITOPS_FORGE="github"
+        PARAM_GITOPS_HOST=""
+        drop_gitops_ca_file_for_github_com
+        GITOPS_INTERVIEW_DECLINED="true"
+        return 0
+        ;;
+      3)
+        PARAM_GITOPS_FORGE="gitlab"
+        return 0
+        ;;
+      2)
+        prompt_read "GitHub Enterprise Server hostname (for example github.example.com)" ghes_host "$ghes_host"
+        if [ -z "$ghes_host" ]; then
+          print_error "A GitHub Enterprise Server install needs the instance's hostname. Choose 'Nowhere yet' to install without a GitOps repository."
+          # With no terminal every answer is the same default, so asking
+          # again would spin.
+          has_controlling_tty || exit 1
+          continue
+        fi
+        PARAM_GITOPS_FORGE="github"
+        PARAM_GITOPS_HOST="$ghes_host"
+        # The CA prompt has no default, so empty stays a way to answer "a
+        # public CA signed it" on every pass.
+        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+          PARAM_GITOPS_CA_FILE=""
+          if [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+            prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
+          fi
+        fi
+        if validate_gitops_forge_flags; then
+          # A github.com spelling clears the host: the install is then github.com.
+          if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
+            print_info "Create the GitHub App on ${PARAM_GITOPS_HOST}, not on github.com: an App belongs to one GitHub host."
+          fi
+          return 0
+        fi
+        # The validator refused the host or the CA file: the menu comes back
+        # as it was first shown, with option 2 still selected, and enter asks
+        # for them again with no default. Options 1 and 4 clear the host and
+        # CA file themselves; option 3 does not, and without this it would
+        # offer the refused Enterprise Server host as the GitLab host's default.
+        ghes_host=""
+        PARAM_GITOPS_HOST="$host_on_entry"
+        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+          PARAM_GITOPS_CA_FILE="$ca_file_on_entry"
+        fi
+        has_controlling_tty || exit 1
+        ;;
+      *)
+        PARAM_GITOPS_FORGE="github"
+        PARAM_GITOPS_HOST=""
+        drop_gitops_ca_file_for_github_com
+        return 0
+        ;;
+    esac
+  done
+}
+
+# The CA file the organization check may hand to curl: --gitops-ca-file when
+# it can be read again later, and nothing for a one-shot source, which only
+# the CA Secret may read. Without a CA, the check on a host behind a private
+# CA cannot verify the host, and it warns and goes on.
+gitops_ca_file_for_check() {
+  if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && gitops_source_is_rereadable "$PARAM_GITOPS_CA_FILE"; then
+    printf '%s' "$PARAM_GITOPS_CA_FILE"
+  fi
+}
+
+# True when PATH is a file the installer can read now and again later: a
+# regular file that is not a descriptor path (/dev/fd/N, /dev/stdin,
+# /dev/stdout, /dev/stderr, /proc/...), also after symlinks are resolved.
+# /dev/stdin, /dev/fd/N and a process substitution can be a redirected regular
+# file, and `[ -f ]` is then true. On macOS, opening /dev/fd/N shares the
+# descriptor's offset, so an early read moves it to the end and the read after
+# the apply finds nothing. Such a source is read only after the apply.
+gitops_source_is_rereadable() {
+  local path="$1" target="" dir="" hops=0
+  [ -f "$path" ] || return 1
+  # Every hop of a symlink chain is checked, not only its end: on Linux,
+  # /dev/stdin resolves through /proc/self/fd/0 to the redirected file itself.
+  # The directory part is made physical at each hop, so `//dev/fd/9`,
+  # `/./dev/fd/9`, a relative path and a symlinked directory are judged by
+  # where they lead. Only the paths that can share a descriptor's offset are
+  # refused; another file under /dev keeps the early check.
+  while :; do
+    dir="$(cd -P -- "$(dirname -- "$path")" 2>/dev/null && pwd -P)" || return 1
+    path="${dir%/}/$(basename -- "$path")"
+    case "$path" in
+      /dev/fd/* | /dev/stdin | /dev/stdout | /dev/stderr | /proc/* | \
+        //dev/fd/* | //dev/stdin | //dev/stdout | //dev/stderr | //proc/*)
+        return 1
+        ;;
+    esac
+    [ -L "$path" ] || return 0
+    hops=$((hops + 1))
+    [ "$hops" -le 40 ] || return 1
+    target="$(readlink -- "$path" 2>/dev/null)" || return 1
+    case "$target" in
+      /*) path="$target" ;;
+      *) path="${dir%/}/$target" ;;
+    esac
+  done
 }
 
 # A token as GitLab issues it is one line; a file or a paste often carries a
@@ -4486,7 +5701,90 @@ gitlab_token_strip() {
   printf '%s' "$t"
 }
 
-# Creates (or replaces) the Secret the GitLab forge's credentialsRef names, in
+# Creates (or replaces) the Secret the forge's caBundleRef names (a self-managed
+# GitLab's or a GitHub Enterprise Server's), from
+# --gitops-ca-file, under the key ca.crt. A CA certificate is public, but it
+# goes in a Secret for its integrity: changing it then needs the rights that
+# changing a Secret needs. Server-side apply, as for the GitLab token, so no
+# last-applied copy is kept. The file is read once, here: a process
+# substitution cannot be read twice. It must hold at least one PEM certificate
+# and no private key. Without a file, an existing Secret is kept, and a missing
+# one is named, because until it exists every call to the forge fails on its
+# certificate.
+create_gitops_ca_secret() {
+  local namespace="$1" context="$2"
+  local name="${GITOPS_CA_SECRET:-}"
+  [ -n "$name" ] || return 0
+  local label="GitLab"
+  [ "${GITOPS_FORGE:-github}" = "gitlab" ] || label="GitHub Enterprise Server"
+  # Set when this call writes the Secret, so the caller can restart what
+  # reads the CA only when it starts.
+  GITOPS_CA_SECRET_WRITTEN="false"
+  local how="  kubectl create secret generic ${name} -n ${namespace} --context ${context} --from-file=ca.crt=<path-to-ca.pem> --dry-run=client -o yaml | kubectl apply --server-side -f -"
+  if [ -z "${PARAM_GITOPS_CA_FILE:-}" ]; then
+    if ! kubectl get secret "$name" -n "$namespace" --context "$context" >/dev/null 2>&1; then
+      print_warning "Secret '${name}' with the ${label} CA does not exist, so the agent cannot verify the ${label} host's certificate yet."
+      print_info "Create it; the agent picks it up with no restart:"
+      print_info "$how"
+      print_github_minter_ca_restart_hint "$namespace" "$context"
+    fi
+    return 0
+  fi
+  local pem="" pem_problem=""
+  IFS= read -r -d '' pem <"$PARAM_GITOPS_CA_FILE" || true
+  pem_problem="$(gitops_ca_pem_problem "$pem")"
+  if [ -n "$pem_problem" ]; then
+    # Only a one-shot source (/dev/stdin, a process substitution) reaches
+    # here with bad content: a regular file was checked before the apply. The
+    # apply has named the Secret already, so say how to create it and go on to
+    # the health checks, as a missing token does.
+    print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' ${pem_problem}"
+    print_warning "The agent cannot verify the ${label} host's certificate until Secret '${name}' exists. Create it; the agent picks it up with no restart:"
+    print_info "$how"
+    print_github_minter_ca_restart_hint "$namespace" "$context"
+    return 0
+  fi
+  printf '%s' "$pem" | kubectl create secret generic "$name" -n "$namespace" --context "$context" \
+    --from-file=ca.crt=/dev/stdin --dry-run=client -o yaml 2>/dev/null |
+    kubectl apply --server-side --force-conflicts --field-manager=kube-agents-installer \
+      -n "$namespace" --context "$context" -f - >/dev/null 2>&1
+  local rcs=("${PIPESTATUS[@]}")
+  if [ "${rcs[1]}" -ne 0 ] || [ "${rcs[2]}" -ne 0 ]; then
+    print_error "Could not write the ${label} CA Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[1]}, apply ${rcs[2]})."
+    return 1
+  fi
+  GITOPS_CA_SECRET_WRITTEN="true"
+  print_success "${label} CA stored in Secret '${name}' (namespace ${namespace})."
+}
+
+# On a GitHub Enterprise Server, the token minter reads the CA too, but only
+# when it starts: Go loads the system roots, SSL_CERT_DIR included, once. So a
+# CA Secret created after the minter started needs a restart of the minter.
+print_github_minter_ca_restart_hint() {
+  local namespace="$1" context="$2"
+  [ "${GITOPS_FORGE:-github}" = "gitlab" ] && return 0
+  print_info "Then restart the token minter, which reads the CA when it starts:"
+  print_info "  kubectl rollout restart deployment/${GITHUB_MINTER_DEPLOYMENT} -n ${namespace} --context ${context}"
+}
+
+# Restarts the token minter after create_gitops_ca_secret wrote a GitHub
+# Enterprise Server's CA, so that the minter reads it. Nothing to do when the
+# install runs no minter. A failed restart is a warning: the CA Secret is in
+# place, and the next restart reads it.
+restart_github_minter_for_ca() {
+  local namespace="$1" context="$2"
+  [ "${GITOPS_CA_SECRET_WRITTEN:-false}" = "true" ] || return 0
+  kubectl get deployment "$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" --context "$context" >/dev/null 2>&1 || return 0
+  if kubectl rollout restart deployment/"$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" --context "$context" >/dev/null 2>&1; then
+    print_info "Restarted the token minter so that it reads the CA."
+  else
+    print_warning "Could not restart the token minter, which reads the CA when it starts. Restart it:"
+    print_info "  kubectl rollout restart deployment/${GITHUB_MINTER_DEPLOYMENT} -n ${namespace} --context ${context}"
+  fi
+}
+
+# Writes the `token` key of the Secret the GitLab forge's credentialsRef names
+# (field manager GITLAB_TOKEN_FIELD_MANAGER, so a read-token key stays), in
 # the agent's namespace, after the apply has made the namespace. The token
 # reaches kubectl through a pipe -- read from the named source, or from a
 # no-echo prompt, into a local that is cleared at once -- so it is never in
@@ -4497,7 +5795,10 @@ create_gitlab_token_secret() {
   local namespace="$1" context="$2"
   local name="${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
   local exists="false" token="" rc=0
-  if kubectl get secret "$name" -n "$namespace" --context "$context" >/dev/null 2>&1; then
+  # The write token's key, not the Secret: a Secret that holds only the
+  # read-token key has no write token to keep.
+  if [ -n "$(kubectl get secret "$name" -n "$namespace" --context "$context" \
+    -o "jsonpath={.data.${GITLAB_TOKEN_SECRET_KEY}}" 2>/dev/null)" ]; then
     exists="true"
   fi
   if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
@@ -4509,7 +5810,7 @@ create_gitlab_token_secret() {
       print_error "The GitLab token source '${PARAM_GITLAB_TOKEN_FILE}' is empty; nothing was stored."
       return 1
     fi
-    printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" || rc=$?
+    printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" "$GITLAB_TOKEN_SECRET_KEY" "$GITLAB_TOKEN_FIELD_MANAGER" || rc=$?
     token=""
     unset token
     [ "$rc" -eq 0 ] || return 1
@@ -4545,11 +5846,34 @@ create_gitlab_token_secret() {
     print_warning "No token entered; nothing was stored. Create Secret '${name}' later (see the install guide)."
     return 0
   fi
-  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" || rc=$?
+  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" "$GITLAB_TOKEN_SECRET_KEY" "$GITLAB_TOKEN_FIELD_MANAGER" || rc=$?
   token=""
   unset token
   [ "$rc" -eq 0 ] || return 1
   print_success "GitLab token stored in Secret '${name}' (namespace ${namespace})."
+}
+
+# Writes the read-only token from GITLAB_READ_TOKEN_FILE into the key
+# "read-token" of the same Secret. The broker presents it only to clone
+# context repositories, never on a write. The token travels as in
+# create_gitlab_token_secret. Without a file, nothing is applied, so an
+# existing read token stays in place.
+create_gitlab_read_token_secret() {
+  local namespace="$1" context="$2"
+  local name="${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
+  local token="" rc=0
+  [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ] || return 0
+  IFS= read -r -d '' token <"$PARAM_GITLAB_READ_TOKEN_FILE" || true
+  token="$(gitlab_token_strip "$token")"
+  if [ -z "$token" ]; then
+    print_error "The GitLab read token source '${PARAM_GITLAB_READ_TOKEN_FILE}' is empty; nothing was stored."
+    return 1
+  fi
+  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" "$GITLAB_READ_TOKEN_SECRET_KEY" "$GITLAB_READ_TOKEN_FIELD_MANAGER" || rc=$?
+  token=""
+  unset token
+  [ "$rc" -eq 0 ] || return 1
+  print_success "GitLab read token stored in Secret '${name}', key ${GITLAB_READ_TOKEN_SECRET_KEY} (namespace ${namespace})."
 }
 
 # Validates that non-interactive minter configuration has either an ENABLED KMS key
@@ -4719,6 +6043,8 @@ summarize_existing_cluster_mutations() {
   else
     if is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
       echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Will enable${C_RESET} legacy Calico addon & enforcement (${C_YELLOW}may recreate nodes, restart workloads${C_RESET})"
+    elif is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_RED}Refused${C_RESET} (the web console requires NetworkPolicy enforcement; pass --enable-network-policy or --enable-web-console=false; install will abort)"
     elif is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
       echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Absent, accepted${C_RESET} (--accept-no-network-policy: cluster unchanged; ${C_YELLOW}every NetworkPolicy kube-agents ships is inert, the agent sandbox included${C_RESET}; recorded on the PlatformAgent)"
     else
@@ -4824,23 +6150,34 @@ import_github_pem() {
   # "already exists" is the expected answer — would print two fatal-looking
   # abort banners and leave a FAILED install report behind mid-run.
   local kms_ring_err="" kms_key_err=""
-  kms_ring_err="$(trap - ERR; gcloud kms keyrings create "$keyring" --location="$kms_location" \
-    --project="$project_id" 2>&1)" || true
+  kms_ring_err="$(trap - ERR; retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" \
+    --project="$project_id")" || true
 
   # --skip-initial-version-creation is required, not optional: KMS answers
   # `INVALID_ARGUMENT: Import-only keys must skip initial version creation` without
   # it. It matches skip_initial_version_creation in terraform/modules/github-minter,
   # which is where the key normally comes from.
-  kms_key_err="$(trap - ERR; gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
-    --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
-    --import-only --skip-initial-version-creation \
-    --protection-level=software --project="$project_id" 2>&1)" || true
+  if printf '%s\n' "$kms_ring_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    kms_key_err="skipped: keyring creation exhausted Cloud KMS API propagation retry budget"
+  else
+    kms_key_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
+      --import-only --skip-initial-version-creation \
+      --protection-level=software --project="$project_id")" || true
+  fi
 
   # The assertion, not the create, is what makes a failure visible. Whatever went
   # wrong above, the import cannot work without this key, and saying so here names
   # the cause instead of leaving a confusing failure two steps later.
-  if ! gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" \
-    --project="$project_id" >/dev/null 2>&1; then
+  local kms_describe_failed=0
+  if printf '%s\n' "$kms_ring_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN" || \
+     printf '%s\n' "$kms_key_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    kms_describe_failed=1
+  elif ! retry_kms_create gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" \
+    --project="$project_id" >/dev/null; then
+    kms_describe_failed=1
+  fi
+  if [ "$kms_describe_failed" -ne 0 ]; then
     # Deliberately says "could not be confirmed" rather than "does not exist":
     # describe also fails on an IAM denial for cloudkms.cryptoKeys.get or an API
     # blip, and asserting absence from that would be stating more than was
@@ -4917,7 +6254,7 @@ run_menu_system() {
   normalize_memory_vars
 
   local project_id="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}"
-  local project_number="${PROJECT_NUMBER:-}"
+  local project_number=""
   local cluster_name="${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}"
   local region="${REGION:-$DEFAULT_REGION}"
   local model_provider="${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
@@ -4927,6 +6264,12 @@ run_menu_system() {
   local gemini_api_key="${GEMINI_API_KEY:-}"
   local openai_api_key="${OPENAI_API_KEY:-}"
   local anthropic_api_key="${ANTHROPIC_API_KEY:-}"
+  local openai_compatible_api_base="${OPENAI_COMPATIBLE_API_BASE:-}"
+  local openai_compatible_target_port="${OPENAI_COMPATIBLE_TARGET_PORT:-}"
+  local openai_compatible_egress_cidrs="${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
+  local openai_compatible_ca_secret_name="${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
+  local openai_compatible_api_key="${OPENAI_COMPATIBLE_API_KEY:-}"
+  local litellm_env_secret_name="${LITELLM_ENV_SECRET_NAME:-}"
   local google_chat_enabled="${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
   local google_chat_home_channel="${GOOGLE_CHAT_HOME_CHANNEL:-}"
   local slack_enabled="${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
@@ -4977,7 +6320,7 @@ run_menu_system() {
     echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name:-Not Set} (${region:-$DEFAULT_REGION})"
     echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} $([ "$enable_webui" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
     echo -e "  • ${C_CYAN}Chat Integrations:${C_RESET} Google Chat: $([ "$google_chat_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF"), Slack: $([ "$slack_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF")"
-    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")"
+    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")$([ "$model_provider" = "openai_compatible" ] && echo " @ ${openai_compatible_api_base}" || echo "")$([ -n "$litellm_env_secret_name" ] && echo " (credentials Secret: ${litellm_env_secret_name})" || echo "")"
     echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
     echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
 
@@ -4985,7 +6328,7 @@ run_menu_system() {
     prompt_menu "Select configuration task:" \
       "🌐 Toggle Hermes Web UI (Port 9119 Dashboard)" \
       "💬 Manage Chat & Messaging Integrations (Google Chat / Slack)" \
-      "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI)" \
+      "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI / OpenAI-compatible)" \
       "🛡️ Modify Security & Permission Boundaries (gVisor / SRE vs Read-Only)" \
       "🗄️ Manage GitOps Repository & GitHub Auth (${DEFAULT_GITOPS_REPO})" \
       "🚀 Save & Apply Configuration Changes (~15s update)" \
@@ -5018,8 +6361,13 @@ run_menu_system() {
             fi
             prompt_read "Allowed Google Chat User Emails (comma-separated, empty allows all users)" \
               allowed_users "$allowed_users" false "$gchat_users_hint"
-            prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
-              google_chat_home_channel "$google_chat_home_channel"
+            if [ "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" = "next" ]; then
+              prompt_read "Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)" \
+                google_chat_home_channel "$google_chat_home_channel"
+            else
+              prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
+                google_chat_home_channel "$google_chat_home_channel"
+            fi
             ;;
           2) slack_enabled="true" ;;
           3) google_chat_enabled="false"; slack_enabled="false" ;;
@@ -5032,6 +6380,8 @@ run_menu_system() {
           "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
           "OpenAI ($(default_model_for_provider openai))" \
           "Anthropic ($(default_model_for_provider anthropic))" \
+          "OpenAI-compatible server (vLLM, TGI, an internal gateway; you name the model)" \
+          "SAP AI Core, or another LiteLLM provider (sap, azure, bedrock, ...; credentials in a Secret you create)" \
           m_opt
         case "$m_opt" in
           1)
@@ -5061,12 +6411,26 @@ run_menu_system() {
             model_default_name="$(default_model_for_provider anthropic)"
             prompt_read "Anthropic API Key" anthropic_api_key "$anthropic_api_key" true
             ;;
+          5)
+            # A model pinned for another provider is not this server's, so the
+            # prompt starts empty on a switch, as main() does.
+            [ "$model_provider" = "openai_compatible" ] || model_default_name=""
+            model_provider="openai_compatible"
+            prompt_openai_compatible_settings model_default_name openai_compatible_api_base \
+              openai_compatible_target_port openai_compatible_egress_cidrs \
+              openai_compatible_api_key openai_compatible_ca_secret_name
+            ;;
+          6)
+            # Back to the menu on an answer nobody can correct; the provider
+            # is unchanged.
+            prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || continue
+            ;;
         esac
         ;;
       4)
         local p_opt=""
         prompt_menu "Select GCP IAM Permission Set:" \
-          "read-only — auditing and observability, no GCP write capability (Default)" \
+          "read-only — auditing and observability: read roles, no write to infrastructure (Default)" \
           "custom — exactly the roles you list, no built-in bundle" \
           p_opt
         case "$p_opt" in
@@ -5108,6 +6472,52 @@ run_menu_system() {
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
+        # The check main() makes at step 7, before anything is saved; back to
+        # the menu on failure.
+        validate_openai_compatible_inputs "$model_provider" "$model_default_name" "$openai_compatible_api_base" \
+          "$openai_compatible_target_port" "$openai_compatible_egress_cidrs" "$openai_compatible_ca_secret_name" || continue
+        validate_model_provider_inputs "$model_provider" "$model_default_name" || continue
+        validate_litellm_env_secret_name "$litellm_env_secret_name" || continue
+        # The chat screen's home channel, which the home-channel warning below
+        # reads; save_env_var exports it again when it writes install.env.
+        export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"
+        # An install.env with no mode key (one copied from install.env.example
+        # onto a running install) would render today here, switching a next
+        # install back with nothing asked. The mode is settled from the
+        # cluster as main() does, and saved with the rest; a guess (a cluster
+        # that cannot be read) is rendered as today and not saved.
+        local menu_mode_to_save=""
+        if ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
+          PARAM_PLATFORM_AGENT_MODE="" PLATFORM_AGENT_MODE_GUESSED="false" PLATFORM_AGENT_MODE_SETTLED="false"
+          resolve_platform_agent_mode_fallback
+          PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \
+            adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || return 1
+          # The menu has no flag, so the recorded prefix is the mirror.
+          local menu_third_party_prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
+          mirrored_first_install_mode "${menu_third_party_prefix%/}"
+          export PLATFORM_AGENT_MODE="$PLATFORM_AGENT_MODE_FALLBACK"
+          [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" = "true" ] || menu_mode_to_save="$PLATFORM_AGENT_MODE_FALLBACK"
+        fi
+        # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
+        # from install.env, and if Slack moves to the A2A gateway under next,
+        # the settings it cannot use are refused (and again after the
+        # generator, for a bot token it recovers from the live Secret).
+        refuse_next_slack_gateway_settings_from_env || return 1
+        warn_next_home_channel_unset_from_env
+        # Kept until the check after the generator has passed, so that a
+        # refusal there puts install.env back as it was.
+        # The copy holds install.env's credentials, so it is 0600 under a
+        # recognisable name, and an EXIT trap removes it if the arm dies
+        # before either path below does (a generator failure exits through
+        # on_error, and Ctrl-C exits too).
+        local install_env_before=""
+        if [ -f "$INSTALL_ENV_FILE" ]; then
+          install_env_before="$(umask 077; mktemp "${TMPDIR:-/tmp}/kube-agents-install-env.XXXXXX")"
+          # Armed before the write, so a failed write leaves no copy either.
+          # shellcheck disable=SC2064 # expand now: the local is gone at exit.
+          trap "rm -f $(printf '%q' "$install_env_before")" EXIT
+          cat "$INSTALL_ENV_FILE" >"$install_env_before"
+        fi
 
         # Into install.env, one key at a time, leaving the operator's comments
         # and ordering alone. This panel is the one place allowed to write
@@ -5117,6 +6527,10 @@ run_menu_system() {
         # PROJECT_NUMBER, KMS_LOCATION and NO_CONFIRM are deliberately not
         # written. The first two are derived wherever they are used, and the third
         # describes an invocation rather than the install.
+        # A non-numeric App ID the file already carries (one a pre-#3076 run
+        # took from the App's name) is refused here too, before anything is
+        # saved or applied.
+        validate_github_app_id "$github_app_id" "GITHUB_APP_ID in ${INSTALL_ENV_FILE}" || return 1
         save_env_var PROJECT_ID "$project_id"
         save_env_var CLUSTER_NAME "$cluster_name"
         save_env_var REGION "$region"
@@ -5128,6 +6542,14 @@ run_menu_system() {
         save_secret_env_var GEMINI_API_KEY "$gemini_api_key"
         save_secret_env_var OPENAI_API_KEY "$openai_api_key"
         save_secret_env_var ANTHROPIC_API_KEY "$anthropic_api_key"
+        if [ "$model_provider" = "openai_compatible" ]; then
+          save_env_var OPENAI_COMPATIBLE_API_BASE "$openai_compatible_api_base"
+          save_env_var OPENAI_COMPATIBLE_TARGET_PORT "$openai_compatible_target_port"
+          save_env_var OPENAI_COMPATIBLE_EGRESS_CIDRS "$openai_compatible_egress_cidrs"
+          save_env_var OPENAI_COMPATIBLE_CA_SECRET_NAME "$openai_compatible_ca_secret_name"
+          save_secret_env_var OPENAI_COMPATIBLE_API_KEY "$openai_compatible_api_key"
+        fi
+        save_env_var LITELLM_ENV_SECRET_NAME "$litellm_env_secret_name"
         save_env_var ALLOWED_USERS "$allowed_users"
         save_env_var CHAT_TOPIC_NAME "$chat_topic_name"
         save_env_var CHAT_SUB_NAME "$chat_sub_name"
@@ -5145,6 +6567,9 @@ run_menu_system() {
         save_env_var GITHUB_APP_ID "$github_app_id"
         save_env_var KMS_KEYRING "$kms_keyring"
         save_env_var KMS_KEY "$kms_key"
+        if [ -n "$menu_mode_to_save" ]; then
+          save_env_var PLATFORM_AGENT_MODE "$menu_mode_to_save"
+        fi
         print_success "Updated configuration saved to: $INSTALL_ENV_FILE"
 
         # One engine for every kind of change: a full terraform apply
@@ -5164,6 +6589,27 @@ run_menu_system() {
         # decide the fate of a database.
         KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
           write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
+        # Again for a bot token the generator recovered from the live Secret.
+        # The keys are saved by now, so a refusal restores install.env and
+        # removes the tfvars that render the refused settings.
+        if ! refuse_next_slack_gateway_settings_from_env; then
+          if [ -n "$install_env_before" ]; then
+            # A 0600 replacement (the .tmp is written under umask 077),
+            # moved into place complete, as save_env_var writes it (on_error
+            # removes a half-written .tmp), before the copy is let go.
+            (umask 077; cat "$install_env_before" >"${INSTALL_ENV_FILE}.tmp")
+            mv -f "${INSTALL_ENV_FILE}.tmp" "$INSTALL_ENV_FILE"
+            trap - EXIT
+            rm -f "$install_env_before"
+            print_info "${INSTALL_ENV_FILE} is put back as it was before this Save & Apply."
+          fi
+          rm -f "$(tf_compose_dir "$repo_dir")/terraform.tfvars"
+          return 1
+        fi
+        if [ -n "$install_env_before" ]; then
+          rm -f "$install_env_before"
+          trap - EXIT
+        fi
         # A provider or minter switch is where a new fixed-name GSA is first
         # planned on an existing install, so the 409 check runs here too.
         check_service_account_ownership || exit 1
@@ -5178,12 +6624,48 @@ run_menu_system() {
         gcloud container clusters get-credentials "$cluster_name" --location "$REGION" \
           --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
         refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+        # A live GitHub minter this render would destroy (#3075), or a GitOps
+        # repository it would drop beside a minter this install did not make.
+        refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" || exit 1
+        # The menu edits no mode key, but an install.env edited by hand since
+        # the last apply reaches the cluster through this apply too, with no
+        # confirmation after the notice.
+        announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
         check_scope_container_access || exit 1
+        check_scope_export_sink_access || exit 1
         enable_scope_selector_apis "$PROJECT_ID"
         apply_crd_upgrades "$repo_dir"
         print_info "Re-applying the install to GKE cluster '$cluster_name' (terraform apply)..."
         run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-$(date -u +%Y%m%dT%H%M%SZ).log"
         print_success "Configuration applied!"
+        # The DM link in the Google Chat checklist is this project's number,
+        # read here rather than inherited: install.env never records it.
+        if is_truthy "$google_chat_enabled"; then
+          project_number="$(gcloud projects describe "$project_id" --format="value(projectNumber)" 2>/dev/null || echo "")"
+        fi
+        local menu_mode="${PLATFORM_AGENT_MODE_AFTER_APPLY:-${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}}"
+        PROJECT_NUMBER="$project_number" print_chat_setup_checklists "$menu_mode"
+        if [ "$CHAT_SETUP_CHECKLIST_PRINTED" = "true" ]; then
+          # Unlike main(), this apply does not wait for a rollout, and the menu
+          # redrawn below would push the checklist off screen. Under next the
+          # A2A gateway answers the platform it holds; the agent, the rest.
+          local menu_listeners="" menu_deployment
+          if google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled" ||
+            slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; then
+            menu_listeners="$PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT"
+          fi
+          if { is_truthy "$google_chat_enabled" && ! google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled"; } ||
+            { is_truthy "$slack_enabled" && ! slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; }; then
+            menu_listeners="${menu_listeners} ${PLATFORM_AGENT_DEPLOYMENT}"
+          fi
+          echo ""
+          for menu_deployment in $menu_listeners; do
+            print_info "Before the first chat message, wait for the rollout: kubectl rollout status deployment/${menu_deployment} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} --context $(gke_context_name)"
+          done
+          # shellcheck disable=SC2034  # the answer is not read
+          local menu_ack=""
+          prompt_read "Press Enter to return to the control panel" menu_ack "" || true
+        fi
         ;;
       7)
         print_info "Exiting Control Panel."
@@ -5252,6 +6734,13 @@ main() {
     # The menu reloads install.env and reads the scope keys, and the scoped
     # service account pool's switch and cap, from it alone; a flag here would
     # be validated and then dropped without a word.
+    # --mode likewise: the menu applies the mode install.env records, so a
+    # flag here would be dropped and the switch it asked for never announced.
+    if [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ]; then
+      print_error "--menu takes no --mode: it applies the PLATFORM_AGENT_MODE install.env records."
+      print_info "Set PLATFORM_AGENT_MODE in install.env to switch the mode; the menu's apply says it is a mode switch before it applies it."
+      exit 1
+    fi
     if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
       print_error "--menu takes no --scope-* flag, --scoped-sa-pool-enabled or --scoped-sa-pool-max-accounts: it edits install.env in place and reads the scope keys and the pool keys from there."
       print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS, SCOPED_SA_POOL_ENABLED or SCOPED_SA_POOL_MAX_ACCOUNTS in install.env, or pass the flag to a plain install.sh run."
@@ -5265,6 +6754,7 @@ main() {
       exit 1
     fi
     run_menu_system
+    print_next_home_channel_unset_summary
     exit 0
   fi
 
@@ -5325,8 +6815,9 @@ main() {
   fi
 
   # The GitOps forge's inputs need nothing but themselves, so they are judged
-  # before any work: a GitLab install handed a GitHub App, a bad host or an
-  # unreadable token source stops here, not after the cluster is built.
+  # before any work: a GitLab install handed a GitHub App, a bad host, an
+  # unreadable token source or an empty token file stops here, not after the
+  # cluster is built.
   validate_gitops_forge_flags || exit 1
 
   # 2. Prerequisite CLI Tools Check & Auto-Installation
@@ -5353,9 +6844,26 @@ main() {
   acquire_source_repo repo_dir "$image_tag"
   source_provisioning_helpers "$repo_dir"
   resolve_shared_defaults
-  # The chat flags against an existing install.env, as soon as is_truthy and
-  # the defaults are loaded: a flag that disagrees with the file stops the run
-  # here, before the interview and long before anything is applied.
+  # The mode first: a value the CRD refuses is named as that, not as a
+  # disagreement with install.env.
+  validate_platform_agent_mode || exit 1
+  # A GitHub App ID that is a name rather than the App's number (#3076), from
+  # the flag or install.env, before the interview and any --dry-run preview.
+  validate_github_app_id "${PARAM_GITHUB_APP_ID:-}" \
+    "$([ "${PARAM_GITHUB_APP_ID_FROM_FLAG:-false}" = "true" ] && echo "--github-app-id" || echo "GITHUB_APP_ID in ${INSTALL_ENV_FILE:-install.env}")" || exit 1
+  # SLACK_HOME_CHANNEL_POLICY, from the flag or install.env, before the file
+  # check below: a flag outside the enum would otherwise be refused as a
+  # disagreement with the file, with a remedy that records a value the
+  # generator and the CRD refuse. The generator checks again on every route.
+  # The remedy names the flag only when this run typed it (note_install_env_flag):
+  # a flag cannot correct a value the file carries, the file check below would
+  # refuse the disagreement, so that value is sent back to the file.
+  require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}" \
+    "$([[ $'\n'"$INSTALL_ENV_FLAGS_TYPED" == *$'\n'"SLACK_HOME_CHANNEL_POLICY|"* ]] && echo "flags" || echo "")" || exit 1
+  # The chat flags and --mode against an existing install.env, as soon as
+  # is_truthy and the defaults are loaded: a flag that disagrees with the file
+  # stops the run here, before the interview and long before anything is
+  # applied.
   check_flags_against_install_env || exit 1
 
   # 3. Google Cloud Authentication Check
@@ -5574,6 +7082,16 @@ main() {
   fi
   print_success "Selected Cluster Name: ${C_BOLD}${cluster_name}${C_RESET}"
 
+  # Settled before step 6, whose prompts and Slack refusals follow the mode:
+  # a run where nothing chose a mode, against a cluster that already runs
+  # kube-agents, keeps the mode it runs; a mirrored first install defaults to
+  # today; and an install.env with no mode key records the result. The target
+  # is known from here; the exports come later.
+  PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \
+    adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+  mirrored_first_install_mode "${PARAM_THIRD_PARTY_REGISTRY_PREFIX%/}"
+  queue_unrecorded_platform_agent_mode
+
   # 6. Chat & Messaging Platform Integration
   print_step "6. Chat & Messaging Integrations Setup"
   # The option the loaded configuration already corresponds to. It is a
@@ -5646,6 +7164,7 @@ main() {
   local slack_allowed_users="${PARAM_SLACK_ALLOWED_USERS:-}"
   local slack_home_channel="${PARAM_SLACK_HOME_CHANNEL:-}"
   local slack_home_channel_name="${PARAM_SLACK_HOME_CHANNEL_NAME:-}"
+  local slack_home_channel_policy="${PARAM_SLACK_HOME_CHANNEL_POLICY:-}"
 
   # No Slack token check here. The obvious place for one is this step -- Slack
   # is asked for here and the relay cannot open a socket without both tokens --
@@ -5685,13 +7204,73 @@ main() {
     # Same shape as allowed_users_hint above: an empty list has to read as a
     # deliberate choice rather than as a missing default.
     [ -z "$slack_allowed_users" ] && slack_allowed_hint="empty list"
+    # Under next with Chat off the A2A gateway takes Slack (the mode was
+    # settled at step 2; arm 3 set google_chat_enabled before this runs), and
+    # it takes one bot token, member IDs and a channel id. Those prompts say
+    # so and ask again on an answer the gateway cannot use, rather than let
+    # the refusal after this step throw the interview away. A run with nobody
+    # to ask keeps its values, and that refusal is its check.
+    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" true "$google_chat_enabled"; then
+      _prompt_slack_settings_for_gateway
+      return 0
+    fi
     prompt_read "Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)" \
       slack_bot_token "$slack_bot_token" true "$bot_hint"
     prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
-    prompt_read "Allowed Slack User IDs / Emails (comma-separated)" \
+    prompt_read "Allowed Slack member IDs (comma-separated, e.g. U0123ABCD; not emails)" \
       slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
     prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" \
       slack_home_channel "$slack_home_channel"
+    prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
+      slack_home_channel_name "$slack_home_channel_name"
+  }
+
+  # _prompt_slack_settings when the A2A gateway takes Slack. Reads the hints
+  # _prompt_slack_settings set (bash scopes them dynamically).
+  _prompt_slack_settings_for_gateway() {
+    local can_ask=true bad=""
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+      can_ask=false
+    fi
+    while :; do
+      prompt_read "Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)" \
+        slack_bot_token "$slack_bot_token" true "$bot_hint"
+      bad="$(slack_bot_token_list_count "$slack_bot_token")"
+      if [ -z "$bad" ] && slack_bot_token_has_separator "$slack_bot_token"; then bad=stray; fi
+      { [ -n "$bad" ] && $can_ask; } || break
+      if [ "$bad" = stray ]; then
+        print_error "SLACK_BOT_TOKEN holds a comma or space. Under spec.mode next the A2A gateway takes one bot token as it is; enter it without one."
+      else
+        print_error "SLACK_BOT_TOKEN holds ${bad} tokens. Under spec.mode next the A2A gateway takes one workspace's bot token; enter one."
+      fi
+      # Not the re-ask's default: prompt_read prints a default it has no
+      # label for, and this one is the list just typed under read -s.
+      slack_bot_token="" bot_hint=""
+    done
+    prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
+    while :; do
+      prompt_read "Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails)" \
+        slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
+      bad="$(slack_allowlist_emails "$slack_allowed_users")"
+      { [ -n "$bad" ] && $can_ask; } || break
+      print_error "These look like emails: ${bad}. Under spec.mode next the allowlist matches Slack member IDs exactly. Find one in Slack: open the person's profile, choose ⋮ (More), then Copy member ID."
+      # The refused list stays the default (an empty one would admit
+      # everyone), so the hint shows it rather than a label for another.
+      slack_allowed_hint=""
+    done
+    while :; do
+      prompt_read "Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there)" \
+        slack_home_channel "$slack_home_channel"
+      bad="$(slack_home_channel_not_an_id "$slack_home_channel")"
+      if [ -n "$bad" ] && $can_ask; then
+        print_error "'${bad}' is not a Slack channel id (C... or G...). The id is at the bottom of the channel details' About tab."
+        # Not the re-ask's default: prompt_read turns an empty answer into
+        # the default, so a bad one could never be cleared.
+        slack_home_channel=""
+        continue
+      fi
+      _confirm_no_home_channel SLACK_HOME_CHANNEL "$slack_home_channel" "$can_ask" && break
+    done
     prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
       slack_home_channel_name "$slack_home_channel_name"
   }
@@ -5719,8 +7298,35 @@ main() {
     fi
     chat_sub_name="$default_sub"
     prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
-    prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
-      google_chat_home_channel "$google_chat_home_channel"
+    if [ "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" != "next" ]; then
+      prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
+        google_chat_home_channel "$google_chat_home_channel"
+      return 0
+    fi
+    local can_ask=true
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+      can_ask=false
+    fi
+    while :; do
+      prompt_read "Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)" \
+        google_chat_home_channel "$google_chat_home_channel"
+      _confirm_no_home_channel GOOGLE_CHAT_HOME_CHANNEL "$google_chat_home_channel" "$can_ask" && break
+    done
+  }
+
+  # Under next the A2A gateway posts alerts and reports only to a home
+  # channel (#3320). An empty answer is allowed, after a warning and a yes:
+  # true to keep the answer, false to ask again. $1 the key, $2 the answer,
+  # $3 whether anyone can be asked. With nobody to ask it keeps the answer;
+  # the warning before the apply and the closing summary say it then.
+  _confirm_no_home_channel() {
+    local home keep=""
+    home="$(trim_go_space "${2:-}")"
+    [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
+    print_warning "$(next_home_channel_unset_message "$1")"
+    prompt_read "Continue without a home channel, so alerts and reports are dropped? (y/N)" keep "n"
+    case "$keep" in [yY] | [yY][eE][sS]) return 0 ;; esac
+    return 1
   }
 
   # Both chat platforms are opt-in and default off, so this is the common
@@ -5730,6 +7336,9 @@ main() {
   # project_id, region and cluster_name are all set by earlier steps, and
   # NAMESPACE is exported before the menu runs.
   _prompt_no_chat_enabled() {
+    # after_summary is true for the repeat at the end of main(), where the
+    # component summary has already printed the web console command.
+    local after_summary="${1:-false}"
     print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
 
     # gcloud rejects --dns-endpoint on clusters without an external DNS
@@ -5776,8 +7385,19 @@ main() {
     # toggle.
     echo -e "  To add a chat platform later, edit install.env and re-run ${C_BOLD}./install.sh${C_RESET}:"
     echo -e "    Google Chat: ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} and ${C_BOLD}ALLOWED_USERS=${C_RESET}<emails> (or use ${C_BOLD}./install.sh --menu${C_RESET})"
-    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<user IDs>, re-run with --slack-bot-token and --slack-app-token"
+    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<member IDs, e.g. U0123ABCD>, re-run with --slack-bot-token and --slack-app-token"
     echo -e "  An allowlist left empty admits every user. --enable-google-chat and --enable-slack are refused over a file that records the key the other way."
+    if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}}"; then
+      if [ "$after_summary" = "true" ]; then
+        # The component summary just above already printed the command.
+        echo -e "  For a browser chat page instead of a terminal, use the Web Console command in the summary above."
+      else
+        echo ""
+        print_web_console_access "${NAMESPACE:-$DEFAULT_NAMESPACE}"
+      fi
+    else
+      echo -e "  For a browser chat page instead of a terminal, re-run with ${C_BOLD}--enable-web-console${C_RESET}."
+    fi
   }
 
   case "$chat_choice" in
@@ -5792,6 +7412,7 @@ main() {
     3)
       google_chat_enabled="true"
       slack_enabled="true"
+      print_info "Under spec.mode next, Google Chat holds the A2A gateway when both are enabled, and Slack stays on the Hermes Slack platform; choose Slack alone to run Slack on the A2A gateway."
       _prompt_google_chat_settings
       _prompt_slack_settings
       ;;
@@ -5799,18 +7420,33 @@ main() {
       _prompt_no_chat_enabled
       ;;
   esac
+  # The Slack settings are settled here, whether from a flag, install.env or
+  # an answer. If Slack moves to the A2A gateway under next, the settings it
+  # cannot use (an email in the allowlist, a home channel that is not a
+  # channel id, a list of bot tokens) are refused now, before the generator,
+  # install.env or any apply. A token the generator recovers from the live
+  # Secret is checked after it. A --dry-run applies nothing, so it is warned
+  # there instead, once, with the recovered token included.
+  if [ "$PARAM_DRY_RUN" != "true" ]; then
+    refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" "$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" flags || exit 1
+  fi
 
   # 7. LLM Model Provider Selection & API Key Auto-Discovery
   print_step "7. AI Model Provider Credentials"
   local model_provider="$PARAM_MODEL_PROVIDER"
   if ! is_valid_model_provider "$model_provider"; then
-    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, or openai."
+    if [ "$model_provider" = "chatgpt" ]; then
+      print_error "Model provider 'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store the chart does not ship. Use openai with an API key."
+    else
+      print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, openai, openai_compatible, sap, or a LiteLLM provider slug (lowercase letters, digits and underscores) with --model-default-name."
+    fi
     exit 1
   fi
   local model_default_name="${PARAM_MODEL_DEFAULT_NAME:-${MODEL_DEFAULT_NAME:-}}"
   if [ -z "$model_default_name" ]; then
     model_default_name="$(default_model_for_provider "$model_provider")"
   fi
+  model_default_name="$(openai_compatible_model_for_run "$model_provider" "$model_default_name" "$PARAM_MODEL_DEFAULT_NAME_PASSED" "${MODEL_PROVIDER:-}")"
   local model_max_tokens="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"
   validate_model_max_tokens || exit 1
   local redaction_ip_action="${PARAM_LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
@@ -5830,6 +7466,9 @@ main() {
   if is_truthy "$redaction_enabled" && [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
     hcl_redaction_rules "$LITELLM_REDACTION_RULES" >/dev/null || exit 1
   fi
+  # The mode was checked at step 2, before check_flags_against_install_env
+  # held --mode to install.env (validate_platform_agent_mode).
+  local platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   # The scoped service account pool, checked here for the same reason as the
   # toggle above: a misspelt switch is refused rather than read as off, and a
   # cap the module would refuse is named with its key before the interview.
@@ -5864,6 +7503,12 @@ main() {
   local gemini_api_key="${detected_gemini_key:-}"
   local openai_api_key="${PARAM_OPENAI_API_KEY:-}"
   local anthropic_api_key="${PARAM_ANTHROPIC_API_KEY:-}"
+  local openai_compatible_api_base="${PARAM_OPENAI_COMPATIBLE_API_BASE:-}"
+  local openai_compatible_target_port="${PARAM_OPENAI_COMPATIBLE_TARGET_PORT:-}"
+  local openai_compatible_egress_cidrs="${PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
+  local openai_compatible_ca_secret_name="${PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
+  local openai_compatible_api_key="${PARAM_OPENAI_COMPATIBLE_API_KEY:-}"
+  local litellm_env_secret_name="${PARAM_LITELLM_ENV_SECRET_NAME:-}"
 
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # Pre-set to the provider already configured, so pressing enter keeps it.
@@ -5875,12 +7520,17 @@ main() {
       vertex_ai) model_choice="2" ;;
       openai) model_choice="3" ;;
       anthropic) model_choice="4" ;;
+      openai_compatible) model_choice="5" ;;
+      # sap, and any other LiteLLM provider slug.
+      *) model_choice="6" ;;
     esac
     prompt_menu "Select Model Provider for the Platform Agent:" \
       "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
       "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
       "OpenAI ($(default_model_for_provider openai) / OpenAI API)" \
       "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
+      "OpenAI-compatible server (vLLM, TGI, an internal gateway; you name the model)" \
+      "SAP AI Core, or another LiteLLM provider (sap, azure, bedrock, ...; credentials in a Secret you create)" \
       model_choice
 
     # A model the install already pins survives a re-run that leaves the
@@ -5927,9 +7577,23 @@ main() {
         fi
         prompt_read "Anthropic API Key" anthropic_api_key "${ANTHROPIC_API_KEY:-}" true
         ;;
+      5)
+        model_provider="openai_compatible"
+        [ "$model_provider_was" = "openai_compatible" ] || model_default_name=""
+        prompt_openai_compatible_settings model_default_name openai_compatible_api_base \
+          openai_compatible_target_port openai_compatible_egress_cidrs \
+          openai_compatible_api_key openai_compatible_ca_secret_name
+        ;;
+      6)
+        prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || exit 1
+        ;;
     esac
   fi
 
+  # The chart refuses the render without these, so the run stops here, before
+  # anything is built, whatever the provider.
+  validate_model_provider_inputs "$model_provider" "$model_default_name" || exit 1
+  validate_litellm_env_secret_name "$litellm_env_secret_name" || exit 1
   case "$model_provider" in
     gemini)
       [ -n "$gemini_api_key" ] || print_warning "No Gemini API key was provided; the agent will require a credential update before model calls can succeed."
@@ -5961,6 +7625,25 @@ main() {
     anthropic)
       [ -n "$anthropic_api_key" ] || print_warning "No Anthropic API key was provided; the agent will require a credential update before model calls can succeed."
       ;;
+    openai_compatible)
+      # Loud, unlike the missing keys above: a keyless install still deploys,
+      # and this one cannot render.
+      validate_openai_compatible_inputs "$model_provider" "$model_default_name" "$openai_compatible_api_base" \
+        "$openai_compatible_target_port" "$openai_compatible_egress_cidrs" "$openai_compatible_ca_secret_name" || exit 1
+      print_info "Serving ${model_default_name} from ${openai_compatible_api_base} through the gateway."
+      if [ -n "$litellm_env_secret_name" ]; then
+        print_info "With OPENAI_COMPATIBLE_OAUTH_TOKEN_URL, _CLIENT_ID and _CLIENT_SECRET in the Secret ${litellm_env_secret_name}, the gateway exchanges them for the server's bearer token."
+      fi
+      ;;
+    *)
+      # sap, and any other LiteLLM provider slug: the credentials live in the
+      # Secret, which the install names and never creates.
+      if [ -z "$litellm_env_secret_name" ]; then
+        print_warning "No credentials Secret was named (--litellm-env-secret); the gateway cannot authenticate to ${model_provider} until one exists and a re-run names it."
+      else
+        print_info "Serving ${model_default_name} through ${model_provider}; the gateway reads its credentials from the Secret ${litellm_env_secret_name} in ${NAMESPACE:-$DEFAULT_NAMESPACE}, which must exist before the first model call."
+      fi
+      ;;
   esac
 
   # 8. GitOps Infrastructure Repository Connection
@@ -5991,21 +7674,7 @@ main() {
 
   # The forge comes first: a GitLab repository has no GitHub organization, App
   # or token minter, so the GitHub interview below does not apply to it.
-  if [ "$PARAM_NON_INTERACTIVE" != "true" ] && [ "${PARAM_GITOPS_FORGE_GIVEN:-false}" != "true" ]; then
-    local forge_choice="1"
-    [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="2"
-    prompt_menu "Where does the GitOps repository live?" \
-      "GitHub" \
-      "GitLab (gitlab.com or self-managed)" \
-      forge_choice
-    if [ "$forge_choice" = "2" ]; then
-      PARAM_GITOPS_FORGE="gitlab"
-    else
-      PARAM_GITOPS_FORGE="github"
-      PARAM_GITOPS_HOST=""
-    fi
-  fi
-
+  ask_gitops_forge
   if [ "$PARAM_GITOPS_FORGE" = "gitlab" ]; then
     # No GitHub org and no minter: write_tfvars_from_state renders neither for
     # GitLab, and the CR names the forge and its token Secret instead.
@@ -6020,9 +7689,14 @@ main() {
       [[ "$github_repo" == */* ]] || github_repo=""
       while true; do
         prompt_read "GitLab host (gitlab.com, or your self-managed instance's hostname)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-gitlab.com}"
-        [ "$PARAM_GITOPS_HOST" = "gitlab.com" ] && PARAM_GITOPS_HOST=""
+        gitlab_host_is_self_managed "$PARAM_GITOPS_HOST" || PARAM_GITOPS_HOST=""
         prompt_read "GitLab project path (group/project or group/subgroup/project)" github_repo "${github_repo}"
         prompt_read "Kubernetes Secret to hold the GitLab token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
+        # Only a self-managed instance can be behind a private CA.
+        # No default: empty must stay a way to answer "none" on every pass.
+        if gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}" && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+          prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
+        fi
         PARAM_GITOPS_REPO="$github_repo"
         if [ -n "$github_repo" ] && validate_gitops_forge_flags; then
           github_repo="$PARAM_GITOPS_REPO"
@@ -6049,11 +7723,16 @@ main() {
     if [ -n "$github_org" ]; then
       gitops_choice="2"
     fi
-    prompt_menu "Would you like to connect or create a GitOps repo for automated PRs?" \
-      "Create a NEW GitHub Repository automatically (Recommended)" \
-      "Connect an EXISTING GitHub Repository" \
-      "Skip for now (Can be enabled later)" \
-      gitops_choice
+    if [ "$GITOPS_INTERVIEW_DECLINED" = "true" ]; then
+      # The forge menu already took the answer: no second menu to decline.
+      gitops_choice="3"
+    else
+      prompt_menu "Would you like to connect or create a GitOps repo for automated PRs?" \
+        "Create a NEW GitHub Repository automatically (Recommended)" \
+        "Connect an EXISTING GitHub Repository" \
+        "Skip for now (Can be enabled later)" \
+        gitops_choice
+    fi
 
     if [ "$gitops_choice" = "1" ] || [ "$gitops_choice" = "2" ]; then
       # The repo must be organization-owned: the token minter resolves App
@@ -6062,7 +7741,11 @@ main() {
       # organization, never their login — suggesting a username would guarantee
       # the failure below.
       local detected_gh_org=""
-      detected_gh_org=$(gh api user/orgs -q '.[0].login' 2>/dev/null || echo "")
+      if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
+        detected_gh_org=$(gh api --hostname "$PARAM_GITOPS_HOST" user/orgs -q '.[0].login' 2>/dev/null || echo "")
+      else
+        detected_gh_org=$(gh api user/orgs -q '.[0].login' 2>/dev/null || echo "")
+      fi
       print_info "The GitOps repo must belong to a GitHub organization; a personal account cannot"
       print_info "mint tokens. A free organization is enough."
       # Every default below is the loaded value first, the project default or
@@ -6078,11 +7761,11 @@ main() {
         if [ -z "$github_org" ]; then
           org_problem="A GitHub organization is required to connect a GitOps repo."
         elif ! is_truthy "${SKIP_GITHUB_ORG_CHECK:-false}"; then
-          case "$(github_account_type "$github_org")" in
+          case "$(github_account_type "$github_org" "${PARAM_GITOPS_HOST:-}" "$(gitops_ca_file_for_check)")" in
             organization) ;;
             user) org_problem="'${github_org}' is a personal GitHub account, not an organization. The token minter cannot mint tokens for it." ;;
-            missing) org_problem="'${github_org}' does not exist on GitHub. Check the spelling." ;;
-            *) print_warning "Could not reach GitHub to verify '${github_org}'; continuing." ;;
+            missing) org_problem="'${github_org}' does not exist on ${PARAM_GITOPS_HOST:-GitHub}. Check the spelling." ;;
+            *) print_warning "Could not reach ${PARAM_GITOPS_HOST:-GitHub} to verify '${github_org}'; continuing." ;;
           esac
         fi
         [ -z "$org_problem" ] && break
@@ -6101,6 +7784,12 @@ main() {
 
       print_info "GitHub access uses the short-lived GitHub App token minter."
       prompt_read "GitHub App ID (optional, press Enter to skip token minter)" github_app_id "${github_app_id}"
+      # Asked again here, rather than refused after the KMS questions: the App's
+      # name in place of its number is the usual slip (#3076).
+      while [ -n "$github_app_id" ] && ! validate_github_app_id "$github_app_id" "GitHub App ID"; do
+        has_controlling_tty && [ "$PARAM_NON_INTERACTIVE" != "true" ] || exit 1
+        prompt_read "GitHub App ID (its number; press Enter to skip token minter)" github_app_id ""
+      done
       if [ -n "$github_app_id" ]; then
         prompt_read "Cloud KMS Keyring Name" kms_keyring "${kms_keyring}"
         prompt_read "Cloud KMS Key Name" kms_key "${kms_key}"
@@ -6158,7 +7847,7 @@ main() {
       if [ -n "$github_org" ] || [ -n "$github_app_id" ]; then
         print_info "GitOps interview skipped; keeping the GitOps configuration this install already records."
       else
-        print_info "GitOps repository connection skipped. Scheduled fleet audits need one and fail without it."
+        print_info "GitOps repository connection skipped. Scheduled fleet audits still run, keep their reports on the agent's volume and post to chat when something changed, but write no ledger issue or pull request without one."
       fi
     fi
   else
@@ -6262,7 +7951,9 @@ main() {
     # These are GCP IAM role bundles for the agent's GSA, nothing else. Kubernetes
     # RBAC stays read-only in every set, and the GitOps pull-request path works in
     # every set, so neither belongs in these labels. read-only leads because it is
-    # the documented default and the only set that enforces no cloud-plane writes.
+    # the documented default and the only set that keeps writes to infrastructure
+    # out at IAM; what its roles carry beyond reads (the Trace role's console
+    # permissions) is on the canonical page, not restated in the label.
     # See docs/site/src/content/docs/reference/security-and-iam.md.
     # The "(Default)" tag follows the option enter keeps — the seeded one on a
     # re-run — for the reason the gVisor prompt below gives: a static tag on
@@ -6275,7 +7966,7 @@ main() {
       perm_tag_custom=" (Default)"
     fi
     prompt_menu "Select Platform Agent GCP IAM Permission Set:" \
-      "read-only — auditing and observability, no GCP write capability${perm_tag_ro}" \
+      "read-only — auditing and observability: read roles, no write to infrastructure${perm_tag_ro}" \
       "custom — exactly the roles you list, no built-in bundle${perm_tag_custom}" \
       perm_choice
 
@@ -6519,12 +8210,28 @@ main() {
   export LITELLM_REDACTION_ENABLED="$redaction_enabled"
   export LITELLM_REDACTION_IP_ACTION="$redaction_ip_action"
   export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"
+  platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
+  export PLATFORM_AGENT_MODE="$platform_agent_mode"
+  # The bus's two third-party images are the operator's compiled defaults
+  # (A2A_NATS_IMAGE and A2A_PROVISION_IMAGE in images.json), which neither
+  # this installer nor the chart points at a mirror, so a next install that
+  # mirrors its third-party images still pulls those two from Docker Hub.
+  if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then
+    print_warning "spec.mode next with a third-party registry prefix: the operator still pulls the NATS bus's two images (nats, nats-box) from Docker Hub. Nothing in this install points them at ${third_party_registry_prefix}."
+    print_info "On a cluster that can pull only from the mirror, the bus stays in ImagePullBackOff until the operator's A2A_NATS_IMAGE and A2A_PROVISION_IMAGE name the mirrored copies (images.json lists both)."
+  fi
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
   export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"
   export GEMINI_API_KEY="$gemini_api_key"
   export OPENAI_API_KEY="$openai_api_key"
   export ANTHROPIC_API_KEY="$anthropic_api_key"
+  export OPENAI_COMPATIBLE_API_BASE="$openai_compatible_api_base"
+  export OPENAI_COMPATIBLE_TARGET_PORT="$openai_compatible_target_port"
+  export OPENAI_COMPATIBLE_EGRESS_CIDRS="$openai_compatible_egress_cidrs"
+  export OPENAI_COMPATIBLE_CA_SECRET_NAME="$openai_compatible_ca_secret_name"
+  export OPENAI_COMPATIBLE_API_KEY="$openai_compatible_api_key"
+  export LITELLM_ENV_SECRET_NAME="$litellm_env_secret_name"
   export ALLOWED_USERS="$allowed_users"
   export CHAT_TOPIC_NAME="$chat_topic_name"
   export CHAT_SUB_NAME="$chat_sub_name"
@@ -6537,6 +8244,7 @@ main() {
   export SLACK_ALLOWED_USERS="$slack_allowed_users"
   export SLACK_HOME_CHANNEL="$slack_home_channel"
   export SLACK_HOME_CHANNEL_NAME="$slack_home_channel_name"
+  export SLACK_HOME_CHANNEL_POLICY="$slack_home_channel_policy"
   export API_SERVER_KEY="$api_server_key"
   export PLATFORM_AGENT_PERMISSION_SET="$permission_set"
   export PLATFORM_AGENT_CUSTOM_ROLES="$custom_roles"
@@ -6555,6 +8263,7 @@ main() {
   export GITOPS_FORGE="$PARAM_GITOPS_FORGE"
   export GITOPS_HOST="$PARAM_GITOPS_HOST"
   export GITLAB_TOKEN_SECRET="$PARAM_GITLAB_TOKEN_SECRET"
+  export GITOPS_CA_SECRET="$PARAM_GITOPS_CA_SECRET"
   # One release of overlap: the agent runtime and the chart still speak
   # GITHUB_*, and normalize_gitops_repo_vars keeps them equal to the GITOPS_*
   # values rather than letting them be a second source of truth.
@@ -6567,6 +8276,11 @@ main() {
   export MEMORY_PROVIDER="$memory_provider"
   export USER_PROFILE_ENABLED="$PARAM_USER_PROFILE_ENABLED"
   export HERMES_DASHBOARD_ENABLED="$PARAM_ENABLE_WEBUI"
+  # Conditional, like ENABLE_DRIFT_DETECTOR below: a run that did not say
+  # leaves the recorded value (or, with none, the default) to the generator.
+  if [ -n "${PARAM_ENABLE_WEB_CONSOLE:-}" ]; then
+    export WEB_CONSOLE_ENABLED="$PARAM_ENABLE_WEB_CONSOLE"
+  fi
   export REGISTRY_PREFIX="$registry_prefix"
   export ENABLE_PUBSUB_PLATFORM="$PARAM_ENABLE_PUBSUB_PLATFORM"
   export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
@@ -6623,6 +8337,21 @@ main() {
   # still supply the tokens; before the apply, because a relay without them
   # CrashLoops.
   require_slack_tokens_after_recovery
+  # Again on the exported keys, for a bot token the generator recovered from
+  # the live Secret (refuse_next_slack_gateway_settings). Still before
+  # install.env and the apply. The tfvars just written render the refused
+  # settings, so a refusal removes them: --generate-only hands that file to
+  # lifecycle.sh apply. A --dry-run warns instead.
+  if [ "$PARAM_DRY_RUN" = "true" ]; then
+    refuse_next_slack_gateway_settings_from_env flags "$SCOPE_CHECK_MODE_WARN"
+  elif ! refuse_next_slack_gateway_settings_from_env flags; then
+    rm -f "$tfvars_file"
+    print_info "Removed ${tfvars_file}, which carried the refused settings, so nothing applies it."
+    exit 1
+  fi
+  # A chat backend the gateway holds with no home channel (#3320): a
+  # warning, never a refusal, repeated at the end of the run.
+  warn_next_home_channel_unset_from_env flags
   print_success "Terraform input saved to: $tfvars_file"
 
   # Before the summary, the confirmation and the dry-run exit alike: a
@@ -6645,6 +8374,54 @@ main() {
       --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
     refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
   fi
+  # A live GitHub minter this render would destroy (#3075): an install.env
+  # without the GitOps keys, and a run without the flags, renders GitOps off.
+  # Over a minter this install did not make, the check guards the GitOps
+  # repository and the chart minter's names instead.
+  # Refused for a run that applies and for --generate-only, which hands its
+  # tfvars to lifecycle.sh apply (as the Slack check treats it); --dry-run
+  # warns. The context is the one the gate above fetched where it ran; without
+  # one, a preview says the check did not run.
+  if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
+    if [ "$PARAM_DRY_RUN" != "true" ]; then
+      if ! refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE"; then
+        # The tfvars just written are the ones the check refused;
+        # --generate-only would hand them to lifecycle.sh apply, so they go.
+        rm -f "$tfvars_file"
+        print_info "Removed ${tfvars_file}, which the check above refused, so nothing applies it."
+        exit 1
+      fi
+    else
+      refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" "$SCOPE_CHECK_MODE_WARN"
+    fi
+  fi
+  # A PLATFORM_AGENT_MODE that moves the CR's spec.mode is a mode switch, and
+  # it is named before the operator confirms the apply. Outside the gate
+  # above, so --dry-run and --generate-only say it too; it takes the reads the
+  # scope check in the gate just made, and reads for itself when the gate did
+  # not run. The reads need this cluster's context, which the gate fetched for
+  # an applying run. A first install reads nothing (the generator found no
+  # cluster); on a cluster that exists, a missing context or a read that fails
+  # says the check did not run.
+  # -y applies without the step-11 prompt, so the notice is the ungated one.
+  local mode_notice_route=""
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_DRY_RUN" != "true" ]; then
+    mode_notice_route="$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
+  fi
+  announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"
+  # Under -y nothing stands between that notice and the apply, so a switch
+  # nobody chose is refused: one that comes from the fallback rather than
+  # from --mode, an exported PLATFORM_AGENT_MODE or the key install.env
+  # records (editing that key is the documented way to switch).
+  if [ "$mode_notice_route" = "$PLATFORM_AGENT_MODE_NOTICE_UNGATED" ] \
+    && [ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ] \
+    && [ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ] \
+    && ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
+    rm -f "$tfvars_file"
+    print_error "Refusing to switch spec.mode under -y when nothing asked for it: no --mode, and install.env records no PLATFORM_AGENT_MODE."
+    print_info "Pass --mode=today or --mode=next to say which mode this install runs, or run without -y to confirm the switch at the prompt."
+    exit 1
+  fi
   # A declared folder or organisation is bound by the apply with this
   # identity, in the container itself, and turns on the Asset API in the host
   # project; both are checked before anything is applied, first install
@@ -6656,11 +8433,15 @@ main() {
   # ones at the keyboard. Here the route is known for --generate-only and -y;
   # an interactive run learns it at the (Y/n/g) prompt below and is checked
   # there, so the g answer is the same choice as the flag.
+  # The sink preflight follows the same route: the apply creates a drift
+  # audit-log sink in each project the scope lists with the same identity.
   if [ "$PARAM_DRY_RUN" != "true" ]; then
     if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
       check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+      check_scope_export_sink_access "$SCOPE_CHECK_MODE_WARN"
     elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
       check_scope_container_access || exit 1
+      check_scope_export_sink_access || exit 1
     fi
   fi
 
@@ -6694,9 +8475,22 @@ main() {
     summarize_existing_cluster_mutations "$project_id" "$cluster_name" "$region" "$enable_gvisor"
   fi
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
+  # Named on every run, a first install included, where no switch notice
+  # fires: a first install is next by default, and this is where it learns
+  # that and how to keep the previous stack instead.
+  if [ "$platform_agent_mode" = "next" ]; then
+    echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (the NATS bus and the A2A gateway in front of the agent; --mode=today on a first install, or PLATFORM_AGENT_MODE=today in install.env, installs the previous stack)"
+  else
+    echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${platform_agent_mode}"
+  fi
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
     echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
+  elif [ "$model_provider" = "openai_compatible" ]; then
+    echo -e "  • ${C_CYAN}OpenAI-compatible Server:${C_RESET} ${openai_compatible_api_base}"
+  fi
+  if [ -n "$litellm_env_secret_name" ]; then
+    echo -e "  • ${C_CYAN}Gateway Credentials Secret:${C_RESET} ${litellm_env_secret_name}"
   fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
   echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"
@@ -6711,7 +8505,11 @@ main() {
   if [ "${PARAM_GITOPS_FORGE:-github}" = "gitlab" ] && [ -n "$github_repo" ]; then
     echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} $(GITOPS_HOST="$PARAM_GITOPS_HOST" GITOPS_REPO="$github_repo" gitlab_repo_url) (GitLab; token in Secret ${PARAM_GITLAB_TOKEN_SECRET})"
   elif [ -n "$github_org" ] && [ -n "$github_repo" ]; then
-    echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
+    if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
+      echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://${PARAM_GITOPS_HOST}/${github_org}/${github_repo} (GitHub Enterprise Server${PARAM_GITOPS_CA_SECRET:+; CA in Secret ${PARAM_GITOPS_CA_SECRET}})"
+    else
+      echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
+    fi
   fi
   echo -e "${C_CYAN}${C_BOLD}"
   draw_separator
@@ -6756,12 +8554,16 @@ main() {
       is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
       if [ "$np_status" -eq 2 ]; then
         print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' could not be queried."
-      elif [ "$np_status" -ne 0 ] && ! is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+      elif [ "$np_status" -ne 0 ] && { ! is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}" || is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; }; then
         if is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
           print_info "Dry-run: skipping terraform plan because Calico has not yet been applied to the live cluster (a real run enables Calico prior to apply)."
         else
           print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' enforces no NetworkPolicy (postcondition would fail)."
-          print_info "A real run will abort unless told which way to go: --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon, a control-plane update that may recreate nodes; --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement and leaves the cluster as it is."
+          if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-false}}"; then
+            print_info "A real run will abort unless NetworkPolicy enforcement is enabled: --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon, a control-plane update that may recreate nodes (--accept-no-network-policy / ACCEPT_NO_NETWORK_POLICY=true cannot be combined with --enable-web-console)."
+          else
+            print_info "A real run will abort unless told which way to go: --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon, a control-plane update that may recreate nodes; --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement and leaves the cluster as it is."
+          fi
           print_info "To enable enforcement by hand beforehand, run these two commands in this order:"
           print_info "  gcloud container clusters update $cluster_name --location $region --project $project_id --update-addons=NetworkPolicy=ENABLED"
           print_info "  gcloud container clusters update $cluster_name --location $region --project $project_id --enable-network-policy"
@@ -6802,6 +8604,7 @@ main() {
     fi
     print_success "Dry-run execution complete! Configuration generated without touching cloud resources."
     write_json_report "DRY_RUN_SUCCESS"
+    print_next_home_channel_unset_summary flags
     exit 0
   fi
 
@@ -6831,11 +8634,13 @@ main() {
         # The apply is chosen: the container preflight refuses here, before
         # step 12 writes anything, as it does above the summary for -y.
         check_scope_container_access || exit 1
+        check_scope_export_sink_access || exit 1
         ;;
       [Gg])
-        # The handoff is chosen: the same check only warns, as for the flag.
+        # The handoff is chosen: the same checks only warn, as for the flag.
         PARAM_GENERATE_ONLY="true"
         check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+        check_scope_export_sink_access "$SCOPE_CHECK_MODE_WARN"
         ;;
       *)
         # Not a hand-off like `g`: `n` is also a decline, so nothing is
@@ -6844,7 +8649,14 @@ main() {
         warn_install_env_keys_not_recorded
         print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
+        # After the lines above: the printers read the mode and the toggles
+        # from install.env, which this route leaves as it found it.
+        if is_truthy "${GOOGLE_CHAT_ENABLED:-}" || is_truthy "${SLACK_ENABLED:-}"; then
+          print_info "After the apply, set up the chat app with the checklist these print:"
+          print_chat_checklist_commands
+        fi
         write_json_report "PAUSED"
+        print_next_home_channel_unset_summary flags
         exit 0
         ;;
     esac
@@ -6852,12 +8664,15 @@ main() {
 
   if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
     print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
-    check_github_org_is_organization "${GITOPS_ORG:-}"
-    # Past every gate that can stop this route: a chat flag whose key the
-    # install.env lacks is recorded for the handoff.
+    check_github_org_is_organization "${GITOPS_ORG:-}" "${GITOPS_HOST:-}" "$(gitops_ca_file_for_check)"
+    # Past every gate that can stop this route: a chat flag or --mode whose
+    # key the install.env lacks is recorded for the handoff, and so are the
+    # GitHub GitOps keys, which the handoff's lifecycle.sh apply renders.
+    record_github_gitops_keys "$INSTALL_ENV_FILE"
     record_flags_into_install_env
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"
+    print_next_home_channel_unset_summary flags
     exit 0
   fi
 
@@ -6869,7 +8684,7 @@ main() {
   # already settled it interactively; this catches an install.env edited by hand
   # and the non-interactive flag path. Warns-only when GitHub is unreachable;
   # SKIP_GITHUB_ORG_CHECK=true bypasses it.
-  check_github_org_is_organization "${GITOPS_ORG:-}"
+  check_github_org_is_organization "${GITOPS_ORG:-}" "${GITOPS_HOST:-}" "$(gitops_ca_file_for_check)"
   # A declared Shared VPC host or Metrics Scope is resolved in the plan, which
   # reads APIs the apply below is what enables; on a first install they
   # have to be on before the plan, or it is refused with the API disabled.
@@ -6929,12 +8744,13 @@ main() {
   provisioning_log="/tmp/kube-agents-provision-$(date -u +%Y%m%dT%H%M%SZ).log"
   print_info "Provisioning output is also being saved to: ${C_BOLD}${provisioning_log}${C_RESET}"
   # Past every gate that can stop this route (set -e makes each step above
-  # one): a chat flag whose key the install.env lacks is recorded for the
-  # apply.
+  # one): a chat flag or --mode whose key the install.env lacks is recorded
+  # for the apply.
   # The forge keys likewise, and only here: a forge switch the operator
   # previewed (--generate-only) or declined must leave install.env as it was,
   # or the next upgrade.sh would render the forge nobody applied.
   record_gitops_forge_keys "$INSTALL_ENV_FILE"
+  record_github_gitops_keys "$INSTALL_ENV_FILE"
   record_flags_into_install_env
   run_lifecycle_apply "$repo_dir" "$provisioning_log"
 
@@ -6973,7 +8789,16 @@ main() {
     exit 1
   fi
   if [ "${GITOPS_FORGE:-github}" = "gitlab" ]; then
+    # The CA first: an empty token source stops the run here, and the CA
+    # Secret must exist by then.
+    create_gitops_ca_secret "$namespace" "$expected_ctx" || exit 1
     create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
+    create_gitlab_read_token_secret "$namespace" "$expected_ctx" || exit 1
+  elif [ -n "${GITOPS_HOST:-}" ]; then
+    # A GitHub Enterprise Server: the CA before the minter restart, which is
+    # how the minter reads it. The broker reads it on each call.
+    create_gitops_ca_secret "$namespace" "$expected_ctx" || exit 1
+    restart_github_minter_for_ca "$namespace" "$expected_ctx"
   fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do
@@ -7045,21 +8870,20 @@ main() {
     fi
     echo -e "    ${C_YELLOW}Browser Dashboard URL:${C_RESET} ${C_UNDERLINE}http://localhost:9119${C_RESET}"
   fi
+  if is_truthy "${PARAM_ENABLE_WEB_CONSOLE:-${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}}"; then
+    print_web_console_access "$namespace"
+  fi
 
-  if [ "${google_chat_enabled:-false}" = "true" ]; then
-    echo ""
-    IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_gchat.sh" || true
-  fi
-  if [ "${slack_enabled:-false}" = "true" ]; then
-    echo ""
-    IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
-  fi
-  # Repeated here, where the two printers above give their instructions. Arm 4
+  # The checklists and the closing summary follow the mode the CR is left
+  # on, which a mode set outside this installer can keep from the key.
+  print_chat_setup_checklists "${PLATFORM_AGENT_MODE_AFTER_APPLY:-$platform_agent_mode}"
+  # Repeated here, where the checklists above give their instructions. Arm 4
   # prints it as well, for the runs that never reach the end of main().
   if [ "$chat_choice" = "4" ]; then
     echo ""
-    _prompt_no_chat_enabled
+    _prompt_no_chat_enabled true
   fi
+  print_next_home_channel_unset_summary flags
 }
 
 if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then

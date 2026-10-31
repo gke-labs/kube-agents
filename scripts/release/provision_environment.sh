@@ -20,6 +20,38 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS="${CLOUDSDK_CORE_DISABLE_PROMPTS:-1}"
 # shellcheck source=scripts/release/platform_agent_mode.sh
 . "$(dirname "${BASH_SOURCE[0]}")/platform_agent_mode.sh"
 
+# A GCE stockout during the install, retried. The nightly environment is
+# created from nothing, and GKE answers a regional capacity shortage with the
+# first message (the zonal form is the second). The retry is a whole
+# provision again -- the teardown below, then install.sh -- not a second
+# install.sh alone: a cluster whose create failed stays in state tainted and
+# in GCP in ERROR with no endpoint, so install.sh's existing-cluster path
+# cannot fetch credentials for it and refuses at the scope check before
+# Terraform runs, while uninstall.sh destroys it (deletion_protection is
+# recorded false) and the install that follows creates afresh. Each further
+# attempt waits first, because a shortage clears in minutes to an hour, and
+# gives up after the budget so a day-long outage does not hold the runner.
+# Both knobs are environment overrides so a test runs with no wait. Any
+# failure that is not this message returns as it is. The caller's
+# timeout-minutes in deploy-environment.yml is sized to this budget.
+readonly PROVISION_STOCKOUT_PATTERN='does not have enough resources available to fulfill request|ZONE_RESOURCE_POOL_EXHAUSTED'
+PROVISION_STOCKOUT_ATTEMPTS="${PROVISION_STOCKOUT_ATTEMPTS:-3}"
+PROVISION_STOCKOUT_WAIT_SECONDS="${PROVISION_STOCKOUT_WAIT_SECONDS:-600}"
+# Each knob has to be a plain decimal: a word makes the attempt comparison
+# below exit 2, which an if reads as false, and the loop would retry until
+# the job timeout; a value past six digits does the same, because `[` calls it
+# not an integer; and a leading zero is octal to the arithmetic below, where
+# 09 is an error that abandons the loop and 0600 reads as 384.
+for _knob in PROVISION_STOCKOUT_ATTEMPTS PROVISION_STOCKOUT_WAIT_SECONDS; do
+  case "${!_knob}" in
+    "" | *[!0-9]* | 0?* | ???????*)
+      echo "::error title=${_knob} is not a plain decimal::${_knob}='${!_knob}' must be a whole number of at most six digits with no leading zero." >&2
+      exit 1
+      ;;
+  esac
+done
+unset _knob
+
 # Verify required GCP/GKE inputs before executing any destructive teardown.
 teardown_require_inputs
 
@@ -74,7 +106,7 @@ fi
 #
 # render_install_env.sh makes this check for the reconcile path, under
 # --strict. This is the same guarantee for the rebuild path, and the two have
-# to agree: deploy-environment.yml offers `autopush` and `staging` in its
+# to agree: deploy-environment.yml offers the long-lived environments in its
 # dropdown, so without it the escape hatch you reach for when a reconcile
 # cannot converge is also the one route into these environments that does not
 # ask about the allowlist.
@@ -144,7 +176,7 @@ fi
 # here reverts to failing after the teardown.
 INSTALL_REFUSAL_STATUS=0
 
-for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED ENABLE_DRIFT_DETECTOR; do
+for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED WEB_CONSOLE_ENABLED ENABLE_DRIFT_DETECTOR VERTEX_MANAGE_SERVING_PROJECT; do
   [ -n "${!_bool_var:-}" ] || continue
   _canonical="$(canonical_bool "${!_bool_var}")"
   case "$_canonical" in
@@ -182,57 +214,65 @@ fi
 # clears of the variable. `next` is applied after the install, at the bottom.
 platform_agent_mode_resolve || exit 1
 # And `next` only on the ephemeral environments; the helper says why.
-# LONG_LIVED_ENVIRONMENT is the workflow's flag for autopush and staging,
-# read with the same truthiness as the allowlist guard above.
+# LONG_LIVED_ENVIRONMENT is the workflow's flag for autopush, autopush-next and
+# staging, read with the same truthiness as the allowlist guard above.
 if provision_is_truthy "${LONG_LIVED_ENVIRONMENT:-}"; then
   platform_agent_mode_refuse_long_lived true "${GKE_CLUSTER_NAME:-}" || exit 1
 fi
 
-TEARDOWN_LOG="$(mktemp)"
+# The teardown half of a provision: uninstall.sh, its three outcomes read out
+# of the exit code, and TEARDOWN_STRICT deciding whether a failed one stops
+# the run. A function because the stockout retry at the bottom runs it again
+# before each further install.
+provision_teardown() {
+  TEARDOWN_LOG="$(mktemp)"
 
-echo "==> Tearing down the existing environment (${TEARDOWN_TARGET}) via canonical uninstall.sh..."
-TEARDOWN_STATUS=0
-teardown_run "${TEARDOWN_LOG}" || TEARDOWN_STATUS=$?
+  echo "==> Tearing down the existing environment (${TEARDOWN_TARGET}) via canonical uninstall.sh..."
+  TEARDOWN_STATUS=0
+  teardown_run "${TEARDOWN_LOG}" || TEARDOWN_STATUS=$?
 
-# uninstall.sh exits 0 when it tore the environment down, 3 when there was no
-# Terraform state to tear down (not a failure), and anything else when the
-# teardown could not start or did not finish; `./uninstall.sh --help` is the
-# contract. Collapsing the three into one warning is how a teardown that tore
-# nothing down went unremarked: the environment survived from run to run
-# while the pipeline reported provisioning a fresh one, and the AgentPlugins
-# and Secrets it left behind were read as E2E flakes.
-case "${TEARDOWN_STATUS}" in
-  0)
-    echo "==> Teardown complete (uninstall.sh exit 0)."
-    ;;
-  3)
-    echo "==> Nothing to tear down: no Terraform state for '${GKE_CLUSTER_NAME}' (uninstall.sh exit 3), so there is no environment to remove."
-    ;;
-  *)
-    teardown_report_failure \
-      "${TEARDOWN_STATUS}" "${TEARDOWN_LOG}" \
-      "uninstall.sh exited ${TEARDOWN_STATUS}; the environment was NOT torn down and this run reinstalls over whatever survived." \
-      "⚠️ Environment teardown failed" \
-      "\`uninstall.sh\` did not tear the environment down. The install below runs" \
-      "on top of the previous run's cluster, CRs, Secrets and pods, so any E2E" \
-      "failure may be stale state rather than a regression in the candidate."
-    # Whether this is fatal is the caller's choice, because the two answers
-    # trade different things. Stopping keeps a candidate from being validated
-    # against stale state; continuing keeps a teardown problem from blocking
-    # every release. TEARDOWN_STRICT picks, and the pipeline sets it from a
-    # variable on the bound GitHub environment so the choice is a setting rather
-    # than a commit. It is read under both TEARDOWN_STRICT and the legacy
-    # RC_TEARDOWN_STRICT; see teardown_common.sh.
-    if teardown_is_strict; then
-      echo "$(teardown_strict_source) is set: refusing to provision on top of a failed teardown." >&2
-      rm -f "${TEARDOWN_LOG}"
-      exit "${TEARDOWN_STATUS}"
-    fi
-    echo "==> Proceeding with provisioning anyway ($(teardown_strict_source) is not set); the environment is NOT fresh." >&2
-    ;;
-esac
+  # uninstall.sh exits 0 when it tore the environment down, 3 when there was no
+  # Terraform state to tear down (not a failure), and anything else when the
+  # teardown could not start or did not finish; `./uninstall.sh --help` is the
+  # contract. Collapsing the three into one warning is how a teardown that tore
+  # nothing down went unremarked: the environment survived from run to run
+  # while the pipeline reported provisioning a fresh one, and the AgentPlugins
+  # and Secrets it left behind were read as E2E flakes.
+  case "${TEARDOWN_STATUS}" in
+    0)
+      echo "==> Teardown complete (uninstall.sh exit 0)."
+      ;;
+    3)
+      echo "==> Nothing to tear down: no Terraform state for '${GKE_CLUSTER_NAME}' (uninstall.sh exit 3), so there is no environment to remove."
+      ;;
+    *)
+      teardown_report_failure \
+        "${TEARDOWN_STATUS}" "${TEARDOWN_LOG}" \
+        "uninstall.sh exited ${TEARDOWN_STATUS}; the environment was NOT torn down and this run reinstalls over whatever survived." \
+        "⚠️ Environment teardown failed" \
+        "\`uninstall.sh\` did not tear the environment down. The install below runs" \
+        "on top of the previous run's cluster, CRs, Secrets and pods, so any E2E" \
+        "failure may be stale state rather than a regression in the candidate."
+      # Whether this is fatal is the caller's choice, because the two answers
+      # trade different things. Stopping keeps a candidate from being validated
+      # against stale state; continuing keeps a teardown problem from blocking
+      # every release. TEARDOWN_STRICT picks, and the pipeline sets it from a
+      # variable on the bound GitHub environment so the choice is a setting rather
+      # than a commit. It is read under both TEARDOWN_STRICT and the legacy
+      # RC_TEARDOWN_STRICT; see teardown_common.sh.
+      if teardown_is_strict; then
+        echo "$(teardown_strict_source) is set: refusing to provision on top of a failed teardown." >&2
+        rm -f "${TEARDOWN_LOG}"
+        exit "${TEARDOWN_STATUS}"
+      fi
+      echo "==> Proceeding with provisioning anyway ($(teardown_strict_source) is not set); the environment is NOT fresh." >&2
+      ;;
+  esac
 
-rm -f "${TEARDOWN_LOG}"
+  rm -f "${TEARDOWN_LOG}"
+}
+
+provision_teardown
 
 # The GitHub variables this script turns into `--enable-*` flags travel
 # through canonical_bool (from teardown_common.sh): the spelling
@@ -244,6 +284,14 @@ INSTALL_ARGS=(
   --gcp-region="${GCP_REGION}"
   --gke-cluster-name="${GKE_CLUSTER_NAME}"
   --image-tag="${IMAGE_TAG}"
+  # Named, not left to install.sh's default: a first install with no
+  # install.env now defaults to next, and a today run must install today (the
+  # E2E readiness check compares the installed mode with this one). A next
+  # run installs next, as the exported PLATFORM_AGENT_MODE already made it,
+  # and the patch and gate at the bottom still run. On a long-lived
+  # environment, where next is refused above, the rendered install.env sets no
+  # mode, which resolves to today, so the flag agrees and is recorded there.
+  --mode="${RELEASE_PLATFORM_AGENT_MODE}"
 )
 
 # Everything below reaches install.sh as a flag rather than as an inherited
@@ -307,6 +355,9 @@ if [ "${SLACK_ENABLED:-false}" = "true" ]; then
   if [ -n "${SLACK_HOME_CHANNEL_NAME:-}" ]; then
     INSTALL_ARGS+=(--slack-home-channel-name="${SLACK_HOME_CHANNEL_NAME}")
   fi
+  if [ -n "${SLACK_HOME_CHANNEL_POLICY:-}" ]; then
+    INSTALL_ARGS+=(--slack-home-channel-policy="${SLACK_HOME_CHANNEL_POLICY}")
+  fi
 fi
 
 if [ -n "${ENABLE_GKE_BACKUP_PLAN:-}" ]; then
@@ -317,6 +368,10 @@ if [ -n "${HERMES_DASHBOARD_ENABLED:-}" ]; then
   INSTALL_ARGS+=(--enable-hermes-dashboard="$(canonical_bool "${HERMES_DASHBOARD_ENABLED}")")
 fi
 
+if [ -n "${WEB_CONSOLE_ENABLED:-}" ]; then
+  INSTALL_ARGS+=(--enable-web-console="$(canonical_bool "${WEB_CONSOLE_ENABLED}")")
+fi
+
 # Unset omits the flag and install.sh's own default answers, which for this one
 # is on. The flag is worth passing anyway: this is a fresh install, so it is the
 # one run that records the choice into the install.env it creates -- which is
@@ -324,6 +379,11 @@ fi
 # file as the durable answer.
 if [ -n "${ENABLE_DRIFT_DETECTOR:-}" ]; then
   INSTALL_ARGS+=(--enable-drift-detector="$(canonical_bool "${ENABLE_DRIFT_DETECTOR}")")
+fi
+
+# The same shape: unset omits the flag and install.sh's default (on) answers.
+if [ -n "${VERTEX_MANAGE_SERVING_PROJECT:-}" ]; then
+  INSTALL_ARGS+=(--vertex-manage-serving-project="$(canonical_bool "${VERTEX_MANAGE_SERVING_PROJECT}")")
 fi
 
 if [ -n "${MODEL_PROVIDER:-}" ]; then
@@ -379,17 +439,47 @@ else
 fi
 
 echo "==> Provisioning the environment at the candidate commit via canonical install.sh..."
-./install.sh "${INSTALL_ARGS[@]}"
+# The install's output streams on and a copy is kept for one grep: whether a
+# failed attempt was the stockout above. errexit is lifted around the
+# pipeline as teardown_run does, so PIPESTATUS describes install.sh and not
+# tee. The copy is removed on every way out.
+provision_install_attempt() {
+  local log_file="$1" status
+  set +e
+  ./install.sh "${INSTALL_ARGS[@]}" 2>&1 | tee -i "${log_file}"
+  status="${PIPESTATUS[0]}"
+  set -e
+  return "${status}"
+}
 
-# spec.mode: next, set on the CR the install just created, then the gate that
-# waits for what the operator renders for it. install.sh on this tree takes no
-# mode, so the switch is the same merge patch the next-mode dev clusters were
-# installed with. The install's --mode flag (#2524) replaces the patch once it
-# merges: that installer takes PLATFORM_AGENT_MODE from the environment this
-# script leaves it exported in under `next` (only rc and nightly get here
-# with it; the long-lived environments are refused above), so the
-# platform_agent_mode_patch_next call below is then the one line to delete
-# (with this paragraph's patch sentences). The wait stays either way.
+INSTALL_LOG="$(mktemp)"
+trap 'rm -f "${INSTALL_LOG}"' EXIT
+attempt=1
+while :; do
+  install_status=0
+  provision_install_attempt "${INSTALL_LOG}" || install_status=$?
+  [ "${install_status}" -ne 0 ] || break
+  grep -Eq "${PROVISION_STOCKOUT_PATTERN}" "${INSTALL_LOG}" || exit "${install_status}"
+  if [ "${attempt}" -ge "${PROVISION_STOCKOUT_ATTEMPTS}" ]; then
+    echo "::error title=GCE is still short of capacity in ${GCP_REGION}::install.sh failed on a GCE stockout ${attempt} times; the region is still short of capacity after $((10#${PROVISION_STOCKOUT_WAIT_SECONDS} * (attempt - 1)))s of waiting. The half-built environment is left for the pipeline's teardown (the staging promotion pipeline runs it on a failed deploy; the RC pipeline's next scheduled run does)."
+    exit "${install_status}"
+  fi
+  attempt=$((attempt + 1))
+  echo "::warning title=GCE stockout in ${GCP_REGION}::install.sh failed because the region had no capacity for the cluster; waiting ${PROVISION_STOCKOUT_WAIT_SECONDS}s, then tearing the half-built environment down and provisioning again (attempt ${attempt} of ${PROVISION_STOCKOUT_ATTEMPTS})."
+  sleep "${PROVISION_STOCKOUT_WAIT_SECONDS}"
+  provision_teardown
+done
+rm -f "${INSTALL_LOG}"
+trap - EXIT
+
+# spec.mode: next, then the gate that waits for what the operator renders for
+# it. install.sh reads PLATFORM_AGENT_MODE from the environment this script
+# leaves it exported in under `next` (only rc and nightly get here with it;
+# the long-lived environments are refused above), so the install already
+# renders spec.mode: next and the merge patch below applies a value the CR
+# already holds. The patch is redundant and stays only because removing it
+# moves the tests that pin it; that removal is its own change. The wait
+# stays either way.
 #
 # install.sh has already pointed kubectl at the cluster and checked the
 # context; the context is still named on each call, so nothing here can reach

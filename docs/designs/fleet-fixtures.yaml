@@ -10,7 +10,7 @@
 #
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
-# on a cluster at all (`orphan-disks` and `startup-fail-vm` are project-scoped,
+# on a cluster at all (`orphan-disks`, `startup-fail-vm` and `world-open-ingress` are project-scoped,
 # so they have no cluster slot and no entry in a catalogue keyed by one).
 #
 # A case names a fixture by role and never by a cluster name or a project id.
@@ -111,6 +111,20 @@ fixtures:
       the posture is observable on apply day; its case still needs a ledger,
       which the idle pool supplies from day 7.
 
+  - role: guaranteed-qos-workload
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/ledger-writer
+    namespace: seeded-qos
+    defect: >-
+      Two replicas whose container sets requests equal to limits (10m /
+      32Mi), so the pods are Guaranteed QoS and a lower request lowers the
+      limit with it. The container burns its 10m CPU limit, so it is
+      throttled there already. A request cut has to name this dependency;
+      the waste audit never names the workload (CPU in use, both dimensions
+      under its resize floor).
+
   - role: stalled-controller
     slot: a
     available_from_day: 0
@@ -190,6 +204,18 @@ fixtures:
       exits 1 on every boot, so the guest agent's failure line is on its
       serial console from the first boot onward.
 
+  - role: world-open-ingress
+    slot: null # Project-scoped, in var.zone; not attached to any cluster.
+    available_from_day: 0
+    objects:
+      - firewall/world-open-2379-<prefix>
+      - instance/world-open-<prefix>
+      - firewall/world-open-deny-remote-<prefix>
+    defect: >-
+      A firewall rule opening tcp:2379 to the internet on the one VM that
+      carries its tag, which holds an external IP. Nothing listens on 2379.
+      A deny rule blocks tcp:22 and tcp:3389 on that VM.
+
   - role: orphan-disks
     slot: null # Project-scoped, in var.zone; not attached to any cluster.
     available_from_day: 30
@@ -209,11 +235,14 @@ fixtures:
       Control plane held one minor behind the REGULAR channel default, and
       enrolled in REGULAR, which is what makes the lag visible to the upgrade
       SOP's master-behind check at all. Held between reconciles by a
-      NO_MINOR_UPGRADES maintenance exclusion. The pin is drawn from the
-      location-wide valid_master_versions rather than the channel's own list,
-      so the held version can be absent from REGULAR; it is still offered at
-      the location, so upgrade check 3.1 branch (a) does not fire and the
-      cluster carries branch (b) at major. See
+      NO_MINOR_UPGRADES maintenance exclusion. The pin is drawn from REGULAR's
+      own list and held when the running patch is one REGULAR does not carry,
+      so the held version can be absent from REGULAR; while another roster or
+      validMasterVersions still offers it (so on 2026-10-14; nothing in the
+      stack keeps it) upgrade check 3.1 branch (a) does not fire and the
+      cluster carries branch (b) at major. A held version newer than every
+      REGULAR patch of its minor is drift (`not_ahead_of_channel` in
+      fixtures.json): agents read it as current or ahead, not behind. See
       docs/designs/bench-fleet-catalog.md.
 
   - role: drift-outlier
@@ -226,7 +255,41 @@ fixtures:
       open-for-eval block. The drift SOP excludes a cluster whose createTime is
       under 24 hours old from every cohort, and its cohort floor is three
       clusters: replacing c silences the finding for a day, and so does
-      replacing any cluster on a project whose fleet predates slot d.
+      replacing any cluster on a project whose fleet predates slot d. The
+      hourly scan reports a c under a day old as drift.
+
+  - role: drift-peer-a
+    slot: a
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot a's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
+
+  - role: drift-peer-b
+    slot: b
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot b's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
+
+  - role: drift-peer-d
+    slot: d
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot d's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
 
   - role: readiness-surge-blocked
     slot: b
@@ -260,6 +323,21 @@ fixtures:
       disruptionsAllowed is 0 permanently and no drain that touches it can
       finish.
 
+  - role: readiness-lb-drain-timeout
+    slot: b
+    available_from_day: 0
+    objects:
+      - backendservice/drain-timeout-<prefix>-b
+      - healthcheck/drain-timeout-<prefix>-b
+    defect: >-
+      A Compute Engine backend service on the default pool's instance group
+      whose connection draining timeout is 720 seconds, a fifth over the 600
+      seconds GKE waits per node during a pool upgrade, behind a TCP health
+      check and no forwarding rule, so it routes nothing and costs nothing;
+      every default-pool node recreate on this cluster waits the 720 seconds
+      on it, which stays under the 30 minutes after which GKE fails the node
+      step.
+
   - role: readiness-failclosed-webhook
     slot: b
     available_from_day: 0
@@ -270,6 +348,129 @@ fixtures:
       Service that does not exist. The missing backend is the defect; Fail
       alone is set by healthy webhooks. Selectors confine it so it rejects no
       other scenario's writes.
+
+  - role: node-local-state
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/cache-on-emptydir
+    namespace: seeded-shapes
+    defect: >-
+      cache-on-emptydir Deployment (one replica) whose queue directory is an emptyDir: the stamp it writes at start is state that lives on the node and does not survive the node rebuild an upgrade performs
+
+  - role: deprecated-label-selector
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/arch-pinned-worker
+    namespace: seeded-shapes
+    defect: >-
+      arch-pinned-worker Deployment (one replica) with a nodeSelector on beta.kubernetes.io/arch, a label deprecated since 1.14 that the kubelet still sets; the pod schedules today and never again once a node image drops the label
+
+  - role: containerd-socket-agent
+    slot: a
+    available_from_day: 0
+    objects:
+      - daemonset/node-runtime-probe
+    namespace: seeded-shapes
+    defect: >-
+      node-runtime-probe DaemonSet mounting the containerd socket from the host, read-only, on the default pool: the agent shape a containerd major change or a CRI API removal breaks
+
+  - role: default-pool-headroom
+    slot: a
+    available_from_day: 0
+    objects:
+      - nodepool/default-pool
+    defect: >-
+      Not a defect: seeded-a's default pool itself, two e2-standard-2 nodes asserted to keep 100m CPU unrequested each so the next planted fixture can place; the one role whose drift means the pool is within ten fixtures of full and a re-apply changes nothing
+
+  - role: intree-pd-volume
+    slot: a
+    available_from_day: 0
+    objects:
+      - persistentvolumeclaim/intree-pd
+      - persistentvolume/intree-pd
+      - deployment/intree-pd-reader
+    namespace: seeded-shapes
+    defect: >-
+      intree-pd PersistentVolume written against the in-tree gcePersistentDisk plugin over the fleet's own disk, bound by the intree-pd claim in seeded-shapes; it attaches only through CSI migration
+
+  - role: retired-registry-image
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/legacy-registry-pull
+    namespace: seeded-shapes
+    defect: >-
+      legacy-registry-pull Deployment (one replica) pulling k8s.gcr.io/pause:3.9 with imagePullPolicy Always: a retired registry hostname that answers by redirect today, so every node rebuild pulls it again from a host that may stop
+
+  - role: moving-admission-default
+    slot: a
+    available_from_day: 0
+    objects:
+      - namespace/seeded-defaults
+      - deployment/baseline-edge-worker
+    namespace: seeded-defaults
+    defect: >-
+      seeded-defaults namespace with Pod Security Admission pinned to enforce baseline at version latest, so the rule set applied to its workloads changes at every minor without anyone editing it; baseline-edge-worker (one replica) is admitted by today's baseline
+
+  - role: stale-client-skew
+    slot: a
+    available_from_day: 0
+    objects:
+      - cronjob/stale-kubectl-client
+    namespace: seeded-shapes
+    defect: >-
+      stale-kubectl-client CronJob running kubectl v1.29.0 against seeded-a's control plane every ten minutes: a client several minors outside the supported skew that still succeeds today
+
+  - role: cgroup-blind-runtime
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/cgroup-blind-jvm
+    namespace: seeded-shapes
+    defect: >-
+      cgroup-blind-jvm Deployment (one replica) whose image is eclipse-temurin 8u302, a JDK 8 from before cgroup v2 support, under a memory limit; the image's JDK version is the dependency and the container process is a sleep
+
+  - role: multi-process-container
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/multi-process-worker
+    namespace: seeded-shapes
+    defect: >-
+      multi-process-worker Deployment (one replica): a shell supervisor forking two workers under one memory limit, the shape a cgroup v2 node with a 1.28+ kubelet OOM-kills whole
+
+  - role: node-image-coupled-agent
+    slot: a
+    available_from_day: 0
+    objects:
+      - daemonset/cni-shaped-agent
+    namespace: seeded-shapes
+    defect: >-
+      cni-shaped-agent DaemonSet on the default pool in the shape of a network plugin: host networking and the node's CNI configuration directory mounted read-only
+
+  - role: cuda-pinned-gpu-job
+    slot: a
+    available_from_day: 0
+    objects:
+      - cronjob/cuda-pinned-trainer
+    namespace: seeded-shapes
+    defect: >-
+      cuda-pinned-trainer CronJob, suspended: requests one GPU on an nvidia-l4 pool with an image pinned to CUDA 12.2, so its manifest carries the driver dependency without ever running
+
+  - role: scaled-zero-gateway
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/storefront
+      - deployment/envoy-seeded-scaled-zero-storefront-edge
+      - service/storefront
+      - gateway/storefront-edge
+      - httproute/storefront
+    namespace: seeded-scaled-zero
+    defect: >-
+      Not a defect: an environment switched off on purpose. The backend and the Gateway's proxy Deployment are at replicas 0, and the Gateway reports Programmed=False (NoResources), the status Envoy Gateway v1.9.2 wrote for that shape. No controller runs. A stall check that reports it is wrong
 
   - role: zonal-skew-scheduling
     slot: d
@@ -297,6 +498,7 @@ fixtures:
     available_from_day: 0
     objects:
       - deployment/capacity-starved-worker
+      - deployment/first-zone-sponge
     namespace: seeded-topology
     defect: >-
       Four replicas at 120m CPU against two e2-small nodes, so those that do

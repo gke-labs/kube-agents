@@ -1,11 +1,11 @@
 ---
 title: Examples
-description: LLM-inference example stacks shipped in examples/.
+description: The LLM-inference example stacks and the reference GitOps repository layout shipped in examples/.
 sidebar:
   order: 3
 ---
 
-Self-contained example stacks live in [`examples/`](https://github.com/gke-labs/kube-agents/tree/main/examples). Each is a plain Kubernetes manifest bundle you deploy with `kubectl apply -f` (see the `README.md` in each directory) — no framework, no rendering.
+Self-contained examples live in [`examples/`](https://github.com/gke-labs/kube-agents/tree/main/examples). The inference stacks are plain Kubernetes manifest bundles you deploy with `kubectl apply -f` (see the `README.md` in each directory) — no framework, no rendering. `gitops-repo` is a repository layout to fork.
 
 ## `inference-replay`
 
@@ -23,7 +23,7 @@ A proxy that sits between the Platform Agent and LiteLLM. Requests are keyed by 
 
 [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini)
 
-LiteLLM Deployment + Service + `ConfigMap` fronting Gemini, plus a `Secret`, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. Reads `GEMINI_API_KEY` from the Secret. The default install path (the chart's `litellm.*` values) deploys an equivalent LiteLLM + Gemini config rather than this example directory; the dev copy lives at `k8s-operator/config/integrations/litellm/base`.
+LiteLLM Deployment + Service + `ConfigMap` fronting Gemini, plus a `Secret`, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. Reads `GEMINI_API_KEY` from the Secret. The default install path (the chart's `litellm.*` values) deploys an equivalent LiteLLM + Gemini config rather than this example directory, plus the pre-call hook described under [Replayed thinking on Gemini](/kube-agents/concepts/inference-gateway/#replayed-thinking-on-gemini), which this example does not mount; the dev copy lives at `k8s-operator/config/integrations/litellm/base`.
 
 **When to use:** the default install path; anything except explicit local-inference or subscription-based demos.
 
@@ -39,13 +39,21 @@ LiteLLM configured to proxy a personal ChatGPT subscription via OAuth device flo
 
 [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma)
 
-vLLM serving Gemma (`gemma-4-e2b-it`) on GKE GPU nodes, based on GKE's official inference tutorial. Ships the vLLM Deployment, Service, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. It does not include a node pool spec or GPU driver installer — a cluster with GPU nodes is a prerequisite.
+vLLM's OpenAI-compatible server (`vllm serve`) serving Gemma 4 26B-A4B (`RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic`) on two L4 GPUs with a 128k-token context, for the `openai_compatible` model provider. Ships the vLLM Deployment, Service, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. The README gives the GPU node-pool command and measured sizing for other Gemma 4 sizes and GPUs.
 
 **When to use:** data-locality, air-gapped, or open-model requirements. Provision a GPU node pool first (or use the `gke-compute-classes` skill to spec one).
 
+## `gitops-repo`
+
+[`examples/gitops-repo/`](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo)
+
+The reference layout for the GitOps repository the agent writes to: per-cluster desired state under `clusters/<cluster>/`, fleet-level policy under `fleet/`, the knowledge base, admission policies, and `.kube-agents/intent.yaml`, where the declaring audits look for declared-intent notes. It is a template to fork as your own repository, separate from the kube-agents source tree; `submit-suggestion` opens pull requests against whichever repository the install names.
+
+**When to use:** setting up the GitOps repository for a new install, or checking where an audit expects a declaration to live.
+
 ## Layering
 
-Both LiteLLM examples and `vllm-gemma` speak OpenAI-compatible Completions. You can layer LiteLLM in front of vLLM to get routing and observability across a mix of hosted and local models — that's the pattern for "one config for many providers".
+Both LiteLLM examples speak OpenAI-compatible Completions. `vllm-gemma` serves the OpenAI API too; to put LiteLLM in front of it, set `MODEL_PROVIDER=openai_compatible` with the values in its README ([Inference gateway](/kube-agents/concepts/inference-gateway/#openai-compatible-endpoints-self-hosted-or-private)).
 
 ## Not shipped as examples (but reference-worthy)
 

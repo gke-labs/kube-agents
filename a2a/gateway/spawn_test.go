@@ -10,6 +10,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
@@ -204,6 +205,18 @@ func TestSpawnedSessionsCarryNoBusPasswordAndAPodBoundTokenInstead(t *testing.T)
 		}
 		if ok && req.Cmp(lim) > 0 {
 			t.Errorf("session pod %s request %s exceeds its limit %s", res, req.String(), lim.String())
+		}
+	}
+
+	// Ephemeral storage too, with the limit equal to the request: the
+	// scratch emptyDir is bounded, and a LimitRange defaulting a smaller
+	// limit would refuse a request with no limit of its own.
+	if req, lim := c.Resources.Requests[corev1.ResourceEphemeralStorage], c.Resources.Limits[corev1.ResourceEphemeralStorage]; req.Cmp(resource.MustParse(workerEphemeralStorageRequest)) != 0 || lim.Cmp(req) != 0 {
+		t.Errorf("session pod ephemeral-storage request %s, limit %s; want both %s", req.String(), lim.String(), workerEphemeralStorageRequest)
+	}
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "scratch" && (v.EmptyDir == nil || v.EmptyDir.SizeLimit == nil || v.EmptyDir.SizeLimit.Cmp(resource.MustParse(workerScratchSizeLimit)) != 0) {
+			t.Errorf("session scratch volume = %+v, want an emptyDir with sizeLimit %s", v, workerScratchSizeLimit)
 		}
 	}
 
@@ -478,5 +491,93 @@ func TestSpawnRendersTheCapabilityContractFromTheGatewaysOwnConfig(t *testing.T)
 				t.Error("the session pod carries POD_NAMESPACE; that is a second source for a value the gateway already resolved")
 			}
 		})
+	}
+}
+
+// A wake reports what a delegation came back with. Given the delegate tool,
+// a wake that reads an interim answer ("still checking, the results will
+// post here") delegates again, and the chain loops to the depth bound with
+// nothing answered. So a wake's pod has the tool off; a human turn's keeps it.
+func TestAWakePodHasNoDelegateTool(t *testing.T) {
+	for _, tc := range []struct {
+		name, role, want string
+	}{
+		{"a human turn", "", "on"},
+		{"a wake", taskRoleWake, "off"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := k8sfake.NewSimpleClientset()
+			cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session", TaskDeadline: time.Minute}
+			s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+			rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-wake", Addressee: "chat-otter-wake",
+				Tasks: []TaskRef{{ID: "task-1", Addressee: "chat-otter-wake", Role: tc.role}}}
+			if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
+				t.Fatal(err)
+			}
+			pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-wake", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := ""
+			for _, e := range pod.Spec.Containers[0].Env {
+				if e.Name == lib.EnvDelegateTool {
+					got = e.Value
+				}
+			}
+			if got != tc.want {
+				t.Errorf("%s = %q, want %q", lib.EnvDelegateTool, got, tc.want)
+			}
+		})
+	}
+}
+
+// The worker reads the conversation so far from a file (lib.EnvPrimerFile),
+// so the pod has to carry the primer annotation, mount it through the
+// downward API at the path the env names, and mount it read-only. A primer
+// left on the annotation alone reaches nobody, and every turn starts cold.
+func TestSpawnMountsTheTranscriptPrimerForTheWorker(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session", TaskDeadline: time.Minute}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-prim", Addressee: "chat-otter-prim"}
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "User: hi\n\nYou: hello\n", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-prim", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pod.Annotations[annoPrimer]; got != "User: hi\n\nYou: hello\n" {
+		t.Errorf("primer annotation = %q", got)
+	}
+
+	var envPath string
+	for _, e := range pod.Spec.Containers[0].Env {
+		if e.Name == lib.EnvPrimerFile {
+			envPath = e.Value
+		}
+	}
+	var mountPath string
+	for _, m := range pod.Spec.Containers[0].VolumeMounts {
+		if m.Name == primerVolume {
+			if !m.ReadOnly {
+				t.Error("the primer is mounted writable")
+			}
+			mountPath = m.MountPath
+		}
+	}
+	var fileOK bool
+	for _, v := range pod.Spec.Volumes {
+		if v.Name != primerVolume || v.DownwardAPI == nil {
+			continue
+		}
+		for _, item := range v.DownwardAPI.Items {
+			if item.FieldRef != nil && item.FieldRef.FieldPath == "metadata.annotations['"+annoPrimer+"']" && mountPath+"/"+item.Path == envPath {
+				fileOK = true
+			}
+		}
+	}
+	if envPath == "" || mountPath == "" || !fileOK {
+		t.Errorf("primer not wired: env %s=%q, mount %q, downward-API file at the env's path %v", lib.EnvPrimerFile, envPath, mountPath, fileOK)
 	}
 }

@@ -2,8 +2,8 @@
 """One feedback request per install, a week after the job first runs.
 
 Backs the ``feedback-prompt`` cron job, which runs with ``no_agent: true`` and
-``deliver: "chat"``: whatever this prints is handed to the Chat Agent to post in
-the install's home channel, and printing nothing relays nothing. Every feedback
+``deliver: "chat"``: whatever this prints is posted in the install's home
+channel by the relay, and printing nothing relays nothing. Every feedback
 channel kube-agents has is reporter-initiated; this is the one place the product
 asks.
 
@@ -37,9 +37,9 @@ channel nothing takes it back; a post the scheduler recorded as undelivered
 bound yet) is a lost request, which the ledger ``chat-delivery-watch`` keeps
 names like any other failed delivery, and which an operator sends again by
 removing ``.feedback_prompt_sent`` from the profile home: the next tick claims
-afresh. At most once is the direction the job fails in. One Chat Agent
-composition is all it ever costs, on the one tick that prints; every other
-tick prints nothing and relays nothing.
+afresh. At most once is the direction the job fails in. One post is all it
+ever costs, on the one tick that prints; every other tick prints nothing and
+relays nothing.
 
 Both markers live on the data volume, which survives pod restarts and image
 rolls and is deleted only by an uninstall. That is what makes an upgrade not
@@ -54,9 +54,10 @@ take their per-install settings (the operator copies them from the CR's
   nothing at all: it neither arms nor claims, so an install that turns the
   prompt on later still gets exactly one request, a delay after it did so.
 - ``FEEDBACK_PROMPT_DELAY`` (default ``7d``; ``<n>d``, ``<n>h`` or ``<n>m``). A
-  value that does not parse is a failed run, exit 1 with the reason on stderr,
-  which the scheduler reports in chat like any other script failure until the
-  value is fixed. Falling back silently was the alternative, and it is not
+  value that does not parse is a failed run, exit 1 with the reason on stderr.
+  The scheduler turns that into its failure line, which the chat relay posts
+  once in plain words, and the run's output, which the scheduler saves under
+  the profile's ``cron/output/``, keeps the reason. Falling back silently was the alternative, and it is not
   observable: the scheduler keeps a zero-exit script's stderr nowhere, so the
   only trace of a rejected value would be the message arriving a week early.
 
@@ -121,8 +122,7 @@ LOG_PREFIX = "feedback_prompt"
 FORM_URL = "https://gke-labs.github.io/kube-agents/feedback"
 REPOSITORY = "gke-labs/kube-agents"
 
-# `deliver: "chat"` relays this through a Chat Agent turn. A heading keeps the
-# message reading as a report to reproduce rather than a greeting to answer.
+# The first line names the message in the channel.
 HEADING = "How is kube-agents working out?"
 MESSAGE = f"""{HEADING}
 

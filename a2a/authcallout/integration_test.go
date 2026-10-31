@@ -1,8 +1,10 @@
 package authcallout
 
 import (
+	"bufio"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // The DoD, proven against a server rather than read out of a config.
@@ -43,7 +47,9 @@ const (
 	strangerSA   = "system:serviceaccount:kubeagents-system:some-other-workload"
 	strangerTok  = "token-for-a-serviceaccount-that-is-not-in-the-map-at-all-padded"
 
-	agentSA = "system:serviceaccount:kubeagents-system:agent"
+	// The platform agent container's principal: the gateway Pod's own
+	// ServiceAccount, as the operator renders it (gatewayServiceAccountName).
+	agentSA = "system:serviceaccount:kubeagents-system:agent-gateway-agent"
 )
 
 // twoIdentityMap grants the two principals deliberately disjoint subjects, so
@@ -62,7 +68,7 @@ const twoIdentityMap = `{
       }
     },
     {
-      "serviceAccount": "system:serviceaccount:kubeagents-system:agent",
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-gateway-agent",
       "user": "agent",
       "account": "APP",
       "grants": {
@@ -78,19 +84,24 @@ type harness struct {
 	url    string
 	store  *Store
 	tokens map[string]Attested
+	// dial trusts the CA the rendered conf's serving pair was minted from
+	// and sets the suite's connect timeout (withTestTLS); every connection
+	// the suite makes needs it, since the render requires TLS of every
+	// client.
+	dial nats.Option
 }
 
 // tokenReviewer maps a presented token to what the cluster would vouch for,
 // and refuses anything else — the shape of a real TokenReview answer, including
 // the audience the validator insists on and the pod-bound Extra fields the
 // authenticator writes for a projected token.
-func tokenReviewer(tokens map[string]Attested, onReview func() func()) *fake.Clientset {
+func tokenReviewer(tokens map[string]Attested, onReview func(token string) func()) *fake.Clientset {
 	c := fake.NewSimpleClientset()
 	c.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		if onReview != nil {
-			defer onReview()()
-		}
 		req := action.(k8stesting.CreateAction).GetObject().(*authnv1.TokenReview)
+		if onReview != nil {
+			defer onReview(req.Spec.Token)()
+		}
 		att, ok := tokens[req.Spec.Token]
 		if !ok {
 			req.Status = authnv1.TokenReviewStatus{Authenticated: false, Error: "invalid bearer token"}
@@ -113,18 +124,53 @@ func tokenReviewer(tokens map[string]Attested, onReview func() func()) *fake.Cli
 	return c
 }
 
-// harnessOption tweaks one harness. There is one so far; see onTokenReview.
+// harnessOption tweaks one harness.
 type harnessOption func(*harnessOptions)
 
 type harnessOptions struct {
-	// onTokenReview is called on entry to every TokenReview the callout makes
-	// and its result on exit, so a test can watch how many are in flight at
-	// once and how long each one takes.
-	onTokenReview func() func()
+	// onTokenReview is called, with the token under review, on entry to
+	// every TokenReview the callout makes and its result on exit, so a test
+	// can watch how many are in flight at once, how long each one takes,
+	// and whose they are.
+	onTokenReview func(token string) func()
+	// grantTTL, when set, replaces the callout's one-hour grant lifetime,
+	// so a test can watch a connection outlive the JWT it was issued.
+	grantTTL time.Duration
+	// taskKeys are the task-signing public keys the callout trusts, for the
+	// per-task credential tests (task_credential_test.go).
+	taskKeys []string
+	// now, when set, is the callout's clock.
+	now func() time.Time
+	// taskLifetime and taskLifetimeErr are the callout's task credential
+	// lifetime settings (Config.TaskCredentialMaxLifetime and ...Invalid).
+	taskLifetime    time.Duration
+	taskLifetimeErr error
+}
+
+// withGrantTTL shortens every grant the callout issues.
+func withGrantTTL(d time.Duration) harnessOption {
+	return func(o *harnessOptions) { o.grantTTL = d }
+}
+
+// withTaskSigningKeys makes the callout honour task credentials from these
+// keys.
+func withTaskSigningKeys(keys ...string) harnessOption {
+	return func(o *harnessOptions) { o.taskKeys = keys }
+}
+
+// withTaskLifetime sets the callout's task credential lifetime, as
+// ParseTaskCredentialMaxLifetime returned it.
+func withTaskLifetime(d time.Duration, err error) harnessOption {
+	return func(o *harnessOptions) { o.taskLifetime, o.taskLifetimeErr = d, err }
+}
+
+// withNow sets the callout's clock.
+func withNow(now func() time.Time) harnessOption {
+	return func(o *harnessOptions) { o.now = now }
 }
 
 // watchingTokenReviews wraps every TokenReview the callout performs.
-func watchingTokenReviews(around func() func()) harnessOption {
+func watchingTokenReviews(around func(token string) func()) harnessOption {
 	return func(o *harnessOptions) { o.onTokenReview = around }
 }
 
@@ -179,6 +225,7 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	}
 	conf := replaceConfKey(string(rendered), "issuer: ", issuerPub)
 	conf = replaceConfKey(conf, "xkey: ", xkeyPub)
+	conf, dialOpt := withTestTLS(t, conf)
 
 	confPath := filepath.Join(t.TempDir(), "nats.conf")
 	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
@@ -190,21 +237,28 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		t.Fatalf("the rendered nats.conf was refused by the server: %v", err)
 	}
 	opts.NoLog, opts.NoSigs = true, true
-	// Ports and paths are the only things a test may move: the render pins
-	// 4222 and 9222 and a JetStream store at /data, none of which a test
-	// process can have. Everything the test is actually asserting about —
-	// accounts, users, grants, the callout block — is untouched.
+	serverConnectBudget(opts)
+	// Ports, paths and the connect budget are the only things a test may
+	// move: the render pins 4222, 8222 and 9222 and a JetStream store at
+	// /data, none of which a test process can have. -1 asks the server for a
+	// free port on each listener, the monitor included, so the server keeps
+	// the shipped shape while nothing fixed is bound. Everything the test is
+	// actually asserting about — accounts, users, grants, the callout block's
+	// keys and policy — is untouched; its two-second timeout is the one
+	// value serverConnectBudget lifts, and why.
 	opts.Port = -1
 	opts.Websocket.Port = -1
+	opts.HTTPPort = -1
+	// The render binds every interface; the test's serving certificate names
+	// the loopback address, so the server is bound there instead.
+	opts.Host = "127.0.0.1"
 	opts.StoreDir = t.TempDir()
 
-	srv, err := natsserver.NewServer(opts)
+	// startNatsServer keeps the server's own log, so a server that never
+	// becomes ready fails the test with its reason rather than a timeout.
+	srv, err := startNatsServer(opts, 10*time.Second)
 	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	go srv.Start()
-	if !srv.ReadyForConnections(10 * time.Second) {
-		t.Fatal("nats-server not ready")
+		t.Fatal(err)
 	}
 	t.Cleanup(srv.Shutdown)
 
@@ -229,6 +283,13 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		// The reserved addressees the operator renders, from the fixture it
 		// keeps equal to its render.
 		ReservedAddressees: renderedFixtureAddressees(t),
+
+		GrantTTL:        options.grantTTL,
+		TaskSigningKeys: options.taskKeys,
+		Now:             options.now,
+
+		TaskCredentialMaxLifetime:        options.taskLifetime,
+		TaskCredentialMaxLifetimeInvalid: options.taskLifetimeErr,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
@@ -237,7 +298,7 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	// The callout is itself a bus client, and it authenticates statically
 	// because it cannot authenticate through itself. auth_users is what
 	// exempts it.
-	svcConn, err := nats.Connect(srv.ClientURL(), nats.UserInfo(svcUser, svcPass), nats.Name("auth-callout"))
+	svcConn, err := nats.Connect(srv.ClientURL(), nats.UserInfo(svcUser, svcPass), nats.Name("auth-callout"), dialOpt)
 	if err != nil {
 		t.Fatalf("the callout service could not connect: %v", err)
 	}
@@ -246,14 +307,14 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		t.Fatalf("Subscribe: %v", err)
 	}
 
-	return &harness{server: srv, url: srv.ClientURL(), store: store, tokens: tokens}
+	return &harness{server: srv, url: srv.ClientURL(), store: store, tokens: tokens, dial: dialOpt}
 }
 
 // connectAs dials with a ServiceAccount token, the way a workload will.
 func (h *harness) connectAs(t *testing.T, user, token string) (*nats.Conn, chan error) {
 	t.Helper()
 	violations := make(chan error, 16)
-	nc, err := nats.Connect(h.url,
+	nc, err := nats.Connect(h.url, h.dial,
 		nats.Token(token),
 		nats.CustomInboxPrefix("_INBOX."+user),
 		nats.Name(user),
@@ -343,7 +404,7 @@ func TestADifferentServiceAccountGetsADifferentGrantSet(t *testing.T) {
 func TestAnUnmappedServiceAccountIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, nats.Token(strangerTok), nats.Name("stranger"))
+	nc, err := nats.Connect(h.url, h.dial, nats.Token(strangerTok), nats.Name("stranger"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a ServiceAccount absent from the identity map connected")
@@ -356,7 +417,7 @@ func TestAnUnmappedServiceAccountIsRefusedAtConnect(t *testing.T) {
 func TestATokenTheClusterRefusesIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, nats.Token("a-token-no-cluster-ever-issued"), nats.Name("forged"))
+	nc, err := nats.Connect(h.url, h.dial, nats.Token("a-token-no-cluster-ever-issued"), nats.Name("forged"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a token the cluster does not authenticate was accepted")
@@ -366,10 +427,90 @@ func TestATokenTheClusterRefusesIsRefusedAtConnect(t *testing.T) {
 	}
 }
 
+// The rendered config requires TLS of every client: the server says so in
+// its INFO, refuses a CONNECT sent in the clear, and refuses a TLS client that
+// does not trust the bus CA. Each of the three would be a plaintext bus by
+// another route.
+func TestTheRenderedBusRefusesPlaintextAndUntrustedClients(t *testing.T) {
+	h := startHarness(t, twoIdentityMap, defaultTokens())
+	addr := strings.TrimPrefix(strings.TrimPrefix(h.url, "tls://"), "nats://")
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	r := bufio.NewReader(conn)
+	info, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading INFO: %v", err)
+	}
+	if !strings.Contains(info, `"tls_required":true`) {
+		t.Fatalf("the server does not advertise tls_required: %s", info)
+	}
+	if _, err := conn.Write([]byte("CONNECT {\"verbose\":false,\"name\":\"plaintext\"}\r\nPING\r\n")); err != nil {
+		t.Fatalf("writing CONNECT: %v", err)
+	}
+	reply, _ := r.ReadString('\n')
+	if strings.HasPrefix(reply, "PONG") {
+		t.Fatal("a CONNECT sent in the clear was answered with PONG")
+	}
+
+	t.Setenv(lib.EnvNATSCAFile, "")
+	nc, err := nats.Connect(h.url, nats.Token(tokenPodA), nats.Name("untrusted"), nats.Timeout(testDialTimeout))
+	if err == nil {
+		nc.Close()
+		t.Fatal("a client that does not trust the bus CA connected")
+	}
+	if !strings.Contains(err.Error(), "certificate") {
+		t.Errorf("connect error = %v, want a certificate verification failure", err)
+	}
+}
+
+// lib.TLSOptions is the trust every product client takes, so it is driven
+// here against the rendered bus rather than inspected: a client that trusts
+// another CA, or the right CA under a name the certificate does not carry, is
+// refused at the handshake, and the right CA under the certificate's name
+// gets past it. A TLSOptions that stopped verifying would pass the third case
+// and fail the first two.
+func TestLibTLSOptionsVerifiesTheBus(t *testing.T) {
+	h := startHarness(t, twoIdentityMap, defaultTokens())
+	rightCA := os.Getenv(lib.EnvNATSCAFile)
+	if rightCA == "" {
+		t.Fatal("the harness set no CA file; every case below would be inert")
+	}
+	_, _ = withTestTLS(t, renderedTLSDir)
+	otherCA := os.Getenv(lib.EnvNATSCAFile)
+
+	// A token the harness maps, so the third case connects outright rather
+	// than being refused at authorization after a handshake it may or may not
+	// have made.
+	dial := func(t *testing.T, ca, serverName string) error {
+		t.Helper()
+		t.Setenv(lib.EnvNATSCAFile, ca)
+		t.Setenv(lib.EnvNATSTLSServerName, serverName)
+		nc, err := nats.Connect(h.url, append(lib.TLSOptions(), nats.Token(gatewayToken), nats.Name("tls-options"), nats.Timeout(testDialTimeout))...)
+		if err == nil {
+			nc.Close()
+		}
+		return err
+	}
+	if err := dial(t, otherCA, ""); err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Errorf("a client trusting another CA: err = %v, want a certificate verification failure", err)
+	}
+	if err := dial(t, rightCA, "attacker.example"); err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Errorf("the right CA under a name the certificate lacks: err = %v, want a certificate verification failure", err)
+	}
+	if err := dial(t, rightCA, "localhost"); err != nil {
+		t.Errorf("the right CA under the certificate's name did not connect: %v", err)
+	}
+}
+
 func TestNoTokenIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, nats.Name("anonymous"))
+	nc, err := nats.Connect(h.url, h.dial, nats.Name("anonymous"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a client presenting no credential at all connected")
@@ -382,7 +523,7 @@ func TestNoTokenIsRefusedAtConnect(t *testing.T) {
 func TestTheTokenIsAcceptedAsAPasswordToo(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url,
+	nc, err := nats.Connect(h.url, h.dial,
 		nats.UserInfo(agentSA, agentToken),
 		nats.CustomInboxPrefix("_INBOX.agent"),
 		nats.Name("agent-via-userinfo"))
@@ -410,7 +551,7 @@ func TestAClientMustUseTheInboxPrefixItsGrantsCover(t *testing.T) {
 	}
 
 	// The default random inbox is not covered by the gateway's grant.
-	wrong, err := nats.Connect(h.url, nats.Token(gatewayToken), nats.Name("gateway-default-inbox"))
+	wrong, err := nats.Connect(h.url, h.dial, nats.Token(gatewayToken), nats.Name("gateway-default-inbox"))
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -441,7 +582,7 @@ func TestACalloutWithNoMapRefusesEveryConnection(t *testing.T) {
 	// the same state a callout is in before its first informer sync.
 	h.store.current.Store(nil)
 
-	nc, err := nats.Connect(h.url, nats.Token(gatewayToken), nats.Name("gateway"))
+	nc, err := nats.Connect(h.url, h.dial, nats.Token(gatewayToken), nats.Name("gateway"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a connection was authorized while no identity map was being served")
@@ -534,7 +675,7 @@ func TestTheCalloutAnswersOneAuthorizationAtATime(t *testing.T) {
 	var mu sync.Mutex
 	inFlight, peak, reviews := 0, 0, 0
 
-	h := startHarness(t, twoIdentityMap, defaultTokens(), watchingTokenReviews(func() func() {
+	h := startHarness(t, twoIdentityMap, defaultTokens(), watchingTokenReviews(func(string) func() {
 		mu.Lock()
 		inFlight++
 		reviews++
@@ -559,7 +700,7 @@ func TestTheCalloutAnswersOneAuthorizationAtATime(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			nc, err := nats.Connect(h.url, nats.Token(agentToken), nats.CustomInboxPrefix("_INBOX.agent"), nats.Name("agent"))
+			nc, err := nats.Connect(h.url, h.dial, nats.Token(agentToken), nats.CustomInboxPrefix("_INBOX.agent"), nats.Name("agent"))
 			if err != nil {
 				failures <- err
 				return

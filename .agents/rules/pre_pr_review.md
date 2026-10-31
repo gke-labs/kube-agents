@@ -1,17 +1,27 @@
 ---
-# Claude Code loads this rule only beside files matching `paths`; other tools ignore this block.
+# Claude Code loads this rule only beside files matching `paths`; Antigravity uses `trigger` and `description`.
 paths:
   - ".github/PULL_REQUEST_TEMPLATE.md"
   - "docs/pull-request-workflow.md"
+trigger: model_decision
+description: "Pre-PR review and validation mechanics: running adversarial and docs-drift reviews in a clean context, live validation, bug-fix recurrence, and keeping PR sections current."
 ---
 
 # Pre-PR review mechanics
 
-[`AGENTS.md`](../../AGENTS.md) owns the rules below — that adversarial self-review and live
-validation are required before opening a pull request, that each is recorded in the pull request
-body, and that a bug fix must name what stops it recurring. This file holds the mechanics of
-carrying them out, and what the automated review shares with the self-review. Change those rules
-in `AGENTS.md`; change how they are done here.
+[`AGENTS.md`](../../AGENTS.md) owns the rules below — that adversarial self-review, docs-drift
+review, and live validation are required before opening a pull request, that each is recorded in the
+pull request body and kept current across rounds, and that a bug fix must name what stops it
+recurring. This file holds the mechanics of carrying them out, and what the automated review shares
+with the self-review. The comments in
+[`.github/PULL_REQUEST_TEMPLATE.md`](../../.github/PULL_REQUEST_TEMPLATE.md) summarise the pair —
+change `AGENTS.md` or this file, whichever owns what you are changing, then reconcile the template
+summary to it. A template section stays in every pull request: the review bot holds a description
+to every heading and has no optional section, and the contributor robot's one exception is the
+"delete this section" phrase. So a section that applies to some pull requests only opens its
+comment with the condition and names the one-line answer the rest write (`Required when ...
+Otherwise write "Not a bug fix."`), never "delete this section"; `make docs-check-pr-template`
+is the tripwire for the shapes seen so far, and a reviewer reads the rest.
 
 ## Adversarial self-review
 
@@ -39,10 +49,14 @@ The rule, and the requirement to fill in the template's **Self-Review** section,
   the reviewer something untrue about how the change was checked.
 - **Every finding gets a disposition: fixed, or deliberately not with a reason that argues about
   this change.** "Out of scope", "pre-existing", and "will fix later" are not reasons on their
-  own; the separate issue you filed is. Fix what a pass confirms and report what it only
-  suspects — a finding it could not pin down is an open question for the section, not a licence
-  to rewrite working code. And "no findings" is an answer only alongside what you looked for: a
-  pass that names none of its angles is indistinguishable from no pass.
+  own; the separate issue you filed is. On a later round of the automated review, a
+  `declined: <reason about this change>` reply in the thread is that disposition
+  ([`docs/pull-request-workflow.md`, "Green is settled"](../../docs/pull-request-workflow.md#green-is-settled));
+  on a first review a finding that correctly applies a rule with no exemption is still a fix. Fix
+  what a pass confirms and report what it only suspects — a finding it could not pin down is an
+  open question for the section, not a licence to rewrite working code. And "no findings" is an
+  answer only alongside what you looked for: a pass that names none of its angles is
+  indistinguishable from no pass.
   [`.agents/skills/review-preflight/SKILL.md`](../skills/review-preflight/SKILL.md) §6
   elaborates, including how to merge two passes that grade differently.
 - **Do not claim more than you did.** A self-review the diff contradicts is worse than none: it
@@ -74,8 +88,9 @@ in `AGENTS.md` under Pull Request Hygiene.
 
 - **For a change to what an agent does, the live validation is the eval loop**: a case seen
   red against `main` and green three times against the branch, per
-  [`eval_driven_development.md`](eval_driven_development.md). The bullets below are the form for
-  runtime changes that do not alter agent behaviour.
+  [`eval_driven_development.md`](eval_driven_development.md), or the record of one of the two
+  agent-behaviour exemptions in that file. The bullets below are the form for runtime changes that
+  do not alter agent behaviour, and for the live or replay check those exemptions also take.
 - **Name the install and what you observed.** Cluster, image tag, operator version; what you
   did; and the result at each layer the change claims to touch — the CR `.status`, the
   Deployment env, the file or process inside the pod.
@@ -99,6 +114,18 @@ in `AGENTS.md` under Pull Request Hygiene.
 - **If the change cannot reach a running installation** — docs-only, a CI workflow, a code path
   that needs infrastructure you do not have — write "Not live-tested" and say why. An empty
   section is not an answer.
+
+## Keeping the sections current
+
+**Self-Review** and **Live validation** tell a reviewer at a glance what has been reviewed and
+exercised against the branch as it stands. A second pass — after review findings, after a rebase —
+folds into what is there rather than being appended beneath it: work that still holds stays and is
+not re-run just to have been run against the new head, a check the new commits invalidated is
+re-run or kept with a line saying it no longer reaches the head, and new findings join the rest.
+What a re-run drops is the superseded round, not the contents these sections owe a reviewer — the
+angles you ran, the layers you observed, what you could not cover. Round-by-round history of a
+_reviewer's_ findings is the exception: it belongs in the threads, where a reply naming the fix and
+its commit stays attached to the finding it answers.
 
 ## Preventing recurrence on a bug fix
 

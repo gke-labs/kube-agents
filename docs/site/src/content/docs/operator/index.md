@@ -27,13 +27,14 @@ k8s-operator/
 Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 
 - **`PlatformAgent`** — declares a Platform Agent instance, container image, service account, chat integrations, and harness toggles.
-- **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`.
+- **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`. The repository ships the Pub/Sub alert adapter and the GKE stockout investigator: [Shipped plugins](/kube-agents/operator/agentplugin-crd/#shipped-plugins).
+- **`AgentProfile`** — under `spec.mode: next` only, declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
 
 The controller reconciles a `PlatformAgent` into:
 
 - A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar and an `agent-api-auth` sidecar that terminates the PlatformAgent API bearer key, runs the `k8s-event-watcher`, and runs the `drift-detector` where an install has enabled it. The gateway executes nothing the model wrote; which credentials it does hold, and why, are on [Credential isolation](/kube-agents/reference/credential-isolation/).
 - A `StatefulSet` (named `<name>-shell`) and its `Service`, the shell sandbox: `sshd` on `2222`, the durable `/opt/data`, and the wrappers that stand in for `gcloud` and `kubectl`. This is the pod that runs model-authored commands, and its ServiceAccount carries no Workload Identity annotation.
-- A `Deployment` (named `<name>-credential-proxy`), a `ClusterIP` `Service` on port `8765`, and a `NetworkPolicy` narrowing who may reach it (the sandbox and the gateway on `8765`; pods in `gke-gmp-system`, where the managed-Prometheus collector runs, and the operator's own pods on the metrics-only port `8766`) — the credential broker, which holds every credential in the install and executes the real CLIs on the sandbox's behalf. See [Credential isolation](/kube-agents/reference/credential-isolation/).
+- A `Deployment` (named `<name>-credential-proxy`), a `ClusterIP` `Service` on port `8765`, a `PodDisruptionBudget` (`maxUnavailable: 1`, which on its one replica refuses no eviction and blocks no drain), and a `NetworkPolicy` narrowing who may reach it (the sandbox and the gateway on `8765`; pods in `gke-gmp-system`, where the managed-Prometheus collector runs, and the operator's own pods on the metrics-only port `8766`) — the credential broker, which holds every credential in the install and executes the real CLIs on the sandbox's behalf. See [Credential isolation](/kube-agents/reference/credential-isolation/).
 - A `Service` fronting the gateway `Deployment` (API port `8642`, plus dashboard port `9119` when the dashboard is enabled).
 - A `PodDisruptionBudget` selecting the Deployment's pods, `maxUnavailable: 1` at every replica count. That declares the agent evictable rather than blocking node drains, and it stays correct when the agent is scaled — a budget keyed to the replica count would deadlock drains the first time someone scaled back to one.
 - A `ServiceAccount` (annotated for Workload Identity) plus RBAC — a viewer `ClusterRoleBinding` and an "explorer" `ClusterRole` with its own `ClusterRoleBinding`.
@@ -41,7 +42,7 @@ The controller reconciles a `PlatformAgent` into:
 - `ConfigMap`s for the pod: config overlays merged into each Hermes profile's `config.yaml` at startup (including the whole rendered config for the default, Planning Agent, profile — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)), a `SETTINGS.md` (GKE scope) mounted into `/opt/data/`, the [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope) declaration as `scope.json` mounted at `/etc/kube-agents/`, and a Fluent Bit config for the logging sidecar. Each profile's base config is baked into the image and scaffolded at startup.
 - A `ConfigMap` (named `<name>-usage-counters`) holding the totals and per-pod baseline behind `status.usage`'s counters, owned by the CR, so it is collected with it, and written outside the reconcile loop; the operator writes it on the leader, at most once per five-minute poll, when a total or the per-pod baseline changed; a quiet poll writes nothing.
 - Optional integrations wired through the CR `spec.integration` block: Google Chat (Pub/Sub topic/subscription), Slack (bot/app token secret refs), and version control (`forges` and the `repositories` on them — GitOps, managed and read-only context — with `github` as a deprecated alias).
-- Under the unsupported `spec.mode: next` dev toggle, additionally the A2A playground stack (NATS, bus provisioning, the auth callout, the capability verifier and, once a chat backend is configured, the A2A gateway), and a `hermes-bridge` container in the agent pod, the bus's task executor, added once the bus is provisioned unless the CR declares its own — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
+- Under `spec.mode: next`, additionally the A2A stack (NATS, bus provisioning, the auth callout, the capability verifier and the A2A gateway, on the console door alone until a chat backend is configured), and a `hermes-bridge` container in the agent pod, the bus's task executor, added once the bus is provisioned unless the CR declares its own — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
 
 ## Custom resource shape
 
@@ -82,7 +83,7 @@ spec:
 proxy only bootstraps a kubectl context when it has the complete triple; leave any one out and every
 `kubectl` call the agent makes resolves to `localhost:8080` instead of a cluster.
 
-Full walkthroughs: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) and [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/).
+Full walkthroughs: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/), [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/) and [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
 
 ## Admission webhooks
 
@@ -204,5 +205,7 @@ minutes.
 
 - [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) — reference for `PlatformAgent` custom resource.
 - [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/) — reference for `AgentPlugin` custom resource.
+- [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/) — reference for `AgentProfile` custom resource.
+- [PlatformAgent fields](/kube-agents/operator/platformagent-fields/), [AgentPlugin fields](/kube-agents/operator/agentplugin-fields/) and [AgentProfile fields](/kube-agents/operator/agentprofile-fields/) — every `spec` and `status` field of each resource, generated from the operator's Go API types.
 - [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) — build, test, and run the operator locally.
 - [`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md) — the installer helper scripts (`install.env` loader, tfvars generator), at the repository root rather than under `k8s-operator/`.

@@ -1,7 +1,8 @@
 # Persona content for the A2A bus
 
 What lives here: the platform agent's `a2a-topics` skill, which is how a
-running agent reads and writes the topic blackboard. It sits under `a2a/`
+running agent reads and writes the topic blackboard, and the session agent's
+persona ([`session/persona.md`](session/persona.md), below). The skill sits under `a2a/`
 rather than in `agents/platform/skills/` on purpose — a skill copied into the
 shipped persona tree would appear in the agent's skill list on every install,
 including the ones where the bus does not exist. "A normal install cannot tell
@@ -21,6 +22,15 @@ profile only on a `next` install (below).
 | The `a2a` client binary                               | built from `a2a/cmd/a2a` in the image's `a2a-builder` stage and `COPY`d to `/usr/local/bin/a2a` — the `k8s-event-watcher` pattern. Ungated: a binary is inert until something invokes it, and the thing that invokes it is what ships dark                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `SKILL.md`                                            | shipped at `/opt/a2a-template/skills/`, overlaid into the profile by `docker-entrypoint.sh` step 2.6a-bis only when `runtime_mode.is_next()`. The overlay rides step 2.6a's staged swap, which is what makes it stick — and what cleans it off on the first boot after a flip back to `today`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `NATS_URL` / `A2A_BUS_USER` / the projected bus token | rendered by the operator into the agent container under `next`. The container holds no password: `A2A_BUS_USER` names the principal (`agent`) and the credential is a ServiceAccount token projected at `/var/run/secrets/a2a-bus/token`, audience `a2a-bus`, which the auth callout resolves to that principal's grants. A bridge sidecar declared in `spec.deployment.sidecars` cannot use it: its route would be a `volumeMounts` entry naming the operator's own `a2a-bus-token` volume, and that name is reserved — refused at admission and stripped from the render. Mounting it would not give the sidecar an identity of its own anyway, since the callout resolves the pod's ServiceAccount and would return the same entry. So the bridge stays on `NATS_USER`/`NATS_PASSWORD` as `bridge`, read through `env.valueFrom.secretKeyRef` against the `<agent>-a2a-nats-creds` Secret |
+
+The binary has a second caller: the agent-side notification callers
+(`agents/platform/scripts/chat_notify.py`) run `a2a notify` to post proactive messages
+through the gateway, and so does the Hermes kanban notifier for card events
+(`deploy/docker/patches/kanban_chat_notify.py`). Both run it only under `next`: proactive posts
+when the operator renders `A2A_NOTIFY_PLATFORM`, and the report of a card filed in a gateway
+conversation, back to that conversation, when it renders `A2A_NOTIFY_CONVERSATIONS`. Onboarding's
+first report goes the same way, into the conversation the user first wrote in
+(`agents/chat/scripts/bootstrap_delivery.py`).
 
 ## The skill copy does not survive a restart, and that is by design
 
@@ -59,3 +69,30 @@ On a `next` install the operator and the image do all three placements; a
 fresh pod roll is the whole procedure. If you find yourself copying anything
 onto the PVC to make the reader work, the install is not actually running
 `mode: next`, and that is the thing to fix.
+
+## The session agent's persona and skills
+
+A `/session` pod runs Claude Code in the `a2a-worker` image. `session/persona.md`
+is its persona, and the image ships it as the harness's user-level `CLAUDE.md`
+beside the cluster agent's skills that `sessionSkills` in
+`a2a/cmd/session-persona` names, taken from `agents/cluster/skills/`, which
+stays their only source. That tool builds the tree at image build time: it
+copies each skill's name and description and nothing else from its
+frontmatter, puts a short note on using the skill in a session after the title,
+marks every code block that writes as a proposal, every one that runs a program
+the session can't run as unavailable, and every piped read as one command per
+call, replaces the cluster agent's kanban reporting steps with "give it in your
+answer", and rewrites references to its scripts, example files and settings as
+not in this session. Only `SKILL.md` ships. The Dockerfile copies the result
+into `CLAUDE_CONFIG_DIR` (`/home/node/.claude`), owned by root.
+
+Editing a skill in `sessionSkills` now also feeds the worker image: its build
+fails if the skill's frontmatter stops parsing, its `name` stops matching its
+directory, or its description is empty or over 1024 characters.
+
+The persona adds no tools and no authority: the tool surface is still the one
+`a2a/cmd/worker-adapter` passes on `--allowedTools`, and that list does not
+name the Skill tool. Claude Code runs a skill whose frontmatter carries only a
+name and description without a permission rule, and a skill that asks for more
+(`allowed-tools`, `hooks`) is refused in a headless run. Its tests in `a2a/cmd/session-persona`
+build the tree from the real sources and fail if a write is left unmarked.

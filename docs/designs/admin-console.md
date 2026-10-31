@@ -159,7 +159,7 @@ admin_console/
     kubectl_local.py       transitional local-only transport
   clients/
     portal_api.py          typed client used by Streamlit
-  pages/                   Streamlit pages; API clients only
+  views/                   Streamlit pages; API clients only
 ```
 
 The central interface is `ChatService`, not FastAPI and not Streamlit. It owns:
@@ -902,6 +902,10 @@ present time-adjacent records as proven causality.
 - Task Kanban inspection uses the same fixed in-pod read mechanism. Queries are
   capped at 500 tasks, 100 runs, 500 events, 200 comments, and 100 attachments;
   delivery destinations and attachment storage paths are deliberately omitted.
-  Production requires a paginated, policy-aware Kanban read API.
+  Session KV also exposes authenticated read-only HTTP endpoints
+  (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`,
+  `GET /v1/tasks`, and `GET /v1/tasks/{task_id}`) backed by `?mode=ro` SQLite
+  reads for headless and non-chat installs. Production requires a paginated,
+  policy-aware Kanban read API.
 - The interfaces in `admin_console/domain.py` are the intended seams for the
   production providers.

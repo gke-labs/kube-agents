@@ -96,6 +96,11 @@ _SHUTDOWN_FLOOR_SECONDS = 1.0
 _SHORT_DRAIN_SECONDS = 2
 _DRAIN_CEILING_SECONDS = 8.0
 
+# The supervisors' budget in the test that proves the runtime drain has its own:
+# well past the ceiling above, so a drain that used it fails on the clock, and
+# inside _run_bash's timeout, so it fails on the assertion rather than by hanging.
+_LONG_DRAIN_SECONDS = 20
+
 # How long to give bash to reap a supervisor the drain has just killed. The wait
 # is what makes the check deterministic: SIGKILL is delivered synchronously but
 # the reap that makes `kill -0` fail is a SIGCHLD the shell handles when it next
@@ -242,7 +247,9 @@ class _ScriptCase(unittest.TestCase):
 class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
     """The three shutdown edges, exercised as bash rather than read as text."""
 
-    def _harness(self, body: str, drain: int = _SHORT_DRAIN_SECONDS) -> str:
+    def _harness(
+        self, body: str, drain: int = _SHORT_DRAIN_SECONDS, runtime_drain: int = _SHORT_DRAIN_SECONDS
+    ) -> str:
         """The shipped drain functions, wired to a fake supervisor.
 
         `body` sets up `drift_pid` and then calls terminate; the caller asserts
@@ -252,7 +259,10 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         set -euo pipefail
         readonly SHUTDOWN_DRAIN_SECONDS={drain}
         readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
+        readonly RUNTIME_DRAIN_SECONDS={runtime_drain}
         {self.lift("drain_supervised")}
+        {self.lift("wait_for_exit")}
+        {self.lift("drain_runtime")}
         {self.lift("terminate")}
         runtime_pid=""
         envoy_pid=""
@@ -370,6 +380,137 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                 elapsed,
                 _SHUTDOWN_FLOOR_SECONDS,
                 "terminate() returned too quickly to have waited for anything",
+            )
+
+    def _runtime(self, child: str, pidfile: pathlib.Path) -> str:
+        """A fake credential runtime assigned to runtime_pid: one process, no loop.
+
+        The broker's shutdown handler is a trap that spends a settle window
+        before exiting, which is what the child stands in for.
+        """
+        return f"""
+        bash -c {shlex.quote(child)} >/dev/null 2>&1 &
+        runtime_pid=$!
+        echo "${{runtime_pid}}" > {pidfile}
+        """
+
+    def test_it_waits_for_the_credential_runtime_to_finish(self) -> None:
+        """The runtime leaves on SIGTERM (its settle window, its Pub/Sub hand-back);
+        a terminate() that killed it and returned SIGKILLed that mid-drain as PID 1.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = pathlib.Path(tmp)
+            ready = tmpdir / "ready"
+            done = tmpdir / "done"
+            returned = tmpdir / "returned"
+            runtime = tmpdir / "runtime"
+
+            child = f"""trap 'sleep {_CHILD_SHUTDOWN_SECONDS}; touch {done}; exit 0' TERM
+                        touch {ready}
+                        for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done"""
+            body = f"""
+            {self._runtime(child, runtime)}
+            while [ ! -e {ready} ]; do sleep {_MARKER_POLL_SECONDS}; done
+            terminate
+            touch {returned}
+            echo "terminate-returned"
+            """
+            try:
+                started = time.monotonic()
+                result = _run_bash(
+                    self._harness(body, runtime_drain=_CHILD_SHUTDOWN_SECONDS * 5)
+                )
+                elapsed = time.monotonic() - started
+            finally:
+                _kill_recorded(runtime)
+
+            self.assertIn("terminate-returned", result.stdout)
+            self.assertTrue(
+                done.exists(),
+                "terminate() returned before the credential runtime had finished shutting "
+                "down; as PID 1 that is the script exiting, and the kernel SIGKILLs the "
+                "settle window the runtime had just started",
+            )
+            self.assertLess(done.stat().st_mtime, returned.stat().st_mtime)
+            self.assertGreater(elapsed, _SHUTDOWN_FLOOR_SECONDS)
+
+    def test_the_runtime_drain_leaves_the_brokered_commands_to_the_runtime(self) -> None:
+        """The runtime's children are brokered commands mid-flight; the runtime keeps
+        its exec route open through its settle window so they finish. A shell-side
+        sweep of them (what drain_supervised does for a supervisor's process) would
+        end them at the first instant of the stop.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = pathlib.Path(tmp)
+            ready = tmpdir / "ready"
+            command_signalled = tmpdir / "command-signalled"
+            runtime = tmpdir / "runtime"
+
+            # The fake runtime: one child standing in for a brokered command,
+            # then a TERM trap that exits without touching it, as the real
+            # runtime leaves a running command to finish inside its window.
+            # The command touches `ready` itself, after its trap, so terminate
+            # cannot run before the trap that the assertion depends on exists.
+            child = f"""bash -c 'trap "touch {command_signalled}; exit 0" TERM
+                                 touch {ready}
+                                 for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done' &
+                        trap 'exit 0' TERM
+                        for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done"""
+            body = f"""
+            {self._runtime(child, runtime)}
+            while [ ! -e {ready} ]; do sleep {_MARKER_POLL_SECONDS}; done
+            terminate
+            echo "terminate-returned"
+            """
+            try:
+                result = _run_bash(self._harness(body))
+            finally:
+                _kill_recorded(runtime)
+                # SIGKILL, never SIGTERM: the orphaned command's TERM trap is
+                # the very marker the assertion below needs to find absent.
+                subprocess.run(["pkill", "-KILL", "-f", f"touch {command_signalled}"], check=False)
+
+            self.assertIn("terminate-returned", result.stdout)
+            self.assertFalse(
+                command_signalled.exists(),
+                "terminate() sent SIGTERM to the runtime's child, a brokered command in "
+                "flight, at the first instant of the stop; the runtime's settle window "
+                "exists so that command can finish",
+            )
+
+    def test_the_runtime_drain_is_bounded_by_its_own_budget(self) -> None:
+        """A runtime that ignores SIGTERM holds the container for RUNTIME_DRAIN_SECONDS,
+        not for the supervisors' budget: the two are sized for different pods.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = pathlib.Path(tmp)
+            ready = tmpdir / "ready"
+            runtime = tmpdir / "runtime"
+
+            child = f"""trap '' TERM
+                        touch {ready}
+                        for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done"""
+            body = f"""
+            {self._runtime(child, runtime)}
+            while [ ! -e {ready} ]; do sleep {_MARKER_POLL_SECONDS}; done
+            terminate
+            echo "terminate-returned"
+            """
+            try:
+                started = time.monotonic()
+                result = _run_bash(
+                    self._harness(body, drain=_LONG_DRAIN_SECONDS, runtime_drain=_SHORT_DRAIN_SECONDS)
+                )
+                elapsed = time.monotonic() - started
+            finally:
+                _kill_recorded(runtime)
+
+            self.assertIn("terminate-returned", result.stdout)
+            self.assertLess(
+                elapsed,
+                _DRAIN_CEILING_SECONDS,
+                "terminate() waited on the runtime for the supervisors' budget rather "
+                "than RUNTIME_DRAIN_SECONDS",
             )
 
     def test_it_gives_up_on_a_process_that_ignores_sigterm(self) -> None:
@@ -499,7 +640,21 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                 )
 
     def test_both_supervisors_are_drained_and_the_signal_precedes_the_kill(self) -> None:
-        drain = self.lift("drain_supervised")
+        # The wait and the last-resort kill live in wait_for_exit. The order
+        # is asserted in two halves: drain_supervised signals and then calls
+        # wait_for_exit (its own text), and wait_for_exit polls before it
+        # kills (its text); a concatenation alone could not tell whether
+        # drain_supervised waits at all.
+        supervised = self.lift("drain_supervised")
+        waiter = self.lift("wait_for_exit")
+        handoff_at = supervised.find("wait_for_exit")
+        self.assertNotEqual(handoff_at, -1, "drain_supervised no longer waits for them to exit")
+        self.assertLess(
+            max(supervised.find("pkill -TERM -P"), supervised.find('kill -TERM "${pid}"')),
+            handoff_at,
+            "drain_supervised waits before it signals, so it waits for nothing",
+        )
+        drain = supervised + waiter
         pkill_at = drain.find("pkill -TERM -P")
         term_at = drain.find('kill -TERM "${pid}"')
         wait_at = drain.find('kill -0 "${pid}"')
@@ -805,6 +960,17 @@ class TheDaemonAddressIsDeclaredOnceAndUsedByBoth(_ScriptCase):
                     "so changing the port takes two edits and the second is silent",
                 )
 
+    def test_the_watcher_waits_for_the_agent_gateway(self) -> None:
+        # Without the flag the watcher offers events while the gateway boots,
+        # and the daemon accepts them with no triage turn behind them.
+        url = _run_bash(
+            "set -u\n"
+            + lift_constant("AGENT_GATEWAY_URL", self.text, _SCRIPT)
+            + 'printf "%s" "${AGENT_GATEWAY_URL}"'
+        ).stdout
+        self.assertEqual(url, "http://127.0.0.1:8642")
+        self.assertIn('--gateway-url="${AGENT_GATEWAY_URL}"', self.lift("start_event_watcher"))
+
 
 class NormalizeBooleanResolvesWhatTheWatcherIsHandedAsAFlag(_ScriptCase):
     """The boolean normaliser, exercised as bash rather than read as text.
@@ -947,6 +1113,248 @@ class NormalizeBooleanResolvesWhatTheWatcherIsHandedAsAFlag(_ScriptCase):
             '--autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}"',
             self.lift("start_event_watcher"),
             "the normalised value no longer reaches the watcher",
+        )
+
+
+# The eight tunables the script hands the watcher as duration or count flags,
+# and which normaliser each goes through. The positive flag marks the one whose
+# validate() also refuses zero.
+_WATCHER_DURATION_KNOBS = {
+    "WATCHER_DEDUP_WINDOW": "--dedup-window",
+    "WATCHER_FAILEDSCHEDULING_MIN_SPAN": "--failedscheduling-min-span",
+    "WATCHER_SCALEUP_HOLD": "--scaleup-hold",
+    "WATCHER_SETTLE": "--settle",
+    "WATCHER_QUIET_AFTER": "--quiet-after",
+}
+_WATCHER_POSITIVE_DURATION_KNOBS = ("WATCHER_DEDUP_WINDOW",)
+_WATCHER_COUNT_KNOBS = {
+    "WATCHER_BACKOFF_MIN_COUNT": "--backoff-min-count",
+    "WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT": "--imagepull-transient-min-count",
+    "WATCHER_FAILEDSCHEDULING_MIN_COUNT": "--failedscheduling-min-count",
+}
+_FALLBACK_DURATION = "2m"
+_FALLBACK_COUNT = "5"
+
+# The most components WATCHER_DURATION_PATTERN admits, and a value far past it:
+# 65,000 of `1s` is 128 KiB, the largest single string execve passes in the
+# environment. Before the cap the loop rescanned the remainder on every pass and
+# took minutes over it; refused by the pattern, it costs one failed match.
+_DURATION_MAX_COMPONENTS = 16
+_PATHOLOGICAL_COMPONENTS = 65000
+_PATHOLOGICAL_SECONDS = 5.0
+
+
+def _watcher_values_passed(watcher: str) -> set[str]:
+    """Every WATCHER_* name read anywhere in the watcher's command line.
+
+    The command runs from the binary's path to the `|| true` that ends it, and
+    every WATCHER_* token inside it counts, however it is quoted, prefixed or
+    nested: `"${ROOT:-/opt}/${WATCHER_X}"` and `"${A:-${WATCHER_X}}"` are found
+    as surely as `"${WATCHER_X}"`. The lookbehind keeps EVENT_WATCHER_* out;
+    the supervisor's own WATCHER_* settings sit outside the command.
+    """
+    command = re.search(r"/usr/local/bin/k8s-event-watcher\b(.*?)\|\| true", watcher, re.S)
+    assert command, "the watcher's command line was not found"
+    return set(re.findall(r"(?<![A-Z0-9_])WATCHER_[A-Z0-9_]+", command.group(1)))
+
+
+class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
+    """The duration and count normalisers, exercised as bash.
+
+    Each value is pasted into a watcher flag, and one the flag package or
+    validate() rejects is an exit on every start: the supervisor backs off,
+    logs that no cluster events are being watched, and the container stays
+    Ready. `120` for a span (a missing unit) and `08` for a count (a bad octal
+    literal to Go) were both enough.
+    """
+
+    def _resolve(
+        self, helper: str, value: str, *args: str, repeat: int = 1
+    ) -> subprocess.CompletedProcess:
+        """Run `helper` on `value` repeated `repeat` times, built inside bash.
+
+        Built there rather than passed in because Linux caps one argument at
+        128 KiB, which the pathological case would exceed inside `bash -c`.
+        """
+        patterns = "\n".join(
+            lift_constant(name, self.text, _SCRIPT)
+            for name in (
+                "WATCHER_DURATION_PATTERN",
+                "WATCHER_COUNT_PATTERN",
+                "NS_PER_US",
+                "NS_PER_MS",
+                "NS_PER_S",
+                "NS_PER_M",
+                "NS_PER_H",
+                "NS_MAX",
+                "DECIMAL_BASE",
+                "WATCHER_DURATION_MAX_HOURS",
+            )
+        )
+        return _run_bash(
+            f"""
+            set -u
+            {patterns}
+            {self.lift("duration_nanoseconds")}
+            {self.lift(helper)}
+            SETTING=""
+            for ((i = 0; i < {repeat}; i++)); do SETTING+={shlex.quote(value)}; done
+            {helper} SETTING {" ".join(shlex.quote(a) for a in args)}
+            printf "resolved=%s" "${{SETTING}}"
+            """
+        )
+
+    def test_a_go_duration_passes_through_unchanged(self) -> None:
+        # 1000000h is the ceiling itself (WATCHER_DURATION_MAX_HOURS).
+        for value in (
+            "2m", "90s", "1h30m", "1.5h", "500ms", "24h", "0", "0s",
+            "604800s", "120000ms", "100000h", "1h1m1s1ms1us", "1000000h",
+        ):
+            with self.subTest(value=value):
+                result = self._resolve("normalize_duration", value, _FALLBACK_DURATION)
+                self.assertIn(f"resolved={value}", result.stdout)
+                self.assertEqual("", result.stderr)
+
+    def test_surrounding_whitespace_is_dropped_not_reported(self) -> None:
+        result = self._resolve("normalize_duration", " 15m\n", _FALLBACK_DURATION)
+        self.assertIn("resolved=15m", result.stdout)
+        self.assertEqual("", result.stderr)
+
+    def test_a_value_the_watcher_would_reject_lands_on_the_default_and_says_so(self) -> None:
+        # 120: no unit. -5m: validate() refuses a negative. 00: ParseDuration
+        # only special-cases a bare 0. The last four are past int64 nanoseconds:
+        # one unit, a second component, and a fraction over the line; without
+        # the range check each wraps negative and passes the ceiling.
+        for value in (
+            "120", "2", "-5m", "abc", "00", "2 m", "5min",
+            "2562048h", "3000000h", "2562047h1h", "2562047h47m16.855s",
+        ):
+            with self.subTest(value=value):
+                result = self._resolve("normalize_duration", value, _FALLBACK_DURATION)
+                self.assertIn(f"resolved={_FALLBACK_DURATION}", result.stdout)
+                self.assertIn("SETTING=", result.stderr)
+                self.assertIn("is not a usable duration", result.stderr)
+
+    def test_the_positive_form_refuses_every_spelling_of_zero(self) -> None:
+        # 0.5ns has a non-zero digit, and Go truncates it to 0 all the same.
+        for value in ("0", "0s", "0m0s", "0.0h", "0.5ns", "0.9ns0.0s"):
+            with self.subTest(value=value):
+                result = self._resolve("normalize_duration", value, "24h", "positive")
+                self.assertIn("resolved=24h", result.stdout)
+                self.assertIn("above zero", result.stderr)
+        for value in ("30m", "1ns", "1.5ns", "0.001us", "0.5s"):
+            with self.subTest(value=value):
+                result = self._resolve("normalize_duration", value, "24h", "positive")
+                self.assertIn(f"resolved={value}", result.stdout)
+                self.assertEqual("", result.stderr)
+
+    def test_a_count_is_rewritten_as_decimal(self) -> None:
+        for value, want in (("5", "5"), ("08", "8"), ("007", "7"), (" 3 ", "3"), ("0", "0")):
+            with self.subTest(value=repr(value)):
+                result = self._resolve("normalize_count", value, _FALLBACK_COUNT)
+                self.assertIn(f"resolved={want}", result.stdout)
+                self.assertEqual("", result.stderr)
+
+    def test_a_count_the_watcher_would_reject_lands_on_the_default_and_says_so(self) -> None:
+        # Nineteen digits can overflow the int64 the flag package parses into.
+        for value in ("abc", "1.5", "3x", "1234567890123456789"):
+            with self.subTest(value=value):
+                result = self._resolve("normalize_count", value, _FALLBACK_COUNT)
+                self.assertIn(f"resolved={_FALLBACK_COUNT}", result.stdout)
+                self.assertIn("is not a usable count", result.stderr)
+
+    def test_spellings_go_accepts_but_a_tunable_does_not_need_land_on_the_default(self) -> None:
+        """Narrowed on purpose, and safe because it is a fallback, never a crash.
+
+        The flag package reads `0x10` as sixteen and `+5m` as five minutes, and
+        validate() lets a negative count through to the filter's default; none
+        is a way anyone sets a debounce or a window, and passing one through
+        would mean copying more of Go's grammar for no tunable's benefit.
+        """
+        for helper, value, fallback in (
+            ("normalize_count", "0x10", _FALLBACK_COUNT),
+            ("normalize_count", "-1", _FALLBACK_COUNT),
+            ("normalize_count", "+3", _FALLBACK_COUNT),
+            ("normalize_count", "1_000", _FALLBACK_COUNT),
+            ("normalize_duration", "+5m", _FALLBACK_DURATION),
+            ("normalize_duration", ".5h", _FALLBACK_DURATION),
+            ("normalize_duration", "1.h", _FALLBACK_DURATION),
+            ("normalize_duration", "0.0001s", _FALLBACK_DURATION),
+            # Inside Go's range, past the ceiling the watcher's sums need.
+            ("normalize_duration", "1000000h1ns", _FALLBACK_DURATION),
+            ("normalize_duration", "2562047h", _FALLBACK_DURATION),
+            ("normalize_duration", "3600000000000001us", _FALLBACK_DURATION),
+            # Inside Go's range, but nineteen digits: the pattern's own cap,
+            # which keeps the arithmetic inside bash's int64.
+            ("normalize_duration", "9223372036854775807ns", _FALLBACK_DURATION),
+        ):
+            with self.subTest(value=value):
+                result = self._resolve(helper, value, fallback)
+                self.assertIn(f"resolved={fallback}", result.stdout)
+                self.assertIn("is not a usable", result.stderr)
+
+    def test_the_unnormalised_value_check_sees_every_spelling_of_a_flag(self) -> None:
+        """The scan behind the last assertion below, on spellings it must not miss."""
+        for line, want in (
+            ('--new-flag="${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}/${WATCHER_NEW}"', "WATCHER_NEW"),
+            ('--new-flag="${EVENT_WATCHER_NEW:-${WATCHER_NEW}}"', "WATCHER_NEW"),
+            ('--new-flag="$(printf %s "${WATCHER_NEW}")"', "WATCHER_NEW"),
+            ('--new-flag="${WATCHER_NEW:-2m}"', "WATCHER_NEW"),
+            ("--new-flag=${WATCHER_NEW}", "WATCHER_NEW"),
+            ("--new-flag=$WATCHER_NEW", "WATCHER_NEW"),
+            ('--new-flag="${WATCHER_5XX_MIN_COUNT}"', "WATCHER_5XX_MIN_COUNT"),
+            ('--new-flag "${WATCHER_NEW}"', "WATCHER_NEW"),
+            ("--http2-window=${WATCHER_NEW}", "WATCHER_NEW"),
+            ('--new-flag="p${WATCHER_NEW}"', "WATCHER_NEW"),
+            ('--settle="${WATCHER_SETTLE}"', "WATCHER_SETTLE"),
+        ):
+            with self.subTest(line=line):
+                command = f"/usr/local/bin/k8s-event-watcher \\\n  {line} || true"
+                self.assertEqual({want}, _watcher_values_passed(command))
+
+    def test_a_duration_is_bounded_in_components(self) -> None:
+        many = "1s" * _DURATION_MAX_COMPONENTS
+        result = self._resolve("normalize_duration", many, _FALLBACK_DURATION)
+        self.assertIn(f"resolved={many}", result.stdout)
+        result = self._resolve("normalize_duration", many + "1s", _FALLBACK_DURATION)
+        self.assertIn(f"resolved={_FALLBACK_DURATION}", result.stdout)
+
+        started = time.monotonic()
+        result = self._resolve(
+            "normalize_duration", "1s", _FALLBACK_DURATION, repeat=_PATHOLOGICAL_COMPONENTS
+        )
+        self.assertIn(f"resolved={_FALLBACK_DURATION}", result.stdout)
+        self.assertLess(time.monotonic() - started, _PATHOLOGICAL_SECONDS)
+
+    def test_every_watcher_flag_tunable_is_normalised_against_a_named_default(self) -> None:
+        """Declared from a named default, normalised, and passed to the watcher.
+
+        A tunable added to the flag list without the middle line is the bug this
+        class exists for, so each of the three is checked per knob.
+        """
+        watcher = self.lift("start_event_watcher")
+        for knobs, helper in (
+            (_WATCHER_DURATION_KNOBS, "normalize_duration"),
+            (_WATCHER_COUNT_KNOBS, "normalize_count"),
+        ):
+            for name, flag in knobs.items():
+                with self.subTest(name=name):
+                    lift_constant(f"{name}_DEFAULT", self.text, _SCRIPT)
+                    self.assertIn(f'{name}="${{{name}:-${{{name}_DEFAULT}}}}"', self.text)
+                    suffix = " positive" if name in _WATCHER_POSITIVE_DURATION_KNOBS else ""
+                    self.assertRegex(
+                        self.text,
+                        rf'(?m)^{helper} {name} "\$\{{{name}_DEFAULT\}}"{suffix}$',
+                    )
+                    self.assertIn(f'{flag}="${{{name}}}"', watcher)
+
+        # And no WATCHER_* value reaches a duration or count flag unnormalised.
+        passed = _watcher_values_passed(watcher)
+        covered = set(_WATCHER_DURATION_KNOBS) | set(_WATCHER_COUNT_KNOBS)
+        self.assertEqual(
+            set(),
+            passed - covered - {"WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD"},
+            "a WATCHER_* value reaches the watcher without a normaliser",
         )
 
 

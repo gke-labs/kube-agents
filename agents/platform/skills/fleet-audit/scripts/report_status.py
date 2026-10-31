@@ -86,6 +86,12 @@ LATEST_KEYS = (
     # does not print `new`/`resolved` of zero as though nothing changed.
     "delta_known",
     "id_scheme",
+    # audit_report.PHASE_TIMER_KEYS: seconds per phase of the run. Null when
+    # the run had no input for a timer, for example `collect_s` on a run
+    # without a collector manifest.
+    "inspect_s",
+    "publish_s",
+    "collect_s",
 )
 
 # Keys the projection never carries. `document` is the whole findings document

@@ -1,0 +1,18 @@
+Subject: Rejoin the large-shape bullet a blank line splits
+
+Why: Upstream puts a blank line inside the large-shape obtainability bullet, so the rest of its first sentence renders as a separate paragraph cut off from the bullet.
+Local-Issue: #2692
+Upstream-Issue: none filed yet
+Retire-When: upstream removes the blank line from the large-shape bullet
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -182,7 +182,6 @@ not block the user's initial request.** If asked for YAML/recommendations:
+     `cloud.google.com/machine-family: <PRIMARY_FAMILY>`. Do NOT recommend GCE
+     Capacity Reservations or manual node pool limits for capping core usage.
+ -   **Large-shape obtainability:** Machine shapes **>32 vCPU** are scarcer than
+-
+     smaller ones (thinner capacity pools, more `out.of.resources` stockouts). A
+     ComputeClass pinned to large machines **only** risks `Pending`. Add
+     **smaller-core fallback priorities** — but only **if the workload allows

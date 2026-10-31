@@ -30,6 +30,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, os.getcwd())
+
 FAILURES: list[str] = []
 
 
@@ -91,6 +93,35 @@ with sqlite3.connect(KV) as kv:
         (SPACE, json.dumps({"platform": "slack", "chat_id": "C0WRONG"})),
     )
 
+    # The route the hermes-bridge records for a gateway conversation's
+    # session (session_kv_server.put_conversation_route), under its own key.
+    kv.execute(
+        "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+        (
+            "a2a-ctx-verify",
+            json.dumps({"conversation_route": {"platform": "google_chat", "context_id": "ctx-verify",
+                                                "conversation": "gchat:spaces/0EXAMPLE/threads/ASK1"}}),
+        ),
+    )
+
+# Hermes's own session store, written through its own API: the gateway
+# conversation's session, compressed twice, so a card filed in the last
+# continuation has a chat_id with no route of its own.
+HOME = TMP / "hermes-home"
+HOME.mkdir()
+os.environ["HERMES_HOME"] = str(HOME)
+# The platform the kanban notifier serves conversations on, as the operator renders it.
+os.environ["A2A_NOTIFY_CONVERSATIONS"] = "google_chat"
+from hermes_state import SessionDB  # noqa: E402
+
+_sessions = SessionDB(HOME / "state.db")
+_sessions.create_session("a2a-ctx-verify", "api_server")
+_sessions.end_session("a2a-ctx-verify", "compression")
+_sessions.create_session("verify-cont-1", "api_server", parent_session_id="a2a-ctx-verify")
+_sessions.end_session("verify-cont-1", "compression")
+_sessions.create_session("verify-cont-2", "api_server", parent_session_id="verify-cont-1")
+_sessions.close()
+
 from hermes_cli import kanban_db_connect as KC  # noqa: E402
 import tools.kanban_tools as kt  # noqa: E402
 
@@ -143,6 +174,28 @@ if rows:
         "and not to the api_server origin no notifier can deliver to",
         row["platform"] != "api_server" and not row["chat_id"].startswith("k8s-evt-"),
     )
+
+# --- A card filed in a gateway conversation -----------------------------------
+print("gateway conversation card:")
+session("api_server", "a2a-ctx-verify")
+asked = tool_create(title="count the nodes on the asking cluster")
+rows = subs(asked)
+check(
+    "the card is subscribed to the gateway conversation that asked",
+    len(rows) == 1
+    and rows[0]["platform"] == "google_chat"
+    and rows[0]["chat_id"] == "a2a-ctx-verify"
+    and rows[0]["thread_id"] == "gchat:spaces/0EXAMPLE/threads/ASK1",
+    f"{[dict(r) for r in rows]}",
+)
+session("api_server", "verify-cont-2")
+compressed = tool_create(title="filed after the session was compressed twice")
+rows = subs(compressed)
+check(
+    "a card filed after compression still reaches the conversation (walks Hermes's compression lineage)",
+    len(rows) == 1 and rows[0]["thread_id"] == "gchat:spaces/0EXAMPLE/threads/ASK1",
+    f"{[dict(r) for r in rows]}",
+)
 
 # --- Fall-through: everything the patch must leave alone ----------------------
 print("sessions the patch must not touch:")

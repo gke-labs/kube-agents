@@ -2,12 +2,12 @@
 """Build gate for the kanban guardrail-exit patch.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
-``apply_kanban_guardrail_exit.py``. The applier only proves its five anchors
+``apply_kanban_guardrail_exit.py``. The applier only proves its seven anchors
 matched exactly once; that says nothing about whether the inserted code is
 reachable, whether it still composes with the upstream helpers it calls, or
 whether the board write it makes lands.
 
-Six things are checked, and each one is a way the patch could match its anchor
+Seven things are checked, and each one is a way the patch could match its anchor
 and still be useless:
 
 1. **The nudge is reachable and terminal.** Parsed out of the *patched*
@@ -31,8 +31,14 @@ and still be useless:
    ``completed`` determination.
 4. **The board write lands.** ``record_missing_terminal_call`` is driven against
    a real kanban database through the real ``_record_task_failure``: claim
-   released, run closed, failure counted, exit reason legible in the event. Plus
-   the three cases that must *not* write — a card the board no longer shows as
+   released, run closed, failure counted, exit reason legible in the event, and
+   no text upstream would re-read as an auth blocker or a protocol violation.
+   Plus a worker whose run already ended (it blocked, the card was re-run, and
+   it ended in text afterwards), which must leave the next worker's run open,
+   and the same hand-over landing between the backstop's read and
+   ``_record_task_failure``'s write, which the run check inside the write
+   transaction must refuse.
+   Plus the three cases that must *not* write — a card the board no longer shows as
    ``running`` (compaction can drop a terminal tool call out of ``messages``,
    the board cannot), a goal-mode worker between turns, and a dispatched cron
    run, which is holding its *caller's* task id. The cron case is checked
@@ -52,7 +58,22 @@ and still be useless:
    real ``block_task``: the card ends ``blocked`` with ``block_kind=transient``,
    the run closed ``blocked`` with the provider text as its summary, and no
    failure counted. A stale run id is refused, a non-429 exhaustion still
-   records ``timed_out``, and ``billing`` is left to the stock exit.
+   records ``timed_out``, and ``billing`` is not blocked.
+7. **A failed chat-path turn is charged by the worker and retried.** The
+   charged text is checked against the pinned tree's own
+   ``_RESPAWN_BLOCKER_RE``, so a Hermes bump that widens it fails the build.
+   The real, patched ``_chat_render_turn`` is run on the ka-next-4 401 result
+   (display hooks stubbed) inside a forked stand-in worker the dispatcher
+   reaps. It must leave exit code 1 (75 for a rate limit, 1 for ``billing``),
+   a comment naming ``failure_reason`` and the provider error, and its own
+   ``crashed`` charge: card back in ``ready``, one failure counted,
+   ``check_respawn_guard`` returning ``None``, the reaper leaving it alone, and
+   the next ``dispatch_once`` respawning it. A second failure reaches
+   ``gave_up``. Three workers failing in one reaper pass all stay retryable,
+   which the reaper's burst breaker would not allow. A stale run id writes
+   nothing and falls back to the reaper. The ``cli.py`` exit is checked for
+   placement after ``chat()`` and the summary, inside the ``try`` that
+   finalizes the query.
 
 The per-turn ``max_web_searches`` ceiling that triggered all this is a config
 change, not a patch, and is gated where the template is built — see the
@@ -759,7 +780,7 @@ check(
 check(
     "billing is deliberately not blocked",
     FailoverReason.billing.value not in RATE_LIMIT_FAILURE_REASONS,
-    "a credit wall does not clear on its own; it keeps the stock exit",
+    "a credit wall does not clear on its own; it is not blocked transient",
 )
 
 
@@ -843,9 +864,9 @@ check(
     ),
 )
 
-# Nothing to hand back twice. This is the guard that makes a false positive
-# impossible rather than merely unlikely: the transcript can lie about a
-# terminal call after compaction, the board cannot.
+# Nothing to hand back twice. The board decides, not the transcript: the
+# transcript can lie about a terminal call after compaction, the board cannot.
+# The status alone is not enough, though — see the re-run case below.
 check("the card is no longer running", not task_is_still_running(conn, card))
 before = len(events(conn, card))
 check(
@@ -905,6 +926,170 @@ check(
     row(conn, card)["status"] == "blocked",
     f"status={row(conn, card)['status']!r}",
 )
+
+# A worker that blocked its own card keeps running until it ends a turn in
+# text; by then the card can be running again under the next worker's run.
+# Its backstop must leave that run alone — _record_task_failure would close it.
+TEXT_EXIT = "text_response(finish_reason=stop)"
+conn = board()
+moved = K.create_task(conn, title="Check PDB coverage (blocked, re-run)", assignee="platform")
+K.recompute_ready(conn)
+check("the first worker's card is claimed", K.claim_task(conn, moved))
+first_run = K.get_task(conn, moved).current_run_id
+check(
+    "the first worker blocks its own run",
+    K.block_task(conn, moved, reason="waiting on a sibling card", expected_run_id=first_run),
+)
+check("and the card is unblocked", K.unblock_task(conn, moved))
+K.recompute_ready(conn)
+check("the next worker claims it", K.claim_task(conn, moved))
+second_run = K.get_task(conn, moved).current_run_id
+check("under a new run", second_run != first_run, f"run {first_run} -> {second_run}")
+check(
+    "the first worker's backstop records nothing",
+    record_missing_terminal_call(
+        task_id=moved,
+        turn_exit_reason=TEXT_EXIT,
+        connect=board,
+        record_failure=KD._record_task_failure,
+        run_id=first_run,
+        stop_nudges=0,
+    )
+    is False,
+)
+conn = board()
+after = row(conn, moved)
+check(
+    "the next worker's run is still open and uncharged",
+    after["status"] == "running"
+    and open_runs(conn, moved) == 1
+    and K.get_task(conn, moved).current_run_id == second_run
+    and (after["consecutive_failures"] or 0) == 0,
+    f"status={after['status']!r} open={open_runs(conn, moved)} "
+    f"failures={after['consecutive_failures']!r}",
+)
+check(
+    "the next worker's own leak is still charged to its run",
+    record_missing_terminal_call(
+        task_id=moved,
+        turn_exit_reason=TEXT_EXIT,
+        connect=board,
+        record_failure=KD._record_task_failure,
+        run_id=second_run,
+        stop_nudges=2,
+    )
+    is True,
+)
+conn = board()
+text_error = row(conn, moved)["last_failure_error"] or ""
+check(
+    "a text exit says the model replied in text, and how often it was nudged",
+    text_error.startswith("model replied in text")
+    and f"turn_exit_reason={TEXT_EXIT}" in text_error
+    and "kanban nudges sent: 2" in text_error,
+    f"last_failure_error={text_error!r}",
+)
+
+# The read above runs before _record_task_failure opens its own transaction.
+# Hand the card over in exactly that gap: the run check inside the write has
+# to refuse the charge, or the new run is closed as before.
+params = inspect.signature(KD._record_task_failure).parameters
+check(
+    "_record_task_failure takes expected_run_id, defaulting to no check",
+    "expected_run_id" in params and params["expected_run_id"].default is None,
+    f"parameters: {list(params)}",
+)
+conn = board()
+raced = K.create_task(conn, title="Check PDB coverage (hand-over mid-charge)", assignee="platform")
+K.recompute_ready(conn)
+K.claim_task(conn, raced)
+raced_run = K.get_task(conn, raced).current_run_id
+handed_over = {}
+
+
+def hand_over_then_record(conn, task_id, **kwargs):
+    K.block_task(conn, task_id, reason="hand-over", expected_run_id=raced_run)
+    K.unblock_task(conn, task_id)
+    K.recompute_ready(conn)
+    K.claim_task(conn, task_id)
+    handed_over["run"] = K.get_task(conn, task_id).current_run_id
+    return KD._record_task_failure(conn, task_id, **kwargs)
+
+
+raced_recorded = record_missing_terminal_call(
+    task_id=raced,
+    turn_exit_reason=TEXT_EXIT,
+    connect=board,
+    record_failure=hand_over_then_record,
+    run_id=raced_run,
+    stop_nudges=0,
+)
+check(
+    "and the backstop does not report a charge the write refused",
+    raced_recorded is False,
+    f"returned {raced_recorded!r}; the finalizer would log 'recorded'",
+)
+conn = board()
+after = row(conn, raced)
+check(
+    "a hand-over between the read and the write leaves the new run open",
+    handed_over.get("run") not in (None, raced_run)
+    and after["status"] == "running"
+    and open_runs(conn, raced) == 1
+    and K.get_task(conn, raced).current_run_id == handed_over.get("run")
+    and (after["consecutive_failures"] or 0) == 0,
+    f"handed over to {handed_over.get('run')!r}; status={after['status']!r} "
+    f"open={open_runs(conn, raced)} failures={after['consecutive_failures']!r}",
+)
+
+# The same hand-over, and the new worker completes the card before the
+# read-back: the card is no longer running, yet nothing of this worker's was
+# charged, so the backstop must still say so.
+conn = board()
+closed = K.create_task(conn, title="Check PDB coverage (hand-over, then done)", assignee="platform")
+K.recompute_ready(conn)
+K.claim_task(conn, closed)
+closed_run = K.get_task(conn, closed).current_run_id
+
+
+def hand_over_then_new_worker_completes(conn, task_id, **kwargs):
+    K.block_task(conn, task_id, reason="hand-over", expected_run_id=closed_run)
+    K.unblock_task(conn, task_id)
+    K.recompute_ready(conn)
+    K.claim_task(conn, task_id)
+    new_run = K.get_task(conn, task_id).current_run_id
+    tripped = KD._record_task_failure(conn, task_id, **kwargs)
+    K.complete_task(conn, task_id, result="done by the next worker", expected_run_id=new_run)
+    return tripped
+
+
+closed_recorded = record_missing_terminal_call(
+    task_id=closed,
+    turn_exit_reason=TEXT_EXIT,
+    connect=board,
+    record_failure=hand_over_then_new_worker_completes,
+    run_id=closed_run,
+    stop_nudges=0,
+)
+check(
+    "a refused charge is not reported even after the new worker closes the card",
+    closed_recorded is False and row(board(), closed)["status"] == "done",
+    f"returned {closed_recorded!r}; status={row(board(), closed)['status']!r}",
+)
+
+# The text is read back by upstream: a respawn-blocker word parks the card as
+# an auth/quota wall, and "protocol violation" feeds the clean-exit streak.
+for reason in (TEXT_EXIT,) + EXIT_REASONS:
+    text = missing_terminal_error(reason, 2)
+    check(
+        f"the {reason} text is not read as a respawn blocker",
+        not KD._RESPAWN_BLOCKER_RE.search(text),
+        f"matched {KD._RESPAWN_BLOCKER_RE.search(text)!r} in {text!r}",
+    )
+    check(
+        f"the {reason} text is not read as a protocol violation",
+        "protocol violation" not in text,
+    )
 
 
 # --- 6. The rate-limit block lands ------------------------------------------
@@ -1126,11 +1311,388 @@ did = block_rate_limited_worker(
     cron_run=False,
     delegated_child=False,
 )
-check("billing is left to the stock exit", did is False)
+check("billing is not blocked", did is False)
 check(
     "and the card is untouched",
     block_row(board(), bill_card)["status"] == "running",
 )
+
+
+# --- 7. A failed chat-path turn exits nonzero and the dispatcher retries it -
+print("failed chat-path turn (hermes_cli/cli_chat_turn_mixin.py, cli.py):")
+
+import types  # noqa: E402
+
+from hermes_cli import cli_chat_turn_mixin as CHAT_MODULE  # noqa: E402
+from hermes_cli import kanban_guardrail_exit as GUARD  # noqa: E402
+
+#: The ka-next-4 result (t_80ff98c9, run 28), as nonretryable_client_error_result
+#: built it: the summary Hermes made of the 401, failure_reason from the
+#: classifier.
+AUTH_ERROR = (
+    "HTTP 401: litellm.AuthenticationError: Vertex_aiException - "
+    '{"error": {"code": 401, "message": "Rejected by RpcSecurityPolicy for '
+    "google.cloud.aiplatform.internal.PredictionService.GenerateContent: mint "
+    'used too late"}}'
+)
+AUTH_RESULT = {
+    "final_response": AUTH_ERROR,
+    "messages": [],
+    "api_calls": 3,
+    "completed": False,
+    "failed": True,
+    "error": AUTH_ERROR,
+    "failure_reason": "auth",
+    "failure_retryable": False,
+}
+EXIT_ATTR = "_kube_kanban_exit_code"
+SINGLE_QUERY_EXIT = "sys.exit(_kube_kanban_exit_code)"
+
+check(
+    "a 401 still classifies as the failure_reason this fixture carries",
+    FailoverReason.auth.value == AUTH_RESULT["failure_reason"],
+)
+check(
+    "the quiet path's rate-limit exit code is still the one the chat path mirrors",
+    getattr(GUARD, "RATE_LIMIT_EXIT_CODE", None) == K.KANBAN_RATE_LIMIT_EXIT_CODE,
+    f"module={getattr(GUARD, 'RATE_LIMIT_EXIT_CODE', None)!r} "
+    f"upstream={K.KANBAN_RATE_LIMIT_EXIT_CODE!r}",
+)
+check(
+    "the module and the inserts agree on where the exit code is left",
+    getattr(GUARD, "EXIT_CODE_ATTR", None) == EXIT_ATTR,
+)
+
+# Placement: the exit sits after chat() and the summary, inside the try whose
+# finally runs _finalize_single_query, as the -Q branch's sys.exit does.
+single = _def(cli_tree, "_run_single_query_mode")
+exits = [
+    n for n in ast.walk(single) if isinstance(n, ast.If) and SINGLE_QUERY_EXIT in ast.unparse(n)
+] if single is not None else []
+check("the single-query exit is in _run_single_query_mode, once", len(exits) == 1, f"found {len(exits)}")
+if len(exits) == 1:
+    block = _enclosing_block(cli_tree, exits[0])
+    calls = [ast.unparse(s) for s in (block or [])]
+    idx = block.index(exits[0]) if block else -1
+    check(
+        "and it runs after chat() and the exit summary",
+        block is not None
+        and any("cli.chat(" in c for c in calls[:idx])
+        and any("cli._print_exit_summary(" in c for c in calls[:idx]),
+        f"statements before it: {calls[:idx]}",
+    )
+    owner = next(
+        (n for n in ast.walk(single) if isinstance(n, ast.Try) and block is n.body),
+        None,
+    )
+    check(
+        "inside the try whose finally finalizes the single query",
+        owner is not None and "_finalize_single_query" in ast.unparse(owner.finalbody),
+    )
+    check(
+        "and nothing there makes a worker with no turn exit non-zero",
+        "single_query_exit_code" not in "\n".join(calls)
+        and "_kube_kanban_turn_seen" not in "\n".join(calls),
+    )
+
+
+class _Turn:
+    def __init__(self, result):
+        self.result = result
+        self.use_streaming_tts = False
+
+
+class _Self:
+    """Just enough CLI for _chat_render_turn: every display hook is a no-op."""
+
+    _voice_continuous = False
+    _voice_tts = False
+
+    def __init__(self):
+        self.agent = types.SimpleNamespace(max_iterations=90)
+        self.panels = []
+
+    def _chat_resolve_interrupt(self, *a):
+        return None, False
+
+    def _chat_print_response_panel(self, turn, response):
+        self.panels.append(response)
+
+    def __getattr__(self, name):
+        if name.startswith("_chat_") or name in ("_emit_focus_recovery_line", "_ring_bell"):
+            return lambda *a, **k: None
+        raise AttributeError(name)
+
+
+def render_failed_turn(result, environ):
+    """Run the real, patched _chat_render_turn; return the exit code it left."""
+    fake_cli = types.ModuleType("cli")
+    fake_cli._DIM = fake_cli._RST = ""
+    fake_cli._cprint = lambda *a, **k: None
+    fake_cli._suspend_output_history = lambda: __import__("contextlib").nullcontext()
+    saved_cli = sys.modules.get("cli")
+    saved_env = dict(os.environ)
+    sys.modules["cli"] = fake_cli
+    os.environ.update(environ)
+    me = _Self()
+    try:
+        CHAT_MODULE.CLIChatTurnMixin._chat_render_turn(me, _Turn(result), None, None)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+        if saved_cli is None:
+            sys.modules.pop("cli", None)
+        else:
+            sys.modules["cli"] = saved_cli
+    check("the response panel still prints the failure", me.panels == [result["final_response"]])
+    return me.__dict__.get(EXIT_ATTR)
+
+
+def spawn_worker(conn, tid):
+    """Fork a stand-in worker process and record its pid the way the dispatcher
+    does at spawn. It waits for ``release`` and exits with the code written
+    there, so the exit lands after the board writes, as a real worker's does."""
+    read_end, write_end = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(write_end)
+        data = os.read(read_end, 8)
+        os._exit(int(data or b"0"))
+    os.close(read_end)
+    KD._set_worker_pid(conn, tid, pid)
+    return pid, write_end
+
+
+def exit_worker(worker, code):
+    """Let the stand-in exit ``code`` and have the dispatcher reap it."""
+    pid, write_end = worker
+    os.write(write_end, str(code or 0).encode())
+    os.close(write_end)
+    for _ in range(500):
+        if pid in KD.reap_worker_zombies():
+            return
+        __import__("time").sleep(0.01)
+
+
+def env_for(tid, run_id):
+    return {
+        "HERMES_KANBAN_TASK": tid,
+        "HERMES_KANBAN_RUN_ID": str(run_id),
+        "HERMES_KANBAN_DB": str(DB),
+        "HERMES_PROFILE": "platform",
+    }
+
+
+def run_failed_worker(tid, run_id, result=None):
+    """Spawn, fail the turn through the real chat-render site, exit, reap.
+    Returns the exit code the site left."""
+    conn = board()
+    worker = spawn_worker(conn, tid)
+    code = render_failed_turn(result or AUTH_RESULT, env_for(tid, run_id))
+    exit_worker(worker, code)
+    return code
+
+
+def respawn_once(tid):
+    saved = KD._profile_exists_fn
+    KD._profile_exists_fn = lambda: (lambda name: True)
+    spawned = []
+    try:
+        KD.dispatch_once(board(), spawn_fn=lambda task, ws, board=None: spawned.append(task.id))
+    finally:
+        KD._profile_exists_fn = saved
+    return tid in spawned
+
+
+os.environ["HERMES_KANBAN_CRASH_GRACE_SECONDS"] = "0"
+
+# The charged text, against the pinned tree's own respawn-guard pattern. A
+# Hermes bump that widens _RESPAWN_BLOCKER_RE to match it fails the build here,
+# instead of stranding every failed card in ready.
+charged = getattr(GUARD, "FAILED_TURN_ERROR", None)
+check(
+    "the charged failure text is not a respawn blocker in this tree",
+    charged is not None and not KD._RESPAWN_BLOCKER_RE.search(charged),
+    f"FAILED_TURN_ERROR={charged!r}",
+)
+check(
+    "and is not counted as a protocol violation",
+    charged is not None and "protocol violation" not in charged,
+)
+
+# One worker, the ka-next-4 401.
+auth_card, auth_run = claimed_card("Count pods in kubeagents-system (401)")
+code = run_failed_worker(auth_card, auth_run)
+check(
+    "a failed kanban turn on the chat path exits 1, as the -Q path does",
+    code == 1,
+    f"exit code {code!r} (None is the stock chat path: exit 0)",
+)
+crashed = KD.detect_crashed_workers(board())
+conn = board()
+after = row(conn, auth_card)
+run = conn.execute(
+    "SELECT outcome, error, metadata FROM task_runs WHERE id = ?", (auth_run,)
+).fetchone()
+comments = [
+    r["body"]
+    for r in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (auth_card,))
+]
+check(
+    "the reason is on the card as a comment naming failure_reason and the provider error",
+    len(comments) == 1
+    and "failure_reason=auth" in comments[0]
+    and "mint used too late" in comments[0]
+    and f"Run {auth_run} " in comments[0],
+    f"comments: {comments}",
+)
+check(
+    "the worker charged its own run crashed, not a protocol violation",
+    run["outcome"] == "crashed" and run["error"] == charged
+    and "protocol_violation" not in (run["metadata"] or ""),
+    f"outcome={run['outcome']!r} error={run['error']!r} metadata={run['metadata']!r}",
+)
+check(
+    "the reaper left it alone: the card was no longer running",
+    auth_card not in crashed,
+    f"crashed={crashed}",
+)
+check(
+    "the failure is counted once and the card is back in ready",
+    after["consecutive_failures"] == 1 and after["status"] == "ready",
+    f"failures={after['consecutive_failures']!r} status={after['status']!r}",
+)
+check(
+    "last_failure_error is the charged text",
+    after["last_failure_error"] == charged,
+    f"last_failure_error={after['last_failure_error']!r}",
+)
+check(
+    "check_respawn_guard lets the card run again",
+    KD.check_respawn_guard(conn, auth_card) is None,
+    f"guard={KD.check_respawn_guard(conn, auth_card)!r}",
+)
+check("and the next dispatch_once respawns it", respawn_once(auth_card))
+
+# At max_retries the card gives up. respawn_once claimed it again; fail that run.
+conn = board()
+second_run = K.get_task(conn, auth_card).current_run_id
+run_failed_worker(auth_card, second_run)
+KD.detect_crashed_workers(board())
+conn = board()
+gave_up = [p for k, p in events(conn, auth_card) if k == "gave_up"]
+check(
+    "a second consecutive failure reaches gave_up (max_retries defaults to 2)",
+    row(conn, auth_card)["status"] == "blocked" and len(gave_up) == 1,
+    f"status={row(conn, auth_card)['status']!r} gave_up={gave_up}",
+)
+check(
+    "and the gave_up event names failure_reason and this detector",
+    gave_up and '"failure_reason": "auth"' in gave_up[0] and DETECTOR in gave_up[0],
+    f"payload={gave_up[:1]}",
+)
+
+# A burst: three workers fail in the same reaper pass, as every in-flight
+# worker did when the shared credential expired. The reaper's burst breaker
+# would give up on all three at once; charged by the workers, each stays
+# retryable.
+burst = [claimed_card(f"Burst card {i} (401)") for i in range(3)]
+workers = []
+conn = board()
+for tid, run_id in burst:
+    workers.append(spawn_worker(conn, tid))
+codes = [render_failed_turn(AUTH_RESULT, env_for(tid, run_id)) for tid, run_id in burst]
+for worker, c in zip(workers, codes):
+    exit_worker(worker, c)
+crashed = KD.detect_crashed_workers(board())
+conn = board()
+rows = [row(conn, tid) for tid, _ in burst]
+check(
+    "three failed workers in one pass all stay retryable (no gave_up on attempt 1)",
+    all(r["status"] == "ready" and r["consecutive_failures"] == 1 for r in rows)
+    and not any(k == "gave_up" for tid, _ in burst for k, _ in events(conn, tid)),
+    f"rows={[(r['status'], r['consecutive_failures']) for r in rows]} codes={codes} crashed={crashed}",
+)
+
+# A charge refused because the card changed hands: no comment, no charge, and
+# the exit falls back to the reaper, which counts it as it always has.
+moved_card, moved_run = claimed_card("Rotate credentials (card moved)")
+conn = board()
+worker = spawn_worker(conn, moved_card)
+code = render_failed_turn(AUTH_RESULT, env_for(moved_card, moved_run + 1000))
+conn = board()
+# A charge refused inside its transaction: the run moved after the worker's
+# read. Nothing lands, so no comment may claim the run counted.
+race_card, race_run = claimed_card("Rotate credentials (run moved mid-charge)")
+_race_comments = []
+_race_landed = GUARD.record_failed_turn(
+    task_id=race_card,
+    run_id=race_run,
+    comment="should not appear",
+    author="platform",
+    failure_reason="auth",
+    failure_retryable=False,
+    connect=board,
+    add_comment=lambda conn, tid, author, body: _race_comments.append(body),
+    record_failure=lambda conn, tid, **kw: KD._record_task_failure(
+        conn, tid, **dict(kw, expected_run_id=race_run + 1000)
+    ),
+) if hasattr(GUARD, "record_failed_turn") else None
+check(
+    "a charge refused inside its transaction leaves no comment and is reported",
+    _race_landed is False
+    and _race_comments == []
+    and row(board(), race_card)["status"] == "running",
+    f"landed={_race_landed!r} comments={_race_comments} status={row(board(), race_card)['status']!r}",
+)
+
+check(
+    "a stale run id writes nothing",
+    row(conn, moved_card)["status"] == "running"
+    and not conn.execute("SELECT 1 FROM task_comments WHERE task_id = ?", (moved_card,)).fetchone(),
+)
+exit_worker(worker, code)
+crashed = KD.detect_crashed_workers(board())
+check(
+    "and its exit 1 is booked crashed by the reaper instead",
+    code == 1 and moved_card in crashed and row(board(), moved_card)["consecutive_failures"] == 1,
+    f"code={code!r} crashed={crashed}",
+)
+
+# billing exits 1 on the chat path, not the quiet path's 75: 75 would respawn
+# a credit wall every cooldown with no limit.
+bill2_card, bill2_run = claimed_card("Estimate egress cost (billing, chat path)")
+code = render_failed_turn(
+    {"final_response": "Error code: 402", "failed": True, "failure_reason": "billing", "error": "Error code: 402"},
+    env_for(bill2_card, bill2_run),
+)
+check(
+    "billing exits 1 on the chat path and is charged like any other failure",
+    code == 1 and row(board(), bill2_card)["consecutive_failures"] == 1,
+    f"exit code {code!r}",
+)
+
+# A rate limit keeps its transient block and mirrors the quiet path's 75.
+rl_card, rl_run = claimed_card("Summarise fleet posture (chat path)")
+code = render_failed_turn(
+    dict(STORM_RESULT, final_response=STORM_ERROR),
+    env_for(rl_card, rl_run),
+)
+conn = board()
+check(
+    "a rate limit is blocked transient and exits 75",
+    code == K.KANBAN_RATE_LIMIT_EXIT_CODE and block_row(conn, rl_card)["status"] == "blocked",
+    f"exit code {code!r} status={block_row(conn, rl_card)['status']!r}",
+)
+check(
+    "and gets no comment or charge: the block carries the text",
+    not conn.execute("SELECT 1 FROM task_comments WHERE task_id = ?", (rl_card,)).fetchone()
+    and not (block_row(conn, rl_card)["consecutive_failures"] or 0),
+)
+
+# Not a worker: the chat path exits as it always has.
+code = render_failed_turn(AUTH_RESULT, {"HERMES_KANBAN_TASK": ""})
+check("a non-worker chat -q keeps its exit", code is None, f"exit code {code!r}")
 
 
 print()

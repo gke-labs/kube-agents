@@ -25,7 +25,7 @@ from admin_console.theme import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CSS_SOURCES = [
     REPO_ROOT / "admin_console" / "ui.py",
-    REPO_ROOT / "admin_console" / "pages" / "autonomous.py",
+    REPO_ROOT / "admin_console" / "views" / "autonomous.py",
 ]
 
 

@@ -9,7 +9,8 @@
 # temporary cluster view (A2A_SESSION_CLUSTER_VIEW) is the other playground
 # posture here: it is a stopgap, not the product.
 
-# Build from the REPOSITORY root (the shim client below lives outside a2a/):
+# Build from the REPOSITORY root (the shim client and the cluster agent's
+# skills below live outside a2a/):
 #   docker build -f a2a/Dockerfile.worker -t <registry>/a2a-worker:<tag> .
 
 # Bases come from images.json, the repo's image inventory, spelled the way
@@ -34,6 +35,12 @@ RUN go mod download
 COPY a2a/ .
 RUN CGO_ENABLED=0 GOOS=linux \
     go build -trimpath -ldflags="-w -s" -o /out/worker-adapter ./cmd/worker-adapter
+# The session agent's Claude Code home: the persona as CLAUDE.md and the
+# cluster agent's read-only skills as skills/<name>/SKILL.md, adapted for a
+# session by cmd/session-persona. agents/cluster/skills stays the one source
+# of the skills; the build fails if one of them stops parsing as a skill.
+COPY agents/cluster/skills/ /skills/
+RUN go run ./cmd/session-persona -skills /skills -persona persona/session/persona.md -out /out/claude
 
 # --- runtime ---
 FROM ${NODE_IMAGE}:${NODE_VERSION}
@@ -81,6 +88,14 @@ COPY --from=build /out/worker-adapter /usr/local/bin/worker-adapter
 # runAsUser); the harness keeps its state under a writable HOME.
 RUN mkdir -p /home/node/.claude /scratch \
     && chown -R node:node /home/node /app /scratch
+# The persona and skills land where Claude Code reads user memory and user
+# skills: CLAUDE_CONFIG_DIR below, which nothing in the session pod's spec
+# mounts over. Copied after the chown so they stay root-owned: the harness
+# reads them and cannot edit one in place. It does own /home/node/.claude, so
+# it could move skills/ aside and write its own; this keeps the shipped text
+# from being changed by accident, and is not a boundary against the harness.
+COPY --from=build /out/claude/CLAUDE.md /home/node/.claude/CLAUDE.md
+COPY --from=build /out/claude/skills/ /home/node/.claude/skills/
 USER node
 ENV HOME=/home/node \
     CLAUDE_CONFIG_DIR=/home/node/.claude \

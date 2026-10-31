@@ -1,0 +1,149 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "checkout-gateway restarts on an OOM.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "It hits its 256Mi limit within a minute of starting.",
+                "type": "text"
+              },
+              {
+                "text": "\n\n",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Evidence",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "Last state: ",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "code": true
+                    },
+                    "text": "OOMKilled",
+                    "type": "text"
+                  },
+                  {
+                    "text": ", exit code 137.",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "text": "The limit is set in the manifest:",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "indent": 0,
+            "style": "bullet",
+            "type": "rich_text_list"
+          },
+          {
+            "elements": [
+              {
+                "text": "resources:\n  limits:\n    memory: 256Mi",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_preformatted"
+          },
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "and has not changed since March",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "indent": 1,
+            "style": "bullet",
+            "type": "rich_text_list"
+          },
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Fix",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "Raise the limit to 512Mi.",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "text": "Watch the restarts for an hour.",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "indent": 0,
+            "style": "ordered",
+            "type": "rich_text_list"
+          }
+        ],
+        "type": "rich_text"
+      }
+    ],
+    "attachments": []
+  }
+]

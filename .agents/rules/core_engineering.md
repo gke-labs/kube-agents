@@ -1,9 +1,11 @@
 ---
-# Claude Code loads this rule only beside files matching `paths`; other tools ignore this block.
+# Claude Code loads this rule only beside files matching `paths`; Antigravity uses `trigger` and `description`.
 paths:
   - "**/*.go"
   - "**/*.py"
   - "**/*.sh"
+trigger: model_decision
+description: "Core engineering rules for Go, Python, and Bash code: no magic constants and credential-aware identifier naming for CodeQL."
 ---
 
 # Core engineering rules
@@ -53,10 +55,10 @@ top-of-file declaration, and there is no second place for a literal to hide.
 ### Enforcement
 
 No linter checks this. The repository runs `go fmt`, `go vet`, pytest, shellcheck at warning
-severity over every tracked script (`make shellcheck`, the upstream-synced `gke-*` skills
-excepted), ruff's error-only rules (`make lint-python`), and prettier; none of them has a
-magic-number rule enabled, and no `golangci-lint` config exists. This is a review expectation,
-and the pre-PR adversarial pass is where it gets caught.
+severity over every tracked script (`make shellcheck`, the upstream copies in
+`third_party/google-skills/` excepted), ruff's error-only rules (`make lint-python`), and prettier;
+none of them has a magic-number rule enabled, and no `golangci-lint` config exists. This is a review
+expectation, and the pre-PR adversarial pass is where it gets caught.
 
 ## Name identifiers for what they hold
 
@@ -109,9 +111,10 @@ sink, where one is honoured at all, hides the next real finding at that line.
 
 ### How CodeQL enforces it
 
-No linter checks this either; CodeQL does, through GitHub's default setup, and
+No linter checks this either; CodeQL does, through `.github/workflows/codeql.yml` on every pull
+request that touches Python, Go, JavaScript or workflow files, fork pull requests included, and
 [`docs/pull-request-workflow.md`](../../docs/pull-request-workflow.md#local-validation-before-committing)
-is canonical for when that runs, why a pull request here cannot count on showing an alert closing,
-and the CLI commands that reproduce one before the pull request opens, from a database over the
-flagged file alone, before and after the change. A pull request that closes an alert cites both
-runs.
+is canonical for what that run reports, why it cannot show an alert closing, and the CLI commands
+that reproduce one before the pull request opens, from a database over the flagged file alone
+(Python) or its module (Go), before and after the change. A pull request that closes an alert
+cites both runs.

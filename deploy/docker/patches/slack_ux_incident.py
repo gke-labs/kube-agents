@@ -4,7 +4,9 @@ Installed into the image at ``/opt/hermes/gateway/slack_ux_incident.py``.
 ``apply_slack_ux_incident.py`` makes the kanban notifier hand the terminal
 send the adapter :func:`adapter_for` returns. With ``KAGE_SLACK_UX`` off, or
 for anything but an incident report bound for its own alert's thread on
-Slack, that is the notifier's own adapter, so the delivery is upstream's.
+Slack, that is the adapter it was handed: the notifier's own, so the delivery
+is upstream's, or with the flag on ``slack_ux_answer``'s, which folds a
+finished card's answer.
 
 Upstream, and why it changes
 ----------------------------
@@ -16,7 +18,9 @@ edited into the report's "What's wrong" sentence, one button per option, the
 links on the report's 🔗 line as link buttons, and the report, up to its
 first divider, in a collapsed fold, rendered by the Slack plugin's own ``block_kit.render_blocks``,
 the renderer the threaded reply goes through when the adapter sends rich
-blocks. The message's ``text`` is the headline, the choices and then the
+blocks. A declared next step (the report's last ``[next: ...]`` line,
+``slack_moments.visible_text``) is left out of all of it: the options are the
+alert's buttons. The message's ``text`` is the headline, the choices and then the
 whole report, because the adapter reads a thread back from ``text`` and
 top-level blocks, never a fold's. That holds on a cold read of the thread
 only: a session already open on it fetches at most the newer replies, which
@@ -27,7 +31,11 @@ A button's text is the option's title, with `` (recommended)`` after the
 recommended one's (the single-fix shape has none); its value is the reply the
 report's call to action asks for, ``apply Option B: <title>`` (``apply:
 <title>`` for the single-fix shape), and that is what ``slack_ux_clicks``
-sends as the clicker's message in the thread. Typing ``apply`` still works:
+sends as the clicker's message in the thread. When the report's ``To
+authorize:`` bullet states that the recommended or single fix's Pull Request is
+already being opened automatically (``INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true``), :func:`parse_triage` strips that recommended or single choice from
+``choices`` so Slack renders buttons only for non-recommended alternatives (or
+no choice buttons when there is only one proposed fix). Typing ``apply`` still works:
 the ``incidents`` row the notifier stores after the send is keyed to the same
 thread, and the report text is untouched, only laid out.
 
@@ -51,6 +59,18 @@ and a note after it do not refuse it; the message ``text`` still carries them.
 Lists are not modelled: under a list item ``block_kit`` reads an indented
 fence or divider as list content, so such a report can fall back to the
 threaded reply or fold where Slack draws no divider.
+
+Under ``spec.mode: next`` the report reaches the alert's thread through the
+kanban notifier's chat.notify stand-in (``kanban_chat_notify``), and the edit
+is a ``kube-agents.chat/v1`` message (:func:`chat_triage`) sent with the
+``update`` key the event watcher's alert post carries, one per alert
+(``chat_notify.alert_update_key`` of the alert's event session, found by its
+thread as :func:`alert_title` finds it), so the gateway edits the alert in place. The
+fold is the report's markdown up to the same divider, laid out by the
+renderer. Each button is the option's title, the recommended one primary, and
+its reply starts with that title: "<title> — apply Option B" (or "<title> —
+apply" for the single fix), so a click both names what was clicked and asks
+for what the report's call to action asks for.
 """
 
 from __future__ import annotations
@@ -73,6 +93,14 @@ try:
     import slack_presenter as _presenter
 except ImportError:  # the scripts directory is not on PYTHONPATH
     _presenter = None
+try:
+    import slack_moments as _moments
+except ImportError:  # the scripts directory is not on PYTHONPATH
+    _moments = None
+try:
+    import chat_message as _chat
+except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
+    _chat = None
 
 #: The Slack plugin's markdown renderer, beside this module's ``gateway/``
 #: directory. It imports only ``re`` and ``typing``, so it loads by path.
@@ -136,12 +164,36 @@ OPTION_NAMED = re.compile(r"\bOption ([A-Z])\b")
 #: A proposed fix the section names in any shape: bullet, numbered, bold label, heading, any case.
 PROPOSED_FIX_NAMED = re.compile(r"\bproposed fix\b", re.IGNORECASE)
 #: The recommendation line, ``- ✅ **Recommended: Option B**``; only markup may precede the
-#: word, so ``Not Recommended: Option A`` is not one.
-RECOMMENDED = re.compile(r"^[^\w\n]*Recommended[*_]*:?[*_\s]*Option ([A-Z])\b", re.MULTILINE)
+#: word, so ``Not Recommended: Option A`` is not one. The emphasis may be ``_`` as well as ``*``
+#: (``__Recommended: Option B__``), so the letter's boundary excludes ``_`` where ``\b`` would
+#: count it as a letter, as ``OPENING_PULL_REQUEST`` does for its marker words.
+RECOMMENDED = re.compile(r"^[^\w\n]*[*_]*Recommended[*_]*:?[*_\s]*Option ([A-Z])(?![^\W_])", re.MULTILINE)
 #: A markdown link; the url may hold balanced parentheses, as a Logs Explorer query does.
 MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
 #: How many edited alerts this process remembers.
 EDITED_MAX = 512
+#: The open-PR ``To authorize`` clause from ``session_kv_server._triage_authorize_clauses(True)``,
+#: matched on its fixed marker words ``is being opened automatically``
+#: (``session_kv_server.TRIAGE_OPEN_PR_MARKER``; ``kanban_board_health`` and the bench case read the
+#: same words). Keyed on the report text rather than ``os.environ`` so drift and controller-stall
+#: reports on the same install keep their ``apply`` buttons, and a report delivered after the env
+#: changes is read against the call to action it actually carries. Only the marker counts: a
+#: restatement of the reply-wanted clause (``a Pull Request will be opened``, ``is being opened for
+#: review``) keeps its buttons, because stripping them would leave a report that asks for ``apply``
+#: with no button for it. The words may wrap onto continuation lines of the bullet. The label
+#: and the marker words may carry ``*`` or ``_`` emphasis (``__To authorize__``,
+#: ``_is being opened automatically_``), so the marker's boundaries exclude ``_`` where ``\b``
+#: would count it as a letter; an indented continuation line may open with bold
+#: (``  **is being opened automatically**``). The clause ends at an unordered list marker (``-``,
+#: ``*``, ``+``) followed by whitespace, a thematic break (``---``, ``***``, ``___``, a trailing
+#: ``\r`` allowed), a ``#`` line, a blank line, or an unindented line opening with ``-``, ``*``
+#: or ``+`` at all: an unindented ``**Note:**`` paragraph under the bullet is not part of it.
+OPENING_PULL_REQUEST = re.compile(
+    r"^[^\w\n]*[*_]*To authorize[*_]*:?"
+    r"(?:[^\n]|\n(?![-*+]|[ \t]*(?:[-*+][ \t]|#|(?P<hr>[-*_])(?:[ \t]*(?P=hr)){2,}[ \t\r]*$)|\s*$))*?"
+    r"(?<![^\W_])is\s+being\s+opened\s+automatically(?![^\W_])",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 #: ``(chat_id, thread_id)`` of the alerts this process has edited, oldest first.
 _edited: OrderedDict[tuple[str, str], None] = OrderedDict()
@@ -249,6 +301,9 @@ def parse_triage(report: str) -> dict | None:
     headline, _body = _presenter.split_answer(_section(sections, WHATS_WRONG))
     if not headline:
         return None
+    fold_title = FOLD_TITLE_OPTIONS if len(choices) > 1 else FOLD_TITLE_SINGLE
+    if OPENING_PULL_REQUEST.search(what_to_do):
+        choices = [choice for choice in choices if not choice[2]]
     return {
         "headline": headline,
         "choices": choices,
@@ -260,7 +315,7 @@ def parse_triage(report: str) -> dict | None:
             for url in (raw.translate(_presenter.MRKDWN_URL_ESCAPES),)
             if _presenter._safe_link_url(url)
         ],
-        "fold_title": FOLD_TITLE_OPTIONS if len(choices) > 1 else FOLD_TITLE_SINGLE,
+        "fold_title": fold_title,
     }
 
 
@@ -372,13 +427,18 @@ def _db_path() -> str:
 
 def _alert_metas(conn: sqlite3.Connection, chat_id: str, thread_id: str) -> list[dict]:
     """The routing metadata of every event alert on Slack posted as ``thread_id`` in ``chat_id``."""
+    return [meta for _session, meta in _alert_rows(conn, chat_id, thread_id)]
+
+
+def _alert_rows(conn: sqlite3.Connection, chat_id: str, thread_id: str) -> list[tuple[str, dict]]:
+    """``(event session id, routing metadata)`` of every event alert on Slack posted as ``thread_id`` in ``chat_id``."""
     # The LIKE on metadata narrows the scan; the JSON check below decides.
     rows = conn.execute(
-        "SELECT metadata FROM session_metadata WHERE session_id LIKE ? AND metadata LIKE '%' || ? || '%'",
+        "SELECT session_id, metadata FROM session_metadata WHERE session_id LIKE ? AND metadata LIKE '%' || ? || '%'",
         (ALERT_SESSION_LIKE, thread_id),
     ).fetchall()
     metas = []
-    for (blob,) in rows:
+    for session_id, blob in rows:
         try:
             meta = json.loads(blob or "")
         except ValueError:
@@ -389,8 +449,18 @@ def _alert_metas(conn: sqlite3.Connection, chat_id: str, thread_id: str) -> list
             and str(meta.get("thread_id") or "") == thread_id
             and str(meta.get("chat_id") or "") == chat_id
         ):
-            metas.append(meta)
+            metas.append((str(session_id), meta))
     return metas
+
+
+def alert_session(chat_id: str, thread_id: str, db_path: str | None = None) -> str:
+    """The event session whose alert was posted as ``thread_id`` in ``chat_id``, else ""."""
+    db_path = db_path or _db_path()
+    if not os.path.exists(db_path):
+        return ""
+    with closing(_read_only(db_path)) as conn:
+        rows = _alert_rows(conn, chat_id, thread_id)
+    return rows[0][0] if rows else ""
 
 
 def _read_only(db_path: str) -> sqlite3.Connection:
@@ -459,6 +529,63 @@ class _AlertEditor:
         return await self._adapter.send(chat_id, content, metadata=metadata, **kwargs)
 
 
+def chat_triage(report: str) -> tuple[dict, str] | None:
+    """``(chat message, its fallback)`` for an alert's triage over chat.notify, or None when it keeps the threaded reply.
+
+    :func:`parse_triage`'s headline, choices and links, and the report up to its
+    first divider as the fold, refused on the same grounds as :func:`render_fold`
+    but for ``block_kit``'s own, which the renderer replaces.
+    """
+    if _chat is None:
+        return None
+    triage = parse_triage(report)
+    if triage is None:
+        return None
+    shown = _before_divider(report)
+    if shown != report and parse_triage(shown) != triage:
+        _refuse_fold("a divider comes before the headline, an option or a link")
+        return None
+    chat = _chat.triage_message(triage, shown)
+    if chat is None:
+        return None
+    return chat, _chat.triage_text(triage, report)
+
+
+class _ChatAlertEditor:
+    """The chat.notify stand-in, with ``send`` editing the alert by its update key instead of replying under it."""
+
+    def __init__(self, adapter: Any, chat_id: str, thread_id: str, chat: dict, text: str):
+        self._adapter = adapter
+        self._chat_id = chat_id
+        self._thread_id = thread_id
+        self._chat = chat
+        self._text = text
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._adapter, name)
+
+    async def send(self, chat_id: Any, content: Any, metadata: Any = None, **kwargs: Any) -> Any:
+        key = (self._chat_id, self._thread_id)
+        if str(chat_id) == self._chat_id and key not in _edited:
+            _edited[key] = None
+            while len(_edited) > EDITED_MAX:
+                _edited.popitem(last=False)
+            try:
+                update = _chat.alert_update(alert_session(self._chat_id, self._thread_id))
+                result = await self._adapter.send_chat(chat_id, self._text, self._chat, update, metadata=metadata)
+            except Exception as exc:  # noqa: BLE001 — the threaded reply still delivers it
+                result = SimpleNamespace(success=False, error=str(exc))
+            if getattr(result, "success", False) is True:
+                logger.info("slack_ux_incident: sent alert %s's triage over chat.notify", self._thread_id)
+                return result
+            _edited.pop(key, None)
+            logger.warning(
+                "slack_ux_incident: the triage of alert %s was refused over chat.notify, replying under it: %s",
+                self._thread_id, getattr(result, "error", None),
+            )
+        return await self._adapter.send(chat_id, content, metadata=metadata, **kwargs)
+
+
 def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) -> Any:
     """``adapter``, or one whose ``send`` edits the alert this report answers.
 
@@ -481,7 +608,12 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
         result = getattr(task, "result", None)
         if not actionable_report(result):
             return adapter
-        report = clip_handoff(str(result).strip(), RESULT_LIMIT)
+        report = str(result).strip()
+        if _moments is not None:
+            # A declared next step is never shown; the alert's options are its buttons. Taken off
+            # before the clip, which could otherwise leave a cut fragment of the line.
+            report = _moments.visible_text(report) or report
+        report = clip_handoff(report, RESULT_LIMIT)
         if len(report) > FOLD_TEXT_MAX:
             return adapter
         chat_id = str(sub.get("chat_id") or "").strip()
@@ -491,6 +623,9 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
         triage = parse_triage(report)
         if triage is None or (chat_id, thread_id) in _edited or not is_open_alert(chat_id, thread_id):
             return adapter
+        if _chat is not None and callable(getattr(adapter, "send_chat", None)):
+            laid_out = chat_triage(report)
+            return adapter if laid_out is None else _ChatAlertEditor(adapter, chat_id, thread_id, *laid_out)
         mrkdwn_fn = getattr(adapter, "format_message", None)
         fold_blocks = render_fold(report, mrkdwn_fn)
         if not fold_blocks:

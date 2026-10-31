@@ -23,8 +23,15 @@ name: Notify on Broken Main
 # What may go on the list: a workflow whose green on a push to main is a
 # statement about the tree, not about the push. The script depends on that and
 # cannot check it -- see its docstring. Every workflow below rebuilds or
-# re-checks everything it covers on every run it starts, and `Operator Tests`
-# only starts on a push that touches an operator path.
+# re-checks everything it covers on every run it starts, and `Operator Tests`,
+# `A2A Module Tests` and `k8s-api-proxy Tests` only start on a push that
+# touches their own paths.
+#
+# `A2A Module Tests` joined the list on 2026-10-13, the day `Run A2A Module
+# Tests` became a required context. It copies `Operator Tests`' trigger
+# arrangement, a `paths:` filter on push and whole-suite runs, so the same
+# reading of its push history holds. `k8s-api-proxy Tests` joined on
+# 2026-10-28 for the same reason, with the same arrangement.
 #
 # `Documentation Checks` and `Python Unit Tests` joined the list after both sat
 # red on main for thirteen hours (2026-09-03 20:54Z to 2026-09-04 10:34Z,
@@ -33,12 +40,13 @@ name: Notify on Broken Main
 # after this list was written, and nothing revisited it. Each runs its whole
 # suite on every push with no `paths:` filter.
 #
-# `Python Unit Tests` also carries two jobs that are not required contexts, so
+# `Python Unit Tests` also carries jobs that are not required contexts, so
 # watching at run level files an issue when only one of them is red. `Run
 # Bench Harness Tests` resolves devops-bench and its dependencies at run time,
 # so a resolver outage during a push run would file an issue naming an
-# innocent commit. Accepted: the alternative is not watching the suite that
-# took thirteen hours to notice. `Run Python Unit Tests on the agent image's
+# innocent commit; since the required join needs that job, the same outage
+# also holds the merge queue until a re-run. Accepted: the alternative is not
+# watching the suite that took thirteen hours to notice. `Run Python Unit Tests on the agent image's
 # Python` runs the same sweep again on `.agent-python-version`, the interpreter
 # inside the platform agent image, where the required job runs it on
 # `.python-version`. An issue from it is wanted, not tolerated: a suite that
@@ -68,13 +76,24 @@ on:
   # this repository, and passes the event nothing but a run id.
   workflow_run:
     workflows:
+      - A2A Module Tests
       - Actionlint
       - Docker Build
       - Documentation Checks
+      - k8s-api-proxy Tests
       - Operator Tests
       - Python Unit Tests
       - Validate Repo Structure
     types: [completed]
+    # The head branch of the triggering run. The job below acts only on a push
+    # to main, but `workflow_run` fires on every completion of a watched
+    # workflow, pull-request and merge-queue runs included, and each one
+    # started a notify run here that the `if:` skipped: about 320 a day in
+    # October 2026, most of what this workflow created (#2943). The filter
+    # keeps those off the queue. It is not the guard: a fork pull request
+    # whose head branch is called `main` passes it, and the `if:` and the
+    # concurrency key below still decide on the event and the repository.
+    branches: [main]
   # The backstop for an event that is never delivered -- a dropped
   # `workflow_run`, a runner outage -- and for anything the group below drops:
   # every watched workflow is reconciled against its newest completed push run
@@ -107,16 +126,17 @@ on:
 # runs after every push run of the burst has finished, and it files whatever the
 # newest of them says.
 #
-# That holds only if nothing else enters the group. `workflow_run` fires for
-# every completion of a watched workflow, pull-request runs included -- several
-# of those per push run -- and the group is evaluated before the job's `if:`
-# skips them. Keyed on the workflow alone, a pull-request run's notify arriving
-# mid-burst would cancel the pending push run's notify and then skip itself,
-# leaving the red to the sweep. So the key repeats the push-to-main half of
-# the `if:`'s test: a push run on main joins its workflow's group, and anything
-# else gets a group of its own that cancels nothing. The `if:` below filters nothing by
-# conclusion for the same reason: a cancelled run's notify can be the last
-# arrival, and it reconciles as well as any other.
+# That holds only if nothing else enters the group. The `branches: [main]`
+# filter on the trigger keeps same-repository pull-request and merge-queue
+# runs out, but a fork pull request whose head branch is called `main` still
+# arrives, and the group is evaluated before the job's `if:` skips it. Keyed
+# on the workflow alone, that run's notify arriving mid-burst would cancel the
+# pending push run's notify and then skip itself, leaving the red to the
+# sweep. So the key repeats the push-to-main half of the `if:`'s test: a push
+# run on main joins its workflow's group, and anything else gets a group of
+# its own that cancels nothing. The `if:` below filters nothing by conclusion
+# for the same reason: a cancelled run's notify can be the last arrival, and
+# it reconciles as well as any other.
 #
 # Sweeps (the schedule and a dispatch) share a group of their own: one sweep at
 # a time is all the serialisation they need, and holding an event run behind a
@@ -167,7 +187,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 

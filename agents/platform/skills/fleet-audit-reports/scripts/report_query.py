@@ -579,8 +579,9 @@ def cmd_checks(args: argparse.Namespace) -> dict:
     what makes that sentence true: the alternative on offer was opening a
     138 KB envelope with a file tool, which the skill forbids for good reason.
 
-    Rows come back in the document's own order, so a truncated answer lines up
-    with the published table rather than a re-sort of it. `--cluster` and
+    Rows come back in the document's own order, one per cluster and check, not
+    in a re-sort. The published table groups the clusters that ran the same
+    command into one row, in order of first appearance. `--cluster` and
     `--check` narrow before `--limit` bites.
 
     `checks_not_applicable` comes back alongside, because the notice counts

@@ -39,9 +39,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: capacity
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # What the deterministic checks below do NOT grade, and why: the
 # expected_output's "across at least two zones" is live capacity weather —
 # one region-level probe legitimately covers two zones when the API returns

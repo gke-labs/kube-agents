@@ -8,7 +8,7 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
 twenty-four-check roster (§3.1–§3.24 of `governance/obtainability_audit_sop.md`),
-`compliance-audit`'s sixteen-check roster (§2.1–§2.16 of
+`compliance-audit`'s seventeen-check roster (§2.1–§2.17 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
 three SOPs define is mechanical — none needed a `needs_triage` judgment call
@@ -21,7 +21,7 @@ opening them (`TRIAGE_BY_SLUG`). Other streams have their own
 collectors (`fleet_drift.py`, `patch_readiness.py`) or none. The three streams
 collect in different shapes: obtainability answers every check from one
 workload dump plus the reads its declaration fields need; compliance issues
-several distinct `kubectl` and `gcloud` reads per cluster, three of them
+several distinct `kubectl` and `gcloud` reads per cluster, four of them
 best-effort because their CRDs are not installed everywhere; ai-security reads
 a workload dump and a Service dump, the second backing exactly one check
 (`inference-endpoint-public`) that joins it against the first.
@@ -31,8 +31,11 @@ the first one happened to need.
 
 What this file does for the checks it covers:
 
-  1. Discovers every project the caller can see (`gcloud projects list`,
-     or the one `--project` names) and enumerates each one's clusters
+  1. Discovers the install's scope: the projects the agent passes from the platform_control
+     `fleet_scope` tool (`--scope-projects`); without them, on an install that declares no
+     scope, every project the caller can see (`gcloud projects list`) or the one `--project`
+     names, and on a sandbox whose operator says a scope is declared, nothing: the run
+     refuses and names the tool. Then enumerates each project's clusters
      (`gcloud container clusters list`), naming every cluster
      `<project>/<location>/<name>` because a bare name is unique only inside
      one project and location.
@@ -64,6 +67,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import errno
+import functools
 import hashlib
 import ipaddress
 import json
@@ -72,7 +77,8 @@ import os
 import posixpath
 import re
 import shlex
-import subprocess
+import stat
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import tempfile
 import time
@@ -96,18 +102,73 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 
 SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
+# The shared kubeconfig directory is this uid's and closed to every other
+# uid: 0755, so only its owner (and root, which no mode binds) creates
+# entries in it. The file names are public and fixed, so a directory other
+# uids could write would let any login on the pod plant an entry at a
+# cluster's name before the tick writes it. A hand run over `kubectl exec`
+# lands as root while the tick runs as uid 1000: root writes into the tick's
+# directory as it is, and a directory another uid made first (a root hand
+# run's) is moved aside in the parent, which is this uid's, and remade
+# (`prepare_kubeconfig`); a wider mode an earlier run or an operator left is
+# brought back to this one.
+KUBECONFIG_DIR_MODE = 0o755
+KUBECONFIG_DIR_MODE_MASK = 0o7777
+# A chmod the filesystem refuses (mode bits it does not carry, a read-only
+# mount) on a directory this uid owns alone -- the owner able to write and
+# search it, no other uid able to write in it (0700, say) -- keeps the
+# directory at its mode, said on stderr: it is closed to other uids as the
+# rule asks. Any other mode the chmod cannot reach is the note.
+KUBECONFIG_DIR_OWNER_WRITE_SEARCH = 0o300
+KUBECONFIG_DIR_OTHERS_WRITE = 0o022
+KUBECONFIG_MODE_KEPT_FORMAT = "{directory} stays at mode {mode}, which could not be changed to {wanted} ({error}): this uid's own and closed to other uids, so usable"
+KUBECONFIG_UNUSABLE_FORMAT = "{name}.unusable-{stamp}"
+KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+# What may stand at a kubeconfig's name before gcloud writes it: this uid's
+# own regular file, writable, which gcloud overwrites. A link is removed
+# (never written through); anything else that is not a regular file -- a
+# directory planted at the name -- is moved aside under the directory's own
+# aside name and said on stderr; another uid's file (root's after a hand run,
+# the tick's from root's side) or one this uid cannot write is removed, and
+# gcloud writes a fresh file. Each refusal is the note.
+KUBECONFIG_FILE_NOT_READ_FORMAT = "{path} could not be read ({error})"
+KUBECONFIG_NOT_A_FILE_MOVED_FORMAT = "{path}: not a regular file, moved aside to {aside}; gcloud writes a fresh file"
+KUBECONFIG_NOT_A_FILE_FORMAT = "{path} is not a regular file, which a kubeconfig must be, and could not be moved aside ({error})"
+KUBECONFIG_NOT_REPLACED_FORMAT = "{path} is not this uid's writable file and could not be replaced ({error})"
+# A rename that finds the directory already moved: another thread of this
+# run, or another collector's tick in the same second, won the move-aside
+# between this thread's stat and its rename (the source gone, or the aside
+# of this second already holding it). Not a refusal: the thread reads what
+# stands there now and goes on.
+KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS = (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST)
+# A symlink at the shared directory's name, which the agent's own account can
+# plant, is never followed: the rule refuses it with a note, its chmod goes
+# through a descriptor opened without following, and `fetch_credentials`
+# runs no gcloud through a directory the rule refused, so a root run neither
+# chmods nor writes into whatever the link points at. A link planted at the
+# kubeconfig file's name is removed before gcloud writes it: `exists()` would
+# follow it and root's `os.access` would keep it.
+KUBECONFIG_IS_SYMLINK_FORMAT = "{directory} is a symbolic link, which the shared directory may not be; it was not followed"
+KUBECONFIG_LINK_NOT_REMOVED_FORMAT = "{path} is a symbolic link, which a kubeconfig may not be, and could not be removed ({error})"
+# The rc a refused directory stands for in the credentials result: gcloud
+# was not run, and the note is the result's error.
+KUBECONFIG_REFUSED_RC = 1
+ROOT_UID = 0
 DEFAULT_TIMEOUT_S = 60
-MAX_WORKERS = 8
-
-# What `default_run` reports when *it* gave up, following the shell convention
-# for a command killed by `timeout(1)`. It is this collector's own marker and
-# never something a `kubectl` or `gcloud` actually returned, so any branch that
-# reads an exit code as a statement about the cluster has to exclude it first.
-# On 2026-09-06 `kcc-object-wedged` did not: it took `rc != 0` on `kubectl get
-# gcp -A` to mean the API server does not serve the category, and published
-# "Config Connector is not installed on this cluster" about the one cluster in
-# the fleet that runs Config Connector, on the strength of its own timeout.
-TIMEOUT_RC = 124
+# How many clusters a sweep reads at once: broker_admission.sweep_width(),
+# resolved in collect_fleet. Every check is a kubectl or gcloud the credential
+# broker runs, and the broker admits its slot cap or what its child memory
+# budget fits at the container's effective limit, whichever is smaller: 8 at
+# the operator's default 2Gi limit, 4 on GKE Autopilot without bursting, where
+# the limit is the 1Gi request. A wider pool only queues the rest at the broker,
+# where a check still waiting at its 60 s admission bound is refused busy, or
+# hits DEFAULT_TIMEOUT_S here first and reads its cluster as unreachable. So the
+# width is read from the broker (GET /v1/exec/admission), less two slots of
+# headroom for chat when it admits six or more, and at most today's four below
+# that; four when the broker can't say. The procedural collectors beside this
+# file resolve the same width. stall_watch.py's and cluster_agent_reconcile.py's
+# background listing pools stay at four: they share the broker with kanban
+# workers, and their own comments say why.
 
 # A judgement this collector hands the sweep (`audit_report.py`'s
 # `NO_SWEEP_TRIAGE`, which carries the same string). A `netpol-missing` fix
@@ -150,6 +211,49 @@ QUALIFIED_TARGET_SEPARATOR = "/"
 # named. Uppercase because a GCP project id cannot be, so no real project can
 # collide with it.
 UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
+# Where the image and the shell sandbox ship the platform scripts the collectors
+# share (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
+# /opt/defaults/scripts), then the checkout's own `scripts/` for a run from the
+# repository, which a copy run from three or fewer directories below `/` does
+# not have. One list: `_import_platform_script` walks the same one lazily for
+# the broker path.
+PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
+PLATFORM_SCRIPT_DIR_DEPTH = 3
+
+
+def _platform_script_dirs() -> tuple[str, ...]:
+    checkout = Path(__file__).resolve().parents
+    beside = (
+        (str(checkout[PLATFORM_SCRIPT_DIR_DEPTH] / "scripts"),)
+        if len(checkout) > PLATFORM_SCRIPT_DIR_DEPTH
+        else ()
+    )
+    return (*PLATFORM_SCRIPT_DIRS, *beside)
+
+
+# The install's declared scope, handed in by the agent from the platform_control
+# `fleet_scope` tool (the collectors run in the shell sandbox and cannot read
+# the reconcile's snapshot themselves): the flags, their parsing and the note
+# live in fleet_scope_args, shared with every collector. `--scope-projects` is
+# the sweep, complete coverage; `--scope-unread` names each declared project
+# the install could not read, recorded as a coverage gap;
+# `--scope-exclude-clusters` names the clusters spec.scope.exclude.clusters
+# leaves out, dropped from the listing unread (#3081). Without them the
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
+for _shared_dir in _platform_script_dirs():
+    if _shared_dir not in sys.path:
+        sys.path.append(_shared_dir)
+import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
+
+# The scope this collector was handed, set by main from the scope flags.
+declared_scope = fleet_scope_args.DeclaredScope()
+
 # What that same target stands for when the operator narrowed the scope on
 # purpose. `--project` skips discovery, so a scoped run reads one project and
 # names no other; without a row saying so, `finish` resolves every ledger
@@ -166,6 +270,24 @@ SCOPED_RUN_NOTE = (
 # this credential may not list may well hold clusters. Same markers as
 # `fleet_drift.API_DISABLED_MARKERS`.
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
+# The project an API refusal names, which gcloud gives by number ("has not been
+# used in project 123456789", "consumer: projects/123456789"). The refusal is
+# the consumer project's, and with a quota project set (`billing/quota_project`)
+# that is not the project being listed. `refusal_owner` below is the one rule
+# for whether a refusal is the listed project's own; `fleet_waste.py`,
+# `fleet_stockout.py` and `upgrade_retrospective.py` read it from here.
+REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
+# The project *id* a refusal names, when it names one rather than a number,
+# in gcloud's phrasings: `project <id> before`, `Project <id> is not found`,
+# `projects/<id>`, then punctuation, a quote or the end. A project id is 6-30
+# lowercase letters, digits and hyphens, starting with a letter and not ending
+# in a hyphen. Used only to say which project a refusal was about.
+REFUSED_PROJECT_ID_RE = re.compile(
+    r"\b(?i:projects?)[ /]['\"\[]?([a-z][a-z0-9-]{4,28}[a-z0-9])"
+    r"(?=\s+(?:before|is|was|has|does)\b|['\"\],.;:)]|\s*$)"
+)
+REFUSED_PROJECT_ID_STOPWORDS = frozenset({"before", "either", "itself", "number", "should", "settings"})
+PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
 # gcloud's words for a `clusters list` some zones answered and others did not.
 # It still exits 0 with a JSON array, so the silent zones' clusters would read
 # as clusters that do not exist. See `fleet_drift.ZONE_TIMEOUT_MARKER`.
@@ -193,11 +315,6 @@ GIT_DIR_NAME = ".git"
 # them. The lease marker above the workspace names the repository; the broker
 # endpoint is the one every other content-mode call uses.
 CREDENTIAL_PROXY_URL_ENV = "CREDENTIAL_PROXY_URL"
-# Where the platform scripts the broker client lives in are found, in the order
-# `audit_report.py` appends them: the image's defaults, the volume's copy, then
-# the repository checkout this file sits in (for tests and local runs).
-PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
-PLATFORM_SCRIPT_DIR_DEPTH = 3
 # How a leased workspace directory names its repository: `owner__name`.
 REPO_DIR_SEPARATOR = "__"
 # What `broker_repo` returns for a content-mode workspace it cannot resolve to a
@@ -395,6 +512,23 @@ MAX_KCC_WEDGE_MESSAGE_CHARS = 240
 # How many blocked objects an excerpt names before it stops and counts. Naming
 # all fifteen is not more informative than naming three and saying fifteen.
 MAX_KCC_BLOCKED_NAMED = 3
+# `check_configsync_reconciler_stalled`. The two Config Sync sync kinds, fully
+# qualified so the read cannot land on another group's `rootsyncs`. Read one
+# at a time: a comma-joined `kubectl get` fails wholesale when either kind is
+# unserved, and a cluster can serve RootSync without RepoSync.
+CONFIGSYNC_SYNC_KINDS = ("rootsyncs.configsync.gke.io", "reposyncs.configsync.gke.io")
+# The reconciler-manager's verdict that it cannot create or run the reconciler.
+CONFIGSYNC_STALLED_CONDITION = "Stalled"
+# The reconciler's verdict on the current commit; `errorSourceRefs` on it name
+# the stage summaries (`status.source.errors` and its siblings) that failed.
+CONFIGSYNC_SYNCING_CONDITION = "Syncing"
+# KNV2016 is Config Sync's transient error code: an error it retries by itself
+# (a render still in progress is the common one). A `Syncing` condition whose
+# only referenced errors carry it is a retry in flight, not a stall.
+CONFIGSYNC_TRANSIENT_ERROR_CODES = frozenset({"2016"})
+# How much of a reconciler message survives into the excerpt; the same budget
+# as a Config Connector message, for the same reason.
+MAX_CONFIGSYNC_MESSAGE_CHARS = MAX_KCC_WEDGE_MESSAGE_CHARS
 
 # The fleet-wide system-namespace set (S1), spelled identically in every SOP
 # that names it. Kept here rather than imported from audit_report.py: this
@@ -433,40 +567,21 @@ def log(msg: str) -> None:
     print(f"[collect] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    """One subprocess's outcome, in the shape the manifest records it."""
-
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+# What `default_run` reports when *it* gave up, following the shell convention
+# for a command killed by `timeout(1)`. It is this collector's own marker and
+# never something a `kubectl` or `gcloud` actually returned, so any branch that
+# reads an exit code as a statement about the cluster has to exclude it first.
+# On 2026-09-06 `kcc-object-wedged` did not: it took `rc != 0` on `kubectl get
+# gcp -A` to mean the API server does not serve the category, and published
+# "Config Connector is not installed on this cluster" about the one cluster in
+# the fleet that runs Config Connector, on the strength of its own timeout.
+TIMEOUT_RC = collector_run.TIMEOUT_RC
+Discovery = collector_run.Discovery
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
-
-
-def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-    """The real subprocess call. Tests inject a fake in its place — every
-    driver function below takes `run` as a parameter rather than calling
-    `subprocess.run` directly, so nothing here needs a live cluster to test.
-    """
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(
-            argv, capture_output=True, text=True, env=env, timeout=timeout
-        )
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
-        # notwithstanding, and every consumer of `Run` slices and joins it as str.
-        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
-
-
-def _text(output: str | bytes | None) -> str:
-    if isinstance(output, bytes):
-        return output.decode(errors="replace")
-    return output or ""
 
 
 # GKE sets `RECONCILING` while work proceeds on a cluster whose
@@ -522,25 +637,30 @@ def target_name(project: str, location: str, name: str) -> str:
     return QUALIFIED_TARGET_SEPARATOR.join([p for p in (project, location) if p] + [name])
 
 
-class Discovery(NamedTuple):
-    projects: list[str]
-    # Set when no project could be resolved at all: an empty fleet is then a
-    # failure to look, and the manifest says so with a top-level `error`.
-    error: str | None
-    # Set when discovery resolved part of the fleet, or the operator narrowed
-    # it with `--project`. `collect_fleet` turns it into a `gate-failed`
-    # target so the loss is a row the document must account for.
-    partial: str | None = None
-
-
 def discover_fleet(base_project: str | None, *, run: RunFn = default_run) -> Discovery:
-    """The project scope. `--project` scopes the run to one project; without
-    one it is the active project plus every project `gcloud projects list`
-    returns -- the scope `fleet_drift.discover_fleet` and
-    `patch_readiness.discover_fleet` use, so every collector audits the same
-    fleet. Discovery names projects and lists none of them."""
+    """The project scope. `--project` scopes the run to one project; else the
+    declared scope the SOP passed from the fleet_scope tool (`--scope-projects`)
+    is the sweep as given, with a declared project the install could not read
+    (`--scope-unread`) as the one note; without either it is the active project
+    plus every project `gcloud projects list` returns -- the scope
+    `fleet_drift.discover_fleet` and `patch_readiness.discover_fleet` use, so
+    every collector audits the same fleet. Discovery names projects and lists
+    none of them."""
     if base_project:
+        override_error = declared_scope.override_error(base_project)
+        if override_error:
+            return Discovery([], override_error, None)
         return Discovery([base_project], None, SCOPED_RUN_NOTE.format(project=base_project))
+
+    if declared_scope.declared:
+        # The declared scope the agent carried from the fleet_scope tool: the
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable is a run that read no project,
+        # reported as such rather than widened to the listing.
+        if not declared_scope.projects:
+            return Discovery([], declared_scope.empty_error(), None)
+        log(f"scope: the install's declared scope, {len(declared_scope.projects)} project(s) from the fleet_scope tool")
+        return Discovery(list(declared_scope.projects), None, declared_scope.note())
 
     result = run(["gcloud", "config", "get-value", "project"])
     base = result.stdout.strip() if result.rc == 0 else ""
@@ -588,6 +708,45 @@ def discover_fleet(base_project: str | None, *, run: RunFn = default_run) -> Dis
     return Discovery(projects, None)
 
 
+def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
+    """Whether an API-disabled refusal is `project`'s own. Only then is it the
+    answer "no cluster can exist here": a refusal from a quota project with the
+    API off names that project instead, and read as this one's it marked every
+    project cluster-free, so `finish` closed an audit that read no cluster. A
+    refusal naming no project, or one this project's number cannot be read
+    for, is a failed read."""
+    return refusal_owner(project, stderr, run=run)[0]
+
+
+def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
+    """`refusal_names_project`'s answer, with why when it is no: which project
+    the refusal named, or that this project's number could not be read. The
+    two call for different fixes -- a quota-project setting, or the describe
+    permission -- and collapsing them sent the operator after the wrong one."""
+    numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
+    if not numbers:
+        # The keyword case-insensitively, as `REFUSED_PROJECT_ID_RE` reads it:
+        # `Project acme` names acme as surely as `project acme` does.
+        if re.search(rf"\b(?i:projects?)[ /]['\"\[]?{re.escape(project)}(?![\w-])", stderr):
+            return True, ""
+        others = sorted(set(REFUSED_PROJECT_ID_RE.findall(stderr)) - REFUSED_PROJECT_ID_STOPWORDS - {project})
+        if others:
+            return False, f"the refusal names another project ({', '.join(map(repr, others))}), so it cannot be tied to {project!r}"
+        return False, f"the refusal names no project, so it cannot be tied to {project!r}"
+    described = run([*PROJECT_DESCRIBE_ARGV, project, "--format", "value(projectNumber)"])
+    if described.rc != 0:
+        return False, (
+            f"`gcloud projects describe {project}` failed (rc={described.rc}), so the refusal's project "
+            f"number could not be compared with this project's: "
+            f"{described.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}"
+        )
+    if numbers == {described.stdout.strip()}:
+        return True, ""
+    return False, (
+        f"the Kubernetes Engine API is off in a project other than {project!r}, such as a quota project"
+    )
+
+
 def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[dict], list[dict], str | None]:
     """Every auditable cluster in `project`, as `{name, target, location,
     project, autopilot}`, plus a manifest target for each cluster that is not,
@@ -614,6 +773,7 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[
         return [], [], f"clusters list returned non-JSON: {exc}"[:ERROR_EXCERPT_CHARS]
     if not isinstance(clusters, list):
         return [], [], "clusters list returned JSON that is not a list"
+    clusters = declared_scope.drop_excluded(project, clusters)
     running = []
     for c in clusters:
         if c.get("status") not in AUDITABLE_STATUSES:
@@ -641,6 +801,122 @@ def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
     return KUBECONFIG_DIR / f"kubeconfig_{project}_{cluster}_{location}.yaml"
 
 
+def prepare_kubeconfig(kc: Path) -> str | None:
+    """The shared kubeconfig directory usable by this run before
+    `get-credentials` writes `kc` into it, and whatever stands at `kc` that
+    is not this uid's own writable file out of the way (a link removed, a
+    directory moved aside, another uid's file removed); None when it is, else
+    why not (the caller logs it, and gcloud's own refusal follows). The one
+    rule for the fleet-audit collectors (`fleet_stockout.py`,
+    `fleet_waste.py` and `upgrade_retrospective.py` import it);
+    `fleet_upgrade_report.py` carries the same rule for its default
+    directory."""
+    note = usable_kubeconfig_dir(kc.parent)
+    if note:
+        return note
+    try:
+        current = kc.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return KUBECONFIG_FILE_NOT_READ_FORMAT.format(path=kc, error=exc)
+    if stat.S_ISLNK(current.st_mode):
+        # Never written through: removed, and gcloud writes a fresh file.
+        try:
+            kc.unlink()
+        except OSError as exc:
+            return KUBECONFIG_LINK_NOT_REMOVED_FORMAT.format(path=kc, error=exc)
+    elif not stat.S_ISREG(current.st_mode):
+        # A directory, or any other object, planted at the name: gcloud's
+        # rename over it would fail on every tick. Moved aside, never entered.
+        aside = kc.with_name(KUBECONFIG_UNUSABLE_FORMAT.format(name=kc.name, stamp=time.strftime(KUBECONFIG_STAMP_FORMAT, time.gmtime())))
+        try:
+            kc.rename(aside)
+        except OSError as exc:
+            return KUBECONFIG_NOT_A_FILE_FORMAT.format(path=kc, error=exc)
+        log(KUBECONFIG_NOT_A_FILE_MOVED_FORMAT.format(path=kc, aside=aside.name))
+    elif current.st_uid != os.geteuid() or not os.access(kc, os.W_OK):
+        # Another uid's file, or one this uid cannot write: replaced by a
+        # fresh file rather than written through.
+        try:
+            kc.unlink()
+        except OSError as exc:
+            return KUBECONFIG_NOT_REPLACED_FORMAT.format(path=kc, error=exc)
+    return None
+
+
+def usable_kubeconfig_dir(directory: Path) -> str | None:
+    """`directory` at `KUBECONFIG_DIR_MODE`, owned by this uid or root: made
+    fresh and chmodded (its missing ancestors keep the caller's umask);
+    brought to the mode when this uid owns it at another, or kept at that
+    mode, said on stderr, when the chmod fails and the directory is this
+    uid's alone; moved aside and remade when it is another uid's, since this
+    uid could not write into it. A note when none of that is possible,
+    naming the owner."""
+    euid = os.geteuid()
+    if os.path.islink(directory):
+        return KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=directory)
+    try:
+        current = directory.stat()
+    except FileNotFoundError:
+        current = None
+    except OSError as exc:
+        # A parent this uid cannot search, or a file where the directory
+        # should be: the note, as for every other refusal here.
+        return f"{directory} could not be read ({exc})"
+    if current is not None and current.st_uid != euid and euid != ROOT_UID:
+        aside = directory.with_name(KUBECONFIG_UNUSABLE_FORMAT.format(name=directory.name, stamp=time.strftime(KUBECONFIG_STAMP_FORMAT, time.gmtime())))
+        try:
+            directory.rename(aside)
+        except OSError as exc:
+            if exc.errno not in KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS:
+                return f"{directory} is owned by uid {current.st_uid} and this run is uid {euid}; it could not be moved aside ({exc})"
+            # Another thread or run moved it first: read what stands there
+            # now (the winner's fresh directory, or nothing yet) and go on.
+            try:
+                current = directory.stat()
+            except FileNotFoundError:
+                current = None
+            except OSError as read_exc:
+                return f"{directory} could not be read ({read_exc})"
+        else:
+            log(f"{directory}: owned by uid {current.st_uid}, moved aside to {aside.name}; this run makes its own")
+            current = None
+    if current is None:
+        # Made at the caller's umask and chmodded below: the umask is
+        # process-wide, and a toggle here would race the other threads.
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            current = directory.stat()
+        except OSError as exc:
+            # A parent this uid cannot create in: the note, as the reporter's
+            # copy of this rule and every other refusal here.
+            return f"{directory} could not be made ({exc})"
+    if (current.st_mode & KUBECONFIG_DIR_MODE_MASK) != KUBECONFIG_DIR_MODE:
+        # Through a descriptor opened without following, so a symlink swapped
+        # in between the stat and here is refused rather than chased.
+        try:
+            opened = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            return f"{directory} could not be opened as a directory ({exc})"
+        try:
+            os.fchmod(opened, KUBECONFIG_DIR_MODE)
+        except OSError as exc:
+            # Judged on the directory the descriptor holds, not the earlier stat.
+            actual = os.fstat(opened)
+            mode = actual.st_mode & KUBECONFIG_DIR_MODE_MASK
+            private = actual.st_uid == euid and (mode & KUBECONFIG_DIR_OWNER_WRITE_SEARCH) == KUBECONFIG_DIR_OWNER_WRITE_SEARCH and not mode & KUBECONFIG_DIR_OTHERS_WRITE
+            if not private:
+                return f"{directory} is at mode {oct(mode)}, not {oct(KUBECONFIG_DIR_MODE)}, and could not be changed ({exc})"
+            # This uid's alone: closed to other uids as the rule asks, so
+            # kept; refusing would read no cluster on every tick over such a
+            # filesystem.
+            log(KUBECONFIG_MODE_KEPT_FORMAT.format(directory=directory, mode=oct(mode), wanted=oct(KUBECONFIG_DIR_MODE), error=exc))
+        finally:
+            os.close(opened)
+    return None
+
+
 def fetch_credentials(
     project: str, cluster: str, location: str, *, run: RunFn = default_run
 ) -> tuple[Path, Run]:
@@ -651,16 +927,19 @@ def fetch_credentials(
     two threads race each other's context).
     """
     kc = kubeconfig_path(project, cluster, location)
-    kc.parent.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, "KUBECONFIG": str(kc)}
-    result = run(
-        [
-            "gcloud", "container", "clusters", "get-credentials", cluster,
-            "--location", location, "--project", project,
-        ],
-        env=env,
-    )
-    return kc, result
+    argv = [
+        "gcloud", "container", "clusters", "get-credentials", cluster,
+        "--location", location, "--project", project,
+    ]
+    note = prepare_kubeconfig(kc)
+    if note:
+        # The directory is not this run's to write through: gcloud is not
+        # run (a link the agent account planted would put a root-owned
+        # kubeconfig wherever it points), and the refusal is the result,
+        # as the retrospective's and the reporter's copies return it.
+        log(f"{project}/{location}/{cluster}: {note}")
+        return kc, Run(argv, KUBECONFIG_REFUSED_RC, "", note, 0.0)
+    return kc, run(argv, env={**os.environ, "KUBECONFIG": str(kc)})
 
 
 DUMP_COMMAND_KINDS = (
@@ -779,7 +1058,7 @@ def dump_state(
     only to paths keyed by its own cluster, and it named this file as the
     example of a name no two threads can collide on — but a cluster name is
     unique within a project, not across the fleet, and this collector runs
-    eight projects at once. Two clusters called `prod` in two projects wrote
+    several projects at once. Two clusters called `prod` in two projects wrote
     the same path, and the loser re-read the winner's dump: not a truncated
     file or a crash, but one cluster's workloads published under the other's
     name, with a manifest recording a clean rc=0 read.
@@ -4078,7 +4357,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
 
 
 # --------------------------------------------------------------------------- #
-# compliance-audit: all sixteen checks of §2.
+# compliance-audit: all seventeen checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -5698,7 +5977,7 @@ AI_ACCELERATOR_KEY_RE = re.compile(r"nvidia\.com/gpu|google\.com/tpu")
 # no model server anywhere.
 AI_PROVIDER_CREDENTIAL_ENV_RE = re.compile(
     r"^(OPENAI|ANTHROPIC|GEMINI|COHERE|MISTRAL|TOGETHER|GROQ|PERPLEXITY|DEEPSEEK|"
-    r"FIREWORKS|ANYSCALE|AZURE_OPENAI|VERTEXAI|XAI|WANDB)_API_KEY$"
+    r"FIREWORKS|ANYSCALE|AZURE_OPENAI|VERTEXAI|XAI|HOSTED_VLLM|WANDB)_API_KEY$"
     r"|^(HF|HUGGING_FACE_HUB|HUGGINGFACE)_(TOKEN|API_TOKEN)$"
     r"|^REPLICATE_API_TOKEN$",
     re.IGNORECASE,
@@ -5817,20 +6096,6 @@ _INLINE_OPTIONS_WITH_VALUE = {
     "perl": frozenset({"-I"}),
 }
 _INTERPRETER_FAMILIES = {"python": "python", "python2": "python", "python3": "python", "nodejs": "node"}
-
-
-def _container_argv(container: dict) -> list[str]:
-    """`command` then `args`, the order the kubelet hands them to the process.
-
-    `command` overrides the image's ENTRYPOINT and `args` its CMD, so this is the
-    process's real argv. The order is load-bearing for anything reading a flag's
-    value out of the next token: a `--model` ending `command` takes its value from
-    the first element of `args`, and the reversed concatenation this replaced
-    reported the flag with nothing beside it.
-    """
-    return [str(t) for t in (container.get("command") or [])] + [
-        str(t) for t in (container.get("args") or [])
-    ]
 
 
 class _Argv(NamedTuple):
@@ -6525,10 +6790,11 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
 # Management ports: remote access (22, 3389), the control plane's own (2379,
 # 2380, 10250), and the datastores -- ports whose service admits a caller on a
 # credential, so opening one to the internet makes that credential the whole
-# perimeter. The networking audit has no firewall-side check with a port set of
-# its own yet, so this is the only copy. One added there must use this same set
-# and a test must pin the pair: a port admitted on one side and not the other is
-# a firewall rule reported daily for a Service this check leaves open.
+# perimeter. The networking audit's firewall-world-open-ingress check keeps the
+# second copy (`networking_audit.MANAGEMENT_PORTS`), and
+# `test_networking_audit.ManagementPortsPinTest` pins the pair: a port admitted
+# on one side and not the other is a firewall rule reported daily for a Service
+# this check leaves open.
 #
 # 80, 443 and 8080 are absent on purpose: a LoadBalancer Service
 # publishing a web port to the internet is a LoadBalancer Service doing its job,
@@ -7339,6 +7605,90 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
     ),
 )
 
+def _condition(item: dict, condition_type: str) -> dict | None:
+    """One typed condition off an object's `status.conditions`, if it has one."""
+    status = item.get("status")
+    conditions = status.get("conditions") if isinstance(status, dict) else None
+    for condition in conditions or []:
+        if isinstance(condition, dict) and condition.get("type") == condition_type:
+            return condition
+    return None
+
+
+def _condition_why(condition: dict) -> str:
+    reason = str(condition.get("reason") or "").strip()
+    message = str(condition.get("message") or "").strip()
+    why = f"{reason}: {message}" if reason and message else (reason or message or "no reason given")
+    return " ".join(why.split())[:MAX_CONFIGSYNC_MESSAGE_CHARS]
+
+
+def _configsync_stage_errors(item: dict, ref: str) -> list[dict]:
+    """The error list an `errorSourceRefs` entry such as `status.source.errors` names."""
+    node: object = item
+    for part in str(ref).split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    return [e for e in node if isinstance(e, dict)] if isinstance(node, list) else []
+
+
+def check_configsync_reconciler_stalled(context: dict) -> list[dict]:
+    """Cluster-scoped: Config Sync RootSync and RepoSync objects whose
+    reconciler has stopped applying the repository.
+
+    §2.12 covers Config Connector, the controller that turns the repository
+    into GCP state. This covers Config Sync, the one that turns it into
+    cluster state, which nothing else in the skill reads either: a stalled
+    RootSync drifts the cluster from Git while every `manifest` remediation
+    this audit opens against that cluster merges and applies nothing.
+
+    Two signals, both the reconciler's own verdict on the object. `Stalled=True`
+    is the reconciler-manager saying it cannot create or run the reconciler
+    (a Deployment that will not come up, an invalid spec). A `Syncing`
+    condition naming `errorSourceRefs` is the reconciler saying the current
+    commit failed to fetch, render or apply, and the stage it names holds the
+    error line. The stage summaries are not read on their own: they keep the
+    previous commit's errors until the next stage overwrites them, and a
+    render in progress writes a transient error there that clears by itself,
+    so a count over them fires on a fix in flight. `Reconciling=True` alone
+    is not a finding: it is the state of every first sync, and a large
+    repository can hold it for longer than any threshold this check could
+    defend.
+    """
+    hits = []
+    for item in context.get("configsync_objects") or []:
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("metadata") or {}
+        kind = str(item.get("kind") or "")
+        name = str(meta.get("name") or "")
+        if not kind or not name:
+            continue
+        why = ""
+        stalled = _condition(item, CONFIGSYNC_STALLED_CONDITION)
+        syncing = _condition(item, CONFIGSYNC_SYNCING_CONDITION)
+        if stalled is not None and str(stalled.get("status")) == "True":
+            why = _condition_why(stalled)
+        elif syncing is not None and syncing.get("errorSourceRefs"):
+            refs = [str(r) for r in syncing["errorSourceRefs"] if r]
+            errors = [e for ref in refs for e in _configsync_stage_errors(item, ref)]
+            real = [e for e in errors if str(e.get("code")) not in CONFIGSYNC_TRANSIENT_ERROR_CODES]
+            if errors and not real:
+                continue
+            first = next((str(e.get("errorMessage") or "").strip() for e in real if e.get("errorMessage")), "")
+            why = _condition_why({"reason": syncing.get("reason"), "message": first or syncing.get("message")})
+            if refs:
+                why = f"{why} (errors in {', '.join(refs)})"
+        if not why:
+            continue
+        hits.append(
+            {
+                "namespace": str(meta.get("namespace") or ""),
+                "object": f"{kind}/{name}",
+                "excerpt": f"Config Sync reports {kind}/{name} is not applying its repository: {why}",
+            }
+        )
+    return sorted(hits, key=lambda h: (h["namespace"], h["object"]))
+
+
 COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
     CheckSpec(
         "privileged-container",
@@ -7501,6 +7851,18 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         # sets of callers and a sentence true of one is false of the other.
         # This is the anonymous arm's, which is the one a reader reaches for.
         _IMPACT_ANONYMOUS_RBAC_ANONYMOUS,
+    ),
+    CheckSpec(
+        "configsync-reconciler-stalled",
+        "cluster",
+        check_configsync_reconciler_stalled,
+        "critical",
+        None,
+        "Config Sync has stopped applying this repository to the cluster. The "
+        "cluster holds whatever state it drifted to, the repository says "
+        "something else, and every pull request merged for this cluster -- "
+        "including a remediation this audit proposes -- changes nothing on it "
+        "until the reconciler is unblocked.",
     ),
 )
 
@@ -7721,6 +8083,7 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "legacy-metadata": ("node_pools",),
     "public-control-plane": ("describe",),
     "kcc-object-wedged": ("kcc",),
+    "configsync-reconciler-stalled": ("configsync",),
     "lb-world-open": ("services",),
 }
 
@@ -7748,10 +8111,10 @@ AUTOPILOT_ALLOWLIST_KINDS = (
 # pod against an idle hub holding 19 objects: 10-14 seconds.
 #
 # That fits inside 60 comfortably, which is why the check looked fine until it
-# ran for real. The collector sweeps `MAX_WORKERS` clusters at once, and the
+# ran for real. The collector sweeps `max_workers` clusters at once, and the
 # fifteen without Config Connector answer this read in about a tenth of a
-# second, so the hub is the only one that is still working when the other seven
-# in its wave are hammering the same pod -- and on 2026-09-06, the first day
+# second, so the hub is the only one that is still working when the rest of
+# its wave are hammering the same pod -- and on 2026-09-06, the first day
 # the check was live, it went past 60 and was recorded as inapplicable. The
 # check has never once executed against the only cluster it can apply to.
 #
@@ -7797,6 +8160,69 @@ _COMPLIANCE_AUTOPILOT_NOT_APPLICABLE: tuple[tuple[str, str], ...] = (
         "that would exempt one.",
     ),
 )
+
+
+def _configsync_disposition(runs: list[tuple[str, dict | None, Run]]) -> tuple[str, dict]:
+    """One answer for §2.17's two reads.
+
+    Returns `(reason, record)`: an `Undetermined:` reason when any read failed
+    for a cause other than the API server not serving the kind (that read
+    cleared nothing, so the check did not run); a not-applicable reason when
+    every kind is unserved or the served kinds hold no objects; else an empty
+    reason and one `commands` record over the served reads, pasteable as one
+    line. The record carries `rc` 0, which is what `cross_check_manifest`
+    reads as the check having run; the unserved kind's non-zero exit is the
+    cluster's shape, not a failure of the read that did happen.
+    """
+    served = [(cmd, result) for cmd, parsed, result in runs if parsed is not None]
+    for cmd, parsed, result in runs:
+        if parsed is not None:
+            continue
+        kind = cmd.split(" get ", 1)[-1].split(" ", 1)[0]
+        if result.rc == TIMEOUT_RC:
+            return (
+                f"{UNDETERMINED_PREFIX} `kubectl get {kind} -A` did not finish within "
+                f"{DEFAULT_TIMEOUT_S}s and was killed, so whether Config Sync is installed "
+                "here -- and whether anything it syncs is stalled -- was not established. "
+                "This check cleared nothing on this cluster.",
+                {},
+            )
+        if result.rc != 0 and RESOURCE_TYPE_ABSENT_MARKER in result.stderr:
+            continue
+        stderr = result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+        detail = (
+            f"exited {result.rc} without saying the kind is unserved ({stderr})"
+            if result.rc != 0
+            else "exited 0 but returned output this collector could not read as a list of objects"
+        )
+        return (
+            f"{UNDETERMINED_PREFIX} `kubectl get {kind} -A` {detail}, so whether Config "
+            "Sync is installed here -- and whether anything it syncs is stalled -- was "
+            "not established. This check cleared nothing on this cluster.",
+            {},
+        )
+    if not served:
+        return (
+            "Config Sync is not installed on this cluster: `kubectl get` answered that "
+            f"the server serves neither {CONFIGSYNC_SYNC_KINDS[0]} nor "
+            f"{CONFIGSYNC_SYNC_KINDS[1]}. Nothing here is reconciled by Config Sync.",
+            {},
+        )
+    if not any((parsed or {}).get("items") for _, parsed, _ in runs if parsed is not None):
+        return (
+            "Config Sync is installed on this cluster -- its sync kinds are served -- but "
+            "it declares no RootSync or RepoSync, so there is nothing whose "
+            "reconciliation could stall.",
+            {},
+        )
+    combined = Run(
+        [],
+        0,
+        "".join(result.stdout for _, result in served),
+        "",
+        sum(result.duration_s for _, result in served),
+    )
+    return "", _record("; ".join(cmd for cmd, _ in served), combined)
 
 
 def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
@@ -7985,6 +8411,26 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         commands["kcc-object-wedged"] = _record(
             f"KUBECONFIG={kubeconfig} {shlex.join(kcc_argv)}", kcc_result
         )
+
+    # Config Sync's sync objects, for §2.17. Ungated like the `gcp` read above
+    # and for the same reason: most clusters do not run Config Sync, and an
+    # absent CRD is the normal answer, not a failed collection. One read per
+    # kind; `_configsync_disposition` folds the two into one answer.
+    configsync_runs: list[tuple[str, dict | None, Run]] = []
+    context["configsync_objects"] = []
+    for kind in CONFIGSYNC_SYNC_KINDS:
+        argv = ["kubectl", "get", kind, "-A", "-o", "json"]
+        parsed, result = run_and_gate(argv, kubeconfig, run=run)
+        configsync_runs.append((f"KUBECONFIG={kubeconfig} {shlex.join(argv)}", parsed, result))
+        if parsed is not None:
+            context["configsync_objects"].extend((parsed or {}).get("items") or [])
+    configsync_reason, configsync_record = _configsync_disposition(configsync_runs)
+    if configsync_reason.startswith(UNDETERMINED_PREFIX):
+        context.setdefault("unevaluated", {})["configsync-reconciler-stalled"] = configsync_reason
+    elif configsync_reason:
+        context.setdefault("not_applicable", {})["configsync-reconciler-stalled"] = configsync_reason
+    else:
+        commands["configsync-reconciler-stalled"] = configsync_record
 
     # Every ServiceAccount, not only `default`: §2.14 looks up the one each
     # workload names, and a read narrowed to `default` left it nothing to find
@@ -9219,9 +9665,10 @@ def collect_fleet(
     project: str | None = None,
     *,
     run: RunFn = default_run,
-    max_workers: int = MAX_WORKERS,
+    max_workers: int | None = None,
     workspace: Path | None = None,
 ) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     checks = CHECK_TABLES.get(audit_id)
     if not checks:
         raise ValueError(f"no check table for {audit_id!r} yet — see this file's module docstring")
@@ -9256,6 +9703,16 @@ def collect_fleet(
     declarations = workload_declarations(workspace) if workspace else {}
     releases = release_declarations(workspace) if workspace else {}
     namespaces = namespace_directories(declarations, releases, workspace)
+
+    # The shared kubeconfig directory, made usable once before the pool
+    # opens: the first wave's threads would otherwise race one another's
+    # move-aside of a directory another uid left, and the losers would log
+    # the race as a refusal. `fetch_credentials` then finds it this run's
+    # and clears a stale file alone.
+    if clusters:
+        shared_note = usable_kubeconfig_dir(KUBECONFIG_DIR)
+        if shared_note:
+            log(f"{KUBECONFIG_DIR}: {shared_note}")
 
     results = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -9337,19 +9794,13 @@ def _import_platform_script(name: str):
     """Import one of the platform scripts the broker path needs, or None.
 
     Lazy, and only on the content-mode path: a directory-mode run needs
-    nothing outside this skill's own scripts, and must not start depending on
-    the platform scripts being importable.
+    nothing outside this skill's own scripts beyond `fleet_scope_args`, which
+    every mode imports at load because every mode parses the scope flags, and
+    must not start depending on the rest being importable.
     """
     import importlib  # noqa: PLC0415 -- lazy with the rest of the broker path
 
-    checkout = Path(__file__).resolve().parents
-    # A copy run from three or fewer directories below `/` has no checkout.
-    beside = (
-        [str(checkout[PLATFORM_SCRIPT_DIR_DEPTH] / "scripts")]
-        if len(checkout) > PLATFORM_SCRIPT_DIR_DEPTH
-        else []
-    )
-    for directory in (*PLATFORM_SCRIPT_DIRS, *beside):
+    for directory in _platform_script_dirs():
         if directory not in sys.path:
             sys.path.append(directory)
     try:
@@ -9949,10 +10400,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--project",
         help=(
-            "single project to audit; omit to audit the active project and every "
+            "single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with "
+            "its collector_args); omit to sweep --scope-projects when given, else the active project and every "
             "project `gcloud projects list` returns"
         ),
     )
+    fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument(
         "--workspace",
         help=(
@@ -9970,6 +10423,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     workspace = Path(args.workspace) if args.workspace else None
     if workspace is not None and not workspace.is_dir():
         # Loud, and not fatal. A typo here would otherwise annotate nothing and

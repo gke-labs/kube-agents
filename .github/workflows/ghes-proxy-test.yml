@@ -1,0 +1,56 @@
+name: GHES Proxy Tests
+
+# Unit tests for hack/ghes-proxy, the GHES-shaped forwarding proxy that the
+# eval lanes use (hack/ghes-proxy/README.md). The module uses only the Go
+# standard library, and its tests run local servers, so the job needs no
+# cluster, no network past the module download and no credential.
+#
+# Not a required check, so the `paths:` filters on the triggers decide whether
+# it runs: a change that does not touch the proxy starts no run.
+on:
+  pull_request:
+    branches: [main, "release/**"]
+    paths:
+      - "hack/ghes-proxy/**"
+      - ".github/workflows/ghes-proxy-test.yml"
+  push:
+    branches: [main]
+    paths:
+      - "hack/ghes-proxy/**"
+      - ".github/workflows/ghes-proxy-test.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run GHES Proxy Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: hack/ghes-proxy
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "hack/ghes-proxy/go.mod"
+          cache: false
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...

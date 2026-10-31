@@ -15,8 +15,10 @@ metadata:
 This reference provides workflows for containerizing and deploying applications
 to GKE for the first time.
 
-> **MCP Tools:** `apply_k8s_manifest`, `get_k8s_resource`,
-> `get_k8s_rollout_status`, `get_k8s_logs`, `describe_k8s_resource`
+> **MCP Tools:** `get_k8s_resource`, `get_k8s_rollout_status`, `get_k8s_logs`,
+> `describe_k8s_resource`
+>
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
 ## Workflow
 
@@ -157,11 +159,11 @@ spec:
 
 ### 5. Deploy
 
+Propose the manifests as a pull request through `submit-suggestion`. Once the GitOps
+repository applies them, verify:
+
 ```
 # MCP (preferred)
-apply_k8s_manifest(parent="projects/<PROJECT>/locations/<REGION>/clusters/<CLUSTER>", yamlManifest="<manifest>")
-
-# Verify
 get_k8s_rollout_status(parent="...", resourceType="deployment", name="my-app")
 get_k8s_resource(parent="...", resourceType="pod", labelSelector="app=my-app")
 ```
@@ -169,7 +171,6 @@ get_k8s_resource(parent="...", resourceType="pod", labelSelector="app=my-app")
 **kubectl fallback:**
 
 ```bash
-kubectl apply -f manifests/
 kubectl rollout status deployment/my-app
 kubectl get pods -l app=my-app
 ```

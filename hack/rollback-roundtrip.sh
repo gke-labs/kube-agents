@@ -10,8 +10,15 @@
 #   hack/rollback-roundtrip.sh [namespace] [platformagent-name]
 #
 # Defaults: kubeagents-system and platform-agent. ROLLBACK_KUBE_CONTEXT pins
-# every kubectl call to one context. hack/ci-eval-pr.sh runs it after the
-# next lane's matrix and reports the result beside the eval verdict, not in it.
+# every kubectl call to one context. hack/ci-eval-pr.sh runs it after a
+# next-mode matrix on main and reports the result beside the eval verdict, not
+# in it.
+#
+# ROLLBACK_END_MODE=today adds a third leg, next -> today again, with leg 1's
+# assertions, so the install is left rolled back: what the today lane
+# (EVAL_ROLLBACK_LANE=1 in hack/ci-eval-pr.sh) runs before it grades today's
+# matrix on that install. It refuses a CR that declares sidecars of its own,
+# before anything changes, since the third flip would have to leave them unset.
 #
 # The two kept objects, as the operator renders them for a CR named <cr>
 # (k8s-operator/internal/controller/platformagent_a2a_manifests.go, cleanupA2A
@@ -94,6 +101,19 @@ readonly CR_REFUSAL_REASONS="A2AProvisionFailed ModeNotRecognized"
 readonly JOB_CONDITION_COMPLETE="Complete"
 readonly JOB_CONDITION_FAILED="Failed"
 
+# The one Degraded phase the not-degraded checks wait out rather than fail on
+# at once, the same one hack/ci-deploy.sh's gate after the sidecar patch
+# forgives (#2414, #2427), with the same reason and the same match: the
+# operator gives the Ready condition this reason for any pod it scans that
+# the scheduler marked Unschedulable, copying the scheduler's words in after
+# "cannot be scheduled onto any available node:" behind "Pod <name>", and a
+# count of nodes short of CPU or memory there is a pod an Autopilot scale-up
+# places. A message with no such count (a taint, a selector or affinity
+# only, or the RuntimeClass sentence) fails on the first read as before.
+# tests/test_rollback_roundtrip.py holds these to hack/ci-deploy.sh.
+readonly CR_READY_REASON_POD_UNSCHEDULABLE="PodUnschedulable"
+readonly SCHEDULER_CAPACITY_SHORTFALL_RE='[0-9]+ Insufficient (cpu|memory)'
+
 # A container waiting for one of these is not coming up on its own, and a pod
 # holding one is stuck rather than starting.
 readonly STUCK_WAITING_REASONS="CrashLoopBackOff ImagePullBackOff ErrImagePull CreateContainerConfigError CreateContainerError InvalidImageName RunContainerError"
@@ -156,6 +176,17 @@ readonly DEFAULT_BRIDGE_TIMEOUT=300
 # Pods and Jobs settling after Ready: nothing pending, terminating or backing
 # off, and under today nothing of the A2A stack left.
 readonly DEFAULT_SETTLE_TIMEOUT=300
+# How long a not-degraded check waits out that one Degraded: hack/ci-deploy.sh's
+# window (MODE_NEXT_UNSCHEDULABLE_ATTEMPTS reads, MODE_NEXT_POLL_SECONDS
+# apart). Only the CR ending the Degraded ends the wait early. The operator
+# watches no Pods, so the scheduler placing a pod starts no pass, and the
+# status keeps the scheduler's message while the pod starts. But it owns
+# the agent Deployment (Owns, no predicate), so the agent pod going Ready
+# changes that Deployment's status and starts a pass that scans the pods
+# again. In periodic 2109267671341076480 the agent pod was bound at
+# 15:14:12Z, the pass its readiness started ran at 15:15:19Z, and the check
+# read the old message at about 15:15:20Z, while that pass was running.
+readonly DEFAULT_UNSCHEDULABLE_TIMEOUT=300
 # One today turn's request, and how many fresh tunnels it gets.
 readonly DEFAULT_TURN_TIMEOUT=120
 readonly DEFAULT_TURN_ATTEMPTS=5
@@ -192,6 +223,7 @@ TEARDOWN_TIMEOUT="${ROLLBACK_TEARDOWN_TIMEOUT:-${DEFAULT_TEARDOWN_TIMEOUT}}"
 BUS_UP_TIMEOUT="${ROLLBACK_BUS_UP_TIMEOUT:-${DEFAULT_BUS_UP_TIMEOUT}}"
 BRIDGE_TIMEOUT="${ROLLBACK_BRIDGE_TIMEOUT:-${DEFAULT_BRIDGE_TIMEOUT}}"
 SETTLE_TIMEOUT="${ROLLBACK_SETTLE_TIMEOUT:-${DEFAULT_SETTLE_TIMEOUT}}"
+UNSCHEDULABLE_TIMEOUT="${ROLLBACK_UNSCHEDULABLE_TIMEOUT:-${DEFAULT_UNSCHEDULABLE_TIMEOUT}}"
 TURN_TIMEOUT="${ROLLBACK_TURN_TIMEOUT:-${DEFAULT_TURN_TIMEOUT}}"
 TURN_ATTEMPTS="${ROLLBACK_TURN_ATTEMPTS:-${DEFAULT_TURN_ATTEMPTS}}"
 BUS_TASK_TIMEOUT="${ROLLBACK_BUS_TASK_TIMEOUT:-${DEFAULT_BUS_TASK_TIMEOUT}}"
@@ -206,6 +238,9 @@ AGENT_URL="${ROLLBACK_AGENT_URL:-}"
 INJECT_URL="${ROLLBACK_INJECT_URL:-}"
 # Optional: every PASS, FAIL and SKIP line is appended here too.
 RESULTS_FILE="${ROLLBACK_RESULTS_FILE:-}"
+# Where the run leaves the install: next (the round trip) or today (a third
+# leg rolls it back again; header).
+END_MODE="${ROLLBACK_END_MODE:-${MODE_NEXT}}"
 
 readonly NATS_NAME="${CR_NAME}${NATS_NAME_SUFFIX}"
 readonly NATS_PVC="${NATS_DATA_CLAIM}-${NATS_NAME}${NATS_ORDINAL_SUFFIX}"
@@ -666,22 +701,53 @@ degraded_baseline_summary() {
   fi
 }
 
+# Whether the CR's last read is the one Degraded the window forgives: phase
+# Degraded, Ready reason PodUnschedulable, and a capacity count in the
+# scheduler's words.
+capacity_unschedulable() {
+  [ "${CR_PHASE}" = "${CR_PHASE_DEGRADED}" ] \
+    && [ "${CR_READY_REASON}" = "${CR_READY_REASON_POD_UNSCHEDULABLE}" ] \
+    && [[ "${CR_READY_MSG}" =~ ${SCHEDULER_CAPACITY_SHORTFALL_RE} ]]
+}
+
 # Fails on a Degraded phase, or on a Degraded condition the baseline did not
-# carry with the same reason.
+# carry with the same reason. One Degraded phase is waited out instead of
+# failed on at once: a pod waiting for CPU or memory
+# (capacity_unschedulable), up to UNSCHEDULABLE_TIMEOUT, with a line per
+# change. The wait ends only when the CR stops saying Degraded, so the PASS
+# is the operator's own verdict after the pod came up, and a fault on a pod
+# its scan reaches later is read rather than hidden behind this one. Still
+# there at the bound, or turned into any other Degraded, it fails as before.
+# A forgiven Degraded is named in the PASS line.
 assert_not_degraded() {
-  local name="$1"
-  read_cr_state || fail "${name}" "the CR could not be read"
-  if [ "${CR_PHASE}" = "${CR_PHASE_DEGRADED}" ]; then
-    fail "${name}" "$(cr_state_summary) ($(degraded_baseline_summary))"
+  local name="$1" start=$SECONDS deadline forgiven="" waited="" last=""
+  deadline=$((SECONDS + UNSCHEDULABLE_TIMEOUT))
+  while :; do
+    read_cr_state || fail "${name}" "the CR could not be read"
+    [ "${CR_PHASE}" = "${CR_PHASE_DEGRADED}" ] || break
+    capacity_unschedulable || fail "${name}" "$(cr_state_summary) ($(degraded_baseline_summary))"
+    waited="$(cr_state_summary)"
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      fail "${name}" "still Degraded after ${UNSCHEDULABLE_TIMEOUT}s on a pod waiting for CPU or memory: $(cr_state_summary) ($(degraded_baseline_summary))"
+    fi
+    if [ "${CR_READY_MSG}" != "${last}" ]; then
+      note "${name}: Degraded on a pod waiting for CPU or memory (#2414), $((SECONDS - start))s in; waiting up to ${UNSCHEDULABLE_TIMEOUT}s for the operator to clear it: $(cr_state_summary)"
+      last="${CR_READY_MSG}"
+    fi
+    sleep "${POLL_SECONDS}"
+  done
+  if [ -n "${waited}" ]; then
+    note "${name}: the PodUnschedulable on capacity cleared after $((SECONDS - start))s"
+    forgiven="forgave a transient PodUnschedulable on capacity, cleared after $((SECONDS - start))s (was: ${waited}); "
   fi
   if [ "${CR_DEGRADED}" = "${CR_CONDITION_TRUE}" ]; then
     if [ "${CR_DEGRADED_REASON:-unspecified}" != "${PRE_DEGRADED_REASON}" ]; then
       fail "${name}" "a Degraded condition new since the flip: $(cr_state_summary) ($(degraded_baseline_summary))"
     fi
-    pass "${name}" "phase ${CR_PHASE}; Degraded=True/${CR_DEGRADED_REASON:-unspecified} is the one the install carried before the flip, not new"
+    pass "${name}" "${forgiven}phase ${CR_PHASE}; Degraded=True/${CR_DEGRADED_REASON:-unspecified} is the one the install carried before the flip, not new"
     return 0
   fi
-  pass "${name}" "phase ${CR_PHASE}, no Degraded condition set ($(degraded_baseline_summary))"
+  pass "${name}" "${forgiven}phase ${CR_PHASE}, no Degraded condition set ($(degraded_baseline_summary))"
 }
 
 # The NATS pod mounts the kept claim, by name, now that the bus is back.
@@ -911,7 +977,7 @@ patch_and_reconcile() {
   local leg="$1" what="$2" patch="$3" before
   before="$(agent_generation)" || fail "${leg}.${what}.patched" "deployment/${AGENT_DEPLOYMENT} could not be read"
   k patch platformagent "${CR_NAME}" --type merge -p "${patch}" >/dev/null || fail "${leg}.${what}.patched" "kubectl patch was refused"
-  if [ "${leg}.${what}" = "leg1.mode-today" ]; then
+  if [ "${what}" = "mode-today" ]; then
     BUS_DOWN=1
   fi
   pass "${leg}.${what}.patched" "merge patch applied"
@@ -935,6 +1001,22 @@ bringup_left() {
   echo $((left > 0 ? left : 0))
 }
 
+# The flip to today and what it must leave: leg 1's, and leg 3's under
+# ROLLBACK_END_MODE=today. The teardown ran to its end: the StatefulSet is
+# the last thing cleanupA2A deletes, and the callout keys Secret is one it
+# deletes rather than keeps, so a kept PVC and creds Secret are kept through
+# a teardown that happened, not through one that never started.
+flip_to_today() {
+  local leg="$1"
+  patch_and_settle "${leg}" "mode-today" "{\"spec\":{\"mode\":\"${MODE_TODAY}\"}}"
+  wait_absent "${leg}.a2a-torn-down" "${TEARDOWN_TIMEOUT}" "statefulset ${NATS_NAME}" "deployment ${CALLOUT_NAME}" "secret ${CALLOUT_KEYS_SECRET}"
+  assert_same_uid "${leg}.pvc-kept" pvc "${NATS_PVC}" "${PVC_UID}"
+  assert_same_uid "${leg}.creds-kept" secret "${CREDS_SECRET}" "${CREDS_UID}"
+  wait_settled "${leg}.nothing-stuck" "${MODE_TODAY}" "${SETTLE_TIMEOUT}"
+  assert_not_degraded "${leg}.not-degraded"
+  assert_today_turn "${leg}.today-turn"
+}
+
 # ─── The run ─────────────────────────────────────────────────────────────────
 command -v python3 >/dev/null 2>&1 || {
   echo "FAIL preflight.tools: python3 is required"
@@ -946,9 +1028,22 @@ note "kept across the flip: pvc/${NATS_PVC}, secret/${CREDS_SECRET}"
 
 # Leg 0: a healthy next install, and the two objects as they are now.
 CURRENT_LEG="pre"
+case "${END_MODE}" in
+  "${MODE_NEXT}" | "${MODE_TODAY}") ;;
+  *) fail "pre.end-mode" "ROLLBACK_END_MODE is '${END_MODE}'; it is ${MODE_NEXT} (the round trip) or ${MODE_TODAY} (a third leg rolls the install back again)" ;;
+esac
 read_cr_state || fail "pre.cr-readable" "platformagent/${CR_NAME} could not be read in ${NAMESPACE}"
 [ "${CR_MODE}" = "${MODE_NEXT}" ] || fail "pre.mode-next" "spec.mode is ${CR_MODE}; the round trip starts from a next install"
 pass "pre.mode-next" "spec.mode is next"
+if [ "${END_MODE}" = "${MODE_TODAY}" ]; then
+  # Read before anything changes: leg 3 would have to unset a declared
+  # sidecar and leave it unset under today, which is a change to the CR this
+  # run does not own. The lane's install declares none.
+  CR_JSON="$(k_read get platformagent "${CR_NAME}" -o json)" || fail "pre.end-mode-today" "platformagent/${CR_NAME} could not be read"
+  DECLARED_SIDECARS="$(printf '%s' "${CR_JSON}" | python3 -c "${PY_SIDECARS}" "${CREDS_SECRET}" "${NATS_NAME}" | sed -n 1p)"
+  [ -z "${DECLARED_SIDECARS}" ] || fail "pre.end-mode-today" "the CR declares spec.deployment.sidecars (${DECLARED_SIDECARS}); ending at ${MODE_TODAY} would leave them unset, so run the round trip without ROLLBACK_END_MODE=${MODE_TODAY}"
+  pass "pre.end-mode-today" "the CR declares no sidecars; the run ends with the install at ${MODE_TODAY}"
+fi
 wait_cr_ready "pre.ready" "${PRE_READY_TIMEOUT}"
 record_degraded_baseline "pre.degraded-baseline"
 wait_rolled "pre.nats-ready" statefulset "${NATS_NAME}" "${PRE_READY_TIMEOUT}"
@@ -979,17 +1074,7 @@ if [ -n "${UNSET_SIDECARS}" ]; then
 else
   skip "leg1.sidecars-unset" "the CR declares no sidecars (a bridge the operator renders leaves with the mode and needs no unset)"
 fi
-patch_and_settle "leg1" "mode-today" "{\"spec\":{\"mode\":\"${MODE_TODAY}\"}}"
-# The teardown ran to its end: the StatefulSet is the last thing cleanupA2A
-# deletes, and the callout keys Secret is one it deletes rather than keeps,
-# so a kept PVC and creds Secret below are kept through a teardown that
-# happened, not through one that never started.
-wait_absent "leg1.a2a-torn-down" "${TEARDOWN_TIMEOUT}" "statefulset ${NATS_NAME}" "deployment ${CALLOUT_NAME}" "secret ${CALLOUT_KEYS_SECRET}"
-assert_same_uid "leg1.pvc-kept" pvc "${NATS_PVC}" "${PVC_UID}"
-assert_same_uid "leg1.creds-kept" secret "${CREDS_SECRET}" "${CREDS_UID}"
-wait_settled "leg1.nothing-stuck" "${MODE_TODAY}" "${SETTLE_TIMEOUT}"
-assert_not_degraded "leg1.not-degraded"
-assert_today_turn "leg1.today-turn"
+flip_to_today "leg1"
 
 # Leg 2: today -> next, on the kept objects.
 CURRENT_LEG="leg2"
@@ -1006,9 +1091,13 @@ CURRENT_LEG="leg2"
 # The arithmetic, at the defaults: patch to Ready is at most
 # GENERATION_TIMEOUT + BUS_UP_TIMEOUT = 300 + 1500 = 1800s, whatever the
 # split between the five. That leaves 1800s of the 3600s ci-eval-pr.sh gives
-# the whole run (EVAL_ROLLBACK_TIMEOUT_SECONDS) for pre, leg 1 and the rest of
-# leg 2, which take minutes on a healthy install; a run that needs more is
-# stopped there and reports itself interrupted at the leg it was in. The
+# the whole run (EVAL_ROLLBACK_TIMEOUT_SECONDS) for pre, leg 1, the rest of
+# leg 2 and, under ROLLBACK_END_MODE=today, leg 3, which take minutes on a
+# healthy install (the round trip has measured about four in CI; each
+# not-degraded check's capacity wait, UNSCHEDULABLE_TIMEOUT, adds at most
+# 300s, 900s for all three); a run that needs more is stopped there and
+# reports itself interrupted at the leg it was in. The today lane runs it
+# before its matrix, where no start-by bound applies. The next-mode run's
 # job-level bound is ci-eval-pr.sh's, beside EVAL_ROLLBACK_START_BY_SECONDS:
 # the run starts by 15600s of job age, deploy included, and with the 3600s
 # bound and its 60s kill grace ends by 19260s, inside the 21600s deadline. The
@@ -1055,6 +1144,15 @@ assert_bus_task "leg2.bus-task"
 wait_settled "leg2.nothing-stuck" "${MODE_NEXT}" "${SETTLE_TIMEOUT}"
 assert_not_degraded "leg2.not-degraded"
 
+ROUTE="next -> today -> next"
+if [ "${END_MODE}" = "${MODE_TODAY}" ]; then
+  # Leg 3: next -> today again, on the objects leg 2 brought back, and the
+  # install is left there for whatever runs after.
+  CURRENT_LEG="leg3"
+  flip_to_today "leg3"
+  ROUTE="${ROUTE} -> today"
+fi
+
 CURRENT_LEG="done"
-echo "ROLLBACK ROUND TRIP PASSED: next -> today -> next on platformagent/${CR_NAME}, pvc/${NATS_PVC} (uid ${PVC_UID}) and secret/${CREDS_SECRET} (uid ${CREDS_UID}) kept throughout"
+echo "ROLLBACK ROUND TRIP PASSED: ${ROUTE} on platformagent/${CR_NAME}, pvc/${NATS_PVC} (uid ${PVC_UID}) and secret/${CREDS_SECRET} (uid ${CREDS_UID}) kept throughout"
 record "PASSED"

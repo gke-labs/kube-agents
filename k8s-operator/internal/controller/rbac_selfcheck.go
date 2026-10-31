@@ -53,7 +53,7 @@ import (
 // the cause.
 //
 // The probe never runs on the reconcile worker. It is one
-// SelfSubjectAccessReview per (verb, resource) — 195 of them today — and the
+// SelfSubjectAccessReview per (verb, resource) — one per tuple in requiredPermissions below — and the
 // PlatformAgent controller has a single worker, so a reconcile that paid for
 // the round trips would stall every agent for their duration. The checker is
 // a manager Runnable that re-probes on its own ticker under a deadline;
@@ -131,6 +131,12 @@ var requiredPermissions = []requiredPermission{
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents/finalizers"}, Verbs: []string{"update"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentplugins"}, Verbs: rbacReadVerbs},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentplugins/status"}, Verbs: []string{"get", "update", "patch"}},
+	// agentprofiles: the AgentProfile reconciler adds and removes its
+	// finalizer (update, patch) and writes status; the PlatformAgent
+	// reconciler lists them into the identity map.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/status"}, Verbs: []string{"get", "update", "patch"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/finalizers"}, Verbs: []string{"update"}},
 	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacWriteVerbs},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacWriteVerbs},
@@ -153,6 +159,8 @@ var requiredPermissions = []requiredPermission{
 	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacWriteVerbs},
 	{Group: "coordination.k8s.io", Resources: []string{"leases"}, Verbs: rbacWriteVerbs},
 	{Group: "node.k8s.io", Resources: []string{"runtimeclasses"}, Verbs: rbacReadVerbs},
+	// storageclasses: growDataClaim reads a data claim's class by name.
+	{Group: "storage.k8s.io", Resources: []string{"storageclasses"}, Verbs: []string{"get"}},
 	{Group: "networking.k8s.io", Resources: []string{"networkpolicies"}, Verbs: rbacWriteVerbs},
 	{Group: "networking.k8s.io", Resources: []string{"ingresses"}, Verbs: rbacReadVerbs},
 	{Group: "networking.gke.io", Resources: []string{"fqdnnetworkpolicies"}, Verbs: rbacWriteVerbs},
@@ -166,6 +174,12 @@ var requiredPermissions = []requiredPermission{
 	{Group: "rbac.authorization.k8s.io", Resources: []string{"clusterroles"}, Verbs: []string{"bind"}, Name: a2aAuthDelegatorRole},
 	{Group: "authentication.k8s.io", Resources: []string{"tokenreviews"}, Verbs: []string{"create"}},
 	{Group: "apiextensions.k8s.io", Resources: []string{"customresourcedefinitions"}, Verbs: rbacReadVerbs},
+	// The GitOps reconcilers' objects: held only so the agent's minimal role,
+	// which grants them, passes escalation prevention.
+	{Group: "argoproj.io", Resources: []string{"applications"}, Verbs: rbacReadVerbs},
+	{Group: "kustomize.toolkit.fluxcd.io", Resources: []string{"kustomizations"}, Verbs: rbacReadVerbs},
+	{Group: "source.toolkit.fluxcd.io", Resources: []string{"gitrepositories", "ocirepositories"}, Verbs: rbacReadVerbs},
+	{Group: "configsync.gke.io", Resources: []string{"rootsyncs", "reposyncs"}, Verbs: rbacReadVerbs},
 }
 
 // describePermission renders one (verb, resource, group) the way kubectl
@@ -336,6 +350,26 @@ func (c *RBACChecker) Denied() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.denied...)
+}
+
+// AgentProfileAccessDenied returns the boot probe's denials on agentprofiles
+// and its subresources. An informer on a kind the role cannot list never syncs,
+// and the manager exits when a cache fails to sync, so the callers registering
+// an AgentProfile informer skip it while this is non-empty. That keeps an
+// image deployed ahead of its ClusterRole running everything else, which is
+// the self-check's rule for an optional path. Restart after fixing the role.
+func AgentProfileAccessDenied(c *RBACChecker) []string {
+	denied := c.Denied()
+	if len(denied) == 0 {
+		return nil
+	}
+	var out []string
+	for _, tuple := range flattenRequiredPermissions() {
+		if tuple.resource == "agentprofiles" && slices.Contains(denied, tuple.label) {
+			out = append(out, tuple.label)
+		}
+	}
+	return out
 }
 
 // Start re-probes every interval until ctx is cancelled. It satisfies

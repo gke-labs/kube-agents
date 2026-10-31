@@ -8,11 +8,12 @@ refuses the blocks, falling back to :func:`headline_fallback` when the fetch or
 the parse fails. The caller must fetch only issues in repositories it manages:
 :func:`ledger_ref` takes the repository from the report's own URL. An issue
 not labelled ``agent:audit`` does not parse. A clean run closes its ledger
-without rewriting the title, so a closed issue's counts are the last run's,
-not this one's: a closed ledger is the clean card ("<Name>: clean. Ledger
-closed."), unless the report's line counts a finding; a zero-finding run that could not read the
-whole fleet, or did not account for a carried finding, leaves the ledger open
-over the same old title, so a finding total in the report's line that
+and then retitles it to 0 findings, but its body still lists the last run's
+findings, so the state decides: a closed ledger is the clean card ("<Name>:
+clean. Ledger closed."), unless the report's line counts a finding; a
+zero-finding run that could not read the whole fleet, or did not account for a
+carried finding, leaves the ledger open over the same old title (or a
+refreshed coverage title), so a finding total in the report's line that
 disagrees with the title also falls back, as does a line with no total that
 counts nothing non-zero or calls the run clean, held or carried; a report that
 is only the link keeps the title. The text goes out through
@@ -52,13 +53,20 @@ are model-written and editable
 on the forge, as is the issue title, and the relayed line is model-written
 too, so a row, the audit name and the relayed line keep a link's text and drop
 its target, and a ``<!channel>``-style token loses its brackets.
+
+A report with no ledger issue that is fleet-audit's summary of a run with no
+GitOps repository (``render_no_forge_summary``) gets the same card from the
+summary itself (:func:`summary_card`): its headline, its finding rows, its
+other lines under them, and "Look at the first one" with no ledger button.
 """
 
 from __future__ import annotations
 
+import functools
 import re
 from typing import NamedTuple
 
+import chat_message as _chat
 from slack_presenter import (
     BACKTICK,
     CLAUSE_ENDS,
@@ -66,6 +74,7 @@ from slack_presenter import (
     HEADLINE_MAX,
     LIST_MARKER,
     MENTION,
+    ROW_TEXT_MAX,
     _clip,
     _plain,
     as_line,
@@ -73,6 +82,7 @@ from slack_presenter import (
     fallback_text,
     gap_parts,
     severity_row,
+    split_lead,
 )
 
 #: Any link Hermes' text path would post (``SlackAdapter.format_message``): its
@@ -89,18 +99,61 @@ LINK_JOIN_BROKEN = "] ("
 
 #: Every count is at most nine digits, so ``int()`` never meets a digit run
 #: past its limit; a longer run matches nothing.
-ISSUE_URL = r"https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/issues/(?P<number>\d{1,9})"
+#: The issue URL on github.com, and on the install's GitHub Enterprise Server
+#: host when it has one (``_issue_url``): no other host's link is a ledger.
+ISSUE_URL_TEMPLATE = r"https://(?P<host>{hosts})/(?P<repo>[\w.-]+/[\w.-]+)/issues/(?P<number>\d{{1,9}})"
+ISSUE_URL = ISSUE_URL_TEMPLATE.format(hosts=r"github\.com")
 #: The ledger link: the report's last URL, after the SOPs' dash or a "Ledger:"
 #: label, bare, in angle brackets or as a markdown link; or a markdown link
 #: whose own label names the ledger ("[Ledger issue #231](url)"), with nothing
 #: before it. Labels are bounded, and the pattern only searches the report's
 #: last ``LEDGER_TAIL_MAX`` characters, so a long report cannot make it backtrack.
-TRAILING_LEDGER = re.compile(
+TRAILING_LEDGER_PREFIX = (
     r"(?:(?:[—–]|\s-|\bledger(?:\s+issue)?:?)\s*(?:\[[^\]\n]{0,80}\]\()?|\[(?P<label>[^\]\n]{0,80})\]\()<?"
-    + ISSUE_URL
-    + r">?\)?[\s.]*\Z",
-    re.IGNORECASE,
 )
+TRAILING_LEDGER_SUFFIX = r">?\)?[\s.]*\Z"
+TRAILING_LEDGER = re.compile(TRAILING_LEDGER_PREFIX + ISSUE_URL + TRAILING_LEDGER_SUFFIX, re.IGNORECASE)
+#: An issue on any forge, anywhere in a report (``failed_line``): GitHub's ``/issues/<n>``,
+#: GitLab's ``/-/issues/<n>`` or ``/-/work_items/<n>``, on any host. Only says a ledger was named.
+#: The host and path exclude ``:``, so one URL's scan ends at the next ``://`` and a report
+#: that is a run of URLs is read once rather than once per URL.
+ANY_ISSUE_URL = re.compile(
+    r"https?://[^\s:/]+(?::\d{1,5})?/(?:[^\s:]*?/)?(?:-/)?(?:issues|work_items)/\d{1,9}\b", re.IGNORECASE
+)
+
+
+@functools.lru_cache(maxsize=8)
+def _trailing_ledger_re(github_host: str) -> re.Pattern:
+    """``TRAILING_LEDGER`` for an install whose GitHub host is ``github_host``.
+
+    github.com alone when that host is github.com; github.com and the GitHub
+    Enterprise Server host otherwise.
+    """
+    host = github_host.strip().lower()
+    if not host or host == "github.com":
+        return TRAILING_LEDGER
+    hosts = r"github\.com|" + re.escape(host)
+    return re.compile(
+        TRAILING_LEDGER_PREFIX + ISSUE_URL_TEMPLATE.format(hosts=hosts) + TRAILING_LEDGER_SUFFIX,
+        re.IGNORECASE,
+    )
+
+
+def _github_host() -> str:
+    """The install's GitHub host, from the mounted repository lists; github.com without them.
+
+    The one input here that is not the text: a ledger on a GitHub Enterprise
+    Server is an issue URL on that host, and nothing in the report says which
+    host is the install's.
+    """
+    try:
+        from gitops_workspace import github_host
+    except ImportError:
+        return "github.com"
+    try:
+        return github_host()
+    except Exception:  # noqa: BLE001 - github.com, as before
+        return "github.com"
 LEDGER_TAIL_MAX = 512
 #: What a link label alone must say to mark the ledger.
 LEDGER_WORD = re.compile(r"\bledger\b", re.IGNORECASE)
@@ -177,6 +230,10 @@ FINDINGS_TOTAL = re.compile(r"\b(?P<count>\d{1,9}|no|zero)\s+findings?\b", re.IG
 #: The other counts an SOP line states for a run that changed its ledger:
 #: "<n> resolved", and a count by severity ("2 critical, 6 major").
 CHANGE_COUNT = re.compile(r"\b(?P<count>\d{1,9})\s+(?:new|resolved|critical|major|minor)\b", re.IGNORECASE)
+#: The lead of fleet-audit's own audit line (``audit_report.findings_headline``): the
+#: count of the most severe findings present, "2 critical findings". It states no
+#: total, so the card checks it against the issue's count at that severity instead.
+FINDINGS_LEAD = re.compile(r"\b(?P<count>\d{1,9})\s+(?P<severity>critical|major|minor)\s+findings?\b", re.IGNORECASE)
 #: A count by severity alone ("2 critical"), which a clean run's line never states above 0.
 SEVERITY_COUNT = re.compile(r"\b(?P<count>\d{1,9})\s+(?:critical|major|minor)\b", re.IGNORECASE)
 #: A line describing a clean, held or carried run, which leaves the ledger open
@@ -184,7 +241,7 @@ SEVERITY_COUNT = re.compile(r"\b(?P<count>\d{1,9})\s+(?:critical|major|minor)\b"
 ZERO_FINDING_RUN = re.compile(r"\b(?:clean|held|carried|nothing\s+reproduced)\b", re.IGNORECASE)
 #: A last line that is only a URL, the ledger wrapped onto a line of its own.
 BARE_URL_LINE = re.compile(r"\A[<(\[]*https?://\S+\Z")
-#: The line that carries a composed report's counts, when its last line is only the link.
+#: The line that carries a report's counts, when its last line is only the link.
 COUNTS_DIGIT = re.compile(r"\d")
 #: The coverage the line states: "across 3 clusters", "across 2 of 7 clusters".
 COVERAGE = re.compile(r"(?<![\w.,-])across\s+(\d{1,9})(?:\s+of\s+(\d{1,9}))?\s+clusters?\b", re.IGNORECASE)
@@ -248,6 +305,49 @@ ACTION_ID_PREFIX = "kage_audit"
 LOOK_FIRST = "Look at the first one"
 LEDGER_BUTTON = "Ledger issue #{number} ↗"
 
+#: fleet-audit's summary of a run with no ledger issue
+#: (``audit_report.render_no_forge_summary``): its first line is the headline,
+#: "<Name>: <n> <severity> finding(s)" or "<Name>: no findings" and what
+#: changed; a finding row is ``audit_report.SUMMARY_ROW``, its severity as
+#: inline code; every other line goes under the rows. Bounded, like the
+#: headline the card shows.
+SUMMARY_HEADLINE = re.compile(
+    r"\A[^\n:`]{1,200}: (?:\d{1,9} (?:critical|major|minor) findings?|no findings)\b[^\n]{0,300}\Z"
+)
+SUMMARY_ROW = re.compile(r"\A`(?P<severity>critical|major|minor)` (?P<text>[^\n]{1,1000})\Z")
+#: The label fleet-audit stores above a re-run's report when an earlier finish
+#: published and stopped (``audit_report.CHAT_REPORT_RERUN_LABEL`` and
+#: ``CHAT_REPORT_RERUN_RELATIVE_LABEL``). Above a summary, the card drops it,
+#: as the ledger card, which reads the report's last line, does.
+RERUN_LABEL = re.compile(r"\ARe-run in this audit after an earlier finish published and stopped; [^\n]{1,200}\Z")
+#: The summary's last line when the install has no GitOps repository at all
+#: (``audit_report.NO_FORGE_NOTE`` and ``NO_FORGE_UNSTORED_NOTE``), which the card
+#: shows whole. Any other note (a repository the broker cannot reach, several
+#: repositories and none chosen) carries a remedy longer than a card's line, so that
+#: summary posts as written.
+NO_LEDGER_NOTES = (
+    "No GitOps repository is connected, so no ledger issue or fix pull requests were opened.",
+    "No GitOps repository is connected, so no ledger issue or fix pull requests were opened. "
+    "This run could not be saved on the install, so keep this message.",
+)
+
+#: The "What's wrong" section of a report written to the Platform Agent's three
+#: sections (``agents/platform/SOUL.md``): a heading (``## What's wrong``) or a
+#: bold label alone on its line, the section's text below it; or the label, a
+#: colon or a dash, a space and the text on the same line (``**What's wrong** —
+#: The audit ...``). Anything else after the label (``## What's wrong?``, ``What's
+#: wrong is that ...``) is not the label, so such a report posts whole.
+WRONG_LABEL = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?What['’]s[ \t]+wrong"
+    r"(?:(?:[ \t]*[:—–-](?:\*\*|__)?|(?:\*\*|__)[ \t]*[:—–-])[ \t]+(?P<rest>\S.*)"
+    r"|[ \t]*(?::?(?:\*\*|__)[ \t]*|:[ \t]*)?(?:#+[ \t]*)?)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+#: A line that ends the section's first paragraph: a heading, a list item, or a bold label alone.
+SECTION_BREAK = re.compile(r"^[ \t]*(?:#{1,6}[ \t]|[-*+][ \t]|\d+[.)][ \t]|(?:\*\*|__)[^*_]+(?:\*\*|__)[ \t]*$)")
+#: How far into a report the "What's wrong" label is looked for; the section opens a report.
+WRONG_READ_MAX = 4000
+
 
 class LedgerRef(NamedTuple):
     url: str
@@ -265,7 +365,8 @@ def _trailing_ledger(text: str) -> tuple[int, re.Match] | None:
     offset = max(len(text.rstrip()) - LEDGER_TAIL_MAX, 0)
     tail = text[offset:]
     at = 0
-    while (match := TRAILING_LEDGER.search(tail, at)) is not None:
+    pattern = _trailing_ledger_re(_github_host())
+    while (match := pattern.search(tail, at)) is not None:
         label = match.group("label")
         if label is None or LEDGER_WORD.search(label):
             return offset + match.start(), match
@@ -277,16 +378,19 @@ def ledger_ref(report: str) -> LedgerRef | None:
     """The ledger issue a report ends with, or None when it does not end with one.
 
     The repository is whatever the report's URL names, so the caller must
-    fetch the issue only from a repository it manages.
+    fetch the issue only from a repository it manages. On github.com it is
+    the bare ``owner/name``; on a GitHub Enterprise Server host it is
+    ``<host>/owner/name``, the name the managed list gives it.
     """
     found = _trailing_ledger(report)
     if found is None:
         return None
     match = found[1]
-    repo, number = match.group("repo"), match.group("number")
+    host, repo, number = match.group("host").lower(), match.group("repo"), match.group("number")
     if any(segment in DOT_SEGMENTS for segment in repo.split("/")):
         return None
-    return LedgerRef(f"https://github.com/{repo}/issues/{number}", repo, int(number))
+    url = f"https://{host}/{repo}/issues/{number}"
+    return LedgerRef(url, repo if host == "github.com" else f"{host}/{repo}", int(number))
 
 
 def _new_count(line: str) -> int:
@@ -435,8 +539,9 @@ def _parse_issue(issue: dict, report: str) -> AuditReport | None:
     ``report`` is the relayed report: its whole ledger line is read for
     gaps and checked against the title. A closed issue, one without the
     ledger label, a zero-finding title and a body listing no finding do not
-    parse: a clean run closes the ledger over its old title
-    (:func:`_clean_name`), and the fallback posts the report's own line.
+    parse: a clean run closes the ledger, then retitles it to 0 findings over
+    the old body (:func:`_clean_name` reads it), and the fallback posts the
+    report's own line.
     Nor does one whose title disagrees with the line's own finding total, or
     one whose line states no total and no non-zero count, or calls the run
     clean, held or carried: a zero-finding partial or held run leaves the old
@@ -470,7 +575,26 @@ def _parse_issue(issue: dict, report: str) -> AuditReport | None:
     if not findings:
         return None  # the card would count findings neither it nor the ledger shows
     body = _without_fences(raw.replace("\r\n", "\n"))
-    return AuditReport(name, count, line, findings, _totals(body, findings, critical), _skipped(body))
+    totals = _totals(body, findings, critical)
+    if not _lead_agrees(line, totals):
+        return None  # the line's own count disagrees with the ledger, which was not rewritten this run
+    return AuditReport(name, count, line, findings, totals, _skipped(body))
+
+
+def _lead_agrees(line: str, totals: dict[str, int]) -> bool:
+    """Whether the line's counts by severity (:data:`FINDINGS_LEAD`), when it states any, are the issue's.
+
+    Each "<n> <severity> findings" the line states must be the issue's count at
+    that severity, and the issue must count none above the most severe one the
+    line states: fleet-audit's own line leads with its most severe level. A line
+    that states none agrees, and is checked by its total instead.
+    """
+    stated = {match.group("severity").lower(): int(match.group("count")) for match in FINDINGS_LEAD.finditer(line)}
+    if not stated:
+        return True
+    most_severe = next(level for level in SEVERITIES if level in stated)
+    above = SEVERITIES[: SEVERITIES.index(most_severe)]
+    return all(totals[level] == count for level, count in stated.items()) and not any(totals[level] for level in above)
 
 
 def _totals(body: str, findings: list[Finding], critical: int) -> dict[str, int]:
@@ -675,6 +799,165 @@ def blocks_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[li
     return blocks, fallback_text(card.headline, rows=card.rows, links=links, after_rows=after)
 
 
+def chat_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[dict, str] | None:
+    """:func:`blocks_from_issue`'s card as a ``kube-agents.chat/v1`` message, for ``spec.mode: next``.
+
+    ``(chat, text)``, or None whenever :func:`blocks_from_issue` is. The same
+    headline, rows, lines under them, "Look at the first one" and ledger link,
+    composed by :func:`chat_message.report_message`. ``text`` is
+    :func:`headline_from_issue`'s markdown, the fallback the gateway posts when
+    it does not lay the message out.
+    """
+    text = headline_from_issue(issue, ref, report)
+    if text is None:
+        return None
+    links = [(LEDGER_BUTTON.format(number=ref.number), ref.url)]
+    clean = _clean_name(issue, report)
+    if clean:
+        return _chat.report_message(CLEAN_CARD.format(name=clean), links=links), text
+    card = _card(_parse_issue(issue, report))
+    chat = _chat.report_message(
+        card.headline,
+        rows=card.rows,
+        after_rows="\n".join(_after_rows(card)),
+        choices=[LOOK_FIRST] if card.rows else [],
+        links=links,
+    )
+    return chat, text
+
+
+def summary_card(report: str) -> Card | None:
+    """The card of a fleet-audit report with no ledger issue, read from fleet-audit's summary, or None.
+
+    The summary is the whole report of a run on an install with no GitOps
+    repository (:data:`SUMMARY_HEADLINE`): its headline, its finding rows,
+    and its other lines under them (the rest counted by severity, the ids the
+    collector still flags, the coverage gaps, why no ledger was written).
+    A re-run's label above the summary (:data:`RERUN_LABEL`) is dropped.
+    None for a report that names an issue URL, which has a ledger; for one
+    whose last line is not one of :data:`NO_LEDGER_NOTES`; for one with a line
+    under the rows that the card would clip, or more of them than a chat
+    message keeps; and for any other shape. Those post as written. A row keeps a link's text and drops its
+    target, as a ledger card's row does.
+    """
+    if ledger_ref(report) is not None or ANY_ISSUE_URL.search(report):
+        return None
+    lines = [line.strip() for line in report.strip().splitlines() if line.strip()]
+    if lines and RERUN_LABEL.match(lines[0]):
+        lines = lines[1:]
+    if not lines or not SUMMARY_HEADLINE.match(lines[0]) or lines[-1] not in NO_LEDGER_NOTES:
+        return None
+    # A run that finished twice keeps both summaries, one under the other: the card
+    # would lead with the first, so the report posts whole.
+    if any(SUMMARY_HEADLINE.match(line) for line in lines[1:]):
+        return None
+    rows: list[dict] = []
+    after: list[str] = []
+    for line in lines[1:]:
+        row = SUMMARY_ROW.match(line)
+        if row and not after:
+            text = _balanced_clip(_row_text(row.group("text")), FINDING_ROW_MAX)
+            rows.append({"severity": row.group("severity"), "text": text})
+        else:
+            after.append(_row_text(line))
+    # A line the card would clip, or one past what a chat message keeps, would lose
+    # what the summary says; the summary then posts whole.
+    if len(after) > _chat.AFTER_MAX or any(len(line) > ROW_TEXT_MAX for line in after):
+        return None
+    return Card(_row_text(lines[0]), rows, "\n".join(after), "")
+
+
+def headline_from_summary(report: str) -> str | None:
+    """:func:`summary_card` as markdown text, the headline in bold, or None whenever it is."""
+    card = summary_card(report)
+    if card is None:
+        return None
+    rows = [severity_row(row["severity"], row["text"]) for row in card.rows]
+    return "\n".join([f"**{card.headline}**", *rows, *_after_rows(card)])
+
+
+def blocks_from_summary(report: str) -> tuple[list[dict], str] | None:
+    """:func:`summary_card` as Block Kit ``(blocks, text)``, with "Look at the first one" and no ledger button."""
+    card = summary_card(report)
+    if card is None:
+        return None
+    after = "\n".join(_after_rows(card))
+    choices = [LOOK_FIRST] if card.rows else []
+    blocks = blocks_report(
+        card.headline, rows=card.rows, after_rows=after, choices=choices, action_id_prefix=ACTION_ID_PREFIX
+    )
+    return blocks, fallback_text(card.headline, rows=card.rows, after_rows=after)
+
+
+def chat_from_summary(report: str) -> tuple[dict, str] | None:
+    """:func:`summary_card` as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
+
+    ``text`` is :func:`headline_from_summary`'s markdown, the fallback the
+    gateway posts when it does not lay the message out.
+    """
+    card = summary_card(report)
+    if card is None:
+        return None
+    chat = _chat.report_message(
+        card.headline,
+        rows=card.rows,
+        after_rows="\n".join(_after_rows(card)),
+        choices=[LOOK_FIRST] if card.rows else [],
+    )
+    return chat, headline_from_summary(report) or report
+
+
+def failed_line(report: str) -> str | None:
+    """The one line a fleet-audit report that could not complete posts, or None.
+
+    A report that ends with its ledger link completed (the card is built from
+    the ledger), and so did one that names an issue URL on any forge anywhere: it wrote a
+    ledger, and posts as written (a URL with a ``:`` past the port, a userinfo with a
+    password, or an IPv6 host, is not read as one). One with no issue URL that opens a
+    "What's wrong" section is a run that could not write its ledger (no GitOps
+    repository registered, say): the line is that section's first sentence, as
+    the agent wrote it, markdown and all; the headline cut past ``HEADLINE_MAX``
+    does not apply, since the line is the whole notification and its "because"
+    clause is why the audit failed. None for a report with no such section,
+    which posts as written.
+    """
+    if ledger_ref(report) is not None or ANY_ISSUE_URL.search(report):
+        return None
+    found = WRONG_LABEL.search(report[:WRONG_READ_MAX])
+    if found is None:
+        return None
+    # Matched again on the whole report, so a line or paragraph past the
+    # search window is read whole rather than cut at it.
+    label = WRONG_LABEL.match(report, found.start())
+    if label is None:
+        return None
+    paragraph = [label.group("rest").strip()] if label.group("rest") else []
+    if not paragraph:
+        for line in report[label.end() :].lstrip("\r\n").splitlines():
+            if not line.strip() or SECTION_BREAK.match(line):
+                break
+            paragraph.append(line.strip())
+    sentence, _rest = split_lead(" ".join(paragraph), cut=False)
+    return sentence.strip() or None
+
+
+def failed_chat(report: str) -> tuple[dict, str] | None:
+    """:func:`failed_line` as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
+
+    The line is the message, and the whole report folds under it ("why"): under
+    next a reply in the thread reaches the gateway, which cannot replay the
+    report the way ``incident_context`` does under today. ``text`` is the
+    report itself, the fallback the gateway posts when it does not lay the
+    message out. None for a report past the fold's cap: the fold would be its only
+    Slack copy, so it goes out whole as text rather than clipped.
+    """
+    line = failed_line(report)
+    if line is None or len(report.strip()) > _chat.FOLD_TEXT_MAX:
+        return None
+    fold = {"title": _chat.FOLD_TITLE_DEFAULT, "text": report.strip()}
+    return _chat.message(detail=_clip(line, _chat.DETAIL_MAX), fold=fold), report
+
+
 def _fallback_line(line: str) -> str:
     """A report line as plain text without its ledger link, any link or mention reduced to its text."""
     found = _trailing_ledger(line)
@@ -698,12 +981,13 @@ def _ledger_line(report: str) -> str:
     if not lines:
         return ""
     end = lines[-1].strip()
-    last = "" if BARE_URL_LINE.match(end) or TRAILING_LEDGER.match(end) else _fallback_line(lines[-1])
+    last = "" if BARE_URL_LINE.match(end) or _trailing_ledger_re(_github_host()).match(end) else _fallback_line(lines[-1])
     if last:
         return last
     counted = [
         line for line in lines[:-1]
-        if COUNTS_DIGIT.search(line) and not line[:1].isspace() and not LIST_MARKER.match(line)
+        if (COUNTS_DIGIT.search(line) or FINDINGS_TOTAL.search(line))
+        and not line[:1].isspace() and not LIST_MARKER.match(line)
     ]
     shaped = [line for line in counted if COVERAGE.search(line) or FINDINGS_TOTAL.search(line) or CHANGE_COUNT.search(line)]
     return _fallback_line((shaped or counted)[-1]) if counted else ""
@@ -712,8 +996,8 @@ def _ledger_line(report: str) -> str:
 def headline_fallback(report: str, ref: LedgerRef) -> str | None:
     """The report's ledger line in bold with the ledger link, for when the issue could not be read.
 
-    The ledger line is the report's last, the SOPs' one line; a sentence the
-    relay turn put above it is not the headline. A last line that is only the
+    The ledger line is the report's last, the SOPs' one line; a sentence above
+    it is not the headline. A last line that is only the
     link falls back to the audit line above it (:func:`_ledger_line` says
     which); with none, there is no headline and the report goes out unchanged.
     """

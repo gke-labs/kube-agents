@@ -371,7 +371,9 @@ func TestSteerOpensNoConsumerOfItsOwn(t *testing.T) {
 		AuthorID: "1001", MessageID: "sb-2", Text: "actually only prod"}
 	waitFor(t, "steer ack", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "steering sent") {
+			// Either route's ack: the fixed route queues it ("I'll take that
+			// next"), the no-first-event line says "steering sent".
+			if strings.Contains(p, "steering sent") || p == ackSteerQueued {
 				return true
 			}
 		}

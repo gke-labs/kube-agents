@@ -31,7 +31,15 @@ from admin_console.project_config import (
 )
 
 
-def task(task_id: str, status: str, *, error: str = "") -> AgentTaskUpdate:
+def task(
+    task_id: str,
+    status: str,
+    *,
+    error: str = "",
+    block_kind: str = "",
+    gave_up: bool = False,
+    has_pr: bool = False,
+) -> AgentTaskUpdate:
     now = datetime.now(UTC)
     return AgentTaskUpdate(
         task_id=task_id,
@@ -42,6 +50,9 @@ def task(task_id: str, status: str, *, error: str = "") -> AgentTaskUpdate:
         updated_at=now,
         summary="Capacity checked" if status == "done" else "",
         error=error,
+        block_kind=block_kind,
+        gave_up=gave_up,
+        has_pr=has_pr,
     )
 
 
@@ -344,10 +355,22 @@ class InteractionApiTest(unittest.TestCase):
         self.assertIn("Task Kanban", result["diagnostics"][0])
 
     def test_blocked_and_crashed_delegated_work_are_failures(self):
-        for status in ("blocked", "crashed"):
-            with self.subTest(status=status):
+        cases = [
+            (task("task-1", "crashed"), "task-1: crashed"),
+            (
+                task("task-1", "blocked", block_kind="needs_input"),
+                "task-1: blocked · needs input",
+            ),
+            # The breaker keeps the old block_kind, so the kind must not hide it.
+            (
+                task("task-1", "blocked", block_kind="needs_input", gave_up=True),
+                "task-1: failed after all attempts",
+            ),
+        ]
+        for card, detail in cases:
+            with self.subTest(detail=detail):
                 backend = ScriptedBackend(
-                    task_snapshots=[TaskUpdateResult((task("task-1", status),), False)]
+                    task_snapshots=[TaskUpdateResult((card,), False)]
                 )
                 client, _ = client_for(backend)
                 interaction_id = self.start(client)
@@ -355,7 +378,8 @@ class InteractionApiTest(unittest.TestCase):
                 result = self.wait_for_terminal(client, interaction_id)
 
                 self.assertEqual(result["status"], "failed")
-                self.assertIn(status, result["error"])
+                self.assertIn("Delegated work failed", result["error"])
+                self.assertIn(detail, result["error"])
 
     def test_all_in_flight_task_states_wait_for_completion(self):
         for status in ("triage", "todo", "ready", "scheduled", "running", "review"):
@@ -632,6 +656,37 @@ class InteractionApiTest(unittest.TestCase):
         self.assertEqual(len(sent), MAX_HISTORY_MESSAGES)
         self.assertEqual(sent[0]["content"], "message-25")
         self.assertEqual(sent[-1]["content"], "message-124")
+
+    def test_client_reads_card_state_from_the_tasks_endpoint(self):
+        class Provider:
+            def get_task_updates(self, *args, **kwargs) -> TaskUpdateResult:
+                return TaskUpdateResult(
+                    (
+                        task("task-1", "blocked", block_kind="capability"),
+                        task("task-2", "blocked", gave_up=True),
+                        task("task-3", "done", has_pr=True),
+                    ),
+                    False,
+                )
+
+        app = create_app(
+            ChatService(lambda: ScriptedBackend()),
+            runtime_provider_factory=Provider,
+        )
+        transport = TestClient(
+            app,
+            base_url="http://testserver/api/v1/",
+            headers=portal_api_headers(),
+        )
+
+        result = PortalApiClient(transport=transport).get_task_updates(
+            "platform-agent", session_id="portal_session"
+        )
+
+        self.assertEqual(
+            [(card.block_kind, card.gave_up, card.has_pr) for card in result.tasks],
+            [("capability", False, False), ("", True, False), ("", False, True)],
+        )
 
     def test_client_explains_api_validation_errors(self):
         client, _ = client_for(ScriptedBackend())

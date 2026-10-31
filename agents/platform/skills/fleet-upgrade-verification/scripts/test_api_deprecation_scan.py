@@ -214,6 +214,17 @@ class ParseManifestsTest(unittest.TestCase):
         self.assertEqual(docs, [])
         self.assertTrue(reason.startswith("JSON did not parse"), reason)
 
+    def test_a_document_the_loader_accepts_but_the_walk_cannot_is_skipped(self):
+        # Python 3.14's json accepts nesting far past the recursion limit, so the
+        # RecursionError moves from the loader into the document walk.
+        deep: list = []
+        for _ in range(sys.getrecursionlimit() + 100):
+            deep = [deep]
+        with patch.object(scan.json, "loads", return_value=deep):
+            docs, reason = scan.parse_manifests("deep.json", b"[]")
+        self.assertEqual(docs, [])
+        self.assertTrue(reason.startswith("JSON did not parse"), reason)
+
     def test_a_bad_scalar_in_one_file_does_not_hide_a_hit_in_another(self):
         snapshot = scan.Snapshot(source="local directory t", sha=None, files={
             "a.yaml": b"apiVersion: v1\nkind: ConfigMap\nmetadata: {name: x, annotations: {reviewed: 2001-02-30}}\n",
@@ -461,6 +472,48 @@ class MainTest(unittest.TestCase):
             self.assertEqual(rc, scan.EXIT_OK)
             self.assertIn("Clean:", out)
 
+    def test_a_versions_file_from_a_narrowed_run_is_refused(self):
+        """A `--cluster` run's report has one cluster's floor, not the fleet's, so
+        reading it would drop every removal the other clusters still serve;
+        the mark the report carries is what the scan refuses on."""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, {"tree/pdb.yaml": PDB_V1BETA1})
+            versions = Path(tmp) / "fleet.json"
+            versions.write_text(json.dumps({**FLEET_JSON, "narrowed_to": ["us-central1/old"]}))
+            rc, out, err = self.run_main(["--versions", str(versions), "--target-version", "1.27.0", "--manifests-dir", str(Path(tmp) / "tree")])
+            self.assertEqual(rc, scan.EXIT_USAGE)
+            self.assertIn("narrowed by --cluster to us-central1/old", err)
+            # The remedy is the one change that works: the two flags together
+            # are refused before the file is opened.
+            self.assertIn("replace --versions with --current-version <version>", err)
+            self.assertNotIn("or pass --current-version", err)
+            self.assertNotIn("API deprecation scan", out)
+            # A full run's file carries the key as null and is read as before.
+            versions.write_text(json.dumps({**FLEET_JSON, "narrowed_to": None}))
+            rc, out, _ = self.run_main(["--versions", str(versions), "--target-version", "1.27.0", "--manifests-dir", str(Path(tmp) / "tree")])
+            self.assertEqual(rc, scan.EXIT_OK)
+            self.assertIn("# API deprecation scan: 1.24 -> 1.27", out)
+
+    def test_a_malformed_narrowed_to_is_refused_as_narrowed_not_crashed(self):
+        """`--versions` is any file the operator hands over. A value that is
+        neither null nor a list is refused with the same usage line and exit
+        code, never iterated into a traceback; an empty list is a full run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(tmp, {"tree/pdb.yaml": PDB_V1BETA1})
+            versions = Path(tmp) / "fleet.json"
+            argv = ["--versions", str(versions), "--target-version", "1.27.0", "--manifests-dir", str(Path(tmp) / "tree")]
+            for value in ("us-central1/prod", {"spec": "us-central1/prod"}, 1, True):
+                with self.subTest(narrowed_to=value):
+                    versions.write_text(json.dumps({**FLEET_JSON, "narrowed_to": value}))
+                    rc, out, err = self.run_main(argv)
+                    self.assertEqual(rc, scan.EXIT_USAGE)
+                    self.assertIn(f"narrowed by --cluster to {json.dumps(value)}", err)
+                    self.assertNotIn("API deprecation scan", out)
+            versions.write_text(json.dumps({**FLEET_JSON, "narrowed_to": []}))
+            rc, out, _ = self.run_main(argv)
+            self.assertEqual(rc, scan.EXIT_OK)
+            self.assertIn("# API deprecation scan: 1.24 -> 1.27", out)
+
     def test_current_version_flag(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_tree(tmp, {"pdb.yaml": PDB_V1BETA1})
@@ -616,6 +669,16 @@ class MainTest(unittest.TestCase):
             self.assertEqual(out, "")
             probe.assert_not_called()
             ensure.assert_not_called()
+
+    def test_main_refuses_an_abbreviated_flag(self):
+        # The bench credits a run by the flag's full word; argparse's prefix matching would run
+        # the scan on `--vers` and leave the run uncredited.
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with redirect_stderr(err), self.assertRaises(SystemExit) as exc:
+                scan.main(["--vers", str(Path(tmp) / "absent.json"), "--manifests-dir", tmp])
+        self.assertEqual(exc.exception.code, scan.EXIT_USAGE)
+        self.assertIn("unrecognized arguments: --vers", err.getvalue())
 
 class ScanLeaseTest(unittest.TestCase):
     def test_explicit_lease_is_used_as_given(self):

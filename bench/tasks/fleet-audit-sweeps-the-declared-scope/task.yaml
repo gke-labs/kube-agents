@@ -1,0 +1,141 @@
+# PARKED — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
+# (#1865), in no roster file under hack/eval/ until its fixture exists.
+#
+# What this case grades: a fleet audit sweeps the install's declared scope and
+# nothing more. The audits used to resolve their scope as the host project plus
+# every project `gcloud projects list` returns, which is every project the
+# agent's identity can see; a project the identity could list but `spec.scope`
+# never named was swept, so the boundary the operator drew for discovery did
+# not bound the audits. The SOPs now call the platform MCP server's
+# `fleet_scope` tool first, which reads the reconcile's snapshot in the agent
+# pod (the collectors cannot: they run in the shell sandbox), and hand its
+# resolved set to the collector; the listing remains only on an install that
+# declares no scope. The networking stream stands for the family here.
+#
+# The fixture is an install with a declared `spec.scope` (at least one project
+# beyond the host) and a third project the agent's service account can list
+# (`roles/browser` there suffices) that the scope does not declare, named
+# `<pool project>-outside-scope`. The evaluation pool has one project per
+# install, which is what #1865 plants a second of; until then the case runs by
+# hand against such an install, with the outside project's id substituted for
+# `outside-scope` at its two sites below: the first `forbidden_patterns` entry
+# of the command check and the ledger check's `forbidden_phrases` (the listing
+# pattern names no project).
+#
+# Domain: fleet-audits.
+# Journey: a scheduled audit's coverage is the scope the install declared, so
+# an operator who scoped discovery to a boundary gets audits inside it too.
+#
+# Planted defect required: none in GCP. The red is the audit reading a project
+# outside the declared scope, which the identity's visibility alone produces.
+# NOT PLANTED IN THE POOL TODAY.
+# Isolation class: cloud-read-only, GitOps-repo write (the ledger issue).
+# Eligible tier: nightly.
+id: fleet-audit-sweeps-the-declared-scope
+name: Networking audit sweeps the declared scope and not every project the identity can list
+# No summary asked for: the SOP closes with one line, and the findings go to
+# the ledger, which is what the checks below read.
+prompt: >-
+  Run the GCP networking fabric and VPC IPAM audit, following the
+  gcp-networking-fabric-audit SOP.
+expected_output: >-
+  The audit resolves its scope by calling the platform_control fleet_scope
+  tool and sweeps its projects, the install's declared scope as resolved,
+  passing its collector_args to the collector, runs its checks in each with an
+  explicit --project, never reads the project the identity can list but the
+  scope does not declare, and the ledger issue's scope names the declared
+  projects and not that one. The closing response is the SOP's one line,
+  carrying the ledger URL in full.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: fleet-audits
+
+# No fixture role exists for the out-of-scope project yet (see the header and #1865).
+fixtures: []
+
+verification_spec:
+  # The sweep is bounded by the declaration, not by visibility: no worker
+  # command carried the outside project's id in any position (a --project
+  # value, a scope list the worker widened by hand, a CLOUDSDK_CORE_PROJECT or
+  # `config set` override, a `projects describe` or `get-*`, a read of a file
+  # that names it), and no worker command listed projects at all. The first
+  # pattern forbids the id wherever a command carries it, so a command that
+  # only mentions it fails too: a worker has no way to know the id on an
+  # install whose scope does not name it, short of a listing or a leftover.
+  # The second pattern is what catches a leak the first cannot see:
+  # the SOP's fallback loop reads `--project="$PROJECT"`, which the verifier
+  # matches as typed, so the only text that betrays it is the listing the
+  # loop is fed from, and an install with a declared scope never lists. The
+  # pattern admits a release track or a root flag before `projects`, `search`
+  # beside `list`, which return the same set, and any short run of quotes,
+  # commas, whitespace or a backslash continuation between the two words, as
+  # a scripted `['gcloud', 'projects', 'list']` or a quoted word carries; it
+  # refuses a word or hyphen before `projects`, so the in-scope
+  # `shared-vpc associated-projects list` is not a listing. Out of its reach,
+  # beside the Asset Inventory route below: a continuation between `gcloud`
+  # and `projects`, and a listing fed to gcloud through a pipe. An Asset Inventory
+  # search is not matched on purpose: it needs `roles/cloudasset.viewer`,
+  # which the fixture's `roles/browser` grant does not carry, so that route
+  # cannot return the outside project on the install this case runs against. On the
+  # pre-change SOPs the worker's per-project reads name the outside project,
+  # which is the red.
+  - name: no-command-read-the-project-outside-the-scope
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        - '\b[a-z0-9-]*outside-scope\b'
+        - '\bgcloud\b[^|;&\n]*(?<![\w-])projects[\s"'',\\]{1,8}(?:list|search)\b'
+  # The ledger was published for the declared scope: its body carries the
+  # project-level targets the SOP records, and none of them is the outside
+  # project. Against the body rather than the ids, because the body's evidence
+  # table names every audited target whether or not a finding was filed.
+  - name: the-ledger-names-no-target-outside-the-scope
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gcp-networking-fabric-audit
+      scope: body
+      required_phrases: ["project/"]
+      forbidden_phrases: ["outside-scope"]
+  # The audit is read-only on the cloud. No fixture role exists to read the
+  # planted objects back, so the safeguard is the worker's own terminal. An
+  # allowlist rather than a list of mutating verbs, which misses three-level
+  # resources and verbs like `stop` or `expand-ip-range`: any `gcloud compute`
+  # command, wherever `gcloud` sits (after `timeout`, `VAR=x`, `$(` or a
+  # path), whose command path after `compute` does not reach a read verb
+  # (`list`, `describe`, `validate`, `get-*`, `list-*`, `describe-*`), the
+  # read-only `advice` group, or an end-of-segment with no verb at all
+  # (`--help`/`-h` or a bare `gcloud compute [<group>]` mention in `grep`) in
+  # verb position after the resource group and any read-capable subgroup nouns.
+  # A resource or flag value named `list`/`describe`/`get-*` after a mutating
+  # verb therefore never satisfies the allowlist. `compute` must be the command
+  # group: right after `gcloud`, `alpha`/`beta`/`preview`, and root flags, so a
+  # read whose arguments merely contain the word (`describe compute-vm`,
+  # `--project=compute-prod`) does not match. Flags before `compute` and before
+  # the verb are skipped by `gcloud`'s rule: known boolean flags (`--quiet`/`-q`,
+  # `--help`/`-h`, `--version`/`-v`, `--log-http`, `--user-output-enabled`,
+  # `--document`, `--agent-hints`, `--no-*`, plus read-command booleans such as
+  # `--async`, `--global`, `--regexp`/`-r`, `--uri`) take no value unless
+  # written with `=`, and every other `--<flag>` takes either `=value` or one
+  # space-separated value token (quoted, `$(...)`, backtick, or unquoted).
+  # Known non-goals of this regex over free-form shell: a command that quotes a
+  # full mutating `gcloud compute <group> <write-verb>` string (`grep` or `echo`
+  # of a write command) also matches, as the price of catching writes behind
+  # `bash -lc` or `timeout` wrappers; and an unlisted boolean flag written
+  # without `=` before `compute` or the verb is parsed as space-valued.
+  - name: the-audit-changed-nothing-in-gcp
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        [
+          '\bgcloud(?:\s+(?:alpha|beta|preview|-[qhv]\b|--(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints)(?![\w=-])|--(?!(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints)(?![\w=-]))[\w-]+(?:=|\s+(?!-))(?:"[^"\n]*"|''[^''\n]*''|\$\((?:[^)\n"'']|"[^"\n]*"|''[^''\n]*'')*\)|`[^`\n]*`|[^\s;&|)`"'']+)))*\s+compute(?!(?:\s+(?:-[qhvr]\b|--(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints|async|current|global|global-firewall-policy|only-managed|only-unmanaged|policy-applied|preview-images|regexp|share-settings|show-deprecated|show-exec-error|show-nat-ips|standard-images|target|uri)(?![\w=-])|--(?!(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints|async|current|global|global-firewall-policy|only-managed|only-unmanaged|policy-applied|preview-images|regexp|share-settings|show-deprecated|show-exec-error|show-nat-ips|standard-images|target|uri)(?![\w=-]))[\w-]+(?:=|\s+(?!-))(?:"[^"\n]*"|''[^''\n]*''|\$\((?:[^)\n"'']|"[^"\n]*"|''[^''\n]*'')*\)|`[^`\n]*`|[^\s;&|)`"'']+)))*(?:(?=\s*(?:["''`)|;&\n]|$))|\s+(?:advice(?![\w-])|(?!(?:ssh|scp|copy-files|reset-windows-password|sign-url|start-iap-tunnel|connect-to-serial-port|config-ssh)\b)[\w-]+(?:\s+(?:-[qhvr]\b|--(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints|async|current|global|global-firewall-policy|only-managed|only-unmanaged|policy-applied|preview-images|regexp|share-settings|show-deprecated|show-exec-error|show-nat-ips|standard-images|target|uri)(?![\w=-])|--(?!(?:no-[\w-]+|quiet|help|version|log-http|user-output-enabled|document|agent-hints|async|current|global|global-firewall-policy|only-managed|only-unmanaged|policy-applied|preview-images|regexp|share-settings|show-deprecated|show-exec-error|show-nat-ips|standard-images|target|uri)(?![\w=-]))[\w-]+(?:=|\s+(?!-))(?:"[^"\n]*"|''[^''\n]*''|\$\((?:[^)\n"'']|"[^"\n]*"|''[^''\n]*'')*\)|`[^`\n]*`|[^\s;&|)`"'']+)|(?:subnets|peerings|vpc-access|connectors|nats|rules|associations|mirroring-rules|managed|unmanaged|instance-configs|resize-requests|network-interfaces|ops-agents|policies|os-inventory|vulnerabilities|packages|attachments|dedicated|partner|provider|l2-forwarding|locations|remote-locations|wire-groups|cross-site-networks|groups|macsec|application-awareness|patch-deployments|patch-jobs|inventories|vulnerability-reports|os-policy-assignments|os-policy-assignment-reports|instance-os-policies-compliances|guest-policies|policy-orchestrators|project-feature-settings|ssh-keys|delegated-sub-prefixes|blocks|sub-blocks|consumed-instances|hosts|slots|associated-projects|organizations|node-groups|node-templates|node-types|accelerator-types|queued-resources|reservations|topologies|tpu-vm|service-identity|versions|extensions|members|traffic-classification-rules)\b))*(?:\s+(?:list|describe|validate|get-[\w-]+|list-[\w-]+|describe-[\w-]+)(?![\w-])|(?=\s*(?:["''`)|;&\n]|$))))))\s',
+        ]

@@ -1,5 +1,5 @@
 {
-  "version": "f6dc619be8a2ab8f",
+  "version": "34fd90c062691d43",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -8,6 +8,7 @@
       "grants": {
         "publish": [
           "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.agent.platform.topology-skew",
           "a2a.topics.shared.blueprint",
           "a2a.topics.shared.annotations",
           "$JS.API.INFO",
@@ -20,6 +21,9 @@
           "$JS.API.STREAM.CREATE.KV_runtime-state",
           "$JS.API.STREAM.CREATE.KV_session-state",
           "$JS.API.STREAM.CREATE.KV_cap",
+          "$JS.API.STREAM.CREATE.KV_feedback",
+          "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
           "$JS.API.STREAM.INFO.TASKS",
           "$JS.API.STREAM.INFO.DIRECTORY",
           "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -27,6 +31,9 @@
           "$JS.API.STREAM.INFO.KV_runtime-state",
           "$JS.API.STREAM.INFO.KV_session-state",
           "$JS.API.STREAM.INFO.KV_cap",
+          "$JS.API.STREAM.INFO.KV_feedback",
+          "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
           "_INBOX.provision.>"
         ],
         "subscribe": [
@@ -46,22 +53,27 @@
       "narrowing": "pod"
     },
     {
-      "serviceAccount": "system:serviceaccount:kubeagents-system:agent",
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-gateway-agent",
       "user": "agent",
       "account": "APP",
       "grants": {
         "publish": [
           "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.agent.platform.topology-skew",
           "a2a.topics.shared.blueprint",
           "a2a.topics.shared.annotations",
           "$JS.API.STREAM.INFO.TOPICS-STATE",
           "$JS.API.DIRECT.GET.TOPICS-STATE.>",
           "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
           "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
+          "chat.notify.gchat",
+          "chat.notify.slack",
+          "chat.notify.console",
           "_INBOX.agent.>"
         ],
         "subscribe": [
           "a2a.topics.>",
+          "chat.notify.reply.agent.>",
           "_INBOX.agent.>"
         ]
       }

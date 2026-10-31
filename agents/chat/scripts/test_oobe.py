@@ -2,14 +2,15 @@
 
 Run: python3 -m unittest agents/chat/scripts/test_oobe.py
 
-oobe imports gitops_workspace from agents/platform/scripts, which the image copies
-beside the chat scripts; the tests stand in for its repository list rather than
-reading this machine's /etc/gitops.
+The stage reads no repository list; the no-repository test stands in an empty one so a
+check that came back would be seen.
 """
 
 import contextlib
 import io
 import json
+import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -34,7 +35,6 @@ NOW_SETTLED = FILED_AT + 600
 FALLBACK_SECONDS = oobe.bootstrap_handoff.DEADLINE_SECONDS + oobe.RANKING_ALLOWANCE_SECONDS
 NOW_PAST_FALLBACK = FILED_AT + FALLBACK_SECONDS
 RANKING_ID = "t_rank"
-REPOS = ["acme/gitops"]
 FIRST = [oobe.FIRST_RUN_AUDITS[0]]
 MINUTE = 60
 
@@ -67,12 +67,15 @@ class StageTest(unittest.TestCase):
         self.board = self.d / "kanban.db"
         self.started: list[tuple[list[str], dict]] = []
         self.failing: set[str] = set()
-        self.repos: list[str] | Exception = list(REPOS)
         self._roster([{"id": job_id, "enabled": True, "state": "scheduled"} for job_id in oobe.FIRST_RUN_AUDITS])
+        # The scan and delivery stages are their own modules, tested beside them; here they are stubs.
+        self.scan = mock.Mock(return_value=0)
+        self.deliver = mock.Mock(return_value=0)
         patches = [
             mock.patch.object(oobe, "board_path", lambda _d: self.board),
             mock.patch.object(oobe.subprocess, "run", self._run),
-            mock.patch.object(oobe, "managed_repositories", self._repos),
+            mock.patch.object(oobe.bootstrap_scan_gate, "main", self.scan),
+            mock.patch.object(oobe.bootstrap_delivery, "main", self.deliver),
         ]
         for p in patches:
             p.start()
@@ -85,11 +88,6 @@ class StageTest(unittest.TestCase):
         self.started.append((argv, env))
         code = 1 if argv[-1] in self.failing else 0
         return subprocess.CompletedProcess(argv, code, stdout="", stderr="no such job" if code else "")
-
-    def _repos(self):
-        if isinstance(self.repos, Exception):
-            raise self.repos
-        return self.repos
 
     def _roster(self, jobs: list[dict]) -> None:
         cron = self.d / "profiles" / "platform" / "cron"
@@ -114,30 +112,39 @@ class StageTest(unittest.TestCase):
         return [argv[-1] for argv, _env in self.started]
 
     def _ledger(
-        self, job_id: str, status: str, claimed_at: float, replace: bool = True, skip_reason: str | None = None
+        self,
+        job_id: str,
+        status: str,
+        claimed_at: float,
+        replace: bool = True,
+        skip_reason: str | None = None,
+        finished_at: float | None = None,
     ) -> None:
         """A run row in the Platform Agent's cron store, as profile-cron-tick leaves one.
 
-        The skip ledger's ``skip_reason`` column is added only for a row that carries one, so the
-        other tests read a store without it.
+        The ``skip_reason`` and ``finished_at`` columns are added only for a row that carries one,
+        so the other tests read a store without them.
         """
         db = self.d / "profiles" / "platform" / "cron" / oobe.EXECUTIONS_DB
         with sqlite3.connect(db) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS executions (id INTEGER PRIMARY KEY, job_id TEXT, status TEXT, claimed_at TEXT)")
+            columns = {"job_id": job_id, "status": status}
             if skip_reason is not None:
-                with contextlib.suppress(sqlite3.OperationalError):
-                    conn.execute("ALTER TABLE executions ADD COLUMN skip_reason TEXT")
+                columns["skip_reason"] = skip_reason
+            if finished_at is not None:
+                columns["finished_at"] = datetime.fromtimestamp(finished_at, timezone.utc).isoformat()
+            for optional in ("skip_reason", "finished_at"):
+                if optional in columns:
+                    with contextlib.suppress(sqlite3.OperationalError):
+                        conn.execute(f"ALTER TABLE executions ADD COLUMN {optional} TEXT")
             # A run's row is updated in place as it ends; a new status replaces the job's in-flight row.
             if replace:
                 conn.execute("DELETE FROM executions WHERE job_id = ? AND status IN ('claimed', 'running')", (job_id,))
-            claimed = datetime.fromtimestamp(claimed_at, timezone.utc).isoformat()
-            if skip_reason is None:
-                conn.execute("INSERT INTO executions (job_id, status, claimed_at) VALUES (?, ?, ?)", (job_id, status, claimed))
-            else:
-                conn.execute(
-                    "INSERT INTO executions (job_id, status, claimed_at, skip_reason) VALUES (?, ?, ?, ?)",
-                    (job_id, status, claimed, skip_reason),
-                )
+            columns["claimed_at"] = datetime.fromtimestamp(claimed_at, timezone.utc).isoformat()
+            conn.execute(
+                f"INSERT INTO executions ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+                tuple(columns.values()),
+            )
 
     def _drive(self, now: float = NOW_SETTLED, ticks: int = 20) -> float:
         """Tick the stage, completing each audit's run a minute after it is marked, until done."""
@@ -311,6 +318,39 @@ class StageTest(unittest.TestCase):
         self._main(now=NOW_PAST_FALLBACK + 10 * oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS)
         self.assertEqual(self._started_ids(), FIRST)
 
+    def test_a_fleet_past_the_first_run_cap_waits_for_its_uncarded_clusters(self):
+        # #3702: the marker's uncarded= agents have no card but are still in the hand-off's deadline.
+        per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
+        clusters = [(f"t_c{i}", "running", f"bootstrap-inventory-cluster-c{i}", SWEEP_CREATED_AT + 1) for i in range(6)]
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(
+            f"task_id={SWEEP_ID}\nfiled_at={FILED_AT}\nuncarded=4\n", encoding="utf-8"
+        )
+        _board(self.board, clusters)
+        self._main(now=NOW_PAST_FALLBACK + 6 * per_card)
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK + 10 * per_card - 1)
+        self.assertEqual(self.started, [])
+        self._main(now=NOW_PAST_FALLBACK + 10 * per_card)
+        self.assertEqual(self._started_ids(), FIRST)
+
+    def test_an_unpinned_sweep_waits_for_the_live_roster_past_the_cap(self):
+        # #3702: the marker pinned nothing (an empty or failed listing at filing), so the
+        # stage budgets the live roster's agents past the cap, as the hand-off does.
+        per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
+        clusters = [(f"t_c{i}", "running", f"bootstrap-inventory-cluster-c{i}", SWEEP_CREATED_AT + 1) for i in range(6)]
+        (self.d / oobe.SCAN_FILED_MARKER).write_text(
+            f"task_id={SWEEP_ID}\nfiled_at={FILED_AT}\ncap=6\n", encoding="utf-8"
+        )
+        _board(self.board, clusters)
+        with mock.patch.object(oobe.bootstrap_scan_gate, "cluster_agents", return_value=[{}] * 10) as listing:
+            self._main(now=NOW_PAST_FALLBACK + 6 * per_card)
+            self.assertEqual(self.started, [])
+            self._main(now=NOW_PAST_FALLBACK + 10 * per_card - 1)
+            self.assertEqual(self.started, [])
+            self._main(now=NOW_PAST_FALLBACK + 10 * per_card)
+        self.assertEqual(self._started_ids(), FIRST)
+        listing.assert_called_with(capped=False)
+
     def test_the_fallback_is_the_hand_offs_deadline_for_the_cards_it_counts(self):
         # An archived cluster card is not one the hand-off waits for, so the stage does not either.
         per_card = oobe.bootstrap_handoff.DEADLINE_PER_CARD_SECONDS
@@ -372,9 +412,10 @@ class StageTest(unittest.TestCase):
             self.assertEqual(env["HERMES_HOME"], str(self.d / "profiles" / "platform"))
 
     def test_the_chain_follows_1866s_order(self):
+        # #1866's four in its order, then the upgrade retrospective.
         self.assertEqual(
             oobe.FIRST_RUN_AUDITS,
-            ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention"),
+            ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention", "upgrade-retrospective"),
         )
 
     def test_the_trigger_marks_the_job_due_and_does_not_run_it(self):
@@ -521,11 +562,20 @@ class StageTest(unittest.TestCase):
 
     def test_a_run_under_way_when_the_sweep_was_filed_is_adopted(self):
         # The 06:20 run claimed while the reconcile held the gate, completed during onboarding.
-        self._ledger("compliance-audit", "completed", FILED_AT - 20 * MINUTE)
+        self._ledger("compliance-audit", "completed", FILED_AT - 20 * MINUTE, finished_at=FILED_AT + 5 * MINUTE)
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self._drive()
         self.assertNotIn("compliance-audit", self._started_ids())
+
+    def test_a_run_that_finished_before_the_sweep_was_filed_is_not_adopted(self):
+        # Claimed inside the run limit, but it saw the fleet before onboarding.
+        self._ledger("compliance-audit", "completed", FILED_AT - 20 * MINUTE, finished_at=FILED_AT - 5 * MINUTE)
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._drive()
+        self.assertEqual(self._started_ids(), list(oobe.FIRST_RUN_AUDITS))
+        self.assertEqual(oobe.read_state(self.d)[oobe.STATE_ADOPTED], [])
 
     def test_a_run_from_before_the_sweep_is_not_adopted(self):
         # Yesterday's scheduled run is not this install's first run.
@@ -775,11 +825,12 @@ class StageTest(unittest.TestCase):
             {"id": "obtainability-audit", "enabled": False, "state": "paused", "paused_at": "2026-10-06T00:00:00"},
             {"id": "stockout-prevention", "enabled": True, "paused_at": "2026-10-06T00:00:00"},
             {"id": "fleet-wide-cost-analysis", "enabled": True},
+            {"id": "upgrade-retrospective", "enabled": True},
         ])
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self._drive()
-        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis"])
+        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis", "upgrade-retrospective"])
         state = oobe.read_state(self.d)
         self.assertEqual(state[oobe.STATE_HELD], {
             "compliance-audit": "disabled",
@@ -837,41 +888,210 @@ class StageTest(unittest.TestCase):
 
     # --- no GitOps repository -------------------------------------------------
 
-    def test_no_repository_skips_and_finishes(self):
+    def test_the_audits_start_on_an_install_with_no_repository(self):
+        """With no repository the audits run without a forge, so the chain starts as it would with one."""
         self._file_scan()
         _board(self.board, [_ranking("done")])
-        self.repos = []
-        self._main()
-        self.assertEqual(self.started, [])
-        state = oobe.read_state(self.d)
-        self.assertTrue(state[oobe.STATE_DONE])
-        self.assertEqual(state[oobe.STATE_REASON], oobe.SKIP_NO_REPOSITORY)
-
-    def test_an_unreadable_repository_list_is_retried(self):
-        self._file_scan()
-        _board(self.board, [_ranking("done")])
-        self.repos = RuntimeError("kubectl binary not found in PATH")
-        self._main()
-        self.assertEqual(self.started, [])
-        self.assertFalse((self.d / oobe.AUDITS_MARKER).exists())
-        self.repos = list(REPOS)
-        self._main()
+        # Every reader the stage has used answers empty, so a repository check that came back
+        # would take its skip branch here rather than fail on a missing name.
+        empty = types.ModuleType("gitops_workspace")
+        for reader in ("get_managed_github_repo_names", "get_managed_github_repos", "get_managed_repos"):
+            setattr(empty, reader, lambda: [])
+        empty.managed_repos_registered = lambda: False
+        with mock.patch.dict(sys.modules, {"gitops_workspace": empty}):
+            self._main()
         self.assertEqual(self._started_ids(), FIRST)
+        self.assertFalse(oobe.read_state(self.d).get(oobe.STATE_SKIPPED))
 
     # --- once only ------------------------------------------------------------
 
-    def test_once_done_it_removes_itself_and_starts_nothing(self):
+    def _claim(self, at: float) -> None:
+        completed = self.d / ".bootstrap_completed"
+        completed.touch()
+        os.utime(completed, (at, at))
+
+    def _main_removing(self, now: float) -> list[str]:
+        removed: list[str] = []
+        jobs = types.ModuleType("cron.jobs")
+        jobs.remove_job = removed.append
+        with mock.patch.dict(sys.modules, {"cron": types.ModuleType("cron"), "cron.jobs": jobs}):
+            self._main(now=now)
+        return removed
+
+    def test_once_every_stage_is_done_it_removes_itself_and_the_old_jobs(self):
         self._file_scan()
         _board(self.board, [_ranking("done")])
         now = self._drive()
         self.started.clear()
-        removed = []
-        jobs = types.ModuleType("cron.jobs")
-        jobs.remove_job = removed.append
-        with mock.patch.dict(sys.modules, {"cron": types.ModuleType("cron"), "cron.jobs": jobs}):
-            self._main(now=now + MINUTE)
+        self.deliver.reset_mock()
+        self._claim(now - oobe.bootstrap_delivery.RETIRE_AFTER_SECONDS)
+        removed = self._main_removing(now)
         self.assertEqual(self.started, [])
-        self.assertEqual(removed, [oobe.OOBE_JOB_ID])
+        # The old entries first; removing oobe ends the run.
+        self.assertEqual(
+            removed, [oobe.bootstrap_delivery.SCAN_JOB_ID, oobe.bootstrap_delivery.DELIVERY_JOB_ID, oobe.OOBE_JOB_ID]
+        )
+        self.deliver.assert_not_called()
+
+    def test_it_stays_until_the_report_is_claimed(self):
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        now = self._drive()
+        self.assertEqual(self._main_removing(now + MINUTE), [])
+        self.deliver.assert_called_with(self.d)
+
+    def test_a_young_claim_keeps_it(self):
+        # The run that claimed the report may still be posting it.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        now = self._drive()
+        self._claim(now - oobe.bootstrap_delivery.RETIRE_AFTER_SECONDS + MINUTE)
+        self.assertEqual(self._main_removing(now), [])
+
+    def test_a_claimed_report_does_not_end_the_audits(self):
+        # Delivery can land before the chain ends; the job stays for the rest of it.
+        self._file_scan()
+        _board(self.board, [_ranking("done")])
+        self._claim(NOW_SETTLED - oobe.bootstrap_delivery.RETIRE_AFTER_SECONDS)
+        self.assertEqual(self._main_removing(NOW_SETTLED), [])
+        self.assertEqual(self._started_ids(), FIRST)
+
+    # --- the stages ------------------------------------------------------------
+
+    def test_the_stages_run_delivery_then_scan_then_audits(self):
+        # Delivery first, within seconds of the scheduler's snapshot of the job's destination.
+        order = []
+        self.scan.side_effect = lambda _d: order.append("scan")
+        self.deliver.side_effect = lambda _d: order.append("deliver") or 0
+        with mock.patch.object(oobe, "first_run_audits", lambda _d, _now: order.append("audits")):
+            self._main()
+        self.assertEqual(order, ["deliver", "scan", "audits"])
+
+    def test_the_exit_is_deliverys(self):
+        # A report delivery cannot read fails the run, which the scheduler posts as an alert.
+        self.deliver.return_value = 1
+        self.assertEqual(oobe.main(self.d, now=NOW_SETTLED), 1)
+
+    def test_a_failing_stage_still_delivers(self):
+        self.scan.side_effect = RuntimeError("board locked")
+        with mock.patch.object(oobe, "first_run_audits", mock.Mock(side_effect=RuntimeError("roster gone"))):
+            self.assertEqual(oobe.main(self.d, now=NOW_SETTLED), 0)
+        self.deliver.assert_called_once_with(self.d)
+
+    def test_only_delivery_reaches_stdout(self):
+        # Once oobe is linked to the chat, whatever it prints is posted there.
+        def speaks(_d, *_rest):
+            print("scan chatter")
+            os.write(oobe.STDOUT_FD, b"subprocess chatter\n")
+
+        def delivers(_d):
+            sys.stdout.write("REPORT")
+            return 0
+
+        self.scan.side_effect = speaks
+        self.deliver.side_effect = delivers
+        with tempfile.TemporaryFile() as captured, mock.patch.object(oobe, "first_run_audits", speaks):
+            saved = os.dup(oobe.STDOUT_FD)
+            out = io.StringIO()
+            try:
+                os.dup2(captured.fileno(), oobe.STDOUT_FD)
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    oobe.main(self.d, now=NOW_SETTLED)
+            finally:
+                os.dup2(saved, oobe.STDOUT_FD)
+                os.close(saved)
+            captured.seek(0)
+            self.assertEqual(captured.read(), b"")
+        self.assertEqual(out.getvalue(), "REPORT")
+
+    def test_a_failed_delivery_carries_only_its_own_stderr(self):
+        # Hermes posts a failed run's stderr to the linked chat, so the other stages log to a file.
+        def speaks(_d, *_rest):
+            sys.stderr.write("scan stderr\n")
+            os.write(oobe.STDERR_FD, b"subprocess stderr\n")
+            os.write(oobe.STDOUT_FD, b"subprocess stdout\n")
+
+        def fails(_d):
+            sys.stderr.write("delivery failed\n")
+            return 1
+
+        self.scan.side_effect = speaks
+        self.deliver.side_effect = fails
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err, mock.patch.object(
+            oobe, "first_run_audits", speaks
+        ):
+            saved = [os.dup(oobe.STDOUT_FD), os.dup(oobe.STDERR_FD)]
+            try:
+                os.dup2(out.fileno(), oobe.STDOUT_FD)
+                os.dup2(err.fileno(), oobe.STDERR_FD)
+                with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(
+                    os.fdopen(os.dup(oobe.STDERR_FD), "w")
+                ) as stream:
+                    code = oobe.main(self.d, now=NOW_SETTLED)
+                    stream.flush()
+            finally:
+                os.dup2(saved[0], oobe.STDOUT_FD)
+                os.dup2(saved[1], oobe.STDERR_FD)
+                for fd in saved:
+                    os.close(fd)
+            out.seek(0)
+            err.seek(0)
+            self.assertEqual(code, 1)
+            self.assertEqual(out.read(), b"")
+            self.assertEqual(err.read(), b"delivery failed\n")
+        log = (self.d / oobe.STAGE_LOG).read_text(encoding="utf-8")
+        self.assertEqual(log.count("scan stderr"), 2)
+        self.assertEqual(log.count("subprocess stderr"), 2)
+        self.assertEqual(log.count("subprocess stdout"), 2)
+
+    def test_a_stage_log_that_cannot_open_still_runs_the_stages_unheard(self):
+        def speaks(_d, *_rest):
+            print("scan chatter")
+
+        self.scan.side_effect = speaks
+        self.deliver.return_value = 0
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(oobe, "_open_stage_log", side_effect=PermissionError("read-only")), mock.patch.object(
+            oobe, "first_run_audits"
+        ) as audits, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(oobe.main(self.d, now=NOW_SETTLED), 0)
+        self.scan.assert_called_once()
+        audits.assert_called_once()
+        self.assertEqual(out.getvalue(), "")
+        self.assertNotIn("scan chatter", err.getvalue())
+
+    def test_a_stage_log_that_cannot_take_writes_still_restores_the_streams(self):
+        class Unwritable(io.StringIO):
+            def fileno(self):
+                return os.open(os.devnull, os.O_WRONLY)
+
+            def flush(self):
+                raise OSError(28, "No space left on device")
+
+            def close(self):
+                # As a real buffered file does: closed, and the failed flush raised.
+                super().close()
+                raise OSError(28, "No space left on device")
+
+        self.scan.side_effect = lambda _d, *_r: sys.stderr.write("scan line\n")
+        self.deliver.return_value = 0
+        before = [os.fstat(fd).st_ino for fd in (oobe.STDOUT_FD, oobe.STDERR_FD)]
+        with mock.patch.object(oobe, "_open_stage_log", side_effect=lambda _d: Unwritable()), mock.patch.object(
+            oobe, "first_run_audits"
+        ) as audits, contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(oobe.main(self.d, now=NOW_SETTLED), 0)
+        audits.assert_called_once()
+        self.assertEqual([os.fstat(fd).st_ino for fd in (oobe.STDOUT_FD, oobe.STDERR_FD)], before)
+        self.assertIn("could not write the stage log", err.getvalue())
+
+    def test_the_stage_log_is_rotated_past_its_cap(self):
+        log = self.d / oobe.STAGE_LOG
+        log.parent.mkdir(parents=True)
+        log.write_text("x" * (oobe.STAGE_LOG_MAX_BYTES + 1), encoding="utf-8")
+        with oobe._open_stage_log(self.d) as fh:
+            fh.write("fresh\n")
+        self.assertEqual(log.read_text(encoding="utf-8"), "fresh\n")
+        self.assertTrue(log.with_name(log.name + oobe.ROTATED_SUFFIX).is_file())
 
     def test_a_corrupt_marker_is_read_as_not_started(self):
         (self.d / oobe.AUDITS_MARKER).write_text("{not json", encoding="utf-8")
@@ -902,6 +1122,30 @@ class RosterTest(unittest.TestCase):
         self.assertEqual(job["script"], "oobe.py")
         self.assertTrue(job["no_agent"])
         self.assertEqual(job["deliver"], "local")
+
+    def test_the_retired_first_run_jobs_ship_disabled(self):
+        # oobe is the only job that may start the first-run audits; the image's
+        # `enabled` is what turns off a copy already on the volume.
+        roster = Path(__file__).resolve().parent.parent / "defaults" / "cron" / "jobs.json"
+        jobs = {job["id"]: job for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
+        entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
+        seeded = next(line for line in entrypoint.splitlines() if line.strip().startswith('ASSUME_RETIRED="bootstrap'))
+        for job_id in ("bootstrap-inventory-scan", "bootstrap-inventory-delivery"):
+            if job_id in jobs:
+                self.assertIs(jobs[job_id].get("enabled"), False, job_id)
+                self.assertIn(job_id, seeded.split('"')[1].split(","), job_id)
+
+    def test_the_retired_first_run_gate_is_deleted_from_volumes(self):
+        # oobe runs the first-run audits. A volume can still hold the gate
+        # enabled, and only the default profile's --cron-retire removes it.
+        roster = Path(__file__).resolve().parent.parent / "defaults" / "cron" / "jobs.json"
+        ids = {job["id"] for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
+        self.assertNotIn("first-run-quick-value-audit", ids)
+        entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
+        # The default profile's call is the one that also forces profile-cron-tick.
+        block = re.search(r'--cron-jobs "profile-cron-tick".*?--cron-retire "([^"]*)"', entrypoint, re.S)
+        self.assertIsNotNone(block, "the default profile's --cron-retire call was not found")
+        self.assertIn("first-run-quick-value-audit", block.group(1).split())
 
 
 if __name__ == "__main__":

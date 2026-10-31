@@ -25,8 +25,8 @@
 # An image without the job gets nothing put back, so nothing starts the audits.
 #
 # Before it arms, the apply waits for the install's own first-run stage to finish
-# (a fresh install has the job until its scan settles, its own chain has started
-# the last audit and the next tick has removed it), failing after `own_wait`. An earlier run's arm left behind is disarmed first. After the arm it
+# (its audits stage done, and, if the report was claimed, the job removed by the
+# tick that follows; own_stage.py says why), failing after `own_wait`. An earlier run's arm left behind is disarmed first. After the arm it
 # waits, up to `chain_wait`, for the stage to finish: it marks the audits one after
 # another, which outlasts the verifier's two-minute window. On an image without the
 # job there is nothing to wait for.
@@ -41,7 +41,8 @@
 # The teardown, and the exit trap on a failed apply, run disarm.py: the markers
 # go back as they were and the `oobe` job comes out if this stack put it there.
 # The audits the stage started are left to finish. Each writes its ledger issue in
-# the install's GitOps repository and posts its summary where it always does.
+# the install's GitOps repository (with none, its report in the report store) and,
+# when it changed something, posts its summary where it always does.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -61,13 +62,16 @@ locals {
   disarm_b64 = base64encode(file("${path.module}/disarm.py"))
   own_b64    = base64encode(file("${path.module}/own_stage.py"))
   # A fresh CI install's scan settles about 17 minutes after boot, then its chain runs three
-  # audits and claims the fourth (one to 45 minutes each). Held under the infra lock, which
-  # gives each stack-bearing case 30 minutes per contender, so a longer wait starves them.
+  # audits and claims the fourth (one to 45 minutes each). The runner holds the onboarding
+  # state lock while this waits, and hack/ci-eval-pr.sh sizes that lock's deadline from
+  # own_wait plus chain_wait (STATE_LOCK_HOLD_SECONDS), so a change here changes that too.
   own_wait = 3600
   # arm.py prints this when the image ships no oobe job.
   no_job = "ships no oobe job"
-  # The chain runs the four audits one after another (1-15 minutes each), and the stage is
-  # done once the last has started.
+  # The chain runs the four fleet audits and then the upgrade retrospective one after
+  # another (1-15 minutes each), and the stage is done once the last, the fifth, has
+  # started: four full runs plus the marks between them, under the hour by the design's
+  # one-to-eight-minute measurement (docs/designs/oobe.md, chain length).
   chain_wait = 3600
   poll       = 30
   # How long an exec into the agent Deployment waits for a pod when it has none.
@@ -161,8 +165,8 @@ resource "null_resource" "oobe" {
       printf '%s\n' "$armed"
 
       # ---- 4. Wait for the chain --------------------------------------------
-      # The stage marks the four audits one after another and is done once the last
-      # has started. Whether or not it gets there in time, the verifier decides; this
+      # The stage marks the five audits one after another and is done once the last,
+      # the retrospective, has started. Whether or not it gets there in time, the verifier decides; this
       # only keeps its two-minute window from opening before the chain has run.
       if [[ "$armed" != *"${local.no_job}"* ]]; then
         elapsed=0

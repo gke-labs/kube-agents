@@ -56,7 +56,17 @@ PREPARE_IMAGE_TREES_ARG="--prepare-image-trees"
 # home root above, so a home that gains a database gains a tripwire with it.
 AGENT_POD_DATABASES="${AGENT_POD_DATABASES:-kanban.db state.db}"
 AGENT_POD_DATABASE_NOTE="NOT-THE-AGENT-POD-DATABASE.txt"
-SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION"
+# KUBEAGENTS_SCOPE_DECLARED: the operator's one bit about the scope, read by the
+# fleet-audit collectors (fleet_scope_args.py) from the root-owned file below
+# first, then from the session's environment, which it reaches only through this
+# list, as the GKE_* variables do.
+# Where the scope answer is written for the collectors, root-owned (step 4).
+SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"
+# KUBEAGENTS_AUDIT_AUTO_PROMOTE: the operator's one bit about the fleet audits'
+# automatic remediation pull requests (off when "false"), read by audit_report.py
+# from the root-owned file below first, then from the session's environment.
+SANDBOX_AUDIT_AUTO_PROMOTE_FILE="/run/kube-agents-sandbox/audit-auto-promote"
+SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED KUBEAGENTS_AUDIT_AUTO_PROMOTE"
 
 # Nearly every name under $DATA is owned by uid 1000 -- the image trees step 1a
 # stages are root's, everything else is the model's -- and all of it survives a
@@ -609,6 +619,18 @@ install -d -m 0755 /etc/ssh/sshd_config.d
   echo "SetEnv $setenv_args"
 } >"$SANDBOX_SSHD_DROPIN"
 chmod 0644 "$SANDBOX_SSHD_DROPIN"
+# The scope answer as a root-owned file too: the SetEnv above hands sessions a
+# variable they can unset or override in one word, and the fleet-audit
+# collectors (fleet_scope_args.py) read this file before the variable so a run
+# that did would still be refused. Written whatever the value, so a session
+# cannot supply the file either.
+install -d -m 0755 "$(dirname "$SANDBOX_SCOPE_DECLARED_FILE")"
+printf '%s\n' "${KUBEAGENTS_SCOPE_DECLARED:-false}" >"$SANDBOX_SCOPE_DECLARED_FILE"
+chmod 0644 "$SANDBOX_SCOPE_DECLARED_FILE"
+# The audits' auto-promotion switch the same way, for the same reason: an
+# operator who turned the sweep off must not have a session turn it back on.
+printf '%s\n' "${KUBEAGENTS_AUDIT_AUTO_PROMOTE:-true}" >"$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"
+chmod 0644 "$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"
 # Fail here rather than in sshd. An invalid drop-in makes sshd exit during
 # startup with a message about /etc/ssh/sshd_config.d/10-sandbox-env.conf, a
 # file that exists in no source tree; `-t` names it while the entrypoint is

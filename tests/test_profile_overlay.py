@@ -309,7 +309,9 @@ class DefaultProfileTest(unittest.TestCase):
             self.home / "config.yaml",
             {
                 "plugins": {"enabled": ["hermes_otel"]},
-                "kanban": {"max_in_progress": 2},
+                # tuning.default's limits are an operator key the default overlay
+                # carries; this stands for the image's or the agent's own value.
+                "agent": {"max_turns": 90},
                 "platforms": {"google_chat": {"home_channel": "spaces/AAA"}},
             },
         )
@@ -334,14 +336,14 @@ class DefaultProfileTest(unittest.TestCase):
             {
                 "plugins": {"enabled": ["adapter"]},
                 "approvals": {"e2e_test_setting": {"enabled": True}},
-                "kanban": {"max_in_progress": 8},
+                "agent": {"max_turns": 40},
             }
         )
         self.assertEqual(self.run_main(), 0)
         cfg = self.config()
         self.assertEqual(cfg["plugins"]["enabled"], ["hermes_otel", "adapter"])
         self.assertEqual(cfg["approvals"], {"e2e_test_setting": {"enabled": True}})
-        self.assertEqual(cfg["kanban"]["max_in_progress"], 8)
+        self.assertEqual(cfg["agent"]["max_turns"], 40)
 
     def test_the_agents_own_keys_survive(self):
         """/sethome's home_channel is the whole reason this file stays writable."""
@@ -352,7 +354,7 @@ class DefaultProfileTest(unittest.TestCase):
         )
 
     def test_withdrawing_the_overlay_reverts_the_front_door(self):
-        self.write_default({"plugins": {"enabled": ["adapter"]}, "kanban": {"max_in_progress": 8}})
+        self.write_default({"plugins": {"enabled": ["adapter"]}, "agent": {"max_turns": 40}})
         self.run_main()
 
         (self.overlay_dir / "profile-default.overlay.yaml").unlink()
@@ -360,19 +362,19 @@ class DefaultProfileTest(unittest.TestCase):
 
         cfg = self.config()
         self.assertEqual(cfg["plugins"]["enabled"], ["hermes_otel"], "plugin must be disabled again")
-        self.assertEqual(cfg["kanban"]["max_in_progress"], 2, "the image's cap must come back")
+        self.assertEqual(cfg["agent"]["max_turns"], 90, "the prior turn budget must come back")
         self.assertFalse((self.home / po.STATE_FILENAME).exists())
 
     def test_no_cluster_class_overlay_reaches_the_front_door(self):
         """`tuning.cluster` is for cluster profiles; the name must not match it."""
         write(self.overlay_dir / po.CLUSTER_CLASS_OVERLAY, {"agent": {"max_turns": 150}})
         self.run_main()
-        self.assertNotIn("agent", self.config())
+        self.assertEqual(self.config()["agent"], {"max_turns": 90})
 
     def test_a_named_profiles_overlay_is_not_applied_here(self):
         write(self.overlay_dir / "profile-platform.overlay.yaml", {"agent": {"max_turns": 150}})
         self.run_main()
-        self.assertNotIn("agent", self.config())
+        self.assertEqual(self.config()["agent"], {"max_turns": 90})
 
     def test_the_name_is_still_required_to_be_default(self):
         """--profile-name is a narrow escape hatch, not a way past validation."""

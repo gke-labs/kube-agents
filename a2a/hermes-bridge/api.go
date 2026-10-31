@@ -22,7 +22,8 @@ import (
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// The API executor: a task is one turn in the conversation's Hermes session.
+// The API executor: a task is a turn in the conversation's Hermes session,
+// and one more turn in it for each follow-up the task queues.
 //
 // Instead of a cold `hermes chat -Q` per task, the bridge POSTs the task's
 // text to the Hermes API server in the same pod, which runs it under the
@@ -36,10 +37,12 @@ import (
 // and the second task sees the first's turns. Nothing in Hermes changes.
 //
 // The subprocess executor stays as a fallback (Config.Executor); what this
-// one does not do, by design of the stopgap it is: steer a running turn (the
-// fixed route keeps refusing steers), or bring a kanban card's completion
-// back to the thread (the API server has no push channel, so it never
-// reaches the A2A task; the subprocess loses it the same way). Both are
+// one does not do, by design of the stopgap it is: steer a running turn (a
+// follow-up waits for the turn to end and runs as the next turn in the same
+// session; bridge.go, queueSteer). A kanban card's completion never reaches
+// the A2A task (the API server has no push channel); it goes back to the
+// conversation through the gateway's chat.notify route instead, on the route
+// this executor records before a task's first turn (route.go). Both are
 // named in a2a/docs/hermes-bridge.md.
 const (
 	// ExecutorAPI runs a task as a turn in the conversation's Hermes session
@@ -79,8 +82,10 @@ const (
 	apiSessionIDHeader  = "X-Hermes-Session-Id"
 	// apiIdempotencyHeader is the server's replay guard: a request retried
 	// with the same key returns the first run's answer instead of running
-	// the turn again. The task id is the key, so a bridge restart that
-	// redelivers a task does not run it twice in the session.
+	// the turn again. Each turn has its own key (apiTurnKey): the task id for
+	// the opening turn, so a bridge restart that redelivers a task does not
+	// run it twice in the session, and "<taskId>/<envelopeId>" for a
+	// follow-up's, so it never replays the opening answer.
 	apiIdempotencyHeader = "Idempotency-Key"
 	// apiRateLimitedStatus is the status the server answers when it is
 	// already running its cap of concurrent turns
@@ -211,7 +216,9 @@ type apiChatMessage struct {
 }
 
 // apiChatResponse is the subset of the chat-completions response the bridge
-// reads: the first choice's text, and the server's own verdict on the turn.
+// reads: the first choice's text, the server's own verdict on the turn, and
+// what the turn cost (Model and Usage, each optional; a server that sends
+// neither leaves the usage artifact with the turn's wall time alone).
 // A turn that failed with no text comes back as an OpenAI error envelope
 // with a non-2xx status, read as text; one that failed with text (a
 // provider error, a rate limit the retries did not outlast, the failure
@@ -226,6 +233,88 @@ type apiChatResponse struct {
 		Failed bool   `json:"failed"`
 		Error  string `json:"error"`
 	} `json:"hermes"`
+	// Raw, decoded on their own by apiTurnUsage: telemetry must not fail
+	// the decode that carries the answer, so a model or usage in a shape
+	// the bridge does not expect is dropped, never the turn.
+	Model json.RawMessage `json:"model"`
+	Usage json.RawMessage `json:"usage"`
+}
+
+// apiUsage is a response's token counts, in either spelling the server may
+// use: the chat-completions one (prompt_tokens, completion_tokens) or the
+// responses one (input_tokens, output_tokens). Hermes's prompt_tokens is
+// every token the model read, cached reads included, which is what the
+// usage artifact's inputTokens means. The counts are float64 so a count
+// written as 1200.0 still decodes; the part carries whole tokens.
+type apiUsage struct {
+	PromptTokens     float64 `json:"prompt_tokens"`
+	CompletionTokens float64 `json:"completion_tokens"`
+	InputTokens      float64 `json:"input_tokens"`
+	OutputTokens     float64 `json:"output_tokens"`
+}
+
+// apiTurnUsage is one answered turn's usage part: the server's model name
+// when it sent one (the alias the request named otherwise), its token
+// counts when it sent them in a shape the bridge reads, and the turn's wall
+// time as the bridge measured it from the request to the body read. No
+// cost: Hermes behind the gateway prices nothing
+// (docs/site/src/content/docs/deploy/telemetry.md), and the artifact
+// carries no figure the producer invented. A field that is present but does
+// not decode is left out and named in dropped, for the one warning the
+// caller logs per turn; it never fails the turn.
+func apiTurnUsage(out *apiChatResponse, requested string, took time.Duration) (u lib.Usage, dropped []string) {
+	u = lib.Usage{DurationMs: turnMillis(took)}
+	switch {
+	case len(out.Model) == 0:
+	case json.Unmarshal(out.Model, &u.Model) != nil:
+		dropped = append(dropped, "model")
+	}
+	if u.Model == "" {
+		u.Model = requested
+	}
+	var counts apiUsage
+	switch {
+	case len(out.Usage) == 0:
+	case json.Unmarshal(out.Usage, &counts) != nil:
+		dropped = append(dropped, "usage")
+	default:
+		// A count that is negative or past what the part carries is that
+		// field dropped, named, so the part keeps its time and model.
+		var ok bool
+		if u.InputTokens, ok = lib.UsageFigure(max(counts.PromptTokens, counts.InputTokens)); !ok {
+			dropped = append(dropped, "usage.prompt_tokens")
+		}
+		if u.OutputTokens, ok = lib.UsageFigure(max(counts.CompletionTokens, counts.OutputTokens)); !ok {
+			dropped = append(dropped, "usage.completion_tokens")
+		}
+	}
+	return u, dropped
+}
+
+// publishTurnUsage publishes an answered or failed API turn's usage under
+// run.mu, and logs the fields the response carried in a shape the bridge
+// does not read, once per turn.
+func (b *Bridge) publishTurnUsage(run *taskRun, out *apiChatResponse, took time.Duration) {
+	u, dropped := apiTurnUsage(out, b.cfg.APIModel, took)
+	if len(dropped) > 0 {
+		b.cfg.Logger.Warn("usage telemetry on the API response did not decode; those figures are not on the bus",
+			"task", run.origin.TaskID, "fields", dropped)
+	}
+	run.mu.Lock()
+	if run.state == stateRunning {
+		b.publishUsageLocked(run, u)
+	}
+	run.mu.Unlock()
+}
+
+// turnMillis is a turn's wall time for the usage part: whole milliseconds,
+// and at least one for a turn that took any time at all, so a fast turn is
+// a figure rather than the zero the part omits.
+func turnMillis(took time.Duration) int64 {
+	if took <= 0 {
+		return 0
+	}
+	return max(1, took.Milliseconds())
 }
 
 // apiTurnFailed reports whether the server marked the turn failed, the case
@@ -236,9 +325,11 @@ func apiTurnFailed(out *apiChatResponse) bool {
 }
 
 // runTaskAPI is runTask for ExecutorAPI. The lifecycle is the subprocess
-// path's: working when the turn starts, one terminal from this goroutine,
-// cancel and the deadline end the request rather than a process group, and
-// shutdown names itself.
+// path's: working when the first turn starts, one terminal from this
+// goroutine, cancel and the deadline end the request rather than a process
+// group, and shutdown names itself. A follow-up queued during a turn runs as
+// the next turn in the same session, under the same session slot, after the
+// turn before it has answered.
 func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	taskID := run.origin.TaskID
 	prompt, ok := promptFromMessage(run.origin.Payload)
@@ -248,59 +339,71 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		return
 	}
 	sessionID := apiSessionID(run.origin.ContextID)
-	body, err := json.Marshal(apiChatRequest{
-		Model:    b.cfg.APIModel,
-		Messages: []apiChatMessage{{Role: "user", Content: prompt}},
+	// The task's own context: the deadline bounds every turn together;
+	// cancel and shutdown end whichever request is in flight. Not the
+	// consumer's context, which a shutdown cancels before shutdownTasks can
+	// name the cause. It stays in cancelReq for the whole task, so a cancel
+	// between turns still ends the next one's request.
+	taskCtx, cancelTask := context.WithTimeout(context.Background(), b.cfg.TaskDeadline)
+	defer cancelTask()
+	// The deadline as a flag too, as the cli timer sets it: nextSteer reads
+	// it between turns, so no follow-up is picked once the deadline is up.
+	stopDeadline := context.AfterFunc(taskCtx, func() {
+		if errors.Is(taskCtx.Err(), context.DeadlineExceeded) {
+			run.deadlineHit.Store(true)
+		}
 	})
-	if err != nil {
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: request-encode-failed - %v", err), nil)
-		return
-	}
-	// The request's own context: the task deadline bounds it, cancel and
-	// shutdown end it, and it is not the consumer's context, which a
-	// shutdown cancels before shutdownTasks can name the cause.
-	reqCtx, cancelReq := context.WithTimeout(context.Background(), b.cfg.TaskDeadline)
-	defer cancelReq()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, b.cfg.APIURL, bytes.NewReader(body))
-	if err != nil {
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: request-build-failed - %v", err), nil)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+b.cfg.APIKey)
-	req.Header.Set(apiSessionKeyHeader, sessionID)
-	req.Header.Set(apiSessionIDHeader, sessionID)
-	req.Header.Set(apiIdempotencyHeader, taskID)
-
+	defer stopDeadline()
 	run.mu.Lock()
 	if run.state != stateRunning {
 		run.mu.Unlock()
 		return
 	}
-	run.cancelReq = cancelReq
+	run.cancelReq = cancelTask
 	if run.canceled.Load() {
-		cancelReq()
+		cancelTask()
 	}
 	run.mu.Unlock()
+	defer func() { run.mu.Lock(); run.cancelReq = nil; run.mu.Unlock() }()
 
 	// A task behind its session's previous turn has not started: it stays
 	// submitted, with no heartbeat, until the turn is its own, so nothing
 	// reads a wait as a run.
-	release := b.turns.acquire(reqCtx, sessionID)
+	release := b.turns.acquire(taskCtx, sessionID)
 	if release == nil {
-		b.finalizeAPIError(run, reqCtx, errWaitingForTurn)
+		b.finalizeAPIError(run, taskCtx, errWaitingForTurn, 1)
 		return
 	}
-	defer release()
-	if err := run.exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+	defer release() // every turn of the task runs under this one slot
+	if err := b.publishWorking(ctx, run); errors.Is(err, errRunEnded) {
+		return // canceled or shut down first; its finalize wrote the terminal
+	} else if err != nil {
 		b.cfg.Logger.Error("working publish failed", "task", taskID, "err", err)
 		b.finalize(run, lib.StateFailed, "reason: bus-publish-failed at working", nil)
 		return
 	}
 
+	// Recorded before the first turn, so a card any turn files finds it;
+	// every turn of the task is the same session and conversation. Best
+	// effort: the task runs either way, and a failure is said in the answer.
+	routeLost := false
+	routeErr := b.recordRoute(taskCtx, sessionID, run.origin)
+	if routeErr != nil && !errors.Is(routeErr, errNoChatConversation) && !errors.Is(routeErr, errRouteDisabled) {
+		b.cfg.Logger.Warn("conversation route not recorded; a card this task files cannot report back",
+			"task", taskID, "session", sessionID, "err", routeErr)
+		routeLost = true
+	}
+	// Only a recorded route lets a card's post reach the conversation, so only
+	// then may the terminal keep the ask for those posts to settle (cardsMark).
+	run.routeRecorded.Store(routeErr == nil)
+	// The opening turn only: a follow-up runs in a session that has already
+	// read the report, and the hook this mirrors reads the thread once per
+	// message a person sends, which the opening turn is.
+	prompt = b.attachPushedReport(taskCtx, sessionID, run.origin, prompt)
+
 	// The door's side of this task: attributed by the session id the hook
 	// payload carries, signed with the pod's shared secret, and only while
-	// this task holds the session's turn.
+	// this task holds the session's turn - every turn of it.
 	act := newSessionActivityState(sessionID, b.apiTraced())
 	act.inTurn.Store(true)
 	defer act.inTurn.Store(false)
@@ -313,26 +416,127 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	go b.runActivity(run)
 	run.mu.Unlock()
 
-	resp, err := b.sendAPI(reqCtx, req, body)
+	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
+	var prev string         // the turn before's answer, published as a turn artifact
+	for turn := 1; ; turn++ {
+		// A follow-up's synthesis step needs work of its own (beginTurn).
+		act.beginTurn()
+		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
+		if !ok {
+			return
+		}
+		next, nextPrompt := b.runnableSteer(ctx, run)
+		if next == nil {
+			// A canceled task whose turn finished anyway won the race:
+			// completed wins, per the payload spec's cancel mapping, as on
+			// the subprocess path.
+			if routeLost {
+				// Above a declared step's line, which has to stay last.
+				text = withNote(text, routeLostNote)
+			}
+			b.finalize(run, lib.StateCompleted, "", &text)
+			return
+		}
+		if !b.publishTurnAnswer(run, turn, text) {
+			return
+		}
+		steer, prompt, prev = next, nextPrompt, text
+	}
+}
+
+// apiTurnKey is a turn's Idempotency-Key. The opening turn keeps the task
+// id, which is what a redelivered submission was always keyed on; a
+// follow-up adds its own envelope id, so it never replays the opening
+// answer and a redelivered follow-up maps to its own first run.
+func apiTurnKey(taskID string, steer *lib.Envelope) string {
+	if steer == nil {
+		return taskID
+	}
+	return taskID + "/" + steer.EnvelopeID
+}
+
+// apiTurn posts one turn to the session on taskCtx and returns its answer.
+// steer is the follow-up the turn runs, nil on turn 1, and prev the answer
+// of the turn before it; the follow-up leaves the queue in the critical
+// section that checks the task is still to run, so a cancel, deadline or
+// shutdown that lands after that check finds the request's context in
+// cancelReq and ends it. false means the task is final: it already was, or
+// this finalized it - including a follow-up's turn that found the task
+// canceled, past its deadline or the bridge stopping, which sends nothing
+// and ends the task with prev still attached as the result
+// (finalizeTurnNotSent).
+func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, steer *lib.Envelope, turn int, prev string) (string, bool) {
+	body, err := json.Marshal(apiChatRequest{
+		Model:    b.cfg.APIModel,
+		Messages: []apiChatMessage{{Role: "user", Content: prompt}},
+	})
 	if err != nil {
-		b.finalizeAPIError(run, reqCtx, err)
-		return
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: request-encode-failed - %v", err), nil)
+		return "", false
+	}
+	req, err := http.NewRequestWithContext(taskCtx, http.MethodPost, b.cfg.APIURL, bytes.NewReader(body))
+	if err != nil {
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: request-build-failed - %v", err), nil)
+		return "", false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+b.cfg.APIKey)
+	req.Header.Set(apiSessionKeyHeader, sessionID)
+	req.Header.Set(apiSessionIDHeader, sessionID)
+	req.Header.Set(apiIdempotencyHeader, apiTurnKey(run.origin.TaskID, steer))
+
+	if steer != nil {
+		run.mu.Lock()
+		if run.state != stateRunning {
+			// Finalized first; it refused this follow-up with the rest.
+			run.mu.Unlock()
+			return "", false
+		}
+		if run.canceled.Load() || run.deadlineHit.Load() || taskCtx.Err() != nil || b.closing.Load() {
+			// Checked under the lock the cancel and shutdown take before
+			// they end cancelReq, after each has stored its flag: one that
+			// lands after this check ends the request below.
+			run.mu.Unlock()
+			b.finalizeTurnNotSent(run, prev)
+			return "", false
+		}
+		if !takeSteerLocked(run, steer) {
+			// A finalize has taken the queue (and refused it) and is on its
+			// way to the terminal. Unreachable while every finalizer sets a
+			// flag checked above; a request here would contradict its notice.
+			run.mu.Unlock()
+			b.cfg.Logger.Error("follow-up gone from the queue head before its turn; not sending",
+				"task", run.origin.TaskID, "envelope", steer.EnvelopeID)
+			return "", false
+		}
+		// The last answer is on the stream as a turn artifact; from here
+		// a shutdown ends this request, and its terminal names the turn.
+		run.answerHeld = false
+		run.turn = turn
+		run.mu.Unlock()
+	}
+
+	resp, connectedAt, err := b.sendAPI(taskCtx, req, body)
+	if err != nil {
+		b.finalizeAPIError(run, taskCtx, err, turn)
+		return "", false
 	}
 	defer resp.Body.Close()
-	// cancelReq stays set through the body read: the server can send its
-	// headers before the body, and a cancel or shutdown in between must
+	// taskCtx stays cancelable through the body read: the server can send
+	// its headers before the body, and a cancel or shutdown in between must
 	// still end the request.
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, apiResponseCap+1))
-	run.mu.Lock()
-	run.cancelReq = nil
-	run.mu.Unlock()
-	if err != nil && reqCtx.Err() != nil {
-		b.finalizeAPIError(run, reqCtx, err)
-		return
+	// The turn's wall time: from the connection the server answered on to
+	// the end of the body, before any lock below adds to it, and without
+	// the refused dials sendAPI retried first.
+	took := time.Since(connectedAt)
+	if err != nil && taskCtx.Err() != nil {
+		b.finalizeAPIError(run, taskCtx, err, turn)
+		return "", false
 	}
 	if err != nil {
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-read-failed - %v", err), nil)
-		return
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-read-failed - %v%s", err, turnNote(turn)), nil)
+		return "", false
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		reason := "hermes-api-failed"
@@ -345,38 +549,70 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 			// turn that ran and failed answers 5xx.
 			reason = "hermes-api-refused"
 		}
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d; session: %s; body tail: %s",
-			reason, resp.StatusCode, sessionID, tail(string(raw), apiBodyTailBytes)), nil)
-		return
+		if resp.StatusCode >= http.StatusInternalServerError {
+			// A turn that ran and failed with no answer: the server's error
+			// envelope carries no counts the bridge reads, so its usage is
+			// the wall time, as the CLI executor's is for a run that failed
+			// on its own. A 4xx ran nothing and publishes nothing.
+			b.publishTurnUsage(run, &apiChatResponse{}, took)
+		}
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d; session: %s%s; body tail: %s",
+			reason, resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
+		return "", false
 	}
 	if len(raw) > apiResponseCap {
 		// Refused, never truncated: a cut answer would fail to parse and
 		// read as a protocol fault, and a shortened one is worse than a
 		// loud failure.
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-oversize - HTTP %d; session: %s; "+
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-oversize - HTTP %d; session: %s%s; "+
 			"the response body is over the %d-byte limit (apiResponseCap in api.go); the answer was refused rather than truncated",
-			resp.StatusCode, sessionID, apiResponseCap), nil)
-		return
+			resp.StatusCode, sessionID, turnNote(turn), apiResponseCap), nil)
+		return "", false
 	}
 	var out apiChatResponse
 	if err := json.Unmarshal(raw, &out); err != nil || len(out.Choices) == 0 {
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreadable - HTTP %d; session: %s; body tail: %s",
-			resp.StatusCode, sessionID, tail(string(raw), apiBodyTailBytes)), nil)
-		return
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreadable - HTTP %d; session: %s%s; body tail: %s",
+			resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
+		return "", false
 	}
 	if apiTurnFailed(&out) {
 		reason := "hermes-api-failed"
 		if apiRateLimitedReasons[resp.Header.Get(apiFailureReasonHeader)] {
 			reason = "hermes-rate-limited"
 		}
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s; error: %s",
-			reason, resp.StatusCode, sessionID, tail(out.Hermes.Error, apiBodyTailBytes)), nil)
-		return
+		// A turn that ran and failed still read tokens: its usage goes out
+		// ahead of the failed terminal, as the worker adapter's does.
+		b.publishTurnUsage(run, &out, took)
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s%s; error: %s",
+			reason, resp.StatusCode, sessionID, turnNote(turn), tail(out.Hermes.Error, apiBodyTailBytes)), nil)
+		return "", false
 	}
-	// A canceled task that finished anyway won the race: completed wins,
-	// per the payload spec's cancel mapping, as on the subprocess path.
-	text := out.Choices[0].Message.Content
-	b.finalize(run, lib.StateCompleted, "", &text)
+	if answer := out.Choices[0].Message.Content; opensWithUnstructuredReasoning(answer) {
+		// The model's reasoning, not an answer (#3206): withheld from the
+		// stream, final or turn answer alike. The turn ran and read tokens,
+		// so its usage goes out ahead of the terminal, as a failed turn's does.
+		b.withholdUnstructuredReasoning(run, sessionID, turn, answer)
+		b.publishTurnUsage(run, &out, took)
+		b.finalize(run, lib.StateFailed, unstructuredReasoningReason(sessionID, turn), nil)
+		return "", false
+	}
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state != stateRunning {
+		return "", false // finalized while the answer was read
+	}
+	// Held until it is on the stream: shutdownTasks leaves the run to this
+	// worker from here (answerHeld).
+	run.answerHeld = true
+	// What the turn cost, ahead of its answer and under the same lock a
+	// finalizer takes, so the usage part never follows the terminal.
+	u, dropped := apiTurnUsage(&out, b.cfg.APIModel, took)
+	if len(dropped) > 0 {
+		b.cfg.Logger.Warn("usage telemetry on the API response did not decode; those figures are not on the bus",
+			"task", run.origin.TaskID, "fields", dropped)
+	}
+	b.publishUsageLocked(run, u)
+	return out.Choices[0].Message.Content, true
 }
 
 // sendAPI sends req, retrying a refused connection every
@@ -384,14 +620,17 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 // A response of any status is returned as it is; an error is wrapped in
 // errNeverConnected when no attempt got a connection, so no request was
 // sent.
-func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*http.Response, error) {
-	var connected atomic.Bool
+func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*http.Response, time.Time, error) {
+	// connectedAt is when the attempt that got a connection got it, as
+	// UnixNano, so the turn's clock starts at the request the server
+	// received rather than at the first refused dial.
+	var connectedAt atomic.Int64
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+		GotConn: func(httptrace.GotConnInfo) { connectedAt.Store(time.Now().UnixNano()) },
 	})
 	req = req.WithContext(ctx)
 	neverConnected := func(err error) error {
-		if connected.Load() {
+		if connectedAt.Load() != 0 {
 			return err
 		}
 		return fmt.Errorf("%w: %w", errNeverConnected, err)
@@ -400,14 +639,14 @@ func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*
 	for {
 		resp, err := b.apiClient.Do(req)
 		if err == nil {
-			return resp, nil
+			return resp, time.Unix(0, connectedAt.Load()), nil
 		}
 		if !errors.Is(err, syscall.ECONNREFUSED) || time.Now().After(giveUp) {
-			return nil, neverConnected(err)
+			return nil, time.Time{}, neverConnected(err)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, neverConnected(err)
+			return nil, time.Time{}, neverConnected(err)
 		case <-time.After(apiConnectRetryInterval):
 		}
 		req = req.Clone(ctx)
@@ -415,10 +654,34 @@ func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*
 	}
 }
 
+// finalizeTurnNotSent ends a task whose next follow-up found it canceled,
+// past its deadline or the bridge stopping before its request was sent. The
+// turn before's answer is already on the stream as a turn artifact, but a
+// reader of the result would not find it, so it is attached as the result
+// too, ahead of the terminal the cause calls for. The attached result is a
+// copy (finalizeCopy): if it fails to publish, the terminal keeps the
+// cause's state, so a cancel still ends canceled. The follow-up never ran,
+// so the terminal does not name its turn.
+func (b *Bridge) finalizeTurnNotSent(run *taskRun, answer string) {
+	switch {
+	case run.canceled.Load():
+		b.finalizeCopy(run, lib.StateCanceled, "reason: canceled-by-request", answer)
+	case b.closing.Load():
+		b.finalizeCopy(run, lib.StateFailed, shutdownReason, answer)
+	default:
+		// Only the deadline is left: it passed between two turns, after
+		// the last answer went out as a turn artifact.
+		b.finalizeCopy(run, lib.StateFailed,
+			fmt.Sprintf("reason: deadline-exceeded - the task deadline %s passed before the next turn; no request was sent", b.cfg.TaskDeadline), answer)
+	}
+}
+
 // finalizeAPIError ends a task whose request (or wait for its session's
 // turn) ended without a response, naming the cause: the cancel, the
-// shutdown and the deadline each end reqCtx, so they are read first.
-func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err error) {
+// shutdown and the deadline each end reqCtx, so they are read first. A
+// follow-up turn (turn ≥ 2) that started and ended here is named, as
+// apiTurn's in-band failures name it.
+func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err error, turn int) {
 	switch {
 	case run.canceled.Load() && errors.Is(err, errWaitingForTurn):
 		// Nothing was sent: the task was still waiting for its turn, the
@@ -427,19 +690,19 @@ func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err erro
 	case run.canceled.Load():
 		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", nil)
 	case b.closing.Load():
-		b.finalize(run, lib.StateFailed, shutdownReason, nil)
+		b.finalize(run, lib.StateFailed, shutdownReason+turnNote(turn), nil)
 	case reqCtx.Err() == context.DeadlineExceeded && errors.Is(err, errWaitingForTurn):
 		b.finalize(run, lib.StateFailed,
 			fmt.Sprintf("reason: session-busy - waited %s for the session's previous turn; no request was sent", b.cfg.TaskDeadline), nil)
 	case reqCtx.Err() == context.DeadlineExceeded && errors.Is(err, errNeverConnected):
 		// Infrastructure, as the refused connection past the retry window
 		// is: the deadline ended a wait for a server that never listened.
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreachable - task deadline %s ended before the server accepted a connection; no request was sent: %v", b.cfg.TaskDeadline, err), nil)
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreachable - task deadline %s ended before the server accepted a connection; no request was sent: %v%s", b.cfg.TaskDeadline, err, turnNote(turn)), nil)
 	case reqCtx.Err() == context.DeadlineExceeded:
 		b.finalize(run, lib.StateFailed,
-			fmt.Sprintf("reason: deadline-exceeded - request ended after %s", b.cfg.TaskDeadline), nil)
+			fmt.Sprintf("reason: deadline-exceeded - request ended after %s%s", b.cfg.TaskDeadline, turnNote(turn)), nil)
 	default:
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreachable - %v", err), nil)
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreachable - %v%s", err, turnNote(turn)), nil)
 	}
 }
 

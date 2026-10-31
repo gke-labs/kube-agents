@@ -53,6 +53,7 @@ def run_hook(
     rc_commit_sha: str = "",
     path_prepend: str = "",
     mode_next: str = "",
+    rollback_lane: str = "",
 ) -> subprocess.CompletedProcess:
     """Exit a `set -euo pipefail` shell with `exit_code`, real trap installed.
 
@@ -69,6 +70,7 @@ def run_hook(
         f'export PULL_NUMBER="{pull_number}"',
         f'export RC_COMMIT_SHA="{rc_commit_sha}"',
         f'export EVAL_MODE_NEXT="{mode_next}"',
+        f'export EVAL_ROLLBACK_LANE="{rollback_lane}"',
         # Always pinned: the suite itself runs under Prow, where a real
         # $ARTIFACTS is set, and the hook copies its log there.
         f'export ARTIFACTS="{artifacts}"',
@@ -204,11 +206,11 @@ class PublishHookFailSafeTest(unittest.TestCase):
             dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
             self.assertEqual(list(dash.glob("*.ran")), [])
 
-    def test_a_next_mode_run_never_publishes(self):
-        """The next lane's periodic is also a periodic with no PULL_NUMBER and
-        no RC_COMMIT_SHA. It measures the next stack, which the dashboard has
-        no lane for, so publishing from one would file a next run as main's
-        today history. Mirrors the baseline recorder's fourth condition."""
+    def test_a_today_lane_run_never_publishes(self):
+        """The today lane's periodic is also a periodic with no PULL_NUMBER and
+        no RC_COMMIT_SHA, flagged EVAL_MODE_NEXT=1 for its deploy. It grades
+        an install rolled back from next, which is not main's history.
+        Mirrors the baseline recorder's fourth condition."""
         marker = (
             "import pathlib, sys\n"
             "pathlib.Path(sys.path[0], 'collect.py.ran').touch()\n"
@@ -222,10 +224,32 @@ class PublishHookFailSafeTest(unittest.TestCase):
                     target="gs://kube-agents-dashboards/evals/",
                     job_type="periodic",
                     mode_next="1",
+                    rollback_lane="1",
                 )
-                self.assert_skipped_once(result, code, "EVAL_MODE_NEXT=1")
+                self.assert_skipped_once(result, code, "EVAL_ROLLBACK_LANE=1")
             dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
             self.assertEqual(list(dash.glob("*.ran")), [])
+
+    def test_a_next_mode_periodic_publishes(self):
+        """A next-mode run on main records under the version key's next mode,
+        so it is main's history and the publisher lets it through, mirroring
+        the recorder."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(
+                pathlib.Path(tmp),
+                """\
+                import json, pathlib, sys
+                out = sys.argv[sys.argv.index("--out") + 1]
+                pathlib.Path(out).write_text(json.dumps({"runs": [{"build": "1"}]}))
+                """,
+            )
+            result = run_hook(
+                0, fake_hack, target="gs://kube-agents-dashboards/evals/",
+                job_type="periodic", mode_next="1",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("eval-dashboard: published to gs://kube-agents-dashboards/evals/", result.stdout)
+            self.assertNotIn(SKIP, result.stdout)
 
     def test_missing_collect_py_skips_fast_and_preserves_the_exit_code(self):
         """This PR may merge before the siblings that add scripts/eval_dashboard/."""
@@ -323,7 +347,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
                 (dash / "render.py").write_text(record_argv)
                 stubs_dir = pathlib.Path(tmp) / "stubs"
                 stubs_dir.mkdir()
-                write_stub(stubs_dir, "gsutil", "exit 1\n")
+                write_stub(stubs_dir, "gcloud", "exit 1\n")
                 result = run_hook(0, fake_hack, target=target, path_prepend=str(stubs_dir))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 argv = json.loads((dash / "render.py.argv").read_text())
@@ -399,8 +423,8 @@ class PublishHookFailSafeTest(unittest.TestCase):
             self.assertNotIn("--health", argv)
             self.assertNotIn("--health-history", argv)
 
-    def test_gsutil_downloads_health_and_history_for_bucket_target(self):
-        """For a gs:// target, the hook calls gsutil cp to download
+    def test_gcloud_storage_downloads_health_and_history_for_bucket_target(self):
+        """For a gs:// target, the hook calls `gcloud storage cp` to download
         health.json and health-history.jsonl and passes them to render.py."""
         collect_ok = """\
             import json, pathlib, sys
@@ -411,10 +435,10 @@ class PublishHookFailSafeTest(unittest.TestCase):
             "import json, pathlib, sys\n"
             "pathlib.Path(sys.path[0], 'render.py.argv').write_text(json.dumps(sys.argv[1:]))\n"
         )
-        fake_gsutil = """\
-            if [[ "$1" == "cp" ]]; then
-                src="$2"
-                dst="$3"
+        fake_gcloud = """\
+            if [[ "$1 $2" == "storage cp" ]]; then
+                src="$3"
+                dst="$4"
                 if [[ "$src" == *"health.json" ]]; then
                     echo '{"state":"GREEN"}' > "$dst"
                     exit 0
@@ -431,7 +455,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
             (dash / "render.py").write_text(record_argv)
             stubs_dir = pathlib.Path(tmp) / "stubs"
             stubs_dir.mkdir()
-            write_stub(stubs_dir, "gsutil", textwrap.dedent(fake_gsutil))
+            write_stub(stubs_dir, "gcloud", textwrap.dedent(fake_gcloud))
             result = run_hook(
                 0,
                 fake_hack,
@@ -445,7 +469,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
 
     def test_zero_collected_runs_skip_instead_of_publishing_empty(self):
         """The evidence_store lesson: an unreadable source is not an empty
-        one. collect.py warns-and-continues on gsutil failures and still
+        one. collect.py warns-and-continues on gcloud storage failures and still
         exits 0 with runs: [], so without the floor a 403 on the sweep would
         overwrite a good dashboard with an empty one and log success."""
         with tempfile.TemporaryDirectory() as tmp:

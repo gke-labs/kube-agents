@@ -1,0 +1,21 @@
+Subject: Keep the Golden Path heading on its own line
+
+Why: upstream fuses the end of best practice 5 into the next heading (the sentence stops at "Service**," and "## Golden Path Backup Defaults" follows on the same line), so the heading does not render and the sentence never says why the distinction matters. The patch restores the clause the previous upstream version ended it with.
+Local-Issue: none (#2359)
+Upstream-Issue: none filed yet
+Retire-When: upstream puts the Golden Path heading on its own line
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -116,7 +116,9 @@ can overwrite or delete existing resources:
+ 5.  **Service Terminology**: Always explicitly refer to the service as **Backup
+     for GKE** in your response. This distinguishes it from the broader (but
+     complementary) Google Cloud **Backup and Disaster Recovery (DR)
+-    Service**, ## Golden Path Backup Defaults
++    Service**, as **Backup for GKE** is built specifically for GKE.
++
++## Golden Path Backup Defaults
+ 
+ The recommended production golden path configuration for Backup for GKE:
+ 

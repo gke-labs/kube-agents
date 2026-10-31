@@ -27,7 +27,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -92,7 +91,7 @@ func newUsageEnvtestHarness(t *testing.T, cfg *rest.Config, scheme *runtime.Sche
 		r:       h.r,
 		source:  h.stub,
 		now:     func() time.Time { return h.clock },
-		streaks: map[types.UID]*usageScrapeStreak{},
+		streaks: map[usageStreakKey]*usageScrapeStreak{},
 	}
 	return h
 }

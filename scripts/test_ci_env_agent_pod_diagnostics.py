@@ -6,7 +6,8 @@ what says why a pod was replaced or a container restarted mid-run: the bridge
 sidecar's log and its previous instance, the agent container's previous
 instance, per-container restarts and last terminations, and the namespace's
 events. These tests run the real function, lifted from the real file with the
-constants it reads, under bash with a `kubectl` stub on PATH.
+byte-cap helper and constants it reads, under bash with a `kubectl` stub on
+PATH.
 """
 
 import math
@@ -31,7 +32,9 @@ WATCH_FILES = ("agent-pods-watch.txt", "agent-events-watch.txt")
 EXIT_DEADLINE_SECONDS = 10
 
 # A kubectl that records every call's arguments in $STUB_CALLS; answers the
-# Deployment's container-name read with $STUB_CONTAINERS; for a watch, prints
+# Deployment's container-name read with $STUB_CONTAINERS; answers the A2A pod
+# listings with nothing (tests/test_ci_a2a_component_logs.py covers them, and the
+# collector reads a listing byte by byte, so STUB_LINES of it cost seconds); for a watch, prints
 # its arguments, records its pid in $STUB_WATCH_PIDS and then either blocks
 # for STUB_WATCH_SECONDS (the apiserver holding the watch open, 60 unless
 # set, which is the request timeout cutting it) or, with STUB_WATCH_EXITS,
@@ -63,6 +66,7 @@ if [ -n "${STUB_FAIL:-}" ]; then
 fi
 case "$*" in
   *"containers[*].name"*) printf '%s' "${STUB_CONTAINERS:-platform-agent}"; exit 0 ;;
+  *" get pods "*" -l "*) exit 0 ;;
 esac
 echo "ARGS: $*"
 line=$(head -c "${STUB_LINE_BYTES:-100}" /dev/zero | tr '\\0' 'a')
@@ -70,7 +74,9 @@ for _ in $(seq 1 "${STUB_LINES:-3}"); do echo "$line"; done
 """
 
 
-FUNCTIONS = ("_agent_pod_watch_loop", "start_agent_pod_watch", "_stop_agent_pod_watch", FUNCTION)
+# `last_bytes` first: the byte cap every log read below is piped through
+# (hack/ci-env.sh, "Byte caps").
+FUNCTIONS = ("last_bytes", "_agent_pod_watch_loop", "start_agent_pod_watch", "_stop_agent_pod_watch", FUNCTION, "collect_a2a_component_logs")
 
 
 def lifted(restart_seconds: str | None = None, healthy_seconds: str | None = None) -> str:
@@ -79,6 +85,12 @@ def lifted(restart_seconds: str | None = None, healthy_seconds: str | None = Non
     constants = re.findall(r"^readonly AGENT_DIAG_[A-Z_]+=.*$", src, re.MULTILINE)
     if len(constants) != 13:  # pragma: no cover - a rename should say so loudly
         raise AssertionError(f"expected thirteen AGENT_DIAG_ constants in {ENV_SCRIPT}, found {constants}")
+    # The A2A component logs the collector ends with; their own suite is
+    # tests/test_ci_a2a_component_logs.py.
+    a2a_constants = re.findall(r"^readonly A2A_DIAG_[A-Z_]+=.*$", src, re.MULTILINE)
+    if len(a2a_constants) != 7:  # pragma: no cover
+        raise AssertionError(f"expected seven A2A_DIAG_ constants in {ENV_SCRIPT}, found {a2a_constants}")
+    constants += a2a_constants
     if restart_seconds is not None:
         constants = [re.sub(r"(WATCH_RESTART_SECONDS=).*", rf"\g<1>{restart_seconds}", c) for c in constants]
     if healthy_seconds is not None:
@@ -147,6 +159,12 @@ def stub_bin(tmp: pathlib.Path) -> pathlib.Path:
     kubectl = stubs / "kubectl"
     kubectl.write_text(KUBECTL_STUB, encoding="utf-8")
     kubectl.chmod(kubectl.stat().st_mode | stat.S_IXUSR)
+    tail = stubs / "tail"
+    tail.write_text(
+        '#!/usr/bin/env bash\nif [ "${1:-}" = "-c" ] && [ "$#" -eq 2 ]; then /usr/bin/tail "$@"; printf "uutils-pipe-overrun"; exit 0; fi\nexec /usr/bin/tail "$@"\n',
+        encoding="utf-8",
+    )
+    tail.chmod(tail.stat().st_mode | stat.S_IXUSR)
     return stubs
 
 

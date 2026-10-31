@@ -11,15 +11,15 @@ Audit standalone GCE virtual machines, Managed Instance Groups (MIGs), serial co
 
 ## 1. Open the Run, Then Execute Compute Inspection
 
-Open the run first with the `fleet-audit` harness's `start` (SOP §0). `finish` refuses a manifest that finished before `start` did, as an earlier run's. Then run the profile-relative compute fleet collector to sweep target projects. It writes a collector manifest to stdout:
+Open the run first with the `fleet-audit` harness's `start` (SOP §0). `finish` refuses a manifest that finished before `start` did, as an earlier run's. Then call the platform_control `fleet_scope` tool (SOP §1) and run the compute fleet collector with its `collector_args`, which hand it the install's declared scope; an install that declares none passes nothing and the collector sweeps every project the identity can list. It writes a collector manifest to stdout:
 
 ```bash
-python3 ./skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py > /opt/data/scratch/manifest_gce-compute-fleet-audit.json
+python3 /opt/data/profiles/platform/skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_gce-compute-fleet-audit.json
 ```
 
 ## 2. Evaluate Findings Against SOP Checks
 
-Read the manifest and follow `governance/gce_compute_fleet_sop.md` §2, which owns the copy rules for `commands`, `checks_not_applicable`, `checks_unevaluated`, `limitations` and `candidates`:
+Read the manifest and follow `/opt/data/profiles/platform/governance/gce_compute_fleet_sop.md` §2, which owns the copy rules for `commands`, `checks_not_applicable`, `checks_unevaluated`, `limitations` and `candidates`:
 
 All four roster checks are collector-verified; none is yours to hand-run.
 

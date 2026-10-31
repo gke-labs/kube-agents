@@ -55,6 +55,24 @@ class LaneDocumentTest(unittest.TestCase):
         self.assertEqual([e["build"] for e in forge_lane.gitlab_document(data, now)["running"]], ["5"])
         self.assertEqual([e["build"] for e in forge_lane.gitlab_document(data)["running"]], ["4", "5"], "without a clock the age is not judged")
 
+    def test_nights_are_listed_apart_from_the_lanes_pull_request_runs(self):
+        data = {"runs": [
+            {"build_id": "1", "tier": "gitlab", "job": "pull-kube-agents-smoke-test-gitlab", "pr": 2758, "result": "SUCCESS"},
+            {"build_id": "2", "tier": "gitlab", "job": "ci-kube-agents-eval-nightly-gitlab", "pr": None, "result": "FAILURE", "log_url": "https://oss.gprow.dev/view/gs/b/logs/ci-kube-agents-eval-nightly-gitlab/2"},
+            {"build_id": "3", "tier": "gitlab", "job": "ci-kube-agents-eval-nightly-gitlab", "pr": None, "result": "SUCCESS"},
+            {"build_id": "4", "tier": "nightly", "job": "ci-kube-agents-eval-nightly", "pr": None, "result": "SUCCESS"},
+        ]}
+        doc = forge_lane.gitlab_document(data)
+        self.assertEqual([r["build"] for r in doc["runs"]], ["1"])
+        self.assertEqual([r["build"] for r in doc["nights"]], ["3", "2"], "nights newest first, the GitHub nightly not among them")
+        self.assertEqual((doc["counts"], doc["night_counts"]), ({"on_record": 1, "green": 1, "red": 0}, {"on_record": 2, "green": 1, "red": 1}))
+        self.assertEqual((doc["job"], doc["nightly_job"]), ("pull-kube-agents-smoke-test-gitlab", "ci-kube-agents-eval-nightly-gitlab"))
+        self.assertEqual(doc["nights"][1]["log_url"], "https://oss.gprow.dev/view/gs/b/logs/ci-kube-agents-eval-nightly-gitlab/2")
+        self.assertIsNone(doc["runs"][0]["log_url"])
+        # A night alone leaves the lane's job at its default, and the other way round.
+        self.assertEqual(forge_lane.gitlab_document({"runs": data["runs"][1:2]})["job"], forge_lane.DEFAULT_JOB)
+        self.assertEqual(forge_lane.gitlab_document({"runs": data["runs"][:1]})["nightly_job"], forge_lane.DEFAULT_NIGHTLY_JOB)
+
     def test_the_tier_filter_is_the_shared_one(self):
         self.assertTrue(tiers.is_gitlab({"tier": "gitlab"}))
         self.assertFalse(tiers.is_presubmit({"tier": "gitlab"}))

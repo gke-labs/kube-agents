@@ -28,7 +28,8 @@ func TestGchatConversationIDRoundTrip(t *testing.T) {
 		want                  string
 		wantSpace, wantThread string
 	}{
-		{"dm binds the space", "spaces/AAA", "spaces/AAA/threads/BBB", "dm", "gchat:dm/spaces/AAA", "spaces/AAA", ""},
+		{"top-level dm binds the space", "spaces/AAA", "", "dm", "gchat:dm/spaces/AAA", "spaces/AAA", ""},
+		{"dm side thread binds the thread", "spaces/AAA", "spaces/AAA/threads/BBB", "dm", "gchat:dm/spaces/AAA/threads/BBB", "spaces/AAA", "spaces/AAA/threads/BBB"},
 		{"threaded space binds the thread", "spaces/AAA", "spaces/AAA/threads/BBB", "group", "gchat:spaces/AAA/threads/BBB", "spaces/AAA", "spaces/AAA/threads/BBB"},
 		{"unthreaded space binds the space", "spaces/CCC", "", "group", "gchat:space/spaces/CCC", "spaces/CCC", ""},
 	}
@@ -43,7 +44,8 @@ func TestGchatConversationIDRoundTrip(t *testing.T) {
 			t.Errorf("%s: gchatSpaceThread(%q) = %q,%q,%v want %q,%q,true", c.name, got, space, thread, ok, c.wantSpace, c.wantThread)
 		}
 	}
-	for _, bad := range []string{"discord:1/2", "slack:C1/1.0", "gchat:", "gchat:dm/", "gchat:space/", "gchat:threads/BBB", "gchat:spaces/AAA", "gchat:spaces/AAA/messages/M"} {
+	for _, bad := range []string{"discord:1/2", "slack:C1/1.0", "gchat:", "gchat:dm/", "gchat:space/", "gchat:threads/BBB", "gchat:spaces/AAA", "gchat:spaces/AAA/messages/M",
+		"gchat:dm/spaces/AAA/threads/", "gchat:dm/spaces/AAA/threads/B/C", "gchat:dm/spaces/AAA/messages/M", "gchat:dm/threads/BBB", "gchat:space/spaces/AAA/threads/BBB"} {
 		if _, _, ok := gchatSpaceThread(bad); ok {
 			t.Errorf("gchatSpaceThread(%q) parsed; must refuse", bad)
 		}
@@ -103,6 +105,16 @@ func TestGchatInboundNormalization(t *testing.T) {
 	}{
 		{"dm delivers on the space", gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "spaces/D1/threads/T1", "spaces/D1/messages/M1", "hi", "", "u1@example.com", "HUMAN"),
 			true, "gchat:dm/spaces/D1", "dm", "hi"},
+		{"dm thread reply binds its thread", func() *gchatEvent {
+			ev := gchatMsg("spaces/D3", "DIRECT_MESSAGE", "THREADED_MESSAGES", "spaces/D3/threads/T3", "spaces/D3/messages/M11", "and the pods?", "", "u1@example.com", "HUMAN")
+			ev.Message.ThreadReply = true
+			return ev
+		}(), true, "gchat:dm/spaces/D3/threads/T3", "dm", "and the pods?"},
+		{"thread reply in a threaded space binds the thread as before", func() *gchatEvent {
+			ev := gchatMsg("spaces/S4", "SPACE", "THREADED_MESSAGES", "spaces/S4/threads/T4", "spaces/S4/messages/M12", "@Kage more", " more", "u2@example.com", "HUMAN")
+			ev.Message.ThreadReply = true
+			return ev
+		}(), true, "gchat:spaces/S4/threads/T4", "group", "more"},
 		{"legacy DM type field delivers", func() *gchatEvent {
 			ev := gchatMsg("spaces/D2", "", "", "", "spaces/D2/messages/M2", "hi", "", "u1@example.com", "HUMAN")
 			ev.Space.Type = "DM"
@@ -240,6 +252,13 @@ type fakeChatRelay struct {
 	tokens    []string
 }
 
+// fakeChatAPIError, as a response, makes the fake relay answer a call with
+// the Chat API's own refusal.
+type fakeChatAPIError struct {
+	status int
+	reason string
+}
+
 type relayCall struct {
 	resource  []string
 	method    string
@@ -271,6 +290,14 @@ func newFakeChatRelay(t *testing.T) *fakeChatRelay {
 		if !ok {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]any{"error": "Google Chat operation failed"})
+			return
+		}
+		if apiErr, ok := resp.(fakeChatAPIError); ok {
+			// The relay's shape for a Chat API refusal: the API's status
+			// and reason under "chat" (gchatRelayError).
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]any{"error": "Google Chat operation failed",
+				"chat": map[string]any{"status": apiErr.status, "reason": apiErr.reason}})
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"response": resp})
@@ -337,6 +364,15 @@ func TestGchatPostThreadsAndTranslates(t *testing.T) {
 		t.Error("DM posts must not set messageReplyOption")
 	}
 
+	if _, err := a.Post("gchat:dm/spaces/D1/threads/T2", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	side := f.call(2)
+	if side.arguments["parent"] != "spaces/D1" || side.arguments["body"].(map[string]any)["thread"].(map[string]any)["name"] != "spaces/D1/threads/T2" ||
+		side.arguments["messageReplyOption"] != gchatReplyOption {
+		t.Errorf("a DM side-thread post must reply in its thread: %+v", side.arguments)
+	}
+
 	if _, err := a.Post("discord:1/2", "x"); err == nil {
 		t.Error("malformed conversation must error")
 	}
@@ -351,7 +387,7 @@ func TestGchatEditPatchesText(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := f.call(0)
-	if c.method != "patch" || c.arguments["name"] != "spaces/S1/messages/M77" || c.arguments["updateMask"] != "text" {
+	if c.method != "patch" || c.arguments["name"] != "spaces/S1/messages/M77" || c.arguments["updateMask"] != gchatLayoutUpdateMask {
 		t.Errorf("patch = %+v", c)
 	}
 	if c.arguments["body"].(map[string]any)["text"] != "✅ *completed*" {
@@ -467,18 +503,24 @@ func TestToGchatText(t *testing.T) {
 		// observed Chat rendering <url|text> from a message the app posted,
 		// so one already present in executor output would publish a link
 		// whose visible text names a host it does not open.
+		// One whose text names no host is the link [the doc](url) would
+		// have made, and is kept (TestToGchatTextKeepsAnExecutorsChatLink).
 		"<https://attacker.example/login|https://github.com/gke-labs/kube-agents>": "< https://attacker.example/login|https://github.com/gke-labs/kube-agents>",
-		"see <https://evil.example|the doc>":                                       "see < https://evil.example|the doc>",
+		"see <https://evil.example|the doc>":                                       "see <https://evil.example|the doc>",
 		// A generated link and an injected one in the same message: the
-		// adapter's own survives, the executor's does not.
-		"[real](https://x.example/p) vs <https://evil.example|real>": "<https://x.example/p|real> vs < https://evil.example|real>",
+		// adapter's own survives, and the executor's survives only where
+		// its text names no other host.
+		"[real](https://x.example/p) vs <https://evil.example|https://x.example/p>": "<https://x.example/p|real> vs < https://evil.example|https://x.example/p>",
 		// A mention or an angle pair inside a markdown link's display text
 		// is inside the sequence the adapter generates, so it is defanged
-		// there too rather than riding out on the exemption. The angle pair
-		// also names a host the link does not open, so that link is refused
-		// as well: the markdown stays, defanged, and no <...|...> is made.
-		"[<users/all>](https://x.example/p)":               "<https://x.example/p|< users/all>>",
-		"[<https://evil.example|hi>](https://x.example/p)": "[< https://evil.example|hi>](https://x.example/p)",
+		// there too rather than riding out on the exemption. An angle pair
+		// that names its host in the text gets the label-host refusal on
+		// both links: the markdown stays, defanged, and no <...|...> is
+		// made. One whose text is prose is a kept link of its own, and the
+		// markdown around it is left as written rather than nesting two.
+		"[<users/all>](https://x.example/p)":                              "<https://x.example/p|< users/all>>",
+		"[<https://evil.example|https://x.example>](https://x.example/p)": "[< https://evil.example|https://x.example>](https://x.example/p)",
+		"[<https://evil.example|hi>](https://x.example/p)":                "[<https://evil.example|hi>](https://x.example/p)",
 		// A `|` or an angle bracket in the URL would let a crafted link close
 		// the generated sequence early and choose its own display text. The
 		// URL class refuses them, so the markdown is left as written instead.
@@ -511,6 +553,164 @@ func TestToGchatText(t *testing.T) {
 		// (TestToGchatTextDefangsAfterAChunkedFence), the defang does not
 		// lean on that. The bold and link passes still read it as a fence.
 		"see ``` <https://evil.example|https://good.example>": "see ``` < https://evil.example|https://good.example>",
+		// The line forms Chat's text format has no syntax for, rewritten by
+		// the pass the Slack adapter runs (#3108): a heading is a bold
+		// line, a rule goes, a table is a fenced block with its columns
+		// padded, and a list marker becomes the one Chat draws a bullet
+		// from. Fenced code is left as written.
+		"### Pods\n---\nthree ready": "*Pods*\nthree ready",
+		"Summary\n===\nok":           "*Summary*\nok",
+		"* one\n+ two\n  - sub":      "- one\n- two\n  - sub",
+		"| Cluster | Nodes |\n|:---|---:|\n| prod-east | **3** |\n| `dev` | 1 |": "```\nCluster   | Nodes\n----------+------\nprod-east | 3\ndev       | 1\n```",
+		"```\n# comment\n- flag\n---\n```":                                       "```\n# comment\n- flag\n---\n```",
+		// A table cell's link shows its URL inside the block, where Chat
+		// renders no link, and the defang does not read the block as prose.
+		"| pr |\n|---|\n| [#1](https://github.com/x/y/pull/1) |": "```\npr\n----------------------------------\n#1 (https://github.com/x/y/pull/1)\n```",
+		"| cmd |\n|---|\n| sort <f\\|uniq |":                     "```\ncmd\n------------\nsort <f|uniq\n```",
+		// A link in Chat's own form inside a cell is one cell, shown as its
+		// label and URL like a markdown link, not split on its pipe; and a
+		// mention in a cell is defanged before the column is measured, so
+		// the rows stay lined up.
+		"| PR | State |\n|---|---|\n| <https://github.com/x/y/pull/1|#1> | open |": "```\nPR                                 | State\n-----------------------------------+------\n#1 (https://github.com/x/y/pull/1) | open\n```",
+		"| who | n |\n|---|---|\n| <users/all> | 1 |\n| me | 2 |":                  "```\nwho          | n\n-------------+--\n< users/all> | 1\nme           | 2\n```",
+		// A `.#` inside a kept link's label is not a glued heading: the
+		// link stays whole and kept.
+		"see <https://x.example|v1.# Notes> now":    "see <https://x.example|v1.# Notes> now",
+		"see [v1.# Notes](https://x.example/p) now": "see <https://x.example/p|v1.# Notes> now",
+	}
+	for in, want := range cases {
+		if got := toGchatText(in); got != want {
+			t.Errorf("toGchatText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A chunk whose padded table would run past Chat's message cap posts its
+// table as written: one 700-character cell over a hundred short rows is
+// under the relay's chunk size raw and tens of thousands of bytes padded,
+// which Chat would refuse along with the rest of the answer.
+func TestToGchatTextLeavesATableThatWouldOverflowChat(t *testing.T) {
+	wide := strings.Repeat("x", 700)
+	rows := []string{"| Pod | Ready |", "|---|---|", "| " + wide + " | 1/1 |"}
+	for i := 0; i < 110; i++ {
+		rows = append(rows, "| p | - |")
+	}
+	in := "Pods:\n\n" + strings.Join(rows, "\n")
+	if len(in) > discordChunk {
+		t.Fatalf("the probe must fit one chunk: %d bytes", len(in))
+	}
+	if rendered := rewriteLineForms(in, gchatBullet, true); len(rendered) <= gchatTextMax {
+		t.Fatalf("the probe must overflow when rendered: %d bytes", len(rendered))
+	}
+	got := toGchatText(in)
+	if len(got) > gchatTextMax {
+		t.Errorf("toGchatText posted %d bytes, past gchatTextMax", len(got))
+	}
+	if strings.Contains(got, "```") || !strings.Contains(got, "|---|---|") {
+		t.Errorf("the table should be left as written:\n%s", got[:200])
+	}
+	// A table that fits still renders.
+	small := "| a | b |\n|---|---|\n| 1 | 2 |"
+	if got := toGchatText(small); !strings.Contains(got, "```") {
+		t.Errorf("a small table should render: %q", got)
+	}
+}
+
+// Through toGchatText, the fleet answer #3108 reported posting as raw pipes
+// ends as Chat's bold and a fenced block, with the links and mentions in its
+// prose still handled as before.
+func TestToGchatTextRendersAMarkdownReport(t *testing.T) {
+	in := "# Fleet Report\n\n---\n\n## Clusters\n\n* 2 clusters, both **Ready** ([board](https://x.example/b))\n\n| Cluster | Location | Nodes |\n|:---|:---|---:|\n| prod-east | us-east1 | 12 |\n| dev | us-central1 | 3 |\n\ncc <users/all>"
+	got := toGchatText(in)
+	for _, want := range []string{
+		"*Fleet Report*",
+		"*Clusters*",
+		"- 2 clusters, both *Ready* (<https://x.example/b|board>)",
+		"```\nCluster   | Location    | Nodes\n----------+-------------+------\nprod-east | us-east1    | 12\ndev       | us-central1 | 3\n```",
+		"cc < users/all>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("toGchatText output lacks %q:\n%s", want, got)
+		}
+	}
+	for _, raw := range []string{"# ", "\n---\n", "|:---|", "* 2"} {
+		if strings.Contains(got, raw) {
+			t.Errorf("toGchatText output still carries raw %q:\n%s", raw, got)
+		}
+	}
+}
+
+// issue3015Reply is the reply #3015 reported from a next-mode install:
+// the executor wrote the link in Chat's own form, the defang put a space in
+// it, and Chat linkified the URL and `|text` together into a 404.
+const issue3015Reply = "Opened <https://github.com/gke-agentic/kube-agents-autopush-next-infra/pull/3|gke-agentic/kube-agents-autopush-next-infra#3> for review."
+
+// TestToGchatTextKeepsAnExecutorsChatLink: models write Chat's <url|text>
+// as well as markdown links, and the defang used to put a space in every
+// one (#3015). A closed one in prose, with an http(s) URL in the markdown
+// destination class and text that names no other host, is the link the
+// adapter would have made from [text](url), so it is kept as written.
+// Everything else stays defanged: text naming another host (the label-host
+// refusal, whatever the text hides it in), a nested or unclosed opener, a
+// pipe the URL class refuses, a URL that is not http(s), a mention, and
+// anything in code or after a fence that never closes.
+func TestToGchatTextKeepsAnExecutorsChatLink(t *testing.T) {
+	cases := map[string]string{
+		issue3015Reply:                                         issue3015Reply,
+		"<https://x.example/p|the doc>":                        "<https://x.example/p|the doc>",
+		"<https://x.example/p|https://x.example/p>":            "<https://x.example/p|https://x.example/p>",
+		"<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>":        "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>",
+		"<https://x.example/a|a> and [b](https://x.example/b)": "<https://x.example/a|a> and <https://x.example/b|b>",
+		// Text naming another host is refused as the markdown link with
+		// that label is, however it is wrapped, and is defanged.
+		"<https://evil.example/login|https://github.com/x>":        "< https://evil.example/login|https://github.com/x>",
+		"<https://evil.example|**https://good.example**>":          "< https://evil.example|*https://good.example*>",
+		"<https://evil.example|https://good.example@evil.example>": "< https://evil.example|https://good.example@evil.example>",
+		// Markdown link syntax in the text: it is the kept link's text, and
+		// the markdown link it spells overlaps the kept link, so it is not
+		// converted and cannot be joined to a different link; where it
+		// names another host the whole is refused and defanged, and the
+		// markdown link inside converts on its own.
+		"<https://x.example/a|[doc](https://x.example/b)>":                        "<https://x.example/a|[doc](https://x.example/b)>",
+		"<https://x.example/a|x](https://x.example/b) [y>":                        "<https://x.example/a|x](https://x.example/b) [y>",
+		"<https://evil.example|x](https://good.example) [y>":                      "< https://evil.example|x](https://good.example) [y>",
+		"<https://good.example|[x](https://evil.example)>":                        "< https://good.example|<https://evil.example|x>>",
+		"[https://good.example <https://evil.example|doc>](https://evil.example)": "[https://good.example <https://evil.example|doc>](https://evil.example)",
+		// Nested and adjacent sequences: an opener whose text holds another
+		// is not closed, and stays defanged around the inner link.
+		"<https://a.example|<https://b.example|c>>":     "< https://a.example|<https://b.example|c>>",
+		"<https://a.example|a><https://b.example|b>":    "<https://a.example|a><https://b.example|b>",
+		"<https://evil.example|https://good.example|x>": "< https://evil.example|https://good.example|x>",
+		"<https://x.example/a|b|c>":                     "< https://x.example/a|b|c>",
+		// An unclosed opener before a link, Chat's or markdown: the
+		// opener is defanged so the link's `>` cannot close it.
+		"see <https://evil.example|docs: <https://x.example/p|doc>":  "see < https://evil.example|docs: <https://x.example/p|doc>",
+		"see <https://evil.example|docs: [doc](https://x.example/p)": "see < https://evil.example|docs: <https://x.example/p|doc>",
+		// Only an http(s) URL in the markdown destination class.
+		"<ftp://x.example|doc>":           "< ftp://x.example|doc>",
+		"<javascript:alert(1)|doc>":       "< javascript:alert(1)|doc>",
+		"<HTTPS://x.example|doc>":         "< HTTPS://x.example|doc>",
+		"<https://x.example/a)b|doc>":     "< https://x.example/a)b|doc>",
+		"<https://x.example|>":            "< https://x.example|>",
+		"<https://x.example|line\nbreak>": "< https://x.example|line\nbreak>",
+		// A mention in the text is not a kept link's text, and is defanged.
+		"<https://x.example|<users/all>>": "< https://x.example|< users/all>>",
+		// Code is as written; a code span cutting the text short leaves the
+		// opener defanged, and a fence that never closes hides nothing.
+		"`<https://x.example|doc>`":                      "`<https://x.example|doc>`",
+		"```\n<https://x.example|doc>\n```":              "```\n<https://x.example|doc>\n```",
+		"<https://x.example|see `code`>":                 "< https://x.example|see `code`>",
+		"see ``` <https://x.example|doc>":                "see ``` < https://x.example|doc>",
+		"```\nsort <f|uniq\n``` <https://x.example|doc>": "```\nsort <f|uniq\n``` <https://x.example|doc>",
+		// The markdown rules read a kept link as the link it is: a bold
+		// pair around it or in its text converts, a `**` in its URL is not
+		// half of a pair, and a markdown link that overlaps it is refused
+		// rather than nested with it or cut into it.
+		"**<https://x.example|doc>**":                        "*<https://x.example|doc>*",
+		"<https://x.example/p|**doc**>":                      "<https://x.example/p|*doc*>",
+		"**a <https://x.example/**/p|doc> b**":               "*a <https://x.example/**/p|doc> b*",
+		"[see <https://x.example|doc>](https://x.example/p)": "[see <https://x.example|doc>](https://x.example/p)",
+		"<https://x.example|a [b> c](https://x.example/p)":   "<https://x.example|a [b> c](https://x.example/p)",
 	}
 	for in, want := range cases {
 		if got := toGchatText(in); got != want {
@@ -998,10 +1198,14 @@ func TestGchatOpenDirectUsesTheLearnedIDForAKnownEmail(t *testing.T) {
 }
 
 // realGchatFixture loads one captured payload from testdata/gchat and
-// base64-encodes it the way the relay hands events over. Every file there
-// is real traffic from the Chat app in bnaylor-kagents-dev (2026-09-09),
-// scrubbed only of identity fields and the one-time redirect token; field
-// set, key order and every other byte are as Chat published them.
+// base64-encodes it the way the relay hands events over. The addon-dm-*.json
+// files are real traffic from the Chat app in bnaylor-kagents-dev
+// (2026-09-09), and legacy-dm-button-click.json from the one in
+// bhoekstra-gkedemos (2026-10-30), scrubbed only of identity fields and the
+// one-time redirect token; field set, key order and every other byte are as
+// Chat published them. addon-dm-button-click.json is the exception: a click
+// composed in the add-on layout from Google's documented shape, since the
+// measured app delivers clicks in the legacy layout.
 func realGchatFixture(t *testing.T, name string) (raw []byte, b64 string) {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("testdata", "gchat", name))
@@ -1017,21 +1221,23 @@ func realGchatFixture(t *testing.T, name string) (raw []byte, b64 string) {
 // adapter read only the legacy layout and acked every one of these away
 // without a log line — the test exists so that cannot recur.
 func TestGchatRealAddonPayloads(t *testing.T) {
+	const dm = "gchat:dm/spaces/_c2fixtureAA"
 	cases := []struct {
 		file    string
 		text    string
 		msgName string
+		conv    string
 	}{
-		{"addon-dm-plain.json", "Hi, here's some traffic", "spaces/_c2fixtureAA/messages/BP9QzqU063c.BP9QzqU063c"},
+		{"addon-dm-plain.json", "Hi, here's some traffic", "spaces/_c2fixtureAA/messages/BP9QzqU063c.BP9QzqU063c", dm},
 		// In a DM a typed "@app" is plain text to Chat: argumentText equals
 		// text, nothing is stripped and no mention annotation is attached,
 		// so it is delivered verbatim rather than treated as a bare mention.
-		{"addon-dm-bare-mention-text.json", "@bkd-test", "spaces/_c2fixtureAA/messages/-IovU-AWTYU.-IovU-AWTYU"},
-		{"addon-dm-mention-with-text.json", "@bkd-test what is your name", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.jhqZwM-35cA"},
-		{"addon-dm-hello.json", "hello", "spaces/_c2fixtureAA/messages/wh-7cP8oL1U.wh-7cP8oL1U"},
+		{"addon-dm-bare-mention-text.json", "@bkd-test", "spaces/_c2fixtureAA/messages/-IovU-AWTYU.-IovU-AWTYU", dm},
+		{"addon-dm-mention-with-text.json", "@bkd-test what is your name", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.jhqZwM-35cA", dm},
+		{"addon-dm-hello.json", "hello", "spaces/_c2fixtureAA/messages/wh-7cP8oL1U.wh-7cP8oL1U", dm},
 		// A reply inside a DM thread: threadReply true, the parent's thread
-		// name. A DM binds the whole space, so it lands in the same session.
-		{"addon-dm-thread-reply.json", "@bkd-test thread reply", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.iuosuA3Wo-0"},
+		// name. It is a side thread, its own conversation.
+		{"addon-dm-thread-reply.json", "@bkd-test thread reply", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.iuosuA3Wo-0", dm + "/threads/jhqZwM-35cA"},
 	}
 	for _, c := range cases {
 		t.Run(c.file, func(t *testing.T) {
@@ -1048,7 +1254,7 @@ func TestGchatRealAddonPayloads(t *testing.T) {
 			if reason != "" {
 				t.Fatalf("dropped: %s", reason)
 			}
-			if msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" || msg.Kind != "dm" ||
+			if msg.Conversation != c.conv || msg.Kind != "dm" ||
 				msg.AuthorID != "sender@example.com" || msg.MessageID != c.msgName || msg.Text != c.text {
 				t.Errorf("normalized = %+v", msg)
 			}
@@ -1127,40 +1333,160 @@ func TestGchatRunDeliversBothWireShapes(t *testing.T) {
 	}
 }
 
-// A DM space is threaded, and a reply belongs in the thread the ask was made
-// in — measured live: an answer to a question asked inside a DM thread landed
-// top-level. The session stays the whole space (the key carries no thread);
-// only where the reply renders follows the latest inbound message.
-func TestGchatDMRepliesFollowTheLatestAskThread(t *testing.T) {
-	f := newFakeChatRelay(t)
-	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/R1"}
-	a := newTestGchatAdapterWithRelay(t, f)
-
-	// Nothing seen yet: a DM post is top-level.
-	if _, err := a.Post("gchat:dm/spaces/_c2fixtureAA", "hello"); err != nil {
-		t.Fatal(err)
+// gchatFixtureEvent decodes one captured payload from testdata/gchat,
+// optionally rewritten first (a second message in the same thread is the
+// captured reply under a new message name).
+func gchatFixtureEvent(t *testing.T, name string, rewrite func(string) string) *gchatEvent {
+	t.Helper()
+	raw, _ := realGchatFixture(t, name)
+	text := string(raw)
+	if rewrite != nil {
+		text = rewrite(text)
 	}
-	if body := f.call(0).arguments["body"].(map[string]any); body["thread"] != nil {
-		t.Errorf("first post threaded with nothing seen: %+v", body)
-	}
-
-	_, b64 := realGchatFixture(t, "addon-dm-thread-reply.json")
-	ev, err := decodeGchatEvent(b64)
+	ev, err := decodeGchatEvent(base64.StdEncoding.EncodeToString([]byte(text)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	msg, reason := a.classify(ev)
-	if reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" {
-		t.Fatalf("classify: %+v %q", msg, reason)
+	return ev
+}
+
+// A Chat DM matches today's Hermes adapter (main flow versus side thread):
+// top-level messages share the space's one conversation and are answered
+// top-level, even though Chat attaches the thread it auto-created for each;
+// a message typed inside an existing thread (threadReply) is its own
+// conversation, answered in that thread, and later replies there join it.
+// Every event is real captured traffic: the top-level ask whose auto thread
+// is jhqZwM-35cA, and the reply typed in that thread.
+func TestGchatDMSideThreadsMatchToday(t *testing.T) {
+	const (
+		space    = "spaces/_c2fixtureAA"
+		thread   = space + "/threads/jhqZwM-35cA"
+		mainFlow = "gchat:dm/" + space
+		sideKey  = "gchat:dm/" + thread
+	)
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": space + "/messages/R1"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	calls := 0
+	postTo := func(conv string) relayCall {
+		t.Helper()
+		if _, err := a.Post(conv, "answer"); err != nil {
+			t.Fatal(err)
+		}
+		calls++
+		return f.call(calls - 1)
 	}
-	if _, err := a.Post(msg.Conversation, "answer"); err != nil {
-		t.Fatal(err)
+	threadOf := func(c relayCall) any {
+		body := c.arguments["body"].(map[string]any)
+		if th, ok := body["thread"].(map[string]any); ok {
+			return th["name"]
+		}
+		return nil
 	}
-	c := f.call(1)
-	body := c.arguments["body"].(map[string]any)
-	thread, _ := body["thread"].(map[string]any)
-	if thread["name"] != "spaces/_c2fixtureAA/threads/jhqZwM-35cA" || c.arguments["messageReplyOption"] != gchatReplyOption {
-		t.Errorf("reply must follow the ask's thread: %+v", c.arguments)
+	classify := func(ev *gchatEvent) InboundMessage {
+		t.Helper()
+		msg, reason := a.classify(ev)
+		if reason != "" {
+			t.Fatalf("dropped: %s", reason)
+		}
+		return msg
+	}
+
+	top := classify(gchatFixtureEvent(t, "addon-dm-mention-with-text.json", nil))
+	if top.Conversation != mainFlow {
+		t.Fatalf("top-level DM = %q, want the space's conversation %q", top.Conversation, mainFlow)
+	}
+	if c := postTo(top.Conversation); threadOf(c) != nil || c.arguments["messageReplyOption"] != nil {
+		t.Errorf("a top-level DM must be answered top-level, not in its auto-created thread: %+v", c.arguments)
+	}
+
+	reply := classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", nil))
+	if reply.Conversation != sideKey || reply.Kind != "dm" {
+		t.Fatalf("in-thread DM reply = %+v, want its own conversation %q", reply, sideKey)
+	}
+	if c := postTo(reply.Conversation); threadOf(c) != thread || c.arguments["messageReplyOption"] != gchatReplyOption {
+		t.Errorf("a side thread must be answered in its thread: %+v", c.arguments)
+	}
+
+	second := classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", func(s string) string {
+		return strings.ReplaceAll(s, "jhqZwM-35cA.iuosuA3Wo-0", "jhqZwM-35cA.secondRepl0")
+	}))
+	if second.Conversation != sideKey {
+		t.Errorf("a second reply in the same thread = %q, want it to join %q", second.Conversation, sideKey)
+	}
+
+	// Back at the top level after a side thread: the main flow, answered
+	// top-level — nothing about the side thread sticks to the space.
+	again := classify(gchatFixtureEvent(t, "addon-dm-hello.json", nil))
+	if again.Conversation != mainFlow {
+		t.Errorf("top-level DM after a side thread = %q, want %q", again.Conversation, mainFlow)
+	}
+	if c := postTo(again.Conversation); threadOf(c) != nil {
+		t.Errorf("the main flow must stay top-level after a side thread: %+v", c.arguments)
+	}
+}
+
+// The same rule through the gateway: a side thread is a separate session,
+// not a steer of the main flow's running task, and a second reply in the
+// thread steers the side thread's own task.
+func TestGchatDMSideThreadIsItsOwnSession(t *testing.T) {
+	r := startGchatRig(t, nil, true)
+	a := newTestGchatAdapter(t)
+	classify := func(ev *gchatEvent) InboundMessage {
+		t.Helper()
+		msg, reason := a.classify(ev)
+		if reason != "" {
+			t.Fatalf("dropped: %s", reason)
+		}
+		return msg
+	}
+	ctx := context.Background()
+	activeTask := func(conv string) string {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		if rec == nil || rec.ActiveTask == nil {
+			return ""
+		}
+		return rec.ActiveTask.TaskID
+	}
+	// submissions is every message the gateway put on the platform's in
+	// subjects, oldest first: a new task or a steer, told apart by taskId.
+	submissions := func(n int) []*lib.Envelope {
+		t.Helper()
+		var envs []*lib.Envelope
+		waitFor(t, fmt.Sprintf("%d submissions", n), func() bool {
+			envs = envs[:0]
+			for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+				if e.Kind == lib.KindMessage {
+					envs = append(envs, e)
+				}
+			}
+			return len(envs) >= n
+		})
+		return envs
+	}
+
+	top := classify(gchatFixtureEvent(t, "addon-dm-mention-with-text.json", nil))
+	r.adapter.inbox <- top
+	mainTask := submissions(1)[0].TaskID
+	waitFor(t, "main-flow task on the record", func() bool { return activeTask(top.Conversation) == mainTask })
+
+	reply := classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", nil))
+	r.adapter.inbox <- reply
+	sideTask := submissions(2)[1].TaskID
+	if sideTask == mainTask {
+		t.Fatalf("the in-thread reply steered the main flow's task %q; a side thread is its own session", mainTask)
+	}
+	waitFor(t, "side-thread task on its own record", func() bool { return activeTask(reply.Conversation) == sideTask })
+
+	second := classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", func(s string) string {
+		return strings.ReplaceAll(s, "jhqZwM-35cA.iuosuA3Wo-0", "jhqZwM-35cA.secondRepl0")
+	}))
+	r.adapter.inbox <- second
+	if got := submissions(3)[2].TaskID; got != sideTask {
+		t.Errorf("a second reply in the thread went to task %q, want a steer on the side thread's %q", got, sideTask)
+	}
+	if got := activeTask(top.Conversation); got != mainTask {
+		t.Errorf("main flow's active task = %q, want %q untouched", got, mainTask)
 	}
 }
 
@@ -1337,6 +1663,15 @@ func TestGchatDefaultDisplayModeRetriesAFailedStateEdit(t *testing.T) {
 	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
 		t.Fatal(err)
 	}
+	// The artifact goes out only once the state edit has been tried and
+	// failed. Published together, the two could reach the relay as one batch,
+	// whose one coalesced edit is the failed one, leaving nothing to retry on:
+	// the test then timed out on about three runs in ten.
+	waitFor(t, "the state edit to fail", func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		return r.adapter.failEdits == 0
+	})
 	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: "step"}}}); err != nil {
 		t.Fatal(err)
 	}

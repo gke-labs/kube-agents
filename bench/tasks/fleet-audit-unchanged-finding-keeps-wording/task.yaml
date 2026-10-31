@@ -1,0 +1,103 @@
+# NIGHTLY -- an entry in hack/eval/nightly-cases.txt.
+#
+# Domain: fleet audits. Journey: an audit runs again over a fleet that did not
+# change, and the ledger keeps the words of the previous run. `finish` keeps
+# the previous run's title, impact, recommendation and manual note for a
+# finding whose evidence and severity did not change
+# (docs/designs/fleet-audit-collector-manifest.md, section 3.2). Without
+# that, the worker writes new words on each run, and an unchanged fleet looks
+# changed on each run.
+#
+# How the case makes the previous run. The bench format runs one prompt, so
+# one case cannot run the stream two times and compare the two ledgers. The
+# stack prebuilt/unchanged-finding-wording plants the previous run in the
+# report store instead. It runs the drift collector in the agent's own
+# container, and writes one stored finding for each candidate, with the id,
+# evidence and severity that `finish` gives that candidate. The planted
+# title, impact, recommendation and manual note start with the `mark`
+# variable below, which a worker does not write. The planted envelope names
+# no issue, so it does not change the delta. The destroy removes each stored
+# envelope of the stream that holds the mark, so a kept wording does not stay
+# in the store for later runs of the stream.
+#
+# Red on main: `finish` publishes the worker's own title, so the mark is not
+# in the ledger, and the objective below fails on a missing phrase. Green
+# with the carry: the drift outlier finding has the same evidence and
+# severity as the planted one, so `finish` publishes the planted title.
+#
+# The stream is fleet-consistency-drift because its collector is the
+# cheapest one: one `clusters list` per project, and no kubeconfig. Its
+# candidates on the seeded fleet do not change between the plant and the run.
+#
+# Planted defect required: drift-outlier (bench/tf/fleet/fixtures.json), the
+# authorized-networks outlier on slot c. Isolation class: cluster-read-only,
+# GitOps-repo write, as for consistency-drift-outlier: the run opens or
+# rewrites the stream's ledger issue in the throwaway eval repository.
+id: fleet-audit-unchanged-finding-keeps-wording
+name: An unchanged drift finding keeps the wording of the previous run
+
+fixtures:
+  - drift-outlier
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/unchanged-finding-wording"
+  teardown: true
+  variables:
+    # Letters, digits and hyphens only, so the ledger renders it as it is.
+    mark: "kept-wording-c4a7"
+
+validated: false
+
+domain: fleet-audits
+
+owner: dshnayder
+
+prompt: >-
+  Run the fleet consistency drift audit, following the
+  fleet-consistency-drift SOP.
+
+expected_output: >-
+  The ledger issue for the fleet-consistency-drift stream names the
+  authorized-networks outlier on the seeded fleet. Its finding has the title
+  of the previous run, which starts with kept-wording-c4a7, because the
+  evidence and the severity did not change. The closing response is the
+  SOP's one line, with the ledger URL in full.
+
+verification_spec:
+  # The previous run's title on the outlier finding. The planted title is
+  # "<mark> <check> <object>", so this phrase binds the mark to the
+  # authorized-networks finding, and a mark on some other finding does not
+  # pass.
+  - name: the-outlier-kept-the-previous-title
+    role: objective
+    # assert: `finish` writes the ledger one time, before the run ends.
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      required_phrases: ["kept-wording-c4a7 authorized-networks"]
+  # The outlier was filed at all. Without this, a run that filed nothing has
+  # the same failure reason as a run that filed it with new words.
+  - name: the-outlier-was-filed
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      scope: finding_ids
+      required_phrases: ["authorized-networks"]
+  # The worker must not copy the mark from the store by hand: that gives a
+  # green on main for the wrong reason. Each pattern is a read of the drift
+  # stream's stored reports.
+  - name: the-store-was-not-read
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        - "fleet-audit/reports"
+        - 'report_query\.py'
+        - 'latest\.json'

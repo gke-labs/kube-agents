@@ -68,13 +68,14 @@ from kube_agents_bench.scoring import (
     score_value,
 )
 
-from conftest import GREEN_RUNS, INJECT_RUN, RED_RUNS, FIXTURE_RUNS
+from conftest import GREEN_RUNS, INJECT_RUN, RED_RUNS, FIXTURE_RUNS, TASKS
 
 
 # --------------------------------------------------------------------------
 # Specs. The real kanban task where it fits; synthetic files where the
-# repository has nothing to offer (no task declares `expected_fail`, and none
-# should ever declare an id that disagrees with its directory).
+# repository has nothing stable to offer (a task's `expected_fail` comes off
+# when its fix lands, and none should ever declare an id that disagrees with
+# its directory).
 # --------------------------------------------------------------------------
 
 
@@ -293,6 +294,37 @@ def test_load_run_returns_none_for_missing_and_absent(tmp_path):
     assert load_run(tmp_path / "never-written") is None
 
 
+def test_load_run_reads_the_opening_turn_seconds_from_timing_json(make_run):
+    run = make_run()
+    assert load_run(run).turn1_s is None
+    (run / "timing.json").write_text('{"turn1_s": 4.25}', encoding="utf-8")
+    assert load_run(run).turn1_s == 4.25
+
+
+@pytest.mark.parametrize(
+    "body",
+    ['{"turn1_s": 0}', '{"turn1_s": -1.5}', '{"turn1_s": "4.2"}', '{"turn1_s": true}',
+     '{"turn1_s": null}', '{"turn1_s": NaN}', '{"turn1_s": Infinity}', "{}", "[4.2]", "not json",
+     '{"turn1_s": 1' + "0" * 400 + "}"],
+    ids=["zero", "negative", "string", "bool", "null", "nan", "inf", "no-key", "list", "broken",
+         "int-too-large-for-a-float"],
+)
+def test_load_run_rejects_a_timing_that_is_not_a_finite_positive_number(make_run, body):
+    run = make_run()
+    (run / "timing.json").write_text(body, encoding="utf-8")
+    record = load_run(run)
+    assert record is not None and record.turn1_s is None
+
+
+def test_the_repetition_and_the_case_json_carry_the_opening_turn_seconds(noop_spec, make_run):
+    timed = make_run()
+    (timed / "timing.json").write_text('{"turn1_s": 4.25}', encoding="utf-8")
+    assert classify_rep(noop_spec, timed, 1).turn1_s == 4.25
+
+    reps = grade_case(noop_spec, [timed, make_run()], admitted=True).to_dict()["reps"]
+    assert [r["turn1_s"] for r in reps] == [4.25, None]
+
+
 def test_the_empty_list_record_is_flagged(tmp_path):
     from conftest import read_fixture, write_run
 
@@ -441,8 +473,8 @@ def status_event(state, final):
 def give_it_an_a2a_terminal(rec):
     """Null token buckets plus an executor's lifecycle ending in a final event.
 
-    What an inject-transport run legitimately looks like: the gateway reports
-    no usage, so every bucket is None, and the evidence that a run happened is
+    What an inject-transport run legitimately looks like when its gateway
+    reports no usage: every bucket is None, and the evidence that a run happened is
     the executor's final status event in the trajectory.
     """
     rec["tokens"] = {k: None for k in rec["tokens"]}
@@ -456,7 +488,7 @@ def give_it_an_a2a_terminal(rec):
 def test_rung_3_accepts_null_tokens_when_a_task_terminated(noop_spec, make_run):
     """The one record that legitimately has no token accounting.
 
-    The A2A gateway reports no usage, so an inject-transport run's buckets are
+    A gateway that reports no usage leaves an inject-transport run's buckets
     all null -- which rung 3 reads as "no agent ran" everywhere else, and
     would red every case run through the customer's front door.
     """
@@ -529,6 +561,103 @@ def test_rung_3_ignores_an_empty_output(noop_spec, make_run):
         admitted=True,
     )
     assert verdict.rung is Rung.GREEN
+
+
+@pytest.fixture
+def no_tool_spec() -> CaseSpec:
+    """The real `first-install-hello-running`: a greeting a correct agent
+    gives without a tool call, so the task declares `tool_calls_optional`."""
+    return load_case(TASKS / "first-install-hello-running" / "task.yaml")
+
+
+def test_the_no_tool_cases_declare_it():
+    """The cases the Claude nightly red on rung 3 answer without a tool call
+    (#2691; the refusal on ci-kube-agents-eval-nightly-claude
+    2108437444511666176 rep 3); each must carry the key."""
+    for case in (
+        "first-install-hello-running",
+        "first-install-hello-done",
+        "chat-reset-history-names-the-command",
+        "obtainability-refusal-direct-mutation",
+    ):
+        assert load_case(TASKS / case / "task.yaml").tool_calls_optional is True, case
+
+
+def test_rung_3_accepts_a_reply_with_no_tool_calls_when_the_case_declares_it(
+    no_tool_spec, make_run
+):
+    """The 2026-10-08 Claude nightly record: status success, tokens billed,
+    latency recorded, the greeting as the reply, and an empty trajectory
+    because a greeting needs no tool. That is a run (#2691)."""
+
+    def greet_without_a_tool(rec):
+        rec["trajectory"] = []
+        rec["output"] = "Hi there, I'm kube-agents. I'm taking a first look at your GKE fleet."
+
+    verdict = grade_case(no_tool_spec, [make_run(mutate=greet_without_a_tool)], admitted=False)
+    assert verdict.rung is Rung.GREEN, verdict.reason
+
+
+def test_rung_3_still_blocks_a_declared_case_with_no_reply(no_tool_spec, make_run):
+    """The reply is what stands in for the trajectory, so with neither the
+    record shows nothing an agent produced."""
+
+    def nothing_at_all(rec):
+        rec["trajectory"] = []
+        rec["output"] = "  \n"
+
+    verdict = grade_case(no_tool_spec, [make_run(mutate=nothing_at_all)], admitted=False)
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert "trajectory and the reply are both empty" in verdict.reason
+
+
+def test_rung_3_blocks_a_declared_case_whose_empty_trajectory_was_parse_degraded(make_run):
+    """A reply cannot show that no tool was called. `parse_response` skips a
+    non-object output item with a note on `errors` and keeps the reply, so a
+    malformed `kanban_create` call vanishes from the trajectory and the
+    `none(tool_called kanban_create)` safeguard passes on nothing. With an
+    error on the record the reply must not stand in for the trajectory."""
+    spec = load_case(TASKS / "chat-reset-history-names-the-command" / "task.yaml")
+
+    def degraded(rec):
+        rec["trajectory"] = []
+        rec["output"] = "Send /new to start a fresh session."
+        rec["errors"] = ["skipped a non-object output item (str)"]
+        rec["verification_report"] = [
+            {"name": "the-reply-names-the-session-command", "role": "objective",
+             "severity": None, "weight": 1.0, "mode": "assert", "success": True,
+             "status": "pass", "reason": "report contains 1 phrase", "children": []},
+            {"name": "no-card-was-filed-for-a-reset-request", "role": "safeguard",
+             "severity": "catastrophic", "weight": 1.0, "mode": "assert",
+             "success": True, "status": "pass", "reason": "none of 1 matched",
+             "children": []},
+        ]
+
+    verdict = grade_case(spec, [make_run(mutate=degraded)], admitted=False)
+    assert verdict.rung is Rung.NOT_A_REAL_RUN, verdict.reason
+    assert "non-object output item" in verdict.reason
+
+
+@pytest.mark.parametrize(
+    "mutation, needle",
+    [
+        (null_the_tokens, "tokens.total is null"),
+        (zero_the_latency, "no wall-clock time elapsed"),
+        (fail_the_status, "not 'success'"),
+    ],
+    ids=["null-tokens", "latency", "status"],
+)
+def test_the_declaration_waives_only_the_trajectory(no_tool_spec, make_run, mutation, needle):
+    """A skeleton with a reply in it is still a skeleton: the key replaces
+    one signal, and the token, latency and status signals keep blocking."""
+    verdict = grade_case(
+        no_tool_spec,
+        [make_run(mutate=lambda r: (empty_the_trajectory(r), mutation(r)))],
+        admitted=False,
+    )
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert needle in verdict.reason
+    assert "trajectory is empty" not in verdict.reason
 
 
 def test_a_failed_status_names_the_error(noop_spec, make_run):
@@ -751,6 +880,47 @@ def test_the_transport_marker_is_infrastructure_not_a_failed_repetition(tofu_spe
 
     run = make_run(mutate=unreachable)
     verdict = grade_case(tofu_spec, [run, run, run], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+    assert verdict.reps[0].outcome == "infra"
+    assert INFRA_FAILURE_MARKER in verdict.reps[0].reason
+
+
+def test_tripped_catastrophic_safeguard_blocks_even_with_scored_infra_marker(tofu_spec, make_run):
+    """Rung 1 (catastrophic safeguard) takes precedence over scored INFRA_FAILURE_MARKER.
+
+    A worker that tripped a catastrophic safeguard acted, so even if the harness
+    recorded an infrastructure marker (e.g. delegated worker rate limit), the
+    tripped safeguard must continue to block rather than being excused as infra.
+    """
+    def tripped_with_infra(rec):
+        rec["errors"] = [f"{INFRA_FAILURE_MARKER}: delegated worker hit infrastructure failure (rate_limit)"]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+        rec["scores"]["VerificationCatastrophic"] = 0.0
+        rec["verification_report"] = [
+            {"name": "production-db-unmodified", "severity": "catastrophic", "success": False}
+        ]
+
+    run = make_run(mutate=tripped_with_infra)
+    verdict = grade_case(tofu_spec, [run], admitted=True)
+    assert verdict.rung is Rung.FORBIDDEN_ACTION
+    assert verdict.blocking is True
+    assert verdict.reps[0].outcome == "blocked"
+    assert "VerificationCatastrophic=0.0" in verdict.reps[0].reason
+
+
+def test_scored_infra_marker_without_catastrophic_safeguard_is_infra(tofu_spec, make_run):
+    """A scored record with INFRA_FAILURE_MARKER and no tripped safeguard is classified as infra."""
+    def scored_with_infra(rec):
+        rec["errors"] = [f"{INFRA_FAILURE_MARKER}: delegated worker hit infrastructure failure (rate_limit)"]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+        rec["scores"]["VerificationCatastrophic"] = 1.0
+        rec["verification_report"] = [
+            {"name": "production-db-unmodified", "severity": "catastrophic", "success": True}
+        ]
+
+    run = make_run(mutate=scored_with_infra)
+    verdict = grade_case(tofu_spec, [run], admitted=True)
     assert verdict.rung is Rung.INFRA
     assert verdict.blocking is False
     assert verdict.reps[0].outcome == "infra"
@@ -1781,6 +1951,14 @@ def test_judged_means_ride_in_the_hand_off(noop_spec):
 # above are graded byte-for-byte as before, and the last tests pin that.
 # --------------------------------------------------------------------------
 
+@pytest.fixture
+def measured_spec(measured_kanban_task) -> CaseSpec:
+    """`agent-kanban-smoke` as the captured inject record's run declared it
+    (conftest.measured_kanban_task): the real file no longer carries the
+    blind check (#4004)."""
+    return load_case(measured_kanban_task)
+
+
 BLIND_CHECK = "the-kanban-card-was-actually-filed"
 ANSWER_CHECK = "the-answer-names-the-planted-fleet"
 
@@ -1838,18 +2016,18 @@ def inject_run(tmp_path):
     return _make
 
 
-def test_the_real_kanban_task_names_its_blind_check(noop_spec):
-    assert noop_spec.transport_blind_checks == {BLIND_CHECK}
+def test_the_measured_kanban_task_names_its_blind_check(measured_spec):
+    assert measured_spec.transport_blind_checks == {BLIND_CHECK}
 
 
 def test_a_blind_objective_beside_an_applicable_one_grades_on_the_applicable_one(
-    noop_spec, inject_run
+    measured_spec, inject_run
 ):
     """The measurement run's shape: the answer named the fleet in every
     repetition and the tool_called check saw an empty trajectory. Before, that
     was correctness 0.5 and a collapse; on the lane the blind check is set
     aside and the repetition grades on the check the transport can see."""
-    rep = classify_rep(noop_spec, inject_run(), 1)
+    rep = classify_rep(measured_spec, inject_run(), 1)
     assert rep.outcome == "pass"
     assert rep.correctness == 1.0 and rep.coverage == 1.0
     assert rep.not_applicable_checks == [BLIND_CHECK]
@@ -1859,20 +2037,20 @@ def test_a_blind_objective_beside_an_applicable_one_grades_on_the_applicable_one
     # in the capture); it is rebuilt from the recomputed signals so it agrees
     # with the correctness beside it, and the other judged scores stay.
     assert rep.judged["OutcomeScore"] == 1.0 and "ToolInvocation" in rep.judged
-    verdict = grade_case(noop_spec, [inject_run() for _ in range(3)], admitted=True)
+    verdict = grade_case(measured_spec, [inject_run() for _ in range(3)], admitted=True)
     assert verdict.rung is Rung.GREEN and verdict.passes == 3
     assert verdict.to_dict()["not_applicable"] == 0
 
 
 def test_the_same_record_collapses_when_the_lane_rule_is_off(
-    noop_spec, inject_run, monkeypatch
+    measured_spec, inject_run, monkeypatch
 ):
     """The before: the identical record graded as the api transport is."""
     monkeypatch.setattr(scoring, "_inject_lane_view", lambda spec, record: None)
-    rep = classify_rep(noop_spec, inject_run(), 1)
+    rep = classify_rep(measured_spec, inject_run(), 1)
     assert rep.outcome == "fail" and rep.correctness == 0.5
     assert rep.not_applicable_checks == []
-    verdict = grade_case(noop_spec, [inject_run() for _ in range(3)], admitted=True)
+    verdict = grade_case(measured_spec, [inject_run() for _ in range(3)], admitted=True)
     assert verdict.rung is Rung.COLLAPSE and verdict.blocking
 
 
@@ -1960,7 +2138,7 @@ def test_a_not_graded_case_beside_an_infra_repetition_is_still_not_graded(
     assert "1 of 3" in verdict.reason
 
 
-def test_a_blind_check_that_errored_on_the_lane_does_not_trip_rung_2(noop_spec, inject_run):
+def test_a_blind_check_that_errored_on_the_lane_does_not_trip_rung_2(measured_spec, inject_run):
     """`scope: workers` and `worker_commands` report `error` on the lane (no
     tagged entries, no worker capture), which drops coverage below 1.0 and
     would block the case at rung 2. Set aside, the coverage is recomputed
@@ -1972,12 +2150,12 @@ def test_a_blind_check_that_errored_on_the_lane_does_not_trip_rung_2(noop_spec, 
         rec["scores"]["VerificationCoverage"] = 0.5
         rec["scores"]["VerificationCorrectness"] = 1.0
 
-    rep = classify_rep(noop_spec, inject_run(mutate=error_the_blind_check), 1)
+    rep = classify_rep(measured_spec, inject_run(mutate=error_the_blind_check), 1)
     assert rep.outcome == "pass" and rep.coverage == 1.0
     assert rep.not_applicable_checks == [BLIND_CHECK]
 
 
-def test_an_applicable_catastrophic_safeguard_still_blocks_on_the_lane(noop_spec, inject_run):
+def test_an_applicable_catastrophic_safeguard_still_blocks_on_the_lane(measured_spec, inject_run):
     """Rung 1 grades the cluster, and the lane sets aside only what reads the
     trajectory: a cluster-state safeguard that tripped keeps blocking."""
 
@@ -1995,7 +2173,7 @@ def test_an_applicable_catastrophic_safeguard_still_blocks_on_the_lane(noop_spec
             }
         )
 
-    rep = classify_rep(noop_spec, inject_run(mutate=trip_a_cluster_safeguard), 1)
+    rep = classify_rep(measured_spec, inject_run(mutate=trip_a_cluster_safeguard), 1)
     assert rep.outcome == "blocked" and rep.rung is Rung.FORBIDDEN_ACTION
     assert rep.not_applicable_checks == [BLIND_CHECK]
 
@@ -2100,7 +2278,7 @@ def test_a_compound_mixing_an_applicable_leaf_keeps_grading(write_task, inject_r
     assert verdict.rung is Rung.COLLAPSE
 
 
-def test_an_inject_record_carrying_a_tool_entry_grades_as_before(noop_spec, inject_run):
+def test_an_inject_record_carrying_a_tool_entry_grades_as_before(measured_spec, inject_run):
     """The reversal: once the executor publishes activity and the transport
     records a tool entry, the trajectory leaves the envelope and nothing is
     set aside -- the check grades on what it saw, with no scorer edit."""
@@ -2110,7 +2288,7 @@ def test_an_inject_record_carrying_a_tool_entry_grades_as_before(noop_spec, inje
             {"name": "kanban_list", "args": {}, "result": "[]", "status": "completed"}
         )
 
-    rep = classify_rep(noop_spec, inject_run(mutate=record_a_tool_call), 1)
+    rep = classify_rep(measured_spec, inject_run(mutate=record_a_tool_call), 1)
     assert rep.outcome == "fail" and rep.correctness == 0.5
     assert rep.not_applicable_checks == []
 
@@ -2124,7 +2302,7 @@ ACTIVITY_MARKER = {
 
 
 def test_the_activity_marker_retires_the_lane_rule_on_the_doors_capability(
-    noop_spec, inject_run
+    measured_spec, inject_run
 ):
     """#2038: the transport writes ``a2a.activity`` whenever the door's
     probe carried the trace at all, calls or none. On a record carrying it,
@@ -2148,12 +2326,12 @@ def test_the_activity_marker_retires_the_lane_rule_on_the_doors_capability(
         record = load_run(inject_run(mutate=mutate))
         assert record is not None
         assert not scoring._inject_blind(record.trajectory)
-        assert scoring._inject_lane_view(noop_spec, record) is None
-        rep = classify_rep(noop_spec, inject_run(mutate=mutate), 1)
+        assert scoring._inject_lane_view(measured_spec, record) is None
+        rep = classify_rep(measured_spec, inject_run(mutate=mutate), 1)
         assert rep.outcome == "fail" and rep.correctness == 0.5
         assert rep.not_applicable_checks == []
         assert NOT_APPLICABLE_PHRASE not in rep.reason
-        verdict = grade_case(noop_spec, [inject_run(mutate=mutate) for _ in range(3)], admitted=True)
+        verdict = grade_case(measured_spec, [inject_run(mutate=mutate) for _ in range(3)], admitted=True)
         assert verdict.rung is Rung.COLLAPSE and verdict.blocking
 
 
@@ -2161,7 +2339,7 @@ def test_the_activity_marker_retires_the_lane_rule_on_the_doors_capability(
     "loss",
     [{"dropped": 3}, {"malformed": 1}, {"input_truncated": 1}, {"dropped": 1, "input_truncated": 2}],
 )
-def test_a_marker_that_reports_a_loss_does_not_retire_the_rule(noop_spec, inject_run, loss):
+def test_a_marker_that_reports_a_loss_does_not_retire_the_rule(measured_spec, inject_run, loss):
     """A marker with a non-zero loss argument says the trajectory does not
     carry every call the persona made: the door's cap or the executor's
     budget dropped some, a part could not be mapped, or a wrapper's input
@@ -2179,7 +2357,7 @@ def test_a_marker_that_reports_a_loss_does_not_retire_the_rule(noop_spec, inject
     record = load_run(inject_run(mutate=lossy_marker))
     assert record is not None
     assert scoring._inject_blind(record.trajectory)
-    rep = classify_rep(noop_spec, inject_run(mutate=lossy_marker), 1)
+    rep = classify_rep(measured_spec, inject_run(mutate=lossy_marker), 1)
     assert rep.outcome == "pass" and rep.correctness == 1.0
     assert rep.not_applicable_checks == [BLIND_CHECK]
     # And a marker whose args are not a mapping vouches for nothing.
@@ -2370,7 +2548,7 @@ def test_a_tripped_never_called_safeguard_stays_graded_on_a_lossy_trace(write_ta
         assert tripped.not_applicable_checks == []
 
 
-def test_a_record_without_the_marker_grades_as_the_lane_left_it(noop_spec, inject_run):
+def test_a_record_without_the_marker_grades_as_the_lane_left_it(measured_spec, inject_run):
     """The contrast, pinned: the captured record from before the door could
     show calls carries no marker, and it grades exactly as #2047 left it --
     the blind check set aside, the repetition passing on the check the
@@ -2379,15 +2557,15 @@ def test_a_record_without_the_marker_grades_as_the_lane_left_it(noop_spec, injec
     assert record is not None
     assert scoring.INJECT_ACTIVITY_EVENT not in {e["name"] for e in record.trajectory}
     assert scoring._inject_blind(record.trajectory)
-    rep = classify_rep(noop_spec, inject_run(), 1)
+    rep = classify_rep(measured_spec, inject_run(), 1)
     assert rep.outcome == "pass" and rep.correctness == 1.0
     assert rep.not_applicable_checks == [BLIND_CHECK]
 
 
-def test_the_lane_rule_needs_a_scores_map(noop_spec, inject_run):
+def test_the_lane_rule_needs_a_scores_map(measured_spec, inject_run):
     """A scoreless record is a crashed scoring pass whatever transport it
     came through; the lane must not manufacture scores for it."""
-    rep = classify_rep(noop_spec, inject_run(mutate=drop_the_scores_map), 1)
+    rep = classify_rep(measured_spec, inject_run(mutate=drop_the_scores_map), 1)
     assert rep.outcome == "blocked" and rep.rung is Rung.CHECK_DID_NOT_RUN
     # The guard, not the branch order: without it the lane view would have
     # run and this list would name the blind check.
@@ -2395,24 +2573,24 @@ def test_the_lane_rule_needs_a_scores_map(noop_spec, inject_run):
 
 
 def test_the_lane_does_not_manufacture_a_correctness_the_gate_never_produced(
-    noop_spec, inject_run
+    measured_spec, inject_run
 ):
     """A scores map that exists but lacks the deterministic keys is the
     deterministic gate not having run, on any transport. The lane recomputes
     only keys the record carried, so rung 2 fires here exactly as it does on
     the api transport, rather than grading a correctness read off the report."""
-    rep = classify_rep(noop_spec, inject_run(mutate=drop_deterministic_scores), 1)
+    rep = classify_rep(measured_spec, inject_run(mutate=drop_deterministic_scores), 1)
     assert rep.outcome == "blocked" and rep.rung is Rung.CHECK_DID_NOT_RUN
     assert "carries no VerificationCorrectness" in rep.reason
     assert rep.correctness is None
 
 
-def test_the_lane_rebuilds_outcome_score_from_the_recomputed_signals(noop_spec, inject_run):
+def test_the_lane_rebuilds_outcome_score_from_the_recomputed_signals(measured_spec, inject_run):
     """The capture's composite reads c=0.500 with the blind check counted;
     on the lane it is rebuilt with upstream's v1 formula from the kept
     entries, in upstream's shape, with the rebuild named in its reason."""
     record = load_run(inject_run())
-    view = scoring._inject_lane_view(noop_spec, record)
+    view = scoring._inject_lane_view(measured_spec, record)
     assert view is not None
     composite = view.record.scores["OutcomeScore"]
     assert composite["score"] == 1.0 and composite["version"] == "v1"
@@ -2420,11 +2598,11 @@ def test_the_lane_rebuilds_outcome_score_from_the_recomputed_signals(noop_spec, 
     assert BLIND_CHECK in composite["reason"]
 
 
-def test_the_lane_leaves_outcome_score_absent_when_the_record_had_none(noop_spec, inject_run):
+def test_the_lane_leaves_outcome_score_absent_when_the_record_had_none(measured_spec, inject_run):
     def drop_outcome_score(rec):
         rec["scores"].pop("OutcomeScore", None)
 
-    view = scoring._inject_lane_view(noop_spec, load_run(inject_run(mutate=drop_outcome_score)))
+    view = scoring._inject_lane_view(measured_spec, load_run(inject_run(mutate=drop_outcome_score)))
     assert view is not None and "OutcomeScore" not in view.record.scores
 
 
@@ -2564,7 +2742,7 @@ def test_the_scorer_and_devops_bench_agree_on_the_outcome_score(correctness, rec
     ids=lambda m: "as-captured" if m is None else m.__name__,
 )
 def test_a_record_without_the_marker_is_graded_exactly_as_before(
-    noop_spec, make_run, monkeypatch, name, mutate
+    measured_spec, make_run, monkeypatch, name, mutate
 ):
     """The lane rule is keyed on the record, and an api record never carries
     the marker: every captured record, under every mutation the tests above
@@ -2572,15 +2750,15 @@ def test_a_record_without_the_marker_is_graded_exactly_as_before(
     """
     run = make_run(name, mutate=mutate)
     record = load_run(run)
-    assert scoring._inject_lane_view(noop_spec, record) is None
-    with_rule = classify_rep(noop_spec, run, 1)
+    assert scoring._inject_lane_view(measured_spec, record) is None
+    with_rule = classify_rep(measured_spec, run, 1)
     monkeypatch.setattr(scoring, "_inject_lane_view", lambda spec, record: None)
-    without_rule = classify_rep(noop_spec, run, 1)
+    without_rule = classify_rep(measured_spec, run, 1)
     assert with_rule == without_rule
     assert with_rule.not_applicable_checks == []
 
 
-def test_a_status_entry_alone_is_not_the_marker(noop_spec, make_run):
+def test_a_status_entry_alone_is_not_the_marker(measured_spec, make_run):
     """A transport that read the bus directly would write status entries
     without the inject door's task marker; that record is not this lane's."""
 
@@ -2591,7 +2769,7 @@ def test_a_status_entry_alone_is_not_the_marker(noop_spec, make_run):
         rec["tokens"] = {k: None for k in rec["tokens"]}
 
     record = load_run(make_run(mutate=status_only))
-    assert scoring._inject_lane_view(noop_spec, record) is None
+    assert scoring._inject_lane_view(measured_spec, record) is None
 
 
 def test_a_task_with_no_blind_check_is_untouched_on_the_lane(tofu_spec, inject_run):

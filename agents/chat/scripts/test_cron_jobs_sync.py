@@ -11,15 +11,21 @@ The property under test throughout is that an image roll changes a job's
 new job simply never appeared — so several tests assert on what did NOT happen.
 """
 
+import fcntl
 import json
 import os
+import sys
 import pathlib
+import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-import cron_jobs_sync
+sys.path.insert(1, str(Path(__file__).resolve().parents[2] / "platform" / "scripts"))
+import cron_jobs_sync  # noqa: E402
+import profile_scaffold  # noqa: E402
 
 
 def job(job_id, **kw):
@@ -204,6 +210,58 @@ class ReconcileTests(unittest.TestCase):
         for entry in jobs:
             with self.subTest(job=entry.get("id")):
                 self.assertEqual(state & set(entry), set())
+
+
+class FoldTests(unittest.TestCase):
+    """The fold of the onboarding jobs into oobe (docs/designs/oobe.md section 5)."""
+
+    SCAN = {"id": "bootstrap-inventory-scan", "schedule": "* * * * *", "enabled": False}
+    DELIVERY = {"id": "bootstrap-inventory-delivery", "schedule": "* * * * *", "enabled": False, "deliver": "local"}
+    OOBE = {"id": "oobe", "schedule": "* * * * *", "deliver": "local"}
+    ORIGIN = {"platform": "google_chat", "chat_id": "spaces/AAA"}
+
+    def _jobs(self, merged):
+        return {j["id"]: j for j in merged}
+
+    def test_the_link_on_the_old_delivery_job_is_carried_to_oobe(self):
+        runtime = [
+            {**self.SCAN, "enabled": True},
+            {**self.DELIVERY, "enabled": True, "deliver": "origin", "origin": self.ORIGIN},
+            dict(self.OOBE),
+        ]
+        merged, _, summary = cron_jobs_sync.reconcile([self.SCAN, self.DELIVERY, self.OOBE], runtime, set())
+        oobe = self._jobs(merged)["oobe"]
+        self.assertEqual((oobe["deliver"], oobe["origin"]), ("origin", self.ORIGIN))
+        self.assertEqual(summary["linked"], ["oobe"])
+
+    def test_a_link_already_on_oobe_stands(self):
+        mine = {"platform": "slack", "chat_id": "C1"}
+        runtime = [
+            {**self.DELIVERY, "deliver": "origin", "origin": self.ORIGIN},
+            {**self.OOBE, "deliver": "origin", "origin": mine},
+        ]
+        merged, _, summary = cron_jobs_sync.reconcile([self.DELIVERY, self.OOBE], runtime, set())
+        self.assertEqual(self._jobs(merged)["oobe"]["origin"], mine)
+        self.assertEqual(summary["linked"], [])
+
+    def test_the_old_jobs_ship_disabled_beside_oobe(self):
+        runtime = [{**self.SCAN, "enabled": True}, {**self.DELIVERY, "enabled": True}, dict(self.OOBE)]
+        merged, _, summary = cron_jobs_sync.reconcile([self.SCAN, self.DELIVERY, self.OOBE], runtime, set())
+        jobs = self._jobs(merged)
+        self.assertEqual((jobs["bootstrap-inventory-scan"]["enabled"], jobs["bootstrap-inventory-delivery"]["enabled"]), (False, False))
+        self.assertEqual(summary["kept_onboarding"], [])
+
+    def test_without_oobe_the_old_jobs_stay_enabled(self):
+        # An earlier image removed oobe once its audits were done, mid-onboarding: the old jobs
+        # are all that can still deliver the report.
+        runtime = [{**self.SCAN, "enabled": True}, {**self.DELIVERY, "enabled": True}]
+        merged, _, summary = cron_jobs_sync.reconcile(
+            [self.SCAN, self.DELIVERY, self.OOBE], runtime, {"bootstrap-inventory-scan", "bootstrap-inventory-delivery", "oobe"}
+        )
+        jobs = self._jobs(merged)
+        self.assertNotIn("oobe", jobs)
+        self.assertEqual((jobs["bootstrap-inventory-scan"]["enabled"], jobs["bootstrap-inventory-delivery"]["enabled"]), (True, True))
+        self.assertEqual(summary["kept_onboarding"], ["bootstrap-inventory-scan", "bootstrap-inventory-delivery"])
 
 
 class SyncFileTests(unittest.TestCase):
@@ -409,6 +467,110 @@ class SyncFileTests(unittest.TestCase):
                 cron_jobs_sync.write_json(target, {"jobs": []})
         self.assertEqual(sorted(p.name for p in self.tmp.glob("*.tmp*")), [])
         self.assertFalse(target.exists(), "a failed write must not create the target")
+
+    def test_cron_jobs_lock_held_during_sync(self):
+        """Issue #3179: Hermes' .jobs.lock must be held exclusively while syncing jobs.json."""
+        self.write(self.image, {"jobs": [job("a")]})
+        self.write(self.runtime, {"jobs": [job("a")]})
+
+        lock_held = False
+        lock_file = self.runtime.parent / ".jobs.lock"
+
+        orig_reconcile = cron_jobs_sync.reconcile
+
+        def probe_reconcile(*args, **kwargs):
+            nonlocal lock_held
+            self.assertTrue(lock_file.is_file(), ".jobs.lock must exist while sync runs")
+            with open(lock_file, "r") as f:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    lock_held = False
+                except (BlockingIOError, OSError):
+                    lock_held = True
+            return orig_reconcile(*args, **kwargs)
+
+        with mock.patch.object(cron_jobs_sync, "reconcile", side_effect=probe_reconcile):
+            cron_jobs_sync.sync(self.image, self.runtime, self.ledger)
+
+        self.assertTrue(lock_held, ".jobs.lock was NOT held exclusively during sync")
+
+    def test_cron_pause_during_sync_not_lost(self):
+        """Issue #3179: A cron pause landing while sync runs must survive."""
+        self.write(self.image, {"jobs": [job("a", prompt="new prompt")]})
+        self.write(self.runtime, {"jobs": [job("a", prompt="old prompt", state="running")]})
+
+        lock_file = self.runtime.parent / ".jobs.lock"
+        jobs_path = self.runtime
+        orig_reconcile = cron_jobs_sync.reconcile
+        pause_thread = None
+        about_to_lock = threading.Event()
+
+        def pause_worker():
+            fd = open(lock_file, "a+", encoding="utf-8")
+            try:
+                about_to_lock.set()
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    data = json.loads(jobs_path.read_text(encoding="utf-8"))
+                    data["jobs"][0]["state"] = "paused"
+                    data["jobs"][0]["paused_at"] = "2026-10-15T07:23:22Z"
+                    jobs_path.write_text(json.dumps(data), encoding="utf-8")
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                fd.close()
+
+        def inject_pause_mid_sync(*args, **kwargs):
+            nonlocal pause_thread
+            pause_thread = threading.Thread(target=pause_worker)
+            pause_thread.start()
+            self.assertTrue(about_to_lock.wait(timeout=5.0))
+            # If sync holds .jobs.lock, pause_worker blocks in flock(LOCK_EX), so join times out.
+            # If sync does NOT hold .jobs.lock, pause_worker finishes immediately, writing mid-sync
+            # before orig_reconcile runs, which sync's write_json clobbers.
+            pause_thread.join(timeout=0.05)
+            return orig_reconcile(*args, **kwargs)
+
+        with mock.patch.object(cron_jobs_sync, "reconcile", side_effect=inject_pause_mid_sync):
+            cron_jobs_sync.sync(self.image, self.runtime, self.ledger)
+
+        if pause_thread:
+            pause_thread.join()
+
+        merged = json.loads(self.runtime.read_text())["jobs"]
+        self.assertEqual(merged[0]["state"], "paused", "pause state was lost during sync")
+        self.assertEqual(merged[0]["paused_at"], "2026-10-15T07:23:22Z")
+        self.assertEqual(merged[0]["prompt"], "new prompt", "image prompt was not updated")
+
+    def test_cron_jobs_lock_non_contention_oserror_fails_open_immediately(self):
+        """Non-BlockingIOError OSError (e.g. ENOLCK/EOPNOTSUPP) fails open immediately without 15s wait."""
+        import errno
+        lock_dir = self.runtime.parent
+        t0 = time.monotonic()
+        with mock.patch("fcntl.flock", side_effect=OSError(errno.ENOLCK, "No record locks available")):
+            with cron_jobs_sync.cron_jobs_lock(lock_dir, timeout=5.0):
+                pass
+        duration = time.monotonic() - t0
+        self.assertLess(duration, 1.0, f"lock waited {duration}s on permanent OSError instead of failing open immediately")
+
+    def test_cron_jobs_lock_timeout_fallback(self):
+        """When .jobs.lock is held and times out, sync still completes."""
+        self.write(self.image, {"jobs": [job("a", prompt="new prompt")]})
+        self.write(self.runtime, {"jobs": [job("a", prompt="old prompt")]})
+
+        lock_file = self.runtime.parent / ".jobs.lock"
+        lock_fd = open(lock_file, "a+")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            with mock.patch.object(profile_scaffold, "DEFAULT_JOBS_LOCK_TIMEOUT_SECONDS", 0.05):
+                rc = cron_jobs_sync.sync(self.image, self.runtime, self.ledger)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+        self.assertEqual(rc, 0)
+        merged = json.loads(self.runtime.read_text())["jobs"]
+        self.assertEqual(merged[0]["prompt"], "new prompt")
 
 
 class CliTests(unittest.TestCase):

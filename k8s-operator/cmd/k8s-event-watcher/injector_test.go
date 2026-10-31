@@ -112,15 +112,15 @@ func TestInjectorInject(t *testing.T) {
 		t.Fatalf("failed to build injector: %v", err)
 	}
 
-	status, err := inj.Inject(context.Background(), sessionID, payload)
+	answer, err := inj.InjectDetailed(context.Background(), sessionID, payload)
 	if err != nil {
 		t.Fatalf("Inject call failed: %v", err)
 	}
 	// The handler above answers 200 with no body, which is what a daemon
 	// predating the status field looks like. It must read as delivered, not
 	// as suppressed.
-	if status == injectStatusSuppressed {
-		t.Errorf("got status %q for a bodyless 200, want it treated as delivered", status)
+	if answer.Status == injectStatusSuppressed {
+		t.Errorf("got status %q for a bodyless 200, want it treated as delivered", answer.Status)
 	}
 }
 
@@ -157,12 +157,12 @@ func TestInjectorInjectReportsSuppressedStatus(t *testing.T) {
 				t.Fatalf("failed to build injector: %v", err)
 			}
 
-			status, err := inj.Inject(context.Background(), "active-session", InjectPayload{Reason: "BackOff"})
+			answer, err := inj.InjectDetailed(context.Background(), "active-session", InjectPayload{Reason: "BackOff"})
 			if err != nil {
 				t.Fatalf("Inject call failed: %v", err)
 			}
-			if status != tc.want {
-				t.Errorf("got status %q, want %q", status, tc.want)
+			if answer.Status != tc.want {
+				t.Errorf("got status %q, want %q", answer.Status, tc.want)
 			}
 		})
 	}

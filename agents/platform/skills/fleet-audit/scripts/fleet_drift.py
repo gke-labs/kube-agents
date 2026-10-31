@@ -28,11 +28,12 @@ agent to do once the manifest hands it the outliers.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import re
 import shlex
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
 from collections import Counter
@@ -57,10 +58,9 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 ]
 
 DEFAULT_TIMEOUT_S = 60
-# What `timeout(1)` exits with, so a timed-out gcloud reads the same in the
-# manifest whichever layer cut it off.
-TIMEOUT_RC = 124
-MAX_WORKERS = 8
+# How many clusters a sweep reads at once is broker_admission.sweep_width(),
+# resolved in collect_fleet: what the credential broker admits, less headroom
+# for chat (collect.py's comment above its own collect_fleet has the reasoning).
 # How much of gcloud's stderr a `gate-failed` entry keeps: enough to carry the
 # API's error sentence, short enough not to dominate the manifest.
 ERROR_EXCERPT_CHARS = 300
@@ -83,6 +83,39 @@ QUALIFIED_TARGET_SEPARATOR = "/"
 # never named. Uppercase because a GCP project id cannot be, so no real project
 # can collide with it.
 UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
+# Where the image and the shell sandbox ship the scripts the collectors share
+# (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
+# /opt/defaults/scripts), then the checkout's own copy for a run from the
+# repository.
+# The checkout's copy only when there is a checkout: a file three or fewer
+# directories below `/` has no parents[3], as collect.py guards the same path.
+SHARED_SCRIPT_DIRS = (
+    "/opt/defaults/scripts",
+    "/opt/data/scripts",
+    *([str(Path(__file__).resolve().parents[3] / "scripts")] if len(Path(__file__).resolve().parents) > 3 else []),
+)
+
+# The install's declared scope, handed in by the agent from the platform_control
+# `fleet_scope` tool (the collectors run in the shell sandbox and cannot read
+# the reconcile's snapshot themselves): the flags, their parsing and the note
+# live in fleet_scope_args, shared with every collector. `--scope-projects` is
+# the sweep, complete coverage; `--scope-unread` names each declared project
+# the install could not read, recorded as a coverage gap. Without them the
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
+for _shared_dir in SHARED_SCRIPT_DIRS:
+    if _shared_dir not in sys.path:
+        sys.path.append(_shared_dir)
+import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
+
+# The scope this collector was handed, set by main from the scope flags.
+declared_scope = fleet_scope_args.DeclaredScope()
+
 # What that same target stands for when the operator narrowed the scope on
 # purpose. `--project` skips discovery, so a scoped run reads one project and
 # names no other -- which is the loss a failed `projects list` produces, minus
@@ -196,36 +229,14 @@ def log(msg: str) -> None:
     print(f"[fleet_drift] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+TIMEOUT_RC = collector_run.TIMEOUT_RC
+Discovery = collector_run.Discovery
+run_and_gate = collector_run.run_and_gate
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
-
-
-def default_run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        return Run(argv, TIMEOUT_RC, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
-    except Exception as exc:
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
-
-
-def run_and_gate(argv: list[str], *, run: RunFn) -> tuple[object | None, Run]:
-    result = run(argv)
-    if result.rc != 0 or not result.stdout.strip():
-        return None, result
-    try:
-        return json.loads(result.stdout), result
-    except json.JSONDecodeError:
-        return None, result
 
 
 def output_digest(text: str) -> str:
@@ -245,30 +256,11 @@ def _record(argv_str: str, result: Run) -> dict:
 # §1: fleet enumeration
 # --------------------------------------------------------------------------- #
 
-class Discovery(NamedTuple):
-    projects: list[str]
-    # Set when no project could be resolved at all -- neither the active
-    # project nor `projects list` answered. An empty fleet is then a failure
-    # to look, not a fleet with nothing in it, and the manifest says so.
-    error: str | None
-    # Set when discovery resolved part of the fleet and lost the rest: the
-    # active project answered and `projects list` did not, so the scope is one
-    # project out of an unknown number. A warning on stderr was all this used
-    # to be, and stderr is not in the manifest -- so the run read one project,
-    # marked every entry `collected`, and the document that followed carried no
-    # coverage gap. `finish` then has no reason to hold a previous ledger
-    # finding on a cluster in any other project: it is absent from the
-    # document, absent from the manifest, and therefore announced resolved and
-    # its remediation pull request stale-closed. `collect_fleet` turns this
-    # into a `gate-failed` target so the loss is a row the document must
-    # account for, the way a project whose `clusters list` failed already is.
-    partial: str | None = None
-
-
 def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
-    """§1.1's project scope. `--project` scopes the run to one project;
-    without one it is the active project plus every project
-    `gcloud projects list` returns.
+    """§1.1's project scope. `--project` scopes the run to one project; else
+    the declared scope the SOP passed from the fleet_scope tool
+    (`--scope-projects`) is the sweep as given; without either it is the
+    active project plus every project `gcloud projects list` returns.
 
     Discovery names projects and lists none of them. It used to decide scope
     by listing each candidate and keeping the ones that answered with at least
@@ -278,7 +270,20 @@ def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
     A project holding no clusters contributes no manifest entry either way, so
     nothing was bought with that round trip."""
     if base_project:
+        override_error = declared_scope.override_error(base_project)
+        if override_error:
+            return Discovery([], override_error, None)
         return Discovery([base_project], None, SCOPED_RUN_NOTE.format(project=base_project))
+
+    if declared_scope.declared:
+        # The declared scope the agent carried from the fleet_scope tool: the
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable is a run that read no project,
+        # reported as such rather than widened to the listing.
+        if not declared_scope.projects:
+            return Discovery([], declared_scope.empty_error(), None)
+        log(f"scope: the install's declared scope, {len(declared_scope.projects)} project(s) from the fleet_scope tool")
+        return Discovery(list(declared_scope.projects), None, declared_scope.note())
 
     result = run(["gcloud", "config", "get-value", "project"])
     base = result.stdout.strip() if result.rc == 0 else ""
@@ -355,8 +360,9 @@ def enumerate_project_clusters(project: str, *, run: RunFn) -> tuple[list[dict],
 
     One failure is not a loss: a project whose Kubernetes Engine API is off
     cannot hold a GKE cluster, so it answers with zero clusters and no error.
-    §1.1 puts every project the credential can see in scope "whether or not
-    they hold a cluster", and that sentence only reads as intended if a project
+    §1.1 puts every project in scope -- the declared scope the agent passes,
+    else every project the credential can see -- "whether or not it holds a
+    cluster", and that sentence only reads as intended if a project
     that cannot hold one reads as empty rather than as unread -- otherwise a
     credential with organisation-wide visibility turns every non-GKE project
     into a permanent coverage gap. See `API_DISABLED_MARKERS`.
@@ -376,6 +382,7 @@ def enumerate_project_clusters(project: str, *, run: RunFn) -> tuple[list[dict],
             return [], None, None
         log(f"{project}: clusters list gate failed (rc={result.rc}); no clusters known from this project")
         return [], None, f"clusters list rc={result.rc}: {result.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}"
+    parsed = declared_scope.drop_excluded(project, parsed)
     for c in parsed:
         c["_project"] = project
     record = _record(shlex.join(argv), result)
@@ -1756,9 +1763,6 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
     checks_run: dict[tuple, list[str]] = {ckey(c): [] for c in clusters}
     candidates: dict[tuple, list[dict]] = {ckey(c): [] for c in clusters}
     outlier_facet_count: dict[tuple, int] = {ckey(c): 0 for c in clusters}
-    # §3.6's guard rewrites a cluster's candidates from its `ckey` alone, so it
-    # needs the same name the per-facet emits used.
-    targets: dict[tuple, str] = {ckey(c): target_name(c) for c in clusters}
 
     layout = cohort_layout(clusters, now=now)
     env_of, strategy = layout.env_of, layout.strategy
@@ -1824,7 +1828,6 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
                         continue
                     if _shape_mismatch(facet, c, baseline_clusters):
                         continue
-                    name = target_name(c)
                     inferred = baseline_inferred or (env_matters and env_of[ckey(c)][1] == "inferred")
                     base_sev = facet.base_severity(observed) if callable(facet.base_severity) else facet.base_severity
                     sev, downgrades = apply_severity_ladder(base_sev, r, k, inferred)
@@ -1859,7 +1862,8 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> tuple[list[di
     return enumerate_project_clusters(project, run=run)
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int | None = None, now: datetime | None = None) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
     discovery = discover_fleet(project, run=run)
@@ -2095,8 +2099,10 @@ def candidate_summary(manifest: dict) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--project", help="single project to audit; omit to run §1's project discovery")
+    parser.add_argument("--project", help="single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else run §1's project discovery")
+    fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     manifest = collect_fleet(args.project)
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):

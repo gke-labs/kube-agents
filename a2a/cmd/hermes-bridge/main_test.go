@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+
+	hermesbridge "github.com/gke-labs/kube-agents/a2a/hermes-bridge"
 )
 
 // unreachableNATSURL is a loopback port nothing listens on. lib.Connect
@@ -341,5 +343,33 @@ func TestAMalformedPodNamespaceIsABootFailure(t *testing.T) {
 				t.Fatalf("configFromEnv with POD_NAMESPACE=%q returned errUsage, want a clean boot", tc.ns)
 			}
 		})
+	}
+}
+
+// The card stop's request bound: unset is the default the Config applies,
+// which defaultCardStopTimeoutSeconds must equal, and a count of seconds sets
+// it.
+func TestCardStopTimeoutFromTheEnvironment(t *testing.T) {
+	if time.Duration(defaultCardStopTimeoutSeconds)*time.Second != hermesbridge.DefaultCardStopTimeout {
+		t.Fatalf("defaultCardStopTimeoutSeconds = %d, want hermesbridge.DefaultCardStopTimeout (%s)",
+			defaultCardStopTimeoutSeconds, hermesbridge.DefaultCardStopTimeout)
+	}
+	for _, tc := range []struct {
+		value string
+		want  time.Duration
+	}{
+		{"", hermesbridge.DefaultCardStopTimeout},
+		{"90", 90 * time.Second},
+		{"soon", hermesbridge.DefaultCardStopTimeout},
+	} {
+		t.Setenv("NATS_URL", unreachableNATSURL)
+		t.Setenv("BRIDGE_CARD_STOP_TIMEOUT_SECONDS", tc.value)
+		cfg, err := configFromEnv(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatalf("configFromEnv: %v", err)
+		}
+		if cfg.CardStopTimeout != tc.want {
+			t.Errorf("CardStopTimeout = %s with BRIDGE_CARD_STOP_TIMEOUT_SECONDS=%q, want %s", cfg.CardStopTimeout, tc.value, tc.want)
+		}
 	}
 }

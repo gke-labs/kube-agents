@@ -21,9 +21,13 @@ GIT_ENV = {
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_NOSYSTEM": "1",
     # No user ignore file, as in the tool: the fixtures must commit every file they write.
-    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_COUNT": "3",
     "GIT_CONFIG_KEY_0": "core.excludesFile",
     "GIT_CONFIG_VALUE_0": os.devnull,
+    "GIT_CONFIG_KEY_1": "gc.autoDetach",
+    "GIT_CONFIG_VALUE_1": "false",
+    "GIT_CONFIG_KEY_2": "maintenance.autoDetach",
+    "GIT_CONFIG_VALUE_2": "false",
     "GIT_AUTHOR_NAME": "test",
     "GIT_AUTHOR_EMAIL": "test@example.invalid",
     "GIT_COMMITTER_NAME": "test",
@@ -448,6 +452,27 @@ class Scenario(unittest.TestCase):
         cafe.write_text("a\nB\nc\n")
         self.assertIn("lines that 0001-add-cafe.patch introduced", self.run_tool("refresh", "basics", "--message", "edit"))
 
+    def test_continue_refuses_markers_in_a_conflicted_file_with_a_space_or_non_ascii_name(self):
+        refs = self.upstream / "skills" / "cloud" / "basics" / "references"
+        names = ("a b.md", "caf\u00e9.md")
+        for name in names:
+            (refs / name).write_text("x\n")
+        git(self.upstream, "add", "-A")
+        git(self.upstream, "commit", "-q", "-m", "named refs")
+        base = git(self.upstream, "rev-parse", "HEAD").stdout.strip()
+        for name in names:
+            (refs / name).write_text("z\n")
+        git(self.upstream, "commit", "-qam", "edit named refs")
+        self.run_tool("sync", "basics", "--ref", base)
+        for name in names:
+            (self.skill().parent / "references" / name).write_text("y\n")
+        self.run_tool("refresh", "basics", "--message", "edit named refs")
+        self.run_tool("sync", "basics", expect=2)
+        scratch = self.repo / ".skill-sync" / "basics"
+        git(scratch, "add", "-A")
+        out = self.run_tool("continue", "basics", expect=1)
+        self.assertIn("conflict markers remain in references/a b.md, references/caf\u00e9.md", out)
+
     def test_patch_in_traditional_form_survives_a_sync(self):
         self.adopt_with_two_patches()
         patch = self.overlay() / "0001-use-location.patch"
@@ -510,18 +535,26 @@ class Helpers(unittest.TestCase):
         self.assertNotIn("index 111..222", out)
         self.assertIn("index 333..444", out)
 
-    def test_conflict_markers_found_in_a_staged_file_with_a_space(self):
+    def test_stage_all_sees_a_same_size_edit_with_unchanged_stat(self):
+        # What Linux CI hit: git compares whole-second times, so a same-size edit copied in
+        # with the old mtime looks unchanged to `git add` unless the index is rebuilt.
         repo = Path(tempfile.mkdtemp())
-        git(repo, "init", "-q", "-b", "main")
-        (repo / "a b.md").write_text("x\n")
-        (repo / "caf\u00e9.md").write_text("x\n")
-        git(repo, "add", "-A")
-        git(repo, "commit", "-q", "-m", "base")
-        for name in ("a b.md", "caf\u00e9.md"):
-            (repo / name).write_text("<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n")
-        git(repo, "add", "-A")
-        self.assertEqual(sorted(self.tool.leftover_conflict_markers(repo, ["a b.md", "caf\u00e9.md"])),
-                         ["a b.md", "caf\u00e9.md"])
+        try:
+            git(repo, "init", "-q", "-b", "main")
+            git(repo, "config", "core.checkStat", "minimal")
+            git(repo, "config", "core.trustctime", "false")
+            f = repo / "a.md"
+            f.write_text("x\n")
+            old = f.stat().st_mtime - 10
+            os.utime(f, (old, old))
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", "x")
+            f.write_text("y\n")
+            os.utime(f, (old, old))
+            self.tool.stage_all(repo)
+            self.assertEqual(git(repo, "diff", "--cached", "--name-only").stdout.split(), ["a.md"])
+        finally:
+            shutil.rmtree(repo)
 
     def test_patch_header_stops_at_a_traditional_diff_and_not_inside_why(self):
         text = "Subject: s\n\nWhy: quotes diff --git here\nRetire-When: x\n\n--- a/SKILL.md\n+++ b/SKILL.md\n"
@@ -554,6 +587,66 @@ class Helpers(unittest.TestCase):
         self.assertEqual(self.tool.separator_for("a\n\n"), "")
         self.assertEqual(self.tool.separator_for("a\n"), "\n")
         self.assertEqual(self.tool.separator_for("a"), "\n\n")
+
+    def test_git_env_disables_background_gc_and_maintenance(self):
+        env = self.tool.GIT_ENV
+        count = int(env["GIT_CONFIG_COUNT"])
+        config_pairs = {
+            env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+            for i in range(count)
+        }
+        self.assertEqual(config_pairs.get("gc.autoDetach"), "false")
+        self.assertEqual(config_pairs.get("maintenance.autoDetach"), "false")
+
+    def test_git_helper_applies_gc_and_maintenance_configs(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            self.tool.git(["init", "-q"], cwd=d)
+            self.assertEqual(self.tool.git_out(["config", "--get", "gc.autoDetach"], cwd=d), "false")
+            self.assertEqual(self.tool.git_out(["config", "--get", "maintenance.autoDetach"], cwd=d), "false")
+        finally:
+            shutil.rmtree(d)
+
+    def test_auto_gc_runs_synchronously_in_foreground(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            self.tool.git(["init", "-q"], cwd=d)
+            # gc.autoPackLimit=1 ensures auto gc triggers on porcelain operations once >= 2 packs exist
+            self.tool.git(["config", "gc.autoPackLimit", "1"], cwd=d)
+            (d / "f1").write_text("1")
+            self.tool.git(["add", "f1"], cwd=d)
+            self.tool.git(["commit", "-q", "-m", "1"], cwd=d)
+            self.tool.git(["repack", "-d"], cwd=d)
+
+            (d / "f2").write_text("2")
+            self.tool.git(["add", "f2"], cwd=d)
+            self.tool.git(["commit", "-q", "-m", "2"], cwd=d)
+            self.tool.git(["repack"], cwd=d)
+
+            (d / "f3").write_text("3")
+            self.tool.git(["add", "f3"], cwd=d)
+
+            loose_before = [p for p in (d / ".git" / "objects").iterdir() if p.is_dir() and p.name not in ("info", "pack")]
+            packs_before = list((d / ".git" / "objects" / "pack").glob("*.pack"))
+            self.assertGreaterEqual(len(packs_before), 2)
+            self.assertGreater(len(loose_before), 0)
+
+            # Porcelain commit triggers auto gc.
+            # With gc.autoDetach=false, housekeeping completes synchronously in the foreground
+            # before git() returns, ensuring repacking finishes before subsequent filesystem operations.
+            self.tool.git(["commit", "-q", "-m", "3"], cwd=d)
+
+            # Assert foreground completion on return: packs consolidated and loose objects pruned
+            packs_after = list((d / ".git" / "objects" / "pack").glob("*.pack"))
+            loose_after = [p for p in (d / ".git" / "objects").iterdir() if p.is_dir() and p.name not in ("info", "pack")]
+            self.assertEqual(len(packs_after), 1)
+            self.assertEqual(len(loose_after), 0)
+
+            # shutil.rmtree succeeds immediately without concurrent background file deletion
+            shutil.rmtree(d)
+        finally:
+            if d.exists():
+                shutil.rmtree(d)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,43 @@
+{
+  "name": "reactions-direct-answer",
+  "source": "deploy/docker/patches/test_slack_ux_reactions.py::DisplayTest.test_a_direct_answer_takes_the_arrival_off_and_leaves_x_only_on_failure",
+  "notes": "A direct answer's terminal carries no mark: the gateway's default takes the ask off, and on failed sets settle failed. Today the arrival is a reaction with no message. On progress the mark rides beside that event's own text, the turn's first progress line: a progress chat message with no text beside it is dropped by the renderer, mark and all, so the emitter sends the mark on the first progress event that has text.",
+  "input": {
+    "events": [
+      {
+        "ask": "fix it"
+      },
+      {
+        "terminal": "completed"
+      },
+      {
+        "ask": "fix it"
+      },
+      {
+        "terminal": "failed"
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "progress",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "mark": {
+          "ask": "change"
+        }
+      }
+    },
+    null,
+    {
+      "carrier": "progress",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "mark": {
+          "ask": "change"
+        }
+      }
+    },
+    null
+  ]
+}

@@ -7,9 +7,11 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // InboundMessage is one chat message, normalized across backends. AuthorID is
@@ -54,15 +56,51 @@ type InboundMessage struct {
 	// a submission nobody took is still on the in subject for a bridge that
 	// binds later to run).
 	TaskID string
+	// TopLevel marks a message that roots a conversation of its own in a
+	// space whose questions each get their own thread, rather than one
+	// typed inside a thread: today a top-level Slack DM, which the adapter
+	// keys on its own message id. Such a conversation has nothing running
+	// in it, so a stop or a status question there gets a reply saying
+	// where to send it instead of being read as an ask. False is every
+	// other message, and every other backend's case.
+	TopLevel bool
+	// Click marks a message that is a click on a choice button rather than a
+	// message of its own: MessageID then names the click (the audit chain's
+	// join), not a message anything can be drawn on. A chain a click starts
+	// carries its mark on the conversation's previous ask instead (mark.go).
+	// False for a typed message, and for every backend but Slack and Google
+	// Chat.
+	Click bool
+	// Answer marks a typed message that answers a question the conversation
+	// has open (one the adapter laid out with choices). Like a click, it
+	// continues that ask's work rather than starting an ask of its own, so
+	// its chain marks the previous ask: otherwise the card that asked
+	// settles on the answer, and the ask keeps ⏸️. False on every backend
+	// but Slack.
+	Answer bool
+	// Unaddressed marks a message the sender did not address to the bot,
+	// delivered only because of where it was typed: today an unmentioned
+	// Slack reply under one of the bot's own posts (an alert, or another
+	// post it roots in the home channel), which is often people talking to each other. An unverified
+	// sender's such message is dropped without the public refusal notice,
+	// since they asked the bot nothing. False on every other path.
+	Unaddressed bool
+	// Shortcut marks a message a member sent by using the "ask about this"
+	// message shortcut on someone's message: the conversation is the thread
+	// under that message, MessageID names it, and Text quotes it. A sender
+	// the gateway cannot verify gets no refusal in that thread, which the
+	// channel reads; the adapter tells them privately. False on every other
+	// path, and on every backend but Slack.
+	Shortcut bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
-// task. The chat backends have no way to express it -- a human types "stop"
-// and the text matcher reads it -- but a program should not have to spell a
-// phrase to reach a control path, and a phrase that changes meaning is a
-// class of bug an API does not have. The inject door has an explicit route
-// for it, and it lands on the bus as kind: cancel exactly as the text route
-// does.
+// task. A chat message cannot express it -- a human types "stop" and the
+// text matcher reads it -- but a program should not have to spell a phrase
+// to reach a control path, and a phrase that changes meaning is a class of
+// bug an API does not have. The inject door has an explicit route for it,
+// Slack's Stop button arrives as it (slack_stop.go), and it lands on the bus
+// as kind: cancel exactly as the text route does.
 const IntentCancel = "cancel"
 
 // Adapter is the five-operation backend interface from the gateway design:
@@ -76,13 +114,31 @@ type Adapter interface {
 	Run(ctx context.Context, handler func(InboundMessage)) error
 
 	// Post writes text to a conversation and returns the backend message id,
-	// used by the rolling progress line's Edit.
+	// used by the rolling progress line's Edit. It is PostMessage for a
+	// message that is text alone.
 	Post(conversation, text string) (messageID string, err error)
 
 	// Edit replaces the text of a previously posted message — the rolling
 	// progress line edits one message as progress artifacts arrive, at zero
 	// model cost.
 	Edit(conversation, messageID, text string) error
+
+	// PostMessage writes one message value. With m.Chat set, a backend that
+	// renders chat messages posts it laid out, as one message, with m.Text
+	// as its fallback; a backend that renders none returns ErrTextOnly, and
+	// a backend that cannot hold this one, or whose API refuses it, returns
+	// the reason. Either way nothing was posted, and the gateway posts
+	// m.Text instead, chunked under the backend's cap (Gateway.postMessage).
+	// With m.Chat nil it is Post(conversation, m.Text), unless m.Feedback
+	// marks an answer a backend draws rating controls on (feedback.go).
+	PostMessage(conversation string, m OutMessage) (messageID string, err error)
+
+	// EditMessage replaces a posted message with m, laid out or not, under
+	// PostMessage's rules: ErrTextOnly from a backend that renders no chat
+	// message, which the gateway answers with Edit. With m.Chat nil a
+	// backend that laid the message out before replaces the layout with the
+	// text; any other backend makes it Edit.
+	EditMessage(conversation, messageID string, m OutMessage) error
 
 	// Roster returns the members of a conversation in the same vocabulary
 	// as AuthorID (so a member who is also the requester matches), and
@@ -95,6 +151,114 @@ type Adapter interface {
 	// that decides to use it comes later. Until then everything posts to the
 	// room it came from.
 	OpenDirect(userID string) (conversation string, err error)
+
+	// React puts the reaction for a mark token on a message the conversation
+	// received, and RemoveReaction takes it off: the `mark` of a chat
+	// message (spec-a2a-payloads.md, "mark"), an ask kind (question,
+	// investigate, ...) or a settle (blocked, failed). The gateway decides
+	// which tokens a message carries; the adapter only owns which emoji, if
+	// any, a token shows, and a token it has none for is a nil no-op.
+	//
+	// Both are best effort, and the rule is the adapter's own: the gateway
+	// holds the bot token, so no credential-proxy rule applies here. An
+	// adapter removes only a reaction the bot itself put on, never anyone
+	// else's, and a backend that cannot react returns nil from both, as
+	// does a reaction that is already there or already gone. A failure is
+	// returned for the caller to log; it never holds up the answer.
+	React(conversation, messageID, token string) error
+	RemoveReaction(conversation, messageID, token string) error
+}
+
+// MarkObserver is the optional extension an Adapter implements to learn a
+// conversation's session mark whenever it changes: the latest ask's whole
+// mark state, or the newest older ask's while that one still has open card
+// work (SessionRecord.sessionMark), beside the React and RemoveReaction calls that draw it. The
+// Slack adapter uses it to hold the thread's Agent Sessions status: an ask
+// whose chain has ended but still carries its kind is card work still open,
+// and a blocked settle is work waiting on the user. Called where the mark is
+// applied, on the conversation's worker under its session lock: record and
+// return.
+type MarkObserver interface {
+	MarkChanged(conversation string, ask, settle string)
+}
+
+// VerifiedObserver is the optional extension an Adapter implements to learn
+// whether a message it handed over passed sender verification (verified:
+// it goes on as a turn) or was dropped. A backend that has to act on the
+// message itself -- the Slack adapter rewriting a clicked question to say
+// who answered, or titling the thread -- must not act for a sender the
+// gateway drops, and only the gateway holds the principal map. Called once
+// per message, on the conversation's inbox worker before the session lock
+// is taken: record and return.
+type VerifiedObserver interface {
+	InboundVerified(conversation, messageID string, verified bool)
+}
+
+// StatusShower is the optional extension an Adapter implements when its
+// backend shows a task's status itself, so the relay's rolling line ("⏳
+// submitted…" edited on to "✅ completed") would only repeat it. The Slack
+// adapter does, with Agent Sessions' Working… status, the ask's reaction and
+// the plan rows, as the today path shows no receipt either. With it true the
+// gateway posts no placeholder for a task, so the relay has no line to edit
+// and every line edit is skipped; the notices that stand on their own (the
+// queue notice, a publish failure, a failed or canceled task) still post.
+// Asked per conversation, so a wrapper (the mux, the side door) answers for
+// the backend that owns it.
+type StatusShower interface {
+	ShowsTaskStatus(conversation string) bool
+}
+
+// OutMessage is one post or edit as a value: the text, and the chat message
+// that lays the same content out (spec-a2a-payloads.md, "Chat messages").
+type OutMessage struct {
+	// Text is the message as text, and the whole of it: what a backend that
+	// renders no chat message posts, and the fallback (the notification,
+	// what a read-back sees) on one that does.
+	Text string
+	// Chat, when set, is a kube-agents.chat/v1 message the gateway has
+	// already read and validated for its carrier (chatmsg.Read); an adapter
+	// renders it or declines it, and never repairs one.
+	Chat *chatmsg.Message
+	// Feedback, when set, is the task id an answer can be rated under: the
+	// root of the chain whose final answer this message is (answer
+	// feedback, feedback.go). A backend that draws rating controls draws
+	// them on this message; every other backend ignores it.
+	Feedback string
+}
+
+// ErrTextOnly is a backend's answer to a message value with a chat message
+// when it renders none: Discord, the inject door, the console and the A2A
+// door. The gateway posts the text instead, so every one of them posts
+// exactly what it posted before chat messages existed. Slack and Google
+// Chat render one (slack_chat.go, gchat_chat.go).
+var ErrTextOnly = errors.New("this backend posts text only")
+
+// ErrLayoutRefused wraps a backend's refusal of one chat message's layout:
+// more than one message holds, or the API's own refusal of the blocks. It
+// is told apart from any other failure (a rate limit, an outage, a message
+// that is gone), which says nothing about the layout and is retried as
+// such rather than counted or remembered as a refusal.
+var ErrLayoutRefused = errors.New("the backend refused this layout")
+
+// ErrMessageGone wraps a backend's answer that the message an edit names
+// cannot be edited at all (deleted, or past the backend's edit window), as
+// distinct from a failure a retry may clear.
+var ErrMessageGone = errors.New("the message can no longer be edited")
+
+// postTextOnly is PostMessage for a backend that renders no chat message.
+func postTextOnly(post func(conversation, text string) (string, error), conversation string, m OutMessage) (string, error) {
+	if m.Chat != nil {
+		return "", ErrTextOnly
+	}
+	return post(conversation, m.Text)
+}
+
+// editTextOnly is EditMessage for a backend that renders no chat message.
+func editTextOnly(edit func(conversation, messageID, text string) error, conversation, messageID string, m OutMessage) error {
+	if m.Chat != nil {
+		return ErrTextOnly
+	}
+	return edit(conversation, messageID, m.Text)
 }
 
 // TaskObserver is the optional extension an Adapter implements when it has to
@@ -156,7 +320,9 @@ type TaskObserver interface {
 	// CancelPublished says a kind:cancel envelope for taskID is on the
 	// task's `in` subject. Called after the publish returns, on both cancel
 	// routes (the active task's and a named task the conversation no longer
-	// holds).
+	// holds), and for the card-stop control a stop sends (cardstop.go), with
+	// the control's id: that stop reached the bus too, whether or not a task
+	// was running to cancel.
 	//
 	// Signalled on success only, like TaskAccepted, and read against the end
 	// of the turn: the gateway's answer to a cancel it did not publish is a
@@ -349,6 +515,12 @@ type ConversationState struct {
 	// Grace is the gateway's FirstEventGrace: the window inside which an
 	// active task with nothing on its stream is legitimately pre-first-event.
 	Grace time.Duration
+	// ContextID is the A2A contextId the record carries for this
+	// conversation, "" when there is no record. Every task the conversation
+	// publishes carries it, and an executor keys its own state on it (the
+	// bridge's api executor names its Hermes session after it), so a caller
+	// can find that state without a turn.
+	ContextID string
 	// TaskID is the task this read describes: the one the caller named,
 	// else the record's active task. Active is whether the record holds
 	// that task as its active one; SubmittedAt and the active-task fields
@@ -397,4 +569,35 @@ type ConversationState struct {
 	// which is the line the relay's rolling edit shows.
 	Activity []json.RawMessage
 	Progress string
+	// Usage is what the front door's own turns cost: the usage artifact's
+	// parts summed (lib.UsageTotal) over TaskID's stream and, for a
+	// delegation chain's root, every wake that continued it, whichever link
+	// the read follows. ChildUsage is the same sum over the chain's child
+	// tasks, the addressees the front door delegated to (the platform
+	// router that files the cards among them), kept apart because it is
+	// another addressee's work. Each is nil when none of its turns
+	// published usage. UsagePartial is set when a link's stream could not
+	// be read, so the sums leave out what that link cost. Each executor
+	// publishes a turn's usage before its terminal, so a read after the
+	// root's end carries all of it. Set only on a probe whose context asked
+	// for it (withChainUsage): summing a chain reads one stream per link,
+	// which a caller polling the read route has no use for on every poll.
+	Usage        *lib.Usage
+	ChildUsage   *lib.Usage
+	UsagePartial bool
+}
+
+// chainUsageKey marks a probe's context as asking for
+// ConversationState.Usage (withChainUsage).
+type chainUsageKey struct{}
+
+// withChainUsage asks the probe run under ctx to sum the front door's usage.
+func withChainUsage(ctx context.Context) context.Context {
+	return context.WithValue(ctx, chainUsageKey{}, true)
+}
+
+// chainUsageAsked reports whether ctx asks the probe for usage.
+func chainUsageAsked(ctx context.Context) bool {
+	asked, _ := ctx.Value(chainUsageKey{}).(bool)
+	return asked
 }

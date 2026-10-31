@@ -1,0 +1,86 @@
+# Skill-guidance probe for gke-upgrades: a node-pool upgrade runbook plus a
+# question about blocking upgrades through a 100-day freeze. Two facts the
+# skill copy on main before the google/skills sync got wrong:
+#   - it upgraded node pools with `gcloud container node-pools upgrade`, a
+#     command that does not exist; the command is
+#     `gcloud container clusters upgrade CLUSTER --node-pool POOL`;
+#   - it bounded `no_upgrades` exclusions by a rolling 365-day window and
+#     maintenance availability by a rolling 32-day window. GKE's rule is 90
+#     days per exclusion, at most three, with 48 hours of maintenance
+#     availability in any rolling 92-day window
+#     (https://cloud.google.com/kubernetes-engine/docs/concepts/maintenance-windows-and-exclusions).
+#
+# Planted defect required: none. deployer: noop: no fixture is deployed, and
+# the prompt tells the agent not to run anything.
+#
+# Isolation class: read-only (nothing is deployed for the case).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: upgrades-freeze-runbook-probe
+name: Node-pool upgrade runbook uses a real command and the 92-day exclusion rule
+
+owner: GinnyJI
+domain: upgrades
+
+prompt: >-
+  Write me a short runbook with the exact gcloud commands to upgrade the node
+  pool default-pool on my GKE cluster prod-1 in us-central1 to the control
+  plane's version. Also: we have a 100-day code freeze coming. Can I chain
+  "no upgrades" maintenance exclusions to cover it, and what limits apply?
+  Do not run anything.
+expected_output: >-
+  The runbook upgrades the pool with gcloud container clusters upgrade prod-1
+  --node-pool default-pool, and the answer explains that a no_upgrades
+  exclusion lasts at most 90 days, a cluster can have at most three, and 48
+  hours of maintenance availability must remain in any rolling 92-day window,
+  so a 100-day freeze needs a scoped exclusion instead.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: the-runbook-uses-clusters-upgrade-node-pool
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["clusters upgrade", "--node-pool"]
+      # `--node-pool` after a `gcloud ... container clusters upgrade` head
+      # (gcloud takes flags on either side of the cluster name), walking only
+      # argument-shaped tokens with no `--master` and no next `gcloud` between
+      # them. Prose that names `clusters upgrade` without the `gcloud` head, or
+      # a sentence whose words carry `:`, `;` or `,`, does not open or extend the
+      # match; bench/tests/test_upgrades_freeze_runbook_pattern.py pins both.
+      any_of_patterns:
+        - 'gcloud (?:\S+ )?container clusters upgrade (?:(?!--master|gcloud )[-\w./=$<>{}"''\\]+ )*?--node-pool(?=[ =])'
+  - name: the-answer-states-the-92-day-window
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["92-day", "92 day"]
+      # The superseded windows, as plain substrings of the flattened report.
+      forbidden_phrases: ["365-day window", "32-day window"]
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # The quota-limited Developer Knowledge tool the personas forbid; see
+        # knowledge-grounding-sources-probe for why both spellings.
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]

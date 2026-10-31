@@ -70,7 +70,7 @@ KNOWN = {P7, P8}
 # code: sha256 over the sorted input entries joined by NUL, docs left out.
 LS_TREE_HEAD = ["ls-tree", "-r", "-z", "--full-tree", "HEAD", "--", "bench/tf/fleet"]
 LS_TREE_FETCHED = ["ls-tree", "-r", "-z", "--full-tree", "FETCH_HEAD", "--", "bench/tf/fleet"]
-FLEET_INPUTS = {"main.tf": "aaa1", "versions.tf": "aaa2", ".terraform.lock.hcl": "aaa3", "reconcile-allow.json": "aaa4"}
+FLEET_INPUTS = {"main.tf": "aaa1", "versions.tf": "aaa2", ".terraform.lock.hcl": "aaa3", "reconcile-allow.json": "aaa4", "seeded_b_pin.py": "aaa5"}
 FLEET_DOCS = {"README.md": "doc1", "fixtures.json": "fix1"}
 
 
@@ -221,10 +221,10 @@ class PlanInspectionTest(unittest.TestCase):
     def test_the_fleet_stack_commits_a_lock_file_that_matches_its_constraints(self):
         lock = (reconcile.FLEET_DIR / ".terraform.lock.hcl").read_text()
         versions = (reconcile.FLEET_DIR / "versions.tf").read_text()
-        for provider in ("google", "kubernetes"):
+        for provider in ("google", "kubernetes", "external"):
             self.assertIn(f'provider "registry.opentofu.org/hashicorp/{provider}"', lock)
         constraints = re.findall(r'version\s*=\s*"(~> [\d.]+)"', versions)
-        self.assertEqual(len(constraints), 2, "one `~>` constraint per provider; another form needs this test and the lock re-done")
+        self.assertEqual(len(constraints), 3, "one `~>` constraint per provider; another form needs this test and the lock re-done")
         for constraint in constraints:
             self.assertIn(f'constraints = "{constraint}"', lock)
         # One h1 hash per locked platform per provider: linux_amd64 for the
@@ -343,6 +343,21 @@ class TargetsTest(unittest.TestCase):
                 "kube-agents-evals-9": {"roles": {"idle-pool": {"state": "drifted", "detail": []}}},
             }
         }
+        self.assertEqual(reconcile.drifted_projects(document), [P8, "kube-agents-evals-9"])
+
+    def test_a_project_whose_only_drift_no_re_apply_clears_is_skipped(self):
+        # #4005: the age gate and a master ahead of its channel; one ordinary line beside them keeps the project.
+        age = 'cluster createTime age_hours_ge 24: observed "2026-09-14T12:00:00+00:00", 1.0 hours old'
+        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", newer than every 1.34 patch REGULAR offers (newest 1.34.11-gke.1209000)'
+        document = {
+            "projects": {
+                P7: {"roles": {"drift-outlier": {"state": "drifted", "detail": [age]}, "version-laggard": {"state": "drifted", "detail": [ahead]}}},
+                P8: {"roles": {"drift-outlier": {"state": "drifted", "detail": [age, "cluster masterAuthorizedNetworksConfig.enabled none_eq true: observed true"]}}},
+            }
+        }
+        # An unset channel on the same op is the stack's to restore, so that project is applied.
+        unset = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000"; release channel unset'
+        document["projects"]["kube-agents-evals-9"] = {"roles": {"version-laggard": {"state": "drifted", "detail": [unset]}}}
         self.assertEqual(reconcile.drifted_projects(document), [P8, "kube-agents-evals-9"])
 
     def test_a_scan_with_no_drift_targets_nothing(self):
@@ -601,6 +616,17 @@ class MainTest(unittest.TestCase):
         self.assertIn("-var=project_id=%s" % P8, tofu.calls[1])
         self.assertEqual(boskos.resets[0]["state"], reconcile.HOLD_STATE)
         self.assertEqual(boskos.resets[0]["expire"], reconcile.STRANDED_AFTER)
+
+    def test_drifted_skips_and_names_a_project_no_re_apply_clears(self):
+        scan = {"projects": {P8: {"roles": {"drift-outlier": {"state": "drifted", "detail": ['cluster createTime age_hours_ge 24: observed "2026-09-14T12:00:00+00:00", 1.0 hours old']}}}}}
+        tofu = _Tofu({})
+        with mock.patch("builtins.print") as printed:
+            rc, _ = self._main(["--drifted"], _Boskos(free=[P8]), tofu, scan=scan)
+        self.assertEqual(rc, reconcile.EXIT_OK)
+        self.assertEqual(tofu.verbs(), [], "an apply there changes nothing")
+        lines = [c.args[0] for c in printed.call_args_list if c.args]
+        self.assertIn("skipped, no re-apply clears their drift: %s" % P8, lines)
+        self.assertIn("1 project(s) drifted in %s, 0 to re-apply" % reconcile.DEFAULT_FIXTURE_STATE, lines)
 
     def test_all_asks_for_every_mapped_project_after_resetting_strands_and_applies_each(self):
         # The full-pass arm: every mapped project is asked for by name, held
@@ -866,7 +892,7 @@ class HoldTest(unittest.TestCase):
             with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", stdout):
                 with self.assertRaises(boskos_pool.Terminated):
                     reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN, outcomes=outcomes)
-            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back after the release")
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool._defer, "later signals are held while the termination unwinds")
         finally:
             signal.signal(signal.SIGINT, previous)
         self.assertEqual(boskos.released, [P7], "released before the termination was delivered")
@@ -966,8 +992,11 @@ class HoldTest(unittest.TestCase):
             self.assertEqual(boskos_pool._DEFERRED, [signal.SIGINT])
             with self.assertRaises(boskos_pool.Terminated):
                 boskos_pool._hold_signals(False)
-            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back")
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool._defer, "later signals are held while the termination unwinds")
             self.assertEqual(boskos_pool._DEFERRED, [])
+            boskos_pool._hold_signals(True)
+            boskos_pool._hold_signals(False)
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back when no signal is deferred")
         finally:
             boskos_pool._DEFERRED.clear()
             boskos_pool._HOLD_DEPTH = 0
@@ -989,7 +1018,7 @@ class HoldTest(unittest.TestCase):
             self.assertEqual(boskos_pool._HOLD_DEPTH, 1)
             with self.assertRaises(boskos_pool.Terminated):
                 boskos_pool._hold_signals(False)
-            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back")
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool._defer, "later signals remain held while the termination unwinds")
             self.assertEqual(boskos_pool._HOLD_DEPTH, 0)
         finally:
             boskos_pool._DEFERRED.clear()
@@ -1744,10 +1773,12 @@ class ConvergedTest(unittest.TestCase):
 class AllowlistTest(unittest.TestCase):
     """What a re-apply may delete or replace is declared in the fleet directory, not in this script."""
 
-    def test_the_committed_allowlist_carries_the_no_surge_pool_as_a_standing_entry(self):
+    def test_the_committed_allowlist_carries_its_two_standing_entries(self):
+        # The no-surge pool's replace on a minor roll, and the scaled-zero
+        # gateway fixture's status writer, replaced when its Gateway or route is.
         entries = reconcile.load_allowlist(reconcile.ALLOWLIST_FILE)
         standing = [e for e in entries if e.standing]
-        self.assertEqual([e.address for e in standing], ["google_container_node_pool.no_surge_pool"])
+        self.assertEqual([e.address for e in standing], ["google_container_node_pool.no_surge_pool", "terraform_data.scaled_zero_status"])
         self.assertTrue(all(e.why for e in entries), "every entry says why")
         self.assertFalse(hasattr(reconcile, "REPLACE_ALLOWED_ADDRESSES"), "one list, in the file")
 
@@ -2207,13 +2238,14 @@ class WorkersTest(unittest.TestCase):
 
         def tofu(argv, **_):
             if argv[1] == "apply":
-                started.wait(timeout=5)
+                started.wait(timeout=15)
                 # The fake stands in for a tofu that exits on the interrupt.
-                for _ in range(100):
-                    if reconcile.terminating():
-                        return subprocess.CompletedProcess(argv, 130, "", "interrupted")
+                deadline = time.monotonic() + 15
+                while not reconcile.terminating() and time.monotonic() < deadline:
                     time.sleep(0.02)
-                return subprocess.CompletedProcess(argv, 0, "", "")
+                if not reconcile.terminating():
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return subprocess.CompletedProcess(argv, 130, "", "interrupted")
             if argv[1] == "plan":
                 return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
             if argv[1] == "show":
@@ -2228,17 +2260,21 @@ class WorkersTest(unittest.TestCase):
         outcomes = {}
 
         def fire():
-            started.wait(timeout=5)
+            started.wait(timeout=15)
             os.kill(os.getpid(), signal.SIGINT)
 
+        fire_thread = threading.Thread(target=fire, daemon=True)
         try:
-            threading.Thread(target=fire, daemon=True).start()
+            fire_thread.start()
             with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
                 with self.assertRaises(boskos_pool.Terminated):
                     reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN | {p9}, run=reconcile.Run(workers=2), outcomes=outcomes)
         finally:
             signal.signal(signal.SIGINT, previous)
             reconcile._TERMINATING.clear()
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            fire_thread.join(timeout=5)
         self.assertEqual(sorted(boskos.released), [P7, P8])
         self.assertEqual(sorted(boskos.acquired), [P7, P8], "no project is leased after the termination")
         self.assertEqual({p: o for p, (o, _) in outcomes.items()}, {P7: reconcile.OUTCOME_INTERRUPTED, P8: reconcile.OUTCOME_INTERRUPTED, p9: reconcile.OUTCOME_NOT_REACHED})
@@ -2255,13 +2291,14 @@ class WorkersTest(unittest.TestCase):
 
         def tofu(argv, **_):
             if argv[1] == "apply":
-                started.wait(timeout=5)
-                for _ in range(100):
-                    if reconcile.terminating():
-                        time.sleep(0.2)
-                        return subprocess.CompletedProcess(argv, 130, "", "interrupted")
+                started.wait(timeout=15)
+                deadline = time.monotonic() + 15
+                while not reconcile.terminating() and time.monotonic() < deadline:
                     time.sleep(0.02)
-                return subprocess.CompletedProcess(argv, 0, "", "")
+                if not reconcile.terminating():
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                time.sleep(0.2)
+                return subprocess.CompletedProcess(argv, 130, "", "interrupted")
             if argv[1] == "plan":
                 return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
             if argv[1] == "show":
@@ -2273,11 +2310,12 @@ class WorkersTest(unittest.TestCase):
         outcomes = {}
 
         def fire():
-            started.wait(timeout=5)
+            started.wait(timeout=15)
             os.kill(os.getpid(), signal.SIGINT)
 
+        fire_thread = threading.Thread(target=fire, daemon=True)
         try:
-            threading.Thread(target=fire, daemon=True).start()
+            fire_thread.start()
             with mock.patch.object(threading.Thread, "join", lambda self, timeout=None: None), mock.patch.object(
                 boskos_pool.urllib.request, "urlopen", boskos
             ), mock.patch("sys.stdout", io.StringIO()):
@@ -2286,7 +2324,110 @@ class WorkersTest(unittest.TestCase):
         finally:
             signal.signal(signal.SIGINT, previous)
             reconcile._TERMINATING.clear()
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            fire_thread.join(timeout=5)
         self.assertEqual(sorted(boskos.released), [P7, P8], "both holds were released before the termination propagated")
+
+    def test_a_termination_landing_during_worker_startup_drains_started_workers(self):
+        # A SIGINT landing while worker threads are being started must be
+        # caught by the drain rather than escaping before _run_workers enters
+        # its try block, ensuring started workers are drained and holds released.
+        # A second SIGINT during the drain must also be deferred so the drain
+        # finishes waiting and signaling children.
+        orig_start = threading.Thread.start
+        first_worker_seen = None
+        second_fired = False
+        in_apply = threading.Event()
+
+        def wrapped_start(thread_self):
+            nonlocal first_worker_seen
+            if thread_self.name.startswith("fleet-reconcile-"):
+                if first_worker_seen is None:
+                    first_worker_seen = thread_self.name
+                    orig_start(thread_self)
+                    return
+                # Wait until worker 0 is in apply before firing the startup SIGINT.
+                # This guarantees worker 0 is waiting in apply rather than racing
+                # startup against _begin_termination().
+                in_apply.wait(timeout=15)
+                os.kill(os.getpid(), signal.SIGINT)
+            orig_start(thread_self)
+
+        def tofu(argv, **_):
+            nonlocal second_fired
+            if argv[1] == "apply":
+                in_apply.set()
+                deadline = time.monotonic() + 15
+                while not reconcile.terminating() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                if not reconcile.terminating():
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                if not second_fired:
+                    second_fired = True
+                    os.kill(os.getpid(), signal.SIGINT)
+                time.sleep(0.1)
+                return subprocess.CompletedProcess(argv, 130, "", "interrupted")
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        boskos = _Boskos(free=[P7, P8])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        outcomes = {}
+        with mock.patch.object(reconcile, "_children_signal", wraps=reconcile._children_signal) as mock_children_signal:
+            try:
+                with mock.patch.object(threading.Thread, "start", wrapped_start), mock.patch.object(
+                    boskos_pool.urllib.request, "urlopen", boskos
+                ), mock.patch("sys.stdout", io.StringIO()):
+                    with self.assertRaises(boskos_pool.Terminated):
+                        reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
+            finally:
+                signal.signal(signal.SIGINT, previous)
+                reconcile._TERMINATING.clear()
+                boskos_pool._DEFERRED.clear()
+                boskos_pool._HOLD_DEPTH = 0
+            self.assertEqual(sorted(boskos.released), sorted(boskos.acquired), "all acquired holds were released before termination propagated")
+            self.assertTrue(len(boskos.released) > 0, "at least one worker ran and released its hold")
+            self.assertTrue(second_fired, "second signal was fired during drain")
+            self.assertTrue(mock_children_signal.called, "_children_signal ran to completion despite second termination")
+
+    def test_a_termination_before_workers_start_drains_without_waiting_on_unstarted_flags(self):
+        # A termination observed before any worker thread is started (e.g. inside
+        # _hold_signals(True) before the swap) leaves started_flags empty.
+        # The drain must wait only on started workers and return promptly rather than
+        # blocking for WORKER_DRAIN_SECONDS (150s) on unstarted flags in done.
+        orig_hold = boskos_pool._hold_signals
+        calls = []
+
+        def hold_and_raise(block):
+            calls.append(block)
+            if block and len(calls) == 1:
+                raise boskos_pool.Terminated("signal 2")
+            return orig_hold(block)
+
+        boskos = _Boskos(free=[P7, P8])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        outcomes = {}
+        started_time = time.monotonic()
+        with mock.patch.object(reconcile, "_children_signal", wraps=reconcile._children_signal) as mock_children_signal:
+            try:
+                with mock.patch.object(boskos_pool, "_hold_signals", hold_and_raise), mock.patch.object(
+                    boskos_pool.urllib.request, "urlopen", boskos
+                ), mock.patch("sys.stdout", io.StringIO()):
+                    with self.assertRaises(boskos_pool.Terminated):
+                        reconcile.reconcile_pool(BOSKOS, OWNER, runner=lambda argv, **_: None, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
+            finally:
+                signal.signal(signal.SIGINT, previous)
+                reconcile._TERMINATING.clear()
+                boskos_pool._DEFERRED.clear()
+                boskos_pool._HOLD_DEPTH = 0
+            elapsed = time.monotonic() - started_time
+            self.assertLess(elapsed, 5, "the drain returned immediately without waiting for WORKER_DRAIN_SECONDS on unstarted flags")
+            self.assertTrue(mock_children_signal.called, "_children_signal was called")
+            self.assertEqual(boskos.acquired, [], "no worker acquired a lease")
 
     def test_no_tofu_is_started_once_a_termination_has_landed(self):
         # The forward reaches the children alive at that instant; a worker
@@ -2317,13 +2458,13 @@ class WorkersTest(unittest.TestCase):
                 order.append(project)
             verbs[project].append(argv[1])
             if argv[1] == "init" and len(order) == 2:
-                started.wait(timeout=5)
+                started.wait(timeout=15)
                 while not reconcile.terminating():
                     time.sleep(0.02)
                 time.sleep(0.1)
                 return subprocess.CompletedProcess(argv, 0, "", "")
             if argv[1] == "apply":
-                started.wait(timeout=5)
+                started.wait(timeout=15)
                 while not reconcile.terminating():
                     time.sleep(0.02)
                 return subprocess.CompletedProcess(argv, 130, "", "interrupted")
@@ -2339,17 +2480,21 @@ class WorkersTest(unittest.TestCase):
         outcomes = {}
 
         def fire():
-            started.wait(timeout=5)
+            started.wait(timeout=15)
             os.kill(os.getpid(), signal.SIGINT)
 
+        fire_thread = threading.Thread(target=fire, daemon=True)
         try:
-            threading.Thread(target=fire, daemon=True).start()
+            fire_thread.start()
             with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
                 with self.assertRaises(boskos_pool.Terminated):
                     reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
         finally:
             signal.signal(signal.SIGINT, previous)
             reconcile._TERMINATING.clear()
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            fire_thread.join(timeout=5)
         early, late = order
         self.assertEqual(verbs[late], ["init"], "the late project ran nothing after the termination")
         self.assertEqual(verbs[early][-1], "apply")
@@ -2391,7 +2536,7 @@ class WorkersTest(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, "", "")
 
             def fire():
-                for _ in range(250):
+                for _ in range(750):
                     if len(os.listdir(tmp)) >= 2:
                         os.kill(os.getpid(), signal.SIGINT)
                         return
@@ -2401,14 +2546,18 @@ class WorkersTest(unittest.TestCase):
             previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
             outcomes = {}
             started = time.monotonic()
+            fire_thread = threading.Thread(target=fire, daemon=True)
             try:
-                threading.Thread(target=fire, daemon=True).start()
+                fire_thread.start()
                 with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
                     with self.assertRaises(boskos_pool.Terminated):
                         reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known=KNOWN, run=reconcile.Run(workers=2), outcomes=outcomes)
             finally:
                 signal.signal(signal.SIGINT, previous)
                 reconcile._TERMINATING.clear()
+                boskos_pool._DEFERRED.clear()
+                boskos_pool._HOLD_DEPTH = 0
+                fire_thread.join(timeout=5)
             self.assertLess(time.monotonic() - started, 20, "the children exited on the interrupt, not on the 30 s sleep")
             pids = [int(name) for name in os.listdir(tmp)]
             self.assertEqual(len(pids), 2)

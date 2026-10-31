@@ -14,10 +14,17 @@ forge and names no forge at all.
 """
 
 from .base import (
+    TALLY_TOTAL,
+    tally_with_open,
     BROKER_VERBS,
     COLLABORATION_VERBS,
+    ISSUE_VERBS,
+    LABEL_FIELDS,
+    LIBRARY_VERBS,
     Forge,
     ForgeUnsupported,
+    IdentityUnknown,
+    LabelsUnsupported,
     StubForge,
     WorkspaceError,
     listing,
@@ -26,11 +33,19 @@ from .credentials import (
     BrokeredCredential,
     Credential,
     MintedReadCredential,
+    MintedWriteCredential,
     NoCredential,
     StaticFileCredential,
 )
-from .errors import GUIDANCE, Guidance, forge_error
-from .registry import AVAILABLE, Registry, build_forges
+from .errors import (
+    GUIDANCE,
+    Guidance,
+    classify_tls,
+    forge_error,
+    tls_refusal,
+    tls_untrusted,
+)
+from .registry import AVAILABLE, Registry, build_forges, load_forge_entries
 from .transport import CliTransport, HttpTransport, Transport
 from .validate import (
     BRANCH_RE,
@@ -54,6 +69,7 @@ __all__ = [
     "BRANCH_RE",
     "BROKER_VERBS",
     "COLLABORATION_VERBS",
+    "LIBRARY_VERBS",
     "BrokeredCredential",
     "CliTransport",
     "HttpTransport",
@@ -62,9 +78,16 @@ __all__ = [
     "Forge",
     "ForgeUnsupported",
     "GUIDANCE",
+    "ISSUE_VERBS",
+    "IdentityUnknown",
+    "LABEL_FIELDS",
+    "LabelsUnsupported",
     "Guidance",
     "MAX_PAGE_SIZE",
+    "TALLY_TOTAL",
+    "tally_with_open",
     "MintedReadCredential",
+    "MintedWriteCredential",
     "NoCredential",
     "StaticFileCredential",
     "Registry",
@@ -73,7 +96,11 @@ __all__ = [
     "Transport",
     "WorkspaceError",
     "build_forges",
+    "classify_tls",
     "forge_error",
+    "load_forge_entries",
+    "tls_refusal",
+    "tls_untrusted",
     "listing",
     "pinned_base",
     "repo_segments",

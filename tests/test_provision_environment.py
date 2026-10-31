@@ -39,7 +39,6 @@ from tests.testing.release import (
     MOCK_CR_NOT_READY,
     MOCK_CR_READY_AT_GENERATION_2,
     MOCK_CR_STALE_READY,
-    MOCK_GATEWAY_DARK_REASON,
     MOCK_MODE_CONTEXT,
     write_mode_kubectl_stub,
 )
@@ -129,6 +128,7 @@ exit 0
                 f"--gcp-region={MOCK_GCP_REGION} "
                 f"--gke-cluster-name={MOCK_GKE_CLUSTER_NAME} "
                 f"--image-tag={MOCK_IMAGE_TAG_SHA} "
+                f"--mode=today "
                 f"--enable-google-chat "
                 f"--google-chat-mode={MOCK_GOOGLE_CHAT_MODE} "
                 f"--google-chat-home-channel=spaces/TEST12345 "
@@ -750,8 +750,9 @@ class LongLivedAllowlistGuardTest(GithubMinterInputsTest):
 class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
     """A GitHub variable a human typed still means what it meant in install.env.
 
-    These settings reach install.sh as `--enable-*` flags, whose validator
-    matches exactly true|false and exits 1 naming the flag. The same variables
+    These settings reach install.sh as boolean flags (`--enable-*`,
+    `--vertex-manage-serving-project`), whose validators match exactly
+    true|false and exit 1 naming the flag. The same variables
     also reach it through the rendered install.env, where is_truthy accepts
     True/yes/y/1/on. An environment spelled `True` deployed fine on the file
     route, so it has to keep deploying on the flag route.
@@ -764,6 +765,9 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
         "ENABLE_GKE_BACKUP_PLAN": "--enable-gke-backup-plan",
         "ENABLE_GVISOR": "--enable-gvisor",
         "HERMES_DASHBOARD_ENABLED": "--enable-hermes-dashboard",
+        "WEB_CONSOLE_ENABLED": "--enable-web-console",
+        "ENABLE_DRIFT_DETECTOR": "--enable-drift-detector",
+        "VERTEX_MANAGE_SERVING_PROJECT": "--vertex-manage-serving-project",
     }
 
     def _install_call(self, tmp_dir):
@@ -940,6 +944,17 @@ class SlackTokensAreRequiredBeforeTheTeardownTest(GithubMinterInputsTest):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("install:", (tmp_dir / MOCK_CALLS_LOG).read_text())
 
+    def test_the_home_channel_policy_flag_follows_the_variable(self):
+        """Set, it reaches install.sh as the flag; unset, no flag at all, so
+        install.sh's own default (auto) stays in charge."""
+        tokens = {**self._ENABLED, "SLACK_BOT_TOKEN": self._BOT, "SLACK_APP_TOKEN": self._APP}
+        proc, tmp_dir = self._run_recording({**tokens, "SLACK_HOME_CHANNEL_POLICY": "manual"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("--slack-home-channel-policy=manual", (tmp_dir / MOCK_CALLS_LOG).read_text())
+        proc, tmp_dir = self._run_recording(tokens)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("--slack-home-channel-policy", (tmp_dir / MOCK_CALLS_LOG).read_text())
+
     def test_an_environment_without_slack_is_never_asked_for_tokens(self):
         """Which is every environment but the ones that opt in."""
         for overrides in ({}, {"SLACK_ENABLED": "false"}):
@@ -977,7 +992,6 @@ class PlatformAgentModeTest(unittest.TestCase):
         "kubectl --context {ctx} rollout status deployment/platform-agent-a2a-callout -n {ns} --timeout=GATE",
         "kubectl --context {ctx} rollout status deployment/platform-agent-a2a-verifier -n {ns} --timeout=GATE",
         "kubectl --context {ctx} rollout status deployment/platform-agent-gateway -n {ns} --timeout=GATE",
-        "kubectl --context {ctx} get platformagent platform-agent -n {ns} -o jsonpath=GATEWAY",
         "kubectl --context {ctx} rollout status deployment/platform-agent-a2a-gateway -n {ns} --timeout=GATE",
     ]
 
@@ -1032,9 +1046,9 @@ class PlatformAgentModeTest(unittest.TestCase):
         for line in lines:
             if "-o jsonpath=" in line:
                 tag = next(
-                    (c for c in ("A2AGateway", "BusProvisioned", "BusCredentialsReady") if c in line),
+                    (c for c in ("BusProvisioned", "BusCredentialsReady") if c in line),
                     "READ",
-                ).replace("A2AGateway", "GATEWAY")
+                )
                 line = line.split("-o jsonpath=", 1)[0] + "-o jsonpath=" + tag
             if line.startswith("kubectl "):
                 match = re.search(r"--timeout=(\d+)s$", line)
@@ -1066,7 +1080,8 @@ class PlatformAgentModeTest(unittest.TestCase):
                 self.assertTrue(calls[1].startswith("install: "), calls)
                 for call in calls:
                     self.assertIn("[PLATFORM_AGENT_MODE=<absent>]", call)
-                self.assertNotIn("--mode", calls[1])
+                # Named: install.sh's own first-install default is next.
+                self.assertIn(" --mode=today ", calls[1])
 
     def test_next_installs_with_todays_arguments_then_patches_and_gates(self):
         _, today_calls = self._run({})
@@ -1079,7 +1094,7 @@ class PlatformAgentModeTest(unittest.TestCase):
             calls[0], today_calls[0].replace("<absent>", "next")
         )
         self.assertEqual(
-            calls[1], today_calls[1].replace("<absent>", "next")
+            calls[1], today_calls[1].replace("<absent>", "next").replace(" --mode=today ", " --mode=next ")
         )
         self.assertEqual(calls[2:], self._expected_gate())
 
@@ -1116,23 +1131,6 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertIn("::error title=mode next: BusProvisioned not True::", proc.stdout)
         self.assertFalse(any("rollout status" in c for c in calls), calls)
 
-    def test_a_dropped_gateway_read_is_retried(self):
-        proc, calls = self._run({"PLATFORM_AGENT_MODE": "next"}, gateway_read_failures=2)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        normalised = self._normalise(calls)
-        self.assertEqual(normalised.count(self._expected_gate()[-2]), 3)
-        self.assertEqual(normalised[-1], self._expected_gate()[-1])
-
-    def test_a_gateway_read_that_never_succeeds_fails_the_step_with_the_state(self):
-        proc, calls = self._run(
-            {"PLATFORM_AGENT_MODE": "next", "PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS": "0"},
-            gateway_read_failures=1000,
-        )
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("::error title=mode next: A2AGateway unreadable::", proc.stdout)
-        self.assertTrue(any("-l app.kubernetes.io/part-of=a2a-next" in c for c in calls), calls)
-        self.assertFalse(any("a2a-gateway" in c and "rollout status" in c for c in calls), calls)
-
     def test_next_is_refused_on_a_long_lived_environment_before_the_teardown(self):
         for spelling in ("true", "1", "yes"):
             with self.subTest(spelling=spelling):
@@ -1157,13 +1155,15 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("did not roll out", proc.stdout)
 
-    def test_a_withheld_gateway_is_reported_not_waited_for(self):
-        proc, calls = self._run(
-            {"PLATFORM_AGENT_MODE": "next"}, gateway_reason=MOCK_GATEWAY_DARK_REASON
-        )
+    def test_the_gate_always_waits_on_the_a2a_gateway(self):
+        # Every next install runs the gateway (on the console door alone with
+        # no chat backend), so the gate reads no condition that could make it
+        # skip the rollout, and the last thing it waits on is that rollout.
+        proc, calls = self._run({"PLATFORM_AGENT_MODE": "next"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self._normalise(calls)[2:], self._expected_gate()[:-1])
-        self.assertIn("configures no chat backend", proc.stdout)
+        self.assertEqual(self._normalise(calls)[-1], self._expected_gate()[-1])
+        self.assertFalse(any("A2AGateway" in c for c in calls), calls)
+        self.assertNotIn("no chat backend", proc.stdout)
 
     def test_a_mode_that_is_not_a_mode_is_refused_before_the_teardown(self):
         for value in ("Next", "nxt", "today ", "TODAY"):
@@ -1235,7 +1235,7 @@ class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
             "render_install_env.sh writes these into install.env for the "
             "reconcile path, but deploy-environment.yml's provision step never "
             "puts them in the environment install.sh reads — so a "
-            "destroy-and-rebuild of autopush or staging installs without them: "
+            "destroy-and-rebuild of a long-lived environment installs without them: "
             f"{missing}",
         )
 
@@ -1254,11 +1254,11 @@ class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
                 self.assertIn(name, step_env)
 
     def test_the_guard_is_armed_for_the_long_lived_environments_only(self):
-        """The dropdown's two long-lived options, and neither ephemeral one."""
+        """The dropdown's three long-lived options, and neither ephemeral one."""
         workflow = yaml.safe_load(self._WORKFLOW.read_text())
         dispatch = workflow[True]["workflow_dispatch"]
         options = dispatch["inputs"]["github_environment"]["options"]
-        self.assertEqual(sorted(options), ["autopush", "nightly", "rc", "staging"])
+        self.assertEqual(sorted(options), ["autopush", "autopush-next", "nightly", "rc", "staging"])
 
         expression = None
         for job in workflow["jobs"].values():
@@ -1266,7 +1266,7 @@ class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
                 if step.get("name") == self._STEP:
                     expression = step["env"]["LONG_LIVED_ENVIRONMENT"]
         self.assertIsNotNone(expression)
-        for env_name in ("autopush", "staging"):
+        for env_name in ("autopush", "autopush-next", "staging"):
             self.assertIn(
                 f"'{env_name}'",
                 expression,
@@ -1274,6 +1274,163 @@ class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
             )
         for env_name in ("rc", "nightly"):
             self.assertNotIn(f"'{env_name}'", expression)
+
+
+class StockoutRetryTest(unittest.TestCase):
+    """A GCE stockout during the install is retried; nothing else is.
+
+    The nightly environment is created from nothing each night, and GKE
+    answers a regional capacity shortage with "does not have enough resources
+    available to fulfill request". The retry is a whole provision again:
+    uninstall.sh, which destroys the cluster the failed create left in state
+    tainted and in GCP in ERROR, then install.sh, which creates afresh. A
+    second install.sh alone would refuse at its scope check, because that
+    cluster has no endpoint to fetch credentials for.
+    """
+
+    STOCKOUT = (
+        "Error: Error waiting for creating GKE cluster: Try a different location, or try "
+        "again later: Google Compute Engine does not have enough resources available to "
+        "fulfill request: us-central1."
+    )
+    EXHAUSTED = "Error: ZONE_RESOURCE_POOL_EXHAUSTED: The zone does not have enough resources."
+
+    def _run(self, failures, message, install_exit=1, overrides=None,
+             with_sequence=False, uninstall_exit_after_first=3,
+             later_failure=None):
+        """install.sh fails `failures` times with `message`, then succeeds.
+
+        `later_failure=(message, exit)` makes every failing call after the
+        first fail that way instead. uninstall.sh answers 3 (nothing to tear
+        down) the first time and `uninstall_exit_after_first` after that.
+        Every call of either script is appended to the calls log, in order."""
+        later_message, later_exit = later_failure or (message, install_exit)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tmp_dir = pathlib.Path(tmp.name)
+        recorded_calls = tmp_dir / MOCK_CALLS_LOG
+        mock_uninstall = tmp_dir / MOCK_UNINSTALL_SCRIPT
+        mock_uninstall.write_text(
+            f"""#!/usr/bin/env bash
+echo "uninstall" >> "{recorded_calls}"
+if [ "$(grep -c '^uninstall$' "{recorded_calls}")" -le 1 ]; then exit 3; fi
+exit {uninstall_exit_after_first}
+"""
+        )
+        mock_uninstall.chmod(0o755)
+        mock_install = tmp_dir / MOCK_INSTALL_SCRIPT
+        mock_install.write_text(
+            f"""#!/usr/bin/env bash
+echo "{MOCK_INSTALL_SUCCESS_SIGNAL}" >> "{recorded_calls}"
+count="$(grep -c '{MOCK_INSTALL_SUCCESS_SIGNAL}' "{recorded_calls}")"
+if [ "$count" -eq 1 ] && [ "$count" -le {failures} ]; then
+  echo "{message}" >&2
+  exit {install_exit}
+fi
+if [ "$count" -le {failures} ]; then
+  echo "{later_message}" >&2
+  exit {later_exit}
+fi
+echo "Apply complete!"
+exit 0
+"""
+        )
+        mock_install.chmod(0o755)
+        base = {
+            "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
+            "GCP_REGION": MOCK_GCP_REGION,
+            "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
+            "IMAGE_TAG": MOCK_IMAGE_TAG_SEMVER,
+            "PROVISION_STOCKOUT_WAIT_SECONDS": "0",
+        }
+        base.update(overrides or {})
+        proc = subprocess.run(
+            ["bash", str(_PROVISION_SCRIPT)],
+            capture_output=True, text=True,
+            env=get_isolated_test_env(overrides=base), cwd=str(tmp_dir),
+        )
+        lines = recorded_calls.read_text().splitlines() if recorded_calls.exists() else []
+        calls = lines.count(MOCK_INSTALL_SUCCESS_SIGNAL)
+        if with_sequence:
+            sequence = ["install" if l == MOCK_INSTALL_SUCCESS_SIGNAL else l for l in lines]
+            return proc, calls, sequence
+        return proc, calls
+
+    def test_a_stockout_is_retried_and_the_second_install_succeeds(self):
+        proc, calls = self._run(failures=1, message=self.STOCKOUT)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(calls, 2, "one retry after the stockout")
+        self.assertIn("::warning", proc.stdout + proc.stderr)
+        self.assertIn("attempt 2 of", proc.stdout + proc.stderr)
+
+    def test_the_retry_tears_down_before_it_installs_again(self):
+        """A second install.sh alone refuses: the failed cluster is in state and
+        in GCP with no endpoint. The retry is a whole provision again."""
+        proc, calls, sequence = self._run(failures=1, message=self.STOCKOUT, with_sequence=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(sequence, ["uninstall", "install", "uninstall", "install"])
+
+    def test_a_strict_teardown_failure_during_the_retry_stops_the_run(self):
+        proc, calls, sequence = self._run(
+            failures=1, message=self.STOCKOUT, with_sequence=True,
+            uninstall_exit_after_first=5, overrides={"TEARDOWN_STRICT": "true"},
+        )
+        self.assertEqual(proc.returncode, 5, "the retry's teardown failed and strict mode stops the run with its code")
+        self.assertEqual(sequence, ["uninstall", "install", "uninstall"])
+
+    def test_the_zone_pool_exhausted_wording_is_retried_too(self):
+        proc, calls = self._run(failures=1, message=self.EXHAUSTED)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(calls, 2)
+
+    def test_another_install_failure_is_not_retried(self):
+        proc, calls = self._run(failures=9, message="Error: Error 409: cluster already exists", install_exit=7)
+        self.assertEqual(proc.returncode, 7, "install.sh's own code comes back unchanged")
+        self.assertEqual(calls, 1)
+        self.assertNotIn("attempt 2 of", proc.stdout + proc.stderr)
+
+    def test_a_different_failure_on_the_retry_returns_its_own_code(self):
+        """The copy is per attempt: attempt one's stockout text must not make a
+        409 on attempt two look retryable."""
+        proc, calls, sequence = self._run(
+            failures=9, message=self.STOCKOUT, with_sequence=True,
+            later_failure=("Error: Error 409: cluster already exists", 7),
+        )
+        self.assertEqual(proc.returncode, 7)
+        self.assertEqual(sequence, ["uninstall", "install", "uninstall", "install"])
+        self.assertNotIn("attempt 3 of", proc.stdout + proc.stderr)
+
+    def test_a_knob_that_is_not_a_plain_decimal_is_refused_before_anything_runs(self):
+        """A word makes `[ -ge ]` exit 2 (read as false: unbounded retries); a
+        leading zero is octal to the arithmetic (09 aborts the loop and the
+        script exits 0 after a failed install); a 20-digit value is "not an
+        integer" to `[` and the budget is never enforced."""
+        for knob, value in (
+            ("PROVISION_STOCKOUT_ATTEMPTS", "three"),
+            ("PROVISION_STOCKOUT_WAIT_SECONDS", "09"),
+            ("PROVISION_STOCKOUT_WAIT_SECONDS", "0600"),
+            ("PROVISION_STOCKOUT_ATTEMPTS", "99999999999999999999"),
+            ("PROVISION_STOCKOUT_ATTEMPTS", "-1"),
+        ):
+            with self.subTest(knob=knob, value=value):
+                proc, calls, sequence = self._run(
+                    failures=0, message=self.STOCKOUT, with_sequence=True,
+                    overrides={knob: value},
+                )
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn(f"{knob}='{value}'", proc.stdout + proc.stderr)
+                self.assertEqual(sequence, [])
+
+    def test_zero_is_a_valid_wait(self):
+        proc, calls = self._run(failures=1, message=self.STOCKOUT)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_the_stockout_retry_budget_is_honoured(self):
+        proc, calls = self._run(failures=9, message=self.STOCKOUT, install_exit=1,
+                                overrides={"PROVISION_STOCKOUT_ATTEMPTS": "2"})
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(calls, 2, "the budget counts attempts, not retries")
+        self.assertIn("still short of capacity", proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":

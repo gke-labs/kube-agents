@@ -38,13 +38,17 @@ DESIGN_ALLOWLIST = [
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/gkehub.viewer",
     "roles/iam.securityReviewer",
 ]
-# Kept in the host project on purpose (§6): actAs, the MCP server's check, quota.
+# Kept in the host project on purpose (§6): actAs, the MCP server's check,
+# quota, and the Trace role, whose Trace-console writes travel with its reads
+# and whose only consumer reads the host project's own traces.
 HOST_ONLY_ROLES = [
     "roles/iam.serviceAccountUser",
     "roles/mcp.toolUser",
     "roles/serviceusage.serviceUsageConsumer",
+    "roles/cloudtrace.user",
 ]
 # The allowlist entries that carry container.clusters.list AND .get; a scoped
 # project bound with neither cannot be listed or have a profile created.
@@ -652,6 +656,83 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         self.assertIn('selector_apis = length(var.scope.shared_vpc_hosts) > 0 ? [\n    "compute.googleapis.com",\n  ] : []', self.main_tf)
         self.assertIn("local.scope_apis, local.selector_apis))", self.main_tf)
         self.assertNotIn('"compute.googleapis.com"', re.search(r"base_apis = \[(.*?)\]", self.main_tf, re.DOTALL).group(1))
+
+
+class DriftSinksFollowTheScopeTest(unittest.TestCase):
+    """The drift ingress exports every project the declaration lists (design §8, the
+    drift-pubsub row): the composition feeds the module's source_projects from one IAM-module
+    output, scope_export_projects, which is scope.projects and the selectors' members less the
+    host and never a container's Asset-Inventory members (an index gap would otherwise destroy
+    a sink and lose the records until the next plan), less the operator's per-project
+    exclusions, the way to keep reading a project without exporting its logs."""
+
+    def setUp(self):
+        self.main_tf = (_COMPOSITION / "main.tf").read_text()
+        self.iam_outputs = (_MODULE / "outputs.tf").read_text()
+
+    def test_the_composition_feeds_the_sinks_from_the_iam_modules_listing(self):
+        call = _block(self.main_tf, "module", "drift_pubsub")
+        self.assertIn("source_projects                       = local.drift_pubsub_source_projects", call,
+                      "the drift module's source_projects must come from the composition's export local")
+        export_local = re.search(r"drift_pubsub_source_projects\s*=\s*sort\(\[(.*?)\n  \]\)", self.main_tf, re.DOTALL)
+        self.assertIsNotNone(export_local, "the export local must be a filtered comprehension over the IAM module's listing")
+        self.assertIn("module.kube_agents_iam.scope_export_projects", export_local.group(1),
+                      "the export local must read the IAM module's scope_export_projects; the pool's scope_discovered_projects carries Asset-Inventory members an index can skip for a plan")
+        self.assertIn("local.drift_pubsub_source_exclude_projects", export_local.group(1),
+                      "the export local must subtract the operator's exclusions")
+        self.assertIn("local.drift_pubsub_scope_exclude_patterns", export_local.group(1),
+                      "the export local must match the scope's own exclusions, globs included, as the reconcile does")
+        self.assertRegex(self.main_tf, r'for entry in var\.scope\.exclude\.projects :\s*"\^\$\{replace\(replace\(replace\(entry, "\*", "\.\*"\), "\?", "\."\), "\[!", "\[\^"\)\}\$"',
+                         "each scope.exclude.projects entry becomes one anchored regex with fnmatch's * ? and [!seq] carried over, which is what fleet_scope_targets.py matches at runtime")
+        exclude = _block((_COMPOSITION / "variables.tf").read_text(), "variable", "drift_pubsub_source_exclude_projects")
+        self.assertIn("type        = string", exclude, "the exclusion list is a string so a TF_VAR_ line can carry it and a blanked line reads as none")
+        self.assertIn('default     = ""', exclude)
+        self.assertIn("source_sink_writer_identity_overrides = local.drift_pubsub_source_sink_writer_identity_overrides", call)
+        # A JSON string, decoded here, because the front doors reach it through a TF_VAR_ line
+        # and a blanked line exports "", which a map-typed variable refuses as HCL.
+        self.assertIn('drift_pubsub_source_sink_writer_identity_overrides = trimspace(var.drift_pubsub_source_sink_writer_identity_overrides) == "" ? {} : tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides))', self.main_tf)
+        variable = _block((_COMPOSITION / "variables.tf").read_text(), "variable", "drift_pubsub_source_sink_writer_identity_overrides")
+        self.assertIn("type        = string", variable, "the composition's override is a string so a blanked TF_VAR_ line reads as no override")
+
+    def test_the_listing_is_the_pools_set_less_the_host(self):
+        output = _block(self.iam_outputs, "output", "scope_discovered_projects")
+        self.assertIn("value       = sort(tolist(setsubtract(local.scoped_pool_projects, toset([var.project_id]))))", output,
+                      "scope_discovered_projects is no longer the pool's set less the host; tests/test_scoped_sa_pool_iam.py pins what that set is")
+
+    def test_the_export_set_is_the_declaration_less_the_host_and_no_index_member(self):
+        output = _block(self.iam_outputs, "output", "scope_export_projects")
+        self.assertIn("value       = sort(tolist(setsubtract(local.scope_listed_projects, toset([var.project_id]))))", output,
+                      "scope_export_projects must be scope_listed_projects (scope.projects and the selectors' members) less the host, and never "
+                      "scoped_pool_projects: a container member the Asset index omits for one plan would lose its sink and its records")
+        self.assertNotIn("scoped_pool", output)
+
+    def test_the_source_projects_are_surfaced(self):
+        outputs = (_COMPOSITION / "outputs.tf").read_text()
+        self.assertIn("value       = try(module.drift_pubsub[0].source_projects, null)", outputs)
+
+    def test_the_installer_probes_sink_create_over_the_same_set_before_the_apply(self):
+        """The installer's pre-apply probe (check_scope_export_sink_access in
+        scripts/installer/installer_common.sh; tests/test_installer_common.py runs
+        it) derives its set from the keys that feed the composition's export
+        local, and asks for the permission the prerequisites table names for
+        the sink, so a project the apply would fail in is refused first."""
+        installer = (_REPO_ROOT / "scripts" / "installer" / "installer_common.sh").read_text()
+        derivation = installer[installer.index("scope_export_projects() {"):installer.index("check_scope_export_sink_access() {")]
+        for key in ("SCOPE_PROJECTS", "PROJECT_ID", "SCOPE_EXCLUDE_PROJECTS",
+                    "TF_VAR_drift_pubsub_source_exclude_projects", "ENABLE_DRIFT_DETECTOR", "TF_VAR_enable_drift_pubsub"):
+            self.assertIn(key, derivation, f"the installer's export set must read {key}, as the composition's does")
+        self.assertNotIn("SCOPE_FOLDERS", derivation, "a container's members get no sink and must not be probed")
+        self.assertIn('readonly SCOPE_SINK_CREATE_PERMISSION="logging.sinks.create"', installer)
+        self.assertIn('readonly SCOPE_SINK_CREATE_ROLE="roles/logging.configWriter"', installer)
+        prerequisites = (_REPO_ROOT / "docs" / "site" / "src" / "content" / "docs" / "install" / "prerequisites.md").read_text()
+        self.assertRegex(prerequisites, r"Log Router sink.*`logging\.sinks\.create`.*`roles/logging\.configWriter`",
+                         "the probe's permission and role are the prerequisites table's for the sink")
+        for front_door in ("upgrade.sh", "install.sh"):
+            lines = (_REPO_ROOT / front_door).read_text().splitlines()
+            calls = lambda name: sum(1 for line in lines if line.strip().startswith(name + " ") or line.strip() == name)
+            self.assertGreater(calls("check_scope_container_access"), 0)
+            self.assertEqual(calls("check_scope_container_access"), calls("check_scope_export_sink_access"),
+                             f"{front_door} must call the sink preflight wherever it calls the container preflight")
 
 
 if __name__ == "__main__":

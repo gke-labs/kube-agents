@@ -20,48 +20,44 @@ below).
 
 ## CLI Reference
 
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+
+Each change below is proposed as Config Connector YAML through `gcp-config-connector`:
+
+-   **BackupRestore addon** (slow cluster-level update):
+    `spec.addonsConfig.gkeBackupAgentConfig.enabled: true` on the cluster's
+    `ContainerCluster`.
+-   **Backup plan** `{plan_name}` for
+    `projects/{project_id}/locations/{location}/clusters/{cluster_name}`: all
+    namespaces, volume data and secrets included, retained `{days}` days, on
+    the cron schedule `{cron}`.
+-   **Restore plan** `{restore_plan_name}` targeting
+    `projects/{project_id}/locations/{location}/clusters/{target_cluster_name}`
+    from the backup plan `{source_backup_plan_name}`: all namespaces, volume data
+    restored from the backup, the cluster-resource conflict policy that keeps
+    existing versions, and the namespaced-resource restore mode that fails on
+    conflict (the safe defaults in Restore Safety below).
+-   **A manual backup** `{backup_name}` and **a restore** `{restore_name}` of it
+    also go through `gcp-config-connector`; a restore needs the confirmation in
+    Restore Safety below.
+
+The backup plan, restore plan, backup and restore are Backup for GKE resources,
+not `ContainerCluster` fields. If `gcp-config-connector` has no resource for one
+of them, it has no declarative path in a Config Connector repository, and the
+agent blocks rather than inventing a field.
+
+Verify the restore status:
+
 ```bash
-# Enable the BackupRestore addon (Slow cluster-level update)
-gcloud container clusters update {cluster_name} \
-  --update-addons=BackupRestore=ENABLED --location={location} --quiet
-
-# Create Backup Plan
-gcloud beta container backup-restore backup-plans create {plan_name} \
-  --project={project_id} --location={location} \
-  --cluster=projects/{project_id}/locations/{location}/clusters/{cluster_name} \
-  --all-namespaces \
-  --include-volume-data --include-secrets \
-  --backup-retain-days={days} --cron-schedule="{cron}" --quiet
-
-# Trigger Manual Backup
-gcloud beta container backup-restore backups create {backup_name} \
-  --backup-plan={plan_name} --location={location} --quiet
-
-# Create Restore Plan
-gcloud beta container backup-restore restore-plans create {restore_plan_name} \
-  --location={location} \
-  --cluster=projects/{project_id}/locations/{location}/clusters/{target_cluster_name} \
-  --backup-plan=projects/{project_id}/locations/{location}/backupPlans/{source_backup_plan_name} \
-  --all-namespaces \
-  --volume-data-restore-policy=restore-volume-data-from-backup \
-  --cluster-resource-conflict-policy=use-existing-version \
-  --namespaced-resource-restore-mode=fail-on-conflict --quiet
-
-# Execute Restore
-gcloud beta container backup-restore restores create {restore_name} \
-  --restore-plan={restore_plan_name} --location={location} \
-  --backup=projects/{project_id}/locations/{location}/backupPlans/{source_backup_plan_name}/backups/{backup_name} \
-  --quiet
-
-# Verify Restore Status
 gcloud beta container backup-restore restores describe {restore_name} \
   --restore-plan={restore_plan_name} --location={location}
 ```
 
-> [!WARNING] **`--include-volume-data` and `--include-secrets` BOTH DEFAULT TO
-> FALSE.** If you omit them, the backup plan silently produces **config-only
-> backups** with no persistent volume snapshots and no Secrets. Always pass both
-> flags explicitly when the goal is full workload protection.
+> [!WARNING] **Volume data inclusion (`--include-volume-data`) and secret
+> inclusion (`--include-secrets`) BOTH DEFAULT TO FALSE.** If you omit them, the
+> backup plan silently produces **config-only backups** with no persistent volume
+> snapshots and no Secrets. Always enable both explicitly in the backup plan when
+> the goal is full workload protection.
 
 Notes:
 
@@ -164,6 +160,6 @@ The recommended production golden path configuration for Backup for GKE:
 > (`--update-addons=BackupRestore=ENABLED`) triggers a slow Google Cloud control
 > plane cluster update that takes several minutes. * **Rule**: **Do not run a
 > terminal loop waiting for the GKE Backup addon to become active.** *
-> **Action**: Provide the command to enable the addon, explain that the
-> operation will proceed in the background, and immediately proceed to write the
-> backup plan configs. Do not block.
+> **Action**: Propose the addon change as a pull request, explain that the
+> operation will proceed in the background once it applies, and immediately
+> proceed to write the backup plan configs. Do not block.

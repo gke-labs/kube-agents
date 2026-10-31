@@ -71,12 +71,13 @@ def head(task_id):
 # The kinds gateway/kanban_watchers.py claims for a subscriber; anything the
 # cursor is left behind is a message that lands in the user's chat thread.
 # Mirrors the tuple as apply_kanban_progress_lines.py leaves it -- "heartbeat"
-# included. Narrower than the patched claim filter and this check goes green on
+# and "pr_opened" included. Narrower than the patched claim filter and this check goes green on
 # exactly the replay it exists to catch: a cursor left behind progress notes
 # would repost them into the thread.
 TERMINAL_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked", "block_loop_detected", "heartbeat",
+    "pr_opened",
 )
 
 
@@ -93,8 +94,15 @@ def would_replay(task_id):
     return [e.kind for e in events]
 
 
+WORKER_CHILD_ASSIGNEE = "cluster-kube-agents-evals-13-seeded-a-us-central1-a"
+
+
 def tool_create(**args):
-    out = json.loads(kt._handle_create({"assignee": "platform", **args}))
+    # Inside a worker the child goes to a Cluster Agent: a platform worker's
+    # card for `platform` that would run alongside it is refused (#3164,
+    # kanban_self_copy).
+    assignee = WORKER_CHILD_ASSIGNEE if os.environ.get("HERMES_KANBAN_TASK") else "platform"
+    out = json.loads(kt._handle_create({"assignee": assignee, **args}))
     if not out.get("ok"):
         raise AssertionError(f"kanban_create failed: {out}")
     return out

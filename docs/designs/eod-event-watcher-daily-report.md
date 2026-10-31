@@ -2,8 +2,9 @@
 
 The recap reports the informational events the severity gate held back from chat, grouped by
 workload and reason, and nothing else. Critical and Warning events are counted in the headline and
-never listed — chat received them as they happened. That holds even for an alert that never reached
-chat: a ceiling drop and a failed delivery are counted, so neither can be printed over with an
+never listed — chat received them as they happened (or, on a headless install with no chat platform
+enabled, the read-only activity feed did). That holds even for an alert that never reached
+chat on a chat-enabled install: a ceiling drop and a failed delivery are counted, so neither can be printed over with an
 all-clear, but neither is named.
 [What this recap does not report](#what-this-recap-does-not-report) is canonical for that contract
 and for the gap it leaves.
@@ -17,12 +18,12 @@ and for the gap it leaves.
 model. The script's stdout _is_ the report: the scheduler hands it to `_deliver_result` the same way
 it hands over a model's final turn, so `deliver` behaves here as it does on the watchdogs.
 
-The entry ships `deliver: "chat"`, as every report-producing entry on the roster does
-bar the two on `"all"`. That routes the report through the
-Chat Agent, which presents it in the channel and can then answer a follow-up about it — the
+The entry ships `deliver: "chat"`, as every report-producing entry on the roster does.
+That routes the report through the
+relay, which posts it into a thread whose replies reach the Chat Agent with it attached — the
 [relay design](cron-report-relay.md) is canonical. `"all"` is the wrong value
 even though it is audible: it expands to every platform with a home channel, and the relay now has
-one, so a job left on `"all"` reports twice — once flat and once through the Chat Agent. `"local"`
+one, so a job left on `"all"` reports twice — once from the scheduler and once through the relay. `"local"`
 resolves to no target and drops the report. The script still emits a bullet list rather than a
 Markdown table, which wraps badly in chat viewports.
 
@@ -35,7 +36,7 @@ scripts directory. It needs no cluster access.
 The `deliver: "chat"` route does not go through `home_target_env`: `profile_cron_tick.spawn_tick`
 sets `CHAT_HOME_CHANNEL` on every cron child unconditionally, so the target always resolves and the
 relay is always attempted. The home channel is needed one hop later, where the Session KV server
-posts what the Chat Agent composed: `_send_to_chat` runs `hermes send --to <platform>` with no
+posts the report: `_send_to_chat` runs `hermes send --to <platform>` with no
 chat id, and that bare form is the one `hermes send` documents as "platform (home channel)". Where
 there is none the send fails and the roster entry records a `last_delivery_error` that nests three
 layers of wrapping — the relay's own words inside the route's 502 detail inside the plugin's report
@@ -55,7 +56,15 @@ chat relay partial: the report did not reach slack. Delivered — do not re-run 
 
 The home channel is set either by the
 CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
-`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Every entry
+`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Under
+`spec.mode: next` `/sethome` does not reach the gateway, so for the platform the gateway holds the CR
+field is the only way. The operator renders the Google Chat field into the gateway as
+`A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
+`spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. A `next` install whose
+only chat platform is the gateway's and has no home channel gets no send at all: the error names the
+platform and the field, as in
+`composed but not delivered to slack (no home channel: set spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`.
+A malformed home channel gets the same refusal without the platform. Every entry
 on the roster shipping `deliver: "chat"` takes this route; nothing about it is specific to
 `no_agent`. It matters here because the recap is the only place a filtered event is ever reported,
 so an install without a home channel loses those events entirely rather than seeing them late.
@@ -79,7 +88,8 @@ in UTC so it agrees with the clock the scheduler ticked on.
 Every number comes from one table: `intercepted_events` in `session_kv.db`
 (`/var/lib/kube-agents/session/session_kv.db`), written by the `session_kv_server.py` REST bridge on
 port 8699. It holds one row per event the watcher forwarded, with `notified` recording whether that
-event was announced in chat. It has other writers — the drift detector's `gitops-drift` injects
+event was announced in chat (`1`), held back or failed (`0`), or dispatched headlessly on an install
+with no chat platform enabled (`2`, `NOTIFIED_HEADLESS`). It has other writers — the drift detector's `gitops-drift` injects
 land in the same table under `reason = 'OutOfBandChange'`, and `controller-stall` injects (see
 [stall-watch-inject.md](stall-watch-inject.md)) under `reason = 'ControllerStall'` — and the
 generator excludes those rows before it counts
@@ -97,7 +107,9 @@ from the ledger: the watcher discards duplicates before the bridge hears about t
 (`dispatcher.Dispatch` returns on `dedupDuplicate`) and hardcodes `count` to `1` on the payload it
 does send, so a ratio over these rows would measure how many distinct incidents shared a key — 400
 duplicate `CrashLoopBackOff` events collapsing into three injects would report zero. The real figure
-is the `eventsDedupSuppress` Prometheus counter.
+is the watcher's `k8s_event_watcher_events_deduped_total` series;
+[Concepts → Observability](../site/src/content/docs/concepts/observability.md) is canonical for where it
+is scraped and the labels it arrives under.
 
 ### Which clusters a recap covers
 
@@ -128,7 +140,7 @@ A missing database, a volume old enough to have the database but not the table, 
 enough to be missing its `cluster` column, all yield zero rows — indistinguishable from a quiet
 fleet. The third is the nastiest, and is not a stale-reader problem: `record_intercepted_event`
 names `cluster` in its INSERT, so on that shape every write fails and the ledger stays permanently
-empty. See ["A pre-release table, and no migration"](../../agents/platform/docs/session_management.md) for the
+empty. See ["Which columns are migrated, and which are not"](../../agents/platform/docs/session_management.md) for the
 `DROP TABLE` that fixes it. Per
 ["I found nothing" and "I could not look" must not arrive as the same silence](../site/src/content/docs/concepts/autonomous-watchdogs.md),
 the header turns 🔴, the body names each path and why it failed, and the telemetry counts, the
@@ -201,20 +213,46 @@ Three properties of the listing follow from what a suppressed event is:
   printed as a fact about every row in it. A session server predating the Info gate wrote
   `notified = 1` on informational events, so for a day or two after an upgrade a group can hold both
   outcomes; the key splits them rather than announcing a delivered event under a heading that says
-  it never arrived.
+  it never arrived. A row folded into its workload's open incident is keyed as one that went out,
+  since its incident was admitted.
 
 ## What this recap does not report
 
-Two classes of event are graded `Critical` or `Warning` and never reached chat. Neither is **named**
+On a chat-enabled install, two classes of event are graded `Critical` or `Warning` and never reached chat. Neither is **named**
 here — no workload, no reason, no message — because the listing has one subject and that subject is
 informational churn. Each is **counted**, on its own line above the body:
 
 - **Alerts the daily ceiling withheld.** `ALERT_DAILY_LIMITS` stopped them. Reported as
-  `⚠️ *N alerts withheld by the daily ceiling and never reached chat.*` `N` is the number of
+  `⚠️ *N alerts from M workloads withheld by the daily ceiling and never reached chat.*` `N` is the number of
   workload incidents chat lost, counted per pod and reason — not the number of times the ceiling
   refused a post, which is larger because a refusal makes the watcher re-offer the same failure on
   every later sighting. `GET /v1/alert-quota` reports the refusals, and
   `k8s_event_watcher_events_quota_suppressed_total` breaks them down by reason and namespace.
+  `M` is the number of workloads that sent those alerts, keyed on cluster, namespace and workload
+  name. A row with no workload name counts as one workload for each object UID. For `N`, a row with
+  no UID counts by its workload in place of the UID. Thus `N` is not less than `M` while each object
+  keeps one workload name. If one object is stored under two names, for example after the cleaner
+  changes during a day, `M` can exceed `N`. The workload
+  key does not include the object kind, so a Pod event and a Deployment event with the same
+  workload name are one workload. The count has no drift or stall rows, because the recap leaves
+  them out (see [Where the numbers come from](#where-the-numbers-come-from)).
+  `clean_workload_name` in
+  [`session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py) sets the workload
+  name. It changes only Pod names, with two rules, and keeps all other names as they are:
+  - A Pod name that ends in a segment of eight to ten hexadecimal characters and then a segment of
+    five characters loses both segments. Thus, the pods of one Deployment fold into one workload.
+    The pods of all the runs of one CronJob also fold into one workload, because the run minute
+    has eight digits.
+  - If the first rule does not apply, a Pod name that ends in a segment of five lowercase letters
+    or digits loses that segment. Thus, the pods of one DaemonSet (`fluentd-x7k2p`) fold into one
+    workload, and the pod of a one-off Job folds to the Job name. The rule also removes a word of
+    five letters, so the pods `ingest-batch` and `ingest-queue` both become `ingest` and count as
+    one workload.
+  - A StatefulSet ordinal of one to four digits stays, so each StatefulSet pod (`db-0`, `db-1`) is
+    a separate workload.
+  - Each Job that a CronJob starts is a separate workload, because the CronJob puts the minute of
+    the run in the Job name. An event on the Job `backup-29340180` and an event on its pod are two
+    workloads, because the pod name folds to `backup`.
 - **Alerts whose delivery failed.** `notified = 1` is written before the chat post is attempted, so
   on its own it records an intention to deliver rather than a delivery. When the post fails the
   ingestion side clears the flag and records why in `delivery_error`. Reported as
@@ -222,8 +260,17 @@ informational churn. Each is **counted**, on its own line above the body:
   ledger column are its only trace anywhere — which is why it is counted here rather than left to a
   metric that does not exist.
 
-Both lines are printed only when the ledger was readable; an unreadable one reports as 🔴 and the
-counts would be meaningless. Beyond counting, both totals veto the ✅ all-clear and the 🟢 header:
+A third class exists on a headless install (`platforms.google_chat.enabled: false` and
+`platforms.slack.enabled: false` with no `A2A_NOTIFY_PLATFORM` route): **alerts dispatched without
+a chat platform** (`notified = 2`, `NOTIFIED_HEADLESS`). `trigger_agent_troubleshooter` stamps `2`
+via `mark_delivery_headless` and queues the triage start without attempting a chat post, and
+`filter_and_aggregate_events` tallies those rows in `dispatched_headless` rather than
+`alerts_posted` or `delivery_failed`. Because no chat post was attempted or refused and the
+read-only activity feed (`/v1/intercepted-events`, `/v1/tasks`) is the intended consumer,
+`dispatched_headless` neither prints a `⚠️` failure line nor vetoes the ✅ all-clear / 🟢 header.
+
+Both `⚠️` lines are printed only when the ledger was readable; an unreadable one reports as 🔴 and the
+counts would be meaningless. Beyond counting, `cap_dropped` and `delivery_failed` veto the ✅ all-clear and the 🟢 header:
 "Nothing was held back from chat today" printed over a day the ceiling ate thirty `Critical` alerts
 is not silence about the drops, it is a denial of them. So such a day reports as 📊, with a count of
 what went wrong and no all-clear over it.
@@ -232,11 +279,11 @@ The line between naming and counting is the contract. A count tells the reader t
 name would make this report the second place the incident is described, which is the duplication the
 recap exists to avoid.
 
-Such a day also prints "counts cover every severity; only informational events are listed" under the
+Such a day — or a day with `dispatched_headless` rows — also prints "counts cover every severity; only informational events are listed" under the
 headline. The headline totals are the whole ledger, the listing below them is `Info` alone, and on a
-day with a ceiling drop or a failed delivery those two disagree by exactly the events this section
+day with a ceiling drop, a failed delivery, or a headless dispatch those two disagree by exactly the events this section
 says are not reported. The line is what stops the gap reading as an arithmetic error. It is gated on
-those two counts rather than printed always: a delivered alert also sits in the totals and not in
+those three counts (`cap_dropped`, `delivery_failed`, `dispatched_headless`) rather than printed always: a delivered alert also sits in the totals and not in
 the listing, but "_N alerts_ went to chat" in the sentence above already accounts for it, and a note
 printed every day is read on none of them.
 
@@ -263,6 +310,13 @@ grades 🟢, and what bounds that claim is the qualifier line rather than the em
 cannot do is any of the above to a ceiling drop or a failed delivery, which is the property that
 matters and is the paragraph above.
 
+One more class of `Critical` or `Warning` row never reached chat and is neither named nor counted:
+one folded into its workload's open incident (`duplicate_of` set, with
+`INCIDENT_WORKLOAD_DEDUP_SECONDS` on). An incident for that workload was admitted, so nothing was
+withheld. The row adds to the headline's forwarded total, and its group is keyed as one that went
+out, so it adds to the group count only when its reason or severity differs from its anchor's, or
+its anchor's chat post failed.
+
 ## Running it by hand
 
 ```bash
@@ -280,25 +334,27 @@ The filter is an environment variable on the agent container:
 | ------------------------ | ----------------------------------------- | ------------------------------------------------- |
 | `EOD_EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease` | Comma-separated; an empty value excludes nothing. |
 
-Set it the way the alert ceiling's `ALERT_DAILY_LIMIT_*` are set — on the `PlatformAgent` CR, under
-`spec.deployment.env`:
+Set it through the chart value `platformAgent.deployment.env`, which the chart renders into the
+`PlatformAgent` CR's `spec.deployment.env`. On the Terraform install, put the same block in
+`extra_helm_values`. Do not edit the CR by hand. Each apply that changes the list that the chart
+renders replaces the full list on the CR, and the hand edit is lost.
 
 ```yaml
-spec:
+platformAgent:
   deployment:
     env:
       - name: EOD_EXCLUDE_NAMESPACES
         value: kube-system,kube-public,kube-node-lease,istio-system
 ```
 
-**The CR is the only route that works, and this is why.** Environment on that container is rendered
-by the operator and filtered through `safeSandboxEnvOverrides`, an allowlist — a name that is not on
-it is dropped with no error, no event and no status condition, so the edit appears to succeed and
-changes nothing. `EOD_EXCLUDE_NAMESPACES` is on it. Editing the Deployment with `kubectl set env` is not
-a shortcut: it mutates `spec.template`, so it rolls the pod, and the next reconcile re-renders the
-Deployment from the CR and reverts it.
+**The CR's `spec.deployment.env` is the only source that works, and this is why.** Environment on
+that container is rendered by the operator and filtered through `safeSandboxEnvOverrides`, an
+allowlist — a name that is not on it is dropped with no error, no event and no status condition, so
+the edit appears to succeed and changes nothing. `EOD_EXCLUDE_NAMESPACES` is on it. Editing the
+Deployment with `kubectl set env` is not a shortcut: it mutates `spec.template`, so it rolls the
+pod, and the next reconcile re-renders the Deployment from the CR and reverts it.
 
-Applying the CR change rolls the pod, and the next tick after it comes up uses the new value. The
+A change to the value rolls the pod, and the next tick after it comes up uses the new value. The
 script re-reads it on every run, so nothing further is needed once the pod is up. No value can fail
 the run: `excluded_namespaces()` is a `getenv`, a `split(",")` and a `strip()`, with no parse step
 to reject anything and no fallback behind it. That matters here because this job's stdout is the

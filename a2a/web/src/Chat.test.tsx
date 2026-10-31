@@ -186,6 +186,17 @@ describe("Chat", () => {
     expect(box.value).toBe(big);
   });
 
+  it("sends /feedback summary from the usage summary button", async () => {
+    const { onSend } = consoleChat();
+    await userEvent.click(screen.getByRole("button", { name: /usage summary/i }));
+    expect(onSend).toHaveBeenCalledWith("/feedback summary");
+  });
+
+  it("offers no usage summary button to the read-only web user", () => {
+    render(<Chat entries={[]} user="web" onProbe={() => {}} />);
+    expect(screen.queryByRole("button", { name: /usage summary/i })).toBeNull();
+  });
+
   it("renders a failed turn's note under its text", () => {
     render(
       <Chat

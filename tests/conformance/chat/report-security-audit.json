@@ -1,0 +1,60 @@
+{
+  "name": "report-security-audit",
+  "source": "agents/platform/scripts/test_slack_presenter.py::BlocksReportTest.test_primary_choice_first_then_the_link",
+  "notes": "blocks_report: the first choice is primary, choices before links.",
+  "input": {
+    "headline": "Security & RBAC audit: 7 findings, 2 critical.",
+    "note": "2 are new since the last run.",
+    "rows": [
+      {
+        "severity": "critical",
+        "text": "seeded-b and -c admit privileged pods"
+      },
+      {
+        "severity": "critical",
+        "text": "default SA is `cluster-admin` on seeded-c"
+      }
+    ],
+    "choices": [
+      "look at: seeded-b and -c admit privileged pods"
+    ],
+    "links": [
+      {
+        "text": "Ledger issue #231 ↗",
+        "url": "https://l/231"
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "result",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Security & RBAC audit: 7 findings, 2 critical.",
+        "note": "2 are new since the last run.",
+        "rows": [
+          {
+            "severity": "critical",
+            "text": "seeded-b and -c admit privileged pods"
+          },
+          {
+            "severity": "critical",
+            "text": "default SA is `cluster-admin` on seeded-c"
+          }
+        ],
+        "choices": [
+          {
+            "text": "look at: seeded-b and -c admit privileged pods",
+            "primary": true
+          }
+        ],
+        "links": [
+          {
+            "text": "Ledger issue #231 ↗",
+            "url": "https://l/231"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,216 @@
+# Upgrade-failure catalogue entry 11 (docs/designs/upgrade-failure-catalogue.md):
+# the control plane is unreachable for minutes on a zonal cluster. Every seeded
+# cluster is zonal, so the fixture is the fleet's own shape and nothing is
+# planted for it. upgrades-zonal-control-plane-outage-warned asks the question
+# as an operator scheduling an upgrade would; this case asks for the readiness
+# report, whose zonal-control-plane rule carries the same fact as a risk on
+# every member (a risk, never a block: the upgrade completes, and what fails is
+# an API client that does not retry).
+#
+# What the case grades is that the readiness report says it: per cluster, that
+# the control plane is zonal, which readiness rule filed that finding, how the
+# report graded it, and the cell the report printed for it. The prompt asks for
+# one declared line per seeded cluster in a fixed vocabulary; the deterministic
+# objectives read those lines and nothing else, the prose is the judge's. The
+# rule id (`zonal-control-plane`) and the grade (`risk`) are the report's
+# vocabulary, which the skill's own text also names, so neither slot alone
+# proves the report ran. The cell slot does: it is the rule's `describe` text as
+# the `risks` column prints it, beginning `control plane is zonal (<zone>): the
+# API is unavailable for minutes while GKE replaces its one replica` behind the
+# column's `zonal-control-plane: ` prefix or without it, as `report.json`
+# carries it, wording the skill paraphrases and the cluster listing cannot supply;
+# a report whose rule is missing prints no such cell, and one whose rule blocks
+# prints it under `other blockers` with a grade the grade slot refuses, so a
+# regression of the rule reds this case rather than passing on the location and
+# the skill text alone. The grade slot names its subject, the rule's own
+# finding: seeded-b is `blocked` on the same report by its budget and its
+# exclusion, and that verdict is not what this slot asks about.
+#
+# The patterns name the slots through `{cluster:<slot>}`, which the verifier
+# expands to the cluster the runner recorded for the slot, so a fleet applied
+# with another prefix is graded on its own names.
+#
+# Isolation class: read-only (chat prompt; the script reads with gcloud
+# container and kubectl get and writes only its own record and per-member
+# kubeconfig files). Eligible tier: nightly from its first merge.
+#
+# No deterministic mutation safeguard, documented: the condition is a setting
+# of the cluster itself (its location), which the fleet's Terraform declares and
+# its reconcile keeps; there is no planted object a check could ground on, as
+# the sibling case's header records for the same shape. No `worker_commands`
+# objective either: it reads delegated workers' terminals only and errors on a
+# run the router answered itself, so the report's own output is graded through
+# the declared lines instead.
+id: upgrades-readiness-zonal-control-plane
+name: Upgrade readiness carries a zonal control plane as a risk on every cluster
+
+prompt: >-
+  For every cluster in this project, run the upgrade readiness check against
+  each cluster's release channel default and include, per cluster, whether its
+  control plane is zonal or regional, what that means for the Kubernetes API
+  while the control plane upgrades, which readiness rule in the report's
+  `risks` or `other blockers` column files that control-plane finding (its rule
+  id, as the report's JSON names it under readiness.rules), whether the report
+  grades that finding as a risk or a blocker, and the cell the report prints
+  for that finding in that column, copied as printed. A member may be blocked
+  by other rules on the same report; the grade and cell slots are about the
+  control-plane finding only. Read only; change and upgrade nothing. End your
+  answer with one line per seeded cluster in exactly this form, no other words
+  on the line: "<cluster>: kind Cluster; control plane: <zonal|regional>;
+  readiness rule: <rule id|none>; graded as: <risk|blocker|none>; cell: <the
+  report's cell for that finding, copied as printed|none>".
+
+expected_output: >-
+  The version table and the readiness table read during this run, with every
+  seeded cluster carrying the zonal control plane as a risk: its location is a
+  zone, so the Kubernetes API is unavailable for a short window while GKE
+  replaces the one control-plane replica, API clients see errors or timeouts
+  for that window, and the running pods are unaffected. The answer says the
+  finding does not block the upgrade, recommends scheduling the control-plane
+  upgrade in a maintenance window and retries with backoff in API clients, and
+  notes that only a regional cluster keeps the API available, which is a
+  recreate. It names the report's rule for the finding, zonal-control-plane,
+  and says the report grades it a risk, whatever else blocks a member. It ends
+  with the declared lines, each reading "kind Cluster; control plane: zonal;
+  readiness rule: zonal-control-plane; graded as: risk; cell: zonal-control-plane:
+  control plane is zonal (<the cluster's zone>): the API is unavailable for
+  minutes while GKE replaces its one replica, ..." with the cell copied from the
+  report's risks column. It cites no CVE identifiers and performs no upgrade.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# No planted defect is read: the case depends on the seeded clusters existing
+# and being zonal, which is the slots' shape (bench/tf/fleet/variables.tf's
+# `zone`), not a role. The four roles below are one per slot, and they are how
+# the declared-line objectives tell a cluster the agent missed from a cluster
+# the project does not have.
+fixtures:
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame, anchored
+  # at both ends, with the line's decoration folded first, and the frame every
+  # cluster must satisfy carries all five slots, the cell included, so a line
+  # that drops the slot fails here and the value objectives below, whose
+  # forbidden patterns need the slot to fire, cannot be passed around on it.
+  # Each value objective also forbids a frame whose value slot holds anything
+  # but the right word.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; control plane: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: kind cluster; control plane: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: kind cluster; control plane: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: kind cluster; control plane: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: [^\n]+$)'
+
+  - name: the-declared-lines-say-the-control-plane-is-zonal
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; control plane: zonal; readiness rule: [^;\n]+; graded as: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; control plane: (?!zonal;)[^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$'
+
+  # The rule id the risks column and the JSON carry, which the skill's text
+  # names too: a report whose rule has regressed gives none, so the slot reads
+  # `none` on a run that read the report; the cell objective below is the one
+  # an agent cannot fill from the skill.
+  - name: the-declared-lines-name-the-reports-rule
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; control plane: [^;\n]+; readiness rule: zonal-control-plane; graded as: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; control plane: [^;\n]+; readiness rule: (?!zonal-control-plane;)[^;\n]+; graded as: [^\n]+$'
+
+  # The grade that makes the line useful: a risk, not a blocker. A report that
+  # blocks every cluster on its own location would stop every upgrade. The
+  # slot is the rule's own grade, so a member blocked by its budget or its
+  # exclusion on the same report still reads `risk` here.
+  - name: the-declared-lines-grade-the-finding-a-risk
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; control plane: [^;\n]+; readiness rule: [^;\n]+; graded as: risk; cell: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; control plane: [^;\n]+; readiness rule: [^;\n]+; graded as: (?!risk;)[^;\n]+; cell: [^\n]+$'
+
+  # The report's own wording: the cell the risks column prints for the finding
+  # is the rule's `describe` text, which the skill paraphrases and the cluster
+  # listing cannot supply. The column prints it behind `zonal-control-plane: `
+  # and `report.json` carries it bare (`readiness.risks[].text`); an agent that
+  # reads the JSON copies the bare text, so the prefix is optional here, the
+  # rule slot having named the rule already. A report whose rule is missing
+  # prints no such cell, so the slot reads `none` or something else and the
+  # line fails here, whatever the other slots say; one whose rule blocks prints
+  # the cell under `other blockers`, and that line passes here and fails the
+  # grade slot. The cell carries a `;`, which keeps the verifier's value-wrap
+  # fold from removing a quote or angle bracket the agent kept around it, so
+  # both patterns admit one opener before
+  # the text.
+  - name: the-declared-lines-quote-the-reports-cell
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; control plane: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: ["''“‘<]?(?:zonal-control-plane: )?control plane is zonal \([a-z0-9-]+\): the api is unavailable for minutes while gke replaces its one replica[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; control plane: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: (?!["''“‘<]?(?:zonal-control-plane: )?control plane is zonal \([a-z0-9-]+\): the api is unavailable for minutes while gke replaces its one replica)[^\n]*$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

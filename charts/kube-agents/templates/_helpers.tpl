@@ -31,25 +31,19 @@ them on their public defaults. Takes the root context.
 {{- end }}
 
 {{/*
-The same for images this project does not build (LiteLLM, fluent-bit). Falls
-back to imageRegistry, since a single-prefix mirror is the common case and a
-chart that mirrored only its own images would render a half-mirrored install —
-the operator handing its managed pods public references after `helm install`
-reported success.
-
-This deliberately does NOT match third_party_registry_prefix in
-scripts/installer/common.sh, which requires THIRD_PARTY_REGISTRY_PREFIX
-explicitly. The asymmetry is about history, not preference: REGISTRY_PREFIX
-shipped before this inventory existed and has always meant "the registry
-holding the images this project builds", so widening it would redirect working
-installs to images their mirror was never given. global.imageRegistry is new
-here and carries no such promise, so it can take the safer default.
+The same for images this project does not build (LiteLLM, fluent-bit, the
+GitHub token minter, Hindsight, the cleanup hook). Empty leaves them on their
+upstream registries; it does NOT fall back to imageRegistry. That matches
+third_party_registry_prefix in scripts/installer/common.sh and
+local.third_party_registry in terraform/examples/full-install/main.tf, so an
+empty third-party prefix means "upstream" at every layer, and an install that
+mirrors everything sets both.
 
 Takes the root context.
 */}}
 {{- define "kube-agents.thirdPartyImageRegistry" -}}
 {{- $g := .Values.global | default dict -}}
-{{- $g.thirdPartyImageRegistry | default $g.imageRegistry | default "" | trimSuffix "/" -}}
+{{- ($g.thirdPartyImageRegistry | default "") | trimSuffix "/" -}}
 {{- end }}
 
 {{/*
@@ -167,6 +161,19 @@ Takes a dict: {repository, tag, name (optional), root (the root context)}.
 {{- end }}
 
 {{/*
+Whether the chart renders the A2A gateway's pod admission policy
+(templates/a2a-gateway-pod-admission-policy.yaml): the admission-policy values gate,
+on a cluster where ValidatingAdmissionPolicy is v1. The template renders on this, and
+the operator's A2A_GATEWAY_POD_POLICY is set from it, so an operator feature gated on
+that signal cannot be on where the policy is not rendered.
+*/}}
+{{- define "kube-agents.a2aGatewayPodPolicyEnabled" -}}
+{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 Whether the Hindsight memory store renders. hindsight.enabled is a tri-state:
 true and false are answers, and null (the default) follows the agent's memory
 provider — the providers that need the Hindsight API get it, everything else
@@ -196,9 +203,52 @@ object it cannot apply. helm template alone has no cluster to ask: pass
 render, or --validate to ask the cluster the kubeconfig points at.
 */}}
 {{- define "kube-agents.platformAgentPodMonitoring" -}}
-{{- $explicit := .Values.platformAgent.podMonitoring -}}
-{{- if kindIs "invalid" $explicit -}}
+{{- include "kube-agents.podMonitoringTriState" (dict "explicit" .Values.platformAgent.podMonitoring "Capabilities" .Capabilities) -}}
+{{- end }}
+
+{{/*
+The tri-state behind every PodMonitoring knob: null follows the cluster, true
+and false decide. Takes a dict with "explicit" (the value) and "Capabilities".
+*/}}
+{{- define "kube-agents.podMonitoringTriState" -}}
+{{- if kindIs "invalid" .explicit -}}
 {{- if .Capabilities.APIVersions.Has "monitoring.googleapis.com/v1/PodMonitoring" -}}
+true
+{{- end -}}
+{{- else if .explicit -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the agent's ServiceMonitors render. platformAgent.serviceMonitor is a
+tri-state: true and false are answers, and null (the default) follows the
+cluster — the ServiceMonitor API is served where Prometheus Operator is
+installed. Pass --api-versions monitoring.coreos.com/v1/ServiceMonitor to helm
+template to see the default render.
+*/}}
+{{- define "kube-agents.platformAgentServiceMonitor" -}}
+{{- $explicit := .Values.platformAgent.serviceMonitor -}}
+{{- if kindIs "invalid" $explicit -}}
+{{- if .Capabilities.APIVersions.Has "monitoring.coreos.com/v1/ServiceMonitor" -}}
+true
+{{- end -}}
+{{- else if $explicit -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the agent's VMPodScrapes render. platformAgent.vmPodScrape is a
+tri-state: true and false are answers, and null (the default) follows the
+cluster — the VMPodScrape API is served where VictoriaMetrics Operator is
+installed. Pass --api-versions operator.victoriametrics.com/v1beta1/VMPodScrape
+to helm template to see the default render.
+*/}}
+{{- define "kube-agents.platformAgentVMPodScrape" -}}
+{{- $explicit := .Values.platformAgent.vmPodScrape -}}
+{{- if kindIs "invalid" $explicit -}}
+{{- if .Capabilities.APIVersions.Has "operator.victoriametrics.com/v1beta1/VMPodScrape" -}}
 true
 {{- end -}}
 {{- else if $explicit -}}
@@ -425,6 +475,227 @@ decidable here, and the docs say so.
 {{- end }}
 
 {{/*
+The egress litellm-policy needs for an openai_compatible server, as the compact JSON the
+operator reads from the kubeagents.x-k8s.io/litellm-upstream-egress annotation, or ""
+when the policy's port-443 rule already reaches the server. The static policy in
+litellm.yaml renders its rule from the same string, so the two copies cannot disagree.
+
+Read off litellm.openaiCompatible.apiBase, first match wins:
+- An in-cluster Service (<svc>, <svc>.<ns>.svc, or <svc>.<ns>.svc.cluster.local; a bare
+  <svc> is the release's own namespace, the way kubectl prints it) is
+  {"namespace":"<ns>","port":<targetPort>}. A two-label <a>.<b> is a hostname here, not
+  <svc>.<ns> as the OTLP lookup reads it: public endpoints such as openrouter.ai have no
+  longer name, and reading "ai" as a namespace would open egress to it. The pod's port,
+  not the URL's: NetworkPolicy matches after the Service has translated the address, so
+  the Service port opens nothing.
+- Otherwise a non-empty egressCIDRs is {"cidrs":[...],"port":<the URL's port>}.
+- Otherwise a host on port 443 that is not a private or IPv6 literal needs no rule: it
+  leaves over the port-443 rule, which reaches public addresses. A hostname that
+  resolves to a private address is not decidable here; egressCIDRs is the remedy.
+- Anything else fails: a NetworkPolicy cannot name a DNS name, and both copies of the
+  443 rule except private space (the static one has no IPv6 peer at all).
+
+Every refusal is a fail naming the value. One shape it cannot judge: a two-label host on
+443 may be a public endpoint or a short in-cluster Service name, so it renders with no
+rule and NOTES.txt warns. Callers include it only when litellm.modelProvider is
+openai_compatible.
+*/}}
+{{- define "kube-agents.openaiCompatibleEgress" -}}
+{{- $values := .Values.litellm.openaiCompatible | default dict -}}
+{{- $apiBase := $values.apiBase | default "" | toString -}}
+{{- /* The operator's cap on the annotation's cidrs list (maxLiteLLMUpstreamCIDRs). */ -}}
+{{- $maxCIDRs := 50 -}}
+{{- $maxPort := 65535 -}}
+{{- $httpsPort := 443 -}}
+{{- $httpPort := 80 -}}
+{{- if empty $apiBase -}}
+{{- fail "litellm.modelProvider 'openai_compatible' needs litellm.openaiCompatible.apiBase: the server's OpenAI-compatible base URL, including /v1." -}}
+{{- end -}}
+{{- if not (regexMatch "^https?://" $apiBase) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q must start with http:// or https:// (lowercase)." $apiBase) -}}
+{{- end -}}
+{{- $hostport := $apiBase | trimPrefix "https://" | trimPrefix "http://" | splitList "/" | first -}}
+{{- $bracketed := hasPrefix "[" $hostport -}}
+{{- $host := splitList ":" $hostport | first -}}
+{{- if $bracketed -}}
+{{- $host = regexFind "^\\[[^\\]]*\\]" $hostport | trimPrefix "[" | trimSuffix "]" -}}
+{{- end -}}
+{{- $afterHost := regexReplaceAll "^(\\[[^\\]]*\\]|[^:]*)" $hostport "" -}}
+{{- /*
+  Userinfo, a query or a fragment in the authority would leave the host and port
+  unreadable, and anything after the host other than :<digits> is not a port.
+*/ -}}
+{{- if or (empty $host) (regexMatch "[?#@]" $hostport) (and $afterHost (not (regexMatch "^:[0-9]+$" $afterHost))) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q: the render cannot read the host and port off it. Give it as http(s)://host[:port]/path, with no userinfo, query, or fragment (the API key belongs in the credentials Secret as OPENAI_COMPATIBLE_API_KEY)." $apiBase) -}}
+{{- end -}}
+{{- $host = lower $host -}}
+{{- $port := ternary $httpsPort $httpPort (hasPrefix "https://" $apiBase) -}}
+{{- if $afterHost -}}
+{{- $port = trimPrefix ":" $afterHost | atoi -}}
+{{- end -}}
+{{- if or (lt $port 1) (gt $port $maxPort) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q: port %d is outside 1-%d." $apiBase $port $maxPort) -}}
+{{- end -}}
+{{- $ipv4 := regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" $host -}}
+{{- $labels := splitList "." $host -}}
+{{- $namespace := "" -}}
+{{- if not (or $bracketed $ipv4) -}}
+{{- if eq (len $labels) 1 -}}
+{{- $namespace = .Release.Namespace -}}
+{{- else if regexMatch "^[^.]+\\.[^.]+\\.svc(\\.cluster\\.local)?\\.?$" $host -}}
+{{- /* A trailing dot is the absolute spelling of the same name. */ -}}
+{{- $namespace = index $labels 1 -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+  A host ending in .svc or .cluster.local that is not <svc>.<ns>.svc[.cluster.local]
+  is an in-cluster name with a part missing or extra (vllm.svc has no namespace).
+  It would otherwise pass as a public hostname and get no rule, so it is refused.
+*/ -}}
+{{- if and (not $namespace) (not $ipv4) (not $bracketed) (regexMatch "\\.(svc|cluster\\.local)\\.?$" $host) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q ends like an in-cluster Service name but is not <svc>.<ns>.svc or <svc>.<ns>.svc.cluster.local, so the gateway could not be given an egress rule for it. Write the Service with both its name and its namespace." $apiBase) -}}
+{{- end -}}
+{{- $egress := dict -}}
+{{- if $namespace -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" $namespace) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q reads as an in-cluster Service in namespace %q, which is not a valid namespace name (a lowercase RFC 1123 label), so the egress rule would select nothing." $apiBase $namespace) -}}
+{{- end -}}
+{{- $targetPort := $values.targetPort -}}
+{{- if or (kindIs "invalid" $targetPort) (empty $targetPort) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q names an in-cluster Service in namespace %q (a bare host is <svc> in the release namespace), so litellm.openaiCompatible.targetPort is required: the server pod's port, which the egress rule names. NetworkPolicy matches after Service translation, so the Service port in the URL opens nothing." $apiBase $namespace) -}}
+{{- end -}}
+{{- $targetPort = int $targetPort -}}
+{{- if or (lt $targetPort 1) (gt $targetPort $maxPort) -}}
+{{- fail (printf "litellm.openaiCompatible.targetPort %d is outside 1-%d." $targetPort $maxPort) -}}
+{{- end -}}
+{{- $egress = dict "namespace" $namespace "port" $targetPort -}}
+{{- else if $values.egressCIDRs -}}
+{{- if gt (len $values.egressCIDRs) $maxCIDRs -}}
+{{- fail (printf "litellm.openaiCompatible.egressCIDRs holds %d entries; the operator accepts at most %d." (len $values.egressCIDRs) $maxCIDRs) -}}
+{{- end -}}
+{{- $cidrs := list -}}
+{{- range $values.egressCIDRs -}}
+{{- $entry := toString . | trim -}}
+{{- with include "kube-agents.openaiCompatibleCIDRRefusal" $entry -}}
+{{- fail (printf "litellm.openaiCompatible.egressCIDRs entry %q %s." $entry .) -}}
+{{- end -}}
+{{- $cidrs = append $cidrs $entry -}}
+{{- end -}}
+{{- $egress = dict "cidrs" $cidrs "port" $port -}}
+{{- else -}}
+{{- /* RFC 1918, CGNAT and link-local: the ranges the operator's 443 rule excepts. */ -}}
+{{- $privateIPv4 := and $ipv4 (regexMatch "^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|169\\.254\\.|100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.)" $host) -}}
+{{- /*
+  <a>.<b> is a hostname here, but it is also the short form of an in-cluster
+  Service, so a mistaken Service gets the hint. Not when <b> is already "svc":
+  that host is missing its namespace, and appending .svc would not fix it.
+*/ -}}
+{{- $serviceHint := "" -}}
+{{- if and (not $ipv4) (eq (len $labels) 2) (ne (index $labels 1) "svc") -}}
+{{- $serviceHint = printf " If this is an in-cluster Service, write it as <svc>.<ns>.svc (%s.svc)." $host -}}
+{{- end -}}
+{{- /* Any host that is not a Service ignores targetPort, so a set one means a Service was meant. */ -}}
+{{- if not (or (kindIs "invalid" $values.targetPort) (empty $values.targetPort)) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q is a hostname, not an in-cluster Service, so litellm.openaiCompatible.targetPort is not used and no egress rule would reach the server.%s" $apiBase $serviceHint) -}}
+{{- end -}}
+{{- if or $bracketed $privateIPv4 -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q names a private or IPv6 address, which the gateway's port-443 rule does not reach. Set litellm.openaiCompatible.egressCIDRs to the CIDR(s) the server is reached at." $apiBase) -}}
+{{- else if ne $port $httpsPort -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q names a host outside the cluster on port %d, but a NetworkPolicy cannot name a DNS name and the gateway reaches external hosts on port %d only. Set litellm.openaiCompatible.egressCIDRs to the CIDR(s) the server is reached at, or use a port-%d endpoint.%s" $apiBase $port $httpsPort $httpsPort $serviceHint) -}}
+{{- end -}}
+{{- end -}}
+{{- with $egress -}}
+{{- toJson . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Why one litellm.openaiCompatible.egressCIDRs entry may not be rendered, or "" when it
+may. The operator refuses the same entries when it reads the annotation
+(litellmUpstreamCIDRRefusal), so a list the render accepts is one the operator keeps
+rather than drops with a log line: CIDR notation, no broader than /12 (IPv4) or /48
+(IPv6), not overlapping the link-local ranges 169.254.0.0/16 and fe80::/10, not inside
+fd20:ce::/48 (the metadata server's IPv6 address is fd20:ce::254), and not an
+IPv4-mapped IPv6 block, which the operator reads as the IPv4 block it maps.
+
+Takes the trimmed entry.
+*/}}
+{{- define "kube-agents.openaiCompatibleCIDRRefusal" -}}
+{{- /* The operator's floors (minIPv4CIDRPrefix, minIPv6CIDRPrefix). */ -}}
+{{- $minIPv4Prefix := 12 -}}
+{{- $minIPv6Prefix := 48 -}}
+{{- $ipv4Bits := 32 -}}
+{{- $ipv6Bits := 128 -}}
+{{- $ipv6Hextets := 8 -}}
+{{- $parts := splitList "/" (lower .) -}}
+{{- $address := first $parts -}}
+{{- $prefix := -1 -}}
+{{- if and (eq (len $parts) 2) (regexMatch "^[0-9]{1,3}$" (last $parts)) -}}
+{{- $prefix = atoi (last $parts) -}}
+{{- end -}}
+{{- /* No leading zeros in an octet: Go's parser, and so the operator, refuses them. */ -}}
+{{- if regexMatch "^(0|[1-9][0-9]{0,2})(\\.(0|[1-9][0-9]{0,2})){3}$" $address -}}
+{{- $octets := list -}}
+{{- range splitList "." $address -}}
+{{- $octets = append $octets (atoi .) -}}
+{{- end -}}
+{{- /* How many second-octet values the prefix spans; 1 at /16 and narrower. */ -}}
+{{- $secondOctetSpan := 1 -}}
+{{- range until (int (sub 16 (min $prefix 16))) -}}
+{{- $secondOctetSpan = mul $secondOctetSpan 2 -}}
+{{- end -}}
+{{- if or (lt $prefix 0) (gt $prefix $ipv4Bits) (gt (max (index $octets 0) (index $octets 1) (index $octets 2) (index $octets 3)) 255) -}}
+is not in CIDR notation (<address>/<prefix>)
+{{- else if lt $prefix $minIPv4Prefix -}}
+is broader than /{{ $minIPv4Prefix }}
+{{- else if and (eq (index $octets 0) 169) (eq (div (index $octets 1) $secondOctetSpan) (div 254 $secondOctetSpan)) -}}
+overlaps the link-local range 169.254.0.0/16, which holds the metadata server
+{{- end -}}
+{{- else if and (contains ":" $address) (regexMatch "^[0-9a-f:]+$" $address) -}}
+{{- $halves := splitList "::" $address -}}
+{{- $head := list -}}
+{{- $tail := list -}}
+{{- with index $halves 0 -}}
+{{- $head = splitList ":" . -}}
+{{- end -}}
+{{- if eq (len $halves) 2 -}}
+{{- with index $halves 1 -}}
+{{- $tail = splitList ":" . -}}
+{{- end -}}
+{{- end -}}
+{{- /* The zero hextets "::" stands for; none without it, at least one with it. */ -}}
+{{- $elided := int (sub $ipv6Hextets (add (len $head) (len $tail))) -}}
+{{- $valid := or (and (eq (len $halves) 1) (eq $elided 0)) (and (eq (len $halves) 2) (gt $elided 0)) -}}
+{{- $hextets := $head -}}
+{{- if gt $elided 0 -}}
+{{- range until $elided -}}
+{{- $hextets = append $hextets "0" -}}
+{{- end -}}
+{{- end -}}
+{{- $normalized := list -}}
+{{- range concat $hextets $tail -}}
+{{- if not (regexMatch "^[0-9a-f]{1,4}$" .) -}}
+{{- $valid = false -}}
+{{- end -}}
+{{- $normalized = append $normalized (regexReplaceAll "^0+(.)" . "${1}") -}}
+{{- end -}}
+{{- if or (not $valid) (lt $prefix 0) (gt $prefix $ipv6Bits) -}}
+is not in CIDR notation (<address>/<prefix>)
+{{- else if lt $prefix $minIPv6Prefix -}}
+is broader than /{{ $minIPv6Prefix }}
+{{- else if eq (slice $normalized 0 6 | join ":") "0:0:0:0:0:ffff" -}}
+is an IPv4-mapped IPv6 block, which the operator reads as the IPv4 block it maps; give that IPv4 CIDR instead
+{{- else if regexMatch "^fe[89ab][0-9a-f]$" (first $normalized) -}}
+overlaps the link-local range fe80::/10
+{{- else if eq (slice $normalized 0 3 | join ":") "fd20:ce:0" -}}
+is inside fd20:ce::/48, which holds the metadata server address fd20:ce::254
+{{- end -}}
+{{- else -}}
+is not in CIDR notation (<address>/<prefix>)
+{{- end -}}
+{{- end }}
+
+{{/*
 Renders a dict of optional CR fields as YAML, dropping the ones left unset.
 
 "Unset" is null or the empty string; `false` and `0` are values and survive,
@@ -453,8 +724,41 @@ Takes a dict of field name to value.
 {{- end }}
 
 {{/*
+The model LiteLLM serves as model-default: litellm.modelDefaultName, or the
+provider's default when that is empty. litellm.yaml renders it into the gateway
+config and web-console.yaml shows it in the console banner, so the two cannot
+name different models. Fails on a provider the table does not know.
+
+Takes the root context.
+*/}}
+{{- define "kube-agents.litellmModel" -}}
+{{- $provider := .Values.litellm.modelProvider }}
+{{- /* Per-provider default model names mirror install.defaults.env (DEFAULT_MODEL_*);
+       a chart cannot source that file, and tests/test_installer_common.py pins the two equal. */}}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" "sap" "anthropic--claude-4.5-sonnet" }}
+{{- /*
+  openai_compatible has no default model, so it is allowed beside the table
+  rather than in it. Any other value is taken as a LiteLLM provider slug
+  (azure, bedrock, databricks, ...) whose credentials arrive through
+  envFromSecret: the chart knows no default model for it, so modelDefaultName
+  is required, and the slug's shape is checked here so a typo fails the render
+  rather than the first model call.
+*/}}
+{{- $litellmSlugPattern := "^[a-z][a-z0-9_]*$" }}
+{{- $tableProvider := or (hasKey $defaultModels $provider) (eq $provider "openai_compatible") }}
+{{- if and (not $tableProvider) (not (regexMatch $litellmSlugPattern $provider)) }}
+{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai, openai_compatible, sap, nor a LiteLLM provider slug (lowercase letters, digits and underscores) — a typo here would otherwise fail only at runtime" $provider) }}
+{{- end }}
+{{- if and (not $tableProvider) (empty .Values.litellm.modelDefaultName) }}
+{{- fail (printf "litellm.modelProvider %q is a LiteLLM provider slug outside the chart's table, so litellm.modelDefaultName must name the model it serves (there is no default); its credentials go in the Secret litellm.envFromSecret names." $provider) }}
+{{- end }}
+{{- .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
+{{- end }}
+
+{{/*
 The LiteLLM gateway config, mirroring
-k8s-operator/config/integrations/litellm/base/config.yaml.
+k8s-operator/config/integrations/litellm/base/config.yaml and its provider
+overlays.
 
 Defined once and consumed twice — as the ConfigMap body and as the input to the
 Deployment's checksum annotation — because those two must not be able to
@@ -464,21 +768,77 @@ ConfigMap changed, the checksum did not, the Deployment did not roll. The
 gateway mounts this with subPath, and a subPath ConfigMap mount never receives
 in-place updates, so the running pod would have kept the old file indefinitely.
 
-Takes a dict of provider, model, callbacks, and maxTokens (optional; 0 or
-absent renders no max_tokens).
+Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
+renders no max_tokens) and reasoningEffort (optional; empty or absent renders
+no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
+neither key), which only openai_compatible passes, and the optional
+dropParams, fallback (a dict of modelName and reasoningEffort), timeoutSeconds
+and numRetries. Every optional input renders nothing when unset, so the default
+render is unchanged.
+callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
 {{- /*
   max_tokens on every alias when .maxTokens is above zero, and no key at all
-  otherwise, so the default render stays byte-identical to the kustomize base
-  (k8s-operator/config/integrations/litellm/base/config.yaml), which carries
-  no such key on purpose. One value for all three aliases: they are one
+  otherwise, so the default render adds no key the kustomize base
+  (k8s-operator/config/integrations/litellm/base/config.yaml) lacks beyond the
+  Gemini thinking key below; the base carries no max_tokens on purpose. One
+  value for every rendered alias (three by default, four with fallback): they are one
   upstream model, and the budget is the backend's property, not the alias's.
   LiteLLM's router spreads litellm_params underneath the request's own
   arguments, so this is what a request that names no max_tokens gets, not a
   ceiling on one that does; values.yaml says what that means for the agent.
+
+  The fallback alias, when asked for, is one more entry for the same upstream
+  model at its own reasoning_effort, and router_settings.fallbacks sends each
+  primary alias to it once the primary's retries are spent.
 */}}
 {{- $maxTokens := int (.maxTokens | default 0) -}}
+{{- /*
+  reasoning_effort on every primary alias when .reasoningEffort is set (the
+  fallback alias carries its own), and no key at
+  all otherwise, for the same reason as max_tokens above: the default render
+  and its checksum stay what they were. LiteLLM translates the OpenAI-style
+  value per provider (thinkingLevel on Gemini 3.x through gemini or vertex_ai,
+  adaptive thinking on Claude, reasoning_effort as-is on OpenAI and
+  hosted_vllm), and, like max_tokens, it is what a request that names no
+  reasoning_effort gets: a request's own value wins. The schema limits it to
+  low, medium and high, which LiteLLM maps on all three; "minimal" is left out
+  because Vertex AI refuses it on Gemini 3.x Flash (see the auxiliary block in
+  deploy/shared/defaults/config.yaml).
+*/}}
+{{- /*
+  thinking: {type: enabled} on every primary alias for a Gemini model that thinks, so
+  its thoughts come back as thought parts (reasoning_content) rather than not
+  at all. Gemini thinks by default but returns its thoughts only when the
+  request sets thinkingConfig.includeThoughts. With that off, Gemini 3.x has
+  been seen writing its reasoning into the answer instead, under a first line
+  `thought`, where nothing downstream can tell it from the answer; asking for
+  the thoughts gives them a channel of their own. Of the
+  settings LiteLLM maps to includeThoughts, this is the one that changes
+  nothing else: with no budget_tokens, LiteLLM v1.106.0
+  (VertexGeminiConfig._map_thinking_param) sends includeThoughts alone on
+  Gemini 3.x, no thinkingLevel, so the model keeps its own depth; on 2.5 it
+  sends no thinkingBudget either.
+
+  Only for a Gemini model that thinks: 2.5, 3.x on, and the -latest aliases
+  LiteLLM counts as 3.x, through gemini or vertex_ai, the name read from its
+  last path segment so a Model Garden path counts. LiteLLM refuses thinking on
+  a model it does not treat as a reasoning model (gemini-2.0-flash, gemma-*;
+  also the 2.5 TTS and computer-use previews, which nobody runs an agent on)
+  and on Claude it would turn thinking on, so every other render stays
+  byte-identical. Left out when .reasoningEffort is set: LiteLLM maps that to
+  includeThoughts as well, and the two on one deployment fail every Gemini 3.x
+  request (thinkingLevel beside a thinking param); on 2.5 the thinking key
+  would drop the effort's thinkingBudget. A request that names its own reasoning_effort gets this key dropped
+  by LiteLLM's router (_deployment_params_with_request_reasoning_override),
+  and its effort maps to includeThoughts too. The kustomize base carries no
+  such key: it picks an overlay by provider alone and also serves openai,
+  which refuses the parameter.
+*/}}
+{{- $geminiThinkingModelPattern := "^gemini-(2[.]5|[3-9]|(pro|flash|flash-lite)-latest$)" -}}
+{{- $geminiThinkingModel := regexMatch $geminiThinkingModelPattern (base .model) -}}
+{{- $geminiThoughts := and (or (eq .provider "gemini") (eq .provider "vertex_ai")) $geminiThinkingModel (not .reasoningEffort) -}}
 {{- /*
   Recent Claude models (Opus 5 among them) answer temperature, top_p and top_k
   with a 400 ("`temperature` is deprecated for this model"), and LiteLLM
@@ -492,47 +852,121 @@ absent renders no max_tokens).
   model, not only the ones that refuse: a name test that tracked which do
   would break on each new release, and an older Claude losing a caller's
   sampling override is a quieter failure than a 400. Claude only: anthropic
-  serves nothing else, vertex_ai serves Claude under claude-* names, and a
-  Gemini or OpenAI render stays byte-identical.
+  serves nothing else, vertex_ai serves Claude under claude-* names, sap (SAP
+  AI Core) under anthropic--* names and forwards temperature and top_p into
+  its orchestration request, and a Gemini or OpenAI render stays
+  byte-identical. $claudeDrop is that set; $claude, which also gates prompt
+  caching below, leaves sap out, because the cache_control markers have not
+  been shown to pass SAP's orchestration API.
 */}}
 {{- $claude := or (eq .provider "anthropic") (and (eq .provider "vertex_ai") (hasPrefix "claude-" .model)) -}}
+{{- $claudeDrop := or $claude (and (eq .provider "sap") (hasPrefix "anthropic--" .model)) -}}
+{{- /*
+  openai_compatible goes through LiteLLM's hosted_vllm handler, which speaks the
+  same OpenAI chat-completions API, rather than through openai/. Read from
+  LiteLLM 1.104.0: openai/ with no api_key falls back to OPENAI_API_KEY, which
+  would hand a real OpenAI key to this server or fail every call, and it
+  ignores a per-model ssl_verify; hosted_vllm reads only HOSTED_VLLM_API_KEY
+  (a placeholder when unset) and honours ssl_verify for this entry alone. So no
+  api_key line: the key arrives as HOSTED_VLLM_API_KEY (litellm.yaml).
+*/}}
+{{- $litellmProvider := ternary "hosted_vllm" .provider (eq .provider "openai_compatible") -}}
+{{- $fallback := .fallback | default dict -}}
+{{- $fallbackEffort := $fallback.reasoningEffort | default "" -}}
+{{- if and $fallback.modelName (not (regexMatch `^[A-Za-z0-9][A-Za-z0-9_.@\-]*$` $fallback.modelName)) -}}
+{{- fail (printf "litellm.fallback.modelName %q must start with a letter or digit and use only letters, digits, _ . @ -" $fallback.modelName) -}}
+{{- end -}}
+{{- $fallbackName := "" -}}
+{{- if and $fallback.modelName (not $fallbackEffort) -}}
+{{- fail (printf "litellm.fallback.modelName %q is set without litellm.fallback.reasoningEffort, which is what renders the fallback alias" $fallback.modelName) -}}
+{{- end -}}
+{{- if $fallbackEffort -}}
+{{- $fallbackName = $fallback.modelName | default (printf "%s-%s" .model $fallbackEffort) -}}
+{{- end -}}
+{{- $timeout := int (.timeoutSeconds | default 0) -}}
+{{- $numRetries := int (.numRetries | default 0) -}}
+{{- $primaries := list "model-default" "hermes-agent" .model -}}
+{{- if and $fallbackName (has $fallbackName $primaries) -}}
+{{- fail (printf "litellm.fallback.modelName %q is already a primary alias (%s); a model cannot fall back to itself" $fallbackName (join ", " $primaries)) -}}
+{{- end -}}
 model_list:
-  - model_name: model-default
+{{- range $primaries }}
+  - model_name: {{ . }}
     litellm_params:
-      model: {{ printf "%s/%s" .provider .model }}
+      model: {{ printf "%s/%s" $litellmProvider $.model }}
+      {{- with $.apiBase }}
+      api_base: {{ . | quote }}
+      {{- end }}
+      {{- with $.sslVerify }}
+      ssl_verify: {{ . | quote }}
+      {{- end }}
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
-      {{- if $claude }}
+      {{- with $.reasoningEffort }}
+      reasoning_effort: {{ . | quote }}
+      {{- end }}
+      {{- if $geminiThoughts }}
+      thinking: {"type": "enabled"}
+      {{- end }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
-  - model_name: hermes-agent
+{{- end }}
+{{- /*
+  The fallback alias carries its own reasoning_effort, so it never takes the
+  Gemini thinking key: the two on one deployment fail every Gemini 3.x request
+  (see $geminiThoughts above).
+*/}}
+{{- if $fallbackName }}
+  - model_name: {{ $fallbackName | quote }}
     litellm_params:
-      model: {{ printf "%s/%s" .provider .model }}
+      model: {{ printf "%s/%s" $litellmProvider .model }}
+      {{- with .apiBase }}
+      api_base: {{ . | quote }}
+      {{- end }}
+      {{- with .sslVerify }}
+      ssl_verify: {{ . | quote }}
+      {{- end }}
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
-      {{- if $claude }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
-  - model_name: {{ .model }}
-    litellm_params:
-      model: {{ printf "%s/%s" .provider .model }}
-      {{- if gt $maxTokens 0 }}
-      max_tokens: {{ $maxTokens }}
-      {{- end }}
-      {{- if $claude }}
-      additional_drop_params: ["temperature", "top_p", "top_k"]
-      {{- end }}
+      reasoning_effort: {{ $fallbackEffort | quote }}
+{{- end }}
 litellm_settings:
+  {{- if or .dropParams $fallbackEffort }}
+  drop_params: true
+  {{- end }}
   callbacks: {{ .callbacks }}
 {{- /*
-  Prompt caching. Kept identical to the kustomize base
-  (k8s-operator/config/integrations/litellm/base/config.yaml) — see that file
-  for why the breakpoints live here rather than in the agent's own config, and
-  why non-Anthropic backends are unaffected.
+  Prompt caching, for Anthropic-family models only: the $claude gate, which
+  leaves sap out, where additional_drop_params above uses $claudeDrop. On Gemini, LiteLLM turns these markers into
+  Vertex explicit context caching: a cachedContents list before every call,
+  and a create whenever the cached prefix is new. A create that Vertex holds
+  past its request credential's life fails the whole turn (a 401 after a
+  ten-minute stall in the incident that found this), and Gemini's
+  implicit caching needs no markers. The kustomize base carries the same block
+  only in its anthropic overlay; see that file for why the breakpoints live
+  here rather than in the agent's own config.
 */}}
+{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) }}
 router_settings:
+  {{- if $fallbackName }}
+  fallbacks:
+    {{- range $primaries }}
+    - {{ . }}: [{{ $fallbackName | quote }}]
+    {{- end }}
+  {{- end }}
+  {{- if gt $timeout 0 }}
+  timeout: {{ $timeout }}
+  {{- end }}
+  {{- if gt $numRetries 0 }}
+  num_retries: {{ $numRetries }}
+  {{- end }}
+  {{- if $claude }}
   default_litellm_params:
     cache_control_injection_points:
       - location: message
@@ -544,6 +978,8 @@ router_settings:
         index: -3
       - location: message
         index: -1
+  {{- end }}
+{{- end }}
 {{- end }}
 
 {{/*
@@ -553,6 +989,83 @@ selectors are immutable once the Deployment exists.
 {{- define "kube-agents.operatorSelectorLabels" -}}
 app.kubernetes.io/name: {{ .Chart.Name }}-operator
 app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Whether the operator's PodMonitoring renders: the same tri-state as
+platformAgent.podMonitoring (null follows the cluster, true and false decide),
+and only while the manager serves metrics at all.
+*/}}
+{{- define "kube-agents.operatorPodMonitoring" -}}
+{{- $metrics := .Values.operator.metrics | default dict -}}
+{{- if $metrics.enabled -}}
+{{- include "kube-agents.podMonitoringTriState" (dict "explicit" $metrics.podMonitoring "Capabilities" .Capabilities) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The manager's metrics port: the bind flag, the containerPort, the
+PodMonitoring endpoint and the NetworkPolicy rule read it here;
+tests/test_chart_operator_monitoring.py holds them together.
+*/}}
+{{- define "kube-agents.operatorMetricsPort" -}}
+8080
+{{- end }}
+
+{{/*
+The smallest memory limit the chart renders for the manager, and the check that
+holds operator.resources.limits.memory to it. The floor is the default, 512Mi,
+which values.yaml sizes from a measurement of the manager's cache; the value
+exists to be raised for a larger cluster, never lowered. Releases up to 0.16.0
+shipped the Kubebuilder scaffold's 128Mi limit and 64Mi request, and
+`helm upgrade --reuse-values` renders this chart against that release's values
+rather than this chart's defaults, so an install upgraded that way kept the
+128Mi the sizing replaced and nothing said so. The check fails the render
+instead, naming the key and the way out. A missing limits.memory is left alone:
+it is no limit at all, not a small one. tests/test_chart_operator_resources.py
+holds the floor to the default and pins the message.
+*/}}
+{{- define "kube-agents.operatorMemoryFloorBytes" -}}
+536870912
+{{- end }}
+
+{{- define "kube-agents.operatorResourcesCheck" -}}
+{{- $prefix := "operator.resources" -}}
+{{- $floor := include "kube-agents.operatorMemoryFloorBytes" . | int64 -}}
+{{- $floorMi := div $floor 1048576 -}}
+{{- $resources := .Values.operator.resources | default dict -}}
+{{- if not (kindIs "map" $resources) -}}
+{{- fail (printf "%s is %v, which is not a map of requests and limits, for example `limits: {memory: %dMi}`" $prefix $resources $floorMi) -}}
+{{- end -}}
+{{- $limits := (index $resources "limits") | default dict -}}
+{{- if not (kindIs "map" $limits) -}}
+{{- fail (printf "%s.limits is %v, which is not a map of resource name to quantity, for example `limits: {memory: %dMi}`" $prefix $limits $floorMi) -}}
+{{- end -}}
+{{- $quantity := index $limits "memory" -}}
+{{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
+{{- $raw := toString $quantity | trim -}}
+{{- $key := printf "%s.limits.memory" $prefix -}}
+{{- /* The grammar kube-agents.containerResourcesCheck admits, so quantityExact
+       scales a value it can read rather than answering zero for one it cannot. */ -}}
+{{- if hasPrefix "-" $raw -}}
+{{- fail (printf "%s is %s; a quantity must not be negative" $key $raw) -}}
+{{- end -}}
+{{- if not (regexMatch (include "kube-agents.quantityPattern" .) (trimPrefix "+" $raw)) -}}
+{{- fail (printf "%s is %q, which is not a Kubernetes quantity (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $key $raw) -}}
+{{- end -}}
+{{- /* Sprig's float64 answers 0 for a value past float64's range, which the
+       compare below would read as under the floor and blame on the wrong thing. */ -}}
+{{- if include "kube-agents.quantityOverflowsFloat64" $raw -}}
+{{- fail (printf "%s is %s, which is not a representable byte count: it is past the range of a float64, which the chart would read as zero, and it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the manager" $key $raw) -}}
+{{- end -}}
+{{- /* Between float64's range and int64's: a float64 holds it, the Downward API does not. */ -}}
+{{- if include "kube-agents.bytesExceedInt64" $raw -}}
+{{- fail (printf "%s is %s, which exceeds the 9223372036854775807 bytes an int64 holds, the most the Downward API hands the manager" $key $raw) -}}
+{{- end -}}
+{{- if lt (include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" $key) | float64) (float64 $floor) -}}
+{{- fail (printf "%s is %s, under the %dMi floor the manager's cache is sized for; below it the manager is OOM-killed as the cache fills. Releases up to 0.16.0 shipped 128Mi, and `helm upgrade --reuse-values` keeps that release's defaults: upgrade with upgrade.sh or `--reset-then-reuse-values`, set at least %dMi, or omit the key for the default" $key $raw $floorMi $floorMi) -}}
+{{- end -}}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -626,15 +1139,21 @@ this, and the minter guard is the reason it has to be one answer.
 
 It also carries the checks the chart can make before the API server does, so
 the failure names the values key: the two spellings are exclusive, forge names
-are unique, a provider must be registered, a GitHub forge's host must be one GitHub serves and its
-namespace a GitHub organisation or user name, a GitLab forge needs a
+are unique, a provider must be registered, a GitHub forge's host must be github.com or a GitHub
+Enterprise Server hostname and its namespace a GitHub organisation or user name, an install has
+one GitHub host and one host is one forge's, a GitLab forge needs a
 credentialsRef, a host that is a hostname and not GitHub's, and a namespace that
-is a GitLab group path, and a repository must name a
+is a GitLab group path, a self-managed forge (gitea) must
+name its host and credentialsRef, only a self-managed forge may declare a port or plain http, and a repository must name a
 declared forge, be neither empty nor the alias's `None`, and be qualified by a
 namespace if it is a bare name; and at most one repository has role gitops. The namespace checks matter beyond the error
 text: a single-forge declaration renders as the alias, so without them the
 refusal would name `github.org` or `github.gitRepo`, keys the values file never
 set.
+
+A self-managed forge has no fixed host list: the host it serves is the one its
+declaration names, so the "host and no repository" test below compares a
+repository against that host rather than against GitHub's spellings.
 
 Renders the empty string when no forge is declared at all, which is a valid
 install: repositories can be registered in the gitops-state ConfigMap later.
@@ -643,13 +1162,17 @@ declares nothing -- reading it as a declaration would make it collide with the
 `forges` list that replaces it, which is the migration every install has to
 make.
 
-The provider list mirrors the CRD's enum on ForgeSpec.Provider, the host list
-mirrors githubHosts, and the GitLab namespace pattern mirrors
-gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
+The provider list mirrors the CRD's enum on ForgeSpec.Provider, the
+self-managed list mirrors the providers with SelfManaged set, the host list
+mirrors githubHosts, and the GitLab and Gitea namespace patterns mirror
+gitlabNamespaceRegex and giteaNamespaceRegex, all in k8s-operator/api/v1alpha1.
 */}}
 {{- define "kube-agents.forgeProviders" -}}
-{{- $registered := list "github" "gitlab" -}}
+{{- $registered := list "github" "gitlab" "gitea" -}}
+{{- $selfManaged := list "gitea" -}}
+{{- $defaultScheme := "https" -}}
 {{- $githubHosts := list "github.com" "www.github.com" "ssh.github.com" -}}
+{{- $reservedHosted := list "github.com" "www.github.com" "ssh.github.com" "gitlab.com" "www.gitlab.com" -}}
 {{- $integ := .Values.platformAgent.integration -}}
 {{- $forges := $integ.forges | default list -}}
 {{- $repos := $integ.repositories | default list -}}
@@ -662,7 +1185,13 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- $names := list -}}
 {{- $providers := list -}}
 {{- $namespaces := dict -}}
-{{- $gitlabHosts := dict -}}
+{{- $credentialHosts := dict -}}
+{{- $forgeHosts := dict -}}
+{{- $hostProviders := dict -}}
+{{- $ghHost := "" -}}
+{{- $ghCA := "" -}}
+{{- /* Mirrors the github provider's ReservedDomains. */ -}}
+{{- $githubReserved := "(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com)$" -}}
 {{- range $i, $f := $forges -}}
 {{- if not $f.name -}}
 {{- fail (printf "platformAgent.integration.forges[%d].name is required" $i) -}}
@@ -676,18 +1205,76 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- $host := $f.host | default "" -}}
 {{- /* ASCII only before `lower`, which is Unicode: `gİthub.com` lowers to github.com, and the operator folds ASCII only, so it is another host. */ -}}
-{{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) -}}
-{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve" $i $f.host) -}}
+{{- /* A forge at a host other than github.com names its provider, as the CRD's rule, and before the host is judged as a GitHub host, so the remedy named is the provider: left to the default, a forge written for a GitLab instance would become a GitHub Enterprise Server. */ -}}
+{{- if and (not $f.provider) $host (regexMatch "^[A-Za-z0-9.-]+$" $host) (not (has (lower $host) $githubHosts)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].provider is required: the forge is at %q, not github.com; name it github for a GitHub Enterprise Server or gitlab for a GitLab instance" $i $f.host) -}}
+{{- end -}}
+{{- /* A github forge is at github.com in one of its spellings, or at a GitHub Enterprise Server host: a hostname, label by label, that is not under a domain where GitHub runs its own services and not GitLab's. */ -}}
+{{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve: name github.com or a GitHub Enterprise Server host" $i $f.host) -}}
+{{- end -}}
+{{- /* One host per forge, and one GitHub host per install, as the operator's hostConflicts. */ -}}
+{{- $canon := lower ($host | default "") -}}
+{{- if eq $provider "github" -}}
+{{- if or (not $canon) (has $canon $githubHosts) }}{{ $canon = "github.com" }}{{ end -}}
+{{- if and $ghHost (ne $ghHost $canon) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: this install's GitHub host is already %s; an install serves one GitHub host, github.com or one GitHub Enterprise Server" $i $ghHost) -}}
+{{- end -}}
+{{- $ghHost = $canon -}}
+{{- else if eq $provider "gitlab" -}}
+{{- if or (not $canon) (eq $canon "www.gitlab.com") }}{{ $canon = "gitlab.com" }}{{ end -}}
+{{- end -}}
+{{- if and $canon (hasKey $hostProviders $canon) (ne (get $hostProviders $canon) $provider) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already the host of a %s forge; one host is one forge's" $i $canon (get $hostProviders $canon)) -}}
+{{- end -}}
+{{- if $canon -}}
+{{- $_ := set $hostProviders $canon $provider -}}
 {{- end -}}
 {{- /* On every provider: the CRD's schema refuses the name wherever it is written, so the chart does too, naming the values key. */ -}}
 {{- $secret := ($f.credentialsRef | default dict).name | default "" -}}
 {{- if and $secret (or (gt (len $secret) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $secret))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].credentialsRef.name is %q, which is not a Secret name (a lowercase DNS subdomain of at most 253 characters)" $i $secret) -}}
 {{- end -}}
+{{- $caMap := ($f.caBundleRef | default dict).name | default "" -}}
+{{- /* A caBundleRef with no name renders nothing, so the CA would be silently missing: the CRD requires the name, and so does the chart. */ -}}
+{{- if and $f.caBundleRef (not $caMap) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef needs a name: the Secret that holds the CA" $i) -}}
+{{- end -}}
+{{- if $caMap -}}
+{{- /* gitlab.com and github.com present certificates the public CAs sign: a private CA must never vouch for them. */ -}}
+{{- if and (has $provider (list "github" "gitlab")) (or (not $host) (has (lower $host) (concat (list "gitlab.com" "www.gitlab.com") $githubHosts))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a self-managed host; gitlab.com and github.com use the public CAs, so set host to the instance's hostname or drop caBundleRef" $i) -}}
+{{- end -}}
+{{- if eq ($f.scheme | default $defaultScheme) "http" -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef cannot be set when scheme is http" $i) -}}
+{{- end -}}
+{{- if or (gt (len $caMap) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $caMap)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.name is %q, which is not a Secret name (a lowercase DNS subdomain of at most 253 characters)" $i $caMap) -}}
+{{- end -}}
+{{- $caKey := ($f.caBundleRef | default dict).key | default "" -}}
+{{- if and $caKey (or (gt (len $caKey) 253) (not (regexMatch "^[-._a-zA-Z0-9]+$" $caKey)) (eq $caKey ".") (hasPrefix ".." $caKey)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.key is %q, which is not a Secret key" $i $caKey) -}}
+{{- end -}}
+{{- /* One CA bundle for the one GitHub host, as the operator's hostConflicts: the broker trusts one bundle per host. */ -}}
+{{- if eq $provider "github" -}}
+{{- $thisCA := printf "%s/%s" $caMap ($caKey | default "ca.crt") -}}
+{{- if and $ghCA (ne $ghCA $thisCA) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s already has a CA bundle, %s; the broker trusts one CA bundle per host, so name the same Secret key on both forges or on one" $i $ghHost $ghCA) -}}
+{{- end -}}
+{{- $ghCA = $thisCA -}}
+{{- end -}}
+{{- end -}}
+{{- $isSelfManaged := has $provider $selfManaged -}}
+{{- if and $f.port (not $isSelfManaged) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].port is set, but provider %s does not accept a port; only %s does" $i $provider (join ", " $selfManaged)) -}}
+{{- end -}}
+{{- if and $f.scheme (ne $f.scheme $defaultScheme) (not $isSelfManaged) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].scheme is %q, but provider %s is %s only" $i $f.scheme $provider $defaultScheme) -}}
+{{- end -}}
 {{- if eq $provider "gitlab" -}}
 {{- /* Any GitHub name, not only its three spellings: api.github.com or raw.githubusercontent.com would hand GitHub's traffic a GitLab token. */ -}}
 {{- /* Label by label, as the operator's DNS-subdomain check: no empty or dash-edged label. */ -}}
-{{- if and $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch "(^|\\.)(github\\.com|githubusercontent\\.com)$" (lower $host))) -}}
+{{- if and $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is not a hostname a gitlab forge can be at" $i $f.host) -}}
 {{- end -}}
 {{- if not $secret -}}
@@ -696,10 +1283,35 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- /* One credential per host in the broker: www.gitlab.com is gitlab.com. */ -}}
 {{- $glHost := lower ($host | default "gitlab.com") -}}
 {{- if eq $glHost "www.gitlab.com" }}{{ $glHost = "gitlab.com" }}{{ end -}}
-{{- if hasKey $gitlabHosts $glHost -}}
-{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already served by forges[%s]; the broker holds one credential per host, so declare one gitlab forge there" $i $glHost (get $gitlabHosts $glHost)) -}}
+{{- if hasKey $credentialHosts $glHost -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already served by forges[%s]; the broker holds one credential per host, so declare one %s forge there" $i $glHost (get $credentialHosts $glHost) $provider) -}}
 {{- end -}}
-{{- $_ := set $gitlabHosts $glHost (toString $i) -}}
+{{- $_ := set $credentialHosts $glHost (toString $i) -}}
+{{- $_ := set $forgeHosts $f.name (ternary (list "gitlab.com" "www.gitlab.com") (list $glHost) (eq $glHost "gitlab.com")) -}}
+{{- else if $isSelfManaged -}}
+{{- if not $host -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is required: provider %s is self-managed and has no default host" $i $provider) -}}
+{{- end -}}
+{{- if or (has (lower $host) $reservedHosted) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is a hosted SaaS domain and cannot be targeted by self-managed provider %s" $i $f.host $provider) -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is not a multi-label DNS hostname" $i $f.host) -}}
+{{- end -}}
+{{- if and (eq ($f.scheme | default $defaultScheme) "http") (not (or (hasSuffix ".svc" (lower $host)) (hasSuffix ".svc.cluster.local" (lower $host)))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].scheme is \"http\", which is only supported for in-cluster Kubernetes Services (*.svc or *.svc.cluster.local); got host %q" $i $f.host) -}}
+{{- end -}}
+{{- if not $secret -}}
+{{- fail (printf "platformAgent.integration.forges[%d].credentialsRef.name is required: provider %s is self-managed and requires an API token Secret" $i $provider) -}}
+{{- end -}}
+{{- $canonHost := lower $host -}}
+{{- if hasKey $credentialHosts $canonHost -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already served by forges[%s]; the broker holds one credential per host, so declare one %s forge there" $i $canonHost (get $credentialHosts $canonHost) $provider) -}}
+{{- end -}}
+{{- $_ := set $credentialHosts $canonHost (toString $i) -}}
+{{- $_ := set $forgeHosts $f.name (list $canonHost) -}}
+{{- else -}}
+{{- $_ := set $forgeHosts $f.name (ternary $githubHosts (list $ghHost) (eq $ghHost "github.com")) -}}
 {{- end -}}
 {{- $namespace := $f.namespace | default "" -}}
 {{- if and (eq $provider "github") $namespace (not (regexMatch "^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$" $namespace)) -}}
@@ -721,6 +1333,15 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- if or (has $first (list "github.com" "www.github.com" "ssh.github.com" "gitlab.com" "www.gitlab.com")) (eq $first (lower ($host | default "gitlab.com"))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which starts with the forge host %q; name the group alone" $i $namespace $first) -}}
 {{- end -}}
+{{- end -}}
+{{- if and (eq $provider "gitea") (gt (len $namespace) 40) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is longer than 40 characters" $i) -}}
+{{- end -}}
+{{- if and (eq $provider "gitea") $namespace (not (regexMatch "^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_])?$" $namespace)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a Gitea user or organisation name" $i $namespace) -}}
+{{- end -}}
+{{- if and (eq $provider "gitea") $namespace (or (has (lower $namespace) $reservedHosted) (eq (lower $namespace) (lower $host))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is the forge host; name the owner or organisation alone" $i $namespace) -}}
 {{- end -}}
 {{- $names = append $names $f.name -}}
 {{- $providers = append $providers $provider -}}
@@ -750,8 +1371,8 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- if and $name (not (hasSuffix "/" $name)) -}}
 {{- $trimmed = trimAll "/" $name -}}
 {{- end -}}
-{{- /* A GitHub host followed only by `/` names no repository, which a namespace would not fix; the operator refuses it against this entry. */ -}}
-{{- $hostOnly := and (hasSuffix "/" $repository) (regexMatch "^[A-Za-z0-9./-]+$" $repository) (has (lower (trimAll "/" $repository)) $githubHosts) -}}
+{{- /* A forge's own host followed only by `/` names no repository, which a namespace would not fix; the operator refuses it against this entry. */ -}}
+{{- $hostOnly := and (hasSuffix "/" $repository) (regexMatch "^[A-Za-z0-9./-]+$" $repository) (has (lower (trimAll "/" $repository)) (get $forgeHosts $r.forge)) -}}
 {{- if and (not (contains "/" $trimmed)) (not (contains ":" $repository)) (not $hostOnly) (not $r.namespace) (not (get $namespaces $r.forge)) -}}
 {{- fail (printf "platformAgent.integration.repositories[%d].repository is %q, a bare name, but neither the entry nor forge %q declares a namespace to qualify it" $i $repository $r.forge) -}}
 {{- end -}}
@@ -877,6 +1498,23 @@ honest — a quota that large cannot constrain this release either way.
 {{- else -}}
 {{- $v | int64 -}}
 {{- end -}}
+{{- end }}
+
+{{- /* Saturating int64 add and multiply for the quota sums. Sprig's add and mul are
+       plain int64 and wrap. A sidecar or proxy resource limit the validator admits
+       (any byte count under 2^63; bytesExceedInt64 refuses the rest) can still carry
+       the agent-pod sum or the replica multiply past int64, wrapping a `required`
+       figure negative so the quota check passes every quota -- the exact failure the
+       preflight exists to prevent. These compute in float64 and clamp with clampInt64,
+       so an over-large figure makes `required` read as the MaxInt64 ceiling, which no
+       real quota satisfies, rather than negative. float64 loses integer precision above
+       2^53, which only shifts a figure already far larger than any quota, where the
+       ceiling is the intended answer. Take (dict "a" <int64> "b" <int64>). */ -}}
+{{- define "kube-agents.satAdd" -}}
+{{- include "kube-agents.clampInt64" (addf (float64 .a) (float64 .b)) -}}
+{{- end }}
+{{- define "kube-agents.satMul" -}}
+{{- include "kube-agents.clampInt64" (mulf (float64 .a) (float64 .b)) -}}
 {{- end }}
 
 {{- define "kube-agents.parseCpuMillis" -}}
@@ -1312,39 +1950,57 @@ please report it" message before the CR template could name the key. The checks 
 compare parsed values (zero limit, floor, crossed pair) stay in the CR template, after
 these have passed.
 */}}
-{{- define "kube-agents.credentialProxyResourcesCheck" -}}
-{{- $proxyResources := . | default dict -}}
-{{- $proxyPrefix := "platformAgent.deployment.credentialProxy.resources" -}}
-{{- $proxyUnknown := keys (omit $proxyResources "limits" "requests" "claims") | sortAlpha -}}
-{{- if $proxyUnknown -}}
-{{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $proxyPrefix (join ", " $proxyUnknown)) -}}
+{{- /* Shape, grammar and representability check for a container's resources override,
+       shared by the credential proxy and the agent-api-auth sidecar. Both the quota
+       preflight and the CR template call it, so a mistyped side key, an unsupported
+       claims, a non-map side, an unknown resource name or a quantity the preflight
+       arithmetic cannot represent (a value float64 reads as zero, a byte count over an
+       int64, a CPU past the millicore range) fails the render naming the key, rather
+       than being pruned silently or reaching the footprint math as garbage. Caller
+       passes resources, prefix, container, pod and consumer (the Downward API reader). */ -}}
+{{- /* The CRD's quantity grammar, the sign already stripped, with the exponent
+       narrowed to the integer form resource.ParseQuantity reads. parseCpuMillis,
+       parseBytes and quantityExact read every form this admits. One definition
+       for the two checks that gate those readers, kube-agents.containerResourcesCheck
+       and kube-agents.operatorResourcesCheck, so they cannot admit different
+       grammars. */ -}}
+{{- define "kube-agents.quantityPattern" -}}
+^(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$
+{{- end }}
+
+{{- define "kube-agents.containerResourcesCheck" -}}
+{{- $resources := .resources | default dict -}}
+{{- $prefix := .prefix -}}
+{{- $container := .container -}}
+{{- $pod := .pod -}}
+{{- $consumer := .consumer -}}
+{{- $unknown := keys (omit $resources "limits" "requests" "claims") | sortAlpha -}}
+{{- if $unknown -}}
+{{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $prefix (join ", " $unknown)) -}}
 {{- end -}}
-{{- if index $proxyResources "claims" -}}
-{{- fail (printf "%s.claims is not supported -- the credential-proxy pod declares no resourceClaims, so the operator refuses the key. Remove it." $proxyPrefix) -}}
+{{- if index $resources "claims" -}}
+{{- fail (printf "%s.claims is not supported -- the %s declares no resourceClaims, so the operator refuses the key. Remove it." $prefix $pod) -}}
 {{- end -}}
-{{- $proxyNames := list "cpu" "memory" "ephemeral-storage" -}}
-{{- /* The CRD's quantity grammar, the sign already stripped, with the
-       exponent narrowed to the integer form resource.ParseQuantity reads.
-       parseCpuMillis and parseBytes read every form this admits. */ -}}
-{{- $proxyQuantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
+{{- $names := list "cpu" "memory" "ephemeral-storage" -}}
+{{- $quantityPattern := include "kube-agents.quantityPattern" . -}}
 {{- range $side := list "limits" "requests" -}}
-{{- $quantities := index $proxyResources $side -}}
+{{- $quantities := index $resources $side -}}
 {{- /* `--set ...limits=2Gi` hands range a string, which it cannot walk, and a list
        gives it integer names; either is a shape the CRD refuses. */ -}}
 {{- if not (or (empty $quantities) (kindIs "map" $quantities)) -}}
-{{- fail (printf "%s.%s is %v, which is not a map of resource name to quantity, for example `limits: {memory: 2Gi}`" $proxyPrefix $side $quantities) -}}
+{{- fail (printf "%s.%s is %v, which is not a map of resource name to quantity, for example `limits: {memory: 2Gi}`" $prefix $side $quantities) -}}
 {{- end -}}
 {{- range $name, $quantity := $quantities | default dict -}}
 {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
 {{- $raw := toString $quantity | trim -}}
-{{- if not (has $name $proxyNames) -}}
-{{- fail (printf "%s.%s.%s: the credential-proxy container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $proxyPrefix $side $name) -}}
+{{- if not (has $name $names) -}}
+{{- fail (printf "%s.%s.%s: the %s container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $prefix $side $name $container) -}}
 {{- end -}}
 {{- if hasPrefix "-" $raw -}}
-{{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $prefix $side $name $raw) -}}
 {{- end -}}
-{{- if not (regexMatch $proxyQuantityPattern (trimPrefix "+" $raw)) -}}
-{{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $proxyPrefix $side $name $raw) -}}
+{{- if not (regexMatch $quantityPattern (trimPrefix "+" $raw)) -}}
+{{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- /* float64 holds 15 significant decimal digits exactly; a 16th lets two quantities
        within one part in 10^16 of each other, or of a bound, read as equal, and the
@@ -1354,31 +2010,35 @@ these have passed.
 {{- $significand := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (regexReplaceAll "[eE][-+]?[0-9]+$" (trimPrefix "+" $raw) "") "" -}}
 {{- $significand = regexReplaceAll "0+$" (regexReplaceAll "^0+" (replace "." "" $significand) "") "" -}}
 {{- if gt (len $significand) 15 -}}
-{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits: the chart compares quantities as float64, which holds 15 exactly, so it cannot check this one against the operator's rules. Write it with a larger unit or fewer digits" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits: the chart compares quantities as float64, which holds 15 exactly, so it cannot check this one against the operator's rules. Write it with a larger unit or fewer digits" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- if include "kube-agents.quantityOverflowsFloat64" $raw -}}
 {{- if eq $name "cpu" -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero, and its millicore value exceeds the 9223372036854775807 an int64 holds, so the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero, and its millicore value exceeds the 9223372036854775807 an int64 holds, so the operator refuses it" $prefix $side $name $raw) -}}
 {{- else -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the %s, and the operator refuses it" $prefix $side $name $raw $consumer) -}}
 {{- end -}}
 {{- end -}}
 {{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $raw) -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the %s, and the operator refuses it" $prefix $side $name $raw $consumer) -}}
 {{- end -}}
 {{- /* The operator reads a CPU quantity in millicores (MilliValue), which wraps past
        2^63; it refuses one there, so the render does too. A suffix that carries a
        finite number past float64's range (a 1 and 306 zeros, then k) fails inside
        quantityExact, naming the key. */ -}}
 {{- if eq $name "cpu" -}}
-{{- $cores := include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" (printf "%s.%s.%s" $proxyPrefix $side $name)) | float64 -}}
+{{- $cores := include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" (printf "%s.%s.%s" $prefix $side $name)) | float64 -}}
 {{- if ge (mulf $cores 1000.0) 9223372036854775808.0 -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a CPU count the scheduler can represent in millicores: its millicore value exceeds the 9223372036854775807 an int64 holds, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a CPU count the scheduler can represent in millicores: its millicore value exceeds the 9223372036854775807 an int64 holds, and the operator refuses it" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end }}
+
+{{- define "kube-agents.credentialProxyResourcesCheck" -}}
+{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.credentialProxy.resources" "container" "credential-proxy" "pod" "credential-proxy pod" "consumer" "broker") -}}
 {{- end }}
 
 {{/*
@@ -1388,11 +2048,11 @@ merged over it, per key, as resolveCredentialProxyResources does in the operator
 carries replaces that number, a key it omits keeps footprint.yaml's -- with one exception
 that follows the API server rather than the operator. The operator renders a CPU and a
 memory request explicitly, so an override that raises only the limit leaves the request where
-the operator put it. It renders no ephemeral-storage request at all: the 2Gi request in
+the operator put it. It renders no ephemeral-storage request at all: the 8Gi request in
 footprint.yaml is the API server defaulting an absent request to the limit
 (scripts/generate_chart_footprint.py models the same rule), and that defaulting follows the
 override's limit, so `limits: {ephemeral-storage: 10Gi}` alone is a 10Gi request too. Summing
-it at 2Gi would pass a quota the pod is then refused on. kube-agents.workloadResources
+it at 8Gi would pass a quota the pod is then refused on. kube-agents.workloadResources
 applies the request-follows-limit rule to every key, which is right for a chart workload
 whose requests the values own and wrong for the two the operator renders, so it is not
 reused here. Takes (dict "workload" <footprint entry> "override" <resources block>) and
@@ -1455,9 +2115,24 @@ The defaults carry no ephemeral-storage request because the operator renders non
 */}}
 {{- define "kube-agents.credentialProxyDefaults" -}}
 {{- dict
-      "requests" (dict "cpu" "500m" "memory" "512Mi")
+      "requests" (dict "cpu" "500m" "memory" "1Gi")
+      "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "8Gi")
+   | toJson -}}
+{{- end }}
+
+{{- /* The agent-api-auth sidecar's defaults, the agentAPIAuth* constants in
+       k8s-operator/internal/controller/platformagent_manifests.go. Declared once so
+       the footprint delta reads them here rather than as scattered literals;
+       tests/test_agent_api_auth_sizing_parity.py holds this equal to the operator. */ -}}
+{{- define "kube-agents.agentAPIAuthDefaults" -}}
+{{- dict
+      "requests" (dict "cpu" "150m" "memory" "384Mi")
       "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "2Gi")
    | toJson -}}
+{{- end }}
+
+{{- define "kube-agents.agentAPIAuthResourcesCheck" -}}
+{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.agentAPIAuth.resources" "container" "agent-api-auth" "pod" "gateway pod" "consumer" "event watcher") -}}
 {{- end }}
 
 {{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}
@@ -1465,6 +2140,17 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- end }}
 
 {{- define "kube-agents.quotaRequirements" -}}
+{{- /* Helm renders quota-preflight.yaml before operator-deployment.yaml, so on a
+       namespace with a ResourceQuota the workload loop below would read a bad
+       operator.resources.limits.memory first and parseBytes would refuse it with
+       "please report it" before the operator template could name the key. Both
+       readers call the check, as both readers of the credential-proxy override
+       call kube-agents.containerResourcesCheck. Gated as the operator template
+       and the workload loop below are: a chart that renders no manager has no
+       limit to hold to the floor. */ -}}
+{{- if .Values.operator.enabled -}}
+{{- include "kube-agents.operatorResourcesCheck" . -}}
+{{- end -}}
 {{- $footprint := .Files.Get "files/footprint.yaml" | fromYaml -}}
 {{- /* The footprint is the only source for the operator-rendered pods, which are most of
        the release. If it is missing or unparseable every one of them silently counts as
@@ -1518,10 +2204,14 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- if .Values.githubMinter.enabled -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
 {{- end -}}
+{{- if .Values.webConsole.enabled -}}
+  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. */ -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.webConsole "pods" 1 "surges" true) -}}
+{{- end -}}
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
   {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall
          while every release pod still exists, so quota admission needs headroom for it. */ -}}
-  {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi") "limits" (dict "cpu" "200m" "memory" "128Mi")) -}}
+  {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi" "ephemeral-storage" "1088Mi") "limits" (dict "cpu" "200m" "memory" "128Mi" "ephemeral-storage" "1088Mi")) -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" $cleanupRes "pods" 1 "surges" false) -}}
 {{- end -}}
 
@@ -1567,8 +2257,10 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- if .Values.platformAgent.enabled -}}
   {{- /* The agent pod is the one operator-rendered workload that scales: the gateway
          Deployment takes spec.replicas from availability.replicas, while the shell
-         StatefulSet and the credential proxy stay at 1 (see the platformagent-ha golden,
-         where the gateway goes to 3 and the other two do not). The footprint records one
+         StatefulSet and the credential proxy stay at 1. The operator now caps the gateway
+         at one replica (supportedGatewayReplicas in manifest_helpers.go), so above one
+         this multiply and the surge below over-count; that errs towards refusing a quota
+         rather than passing one the pods will not fit. The footprint records one
          pod's worth, so it is multiplied here — without this an HA install passes the
          check and then leaves its extra replicas Pending, which is the failure this
          whole template exists to prevent. An absent value means the operator's own
@@ -1582,6 +2274,82 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $podReqEph := $base.ephemeralStorageBytesRequest | default 0 | int64 -}}
   {{- $podLimEph := $base.ephemeralStorageBytesLimit | default 0 | int64 -}}
 
+  {{- /* The agent-api-auth sidecar is one container of this pod, so its default
+         requests and limits are already in agentPod.base above. A
+         spec.deployment.agentAPIAuth.resources override (resolveAgentAPIAuthResources
+         in the operator) changes them per key, so add the override-minus-default
+         delta here before the pod is multiplied by replicas, the same accounting
+         kube-agents.credentialProxyFootprint does for the proxy's own pod. Without
+         it the preflight passes a quota the raised sidecar will not fit, and the
+         gateway's Recreate rollout then deletes the running Pod before the quota
+         refuses the larger one. The defaults are the agentAPIAuth* constants in
+         k8s-operator/internal/controller/platformagent_manifests.go: 150m and 384Mi
+         requests, 1 CPU, 2Gi memory and 2Gi ephemeral-storage limits; the sidecar
+         declares no ephemeral request, which the API server defaults to the limit,
+         so the base counts 2Gi on both ephemeral sides. */ -}}
+  {{- $aaResources := (((.Values.platformAgent.deployment | default dict).agentAPIAuth | default dict).resources) | default dict -}}
+  {{- include "kube-agents.agentAPIAuthResourcesCheck" $aaResources -}}
+  {{- $aaReq := (index $aaResources "requests") | default dict -}}
+  {{- $aaLim := (index $aaResources "limits") | default dict -}}
+  {{- $aaDefaults := include "kube-agents.agentAPIAuthDefaults" . | fromJson -}}
+  {{- $aaReqDef := index $aaDefaults "requests" -}}
+  {{- $aaLimDef := index $aaDefaults "limits" -}}
+  {{- /* Default sidecar figures as the numbers the footprint uses. */ -}}
+  {{- $defCpuReq := include "kube-agents.parseCpuMillis" (index $aaReqDef "cpu") | int64 -}}
+  {{- $defCpuLim := include "kube-agents.parseCpuMillis" (index $aaLimDef "cpu") | int64 -}}
+  {{- $defMemReq := include "kube-agents.parseBytes" (index $aaReqDef "memory") | int64 -}}
+  {{- $defMemLim := include "kube-agents.parseBytes" (index $aaLimDef "memory") | int64 -}}
+  {{- $defEph := include "kube-agents.parseBytes" (index $aaLimDef "ephemeral-storage") | int64 -}}
+  {{- /* Merged over the defaults, the pod the operator would render. The sidecar declares
+         no ephemeral request, which the API server defaults to the limit, so both ephemeral
+         sides start at the default limit and the request follows an override of the limit
+         unless set explicitly. */ -}}
+  {{- $mCpuReq := $defCpuReq -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "cpu") "fallback" "") -}}{{- $mCpuReq = include "kube-agents.parseCpuMillis" . | int64 -}}{{- end -}}
+  {{- $mCpuLim := $defCpuLim -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "cpu") "fallback" "") -}}{{- $mCpuLim = include "kube-agents.parseCpuMillis" . | int64 -}}{{- end -}}
+  {{- $mMemReq := $defMemReq -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "memory") "fallback" "") -}}{{- $mMemReq = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
+  {{- $mMemLim := $defMemLim -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "memory") "fallback" "") -}}{{- $mMemLim = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
+  {{- $mEphLim := $defEph -}}{{- $mEphReq := $defEph -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "ephemeral-storage") "fallback" "") -}}{{- $mEphLim = include "kube-agents.parseBytes" . | int64 -}}{{- $mEphReq = $mEphLim -}}{{- end -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "ephemeral-storage") "fallback" "") -}}{{- $mEphReq = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
+  {{- /* The operator refuses a zero limit or a request above its limit (validateContainerResources)
+         and renders the sidecar at its defaults, Degraded. agentAPIAuthResourcesCheck above does not
+         refuse those -- they stay the operator's and the webhook's -- so the preflight must count the
+         override's delta only for an override the operator will actually render, or it under- or
+         over-counts the pod against the quota the operator never asks for. */ -}}
+  {{- /* The refusal is the operator's exact resource.Quantity comparison, so it reads the
+         merged raw quantities through kube-agents.quantityExact rather than the rounded
+         $mMemLim/$mMemReq integers above: parseBytes and parseCpuMillis ceil an m/u/n
+         quantity, so a limit half a byte under a default request rounds up onto it and the
+         integer gate would miss a crossed pair the operator refuses. The proxy's CR block
+         decides the same thing on the same exact figures (platform-agent-cr.yaml). The
+         rounded integers stay the quota-sum arithmetic, which wants the whole-byte figure. */ -}}
+  {{- $mCpuLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "cpu") "fallback" (index $aaLimDef "cpu")) -}}
+  {{- $mCpuReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "cpu") "fallback" (index $aaReqDef "cpu")) -}}
+  {{- $mMemLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "memory") "fallback" (index $aaLimDef "memory")) -}}
+  {{- $mMemReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "memory") "fallback" (index $aaReqDef "memory")) -}}
+  {{- $mEphLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "ephemeral-storage") "fallback" (index $aaLimDef "ephemeral-storage")) -}}
+  {{- $mEphReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "ephemeral-storage") "fallback" $mEphLimRaw) -}}
+  {{- $xCpuLim := include "kube-agents.quantityExact" (dict "raw" $mCpuLimRaw "cpu" true "key" "platformAgent.deployment.agentAPIAuth.resources.limits.cpu") | float64 -}}
+  {{- $xCpuReq := include "kube-agents.quantityExact" (dict "raw" $mCpuReqRaw "cpu" true "key" "platformAgent.deployment.agentAPIAuth.resources.requests.cpu") | float64 -}}
+  {{- $xMemLim := include "kube-agents.quantityExact" (dict "raw" $mMemLimRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.limits.memory") | float64 -}}
+  {{- $xMemReq := include "kube-agents.quantityExact" (dict "raw" $mMemReqRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.requests.memory") | float64 -}}
+  {{- $xEphLim := include "kube-agents.quantityExact" (dict "raw" $mEphLimRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.limits.ephemeral-storage") | float64 -}}
+  {{- $xEphReq := include "kube-agents.quantityExact" (dict "raw" $mEphReqRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.requests.ephemeral-storage") | float64 -}}
+  {{- $aaRefused := false -}}
+  {{- if or (eq $xCpuLim 0.0) (eq $xMemLim 0.0) (eq $xEphLim 0.0) -}}{{- $aaRefused = true -}}{{- end -}}
+  {{- if or (gt $xCpuReq $xCpuLim) (gt $xMemReq $xMemLim) (gt $xEphReq $xEphLim) -}}{{- $aaRefused = true -}}{{- end -}}
+  {{- if not $aaRefused -}}
+  {{- /* satAdd, not add: an admitted sidecar limit near 2^63 carries the pod sum past
+         int64 and would wrap `required` negative. The sub stays plain -- a merged
+         figure minus its default is always below the merged figure and cannot wrap. */ -}}
+  {{- $podReqCpu = include "kube-agents.satAdd" (dict "a" $podReqCpu "b" (sub $mCpuReq $defCpuReq)) | int64 -}}
+  {{- $podLimCpu = include "kube-agents.satAdd" (dict "a" $podLimCpu "b" (sub $mCpuLim $defCpuLim)) | int64 -}}
+  {{- $podReqMem = include "kube-agents.satAdd" (dict "a" $podReqMem "b" (sub $mMemReq $defMemReq)) | int64 -}}
+  {{- $podLimMem = include "kube-agents.satAdd" (dict "a" $podLimMem "b" (sub $mMemLim $defMemLim)) | int64 -}}
+  {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" (sub $mEphLim $defEph)) | int64 -}}
+  {{- $podReqEph = include "kube-agents.satAdd" (dict "a" $podReqEph "b" (sub $mEphReq $defEph)) | int64 -}}
+  {{- end -}}
+
   {{- /* The dashboard is another container in the agent pod rather than a pod of its own,
          so it scales with the same replica count and adds no pod. Its flag is
          harness.hermes.dashboardEnabled; reading it one level up at harness.dashboardEnabled
@@ -1594,26 +2362,31 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- end -}}
   {{- if $dashEnabled -}}
     {{- $dash := (index $op "agentPod" "dashboard") | default dict -}}
-    {{- $podReqCpu = add $podReqCpu ($dash.cpuMillisRequest | default 0 | int64) -}}
-    {{- $podLimCpu = add $podLimCpu ($dash.cpuMillisLimit | default 0 | int64) -}}
-    {{- $podReqMem = add $podReqMem ($dash.memoryBytesRequest | default 0 | int64) -}}
-    {{- $podLimMem = add $podLimMem ($dash.memoryBytesLimit | default 0 | int64) -}}
-    {{- $podReqEph = add $podReqEph ($dash.ephemeralStorageBytesRequest | default 0 | int64) -}}
-    {{- $podLimEph = add $podLimEph ($dash.ephemeralStorageBytesLimit | default 0 | int64) -}}
+    {{- /* satAdd: the pod sum above may already be the saturated ceiling from a huge
+           sidecar override, which a plain add would wrap. */ -}}
+    {{- $podReqCpu = include "kube-agents.satAdd" (dict "a" $podReqCpu "b" ($dash.cpuMillisRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimCpu = include "kube-agents.satAdd" (dict "a" $podLimCpu "b" ($dash.cpuMillisLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqMem = include "kube-agents.satAdd" (dict "a" $podReqMem "b" ($dash.memoryBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimMem = include "kube-agents.satAdd" (dict "a" $podLimMem "b" ($dash.memoryBytesLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqEph = include "kube-agents.satAdd" (dict "a" $podReqEph "b" ($dash.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" ($dash.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
   {{- end -}}
 
-  {{- $reqPods = add $reqPods (mul ($base.pods | default 1 | int64) $agentReplicas) -}}
-  {{- $reqCpu = add $reqCpu (mul $podReqCpu $agentReplicas) -}}
-  {{- $limCpu = add $limCpu (mul $podLimCpu $agentReplicas) -}}
-  {{- $reqMem = add $reqMem (mul $podReqMem $agentReplicas) -}}
-  {{- $limMem = add $limMem (mul $podLimMem $agentReplicas) -}}
-  {{- $reqEph = add $reqEph (mul $podReqEph $agentReplicas) -}}
-  {{- $limEph = add $limEph (mul $podLimEph $agentReplicas) -}}
+  {{- /* satMul/satAdd: the pod sum times the replica count is where an admitted
+         override most easily passes int64 -- a figure under 2^63 doubles over it at
+         two replicas -- so both the multiply and the accumulation saturate. */ -}}
+  {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.satMul" (dict "a" ($base.pods | default 1 | int64) "b" $agentReplicas))) | int64 -}}
+  {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (include "kube-agents.satMul" (dict "a" $podReqCpu "b" $agentReplicas))) | int64 -}}
+  {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (include "kube-agents.satMul" (dict "a" $podLimCpu "b" $agentReplicas))) | int64 -}}
+  {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (include "kube-agents.satMul" (dict "a" $podReqMem "b" $agentReplicas))) | int64 -}}
+  {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (include "kube-agents.satMul" (dict "a" $podLimMem "b" $agentReplicas))) | int64 -}}
+  {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" $podReqEph "b" $agentReplicas))) | int64 -}}
+  {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" $podLimEph "b" $agentReplicas))) | int64 -}}
   {{- /* Only an HA gateway surges. The operator gives the gateway Deployment a
-         RollingUpdate strategy only when availability.replicas is above 1 and renders
+         RollingUpdate strategy only above one effective replica and renders
          `strategy: Recreate` otherwise (resolveDeploymentReplicasAndStrategy in
-         k8s-operator/internal/controller/manifest_helpers.go; the default-CR golden
-         platformagent.yaml shows Recreate, the platformagent-ha one RollingUpdate). A
+         k8s-operator/internal/controller/manifest_helpers.go), and it caps the count at
+         one, so every gateway it renders today is Recreate. A
          Recreate rollout deletes the old Pod before creating the new one, so it needs no
          extra room. Counting the agent pod here at one replica made it win the max on
          every default install — it is the largest workload in the release — and the
@@ -1633,26 +2406,30 @@ The defaults carry no ephemeral-storage request because the operator renders non
          generic keys here ensures that any workload summed into extract_footprint is
          automatically counted by the preflight without requiring manual template edits.
          agentPod and storage are handled separately above and below. */ -}}
-  {{- /* The one operator-rendered workload with a sizing override in values: the proxy's
-         footprint entry takes platformAgent.deployment.credentialProxy.resources over it
-         per key (kube-agents.credentialProxyFootprint) before it is summed, so a raised
-         memory limit is counted here as the pod the operator will write, rather than the
-         preflight passing a quota the release will not fit. An ephemeral-storage limit set
-         alone is counted as a request of that size too: the operator renders no
-         ephemeral-storage request and the API server defaults it to the limit. */ -}}
+  {{- /* The credential proxy is the one operator-rendered workload of its own pod with a
+         sizing override: its footprint entry takes platformAgent.deployment.credentialProxy.resources
+         over it per key (kube-agents.credentialProxyFootprint) before it is summed, so a
+         raised memory limit is counted here as the pod the operator will write, rather than
+         the preflight passing a quota the release will not fit. An ephemeral-storage limit
+         set alone is counted as a request of that size too: the operator renders no
+         ephemeral-storage request and the API server defaults it to the limit. The
+         agent-api-auth sidecar has a sizing override too, but it is a container of the agent
+         pod, so its delta is added to agentPod above rather than counted here. */ -}}
   {{- $proxyOverride := (((.Values.platformAgent.deployment | default dict).credentialProxy | default dict).resources) | default dict -}}
   {{- range $key, $workload := $op -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
       {{- if and (eq $key "credentialProxy") $proxyOverride -}}
         {{- $workload = include "kube-agents.credentialProxyFootprint" (dict "workload" $workload "override" $proxyOverride) | fromJson -}}
       {{- end -}}
-      {{- $reqPods = add $reqPods (include "kube-agents.replicaCount" $workload.pods | int64) -}}
-      {{- $reqCpu = add $reqCpu ($workload.cpuMillisRequest | default 0 | int64) -}}
-      {{- $limCpu = add $limCpu ($workload.cpuMillisLimit | default 0 | int64) -}}
-      {{- $reqMem = add $reqMem ($workload.memoryBytesRequest | default 0 | int64) -}}
-      {{- $limMem = add $limMem ($workload.memoryBytesLimit | default 0 | int64) -}}
-      {{- $reqEph = add $reqEph ($workload.ephemeralStorageBytesRequest | default 0 | int64) -}}
-      {{- $limEph = add $limEph ($workload.ephemeralStorageBytesLimit | default 0 | int64) -}}
+      {{- /* satAdd: a total above may already be the saturated ceiling from a huge
+             agent-pod override, which a plain add here would wrap back negative. */ -}}
+      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.replicaCount" $workload.pods | int64)) | int64 -}}
+      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($workload.cpuMillisRequest | default 0 | int64)) | int64 -}}
+      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($workload.cpuMillisLimit | default 0 | int64)) | int64 -}}
+      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($workload.memoryBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($workload.memoryBytesLimit | default 0 | int64)) | int64 -}}
+      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($workload.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($workload.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
     {{- end -}}
   {{- end -}}
 
@@ -1660,6 +2437,21 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $storage := (index $op "storage") | default dict -}}
   {{- $reqPvc = add $reqPvc ($storage.persistentVolumeClaims | default 0 | int64) -}}
   {{- $reqStorage = add $reqStorage ($storage.storageBytesRequest | default 0 | int64) -}}
+  {{- /* platformAgent.storage.size resizes the agent's data claim and the sandbox's data
+         claim together, and footprint.yaml counts each of them at the operator default.
+         So each claim moves by (size - default): dataClaims x the difference, which is
+         negative for a size below the default. Absent keys mean a footprint.yaml from
+         before them, which would leave the claims at the default in silence.
+         satMul/satAdd, as above: parseBytes clamps an oversized size to MaxInt64,
+         and dataClaims times that would wrap the total negative. Both take a
+         negative delta. */ -}}
+  {{- with (.Values.platformAgent.storage | default dict).size -}}
+    {{- if not (and (hasKey $storage "dataClaims") (hasKey $storage "dataClaimBytesRequest")) -}}
+      {{- fail "quota preflight: footprint.yaml has no dataClaims or dataClaimBytesRequest, so platformAgent.storage.size cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- $dataClaimDelta := sub (include "kube-agents.parseBytes" . | int64) ($storage.dataClaimBytesRequest | int64) -}}
+    {{- $reqStorage = include "kube-agents.satAdd" (dict "a" $reqStorage "b" (include "kube-agents.satMul" (dict "a" ($storage.dataClaims | int64) "b" $dataClaimDelta))) | int64 -}}
+  {{- end -}}
 {{- end -}}
 
 {{- dict
@@ -1842,7 +2634,7 @@ The defaults carry no ephemeral-storage request because the operator renders non
       {{- $patchCmd := printf "kubectl patch resourcequota %s -n %s --type=strategic --patch '%s'" $qName $ctx.Release.Namespace $patchBody -}}
       {{- $ephNote := "" -}}
       {{- if $constrainsEphemeral -}}
-        {{- $ephNote = printf "\n(a quota constraining ephemeral storage additionally requires a LimitRange in namespace %q providing default requests and limits, because chart workloads and operator containers omit them; without one, pod creation fails with 'must specify requests.ephemeral-storage')" $ctx.Release.Namespace -}}
+        {{- $ephNote = printf "\n(a quota constraining ephemeral storage additionally requires a LimitRange in namespace %q providing default requests and limits, because the operator, the minter, the Hindsight API and several operator-rendered containers omit them; without one, pod creation fails with 'must specify requests.ephemeral-storage')" $ctx.Release.Namespace -}}
       {{- end -}}
       {{- $report := printf "ResourceQuota %q in namespace %q has insufficient capacity for release %q:\n%s\n\nRemediation: increase the quota with:\n  %s\n(those values leave room for one rollout surge Pod, except for claim counts and storage, which a surge Pod does not add to)%s" $qName $ctx.Release.Namespace $ctx.Release.Name (join "\n" $shortfalls) $patchCmd $ephNote -}}
       {{- $quotaReports = append $quotaReports $report -}}

@@ -5,6 +5,10 @@ This directory contains the configuration and deployment manifests for integrati
 - **Upstream Project & Guide:** [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter)
 - **Operational Model:** **Ahead-Of-Time (AOT)**. Cloud KMS keyrings, asymmetric signing keys, and the GitHub App private key import are pre-provisioned once upfront as durable cloud infrastructure. Because Cloud KMS keys cannot be destroyed or deleted in GCP, once Version 1 is `ENABLED`, it persists permanently across cluster teardowns and redeployments.
 
+## GitHub Enterprise Server
+
+These manifests mint on github.com only. For a GitHub Enterprise Server, use the chart, which sets the minter's API URL (`SOURCE_SYSTEM_API_BASE_URL`) and CA (`SSL_CERT_DIR`) from the GitHub forge: see [GitHub Enterprise Server in INSTALL.md](../../../../INSTALL.md#github-enterprise-server).
+
 ## How It All Works
 
 Minty acts as a secure broker between Google Cloud IAM (Workload Identity) and GitHub. When an agent requires access to a GitHub repository, the following flow occurs:
@@ -82,7 +86,7 @@ To manually verify the Token Minter integration, you can execute a debug pod run
 kubectl run debug-box --rm -it \
   --image=curlimages/curl \
   --namespace=kubeagents-system \
-  --labels="app=platform-agent" \
+  --labels="kubeagents.x-k8s.io/has-credential-proxy=true" \
   --overrides='
   {
     "spec": {
@@ -112,4 +116,4 @@ curl -i -X POST http://github-token-minter.kubeagents-system.svc.cluster.local:8
 
 If successful, Minty will return a JSON payload containing the short-lived, repository-scoped GitHub access token.
 
-The rule ConfigMap also exposes `platform-agent-read-scope`, which grants `contents: read` alone: the scope the credential broker requests for its clone of a repository registered under `context_repos`. The operator renders one such policy per context repository, from `default.yaml`.
+The rule ConfigMap also exposes `platform-agent-read-scope`, which grants `contents: read` alone: the scope the credential broker requests for its clone of a repository registered under `context_repos`. The operator renders one such policy per context repository, from `default.yaml`. It also exposes `platform-agent-sweep-scope`, which grants `contents`, `pull_requests` and `issues` read: the scope the broker requests, per managed repository, to read the outcome of the agent's own proposals. The operator renders it into managed repository policies only.

@@ -17,6 +17,20 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(__file__))
 import fleet_waste as fw  # noqa: E402
 
+# Every resolver asks the operator's answer when a run passes neither scope flag:
+# the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
+# that carries either (the sandbox session, a developer reproducing the guard)
+# would turn this suite's listing tests into refusals. The suite is about the
+# collector, not the host it runs on, so both are neutralised at import.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URL unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+import fleet_scope_args as _fleet_scope_args  # noqa: E402
+
+_fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
+
 NOW = datetime(2026, 8, 1, tzinfo=timezone.utc)
 
 
@@ -4933,6 +4947,47 @@ class CollectProjectComputeTest(unittest.TestCase):
         self.assertIn("--filter=-users:*", disks)
         self.assertNotIn("--filter", disks)
 
+    def test_an_excluded_cluster_s_disk_is_skipped_beside_a_read_cluster_s(self):
+        # #3081, the mixed project: lane-b is excluded (known, never read) and
+        # ka-today was read. lane-b's detached disk is skipped, not judged
+        # against ka-today's PersistentVolumes; ka-today's is judged.
+        def disk(name, owner):
+            return {"name": name, "sizeGb": "10", "type": "pd-standard", "creationTimestamp": "2026-01-01T00:00:00Z",
+                    "zone": "us-central1-a", "users": [], "labels": {fw.GKE_CLUSTER_LABEL: owner}}
+
+        def run(argv, **kwargs):
+            if argv[2] == "disks":
+                return run_of(0, json.dumps([disk("gke-lane-b-pvc-1", "lane-b"), disk("gke-ka-today-pvc-1", "ka-today")]))
+            return self.run_with()(argv, **kwargs)
+
+        target = fw.collect_project_compute("acme", False, self.FACTS, run=run, now=NOW, known_clusters={"ka-today", "lane-b"},
+                                            unread_clusters=frozenset({"lane-b"}), clusters_read=1, excluded=["lane-b"])
+        disks = [c["object"] for c in target["candidates"] if c["check"] == "unattached-disk"]
+        self.assertEqual(disks, ["Disk/us-central1-a:gke-ka-today-pvc-1"])
+        self.assertIn("could belong to a cluster this run did not read (lane-b)", target["limitations"])
+        self.assertIn("lane-b in this project are excluded", target["limitations"])
+        self.assertIn("the clusters the install excludes were not read", target["limitations"])
+
+    def test_only_excluded_unread_is_decided_on_name_and_location(self):
+        excluded = [("lane-b", "us-central1")]
+        known = {("lane-b", "us-central1"), ("ka-today", "us-central1")}
+        self.assertTrue(fw._only_excluded_unread(known, {("ka-today", "us-central1")}, excluded))
+        # A same-named lane-b in us-east1 that was not read is not an exclusion.
+        known_twin = known | {("lane-b", "us-east1")}
+        self.assertFalse(fw._only_excluded_unread(known_twin, {("ka-today", "us-central1")}, excluded))
+        self.assertFalse(fw._only_excluded_unread(known, {("ka-today", "us-central1")}, []))
+
+    def test_a_same_named_cluster_that_failed_is_not_read_as_an_exclusion(self):
+        # lane-b in us-central1 is excluded; another lane-b in us-east1 was not
+        # read. By name the unread set is {lane-b}, which the exclusion covers;
+        # by (name, location) it is not, and the caller says so.
+        target = fw.collect_project_compute("acme", False, self.FACTS, run=self.run_with(), now=NOW, known_clusters={"lane-b"},
+                                            unread_clusters=frozenset({"lane-b"}), clusters_read=0, excluded=["lane-b"],
+                                            only_excluded_unread=False)
+        self.assertIn("none of its clusters (lane-b) could be read", target["limitations"])
+        self.assertIn("could not be read", target["limitations"])
+        self.assertNotIn("the clusters the install excludes were not read", target["limitations"])
+
     def test_a_failed_read_names_the_command_and_what_it_said(self):
         target = fw.collect_project_compute(
             "acme", True, self.FACTS, run=self.run_with(fail={"addresses": "PERMISSION_DENIED: compute.addresses.list"}), now=NOW
@@ -5733,6 +5788,19 @@ class SoleNodePoolNotApplicableTest(unittest.TestCase):
     CLUSTER = {"name": "sole-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
     POOL = {"name": "default-pool", "config": {"machineType": "e2-standard-4"}}
 
+
+    def test_a_cluster_the_scope_excludes_is_dropped_from_the_listing(self):
+        # #3081: spec.scope.exclude.clusters bounds every fleet read, so an
+        # excluded cluster in a swept project is neither audited nor recorded.
+        fw.declared_scope.set("acme", None, "acme/us-central1/lane-b")
+        self.addCleanup(fw.declared_scope.set, None, None)
+        listing = [{"name": "ka-today", "location": "us-central1", "status": "RUNNING"},
+                   {"name": "lane-b", "location": "us-central1", "status": "RUNNING"}]
+        with patch("sys.stderr"):
+            running, not_running = fw.enumerate_clusters("acme", run=lambda argv, **kwargs: run_of(0, json.dumps(listing)))
+        self.assertEqual([c["name"] for c in running], ["ka-today"])
+        self.assertEqual(not_running, [])
+
     def collect(self, pools):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
@@ -6065,6 +6133,43 @@ class GetTargetProjectsTest(unittest.TestCase):
             {("project/proj-a", "collected"), ("project/proj-b", "collected")},
         )
 
+
+    def test_an_excluded_cluster_s_objects_are_not_reported_as_abandoned(self):
+        # #3081: the excluded cluster is dropped unread, but it still owns the
+        # project's disks, forwarding rules and addresses. Its detached disk
+        # must not read as "provisioned for a cluster this project no longer
+        # runs", and the checks that need every cluster's Services are
+        # withheld, not judged clean or flagged.
+        fw.declared_scope.set("proj-a", None, "proj-a/us-central1/lane-b")
+        self.addCleanup(fw.declared_scope.set, None, None)
+        disk = {"name": "gke-lane-b-pvc-1", "sizeGb": "10", "type": "pd-balanced", "creationTimestamp": "2026-01-01T00:00:00Z",
+                "zone": "us-central1-b", "users": [], "lastDetachTimestamp": "2026-07-22T00:00:00Z",
+                "labels": {"goog-k8s-cluster-name": "lane-b"}}
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return run_of(0, json.dumps([{"name": "lane-b", "location": "us-central1", "status": "RUNNING"}]))
+            if argv[:3] == ["gcloud", "compute", "disks"]:
+                return run_of(0, json.dumps([disk]))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            raise AssertionError(argv)
+
+        with patch("sys.stderr"):
+            manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
+        entries = {c["name"]: c for c in manifest["clusters"]}
+        self.assertNotIn("proj-a/us-central1/lane-b", entries)
+        project = entries["project/proj-a"]
+        self.assertEqual([c for c in project.get("candidates", []) if c["check"] in ("unattached-disk", "orphan-lb", "idle-address")], [])
+        unevaluated = {c["check"]: c["reason"] for c in project.get("checks_unevaluated", [])}
+        self.assertIn("excluded by spec.scope.exclude.clusters", unevaluated["orphan-lb"])
+        self.assertIn("excluded by spec.scope.exclude.clusters", unevaluated["idle-address"])
+        self.assertIn("lane-b in this project are excluded", project["limitations"])
+        self.assertIn("the clusters the install excludes were not read", project["limitations"])
+        self.assertNotIn("the reason each one failed", project["limitations"])
+        self.assertIn("its clusters (lane-b) are all excluded by spec.scope.exclude.clusters and were not read", project["limitations"])
+        self.assertNotIn("could be read", project["limitations"])
+        self.assertEqual(unevaluated["unattached-disk"], "this project's clusters are all excluded by spec.scope.exclude.clusters")
     def test_project_list_failure_falls_back_to_the_base_project(self):
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
@@ -7303,18 +7408,14 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
 
 
 class DeclarationIndexIsACopyTest(unittest.TestCase):
-    """`workload_declarations` and `declaration_for` are duplicated from
-    `collect.py` rather than imported. Every collector here runs standalone
-    under `python3 <file>`; `fleet_stockout.py` imports a few leaf helpers
-    from its siblings, but this one keeps its own copy, for the reason
-    `fleet_waste.workload_declarations` gives.
-
-    Duplication is the convention, and drift is what it costs: two collectors
-    resolving the same object to different files, or one of them keeping a bug
-    the other fixed, with nothing failing to say so. These tests are the guard
-    the convention does not otherwise have -- they compare the executable code
-    and ignore the docstrings, which differ on purpose because each copy argues
-    from the findings its own stream published.
+    """The declaration index is `collect.py`'s: `workload_declarations`,
+    `declaration_for`, `release_declarations` and `release_declaration_for`
+    are imported from it, so the two collectors cannot resolve the same object
+    to different files. The first tests pin the imports. `release_of`,
+    `reconciler_of` and the internal-LB constants are still copies, so the
+    remaining tests compare their executable code with the original and ignore
+    the docstrings, which differ on purpose because each copy argues from the
+    findings its own stream published.
     """
 
     def test_the_internal_load_balancer_annotations_match_collect(self):
@@ -7347,13 +7448,15 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
             out.append(ast.dump(fn))
         return out
 
-    def test_workload_declarations_matches_collect_py(self):
-        mine, theirs = self.bodies("workload_declarations")
-        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+    def test_workload_declarations_is_collect_py_s(self):
+        import collect
 
-    def test_declaration_for_matches_collect_py(self):
-        mine, theirs = self.bodies("declaration_for")
-        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+        self.assertIs(fw.workload_declarations, collect.workload_declarations)
+
+    def test_declaration_for_is_collect_py_s(self):
+        import collect
+
+        self.assertIs(fw.declaration_for, collect.declaration_for)
 
     def test_reconciler_of_matches_collect_py(self):
         # Under the same convention and with the same cost of drift: the phrase
@@ -7363,53 +7466,38 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
         mine, theirs = self.bodies("reconciler_of")
         self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
 
-    def test_the_release_resolver_matches_collect_py(self):
-        # Every half of the branch that resolves a rendered workload, under the
-        # same convention. Drift here is worse than in the pair above, because
-        # what these resolve to is a file a pull request rewrites: two
-        # collectors disagreeing about which Application declares a release
-        # means one of them opens a PR against the wrong chart.
-        for name in ("release_of", "_argocd_chart_source", "_argocd_kustomize_source", "_argocd_values_field", "release_declarations", "release_declaration_for"):
-            with self.subTest(function=name):
-                mine, theirs = self.bodies(name)
-                self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+    def test_the_release_index_is_collect_py_s(self):
+        import collect
+
+        self.assertIs(fw.release_declarations, collect.release_declarations)
+        self.assertIs(fw.release_declaration_for, collect.release_declaration_for)
+
+    def test_release_of_matches_collect_py(self):
+        # The half of the release branch that is still a copy. Drift here is
+        # worse than in reconciler_of: what the index resolves a release to is
+        # a file a pull request rewrites, so two collectors disagreeing about
+        # which release an object belongs to means one of them opens a PR
+        # against the wrong chart.
+        mine, theirs = self.bodies("release_of")
+        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
 
     def test_the_constants_it_reads_match_too(self):
         """An identical function over a different constant is a different
-        function. `GITOPS_CLUSTER_TREE_DEPTH` in particular decides which files
-        are indexed at all, so a copy that drifted here would index the whole
-        repository or none of it and still pass the two tests above.
+        function. `reconciler_of` and `release_of` read the five annotations
+        and labels, so a copy that drifted there would name a release
+        differently and still pass the two tests above; `main`'s clone check
+        and `collect`'s walks must agree on what `.git` is called.
         """
         import importlib
 
         collect = importlib.import_module("collect")
         for const in (
-            "GITOPS_CLUSTER_TREE_ROOT",
-            "GITOPS_CLUSTER_TREE_DEPTH",
             "GIT_DIR_NAME",
-            "MIRROR_RELEASES_WITHHELD_MARKER",
-            "KCC_API_GROUP_SUFFIX",
             "_HELM_RELEASE_ANNOTATION",
             "_HELM_NAMESPACE_ANNOTATION",
             "_ARGOCD_TRACKING_ANNOTATION",
             "_MANAGED_BY_LABEL",
             "_HELM_MANAGED_BY",
-            "ARGOCD_APPLICATION_KIND",
-            "ARGOCD_CLUSTER_SECRET_LABEL",
-            "ARGOCD_CLUSTER_SECRET_VALUE",
-            "ARGOCD_IN_CLUSTER_SERVER",
-            "FLUX_HELM_RELEASE_KIND",
-            "FLUX_HELM_REPOSITORY_KIND",
-            "RELEASE_KEY_APPLICATION",
-            "RELEASE_KEY_RELEASE",
-            "RELEASE_KEY_NAMESPACE",
-            "ARGOCD_VALUES_OBJECT_FIELD",
-            "ARGOCD_VALUES_STRING_FIELD",
-            "FLUX_VALUES_FIELD",
-            "ARGOCD_KUSTOMIZE_PATCHES_FIELD",
-            "RENDERER_HELM",
-            "RENDERER_KUSTOMIZE",
-            "KUSTOMIZATION_FILE_NAMES",
         ):
             with self.subTest(const=const):
                 self.assertEqual(getattr(fw, const), getattr(collect, const))
@@ -7659,12 +7747,16 @@ class ReleaseDeclarationsSurviveMalformedDocumentsTest(unittest.TestCase):
                     self.assertNotIn((*key_prefix, release), index)
 
     def test_each_malformed_document_is_skipped(self):
-        self.assert_skips_every_malformed_document(fw.release_declarations, ("prod-usc1", fw.RELEASE_KEY_RELEASE, "apps"))
+        import collect
+
+        self.assert_skips_every_malformed_document(fw.release_declarations, ("prod-usc1", collect.RELEASE_KEY_RELEASE, "apps"))
 
     def test_the_chart_ref_form_still_indexes_on_an_empty_chart(self):
         """No `chart` at all is `spec.chartRef`, not a malformed template."""
         text = "kind: HelmRelease\nmetadata: {name: e, namespace: apps}\nspec: {chartRef: {kind: OCIRepository, name: e}}\n"
-        entry = self.index_with(fw.release_declarations, text)[("prod-usc1", fw.RELEASE_KEY_RELEASE, "apps", "e")]
+        import collect
+
+        entry = self.index_with(fw.release_declarations, text)[("prod-usc1", collect.RELEASE_KEY_RELEASE, "apps", "e")]
         self.assertEqual((entry["chart"], entry["values_field"]), ("", "spec.values"))
 
 
@@ -7685,9 +7777,9 @@ class CandidatesCarryTheirReleaseDeclarationTest(unittest.TestCase):
     A right-size is the fix a pull request carries best, and `resources` is the
     key nearly every chart publishes -- so a chart-rendered workload resolving
     to the file declaring its release is the difference between a diff and a
-    paragraph. `release_declarations` is a copy of `collect.py`'s
-    (`DeclarationIndexIsACopyTest`), tested on malformed documents in both
-    files; what is new here is the trip from `collect_fleet` through the thread
+    paragraph. `release_declarations` is `collect.py`'s, imported
+    (`DeclarationIndexIsACopyTest` pins it) and tested on malformed documents
+    here as well; what is new here is the trip from `collect_fleet` through the thread
     pool, into the per-cluster index `_releases_by_object` builds off the dump,
     and out through the `emit` closure.
     """
@@ -7957,6 +8049,176 @@ class ContentModeWorkspaceTest(unittest.TestCase):
                     patch("sys.stdout"):
                 fw.main(["--workspace", str(scratch)])
         self.assertIsNone(seen["w"], "a failed mirror indexes nothing, not the scratch")
+
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    def setUp(self):
+        # The variable half of the operator's answer, per test as well as at
+        # import; the file half is pointed at a path that does not exist above.
+        env = patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        fw.declared_scope.set(None, None)
+
+    def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        fw.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        def run(argv, **kwargs):
+            raise AssertionError(f"the declared scope is the sweep; nothing should be listed: {argv}")
+
+        fw.declared_scope.set("ops-mgmt,payments-prod", "payments-staging=denied")
+        projects, partial = fw.get_target_projects(None, run=run)
+        self.assertEqual(projects, ["ops-mgmt", "payments-prod"])
+        self.assertIn("payments-staging (denied)", partial)
+        self.assertIn("fleet_scope tool", partial)
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        fw.declared_scope.set("ops-mgmt payments-prod", "")
+        self.assertEqual(fw.get_target_projects(None, run=lambda *a, **k: run_of(1)), (["ops-mgmt", "payments-prod"], None))
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"]:
+                return run_of(0, "acme\n")
+            return run_of(0, "acme\nother\n")
+
+        fw.declared_scope.set(None, None)
+        self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "other"], None))
+
+    def test_a_project_override_inside_the_declared_scope_wins_and_one_outside_is_refused(self):
+        fw.declared_scope.set("ops-mgmt,payments-prod", None)
+        self.assertEqual(fw.get_target_projects("payments-prod", run=lambda *a, **k: run_of(1))[0], ["payments-prod"])
+        with self.assertRaises(fw.NoProjectInScope) as caught:
+            fw.get_target_projects("acme-only", run=lambda *a, **k: run_of(1))
+        self.assertIn("declared scope does not list", str(caught.exception))
+        with patch.dict(os.environ, {"KUBEAGENTS_SCOPE_DECLARED": "true"}):
+            fw.declared_scope.set(None, None)
+            with self.assertRaises(fw.NoProjectInScope) as caught:
+                fw.get_target_projects("ops-mgmt", run=lambda *a, **k: run_of(1))
+            self.assertIn("got no collector_args", str(caught.exception))
+        fw.declared_scope.set(None, None)
+        self.assertEqual(fw.get_target_projects("acme-only", run=lambda *a, **k: run_of(1))[0], ["acme-only"])
+
+    def test_the_declared_scope_note_is_a_scope_note_not_a_discovery_failure(self):
+        # The unenumerated row that carries the tool's unread projects explains
+        # a partial sweep, not why nothing was collected.
+        note = fw.fleet_scope_args.unread_note([("payments-staging", "denied")])
+        entry = {"name": fw.UNENUMERATED_PROJECTS_TARGET, "error": note}
+        self.assertTrue(fw._only_a_scope_note(entry, None))
+        self.assertFalse(fw._only_a_scope_note({"name": fw.UNENUMERATED_PROJECTS_TARGET, "error": "`gcloud projects list` rc=1: boom"}, None))
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the three flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with patch.object(fw.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            fw.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied", "--scope-exclude-clusters", "ops-mgmt/us-central1/lane-b"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied", "ops-mgmt/us-central1/lane-b")
+
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to the listing.
+        fw.declared_scope.set(None, "payments-staging=denied")
+        with self.assertRaises(fw.NoProjectInScope) as caught:
+            fw.get_target_projects(None, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed")))
+        self.assertIn("no project this install could read", str(caught.exception))
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, fw.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
+
+
+class CredentialsNoteTest(unittest.TestCase):
+    def test_a_refused_directory_is_the_failed_credentials_and_gcloud_is_not_run(self):
+        # `prepare_kubeconfig`'s note is the `get-credentials` result: gcloud is not run through a
+        # directory this run may not write (a root run would otherwise write a kubeconfig wherever a
+        # planted symlink points), and the entry built from the result names the owner or the link.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            owner = kc.parent.stat().st_uid
+            other = owner + 1
+            calls = []
+
+            def recording(argv, env=None, **kwargs):
+                calls.append(argv)
+                return run_of(0)
+
+            with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                _, result = fw.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls), (fw.KUBECONFIG_REFUSED_RC, []))
+            self.assertTrue(result.stderr.startswith(f"{kc.parent} is owned by uid {owner} and this run is uid {other}; it could not be moved aside"), result.stderr)
+            # A symlink planted at the directory's name: refused the same way, nothing run through it,
+            # the target left empty.
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o700)
+            linked = Path(tmp) / "linked" / "kubeconfig_p_c_l.yaml"
+            linked.parent.symlink_to(elsewhere)
+            with patch.object(fw, "KUBECONFIG_DIR", linked.parent):
+                _, result = fw.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls, sorted(p.name for p in elsewhere.iterdir())), (fw.KUBECONFIG_REFUSED_RC, [], []))
+            self.assertIn("is a symbolic link", result.stderr)
+            # With the directory usable, gcloud runs and its result is returned as is.
+            with patch.object(fw, "KUBECONFIG_DIR", kc.parent):
+                _, ok = fw.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((ok.rc, ok.stderr, len(calls)), (0, "", 1))
+
+def owned_by(path, uid):
+    """`Path.stat` reporting `uid` as `path`'s owner, the test's own fact rather than the runner's uid,
+    real for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real = Path.stat
+
+    def fake(self, *args, **kwargs):
+        result = real(self, *args, **kwargs)
+        if self == path:
+            return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
+        return result
+
+    return patch.object(Path, "stat", fake)
+
+
+class PrepareKubeconfigTest(unittest.TestCase):
+    def test_fetch_credentials_prepares_the_shared_directory(self):
+        # The shared `.kubeconfigs` is prepared by `collect.prepare_kubeconfig`, the one rule for the
+        # fleet-audit collectors, before gcloud runs: this uid's and closed to other uids (0755) whatever
+        # the umask, a directory this uid made at another mode brought to it, a stale kubeconfig this uid
+        # cannot write removed.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("stale")
+            kc.chmod(0o400)
+            # The keep follows `os.access`, true for a 0400 file to root alone, not the runner's uid.
+            kept = os.access(kc, os.W_OK)
+            mask = os.umask(0o077)
+            try:
+                with patch.object(fw, "KUBECONFIG_DIR", kc.parent):
+                    path, _ = fw.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
+            finally:
+                os.umask(mask)
+            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists()), (kc, 0o755, kept))
+
+    def test_a_root_run_keeps_another_uids_directory(self):
+        # The tick's directory, then a root hand run: from root's side it is another uid's, and root
+        # keeps it rather than moving it aside, and replaces the tick's stale file rather than writing
+        # through it. Mocked root shows both branches.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("the tick's")
+            with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=0), owned_by(kc.parent, 1), owned_by(kc, 1):
+                path, _ = fw.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
+            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists(), [p.name for p in Path(tmp).iterdir()]), (kc, 0o755, False, [".kubeconfigs"]))
 
 if __name__ == "__main__":
     unittest.main()

@@ -99,9 +99,9 @@ Check **Autoscaler Visibility logs**
 
 ## Symptom 8: "ANY" Reservation Bypasses Fallbacks
 
--   **Cause:** `reservations.affinity: AnyBestEffort` falls back to On-Demand at
-    GCE layer.
--   **Fix:** Use `affinity: Specific` with named reservations.
+-   **Cause:** `reservations.affinity: AnyBestEffort` consumes On-Demand capacity at
+    the GCE layer before evaluating your remaining ComputeClass priorities, preventing your intended fallback.
+-   **Fix:** Use `affinity: AnyThenFail` (GKE 1.36.0-gke.3204000+) or `affinity: Specific` with named reservations.
 
 ## Symptom 9: Disk/PV Attachment Fail
 
@@ -124,10 +124,14 @@ Check **Autoscaler Visibility logs**
 
 ## Symptom 11: List Loops / Backoff
 
--   **Cause:** >10 priorities. Unobtainable shapes enter a 5-minute cooldown.
-    Long lists expire upper-tier cooldowns before reaching the bottom, causing
-    an infinite loop.
--   **Fix:** Trim list; remove redundant rules.
+-   **Cause:** A long list of rules that name manual node pools
+    (`priorities[].nodepools`). Those rules rely on 5-minute GCE MIG backoffs
+    rather than the ComputeClass cooldown prolongation, so early backoffs expire
+    before the lower rungs are tried and the autoscaler restarts from the top.
+    Declarative `machineFamily` rungs prolong each other's cooldown and move
+    forward instead (`compute-class-prioritization.md`).
+-   **Fix:** Keep the list to 6–8 rungs; replace manual-pool rules with
+    `machineFamily` rules and `nodePoolAutoCreation.enabled: true`.
 
 ## Symptom 12: Pods on Low-Priority Nodes
 

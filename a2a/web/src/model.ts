@@ -4,17 +4,21 @@
  * here reads the clock or the network — timestamps always arrive on the event
  * so replay and live traffic reduce identically. Lifted from the demo UI and
  * reworked for a2a-jetstream/0.4: kinds changed (`task` → `message`,
- * `message-chunk` is gone), the transcript is driven by the four reserved
- * artifact names, and there are no heartbeats — the `web` user's read surface
+ * `message-chunk` is gone), the transcript is driven by the reserved artifact
+ * names in protocol.ts (`turn` among them), and there are no heartbeats — the `web` user's read surface
  * is `a2a.>` only, and nothing on the install publishes heartbeats yet, so
  * liveness is derived from stream traffic.
  */
 import {
   ARTIFACT_PROGRESS,
   ARTIFACT_RESULT,
+  ARTIFACT_TURN,
+  ARTIFACT_USAGE,
   TERMINAL_STATES,
   authorityOf,
   partsText,
+  usageParts,
+  usageTotal,
   type Artifact,
   type ArtifactUpdate,
   type Envelope,
@@ -22,6 +26,7 @@ import {
   type StatusUpdate,
   type SubjectInfo,
   type TaskState,
+  type Usage,
 } from "./protocol.ts";
 import { turnFate, type ConsoleOutFrame } from "./console.ts";
 
@@ -113,6 +118,10 @@ export interface TaskView {
   endedAt?: number;
   /** The message text on that terminal status: why the task ended. */
   reason?: string;
+  /** The `usage` artifact's turns summed; absent until a turn reports one. */
+  usage?: Usage;
+  /** The latest turn's usage part, held until that turn's answer takes it as its footer. */
+  turnUsage?: Usage;
 }
 
 export interface AnomalyCounts {
@@ -188,6 +197,8 @@ export interface ChatEntry {
   taskId?: string;
   /** A sentence about the entry's delivery, shown under it. */
   note?: string;
+  /** An answer's footer: the usage part the turn published ahead of it. */
+  usage?: Usage;
 }
 
 export type ProbeOutcome = "refused" | "sent" | "error";
@@ -649,12 +660,35 @@ function reduceArtifactUpdate(
     text: payload.append && existing ? existing.text + text : text,
     chunks: (existing?.chunks ?? 0) + 1,
   });
+  // Each usage chunk is one turn's figures; the task keeps the sum, and the
+  // parts published since the last answer opened wait, summed, for the next
+  // answer, which takes them as its footer: the worker adapter publishes a
+  // part per harness result line but one answer for the steered turns they
+  // settle, so the footer under that answer is their total. A part that is
+  // not usage is skipped, as the library's reader skips it.
+  // As the library's fold does for every artifact, a non-append usage chunk
+  // replaces the task's turns and an append chunk extends them, so a
+  // re-published artifact is counted once, as UsageTotal over the folded
+  // task would count it.
+  const turns = name === ARTIFACT_USAGE ? usageParts(artifact.parts) : [];
+  const extends_ = payload.append === true;
+  const usage =
+    name === ARTIFACT_USAGE ? usageTotal([...(extends_ && prev?.usage ? [prev.usage] : []), ...turns]) : prev?.usage;
+  const answerOpens = (name === ARTIFACT_RESULT || name === ARTIFACT_TURN) && !extends_;
+  const turnUsage =
+    name === ARTIFACT_USAGE
+      ? usageTotal([...(extends_ && prev?.turnUsage ? [prev.turnUsage] : []), ...turns])
+      : answerOpens
+        ? undefined
+        : prev?.turnUsage;
   next.tasks = upsertTask(state.tasks, env, subject, {
     artifacts,
     executor: prev?.executor ?? env.from.session,
+    usage,
+    turnUsage,
   });
 
-  if (name === ARTIFACT_RESULT) {
+  if (name === ARTIFACT_RESULT || name === ARTIFACT_TURN) {
     next.chat = appendChunk(
       state,
       env,
@@ -664,6 +698,7 @@ function reduceArtifactUpdate(
         text,
         correlationId: env.correlationId,
         taskId: env.taskId,
+        usage: prev?.turnUsage,
       },
       payload.append === true,
     );

@@ -25,7 +25,9 @@ Contracts that each fail silently today when the two sides drift:
 
 from __future__ import annotations
 
+import copy
 import contextlib
+import fnmatch
 import io
 import json
 import os
@@ -47,19 +49,57 @@ WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 # qualifies and why `Prettier Check` does not. `Documentation Checks` and
 # `Python Unit Tests` are here because they were missing when both went red on
 # main for thirteen hours and nothing paged (gke-labs/kube-agents#1223).
+# `A2A Module Tests` joined when its job became a required context on
+# 2026-10-13, and `k8s-api-proxy Tests` on 2026-10-28; both filter on push as
+# `Operator Tests` does.
 BROKEN_MAIN_NOTIFIER = "main-broken-notify.yml"
 BROKEN_MAIN_WATCHED_WORKFLOWS = (
+    "A2A Module Tests",
     "Actionlint",
     "Docker Build",
     "Documentation Checks",
+    "k8s-api-proxy Tests",
     "Operator Tests",
     "Python Unit Tests",
     "Validate Repo Structure",
 )
+# The release pipelines `release-stage-broken-notify.yml` must watch: the three
+# `workflow_dispatch` workflows the schedulers start, whose red run is
+# otherwise a row in the Actions tab and nothing more (gke-labs/kube-agents#1978).
+# The watched list is `WATCHED_WORKFLOWS` in
+# `scripts/release/notify_release_stage_broken.py`, which the sweep reads.
+RELEASE_STAGE_NOTIFIER = "release-stage-broken-notify.yml"
+RELEASE_STAGE_WATCHED_WORKFLOWS = (
+    "RC: Release Pipeline",
+    "Staging: Promotion Pipeline",
+    "Release & Publish (GA)",
+)
+# The compensation and non-gating jobs of those workflows, by `name:`: the
+# ones the notifier names as the failing stage only when nothing else failed,
+# because they run after a gating failure or fail inside green runs and are
+# skipped on an ordinary green night. The notifier knows them by the
+# substrings in `COMPENSATION_JOB_MARKERS`; this tuple is what those
+# substrings have to select, so a rename of any of them reds the test.
+RELEASE_STAGE_COMPENSATION_JOBS = (
+    "Step 5 - Tear Down RC Environment",
+    "Today mode (non-gating) - Step 6 - Provision RC Environment",
+    "Today mode (non-gating) - Step 7 - Run E2E Tests",
+    "Today mode (non-gating) - Step 8 - Tear Down RC Environment",
+    "Step 3b - Roll Back to the Previous GA and Forward Again",
+    "Step 5b - Withdraw an Unsettled Nomination",
+    "Step 7 - Tear Down Nightly Environment",
+)
+# What marks a job as one that runs regardless of, or without failing, the
+# run: job-level `continue-on-error`, or an `if:` that runs it after a
+# failure. Every job of the watched workflows that carries one has to be in
+# the tuple above.
+RELEASE_STAGE_ALWAYS_RUN_CONDITIONS = ("always()", "!cancelled()")
 # The flaky-check reporter's contract is the inverse of the broken-main one:
 # not a fixed list it must contain, but that every pull-request check is
-# either watched or named here as left out on purpose. The reasons are in the
-# workflow's header comment; this tuple is the machine-readable copy of it.
+# either watched or named here as left out on purpose. The watched list is
+# `WATCHED_WORKFLOWS` in `scripts/notify_flaky_check.py`, which the sweep
+# reads; the reasons for the exclusions are beside it, and this tuple is the
+# machine-readable copy of them.
 FLAKY_CHECK_NOTIFIER = "flaky-check-notify.yml"
 FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     # A title edit legitimately turns it green without a commit.
@@ -67,8 +107,9 @@ FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     # The advisory database moves between attempts.
     "Security Scanning",
     # pull_request_target automations, not checks on the tree.
-    "Auto Assign Milestone on Merge",
+    "Auto Enqueue",
     "Hold Unresolved Threads",
+    "Merge Gate",
     "Risk Classification",
 )
 SCRIPTS_DIR = REPO_ROOT / "agents" / "platform" / "scripts"
@@ -84,6 +125,24 @@ def _yaml():
     import yaml
 
     return yaml
+
+
+def _flaky_check_reporter():
+    sys.path.insert(0, str(REPO_SCRIPTS))
+    try:
+        import notify_flaky_check
+    finally:
+        sys.path.remove(str(REPO_SCRIPTS))
+    return notify_flaky_check
+
+
+def _release_stage_notifier():
+    sys.path.insert(0, str(REPO_SCRIPTS / "release"))
+    try:
+        import notify_release_stage_broken
+    finally:
+        sys.path.remove(str(REPO_SCRIPTS / "release"))
+    return notify_release_stage_broken
 
 
 class SpecToolRegistryTest(unittest.TestCase):
@@ -108,6 +167,33 @@ class SpecToolRegistryTest(unittest.TestCase):
     }
     HERMES_BUILTIN_TOOLS = set().union(*HERMES_BUILTIN_EVIDENCE.values())
 
+    # Tools of Hermes's built-in `file` toolset that a spec names: a check that
+    # a worker wrote a file. No image patch touches them, so their evidence is
+    # different (test_the_file_tools_still_have_evidence_in_the_configs): the
+    # Chat Agent's config names the tools beside the `file` toolset it
+    # disables, and the Platform Agent's config gives its kanban workers the
+    # `hermes-cli` bundle (which holds that toolset) on `cli` and does not
+    # disable `file`. A name added here needs the same.
+    # `read_file` is the read half of the same toolset: the retrospective cases
+    # grade the worker reading the saved report or the chat record through it.
+    HERMES_FILE_TOOLS = {"read_file", "write_file", "patch"}
+    HERMES_FILE_TOOLSET = "file"
+    HERMES_FILE_TOOL_DOC = "agents/chat/config.yaml"
+    PLATFORM_CONFIG = "agents/platform/config.yaml"
+    PLATFORM_WORKER_TOOLSET_KEY = "cli"
+    PLATFORM_WORKER_BUNDLE = "hermes-cli"
+    # Hermes core tools no image patch touches, so the patches carry no
+    # evidence of them. Evidence of each is the agent text that tells the agent
+    # to use it, backticked or called
+    # (test_the_core_allowlist_still_has_evidence_in_the_agent_text).
+    # `terminal` is the tool a worker's shell commands go through, which
+    # delegated-proposal-stays-in-reply's safeguard reads (#2610).
+    HERMES_CORE_TOOLS = {"skill_view", "terminal"}
+    CORE_TOOL_EVIDENCE = (
+        "agents/platform/skills/github-issue-resolver/SKILL.md",
+        "agents/platform/AGENTS.md",
+    )
+
     # Tools behind a remote MCP proxy (`/opt/mcp-remote/dist/proxy.js <url>`),
     # as (server alias, tool): nothing in this repository can enumerate them,
     # so a spec may name one only through this list, registered under both
@@ -129,6 +215,61 @@ class SpecToolRegistryTest(unittest.TestCase):
         "agents/cluster/SOUL.md",
         "agents/platform/skills/gke-basics/references/mcp-usage.md",
     )
+
+    # Claude Code harness tools the session worker runs under, by the name its
+    # stream-json carries (the name a `tool_called` check on a session case
+    # matches). Nothing here defines them; each needs evidence in the worker
+    # source (test_the_session_harness_tools_still_have_evidence_in_the_worker):
+    #
+    # * a built-in on the adapter's `defaultAllowedTools` constant in
+    #   a2a/cmd/worker-adapter/main.go, the surface every session gets;
+    # * `Bash`, from the same file's `clusterViewAllowedTools`, the surface a
+    #   session gets only with the cluster view (`Bash(kubectl:*)` and
+    #   `Bash(gcloud:*)`, both the Bash tool); `defaultDisallowedTools`
+    #   disallows it otherwise, which is what lets a case read a Bash call as
+    #   "the view was on";
+    # * the delegate MCP tool, as main.go's `delegateToolID` composes it:
+    #   "mcp__" + DelegateMCPServer + "__" + DelegateToolName, both halves
+    #   from a2a/worker-adapter/mcp.go;
+    # * `Skill`, which is deliberately on no allowlist: the harness runs a
+    #   skill whose frontmatter carries only name and description without a
+    #   permission rule (a2a/cmd/worker-adapter/skill_allowlist_test.go). Its
+    #   evidence is the session persona telling the model to load skills
+    #   "with the Skill tool" and the persona build (a2a/cmd/session-persona)
+    #   cutting each skill's frontmatter down to the two fields that tool
+    #   runs unprompted. Neither proves the harness exposes the tool, only
+    #   that this repository relies on it; the eval is what proves the rest.
+    SESSION_HARNESS_TOOLS = {"Read", "Glob", "Grep", "Bash", "mcp__a2a__delegate", "Skill"}
+    WORKER_ADAPTER_MAIN = "a2a/cmd/worker-adapter/main.go"
+    WORKER_ADAPTER_MCP = "a2a/worker-adapter/mcp.go"
+    SKILL_TOOL_EVIDENCE = (
+        "a2a/persona/session/persona.md",
+        "a2a/cmd/session-persona/transform.go",
+    )
+
+    # Trajectory markers a transport writes as entries of its own, not tool
+    # calls. A spec may name one in `tool_called` (wrapped in `none`, it says
+    # "this record is not the inject transport's"). Evidence of each is a
+    # constant the inject transport passes to `self._record` and a constant
+    # scoring's `_inject_record` reads it by
+    # (test_the_transport_markers_still_have_evidence_in_writer_and_reader).
+    TRANSPORT_MARKERS = {"inject.task"}
+    INJECT_TRANSPORT = "bench/kube_agents_bench/inject_transport.py"
+    SCORING = "bench/kube_agents_bench/scoring.py"
+
+    # Trajectory entries the harness writes itself (a stopped ask's, a
+    # pushed-report replay's plant): what it did, not a tool the agent called.
+    # A spec names them in `tool_called` with `require_success`. Evidence of
+    # each is a constant in the module named beside it that the harness, or
+    # that module, puts on an entry's `name`
+    # (test_the_harness_entries_still_have_evidence_in_the_hook_and_harness).
+    HARNESS_ENTRY_MODULES = {
+        "harness_stop_sent": "bench/kube_agents_bench/stop_hook.py",
+        "harness_cards_stopped": "bench/kube_agents_bench/stop_hook.py",
+        "harness_pushed_report_stored": "bench/kube_agents_bench/pushed_report.py",
+    }
+    HARNESS_ENTRIES = frozenset(HARNESS_ENTRY_MODULES)
+    HARNESS = "bench/kube_agents_bench/harness.py"
 
     def _mcp_server_aliases(self):
         """Alias → the local server script it launches, from every agent config.
@@ -253,7 +394,16 @@ class SpecToolRegistryTest(unittest.TestCase):
         return wanted
 
     def test_every_spec_tool_name_resolves_to_a_registry(self):
-        registry = self._registered_mcp_tools() | self._remote_mcp_tools() | self.HERMES_BUILTIN_TOOLS
+        registry = (
+            self._registered_mcp_tools()
+            | self._remote_mcp_tools()
+            | self.HERMES_BUILTIN_TOOLS
+            | self.HERMES_FILE_TOOLS
+            | self.HERMES_CORE_TOOLS
+            | self.SESSION_HARNESS_TOOLS
+            | self.TRANSPORT_MARKERS
+            | self.HARNESS_ENTRIES
+        )
         unresolved = [
             f"{path.parent.name}: {name}"
             for path, name in self._spec_tool_names()
@@ -299,6 +449,46 @@ class SpecToolRegistryTest(unittest.TestCase):
         self.assertFalse(self._names_builtin("skill_manage", 'if action == "create":'))
 
 
+    def test_the_file_tools_still_have_evidence_in_the_configs(self):
+        yaml = _yaml()
+        doc = (REPO_ROOT / self.HERMES_FILE_TOOL_DOC).read_text(errors="replace")
+        toolset_line = next(
+            (line for line in doc.splitlines() if re.match(rf"\s*-\s*{self.HERMES_FILE_TOOLSET}\s*#", line)),
+            "",
+        )
+        for name in sorted(self.HERMES_FILE_TOOLS):
+            self.assertRegex(
+                toolset_line,
+                rf"\b{name}\b",
+                f"{name} is allowlisted as a `{self.HERMES_FILE_TOOLSET}` toolset tool but "
+                f"{self.HERMES_FILE_TOOL_DOC} no longer names it beside that toolset — stale allowlist entry",
+            )
+        platform = yaml.safe_load((REPO_ROOT / self.PLATFORM_CONFIG).read_text())
+        worker = platform["platform_toolsets"][self.PLATFORM_WORKER_TOOLSET_KEY]
+        self.assertIn(
+            self.PLATFORM_WORKER_BUNDLE,
+            worker,
+            f"{self.PLATFORM_CONFIG} no longer gives its kanban workers {self.PLATFORM_WORKER_BUNDLE}, "
+            "so the file tools are not a platform worker's — stale allowlist entry",
+        )
+        self.assertNotIn(
+            self.HERMES_FILE_TOOLSET,
+            (platform.get("agent") or {}).get("disabled_toolsets") or [],
+            f"{self.PLATFORM_CONFIG} disables the `{self.HERMES_FILE_TOOLSET}` toolset, so no "
+            "platform worker can call the file tools — stale allowlist entry",
+        )
+
+    def test_the_core_allowlist_still_has_evidence_in_the_agent_text(self):
+        corpus = "\n".join(
+            (REPO_ROOT / rel).read_text(errors="replace") for rel in self.CORE_TOOL_EVIDENCE
+        )
+        for name in sorted(self.HERMES_CORE_TOOLS):
+            self.assertTrue(
+                f"`{name}`" in corpus or f"{name}(" in corpus,
+                f"{name} is allowlisted as a hermes core tool but the agent text "
+                "carries no evidence of it — stale allowlist entry",
+            )
+
     def test_the_remote_allowlist_still_has_evidence_in_the_agent_text(self):
         remote = self._remote_mcp_aliases()
         corpus = "\n".join(
@@ -315,6 +505,89 @@ class SpecToolRegistryTest(unittest.TestCase):
                 f"{alias}__{tool}" in corpus or f"`{tool}`" in corpus,
                 f"{alias}/{tool} is allowlisted as a remote MCP tool but the personas "
                 "and skill references carry no evidence of it — stale allowlist entry",
+            )
+
+    @staticmethod
+    def _go_string_const(source, name):
+        """The value of a Go `name = "literal"` constant, or None."""
+        found = re.search(rf'^\s*{name}\s*=\s*"([^"]*)"\s*$', source, re.M)
+        return found.group(1) if found else None
+
+    def _session_harness_evidence(self):
+        """Every harness tool name the worker source gives evidence of."""
+        main = (REPO_ROOT / self.WORKER_ADAPTER_MAIN).read_text(errors="replace")
+        mcp = (REPO_ROOT / self.WORKER_ADAPTER_MCP).read_text(errors="replace")
+        evidenced = set()
+
+        allowed = self._go_string_const(main, "defaultAllowedTools")
+        self.assertTrue(allowed, f"{self.WORKER_ADAPTER_MAIN} no longer defines defaultAllowedTools as a literal")
+        evidenced.update(t.strip() for t in allowed.split(",") if t.strip())
+        view = re.search(r'^\s*clusterViewAllowedTools\s*=\s*defaultAllowedTools\s*\+\s*"([^"]*)"\s*$', main, re.M)
+        if view:
+            # `Bash(kubectl:*)` is the Bash tool with a permission rule.
+            evidenced.update(t.strip().split("(")[0] for t in view.group(1).split(",") if t.strip())
+
+        server = self._go_string_const(mcp, "DelegateMCPServer")
+        tool = self._go_string_const(mcp, "DelegateToolName")
+        self.assertTrue(server and tool, f"{self.WORKER_ADAPTER_MCP} no longer names the delegate server and tool")
+        composed = re.search(
+            r'delegateToolID\s*=\s*"mcp__"\s*\+\s*workeradapter\.DelegateMCPServer\s*\+\s*"__"'
+            r"\s*\+\s*workeradapter\.DelegateToolName",
+            main,
+        )
+        if composed:
+            evidenced.add(f"mcp__{server}__{tool}")
+
+        corpora = [(REPO_ROOT / rel).read_text(errors="replace") for rel in self.SKILL_TOOL_EVIDENCE]
+        if all("the Skill tool" in corpus for corpus in corpora):
+            evidenced.add("Skill")
+        return evidenced
+
+    def test_the_session_harness_tools_still_have_evidence_in_the_worker(self):
+        evidenced = self._session_harness_evidence()
+        # Read alone is on the allowlist today; an extraction that went empty
+        # would leave only the Skill/delegate branches, which this catches.
+        self.assertIn("Read", evidenced, "the defaultAllowedTools extraction found nothing")
+        for name in sorted(self.SESSION_HARNESS_TOOLS):
+            self.assertIn(
+                name,
+                evidenced,
+                f"{name} is registered as a session harness tool but the worker adapter, "
+                "its delegate server and the session persona carry no evidence of it — "
+                "stale registry entry",
+            )
+
+    def test_the_transport_markers_still_have_evidence_in_writer_and_reader(self):
+        transport = (REPO_ROOT / self.INJECT_TRANSPORT).read_text(errors="replace")
+        scoring = (REPO_ROOT / self.SCORING).read_text(errors="replace")
+        reader = re.search(r"^def _inject_record\(.*?(?=^\S)", scoring, re.M | re.S)
+        self.assertIsNotNone(reader, f"{self.SCORING} no longer defines _inject_record")
+        for marker in sorted(self.TRANSPORT_MARKERS):
+            literal = re.escape(json.dumps(marker))
+            writers = re.findall(rf"^(\w+)\s*=\s*{literal}\s*$", transport, re.M)
+            self.assertTrue(
+                any(f"self._record({const}," in transport for const in writers),
+                f"{marker} is registered as a transport marker but {self.INJECT_TRANSPORT} "
+                "no longer writes it — stale registry entry",
+            )
+            readers = re.findall(rf"^(\w+)\s*=\s*{literal}\s*$", scoring, re.M)
+            self.assertTrue(
+                any(re.search(rf"\b{const}\b", reader.group(0)) for const in readers),
+                f"{marker} is registered as a transport marker but scoring's _inject_record "
+                "no longer reads it — stale registry entry",
+            )
+
+    def test_the_harness_entries_still_have_evidence_in_the_hook_and_harness(self):
+        harness = (REPO_ROOT / self.HARNESS).read_text(errors="replace")
+        for entry, module in sorted(self.HARNESS_ENTRY_MODULES.items()):
+            source = (REPO_ROOT / module).read_text(errors="replace")
+            modname = Path(module).stem
+            literal = re.escape(json.dumps(entry))
+            consts = re.findall(rf"^(\w+)\s*=\s*{literal}\s*$", source, re.M)
+            self.assertTrue(
+                any(f'"name": {modname}.{const}' in harness or f'"name": {const}' in source for const in consts),
+                f"{entry} is registered as a harness entry but neither {self.HARNESS} nor {module} "
+                f"writes it from a {module} constant — stale registry entry",
             )
 
 
@@ -453,8 +726,7 @@ class WorkflowNameJoinTest(unittest.TestCase):
         new check has to choose. The reverse holds too: an exclusion that no
         longer names a workflow is stale."""
         documents = self._workflows()
-        triggers = documents[FLAKY_CHECK_NOTIFIER].get("on") or documents[FLAKY_CHECK_NOTIFIER].get(True) or {}
-        watched = set((triggers.get("workflow_run") or {}).get("workflows") or [])
+        watched = set(_flaky_check_reporter().WATCHED_WORKFLOWS)
         pull_request_checks = set()
         for filename, document in documents.items():
             if filename == FLAKY_CHECK_NOTIFIER:
@@ -503,14 +775,87 @@ class WorkflowNameJoinTest(unittest.TestCase):
             + ", ".join(missing),
         )
 
+    def test_the_release_stage_notifier_watches_every_release_pipeline(self):
+        """A release pipeline missing from the watch list fails silently: its
+        red run is a row in the Actions tab, the next scheduler tick skips,
+        and nobody is told (gke-labs/kube-agents#1978). The notifier is a
+        sweep rather than a `workflow_run` consumer, so the list lives in the
+        script alone; this holds it to the roster above and to the workflows
+        that exist, since a rename would otherwise red every sweep."""
+        watched = tuple(_release_stage_notifier().WATCHED_WORKFLOWS)
+        self.assertEqual(
+            RELEASE_STAGE_WATCHED_WORKFLOWS,
+            watched,
+            f"{RELEASE_STAGE_NOTIFIER}'s script no longer watches the release pipelines named here",
+        )
+        documents = self._workflows()
+        self.assertIn(RELEASE_STAGE_NOTIFIER, documents)
+        display_names = {document.get("name") for document in documents.values() if document.get("name")}
+        missing = sorted(set(watched) - display_names)
+        self.assertEqual(
+            [],
+            missing,
+            "watched release workflows that match no workflow name (renamed?): " + ", ".join(missing),
+        )
+
+    def test_the_release_stage_notifier_finds_the_eval_wait_and_its_withdrawal(self):
+        """The notifier reads a promotion night red on the eval's RED verdict
+        alone as green, by job name: the eval wait failed and the withdrawal
+        was skipped, which the withdrawal's `if:` makes mean a settled
+        verdict. A rename of either job, or a withdrawal that no longer keys
+        on `settled`, would leave every RED night filing an issue again, with
+        every unit test green on the recorded names."""
+        notifier = _release_stage_notifier()
+        documents = self._workflows()
+        promotion = [document for document in documents.values() if document.get("name") == notifier.EVAL_PIPELINE]
+        self.assertEqual(len(promotion), 1, f"no workflow named {notifier.EVAL_PIPELINE!r}")
+        jobs = (promotion[0].get("jobs") or {}).values()
+        eval_waits = [job for job in jobs if notifier.EVAL_WAIT_JOB_MARKER in (job.get("name") or "")]
+        withdrawals = [job for job in jobs if notifier.WITHDRAWAL_JOB_MARKER in (job.get("name") or "")]
+        self.assertEqual(len(eval_waits), 1, "EVAL_WAIT_JOB_MARKER selects no job, or more than one, in the promotion pipeline")
+        self.assertEqual(len(withdrawals), 1, "WITHDRAWAL_JOB_MARKER selects no job, or more than one, in the promotion pipeline")
+        self.assertIn("settled != 'true'", str(withdrawals[0].get("if", "")), "the withdrawal no longer keys on the verdict having settled")
+
+    def test_the_release_stage_notifier_knows_every_compensation_job(self):
+        """The jobs API carries neither `if:` nor `continue-on-error`, so the
+        notifier tells a compensation job (a withdrawal that runs because the
+        eval did not settle, a teardown, a rollback leg, a non-gating next-mode
+        leg) from a gating stage by its name. The markers have to select
+        exactly the jobs named above, and every job the workflow files mark as
+        running after a failure or without failing the run has to be among
+        them, or a renamed leg is named as the stage and holds its issue open
+        for good."""
+        markers = tuple(_release_stage_notifier().COMPENSATION_JOB_MARKERS)
+        documents = self._workflows()
+        watched = [document for document in documents.values() if document.get("name") in RELEASE_STAGE_WATCHED_WORKFLOWS]
+        self.assertEqual(len(watched), len(RELEASE_STAGE_WATCHED_WORKFLOWS))
+        selected, always_run = set(), set()
+        for document in watched:
+            for job in (document.get("jobs") or {}).values():
+                name = (job or {}).get("name") or ""
+                if any(marker in name for marker in markers):
+                    selected.add(name)
+                condition = str((job or {}).get("if", ""))
+                if (job or {}).get("continue-on-error") is True or any(each in condition for each in RELEASE_STAGE_ALWAYS_RUN_CONDITIONS):
+                    always_run.add(name)
+        self.assertEqual(
+            set(RELEASE_STAGE_COMPENSATION_JOBS),
+            selected,
+            "COMPENSATION_JOB_MARKERS selects a different set of jobs than RELEASE_STAGE_COMPENSATION_JOBS names",
+        )
+        unmarked = sorted(always_run - selected)
+        self.assertEqual([], unmarked, "jobs that run after a failure or without failing the run, and no marker selects: " + ", ".join(unmarked))
+        unused = [marker for marker in markers if not any(marker in name for name in selected)]
+        self.assertEqual([], unused, "markers that select no job: " + ", ".join(unused))
+
     def test_the_required_python_job_runs_the_suite_in_strict_mode(self):
         """The gate is one flag on one line, and losing it fails open.
 
         `make coverage` tolerates a failing test directory by design -- it is a
         meter, and one red directory must not hide the number for the rest. The
-        job that reports the required `Run Python Unit Tests` context runs that
-        target, so COVERAGE_STRICT=1 is the only thing making a red suite a red
-        check. Drop it in a reformat and CI reports success on failing tests:
+        job that reports the required `Run Python Unit Tests` context joins the
+        shards' results with `make coverage-merge`, so COVERAGE_STRICT=1 there
+        is what makes a red file in any shard a red check. Drop it in a reformat and CI reports success on failing tests:
         the suite still runs, the log still shows the failures, and the context
         still goes green. Nothing else in the repository asserts this.
         """
@@ -526,6 +871,191 @@ class WorkflowNameJoinTest(unittest.TestCase):
             "but would not fail the check",
         )
 
+    SHARD_RESULT = "${{needs.test-shard.result}}"
+    BENCH_RESULT = "${{needs.bench-tests.result}}"
+    NOT_SUCCESS = ("failure", "cancelled", "skipped")
+
+    @staticmethod
+    def _expr(value):
+        """A GitHub expression with its whitespace removed, so `${{ x }}` and `${{x}}` compare equal."""
+        return "".join(str(value).split())
+
+    def assert_join_fails_closed(self, workflow):
+        """The required check is one join job that runs on every outcome, and its
+        guard step exits non-zero whenever a shard or the bench job did not
+        succeed. The guard is found by what it reads (both job results in its
+        env) and judged by running its script as the runner does, not by the
+        spelling of its comparisons."""
+        self.assertNotIn("shell", (workflow.get("defaults") or {}).get("run") or {}, "the workflow sets a default shell")
+        jobs = workflow["jobs"]
+        named = [key for key, job in jobs.items() if job.get("name") == "Run Python Unit Tests"]
+        self.assertEqual(named, ["test"], "the required check's name is not on exactly the join job")
+        join = jobs["test"]
+        needs = join.get("needs")
+        needs = [needs] if isinstance(needs, str) else list(needs or [])
+        self.assertTrue({"test-shard", "bench-tests"} <= set(needs), f"the join does not need both jobs: {needs}")
+        self.assertEqual(self._expr(join.get("if", "")), "${{always()}}")
+        self.assertNotIn("continue-on-error", join, "the join job is continue-on-error")
+        self.assertNotIn("shell", (join.get("defaults") or {}).get("run") or {}, "the join sets a default shell")
+        guards = [step for step in join["steps"] if self._result_names(step)]
+        self.assertEqual(len(guards), 1, "the join has no single step that reads both job results")
+        guard = guards[0]
+        shards_name, bench_name = self._result_names(guard)
+        self.assertEqual(self._expr(guard.get("if", "")), "${{always()}}")
+        # The key's absence, not its value: `continue-on-error: ${{ true }}` is
+        # a string to the YAML reader and true to GitHub. A step-level shell
+        # would run the script through a template of its own choosing.
+        self.assertNotIn("continue-on-error", guard, "the guard step is continue-on-error, so its red does not fail the check")
+        self.assertNotIn("shell", guard, "the guard step sets its own shell")
+        script = guard.get("run", "")
+        self.assertEqual(self._guard_exit_status(script, {shards_name: "success", bench_name: "success"}), 0,
+                         "the guard fails when every job succeeded")
+        for outcome in self.NOT_SUCCESS:
+            for env in ({shards_name: outcome, bench_name: "success"}, {shards_name: "success", bench_name: outcome}):
+                self.assertNotEqual(self._guard_exit_status(script, env), 0, f"the guard passes on {env}")
+        runs = " ".join(step.get("run", "") for step in join["steps"])
+        self.assertIn("coverage-merge", runs)
+
+    def _result_names(self, step):
+        """The env names under which a step reads the shards' and the bench job's
+        results, or None when it does not read exactly one of each."""
+        env = step.get("env") or {}
+        shards = [name for name, value in env.items() if self._expr(value) == self.SHARD_RESULT]
+        bench = [name for name, value in env.items() if self._expr(value) == self.BENCH_RESULT]
+        if len(shards) == 1 and len(bench) == 1:
+            return shards[0], bench[0]
+        return None
+
+    @staticmethod
+    def _guard_exit_status(script, env):
+        """Runs the guard's script the way the runner runs a `run:` step that
+        names no shell: written to a file and given to `bash -e` (the runner
+        adds pipefail only when `shell: bash` is spelled out; `--noprofile
+        --norc` keep this machine's startup files out). The body is an `echo`
+        and an `exit`, so running it here is safe."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "guard.sh"
+            path.write_text(script)
+            done = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-e", str(path)],
+                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), **env},
+                capture_output=True, text=True, timeout=30,
+            )
+        return done.returncode
+
+    def assert_bench_job_is_hard(self, bench):
+        """The bench job the join needs must be able to go red: nothing on it or
+        its steps is continue-on-error, and one ungated step with the default
+        shell runs exactly `make test-bench`, so a `|| true`, a soft step or a
+        gated step cannot report success without the suite going green."""
+        self.assertNotIn("continue-on-error", bench, "the bench job is continue-on-error")
+        for step in bench["steps"]:
+            self.assertNotIn("continue-on-error", step, f"a bench step is continue-on-error: {step.get('name')}")
+        run_steps = [step for step in bench["steps"] if str(step.get("run", "")).strip() == "make test-bench"]
+        self.assertEqual(len(run_steps), 1, f"no single bench step runs exactly `make test-bench`: {[str(s.get('run', '')).strip() for s in bench['steps']]}")
+        self.assertNotIn("shell", run_steps[0], "the bench run step sets its own shell")
+        self.assertNotIn("if", run_steps[0], "the bench run step is gated by an if, so the job can pass without running the suite")
+
+    def test_the_required_python_check_fails_closed_on_its_shards(self):
+        """The required check is a join of three shards and the bench job, and a skip is a pass.
+
+        A job skipped because a job it needs failed reports success to a
+        required check. So the join must run whatever the shards and the bench
+        job did, a cancelled run included (`always()`), and must itself fail
+        unless every shard and the bench job succeeded. The bench job is in the
+        join because the merge queue re-tests the combined tree, and a bench red
+        there held no merge while the job sat outside the required context.
+        Each shard runs strict as well, so its own red is visible on its row,
+        and the shard count is written once in the matrix and must match
+        everywhere else it appears, or files drop out of every shard with the
+        check still green.
+        """
+        yaml = _yaml()
+        workflow = yaml.safe_load((WORKFLOWS / "python-tests.yml").read_text())
+        jobs = workflow["jobs"]
+        join, shards = jobs["test"], jobs["test-shard"]
+        self.assert_join_fails_closed(workflow)
+        # The pin must refuse a neutralised gate, not only a missing one. Two
+        # spelling-free mutants, judged by the same executed helper: the soft
+        # flag written as an expression, and a guard that always passes.
+        guard_index = next(i for i, step in enumerate(join["steps"]) if self._result_names(step))
+        for label, key, value in (("a guard soft by expression", "continue-on-error", "${{ true }}"), ("a guard that always passes", "run", "true")):
+            mutant = copy.deepcopy(workflow)
+            mutant["jobs"]["test"]["steps"][guard_index][key] = value
+            with self.subTest(mutant=label), self.assertRaises(AssertionError):
+                self.assert_join_fails_closed(mutant)
+        # The bench job itself must stay able to go red, or the join's bench
+        # branch guards nothing.
+        self.assert_bench_job_is_hard(jobs["bench-tests"])
+        shard_runs = " ".join(step.get("run", "") for step in shards["steps"])
+        self.assertIn("COVERAGE_STRICT=1", shard_runs)
+        # In the environment, not on make's command line, where it would also
+        # travel in MAKEFLAGS into every make the tests start.
+        self.assertNotIn("PYTHON_TEST_SHARD", shard_runs)
+        count = len(shards["strategy"]["matrix"]["shard"])
+        self.assertEqual(shards["strategy"]["matrix"]["shard"], list(range(1, count + 1)))
+        shard_env = " ".join(str((step.get("env") or {}).get("PYTHON_TEST_SHARD", "")) for step in shards["steps"])
+        self.assertIn(f"/{count}", shard_env, "a shard divides the sweep by another count than the matrix has")
+        join_runs = " ".join(step.get("run", "") for step in join["steps"])
+        self.assertIn(f"COVERAGE_SHARD_COUNT={count}", join_runs, "the join expects another shard count than the matrix has")
+        self.assertFalse(shards["strategy"].get("fail-fast", True), "one red shard would cancel the others")
+
+    def test_the_join_downloads_the_shards_coverage_twice(self):
+        """The required join's artifact download gets two attempts, and the
+        second is the hard one.
+
+        The action's own retries ran out twice on 2026-10-30 with every shard
+        uploaded and every test green, and nothing in a normal run shows the
+        shape that rescues it: drop `continue-on-error` from the first
+        download, or the `if` from the second, and every check stays green
+        until the next bad minute. The first attempt may be soft only because
+        the second is not; a second attempt that is also soft, or that runs
+        whatever the first did, is a different gate from the one described.
+        The clearing step in between is what keeps a half-extracted first
+        attempt out of the join.
+        """
+        yaml = _yaml()
+        workflow = yaml.safe_load((WORKFLOWS / "python-tests.yml").read_text())
+        self.assert_join_downloads_twice(workflow)
+        attempts = self._download_attempts(workflow["jobs"]["test"])
+        for label, mutate in (
+            ("a hard first attempt", lambda steps: steps[0].pop("continue-on-error")),
+            ("a soft second attempt", lambda steps: steps[-1].__setitem__("continue-on-error", True)),
+            ("an ungated second attempt", lambda steps: steps[-1].pop("if")),
+            ("a second attempt with other inputs", lambda steps: steps[-1]["with"].__setitem__("path", "elsewhere")),
+        ):
+            mutant = copy.deepcopy(workflow)
+            mutate(self._download_attempts(mutant["jobs"]["test"]))
+            with self.subTest(mutant=label), self.assertRaises(AssertionError):
+                self.assert_join_downloads_twice(mutant)
+        # The three places the artifact name is spelled agree: the shards'
+        # upload name and the pattern both download attempts filter by.
+        uploads = [step for step in workflow["jobs"]["test-shard"]["steps"] if "upload-artifact" in str(step.get("uses", ""))]
+        names = [str(step["with"]["name"]).replace("${{ matrix.shard }}", "1") for step in uploads]
+        pattern = attempts[0]["with"]["pattern"]
+        self.assertTrue(any(fnmatch.fnmatch(name, pattern) for name in names), f"no shard upload name matches the join's download pattern {pattern!r}: {names}")
+
+    @staticmethod
+    def _download_attempts(join):
+        """The join's download-artifact steps, in order."""
+        return [step for step in join["steps"] if "download-artifact" in str(step.get("uses", ""))]
+
+    def assert_join_downloads_twice(self, workflow):
+        join = workflow["jobs"]["test"]
+        attempts = self._download_attempts(join)
+        self.assertEqual(len(attempts), 2, f"the join has {len(attempts)} download-artifact steps, not two")
+        first, second = attempts
+        self.assertIs(first.get("continue-on-error"), True, "the first download attempt is not continue-on-error, so its failure ends the job before the second attempt")
+        self.assertTrue(first.get("id"), "the first download attempt has no id for the second to read")
+        gate = "${{steps.%s.outcome=='failure'}}" % first["id"]
+        self.assertEqual(self._expr(second.get("if", "")), gate, "the second download attempt is not gated on the first attempt's failure")
+        self.assertNotIn("continue-on-error", second, "the second download attempt is continue-on-error, so a download that fails twice does not fail the check")
+        self.assertEqual(first.get("uses"), second.get("uses"), "the two download attempts pin different action versions")
+        self.assertEqual(first.get("with"), second.get("with"), "the two download attempts take different inputs")
+        between = join["steps"][join["steps"].index(first) + 1 : join["steps"].index(second)]
+        clears = [step for step in between if self._expr(step.get("if", "")) == gate and f"rm -rf {first['with']['path']}" in str(step.get("run", ""))]
+        self.assertEqual(len(clears), 1, "no step gated on the first attempt's failure clears its download directory before the second attempt")
+
     def test_the_coverage_artifact_name_join_holds(self):
         producer = (WORKFLOWS / "python-tests.yml").read_text()
         consumer_path = WORKFLOWS / "coverage-comment.yml"
@@ -538,6 +1068,49 @@ class WorkflowNameJoinTest(unittest.TestCase):
             consumer,
             "the poster downloads an artifact name the producer no longer uploads",
         )
+
+
+class PoolPressureJobOwnersContractTest(unittest.TestCase):
+    """pool_pressure.py's BOSKOS_JOB_OWNERS copies the fixed Boskos owners the
+    hack/ scripts lease under. A rename there and not here would move that
+    job's leases under "no build ID in the owner" with nothing red."""
+
+    @staticmethod
+    def _script(name):
+        import importlib.util
+
+        hack = REPO_SCRIPTS.parent / "hack"
+        spec = importlib.util.spec_from_file_location(f"job_owner_{name}", hack / f"{name}.py")
+        module = importlib.util.module_from_spec(spec)
+        # The scripts import their hack/ siblings by bare name.
+        sys.path.insert(0, str(hack))
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path.remove(str(hack))
+        return module
+
+    def test_the_fixed_job_owners_are_the_scripts_defaults(self):
+        # Discovered, not enumerated: every hack/ script that leases through
+        # boskos_pool and names a default owner is in the tuple, so the next
+        # such script goes red here rather than into "no build ID in the owner".
+        sys.path.insert(0, str(REPO_SCRIPTS))
+        import pool_pressure
+
+        owners = set()
+        for path in sorted((REPO_SCRIPTS.parent / "hack").glob("*.py")):
+            if not re.search(r"^\s*(?:import|from)\s+boskos_pool\b", path.read_text(encoding="utf-8"), re.M):
+                continue
+            script = self._script(path.stem)
+            for name in ("DEFAULT_OWNER", "DEFAULT_BOSKOS_OWNER"):
+                if hasattr(script, name):
+                    owners.add(getattr(script, name))
+        self.assertEqual(
+            {"fleet-reconcile", "ci-kube-agents-compute-sweep", "ci-kube-agents-pull-sweep"},
+            owners,
+            "the scripts this test expects to find; a new one is added to both sets",
+        )
+        self.assertEqual(owners, set(pool_pressure.BOSKOS_JOB_OWNERS))
 
 
 class PoolPressureArtifactContractTest(unittest.TestCase):
@@ -631,6 +1204,9 @@ class PoolPressureArtifactContractTest(unittest.TestCase):
                 "threshold_p95_s": int(doc["thresholds"]["p95_minutes"] * 60),
                 "free": doc["pool"]["free"],
                 "total": doc["pool"]["total"],
+                "lease_failures": doc["recent"]["lease_failures"],
+                "lease_failures_hours": doc["recent"]["hours"],
+                "no_build_id": sum(doc["no_build_id"].values()),
                 "max_concurrency": doc["max_concurrency"],
             },
             {key: note[key] for key in note if key not in ("since", "measured_at")},

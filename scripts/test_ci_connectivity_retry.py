@@ -26,13 +26,16 @@ DEPLOY_SCRIPT = REPO_ROOT / "hack" / "ci-deploy.sh"
 ENV_SCRIPT = REPO_ROOT / "hack" / "ci-env.sh"
 
 SECTION_START = "# ─── 7. Agent API Connectivity Verification"
-SECTION_END = "TOTAL_DURATION="
+# The next section's header: 7b gates on the Pub/Sub platform adapter and has
+# its own test (tests/test_ci_deploy_pubsub_relay_gate.py) and constants.
+SECTION_END = "# ─── 7b. "
 
 KUBECTL_STUB = """#!/usr/bin/env bash
 echo "$@" >> "${STUB_LOG}/kubectl.args"
 case "$1" in
   port-forward)
     echo "Forwarding from 127.0.0.1:8642 -> 8642"
+    touch "${STUB_LOG}/pf-up"
     exec sleep 60
     ;;
   get)
@@ -54,8 +57,19 @@ fi
 exit 0
 """
 
+# The section kills the tunnel as soon as curl returns, so an nc that answers
+# at once lets the kill land before the kubectl stub has logged its call. Like
+# the real `nc -z`, this one reports the port open only once the tunnel is up:
+# the marker the kubectl stub leaves, taken so the next attempt waits for its own.
 NC_STUB = """#!/usr/bin/env bash
-exit 0
+for _ in $(seq 1 50); do
+  if [ -e "${STUB_LOG}/pf-up" ]; then
+    rm -f "${STUB_LOG}/pf-up"
+    exit 0
+  fi
+  sleep 0.01
+done
+exit 1
 """
 
 
@@ -84,20 +98,31 @@ def dump_function() -> str:
 
 
 def gateway_collector() -> str:
-    """collect_gateway_log() and the log-tail constants, lifted from ci-env.sh.
+    """last_bytes(), collect_gateway_log(), collect_litellm_log(),
+    collect_credential_proxy_evidence() and their constants, lifted from
+    ci-env.sh.
 
-    The dumper calls it for the running pod's log, so the dump under test
-    carries the real collector rather than a stub: its `|| true` guard is
-    one of the ones the survival test below is about. Every `*_LOG_*`
-    readonly comes along, since the dumper reads the litellm and envoy tail
-    sizes too and `set -u` would end the script at the first unbound one.
+    The dumper calls all three collectors, and each bounds its log through
+    last_bytes(), so the dump under test carries the real collectors and
+    helper rather than stubs: their `|| true` guards are among the ones
+    the survival test below is about. Every `*_LOG_*` and `CREDENTIAL_PROXY_*`
+    readonly comes along, since `set -u` would end the script at the first
+    unbound one.
     """
     src = ENV_SCRIPT.read_text(encoding="utf-8")
-    constants = re.findall(r"^readonly [A-Z_]*_LOG_[A-Z_]+=.*$", src, re.MULTILINE)
-    match = re.search(r"^collect_gateway_log\(\) \{\n.*?^\}$", src, re.DOTALL | re.MULTILINE)
-    if match is None or not constants:  # pragma: no cover
-        raise AssertionError(f"collect_gateway_log() not found in {ENV_SCRIPT}")
-    return "\n".join([*constants, match.group(0)])
+    constants = re.findall(r"^readonly (?:[A-Z_]*_LOG_[A-Z_]+|CREDENTIAL_PROXY_[A-Z_]+)=.*$", src, re.MULTILINE)
+    functions = []
+    for name in (
+        "last_bytes",
+        "collect_gateway_log",
+        "collect_litellm_log",
+        "collect_credential_proxy_evidence",
+    ):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
+        if match is None or not constants:  # pragma: no cover
+            raise AssertionError(f"{name}() not found in {ENV_SCRIPT}")
+        functions.append(match.group(0))
+    return "\n".join([*constants, *functions])
 
 
 def write_stub(directory: pathlib.Path, name: str, body: str) -> None:
@@ -120,6 +145,10 @@ def run_check(succeed_on: int) -> tuple[subprocess.CompletedProcess, pathlib.Pat
             "NAMESPACE=test-ns",
             "STEP_START=0",
             "dump_prow_artifacts_on_failure() { :; }",
+            # The section's EXIT traps chain to the deploy's exit function and
+            # stop its lease heartbeat (#3129); both are defined in section 2.
+            "stop_deploy_heartbeat() { :; }",
+            "deploy_exit() { dump_prow_artifacts_on_failure; }",
             connectivity_section(),
             'echo "SECTION COMPLETED"',
         ]
@@ -221,6 +250,13 @@ class FailureDumpArtifactsTest(unittest.TestCase):
     def test_the_envoy_sidecar_and_kube_system_events_are_captured(self):
         result, tmp = self.run_dump(kubectl_exit=0)
         self.assertIn("SURVIVED", result.stdout)
+        self.assertNotIn("command not found", result.stderr)
+        for name in (
+            "platform-agent-gateway.log",
+            "litellm.log",
+            "envoy-credential-proxy.log",
+        ):
+            self.assertTrue((tmp / "artifacts" / name).is_file(), name)
         kubectl_args = (tmp / "kubectl.args").read_text(encoding="utf-8")
         self.assertIn("-c envoy-credential-proxy", kubectl_args)
         self.assertRegex(

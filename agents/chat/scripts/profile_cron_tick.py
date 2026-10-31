@@ -40,7 +40,8 @@ at import (``cron/executions.py`` binds ``EXECUTIONS_FILE`` when it loads). A
 fresh process is the only way to get all of them pointing at one profile, and
 it is the same path ``hermes cron tick`` takes for a manual tick — so a job
 fires through the identical execute → save → deliver → mark body the gateway
-ticker uses, with the profile's own persona, toolsets and ``max_turns``.
+ticker uses, with the profile's own persona and toolsets and the entry's own
+``skills``, ``model`` and ``max_turns``.
 
 Correctness comes from ``tick()`` itself, not from bookkeeping here:
 
@@ -253,7 +254,7 @@ HOME_TARGET_ENV_KEYS = {
 #
 # It is the `cron_deliver_env_var` of the bundled `chat` platform plugin
 # (`deploy/docker/plugins/chat/adapter.py`), which hands a job's finished report
-# to the Chat Agent instead of posting it. Setting it does two things at once:
+# to the Session KV server's relay instead of posting it. Setting it does two things at once:
 # it makes `load_gateway_config` enable the platform in this child, and it gives
 # `_get_home_target_chat_id("chat")` a value, without which the scheduler will
 # not resolve `deliver: "chat"` to a target.
@@ -318,8 +319,10 @@ def home_target_env(root_home: Path) -> dict[str, str]:
       an affected install, so nothing lands and the lookup below finds nothing.
 
     Only the operator rendering a ``home_channel`` beside the ``enabled`` and
-    ``typing_status_text`` it already writes covers both, and covers the install
-    where nobody has typed ``/sethome`` at all. That is still missing.
+    ``typing_status_text`` it already writes covers both. On a writable file the
+    ``bootstrap_onboarding`` plugin sets one on a fresh install's first chat
+    message; an install onboarded before that, or the second platform on an
+    install with both, still has none.
 
     Two things to get right if you write that, both worse than the bug this
     function fixes. **The shape:** only ``chat_id`` is read here, but the whole

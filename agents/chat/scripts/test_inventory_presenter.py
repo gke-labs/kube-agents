@@ -1,7 +1,8 @@
-"""Tests for inventory_presenter and its flag gate in bootstrap_delivery."""
+"""Tests for inventory_presenter and the text path's flag gate in bootstrap_delivery."""
 
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -53,12 +54,8 @@ I scanned 3 clusters and 41 workloads. Posture is mostly healthy.
    Any workload can escape to the node; enforce baseline Pod Security.
 2. **Default service account is cluster-admin on seeded-c**
    A compromised pod owns the cluster; remove the binding.
-3. **Workload Identity is off on seeded-a (major)**
-   Pods fall back to the node SA; enable it on the node pool.
-4. **payments-api has no PodDisruptionBudget**
-   An upgrade can take every replica down; add a PDB.
 
-Also found: 18 more items, tracked in the findings queue — ask for the full list.
+Also found: 20 more items, tracked in the findings queue — ask for the full list.
 
 The full inventory is available — just ask.
 """
@@ -74,15 +71,81 @@ The full inventory is available — just ask.
 """
 
 
+#: The SOP's roll-up when criticals were left out, with the pace `select` printed.
+DEFERRED_ROLLUP = (
+    "Also found: 20 more items, 2 of them critical, tracked in the findings queue. "
+    "I'll bring the critical ones to you from 12:00 UTC the day after this report, at most 2 a day."
+)
+
+
 class PresentTest(unittest.TestCase):
     def test_the_card_headline_top_two_and_the_closing_line(self):
         self.assertEqual(inventory_presenter.present(REPORT), PRESENTED)
 
+    def test_a_roll_up_counting_left_out_criticals_is_kept_under_the_rows(self):
+        report = REPORT.replace(
+            "Also found: 20 more items, tracked in the findings queue — ask for the full list.", DEFERRED_ROLLUP
+        )
+        self.assertNotEqual(report, REPORT)
+        out = inventory_presenter.present(report)
+        rows_end = "remove the binding.\n\n"
+        self.assertIn(rows_end + DEFERRED_ROLLUP + "\n\nThe full inventory is available — just ask.\n", out)
+        self.assertIn("found 22 things to look at.", out)
+        # Kept in its place, so no ask replaces it.
+        last = report.replace("\n\nThe full inventory is available — just ask.\n", "\n")
+        out = inventory_presenter.present(last)
+        self.assertTrue(out.endswith(DEFERRED_ROLLUP + "\n"))
+        self.assertNotIn("Ask me to see all", out)
+
+    def test_a_roll_up_with_no_critical_left_out_still_goes(self):
+        report = REPORT.replace("tracked in the findings queue", "none of them critical, tracked in the findings queue")
+        self.assertNotEqual(report, REPORT)
+        self.assertNotIn("Also found", inventory_presenter.present(report))
+
     def test_the_rest_and_the_roll_up_are_left_out(self):
         out = inventory_presenter.present(REPORT)
-        for absent in ("Workload Identity", "payments-api", "Also found", "18 more", "more worth a look", "mostly healthy"):
+        for absent in ("Also found", "20 more", "more worth a look", "mostly healthy"):
             with self.subTest(absent=absent):
                 self.assertNotIn(absent, out)
+
+    def test_the_scans_posture_line_is_kept_whole_under_the_headline(self):
+        line = inventory_presenter.SCAN_SCOPE_LINE
+        # SOP Step 6 writes it as its own paragraph; a wrapped copy is the same line.
+        wrapped = line.replace("; ", ";\n")
+        self.assertNotEqual(wrapped, line)
+        for posture in (line, wrapped):
+            with self.subTest(wrapped=posture != line):
+                report = REPORT.replace(
+                    "I scanned 3 clusters and 41 workloads. Posture is mostly healthy.",
+                    f"Scanned 3 clusters and 41 workloads.\n\n{posture}",
+                )
+                self.assertNotEqual(report, REPORT)
+                out = inventory_presenter.present(report)
+                self.assertTrue(out.startswith(
+                    "**I scanned 3 clusters and 41 workloads and found 22 things to look at.**\n"
+                    f"{line} Two are worth fixing first:\n\n"
+                ), out)
+                # The card's line under the headline is clipped shorter than the line, so the card
+                # carries it under the rows, a sentence a line, unclipped.
+                blocks, _ = inventory_presenter.blocks(report)
+                message, _ = inventory_presenter.chat(report)
+                for sentence in inventory_presenter.SCAN_SCOPE_SENTENCES:
+                    self.assertIn(json.dumps(sentence), json.dumps(blocks))
+                    self.assertIn(json.dumps(sentence), json.dumps(message))
+
+    def test_the_posture_line_written_after_the_list_is_kept_once(self):
+        line = inventory_presenter.SCAN_SCOPE_LINE
+        report = REPORT.replace(
+            "I scanned 3 clusters and 41 workloads. Posture is mostly healthy.", "Scanned 3 clusters and 41 workloads."
+        ).replace("Also found:", f"{line}\n\nAlso found:")
+        out = inventory_presenter.present(report)
+        self.assertTrue(out.startswith(
+            "**I scanned 3 clusters and 41 workloads and found 22 things to look at.**\n"
+            f"{line} Two are worth fixing first:\n\n"
+        ), out)
+        self.assertEqual(out.count(line), 1)
+        message, _ = inventory_presenter.chat(report)
+        self.assertIn(json.dumps(line), json.dumps(message))
 
     def test_two_items_have_no_lead(self):
         report = "# Scan\n\nAll quiet. One thing stands out.\n\n1. **A (minor)**\n   Fix it.\n2. **B**\n   Fix that.\n"
@@ -91,11 +154,12 @@ class PresentTest(unittest.TestCase):
             "**I found 2 things to look at:**\n\n`minor` A\nFix it.\n**B**\nFix that.\n",
         )
 
-    def test_three_items_show_two_under_the_neutral_lead(self):
+    def test_every_listed_item_is_shown(self):
+        # The report is already the selection (`inventory_findings.py select`).
         report = "Posture.\n\n1. **A**\n   x\n2. **B**\n   y\n3. **C**\n   z\n"
         self.assertEqual(
             inventory_presenter.present(report),
-            "**I found 3 things to look at.** Start with these two:\n\n**A**\nx\n**B**\ny\n",
+            "**I found 3 things to look at:**\n\n**A**\nx\n**B**\ny\n**C**\nz\n",
         )
 
     def test_severity_in_the_sentence_is_not_a_label(self):
@@ -113,9 +177,10 @@ class PresentTest(unittest.TestCase):
         )
         self.assertEqual(
             inventory_presenter.present(report),
-            "**I found 3 things to look at.** Two are worth fixing first:\n\n"
+            "**I found 3 things to look at:**\n\n"
             "`critical` seeded-b and seeded-c admit privileged pods.\nEnforce baseline.\n"
-            "**seeded-c: the default service account is cluster-admin.**\nRemove the binding.\n",
+            "**seeded-c: the default service account is cluster-admin.**\nRemove the binding.\n"
+            "**No PDB on payments-api**\nAdd one.\n",
         )
 
     def test_a_bold_sentence_is_the_headline_and_the_rest_its_sentence(self):
@@ -135,18 +200,18 @@ class PresentTest(unittest.TestCase):
         )
         self.assertEqual(
             inventory_presenter.present(report),
-            "**I found 3 things to look at.** Start with these two:\n\n**A on seeded-b**\nAny workload can escape.\n"
-            "**B on seeded-c**\nA compromised pod owns it.\n\n"
+            "**I found 3 things to look at:**\n\n**A on seeded-b**\nAny workload can escape.\n"
+            "**B on seeded-c**\nA compromised pod owns it.\n"
+            "**C on payments-api**\nAn upgrade takes it down.\n\n"
             "The full inventory is available.\n",
         )
 
-    def test_criticals_are_never_rolled_up(self):
+    def test_criticals_past_two_are_shown(self):
         report = "Posture.\n\n" + "".join(f"{i}. **[critical] problem {i}**\n   x\n" for i in range(1, 4))
-        report += "4. **other**\n   y\n"
+        report += "\nAlso found: 4 more items.\n"
         out = inventory_presenter.present(report)
         rows = "\n".join(f"`critical` problem {i}\nx" for i in range(1, 4))
-        self.assertIn("**I found 4 things to look at.** Three are worth fixing first:\n\n" + rows, out)
-        self.assertNotIn("other", out)
+        self.assertIn("**I found 7 things to look at.** Three are worth fixing first:\n\n" + rows, out)
         self.assertNotIn("[critical]", out)
 
     def test_more_of_a_scope_noun_is_not_more_findings(self):
@@ -241,10 +306,8 @@ class PresentTest(unittest.TestCase):
             with self.subTest(separator=separator):
                 report = "Posture.\n\n"
                 report += "".join(f"{i}. **Critical{separator}problem {i}**\n   x\n" for i in range(1, 4))
-                report += "4. **other**\n   y\n"
                 out = inventory_presenter.present(report)
-                self.assertIn("Three are worth fixing first:\n\n" + rows, out)
-                self.assertNotIn("other", out)
+                self.assertIn(":**\n\n" + rows, out)
 
     def test_a_hyphenated_severity_word_is_not_a_label(self):
         report = "Posture.\n\n1. **Critical-path job lags on prod**\n   Scale it.\n"
@@ -253,8 +316,7 @@ class PresentTest(unittest.TestCase):
             "**I found 1 thing to look at:**\n\n**Critical-path job lags on prod**\nScale it.\n",
         )
 
-    def test_a_list_past_the_sops_cap_is_kept_whole(self):
-        # The SOP lists more than five only when every one is critical, labelled or not.
+    def test_a_long_list_is_kept_whole(self):
         report = "Posture.\n\n" + "".join(f"{i}. **problem {i} on c{i}**\n   x\n" for i in range(1, 7))
         out = inventory_presenter.present(report)
         for i in range(1, 7):
@@ -264,8 +326,9 @@ class PresentTest(unittest.TestCase):
     def test_a_quiet_cluster_gets_the_neutral_lead(self):
         report = "No critical or major findings.\n\n"
         report += "".join(f"{i}. **item {i} (minor)**\n   x\n" for i in range(1, 4))
+        report += "\nAlso found: 2 more items.\n"
         out = inventory_presenter.present(report)
-        self.assertIn("Start with these two:", out)
+        self.assertIn("Start with these three:", out)
         self.assertNotIn("worth fixing", out)
 
     def test_a_severity_word_inside_a_name_is_not_a_label(self):
@@ -276,7 +339,8 @@ class PresentTest(unittest.TestCase):
         )
 
     def test_a_gap_is_its_own_line_under_the_bold_headline(self):
-        report = "2 clusters were unreachable. Scanned 3 clusters.\n\n1. **A (major)**\n   x\n2. **B**\n   y\n3. **C**\n   z\n"
+        report = "2 clusters were unreachable. Scanned 3 clusters.\n\n1. **A (major)**\n   x\n2. **B**\n   y\n"
+        report += "\nAlso found: 1 more item.\n"
         out = inventory_presenter.present(report)
         self.assertTrue(
             out.startswith(
@@ -814,6 +878,17 @@ KNOWN_WRONG_TOTALS = (
 
 
 class BlocksTest(unittest.TestCase):
+    def test_a_roll_up_counting_left_out_criticals_is_a_line_under_the_rows(self):
+        report = REPORT.replace(
+            "Also found: 20 more items, tracked in the findings queue — ask for the full list.", DEFERRED_ROLLUP
+        )
+        blocks, _ = inventory_presenter.blocks(report)
+        last_divider = max(i for i, block in enumerate(blocks) if block["type"] == "divider")
+        after = blocks[last_divider + 1]
+        self.assertEqual(after["type"], "rich_text")
+        self.assertEqual(after["elements"][0]["elements"][0]["text"], DEFERRED_ROLLUP)
+        self.assertEqual(self._buttons(blocks), ["Fix the first one", "See all 22"])
+
     def _types(self, blocks):
         return [block["type"] for block in blocks]
 
@@ -879,7 +954,7 @@ class BlocksTest(unittest.TestCase):
     def test_the_total_is_the_only_count_on_the_card(self):
         blocks, _ = inventory_presenter.blocks(REPORT)
         card = str(blocks)
-        for gone in ("1 critical", "more worth a look", "Also found", "18", "Posture is mostly healthy", "full inventory"):
+        for gone in ("1 critical", "more worth a look", "Also found", "20", "Posture is mostly healthy", "full inventory"):
             with self.subTest(gone=gone):
                 self.assertNotIn(gone, card)
         self.assertNotIn("container", self._types(blocks))
@@ -888,7 +963,7 @@ class BlocksTest(unittest.TestCase):
         report = REPORT.replace("41 workloads.", "41 workloads, 23 findings.")
         blocks, _ = inventory_presenter.blocks(report)
         self.assertEqual(self._buttons(blocks), ["Fix the first one", "See all 22"])
-        report = report.replace("Also found: 18 more items, tracked in the findings queue — ask for the full list.\n\n", "")
+        report = report.replace("Also found: 20 more items, tracked in the findings queue — ask for the full list.\n\n", "")
         blocks, _ = inventory_presenter.blocks(report)
         self.assertEqual(self._buttons(blocks), ["Fix the first one", "See all 23"])
         self.assertIn("found 23 things", self._headline(report)[0])
@@ -1101,10 +1176,10 @@ class BlocksTest(unittest.TestCase):
         )
 
     def test_a_roll_up_without_more_is_counted(self):
-        report = REPORT.replace("18 more items", "14 items")
+        report = REPORT.replace("20 more items", "14 items")
         self.assertNotEqual(report, REPORT)
         blocks, _ = inventory_presenter.blocks(report)
-        self.assertEqual(self._buttons(blocks), ["Fix the first one", "See all 18"])
+        self.assertEqual(self._buttons(blocks), ["Fix the first one", "See all 16"])
 
     def test_every_row_carries_its_sentence_as_a_second_line(self):
         blocks, text = inventory_presenter.blocks(REPORT)
@@ -1143,7 +1218,7 @@ class BlocksTest(unittest.TestCase):
 
     def test_a_posture_with_no_counts_says_only_what_was_found(self):
         report = "Posture.\n\n1. **A (major)**\n   x\n2. **B**\n   y\n3. **C**\n   z\n"
-        self.assertEqual(self._headline(report), ("I found 3 things to look at.", "Two are worth fixing first:"))
+        self.assertEqual(self._headline(report), ("I found 3 things to look at:", ""))
 
     def test_the_primary_button_value_is_its_label(self):
         # A click posts the label in the card's thread; the row it means is on the card.
@@ -1165,7 +1240,7 @@ class BlocksTest(unittest.TestCase):
             (
                 "I scanned 5 clusters and 41 workloads and found 22 things to look at.",
                 "",
-                "2 clusters could not be scanned (permission denied). Start with these two:",
+                "2 clusters could not be scanned (permission denied). Start with these three:",
             ),
         )
         blocks, text = inventory_presenter.blocks(report)
@@ -1219,7 +1294,7 @@ class BlocksTest(unittest.TestCase):
             with self.subTest(posture=posture):
                 self.assertEqual(
                     self._headline(self._probe(posture)),
-                    ("I scanned 3 clusters and 41 workloads and found 22 things to look at.", "Start with these two:"),
+                    ("I scanned 3 clusters and 41 workloads and found 22 things to look at.", "Start with these three:"),
                 )
 
     def test_a_denied_or_forbidden_finding_is_not_a_gap(self):
@@ -1232,7 +1307,7 @@ class BlocksTest(unittest.TestCase):
             with self.subTest(posture=posture):
                 self.assertEqual(
                     self._headline(self._probe(posture)),
-                    (f"{headline} and found 22 things to look at.", "Start with these two:"),
+                    (f"{headline} and found 22 things to look at.", "Start with these three:"),
                 )
 
     def test_a_gap_after_a_clean_part_of_its_clause_is_kept(self):
@@ -1241,7 +1316,7 @@ class BlocksTest(unittest.TestCase):
             ("I scanned 3 clusters; 2 clusters with no credentials could not be scanned.", "2 clusters with no credentials could not be scanned."),
         ):
             with self.subTest(posture=posture):
-                self.assertEqual(self._headline(self._probe(posture))[2], f"{gap} Start with these two:")
+                self.assertEqual(self._headline(self._probe(posture))[2], f"{gap} Start with these three:")
 
     def test_every_gap_is_kept_with_the_names_its_colon_lists(self):
         for posture, gap in (
@@ -1264,7 +1339,7 @@ class BlocksTest(unittest.TestCase):
             with self.subTest(posture=posture):
                 self.assertEqual(
                     self._headline(self._probe(posture)),
-                    ("I scanned 3 clusters and found 22 things to look at.", "", f"{gap} Start with these two:"),
+                    ("I scanned 3 clusters and found 22 things to look at.", "", f"{gap} Start with these three:"),
                 )
 
     def test_a_sentence_opening_on_a_number_is_a_clause_of_its_own(self):
@@ -1288,7 +1363,7 @@ class BlocksTest(unittest.TestCase):
                     (
                         "I scanned 3 clusters and 41 workloads and found 22 things to look at.",
                         "",
-                        f"{gap} Start with these two:",
+                        f"{gap} Start with these three:",
                     ),
                 )
 
@@ -1395,7 +1470,8 @@ class BlocksTest(unittest.TestCase):
     def test_a_decimal_is_not_a_posture_total(self):
         report = self._probe("I scanned 3 clusters running 1.30 and 4.5 findings per cluster on average.", "")
         blocks, _ = inventory_presenter.blocks(report)
-        self.assertEqual(self._buttons(blocks), ["Fix the first one", "See all 3"])
+        self.assertEqual(self._buttons(blocks), ["Fix the first one"])
+        self.assertEqual(inventory_presenter._shape(report).total, 3)
 
     def test_unparseable_is_none(self):
         self.assertIsNone(inventory_presenter.blocks("# Report\n\n| Cluster | ... |\n"))
@@ -1428,6 +1504,15 @@ class OriginPlatformTest(unittest.TestCase):
             self.assertIsNone(bootstrap_delivery._origin_platform())
 
 
+# The audits note with no oobe marker: the chain's sentence, then where the summaries go.
+RUNNING_NOTE = f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} {bootstrap_delivery.AUDITS_HOME_SENTENCE}"
+
+
+def delivered(report: str) -> str:
+    """What delivery prints for a report with no oobe marker beside it: the report, then the audits note."""
+    return report.rstrip("\n") + "\n\n" + RUNNING_NOTE + "\n"
+
+
 class DeliveryFlagTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1457,21 +1542,21 @@ class DeliveryFlagTest(unittest.TestCase):
         return buf.getvalue()
 
     def test_flag_unset_delivers_presented(self):
-        self.assertEqual(self._run(None), PRESENTED)
+        self.assertEqual(self._run(None), delivered(PRESENTED))
 
     def test_flag_off_delivers_verbatim(self):
-        self.assertEqual(self._run("0"), REPORT)
+        self.assertEqual(self._run("0"), delivered(REPORT))
 
     def test_flag_on_delivers_presented_and_archives_original(self):
-        self.assertEqual(self._run("1"), PRESENTED)
+        self.assertEqual(self._run("1"), delivered(PRESENTED))
         self.assertEqual((self.d / "INVENTORY.delivered.md").read_text(encoding="utf-8"), REPORT)
 
-    def test_flag_on_without_a_relay_prints_the_text(self):
-        # A Slack origin with a chat id, so only the missing relay stops the blocks.
+    def test_flag_on_with_no_card_prints_the_text(self):
+        # No files beside the report, so no card: the reshaped text goes and no blocks are posted.
         import slack_blocks_post
 
         with mock.patch.object(slack_blocks_post, "post") as poster:
-            self.assertEqual(self._run("1"), PRESENTED)
+            self.assertEqual(self._run("1"), delivered(PRESENTED))
         poster.assert_not_called()
 
     def test_google_chat_is_verbatim_with_the_flag_on(self):
@@ -1479,87 +1564,96 @@ class DeliveryFlagTest(unittest.TestCase):
         import slack_blocks_post
 
         with mock.patch.object(slack_blocks_post, "post") as poster:
-            self.assertEqual(self._run("1", platform="google_chat", relay=RELAY_URL), REPORT)
+            self.assertEqual(self._run("1", platform="google_chat", relay=RELAY_URL), delivered(REPORT))
         poster.assert_not_called()
 
     def test_a_missing_origin_is_verbatim_with_the_flag_on(self):
         import slack_blocks_post
 
         with mock.patch.object(slack_blocks_post, "post") as poster:
-            self.assertEqual(self._run("1", platform=None, relay=RELAY_URL), REPORT)
+            self.assertEqual(self._run("1", platform=None, relay=RELAY_URL), delivered(REPORT))
         poster.assert_not_called()
 
     def test_presenter_failure_delivers_verbatim(self):
         boom = mock.patch.object(inventory_presenter, "present", side_effect=ValueError("boom"))
         with boom, contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(self._run("1"), REPORT)
+            self.assertEqual(self._run("1"), delivered(REPORT))
 
 
 
-class BlocksDeliveryTest(unittest.TestCase):
-    ORIGIN = {"platform": "slack", "chat_id": "C1", "thread_id": "1.5"}
+#: A report listing five findings: the card shows two and folds three (mock 15).
+FIVE = """# GKE Environment Scan
 
-    def setUp(self):
-        import slack_blocks_post
+I scanned 3 clusters and 41 workloads.
 
-        self.sbp = slack_blocks_post
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.d = Path(self._tmp.name)
-        (self.d / "INVENTORY.md").write_text(REPORT, encoding="utf-8")
-        (self.d / ".user_aligned").touch()
+1. **[critical] seeded-b and seeded-c admit privileged pods**
+   Enforce baseline Pod Security.
+2. **[major] seeded-c is a minor version behind its channel**
+   Upgrade the control plane.
+3. **No PDB on payments-api**
+   Add one.
+4. **[minor] Default namespace holds workloads**
+   Move them.
+5. **Workload Identity is off on one node pool**
+   Turn it on.
 
-    def _run(self, post, flag="1", origin=ORIGIN):
-        env = {k: v for k, v in os.environ.items() if k != "KAGE_SLACK_UX"}
-        env.update({"KAGE_SLACK_UX": flag, "SLACK_RELAY_URL": RELAY_URL})
-        out, err = io.StringIO(), io.StringIO()
-        with (
-            mock.patch.dict(os.environ, env, clear=True),
-            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
-            mock.patch.object(bootstrap_delivery.sandbox_exec, "sandbox_enabled", return_value=False),
-            mock.patch.object(self.sbp, "post", side_effect=post) as poster,
-            contextlib.redirect_stdout(out),
-            contextlib.redirect_stderr(err),
-        ):
-            self.assertEqual(bootstrap_delivery.main(self.d), 0)
-        self.posts = poster.call_args_list
-        return out.getvalue()
+Also found: 18 more items, tracked in the findings queue.
+"""
 
-    def test_posts_blocks_into_the_origin_and_prints_nothing(self):
-        self.assertEqual(self._run(lambda *a: "9.9"), "")
-        (post,) = self.posts
-        channel, text, blocks, thread_ts = post.args
-        self.assertEqual((channel, thread_ts), ("C1", "1.5"))
-        self.assertEqual(blocks[-1]["elements"][0]["text"]["text"], "Fix the first one")
-        self.assertTrue(text.startswith("*I scanned 3 clusters and 41 workloads and found 22 things to look at."))
-        self.assertTrue((self.d / ".bootstrap_completed").exists())
-        self.assertEqual((self.d / "INVENTORY.delivered.md").read_text(encoding="utf-8"), REPORT)
 
-    def test_flag_off_is_byte_identical(self):
-        self.assertEqual(self._run(lambda *a: "9.9", flag="0"), REPORT)
-        self.assertEqual(self.posts, [])
+class FoldTest(unittest.TestCase):
+    """The card shows the top two findings and folds the rest the report lists, in both modes."""
 
-    def test_a_refusal_that_is_not_about_blocks_is_not_retried(self):
-        self.assertEqual(self._run(self.sbp.Refused("channel_not_found")), PRESENTED)
-        self.assertEqual(len(self.posts), 1)
+    def test_the_card_folds_past_two(self):
+        blocks, text = inventory_presenter.blocks(FIVE)
+        self.assertEqual(
+            [b["type"] for b in blocks], ["rich_text", "divider", "rich_text", "divider", "container", "actions"]
+        )
+        self.assertEqual(blocks[0]["elements"][0]["elements"][1]["text"], " Two are worth fixing first:")
+        self.assertEqual(len(blocks[2]["elements"]), 2)
+        fold = blocks[4]
+        self.assertEqual(fold["title"], {"type": "plain_text", "text": "3 more worth a look"})
+        self.assertTrue(fold["is_collapsible"] and fold["default_collapsed"])
+        folded = fold["child_blocks"][0]["elements"]
+        self.assertEqual([row["elements"][0]["text"] for row in folded], ["No PDB on payments-api", "minor", "Workload Identity is off on one node pool"])
+        self.assertEqual([b["text"]["text"] for b in blocks[-1]["elements"]], ["Fix the first one", "See all 23"])
+        # The fallback still carries every finding the report lists.
+        for name in ("privileged pods", "payments-api", "Workload Identity"):
+            self.assertIn(name, text)
 
-    def test_refused_blocks_are_not_retried(self):
-        # The card has no fold to leave out, so the same blocks would be refused again.
-        self.assertEqual(self._run(self.sbp.Refused("invalid_blocks")), PRESENTED)
-        self.assertEqual(len(self.posts), 1)
+    def test_two_or_fewer_have_no_fold(self):
+        blocks, _ = inventory_presenter.blocks(REPORT)
+        self.assertNotIn("container", [b["type"] for b in blocks])
+        chat, _ = inventory_presenter.chat(REPORT)
+        self.assertNotIn("fold", chat)
 
-    def test_a_relay_failure_prints_the_text(self):
-        self.assertEqual(self._run(OSError("connection refused")), PRESENTED)
-        self.assertEqual(len(self.posts), 1)
+    def test_the_text_layout_still_lists_every_finding(self):
+        out = inventory_presenter.present(FIVE)
+        self.assertIn("Five are worth fixing first:", out)
+        self.assertNotIn("more worth a look", out)
+        self.assertIn("Workload Identity is off on one node pool", out)
 
-    def test_a_post_that_may_have_landed_still_prints_the_text(self):
-        # The first inventory is sent once, so a second copy beats none.
-        self.assertEqual(self._run(TimeoutError("timed out")), PRESENTED)
-        self.assertEqual(len(self.posts), 1)
+    def test_the_chat_message_folds_the_same_rows(self):
+        chat, text = inventory_presenter.chat(FIVE)
+        self.assertEqual(chat, {
+            "schema": "kube-agents.chat/v1",
+            "headline": "I scanned 3 clusters and 41 workloads and found 23 things to look at.",
+            "note": "Two are worth fixing first:",
+            "rows": [
+                {"text": "seeded-b and seeded-c admit privileged pods", "severity": "critical", "detail": "Enforce baseline Pod Security."},
+                {"text": "seeded-c is a minor version behind its channel", "severity": "major", "detail": "Upgrade the control plane."},
+            ],
+            "fold": {
+                "title": "3 more worth a look",
+                "text": "No PDB on payments-api\nAdd one.\n`minor` Default namespace holds workloads\nMove them.\n"
+                "Workload Identity is off on one node pool\nTurn it on.",
+            },
+            "choices": [{"text": "Fix the first one", "primary": True}, {"text": "See all 23"}],
+        })
+        self.assertEqual(text, inventory_presenter.present(FIVE))
 
-    def test_no_chat_id_prints_the_text(self):
-        self.assertEqual(self._run(lambda *a: "9.9", origin={"platform": "slack"}), PRESENTED)
-        self.assertEqual(self.posts, [])
+    def test_a_report_that_does_not_parse_has_no_chat_message(self):
+        self.assertIsNone(inventory_presenter.chat("# Report\n\n| Cluster | ... |\n"))
 
 
 if __name__ == "__main__":

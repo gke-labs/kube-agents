@@ -27,7 +27,13 @@
 # count goes stale the next time something sources this file.
 #
 # The Python equivalent, used by the agent at runtime, is
-# agents/platform/scripts/gke_endpoint.py. Keep the two predicates in step.
+# agents/platform/scripts/gke_endpoint.py. Keep the two predicates in step on
+# the DNS rule. The Python one also passes --internal-ip for a cluster on the
+# agent pod's own VPC (docs/designs/private-endpoint-selection.md); that rule
+# has no place here, because this file runs on a workstation or in CI, outside
+# any GKE VPC: whatever cluster its callers reach, there is no VPC-local private
+# endpoint to prefer, and a cluster whose private endpoint is the only one gets
+# it from gcloud unflagged.
 
 # Empty until asked, then 1 or 0. gcloud is slow to start and cannot grow a flag
 # mid-run. The agent image installs an unpinned google-cloud-cli so the answer is

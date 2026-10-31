@@ -95,9 +95,9 @@ Ensure high availability and graceful degradation.
 
 Harden the cluster and workloads.
 
--   **Action**: You MUST run the `gke-platform-security` and
-    `gke-workload-security` skills for Workload Identity, Network Policies, and
-    Shielded Nodes.
+-   **Action**: You MUST run the `gke-workload-identity` skill for Workload
+    Identity, and the `gke-platform-security` and `gke-workload-security` skills
+    for Network Policies and Shielded Nodes.
 -   **Namespace Isolation**: Ensure workloads run in dedicated namespaces with
     Pod Security Standards (PSS) enforced via labels.
 -   **Least Privilege**: Ensure workloads use dedicated ServiceAccounts instead

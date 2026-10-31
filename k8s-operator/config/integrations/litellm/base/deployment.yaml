@@ -27,6 +27,11 @@ spec:
         # the pod template itself change, which is what triggers the rollout.
         kubeagents.x-k8s.io/model-config: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
     spec:
+      # Kept in step with charts/kube-agents/templates/litellm.yaml (#3878):
+      # explicitly point at "default" for non-vertex providers to prevent
+      # Kubernetes from resurrecting a deleted KSA from the deprecated
+      # serviceAccount twin field during provider switches.
+      serviceAccountName: default
       # Kept in step with charts/kube-agents/templates/_helpers.tpl's
       # kube-agents.topologySpreadConstraints, which owns the rationale: the PDB
       # beside this file stalls a drain that would take both replicas, but a
@@ -81,13 +86,22 @@ spec:
             requests:
               cpu: "100m"
               memory: "2Gi"
+              # The tmp emptyDir's sizeLimit plus 256Mi for logs, as the chart.
+              ephemeral-storage: "1280Mi"
             limits:
               cpu: "500m"
               memory: "3Gi"
+              ephemeral-storage: "1280Mi"
           env:
             # See the pod securityContext above: the only writable directory.
             - name: HOME
               value: /tmp
+            # LiteLLM v1.104.0+ refuses to boot without a master key unless permitted.
+            # In kube-agents, LiteLLM is an in-cluster gateway on a private Service
+            # protected by NetworkPolicy, and internal callers authenticate at the
+            # transport boundary rather than via LiteLLM's user-auth layer.
+            - name: LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY
+              value: "true"
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -147,11 +161,17 @@ spec:
             - name: config-volume
               mountPath: /app/config.yaml
               subPath: config.yaml
+            # Beside config.yaml, where LiteLLM resolves a custom callback module.
+            - name: config-volume
+              mountPath: /app/litellm_thinking_replay_callback.py
+              subPath: litellm_thinking_replay_callback.py
             - name: tmp
               mountPath: /tmp
       volumes:
         - name: config-volume
           configMap:
             name: litellm-config
+        # As the chart (templates/litellm.yaml): HOME and the tokenizer caches.
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 1Gi

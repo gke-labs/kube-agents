@@ -103,8 +103,9 @@ func TestAGitLabForgeReachesTheBrokerAndOnlyTheBroker(t *testing.T) {
 	want := []map[string]any{
 		{"provider": "github", "host": "github.com"},
 		{"provider": "gitlab", "host": "gitlab.com",
-			"tokenPath":    forgeCredentialsDir + "/gitlab/token",
-			"allowedPaths": []any{"acme", "platform"}},
+			"tokenPath":     forgeCredentialsDir + "/gitlab/token",
+			"readTokenPath": forgeCredentialsDir + "/gitlab/read-token",
+			"allowedPaths":  []any{"acme", "platform"}},
 	}
 	if !reflect.DeepEqual(document.Forges, want) {
 		t.Errorf("forges = %v, expected %v", document.Forges, want)
@@ -118,7 +119,9 @@ func TestAGitLabForgeReachesTheBrokerAndOnlyTheBroker(t *testing.T) {
 	if value, _ := brokerEnvValue(container.Env, vcsForgesEnv); value != vcsForgesMountPath {
 		t.Errorf("%s = %q, expected %q", vcsForgesEnv, value, vcsForgesMountPath)
 	}
-	for _, path := range []string{vcsForgesMountPath, forgeCredentialsDir + "/gitlab/token"} {
+	for _, path := range []string{
+		vcsForgesMountPath, forgeCredentialsDir + "/gitlab/token", forgeCredentialsDir + "/gitlab/read-token",
+	} {
 		mount := mountCovering(&container, path)
 		if mount == nil {
 			t.Errorf("%s is supplied by no mount in the broker container", path)
@@ -137,8 +140,15 @@ func TestAGitLabForgeReachesTheBrokerAndOnlyTheBroker(t *testing.T) {
 	if secret == nil {
 		t.Fatal("the broker pod does not project the forge's Secret")
 	}
-	if len(secret.Items) != 1 || secret.Items[0].Key != "token" || secret.Optional == nil || !*secret.Optional {
-		t.Errorf("the Secret projection is %+v; expected only the token key, optional", secret)
+	// The token and the read-only token, each under its own name, and nothing
+	// else. Optional, so a Secret without the read-only token still starts
+	// the pod: kubelet skips a missing key of an optional Secret.
+	wantItems := []corev1.KeyToPath{{Key: "token", Path: "token"}, {Key: "read-token", Path: "read-token"}}
+	if !reflect.DeepEqual(secret.Items, wantItems) || secret.Optional == nil || !*secret.Optional {
+		t.Errorf("the Secret projection is %+v; expected only the token and read-token keys, optional", secret)
+	}
+	if secret.DefaultMode == nil || *secret.DefaultMode != 0o400 {
+		t.Errorf("the Secret projection mode is %v, expected 0400", secret.DefaultMode)
 	}
 
 	// And nothing else holds the Secret: not the gateway pod, not the sandbox.
@@ -201,5 +211,158 @@ func TestTheForgeConfigurationRollsTheBrokerNotTheGateway(t *testing.T) {
 	}
 	if broker == base {
 		t.Error("declaring a GitLab forge does not change the broker's policy hash")
+	}
+}
+
+// A forge's CA bundle is the Secret key caBundleRef names, mounted into the
+// broker's pod only, at the path its configuration entry names. It comes from
+// a Secret so that changing it needs the same rights as changing the token
+// beside it; a ConfigMap of the same name is never read. Optional, so a missing
+// Secret does not stop the broker, and not a SubPath, so kubelet's refresh of
+// the Secret reaches the broker with no restart.
+func TestAForgeCABundleIsMountedIntoTheBrokerOnly(t *testing.T) {
+	agent := gitlabAgent("gitlab-forge-token")
+	// A self-managed host: gitlab.com refuses caBundleRef.
+	agent.Spec.Integration.Forges[1].Host = "gitlab.internal.example"
+	agent.Spec.Integration.Forges[1].CABundleRef = &agentv1alpha1.ForgeCABundleRef{Name: "gitlab-forge-ca", Key: "root.pem"}
+
+	var document struct {
+		Forges []map[string]any `json:"forges"`
+	}
+	raw := buildCredentialProxyPolicyConfigMap(agent).Data[vcsForgesKey]
+	if err := json.Unmarshal([]byte(raw), &document); err != nil {
+		t.Fatalf("the forge configuration is not JSON: %v\n%s", err, raw)
+	}
+	caFile := forgeCADir + "/gitlab/" + agentv1alpha1.ForgeCABundleFileName
+	if got := document.Forges[1]["caFile"]; got != caFile {
+		t.Errorf("caFile = %v, expected %s", got, caFile)
+	}
+	if _, found := document.Forges[0]["caFile"]; found {
+		t.Error("GitHub's entry carries a caFile")
+	}
+
+	dep := buildCredentialProxyDeployment(agent, "hash")
+	container := dep.Spec.Template.Spec.Containers[0]
+	mount := mountCovering(&container, caFile)
+	if mount == nil {
+		t.Fatalf("%s is supplied by no mount in the broker container", caFile)
+	}
+	if mount.SubPath != "" || !mount.ReadOnly {
+		t.Errorf("the CA mount is %+v; expected a read-only directory mount", mount)
+	}
+	var source *corev1.SecretVolumeSource
+	for _, volume := range dep.Spec.Template.Spec.Volumes {
+		if volume.Name == mount.Name {
+			source = volume.Secret
+		}
+		// A ConfigMap of the same name is not the CA: a ConfigMap write must
+		// not choose the broker's trust anchor.
+		if volume.ConfigMap != nil && volume.ConfigMap.Name == "gitlab-forge-ca" {
+			t.Errorf("the broker pod reads a ConfigMap named like the CA Secret, as %q", volume.Name)
+		}
+	}
+	if source == nil || source.SecretName != "gitlab-forge-ca" {
+		t.Fatalf("the CA mount %q is not the Secret gitlab-forge-ca: %+v", mount.Name, source)
+	}
+	if len(source.Items) != 1 || source.Items[0].Key != "root.pem" || source.Items[0].Path != agentv1alpha1.ForgeCABundleFileName {
+		t.Errorf("the Secret projection is %+v; expected only root.pem, as ca.crt", source.Items)
+	}
+	if source.Optional == nil || !*source.Optional {
+		t.Error("the CA Secret projection is not optional, so a missing Secret would stop the broker")
+	}
+
+	gateway := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{})
+	sandbox := buildShellSandboxStatefulSet(agent, "keys", credentialProxyURL(agent), "s")
+	for name, podVolumes := range map[string][]corev1.Volume{
+		"gateway": gateway.Spec.Volumes,
+		"sandbox": sandbox.Spec.Template.Spec.Volumes,
+	} {
+		for _, volume := range podVolumes {
+			if (volume.Secret != nil && volume.Secret.SecretName == "gitlab-forge-ca") ||
+				(volume.ConfigMap != nil && volume.ConfigMap.Name == "gitlab-forge-ca") {
+				t.Errorf("the %s pod mounts the forge's CA as %q", name, volume.Name)
+			}
+		}
+	}
+}
+
+// ghesAgent is the broker-pod agent with one GitHub forge at a GitHub
+// Enterprise Server host, behind a private CA.
+func ghesAgent() *agentv1alpha1.PlatformAgent {
+	agent := brokerPodAgent()
+	agent.Spec.Integration.Forges = []agentv1alpha1.ForgeSpec{{
+		Name: "github", Provider: "github", Host: "ghe.example.com", Namespace: "acme",
+		CABundleRef: &agentv1alpha1.ForgeCABundleRef{Name: "ghe-ca"},
+	}}
+	agent.Spec.Integration.Repositories = []agentv1alpha1.RepositorySpec{
+		{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+	}
+	return agent
+}
+
+// A GitHub Enterprise Server install hands the broker a configuration with
+// the GitHub entry at the declared host, mounts the CA bundle into the broker
+// only, and seeds the GitOps repository by its full URL on that host.
+func TestAGitHubEnterpriseServerForgeReachesTheBroker(t *testing.T) {
+	agent := ghesAgent()
+	raw := buildCredentialProxyPolicyConfigMap(agent).Data[vcsForgesKey]
+	caFile := forgeCADir + "/github/" + agentv1alpha1.ForgeCABundleFileName
+	want := `{"forges":[{"provider":"github","host":"ghe.example.com","caSecret":"ghe-ca","caKey":"ca.crt","caFile":"` + caFile + `"}]}`
+	if raw != want {
+		t.Errorf("forge configuration =\n %s\nexpected\n %s", raw, want)
+	}
+	dep := buildCredentialProxyDeployment(agent, "hash")
+	container := dep.Spec.Template.Spec.Containers[0]
+	if got, _ := brokerEnvValue(container.Env, vcsForgesEnv); got != vcsForgesMountPath {
+		t.Errorf("%s = %q, expected %s", vcsForgesEnv, got, vcsForgesMountPath)
+	}
+	if mountCovering(&container, caFile) == nil {
+		t.Errorf("%s is supplied by no mount in the broker container", caFile)
+	}
+	gateway := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{})
+	for _, volume := range gateway.Spec.Volumes {
+		if volume.Secret != nil && volume.Secret.SecretName == "ghe-ca" {
+			t.Errorf("the gateway pod mounts the GitHub Enterprise Server CA as %q", volume.Name)
+		}
+	}
+	stateData := buildGitopsStateConfigMap(agent).Data
+	if want := `[{"type":"github","url":"https://ghe.example.com/acme/infra"}]`; stateData[gitopsStateManagedReposKey] != want {
+		t.Errorf("managed_repos = %s, expected %s", stateData[gitopsStateManagedReposKey], want)
+	}
+	if got := stateData[gitopsStateGitHubHostKey]; got != "ghe.example.com" {
+		t.Errorf("github_host = %q, expected ghe.example.com", got)
+	}
+}
+
+// A github.com install renders the same broker, gateway, policy and state
+// whichever way it spells github.com, and none of them carries a forge
+// configuration: what a github.com install rendered before GitHub Enterprise
+// Server.
+func TestAGitHubDotComInstallRendersTheSameWhateverItsSpelling(t *testing.T) {
+	render := func(host string) []any {
+		agent := brokerPodAgent()
+		agent.Spec.Integration.Forges = []agentv1alpha1.ForgeSpec{{Name: "github", Host: host, Namespace: "acme"}}
+		agent.Spec.Integration.Repositories = []agentv1alpha1.RepositorySpec{
+			{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+		}
+		return []any{
+			buildCredentialProxyPolicyConfigMap(agent),
+			buildCredentialProxyDeployment(agent, "hash"),
+			buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{}),
+			buildGitopsStateConfigMap(agent),
+			agentv1alpha1.ForgeEgressPatterns(&agent.Spec.Integration.IntegrationSpec),
+		}
+	}
+	base := render("")
+	if _, found := base[0].(*corev1.ConfigMap).Data[vcsForgesKey]; found {
+		t.Fatal("a github.com install carries a forge configuration")
+	}
+	if _, found := base[3].(*corev1.ConfigMap).Data[gitopsStateGitHubHostKey]; found {
+		t.Fatal("a github.com install carries a github_host key")
+	}
+	for _, host := range []string{"github.com", "WWW.GitHub.com", "ssh.github.com"} {
+		if got := render(host); !reflect.DeepEqual(got, base) {
+			t.Errorf("host %q renders differently from no host", host)
+		}
 	}
 }

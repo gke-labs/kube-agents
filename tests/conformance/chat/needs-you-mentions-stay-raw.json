@@ -1,0 +1,27 @@
+{
+  "name": "needs-you-mentions-stay-raw",
+  "source": "agents/platform/scripts/test_slack_moments.py::NeedsYouTest.test_the_reason_cannot_mention_anyone",
+  "notes": "Fields carry the raw text; the renderer escapes every field, so none renders as a mention.",
+  "input": {
+    "reason": "Question\n<@U123> said so. Which?\n- <!here>\n- <!channel>"
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Question",
+        "detail": "<@U123> said so. Which?",
+        "tone": "attention",
+        "choices": [
+          {
+            "text": "<!here>"
+          },
+          {
+            "text": "<!channel>"
+          }
+        ]
+      }
+    }
+  ]
+}

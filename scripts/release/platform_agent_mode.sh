@@ -3,13 +3,15 @@
 # scripts carry for it, the patch that applies `next` after an install, and the
 # gate that waits for what `next` renders.
 #
-# PLATFORM_AGENT_MODE is the install.env key the install's planned --mode
-# flag (#2524) will read and record, so the release path spells it the same
-# way. Unset or `today` is the default and changes nothing:
+# PLATFORM_AGENT_MODE is the install.env key the install's --mode flag reads
+# and records, so the release path spells it the same way, and an exported
+# `next` reaches install.sh as well. Unset or `today` is the default:
 # platform_agent_mode_resolve unsets the variable, so a release script and
-# everything it runs see exactly the environment they saw before the mode
-# existed, and render_install_env.sh writes no key for it (an absent spec.mode
-# is `today` to the CRD). Only `next` adds anything.
+# everything it runs see the environment they saw before the mode existed,
+# and render_install_env.sh writes no key for it (an absent spec.mode is
+# `today` to the CRD). provision_environment.sh still names the mode to
+# install.sh with --mode, whose own first-install default is `next`. Only
+# `next` adds a patch and a gate.
 #
 # `next` is for the ephemeral rc and nightly clusters only.
 # platform_agent_mode_refuse_long_lived says why.
@@ -30,21 +32,20 @@ readonly PLATFORM_AGENT_MODE_A2A_GATEWAY="deployment/${PLATFORM_AGENT_MODE_CR_NA
 readonly PLATFORM_AGENT_MODE_AGENT="deployment/${PLATFORM_AGENT_MODE_CR_NAME}-gateway"
 
 # The two values the CRD's spec.mode enum takes, and the merge patch that sets
-# the second. The chart renders no spec.mode, so a later helm upgrade leaves a
-# patched value alone.
+# the second. The chart renders spec.mode from its platformAgent.mode value,
+# so a later full upgrade renders whatever install.env records.
 readonly PLATFORM_AGENT_MODE_TODAY="today"
 readonly PLATFORM_AGENT_MODE_NEXT="next"
 readonly PLATFORM_AGENT_MODE_NEXT_PATCH='{"spec":{"mode":"next"}}'
 
 # The conditions the operator writes under `next`
 # (k8s-operator/internal/controller): BusProvisioned once the provisioning Job
-# has completed, BusCredentialsReady while the auth callout serves the current
-# identity map, and A2AGateway, present only while the gateway is withheld for
-# want of a chat backend, with this reason.
+# has completed, and BusCredentialsReady while the auth callout serves the
+# current identity map. Every next install runs the A2A gateway (on the
+# console door alone when no chat backend is configured), so the gate always
+# waits on its rollout.
 readonly PLATFORM_AGENT_MODE_BUS_PROVISIONED="BusProvisioned"
 readonly PLATFORM_AGENT_MODE_BUS_CREDENTIALS="BusCredentialsReady"
-readonly PLATFORM_AGENT_MODE_GATEWAY_CONDITION="A2AGateway"
-readonly PLATFORM_AGENT_MODE_GATEWAY_DARK_REASON="NoChatBackend"
 
 # One budget for the whole gate, every wait inside it taking what is left.
 # Ready under `next` counts NATS, the callout, the provisioning Job and the A2A
@@ -87,18 +88,18 @@ platform_agent_mode_resolve() {
   esac
 }
 
-# Refuses `next` on a long-lived environment (autopush, staging). The patch
-# outlives the run there: the chart renders no spec.mode and the installer
-# does not read the key, so no later upgrade or reconcile puts it back, drift
-# detection plans nothing for it, and Google Chat stays moved off the legacy
-# consumer onto the A2A gateway until somebody rebuilds the environment on
-# `today`. rc and nightly are destroyed and rebuilt every run, so the mode
-# goes with them. Call after platform_agent_mode_resolve.
+# Refuses `next` on a long-lived environment (autopush, autopush-next,
+# staging). A long-lived environment's mode is its PLATFORM_AGENT_MODE
+# variable, which the reconcile path renders into the chart; the rebuild's
+# mode input is not consulted for it, so a rebuild installs `today` and the
+# next reconcile moves the environment to its declared mode. rc and nightly
+# are destroyed and rebuilt every run, so the mode goes with them. Call after
+# platform_agent_mode_resolve.
 platform_agent_mode_refuse_long_lived() {
   local long_lived="${1:-}" environment="${2:-this environment}"
   [ "${RELEASE_PLATFORM_AGENT_MODE}" = "${PLATFORM_AGENT_MODE_NEXT}" ] || return 0
   [ -n "${long_lived}" ] || return 0
-  echo "::error title=spec.mode next is for the ephemeral environments::Refusing spec.mode ${PLATFORM_AGENT_MODE_NEXT} on '${environment}', a long-lived environment. Nothing that later moves it (an upgrade, a reconcile, drift detection) knows about the patched mode, so it would stay next, with Google Chat moved to the A2A gateway, until a ${PLATFORM_AGENT_MODE_TODAY} rebuild. Use the ephemeral rc or nightly environment for next."
+  echo "::error title=spec.mode next is for the ephemeral environments::Refusing spec.mode ${PLATFORM_AGENT_MODE_NEXT} on '${environment}', a long-lived environment. Its mode is its PLATFORM_AGENT_MODE variable, applied by the reconcile path, not this input. A rebuild installs ${PLATFORM_AGENT_MODE_TODAY} and the next reconcile moves it to the declared mode. Use the ephemeral rc or nightly environment for next."
   echo "==> spec.mode ${PLATFORM_AGENT_MODE_NEXT} refused on long-lived '${environment}'." >&2
   return 1
 }
@@ -218,11 +219,10 @@ platform_agent_mode_wait_condition() {
 # patch the CR still carries the Ready the operator wrote for today, and the
 # Ready condition's observedGeneration is what tells the two apart. Under
 # `next` Ready counts the NATS StatefulSet, the auth callout, the provisioning
-# Job (until BusProvisioned latches) and the A2A gateway unless the install
-# has no chat backend. Then the two conditions that say the bus is usable, and
-# each workload's rollout, so the tests do not start in the middle of one. The
-# verifier is gated by rollout alone because it is deliberately not a Ready
-# row. The A2A gateway is skipped only when the operator says it withheld it.
+# Job (until BusProvisioned latches) and the A2A gateway. Then the two
+# conditions that say the bus is usable, and each workload's rollout, so the
+# tests do not start in the middle of one. The verifier is gated by rollout
+# alone because it is deliberately not a Ready row.
 platform_agent_mode_wait_next() {
   local namespace="$1" context="${2:-}"
   local -a kc=(kubectl)
@@ -259,25 +259,7 @@ platform_agent_mode_wait_next() {
     platform_agent_mode_gate_rollout "${namespace}" "${context}" "${workload}" "${deadline}" || return 1
   done
 
-  # Empty is an answer here (the condition is absent while the gateway is
-  # rendered), so a dropped read is told from it by the exit status and
-  # retried inside the budget like every other read in the gate.
-  local gateway_reason=""
-  until gateway_reason="$("${kc[@]}" get platformagent "${PLATFORM_AGENT_MODE_CR_NAME}" -n "${namespace}" \
-    -o jsonpath="{.status.conditions[?(@.type==\"${PLATFORM_AGENT_MODE_GATEWAY_CONDITION}\")].reason}" 2>/dev/null)"; do
-    gateway_reason=""
-    if [ "${SECONDS}" -ge "${deadline}" ]; then
-      echo "::error title=mode next: ${PLATFORM_AGENT_MODE_GATEWAY_CONDITION} unreadable::PlatformAgent/${PLATFORM_AGENT_MODE_CR_NAME}'s ${PLATFORM_AGENT_MODE_GATEWAY_CONDITION} condition could not be read within the gate's ${PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS}s, so whether to wait for the A2A gateway is unknown."
-      platform_agent_mode_dump_state "${namespace}" "${context}"
-      return 1
-    fi
-    sleep "${PLATFORM_AGENT_MODE_POLL_SECONDS}"
-  done
-  if [ "${gateway_reason}" = "${PLATFORM_AGENT_MODE_GATEWAY_DARK_REASON}" ]; then
-    echo "${PLATFORM_AGENT_MODE_A2A_GATEWAY} is withheld (${PLATFORM_AGENT_MODE_GATEWAY_CONDITION}=False ${PLATFORM_AGENT_MODE_GATEWAY_DARK_REASON}): this install configures no chat backend, so there is no A2A gateway to wait for."
-  else
-    platform_agent_mode_gate_rollout "${namespace}" "${context}" "${PLATFORM_AGENT_MODE_A2A_GATEWAY}" "${deadline}" || return 1
-  fi
+  platform_agent_mode_gate_rollout "${namespace}" "${context}" "${PLATFORM_AGENT_MODE_A2A_GATEWAY}" "${deadline}" || return 1
 
   echo "✅ spec.mode ${PLATFORM_AGENT_MODE_NEXT}: everything the operator renders for it is ready."
 }

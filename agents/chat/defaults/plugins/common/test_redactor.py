@@ -22,6 +22,38 @@ from common.redactor import SALT_ENV_VAR, AuditRedactor, RedactionRule  # noqa: 
 import common.redactor as redactor_module  # noqa: E402
 
 
+class SecondPassTest(unittest.TestCase):
+    """A second pass over redacted text is a no-op: markers are never rewritten."""
+
+    def test_a_loose_pattern_rule_does_not_nest_its_own_marker(self):
+        rules = AuditRedactor.rules_from_config({
+            "ip": {"action": "off"},
+            "rules": [{"name": "project", "pattern": "[a-z][a-z0-9_-]{5,28}", "action": "pseudonym"}],
+        })
+        once, counts = AuditRedactor.apply_rules("pods in acme-prod now", rules)
+        self.assertRegex(once, r"^pods in \[project:[0-9a-f]{12}\] now$")
+        self.assertEqual(counts, {"project": 1})
+        twice, counts_again = AuditRedactor.apply_rules(once, rules)
+        self.assertEqual(twice, once)
+        self.assertEqual(counts_again, {})
+
+    def test_a_mask_marker_is_not_rewritten_by_an_upper_case_pattern(self):
+        rules = AuditRedactor.rules_from_config({
+            "ip": {"action": "off"},
+            "rules": [{"name": "cluster-name", "pattern": "[A-Za-z0-9-]{8,}"}],
+        })
+        once, _ = AuditRedactor.apply_rules("on prod-eu-cluster-1 today", rules)
+        self.assertEqual(once, "on [REDACTED_CLUSTER_NAME] today")
+        self.assertEqual(AuditRedactor.apply_rules(once, rules)[0], once)
+
+    def test_text_beside_a_marker_is_still_redacted(self):
+        rules = AuditRedactor.rules_from_config({"ip": {"action": "mask"}, "rules": [{"name": "c", "literal": "prod-eu-1"}]})
+        text = "[REDACTED_SECRET] at 10.1.2.3 on prod-eu-1 [ip:a6788cec5b31]"
+        out, counts = AuditRedactor.apply_rules(text, rules)
+        self.assertEqual(out, "[REDACTED_SECRET] at [REDACTED_IP] on [REDACTED_C] [ip:a6788cec5b31]")
+        self.assertEqual(counts["c"], 1)
+
+
 class TestRedactText(unittest.TestCase):
 
     def assertRedacted(self, text, secret):
@@ -280,9 +312,20 @@ class TestRedactText(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2.0)
 
     def test_a_long_hyphenated_run_stays_linear(self):
-        # The key/value name prefix used to rescan from every word boundary.
+        # The key/value name prefix used to rescan from every word boundary,
+        # and the e-mail local part from every character: 20 KB took about
+        # 0.7 s, enough for a slow runner to overrun the bound.
         started = time.monotonic()
         AuditRedactor.redact_text("a-" * 10000 + "password=x")
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_a_long_run_of_local_part_characters_stays_linear(self):
+        # A base64 blob or a long identifier: 80 KB of e-mail local-part
+        # characters with no `@` after them. Only the e-mail pattern is slow on
+        # it (about 6 s rescanning from every character); every other pattern
+        # finishes in milliseconds, so the bound is far from either outcome.
+        started = time.monotonic()
+        AuditRedactor.redact_text("a" * 80000)
         self.assertLess(time.monotonic() - started, 2.0)
 
     def test_env_block_scalar_value_is_masked_and_stays_a_block(self):
@@ -487,6 +530,30 @@ class TestRedactText(unittest.TestCase):
             AuditRedactor.redact_text("ping alice@example.com now"),
             "ping [REDACTED_EMAIL] now",
         )
+
+    def test_an_address_glued_to_the_end_of_another_is_redacted_too(self):
+        # The second address starts where EMAIL_RUN_START_PATTERN's lookbehind
+        # forbids a start, so the complete shape is tried at the end of each
+        # match, and it carries the service-account exemption and its edges.
+        for text, expected in (
+            (
+                "alice@example.com-bob@example.org",
+                "[REDACTED_EMAIL][REDACTED_EMAIL]",
+            ),
+            ("a@b.cc1c@d.cc1e@f.cc", "[REDACTED_EMAIL][REDACTED_EMAIL][REDACTED_EMAIL]"),
+            ("x@y.com,z@w.org", "[REDACTED_EMAIL],[REDACTED_EMAIL]"),
+            (
+                "bob@example.com-sa@p.iam.gserviceaccount.com",
+                "[REDACTED_EMAIL]-sa@p.iam.gserviceaccount.com",
+            ),
+            (
+                "bob@example.com-victim@corp.gserviceaccount.com.attacker.io",
+                "[REDACTED_EMAIL][REDACTED_EMAIL]",
+            ),
+            ("bob@example.com-a@notgserviceaccount.com", "[REDACTED_EMAIL][REDACTED_EMAIL]"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(AuditRedactor.redact_text(text), expected)
 
     def test_ordinary_text_is_untouched(self):
         for text in (

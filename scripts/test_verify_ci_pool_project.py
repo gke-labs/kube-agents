@@ -3,8 +3,10 @@
 
 import argparse
 import base64
+import builtins
 import inspect
 import io
+import fnmatch
 import json
 import os
 import pathlib
@@ -14,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
@@ -240,6 +243,12 @@ class RequiredApisTest(unittest.TestCase):
         # bench/tf/fleet declares google_compute_disk directly.
         self.assertIn("compute.googleapis.com", checker.REQUIRED_APIS)
 
+    def test_cloudtrace_api_is_required(self):
+        # The observability nightly case reads traces through the broker's
+        # relay on roles/cloudtrace.user; a project with the role and the API
+        # off fails it with SERVICE_DISABLED, which this check exists to catch.
+        self.assertIn("cloudtrace.googleapis.com", checker.REQUIRED_APIS)
+
     def test_all_apis_enabled_passes(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
@@ -425,7 +434,15 @@ class GkeAndCmekTest(unittest.TestCase):
         # it says the opposite. Widening the set is a claim about a finding's
         # effect on a run, made here beside the finding that emits it.
         self.assertEqual(checker.FINDING_HOST_OTEL_SCOPE, "gke/host-otel-scope")
-        self.assertEqual(checker.LEASE_SILENT_FINDINGS, frozenset({checker.FINDING_HOST_OTEL_SCOPE}))
+        self.assertEqual(checker.FINDING_COMPUTE_SWEEPER_MISSING, "iam/compute-sweeper/missing")
+        # The Compute plant sweeper holds nothing a leased run uses, so a
+        # missing grant fails only the hourly sweep.
+        self.assertEqual(
+            checker.LEASE_SILENT_FINDINGS,
+            frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_COMPUTE_SWEEPER_MISSING, checker.FINDING_DNS_API}) | checker.FORGE_FINDINGS,
+        )
+        # The forge pieces serve the self-managed lanes alone (docs 5.8): the two
+        # public lanes read none of them, so a leased run passes with any of them.
 
     def test_fleet_clusters_are_not_held_to_the_otel_scope(self):
         # Nothing reads the seeded clusters' traces, and bench/tf/fleet does not
@@ -2079,6 +2096,381 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         self.assertIsNone(checker._note_declaration_problem(checker.GITOPS_INTENT_NOTE_CONTENT + "\n", "gke-agentic/x-infra"))
 
 
+class GitlabWorkloadManifestTest(unittest.TestCase):
+    """The GitLab lane's twin of the workload check reads gke-agentic/<project>-infra on gitlab.com (#3145, 3145-F1)."""
+
+    _PATH = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
+    _PROJECT = "gke-agentic/kube-agents-evals-3-infra"
+
+    class _Forge:
+        """What check_gitlab_workload_manifest uses of hack/ci_gitlab_forge.py, served from a dict of files."""
+
+        GROUP = "gke-agentic"
+        PROJECT_SUFFIX = "-infra"
+        DEFAULT_HOST = "gitlab.com"
+        FILE_PRESENT = "present"
+        FILE_ABSENT = "absent"
+
+        def __init__(self, files=None, project_status=None, default="main"):
+            self.files = dict(files or {})
+            self.project_status = project_status
+            self.default = default
+            self.calls = []
+
+        def _raise(self, code):
+            raise urllib.error.HTTPError("x", code, "", {}, io.BytesIO(b""))
+
+        def project_view(self, path, token, host="gitlab.com"):
+            self.calls.append(("project_view", path, token, host))
+            if self.project_status:
+                self._raise(self.project_status)
+            return 7, self.default
+
+        def repository_file(self, path, file_path, token, host="gitlab.com", ref=None):
+            self.calls.append(("repository_file", file_path, ref))
+            if file_path in self.files:
+                return self.FILE_PRESENT, self.files[file_path]
+            return self.FILE_ABSENT, ""
+
+        def repository_blobs(self, path, prefix, token, host="gitlab.com", ref=None):
+            self.calls.append(("repository_blobs", prefix, ref))
+            return sorted(p for p in self.files if p.startswith(prefix + "/"))
+
+    def _check(self, forge, token=("tok", "GITLAB_VERIFY_TOKEN")):
+        with mock.patch.object(checker, "_load_gitlab_forge", return_value=forge), \
+                mock.patch.object(checker, "_gitlab_read_token", return_value=token):
+            return checker.check_gitlab_workload_manifest("kube-agents-evals-3")
+
+    def test_a_project_with_the_declaration_passes_on_its_default_branch(self):
+        forge = self._Forge({self._PATH: checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n", "README.md": "x"}, default="trunk")
+        result = self._check(forge)
+        self.assertTrue(result.passed, result.message)
+        self.assertEqual([], result.warnings)
+        self.assertIn(f"gitlab.com/{self._PROJECT} declares Deployment/checkout-gateway at {self._PATH} on trunk", result.message)
+        self.assertEqual(("project_view", self._PROJECT, "tok", "gitlab.com"), forge.calls[0])
+        self.assertIn(("repository_file", self._PATH, "trunk"), forge.calls)
+        self.assertIn(("repository_blobs", "clusters/seeded-a", "trunk"), forge.calls)
+
+    def test_an_absent_file_fails_with_the_seed_command(self):
+        result = self._check(self._Forge({"README.md": "x"}))
+        self.assertFalse(result.passed)
+        self.assertIn(f"has no {self._PATH} on main", result.message)
+        self.assertIn("GitLab lane", result.message)
+        self.assertIn(f"seed-file --project-id kube-agents-evals-3 --path {self._PATH}", result.message)
+        self.assertIn("GITLAB_SEED_TOKEN=", result.message)
+        self.assertIn("--host gitlab.com", result.message)
+
+    def test_a_project_the_token_cannot_see_fails_naming_both_readings_and_the_onboarding(self):
+        result = self._check(self._Forge(project_status=404))
+        self.assertFalse(result.passed)
+        self.assertIn("does not exist, or the token from GITLAB_VERIFY_TOKEN cannot see it", result.message)
+        self.assertIn("5.6", result.message)
+
+    def test_a_token_that_no_longer_authenticates_leaves_the_check_unread(self):
+        result = self._check(self._Forge(project_status=401))
+        self.assertTrue(result.passed)
+        self.assertFalse(result.read)
+        self.assertIn("HTTP 401", result.warnings[0])
+
+    def test_no_token_leaves_the_check_unread_with_the_reason(self):
+        result = self._check(self._Forge(), token=("", "no token in GITLAB_VERIFY_TOKEN and kube-agents-prow/gitlab-ledger-token could not be read (denied)"))
+        self.assertTrue(result.passed)
+        self.assertFalse(result.read)
+        self.assertIn("gitlab-ledger-token could not be read", result.warnings[0])
+
+    def test_a_second_declaration_under_the_tree_fails_as_the_index_refuses_it(self):
+        good = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"
+        result = self._check(self._Forge({self._PATH: good, "clusters/seeded-a/apps/checkout-gateway-copy.yaml": good}))
+        self.assertFalse(result.passed)
+        self.assertIn("more than once", result.message)
+        self.assertIn("clusters/seeded-a/apps/checkout-gateway-copy.yaml", result.message)
+        self.assertIn(f"Remove every declaration but {self._PATH}", result.message)
+
+    def test_an_index_raise_a_sibling_causes_names_the_sibling_not_a_replace(self):
+        good = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"
+        result = self._check(self._Forge({self._PATH: good, "clusters/seeded-a/apps/x.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n  namespace: seeded-reliability\ndata:\n  n: !!int two\n"}))
+        self.assertFalse(result.passed)
+        self.assertIn("the seed stands", result.message)
+        self.assertIn("makes the index raise", result.message)
+        self.assertIn("clusters/seeded-a/apps/x.yaml", result.message, "the raiser is named")
+        self.assertNotIn("seed-file", result.message)
+
+    def test_a_seed_that_does_not_key_the_deployment_keeps_the_replace_verdict_beside_a_raising_sibling(self):
+        bad_seed = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: checkout-gateway\n  namespace: seeded-reliability\n"
+        result = self._check(self._Forge({self._PATH: bad_seed, "clusters/seeded-a/apps/x.yaml": "data:\n  n: !!int two\n"}))
+        self.assertFalse(result.passed)
+        self.assertNotIn("the seed stands", result.message)
+        self.assertIn("seed-file", result.message, "the seed is the file at fault, so the replace command is right")
+        self.assertIn("no document in it is keyed", result.message, "and the verdict says what the seed lacks, not that it raises")
+        self.assertIn("clusters/seeded-a/apps/x.yaml", result.message, "with the raising sibling named for the next run")
+
+    def test_the_run_deadline_cuts_the_helpers_timeout_and_stops_a_run_out_of_time(self):
+        forge = self._Forge({self._PATH: checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"})
+        forge.REQUEST_TIMEOUT_SECONDS = 30
+        with mock.patch.object(checker, "_RUN_DEADLINE", time.monotonic() + 5):
+            result = self._check(forge)
+        self.assertTrue(result.passed, result.message)
+        self.assertLessEqual(forge.REQUEST_TIMEOUT_SECONDS, 5)
+        self.assertGreaterEqual(forge.REQUEST_TIMEOUT_SECONDS, checker.NET_TIMEOUT_FLOOR_SECONDS)
+        spent = self._Forge({self._PATH: checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"})
+        with mock.patch.object(checker, "_RUN_DEADLINE", time.monotonic() - 1):
+            result = self._check(spent)
+        self.assertFalse(result.read)
+        self.assertIn("deadline passed", result.warnings[0])
+        self.assertEqual([], spent.calls, "a run out of time starts no read")
+
+    def test_an_unwritable_scratch_tree_leaves_the_check_unread(self):
+        forge = self._Forge({self._PATH: checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n", "clusters/seeded-a/apps/x.yaml": "a: 1\n"})
+        with mock.patch.object(checker.tempfile, "TemporaryDirectory", side_effect=FileNotFoundError("TMPDIR")):
+            result = self._check(forge)
+        self.assertTrue(result.passed)
+        self.assertFalse(result.read)
+        self.assertIn("temporary directory", result.warnings[0])
+
+    def test_a_body_the_index_does_not_key_fails_with_the_replace_instruction(self):
+        result = self._check(self._Forge({self._PATH: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: checkout-gateway\n  namespace: seeded-reliability\n"}))
+        self.assertFalse(result.passed)
+        self.assertIn("does not key Deployment/checkout-gateway", result.message)
+        self.assertIn("seed-file", result.message)
+
+    def test_the_token_comes_from_the_environment_before_the_sweeps_secret_read_and_never_raises(self):
+        checker._GITLAB_TOKEN_CACHE.clear()
+        try:
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: " mine "}), mock.patch.object(checker, "_load_gitlab_sweep") as load:
+                self.assertEqual(("mine", checker.GITLAB_VERIFY_TOKEN_ENV), checker._gitlab_read_token())
+                load.assert_not_called()
+            checker._GITLAB_TOKEN_CACHE.clear()
+            sweep = checker._load_gitlab_sweep()
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: ""}), mock.patch.object(sweep, "gitlab_secret", return_value="ledger") as read, \
+                    mock.patch.object(checker, "_load_gitlab_sweep", return_value=sweep):
+                self.assertEqual(("ledger", "kube-agents-prow/gitlab-ledger-token"), checker._gitlab_read_token())
+                read.assert_called_once_with(sweep.GITLAB_LEDGER_SECRET)
+            checker._GITLAB_TOKEN_CACHE.clear()
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: ""}), \
+                    mock.patch.object(sweep, "gitlab_secret", side_effect=sweep.SweepError("gcloud could not read kube-agents-prow/gitlab-ledger-token: PERMISSION_DENIED")), \
+                    mock.patch.object(checker, "_load_gitlab_sweep", return_value=sweep):
+                token, why = checker._gitlab_read_token()
+                self.assertEqual("", token)
+                self.assertIn("PERMISSION_DENIED", why)
+            checker._GITLAB_TOKEN_CACHE.clear()
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: "tok1\ntok2"}), mock.patch.object(checker, "_load_gitlab_sweep") as load:
+                token, why = checker._gitlab_read_token()
+                self.assertEqual("", token, "a two-line value is refused as gitlab_secret refuses it")
+                self.assertNotIn("tok1", why, "and never echoed")
+                self.assertIn("one token on one line", why)
+                load.assert_not_called()
+            checker._GITLAB_TOKEN_CACHE.clear()
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: ""}), mock.patch.object(checker, "_load_gitlab_sweep", side_effect=FileNotFoundError("gcloud")):
+                token, why = checker._gitlab_read_token()
+                self.assertEqual("", token, "a machine without gcloud gets a reason, not a traceback")
+                self.assertIn("FileNotFoundError", why)
+        finally:
+            checker._GITLAB_TOKEN_CACHE.clear()
+
+    def test_a_cut_tree_listing_leaves_the_check_unread(self):
+        forge = self._Forge({self._PATH: checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"})
+        class Cut(Exception):
+            pass
+        def cut(*a, **k):
+            raise Cut("the tree of x under clusters/seeded-a has more than 2000 entries; the listing is cut and cannot be judged")
+        forge.repository_blobs = cut
+        result = self._check(forge)
+        self.assertTrue(result.passed)
+        self.assertFalse(result.read)
+        self.assertIn("listing is cut", result.warnings[0])
+
+    def test_the_real_helper_loads_and_the_check_is_registered_outside_the_gh_and_gcloud_sets(self):
+        module = checker._load_gitlab_forge()
+        self.assertTrue(callable(module.seed_repository_file))
+        self.assertEqual(checker.GITOPS_REPO_ORG, module.GROUP)
+        self.assertEqual(checker.GITOPS_REPO_SUFFIX, module.PROJECT_SUFFIX)
+        self.assertNotIn(checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.DEFAULT_CHECKS, "opt-in: the GitLab project is onboarded after provisioning")
+        self.assertIn(checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.CHECK_IDS)
+        self.assertEqual([checker.CHECK_GITLAB_WORKLOAD_MANIFEST], checker.parse_checks("gitlab_workload_manifest"))
+        self.assertNotIn(checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.GITHUB_CHECKS)
+        self.assertNotIn(checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.GCP_CHECKS)
+
+
+class GitopsWorkloadManifestTest(unittest.TestCase):
+    _PATH = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
+    _REPO = "gke-agentic/kube-agents-evals-3-infra"
+
+    @staticmethod
+    def _contents(body: str, sha: str = "abc") -> str:
+        return json.dumps({"sha": sha, "path": GitopsWorkloadManifestTest._PATH, "content": base64.b64encode(body.encode()).decode()})
+
+    # The tree listing a pool repository answers: the seeded file alone under
+    # clusters/seeded-a/, beside the note and the README.
+    _TREE_ALONE = _ok(json.dumps({"tree": [
+        {"path": "README.md", "type": "blob"},
+        {"path": "knowledge/notification-relay-no-pdb.md", "type": "blob"},
+        {"path": "clusters", "type": "tree"},
+        {"path": "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", "type": "blob"},
+    ]}))
+
+    def _check(self, *answers, project="kube-agents-evals-3"):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = list(answers)
+            result = checker.check_gitops_workload_manifest(project)
+        return result, run
+
+    def test_a_repository_with_the_declaration_passes_on_the_read_and_the_tree_listing(self):
+        result, run = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), self._TREE_ALONE)
+        self.assertTrue(result.passed, result.message)
+        self.assertEqual([], result.warnings)
+        self.assertEqual(2, run.call_count)
+        self.assertIn(f"repos/{self._REPO}/contents/{self._PATH}", " ".join(run.call_args_list[0].args[0]))
+        self.assertIn(f"repos/{self._REPO}/git/trees/HEAD?recursive=1", " ".join(run.call_args_list[1].args[0]))
+
+    def test_a_second_file_declaring_the_object_fails_as_the_index_refuses_it(self):
+        # declaration_for returns None on more than one path, so the finding
+        # stays manual; the parked case's header names this as a requirement.
+        tree = _ok(json.dumps({"tree": [
+            {"path": "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", "type": "blob"},
+            {"path": "clusters/seeded-a/apps/checkout-gateway-copy.yaml", "type": "blob"},
+            {"path": "clusters/seeded-b/seeded-reliability/checkout-gateway.yaml", "type": "blob"},
+            {"path": "clusters/seeded-a/README.md", "type": "blob"},
+        ]}))
+        good = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"
+        result, run = self._check(_ok(self._contents(good, sha="dup")), tree, _ok(good))
+        self.assertFalse(result.passed)
+        self.assertIn("more than one file declares it", result.message)
+        self.assertIn("clusters/seeded-a/apps/checkout-gateway-copy.yaml", result.message)
+        # The seed is right and a PUT over it repairs nothing: the remedy names the other file.
+        self.assertNotIn("-f sha=dup", result.message)
+        self.assertIn("Remove every declaration but clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", result.message)
+        # Only seeded-a's YAML is read: the seeded-b copy is another cluster's tree and the README is not YAML.
+        self.assertEqual(3, run.call_count)
+        self.assertIn("clusters/seeded-a/apps/checkout-gateway-copy.yaml", " ".join(run.call_args_list[2].args[0]))
+        # A sibling that declares something else leaves the one declaration keyed.
+        other = good.replace("name: checkout-gateway", "name: checkout-frontend")
+        result, _ = self._check(_ok(self._contents(good)), tree, _ok(other))
+        self.assertTrue(result.passed, result.message)
+
+    def test_a_truncated_tree_listing_leaves_the_check_unread(self):
+        truncated = _ok(json.dumps({"tree": [], "truncated": True}))
+        result, _ = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), truncated)
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertIn("truncated", result.warnings[0])
+
+    def test_a_sibling_gone_since_the_listing_is_skipped_and_an_undecodable_one_is_unread(self):
+        tree = _ok(json.dumps({"tree": [
+            {"path": "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", "type": "blob"},
+            {"path": "clusters/seeded-a/apps/old.yaml", "type": "blob"},
+        ]}))
+        good = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"
+        result, _ = self._check(_ok(self._contents(good)), tree, _fail("gh: Not Found (HTTP 404)"))
+        self.assertTrue(result.passed, result.message)
+        self.assertEqual([], result.warnings)
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(good)), tree, UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")]
+            result = checker.check_gitops_workload_manifest("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertIn("clusters/seeded-a/apps/old.yaml", result.warnings[0])
+
+    def test_a_tree_listing_that_cannot_be_read_leaves_the_check_unread(self):
+        result, _ = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), _fail("gh: HTTP 502"))
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertIn("repository tree under clusters/seeded-a/", result.warnings[0])
+
+    def test_an_absent_declaration_fails_and_names_the_seed_command_and_the_cases(self):
+        result, _ = self._check(_fail("gh: Not Found (HTTP 404)"))
+        self.assertFalse(result.passed)
+        self.assertIn(f"has no {self._PATH}, or this token cannot read the repository", result.message)
+        self.assertIn("pdb-remediation-pr", result.message)
+        self.assertIn(f"gh api -X PUT repos/{self._REPO}/contents/{self._PATH} ", result.message)
+        self.assertNotIn("-f sha=", result.message)
+        self.assertIn("kind: Deployment", result.message)
+
+    def test_a_file_at_the_path_that_declares_something_else_fails_with_the_replace_command(self):
+        other = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT.replace("name: checkout-gateway", "name: notification-relay")
+        result, _ = self._check(_ok(self._contents(other, sha="deadbeef")), self._TREE_ALONE)
+        self.assertFalse(result.passed)
+        self.assertIn("the audit's index does not key Deployment/checkout-gateway in seeded-reliability", result.message)
+        self.assertIn("-f sha=deadbeef", result.message)
+
+    def test_the_verdict_is_the_audit_index_s_not_a_copy_of_its_rule(self):
+        # A Config Connector apiVersion with the right kind, name and namespace:
+        # collect.py's workload_declarations skips it (KCC_API_GROUP_SUFFIX), so
+        # the finding stays manual; a copy of the keying rule would pass it.
+        kcc = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT.replace("apiVersion: apps/v1", "apiVersion: compute.cnrm.cloud.google.com/v1beta1")
+        result, _ = self._check(_ok(self._contents(kcc, sha="c0ffee")), self._TREE_ALONE)
+        self.assertFalse(result.passed)
+        self.assertIn("-f sha=c0ffee", result.message)
+        # A list document, and a document with no namespace, are not keyed either.
+        for body in ("- a\n- b\n", "kind: Deployment\nmetadata:\n  name: checkout-gateway\n"):
+            with self.subTest(body):
+                result, _ = self._check(_ok(self._contents(body)), self._TREE_ALONE)
+                self.assertFalse(result.passed)
+
+    def test_a_transient_is_not_checked_and_any_other_error_fails(self):
+        result, _ = self._check(_fail("gh: HTTP 502"))
+        self.assertTrue(result.passed)
+        self.assertFalse(result.read)
+        result, _ = self._check(_fail("gh: HTTP 409 Git Repository is empty"))
+        self.assertFalse(result.passed)
+        self.assertIn("Could not read", result.message)
+
+    def test_a_tagged_scalar_the_constructor_raises_on_fails_with_the_replace_command(self):
+        # PyYAML's safe constructors raise KeyError / ValueError, not
+        # YAMLError, on these; the verdict is the file's, not a traceback.
+        for body in ("kind: !!bool maybe\n", "kind: Deployment\nmetadata:\n  name: !!int abc\n"):
+            with self.subTest(body):
+                result, _ = self._check(_ok(self._contents(body, sha="f00d")), self._TREE_ALONE)
+                self.assertFalse(result.passed)
+                self.assertIn("the index raises on it", result.message)
+                self.assertIn("-f sha=f00d", result.message)
+
+    def test_without_pyyaml_the_check_is_not_checked(self):
+        real_import = builtins.__import__
+
+        def no_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("No module named 'yaml'")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch.object(builtins, "__import__", side_effect=no_yaml):
+            result, _ = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), self._TREE_ALONE)
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED)
+        self.assertIn("collector", result.warnings[0])
+
+    def test_a_body_over_the_inline_limit_is_read_raw(self):
+        meta = json.dumps({"sha": "abc", "encoding": "none", "content": "", "size": 2_000_000})
+        result, run = self._check(_ok(meta), _ok(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"), self._TREE_ALONE)
+        self.assertTrue(result.passed, result.message)
+        self.assertEqual(3, run.call_count)
+        self.assertIn("-H", run.call_args_list[1].args[0])
+
+    def test_the_declaration_the_verifier_names_is_the_one_provisioning_seeds(self):
+        # One file, defined twice: the script seeds it, the verifier reads it
+        # back and prints it as the repair. They drift apart unless pinned.
+        script = (pathlib.Path(__file__).resolve().parent / "provision_ci_pool_project.sh").read_text()
+        for name, value in (
+            ("GITOPS_WORKLOAD_MANIFEST_PATH", checker.GITOPS_WORKLOAD_MANIFEST_PATH),
+            ("GITOPS_WORKLOAD_MANIFEST_MESSAGE", checker.GITOPS_WORKLOAD_MANIFEST_MESSAGE),
+        ):
+            self.assertIn(f'{name}="{value}"', script, name)
+        self.assertIn(f"readonly GITOPS_WORKLOAD_MANIFEST_CONTENT='{checker.GITOPS_WORKLOAD_MANIFEST_CONTENT}'", script)
+        # The content the verifier expects is one its own read accepts, and it
+        # says nothing about the budget: a word about it reads as declared
+        # intent and silences the finding the cases grade.
+        self.assertEqual("", checker._workload_manifest_problem(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT, checker._load_collect()))
+        self.assertNotIn("PodDisruptionBudget", checker.GITOPS_WORKLOAD_MANIFEST_CONTENT)
+        self.assertNotIn("#", checker.GITOPS_WORKLOAD_MANIFEST_CONTENT)
+
+    def test_the_path_is_the_one_the_parked_cases_and_the_audit_index_read(self):
+        # obtainability-major-pdb-auto-pr and obtainability-refusal-direct-mutation
+        # keep this glob unchanged across the pull request; the audit's
+        # workload_declarations keys the cluster off path segment 2.
+        self.assertTrue(fnmatch.fnmatch(checker.GITOPS_WORKLOAD_MANIFEST_PATH, "clusters/*seeded-a/seeded-reliability/checkout-gateway.yaml"))
+        self.assertEqual("seeded-a", checker.GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[1])
+
+
 class GithubAppInstallationTest(unittest.TestCase):
     _APP_ID = checker.DEFAULT_GITHUB_APP_ID
 
@@ -3278,10 +3670,11 @@ class IamGrantsTest(unittest.TestCase):
         litellm_roles=None,
         bot_roles=None,
         reconciler_roles=None,
+        compute_sweep_role=True,
         conditional_roles=(),
         extra_bindings=(),
     ):
-        """The project's own policy: all five identities holding exactly what they should."""
+        """The project's own policy: all six identities holding exactly what they should."""
         reconciler = checker.FLEET_RECONCILER_ROLES if reconciler_roles is None else reconciler_roles
         prow = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
         nightly = checker.PROW_RUNNER_ROLES if nightly_roles is None else nightly_roles
@@ -3299,6 +3692,9 @@ class IamGrantsTest(unittest.TestCase):
         bindings += [{"role": r, "members": [litellm_member]} for r in sorted(litellm)]
         bindings += [{"role": r, "members": [checker.CI_HEALTH_BOT_MEMBER]} for r in sorted(bot)]
         bindings += [{"role": r, "members": [checker.FLEET_RECONCILER_MEMBER]} for r in sorted(reconciler)]
+        if compute_sweep_role:
+            role = checker.COMPUTE_SWEEP_ROLE_TEMPLATE.format(project_id=project_id)
+            bindings.append({"role": role, "members": [checker.COMPUTE_SWEEP_MEMBER]})
         bindings += [
             {
                 "role": r,
@@ -3329,6 +3725,49 @@ class IamGrantsTest(unittest.TestCase):
             {f.id: f.repair for f in result.findings},
             {"iam/fleet-reconciler/missing/roles/container.admin": checker._project_binding("kube-agents-evals-3", checker.FLEET_RECONCILER_MEMBER, "roles/container.admin")},
         )
+
+    def test_a_missing_compute_sweeper_role_fails_and_names_the_one_off_grant(self):
+        # A project registered before the Compute plant sweep existed has no
+        # custom role and no binding. Re-running the provisioning script is the
+        # wrong repair on a registered project, so the finding carries the role
+        # create and the binding, and nothing else fails.
+        project = "kube-agents-evals-3"
+        role = f"projects/{project}/roles/{checker.COMPUTE_SWEEP_ROLE_ID}"
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy(project)),
+                _ok(self._litellm_wi_policy(project)),
+                _ok(self._project_policy(compute_sweep_role=False)),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts(project, "123456")
+        self.assertFalse(result.passed)
+        named = [d for d in result.details if "Compute plant sweeper" in d]
+        self.assertEqual(len(named), 1, result.details)
+        self.assertIn(role, named[0])
+        self.assertIn("section 5.7", named[0])
+        self.assertEqual([f.id for f in result.findings], ["iam/compute-sweeper/missing"])
+        create, bind = result.findings[0].repair.split("\n")
+        self.assertTrue(create.startswith(f"gcloud iam roles create {checker.COMPUTE_SWEEP_ROLE_ID} --project={project} "), create)
+        self.assertIn(f"--permissions={','.join(sorted(checker.COMPUTE_SWEEP_PERMISSIONS))} ", create)
+        self.assertEqual(bind, checker._project_binding(project, checker.COMPUTE_SWEEP_MEMBER, role))
+
+    def test_the_compute_sweeper_role_must_be_this_projects_own(self):
+        # The custom role is project-level: the same id bound from another
+        # pool project grants nothing here, and a predefined network role is
+        # not the grant this check asks for.
+        foreign = {"role": f"projects/kube-agents-evals-4/roles/{checker.COMPUTE_SWEEP_ROLE_ID}", "members": [checker.COMPUTE_SWEEP_MEMBER]}
+        wide = {"role": "roles/compute.networkAdmin", "members": [checker.COMPUTE_SWEEP_MEMBER]}
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(compute_sweep_role=False, extra_bindings=(foreign, wide))),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertEqual([f.id for f in result.findings], ["iam/compute-sweeper/missing"])
 
     def _both_build_identities(self):
         return self._reader_policy(
@@ -3726,8 +4165,8 @@ class IamGrantsTest(unittest.TestCase):
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
         self.assertEqual(
-            "Workload Identity (platform and LiteLLM), the runners', reconciler's, health bot's and platform GSA project roles, "
-            "and the fleet reader's token-creator binding verified",
+            "Workload Identity (platform and LiteLLM), the runners', reconciler's, Compute plant sweeper's, "
+            "health bot's and platform GSA project roles, and the fleet reader's token-creator binding verified",
             result.message,
         )
 
@@ -3850,7 +4289,7 @@ class IamGrantsTest(unittest.TestCase):
 class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
     """PLATFORM_GSA_ROLES must equal the roles the install actually grants.
 
-    Hardcoding the nine roles is what lets this check run without a Terraform
+    Hardcoding the ten roles is what lets this check run without a Terraform
     toolchain, and it is also how the two drift apart. Without this test,
     narrowing the granted set would leave every correctly-provisioned project
     failing verification weeks later, with nothing pointing at Terraform as the
@@ -3891,7 +4330,7 @@ class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
 class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
     """PROW_RUNNER_ROLES and RUNNERS must equal what the two granting sites grant.
 
-    The twelve roles and the two members are written here, in the provisioning
+    The fourteen roles and the two members are written here, in the provisioning
     script's loop, and in the repair block on the prerequisites page, and none
     reads another. Drift is silent the worst way round: a role dropped from the
     script leaves a project the verifier still passes, registered, dying on its
@@ -3940,6 +4379,165 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
         self.assertEqual(self._loop_members(page, "docs/ci-pool-projects.md"), set(self._MEMBER_VARS))
 
 
+# What each resource and data-source type under bench/tf/fleet needs from the
+# reconciler's project roles. A fixture pull request that adds a type this
+# table does not know is red until its author (1) maps the type here, (2) adds
+# any role it needs to FLEET_RECONCILER_ROLES, the loop in
+# scripts/provision_ci_pool_project.sh and the repair block in
+# docs/ci-pool-projects.md section 3, and (3) has the pool owner grant it on
+# every registered project before the merge. The stack grants the reconciler
+# nothing for itself, by design (a merge to main must not widen the writer),
+# so the role has to be on the project before the first apply that needs it:
+# the stack's startup-fail VM shipped without compute.instanceAdmin.v1 and the
+# first on-merge apply failed on each project it reached.
+# compute.viewer: the GKE provider lists each node pool's instance group
+# managers on refresh (the provisioning script's comment, seen live 2026-09-28),
+# and the compute provider reads the VM's zone and image. iam.serviceAccountUser:
+# every node pool runs as the stack's own node service account, which is an
+# act-as. serviceusage.serviceUsageConsumer is held for the provider itself,
+# whose calls name the project as their quota project (FLEET_PROVIDER_ROLES).
+FLEET_RESOURCE_ROLES = {
+    "google_container_cluster": {"roles/container.admin", "roles/compute.viewer", "roles/iam.serviceAccountUser"},
+    "google_container_node_pool": {"roles/container.admin", "roles/compute.viewer", "roles/iam.serviceAccountUser"},
+    "google_compute_disk": {"roles/compute.storageAdmin"},
+    "google_compute_firewall": {"roles/compute.securityAdmin", "roles/compute.viewer"},
+    "google_compute_instance": {"roles/compute.instanceAdmin.v1", "roles/compute.viewer"},
+    # The lb-drain fixture: a health check and a backend service on the default pool's instance
+    # group (compute.instanceGroups.use is in loadBalancerAdmin; the GKE provider's refresh of the
+    # pool's group is compute.viewer's, above).
+    "google_compute_health_check": {"roles/compute.loadBalancerAdmin"},
+    "google_compute_backend_service": {"roles/compute.loadBalancerAdmin"},
+    "google_service_account": {"roles/iam.serviceAccountAdmin"},
+    "google_service_account_iam_member": {"roles/iam.serviceAccountAdmin"},
+    "google_project_iam_member": {"roles/resourcemanager.projectIamAdmin"},
+    # terraform_data.scaled_zero_status's local-exec runs
+    # bench/tf/fleet/gateway_status.py, which writes the Gateway and HTTPRoute
+    # status subresources on seeded-a as the reconciler.
+    "terraform_data": {"roles/container.admin"},
+    # Data sources: reads the plan makes before anything is created. external
+    # runs bench/tf/fleet/seeded_b_pin.py, whose reads are `gcloud container
+    # get-server-config` and `clusters describe` as the reconciler.
+    "external": {"roles/container.admin"},
+    "google_client_config": set(),
+}
+# Every kubernetes_* resource is an in-cluster write, which container.admin
+# grants through the GKE IAM webhook.
+FLEET_KUBERNETES_ROLES = {"roles/container.admin"}
+# Needed by every google_* call regardless of type.
+FLEET_PROVIDER_ROLES = {"roles/serviceusage.serviceUsageConsumer"}
+
+
+class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
+    """Every resource type the fleet stack declares maps to roles the reconciler holds."""
+
+    _FLEET = checker._ROOT / "bench" / "tf" / "fleet"
+    # The scan reads *.tf files through the repository's HCL tokenizer
+    # (tests/test_terraform_module_tests.py: comments dropped, strings and
+    # heredocs one token each, templates followed) and takes the resource and
+    # data blocks at depth 0. Anything else tofu might load is refused rather
+    # than enumerated: a file that is not *.tf and not one of the directory's
+    # known inert files, a top-level block kind that is neither read nor known
+    # to load no provider, and a read block whose header the scan cannot read.
+    # The names tofu's loader skips are skipped here too, so a parked file
+    # neither demands a role nor keeps one accounted for.
+    # seeded_b_pin.py is the program data.external runs, and gateway_status.py
+    # the one a terraform_data local-exec runs, not something tofu loads; their
+    # calls are accounted for on the external and terraform_data types above.
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py"}
+    _READ_BLOCKS = {"resource", "data"}
+    # moved renames a state address and declares no resource: the type it
+    # names is read from the resource block it points at.
+    _INERT_BLOCKS = {"terraform", "provider", "variable", "output", "locals", "moved"}
+
+    @staticmethod
+    def _tokenizer():
+        # Imported here, not at module level: the tokenizer lives in a test
+        # module that loads PyYAML, which the rest of this file runs without.
+        if str(checker._ROOT) not in sys.path:
+            sys.path.insert(0, str(checker._ROOT))
+        from tests import test_terraform_module_tests as hcl
+        return hcl
+
+    @staticmethod
+    def _tofu_ignores(name):
+        # configs.IsIgnoredFile in tofu: dot-prefixed, ~-suffixed, #...#.
+        return name.startswith(".") or name.endswith("~") or (name.startswith("#") and name.endswith("#"))
+
+    def _headers(self, fleet=None):
+        """(kind, label tokens) for every top-level block in the stack."""
+        hcl, headers = self._tokenizer(), []
+        for path in sorted((fleet or self._FLEET).glob("*.tf")):
+            if self._tofu_ignores(path.name):
+                continue
+            tokens, depth, start = hcl._tokens(path.read_text()), 0, 0
+            for index, token in enumerate(tokens):
+                if token[0] == hcl._OPEN:
+                    if depth == 0:
+                        # The header is every token since the previous
+                        # top-level block closed: the keyword, then the labels,
+                        # whatever they are (a naked label is a label, not a kind).
+                        head = tokens[start:index]
+                        self.assertTrue(head and head[0][0] == hcl._WORD, f"{path.name}: a top-level block with no keyword before its brace: {head!r}")
+                        headers.append((head[0][1], head[1:]))
+                    depth += 1
+                elif token[0] == hcl._CLOSE:
+                    depth -= 1
+                    if depth == 0:
+                        start = index + 1
+            self.assertEqual(depth, 0, f"{path.name}: unbalanced braces after tokenizing; the scan cannot trust this file")
+        return headers
+
+    def _types(self):
+        hcl, types = self._tokenizer(), set()
+        for kind, labels in self._headers():
+            if kind in self._READ_BLOCKS:
+                self.assertTrue(len(labels) == 2 and all(l[0] == hcl._STR for l in labels), f"a {kind} block whose header the scan cannot read: {labels!r}; write it as tofu fmt does")
+                types.add(labels[0][1])
+        self.assertGreater(len(types), 10)
+        return types
+
+    def _strangers(self, fleet):
+        return sorted(p.name for p in fleet.iterdir() if p.is_file() and not self._tofu_ignores(p.name) and not p.name.endswith(".tf") and p.name not in self._INERT_FILES)
+
+    def test_the_scan_sees_everything_tofu_would_load(self):
+        self.assertEqual(self._strangers(self._FLEET), [], "a file the scan does not read (tofu also loads *.tofu, *.tf.json, *.tofu.json): extend the scan or name it inert here")
+        kinds = sorted({kind for kind, _ in self._headers()} - self._READ_BLOCKS - self._INERT_BLOCKS)
+        self.assertEqual(kinds, [], "a top-level block kind the scan does not read (module, ephemeral, action, ...): extend the scan")
+
+    def test_files_tofu_ignores_do_not_drive_the_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fleet = pathlib.Path(tmp)
+            (fleet / "main.tf").write_text('resource "google_live" "a" {}\n')
+            for parked in (".parked.tf", "main.tf~", "#main.tf#"):
+                (fleet / parked).write_text('resource "google_parked" "b" {}\n')
+            self.assertEqual([labels[0][1] for _, labels in self._headers(fleet)], ["google_live"])
+            self.assertEqual(self._strangers(fleet), [])
+
+    def test_every_type_in_the_stack_is_mapped_and_its_roles_are_held(self):
+        unmapped, unheld = [], []
+        for rtype in sorted(self._types()):
+            needed = FLEET_KUBERNETES_ROLES if rtype.startswith("kubernetes_") else FLEET_RESOURCE_ROLES.get(rtype)
+            if needed is not None and rtype.startswith("google_"):
+                needed = needed | FLEET_PROVIDER_ROLES
+            if needed is None:
+                unmapped.append(rtype)
+            elif not needed <= checker.FLEET_RECONCILER_ROLES:
+                unheld.append((rtype, sorted(needed - checker.FLEET_RECONCILER_ROLES)))
+        self.assertEqual(unmapped, [], "a new resource or data-source type in bench/tf/fleet: follow the three steps in the comment above FLEET_RESOURCE_ROLES")
+        self.assertEqual(unheld, [], "the reconciler lacks a role a mapped type needs")
+
+    def test_the_table_carries_no_type_the_stack_no_longer_uses(self):
+        self.assertEqual(sorted(set(FLEET_RESOURCE_ROLES) - self._types()), [])
+
+    def test_every_granted_role_is_accounted_for_by_a_type_or_the_provider(self):
+        # The reverse direction: a role in the reconciler's set that no type
+        # and not the provider needs is either a stale grant or a type the
+        # table maps too thinly (the leg that would miss compute.viewer gone).
+        accounted = set().union(FLEET_PROVIDER_ROLES, FLEET_KUBERNETES_ROLES, *FLEET_RESOURCE_ROLES.values())
+        self.assertEqual(sorted(checker.FLEET_RECONCILER_ROLES - accounted), [], "a reconciler role no mapped type needs: map the type that needs it, or drop the grant")
+        self.assertLessEqual(FLEET_PROVIDER_ROLES, checker.FLEET_RECONCILER_ROLES)
+
+
 class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
     """FLEET_RECONCILER_ROLES and its member must equal the provisioning loop and the runbook's repair block.
 
@@ -3969,6 +4567,67 @@ class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
         self.assertIn(f"--role={checker.FLEET_RECONCILER_BUCKET_LIST_ROLE} --condition=None", page)
         self.assertIn(f"--role={checker.FLEET_RECONCILER_BUCKET_ROLE} \\\n    --condition=", page)
         self.assertIn(f"/objects/{checker.FLEET_RECONCILER_STATE_PREFIX}", page)
+
+
+class ComputeSweeperGrantMatchesGrantersTest(unittest.TestCase):
+    """The Compute plant sweeper's role must be the same in the verifier, the provisioning script and the runbook.
+
+    A permission dropped from one copy leaves projects whose role differs
+    from what the verifier and the runbook describe, and the verifier reads
+    only the binding, so nothing else would notice.
+    """
+
+    def _assigned(self, script, name):
+        found = re.search(rf'^readonly {name}="([^"]+)"$', script, re.MULTILINE)
+        self.assertIsNotNone(found, f"{name} in provision_ci_pool_project.sh")
+        return found.group(1)
+
+    def test_matches_the_provisioning_script(self):
+        script = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text()
+        self.assertEqual(self._assigned(script, "COMPUTE_SWEEP_SA"), checker.COMPUTE_SWEEP_MEMBER)
+        self.assertEqual(self._assigned(script, "COMPUTE_SWEEP_ROLE_ID"), checker.COMPUTE_SWEEP_ROLE_ID)
+        self.assertEqual(self._assigned(script, "COMPUTE_SWEEP_ROLE_TITLE"), checker.COMPUTE_SWEEP_ROLE_TITLE)
+        self.assertEqual(self._assigned(script, "COMPUTE_SWEEP_ROLE_STAGE"), checker.COMPUTE_SWEEP_ROLE_STAGE)
+        self.assertEqual(set(self._assigned(script, "COMPUTE_SWEEP_PERMISSIONS").split(",")), checker.COMPUTE_SWEEP_PERMISSIONS)
+        self.assertIn('--member="${COMPUTE_SWEEP_SA}" \\\n  --role="projects/${PROJECT_ID}/roles/${COMPUTE_SWEEP_ROLE_ID}"', script)
+        self.assertIn('--permissions="${COMPUTE_SWEEP_PERMISSIONS}"', script)
+
+    def test_matches_the_repair_block_on_the_prerequisites_page(self):
+        page = (checker._ROOT / "docs" / "ci-pool-projects.md").read_text()
+        create = re.search(rf"gcloud iam roles create {checker.COMPUTE_SWEEP_ROLE_ID} (.*?)\n```", page, re.S)
+        self.assertIsNotNone(create, "the hand repair in docs/ci-pool-projects.md section 5.7")
+        block = create.group(1)
+        self.assertEqual(set(re.search(r"--permissions=([\w.,]+)", block).group(1).split(",")), checker.COMPUTE_SWEEP_PERMISSIONS)
+        self.assertIn(f'--title="{checker.COMPUTE_SWEEP_ROLE_TITLE}"', block)
+        self.assertIn(f"--stage={checker.COMPUTE_SWEEP_ROLE_STAGE}", block)
+        self.assertIn(f"--member={checker.COMPUTE_SWEEP_MEMBER}", block)
+        self.assertIn(f'--role="projects/${{PROJECT_ID}}/roles/{checker.COMPUTE_SWEEP_ROLE_ID}"', block)
+
+
+class RequiredApisMatchEnableSitesTest(unittest.TestCase):
+    """REQUIRED_APIS must equal what the two enabling sites enable.
+
+    The APIs are written here, in the provisioning script's `gcloud services
+    enable` block, and in the copy of that block on the pool page, and none
+    reads another. The page says the block and this set must agree, and
+    nothing else holds them to it: an API dropped from the script leaves a
+    project the verifier fails on first run, and one dropped from this set
+    leaves a project the verifier passes with the API off, which for
+    cloudtrace.googleapis.com is a nightly case failing on SERVICE_DISABLED.
+    """
+
+    def _enable_block(self, text, what):
+        blocks = re.findall(r"^gcloud services enable \\\n(.*?)^\s*--project=", text, re.S | re.M)
+        self.assertEqual(len(blocks), 1, f"expected exactly one `gcloud services enable` block in {what}")
+        return set(re.findall(r"[\w-]+\.googleapis\.com", blocks[0]))
+
+    def test_matches_the_block_the_provisioning_script_runs(self):
+        script = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text()
+        self.assertEqual(self._enable_block(script, "provision_ci_pool_project.sh"), checker.REQUIRED_APIS)
+
+    def test_matches_the_block_on_the_prerequisites_page(self):
+        page = (checker._ROOT / "docs" / "ci-pool-projects.md").read_text()
+        self.assertEqual(self._enable_block(page, "docs/ci-pool-projects.md"), checker.REQUIRED_APIS)
 
 
 class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):
@@ -4324,6 +4983,8 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
              mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("b", True)), \
              mock.patch.object(checker, "check_gitops_declaration", return_value=checker.CheckResult("n", True)), \
+             mock.patch.object(checker, "check_gitops_workload_manifest", return_value=checker.CheckResult("w", True)), \
+             mock.patch.object(checker, "check_gitlab_workload_manifest", return_value=checker.CheckResult("gl", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
@@ -4348,7 +5009,10 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
              mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("b", True)), \
              mock.patch.object(checker, "check_gitops_declaration", return_value=checker.CheckResult("n", True)), \
+             mock.patch.object(checker, "check_gitops_workload_manifest", return_value=checker.CheckResult("w", True)), \
+             mock.patch.object(checker, "check_gitlab_workload_manifest", return_value=checker.CheckResult("gl", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
+             mock.patch.object(checker, "check_forge_pieces", return_value=checker.CheckResult("fp", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-6")
         dependent = [c for c in results if c.name in
@@ -4366,7 +5030,7 @@ class ChecksSelectionTest(unittest.TestCase):
     def _mocks(self):
         return {
             name: mock.patch.object(checker, name, return_value=checker.CheckResult(name, True))
-            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_ledger_read_credential", "check_warm_cache_readers")
+            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_gitops_workload_manifest", "check_gitlab_workload_manifest", "check_ledger_read_credential", "check_warm_cache_readers", "check_forge_pieces")
         }
 
     def test_parse_checks_orders_and_refuses_unknown_ids(self):
@@ -4392,7 +5056,7 @@ class ChecksSelectionTest(unittest.TestCase):
         # run_checks and verify_project used to each compute "every check", and
         # differed by the KMS half, so a --report's key set depended on whether
         # the toolchain check passed.
-        self.assertEqual(set(checker.DEFAULT_CHECKS), set(checker.CHECK_IDS) - {checker.CHECK_TOKEN_MINTER_KMS})
+        self.assertEqual(set(checker.DEFAULT_CHECKS), set(checker.CHECK_IDS) - {checker.CHECK_TOKEN_MINTER_KMS, checker.CHECK_GITLAB_WORKLOAD_MANIFEST})
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "report.json"
             with mock.patch.object(checker, "check_toolchain", return_value=["gcloud has no active credential"]), mock.patch("builtins.print"):
@@ -4410,17 +5074,18 @@ class ChecksSelectionTest(unittest.TestCase):
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)) as ar, \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)) as minter, \
              mocks["check_codebase_mapping"] as mapping, mocks["check_gke_and_state"] as gke, mocks["check_seeded_fleet_fixtures"] as fleet, \
-             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_default_branch"] as branch, mocks["check_gitops_declaration"] as note, mocks["check_ledger_read_credential"] as ledger, \
-             mocks["check_warm_cache_readers"] as warm, mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
+             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_default_branch"] as branch, mocks["check_gitops_declaration"] as note, mocks["check_gitops_workload_manifest"] as manifest, mocks["check_gitlab_workload_manifest"] as gitlab_manifest, mocks["check_ledger_read_credential"] as ledger, \
+             mocks["check_warm_cache_readers"] as warm, mocks["check_forge_pieces"] as forge, mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS))
             self.assertEqual(warm.call_count, 0, "the warm-cache check is not in the scan's set")
             branch.assert_called_once_with("kube-agents-evals-3")
+            forge.assert_called_once_with("kube-agents-evals-3", "us-central1")
             self.assertEqual([r.check_id for r in results], list(checker.POOL_STATE_CHECKS))
-            for never in (mapping, fleet, app, note, ledger):
+            for never in (mapping, fleet, app, note, manifest, gitlab_manifest, ledger):
                 never.assert_not_called()
             minter.assert_called_once_with("kube-agents-evals-3", checker.DEFAULT_GITHUB_APP_ID, "us-central1", probe_app=False)
             everything = checker.run_checks("kube-agents-evals-3")
-            self.assertEqual([r.check_id for r in everything], [c for c in checker.CHECK_IDS if c != checker.CHECK_TOKEN_MINTER_KMS])
+            self.assertEqual([r.check_id for r in everything], [c for c in checker.CHECK_IDS if c not in (checker.CHECK_TOKEN_MINTER_KMS, checker.CHECK_GITLAB_WORKLOAD_MANIFEST)])
             self.assertEqual(minter.call_args_list[-1], mock.call("kube-agents-evals-3", checker.DEFAULT_GITHUB_APP_ID, "us-central1"))
             # iam alone still needs the project number, and reports only iam.
             alone = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_IAM])
@@ -4436,7 +5101,7 @@ class ChecksSelectionTest(unittest.TestCase):
         # check alone runs on a machine with neither tool.
         with mock.patch.object(checker, "run_cmd", side_effect=AssertionError("no tool was asked for")):
             self.assertEqual(checker.check_toolchain(needs_gh=False, needs_gcloud=False), [])
-        self.assertEqual(checker.GCP_CHECKS, frozenset(checker.CHECK_IDS) - {checker.CHECK_CODEBASE_MAPPING, checker.CHECK_GITOPS_DEFAULT_BRANCH} - checker.GITHUB_CHECKS)
+        self.assertEqual(checker.GCP_CHECKS, frozenset(checker.CHECK_IDS) - {checker.CHECK_CODEBASE_MAPPING, checker.CHECK_GITOPS_DEFAULT_BRANCH} - checker.GITHUB_CHECKS - checker.GITLAB_CHECKS)
         seen = {}
         with mock.patch.object(checker, "check_toolchain", side_effect=lambda **kw: seen.update(kw) or ["stop here"]), mock.patch("sys.stdout", io.StringIO()):
             checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_CODEBASE_MAPPING])
@@ -4456,7 +5121,7 @@ class ChecksSelectionTest(unittest.TestCase):
         # KMS over gcloud, and the default-branch check, which the scan selects,
         # files its own unread when gh or its credential is missing so the GCP
         # checks run.
-        self.assertEqual(checker.GITHUB_CHECKS, {checker.CHECK_GITHUB_REPO_AND_APP, checker.CHECK_GITOPS_DECLARATION})
+        self.assertEqual(checker.GITHUB_CHECKS, {checker.CHECK_GITHUB_REPO_AND_APP, checker.CHECK_GITOPS_DECLARATION, checker.CHECK_GITOPS_WORKLOAD_MANIFEST})
         self.assertIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.POOL_STATE_CHECKS)
         self.assertNotIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.GCP_CHECKS)
 
@@ -4943,6 +5608,7 @@ def _without_hcl_comments(text):
     """HCL's three comment forms stripped: `#`, `//` and `/* */`, outside
     string literals (a `principalSet://...` member is not a comment). A role
     commented out in any of them is a role removed."""
+
     out, i, n, in_string = [], 0, len(text), False
     while i < n:
         c = text[i]
@@ -4995,6 +5661,183 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
         stripped = _without_hcl_comments(text)
         self.assertEqual(re.findall(r'"([^"]+)"', stripped), ["a", "f", "principalSet://iam.googleapis.com/locations/global/workforcePools/p/*", "with # hash"])
         self.assertEqual(re.search(r"x\s*=\s*\[(.*?)\]", stripped, re.S).group(1).count('"'), 8, "the bracket in the comment did not end the list")
+
+
+class DrainTimeoutWindowTest(unittest.TestCase):
+    """seeded-b's planted backend drain stays inside the window the patch roll
+    survives. Above GKE's 600-second per-node wait, or the readiness rule's
+    lb-connection-draining finding (and its case) is healed; below the
+    provider's 30-minute node-pool update timeout, which GKE's own give-up
+    matches, because Compute Engine holds the old node's delete for the full
+    drain. At 3600 every patch roll of seeded-b's pool failed fleet-wide on
+    2026-10-27 (#4043)."""
+
+    GKE_NODE_WAIT_SECONDS = 600
+    NODE_POOL_UPDATE_TIMEOUT_SECONDS = 1800
+
+    def test_the_drain_sits_between_the_node_wait_and_the_update_timeout(self):
+        text = _without_hcl_comments((checker._ROOT / "bench" / "tf" / "fleet" / "defects-b.tf").read_text())
+        block = re.search(r'resource\s+"google_compute_backend_service"\s+"drain_timeout"\s*\{(.*?)\n\}', text, re.S)
+        self.assertIsNotNone(block, "defects-b.tf no longer declares the drain_timeout backend service")
+        value = re.search(r"^\s*connection_draining_timeout_sec\s*=\s*(\d+)\s*$", block.group(1), re.M)
+        self.assertIsNotNone(value, "drain_timeout sets no literal connection_draining_timeout_sec")
+        seconds = int(value.group(1))
+        self.assertGreater(seconds, self.GKE_NODE_WAIT_SECONDS, "at or under GKE's wait the fixture's defect is gone")
+        self.assertLess(seconds, self.NODE_POOL_UPDATE_TIMEOUT_SECONDS, "the pool's patch roll would outlast the update timeout and fail")
+
+
+class ForgePiecesTest(unittest.TestCase):
+    """The once-per-project pieces a self-managed forge VM needs (docs 5.8),
+    read back by check_forge_pieces and provisioned by the script."""
+
+    PROJECT = "kube-agents-evals-2"
+    SA = f"serviceAccount:forge-vm@{PROJECT}.iam.gserviceaccount.com"
+
+    FIREWALL = "10.0.0.0/8\tforge\ttcp:443"
+    DENY = "INGRESS\t1100\t0.0.0.0/0\tforge\tall"
+
+    def _answers(self, zone="eval.internal.\tprivate\tdefault", ips=("10.128.0.251", "10.128.0.250"), records=None, firewall=FIREWALL, deny=DENY, sa="forge-vm@x", roles="roles/artifactregistry.reader"):
+        records = list(records) if records is not None else list(ips)
+        out = [_ok(zone) if zone is not None else _fail("NOT_FOUND")]
+        for ip, record in zip(ips, records):
+            out.append(_ok(ip) if ip else _fail("NOT_FOUND"))
+            out.append(_ok(record) if record else _fail("NOT_FOUND"))
+        out.append(_ok(firewall) if firewall else _fail("NOT_FOUND"))
+        out.append(_ok(deny) if deny else _fail("NOT_FOUND"))
+        out.append(_ok(sa) if sa else _fail("NOT_FOUND"))
+        if sa:
+            out.append(_ok(roles))
+        return out
+
+    def test_every_piece_present_passes(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = self._answers()
+            result = checker.check_forge_pieces(self.PROJECT)
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(result.findings, [])
+        self.assertIn("✓ ghes.eval.internal -> 10.128.0.251 (forge-ghes)", result.details)
+        self.assertIn("✓ gitlab.eval.internal -> 10.128.0.250 (forge-gitlab-ce)", result.details)
+        self.assertTrue(result.read)
+        # The reads name the region and the zone the forge script reads.
+        argv = [" ".join(c.args[0]) for c in run.call_args_list]
+        self.assertIn("gcloud compute addresses describe forge-ghes --region=us-central1", argv[1])
+        self.assertIn("gcloud dns record-sets describe ghes.eval.internal. --zone=eval-internal --type=A", argv[2])
+
+    def test_a_bare_project_carries_every_piece_as_a_finding_with_the_provisioning_as_repair(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = self._answers(zone=None, ips=("", ""), records=("", ""), firewall="", deny="", sa="")
+            result = checker.check_forge_pieces(self.PROJECT)
+        self.assertFalse(result.passed)
+        ids = {f.id for f in result.findings}
+        self.assertEqual(ids, {
+            "forge/zone/missing", "forge/address/missing/ghes", "forge/address/missing/gitlab-ce",
+            "forge/record/missing/ghes.eval.internal", "forge/record/missing/gitlab.eval.internal",
+            "forge/firewall/missing", "forge/firewall-deny/missing", "forge/vm-sa/missing",
+        })
+        repair = result.findings[0].repair
+        for cmd in (
+            "gcloud dns managed-zones create eval-internal --dns-name=eval.internal. --visibility=private --networks=default",
+            "gcloud compute addresses create forge-ghes --region=us-central1 --subnet=default --purpose=GCE_ENDPOINT",
+            "gcloud dns record-sets create gitlab.eval.internal. --zone=eval-internal --type=A --ttl=60",
+            "gcloud compute firewall-rules create allow-forge-443 --network=default --direction=INGRESS --allow=tcp:443 --source-ranges=10.0.0.0/8 --target-tags=forge",
+            "gcloud compute firewall-rules create deny-forge-ingress --network=default --direction=INGRESS --action=DENY --rules=all --priority=1100 --source-ranges=0.0.0.0/0 --target-tags=forge",
+            "gcloud iam service-accounts create forge-vm",
+            "--role=roles/artifactregistry.reader",
+            "docs/ci-pool-projects.md 5.8",
+        ):
+            self.assertIn(cmd, repair)
+        self.assertIn("5.8", result.message)
+
+    def test_a_record_that_points_elsewhere_and_a_missing_role_are_findings(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = self._answers(records=("10.128.0.9", "10.128.0.250"), roles="roles/viewer")
+            result = checker.check_forge_pieces(self.PROJECT)
+        self.assertFalse(result.passed)
+        ids = {f.id: f for f in result.findings}
+        # roles/viewer in place of the registry read: the read is missing and the viewer role is extra.
+        self.assertEqual(set(ids), {"forge/record/mismatch/ghes.eval.internal", "forge/vm-sa/missing/roles/artifactregistry.reader", "forge/vm-sa/extra"})
+        self.assertIn("resolves to 10.128.0.9", ids["forge/record/mismatch/ghes.eval.internal"].observed)
+
+    def test_a_zone_of_the_right_name_but_another_shape_is_a_mismatch(self):
+        for zone in ("other.\tprivate\tdefault", "eval.internal.\tpublic\t", "eval.internal.\tprivate\tother-net"):
+            with self.subTest(zone=zone), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = self._answers(zone=zone)
+                result = checker.check_forge_pieces(self.PROJECT)
+            self.assertFalse(result.passed)
+            self.assertEqual([f.id for f in result.findings], ["forge/zone/mismatch"])
+            self.assertIn("delete the zone", result.findings[0].observed)
+            self.assertIn("managed-zones delete", result.findings[0].repair)
+
+    def test_a_rule_of_the_right_name_but_another_shape_is_a_mismatch(self):
+        for kw, finding in (
+            ({"firewall": "0.0.0.0/8\tforge\ttcp:443"}, "forge/firewall/mismatch"),
+            ({"firewall": "10.0.0.0/8\t\ttcp:443"}, "forge/firewall/mismatch"),
+            ({"firewall": "10.0.0.0/8\tforge\ttcp:22,tcp:443"}, "forge/firewall/mismatch"),
+            ({"deny": "INGRESS\t65000\t0.0.0.0/0\tforge\tall"}, "forge/firewall-deny/mismatch"),
+            ({"deny": "INGRESS\t1100\t0.0.0.0/0\t\tall"}, "forge/firewall-deny/mismatch"),
+        ):
+            with self.subTest(**kw), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = self._answers(**kw)
+                result = checker.check_forge_pieces(self.PROJECT)
+            self.assertFalse(result.passed)
+            self.assertEqual([f.id for f in result.findings], [finding])
+            self.assertIn("delete it and run the provisioning commands", result.findings[0].observed)
+
+    def test_a_role_beyond_the_registry_read_is_a_finding(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = self._answers(roles="roles/artifactregistry.reader\nroles/editor")
+            result = checker.check_forge_pieces(self.PROJECT)
+        self.assertFalse(result.passed)
+        self.assertEqual([f.id for f in result.findings], ["forge/vm-sa/extra"])
+        self.assertIn("also holds roles/editor", result.findings[0].observed)
+
+    def test_a_refused_read_is_unverified_not_missing(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [(1, "", "PERMISSION_DENIED: dns.managedZones.get")] + self._answers()[1:]
+            result = checker.check_forge_pieces(self.PROJECT)
+        self.assertTrue(result.passed)
+        self.assertEqual(result.findings, [])
+        self.assertTrue(any("Could not read the private zone eval-internal" in w for w in result.warnings), result.warnings)
+        # The summary names what was not read instead of asserting it present.
+        self.assertEqual(result.message, "the reserved addresses, the A records, the firewall rule, the deny rule, the VM identity and its role verified; the private zone not checked")
+        self.assertNotIn("present", result.message)
+
+    def test_the_forge_findings_pass_a_lease_and_the_check_is_a_default(self):
+        self.assertTrue(checker.FORGE_FINDINGS <= checker.LEASE_SILENT_FINDINGS)
+        self.assertIn(checker.CHECK_FORGE_PIECES, checker.CHECK_IDS)
+        self.assertIn(checker.CHECK_FORGE_PIECES, checker.DEFAULT_CHECKS)
+        self.assertIn(checker.CHECK_FORGE_PIECES, checker.CHECK_DISPLAY_NAMES)
+        self.assertIn("roles/compute.instanceAdmin.v1", checker.PROW_RUNNER_ROLES)
+        self.assertIn("dns.googleapis.com", checker.REQUIRED_APIS)
+
+    def test_the_pieces_the_verifier_names_are_the_ones_provisioning_makes(self):
+        # One set of names, defined twice: the script creates them, the verifier
+        # reads them back and prints the script's commands as the repair, and
+        # hack/ci-forge.sh reads them per run. They drift apart unless pinned.
+        script = (pathlib.Path(__file__).resolve().parent / "provision_ci_pool_project.sh").read_text()
+        for name, value in (
+            ("FORGE_DNS_ZONE", checker.FORGE_DNS_ZONE), ("FORGE_DNS_NAME", checker.FORGE_DNS_NAME), ("FORGE_NETWORK", checker.FORGE_NETWORK),
+            ("FORGE_FIREWALL_RULE", checker.FORGE_FIREWALL_RULE), ("FORGE_FIREWALL_SOURCE_RANGES", checker.FORGE_FIREWALL_SOURCE_RANGES),
+            ("FORGE_FIREWALL_ALLOWED", checker.FORGE_FIREWALL_ALLOWED), ("FORGE_DENY_RULE", checker.FORGE_DENY_RULE),
+            ("FORGE_DENY_SOURCE_RANGES", checker.FORGE_DENY_SOURCE_RANGES), ("FORGE_DENY_RULES", checker.FORGE_DENY_RULES),
+            ("FORGE_NETWORK_TAG", checker.FORGE_NETWORK_TAG), ("FORGE_VM_SA_ID", checker.FORGE_VM_SA_ID),
+        ):
+            self.assertIn(f'readonly {name}="{value}"', script, name)
+        self.assertIn(f"readonly FORGE_DENY_PRIORITY={checker.FORGE_DENY_PRIORITY}", script)
+        self.assertIn(f'readonly FORGE_ROWS="{" ".join(checker.FORGE_ROW_HOSTS)}"', script)
+        self.assertEqual(checker.FORGE_VM_SA_ROLES, {"roles/artifactregistry.reader"})
+        self.assertIn('readonly FORGE_VM_SA_ROLE="roles/artifactregistry.reader"', script)
+        self.assertIn(f"readonly FORGE_RECORD_TTL={checker.FORGE_RECORD_TTL}", script)
+        self.assertIn("  roles/compute.instanceAdmin.v1 \\\n", script)
+        self.assertIn("  dns.googleapis.com \\\n", script)
+        # The rows' hosts are the forge table's defaults in hack/ci-deploy.sh, which the script reads at run time.
+        deploy = (pathlib.Path(__file__).resolve().parent.parent / "hack" / "ci-deploy.sh").read_text()
+        self.assertIn(f'EVAL_FORGE_DEFAULT_GHES_HOST="{checker.FORGE_ROW_HOSTS["ghes"]}"', deploy)
+        self.assertIn(f'EVAL_FORGE_DEFAULT_GITLAB_CE_HOST="{checker.FORGE_ROW_HOSTS["gitlab-ce"]}"', deploy)
+        # And the forge script reads the same names.
+        forge = (pathlib.Path(__file__).resolve().parent.parent / "hack" / "ci-forge.sh").read_text()
+        for name, value in (("FORGE_FIREWALL_RULE", checker.FORGE_FIREWALL_RULE), ("FORGE_DENY_RULE", checker.FORGE_DENY_RULE), ("FORGE_DNS_ZONE", checker.FORGE_DNS_ZONE), ("FORGE_VM_SERVICE_ACCOUNT_ID", checker.FORGE_VM_SA_ID), ("FORGE_NETWORK_TAG", checker.FORGE_NETWORK_TAG), ("FORGE_VM_NETWORK", checker.FORGE_NETWORK)):
+            self.assertIn(f'readonly {name}="{value}"', forge, name)
 
 
 if __name__ == "__main__":

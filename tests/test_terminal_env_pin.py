@@ -480,6 +480,44 @@ class ManagedEnvTest(unittest.TestCase):
                     tep.managed_terminal_env()
 
 
+class TerminalDefaultMirrorTest(unittest.TestCase):
+    """The preflight's mirror of the terminal tool's default, against a Hermes tree
+    written here, so CI runs the parse and the mismatch without Hermes importable.
+    The image build runs the same check against the Hermes it ships."""
+
+    TOOL_LINE = '        "timeout": _parse_env_var("TERMINAL_TIMEOUT", "{seconds}"),\n'
+
+    def hermes_tree(self, seconds, line=None):
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        tool = root / tep.TERMINAL_TOOL_FILE
+        tool.parent.mkdir(parents=True)
+        tool.write_text("FOREGROUND_MAX_TIMEOUT = 600\n" + (self.TOOL_LINE.format(seconds=seconds) if line is None else line))
+        return root
+
+    def test_the_mirror_is_read_from_the_preflight_in_the_checkout(self):
+        script = pathlib.Path(__file__).resolve().parents[1] / "agents" / "platform" / "scripts" / tep.PREFLIGHT_SCRIPT_NAME
+        declared = tep.PREFLIGHT_TERMINAL_MIRROR_RE.search(script.read_text())
+        self.assertIsNotNone(declared, "cluster_preflight.sh no longer declares TERMINAL_TOOL_TIMEOUT_SECONDS")
+        self.assertEqual(int(declared.group(1)), tep.preflight_terminal_mirror_seconds())
+
+    def test_the_default_is_read_from_the_terminal_tool_source(self):
+        mirror = tep.preflight_terminal_mirror_seconds()
+        self.assertEqual(mirror, tep.hermes_terminal_default_seconds(self.hermes_tree(mirror)))
+        self.assertIsNone(tep.terminal_default_mismatch(self.hermes_tree(mirror)))
+
+    def test_a_hermes_whose_default_moved_is_a_mismatch_naming_both_figures(self):
+        mirror = tep.preflight_terminal_mirror_seconds()
+        message = tep.terminal_default_mismatch(self.hermes_tree(mirror + 1))
+        self.assertIsNotNone(message)
+        self.assertIn(f"{mirror + 1}s on this Hermes", message)
+        self.assertIn(f"mirrors it as {mirror}s", message)
+
+    def test_a_terminal_tool_the_regex_no_longer_matches_is_an_error_not_a_pass(self):
+        with self.assertRaisesRegex(tep.PinError, "TERMINAL_TIMEOUT"):
+            tep.hermes_terminal_default_seconds(self.hermes_tree(0, line='        "timeout": 180,\n'))
+
+
 @unittest.skipUnless(HAS_HERMES, "needs hermes-agent importable")
 class HermesTest(unittest.TestCase):
     """What a real Hermes resolves, in and out of an operator pod."""
@@ -529,6 +567,16 @@ class HermesTest(unittest.TestCase):
             code, err = self.build_check()
         self.assertEqual(1, code)
         self.assertIn("would not pin the named profile", err)
+
+    def test_the_build_check_fails_when_the_preflight_mirror_disagrees_with_hermes(self):
+        # The wiring: build_check returns 1 on the mismatch. The parse and the
+        # mismatch text themselves are TerminalDefaultMirrorTest's, which CI
+        # runs; the agreement with the shipped Hermes is the image build's
+        # (deploy/docker/Dockerfile runs --build-check under it).
+        with mock.patch.object(tep, "hermes_terminal_default_seconds", return_value=tep.preflight_terminal_mirror_seconds() + 1):
+            code, err = self.build_check()
+        self.assertEqual(1, code)
+        self.assertIn("mirrors it as", err)
 
     def test_outside_the_operator_an_empty_etc_hermes_pins_nothing(self):
         self.assertEqual({}, tep.managed_terminal_env())

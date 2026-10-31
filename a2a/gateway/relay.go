@@ -1,14 +1,19 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // discordChunk leaves headroom under Discord's 2000-char message cap.
@@ -47,6 +52,21 @@ const (
 	requeueDelay    = 2 * time.Second
 )
 
+// relayMaxAckPending caps the events the relay holds unrendered on its
+// durable. Each is held until its conversation's worker renders it, so a
+// conversation whose door is slow holds its backlog, and at the cap the
+// server stops delivering to every conversation. The server default (1000)
+// is a few minutes of one busy conversation's progress events; this is
+// headroom for one stalled room without lifting the bound.
+const relayMaxAckPending = 8192
+
+// relayStopDrainTimeout bounds how long a stopping gateway waits for the
+// batches already rendering before it gives the rest back. The gateway pod
+// gets the kubelet's default 30s grace period, and the give-back has to run
+// inside it, or every held event waits out AckWait on the next gateway. A
+// batch that overruns this is given back and may post twice.
+const relayStopDrainTimeout = 15 * time.Second
+
 // relayState is the in-memory render state for one task's rolling line. It
 // is cache: a gateway restart loses it, and the terminal path falls back to
 // a stream replay to recover the result — the stream is the record.
@@ -58,6 +78,14 @@ type relayState struct {
 	// drops the narration does not burn a backend edit per progress artifact
 	// re-rendering an unchanged line.
 	lastLine string
+	// busyShown is set when the gateway's busy notice is on the line
+	// (showBusy). The line then stays on it through the executor's own
+	// submitted event, which would otherwise re-render it as "⏳ submitted"
+	// and move it back; the first state past submitted replaces it. Cache
+	// like the rest: a restart forgets it, and a submitted-state event after
+	// the restart (a steer refusal on a still-queued task) re-renders the
+	// line as submitted. Cosmetic, and the next state replaces it anyway.
+	busyShown bool
 	// notices wait for the task's terminal and post after its deliverable:
 	// a delegation refusal follows the turn's "delegated to platform".
 	notices []string
@@ -70,11 +98,74 @@ type relayState struct {
 	// with it unset reads the fold for a request this process never saw
 	// (relayTerminal).
 	sawDelegate bool
+	// handoff is set once the task published lib.ArtifactHandoff: it handed
+	// work to kanban cards that report into the conversation themselves
+	// (#3258).
+	handoff bool
 	// local is set when this gateway started the task (startTaskWith), so
 	// every event of it reached this process's relay: an event acked and
 	// lost before its batch takes a crash, and a restart starts the task's
 	// relay state afresh without it.
 	local bool
+	// steersSent counts the follow-ups steerTask published to a fixed-route
+	// task, under g.mu, for the relay to weigh against the executor's steer
+	// notices at the terminal.
+	steersSent int
+	// The executor's word on those follow-ups: answered, the envelope
+	// ids it sent a steer notice for; queued, those it queued and has not
+	// refused since; ended, those it refused task-ended. turnsStarted counts the turn answers posted. The
+	// executor publishes one just before the next queued follow-up's turn
+	// starts, so it counts that turn as started even if a cancel, deadline
+	// or shutdown stops it in between. Such a follow-up is then refused
+	// task-ended, so it moves from queued to ended and is still counted. A
+	// bridge that crashes refuses nothing, so a follow-up whose turn had
+	// started when it died counts as run, though its answer never came; the
+	// ones still waiting behind it count as not run. At the terminal
+	// (postSteerShortfall), steersSent - answered never reached a live run,
+	// and ended plus queued - turnsStarted never ran. Cache like the rest: a
+	// gateway restart forgets them and the follow-ups sent, so that terminal
+	// posts no never-answered line and counts only the notices after it.
+	answered     map[string]bool
+	queued       map[string]bool
+	ended        map[string]bool
+	turnsStarted int
+	// turn is the turn answer being assembled; turnPending, that it has
+	// parts not yet posted.
+	turn        []lib.Part
+	turnPending bool
+	// turnAnswers are the turn answers flushTurn posted, in order, for a
+	// child's wake: the first answers the delegated request, not the result.
+	turnAnswers []string
+	// resultChunks and turnChunks are the result and the assembling turn
+	// answer as the artifact-updates that carried them, for the chat
+	// message only their last chunk may carry (relay_chat.go).
+	resultChunks []lib.ArtifactUpdate
+	turnChunks   []lib.ArtifactUpdate
+	// lineChat is the chat message the newest progress artifact carried,
+	// the live message's whole state, nil when it carried none; lineLaidOut
+	// is set while the live message shows a layout (renderLine).
+	lineChat    *chatmsg.Message
+	lineLaidOut bool
+	// lineTextOnly is set once the adapter answered a laid-out line with
+	// ErrTextOnly: its edits are text from then on, and a change to the
+	// progress chat message alone costs no backend edit.
+	lineTextOnly bool
+	// lineRefused is the lineKey of the layout the backend last refused for
+	// this line (an API refusal, or one too large for it), so the same
+	// layout is not re-sent on every later artifact.
+	lineRefused string
+}
+
+// relayFor is the task's render state, created on first use.
+func (g *Gateway) relayFor(taskID string) *relayState {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	rs, ok := g.relays[taskID]
+	if !ok {
+		rs = &relayState{}
+		g.relays[taskID] = rs
+	}
+	return rs
 }
 
 // relayItem is one queued event with the subject it arrived on. The relay's
@@ -83,9 +174,72 @@ type relayState struct {
 // executor's off the first, the supervisor's -- this gateway's, about an
 // executor that died or never ran -- off the second. The envelope does not
 // carry it, so it rides beside the envelope to the terminal.
+//
+// d is the event's delivery on the relay durable, settled once the event has
+// been rendered or deliberately dropped, so an event this gateway queued but
+// never rendered goes back to the stream for the next one. nil for an item
+// that didn't come off the durable.
 type relayItem struct {
 	env     *lib.Envelope
 	subject string
+	d       lib.DeferredDelivery
+}
+
+// settle acks the item's delivery: it was rendered, or it is not one this
+// gateway will ever render. A failed ack leaves it held, renewed, and the
+// stream redelivers it only if this gateway dies; the sequence guard
+// (SessionRecord.relayed) keeps a rendered one from posting twice.
+func (g *Gateway) settle(item relayItem) {
+	if item.d == nil {
+		return
+	}
+	if err := item.d.Ack(); err != nil {
+		g.log.Warn("relay: ack failed", "taskId", item.env.TaskID, "err", err)
+	}
+}
+
+// giveBackLater returns the item's delivery to the stream after
+// requeueDelay, for a try that may succeed then; an item that didn't come
+// off the durable is requeued in memory instead.
+func (g *Gateway) giveBackLater(item relayItem) {
+	if item.d == nil {
+		sessionKey := g.sessionForTask(g.runCtx, item.env.TaskID)
+		go func() {
+			select {
+			case <-g.runCtx.Done():
+			case <-time.After(requeueDelay):
+				if sessionKey != "" {
+					g.events.enqueue(sessionKey, item)
+				}
+			}
+		}()
+		return
+	}
+	if g.runCtx.Err() != nil {
+		// Stopping: the subscription's stop gives it back in stream order.
+		return
+	}
+	if err := item.d.Nak(requeueDelay); err != nil {
+		g.log.Warn("relay: give-back failed", "taskId", item.env.TaskID, "err", err)
+	}
+}
+
+// firstDeliveryLevel is Error for an item's first delivery and Debug for a
+// redelivery: a KV outage gives every held event back every requeueDelay,
+// and one Error line per event says so without one per retry.
+func firstDeliveryLevel(item relayItem) slog.Level {
+	if item.d == nil || item.d.NumDelivered() <= 1 {
+		return slog.LevelError
+	}
+	return slog.LevelDebug
+}
+
+// sequence is the item's stream sequence, 0 when it has none.
+func (item relayItem) sequence() uint64 {
+	if item.d == nil {
+		return 0
+	}
+	return item.d.Sequence()
 }
 
 // terminalSourceOf attributes a terminal by the subject it arrived on, the
@@ -101,22 +255,46 @@ func terminalSourceOf(subject string) TerminalSource {
 	return TerminalFromExecutor
 }
 
-// relayEvent routes one event to its conversation's queue. Runs on the
+// relayDelivery routes one event off the relay durable to its conversation's
+// queue; its delivery stays held until the item is settled. Runs on the
 // durable consumer's dispatch goroutine, so it must not block: the actual
 // rendering — session lock, KV, chat REST calls — happens on the per-session
 // worker, where one slow conversation stalls only itself.
-func (g *Gateway) relayEvent(ctx context.Context, subject string, env *lib.Envelope) {
+func (g *Gateway) relayDelivery(ctx context.Context, d lib.DeferredDelivery) {
+	g.relayItemIn(ctx, relayItem{env: d.Envelope(), subject: d.Subject(), d: d})
+}
+
+func (g *Gateway) relayItemIn(ctx context.Context, item relayItem) {
+	env := item.env
 	if env.Kind != lib.KindStatusUpdate && env.Kind != lib.KindArtifactUpdate {
+		g.settle(item)
 		return
 	}
-	sessionKey := g.sessionForTask(ctx, env.TaskID)
+	if ctx.Err() != nil && item.d != nil {
+		// Stopping: leave the delivery unsettled, so the subscription's stop
+		// gives it back in stream order with the rest.
+		return
+	}
+	sessionKey, err := g.lookupTaskSession(ctx, env.TaskID)
+	if err != nil && ctx.Err() != nil && item.d != nil {
+		// The lookup failed because the stop began during it.
+		return
+	}
+	if err != nil {
+		// A failed lookup isn't "not ours": give it back for a later try
+		// rather than ack away an event this gateway may own.
+		g.log.Log(ctx, firstDeliveryLevel(item), "task index lookup failed", "taskId", env.TaskID, "err", err)
+		g.giveBackLater(item)
+		return
+	}
 	if sessionKey == "" {
 		// Not a task this gateway submitted (another requester's traffic on
 		// the shared events wildcard, or a post-terminal straggler whose
 		// index was already retired); not ours to render.
+		g.settle(item)
 		return
 	}
-	g.events.enqueue(sessionKey, relayItem{env: env, subject: subject})
+	g.events.enqueue(sessionKey, item)
 }
 
 // relayBatch renders a session's queued events in order. Rolling-line edits
@@ -128,7 +306,19 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	l.Lock()
 	defer l.Unlock()
 
-	ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
+	// A stopping gateway renders nothing new: its run context is done, so
+	// every read would fail, and the batch's deliveries are left for the
+	// stop's in-order give-back.
+	if g.runCtx.Err() != nil || !g.relayInFlight.enter() {
+		g.dropStoppedBatch(sessionKey, batch)
+		return
+	}
+	defer g.relayInFlight.leave()
+	// Past that check the batch renders to the end, and Run waits for it
+	// before it gives the relay's deliveries back: a stop cancelling the
+	// render midway would leave posts out and the record unwritten, and the
+	// next gateway would post them again.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(g.runCtx), turnTimeout)
 	defer cancel()
 
 	var rec *SessionRecord
@@ -138,16 +328,22 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 		return e
 	})
 	if err != nil {
-		// The events stay unrendered but the stream keeps them; requeue the
-		// batch so a transient KV failure on a terminal event cannot wedge
-		// the conversation with the result never posted.
-		g.log.Error("relay: session record unavailable; requeueing batch", "session", sessionKey, "err", err)
-		go func() {
-			time.Sleep(requeueDelay)
-			for _, item := range batch {
-				g.events.enqueue(sessionKey, item)
-			}
-		}()
+		// The gateway may have begun stopping during the read: leave the
+		// batch to the stop's in-order give-back.
+		if g.runCtx.Err() != nil {
+			g.dropStoppedBatch(sessionKey, batch)
+			return
+		}
+		// A transient KV failure on a terminal event must not lose the
+		// result: each event goes back to the stream for a later try.
+		// Redelivered, the batch renders in stream order again. A delayed
+		// nak keeps the event in the durable's pending count until it is
+		// redelivered, so an outage long enough to fill relayMaxAckPending
+		// still stalls new events; it no longer loses any.
+		g.log.Log(ctx, firstDeliveryLevel(batch[0]), "relay: session record unavailable; giving the batch back", "session", sessionKey, "err", err)
+		for _, item := range batch {
+			g.giveBackLater(item)
+		}
 		return
 	}
 	if rec == nil {
@@ -164,16 +360,62 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			if err := g.reg.DropTask(ctx, taskID); err != nil {
 				g.log.Warn("relay: task index cleanup failed", "taskId", taskID, "err", err)
 			}
+			g.settle(item)
 		}
 		return
 	}
 
-	for i, item := range batch {
-		g.applyEvent(ctx, rec, item, i == len(batch)-1)
+	// An event a gateway already rendered comes again only if that gateway
+	// died between its record write and its ack; its sequence is on the
+	// record then, and it is acked without rendering twice.
+	// In stream order: a stop gives deliveries back in order, but redelivery
+	// can still interleave with new events, and the stream sequence is the
+	// order they were written in. Items without one (not off the durable)
+	// keep the order they were queued in.
+	if !slices.ContainsFunc(batch, func(it relayItem) bool { return it.sequence() == 0 }) {
+		slices.SortStableFunc(batch, func(a, b relayItem) int { return cmp.Compare(a.sequence(), b.sequence()) })
+	}
+	fresh := batch[:0:0]
+	inBatch := map[uint64]bool{}
+	for _, item := range batch {
+		seq := item.sequence()
+		// A redelivery can share a batch with its original (a hold that
+		// outlived AckWait), so a sequence seen earlier in the batch counts
+		// as rendered too.
+		if rec.relayed(item.env.TaskID, seq) || (seq != 0 && inBatch[seq]) {
+			g.settle(item)
+			continue
+		}
+		if seq != 0 {
+			inBatch[seq] = true
+		}
+		fresh = append(fresh, item)
+	}
+	for i, item := range fresh {
+		if g.relayInFlight.abandoned() {
+			// The stop's wait ran out on this batch: its deliveries have been
+			// given back and the adapters closed, so nothing past here would
+			// post. Writing the record or acking would mark unsent events
+			// rendered; leaving both, the next gateway renders the batch
+			// again, which may repeat what this one already posted.
+			g.log.Warn("relay: stop drain timed out; batch left for the next gateway", "session", sessionKey, "rendered", i, "events", len(fresh))
+			return
+		}
+		g.applyEvent(ctx, rec, item, i == len(fresh)-1)
+		rec.markRelayed(item.env.TaskID, item.sequence())
+	}
+	if g.relayInFlight.abandoned() {
+		g.log.Warn("relay: stop drain timed out; batch left for the next gateway", "session", sessionKey, "rendered", len(fresh), "events", len(fresh))
+		return
 	}
 
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("relay: session record write failed", "session", rec.Key, "err", err)
+	}
+	// Rendered, so acked whatever the write did: the posts are out, and a
+	// redelivery would make them again.
+	for _, item := range fresh {
+		g.settle(item)
 	}
 }
 
@@ -181,13 +423,19 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 // rolling-line edit; posts always happen.
 func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relayItem, render bool) {
 	env := item.env
-	g.mu.Lock()
-	rs, ok := g.relays[env.TaskID]
-	if !ok {
-		rs = &relayState{}
-		g.relays[env.TaskID] = rs
+	if g.sessionForTask(ctx, env.TaskID) != rec.Key {
+		return
 	}
-	g.mu.Unlock()
+	rs := g.relayFor(env.TaskID)
+	// The card-stop control is not a turn and renders as none (cardstop.go).
+	if rec.CardStop != nil && rec.CardStop.TaskID == env.TaskID {
+		g.applyCardStopEvent(ctx, rec, rs, item)
+		return
+	}
+	if slices.Contains(rec.RetiredCardStops, env.TaskID) {
+		g.retireTaskRoute(ctx, env.TaskID)
+		return
+	}
 
 	switch env.Kind {
 	case lib.KindStatusUpdate:
@@ -214,19 +462,25 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 		g.relayTerminal(ctx, rec, rs, taskID, s, source)
 	case s.Status.State == lib.StateInputRequired:
 		ask := ""
+		var question chatmsg.Reading
 		if s.Status.Message != nil {
 			ask = joinTextParts(s.Status.Message.Parts)
+			question = g.readChat(rec.Key, taskID, chatmsg.Question, s.Status.Message.Parts)
 		}
 		if ask == "" {
 			ask = "the task needs input to continue"
 		}
-		g.post(rec.Key, "❓ "+ask)
+		g.postMessage(rec.Key, OutMessage{Text: "❓ " + ask, Chat: layoutOf(question)})
+		g.markFrom(rec, taskID, question)
 		g.updateRollingLine(rec, taskID, rs)
 	default:
-		// A non-final status message (eg W7's honest "Hermes cannot absorb
-		// mid-run input" answer to a steer) is worth the room seeing.
+		// A steer notice is the executor's word on one follow-up and is
+		// rendered by what it says (applySteerNotice), not as its text part.
+		// Any other non-final status message is worth the room seeing.
 		if s.Status.Message != nil {
-			if note := joinTextParts(s.Status.Message.Parts); note != "" {
+			if n, ok := lib.SteerNoticeOf(s.Status.Message.Parts); ok {
+				g.applySteerNotice(rec, rs, taskID, n)
+			} else if note := joinTextParts(s.Status.Message.Parts); note != "" {
 				g.post(rec.Key, "ℹ️ "+note)
 			}
 		}
@@ -244,6 +498,16 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		if text := lastTextPart(a.Artifact.Parts); text != "" {
 			rs.progress = truncateRunes(text, progressCap)
 		}
+		// A chat message here is the live message's whole state, so one
+		// without it returns the line to text.
+		progress := g.readChat(rec.Key, taskID, chatmsg.Progress, a.Artifact.Parts)
+		rs.lineChat = layoutOf(progress)
+		if rs.lineChat != nil && rs.lineRefused != "" && lineKey("", rs) == rs.lineRefused {
+			// The backend refused this very layout already.
+			rs.lineChat = nil
+		}
+		// The mark is state whatever the batch renders.
+		g.markFrom(rec, taskID, progress)
 		if render {
 			g.updateRollingLine(rec, taskID, rs)
 		}
@@ -253,6 +517,32 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		} else {
 			rs.result = append([]lib.Part(nil), a.Artifact.Parts...)
 		}
+		rs.resultChunks = appendChunk(rs.resultChunks, a)
+	case lib.ArtifactTurn:
+		// An earlier turn's answer: posted as it completes, never the
+		// deliverable, which stays the result. A non-append chunk starts
+		// the next turn's answer, so one whose last chunk never came is
+		// posted then.
+		if !a.Append {
+			g.flushTurn(rec, rs, taskID)
+		}
+		rs.turn = append(rs.turn, a.Artifact.Parts...)
+		rs.turnChunks = append(rs.turnChunks, a)
+		rs.turnPending = true
+		if a.LastChunk {
+			g.flushTurn(rec, rs, taskID)
+		}
+	case lib.ArtifactNotice:
+		// A message the task posts on its own, once, beside its live
+		// message and its answer: to every backend, the console included,
+		// since it is not the deliverable the console reads off TASKS.
+		notice := g.readChat(rec.Key, taskID, chatmsg.Notice, a.Artifact.Parts)
+		g.postMessage(rec.Key, OutMessage{Text: notice.Fallback, Chat: layoutOf(notice)})
+		g.markFrom(rec, taskID, notice)
+	case lib.ArtifactHandoff:
+		// The task handed its work to kanban cards (#3258); read with the
+		// terminal's mark by a delegated child's wake, never rendered.
+		rs.handoff = rs.handoff || lastTextPart(a.Artifact.Parts) == lib.HandoffCards
 	case lib.ArtifactDelegate:
 		// A request to the gateway, never rendered to chat.
 		rs.sawDelegate = true
@@ -266,21 +556,51 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 // text, in the room and in a wake.
 const completedNonTextResult = "(completed with a non-text result; see the stream)"
 
+// terminalNotice is the line a conversation is told when a task ends other
+// than completed, with the executor's reason when it gave one: the relay's
+// notice, and the text of a console conversation's terminal frame.
+func terminalNotice(state lib.TaskState, reason string) string {
+	switch state {
+	case lib.StateFailed:
+		if reason != "" {
+			return "❌ failed: " + reason
+		}
+		return "❌ the task failed"
+	case lib.StateCanceled:
+		return "🛑 canceled"
+	case lib.StateRejected:
+		if reason != "" {
+			return "🚫 the executor rejected the task: " + reason
+		}
+		return "🚫 the executor rejected the task"
+	}
+	return string(state)
+}
+
 // relayTerminal posts the deliverable (or the failure), releases the
 // session's serialization, and retires the task's index — the stream is
 // the durable record; the index only exists to route live events. source is
 // whose word the terminal is, read off the subject it arrived on.
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
+	// A turn answer still assembling posts before the deliverable it led to.
+	g.flushTurn(rec, rs, taskID)
 	result := joinTextParts(rs.result)
-	// The console never posts the deliverable (see the StateCompleted arm), so
-	// replaying the stream to recover it would buy nothing. Checking here and
-	// not there is the difference between skipping the replay and paying for
-	// one whose result is then dropped.
-	// A child's result feeds its wake as well as the room, so a child on a
-	// console conversation still has it replayed.
+	// The console never posts the deliverable as a notice (see the
+	// StateCompleted arm), but its terminal frame carries it (observeEnded,
+	// consoleFrame), so a result the render state lost is read back from the
+	// stream whatever the conversation, except for a console task whose
+	// terminal the heal already observed: it gets no second frame, so the
+	// replay would buy nothing.
 	ref, _ := rec.TaskRefFor(taskID)
 	needResult := result == "" && s.Status.State == lib.StateCompleted &&
-		(!isConsoleConversation(rec.Key) || ref.Role == taskRoleChild)
+		!(isConsoleConversation(rec.Key) && ref.TerminalObserved)
+	// A child's turn answers feed its wake too, however it ended. The render
+	// state holds them when this process relayed every event (local);
+	// otherwise a restart may have lost some, and the stream has them all. A
+	// child its requester stopped wakes nothing, so it needs none.
+	turns := rs.turnAnswers
+	needTurns := ref.Role == taskRoleChild && !ref.Canceled && !rs.local
+	turnsUnread := false
 	// A session turn that ends completed may have asked to delegate in an
 	// event this process never ran: the artifact's delivery was acked and
 	// lost to a crash before its batch, and only the terminal was
@@ -292,7 +612,10 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// the turn ends - otherwise the hand-off line would end the chain.
 	needDelegate := s.Status.State == lib.StateCompleted && !rs.local && !rs.sawDelegate && rec.mayHaveUnhandledDelegate(taskID)
 	evidence := delegateAbsent
-	if needResult || needDelegate {
+	// The result as the replay folded it, when the render state had none:
+	// its chat message is read from there (resultChat).
+	var replayedResult []lib.Part
+	if needResult || needTurns || needDelegate {
 		// Render state is cache; if a restart lost it, the stream still has
 		// everything. Replay against the addressee the task's own subjects
 		// carried - after a Delegate re-home, rec.Addressee is not it.
@@ -300,9 +623,18 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if task, err := g.replayForTerminal(ctx, addressee, taskID); err == nil {
 			if art := task.Artifact(lib.ArtifactResult); art != nil && needResult {
 				result = joinTextParts(art.Parts)
+				replayedResult = art.Parts
+			}
+			if needTurns {
+				turns = turnAnswers(task)
 			}
 			if task.Artifact(lib.ArtifactDelegate) != nil {
 				evidence = delegateSeen
+			}
+			// A handoff acked and lost to a restart before the terminal
+			// was processed is still on the stream (#3258).
+			if foldHandedOff(task) {
+				rs.handoff = true
 			}
 			if needDelegate {
 				g.runFoldedDelegate(ctx, rec, rs, taskID, addressee, task)
@@ -315,6 +647,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if needDelegate {
 				evidence = delegateUnknown
 			}
+			// The render state holds only the turns relayed since the
+			// restart, and the wake reads them by position: the first would
+			// pass for the answer to the delegated request. A wake that says
+			// the answers are missing beats one that misattributes them.
+			if needTurns {
+				turns, turnsUnread = nil, true
+			}
 		}
 	}
 	if rs.sawDelegate {
@@ -326,6 +665,22 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// observeEnded below and by the read route).
 	g.settleHandOff(rec, taskID, evidence)
 
+	// The terminal's chat message is its mark alone, with no fallback; a
+	// terminal without one takes the default (applyTerminalMark), drawn below
+	// after the answer, so the ask's reaction comes off once the answer is
+	// posted. Read here because it also says whether the turn left cards
+	// running (cardsPending), whose report, not this result, answers the ask.
+	var terminal chatmsg.Reading
+	if s.Status.Message != nil {
+		terminal = g.readChat(rec.Key, taskID, chatmsg.Terminal, s.Status.Message.Parts)
+	}
+	// A task that handed the ask to cards, a delegated child's included,
+	// leaves the answer to a card's report for the whole chain.
+	toCards := cardsPending(s.Status.State, terminal) || handedOff(s.Status.State, rs.handoff)
+	if toCards {
+		rec.markCardsAnswer(taskID)
+	}
+
 	switch s.Status.State {
 	case lib.StateCompleted:
 		// Whole, to the adapter whose caller is a program, before the chunked
@@ -334,32 +689,48 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if result != "" {
 			g.observeDelivered(rec, taskID, result)
 		}
+		// A chat message needs its text fallback, so a non-text result
+		// posts the notice alone.
+		answer := OutMessage{Text: result}
+		var answerChat chatmsg.Reading
 		if result == "" {
-			result = completedNonTextResult
+			answer.Text = completedNonTextResult
+		} else if !isConsoleConversation(rec.Key) {
+			answerChat = g.resultChat(rec.Key, taskID, rs, replayedResult)
+			answer.Chat = layoutOf(answerChat)
+			// The chain's final answer, and only that, can be rated: not a
+			// turn that handed the ask to cards, whose result is the hand-off
+			// acknowledgement (the card's report is rated instead,
+			// Notifier.postConversation).
+			if !toCards {
+				answer.Feedback = g.feedbackTarget(rec, taskID)
+			}
 		}
+		result = answer.Text
 		// The console renders answers straight off TASKS, so posting the
-		// deliverable here too would show it twice and put a burst of
-		// answer-sized frames on a subject documented to carry only notices
+		// deliverable here as a notice would show it twice; its terminal
+		// frame carries it instead (consoleFrame), which the page skips
 		// (console.go and spec-chatops-gateway.md, "The console adapter").
 		// The other terminal arms below are notices, not answers, and go to
 		// every backend. Chat backends have no TASKS view, so for them this
-		// post IS the answer. The replay above is skipped for the same
-		// backends, so reaching here with an empty result costs nothing.
+		// post IS the answer.
 		if !isConsoleConversation(rec.Key) {
-			g.post(rec.Key, result)
+			if ref.TerminalObserved && result == completedNonTextResult {
+				// The heal already posted the status card; skip completedNonTextResult.
+			} else {
+				g.postMessage(rec.Key, answer)
+			}
 		}
-	case lib.StateFailed:
+		g.markFrom(rec, taskID, answerChat)
+	case lib.StateFailed, lib.StateCanceled:
 		reason := ""
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
-		if reason != "" {
-			g.post(rec.Key, "❌ failed: "+reason)
-		} else {
-			g.post(rec.Key, "❌ the task failed")
+		// A Slack Stop answers with its own one reply (slack_stop.go).
+		if s.Status.State != lib.StateCanceled || !ref.QuietCancel {
+			g.post(rec.Key, terminalNotice(s.Status.State, reason))
 		}
-	case lib.StateCanceled:
-		g.post(rec.Key, "🛑 canceled")
 	case lib.StateRejected:
 		// Same shape as failed above, and for the same reason. Both
 		// executors put the cause in the terminal message -- a capability
@@ -372,13 +743,11 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
-		if reason != "" {
-			g.post(rec.Key, "🚫 the executor rejected the task: "+reason)
-		} else {
-			g.post(rec.Key, "🚫 the executor rejected the task")
-		}
+		g.post(rec.Key, terminalNotice(s.Status.State, reason))
 	}
+	g.postSteerShortfall(rec, rs, taskID)
 	g.flushNotices(rec.Key, rs)
+	g.terminalMark(rec, taskID, s.Status.State, terminal)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
 		if active.StatusMsgID != "" {
@@ -388,13 +757,14 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote))
+			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs)
 		}
+		unmarkOnSupervisorTerminal(rec, taskID, source)
 		rec.ActiveTask = nil
-		// An executor's end of a live task is activity. The idle TTL that
-		// bounds the session (the reap, and the Slack adapter's session-
-		// thread rule through hasSession) counts from here, not from the ask
-		// that started the task: a long task's thread must not go quiet the
+		// An executor's end of a live task is activity. The Slack adapter's
+		// session-thread rule (hasSession, through LastTaskActivity) counts
+		// from here, not from the ask that started the task; the reap does
+		// not, it counts from the last user message (idleSince): a long task's thread must not go quiet the
 		// instant its answer posts, and the user's follow-up right after the
 		// result is the most ordinary message a session carries. The
 		// executor's confirmation of a stop is an answer too: a detached
@@ -419,7 +789,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if g.cfg.DisplayMode == displayModeDefault {
 			progress = ""
 		}
-		g.editLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress))
+		g.renderLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress), rs)
 		setParentLine(rec, taskID, "")
 		if source == TerminalFromExecutor {
 			rec.LastTaskActivity = time.Now().UTC()
@@ -463,13 +833,146 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// chain's (observedAs): a turn that delegated and a child end quietly,
 	// and the root's one terminal comes from the wake or, when none runs,
 	// from observeChildEnd below.
-	g.observeEnded(rec, taskID, s.Status.State, source, reason)
+	if !ref.TerminalObserved {
+		// A console client is told the turn handed work to cards, so it
+		// waits for their reports (notify frames) only when there are some.
+		// Any task in the chain may file them (a delegated child usually
+		// does), so the mark goes on the chain's root whichever task this
+		// is, and the chain's end (the wake, or the child's own end when no
+		// wake runs) takes it in consoleFrame.
+		if isConsoleConversation(rec.Key) && handedOff(s.Status.State, rs.handoff) {
+			root, _ := rec.observedAs(taskID)
+			g.consoleCardsPending.put(root, "")
+		}
+		g.observeEnded(rec, taskID, s.Status.State, source, reason)
+	}
 
 	// A delegated child's end wakes the session that asked.
 	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
-		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, result, reason); !woken {
+		// Only the wake's copy carries the stand-in: the room and the
+		// observers have the result and the reason as they are.
+		wakeResult, wakeReason := result, reason
+		if turnsUnread {
+			wakeResult, wakeReason = withTurnsUnread(result), withTurnsUnread(reason)
+		}
+		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, turns, wakeResult, wakeReason, true, toCards); !woken {
 			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)
 		}
+	}
+}
+
+// applySteerNotice reads the executor's word on one follow-up. Queued posts
+// nothing: steerTask already acknowledged it. Refused posts why, except
+// task-ended, which the terminal reports in one line with any lost ones. A
+// no-resume refusal (the bridge's cli executor, which cannot continue a
+// session; follow-ups run on the api executor only) posts at once like the
+// rest, so the room hears it while the task runs. It also records
+// that the task's addressee speaks steer notices (postSteerShortfall says
+// why), and whether its newest one said it refuses follow-ups
+// (steersRefusedBy, for routeTurn's status matcher).
+func (g *Gateway) applySteerNotice(rec *SessionRecord, rs *relayState, taskID string, n lib.SteerNotice) {
+	if rs.answered == nil {
+		rs.answered, rs.queued, rs.ended = make(map[string]bool), make(map[string]bool), make(map[string]bool)
+	}
+	addressee := rec.AddresseeFor(taskID)
+	g.mu.Lock()
+	g.steerNoticesFrom[addressee] = true
+	switch {
+	case n.Reason == lib.SteerReasonNoResume:
+		g.steersRefusedBy[addressee] = true
+	case n.Steer == lib.SteerQueued:
+		delete(g.steersRefusedBy, addressee)
+	}
+	g.mu.Unlock()
+	rs.answered[n.EnvelopeID] = true
+	switch {
+	case n.Steer == lib.SteerQueued:
+		rs.queued[n.EnvelopeID] = true
+	case n.Reason == lib.SteerReasonTaskEnded:
+		delete(rs.queued, n.EnvelopeID)
+		rs.ended[n.EnvelopeID] = true
+	default:
+		delete(rs.queued, n.EnvelopeID)
+		g.post(rec.Key, steerNotTakenNotice(n.Reason))
+	}
+}
+
+// steerReasonQuoteMax bounds, in bytes cut on a rune boundary
+// (truncateRunes), a refusal token this gateway does not know when the room
+// is shown it.
+const steerReasonQuoteMax = 64
+
+// steerNotTakenNotice words a refusal for the room. A token this gateway
+// does not know is quoted, bounded, rather than dropped; an empty one says
+// no reason was given rather than quoting nothing.
+func steerNotTakenNotice(reason string) string {
+	why, ok := steerRefusalWhy[reason]
+	switch {
+	case ok:
+	case strings.TrimSpace(reason) == "":
+		why = "the executor gave no reason"
+	default:
+		why = "the executor said " + truncateRunes(reason, steerReasonQuoteMax)
+	}
+	return fmt.Sprintf(noticeSteerNotTaken, why)
+}
+
+// flushTurn posts the assembled turn answer, once. Console conversations
+// get no post: the page reads turn answers off TASKS, and a console client's
+// terminal frame carries only the task's end (consoleFrame).
+func (g *Gateway) flushTurn(rec *SessionRecord, rs *relayState, taskID string) {
+	if !rs.turnPending {
+		return
+	}
+	text := joinTextParts(rs.turn)
+	chunks := rs.turnChunks
+	rs.turn, rs.turnChunks, rs.turnPending = nil, nil, false
+	rs.turnsStarted++
+	rs.turnAnswers = append(rs.turnAnswers, text)
+	if text != "" && !isConsoleConversation(rec.Key) {
+		turn := g.readChatArtifact(rec.Key, taskID, chatmsg.Turn, chunks)
+		g.postMessage(rec.Key, OutMessage{Text: text, Chat: layoutOf(turn)})
+		g.markFrom(rec, taskID, turn)
+	}
+}
+
+// refusesFollowUps reports whether addressee's newest steer notice was a
+// no-resume refusal (steersRefusedBy).
+func (g *Gateway) refusesFollowUps(addressee string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.steersRefusedBy[addressee]
+}
+
+// postSteerShortfall tells the room, after the deliverable, about follow-ups
+// it was told would be taken and were not: ones the executor never answered
+// (they reached the stream after its terminal), queued ones whose turn never
+// started (refused task-ended, or lost with the executor). Each line
+// carries its count.
+//
+// The never-answered line needs an executor that answers at all. A bridge
+// that predates steer notices (a sidecar image older than the gateway, which
+// the CR pins separately) answers none, and every follow-up would read as
+// missed. So the line posts only once this gateway has heard a steer notice
+// from the task's addressee, on this task or another since it started.
+//
+// The not-run count is best-effort across a gateway restart. turnsStarted
+// counts every turn answer relayed since the restart, including turns run
+// for follow-ups queued before it, whose queued notices this process never
+// saw; such a turn cancels out a follow-up queued after the restart that
+// never ran (a bridge crash), so the count reads low, never high. Nothing on
+// the stream ties a turn to the follow-up it ran, so the relay cannot tell
+// the two apart.
+func (g *Gateway) postSteerShortfall(rec *SessionRecord, rs *relayState, taskID string) {
+	g.mu.Lock()
+	sent := rs.steersSent
+	speaks := g.steerNoticesFrom[rec.AddresseeFor(taskID)]
+	g.mu.Unlock()
+	if missed := sent - len(rs.answered); missed > 0 && speaks {
+		g.post(rec.Key, fmt.Sprintf(noticeSteerMissed, missed))
+	}
+	if unrun := len(rs.ended) + max(0, len(rs.queued)-rs.turnsStarted); unrun > 0 {
+		g.post(rec.Key, fmt.Sprintf(noticeSteersUnrun, unrun))
 	}
 }
 
@@ -524,20 +1027,26 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	if active == nil || active.TaskID != taskID || active.StatusMsgID == "" {
 		return
 	}
+	if rs.busyShown && lineStillSubmitted(rs) {
+		return
+	}
 	progress := rs.progress
 	if g.cfg.DisplayMode == displayModeDefault {
 		progress = ""
 	}
 	line := withLineNote(statusLine(rs.state, progress), active.LineNote)
-	if line == rs.lastLine {
+	// The progress chat message is laid out under every display mode: it is
+	// the executor's statement of where the work is (a plan), not narration.
+	shown := lineKey(line, rs)
+	if shown == rs.lastLine {
 		return
 	}
 	// Recorded only once the edit landed: under default mode every later
 	// artifact renders this same line, so a failed edit recorded as sent
 	// would never be retried and the line would sit at the previous state
 	// until the terminal.
-	if g.editLine(rec.Key, active.StatusMsgID, line) {
-		rs.lastLine = line
+	if g.renderLine(rec.Key, active.StatusMsgID, line, rs) {
+		rs.lastLine = lineKey(line, rs) // after the render, which may have found the backend text-only
 	}
 }
 
@@ -671,4 +1180,71 @@ func withRetry(n int, f func() error) error {
 		time.Sleep(time.Duration(i+1) * kvRetryPause)
 	}
 	return err
+}
+
+// dropStoppedBatch records a batch a stopping gateway won't render: the one
+// line that says which conversation lost how many events.
+func (g *Gateway) dropStoppedBatch(sessionKey string, batch []relayItem) {
+	g.log.Warn("relay: gateway stopping; batch not rendered", "session", sessionKey, "events", len(batch))
+}
+
+// inFlight counts the relay batches past their stop check, so a stop can wait
+// for them. Once draining starts, no batch enters.
+type inFlight struct {
+	mu       sync.Mutex
+	n        int
+	stopping bool
+	// timedOut is set when drain gave up waiting: a batch still rendering
+	// then records and acks nothing (relayBatch).
+	timedOut bool
+	idle     chan struct{}
+}
+
+// abandoned reports whether the stop's wait ran out on the batches still
+// rendering.
+func (f *inFlight) abandoned() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.timedOut
+}
+
+func (f *inFlight) enter() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stopping {
+		return false
+	}
+	f.n++
+	return true
+}
+
+func (f *inFlight) leave() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.n--
+	if f.n == 0 && f.idle != nil {
+		close(f.idle)
+		f.idle = nil
+	}
+}
+
+// drain stops new batches from entering and waits up to timeout for the ones
+// rendering to finish.
+func (f *inFlight) drain(timeout time.Duration) {
+	f.mu.Lock()
+	f.stopping = true
+	if f.n == 0 {
+		f.mu.Unlock()
+		return
+	}
+	idle := make(chan struct{})
+	f.idle = idle
+	f.mu.Unlock()
+	select {
+	case <-idle:
+	case <-time.After(timeout):
+		f.mu.Lock()
+		f.timedOut = f.n > 0
+		f.mu.Unlock()
+	}
 }

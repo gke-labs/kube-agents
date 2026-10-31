@@ -21,11 +21,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,18 +36,20 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 )
 
 const (
+	// componentName prefixes the profile scan's log lines, as the binary's
+	// name, and skipConsequence finishes their "its cluster will NOT be ...".
+	componentName   = "k8s-event-watcher"
+	skipConsequence = "watched"
 	// memoryLimitEnv carries the container's memory limit in bytes. The
 	// operator sets it through the Downward API from the agent-api-auth
 	// container's limits.memory (see buildAgentAPIAuthSidecar), so the watcher
 	// learns the ceiling it shares without a flag that could drift from it.
+	// An explicit GOMEMLIMIT takes precedence (internal/memlimit).
 	memoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
-	// goMemLimitEnv is the Go runtime's own soft-limit variable. When it is
-	// set the runtime has already applied it before main runs, and it is an
-	// explicit choice that this process does not second-guess.
-	goMemLimitEnv = "GOMEMLIMIT"
 	// memoryLimitFraction is the share of the container limit the watcher
 	// claims as its soft limit. The Python API authenticator lives in the same
 	// container, so the whole limit is not the watcher's to spend; half leaves
@@ -56,6 +57,46 @@ const (
 	// thing enforcing the ceiling. A soft limit makes GC more aggressive as
 	// the heap approaches it; it does not cap live heap.
 	memoryLimitFraction = 0.5
+	// defaultGatewayWait outlasts two of the agent container's startup probe
+	// budgets (905s: agentAPIProbeInitialDelaySeconds plus the agentAPIStartupProbe* constants in platformagent_manifests.go)
+	// plus the kill grace period and restart backoff between them. A boot
+	// that overruns one budget is restarted, and the restarted entrypoint
+	// redoes its profile steps before the gateway binds, so a single budget
+	// would give up on exactly the slowest boots.
+	defaultGatewayWait = 35 * time.Minute
+
+	// defaultQuietAfter is how long an alerted incident's object goes
+	// unsighted before the daemon is told: three times kubelet's 5m restart
+	// back-off ceiling, so a crash loop still going is never reported quiet
+	// between two of its back-offs, with a margin for a slow recorder; the
+	// stall watch's tick is the same length.
+	defaultQuietAfter = 15 * time.Minute
+	// sweepInterval is how often each cluster's dispatcher ages its settle
+	// holds and looks for quiet incidents: the dedup snapshot's cadence, so a
+	// follow-up lands within half a minute of its period.
+	sweepInterval = 30 * time.Second
+	// settleClearedFloor is the least time a cleared key's tombstone is kept
+	// (settleClearedTTL): the API server's default event TTL.
+	settleClearedFloor = time.Hour
+	// followupResumeGrace is how long after the informer becomes delivering
+	// the sweep waits before sending follow-ups: the relist that follows a
+	// returned watch re-delivers every event still inside the API server's
+	// TTL within seconds, and the grace puts the sweep behind it.
+	followupResumeGrace = 2 * time.Minute
+	// followupMessage is the Message of a k8s-event-followup payload: what
+	// the watcher knows, and no more.
+	followupMessage = "no new events for this object since the last sighting"
+	// The outcomes of k8s_event_watcher_followups_total: the daemon accepted
+	// the line (for a session with a thread it posts after answering, so a
+	// chat failure past that point is invisible here, as for the alert; for
+	// one with a card but no thread the card line was already written), it
+	// had neither a thread nor a card it could find within the hour to post
+	// into, or the inject failed,
+	// which includes the daemon's 503 for a card still to come, retried each
+	// sweep for an hour.
+	followupOutcomeSent     = "sent"
+	followupOutcomeUnrouted = "unrouted"
+	followupOutcomeError    = "error"
 )
 
 // flags holds the CLI-based configurations parsed once during startup.
@@ -76,14 +117,22 @@ type flags struct {
 	// image-pull family; see filter.go.
 	imagePullTransientMinCount int
 	// failedSchedulingMinCount is the FailedScheduling backstop when
-	// cluster-autoscaler has said nothing about the pod; scaleUpHold is how
-	// long its TriggeredScaleUp holds the pod's events. See filter.go.
+	// cluster-autoscaler has said nothing about the pod, and
+	// failedSchedulingMinSpan how long such an event must have lasted on top;
+	// scaleUpHold is how long its TriggeredScaleUp holds the pod's events.
+	// See filter.go.
 	failedSchedulingMinCount int
+	failedSchedulingMinSpan  time.Duration
 	scaleUpHold              time.Duration
 	// autopilotScaleToZeroHold holds the FailedScheduling an Autopilot cluster
 	// emits for GKE's own system pods once it has scaled to zero nodes. On by
 	// default, so the flag exists to turn it off; see filter.go.
 	autopilotScaleToZeroHold bool
+	// settle is the settle period for the settle family, and quietAfter how
+	// long an alerted incident's object goes unsighted before the daemon is
+	// told. See filter.go for the first and dispatcher.Sweep for the second.
+	settle     time.Duration
+	quietAfter time.Duration
 
 	inCluster        bool
 	kubeconfig       string
@@ -92,7 +141,10 @@ type flags struct {
 	logLevel         string
 	dryRun           bool
 	metricsAddr      string
+	dataVolume       string
 	snapshotInterval time.Duration
+	gatewayURL       string
+	gatewayWait      time.Duration
 }
 
 // parseFlags reads command-line arguments into the flags struct.
@@ -120,8 +172,11 @@ func parseFlags(args []string) (*flags, error) {
 	fs.IntVar(&f.unhealthyMinCount, "unhealthy-min-count", 3, "Require this many consecutive Unhealthy events before firing.")
 	fs.IntVar(&f.backoffMinCount, "backoff-min-count", 3, "Require this many consecutive crash-loop (BackOff/CrashLoopBackOff) events before firing. Suppresses startup races that resolve on their own. 1 = fire on the first event.")
 	fs.IntVar(&f.imagePullTransientMinCount, "imagepull-transient-min-count", 3, "Require this many consecutive image-pull failures before firing, when the error looks self-clearing (registry 429/5xx, timeouts). Terminal causes such as a bad tag, and any cause the classifier does not recognize, always fire on the first event. 1 = fire on the first event.")
-	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1 = fire on the first event.")
+	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1, with --failedscheduling-min-span=0, = fire on the first event.")
+	fs.DurationVar(&f.failedSchedulingMinSpan, "failedscheduling-min-span", defaultFailedSchedulingMinSpan, "How long a FailedScheduling with no cluster-autoscaler verdict has to have lasted, by the event's own first and last sighting, before it fires, on top of --failedscheduling-min-count. Holds the burst a node scale-down drives the count through for a pod placed seconds later. 0 = off.")
 	fs.DurationVar(&f.scaleUpHold, "scaleup-hold", defaultScaleUpHold, "How long a TriggeredScaleUp on a pod holds its FailedScheduling events, measured from the autoscaler's event to the FailedScheduling's own last sighting. Past it the count threshold applies again. Cluster-autoscaler's default node-provision timeout.")
+	fs.DurationVar(&f.settle, "settle", defaultSettle, "How long a failure in the settle family (the crash-loop family, FailedMount, Unhealthy; the reasons kubelet re-emits while they last) has to have lasted, by the event's own first and last sighting, before it is forwarded; a failure that clears inside it is not forwarded, and a repeat blip on the same event object is measured from its own start while the in-process memo remembers the first. Applied after the count thresholds, never to OOMKilled, the image-pull family or FailedScheduling. 0 = off.")
+	fs.DurationVar(&f.quietAfter, "quiet-after", defaultQuietAfter, "How long after its last sighting an incident whose alert went out is reported quiet: the daemon gets one k8s-event-followup inject for it, which it posts into the alert's thread and onto its card (the card alone where no thread is routed). Silence is read off the events alone; no object is read back. 0 = off.")
 	fs.BoolVar(&f.autopilotScaleToZeroHold, "autopilot-scale-to-zero-hold", true, "Hold FailedScheduling saying 'no nodes available to schedule pods' on an Autopilot cluster with no cluster-autoscaler verdict on the pod: an Autopilot cluster with no user workloads scales to zero and leaves GKE's own system pods Pending by design. =false reports them, on the count backstop as before. Zero nodes on a GKE Standard cluster is a fault and still fires. Requires both TriggeredScaleUp and NotTriggerScaleUp in --reason, without which no verdict can be recorded and 'no verdict' would not distinguish an abandoned pod from a declined one; the hold turns itself off and logs when either is missing, which includes the shipped --reason default.")
 
 	// Kubernetes client.
@@ -134,7 +189,10 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.logLevel, "log-level", "info", "One of: debug, info, warn, error.")
 	fs.BoolVar(&f.dryRun, "dry-run", false, "Print inject payloads to stdout without calling the daemon.")
 	fs.StringVar(&f.metricsAddr, "metrics-addr", "", "Prometheus /metrics + /healthz listener address (host:port). Empty = disabled.")
+	fs.StringVar(&f.dataVolume, "data-volume", "", "Path on the agent's data volume (normally /opt/data). When set, /metrics also exports the volume's size and free space, read at each scrape. Empty = not exported.")
 	fs.DurationVar(&f.snapshotInterval, "snapshot-interval", 30*time.Second, "How often to persist the dedup cache when --dedup-persist is set. 0 = only on shutdown.")
+	fs.StringVar(&f.gatewayURL, "gateway-url", "", "Base URL of the agent gateway the daemon starts triage turns on. When set, events are not watched until it answers or --gateway-wait passes. Empty = do not wait.")
+	fs.DurationVar(&f.gatewayWait, "gateway-wait", defaultGatewayWait, "Longest time to wait for --gateway-url to answer before watching events anyway.")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -157,9 +215,36 @@ func (f *flags) filterThresholds() filterThresholds {
 		backoffMinCount:                 f.backoffMinCount,
 		imagePullTransientMinCount:      f.imagePullTransientMinCount,
 		failedSchedulingMinCount:        f.failedSchedulingMinCount,
+		failedSchedulingMinSpan:         offThreshold(f.failedSchedulingMinSpan),
 		scaleUpHold:                     f.scaleUpHold,
 		disableAutopilotScaleToZeroHold: !f.autopilotScaleToZeroHold,
+		settle:                          offThreshold(f.settle),
 	}
+}
+
+// settleClearedTTL is how long the settle memo keeps a cleared key's
+// tombstone: the dedup window, past which a repeat is a new incident anyway,
+// but never less than settleClearedFloor, the API server's default event
+// TTL, inside which kubelet's recorder still holds the blip's event object
+// and a repeat arrives with the old first sighting. The binary's own 5m
+// window default would otherwise forget a blip twelve minutes after it
+// cleared and forward its repeat at once.
+func settleClearedTTL(dedupWindow time.Duration) time.Duration {
+	if dedupWindow > settleClearedFloor {
+		return dedupWindow
+	}
+	return settleClearedFloor
+}
+
+// offThreshold turns a duration flag's reading into the config's, for
+// --settle and --failedscheduling-min-span: on the flag 0 is off and the
+// default is the flag's own; in filterThresholds 0 is the default, as it is
+// for every count, so off travels as a negative.
+func offThreshold(flagValue time.Duration) time.Duration {
+	if flagValue == 0 {
+		return -1
+	}
+	return flagValue
 }
 
 // validate checks for invalid or missing flag combinations before starting services.
@@ -187,6 +272,9 @@ func (f *flags) validate() error {
 		if f.targetSession == "" {
 			return errors.New("--target-session is required in shared mode")
 		}
+		if !sessionIDPattern.MatchString(f.targetSession) {
+			return fmt.Errorf("--target-session %q is not a session id the daemon issues (%s)", f.targetSession, sessionIDPattern)
+		}
 	default:
 		return fmt.Errorf("--mode must be per-incident or shared (got %q)", f.mode)
 	}
@@ -195,6 +283,29 @@ func (f *flags) validate() error {
 	}
 	if f.snapshotInterval < 0 {
 		return errors.New("--snapshot-interval must be >= 0")
+	}
+	if f.settle < 0 {
+		return errors.New("--settle must be >= 0 (0 = off)")
+	}
+	if f.failedSchedulingMinSpan < 0 {
+		return errors.New("--failedscheduling-min-span must be >= 0 (0 = off)")
+	}
+	if f.quietAfter < 0 {
+		return errors.New("--quiet-after must be >= 0 (0 = off)")
+	}
+	if f.gatewayURL != "" && f.gatewayWait <= 0 {
+		return errors.New("--gateway-wait must be > 0 when --gateway-url is set")
+	}
+	if strings.HasSuffix(f.gatewayURL, "/") {
+		return fmt.Errorf("--gateway-url must not end with '/' (got %q)", f.gatewayURL)
+	}
+	// Checked here because a URL the probe cannot use fails every attempt the
+	// way a gateway that is not up yet does, and would hold the informers for
+	// the whole wait.
+	if f.gatewayURL != "" {
+		if u, err := url.Parse(f.gatewayURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("--gateway-url must be an http:// or https:// URL with a host (got %q)", f.gatewayURL)
+		}
 	}
 	// Cluster sources are additive, not exclusive: --profiles-dir contributes
 	// every Cluster Agent profile, and --in-cluster / --kubeconfig contributes
@@ -332,69 +443,53 @@ func (tc targetCluster) identity() string {
 }
 
 // discovery is the profile scan discoverClusterProfiles runs. Its zero value
-// reaches the real GKE API with this pod's own credentials; the tests replace
-// its Describe and TokenSource fields so the scan needs neither. OnSkip is set
-// per call instead, because it needs the metrics registry the caller holds.
+// reaches the real GKE API with this pod's own credentials, or through the
+// credential proxy when clusterprofiles.BrokerFromEnv names one; the tests replace
+// its Describe and TokenSource fields so the scan needs neither.
 var discovery clusterprofiles.Discoverer
 
 // discoverClusterProfiles scans a Hermes profiles directory (normally
 // /opt/data/profiles) and returns one targetCluster per Cluster Agent profile
-// found. clusterprofiles.Discoverer.Discover does the scanning and the
-// addressing — read its doc comment for what counts as a cluster profile and
-// which failures are fatal — and this function adds the two things that are the
-// watcher's rather than the package's: a Kubernetes client per cluster, and
-// what a skipped profile looks like in the logs and in clusterDiscoveryErrors.
-//
-// The package returns configs rather than clients because the drift detector
-// wants a dynamic.Interface from the same scan. Building the informer-backed
-// kubernetes.Interface here is what keeps that choice with the caller who makes
-// it.
+// found. clusterprofiles.DiscoverAndBuild does the scanning, the addressing and
+// the failure policy — read its doc comment for which failures are fatal — and
+// this function adds the two things that are the watcher's rather than the
+// package's: an informer-backed Kubernetes client per cluster, and a
+// clusterDiscoveryErrors{profile} increment per skip.
 //
 // A profile that looks like a cluster profile but fails to load is skipped, not
 // fatal. Dropping one cluster is bad; the alternative is worse, because these
 // errors would propagate out of buildWatchSet before it has even built the
 // direct client, so a single unparseable config.yaml would stop the watcher
 // monitoring anything at all — including the management cluster, whose client
-// would have been fine. Every skip logs and increments
-// clusterDiscoveryErrors{profile}, so "this cluster is not being watched" stays
-// visible and alertable without being fatal.
+// would have been fine. Every skip, the unreadable directory included under
+// clusterprofiles.NoProfile, increments clusterDiscoveryErrors{profile}, so
+// "this cluster is not being watched" stays visible and alertable without
+// being fatal.
 func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]targetCluster, error) {
-	skip := func(profile string, err error) {
-		if profile == clusterprofiles.NoProfile {
-			// The directory itself, not a profile in it — the error already
-			// says which directory and what it means.
-			log.Printf("k8s-event-watcher: %v", err)
-		} else {
-			log.Printf("k8s-event-watcher: skipping profile %s, its cluster will NOT be watched: %v", profile, err)
-		}
-		m.clusterDiscoveryErrors.WithLabelValues(profile).Inc()
-	}
-
-	// A copy, so setting OnSkip does not write to the package-level seam.
-	d := discovery
-	d.OnSkip = skip
-	discovered, err := d.Discover(ctx, dir)
-	if err != nil {
-		return nil, err
-	}
-
-	clusters := make([]targetCluster, 0, len(discovered))
-	for _, c := range discovered {
+	scan, err := clusterprofiles.DiscoverAndBuild(ctx, discovery, dir, clusterprofiles.ScanOptions{
+		Component:   componentName,
+		Consequence: skipConsequence,
+		OnSkip: func(profile string, _ error) {
+			m.clusterDiscoveryErrors.WithLabelValues(profile).Inc()
+		},
+	}, func(c clusterprofiles.Cluster) (targetCluster, error) {
 		client, err := kubernetes.NewForConfig(c.Config)
 		if err != nil {
-			skip(c.Profile, fmt.Errorf("kubernetes client: %w", err))
-			continue
+			return targetCluster{}, fmt.Errorf("kubernetes client: %w", err)
 		}
-		clusters = append(clusters, targetCluster{
+		return targetCluster{
 			Name:      c.Identity.Cluster,
 			ProjectID: c.Identity.Project,
 			Location:  c.Identity.Location,
 			Profile:   c.Profile,
 			Client:    client,
 			Autopilot: c.Autopilot,
-		})
+		}, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return clusters, nil
+	return scan.Built, nil
 }
 
 // initialSyncGrace is how long the process will run with nothing synced before
@@ -407,16 +502,18 @@ const initialSyncGrace = 2 * time.Minute
 
 // dispatcher coordinates the filter, deduplication, HTTP injector, and metrics for streamed events.
 // One dispatcher is built per watched cluster, each owning that cluster's dedup
-// cache; filter, injector, and metrics are shared across all of them. The source
-// cluster is still read off each TriageEvent rather than stored here, so the
-// payload is correct regardless of how dispatchers are wired.
+// cache and memos; filter, injector, and metrics are shared across all of them.
+// An event's payload reads its cluster off the TriageEvent; the dispatcher also
+// keeps the cluster (set by main) for the sweep, which has no event in hand.
 //
-// Dispatch holds no dispatcher-wide lock, and does not need one. client-go
-// delivers events to a handler from a single per-informer processorListener
-// goroutine, so a given dispatcher is only ever entered by its own cluster's
-// watcher, one event at a time. Across clusters the dispatchers share nothing
-// mutable. A lock here would have served only to make one cluster's slow daemon
-// round-trip stall every other cluster.
+// Dispatch holds no dispatcher-wide lock, and does not need one. Each
+// cluster's watcher delivers from a single goroutine of its own (see Run in
+// watcher.go), so Dispatch is only ever entered by its own cluster's watcher,
+// one event at a time; the sweep (runSweepLoop) is the one other goroutine
+// that enters a dispatcher, and everything the two share — the dedup cache,
+// the memos, the metrics — carries its own lock. Across clusters the
+// dispatchers share nothing mutable. A lock here would have served only to make
+// one cluster's slow daemon round-trip stall every other cluster.
 type dispatcher struct {
 	filter *filter
 	dedup  *dedupCache
@@ -429,11 +526,46 @@ type dispatcher struct {
 	// records it to the FailedScheduling events it qualifies. Per-cluster for
 	// the same reason; pod UIDs are unique across clusters regardless.
 	scaleUps  *scaleUpMemo
+	settles   *settleMemo
 	injector  *injector
 	metrics   *metrics
 	mode      string // "per-incident" or "shared"
 	targetSid string // for shared mode
 	dryRun    bool
+	// quietAfter is --quiet-after; zero sends no follow-ups. cluster labels
+	// the sweep's log lines and metrics, since no event is in hand there.
+	quietAfter time.Duration
+	cluster    targetCluster
+	// now is the sweep's clock, overridable in tests.
+	now func() time.Time
+	// readyAt is the watcher's clock at which the cluster's informer last
+	// became delivering (main's onWatching: set once the first list has
+	// completed and again when a watch returns after a failure, zero while a
+	// 403 holds the watch or any other list or watch error stands). While it
+	// is zero, and for followupResumeGrace after it is set, the sweep sends
+	// no follow-up: an entry's LastSeen moves only on a sighting the informer
+	// delivers, so a watcher that is not listening would call every open
+	// incident quiet, and a watch that has just returned re-delivers every
+	// live entry's events in the relist that follows, which the grace lets
+	// land first.
+	readyAt atomic.Int64
+	// lastDelivery is the watcher's clock at the last event the informer
+	// delivered to this dispatcher, any event, admitted or not. The 403 hold
+	// is the one outage the watcher reports; a control-plane outage, a bad
+	// credential or a partition keeps the reflector in its own backoff and
+	// says nothing, so the sweep also wants to have seen the cluster speak
+	// inside the quiet period before it calls anything on it quiet.
+	lastDelivery atomic.Int64
+	// noFollowupLogged keeps the "daemon serves no follow-ups" line to one
+	// per change of answer.
+	noFollowupLogged atomic.Bool
+}
+
+func (d *dispatcher) clock() time.Time {
+	if d.now != nil {
+		return d.now()
+	}
+	return time.Now()
 }
 
 // newDispatcher builds a dispatcher around one cluster's dedup cache. filter,
@@ -451,11 +583,13 @@ func newDispatcher(f *flags, filter *filter, dedup *dedupCache, inj *injector, m
 		dedup:       dedup,
 		pullClasses: newPullClassMemo(defaultPullClassTTL, defaultPullClassEntries),
 		scaleUps:    newScaleUpMemo(scaleUpMemoTTL(f.dedupWindow, filter.cfg.scaleUpHold), defaultScaleUpEntries),
+		settles:     newSettleMemo(defaultSettleEntries, settleClearedTTL(f.dedupWindow)),
 		injector:    inj,
 		metrics:     m,
 		mode:        f.mode,
 		targetSid:   f.targetSession,
 		dryRun:      f.dryRun,
+		quietAfter:  f.quietAfter,
 	}
 }
 
@@ -553,6 +687,7 @@ func (d *dispatcher) reopenPolicyFiltered(ev TriageEvent, replay bool) (dedupRes
 // mark is filed under the event's own namespace with the UID, so it is found
 // only by a FailedScheduling on a pod in that namespace (scaleup.go).
 func (d *dispatcher) RecordScaleUpMark(ev TriageEvent) bool {
+	d.lastDelivery.Store(d.clock().UnixNano())
 	if d.filter.Decide(ev) != gateScaleUpMark {
 		return false
 	}
@@ -563,6 +698,7 @@ func (d *dispatcher) RecordScaleUpMark(ev TriageEvent) bool {
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason).Inc()
+	d.lastDelivery.Store(d.clock().UnixNano())
 	// Resolved before the filter, deliberately. kubelet splits an image-pull
 	// incident across four events and only one of them names the cause; that one is
 	// reason=Failed, which the shipped default --reason list does not carry. The
@@ -588,7 +724,28 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	if ev.Key.Reason == reasonFailedScheduling {
 		ev.ScaleUp = d.scaleUps.Lookup(ev.Namespace, ev.Key.UID)
 	}
+	canonical := canonicalizeReason(ev.Key.Reason, ev.Message)
+	// A repeat blip on an event object kubelet kept from an earlier one
+	// carries that one's first sighting; the memo knows where this blip
+	// began, and the gate measures the span from there (settleMemo.BlipStart).
+	if settleApplies(canonical) {
+		if start, ok := d.settles.BlipStart(ev, canonical, d.clock()); ok && start.After(ev.FirstSeen) {
+			ev.FirstSeen = start
+		}
+	}
 	if gate := d.filter.Decide(ev); gate != gateAccepted {
+		if gate == gateSettle {
+			d.settles.Hold(ev, canonical, d.clock())
+			log.Printf("held %s pod=%s/%s (count=%d, lasted %s of the %s settle period); not forwarded yet",
+				ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, ev.LastSeen.Sub(ev.FirstSeen).Round(time.Second), d.filter.cfg.settle)
+		}
+		// A settle-family sighting the count gate stopped is a blip the memo
+		// has to remember too: one that clears at two sightings and repeats
+		// inside the event's TTL would otherwise arrive at count three with
+		// the object's old first sighting and no tombstone to measure from.
+		if (gate == gateBackoffMinCount || gate == gateUnhealthyMinCount) && d.filter.cfg.settle > 0 && settleApplies(canonical) {
+			d.settles.Hold(ev, canonical, d.clock())
+		}
 		if gate == gateScaleUpMark {
 			verdict := scaleUpVerdictFor(ev.Key.Reason)
 			d.scaleUps.Record(ev.Namespace, ev.Key.UID, verdict, ev.LastSeen)
@@ -599,8 +756,16 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			log.Printf("ignored %s pod=%s/%s reported by %q, not %s; no verdict recorded, not forwarded",
 				ev.Key.Reason, ev.Namespace, ev.Name, ev.Reporter, scaleUpReporter)
 		}
+		// A sighting a gate stopped is still a sighting: an alerted object
+		// the scale-up hold keeps from Observe is not quiet.
+		d.dedup.Sighted(ev.Key, ev.Message, ev.LastSeen)
 		d.metrics.eventsFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, string(gate)).Inc()
 		return
+	}
+	if d.settles.Release(ev, canonical) {
+		d.metrics.settleOutcomes.WithLabelValues(ev.Cluster, ev.Project, ev.Location, canonical, settleOutcomeForwarded).Inc()
+		log.Printf("settled %s pod=%s/%s (count=%d, lasted %s); forwarding",
+			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, ev.LastSeen.Sub(ev.FirstSeen).Round(time.Second))
 	}
 	result := d.dedup.Observe(ev.Key, ev.Message, ev.LastSeen)
 	d.metrics.activeIncidents.WithLabelValues(ev.Cluster, ev.Project, ev.Location).Set(float64(d.dedup.Len()))
@@ -618,7 +783,10 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		result = reopened
 	}
 	// Create or reuse a troubleshooter session, then inject event telemetry.
+	// opened says this dispatch created the session, which is what
+	// triageSessions counts once the inject below is delivered.
 	sid := d.targetSid
+	opened := false
 	if d.mode == "per-incident" && !d.dryRun {
 		newSid, err := d.injector.CreateSession(ctx)
 		if err != nil {
@@ -633,8 +801,10 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			return
 		}
 		sid = newSid
+		opened = true
 		d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "ok").Inc()
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
+		d.dedup.BindObject(ev.Key, ev.Message, ev.Namespace, ev.KindOfObject, ev.Name, ev.FirstSeen, ev.Count)
 	}
 	payload := InjectPayload{
 		Kind:         injectKindEvent,
@@ -667,7 +837,8 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 		return
 	}
-	status, err := d.injector.Inject(ctx, sid, payload)
+	answer, err := d.injector.InjectDetailed(ctx, sid, payload)
+	status := answer.Status
 	if err != nil {
 		// Same rollback as the CreateSession path above. A session may
 		// have been created for this attempt and is now orphaned; it
@@ -696,6 +867,15 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			ev.Key.Reason, ev.Namespace, ev.Name, sid)
 		return
 	}
+	if status == injectStatusFolded {
+		// 2xx, and the daemon recorded it against an incident already
+		// admitted for this workload. Kept rather than rolled back, and not
+		// flagged: see injectStatusFolded.
+		d.metrics.eventsFolded.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+		log.Printf("folded %s pod=%s/%s (sid=%s) — the workload's incident is already open",
+			ev.Key.Reason, ev.Namespace, ev.Name, sid)
+		return
+	}
 	if status == injectStatusSuppressed {
 		// 2xx, and nobody was told: the daemon spent the day's ceiling
 		// for this severity and dropped the alert. Rolled back for the
@@ -710,44 +890,156 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		return
 	}
 	d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+	if answer.Supports(injectFeatureFollowup) {
+		d.dedup.MarkFollowupSupported(ev.Key, ev.Message)
+	}
+	if opened {
+		d.metrics.triageSessions.WithLabelValues(ev.Cluster, ev.Project, ev.Location).Inc()
+	}
 	log.Printf("fire %s pod=%s/%s → sid=%s (mode=%s)",
 		ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 }
 
-// deriveMemoryLimit decides the Go soft memory limit from the two variables
-// that can set it. It returns the limit in bytes and true when
-// memoryLimitEnv should be applied, or zero, false and the reason when the
-// runtime's own setting should stand: GOMEMLIMIT already set (the runtime
-// applied it and it wins), the container limit absent (running outside the
-// operator's Deployment), or unparseable or non-positive (the value is not a
-// byte count, so nothing is derived from it).
-func deriveMemoryLimit(goMemLimit, containerLimit string) (int64, bool, string) {
-	if goMemLimit != "" {
-		return 0, false, fmt.Sprintf("%s=%s is set and takes precedence", goMemLimitEnv, goMemLimit)
+// Sweep ages the settle holds and sends the quiet follow-ups, as of now. It
+// runs every sweepInterval per cluster (runSweepLoop) and is safe to call
+// from tests with a fixed clock.
+//
+// A held key unsighted for the settle period plus settleQuietSlack cleared on
+// its own: counted self_resolved and forgotten, which is the one reading of
+// the gate's suppression rate the counter gives. An incident whose alert
+// went out and whose object has been unsighted for quietAfter gets one
+// k8s-event-followup inject on its own session, which the daemon posts into
+// the alert's thread and onto its card, the card alone where no thread is
+// routed (session_kv_server, _inject_followup). What the watcher
+// knows is silence, and the payload says so: the object was not read back,
+// since the broker's watcher route serves no pods, and a deleted pod and a
+// recovered one both go quiet. One per incident, held on the dedup entry so
+// it survives a restart with the entry; an inject that fails is retried on
+// the next sweep. Dry-run prints the payload as Dispatch does.
+func (d *dispatcher) Sweep(ctx context.Context) {
+	now := d.clock()
+	quiet := d.filter.cfg.settle + settleQuietSlack
+	for _, h := range d.settles.Expire(now, quiet) {
+		d.metrics.settleOutcomes.WithLabelValues(h.Cluster, h.Project, h.Location, h.Reason, settleOutcomeSelfResolved).Inc()
 	}
-	if containerLimit == "" {
-		return 0, false, fmt.Sprintf("%s is not set; the runtime default applies", memoryLimitEnv)
+	if d.quietAfter <= 0 || d.mode != "per-incident" {
+		return
 	}
-	limitBytes, err := strconv.ParseInt(containerLimit, 10, 64)
-	if err != nil || limitBytes <= 0 {
-		return 0, false, fmt.Sprintf("%s=%q is not a positive byte count; the runtime default applies", memoryLimitEnv, containerLimit)
+	readyAt := d.readyAt.Load()
+	if readyAt == 0 || now.Sub(time.Unix(0, readyAt)) < followupResumeGrace {
+		return
 	}
-	return int64(float64(limitBytes) * memoryLimitFraction), true, ""
+	// The cluster has to have spoken inside the quiet period: a watch down
+	// for any reason the watcher does not report keeps LastSeen from moving
+	// just as a quiet object does, and the two cannot be told apart.
+	if last := d.lastDelivery.Load(); last == 0 || now.Sub(time.Unix(0, last)) >= d.quietAfter {
+		return
+	}
+	candidates := d.dedup.QuietIncidents(now, d.quietAfter)
+	if len(candidates) == 0 {
+		return
+	}
+	if d.dryRun || d.injector == nil {
+		// Dry-run builds no injector. A candidate reaches it only through a
+		// snapshot a live run wrote; print it as Dispatch prints payloads.
+		for _, q := range candidates {
+			out, _ := json.MarshalIndent(d.followupPayload(q), "", "  ")
+			fmt.Printf("--- dry-run follow-up for session %q ---\n%s\n", q.SessionID, string(out))
+			d.dedup.MarkQuietNotified(q.Key)
+		}
+		return
+	}
+	// The daemon of this moment, not the one that answered the alert: an
+	// agent image rolled back to a build without the follow-up branch would
+	// take the kind down the event path and post a second alert.
+	features, err := d.injector.Features(ctx)
+	if err != nil {
+		log.Printf("dispatcher: follow-ups held, daemon health unreadable: %v", err)
+		return
+	}
+	if !hasFeature(features, injectFeatureFollowup) {
+		if !d.noFollowupLogged.Swap(true) {
+			log.Printf("dispatcher: follow-ups held, the daemon lists no %q under %s (an older session server); they go out once it does", injectFeatureFollowup, injectFeaturesKey)
+		}
+		return
+	}
+	d.noFollowupLogged.Store(false)
+	for _, q := range candidates {
+		answer, err := d.injector.InjectDetailed(ctx, q.SessionID, d.followupPayload(q))
+		if err != nil {
+			d.metrics.followups.WithLabelValues(d.cluster.Name, d.cluster.ProjectID, d.cluster.Location, q.Key.Reason, followupOutcomeError).Inc()
+			log.Printf("dispatcher: follow-up for %s/%s (sid=%s): %v", q.Namespace, q.Name, q.SessionID, err)
+			continue
+		}
+		// Marked, then written out at once: the snapshot loop's next tick is
+		// up to 30s away, and a process killed before it would restore the
+		// entry unmarked and post the line a second time.
+		d.dedup.MarkQuietNotified(q.Key)
+		if err := d.dedup.Snapshot(); err != nil {
+			log.Printf("dedup snapshot after follow-up: %v", err)
+		}
+		outcome := followupOutcomeSent
+		if answer.Status == injectStatusUnrouted {
+			// The daemon had neither a thread nor a card it could find within
+			// its hour for the session (the alert never reached chat, and its
+			// card never came), so it posted nothing; there is nothing to retry.
+			outcome = followupOutcomeUnrouted
+		}
+		d.metrics.followups.WithLabelValues(d.cluster.Name, d.cluster.ProjectID, d.cluster.Location, q.Key.Reason, outcome).Inc()
+		log.Printf("followup %s pod=%s/%s → sid=%s %s (quiet since %s, %s ago)",
+			q.Key.Reason, q.Namespace, q.Name, q.SessionID, outcome, q.LastSeen.UTC().Format(time.RFC3339), now.Sub(q.LastSeen).Round(time.Second))
+	}
+}
+
+// followupPayload is the k8s-event-followup inject for a quiet incident: the
+// object and the alerted event's own first sighting and count, the last real
+// sighting, and the dispatcher's cluster.
+func (d *dispatcher) followupPayload(q quietIncident) InjectPayload {
+	return InjectPayload{
+		Kind:         injectKindFollowup,
+		Reason:       q.Key.Reason,
+		Namespace:    q.Namespace,
+		KindOfObject: q.Kind,
+		Name:         q.Name,
+		UID:          q.Key.UID,
+		Message:      followupMessage,
+		Count:        q.Count,
+		FirstSeen:    q.FirstSeen,
+		LastSeen:     q.LastSeen,
+		Cluster:      d.cluster.Name,
+		Project:      d.cluster.ProjectID,
+		Location:     d.cluster.Location,
+		Type:         eventTypeWarning,
+	}
+}
+
+// runSweepLoop calls Sweep every interval until ctx ends.
+func runSweepLoop(ctx context.Context, d *dispatcher, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			d.Sweep(ctx)
+		}
+	}
 }
 
 // applyMemoryLimit sets the Go runtime's soft memory limit to
 // memoryLimitFraction of the container's, when the operator has told the
-// watcher what that is and nothing else has set a limit. debug.SetMemoryLimit
-// is the same knob GOMEMLIMIT turns; doing it here rather than in the
-// entrypoint keeps the derivation under test. One line either way, so the
-// startup log says which limit the process is running under.
+// watcher what that is and nothing else has set a limit (memlimit.Apply, the
+// derivation the manager shares; its input classes are tested there). Doing
+// it here rather than in the entrypoint keeps the call under test. One line
+// either way, so the startup log says which limit the process is running
+// under.
 func applyMemoryLimit() {
-	limitBytes, apply, reason := deriveMemoryLimit(os.Getenv(goMemLimitEnv), os.Getenv(memoryLimitEnv))
-	if !apply {
+	limitBytes, applied, reason := memlimit.Apply(memoryLimitEnv, memoryLimitFraction)
+	if !applied {
 		log.Printf("k8s-event-watcher: memory limit not derived: %s", reason)
 		return
 	}
-	debug.SetMemoryLimit(limitBytes)
 	log.Printf("k8s-event-watcher: Go soft memory limit set to %d bytes (%s=%s × %g)",
 		limitBytes, memoryLimitEnv, os.Getenv(memoryLimitEnv), memoryLimitFraction)
 }
@@ -787,6 +1079,9 @@ func realMain(argv []string) error {
 	filter := newFilter(filterCfg)
 
 	m := newMetrics()
+	if f.dataVolume != "" {
+		m.registry.MustRegister(newDataVolumeCollector(f.dataVolume, dataVolumeStatfs))
+	}
 
 	var inj *injector
 	if !f.dryRun {
@@ -838,6 +1133,22 @@ func realMain(argv []string) error {
 	if err != nil {
 		return err
 	}
+
+	// After buildWatchSet, so a watch set that cannot be built still exits
+	// at once and counts as a failed start to the entrypoint's supervisor;
+	// before any dedup cache, so nothing is restored or snapshotted while
+	// the process may yet be a standby. cluster_up is published at 0 first,
+	// so the wait reads as "registered, not yet watching" rather than as no
+	// watcher at all.
+	if f.gatewayURL != "" && !f.dryRun {
+		for _, tc := range clusters {
+			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
+		}
+		waitForGateway(ctx, f.gatewayURL, f.gatewayWait, gatewayProbeInterval)
+		if ctx.Err() != nil {
+			return nil
+		}
+	}
 	if f.dryRun {
 		log.Printf("k8s-event-watcher: running in --dry-run mode; watching %d cluster(s) without calling the daemon", len(clusters))
 	}
@@ -870,13 +1181,15 @@ func realMain(argv []string) error {
 		caches = append(caches, cache)
 		started++
 		clusterDisp := newDispatcher(f, filter, cache, inj, m)
+		clusterDisp.cluster = tc
 		if f.dedupPersist != "" && f.snapshotInterval > 0 {
 			go runSnapshotLoop(ctx, cache, f.snapshotInterval)
 		}
+		go runSweepLoop(ctx, clusterDisp, sweepInterval)
 		wg.Add(1)
 		go func(tc targetCluster, disp *dispatcher) {
 			defer wg.Done()
-			w := newWatcher(tc.Client, disp, tc, 0)
+			w := newWatcher(tc.Client, disp, tc)
 			log.Printf("k8s-event-watcher: [%s] starting: preflight, then informer (source=%s project=%s location=%s)",
 				tc.Name, tc.Profile, tc.ProjectID, tc.Location)
 			// Starts at 0 and only reaches 1 once the initial list completes.
@@ -896,10 +1209,13 @@ func realMain(argv []string) error {
 			onWatching := func(watching bool) {
 				if !watching {
 					m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
-					log.Printf("k8s-event-watcher: [%s] events forbidden, no longer watching until the next successful attempt", tc.Name)
+					// Blind again: nothing it does not see can be called quiet.
+					disp.readyAt.Store(0)
+					log.Printf("k8s-event-watcher: [%s] events are not being delivered (the watch was refused or failed), no longer watching until the next successful attempt", tc.Name)
 					return
 				}
 				m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(1)
+				disp.readyAt.Store(disp.clock().UnixNano())
 				if !counted.Swap(true) {
 					synced.Add(1)
 					log.Printf("k8s-event-watcher: [%s] informer synced, now watching", tc.Name)
@@ -986,10 +1302,12 @@ func realMain(argv []string) error {
 // The two entries are not interchangeable, so which one survives matters. The
 // profile carries the project/location/cluster identity that stamps the payload
 // and labels every metric; the direct entry knows only a name. But the profile
-// also carries a credential that can be refused: it authenticates as the GSA,
-// so a permission set without roles/container.viewer, or master authorized
-// networks that exclude the pod's egress, denies it. The direct entry uses the pod's own service account against
-// kubernetes.default.svc and never leaves the cluster.
+// also carries a credential that can be refused: it authenticates as a GSA
+// (the broker's, through the credential proxy, or the pod's without one), so a
+// permission set without roles/container.viewer, or master authorized networks
+// that exclude that identity's egress, denies it. The direct entry uses the
+// pod's own service account against kubernetes.default.svc and never leaves the
+// cluster.
 //
 // Nothing here would notice the difference. discoverClusterProfiles contacts
 // the GKE API for the control plane's address, but nothing exercises that

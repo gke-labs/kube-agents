@@ -29,7 +29,7 @@ SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -119,23 +119,24 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # or carries a `# shellcheck disable=SCnnnn # reason` on the line above, so widening this
 # list is how a real finding gets silenced.
 #
-# The scripts under agents/platform/skills/gke-*/ are left out. Those trees are
-# copies of google/skills that scripts/sync-upstream-skills.py deletes and
-# re-copies wholesale (AGENTS.md, Skills Guidelines), and its substitution
-# hooks rewrite SKILL.md only, so a directive or fix written into one of their
-# .sh files lasts until the next sync and the target goes red on a tree nobody
-# edited by hand. A warning in one of them is fixed upstream, not here.
+# The scripts under agents/platform/skills/gke-*/ are linted like the rest. They
+# are generated from google/skills plus a patch overlay (scripts/skill_overlay.py;
+# AGENTS.md, Skills Guidelines), so a fix, or for a false positive a
+# `# shellcheck disable=SCnnnn # reason`, is recorded as a patch and survives
+# every sync.
 SHELLCHECK_PATHSPEC := *.sh
-SHELLCHECK_SKIP_PATHSPEC := :!agents/platform/skills/gke-*
+# third_party/google-skills/ holds byte-identical copies of upstream's skills, which
+# are never edited; the generated skills in agents/platform/skills/gke-*/ carry any fix.
+SHELLCHECK_SKIP_PATHSPEC := :!third_party/google-skills/*
 SHELLCHECK_SEVERITY := warning
 SHELLCHECK_EXCLUDE := SC1090,SC1091
 
-shellcheck: ## Run shellcheck over every tracked .sh file (upstream-synced gke-* skills excepted) at warning severity.
+shellcheck: ## Run shellcheck over every tracked .sh file (the upstream copies in third_party/ excepted) at warning severity.
 	@command -v shellcheck >/dev/null 2>&1 || { \
 		echo "shellcheck needs the shellcheck binary; install the release .github/workflows/validate.yml pins (https://github.com/koalaman/shellcheck/releases) so local and CI findings match"; \
 		exit 1; \
 	}
-	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' '$(SHELLCHECK_SKIP_PATHSPEC)' | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)
+	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' $(foreach p,$(SHELLCHECK_SKIP_PATHSPEC),'$(p)') | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)
 
 # ruff's error-only rules: syntax errors (E9), comparisons that are always
 # wrong (F63), misplaced control flow (F7) and undefined names (F82) -- the
@@ -244,14 +245,91 @@ endif
 # runs in structural too, which is the other half of measuring the same suite.
 PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/pubsub-platform
 
+# The files the sweep hands out first. xargs feeds the workers in list order,
+# and the globs above sort by path, so a long file that sorts late started
+# late: on 2026-10-14 (run 38592675526) every other file had finished at
+# 16:01:24 and tests/test_rollback_roundtrip.py, 182 s on its own and sorted
+# into the last tenth of the list, ran alone until 16:03:32 with three of four
+# workers idle.
+# Longest-first is the schedule that closes that gap, and the simulation over
+# that run's per-file times puts the sweep at its floor, the total divided by
+# the worker count, instead of two minutes above it. These are the files that
+# took over 30 s in that run, longest first; the rest of the sweep is a long
+# tail that no order can move by much. A file named here that no glob reaches
+# fails tests/test_python_test_sweep.py, which is what keeps the list honest
+# when a test moves or is deleted. A file that grows heavy later costs the
+# tail again until someone adds it; the per-file blocks the sweep prints carry
+# the `Ran N tests in S s` line to find it by.
+PYTHON_TEST_HEAVY_FILES := \
+	scripts/test_eval_dashboard_pages.py \
+	tests/test_rollback_roundtrip.py \
+	agents/platform/scripts/test_credential_proxy.py \
+	tests/test_bootstrap_discovery_plant.py \
+	tests/test_fleet_fixture_state.py \
+	scripts/test_task_registration.py \
+	tests/test_install_script.py \
+	tests/test_bootstrap_ranking_plant.py \
+	scripts/test_eval_dashboard_fixture_state.py \
+	tests/test_gitops_fix_cycle_scripts.py \
+	tests/test_python_test_sweep.py \
+	scripts/test_skill_overlay.py \
+	tests/integration/test_seam_injector_kv.py \
+	scripts/test_eval_dashboard_nightly.py \
+	scripts/test_ci_env_agent_pod_diagnostics.py \
+	scripts/test_eval_dashboard_trend.py \
+	scripts/test_eval_dashboard_publish.py \
+	agents/platform/skills/fleet-audit/scripts/test_audit_report.py \
+	tests/test_installer_common.py \
+	agents/platform/scripts/test_credential_proxy_metrics.py
+
+# The order the workers take files in: the heavy files above that are in
+# PYTHON_TEST_FILES, in that order, then every other file in PYTHON_TEST_FILES
+# order. Filtered both ways so it is a permutation of PYTHON_TEST_FILES and
+# nothing more -- a run narrowed with PYTHON_TEST_FILES="..." runs the files
+# it names, not those plus the heavy list. The heavy names are the patterns in
+# both filters and PYTHON_TEST_FILES is only ever the text, because make reads
+# `%` in a pattern word as a wildcard: with the caller's list as the pattern, a
+# typed PYTHON_TEST_FILES='tests/%' pulled every heavy file under tests/ into
+# the feed, where the output loop below, which walks PYTHON_TEST_FILES, would
+# print none of their blocks and read none of their verdicts. This way that
+# word reaches the worker as the literal it is and fails its regular-file
+# check, the same as on any other path that is not a file. Only the feed to
+# xargs reads this; the captured output is still printed in PYTHON_TEST_FILES
+# order, so the blocks read in path order whatever order the files ran in.
+PYTHON_TEST_RUN_ORDER = $(foreach heavy,$(PYTHON_TEST_HEAVY_FILES),$(filter $(heavy),$(PYTHON_TEST_FILES))) $(filter-out $(PYTHON_TEST_HEAVY_FILES),$(PYTHON_TEST_FILES))
+
+# Which part of the sweep this run takes, as `<k>/<n>`: the k-th of n shards.
+# CI runs the required job as three shards on three runners and joins their
+# coverage after (python-tests.yml), because one runner spent about 18 minutes
+# on a suite whose single longest file takes five. A shard takes every n-th
+# file of PYTHON_TEST_RUN_ORDER starting at the k-th, so the heavy files at the
+# front spread one to a shard and shard 1 holds the heaviest of each n. The
+# default, 1/1, is the whole sweep, unchanged.
+PYTHON_TEST_SHARD ?= 1/1
+# Kept out of the environment of the tests the sweep runs, or a test that
+# drives the Makefile itself (tests/test_python_test_sweep.py) would shard its
+# own fixtures. CI sets it in the environment, which `unexport` covers; set on
+# make's command line it would also travel in MAKEFLAGS, which `unexport`
+# does not cover and tests/_run_make.py drops.
+unexport PYTHON_TEST_SHARD
+PYTHON_TEST_SHARD_INDEX = $(word 1,$(subst /, ,$(PYTHON_TEST_SHARD)))
+PYTHON_TEST_SHARD_COUNT = $(word 2,$(subst /, ,$(PYTHON_TEST_SHARD)))
+# The files this shard runs, in run order. A malformed PYTHON_TEST_SHARD, or a
+# shard that would get no file, expands to the word below, which the worker
+# refuses as a path that is not a file, so the shard fails rather than reading
+# green having run nothing.
+PYTHON_TEST_SHARD_BAD := invalid-PYTHON_TEST_SHARD
+PYTHON_TEST_SHARD_ORDER = $(shell printf '%s\n' $(PYTHON_TEST_RUN_ORDER) | awk -v s='$(PYTHON_TEST_SHARD)' -v k='$(PYTHON_TEST_SHARD_INDEX)' -v n='$(PYTHON_TEST_SHARD_COUNT)' -v bad='$(PYTHON_TEST_SHARD_BAD)' 'BEGIN { if (s !~ /^[1-9][0-9]*\/[1-9][0-9]*$$/ || k + 0 > n + 0) { print bad; done = 1; exit } } (NR - 1) % n == k - 1 { print; c++ } END { if (!c && !done) print bad }')
+
 # How many of those files `test-python` and `coverage` run at once. They are
 # separate `python3` processes that share nothing -- each cd's into its own
 # directory, servers in the seam tier bind port 0, and fixtures go through
 # tempfile. The sweep used to run one worker per directory, which cost its
 # slowest single directory however many workers there were: on CI's four,
 # tests/ alone took ten of the job's twelve minutes while the other three sat
-# idle. Per file, the shards spread across the workers and the sweep costs
-# about the total divided by this number, down to the slowest single file.
+# idle. Per file, the files spread across the workers and the sweep costs
+# about the total divided by this number, down to the slowest single file,
+# provided the long files start first (PYTHON_TEST_RUN_ORDER above).
 #
 # Set it to 1 to serialise. That is for reproducing a failure you suspect is
 # concurrency's doing, or for a machine you need the cores back on -- not for
@@ -281,7 +359,8 @@ PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 # xargs keeps going, and each worker records its own verdict in a file because
 # a variable assigned in a subprocess cannot come back to the parent. And each
 # file's output still arrives as a labelled block, because it is captured to
-# its own file and printed afterwards in PYTHON_TEST_FILES order -- concurrent
+# its own file and printed afterwards in PYTHON_TEST_FILES order, whatever
+# order PYTHON_TEST_RUN_ORDER ran them in -- concurrent
 # writers to one stream interleave mid-line and the "==> file" headers stop
 # meaning anything. What that costs is progress, and a run killed mid-sweep (a
 # CI cancellation, a step timeout) loses the captured output entirely, so each
@@ -290,13 +369,13 @@ PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 # The verdict file is per-file and read as fail-closed: a file whose .rc is
 # missing or non-zero counts as failed. One shared append-only file would be
 # shorter, but a failed append -- a full TMPDIR, which hundreds of concurrent
-# shards make likelier than the old loop did -- would silently drop a red file
+# files make likelier than the old loop did -- would silently drop a red file
 # and let the gate pass. Absence has to mean failure, not success.
 #
 # The worker refuses a path that is not a regular file before discovery runs.
 # A directory, or a file that is not there, would otherwise reach `discover -p`
 # as a pattern that matches nothing, and Python 3.11 exits 0 on an empty
-# collection: the shard reads green having run nothing. The globs above only
+# collection: the file reads green having run nothing. The globs above only
 # ever produce files that exist; a hand-typed PYTHON_TEST_FILES=tests/, the
 # old per-directory habit on the new variable, is how such a path arrives.
 #
@@ -308,7 +387,10 @@ define sweep_python_test_files
 work=$$(mktemp -d); \
 trap 'rm -rf "$$work"' EXIT INT TERM; \
 export work; \
-printf '%s\n' $(PYTHON_TEST_FILES) | xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
+printf '%s\n' $(PYTHON_TEST_SHARD_ORDER) >"$$work/shard.list" \
+	&& [ "$$(wc -l <"$$work/shard.list")" -eq $(words $(PYTHON_TEST_SHARD_ORDER)) ] \
+	|| { echo "could not write the shard's file list"; exit 1; }; \
+xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
 	file="$$1"; \
 	dir="$$(dirname "$$file")"; \
 	name="$$(basename "$$file")"; \
@@ -320,10 +402,11 @@ printf '%s\n' $(PYTHON_TEST_FILES) | xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
 		rc=1; printf "  FAIL  %s\n" "$$file"; \
 	fi; \
 	echo "$$rc" >"$$stem.rc" \
-' _ {}; \
+' _ {} <"$$work/shard.list"; \
 echo; \
 failed=""; \
-for file in $(PYTHON_TEST_FILES); do \
+for file in $(PYTHON_TEST_FILES) $(filter $(PYTHON_TEST_SHARD_BAD),$(PYTHON_TEST_SHARD_ORDER)); do \
+	case " $(PYTHON_TEST_SHARD_ORDER) " in *" $$file "*) ;; *) continue ;; esac; \
 	echo "==> $$file"; \
 	stem="$$work/$$(printf "%s" "$$file" | tr "/" "_")"; \
 	if [ -f "$$stem.log" ]; then \
@@ -366,6 +449,8 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 	@echo "==> go build (a2a)"; cd a2a && go build ./...
 	@echo "==> go vet (a2a)";   cd a2a && go vet ./...
 	@echo "==> go test (a2a)";  cd a2a && go test ./...
+	@echo "==> go vet (ghes-proxy)";  cd hack/ghes-proxy && go vet ./...
+	@echo "==> go test (ghes-proxy)"; cd hack/ghes-proxy && go test ./...
 	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
 	@echo "==> python (everything else)"; $(MAKE) --no-print-directory test-python
 	@echo "==> conformance"; $(MAKE) --no-print-directory conformance
@@ -439,7 +524,8 @@ test-python: ## Run every Python unit-test file in PYTHON_TEST_FILES, the operat
 #
 # COVERAGE_STRICT=1 makes the target fail at the end when any file failed,
 # which is what lets one run serve as both the verdict and the meter. CI's
-# required job sets it, so the verdict and the number come from one execution
+# shard jobs set it, and the required job sets it again on coverage-merge over
+# the shards' joined lists, so the verdict and the number come from one execution
 # rather than a measured run beside an unmeasured one on the same interpreter;
 # the one other run of the sweep in CI is on the agent image's Python, which is
 # a different question, not a second meter. The default stays 0 because
@@ -537,6 +623,46 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 # The strict gate, last in the target on purpose: combine, xml and report have
 # all run by the time it fails, so a red run still leaves coverage.xml on disk
 # for the CI job to upload and the coverage comment to be posted from.
+	@if [ "$(COVERAGE_STRICT)" = "1" ] && [ -s $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE) ]; then \
+		echo "FAIL (COVERAGE_STRICT=1) -- failing test files: $$(cat $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE))"; \
+		exit 1; \
+	fi
+
+# The coverage directories the shards' CI jobs upload, one per shard, each with
+# the shard's combined .coverage and its failed-files list. CI downloads them
+# under COVERAGE_DIR before it runs coverage-merge.
+COVERAGE_SHARD_DIRS ?= $(wildcard $(COVERAGE_DIR)/python-coverage-shard-*)
+# How many shard directories coverage-merge requires; CI passes its shard count.
+COVERAGE_SHARD_COUNT ?= 1
+
+coverage-merge: ## Join the coverage the sharded `make coverage` runs left in COVERAGE_SHARD_DIRS: one coverage.xml, one total, and COVERAGE_STRICT over every shard's failing files.
+# The same refusal as in `coverage`, for the same reason: a truthy-looking
+# spelling would read as "not 1" to the gate below and pass a red list.
+	@case "$(COVERAGE_STRICT)" in \
+		0|1) ;; \
+		*) echo "ERROR: COVERAGE_STRICT must be 0 or 1, got '$(COVERAGE_STRICT)'."; \
+		   exit 1;; \
+	esac
+	@found=$(words $(COVERAGE_SHARD_DIRS)); \
+	if [ "$$found" != "$(COVERAGE_SHARD_COUNT)" ]; then \
+		echo "ERROR: expected $(COVERAGE_SHARD_COUNT) shard coverage directories under $(COVERAGE_DIR), found $$found: $(COVERAGE_SHARD_DIRS)"; \
+		exit 1; \
+	fi; \
+	for dir in $(COVERAGE_SHARD_DIRS); do \
+		[ -f "$$dir/.coverage" ] || { echo "ERROR: $$dir holds no .coverage data"; exit 1; }; \
+		[ -f "$$dir/$(COVERAGE_FAILED_FILE)" ] || { echo "ERROR: $$dir holds no $(COVERAGE_FAILED_FILE)"; exit 1; }; \
+	done
+# Fail-closed on the shards' verdicts as well as on their data: a shard whose
+# list is missing counts as failed above, and the lists are joined here for the
+# strict gate below, so a red file in any shard reds the joined check.
+	@for dir in $(COVERAGE_SHARD_DIRS); do cat "$$dir/$(COVERAGE_FAILED_FILE)"; printf ' '; done \
+		| tr -s ' ' | sed 's/^ //; s/ $$//' > $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE)
+	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+		python3 -m coverage combine --keep --rcfile=$(CURDIR)/.coveragerc $(addsuffix /.coverage,$(COVERAGE_SHARD_DIRS))
+	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+		python3 -m coverage xml --rcfile=$(CURDIR)/.coveragerc -o $(COVERAGE_XML)
+	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
+		python3 -m coverage report --rcfile=$(CURDIR)/.coveragerc | grep '^TOTAL'
 	@if [ "$(COVERAGE_STRICT)" = "1" ] && [ -s $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE) ]; then \
 		echo "FAIL (COVERAGE_STRICT=1) -- failing test files: $$(cat $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE))"; \
 		exit 1; \
@@ -675,8 +801,9 @@ skills-refresh: ## Record edits to a mirrored skill as a patch (SKILL=name [MSG=
 skills-generate: ## Rebuild a mirrored skill from its upstream copy and overlay (SKILL=name).
 	@$(SKILL_OVERLAY) generate $(SKILL)
 
-skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, offline.
+skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, and every shipped skill document fits skill_view.
 	@$(SKILL_OVERLAY) check
+	@python3 scripts/check_skill_size.py
 
 skills-status: ## List mirrored skills google/skills has moved past, and upstream skills not mirrored.
 	@$(SKILL_OVERLAY) status
@@ -694,7 +821,7 @@ docs-generate: ## Regenerate the generated doc regions and files from their sour
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
-docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
+docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template ## Run every documentation check CI runs.
 
 docs-check-generated:
 	@python3 scripts/generate_sop_geography.py --check
@@ -706,11 +833,17 @@ docs-check-links:
 docs-check-terminology:
 	@./hack/check-docs-terminology.sh
 
-docs-check-audience: ## Fail when a published site page carries a maintainer identifier (shapes: scripts/docs_audience_denylist.txt).
+docs-check-audience: ## Fail when a published site page carries a maintainer identifier or cites a pull request (shapes: scripts/docs_audience_denylist.txt; pinned backlog: scripts/docs_audience_allowlist.txt).
 	@python3 scripts/check_docs_audience.py
+
+docs-check-prose: ## Fail when a published site page's prose is out of step with scripts/docs_prose_ratchet.json (above a ceiling: fix the prose; below: lower the entry).
+	@python3 scripts/check_docs_prose.py
 
 docs-check-context-budget:
 	@python3 scripts/check_context_budget.py
+
+docs-check-pr-template: ## Fail when a section of .github/PULL_REQUEST_TEMPLATE.md tells the author to delete it, opens with a condition and names no one-line answer for the rest, or holds a comment the description readers split on (why: .agents/rules/pre_pr_review.md).
+	@python3 scripts/check_pr_template.py
 
 chart-sync: ## Sync the chart's CRD, ClusterRole-rule and admission-policy copies from k8s-operator/config, and regenerate files/footprint.yaml from the operator golden; the webhook template is hand-maintained and only checked.
 	@./hack/sync-chart-manifests.sh
@@ -774,7 +907,7 @@ terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `te
 	done; \
 	if [ -n "$$failed" ]; then echo "Failing Terraform test directories:$$failed"; exit 1; fi
 
-tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind.
+tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind; an approved apply (ARGS=-auto-approve) retries past Cloud KMS's first-enablement 403.
 	@./terraform/examples/full-install/lifecycle.sh apply $(ARGS)
 
 tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, backups, and deletion protection first.

@@ -2,15 +2,25 @@
 
 > **STATUS — partly implemented.** §12 items 1–6 ship in
 > `agents/platform/scripts/findings_queue.py`, `inventory_findings.py` and the Session KV server:
-> the two tables and their indexes (§3.1), the rubric and the severity it derives (§4), the upsert
-> rules (§5.2), the eight endpoints and MCP tools (§6.1), and the inventory sweep's registration
-> path (§5). Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Items 8 and
-> 10 ship in part: `agents/platform/scripts/findings_nudge.py` and the `findings-morning-nudge`
-> entry in `jobs.json` post §7.2's message behind item 10's `content_hash` change gate. The gate is
-> narrower than the design's: it applies only to a morning that names no critical the last complete
-> sweep still saw, so an unchanged quiet queue — including an empty one — says nothing, while a
-> critical the fleet still has is repeated every morning until it is fixed. That removes the case item 10's weekly floor exists to protect,
-> and the floor and its alarm are deferred. Item 8's `findings_publish_sop.md` is not written: the
+> the tables and their indexes (§3.1), the rubric and the severity it derives (§4), the upsert
+> rules (§5.2), the endpoints and MCP tools (§6.1), and the inventory sweep's registration
+> path (§5). A second writer ships beside the sweep: the Saturday `upgrade-readiness-weekly-review` job
+> (`agents/platform/scripts/upgrade_readiness_review.py`) registers the readiness report's blockers
+> and risks as `source: upgrade-readiness` rows under `upgrade-` check slugs of its own rather than the audit
+> streams' slugs (`pool-skew`, `blocking-exclusion`, `blocking-pdb`, which those streams file to their
+> ledgers, not to the queue): one problem must stay one row across weeks here, and the review also
+> reads objects no stream names (fail-closed webhooks, the readiness rules' rows); its completeness
+> claim names that family and its own source (`scope.check_prefix`, `scope.source`), so it lowers only its own rows in the family: no other family's, and not the `upgrade-` rows the audit streams (`upgrade-blocked`) or the retrospective write under their own sources. Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Item 8
+> ships in part: `agents/platform/scripts/findings_nudge.py` and the `findings-morning-nudge`
+> entry in `jobs.json` post a paced version of §7.2's message, hourly: at most two new criticals a
+> UTC day, a few non-criticals in the afternoon, nothing new while a non-critical it named waits for
+> a decision, and pending criticals reminded once a day (§7.2, "What ships is paced"). The first
+> inventory report is paced too: it lists at most `FINDINGS_FIRST_REPORT_CRITICALS` (2) critical items
+> and nothing below critical, and its delivery marks them shown. This reverses §7.3's "no selection"
+> on purpose. Item 10 does not ship: the paced nudge replaces its
+> `content_hash` change gate, so the nudge keeps no `queue_publications` row (§3.1, §7.5 describe
+> the gate; the nudge's own state is `.findings_nudge_state.json` in its profile home), and the
+> weekly floor and the alarm's `alarmed_at` edge trigger are deferred. Item 8's `findings_publish_sop.md` is not written: the
 > nudge runs as a `no_agent` script rather than as §7.5's SOP-driven job. Items 9 and 11–13 do not ship, so nothing publishes
 > the backlog and no finding reaches a pull request — §7.1, §7.4 and §9 remain design. The pipeline
 > this design extends does ship: the sweep in
@@ -19,11 +29,11 @@
 > the remediation-PR machinery described in
 > [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md).
 
-The first-time environment sweep finds everything and reports five things. On a neglected fleet the
-gap between those numbers is the whole problem: the sweep ranks dozens of findings, renders the top
-five, rolls the rest into one `Also found: N items` line, and the ranking work is discarded with the
-process that did it. Nothing re-reads the remainder, nothing re-verifies it against a cluster that
-has since changed, and the only route back to it is the user thinking to ask.
+Before this design, the first-time environment sweep found everything and reported five things. On a
+neglected fleet the gap between those numbers was the whole problem: the sweep ranked dozens of
+findings, rendered the top five, rolled the rest into one `Also found: N items` line, and the ranking
+work was discarded with the process that did it. Nothing re-read the remainder, nothing re-verified it
+against a cluster that had since changed, and the only route back to it was the user thinking to ask.
 
 This design turns the discarded remainder into a durable queue: one row per problem, ordered by a
 published rubric, published in full as a list the user can read whenever they want, re-verified
@@ -37,15 +47,16 @@ The shipped path is four stages, described in full by the
 [`bootstrap_onboarding` README](../../agents/chat/defaults/plugins/bootstrap_onboarding/README.md)
 and the site's [ChatOps concepts page](../site/src/content/docs/concepts/chatops.md), which are
 canonical for it. In outline: `bootstrap_scan_gate.py` files a kanban card to `platform`; that
-worker follows `inventory.md` and lists the fleet, while the gate files one audit card per Cluster Agent; once their cards settle,
+worker follows `inventory.md` and lists the fleet, while the gate files one audit card per Cluster Agent up to the first-run cap (the sweep audits the rest); once their cards settle,
 `bootstrap_handoff.py` writes the complete findings to `/opt/data/INVENTORY.raw.md`; a
-second card follows `inventory_prioritize_sop.md`, collapsing duplicates and ranking everything
-before rendering at most five items to `/opt/data/INVENTORY.md`; `bootstrap_delivery.py` posts that
-file to chat verbatim (on Slack with `KAGE_SLACK_UX` on, laid out again by a fixed script that keeps
-the top two findings and every critical one, or the whole list when it runs past five, each with its sentence as written). The cap has one exception, which matters to the argument below: when
-critical findings alone exceed five they are never capped and never rolled up, so the list is
-exactly those criticals. A fleet with six criticals gets all six; a fleet with one critical and
-forty gaps gets five.
+second card follows `inventory_prioritize_sop.md`, scoring and registering everything, and
+`inventory_findings.py select` chooses what it renders to `/opt/data/INVENTORY.md`: at most
+`FINDINGS_FIRST_REPORT_CRITICALS` (2) critical items and nothing below critical (§7.2);
+`bootstrap_delivery.py` posts that file to chat as written, followed by a note on the fleet audits (on Slack with `KAGE_SLACK_UX` on, laid out
+again by a fixed script that keeps every listed finding with its sentence as written) and marks the
+listed findings shown. The cap covers criticals too. A fleet with six criticals gets two in the report
+and the other four through the paced nudge; a fleet with one critical and forty gaps gets one, and the
+forty reach chat through the nudge once that critical is decided.
 
 Three things go wrong at the last step. The shape of the problem is the one
 [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md) §1 sets out for the pull request as a
@@ -54,15 +65,15 @@ failures differ.
 
 **The ranking is computed and thrown away.** Step 3 of the prioritization SOP scores every surviving
 finding on three dimensions. Step 4 reads the top of that order and discards the rest of it. The
-sixth-ranked finding and the fortieth are indistinguishable by the time the report is written — both
+third-ranked finding and the fortieth are indistinguishable by the time the report is written — both
 are a contribution to one integer in `Also found: 14 informational items`.
 
-**A display cap is doing the work of a lifecycle.** Five is the right number of items to put in a
-first chat message. It is not a statement that the sixth problem is resolved, deferred, or accepted,
-and there is nowhere to record which of those it is. `inventory_prioritize_sop.md` is careful that
-nothing is dropped _from the report_ — "every finding in the raw file is either shown, merged into a
-shown finding, or counted in the roll-up" — but a count is not a queue, and the guarantee stops at
-the message boundary.
+**A display cap is doing the work of a lifecycle.** A short list is the right thing to put in a
+first chat message. It is not a statement that the problem left off it is resolved, deferred, or
+accepted, and there is nowhere to record which of those it is. `inventory_prioritize_sop.md` is
+careful that nothing is dropped _from the report_ — "every registered finding is either listed,
+gathered into a listed line, or counted in the roll-up" — but a count is not a queue, and the
+guarantee stops at the message boundary.
 
 **A snapshot has no mechanism for noticing it has gone stale.** `INVENTORY.raw.md` records what was
 true during one sweep. A finding fixed the following week stays in the file; a finding that got
@@ -109,9 +120,8 @@ write the table are the cron relay's and `platform_mcp_server.py`'s. The watcher
 second of those — `trigger_agent_troubleshooter` registers session routing, and the troubleshooting
 agent's threaded `send_notification` then POSTs `/v1/incidents` — so `incident_context` is right
 that the watcher is one of two writers. The point survives the correction: what lands is the
-composed chat message, which for the relay's own writes the server describes as "the relay's
-composed output rather than the specialist's finding." Neither writer produces a ranked, stateful
-row for a problem.
+chat message as posted, which for the relay's own writes is the specialist's report. Neither
+writer produces a ranked, stateful row for a problem.
 
 So `findings` is a new table beside `incidents` with a disjoint job: `findings` is the queue,
 `incidents` is the chat-thread transcript. ("Ledger" is reserved throughout this document for the
@@ -125,8 +135,8 @@ Grain is one problem: one check, at one object, on one cluster.
 | column                                       | notes                                                                                                                                                                                                                      |
 | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `id`                                         | identity; primary key. Derived, never written by a model — see below                                                                                                                                                       |
-| `source`                                     | `inventory` \| `event-watcher` \| `audit`                                                                                                                                                                                  |
-| `check`                                      | the check slug; the same vocabulary the audit streams use (§10)                                                                                                                                                            |
+| `source`                                     | `inventory` \| `event-watcher` \| `audit` \| `upgrade-readiness`                                                                                                                                                           |
+| `check`                                      | the check slug; the audit streams' vocabulary (§10), and the `upgrade-` family the weekly readiness review writes                                                                                                          |
 | `project`, `cluster`, `namespace`, `object`  | the GCP project qualifies the cluster — a cluster name is only unique within one (a second project's `prod` must not overwrite the first's rows); `namespace` empty for cluster-scoped objects                             |
 | `severity`                                   | `critical` \| `major` \| `minor`. Derived from `rank_score`, not judged separately, with one floor for findings that are failing now (§4.2)                                                                                |
 | `rank_score`                                 | the ordering key. Every row has one, gated or not (§4.4). Written at registration, changed only by a named re-rank event                                                                                                   |
@@ -140,6 +150,8 @@ Grain is one problem: one check, at one object, on one cluster.
 | `state`                                      | `queued` → `surfaced` → `accepted` \| `dismissed` \| `resolved`, plus `snoozed` and `stale`                                                                                                                                |
 | `first_seen`, `last_verified`, `surfaced_at` |                                                                                                                                                                                                                            |
 | `surface_count`, `snoozed_until`             | how many nudges have named it, and the explicit silence (§7)                                                                                                                                                               |
+| `first_shown_at`, `added_class`              | when a paced publisher first named it, and the class of the item it was added under; what makes a row pending (§7.2). Neither is set by a pull; a recurrence clears both (§5.2)                                            |
+| `absent_since`                               | when a complete sweep first stopped reporting it (§5.2); cleared when it is reported again. A shown row with it set is not pending (§7.2)                                                                                  |
 | `alarmed_at`                                 | when the alarm last fired for this row, and the edge trigger that stops it firing again while the same fault persists. §7.2 owns the rule                                                                                  |
 | `verification`                               | `{kind, command, still_failing_when}` — how to ask the cluster whether this is still true. Written at registration by whoever found it (§7.4)                                                                              |
 | `chat_id`, `thread_id`                       | null until surfaced; written _after_ the send. The join to `incidents`, and not a delivery input (§8)                                                                                                                      |
@@ -170,7 +182,7 @@ next sweep re-registers what the user already rejected and it reappears on the l
 ```sql
 CREATE TABLE IF NOT EXISTS findings (
     id               TEXT PRIMARY KEY,
-    source           TEXT NOT NULL,               -- inventory | event-watcher | audit
+    source           TEXT NOT NULL,               -- inventory | event-watcher | audit | upgrade-readiness
     check_slug       TEXT NOT NULL,
     project          TEXT NOT NULL,               -- the GCP project id; qualifies cluster
     cluster          TEXT NOT NULL,
@@ -195,6 +207,9 @@ CREATE TABLE IF NOT EXISTS findings (
     last_verification TEXT,                       -- JSON {outcome, observed, at}; see §7.4
     surfaced_at      TIMESTAMP,
     surface_count    INTEGER NOT NULL DEFAULT 0,
+    first_shown_at   TIMESTAMP,                   -- §7.2: first paced showing; cleared on recurrence (§5.2)
+    added_class      TEXT,                        -- critical | noncritical; null when not an addition
+    absent_since     TIMESTAMP,                   -- §5.2: first complete sweep that missed it; null once reported
     snoozed_until    TIMESTAMP,
     alarmed_at       TIMESTAMP,                   -- §7.2's alarm edge trigger
     chat_id          TEXT,
@@ -255,6 +270,11 @@ a column leaves it alone rather than nulling it. A full-row replace would let th
 erase the URL the backlog needs on its next run, and the symptom of that is a second backlog document
 rather than an error.
 
+`findings_additions` holds one row per addition a paced publisher makes (§7.2), the nudge or the
+first inventory report's delivery: the UTC day, the item's key, the run and the class it was added
+under. Only `mark_surfaced` writes it and nothing clears it, so neither a decision nor a recurrence
+gives a day's budget back.
+
 `snoozed_until` is stored as UTC `YYYY-MM-DD HH:MM:SS`, whatever form the caller sent, because the
 expiry sweep asks `snoozed_until <= datetime('now')` and that is a string comparison. An ISO
 timestamp with a `T` or an offset sorts wrong against it, so a snooze kept in the shape it arrived in
@@ -286,7 +306,7 @@ transition has exactly one actor.
 | ----------- | -------------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------- |
 | `queued`    | registration, for an id not already present                    | any source (§5)                                           | on the list, in score order                                   |
 | `surfaced`  | a nudge or an on-demand pull named it                          | the publisher, after send                                 | stays on the list; `surface_count` records how often          |
-| `snoozed`   | the user said "not now" and gave or implied a date             | user, via a kanban card; the nudge's daily run returns it | off the list until `snoozed_until`, then back to `surfaced`   |
+| `snoozed`   | the user said "not now" and gave or implied a date             | user, via a kanban card; the next hourly nudge returns it | off the list until `snoozed_until`, then back to `surfaced`   |
 | `accepted`  | the user took it on — working it, or its PR is open            | user, via a kanban card                                   | its own section of the list; still re-verified                |
 | `dismissed` | the user rejected it — won't fix, or not a real problem        | user, via a kanban card                                   | off the list permanently; sticky against every automated path |
 | `resolved`  | re-verification found it no longer reproduces                  | the daily job                                             | off the list; kept as the record that it was fixed            |
@@ -316,6 +336,26 @@ the queue's boundary costs a round trip, and it is the same boundary §6 decline
 
 Silence transitions nothing. §7.1 says why: inferring dismissal from an unanswered message is how
 this design would end up back at ignoring its own top item.
+
+**Shown, pending and item are pacing's words, not states (§7.2).** A row is _shown_ once a paced
+publisher (the nudge or the first report) has named it and marked it with `publisher`, which sets
+`first_shown_at`; a pull that names a row and calls the same route without `publisher` leaves it
+unshown. A shown row is _pending_ while its state is `surfaced` and no complete sweep has missed it
+since it was last reported (`absent_since` unset, §5.2), so snoozed, accepted, dismissed, resolved
+and stale rows are not pending, and a lapsed snooze makes a shown row pending again. `surfaced`
+alone does not mean shown: `expire_snoozes`, a `PATCH` and a pull all set it without a paced send.
+An _item_ is the rows that share check, project and cluster, one gathered line: they are named and
+marked together, the item is pending while any of them is, and its severity is the highest among its
+pending and never-shown members. A decision (accept, snooze, dismiss) on any row of an item is
+applied to every other row of it that is still `surfaced`, so the one id the nudge
+prints is enough to decide the line it named; a `queued` row of the item, which no message has
+named, keeps its state (§7.2); the count the nudge prints beside that id is the number of rows
+the decision reaches, which includes shown rows a sweep stopped reporting; the nudge does not list
+those, and says how many of the count they are. Two consequences of the
+severity rule are accepted rather than designed around: a new critical row that joins a pending
+non-critical line makes the line a pending critical, which lifts stop-add and is reminded rather
+than added, so it spends no daily budget; and a row that joins a pending critical line outside the
+day's top reminders is not named until the line ranks into them.
 
 **One transition has no actor yet, and it is the gap to close at implementation.** `pr_state` needs
 someone to notice a merge. The core cannot do it — noticing a merge means talking to a repository,
@@ -404,10 +444,11 @@ read from live object state; 0.6 inferred from absence or a heuristic.
 
 **Severity is derived, not judged separately:** `critical` at 150 and above, `major` from 40 to 149,
 `minor` below 40. These are initial thresholds, and §7.2 records what a dry run against a simulated
-fleet says about them: the bands are wide in the middle, with `major` holding half the queue. That
-is tolerable because nothing selects on the band — the list orders by `rank_score` and the band is
-a label — but it is the first thing to calibrate against a real sweep, and the calibration belongs
-here when it exists.
+fleet says about them: the bands are wide in the middle, with `major` holding half the queue. The
+list orders by `rank_score`, but pacing (§7.2) selects on the band: `critical` decides which
+findings the first inventory report may list, how many findings a day the nudge adds, and whether a
+pending one stops additions. That makes the bands the first thing to calibrate against a real sweep,
+and the calibration belongs here when it exists.
 
 **One floor overrides the thresholds: a finding that is failing now, on something the user depends
 on, is `critical` whatever it scores.** Formally, `L = 10 ∧ B ≥ 3` floors `severity` at `critical`.
@@ -430,13 +471,13 @@ over two of those fields and stays correct through a re-rank by construction. A 
 column would be a second copy of the same fact, free to disagree with the vector the moment §4.6's
 re-rank moves L.
 
-The threshold is load-bearing in one place. A `critical` grade always clears the severity floor of
+For promotion, the threshold is load-bearing in one place. A `critical` grade always clears the severity floor of
 the auto-promotion sweep in `finish`, which is what opens a pull request without being asked (`major`
 clears it only on the few checks `MAJOR_SWEEP_CHECKS` names). It is
 **not** a condition on `remediate`, which passes `auto_promote=False` and "opens what was named and
 nothing else" — and `remediate` is the call §9 puts on this path. So on the queue's own path the
 threshold decides nothing about promotion; it decides what the surfaced message calls the finding,
-and what a future `finish`-style sweep would pick up if one were ever pointed at this table.
+when pacing lets it reach chat (below), and what a future `finish`-style sweep would pick up if one were ever pointed at this table.
 
 That is also what makes the floor cheap. Widening `critical` would be alarming if `critical` opened
 pull requests, and on the queue's path it does not: promotion is bounded by the promotion slice (§9), not
@@ -444,6 +485,13 @@ by the band. The one thing to carry forward is that a `finish`-style sweep point
 table later would inherit the floor as a promotion trigger — so whoever builds that decides then
 whether an actively-failing finding should auto-promote, rather than acquiring the answer by
 accident from a labelling rule written here.
+
+Pacing (§7.2) makes the threshold load-bearing on the queue's own path as well. Only a `critical`
+finding can be listed in the first inventory report, and after it a `critical` finding is added to
+chat under its own daily limit and from noon UTC; anything below it waits for the afternoon, and
+while one such finding is pending it holds every addition back. Widening `critical` therefore moves
+findings into the first report's reach and from the afternoon slot to the noon one, and changes what
+stop-add waits on.
 
 ### 4.3 Worked examples
 
@@ -547,9 +595,9 @@ obvious alternative — a per-source priority band — is worse and a reader wil
 ## 5. Who writes it
 
 **Inventory.** Extend `inventory_prioritize_sop.md` rather than adding a stage. It already ranks
-everything in Step 3; today Step 4 discards all but five. Have it register the full set with rubric
-vectors, then render the delivered report from what it registered. One ranking pass, no new card,
-and the `Also found: N items` line becomes a pointer into the queue instead of a dead end.
+everything in Step 3, and the report shows only the top of that order. Have it register the full set
+with rubric vectors, then render the delivered report from what it registered. One ranking pass, no
+new card, and the `Also found: N items` line becomes a pointer into the queue instead of a dead end.
 
 What that stage may decide is narrower than it first looks. Asked to enumerate the findings out of
 the raw file's prose and make the registration call itself, it lost findings three ways: it decided
@@ -559,7 +607,12 @@ back one field at a time and was abandoned; and one accepted call read as done. 
 judgement, so the findings travel as a machine-readable block, written by
 `bootstrap_handoff.py` from the Cluster Agents' structured results, and `agents/platform/scripts/inventory_findings.py` owns both ends —
 `extract` produces the numbered set, `register` refuses to send anything until every number carries
-a score. The stage's judgement is scoring, which is the part that needs a model.
+a score. The stage's judgement is scoring, which is the part that needs a model. The worker's
+terminal is the shell sandbox, which cannot reach the queue on the agent pod's loopback, so there
+`register` exits 13 having sent nothing; `bootstrap_delivery.py`, which runs in the agent pod, reads
+the same items and scores files out of the sandbox and registers the batch before it claims the
+report's delivery. Registration is an upsert, so where the worker's `register` did reach the queue
+the second pass changes nothing.
 
 **The event watcher.** [`k8s-event-watcher`](../../k8s-operator/cmd/k8s-event-watcher/) already
 POSTs to the same Session KV server, so registering a finding is one more call on a path that
@@ -628,8 +681,10 @@ rule is per state, and two of the seven are the whole point of writing it down:
   `queued`, and it reappears on the list — which is not a queue with a dismissal, it is a queue that
   forgets. Record the re-observation on the row so the count is honest; do not act on it.
 - `resolved`, `stale` — a re-registration means it came back. Move to `queued`, keep `first_seen`,
-  clear `surface_count` and `alarmed_at`. A recurrence is news and should be allowed to trigger the
-  alarm again, but it is the same problem with a history, not a new one.
+  clear `surface_count`, `alarmed_at`, `first_shown_at` and `added_class`. A recurrence is news and
+  should be allowed to trigger the alarm again, but it is the same problem with a history, not a new
+  one. For pacing (§7.2) it is a new addition; the earlier addition stays counted against its day in
+  `findings_additions`, which nothing clears.
 
 **A finding that stops being reported is not thereby resolved.** This is the reciprocal case and the
 one an upsert cannot express, because it is about the rows a run did _not_ mention. The temptation
@@ -638,11 +693,20 @@ in the expensive direction. A sweep that failed halfway, ran against one cluster
 credential produces exactly the same absence as a fleet that got healthier overnight, and closing on
 it announces fixes that did not happen.
 
-So absence downgrades confidence rather than deciding anything: on a completed run, a `queued` row
-the run did not re-report has `C` lowered to 0.6 — the rubric's own value for "inferred from
+So absence downgrades confidence rather than deciding anything: on a completed run, a `queued` or
+`surfaced` row the run did not re-report has `C` lowered to 0.6 — the rubric's own value for "inferred from
 absence" — which re-ranks it down without asserting anything about it, and the definite answer comes
 from §7.4's verification the next time the row is named in a nudge. Only a run that reports its own scope as
-complete for that cluster may do even this much; a partial run touches nothing.
+complete for that cluster may do even this much; a partial run touches nothing. The claim's reach is decided in two steps: the rows whose check starts with `scope.check_prefix` when the scope names one (a run that reads one family of checks: whatever source wrote the rows, or, when `scope.source` names a source beside the prefix, that source's rows in the family alone); else the rows of the batch's own `source`, or of `scope.source`, which must be a known source and, for a batch that is not empty, one the batch wrote, so a hand re-run of the inventory sweep lowers no other writer's rows. An empty complete batch that names neither has no source of its own to claim for and is refused, so no caller lowers every row on a cluster by accident. The weekly upgrade readiness review writes under a source of its own, `upgrade-readiness`, so a prefix-less claim made under another writer's source never reaches its rows. The review's own claim names the `upgrade-` family and its source together, so it reaches only its own rows in the family, never an `upgrade-` row another writer filed. With a complete scope an empty batch that names a prefix or a source is accepted, since a sweep that found nothing is exactly the case the rule is for.
+
+The same run sets `absent_since` on each such row, keeping the first miss, including on a row
+already at 0.6, which is not re-ranked (the register response's `downgraded` counts only the rows
+re-ranked, so such a row is not in it). A source may register a finding at 0.6 ("inferred"), so C
+alone cannot say whether a sweep stopped reporting a row, and pacing (§7.2) reads the marker
+instead. Any re-registration clears it, whatever the row's state, as does a verification that finds
+it still failing. `absent_since` was added after the table shipped and is not backfilled: a row
+downgraded before then cannot be told apart from one registered at 0.6, so it reads as still
+reported until a complete sweep misses it again.
 
 ## 6. Who reads it
 
@@ -681,15 +745,17 @@ gets the same treatment, for two reasons that are not stylistic:
 | ------------------------------------------------ | --------------------------------- | -------------------------------------------------------------------------------------- |
 | `POST /v1/findings`                              | prioritize worker, watcher, audit | upsert a batch under §5.2's per-state rules; returns created/updated/suppressed per id |
 | `GET /v1/findings/ranked`                        | any publisher (§7)                | the open queue in the order below; the whole list, ordering in code                    |
-| `GET /v1/findings`                               | the `platform` worker             | the on-demand pull, filterable by project, cluster, state, severity                    |
+| `GET /v1/findings`                               | `platform` worker, weekly brief   | the on-demand pull, filterable by project, cluster, state, severity, check prefix      |
 | `POST /v1/findings/{id}/surfaced`                | any publisher                     | after the send: `surface_count`, `surfaced_at`, `chat_id`, `thread_id`                 |
-| `POST /v1/findings/expire-snoozes`               | the nudge's daily run             | return every row whose `snoozed_until` has lapsed to `surfaced` (§3.2)                 |
-| `PATCH /v1/findings/{id}`                        | the `platform` worker             | the three human transitions (§3.2), plus `pr_url`/`pr_state` reconciliation            |
+| `POST /v1/findings/{id}/surfaced` + `publisher`  | a paced publisher (§7.2)          | also `added_class`, `run`: `first_shown_at` on a first paced showing, and the addition |
+| `GET /v1/findings/additions?day=`                | the nudge                         | items added on a UTC day, by class, from `findings_additions` (§7.2)                   |
+| `POST /v1/findings/expire-snoozes`               | the nudge, every run              | return every row whose `snoozed_until` has lapsed to `surfaced` (§3.2)                 |
+| `PATCH /v1/findings/{id}`                        | the `platform` worker             | the three human transitions (§3.2) for the row's item, plus `pr_url`/`pr_state`        |
 | `POST /v1/findings/{id}/verified`                | the daily job                     | the three-outcome result of §7.4, with what was observed                               |
 | `GET`/`PUT /v1/findings/publication/{publisher}` | any publisher                     | read and write that publisher's row in `queue_publications` (§3.1)                     |
 
 **What `/ranked` means by "open", and what order it returns.** Open is `queued`, `surfaced`, and
-`accepted`; a `snoozed` row rejoins them when the nudge's daily run expires its lapsed `snoozed_until`
+`accepted`; a `snoozed` row rejoins them when the nudge's next run expires its lapsed `snoozed_until`
 (§3.2), which is a stored transition rather than a predicate the query evaluates — otherwise the
 backlog shows a row that `GET /v1/findings` still reports as snoozed.
 
@@ -752,7 +818,7 @@ publishers reading `GET /v1/findings/ranked` (§6.2). Three ship:
 | publisher       | what it is                                                 | cadence                                     |
 | --------------- | ---------------------------------------------------------- | ------------------------------------------- |
 | **the backlog** | the whole ranked list, as one document, rewritten in place | after every sweep and every daily run       |
-| **the nudge**   | a three-line chat message: count, top three, link          | daily, when the list changed (§7.2)         |
+| **the nudge**   | paced chat additions, daily reminders, a stop-add notice   | hourly, paced (§7.2)                        |
 | **the alarm**   | a chat message about one finding that is failing now       | the run that finds it crossing §4.2's floor |
 
 **The backlog is the queue; chat is how you hear about it.** That split is the whole of §7, and it
@@ -836,6 +902,113 @@ several weeks with no state change, the nudge should say so rather than name it 
 Either the rubric mis-scored it or the fix is blocked on something, and both are worth surfacing.
 `surface_count` and `first_seen` are what make that detectable.
 
+**What ships is paced.** The first-day experience asks for a short list the operator can act on
+rather than the whole queue at once, so the first inventory report lists only its top criticals,
+and after it `findings_nudge.py` runs hourly and names only what `findings_queue.pace` allows, using
+§3.2's _shown_, _pending_ and _item_:
+
+- **The first report:** at most `FINDINGS_FIRST_REPORT_CRITICALS` (2) critical items, never more
+  than the 20 rows one chat message carries, and nothing below critical. Its delivery marks them shown as critical additions on that UTC day, so they count
+  against that day's `FINDINGS_DAILY_CRITICALS`, are pending from then on, and are reminded from the
+  next UTC day.
+- **Criticals:** new critical items are added from 12:00 UTC (`REMIND_HOUR`), at most
+  `FINDINGS_DAILY_CRITICALS` (2) a UTC day.
+- **Non-criticals:** new major and minor items are added from `FINDINGS_NONCRITICAL_AFTER_HOUR`
+  (16, a UTC hour), at most `FINDINGS_NONCRITICAL_MAX` (3) a UTC day, and only while no critical
+  item is pending and none is waiting for the day's budget or the hour. A non-critical added in
+  front of a waiting critical would hold it back behind stop-add.
+- **Stop-add:** while any non-critical item is pending, nothing new of any severity is added.
+- **Reminders:** once a UTC day, on the first run at or after 12:00, the top
+  `FINDINGS_DAILY_CRITICALS` pending critical items not first shown that day are named again.
+  They are not additions and count against nothing. A pending critical below that top is named
+  only on the day it was added.
+- **The stop-add notice:** the same once-a-day part names every pending non-critical item, its
+  id, and the three decisions that release it (dismiss, snooze, accept), so stop-add is never
+  silent for more than a day. A pending critical holding non-criticals back gets no such notice.
+
+The day's limits count additions from `findings_additions` (§3.1, `GET /v1/findings/additions`),
+one row per item added, with the class the item had when it was added, so neither dismissing,
+snoozing nor a recurrence (§5.2) refunds the budget, a line added twice in a day counts twice, and
+a later re-score cannot move an addition between the two counts. Only a paced publisher sets `first_shown_at`: the MCP tool
+`mark_finding_surfaced`, which a model calls after answering a pull, does not, so a pull is never
+an addition and never makes anything pending. The upgrade that adds `first_shown_at` marks as shown
+only the two criticals the old nudge named each morning (the top two nameable criticals that were
+marked, in ranked order), so they keep being reminded; any other row marked before the upgrade, such
+as one a pull marked, comes back once as new. A limit of 0 adds none of that kind, which is the
+opposite of what 0 means for the alert ceilings; a value that is not a whole number, is negative,
+or (for the hour) is not 0–23 falls back to its default with a line on stderr. The defaults live in
+`findings_queue.py` and nowhere else; the site's cron reference says where an install sets them.
+A never-shown row a complete sweep stopped reporting is still added as new, as the old nudge named
+it: absence lowers its rank (§5.2) and does not withdraw it. A row registered at C = 0.6 is pending
+once shown, like any other.
+
+`inventory_findings.py select` chooses the first report's items. It reads the scores the
+prioritization worker just wrote and derives each finding's score and severity with the queue's own
+functions, so the choice does not depend on the queue being reachable and sees only this sweep. It
+gathers rows into items, leaves out provider-managed observations (§4.4) and the ids the worker's
+`register` reported as suppressed (on a sandboxed install, where `register` cannot reach the queue,
+there are none), and takes the top critical items in the queue's order. It never fills the list: a sweep
+with fewer criticals than the limit lists those, a sweep with none gets a report that says so and
+lists nothing, and a limit of 0 lists nothing. The worker writes the report from what `select`
+printed. Its roll-up line counts every item not listed, plus each line of provider-managed
+observations once, and a line that also has an ordinary row only once, as its item (the nudge's open
+count still counts such a line twice). It says how many of them are critical, and
+when criticals were left out or none was listed it also gives the hour and daily count at which the
+nudge adds the rest. The limit is the value the onboarding hand-off read when it filed the ranking
+card, written to `/opt/data/INVENTORY.limits.json`. `select` also writes the listed rows' ids to
+`/opt/data/INVENTORY.shown.json`, and `bootstrap_delivery.py` marks each of them shown, with
+publisher `first_report` and class `critical`, right after it claims delivery and before it posts.
+The items count as shown when the report's delivery is claimed, not when it is written, so a report
+that is never claimed leaves them new for the nudge; one claimed and then lost in posting does not. The claim ends the nudge's hold, so a nudge run in the
+moment between the claim and the marks can announce the report's items as new. Under
+`spec.mode: next`, where the report goes into the conversation the user first wrote in, the marks
+follow the post instead: a claim there can be released and retried (Rule 5 in the plugin README),
+so only a kept claim marks the items (a landed post, or on the text path one that most likely
+landed), and a released one marks none. Marking never holds
+delivery back: a row the queue refuses, such as one it never registered, is skipped, a queue that
+does not answer ends the marking for that delivery, and either goes to the delivery run's stderr. An
+item whose mark failed stays unshown, and the nudge adds it as new later. A paced publisher may
+mark only a row waiting for a decision (`queued` or `surfaced`); the queue refuses a dismissed,
+accepted or snoozed one, and delivery does not send a mark for an id its own registration reported
+`suppressed`. On a sandboxed install the report can still name a finding the user dismissed in an
+earlier onboarding, because the worker cannot reach the queue until #2143, so `select` never learns
+of the dismissal. That finding is not marked, spends no slot and is never pending.
+
+Three things keep the hourly run from adding noise. It prints nothing on a run with nothing to say,
+which is most of them. It adds nothing until the first inventory report's delivery is claimed
+(onboarding's `.bootstrap_scan_filed` present and `.bootstrap_completed` absent; under
+`spec.mode: next`, when the report goes to a recorded conversation, `.bootstrap_conversation_done`
+absent, since a claim there can be released), so that report stays the first thing the user hears; an install that never ran onboarding is not held. The hold
+ends 24 hours (`FIRST_REPORT_HOLD_HOURS`) after the sweep was filed, by the marker's `filed_at` line
+or, failing that, its mtime: a report still undelivered by then means onboarding stalled, and
+holding on would add nothing ever again. Each run that is held, or would be but for that limit, says
+which on stderr. And a run that fails before it posts, a failed queue read included, exits non-zero,
+which the scheduler posts, at most once a UTC day; later failures that day go to stderr. The day's
+state (the daily part sent, the items added today, the failure reported) is a file in the platform
+profile home, written before the rows are marked. An addition whose mark fails is not announced
+again that day and still counts against that day's limit, though `findings_additions` has no row
+for it. It also holds additions back as a pending item of its class would: a critical one holds
+non-criticals back, and a non-critical one stops every addition, though the stop-add notice does not
+name it. Unlike a recorded addition, it counts only while it stays undecided and under the class
+it has now: a decision on it the same day refunds its slot, and a re-score can move it between
+the two counts. It comes back as new the next day. If the state file cannot be written either,
+the additions and the daily part repeat every hour.
+
+What this costs is the starvation §7.3 measured, brought back deliberately, from two sources. An
+ignored non-critical holds every new finding back until someone decides, and the daily notice is
+what makes that visible. An undecided critical holds every new non-critical back for as long as it
+stays pending, while new criticals still arrive within the day's budget; the daily reminder names
+it only if it is in the day's top, and nothing says that non-criticals are waiting. On a standard
+install only a person's decision (dismiss, snooze or accept) releases a pending item: clearing one without a person needs §7.4's verification, which is not
+built. A decision reaches only the rows of the item a message has named: the nudge marks every
+member of a line it names, so its count is what the decision covers, while a row a sweep adds to the
+line after the message stays `queued` and keeps its state, and the decision returns its id as left
+open (`item_rows_left_open`) until a later message names it. The onboarding sweep runs once, so for its rows no recurring complete sweep lowers a fixed
+row's `C` unless someone re-runs the sweep by hand; the weekly upgrade readiness review is such a
+sweep for its own `upgrade-` rows, so a shown row of that family that a Saturday no longer reports
+is not pending and is not reminded from that Saturday on, and comes back at the confidence the
+review registers it with the Saturday it is found again.
+
 ### 7.3 What a dry run showed, and why there is no selection
 
 An earlier draft of §7 chose two findings a morning and posted them into chat, and nothing else was
@@ -878,6 +1051,16 @@ rather than lists flat.
 The simulation is a design aid, not a test. It assumes the rubric's own scores are right and models
 a fleet rather than measuring one. What it can show is a delivery rule starving its own queue, which
 it did.
+
+**The shipped pacing reverses this on purpose.** The backlog document that made selection unnecessary
+is not built (§7.1), and the first-day experience wants a short list in chat more than it wants the
+whole queue at once, so the first report and the nudge select again (§7.2, "What ships is paced").
+The two findings that starved this exercise would be pending criticals there: reminded once a day
+without spending the day's budget, so two new criticals still arrive each day behind them until
+every critical has been added. The stuck criticals also hold back every major and minor finding
+until someone decides them, and nothing names those held findings; the criticals added after the
+top two are named once, on the day they are added. A non-critical that never moves holds back
+everything, and the daily notice names it.
 
 ### 7.4 Re-verification, and why the finding has to carry its own check
 
@@ -1089,29 +1272,41 @@ rejected before any git/gh call", with that stream labelling the PR and linking 
 
 ## 10. Overlap with the audit streams
 
-The seven audit streams re-scan much of what the bootstrap sweep looks at, on their own schedules,
-into their own ledger issues. Comparing the sweep in `inventory.md` against the check rosters in
-`AUDITS` shows the overlap is not partial — it is nearly total:
+The seven audit streams re-scan some of what the bootstrap sweep looks at, on their own schedules,
+into their own ledger issues. The sweep used to check most of the compliance and reliability
+audits' workload checks as well: liveness and readiness probes, requests and limits, HPA,
+NetworkPolicy, the cluster's Workload Identity setting and pod security. Four streams
+(`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`) now
+also run once right after the scan as the first-run audits (`oobe.md`), so the sweep leaves their
+checks to them (`cluster_inventory_audit_sop.md`, Step 5), on every install. What the sweep still shares
+with a stream everywhere is four cluster settings whose owners are not in the first-run chain:
 
-| what the sweep checks           | stream that owns it           | check slug                            |
-| ------------------------------- | ----------------------------- | ------------------------------------- |
-| liveness / readiness probes     | `obtainability-audit`         | `probes-liveness`, `probes-readiness` |
-| requests, limits, QoS class     | `obtainability-audit`         | `no-requests`, `no-memory-limit`      |
-| HPA coverage                    | `obtainability-audit`         | `no-hpa`, `hpa-cannot-scale`          |
-| NetworkPolicy                   | `compliance-audit`            | `netpol-missing`                      |
-| Workload Identity               | `compliance-audit`            | `workload-identity-off`               |
-| `runAsNonRoot` security context | `compliance-audit`            | `podsecurity-gaps`                    |
-| Shielded Nodes                  | `fleet-consistency-drift`     | `shielded-nodes`                      |
-| Dataplane V2                    | `fleet-consistency-drift`     | `datapath-provider`                   |
-| Managed Service for Prometheus  | `fleet-consistency-drift`     | `managed-prometheus`                  |
-| node auto-upgrade               | `security-patch-orchestrator` | `no-autoupgrade`                      |
+| what the sweep checks          | stream that owns it           | check slug           |
+| ------------------------------ | ----------------------------- | -------------------- |
+| Shielded Nodes                 | `fleet-consistency-drift`     | `shielded-nodes`     |
+| Dataplane V2                   | `fleet-consistency-drift`     | `datapath-provider`  |
+| Managed Service for Prometheus | `fleet-consistency-drift`     | `managed-prometheus` |
+| node auto-upgrade              | `security-patch-orchestrator` | `no-autoupgrade`     |
+
+They stay in the sweep on purpose. Drift flags only a cluster that differs from its peers, and only
+when at least three clusters can be compared; the patch orchestrator runs weekly. On a small fleet,
+nothing else reports them on day one.
+
+The split has a cost in the queue. No audit stream registers its findings in the queue (the end of
+§10.1 keeps the ledgers out of the queue's job), so on an install with a repository the checks the
+sweep leaves to the first-run audits no longer reach it. The morning nudge, the first report's
+critical cap and "Fix the first one" never surface them; they appear only on the audits' ledger
+issues, chat summaries and remediation pull requests. That is the price of telling the user about
+each problem once rather than twice, under two ids. It lasts until the audits feed the queue, which
+is the follow-up this split calls for.
 
 **This resolves two questions at once, so adopt the audit check slugs as the inventory sweep's
 vocabulary.**
 
 The first question is what happens when both sources report the same problem. If the sweep emits
-`probes-readiness` on the object `obtainability-audit` also emits it on, `derive_finding_id` yields
-the same string for both, so they are one row rather than two findings to reconcile. (That holds
+`no-autoupgrade` on the cluster `security-patch-orchestrator` also emits it on, `derive_finding_id`
+yields the same string for both, so they are one row rather than two findings to reconcile, once
+that stream registers in the queue. (That holds
 because the queue derives the id itself from the registration payload — a source never sends one —
 and the payload's required `project` is the same GCP project either way.) Whichever
 arrives first creates it; the other updates `last_verified` and, if the rubric vector moved, triggers
@@ -1129,7 +1324,7 @@ new SOP, and no change to shared code the seven live streams depend on.
 
 ### 10.1 The residue, and the three checks that need a home
 
-Five sweep checks have no owning stream. Two of them cost nothing: SLO and error-budget alerting
+Seven sweep checks have no owning stream. Two of them cost nothing: SLO and error-budget alerting
 practice, and the OTel collector inventory, are unactionable observations caught by §4.4's gate.
 They never reach `remediate`, so the allowlist never sees them; the queue ranks and surfaces them
 with their recommendation and no PR, exactly as §9 says.
@@ -1137,19 +1332,24 @@ with their recommendation and no PR, exactly as §9 says.
 The other three are manifest-kind, promotable, and unowned, which is the case per-check routing
 cannot serve:
 
-| unowned sweep check                         | where it is stated                    | nearest stream        |
-| ------------------------------------------- | ------------------------------------- | --------------------- |
-| `startupProbe` absent                       | `inventory.md` Probes Check           | `obtainability-audit` |
-| `readOnlyRootFilesystem` absent             | `inventory.md` Security Context Check | `compliance-audit`    |
-| namespace has no ResourceQuota / LimitRange | `inventory.md` Multi-Tenancy Audit    | `compliance-audit`    |
+| unowned sweep check                         | where it is stated (`cluster_inventory_audit_sop.md` Step 3) | nearest stream        |
+| ------------------------------------------- | ------------------------------------------------------------ | --------------------- |
+| `startupProbe` absent                       | Startup probes                                               | `obtainability-audit` |
+| `readOnlyRootFilesystem` absent             | Security Context                                             | `compliance-audit`    |
+| namespace has no ResourceQuota / LimitRange | Multi-Tenancy & Governance                                   | `compliance-audit`    |
 
-Each is a pod-spec or namespace YAML edit — the most promotable kind of finding there is — and each
+The sixth, `static-sa-key` (a pod on static Google Cloud keys rather than Workload Identity), was filed under `compliance-audit`'s cluster-level `workload-identity-off` until the sweep left that check to the audit. Its fix spans the pod's ServiceAccount and an IAM binding, so it stays `manual` and is not one of the three.
+
+The seventh, `added-capabilities` (a container adding a Linux capability other than `SYS_ADMIN`), runs on every sweep because no audit covers it: `compliance-audit`'s `privileged-container` flags only `privileged` and an added `SYS_ADMIN`, and `podsecurity-gaps` checks for `drop: ALL` but not what a container adds. Removing a capability the workload may need is the owner's call, so it stays `manual` and is not one of the three either.
+
+Each of the three is a pod-spec or namespace YAML edit — the most promotable kind of finding there is — and each
 would be rejected by `validate_audit_id` for want of a stream. The near misses are worth naming so
 nobody re-derives them: `obtainability-audit` covers `probes-liveness` and `probes-readiness` but
 has no startup-probe check; `podsecurity-gaps` covers `runAsNonRoot`, `runAsUser`, and
 `seccompProfile` but not read-only root filesystems, and its remediation template sets
-`allowPrivilegeEscalation` and `capabilities` without touching them; `netpol-missing` covers the
-NetworkPolicy third of the multi-tenancy check and leaves quotas and limit ranges.
+`allowPrivilegeEscalation` and `capabilities` without touching them; `netpol-missing` covers
+NetworkPolicy, which the sweep's multi-tenancy check leaves to `compliance-audit`, and not quotas or
+limit ranges.
 
 **Give each of the three a `####` section in the SOP of its nearest stream.** That is the
 implementation task this design names rather than papers over: a heading, a detection query, a
@@ -1170,23 +1370,23 @@ stream owns. It would solve §10.1 without touching the existing SOPs, which is 
 is still the wrong trade: `AuditSpec` requires a SOP under `agents/platform/governance/` whose
 `####` check headings are re-derived in CI by `test_check_rosters_match_the_sops`, so the cost is
 restructuring `inventory.md` into a check roster and maintaining a coverage denominator for a job
-that runs once per install — and it buys a second name for the eight checks that already have one,
+that runs once per install — and it buys a second name for the checks that already have one,
 to give three checks a first name. Three `####` sections in the SOPs that should have had them is
 the smaller change and leaves one vocabulary.
 
 ## 11. What this does not do
 
 It does not replace the audit ledgers. It builds no new remediation-PR machinery, reusing
-`remediate` wholesale. It leaves the shape of the first-time report alone — the delivered
-`INVENTORY.md` keeps its five-item cap and is still posted verbatim (laid out again on Slack
-with `KAGE_SLACK_UX` on, down to the top two findings and every critical one, or the whole list past five, as written), and its `Also found: N items`
-line gains a link to the backlog (§5). What does change is which five: §5 renders the report from
-what the sweep registered, so §4's single scale decides the order and §4.2's thresholds supply the
-severity word, where `inventory_prioritize_sop.md` today preserves the severity each finding was
-found with. That is the point of computing on one scale (§4.1) and not a side effect, but it is a
-change to the report and this section should not claim otherwise. And `INVENTORY.raw.md` stays where
-it is as the full-detail record of what a sweep saw, which the queue references rather than
-replaces.
+`remediate` wholesale. It changes the shape of the first-time report only as pacing needs (§7.2):
+the delivered `INVENTORY.md` lists at most `FINDINGS_FIRST_REPORT_CRITICALS` (2) critical items and
+nothing below critical, it is still posted as written (laid out again on Slack with `KAGE_SLACK_UX` on,
+each listed finding as written), and its `Also found: N items` line gains a link to the backlog (§5).
+What also changes is which items: §5 renders the report from what the sweep registered, so §4's
+single scale decides the order and §4.2's thresholds supply the severity word, where
+`inventory_prioritize_sop.md` today preserves the severity each finding was found with. That is the
+point of computing on one scale (§4.1) and not a side effect, but it is a change to the report and
+this section should not claim otherwise. And `INVENTORY.raw.md` stays where it is as the full-detail
+record of what a sweep saw, which the queue references rather than replaces.
 
 ## 12. What building this consists of
 

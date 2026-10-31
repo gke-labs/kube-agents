@@ -49,6 +49,10 @@ const (
 	a2aNATSConfigSuffix  = "-config"
 	a2aCalloutNameSuffix = "-a2a-callout"
 	a2aCalloutKeysSuffix = "-keys"
+	a2aNATSTLSSuffix     = "-tls"
+	a2aNATSCASuffix      = "-ca"
+
+	a2aTaskSigningKeySuffix = "-a2a-task-signing-key"
 )
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
@@ -77,6 +81,25 @@ func A2ACalloutKeysSecretName(agentName string) string {
 	return A2ACalloutName(agentName) + a2aCalloutKeysSuffix
 }
 
+// A2ATaskSigningKeySecretName is the Secret holding the task-signing key the
+// dispatcher signs per-task credentials with (#3889). Generated beside the
+// callout's keys; only the dispatcher will mount it, and nothing mounts it yet.
+func A2ATaskSigningKeySecretName(agentName string) string {
+	return agentName + a2aTaskSigningKeySuffix
+}
+
+// A2ANATSTLSSecretName is the Secret holding the bus's serving certificate
+// and key, which the NATS pod mounts for its client listener.
+func A2ANATSTLSSecretName(agentName string) string {
+	return A2ANATSName(agentName) + a2aNATSTLSSuffix
+}
+
+// A2ANATSCASecretName is the Secret holding the CA the operator signs the
+// bus's serving certificate with, private key included.
+func A2ANATSCASecretName(agentName string) string {
+	return A2ANATSName(agentName) + a2aNATSCASuffix
+}
+
 // A2ACredentialSecretNames is every Secret the operator renders with a bus
 // credential in it, for a PlatformAgent of that name. It is the set
 // BusCredentialRoutes refuses a user volume for; a Secret added to the bus
@@ -87,6 +110,14 @@ func A2ACredentialSecretNames(agentName string) []string {
 		A2ACredsSecretName(agentName),
 		A2ANATSConfigSecretName(agentName),
 		A2ACalloutKeysSecretName(agentName),
+		// Not passwords, but a key either way: the serving key lets a pod
+		// impersonate the bus to every client, and the CA key lets it mint
+		// a certificate that does the same.
+		A2ANATSTLSSecretName(agentName),
+		A2ANATSCASecretName(agentName),
+		// The task-signing seed: with a worker pod's own token, it scopes
+		// that pod to any task of its profile.
+		A2ATaskSigningKeySecretName(agentName),
 	}
 }
 
@@ -144,9 +175,26 @@ var SensitiveEnvVars = map[string]struct{}{
 	// anything but an override of the projection.
 	"A2A_BUS_TOKEN_FILE": {},
 	"A2A_BUS_USER":       {},
-	"NATS_URL":           {},
-	"NATS_USER":          {},
-	"NATS_PASSWORD":      {},
+	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
+	// the gateway's chat.notify route. The operator renders it exactly when
+	// the next stack holds the chat backend; an override either way leaves
+	// posts going to a platform that is not there.
+	"A2A_NOTIFY_PLATFORM": {},
+	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
+	// gateway conversation a card was filed in, on the same route, and names
+	// the platform in the cron relay's refusal when no home channel is set.
+	// The operator renders it exactly when the gateway arms the route.
+	"A2A_NOTIFY_CONVERSATIONS":     {},
+	"KUBE_AGENTS_ENABLED_PROFILES": {},
+	// NATS_CA_FILE names the CA the client trusts the bus by. An override is
+	// the TLS half of a redirected NATS_URL: pointed at a CA of the setter's
+	// choosing, the client accepts a server that CA signed as the bus, and
+	// hands it the bearer token at CONNECT.
+	"NATS_CA_FILE":      {},
+	"NATS_URL":          {},
+	"NATS_USER":         {},
+	"NATS_PASSWORD":     {},
+	"VCS_FORGES_CONFIG": {},
 }
 
 // ReservedVolumeNames defines pod volume names the operator renders itself and
@@ -201,7 +249,7 @@ var SensitiveEnvVars = map[string]struct{}{
 // source half of this reservation: the audience route, and the creds-Secret
 // route that is cheaper than it.
 //
-// One member so far. `a2a-bus-token` is the projected ServiceAccount token the
+// Two members. The first, `a2a-bus-token`, is the projected ServiceAccount token the
 // platform-agent container presents to the bus under `mode: next`, and it is
 // that container's alone — the auth callout resolves the POD's ServiceAccount,
 // so any other container mounting this token is a second workload wearing the
@@ -209,8 +257,23 @@ var SensitiveEnvVars = map[string]struct{}{
 // union of the two grant sets, which is the retired `worker` credential rebuilt
 // out of a volumeMount. See a2aStripBusTokenMounts and, for the fifth field,
 // a2aStripBusTokenVolumeMounts.
+//
+// The watchers' broker token is the second member, in either mode: it is
+// projected into the gateway's agent-api-auth container alone, and any other
+// container holding it holds the broker's watcher role (every fleet cluster's
+// events and named objects). The controller's watcherTokenSourceNames strips
+// it, and any volume projecting its audience under another name, at render;
+// this is the name half's admission message. The source half is render-only.
 var ReservedVolumeNames = map[string]struct{}{
-	"a2a-bus-token": {},
+	"a2a-bus-token":                  {},
+	"watcher-credential-proxy-token": {},
+}
+
+// ReservedVolumePrefixes lists volume name prefixes reserved for operator-managed
+// forge credential and CA projections (`vcs-forge-credentials-*`, `vcs-forge-ca-*`).
+var ReservedVolumePrefixes = []string{
+	ForgeCredentialVolumePrefix,
+	ForgeCAVolumePrefix,
 }
 
 // BusCredentialRouteKind says which of the two sources a user-authored volume
@@ -256,12 +319,14 @@ const BusCredentialRouteVolumeSource = -1
 // ServiceAccount, so the name on the volume changes nothing about what the
 // callout sees. The Secrets in A2ACredentialSecretNames need no token minting
 // at all and are the cheaper route; a check on the audience alone would narrow
-// the expensive route and advertise the cheap one. There are three of them
-// because the same credentials sit in three places: the creds Secret holds
-// the static passwords (`bridge-password` among them), the nats-config Secret
-// holds nats.conf with every one of those passwords inline, and the
-// callout-keys Secret holds the issuer seed that signs every identity the bus
-// accepts, which is worth more than any password in the other two.
+// the expensive route and advertise the cheap one. There are six of them:
+// the creds Secret holds the static passwords (`bridge-password` among them),
+// the nats-config Secret holds nats.conf with every one of those passwords
+// inline, the callout-keys Secret holds the issuer seed that signs every
+// identity the bus accepts, which is worth more than any password in the
+// others, and the two TLS Secrets hold the keys that let a pod pass as the
+// bus: the serving key, and the CA key that can mint another. The sixth holds
+// the dispatcher's task-signing seed.
 //
 // Volume shapes only. A `secret` volume and a projected `secret` source are
 // the two volume shapes that put a Secret's data in the container; the other
@@ -390,15 +455,46 @@ type HarnessSpec struct {
 	// +optional
 	DriftDetector *DriftDetectorSpec `json:"driftDetector,omitempty"`
 
+	// StallWatch tunes the controller stall watch — the stall-watch cron job on the
+	// Platform Agent's roster that sweeps the fleet for controllers that stopped
+	// making progress and raises an alert for each new stall. Absent keeps the
+	// watch's built-in behaviour.
+	// +optional
+	StallWatch *StallWatchSpec `json:"stallWatch,omitempty"`
+
 	// Tuning sets per-persona execution limits. Unset values keep the defaults
 	// baked into the agent image.
 	// +optional
 	Tuning *TuningSpec `json:"tuning,omitempty"`
 
+	// Retention bounds how long the agent keeps its own working data: the session
+	// history in every profile's state.db and its rotated log files. Absent keeps
+	// the operator's default.
+	// +optional
+	Retention *RetentionSpec `json:"retention,omitempty"`
+
 	// Experimental holds opt-in behaviour that is not supported and may change
 	// or disappear in any release.
 	// +optional
 	Experimental *ExperimentalSpec `json:"experimental,omitempty"`
+}
+
+// RetentionSpec sets how long the agent keeps its working data.
+type RetentionSpec struct {
+	// SessionDays is how many days of inactivity an ended session is kept before
+	// Hermes' own pruning deletes it, with its messages and transcript files, in
+	// every profile: the front door's conversations, the Platform Agent's, and each
+	// Cluster Agent's. Rotated log backups older than this are removed too. Open,
+	// pinned and mid-turn sessions are never pruned, and the daily job pins a
+	// session another still points to as its parent before it prunes. Unset uses the operator's default
+	// (defaultSessionRetentionDays in the controller, 90). The minimum is 90 for
+	// now: some readers follow a session's lineage further than the parent guard
+	// has been shown to hold below that. Lowering it deletes the older history at
+	// the next daily prune.
+	// +kubebuilder:validation:Minimum=90
+	// +kubebuilder:validation:Maximum=365
+	// +optional
+	SessionDays *int `json:"sessionDays,omitempty"`
 }
 
 // ExperimentalSpec gathers the unsupported switches. Nothing here carries a
@@ -574,12 +670,63 @@ type DriftDetectorSpec struct {
 	GitopsManagers string `json:"gitopsManagers,omitempty"`
 }
 
+// StallWatchSpec configures the stall-watch cron job (stall_watch.py), which
+// runs stall_report.py over every non-system namespace of every cluster with a
+// Cluster Agent profile and raises an alert for each namespace with a new stall.
+//
+// Every field reaches the script through the managed .env, so a change rolls the
+// pod, and the agent cannot override a value through its own .env. Apart from
+// these fields, a namespace or an object with the annotation
+// `kubeagents.x-k8s.io/stall-watch: exempt` is left out of the watch's alerts.
+type StallWatchSpec struct {
+	// ExcludeNamespaces names namespaces the watch never reads, on every cluster,
+	// in addition to the system namespaces it always skips. Matched exactly. An
+	// open alert in a namespace added here is closed with a note that the
+	// namespace was excluded.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +optional
+	ExcludeNamespaces []string `json:"excludeNamespaces,omitempty"`
+
+	// MinStallAgeMinutes holds a new alert until one of the namespace's stalls has
+	// lasted at least this long. The age is the longer of what stall_report.py
+	// measures on the object and how long the watch has seen it. A stall that is
+	// younger stays in the watch's ledger and is checked again on each run; an
+	// object that joins a namespace with an open alert is not held. Absent or 0
+	// alerts on the first run that sees the stall.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1440
+	// +optional
+	MinStallAgeMinutes *int32 `json:"minStallAgeMinutes,omitempty"`
+
+	// Kinds replaces the watch's default list of resources to scan (Deployments,
+	// StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and
+	// cert-manager Certificates). Each item is a kubectl resource name such as
+	// `deployments` or `gateways.gateway.networking.k8s.io`. The single item `all`
+	// scans every namespaced kind the cluster serves, one read per kind per
+	// namespace, which is slow on a large fleet. Absent or empty keeps the
+	// default list. Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
+	// ControllerRevisions and Leases are refused: the scan reports nothing from
+	// them, and a Secret listing would carry every body.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=20
+	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k == 'all') || self.size() == 1",message="kinds: all must be the only item"
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.split('.')[0] in ['secrets', 'secret', 'configmaps', 'configmap', 'cm', 'events', 'event', 'ev', 'endpoints', 'endpoint', 'ep', 'endpointslices', 'endpointslice', 'controllerrevisions', 'controllerrevision', 'leases', 'lease'])",message="kinds: secrets, configmaps, events, endpoints, endpointslices, controllerrevisions and leases are never scanned"
+	// +optional
+	Kinds []string `json:"kinds,omitempty"`
+}
+
 // TuningSpec carries execution limits per agent persona.
 //
 // Keys are personas, not profile names, because the profiles they map to are not all
 // known when the CR is written: cluster profiles are scaffolded at runtime, one per
 // managed cluster, with generated names like `cluster-<project>-<cluster>-<region>`.
 // `Cluster` therefore applies to every `cluster-*` profile rather than to one of them.
+// +kubebuilder:validation:XValidation:rule="!has(self.profiles) || !has(self.profiles.childReserve) || self.profiles.childReserve < (has(self.profiles.ceiling) ? self.profiles.ceiling : (has(self.maxInProgress) ? self.maxInProgress : 6))",message="profiles.childReserve must be below the profile ceiling (profiles.ceiling, or maxInProgress when that is unset, default 6): the reserve is a share of the ceiling that top-level tasks can't take"
 type TuningSpec struct {
 	// Default applies to the `default` profile — the Chat Agent front door. Delivered
 	// as a config overlay merged into that profile at pod startup, like the others.
@@ -669,9 +816,10 @@ type TuningSpec struct {
 	// preemption.
 	//
 	// The number lands in three places that deliberately differ. The gateway's
-	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
-	// delegation is refused with a chat reply naming the numbers, never queued,
-	// never dropped. The namespace ResourceQuota is rendered a fixed headroom
+	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap the
+	// gateway first evicts the longest-idle session pod (its conversation is
+	// told); only with none idle is a new turn refused with a chat reply naming
+	// the numbers, never queued, never dropped. The namespace ResourceQuota is rendered a fixed headroom
 	// ABOVE it as the enforcement control: a compromised or buggy gateway
 	// ignores its own cap and cannot ignore the quota, and keeping the quota
 	// above the cap is what makes users hit the honest refusal rather than an
@@ -713,9 +861,10 @@ type TuningSpec struct {
 	//
 	// Raising it buys concurrent delegations at the per-pod price plus model
 	// concurrency against the shared LiteLLM endpoint; the quota lifts with it.
-	// Lowering it turns busy-hour delegations into refusals sooner - a lower
-	// cap never reaps in-flight sessions, it only blocks new spawns until they
-	// finish. Setting it to 1 serialises delegated SESSION work; kanban worker
+	// Lowering it turns busy-hour delegations into evictions and refusals
+	// sooner - a lower cap never stops a running task: a new spawn at the cap
+	// evicts the session pod idle longest, and is refused only when none is
+	// idle. Setting it to 1 serialises delegated SESSION work; kanban worker
 	// concurrency is MaxInProgress above, a different lane.
 	//
 	// The Maximum exists because the quota render adds its headroom to this
@@ -725,7 +874,116 @@ type TuningSpec struct {
 	// +kubebuilder:validation:Maximum=10000
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
+
+	// Profiles sizes AgentProfile work (#3655): the install-wide ceiling on
+	// concurrent profile tasks and the warm workers kept per interactive
+	// (profile, tier). Until the sizing budget exists these are fixed,
+	// conservative defaults.
+	// +optional
+	Profiles *ProfileTuning `json:"profiles,omitempty"`
 }
+
+// ProfileTuning carries the AgentProfile knobs on the PlatformAgent.
+//
+// The interval rules apply each field's default when it is absent, so a
+// field set alone is still checked against the other's default.
+// +kubebuilder:validation:XValidation:rule="(has(self.leaseSeconds) ? self.leaseSeconds : 90) >= 3 * (has(self.renewSeconds) ? self.renewSeconds : 20)",message="leaseSeconds must be at least three renewSeconds (defaults 90 and 20), so one late renewal doesn't expire a live task's lease"
+// +kubebuilder:validation:XValidation:rule="(has(self.restartGraceSeconds) ? self.restartGraceSeconds : 60) >= 2 * (has(self.renewSeconds) ? self.renewSeconds : 20)",message="restartGraceSeconds must be at least two renewSeconds (defaults 60 and 20), so a live worker renews at least twice inside a restarted dispatcher's grace"
+type ProfileTuning struct {
+	// Ceiling is the most profile tasks running at once across every profile
+	// on the install, of every kind. The dispatcher keeps two disjoint
+	// reserves in it, ChildReserve for child tasks (so waiting parents can't
+	// hold every slot) and max(1, ceil(Ceiling/3)) for interactive tiers (so
+	// unattended work can't starve people), trimmed child first to leave at
+	// least one slot for top-level unattended work. With the default
+	// reserves, ceilings of 1, 2 and 4 can't honour both in full, and the
+	// PlatformAgent warns. The profile namespace's pod quota is derived
+	// from it. Absent means maxInProgress's resolved value, so an install's
+	// footprint doesn't jump while both exist (spec-profiles-dispatch.md).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1000
+	// +optional
+	Ceiling *int `json:"ceiling,omitempty"`
+
+	// ChildReserve is the share of Ceiling kept for child tasks, which
+	// top-level tasks can't take. A parent holds its slot while its children
+	// run, so without it a ceiling full of waiting parents could never start
+	// their children. Absent means max(1, ceil(Ceiling/3)), trimmed to
+	// Ceiling-1 so one slot stays unreserved (none at a ceiling of 1).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=999
+	// +optional
+	ChildReserve *int `json:"childReserve,omitempty"`
+
+	// LeaseSeconds is how long a task's liveness lease lasts without a
+	// renewal before the dispatcher fails the task (it is never re-run).
+	// Absent means DefaultProfileLeaseSeconds.
+	// +kubebuilder:validation:Minimum=15
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	LeaseSeconds *int `json:"leaseSeconds,omitempty"`
+
+	// RenewSeconds is how often a worker renews each task's lease; the
+	// dispatcher sends it with every offer. Absent means
+	// DefaultProfileRenewSeconds.
+	// +kubebuilder:validation:Minimum=5
+	// +kubebuilder:validation:Maximum=300
+	// +optional
+	RenewSeconds *int `json:"renewSeconds,omitempty"`
+
+	// RestartGraceSeconds is how long a restarted dispatcher waits, from its
+	// own start, for a renewal on each task it re-adopts before failing it.
+	// While the dispatcher is down nobody reads renewals, so this is what
+	// keeps a redeploy from failing every task in flight. Absent means
+	// DefaultProfileRestartGraceSeconds.
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	RestartGraceSeconds *int `json:"restartGraceSeconds,omitempty"`
+
+	// AcceptTimeoutSeconds is how long the dispatcher waits for a worker to
+	// accept an offer before treating it as declined. Absent means
+	// DefaultProfileAcceptTimeoutSeconds.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=120
+	// +optional
+	AcceptTimeoutSeconds *int `json:"acceptTimeoutSeconds,omitempty"`
+
+	// MaxTaskDeadlineSeconds caps the deadline any profile task gets: a
+	// profile whose lifecycle.activeDeadlineSeconds is longer has its tasks
+	// clamped to this, with a warning. Once profile tasks get their own bus
+	// credentials it is also the longest a task's credential may live, which the
+	// auth callout enforces, bounding a leaked one; the operator renders it
+	// to the callout already. It may only be lowered from the default.
+	// Absent means DefaultProfileMaxTaskDeadlineSeconds (6h).
+	// +kubebuilder:validation:Minimum=60
+	// +kubebuilder:validation:Maximum=21600
+	// +optional
+	MaxTaskDeadlineSeconds *int `json:"maxTaskDeadlineSeconds,omitempty"`
+
+	// WarmReplicas is how many warm worker pods each interactive (profile,
+	// tier) keeps running. Absent means DefaultProfileWarmReplicas.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	WarmReplicas *int `json:"warmReplicas,omitempty"`
+}
+
+// MaxProfileCeiling is ProfileTuning.Ceiling's maximum, which the ceiling
+// also holds to when it defaults to maxInProgress.
+const MaxProfileCeiling = 1000
+
+// The ProfileTuning defaults. The ceiling's is maxInProgress's resolved
+// value, which the controller owns, and ChildReserve's is derived from the
+// ceiling.
+const (
+	DefaultProfileWarmReplicas           = 1
+	DefaultProfileLeaseSeconds           = 90
+	DefaultProfileRenewSeconds           = 20
+	DefaultProfileRestartGraceSeconds    = 60
+	DefaultProfileAcceptTimeoutSeconds   = 10
+	DefaultProfileMaxTaskDeadlineSeconds = 21600
+)
 
 // AgentLimits bounds a single agent run. Both limits exist because they fail the same
 // way — the run stops mid-task without calling a terminal kanban tool, which the
@@ -870,7 +1128,8 @@ type DeploymentSpec struct {
 	// its source is one of the routes to the agent's A2A bus credentials: a
 	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
 	// to one of the Secrets the operator renders bus credentials into
-	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys),
+	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys,
+	// <agent>-a2a-nats-tls, <agent>-a2a-nats-ca, <agent>-a2a-task-signing-key),
 	// as either a secret volume or a projected secret source. The refusal is on
 	// the name and the shape of the source, not on what a given Secret happens to
 	// hold at the time. Reading those Secrets through env is not refused here. On
@@ -887,8 +1146,10 @@ type DeploymentSpec struct {
 	// ExtraVolumes specifies custom volumes to mount for the main container.
 	// The same reserved names and reserved sources as SidecarVolumes are refused
 	// at admission -- a ServiceAccount token projection for the "a2a-bus"
-	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config
-	// or <agent>-a2a-callout-keys -- and dropped from the render on an install
+	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config,
+	// <agent>-a2a-callout-keys, <agent>-a2a-nats-tls, <agent>-a2a-nats-ca or
+	// <agent>-a2a-task-signing-key -- and
+	// dropped from the render on an install
 	// running the A2A surface.
 	// +listType=map
 	// +listMapKey=name
@@ -927,6 +1188,12 @@ type DeploymentSpec struct {
 	// +optional
 	CredentialProxy *CredentialProxySpec `json:"credentialProxy,omitempty"`
 
+	// AgentAPIAuth configures the agent-api-auth sidecar in the gateway pod, the
+	// native container that authenticates the agent's API-server calls and also
+	// runs the event watcher and the drift detector.
+	// +optional
+	AgentAPIAuth *AgentAPIAuthSpec `json:"agentAPIAuth,omitempty"`
+
 	// DefaultStorageClassName specifies the default storage class to use for the system and data PVCs.
 	// +optional
 	DefaultStorageClassName *string `json:"defaultStorageClassName,omitempty"`
@@ -944,16 +1211,26 @@ type CredentialProxySpec struct {
 	// Each key set here replaces the operator's default for that key and the
 	// rest keep their defaults, unlike spec.deployment.resources, which replaces
 	// the agent container's block wholesale: a CR that sets only limits.memory
-	// keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage
+	// keeps the default 500m CPU request, 1 CPU limit and 8Gi ephemeral-storage
 	// limit. The broker sizes how many commands it admits at once from the
 	// memory limit, so raising the limit is the one knob for an install whose
 	// fleet outgrows the default; the ephemeral-storage limit bounds the content
-	// workspace the broker clones into; the proxy's state and /tmp emptyDirs
-	// (sizeLimits 5Gi and 2Gi) follow it when it is raised above their
-	// defaults, so the kubelet does not evict the pod at the smaller figure.
+	// workspace the broker clones into; the proxy's state emptyDir (sizeLimit
+	// 5Gi) grows by whatever the limit is raised above the 8Gi default, and
+	// its /tmp emptyDir keeps its 2Gi, so the kubelet does not evict the pod
+	// at the smaller figure.
+	// The limit a fleet needs grows with the size of its clusters as well as
+	// their number: the broker charges each command about 128Mi, the size of
+	// a listing of a small cluster, and a kubectl listing thousands of objects
+	// holds several hundred Mi on its own, so size the limit to the largest
+	// listing the fleet produces for every command that runs at once (eight
+	// at the slot cap) plus the 320Mi of fixed reserves (192Mi for the broker
+	// and Envoy, 128Mi for the content workspace); the broker's child peak and
+	// memory high-water series give the figure.
 	// Only cpu, memory and ephemeral-storage
 	// are accepted, the quantities the container declares. The operator
-	// refuses a memory limit below what admits two commands at once, a request
+	// refuses a memory limit below what admits two commands at once, a limits
+	// entry set alone below the default request it would cross, a request
 	// above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
 	// pod declares no resourceClaims. A refused override, including an edit of
 	// one that was valid, renders the proxy Deployment at the operator's
@@ -972,6 +1249,35 @@ type CredentialProxySpec struct {
 	// without bursting sets the limits equal to the requests, so there the
 	// proxy runs at the request and the limit has no effect. With bursting the
 	// declared limits stand.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// AgentAPIAuthSpec configures the agent-api-auth sidecar in the gateway pod.
+type AgentAPIAuthSpec struct {
+	// Resources overrides the agent-api-auth container's requests and limits.
+	// Each key set here replaces the operator's default for that key and the
+	// rest keep their defaults, unlike spec.deployment.resources, which replaces
+	// the agent container's block wholesale: a CR that sets only limits.memory
+	// keeps the default 150m CPU request, 384Mi memory request, 1 CPU limit and
+	// 2Gi ephemeral-storage limit. The container runs the event watcher, the
+	// drift detector and the API authenticator together; the event watcher
+	// reads the memory limit through the Downward API and sets its Go soft
+	// memory limit to half of it, so raising the memory limit is the knob for an
+	// install whose fleet of watched clusters outgrows the 2Gi default (#2648).
+	// Only cpu, memory and ephemeral-storage are accepted, the quantities the
+	// container declares. The operator refuses a request above its limit, a
+	// negative quantity, a zero limit, an unrepresentable byte or CPU count and
+	// claims, because the gateway pod declares no resourceClaims. A refused
+	// override, including an edit of one that was valid, renders the sidecar at
+	// the operator's defaults until it is corrected, and the operator reports
+	// Degraded with reason InvalidAgentAPIAuthResources when no higher-ranked
+	// Degraded cause is present, the agent staying Ready, whether or not the
+	// validating webhook is enabled. Where the webhook is on, it refuses the
+	// edit at apply. The webhook warns when memory per CPU on the requests pair
+	// leaves the band GKE Autopilot admits unchanged, and when a cpu or memory
+	// limit is set without the same key under requests, for the reasons the
+	// credential-proxy field documents.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
@@ -1010,7 +1316,11 @@ type StorageSpec struct {
 
 // AvailabilitySpec defines high availability and scheduling settings.
 type AvailabilitySpec struct {
-	// Replicas specifies the desired number of pod replicas. If omitted, defaults to 1.
+	// Replicas specifies the desired number of gateway pod replicas. If omitted, defaults to 1.
+	// The operator runs the gateway as a single replica: a value above 1 is rendered as 1, and
+	// the ReplicasLimited status condition says so. A multi-replica gateway does not start yet,
+	// because its leader election has no in-cluster ServiceAccount token to use and the data
+	// volumes an install creates at one replica are ReadWriteOnce.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	Replicas *int32 `json:"replicas,omitempty"`
@@ -1142,22 +1452,19 @@ type SecuritySpec struct {
 	// What the gateway policy already permits, and therefore what this cannot
 	// take away:
 	//
-	//   - 169.254.169.254/32 on TCP 80, plus the discovered metadata-daemon port (988 by default) to both link-local
-	//     metadata addresses — the pre- and post-DNAT forms of a metadata
-	//     request (the 988 rule is suppressed when the resolved metadata
-	//     daemon IP is empty). So the metadata path stays open. The same
-	//     address is also permitted on port 53, where it is the Cloud DNS for
-	//     GKE resolver rather than a credential path.
+	//   - 169.254.169.254/32 on port 53 only, where it is the Cloud DNS for
+	//     GKE resolver rather than a credential path. The gateway policy opens
+	//     no metadata credential port: the gateway Pod holds no Google identity
+	//     (it runs as its own unannotated ServiceAccount), so there is no
+	//     metadata path left for this field to close.
 	//   - TCP 443 to 0.0.0.0/0 minus the private ranges, unless the
 	//     FQDNNetworkPolicy annotation is set. So every HTTPS destination on
 	//     the public internet stays open, and with it the exfiltration half of
 	//     what this control is meant to be.
 	//
-	// The overlap is deliberate rather than an oversight. Workload Identity
-	// needs the metadata path, and <name>-gateway-netpol still permits it to
-	// the agent Pod. Narrowing that allowance to the broker Pod, which is the
-	// only one that mints a cloud token, is the work that turns this field into
-	// a control.
+	// The overlap is deliberate rather than an oversight. Narrowing
+	// <name>-gateway-netpol's internet rule is the work that turns this field
+	// into a control.
 	//
 	// So what is this for today? Two things, and they are worth having, but
 	// neither is enforcement. It renders an auditable statement of the
@@ -1196,21 +1503,18 @@ type SecuritySpec struct {
 	//
 	// The allowlist covers DNS, the credential broker, LiteLLM, the namespace
 	// of the OpenTelemetry collector the agent resolved, the Hindsight memory
-	// API, and whatever egressAllowlist adds. Everything else the agent
-	// container reaches on its own would go away:
+	// API, and whatever egressAllowlist adds. The gke and developer_knowledge
+	// MCP servers go through the broker and are unaffected. Everything else the
+	// agent container reaches on its own would go away:
 	//
 	//   - DuckDuckGo web search, which the shared default config turns on for
 	//     every profile, and the "browser" toolset, which only the Chat Agent
 	//     disables;
-	//   - the gke and developer_knowledge MCP servers, which proxy
-	//     container.googleapis.com and developerknowledge.googleapis.com;
 	//   - github.com reached directly from the sandbox, though not the gh and
 	//     git wrappers, which go through the broker;
-	//   - the metadata lookup in cluster_agent_reconcile.py, which finds that
-	//     script's project id. It fails soft after a five-second timeout and
-	//     falls back to a broker gcloud call. RECONCILE_PROJECT, the old override, is
-	//     pinned empty in the managed .env (a project other than the pod's belongs in
-	//     spec.scope.projects, the management project still has to resolve).
+	//   - nothing in cluster_agent_reconcile.py, which reads its management
+	//     project from GKE_PROJECT_ID (pinned in the managed .env, beside
+	//     RECONCILE_PROJECT pinned empty) and asks no metadata server.
 	//
 	// Those would not be accidental casualties. A headless browser with
 	// unrestricted egress is the exfiltration path, so the capabilities this
@@ -1293,10 +1597,8 @@ type EgressAllowlistSpec struct {
 	// chose at creation time or at a public address, and the in-cluster
 	// "kubernetes" Service is translated to that address before policy is
 	// evaluated. Leaving this empty is allowed and is the stricter choice. It
-	// costs the agent container its API-server connection, which matters at
-	// spec.deployment.replicas above 1, where the container runs
-	// leader_elect.py and holds a Lease, and to any sidecar or plugin you
-	// added that talks to the API. Find the range with
+	// costs the agent container its API-server connection, which matters to
+	// any sidecar or plugin you added that talks to the API. Find the range with
 	// `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
 	// On a cluster with a public endpoint that command emits a bare address;
 	// paste it as-is and it is widened to a single-host prefix.
@@ -1455,9 +1757,18 @@ var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
 // same-named repository on this one. See
 // docs/designs/version-control-support.md §6.
 //
-// A gitlab forge's credentialsRef is required by the API server too, so it
-// holds with the webhook off -- the chart ships it off.
+// A gitlab or gitea forge's credentialsRef (and a gitea forge's host) are
+// required by the API server too, so they hold with the webhook off -- the
+// chart ships it off.
+// +kubebuilder:validation:XValidation:rule="has(self.provider) || !has(self.host) || size(self.host) == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com', 'ssh.github.com']",message="a forge at a host other than github.com names its provider: github for a GitHub Enterprise Server, gitlab for a GitLab instance, gitea for a Gitea instance"
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitlab' || has(self.credentialsRef)",message="a gitlab forge needs credentialsRef.name: the Secret holding its access token under the key token"
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitea' || has(self.credentialsRef)",message="a gitea forge needs credentialsRef.name: the Secret holding its access token under the key token"
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitea' || (has(self.host) && size(self.host) > 0)",message="a gitea forge has no default host; host is required"
+// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.host) && size(self.host) > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com', 'github.com', 'www.github.com', 'ssh.github.com']))",message="caBundleRef is for a self-managed host: gitlab.com and github.com present a certificate the public CAs sign, and a private CA must never vouch for it"
+// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || !has(self.scheme) || self.scheme != 'http'",message="caBundleRef cannot be set when scheme is http"
+// +kubebuilder:validation:XValidation:rule="!has(self.scheme) || self.scheme != 'http' || (has(self.provider) && self.provider == 'gitea')",message="scheme http is only supported for provider gitea"
+// +kubebuilder:validation:XValidation:rule="!has(self.scheme) || self.scheme != 'http' || (has(self.host) && (self.host.lowerAscii().endsWith('.svc') || self.host.lowerAscii().endsWith('.svc.cluster.local')))",message="scheme http sends the forge token unencrypted and is only allowed for an in-cluster service host (*.svc or *.svc.cluster.local)"
+// +kubebuilder:validation:XValidation:rule="!has(self.port) || self.port == 0 || (has(self.provider) && self.provider == 'gitea')",message="port is only supported for provider gitea"
 type ForgeSpec struct {
 	// Name identifies the forge within this PlatformAgent. Repositories refer
 	// to it by this name. The deprecated GitHub alias is the forge "github".
@@ -1471,20 +1782,31 @@ type ForgeSpec struct {
 	// the agent reads which forge was declared rather than guessing from the
 	// URL's text.
 	//
-	// "github" and "gitlab" are registered; the enum grows with each
-	// agent-side provider. Defaults to "github".
-	// +kubebuilder:validation:Enum=github;gitlab
-	// +kubebuilder:default=github
+	// "github", "gitlab", and "gitea" are registered; the enum grows with each
+	// agent-side provider. Omitted, it is "github".
+	//
+	// A forge at a host other than a spelling of github.com must name it, so
+	// a forge written for another instance is never read as a GitHub
+	// Enterprise Server by default.
+	// +kubebuilder:validation:Enum=github;gitlab;gitea
 	// +optional
 	Provider string `json:"provider,omitempty"`
 
 	// Host is the forge hostname. Omit it for the provider's default
 	// ("github.com" for GitHub, "gitlab.com" for GitLab). A host the declared
 	// provider does not serve is rejected, and an alternative spelling of one
-	// it does serve resolves to the provider's canonical host. For GitLab it may
-	// also be a self-managed instance's hostname, which every repository on the
-	// forge must then name or leave implied; a host another provider serves is
-	// rejected.
+	// it does serve resolves to the provider's canonical host. It may also be a
+	// self-managed instance's hostname: a GitLab instance, a Gitea instance, or
+	// a GitHub Enterprise Server instance. Every repository on the forge must
+	// then name that host or leave it implied. A self-managed provider such as
+	// "gitea" has no default, so the host is required there. A host another
+	// provider serves is rejected, and so is a host under a domain where the
+	// provider runs its own services (for GitHub: github.com,
+	// githubusercontent.com, ghe.com and others).
+	//
+	// An install serves one GitHub host: github.com, or one GitHub Enterprise
+	// Server instance. A second GitHub forge at another host is rejected, and
+	// so is one host declared for two providers.
 	//
 	// The pattern is a DNS name, which every forge's host is; it is here rather
 	// than only in the webhook so the API server still refuses whitespace and
@@ -1519,19 +1841,85 @@ type ForgeSpec struct {
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 
+	// Scheme is how the forge is reached: "https", the default, or "http".
+	// Only a provider that allows plain http accepts it, and only when it is
+	// written out; GitHub is https only. Over http the token and repository
+	// contents cross the network unencrypted, so admission warns, and it is
+	// meant for a forge inside the cluster.
+	// +kubebuilder:validation:Enum=https;http
+	// +optional
+	Scheme string `json:"scheme,omitempty"`
+
+	// Port is the forge's port, for a forge not on the scheme's default port.
+	// Only provider "gitea" accepts it; it is refused for every other provider,
+	// a self-managed GitLab included, whose broker client does not compose one.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +optional
+	Port int32 `json:"port,omitempty"`
+
 	// CredentialsRef names a Secret in the PlatformAgent's namespace holding
 	// the credentials for this forge. It is for providers whose credentials an
 	// administrator supplies, and it is required for them. GitHub's come from
 	// the install's GitHub App through the token minter, so it is ignored for
 	// provider "github", and admission warns when it is set there.
 	//
-	// For GitLab the Secret holds an access token under the key `token`: a
-	// group or project access token, or a dedicated account's personal access
-	// token where the tier offers neither. It is mounted into the credential
+	// For GitLab and Gitea the Secret holds an access token under the key
+	// `token`: on GitLab a group or project access token, or a dedicated
+	// account's personal access token where the tier offers neither; on Gitea
+	// a dedicated account's access token. It is mounted into the credential
 	// broker's pod only, never the agent's or the sandbox's, and read on every
-	// call, so rotating the token is updating the Secret.
+	// call, so rotating the token is updating the Secret. A GitLab Secret may
+	// also hold a read-only token under the key `read-token`; the broker
+	// presents it only to clone the forge's context repositories, never on a
+	// write.
 	// +optional
 	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
+
+	// CABundleRef names a Secret in the PlatformAgent's namespace that holds
+	// the PEM CA certificates that signed this forge's TLS certificate:
+	// a self-managed instance behind a private CA. The broker trusts these
+	// certificates for this forge's host only, beside the system bundle, in
+	// its API client and in git. On a GitHub Enterprise Server forge, the
+	// chart also gives them to the token minter, which trusts them for all of
+	// its outbound calls. It is
+	// for a forge at a self-managed host, GitLab or GitHub Enterprise Server: it
+	// is refused when host is empty, gitlab.com or github.com, whose
+	// certificates the public CAs sign.
+	//
+	// The operator mounts the one key into the credential broker's pod only.
+	// The mount is optional: a missing Secret does not stop the broker, and
+	// calls to this forge answer FORGE_TLS_UNTRUSTED until it exists. The
+	// broker reads the file on each call, so an update reaches it with no
+	// restart.
+	// +optional
+	CABundleRef *ForgeCABundleRef `json:"caBundleRef,omitempty"`
+}
+
+// ForgeCABundleRef names the Secret key that holds a forge's CA certificates.
+// A CA certificate is public, but it is kept in a Secret for its integrity:
+// whoever can change it chooses which servers the broker presents the forge's
+// token to. In a Secret, changing it needs the same rights as changing the
+// token Secret beside it, which a ConfigMap does not.
+//
+// The key rule is the operator's IsConfigMapKey, which Kubernetes applies to
+// Secret keys too and which the pattern alone does not hold: it also refuses
+// "." and a key that starts with "..".
+// +kubebuilder:validation:XValidation:rule="!has(self.key) || !(self.key == '.' || self.key.startsWith('..'))",message="caBundleRef.key may not be . or start with .."
+type ForgeCABundleRef struct {
+	// Name is the Secret's name: a lowercase DNS subdomain.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	Name string `json:"name"`
+
+	// Key is the Secret key that holds the PEM certificates. Defaults to
+	// "ca.crt".
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]+$`
+	// +kubebuilder:default="ca.crt"
+	// +optional
+	Key string `json:"key,omitempty"`
 }
 
 // ForgeCredentialsRef names the Secret holding a forge's credential. The JSON
@@ -1693,9 +2081,9 @@ type NetworkPolicySpec struct {
 	AdditionalEgress []EgressRule `json:"additionalEgress,omitempty"`
 }
 
-// MetadataDaemonSpec pins the post-NAT metadata-daemon egress target (rule 3).
+// MetadataDaemonSpec pins the post-NAT metadata-daemon egress target in the LiteLLM policy (litellm-policy), the one generated policy that still opens the metadata path; the gateway policy opens none.
 type MetadataDaemonSpec struct {
-	// Endpoint is the daemon IP. "" (explicitly set) suppresses rule 3 entirely;
+	// Endpoint is the daemon IP. "" (explicitly set) suppresses that rule entirely;
 	// the empty alternative in the pattern is required because the API server
 	// validates an explicitly-set "", which omitempty does not suppress.
 	// +kubebuilder:validation:Pattern=`^($|(((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]))|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}))$`
@@ -1810,6 +2198,18 @@ type StorageStatus struct {
 	// Bound indicates if the primary PVC has been successfully provisioned.
 	// +optional
 	Bound bool `json:"bound,omitempty"`
+
+	// CapacityBytes is the size of the filesystem on the agent's data volume,
+	// as the gateway pod's event watcher last read it. Absent when the watcher
+	// is disabled or the operator has no current reading from it.
+	// +optional
+	CapacityBytes *int64 `json:"capacityBytes,omitempty"`
+
+	// FreeBytes is the space left on the agent's data volume for the agent's
+	// own non-root user, read with CapacityBytes. The DataVolumeNearlyFull
+	// condition is computed from the two.
+	// +optional
+	FreeBytes *int64 `json:"freeBytes,omitempty"`
 }
 
 // TelemetryStatus reports the telemetry wiring the operator resolved for this agent.
@@ -1862,11 +2262,11 @@ type NetworkPolicyStatus struct {
 	// +optional
 	DNSClusterIPsSource string `json:"dnsClusterIPsSource,omitempty"`
 
-	// MetadataDaemonIP is the post-NAT daemon IP in rule 3, empty when suppressed.
+	// MetadataDaemonIP is the post-NAT daemon IP in the LiteLLM policy's metadata rule, empty when suppressed.
 	// +optional
 	MetadataDaemonIP string `json:"metadataDaemonIP,omitempty"`
 
-	// MetadataDaemonPort is the post-NAT daemon port in rule 3, resolved from the live
+	// MetadataDaemonPort is the post-NAT daemon port in the LiteLLM policy's metadata rule, resolved from the live
 	// DaemonSet when metadataDaemonIPSource is Discovered, else the documented default (988).
 	// +optional
 	MetadataDaemonPort int32 `json:"metadataDaemonPort,omitempty"`
@@ -1878,7 +2278,7 @@ type NetworkPolicyStatus struct {
 
 // AgentStatus defines the observed state of an agent.
 type AgentStatus struct {
-	// Phase is the overall state (Pending, Provisioning, Ready, Failed).
+	// Phase is the overall state (Pending, Provisioning, Ready, Degraded, Failed).
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
@@ -1908,7 +2308,7 @@ type AgentStatus struct {
 	// +optional
 	ServiceStatus ServiceStatus `json:"serviceStatus,omitempty"`
 
-	// StorageStatus tracks PVC binding state.
+	// StorageStatus tracks PVC binding state and the data volume's usage.
 	// +optional
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
 
@@ -1952,15 +2352,27 @@ type AgentStatus struct {
 // as the rest of the status.
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
-// update, and ToolExecutionsTotal, EventsIngestedTotal and LastActiveTime from
-// the broker's and the event watcher's metrics listeners, which it reads every
-// five minutes on the leader; the agent's own ServiceAccount holds no write
-// verb on this status. The other counters are declared so that the schema
-// names them, but nothing writes them yet, and each is absent (omitempty)
-// until a series exists for it.
+// update, and ToolExecutionsTotal, ToolExecutionsBlockedTotal, EventsIngestedTotal,
+// SessionsTotal, RemediationsProposedTotal, ChatMessagesInboundTotal,
+// LastActiveTime, LastHumanActiveTime, ClustersRegistered and
+// ClustersMonitored from the broker's, the event watcher's, the chat
+// plugin's and, on a next install, the A2A gateway's metrics
+// listeners, and the six proposal readings (RemediationsMergedTotal,
+// RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
+// ProposalHumanTouches and ProposalsMergedUntouched) from the broker's, all
+// of which it reads every five minutes on the leader; the agent's own
+// ServiceAccount holds no write verb on this status.
 type AgentUsageStatus struct {
-	// SessionsTotal is the cumulative number of interactive sessions handled.
-	// Nothing writes it yet.
+	// SessionsTotal is the cumulative count of sessions the agent opened: the
+	// triage sessions the event watcher opened for events the daemon
+	// delivered (its k8s_event_watcher_triage_sessions_total; a session
+	// whose inject was filtered, suppressed or failed is not counted) plus
+	// the chat conversations the gateway opened a session for (the session_store
+	// plugin's kubeagents_chat_sessions_total on a today install, the A2A
+	// gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+	// chat conversation that resumes after the session store's retention
+	// window (seven days by default) counts again. Read every five minutes
+	// and kept monotonic across restarts, like toolExecutionsTotal.
 	// +optional
 	SessionsTotal int64 `json:"sessionsTotal,omitempty"`
 
@@ -1980,19 +2392,229 @@ type AgentUsageStatus struct {
 	// it rejected or failed on before running: its success and error outcomes.
 	// Read from the broker's kubeagents_tool_invocations_total every five
 	// minutes and kept monotonic the same way; commands refused by policy,
-	// busy and abandoned are not counted.
+	// busy and abandoned are not counted here but in
+	// ToolExecutionsBlockedTotal.
 	// +optional
 	ToolExecutionsTotal int64 `json:"toolExecutionsTotal,omitempty"`
 
-	// RemediationsProposedTotal is the cumulative count of remediations generated.
-	// Nothing writes it yet.
+	// RemediationsProposedTotal is the cumulative count of proposals the
+	// credential broker's version-control route opened: proposal-create
+	// requests the forge accepted. Read from the broker's
+	// kubeagents_vcs_requests_total under verb proposal-create and status
+	// success, summed over its provider label, every five minutes and kept
+	// monotonic the same way as
+	// ToolExecutionsTotal; a proposal the forge refused or that failed is not
+	// counted. Moves LastActiveTime.
 	// +optional
 	RemediationsProposedTotal int64 `json:"remediationsProposedTotal,omitempty"`
 
-	// RemediationsAppliedTotal is the cumulative count of remediations approved and applied.
-	// Nothing writes it yet.
+	// RemediationsMergedTotal is the forge's count now of the proposals this
+	// install authored in its managed repositories that are merged: the
+	// broker's readings sweep asks the forge, and this is its
+	// kubeagents_vcs_proposals under state merged, projected as the latest
+	// poll's reading. A reading, not an accumulation: it falls when a
+	// repository leaves the managed list, and the name keeps its Total for
+	// the readers that already use it. Part of the outcomes reading with
+	// RemediationsOpen and ProposalsAuthored: one poll that cannot read the
+	// broker, or reads it without that reading, leaves the three where they
+	// were, and a second in a row clears them to absent; the broker itself
+	// stops serving a reading more than an hour old. A 0 is a reading. A merge
+	// no longer moves LastActiveTime: a reading cannot say when a merge
+	// happened, and a merge is a person's or a forge rule's act.
 	// +optional
-	RemediationsAppliedTotal int64 `json:"remediationsAppliedTotal,omitempty"`
+	RemediationsMergedTotal *int64 `json:"remediationsMergedTotal,omitempty"`
+
+	// RemediationsOpen is the forge's count now of this install's proposals
+	// that are open: kubeagents_vcs_proposals under state open. Part of the
+	// outcomes reading, absent on the same terms as RemediationsMergedTotal.
+	// Does not move LastActiveTime.
+	// +optional
+	RemediationsOpen *int64 `json:"remediationsOpen,omitempty"`
+
+	// ProposalsAuthored is the forge's count now of every proposal this
+	// install authored in its managed repositories, open, merged or closed,
+	// its own closes included: kubeagents_vcs_proposals summed over state.
+	// The denominator of the merge rate, from the same reading as
+	// RemediationsMergedTotal; RemediationsProposedTotal, the install's own
+	// record of the proposals it opened, can differ from it. Part of the
+	// outcomes reading, absent on the same terms as RemediationsMergedTotal.
+	// Does not move LastActiveTime.
+	// +optional
+	ProposalsAuthored *int64 `json:"proposalsAuthored,omitempty"`
+
+	// ChatMessagesInboundTotal is the cumulative count of chat messages that
+	// reached the gateway, from every platform it serves: Google Chat, Slack,
+	// Teams and its own API port alike. Counted at the gateway's dispatch
+	// hook, which Hermes runs after dropping its own internal events and
+	// before it checks the sender against the allowlist, so an unlisted
+	// user's message counts and nothing the gateway never hands to the hook
+	// does. Read every five minutes from the chat_metrics plugin's
+	// kubeagents_chat_messages_inbound_total on the platform-agent container
+	// of the gateway pod that runs Hermes (above one replica, the leader
+	// alone), summed across the pods that have led, and, on a next-mode
+	// install, from the A2A gateway's
+	// kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
+	// ingress is that gateway's there; kept monotonic the same way as
+	// ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
+	// brokered command is activity, and LastHumanActiveTime, which nothing
+	// else moves.
+	// +optional
+	ChatMessagesInboundTotal int64 `json:"chatMessagesInboundTotal,omitempty"`
+
+	// ToolExecutionsBlockedTotal is the cumulative count of requests the
+	// credential broker did not run to an exit: its blocked outcome
+	// (a policy refusal), its busy outcome (the broker's command slots or its
+	// child memory budget held the request for the whole wait) and its
+	// abandoned outcome (the caller hung up while the request was queued or
+	// running). Read from the same kubeagents_tool_invocations_total as
+	// ToolExecutionsTotal, over the other three statuses, every five minutes
+	// and kept monotonic the same way; the two together are every request the
+	// broker's exec route took as far as its policy; a request it
+	// rejected as malformed before that reaches neither. A rising share of this against
+	// ToolExecutionsTotal says the agent keeps asking for what its mode or
+	// policy refuses, or that the broker is saturated. Moves LastActiveTime:
+	// a refused command is still the agent at work.
+	// +optional
+	ToolExecutionsBlockedTotal int64 `json:"toolExecutionsBlockedTotal,omitempty"`
+	// BrokerFailuresTotal is the cumulative count of brokered work the
+	// credential broker took on and could not carry out for a reason that is
+	// its own or its upstream's: a command that ran past its deadline (exit
+	// 124), a broker fault on the exec route (a 500), a git failure on the
+	// version-control route (a 500 or 502), a failed forge token mint (a
+	// 502), or any 5xx on the Cloud API, MCP and watcher relays, whose
+	// upstream status passes through. A command's own non-zero exit is not
+	// one (that is ToolExecutionsTotal's error outcome), nor is a policy
+	// refusal or the broker's own busy (a 403 or 503; the version-control
+	// route's 503 for an unreadable managed-repository list is a fault and
+	// does count), nor a chat or Slack post the forge refused for the
+	// caller's channel or scope; the broker's own chat event pull failing,
+	// its Pub/Sub subscription or its credential to it, does count. Read from the
+	// broker's kubeagents_broker_execution_failures_total, summed over its
+	// kind and tool labels, every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal; a timed-out command counts here and as an error
+	// there. A rising share of this against ToolExecutionsTotal says the
+	// broker, its credentials or its upstreams are failing, where a policy
+	// refusal is the tool counter's blocked outcome in Prometheus. Does not
+	// move LastActiveTime: a watcher retrying an unreachable fleet cluster
+	// through the relay is not the agent at work.
+	// +optional
+	BrokerFailuresTotal int64 `json:"brokerFailuresTotal,omitempty"`
+	// ChatTurnsErroredTotal is the cumulative count of synchronous chat turns
+	// the gateway failed to complete: on the Hermes gateway, an exception out
+	// of the turn, a result the agent marked failed (a provider 429 or 5xx, a
+	// connection error, the gateway timeout) or a provider authentication
+	// failure, counted by the chat_metrics plugin's
+	// kubeagents_chat_turns_errored_total on the gateway pod that runs
+	// Hermes; and on a next-mode install, an A2A task that ended failed or
+	// rejected, read from the A2A gateway's
+	// kubeagents_a2a_gateway_task_terminals_total under those two states.
+	// That family carries no platform, so on next it counts every A2A task's
+	// terminal, a door's program-to-program task included, not chat alone;
+	// rejected is a task the executor refused, counted as the design asks.
+	// Read every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal. Does not move LastActiveTime: the message that
+	// started the turn already did.
+	// +optional
+	ChatTurnsErroredTotal int64 `json:"chatTurnsErroredTotal,omitempty"`
+	// BackgroundTasksGaveUpTotal is the cumulative count of background cards on
+	// the agent's board whose breaker tripped: cards that exhausted their
+	// attempts and gave up, whether a cluster event or a chat ask started
+	// them. Hermes parks such a card as blocked and records a gave_up event
+	// against it, and that event is what is counted, once per card. Read
+	// every five minutes from the chat_metrics plugin's
+	// kubeagents_kanban_tasks_gave_up_total on the gateway pod that runs
+	// Hermes, which reads the board at scrape time and counts the cards that
+	// gave up since its listener started (the ones that had already given up
+	// are its baseline, so a restart adds nothing twice; a card that gives
+	// up while the gateway restarts is missed, an under-count); kept
+	// monotonic the same way as ToolExecutionsTotal. Does not move
+	// LastActiveTime: a card giving up is not the agent at work.
+	// +optional
+	BackgroundTasksGaveUpTotal int64 `json:"backgroundTasksGaveUpTotal,omitempty"`
+	// NegativeFeedbackTotal is the cumulative count of thumbs-down reactions
+	// put on one of the bot's Slack messages: the chat_feedback_reactions hook
+	// on the Hermes gateway counts a -1 or thumbsdown reaction, skin tone or
+	// not, whose reactor is not the bot and whose message is the bot's, once
+	// per reactor and message within one gateway process (a thumbs-down taken
+	// off and put back is one; after a restart the same one counts again, and
+	// a reaction before the first inbound message after a start is not
+	// counted), into the
+	// chat_metrics plugin's kubeagents_chat_feedback_negative_total, which is
+	// read every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal. Slack through the Hermes gateway only: Google Chat
+	// delivers no reaction events, and the A2A gateway's Slack adapter does not
+	// subscribe to them, so on a next-mode install with Slack through A2A this
+	// stays at 0. Does not move LastActiveTime: the message the person
+	// reacted to already did.
+	// +optional
+	NegativeFeedbackTotal int64 `json:"negativeFeedbackTotal,omitempty"`
+	// RemediationsClosedUnmergedTotal is the forge's count now of this
+	// install's proposals closed without a merge by a person or a bot:
+	// kubeagents_vcs_proposals_closed_by under actor human plus actor bot. A
+	// close the install made itself, the fleet audit tidying a stale
+	// proposal, is not counted. A reading, not an accumulation, projected as
+	// the latest poll's; the name keeps its Total for the readers that already
+	// use it. A high share of this against RemediationsMergedTotal says the
+	// agent's proposals are being rejected. Part of the details reading with
+	// ProposalHumanTouches and ProposalsMergedUntouched: one poll that cannot
+	// read the broker, or reads it without that reading, leaves the three
+	// where they were, and a second in a row clears them to absent; a broker
+	// still warming serves the outcomes reading without this one, and one
+	// whose last sweep could not read the details keeps serving the details
+	// it last read, for an hour. A 0 is a reading. Does not
+	// move LastActiveTime: a close is not the agent at work.
+	// +optional
+	RemediationsClosedUnmergedTotal *int64 `json:"remediationsClosedUnmergedTotal,omitempty"`
+
+	// ProposalHumanTouches is the forge's count now of the events people
+	// made on this install's proposals: reviews, inline and conversation
+	// comments, commits on the source branch and /agent addresses by any
+	// account the forge does not mark as automation, summed over every
+	// proposal (kubeagents_vcs_proposal_touches under actor human, summed over
+	// kind). Part of the details reading, absent on the same terms as
+	// RemediationsClosedUnmergedTotal. Moves neither LastActiveTime nor
+	// LastHumanActiveTime.
+	// +optional
+	ProposalHumanTouches *int64 `json:"proposalHumanTouches,omitempty"`
+
+	// ProposalsMergedUntouched is the forge's count now of this install's
+	// merged proposals that carried no human touch of any kind:
+	// kubeagents_vcs_proposal_touches_per_proposal under outcome merged and le
+	// 0. Part of the details reading, absent on the same terms as
+	// RemediationsClosedUnmergedTotal. Does not move LastActiveTime.
+	// +optional
+	ProposalsMergedUntouched *int64 `json:"proposalsMergedUntouched,omitempty"`
+
+	// ClustersRegistered is the number of clusters the event watcher built a
+	// client for at its last start: the management cluster and the Cluster
+	// Agent profiles the GKE API would describe, the management cluster
+	// counted once even where a profile also covers it. Read every five
+	// minutes as the number of k8s_event_watcher_cluster_up series the watcher
+	// exports, the largest reading across gateway replicas. The watcher
+	// discovers its fleet once per process, so a cluster that joins or leaves
+	// is counted after the gateway pod restarts, not before. A gauge, not a
+	// counter: it falls after such a restart. Absent when the operator has no
+	// current reading: before the first poll, while the event watcher is
+	// disabled, and after two polls in a row in which no gateway replica
+	// could be read, whether its listener failed, its pod was not running, or
+	// the operator could not reach it; the CR's events and the gateway pod's
+	// state say which. A 0 is a reading: the watcher answered and exports no
+	// series.
+	// +optional
+	ClustersRegistered *int64 `json:"clustersRegistered,omitempty"`
+
+	// ClustersMonitored is how many of ClustersRegistered are delivering
+	// events: the k8s_event_watcher_cluster_up series at 1, whose informer
+	// has completed its initial list. The difference from ClustersRegistered
+	// is the number of clusters silently unwatched, a stuck informer, a 403
+	// on the events list, or a stopped one. A 0 is a reading, and the normal
+	// one while the watcher starts, so read a fall alongside the pod's age.
+	// Absent on the same terms as ClustersRegistered: one poll in which no
+	// gateway replica could be read leaves both where they were, and a
+	// second in a row clears both, because the operator then has no current
+	// reading and an absent field says so.
+	// +optional
+	ClustersMonitored *int64 `json:"clustersMonitored,omitempty"`
 
 	// ActiveInterfaces lists the communication channels the spec enables, sorted:
 	// "dashboard" unless spec.harness.hermes.dashboardEnabled is false, and
@@ -2006,14 +2628,32 @@ type AgentUsageStatus struct {
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
 	// LastActiveTime is the time of the last poll in which a counter above
-	// moved: a brokered command ran, or an event was accepted for triage.
-	// Until SessionsTotal has a source, a chat turn that runs no brokered
-	// command does not move it. Scheduled maintenance jobs that run brokered
-	// commands do move it, though -- the Controller Stall Watch cron runs some
-	// every 30 minutes by default -- so it marks agent activity of any origin,
-	// not human or operator use alone. Advances at most once per five minutes.
+	// moved: a brokered command ran or was refused, a proposal was opened, a
+	// chat message reached the gateway, or an event was accepted for triage;
+	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal
+	// and NegativeFeedbackTotal alone leave it where it was, and the six
+	// proposal readings never move it.
+	// Scheduled maintenance jobs that run brokered commands move it too --
+	// the Controller Stall Watch cron runs some every 30 minutes by default
+	// -- so it marks agent activity of any origin, not human or operator use
+	// alone; LastHumanActiveTime is the one that does. Advances at most once
+	// per five minutes.
 	// +optional
 	LastActiveTime *metav1.Time `json:"lastActiveTime,omitempty"`
+
+	// LastHumanActiveTime is the time of the last poll in which the one
+	// counter only a person moves advanced: ChatMessagesInboundTotal, a chat
+	// message that reached the gateway, counted before the sender allowlist,
+	// so an unlisted sender is still a person. Nothing else moves it. Brokered
+	// commands and accepted events come from the stall-watch cron and the
+	// event watcher on their own, and proposals from the fleet audits, which
+	// open them with nobody asking; those move LastActiveTime and leave this
+	// alone, as the proposal readings leave both alone, so an install nobody has
+	// talked to in a month shows it. Absent until a person has sent a message
+	// since the operator that writes it started. Advances at most once per
+	// five minutes.
+	// +optional
+	LastHumanActiveTime *metav1.Time `json:"lastHumanActiveTime,omitempty"`
 }
 
 const (
@@ -2055,6 +2695,29 @@ func CleanRepoSlug(rawURL string) (string, error) {
 // ResolvedRepository.Resolve.
 func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
 	ref, err := resolveGitHub(rawURL, org)
+	if err != nil {
+		return "", err
+	}
+	return ref.Path, nil
+}
+
+// GitHubRepoSlugOnHost reads a GitHub repository entry into "owner/repo" on
+// the install's GitHub host: github.com, or a GitHub Enterprise Server host. A
+// bare name is qualified by org. An entry that names another host is refused,
+// never moved onto host. It is what the minter policy sync reads the state
+// ConfigMap's GitHub entries with: the minter mints for the one GitHub host.
+func GitHubRepoSlugOnHost(rawURL, org, host string) (string, error) {
+	if trimmed := strings.TrimSpace(rawURL); trimmed == "" || trimmed == NoRepositorySentinel {
+		return "", fmt.Errorf("empty repository")
+	}
+	provider, err := LookupGitProvider(GitProviderGitHub)
+	if err != nil {
+		return "", err
+	}
+	if provider.Hosts[lowerASCII(strings.TrimSpace(host))] {
+		host = ""
+	}
+	ref, err := provider.Resolve(host, rawURL, org)
 	if err != nil {
 		return "", err
 	}

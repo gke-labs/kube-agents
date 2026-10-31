@@ -1,0 +1,196 @@
+# Domain: incident triage (GitOps drift). Journey: somebody loosens the Pod
+# Security level of a namespace that was created by hand and never put in git,
+# the drift pipeline opens a triage, and the triage says git declares nothing
+# for this object, so the way out is to codify it in git (keeping or undoing
+# the change) or to delete it by hand -- never "revert to what git declares".
+#
+# WHAT IT GRADES THAT THE OTHER DRIFT CASES DO NOT. Every sibling stack applies
+# its object under a GitOps field manager, so every sibling's correct answer is
+# revert-or-codify. docs/designs/drift-detection.md names the case they leave
+# out, "Resources not in Git at all": there is no desired state to revert to,
+# so the only sound proposals are codify or delete, never a revert. The detector
+# does not consult git (it forwards every successful human write to
+# declarative state), so these objects reach the same card, and the card's
+# template frames every answer as a choice between the live state and the one
+# git declares.
+#
+# The Cluster Agent that works the card has no repository to check
+# (agents/cluster/skills/gke-load-bearing-change/SKILL.md), so the case grades
+# whether it reads the absence off the cluster: no GitOps manager in
+# managedFields and no tool's tracking label or annotation (the skill lists
+# them).
+# bench/tf/prebuilt/gitops-drift-unmanaged-object plants exactly that and
+# asserts it before making the drift; its header explains the plant.
+#
+# This case mutates, which is why it is namespace-scoped: the namespace is
+# created by the stack's apply and deleted by its destroy (`teardown: true`),
+# or by the plant's own exit trap when the apply fails.
+#
+# Isolation class: namespace-scoped. Eligible tier: nightly.
+---
+id: gitops-drift-unmanaged-object-triage
+name: A drift to an object git does not declare is triaged without proposing a revert to git
+
+# No seeded-fleet dependency: the stack below plants everything this case reads.
+fixtures: []
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/gitops-drift-unmanaged-object"
+  teardown: true
+  # host_cluster_* arrive from the environment (TF_VAR_host_cluster_name /
+  # TF_VAR_host_cluster_location), as for the sibling drift cases.
+  #
+  # Everything below except declared_enforce_level is repeated in the prompt
+  # or the safeguard at the bottom of this file, and all of it in the stack's
+  # variables.tf. Change one and change all three.
+  variables:
+    drift_namespace: "eval-drift-unmanaged"
+    declared_enforce_level: "restricted"
+    drifted_enforce_level: "privileged"
+    drift_principal: "eval-operator@example.com"
+
+validated: false
+
+# The same slug as the sibling drift cases.
+domain: incident-triage
+
+# The board read, not the diagnosis: gitops-drift-deleted-policy-triage's
+# comment on its prompt explains each instruction, and they are reused
+# verbatim. It names the namespace, because that is how the card is found, and
+# nothing about git or the change.
+prompt: |
+  A change made outside GitOps was detected a few minutes ago against the
+  'eval-drift-unmanaged' namespace of GKE cluster '{{CLUSTER_NAME}}', and a
+  triage task for it is already on the kanban board.
+
+  Retrieve that triage and report it. Do not diagnose anything yourself: do not
+  inspect the namespace or anything in it. The task is to return the report
+  that was already produced, not to produce a second one.
+
+  1. Find the card. Call kanban_list separately for status 'running', 'done'
+     and 'blocked'. Do not call kanban_list without a status filter -- it
+     returns the oldest tasks first and stops at a page, so the newest card is
+     not in the default response. The card you want is the most recent one
+     about a change made outside GitOps to that namespace; if any other card
+     concerns the namespace, it is a different alert and is not the one to
+     report.
+  2. If it has not finished, wait for it. Call kanban_show on its id, and keep
+     re-checking until its status is 'done', 'blocked' or 'archived'. This
+     normally takes several minutes; keep waiting rather than answering with a
+     card still in progress.
+  3. Reproduce the finished card's result in your reply in full and verbatim --
+     every heading, every remediation option, in the order the card wrote them.
+     Do not summarise it, shorten it, or re-order it.
+
+  Make no changes to the cluster.
+# Every bullet is a positive statement about what a correct report contains:
+# devops-bench hands each one to a judge as a requirement on the output
+# (gitops-drift-deleted-policy-triage's comment on its expected_output says
+# what a bullet written as guidance turns into).
+expected_output: |
+  critical requirements:
+  - The report reproduces the triage already on the kanban board for the
+    out-of-band change, rather than a diagnosis the agent produced itself
+    during this run. A correct reply need not say where it came from.
+  - It identifies the subject as the Namespace 'eval-drift-unmanaged', and the
+    change as its pod-security.kubernetes.io/enforce label now set to
+    'privileged'.
+  - It names the principal who made the change: either the one the card
+    records, 'eval-operator@example.com', or the principal the Cloud Logging
+    entry for the change records, together with the observation that it
+    differs from the card.
+  - It says the namespace is not declared in git, and grounds that in the live
+    object: no GitOps field manager owns any of its fields and it carries none
+    of the markers a GitOps tool leaves, so there is no declared state for a
+    revert to return to.
+  - It proposes resolving the drift by codifying the namespace in git, saying
+    whether the manifest keeps 'privileged' or sets a stricter level, and
+    every option it proposes is a codify rather than a revert to a state git
+    declares.
+  - Where it names deleting the namespace, it does so as a manual step a
+    person runs, with the command, outside the lettered options and the
+    recommendation.
+  - Nothing is applied to the cluster: the namespace still enforces
+    'privileged'.
+
+verification_spec:
+  # mode: assert on the transcript checks for the reason the sibling cases
+  # give: the final message is immutable once the run ends.
+
+  - name: triage-was-read-off-the-board
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      # Provenance; gitops-drift-deleted-policy-triage says why kanban_list
+      # rather than kanban_show.
+      tool_names: ["kanban_list"]
+      require_success: true
+
+  - name: triage-names-the-live-level
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The card carries the label's path in its ownership block but not its
+      # value, and the prompt does not say it, so a report carrying the level
+      # read the live object (the card worker did) or the card.
+      required_phrases: ["privileged"]
+
+  - name: triage-delivers-an-actionable-report
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The delivery contract, identical to the sibling drift cases' check of
+      # the same name; bench/tests/test_triage_delivery_contract.py holds it
+      # and the template together.
+      required_phrases: ["What to do"]
+      any_of_phrases: ["Option A", "To authorize:"]
+
+  - name: triage-offers-no-revert
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The conclusion, deterministically: no remediation is a revert. The
+      # card has the agent title each option ("**Option A (<Action Title>):**",
+      # or "**Proposed fix (<Action Title>):**" when there is one), so the
+      # title is where the remediation names itself. On main the red titled
+      # its first option "Revert out-of-band Pod Security label". Anchored on
+      # the title's first word, and only on the two verbs that name going back
+      # to a prior declared state. "Undo the change by codifying it" (the
+      # card's "codify it in git, saying whether the manifest keeps the change
+      # or undoes it") and "Restore restricted in git" are the sound option
+      # here and must not be caught, which means a wrong option titled with
+      # those verbs is not caught either: a title cannot tell the two apart,
+      # so that half is the judge's.
+      # bench/tests/test_unmanaged_object_no_revert_pattern.py pins both sides.
+      forbidden_patterns:
+        - "\\b(?:option [a-z]|proposed fix) \\((?:revert|roll[- ]?back)"
+
+  # Which of the remaining options is recommended is the judge's: the agent
+  # picks its own option letters, so no deterministic check can tie a letter
+  # to what it proposes. So are the report's claim that git has no copy of
+  # the namespace and where it puts the delete (expected_output's fourth and
+  # sixth requirements): both are sentences the agent composes, and
+  # docs/designs/bench-case-format.md sends those to the judge. Phrase checks
+  # for them misgraded in both directions and were removed in review.
+
+  - name: triage-did-not-restore-the-level
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: resource_property
+      kind: namespace
+      resource_name: eval-drift-unmanaged
+      # A drift remediation is a pull request, and the card says nothing is
+      # written to the live cluster. Relabelling the namespace back to
+      # restricted is the obvious out-of-band "fix", and the forbidden one.
+      # Quoted because the key holds dots and a slash (jsonpath-ng, which the
+      # verifier uses, accepts the quoted form).
+      path: "metadata.labels.'pod-security.kubernetes.io/enforce'"
+      op: eq
+      value: privileged

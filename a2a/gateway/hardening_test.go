@@ -2,7 +2,7 @@ package gateway
 
 // The tests here pin the fixes from the upstream cut's adversarial pass:
 // the spawn-failure supervisor terminal, the route-conditioned steer
-// acknowledgement, the stop guards, the detached-task width bias, the
+// acknowledgement, the stop guards, the detached-task status matcher, the
 // pre-delete replay guard, the healed-terminal card, and the session pod's
 // seccomp profile.
 
@@ -10,6 +10,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -68,13 +70,15 @@ func TestSpawnFailureClosesTheTaskAsItsSupervisor(t *testing.T) {
 	})
 }
 
-// TestSteerAckIsRouteConditioned: the spec's gateway-authored-posts rule
-// (amended 8/31) — the acknowledgement reports the steer is on the stream,
-// and what it says next depends on what the executor will do with it. Each
-// task has its first event on the stream before the steer: a task with none
-// gets a line that promises nothing (TestSteerIntoTaskWithNoFirstEventPromisesNoReply).
+// TestSteerAckIsRouteConditioned: the spec's gateway-authored-posts rule —
+// the acknowledgement depends on what the executor will do with the steer:
+// the fixed route's executor queues it and answers it next, a session
+// worker absorbs it at its next turn boundary if the task is still running.
+// Each task has its first event on the stream before the steer: a task with
+// none gets a line that promises nothing
+// (TestSteerIntoTaskWithNoFirstEventPromisesNoReply).
 func TestSteerAckIsRouteConditioned(t *testing.T) {
-	t.Run("fixed route says the executor refuses", func(t *testing.T) {
+	t.Run("fixed route says it takes it next", func(t *testing.T) {
 		r := startRig(t)
 		conv := "discord:g1/thread-ackfixed"
 		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
@@ -87,7 +91,7 @@ func TestSteerAckIsRouteConditioned(t *testing.T) {
 			AuthorID: "1001", MessageID: "af-2", Text: "actually only prod"}
 		waitFor(t, "fixed-route steer ack", func() bool {
 			for _, p := range r.adapter.postTexts() {
-				if strings.Contains(p, "does not take mid-task input") {
+				if strings.Contains(p, ackSteerQueued) {
 					return true
 				}
 			}
@@ -116,7 +120,7 @@ func TestSteerAckIsRouteConditioned(t *testing.T) {
 			AuthorID: "1001", MessageID: "as-2", Text: "actually only prod"}
 		waitFor(t, "session-route steer ack", func() bool {
 			for _, p := range r.adapter.postTexts() {
-				if strings.Contains(p, "if the task is still running") {
+				if strings.Contains(p, ackSteerSession) {
 					return true
 				}
 			}
@@ -137,7 +141,9 @@ func TestStopWithNothingToStopStartsNoTask(t *testing.T) {
 		AuthorID: "1001", MessageID: "sg-1", Text: "stop"}
 	waitFor(t, "bare stop answered", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "nothing is running") {
+			// The plain reply: a conversation that never ran a task has
+			// no card of its own to mention (gke-labs#3263).
+			if p == nothingRunningNotice {
 				return true
 			}
 		}
@@ -180,12 +186,44 @@ func TestStopWithNothingToStopStartsNoTask(t *testing.T) {
 	}
 }
 
-// TestDetachedTaskNarrowsTheStatusMatcher: the wide interrogative rule is
-// justified where the alternative reading is a refused steer. After a stop
-// the alternative is a NEW task, so a status-shaped new ask must start one
-// rather than replaying the dead task — while the exact phrases still
-// answer status.
-func TestDetachedTaskNarrowsTheStatusMatcher(t *testing.T) {
+// The wide matcher an addressee that refuses follow-ups earns (gh#2723
+// items 5 and 16) stays off for a detached task: after a stop, "any update
+// on the rollout" is a NEW task even on such an addressee, never a replay
+// of the dead one.
+func TestAfterAStopTheWideMatcherStaysOffForANoResumeAddressee(t *testing.T) {
+	r := startRig(t)
+	r.g.mu.Lock()
+	r.g.steersRefusedBy["platform"] = true
+	r.g.mu.Unlock()
+	conv := "discord:g1/thread-detachwide-noresume"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "dn-1", Text: "run the audit"}
+	r.awaitTask(t, "platform")
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "dn-2", Text: "stop"}
+	waitFor(t, "task detached", func() bool {
+		rec, err := r.g.reg.Get(context.Background(), conv)
+		return err == nil && rec != nil && rec.ActiveTask != nil && rec.ActiveTask.Detached
+	})
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
+		AuthorID: "1001", MessageID: "dn-3", Text: "any update on the rollout"}
+	waitFor(t, "new task started", func() bool {
+		rec, err := r.g.reg.Get(context.Background(), conv)
+		return err == nil && rec != nil && len(rec.Tasks) == 2 &&
+			rec.ActiveTask != nil && rec.ActiveTask.Ask == "any update on the rollout"
+	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "🔎 task") {
+			t.Fatalf("a detached task's status was replayed: %q", p)
+		}
+	}
+}
+
+// TestAfterAStopANonExactStatusAskIsANewTask: a detached task gets the exact
+// phrase set only, so after a stop a status-shaped but
+// non-exact ask is a NEW task, not a replay of the dead one — while the
+// exact phrases still answer status.
+func TestAfterAStopANonExactStatusAskIsANewTask(t *testing.T) {
 	r := startRig(t)
 	conv := "discord:g1/thread-detachwide"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
@@ -197,7 +235,7 @@ func TestDetachedTaskNarrowsTheStatusMatcher(t *testing.T) {
 		rec, err := r.g.reg.Get(context.Background(), conv)
 		return err == nil && rec != nil && rec.ActiveTask != nil && rec.ActiveTask.Detached
 	})
-	// Wide-shaped but not an exact phrase: a new ask, not a status poke.
+	// Status-shaped but not an exact phrase: a new ask, not a status poke.
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
 		AuthorID: "1001", MessageID: "dw-3", Text: "any update on the rollout"}
 	waitFor(t, "new task started", func() bool {
@@ -205,6 +243,27 @@ func TestDetachedTaskNarrowsTheStatusMatcher(t *testing.T) {
 		return err == nil && rec != nil && len(rec.Tasks) == 2 &&
 			rec.ActiveTask != nil && rec.ActiveTask.Ask == "any update on the rollout"
 	})
+}
+
+// On the fixed route an interrogative that is not an exact phrase is a
+// steer, published to the running task, not answered by replay, while the
+// addressee has sent no no-resume refusal (steersRefusedBy; the wide rule
+// for an executor that refuses follow-ups is
+// TestNoResumeAddresseeGetsTheWideStatusMatcher).
+func TestFixedRouteWideAskIsASteer(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-wide"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "w-1", Text: "check the fleet"}
+	origin := r.awaitTask(t, "platform")
+	_ = r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "w-2", Text: "what is the agent doing"}
+	waitFor(t, "steer on the in subject", func() bool { return len(inSubjectEnvelopes(t, r.url, "platform")) == 2 })
+	waitFor(t, "ack", postedContaining(r, ackSteerQueued))
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "🔎 task") {
+			t.Fatalf("answered by replay: %q", p)
+		}
+	}
 }
 
 // TestPreDeleteGuardKeepsPodWhenReplayFails: a replay failure means an
@@ -393,5 +452,74 @@ func TestSpawnSetsSeccompRuntimeDefault(t *testing.T) {
 	csc := pod.Spec.Containers[0].SecurityContext
 	if csc == nil || csc.SeccompProfile == nil || csc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 		t.Fatalf("container securityContext missing seccompProfile RuntimeDefault: %+v", csc)
+	}
+}
+
+// A session pod trusts the bus the way the gateway does: the same CA bundle,
+// from the same ConfigMap, at the same path, named by NATS_CA_FILE. And it is
+// stamped with the transport it was given, the stamp reuse checks.
+func TestSpawnHandsTheSessionThePodTheBusCA(t *testing.T) {
+	caFile := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(caFile, []byte("ca-one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+		TaskDeadline: 15 * time.Minute, NATSURL: "tls://agent-a2a-nats.test-ns.svc:4222",
+		NATSCAFile: caFile, NATSCAConfigMap: "agent-a2a-nats-ca-bundle"}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1",
+		BusSession: "chat-otter-tls", Addressee: "chat-otter-tls"}
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-tls", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := pod.Spec.Containers[0]
+	var envCA string
+	for _, e := range c.Env {
+		if e.Name == lib.EnvNATSCAFile {
+			envCA = e.Value
+		}
+	}
+	if envCA != caFile {
+		t.Errorf("%s = %q, want %q", lib.EnvNATSCAFile, envCA, caFile)
+	}
+	var mounted bool
+	for _, m := range c.VolumeMounts {
+		if m.Name == natsCAVolume && m.MountPath == filepath.Dir(caFile) && m.ReadOnly {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Errorf("no read-only %s mount at %s: %+v", natsCAVolume, filepath.Dir(caFile), c.VolumeMounts)
+	}
+	var fromConfigMap bool
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == natsCAVolume && v.ConfigMap != nil && v.ConfigMap.Name == "agent-a2a-nats-ca-bundle" {
+			fromConfigMap = true
+		}
+	}
+	if !fromConfigMap {
+		t.Errorf("the %s volume does not come from the bundle ConfigMap: %+v", natsCAVolume, pod.Spec.Volumes)
+	}
+	stamp := pod.Annotations[annoBusTransport]
+	if stamp == "" || stamp != s.busTransport() {
+		t.Fatalf("bus-transport stamp = %q, want the spawner's %q", stamp, s.busTransport())
+	}
+	// A CA the kubelet rewrote in place does not move the stamp: the pod
+	// reads the bundle on each handshake and heals on its own. A pod spawned
+	// with the plaintext URL and no CA has another stamp, and is not reused.
+	if err := os.WriteFile(caFile, []byte("ca-two"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s.busTransport() != stamp {
+		t.Error("the stamp moved when only the CA bundle's bytes changed")
+	}
+	plain := &podSpawner{cfg: &Config{NATSURL: "nats://agent-a2a-nats.test-ns.svc:4222"}}
+	if plain.busTransport() == stamp {
+		t.Error("a plaintext spawner stamps its pods the same as a TLS one")
 	}
 }

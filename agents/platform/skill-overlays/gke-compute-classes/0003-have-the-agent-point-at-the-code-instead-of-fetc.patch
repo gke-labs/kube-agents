@@ -1,0 +1,55 @@
+Subject: Have the agent read the code through inspect-repository instead of cloning it
+
+Why: This install's terminal has no `git` and cannot clone or fetch from GitHub itself, so the CODE-FIRST rule sends the agent to the `inspect-repository` skill, which clones broker-side and returns files at a cited `sha` but no history; `git log -S` and `git blame` are handed to the user, and the agent never states a version or date it has not read. The code index's clone preamble is rewritten to `inspect-repository`'s order (`grep` the indexed symbol, then `fetch` the path `grep` returned, never an index path unread, since upstream's paths move), its verification steps are addressed to the user for the same reason, and its `groupRulesByScore` symbol, which the upstream source does not have, is dropped so the agent does not hand the user a symbol to search for that is not there.
+Local-Issue: #2692
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; the install's terminal has no GitHub egress or `git` by design
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -23,7 +23,7 @@ Guidance on configuring, optimizing, and troubleshooting GKE ComputeClasses.
+ --------------------------------------------------------------------------------
+ 
+ ## CRITICAL RULES
+-- **CODE-FIRST VERIFICATION (OPEN-SOURCE CODEBASE):** GKE Cluster Autoscaler and ComputeClasses are open-sourced at `https://github.com/GoogleCloudPlatform/cluster-autoscaler`. When user questions challenge or explore undocumented/subtle behaviors, or when guidance is not explicitly established in this skill, **VERIFY BEHAVIOR DIRECTLY IN CODE** (via local repository clone or fetching raw files from GitHub). Check `git log -S` and `git blame` to identify the exact commit and date when behavior changed, and communicate version/date ranges to the user (e.g. *"This behavior changed on July 20, 2026 in upstream commit 129daa3756..."*). See `references/compute-class-code-index.md` for exact package and symbol mappings.
++- **CODE-FIRST VERIFICATION (OPEN-SOURCE CODEBASE):** GKE Cluster Autoscaler and ComputeClasses are open-sourced at `https://github.com/GoogleCloudPlatform/cluster-autoscaler`. When user questions challenge or explore undocumented/subtle behaviors, or when guidance is not explicitly established in this skill, **READ THE CODE WITH THE `inspect-repository` SKILL**: this install's terminal has no `git` and cannot clone or fetch from GitHub itself, but `inspect-repository` clones broker-side and lets you `grep` and `fetch` files at the cloned `sha`. Start from the package or symbol in the code index and cite the commit you read. It returns files without history, so `git log -S` and `git blame` are the user's to run: name the symbol for them, and do not state a version or date range you have not read. See `references/compute-class-code-index.md` for exact package and symbol mappings.
+ 
+ ## Engagement Rules: Generalized First, Refine Later
+ 
+diff --git a/references/compute-class-code-index.md b/references/compute-class-code-index.md
+--- a/references/compute-class-code-index.md
++++ b/references/compute-class-code-index.md
+@@ -2,7 +2,7 @@
+ 
+ This reference maps GKE ComputeClasses behaviors, lifecycle events, and priority rules directly to source files and key function symbols in the open-source repository: [https://github.com/GoogleCloudPlatform/cluster-autoscaler](https://github.com/GoogleCloudPlatform/cluster-autoscaler).
+ 
+-When verifying behavior or investigating edge cases, clone the repository or fetch raw source files directly from GitHub.
++This install's terminal cannot clone or fetch from GitHub itself: read the code with the `inspect-repository` skill: `open` the repository, `grep` for the symbol this index names, then `fetch` the path `grep` returned. The paths below are where upstream last saw each symbol and may have moved, so do not `fetch` one unread, and a symbol `grep` cannot find is not proof the behaviour is gone. The skill returns source without history, so leave `git log -S` and `git blame` to the user in their own clone.
+ 
+ ---
+ 
+@@ -12,7 +12,7 @@ When verifying behavior or investigating edge cases, clone the repository or fet
+ 
+ | Behavior / Feature | Source File Path | Key Structs & Functions | Behavioral Notes |
+ |---|---|---|---|
+-| **Priority rule evaluation & grouping** | `pkg/computeclass/organizer.go` | `organizer.organizeByRules`, `groupRulesByScore` | Sorts and evaluates `priorities[]` top-to-bottom. Rules sharing `priorityScore` evaluate as a single tier. |
++| **Priority rule evaluation & grouping** | `pkg/computeclass/organizer.go` | `organizer.organizeByRules` | Sorts and evaluates `priorities[]` top-to-bottom. Rules sharing `priorityScore` evaluate as a single tier. |
+ | **5-minute fixed cooldown** | `pkg/backoff/gke_mig_backoff.go` | `NpcBackoffDuration = 5 * time.Minute` | Fixed non-exponential cooldown applied to failing declarative priority rungs upon stockout. |
+ | **Cumulative cooldown prolongation** | `pkg/backoff/npc_backoff.go` | `npcCrdBackoff.Backoff`, `npcCrdBackoff.BackoffStatus` | Reset and prolonged to `currentTime + 5m` across all previously failing rungs when a lower priority fails sequentially. |
+ | **Fallback floor safety guarantee** | `pkg/backoff/npc_backoff.go` | `getRuleCount`, line check `ruleIdx >= getRuleCount(npcCrd)-1` | The final priority rule (and implicit `ScaleUpAnyway` fallback tier) is never backed off by `npcCrdBackoff`. |
+@@ -50,7 +50,7 @@ When verifying behavior or investigating edge cases, clone the repository or fet
+ 
+ ## Code verification instructions
+ 
+-When troubleshooting or investigating behavioral changes:
++These steps run in the user's own clone, not in this install; hand them to the user when troubleshooting or investigating behavioral changes:
+ 1. **Search Git Log by Symbol**:
+    ```bash
+    git log -S "<function_or_const_name>" -p -- <filepath>
+@@ -61,4 +61,4 @@ When troubleshooting or investigating behavioral changes:
+    ```
+ 3. **Trace Behavioral Evolution**:
+    - Determine the commit date and message when a logic branch was altered.
+-   - If the exact GKE patch version is unreleased or not yet documented, communicate the commit hash, upstream PR, and date range to the user.
++   - If the exact GKE patch version is unreleased or not yet documented, the commit hash, upstream PR, and date range are the answer to record.

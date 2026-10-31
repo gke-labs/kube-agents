@@ -1,0 +1,58 @@
+{
+  "name": "plan-titled-with-a-failed-card",
+  "source": "agents/platform/scripts/test_slack_status.py::PlanTest.test_text",
+  "notes": "Steps are the card's notes, unmarked: the renderer draws today's ✓ and ◌ from the item's status (the last step of an in_progress item is the open one).",
+  "input": {
+    "title": "is it up?",
+    "rows": [
+      {
+        "task_id": "t_a",
+        "title": "check payments",
+        "lines": [
+          "a",
+          "b"
+        ],
+        "status": "in_progress",
+        "note": "b",
+        "steps": 2
+      },
+      {
+        "task_id": "t_b",
+        "title": "check seeded-b",
+        "lines": [],
+        "status": "error",
+        "steps": 0
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "plan": {
+          "title": "is it up?",
+          "items": [
+            {
+              "id": "t_a",
+              "title": "check payments · b · step 2 ▸",
+              "status": "in_progress",
+              "steps": [
+                "a",
+                "b"
+              ],
+              "stepCount": 2,
+              "note": "b"
+            },
+            {
+              "id": "t_b",
+              "title": "check seeded-b",
+              "status": "error"
+            }
+          ]
+        }
+      },
+      "update": "plan"
+    }
+  ]
+}

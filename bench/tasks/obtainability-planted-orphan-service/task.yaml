@@ -20,10 +20,13 @@
 #
 # Isolation class: namespace-scoped plant on the host cluster, read-only
 # fleet sweep, GitOps-repo write (the ledger, on the same throwaway-repo terms
-# as every audit). The run opens no remediation pull request, for two reasons
-# either of which suffices: the plant is not declared in the GitOps repo, so
+# as every audit). The plant yields no remediation pull request, for two
+# reasons either of which suffices: it is not declared in the GitOps repo, so
 # its remediation is `manual` (SOP 3.16), and 3.16 is off the checks the sweep
-# opens at `major` and is marked `needs_triage: service-selector` besides.
+# opens at `major` and is marked `needs_triage: service-selector` besides. The
+# run as a whole may open one for checkout-gateway's `no-pdb` finding once the
+# repository declares that workload (pdb-remediation-pr's header, "Repository
+# fixture required"); nothing here asserts on it.
 #
 # Expected cost bracket: the full-audit shape, 600-1300s a repetition, as
 # obtainability-planted-pdb (962s measured).

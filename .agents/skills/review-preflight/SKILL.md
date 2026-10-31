@@ -77,10 +77,10 @@ make docs-check
 
 Every time, whatever the range touches: CI runs it unfiltered on every pull request. It is cheap, it
 is deterministic, and its output is a fact the passes would otherwise re-derive, so hand the result
-on. It does not substitute for its pass — it covers generated regions, links, terminology, map
-coverage, maintainer identifiers on site pages, and the always-loaded instruction files' context
-budget, but not whether the prose is still true, which is the whole of what `review-docs-drift`
-asks.
+on. It does not substitute for its pass — it covers generated regions, links and section anchors,
+reachability, terminology, maintainer identifiers and PR/issue citations on site pages, site prose
+ceilings, and the always-loaded instruction files' context budget, but not whether the prose is
+still true, which is the whole of what `review-docs-drift` asks.
 
 It is here because the passes want its output, not because it is the local check you owe.
 `AGENTS.md` "Local Validation Checks" is that list — prettier on changed Markdown and YAML,
@@ -198,7 +198,10 @@ A fix changes the shared range, so re-run whatever the fix invalidated — not w
 the finding. They are rarely the same set: rewriting a paragraph to answer an adversarial finding is
 exactly how the prose starts contradicting another document, which is docs-drift's question and not
 one `make docs-check` can answer. Work that still holds stays, and is not re-run just to have been
-run against the new head; `AGENTS.md` states that rule and this restates it.
+run against the new head; `AGENTS.md` states that rule and this restates it. Look where you fixed:
+a line changed to answer a finding — a pass's or a reviewer's — is where adjacent defects cluster,
+so the re-run's range covers those lines and what they touch, handed as a range and never as the
+finding.
 
 New context, same handoff. Feeding the previous round's findings into the re-run defeats the point
 of the fresh one.

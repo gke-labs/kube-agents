@@ -516,9 +516,11 @@ func TestBridgeLookAheadIsInTheA2AModule(t *testing.T) {
 // function they stand for, holds the arithmetic they feed to what it
 // promises (at the presubmit's 4 workers and at 6, a budget within the
 // floor, so TASKS is created at it; at 8 the floor cannot hold the
-// reserve, and the lane relies on its Degraded gate), and decodes the patch
-// the script renders into the CR type, so the field path it names is one
-// the API has. Read from the source, for the reason the SessionConsumerRoles
+// reserve, and the lane relies on its Degraded gate), and decodes the values
+// document the script hands the chart into the CR type, so the field path it
+// names is one the API has: under platformAgent the document carries the
+// CR's own spec paths, which the chart renders one for one
+// (tests/test_ci_deploy_mode_next.py renders it to check that half). Read from the source, for the reason the SessionConsumerRoles
 // test gives, and every step fails rather than defaults.
 func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 	script, err := os.ReadFile(ciDeploySource)
@@ -566,9 +568,9 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 		}
 		return n
 	}
-	format := regexp.MustCompile(`(?m)^readonly MODE_NEXT_PATCH_FORMAT='(.*)'$`).FindSubmatch(script)
+	format := regexp.MustCompile(`(?m)^readonly MODE_NEXT_HELM_VALUES_FORMAT='(.*)'$`).FindSubmatch(script)
 	if format == nil {
-		t.Fatalf("no `readonly MODE_NEXT_PATCH_FORMAT='...'` in %s; it is the patch that carries the mode and the cap", ciDeploySource)
+		t.Fatalf("no `readonly MODE_NEXT_HELM_VALUES_FORMAT='...'` in %s; it is the values document that carries the mode and the cap", ciDeploySource)
 	}
 	for _, tc := range []struct {
 		workers, want int
@@ -582,20 +584,29 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 		if n != tc.want {
 			t.Errorf("at %d workers the script sizes maxSessions=%d, want %d", tc.workers, n, tc.want)
 		}
-		// The first patch, decoded into the CR type with unknown fields
-		// refused: the path is spec.harness.tuning.maxSessions, and the mode
-		// rides in the same merge so the first render sees both.
+		// The first change's values document, its platformAgent object
+		// decoded as the CR's spec with unknown fields refused: the path is
+		// spec.harness.tuning.maxSessions, and the mode rides in the same
+		// upgrade so the first render sees both.
+		var values struct {
+			PlatformAgent json.RawMessage `json:"platformAgent"`
+		}
+		vdec := json.NewDecoder(strings.NewReader(fmt.Sprintf(string(format[1]), n)))
+		vdec.DisallowUnknownFields()
+		if err := vdec.Decode(&values); err != nil || values.PlatformAgent == nil {
+			t.Fatalf("MODE_NEXT_HELM_VALUES_FORMAT is not a document with platformAgent alone at its top (%v)", err)
+		}
 		agent := &agentv1alpha1.PlatformAgent{}
-		dec := json.NewDecoder(strings.NewReader(fmt.Sprintf(string(format[1]), n)))
+		dec := json.NewDecoder(strings.NewReader(`{"spec":` + string(values.PlatformAgent) + `}`))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(agent); err != nil {
-			t.Fatalf("MODE_NEXT_PATCH_FORMAT does not decode into a PlatformAgent: %v", err)
+			t.Fatalf("MODE_NEXT_HELM_VALUES_FORMAT's platformAgent does not decode into a PlatformAgent spec: %v", err)
 		}
 		if agent.Spec.Mode == nil || *agent.Spec.Mode != "next" {
-			t.Errorf("the first patch does not set spec.mode: next (got %v)", agent.Spec.Mode)
+			t.Errorf("the first change does not set spec.mode: next (got %v)", agent.Spec.Mode)
 		}
 		if got := resolveA2AMaxSessions(agent); got != n {
-			t.Errorf("the first patch's maxSessions resolves to %d, want %d: the field path is not the one the operator reads", got, n)
+			t.Errorf("the first change's maxSessions resolves to %d, want %d: the field path is not the one the operator reads", got, n)
 		}
 		// The render, with the bridge concurrency CI passes through the
 		// operator's env: the operator renders the bridge and budgets it
