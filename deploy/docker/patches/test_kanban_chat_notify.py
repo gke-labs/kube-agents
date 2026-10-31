@@ -69,6 +69,70 @@ ROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}
 UNROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: ""}
 
 
+class SharedHomeFileContractTest(unittest.TestCase):
+    """The patch imports nothing of ours, so it carries its own copy of the
+    projected file's mount path and key; the two copies must stay one file.
+    Outside the fixture above, which patches the directory per test."""
+
+    def test_the_stand_in_reads_the_same_file_as_chat_notify(self):
+        scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "agents", "platform", "scripts")
+        sys.path.insert(0, os.path.abspath(scripts))
+        try:
+            import chat_notify
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(kanban_chat_notify.HOME_FILE_DIR, chat_notify.HOME_FILE_DIR)
+        self.assertEqual(kanban_chat_notify.HOME_FILE_KEY, chat_notify.HOME_FILE_KEY)
+
+
+class RoutedPlatformFromTheFileTest(unittest.TestCase):
+    """A learned Slack home channel reaches the stand-in through the operator's
+    projected file, not the env: routed when the gateway holds Slack and the
+    file names a channel, and the env still wins when it is set."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.dir], check=False))
+        env = mock.patch.dict(os.environ, {
+            kanban_chat_notify.NOTIFY_PLATFORM_ENV: "",
+            kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        directory = mock.patch.object(kanban_chat_notify, "HOME_FILE_DIR", self.dir)
+        directory.start()
+        self.addCleanup(directory.stop)
+
+    def _write(self, text):
+        with open(os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_the_file_routes_slack(self):
+        self.assertEqual(kanban_chat_notify.routed_platform(), "")
+        self._write("")
+        self.assertEqual(kanban_chat_notify.routed_platform(), "")
+        self._write("C0FILE\n")
+        self.assertEqual(kanban_chat_notify.routed_platform(), "slack")
+        self.assertTrue(kanban_chat_notify.routes("slack"))
+        self.assertIn("slack", kanban_chat_notify.served_platforms())
+
+    def test_a_file_that_is_not_text_routes_nothing(self):
+        with open(os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY), "wb") as handle:
+            handle.write(b"\xff\xfe\x00C0")
+        self.assertEqual(kanban_chat_notify.routed_platform(), "")
+
+    def test_the_env_wins_and_another_platform_ignores_the_file(self):
+        self._write("C0FILE\n")
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):
+            self.assertEqual(kanban_chat_notify.routed_platform(), "google_chat")
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat"}):
+            self.assertEqual(kanban_chat_notify.routed_platform(), "")
+
+    def test_an_absent_directory_routes_nothing(self):
+        with mock.patch.object(kanban_chat_notify, "HOME_FILE_DIR", os.path.join(self.dir, "absent")):
+            self.assertEqual(kanban_chat_notify.routed_platform(), "")
+
+
 class _Runner:
     config = types.SimpleNamespace(multiplex_profiles=False)
 

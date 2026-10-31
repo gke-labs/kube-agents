@@ -795,19 +795,43 @@ def report_task_kubeconfig(generated: str) -> None:
     )
 
 
+_GET_CREDENTIALS_WORDS = ("container", "clusters", "get-credentials")
+
+
 def is_get_credentials(argv: list[str]) -> bool:
     """Is this the one command that legitimately authors a kubeconfig?
 
-    Matched on the subcommand sequence rather than on position, so global flags
-    may appear anywhere ahead of it.
+    Read the way the broker reads it: the command words past gcloud's flags, so
+    a flag between the words (`container clusters --location l get-credentials`)
+    is the same command. The shim can't import the broker's policy, so this walk
+    doesn't know every flag's arity. A bare `--flag` takes the next token as its
+    value unless that token is one of the command words, and none of the three
+    is a plausible flag value.
     """
     if not argv or argv[0] != "gcloud":
         return False
-    try:
-        index = argv.index("container")
-    except ValueError:
-        return False
-    return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
+    words: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            break
+        if token.startswith("-"):
+            if (
+                token.startswith("--")
+                and "=" not in token
+                and index + 1 < len(argv)
+                and not argv[index + 1].startswith("-")
+                and argv[index + 1] not in _GET_CREDENTIALS_WORDS
+            ):
+                index += 1
+            index += 1
+            continue
+        words.append(token)
+        index += 1
+    if words[:1] and words[0] in ("alpha", "beta"):
+        words = words[1:]
+    return words[:3] == list(_GET_CREDENTIALS_WORDS)
 
 
 def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None]:
@@ -1430,7 +1454,8 @@ class ApiSession:
     rewrites `https://<host>/<path>` onto the broker's `/v1/gcp/<host>/<path>`
     route and attaches the caller token; the broker checks the read against
     `api_policy.API_READ_ROUTES`, forwards it on its own credential, and hands
-    back the upstream status, `Content-Type` and body unchanged. A refusal
+    back the upstream status, `Content-Type` and body unchanged (or, on a route
+    with a projection, a 2xx body cut down to the fields it names). A refusal
     arrives as a 403 whose JSON body carries `rule` and `message`, the same
     shape `/v1/exec` uses.
 

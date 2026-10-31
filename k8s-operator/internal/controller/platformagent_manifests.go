@@ -1138,6 +1138,34 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // admitting at least this many.
 const defaultKanbanMaxInProgress = 6
 
+// defaultSessionRetentionDays is how long an ended session is kept when
+// spec.harness.retention.sessionDays says nothing: Hermes' own default
+// (hermes_cli/config_defaults.py, sessions.retention_days), so an upgrade that
+// starts rendering the key deletes nothing it would not have deleted anyway. The
+// fleet-scale requirements propose 7 days for working data; flipping to that is
+// this one constant, plus the release note that names the deletion it causes.
+const defaultSessionRetentionDays = 90
+
+// managedSessionsConfig is the `sessions` block in the managed scope. Hermes
+// prunes ended sessions inactive for retention_days whenever a CLI or the gateway
+// starts (at most once a day per state.db), and the session-retention cron job
+// runs the same maintenance daily for profiles that do not start on their own.
+// auto_prune is rendered true so a later Hermes default cannot switch it off.
+type managedSessionsConfig struct {
+	AutoPrune     bool `json:"auto_prune"`
+	RetentionDays int  `json:"retention_days"`
+}
+
+// resolveSessionRetentionDays is spec.harness.retention.sessionDays, or
+// defaultSessionRetentionDays when it is unset.
+func resolveSessionRetentionDays(agent *agentv1alpha1.PlatformAgent) int {
+	if agent != nil && agent.Spec.Harness != nil && agent.Spec.Harness.Retention != nil &&
+		agent.Spec.Harness.Retention.SessionDays != nil {
+		return *agent.Spec.Harness.Retention.SessionDays
+	}
+	return defaultSessionRetentionDays
+}
+
 // defaultProfileLimits, platformProfileLimits and clusterProfileLimits read
 // spec.harness.tuning, tolerating every level being nil.
 func defaultProfileLimits(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.AgentLimits {
@@ -1990,6 +2018,14 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		Kanban struct {
 			MaxInProgress int `json:"max_in_progress"`
 		} `json:"kanban"`
+		// Session retention, read by Hermes' own state.db auto-maintenance in every
+		// profile (cli.py and gateway/run.py: sessions.auto_prune / retention_days).
+		// Always rendered, and rendered here because it meets both of this function's
+		// tests. Uniform: one retention policy for the install's working data, the
+		// same for every profile. Beyond the agent's repair: a profile that lengthened
+		// its own retention would keep conversation history past the period the
+		// install promises to delete it after.
+		Sessions managedSessionsConfig `json:"sessions"`
 	}{}
 
 	// Model. The endpoint every profile in the pod reasons through, and the setting
@@ -2059,6 +2095,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// became 6. A pin is applied over the persisted config on every load, whatever that
 	// file's history.
 	cfg.Kanban.MaxInProgress = resolveKanbanMaxInProgress(agent)
+	cfg.Sessions = managedSessionsConfig{AutoPrune: true, RetentionDays: resolveSessionRetentionDays(agent)}
 
 	cfg.Display.Platforms = map[string]map[string]any{}
 

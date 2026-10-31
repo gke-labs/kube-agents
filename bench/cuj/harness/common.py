@@ -1172,7 +1172,10 @@ def _deploy_web_console_on_existing_cluster(
             str(REPO_ROOT / "charts" / "kube-agents"),
             "-n",
             namespace,
-            "--reuse-values",
+            # Not --reuse-values: that renders the checkout's chart against the
+            # release's old defaults, which on a release up to 0.16.0 carries an
+            # operator memory limit the chart now refuses.
+            "--reset-then-reuse-values",
             "--set",
             "webConsole.enabled=true",
             "--wait",
@@ -1215,7 +1218,10 @@ def _teardown_web_console_on_existing_cluster(
             str(REPO_ROOT / "charts" / "kube-agents"),
             "-n",
             namespace,
-            "--reuse-values",
+            # Not --reuse-values: that renders the checkout's chart against the
+            # release's old defaults, which on a release up to 0.16.0 carries an
+            # operator memory limit the chart now refuses.
+            "--reset-then-reuse-values",
             "--set",
             "webConsole.enabled=false",
             "--wait",

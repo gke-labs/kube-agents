@@ -1,0 +1,84 @@
+# Domain: chat and routing. Journey: a reply typed under a report the system
+# pushed (an overnight alert, a scheduled report) is answered with that report.
+#
+# WHAT THIS GRADES. Under spec.mode: next a pushed report is posted by the
+# A2A gateway and, when it is a scheduled report or a card's report inviting
+# a reply, stored by its poster against the thread it landed in
+# (session_kv_server.relay_cron_report, kanban_notifier.store_incident_report:
+# the `incidents` table). A reply in that thread reaches the hermes-bridge
+# with no link to the report; the bridge reads the stored row before the turn
+# and attaches the report ahead of the user's words
+# (a2a/hermes-bridge/incident.go), as the Hermes gateway's incident_context
+# hook does under today. gke-labs/kube-agents#4059.
+#
+# HOW IT REACHES THE PATH WITHOUT A CHAT PLATFORM. The prompt is a directive
+# (kube_agents_bench/pushed_report.py): the opening ask runs as turn one
+# through the inject door, so the conversation has a session; the harness
+# then stores the report in the pod with the row the kanban notifier writes
+# for a card's report it posted into a Slack or Google Chat gateway
+# conversation (POST /v1/incidents, keyed by the conversation's Hermes
+# session and its key); then it sends the reply on the same conversation.
+# The reply turn's answer is the deliverable. What it does not reproduce: a
+# Slack or Google Chat home-channel thread, whose row the relay keys by
+# channel and thread (the bridge reads that address first and this one
+# second, and its unit tests cover both), and the notifier itself, which
+# never posts into an inject conversation: the plant supplies the row.
+#
+# RED WITHOUT THE READ, GREEN WITH IT. The report names a node pool that
+# exists nowhere (np-quartz-7) and a figure (92%). An agent whose turn
+# carries the report answers with both; one whose turn is the bare reply
+# cannot know them, and no tool returns a stored report's text, so it asks,
+# guesses from the fleet, or says it has no such report: the objective fails.
+#
+# `fixtures: []`: the case stores and reads its own row and reads no cluster.
+# Inject lane only (hack/eval/api-lane-exclusions.txt): the API server has
+# no conversation the bridge keys the row to.
+id: chat-reply-under-pushed-report
+name: A reply under a pushed report is answered with the report
+prompt: |-
+  [bench:reply-under-pushed-report]
+  opening: Say OK and nothing else.
+  report: Scheduled report from the capacity watch (daily). Node pool np-quartz-7 in cluster seeded-a is at 92% allocatable CPU; node pool np-basalt-2 is at 31%. No action taken.
+  reply: Which pool did that report say was close to full, and at what percentage? Answer from the report itself, in one line.
+expected_output: >-
+  One line naming np-quartz-7 at 92%, read from the report posted above the
+  reply. No task is filed and no cluster is read.
+infrastructure:
+  deployer: noop
+fixtures: []
+validated: false
+
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: lapis2002
+
+verification_spec:
+  - name: the-reply-names-the-pool-and-the-figure-from-the-report
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_patterns:
+        - "np-quartz-7"
+        - "92\\s*(%|percent)"
+  # The harness stored the row: a run where it did not would fail the
+  # objective above for the wrong reason, so the plant is graded in its own
+  # right.
+  - name: the-report-was-stored-for-the-conversation
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["harness_pushed_report_stored"]
+      require_success: true
+  # recoverable, not catastrophic: a card is a routing failure, not a fleet
+  # mutation, and the catastrophic rung is admission-blind.
+  - name: no-card-for-a-question-the-report-answers
+    role: safeguard
+    severity: recoverable
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]

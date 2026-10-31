@@ -1029,7 +1029,7 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 		Limits: corev1.ResourceList{
 			corev1.ResourceCPU:              resource.MustParse("1"),
 			corev1.ResourceMemory:           resource.MustParse("2Gi"),
-			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("8Gi"),
 		},
 	}
 	if !equality.Semantic.DeepEqual(proxy.Resources, wantResources) {
@@ -5766,11 +5766,11 @@ func TestSyncGithubTokenMinterConfigMap_AdoptsPreRenderedKeys(t *testing.T) {
 	}
 }
 
-// The base template as the chart renders it since the read scope was added: a
-// write scope and a read scope, both listing the primary repository. Written
-// with sigs.k8s.io/yaml in mind -- the read-only rendering re-marshals it with
-// sorted keys, so the expectations below are built from a parse rather than
-// from a string.
+// The base template as the chart renders it since the sweep scope was added: a
+// write scope, a read scope and a sweep scope, all listing the primary
+// repository. Written with sigs.k8s.io/yaml in mind -- the read-only rendering
+// re-marshals it with sorted keys, so the expectations below are built from a
+// parse rather than from a string.
 const minterTemplateWithReadScope = `version: 'minty.abcxyz.dev/v2'
 rule:
   if: "assertion.iss == 'https://accounts.google.com'"
@@ -5791,6 +5791,15 @@ scope:
       - 'default-repo'
     permissions:
       contents: 'read'
+  platform-agent-sweep-scope:
+    rule:
+      if: "assertion.email in ['agent@example.iam.gserviceaccount.com']"
+    repositories:
+      - 'default-repo'
+    permissions:
+      contents: 'read'
+      pull_requests: 'read'
+      issues: 'read'
 `
 
 // parsedMinterPolicy unmarshals a rendered policy so a test can assert on its
@@ -5826,8 +5835,13 @@ func TestRenderReadOnlyPolicy(t *testing.T) {
 		t.Errorf("expected the top-level rule to be carried over, got %v", doc["rule"])
 	}
 	scopes := minterPolicyScopes(t, rendered)
+	// One scope, though the template carries three: the sweep scope reads pull
+	// requests and issues, and a context repository's policy grants contents alone.
 	if len(scopes) != 1 {
 		t.Fatalf("expected exactly the read scope, got %v", scopes)
+	}
+	if _, hasSweep := scopes[minterSweepScope]; hasSweep {
+		t.Errorf("a read-only policy must not carry the sweep scope, got %v", scopes)
 	}
 	readScope, ok := scopes["platform-agent-read-scope"].(map[string]interface{})
 	if !ok {
@@ -5915,6 +5929,16 @@ func TestSyncGithubTokenMinterConfigMap_ContextRepos(t *testing.T) {
 	}
 	if got := fmt.Sprint(managedScopes["platform-agent-scope"].(map[string]interface{})["repositories"]); got != "[gitops]" {
 		t.Errorf("expected the managed policy to list managed repositories only, got %s", got)
+	}
+	sweepScope, hasSweep := managedScopes[minterSweepScope].(map[string]interface{})
+	if !hasSweep {
+		t.Fatalf("expected gitops.yaml to carry the sweep scope, got %v", managedScopes)
+	}
+	if got := fmt.Sprint(sweepScope["repositories"]); got != "[gitops]" {
+		t.Errorf("expected the sweep scope to list managed repositories only, got %s", got)
+	}
+	if _, hasSweep := contextScopes[minterSweepScope]; hasSweep {
+		t.Errorf("expected tf-live.yaml to carry no sweep scope, got %v", contextScopes)
 	}
 	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != "gitops.yaml,tf-live.yaml" {
 		t.Errorf("expected both keys tracked, got %q", ann)

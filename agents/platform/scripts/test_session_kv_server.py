@@ -2002,6 +2002,28 @@ class TestSlackHomeChannelResolution(unittest.TestCase):
         # degrades to "" rather than raising.
         self.assertEqual(session_kv_server._slack_home_channel(), "")
 
+    def test_a_mounted_projection_outranks_the_config_files(self):
+        # Under `next` the operator projects the home channel into a file the
+        # kubelet refreshes in place, and the gateway posts into that value. A
+        # `/sethome` channel left in the data volume by today mode must not
+        # make the agent name a different channel than the gateway, so a
+        # mounted file decides, empty or not; the config files count only
+        # where no file is mounted.
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, chat_notify.HOME_FILE_KEY)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("C0PROJECTED\n")
+            self._point("CONFIG_PATH", "platforms:\n  slack:\n    home_channel: C0FILE\n")
+            with patch.object(chat_notify, "HOME_FILE_DIR", directory), patch.dict(os.environ, {}):
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0PROJECTED")
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("")
+                self.assertEqual(session_kv_server._slack_home_channel(), "")
+                os.environ["SLACK_HOME_CHANNEL"] = "C0ENV"
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0ENV")
+            with patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(directory, "unmounted")):
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0FILE")
+
     def test_a_hostile_config_shape_costs_the_lookup_and_not_the_caller(self):
         self._point("CONFIG_PATH", "platforms: slack\n")
         self.assertEqual(session_kv_server._slack_home_channel(), "")
@@ -3248,6 +3270,21 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(loaded["SAFE_KEY"], "loaded_ok")
         self.assertEqual(loaded["COMMENTED"], "value")
         self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
+
+    def test_a_mirrored_home_channel_yields_to_a_mounted_projection(self):
+        # A today-era /sethome left SLACK_HOME_CHANNEL in the PVC .env. With
+        # the operator's projection mounted the file is the home channel the
+        # gateway posts into, so the mirror is skipped; without it, it loads.
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+                handle.write("")
+            with patch.object(chat_notify, "HOME_FILE_DIR", directory):
+                loaded = self._load_dotenv(b"SLACK_HOME_CHANNEL=C0OLD\nSAFE_KEY=1\n", ("SLACK_HOME_CHANNEL", "SAFE_KEY"))
+            self.assertIsNone(loaded["SLACK_HOME_CHANNEL"])
+            self.assertEqual(loaded["SAFE_KEY"], "1")
+            with patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(directory, "unmounted")):
+                loaded = self._load_dotenv(b"SLACK_HOME_CHANNEL=C0OLD\n", ("SLACK_HOME_CHANNEL",))
+            self.assertEqual(loaded["SLACK_HOME_CHANNEL"], "C0OLD")
 
     def test_an_undecodable_pvc_dotenv_does_not_stop_the_import(self):
         loaded = self._load_dotenv(b"# caf\xe9\nSAFE_KEY=1\n", ("SAFE_KEY",))
@@ -6482,11 +6519,24 @@ class TestFindingsQueueApi(unittest.TestCase):
     def test_a_decision_on_one_id_covers_its_gathered_line(self):
         self._register(self._finding(), self._finding(object="Deployment/cart"))
         first, second = sorted(f["id"] for f in self.client.get("/v1/findings/ranked").json()["findings"])
+        for fid in (first, second):
+            self.client.post(f"/v1/findings/{fid}/surfaced", json={})
 
         dismissed = self.client.patch(f"/v1/findings/{first}", json={"state": "dismissed"}).json()
 
         self.assertEqual(dismissed["item_rows_decided"], [second])
+        self.assertEqual(dismissed["item_rows_left_open"], [])
         self.assertEqual(self.client.get("/v1/findings/ranked").json()["findings"], [])
+
+    def test_a_decision_leaves_a_never_named_row_of_the_line_open(self):
+        self._register(self._finding(), self._finding(object="Deployment/cart"))
+        first, second = sorted(f["id"] for f in self.client.get("/v1/findings/ranked").json()["findings"])
+        self.client.post(f"/v1/findings/{first}/surfaced", json={})
+
+        dismissed = self.client.patch(f"/v1/findings/{first}", json={"state": "dismissed"}).json()
+
+        self.assertEqual((dismissed["item_rows_decided"], dismissed["item_rows_left_open"]), ([], [second]))
+        self.assertEqual([f["id"] for f in self.client.get("/v1/findings/ranked").json()["findings"]], [second])
 
     def test_additions_refuse_a_day_that_is_not_a_date(self):
         for day in ("yesterday", "2026-99-99"):

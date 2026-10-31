@@ -1,9 +1,4 @@
-# FIXTURE NOT READY — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
-# until two things land (#4098): the scaled-zero-gateway role applied to pool
-# projects and verified, and stall_report.py's rule that drops a Gateway or
-# HTTPRoute in front of workloads scaled to zero. With the role and without the
-# rule the case is red on every run; un-park it in the pull request that adds
-# the rule, with its red-to-green record.
+# NIGHTLY-TIER ACTIVE — an entry in hack/eval/nightly-cases.txt (#4098).
 #
 # Domain: cluster debugging. Journey: an environment switched off on purpose
 # looks stalled, and the correct answer is that it is not.

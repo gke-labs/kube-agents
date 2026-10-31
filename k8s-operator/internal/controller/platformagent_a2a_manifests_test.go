@@ -304,7 +304,7 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	}
 }
 
-// The provisioning payload: four streams, five KV buckets, four starter
+// The provisioning payload: five streams, five KV buckets, four starter
 // topics, the deployment spec's retention numbers verbatim.
 func TestBuildA2AProvisionJob(t *testing.T) {
 	agent := a2aTestAgent()

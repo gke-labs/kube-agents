@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import copy
 import contextlib
+import fnmatch
 import io
 import json
 import os
@@ -185,8 +186,13 @@ class SpecToolRegistryTest(unittest.TestCase):
     # evidence of them. Evidence of each is the agent text that tells the agent
     # to use it, backticked or called
     # (test_the_core_allowlist_still_has_evidence_in_the_agent_text).
-    HERMES_CORE_TOOLS = {"skill_view"}
-    CORE_TOOL_EVIDENCE = ("agents/platform/skills/github-issue-resolver/SKILL.md",)
+    # `terminal` is the tool a worker's shell commands go through, which
+    # delegated-proposal-stays-in-reply's safeguard reads (#2610).
+    HERMES_CORE_TOOLS = {"skill_view", "terminal"}
+    CORE_TOOL_EVIDENCE = (
+        "agents/platform/skills/github-issue-resolver/SKILL.md",
+        "agents/platform/AGENTS.md",
+    )
 
     # Tools behind a remote MCP proxy (`/opt/mcp-remote/dist/proxy.js <url>`),
     # as (server alias, tool): nothing in this repository can enumerate them,
@@ -251,14 +257,18 @@ class SpecToolRegistryTest(unittest.TestCase):
     INJECT_TRANSPORT = "bench/kube_agents_bench/inject_transport.py"
     SCORING = "bench/kube_agents_bench/scoring.py"
 
-    # Trajectory entries the harness writes itself after a stopped ask's
-    # opening turn (bench/kube_agents_bench/stop_hook.py): what it did, not a
-    # tool the agent called. A spec names them in `tool_called` with
-    # `require_success`. Evidence of each is a constant in the stop hook that
-    # the harness puts on an entry's `name`
+    # Trajectory entries the harness writes itself (a stopped ask's, a
+    # pushed-report replay's plant): what it did, not a tool the agent called.
+    # A spec names them in `tool_called` with `require_success`. Evidence of
+    # each is a constant in the module named beside it that the harness, or
+    # that module, puts on an entry's `name`
     # (test_the_harness_entries_still_have_evidence_in_the_hook_and_harness).
-    HARNESS_ENTRIES = {"harness_stop_sent", "harness_cards_stopped"}
-    STOP_HOOK = "bench/kube_agents_bench/stop_hook.py"
+    HARNESS_ENTRY_MODULES = {
+        "harness_stop_sent": "bench/kube_agents_bench/stop_hook.py",
+        "harness_cards_stopped": "bench/kube_agents_bench/stop_hook.py",
+        "harness_pushed_report_stored": "bench/kube_agents_bench/pushed_report.py",
+    }
+    HARNESS_ENTRIES = frozenset(HARNESS_ENTRY_MODULES)
     HARNESS = "bench/kube_agents_bench/harness.py"
 
     def _mcp_server_aliases(self):
@@ -568,15 +578,16 @@ class SpecToolRegistryTest(unittest.TestCase):
             )
 
     def test_the_harness_entries_still_have_evidence_in_the_hook_and_harness(self):
-        hook = (REPO_ROOT / self.STOP_HOOK).read_text(errors="replace")
         harness = (REPO_ROOT / self.HARNESS).read_text(errors="replace")
-        for entry in sorted(self.HARNESS_ENTRIES):
+        for entry, module in sorted(self.HARNESS_ENTRY_MODULES.items()):
+            source = (REPO_ROOT / module).read_text(errors="replace")
+            modname = Path(module).stem
             literal = re.escape(json.dumps(entry))
-            consts = re.findall(rf"^(\w+)\s*=\s*{literal}\s*$", hook, re.M)
+            consts = re.findall(rf"^(\w+)\s*=\s*{literal}\s*$", source, re.M)
             self.assertTrue(
-                any(f'"name": stop_hook.{const}' in harness for const in consts),
-                f"{entry} is registered as a harness entry but {self.HARNESS} no longer "
-                f"writes it from a {self.STOP_HOOK} constant — stale registry entry",
+                any(f'"name": {modname}.{const}' in harness or f'"name": {const}' in source for const in consts),
+                f"{entry} is registered as a harness entry but neither {self.HARNESS} nor {module} "
+                f"writes it from a {module} constant — stale registry entry",
             )
 
 
@@ -988,6 +999,62 @@ class WorkflowNameJoinTest(unittest.TestCase):
         join_runs = " ".join(step.get("run", "") for step in join["steps"])
         self.assertIn(f"COVERAGE_SHARD_COUNT={count}", join_runs, "the join expects another shard count than the matrix has")
         self.assertFalse(shards["strategy"].get("fail-fast", True), "one red shard would cancel the others")
+
+    def test_the_join_downloads_the_shards_coverage_twice(self):
+        """The required join's artifact download gets two attempts, and the
+        second is the hard one.
+
+        The action's own retries ran out twice on 2026-10-30 with every shard
+        uploaded and every test green, and nothing in a normal run shows the
+        shape that rescues it: drop `continue-on-error` from the first
+        download, or the `if` from the second, and every check stays green
+        until the next bad minute. The first attempt may be soft only because
+        the second is not; a second attempt that is also soft, or that runs
+        whatever the first did, is a different gate from the one described.
+        The clearing step in between is what keeps a half-extracted first
+        attempt out of the join.
+        """
+        yaml = _yaml()
+        workflow = yaml.safe_load((WORKFLOWS / "python-tests.yml").read_text())
+        self.assert_join_downloads_twice(workflow)
+        attempts = self._download_attempts(workflow["jobs"]["test"])
+        for label, mutate in (
+            ("a hard first attempt", lambda steps: steps[0].pop("continue-on-error")),
+            ("a soft second attempt", lambda steps: steps[-1].__setitem__("continue-on-error", True)),
+            ("an ungated second attempt", lambda steps: steps[-1].pop("if")),
+            ("a second attempt with other inputs", lambda steps: steps[-1]["with"].__setitem__("path", "elsewhere")),
+        ):
+            mutant = copy.deepcopy(workflow)
+            mutate(self._download_attempts(mutant["jobs"]["test"]))
+            with self.subTest(mutant=label), self.assertRaises(AssertionError):
+                self.assert_join_downloads_twice(mutant)
+        # The three places the artifact name is spelled agree: the shards'
+        # upload name and the pattern both download attempts filter by.
+        uploads = [step for step in workflow["jobs"]["test-shard"]["steps"] if "upload-artifact" in str(step.get("uses", ""))]
+        names = [str(step["with"]["name"]).replace("${{ matrix.shard }}", "1") for step in uploads]
+        pattern = attempts[0]["with"]["pattern"]
+        self.assertTrue(any(fnmatch.fnmatch(name, pattern) for name in names), f"no shard upload name matches the join's download pattern {pattern!r}: {names}")
+
+    @staticmethod
+    def _download_attempts(join):
+        """The join's download-artifact steps, in order."""
+        return [step for step in join["steps"] if "download-artifact" in str(step.get("uses", ""))]
+
+    def assert_join_downloads_twice(self, workflow):
+        join = workflow["jobs"]["test"]
+        attempts = self._download_attempts(join)
+        self.assertEqual(len(attempts), 2, f"the join has {len(attempts)} download-artifact steps, not two")
+        first, second = attempts
+        self.assertIs(first.get("continue-on-error"), True, "the first download attempt is not continue-on-error, so its failure ends the job before the second attempt")
+        self.assertTrue(first.get("id"), "the first download attempt has no id for the second to read")
+        gate = "${{steps.%s.outcome=='failure'}}" % first["id"]
+        self.assertEqual(self._expr(second.get("if", "")), gate, "the second download attempt is not gated on the first attempt's failure")
+        self.assertNotIn("continue-on-error", second, "the second download attempt is continue-on-error, so a download that fails twice does not fail the check")
+        self.assertEqual(first.get("uses"), second.get("uses"), "the two download attempts pin different action versions")
+        self.assertEqual(first.get("with"), second.get("with"), "the two download attempts take different inputs")
+        between = join["steps"][join["steps"].index(first) + 1 : join["steps"].index(second)]
+        clears = [step for step in between if self._expr(step.get("if", "")) == gate and f"rm -rf {first['with']['path']}" in str(step.get("run", ""))]
+        self.assertEqual(len(clears), 1, "no step gated on the first attempt's failure clears its download directory before the second attempt")
 
     def test_the_coverage_artifact_name_join_holds(self):
         producer = (WORKFLOWS / "python-tests.yml").read_text()

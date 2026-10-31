@@ -56,6 +56,13 @@ without that button, is broken, not red. The answer turn's reply rides on the
 trajectory's :data:`SETTLED_ENTRY` (``args.answer_reply``), so
 ``reply_is_silent`` can grade it as well as the wake's.
 
+**A card that blocked on something other than a question.** A prompt whose
+first line is :data:`BLOCK_DIRECTIVE` plants a card blocked with the case's
+``kind`` and ``reason`` instead, the way a worker blocks its own card on a
+provider rate limit (``kind: transient``, ``deploy/docker/patches/kanban_guardrail_exit.py``).
+Nothing is posted and nobody answers: the wake is the run's one turn, and the
+reply to it is what is graded.
+
 What the replay does not reproduce: the turns arrive on the run's own
 ``/v1/responses`` conversation rather than the session that filed the card, so
 the front door has not seen the ask that led to it; the flag is set in the
@@ -96,6 +103,7 @@ from devops_bench.agents import AgentResult
 from kube_agents_bench.worker_trajectory import FALLBACK_PYTHON, HERMES_PYTHON
 
 __all__ = [
+    "BLOCK_DIRECTIVE",
     "QUESTION_DIRECTIVE",
     "SETTLED_ENTRY",
     "Planted",
@@ -127,6 +135,13 @@ SESSION_FRESH = "fresh"
 ANSWER_BY_FIELD = "answer_by"
 ANSWER_BY_CLICK = "click"
 OPTION_SEPARATOR = "|"
+# First line of a block replay, and its fields, all required.
+BLOCK_DIRECTIVE = "[bench:card-block-wake]"
+_BLOCK_FIELDS = ("title", "kind", "reason")
+# The block kind a question replay files, and the kinds a block replay may
+# name: Hermes' VALID_BLOCK_KINDS less the question's, which needs an answer.
+NEEDS_INPUT = "needs_input"
+BLOCK_KINDS = ("transient", "capability", "dependency")
 
 # The name of the harness trajectory entry carrying the card as the run left
 # it: ``args.card`` is the card, ``result`` is ``Settled.as_metadata()`` or
@@ -173,11 +188,12 @@ ASK_MESSAGE_ID = "bench-ask"
 
 # Runs inside the agent container. Positional arguments: the sentinel, the
 # hermes root, the scripts directory, the flag, its on value, the creator,
-# the stub channel, the stub thread, the card title, the block reason (also
-# the card's body), the wake's assignee, the run's key,
+# the stub channel, the stub thread, the card title, the block reason, the
+# card's body, the block's kind, the wake's assignee, the run's key,
 # the decoy's key (empty for no decoy), the label of the button an answer
 # by click presses (empty for a typed answer), the replay key prefix and the
-# stale age. Before filing, it archives other runs' replay cards older than the
+# stale age. Only a ``needs_input`` block is posted as a question. Before
+# filing, it archives other runs' replay cards older than the
 # stale age, which an archive whose exec failed left on the board; that sweep
 # failing does not stop the plant. The cards are archived again if anything
 # after filing them fails.
@@ -185,9 +201,10 @@ _PLANT_SCRIPT = r"""
 import asyncio, dataclasses, json, os, sys, time
 
 (SENTINEL, HERMES_ROOT, SCRIPTS, FLAG, ON, CREATOR,
- CHANNEL, THREAD, TITLE, REASON, ASSIGNEE, KEY, DECOY_KEY, CLICK, PREFIX,
- STALE) = sys.argv[1:17]
+ CHANNEL, THREAD, TITLE, REASON, BODY, KIND, ASSIGNEE, KEY, DECOY_KEY, CLICK, PREFIX,
+ STALE) = sys.argv[1:19]
 STUB_TS = "1700000000.000200"
+NEEDS_INPUT = "needs_input"
 # The decoy lists first (kanban_list sorts by priority, then created_at) and
 # the planted card is backdated so the decoy is the newer: created_at is
 # whole seconds, and two cards filed together would otherwise tie.
@@ -240,9 +257,9 @@ try:
         out["swept"] = [old for old in stale if kb.archive_task(conn, old)]
     except Exception as exc:
         out["sweep_error"] = "%s: %s" % (type(exc).__name__, exc)
-    card = kb.create_task(conn, title=TITLE, body=REASON, created_by=CREATOR, idempotency_key=KEY)
+    card = kb.create_task(conn, title=TITLE, body=BODY, created_by=CREATOR, idempotency_key=KEY)
     out["card"] = card
-    if not kb.block_task(conn, card, reason=REASON, kind="needs_input"):
+    if not kb.block_task(conn, card, reason=REASON, kind=KIND):
         raise RuntimeError("card %s would not block" % card)
     events = kb.list_events(conn, card)[-1:]
     if not events or events[-1].kind != "blocked":
@@ -250,7 +267,7 @@ try:
     sub = {"task_id": card, "platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD,
            "delivery_mode": "notify+wake"}
     adapter = _Adapter()
-    if moments is not None:
+    if moments is not None and KIND == NEEDS_INPUT:
         asyncio.run(moments.needs_you(adapter, sub, events[0].payload or {}, events[0].id))
         if not adapter.posts:
             raise RuntimeError("the image has slack_ux_moments but it posted nothing for card %s" % card)
@@ -298,7 +315,7 @@ try:
         decoy = kb.create_task(conn, title=TITLE, body=REASON, created_by=CREATOR,
                                priority=DECOY_PRIORITY, idempotency_key=DECOY_KEY)
         out["decoy"] = decoy
-        if not kb.block_task(conn, decoy, reason=REASON, kind="needs_input"):
+        if not kb.block_task(conn, decoy, reason=REASON, kind=NEEDS_INPUT):
             raise RuntimeError("decoy card %s would not block" % decoy)
         conn.execute("UPDATE tasks SET created_at = created_at - ? WHERE id = ?",
                      (CARD_BACKDATE_SECONDS, card))
@@ -424,7 +441,11 @@ class ReplayBroken(RuntimeError):
 
 @dataclass(frozen=True)
 class Replay:
-    """A replay prompt's fields: the card, its question and the user's answer."""
+    """A replay prompt's fields: the card, its question and the user's answer.
+
+    A block replay carries its ``kind`` and ``block_reason`` and no question,
+    options or answer.
+    """
 
     title: str
     question: str
@@ -432,11 +453,27 @@ class Replay:
     answer: str
     fresh: bool = False
     clicked: bool = False
+    kind: str = NEEDS_INPUT
+    block_reason: str = ""
 
     @property
     def reason(self) -> str:
-        """The block reason as a specialist writes it: the question, then a ``- `` line per choice."""
+        """The block reason: a block replay's own, else the question as a specialist
+        writes it, then a ``- `` line per choice."""
+        if self.block_reason:
+            return self.block_reason
         return "\n".join([self.question, *(f"- {option}" for option in self.options)])
+
+    @property
+    def body(self) -> str:
+        """The card's body: the title for a block replay, whose reason is the failure
+        rather than the work, else the question's reason."""
+        return self.title if self.block_reason else self.reason
+
+    @property
+    def answered(self) -> bool:
+        """Whether the replay sends an answer turn after the wake."""
+        return bool(self.answer)
 
 
 @dataclass(frozen=True)
@@ -499,12 +536,14 @@ def parse(prompt: str) -> Replay | None:
     """The replay ``prompt`` asks for, or ``None`` when it is an ordinary ask.
 
     Raises :class:`ValueError` for a replay prompt missing a field, carrying
-    a line that is not one, or giving ``session``
-    or ``answer_by`` any value but its one: that is a case authoring error,
-    not a run.
+    a line that is not one, giving ``session``
+    or ``answer_by`` any value but its one, or a block replay naming a kind
+    not in :data:`BLOCK_KINDS`: that is a case authoring error, not a run.
     """
     lines = prompt.strip().splitlines()
     directive = lines[0].strip() if lines else ""
+    if directive == BLOCK_DIRECTIVE:
+        return _parse_block(directive, lines[1:])
     if directive != QUESTION_DIRECTIVE:
         return None
     fields = _fields(lines[1:], (*_QUESTION_FIELDS, SESSION_FIELD, ANSWER_BY_FIELD))
@@ -525,6 +564,16 @@ def parse(prompt: str) -> Replay | None:
     return Replay(
         fields["title"], fields["question"], options, fields["answer"], session == SESSION_FRESH, bool(answer_by)
     )
+
+
+def _parse_block(directive: str, lines: list[str]) -> Replay:
+    fields = _fields(lines, _BLOCK_FIELDS)
+    missing = [f for f in _BLOCK_FIELDS if not fields.get(f)]
+    if missing:
+        raise ValueError(f"{directive} prompt is missing {', '.join(missing)}")
+    if fields["kind"] not in BLOCK_KINDS:
+        raise ValueError(f"{directive} kind {fields['kind']!r} is not one of {', '.join(BLOCK_KINDS)}")
+    return Replay(fields["title"], "", (), "", kind=fields["kind"], block_reason=fields["reason"])
 
 
 def _command(script: str, args: list[str]) -> str:
@@ -560,6 +609,8 @@ def plant_command(replay: Replay, key: str) -> str:
             STUB_THREAD,
             replay.title,
             replay.reason,
+            replay.body,
+            replay.kind,
             WAKE_ASSIGNEE,
             key,
             decoy_key(key) if replay.fresh else "",
@@ -656,7 +707,7 @@ def plant(shell: Callable[[str, float], str], replay: Replay, timeout: float, ke
     error: it would build the plain wake and pass for a red run.
     """
     key = key or new_key()
-    what = "question wake"
+    what = "question wake" if replay.answered else "block wake"
     try:
         payload = _reply(shell(plant_command(replay, key), timeout), what)
     except ReplayUnavailable:
@@ -839,8 +890,9 @@ def merge(
 
 
 def tag(planted: Planted, wake: AgentResult, settled: Settled | None = None) -> AgentResult:
-    """A replay whose wake turn errored with no reply (:func:`no_reply`), with the card,
-    its wake and ``settled`` kept in metadata under ``question_wake``.
+    """A replay that sent no answer turn, with the card, its wake and ``settled`` kept
+    in metadata under ``question_wake``: a block replay, or a question replay whose
+    wake turn errored with no reply (:func:`no_reply`).
 
     The reply to the wake is already the run's ``final_message``; the trajectory
     gains :data:`SETTLED_ENTRY` and nothing else changes.

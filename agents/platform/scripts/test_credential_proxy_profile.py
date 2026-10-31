@@ -11,10 +11,12 @@ to its target cluster and project.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import http.client
 import json
 import logging
 import os
+import re
 import threading
 import unittest
 import urllib.error
@@ -498,6 +500,28 @@ class LocalOnlyTest(unittest.TestCase):
                 with self.assertRaisesRegex(ConfinementRefusal, "no target|may not name"):
                     confine(argv, context, None)
 
+    def test_the_no_target_refusal_promises_only_what_the_policy_admits(self):
+        # `kubectl apply --help` is refused by the policy (#4298), so the
+        # message may not promise "--help on a command" runs.
+        for argv in (["kubectl", "get", "pods"], ["gcloud", "container", "clusters", "list"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(ConfinementRefusal) as caught:
+                    confine(argv, None, None)
+                self.assertNotRegex(str(caught.exception), r"--help on a command(?! it admits)")
+                self.assertIn("the read-only policy admits", str(caught.exception))
+
+    def test_a_local_shaped_gcloud_argv_with_a_separator_is_refused_for_the_separator(self):
+        # The `--` refusal precedes the policy call: the policy would judge a
+        # reordered argv in which the post-`--` word has become a flag.
+        argv = ["gcloud", "container", "clusters", "list", "--help", "--", "--flags-file=/tmp/x"]
+        for target in (None, TARGET):
+            with self.subTest(target=target):
+                with self.assertRaises(ConfinementRefusal) as caught:
+                    confine(argv, None, target)
+                self.assertEqual(task_confinement.RULE_TASK_TARGET, caught.exception.rule)
+                self.assertIsNone(caught.exception.policy_argv)
+                self.assertIn("takes no --", str(caught.exception))
+
     def test_a_target_that_is_not_a_gke_name_is_no_target(self):
         self.assertIsNone(task_confinement.target_from_claims("proj_a", "us-central1", "c"))
         self.assertEqual(TARGET, task_confinement.target_from_claims("proj-a", "us-central1", "cluster-a"))
@@ -672,6 +696,49 @@ class ProfileRouteTest(unittest.TestCase):
         self.assertTrue(kwargs["confined"].isolated)
         self.assertIsNone(kwargs["kubeconfig_context"])
 
+    # -- --help parity with the read-only policy (#4298) ------------------------
+
+    HELP_THE_POLICY_REFUSES = (
+        ["kubectl", "apply", "--help"],
+        ["kubectl", "delete", "--help"],
+        ["kubectl", "rollout", "restart", "--help"],
+        ["kubectl", "delete", "pods", "-h"],
+        ["gcloud", "components", "list", "--help"],
+        ["gcloud", "init", "--help"],
+    )
+
+    def test_help_on_a_command_the_policy_refuses_gets_the_policys_refusal(self):
+        # `--help` makes a command local-only only when command_policy admits
+        # it: a write's --help is refused with the policy's own rule and
+        # message, with or without a task, not a confinement refusal that
+        # promised "--help on a command" runs.
+        for argv in self.HELP_THE_POLICY_REFUSES:
+            decision = command_policy.evaluate(argv)
+            self.assertFalse(decision.allowed, argv)
+            for token in (VALID["token"], None):
+                with self.subTest(argv=argv, task=token is not None):
+                    status, body = self.post({"argv": argv}, token=token)
+                    self.assert_refused(status, body, decision.rule_id)
+                    # The whole body the policy gate gives (message, verb,
+                    # local_render), so the shim's refusal stop reads it alike.
+                    self.assertEqual(credential_proxy.read_only_refusal(argv)[0], body)
+
+    def test_help_on_a_command_the_policy_admits_still_runs_isolated(self):
+        for argv in (
+            ["kubectl", "get", "pods", "--help"],
+            ["kubectl", "describe", "pods", "--help"],
+            ["gcloud", "container", "clusters", "list", "--help"],
+        ):
+            for token in (VALID["token"], None):
+                with self.subTest(argv=argv, task=token is not None):
+                    self.executor.calls.clear()
+                    status, body = self.post({"argv": argv}, token=token)
+                    self.assertEqual(200, status, body)
+                    (ran, kwargs), = self.executor.calls
+                    self.assertEqual(argv, ran)
+                    self.assertTrue(kwargs["confined"].isolated)
+                    self.assertIsNone(kwargs["kubeconfig_context"])
+
     def test_no_gate_is_no_task(self):
         CredentialProxyHandler.profile_gate = None
         status, body = self.post({"argv": ["kubectl", "get", "pods"]}, token=None)
@@ -781,6 +848,74 @@ class ProfileRouteTest(unittest.TestCase):
         with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
             status, body = self.post({"argv": ["git", "status"]})
         self.assert_refused(status, body, credential_proxy.RULE_CALLER_EXECUTABLE)
+
+
+class ProfileRouteDenylistTest(ProfileRouteTest):
+    """ProfileRouteTest with the shipped credential denylist installed.
+
+    The two rules and the blocked message are copied from the shipped policy
+    (k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml);
+    neither rule carries a message of its own there. Every inherited test runs
+    again with them in place.
+    """
+
+    BLOCKED_MESSAGE = "Command blocked for security reasons."
+    RULES = (
+        (
+            "kubernetes.token-disclosure",
+            r"\bkubectl\b(?:\s+\S+)*?\s+create\b(?:\s+\S+)*?\s+token\b"
+            r"|\bkubectl\b(?:\s+\S+)*?\s+config\b(?:\s+\S+)*?\s+view\b(?:\s+\S+)*?\s+--raw\b",
+        ),
+        (
+            "tool.self-modification",
+            r"\bgcloud\b(?:\s+\S+)*?\s+components\b(?:\s+\S+)*?\s+(?:install|update|remove)\b"
+            r"|\bgh\b(?:\s+\S+)*?\s+extension\b(?:\s+\S+)*?\s+(?:install|upgrade|remove)\b"
+            r"|\bgh\b(?:\s+\S+)*?\s+(?:alias|config)\b(?:\s+\S+)*?\s+(?:set|import|delete)\b",
+        ),
+    )
+
+    def setUp(self):
+        super().setUp()
+        CredentialProxyHandler.policy = Policy(
+            rules=[
+                credential_proxy.Rule(rule_id=rule_id, pattern=re.compile(pattern, re.IGNORECASE | re.MULTILINE),
+                                      message=self.BLOCKED_MESSAGE)
+                for rule_id, pattern in self.RULES
+            ],
+            blocked_message=self.BLOCKED_MESSAGE,
+        )
+
+    def test_help_on_a_denylisted_command_keeps_the_denylist_rule(self):
+        # The help-shaped argv the read-only policy refuses is asked of the
+        # denylist first, as the normal path asks it before the read-only
+        # gate: its specific rule and message, not kubernetes.read-only.
+        for argv, rule_id in (
+            (["kubectl", "create", "token", "sa", "--help"], "kubernetes.token-disclosure"),
+            (["gcloud", "components", "install", "--help"], "tool.self-modification"),
+        ):
+            self.assertFalse(command_policy.evaluate(argv).allowed, argv)
+            for token in (VALID["token"], None):
+                with self.subTest(argv=argv, task=token is not None):
+                    self.records.clear()
+                    status, body = self.post({"argv": argv}, token=token)
+                    self.assert_refused(status, body, rule_id)
+                    self.assertEqual(
+                        {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": rule_id,
+                         "message": self.BLOCKED_MESSAGE},
+                        body,
+                    )
+                    blocked = [record for record in self.records if '"status": "blocked"' in record]
+                    self.assertTrue(blocked, self.records)
+                    for record in blocked:
+                        self.assertIn(f'"rule": "{rule_id}"', record)
+
+    def test_a_separator_beside_help_is_refused_for_the_separator(self):
+        argv = ["gcloud", "container", "clusters", "list", "--help", "--", "--flags-file=/tmp/x"]
+        for token in (VALID["token"], None):
+            with self.subTest(task=token is not None):
+                status, body = self.post({"argv": argv}, token=token)
+                self.assert_refused(status, body, task_confinement.RULE_TASK_TARGET)
+                self.assertIn("takes no --", body["message"])
 
 
 class ChangedDefaultTest(unittest.TestCase):
@@ -905,12 +1040,13 @@ print("context=" + context)
         self.assertEqual({"context": CONTEXT}, seen)
         self.assertEqual([CONTEXT], self.resolved)
 
-    def post(self, argv):
+    def post(self, argv, token=VALID["token"]):
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers[credential_proxy.TASK_CREDENTIAL_HEADER] = token
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.server.server_port}/v1/exec",
-            data=json.dumps({"argv": argv}).encode("utf-8"),
-            headers={"Content-Type": "application/json", credential_proxy.TASK_CREDENTIAL_HEADER: VALID["token"]},
-            method="POST",
+            data=json.dumps({"argv": argv}).encode("utf-8"), headers=headers, method="POST",
         )
         try:
             with urllib.request.urlopen(request) as response:
@@ -935,21 +1071,39 @@ print("context=" + context)
                 self.assertNotEqual(200, status, body)
                 self.assertNotIn(OTHER_CONTEXT, self.resolved)
 
-    def test_get_credentials_with_help_makes_no_call_for_another_cluster(self):
+    def test_get_credentials_with_help_is_an_isolated_help_read(self):
         # Local-only (--help) runs isolated: no get-credentials handling, so
-        # no endpoint describe of the cluster the argv names.
+        # no endpoint describe of the cluster the argv names and no
+        # kubeconfig, but the synopsis does run (#4298: it ended as a 400).
+        executor = CredentialProxyHandler.executor
         describe = mock.Mock(side_effect=AssertionError("a GKE describe ran"))
-        CredentialProxyHandler.executor._endpoint_decision = describe
+        executor._endpoint_decision = describe
+        executor._execute_get_credentials = mock.Mock(side_effect=AssertionError("get-credentials handling ran"))
+        plain = executor._execute
+        kubeconfigs = []
+
+        def run(command, **kwargs):
+            kubeconfigs.append(kwargs.get("kubeconfig_path"))
+            return plain(command, **kwargs)
+
+        executor._execute = run
         for argv in (
             ["gcloud", "container", "clusters", "get-credentials", "cluster-b", "--location=europe-west1",
              "--project=proj-b", "--help"],
             ["gcloud", "container", "clusters", "get-credentials", "cluster-a", "--help"],
+            ["gcloud", "container", "clusters", "get-credentials", "c", "--help"],
         ):
-            with self.subTest(argv=argv):
-                status, body = self.post(argv)
-                self.assertNotEqual(200, status, body)
-                self.assertNotEqual(500, status, body)
+            for token in (VALID["token"], None):
+                with self.subTest(argv=argv, task=token is not None):
+                    kubeconfigs.clear()
+                    self.resolved.clear()
+                    status, body = self.post(argv, token=token)
+                    self.assertEqual(200, status, body)
+                    self.assertEqual(0, body["exitCode"], body)
+                    self.assertEqual([Path(os.devnull)], kubeconfigs)
+                    self.assertEqual([], self.resolved)
         describe.assert_not_called()
+        executor._execute_get_credentials.assert_not_called()
 
     def test_get_credentials_with_flags_between_its_words_is_still_get_credentials(self):
         # Spelt with a flag between the command words, it still reaches the
@@ -1091,6 +1245,33 @@ class ParseOnceTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 with self.assertRaises(ConfinementRefusal):
                     confine(argv, None, None)
+        # --help is local-only only where the policy admits the command: the
+        # dynamic path, not just the static lists above (#4298). A refused
+        # one carries the policy's rule and message, with or without a task.
+        for argv in (
+            ["kubectl", "apply", "--help"],
+            ["kubectl", "delete", "--help"],
+            ["kubectl", "rollout", "restart", "--help"],
+            ["gcloud", "components", "list", "--help"],
+            ["gcloud", "init", "--help"],
+        ):
+            decision = command_policy.evaluate(argv)
+            for target in (TARGET, None):
+                with self.subTest(argv=argv, target=target):
+                    with self.assertRaises(ConfinementRefusal) as refused:
+                        confine(argv, None, target)
+                    self.assertEqual(decision.rule_id, refused.exception.rule)
+                    self.assertEqual(decision.message, str(refused.exception))
+        for argv in (
+            ["kubectl", "rollout", "status", "--help"],
+            ["gcloud", "container", "clusters", "get-credentials", "c", "--help"],
+        ):
+            for target in (TARGET, None):
+                with self.subTest(argv=argv, target=target):
+                    confined = confine(argv, None, target)
+                    self.assertTrue(confined.isolated)
+                    self.assertFalse(confined.get_credentials)
+                    self.assertTrue(command_policy.evaluate(confined.argv).allowed, confined.argv)
         # --version is not local beside a command: it is confined like any read.
         with self.assertRaisesRegex(ConfinementRefusal, "--project"):
             confine(["gcloud", "container", "clusters", "list", "--project=proj-b", "--version"], None, TARGET)
@@ -1129,9 +1310,18 @@ class ConfinedExecutionTest(unittest.TestCase):
         self.executor.execute(confined.argv, confined=confined)
         self.assertEqual(Path(os.devnull), self.seen["kwargs"]["kubeconfig_path"])
         self.assertEqual([], self.resolved)
+        # get-credentials --help is an isolated help read (#4298): no
+        # get-credentials handling, no kubeconfig.
         confined = confine(["gcloud", "container", "clusters", "get-credentials", "cluster-b", "--help"], None, TARGET)
+        self.assertFalse(confined.get_credentials)
+        self.executor.execute(confined.argv, confined=confined)
+        self.assertEqual(Path(os.devnull), self.seen["kwargs"]["kubeconfig_path"])
+        self.assertEqual([], self.resolved)
+        # The executor still refuses a structure that is isolated and
+        # get-credentials both: it would describe a cluster an isolated call
+        # reaches none of.
         with self.assertRaises(ValueError):
-            self.executor.execute(confined.argv, confined=confined)
+            self.executor.execute(confined.argv, confined=dataclasses.replace(confined, get_credentials=True))
 
     def test_an_argv_that_is_not_the_confined_one_is_refused(self):
         confined = confine(["kubectl", "get", "pods"], None, TARGET)
@@ -1312,9 +1502,14 @@ class IsolatedExecutionTest(unittest.TestCase):
         confined = confine(["kubectl", "version", "--client"], None, None)
         executor.execute(confined.argv, confined=confined)
         self.assertEqual(Path(os.devnull), seen["kwargs"]["kubeconfig_path"])
+        # get-credentials --help with no task is an isolated help read too
+        # (#4298); a structure isolated and get-credentials both is refused.
+        seen.clear()
         confined = confine(["gcloud", "container", "clusters", "get-credentials", "c", "--help"], None, None)
+        executor.execute(confined.argv, confined=confined)
+        self.assertEqual(Path(os.devnull), seen["kwargs"]["kubeconfig_path"])
         with self.assertRaises(ValueError):
-            executor.execute(confined.argv, confined=confined)
+            executor.execute(confined.argv, confined=dataclasses.replace(confined, get_credentials=True))
 
 
 if __name__ == "__main__":
