@@ -797,6 +797,12 @@ def report_task_kubeconfig(generated: str) -> None:
 
 _GET_CREDENTIALS_WORDS = ("container", "clusters", "get-credentials")
 
+# gcloud's short flags that take a value: the single-dash members of
+# `command_policy._GCLOUD_FLAGS_WITH_VALUE`, which the shim can't import. A
+# test holds the two equal, so a short valued flag added there fails it.
+_GCLOUD_SHORT_FLAGS_WITH_VALUE = frozenset({"-z"})
+_GCLOUD_RELEASE_TRACKS = frozenset({"alpha", "beta"})
+
 
 def is_get_credentials(argv: list[str]) -> bool:
     """Is this the one command that legitimately authors a kubeconfig?
@@ -804,9 +810,10 @@ def is_get_credentials(argv: list[str]) -> bool:
     Read the way the broker reads it: the command words past gcloud's flags, so
     a flag between the words (`container clusters --location l get-credentials`)
     is the same command. The shim can't import the broker's policy, so this walk
-    doesn't know every flag's arity. A bare `--flag` takes the next token as its
-    value unless that token is one of the command words, and none of the three
-    is a plausible flag value.
+    doesn't know every flag's arity. A short valued flag (`-z`) always takes the
+    next token. A bare `--flag` takes the next token as its value unless that
+    token is one of the command words, and none of the three is a plausible
+    flag value.
     """
     if not argv or argv[0] != "gcloud":
         return False
@@ -816,7 +823,15 @@ def is_get_credentials(argv: list[str]) -> bool:
         token = argv[index]
         if token == "--":
             break
+        if token in _GCLOUD_SHORT_FLAGS_WITH_VALUE:
+            index += 2
+            continue
         if token.startswith("-"):
+            # Known and harmless: a bare `--flag` never takes one of the three
+            # command words as its value, so `clusters --format get-credentials
+            # list` is get-credentials here but not to the broker, which knows
+            # `--format` takes a value. The shim then asks for a file the broker
+            # doesn't send and nothing lands. The parity test lists it.
             if (
                 token.startswith("--")
                 and "=" not in token
@@ -829,7 +844,7 @@ def is_get_credentials(argv: list[str]) -> bool:
             continue
         words.append(token)
         index += 1
-    if words[:1] and words[0] in ("alpha", "beta"):
+    if words[:1] and words[0] in _GCLOUD_RELEASE_TRACKS:
         words = words[1:]
     return words[:3] == list(_GET_CREDENTIALS_WORDS)
 
