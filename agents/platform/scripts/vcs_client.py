@@ -377,8 +377,12 @@ def _call(verb: str, payload: dict) -> dict:
 # ---- the local working copy ----------------------------------------------
 
 
-def local_git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+def local_git(cwd: Path, *args: str, check: bool = True, text: bool = True) -> subprocess.CompletedProcess:
     """git, in this container, on a repository with no remote.
+
+    `text=False` returns stdout and stderr as bytes, for a caller whose
+    output holds file content: text mode's universal newlines would turn a
+    lone carriage return in it into a line break.
 
     The environment is the argument that this cannot execute anything the
     repository supplied. A bundle carries objects and refs and no config, so the
@@ -427,7 +431,7 @@ def local_git(cwd: Path, *args: str, check: bool = True) -> subprocess.Completed
         argv,
         cwd=str(cwd),
         capture_output=True,
-        text=True,
+        text=text,
         check=check,
         timeout=600,
         env=environment,

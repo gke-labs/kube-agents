@@ -27,23 +27,20 @@ Two-command lifecycle, plus three on-demand commands:
     audit_report.py list      --audit <audit-id> [--prefix <repo-path>]
 
 There are two ways a fix reaches GitHub, and which one runs depends on whether
-the broker has content workspaces armed.
+a broker is configured.
 
 **Content mode.** The workspace `start` hands over is a plain directory. The
-agent writes its remediation manifests into it, and `finish` reads the bytes and
-hands them to the broker, which owns the only checkout. Nothing here ever sees a
-`.git`, so nothing here can author the `.git/config` that every known
-code-execution route through the credential container needs — a filter driver,
-an alias, a hook path. `list` and `fetch` are the read half — the names of the
-files in the broker's checkout, and the bytes of the ones a fix has to start
-from.
+agent writes its remediation manifests into it, and `finish` copies the bytes
+into a clone the broker sends down (`vcs_client.clone`), commits them there
+with the sandbox's local git, and sends the revision up (`vcs_client.publish`).
+The broker holds the credential and does the push. `list`, `grep` and `fetch`
+are the read half: each reads a snapshot of the repository
+(`vcs_client.snapshot`), which has no `.git`.
 
 **Directory mode** is what ran before: a leased clone on the shared volume, and
 `checkout`, `add`, `commit`, `push` run in it. The sandbox's `git` has no network
 transport and no credential, so it cannot run there any more. It is taken only
-when no broker is configured at all (`CREDENTIAL_PROXY_URL` unset), and with a
-broker configured a probe that does not answer yes refuses `start` rather than
-fall back to it.
+when no broker is configured at all (`CREDENTIAL_PROXY_URL` unset).
 
 `start` reports which one it took as the `mode` field of its JSON line, and the
 mode is resolved once per process so a single run cannot take both forks.
@@ -1943,9 +1940,28 @@ PDB_NAME_LINE = (
 # Where the name goes in PDB_NAME_LINE; replaced rather than formatted, since
 # the pattern's own braces are flow-mapping characters.
 PDB_NAME_SLOT = "{name}"
-# How many times one `finish` tries to open the broker for its repository
+# How many times one `finish` tries to take the snapshot for its repository
 # questions: the Config Connector scan, then planning.
 PROBE_OPEN_ATTEMPTS = 2
+# Where a read unpacks its snapshot: a directory under the vcs client's copies
+# root, named with this prefix, so a run killed mid-read leaves a directory
+# `remove_stale_snapshots` can find. The snapshot itself goes one level down.
+SNAPSHOT_DIR_PREFIX = "fleet-audit-snapshot-"
+SNAPSHOT_TREE_DIR = "tree"
+SECONDS_PER_HOUR = 3600
+# The bounds `list` and `grep` answer within: the agent reads every entry and
+# match it is given, so a large repository needs `--prefix`.
+LIST_MAX_ENTRIES = 256
+GREP_MAX_MATCHES = 200
+GREP_MAX_MATCH_CHARS = 400
+# `git grep`'s exit codes: 0 found, 1 found nothing; anything else is an error.
+GREP_NO_MATCH_EXIT_CODE = 1
+# What every `git grep -n -z` record holds after its path: `\0<line>\0`.
+GREP_RECORD_HEAD = re.compile(r"\x00[0-9]+\x00")
+# The broker's refusal of a snapshot whose `paths` name nothing at that revision.
+SNAPSHOT_PATH_NOT_FOUND = "PATH_NOT_FOUND"
+# How many characters of a revision a message names.
+REVISION_SHOWN_CHARS = 12
 # The GitOps layout's per-cluster tree, `clusters/<name>/`, as the collector
 # reads it: a PDB name collides only inside its own cluster's tree.
 CLUSTER_TREE_ROOT = "clusters"
@@ -2210,8 +2226,6 @@ SKIPPED_TREE_DIRS = frozenset({".git"})
 # (`tooLarge`, `requestBudget`) withholds a file the harness would have read,
 # and such a file under the searched paths is a note it may have missed.
 BROKER_SKIP_NOT_A_FILE_REASONS = frozenset({"symlink", "notAFile"})
-# The one `skipped` reason that means "ask again for the rest".
-BROKER_SKIP_REQUEST_BUDGET = "requestBudget"
 # The copies come from the sibling skill's script, which works in both broker
 # modes and prints `sha` and `complete`; resolved from this file so the staged
 # and the source layouts both find it. Shallow, because the read is of one
@@ -14288,16 +14302,16 @@ def pr_record(proposal: dict) -> dict:
 
 # Which mechanism publishes a fix, and where the answer comes from.
 #
-# Content mode hands the broker `{path, bytes}` and a commit message; the broker
-# owns the only checkout and this container never sees a `.git`. Directory mode
+# Content mode commits in a copy the broker clones down and publishes up; the
+# broker holds the credential and does the push. Directory mode
 # is what ran before: a leased clone on a volume both containers mount, with the
 # agent running `checkout`, `add`, `commit` and `push` in it through the shim.
 #
-# The switch is not a flag in this container. The answer is asked of the broker
-# once per process and remembered — every later branch in the run has to take
-# the same fork, and a second probe could answer differently if the sidecar
-# restarted mid-run. Directory mode is reached only with no broker configured;
-# see `detect_content_mode`.
+# The switch is not a flag in this container. It is read once per process and
+# remembered, so every later branch in the run takes the same fork. Directory
+# mode is reached only with no broker configured (`CREDENTIAL_PROXY_URL`
+# unset); with one configured, content mode is the only mode, because the
+# sandbox's `git` has no network transport and no credential.
 _CONTENT_MODE: bool = False
 
 
@@ -14312,38 +14326,6 @@ def content_mode() -> bool:
 def set_content_mode(enabled: bool) -> None:
     global _CONTENT_MODE
     _CONTENT_MODE = bool(enabled)
-
-
-def detect_content_mode() -> bool:
-    """Ask the broker whether it takes content; refuse `start` if it will not say yes.
-
-    False only when no broker is configured at all. With one configured,
-    directory mode is no fallback: the sandbox's `git` has no network transport
-    and no credential, so the leased clone would fail on its first remote
-    command, later and with a `git` error that names nothing. A broker that is
-    down, unreachable, token-less, or not yet rolled to a build serving the
-    workspace routes (`workspaces_available` answers False for all of those)
-    refuses the command here instead, with a message naming the broker.
-    """
-    endpoint = proxy_endpoint()
-    if not endpoint:
-        return False
-    import credential_proxy_client
-
-    try:
-        armed = credential_proxy_client.workspaces_available(endpoint)
-    except Exception as exc:  # noqa: BLE001 — named in the refusal below
-        armed, why = False, f": {exc}"
-    else:
-        why = ""
-    if armed:
-        return True
-    raise BrokerUnavailable(
-        f"the broker at {endpoint} did not confirm its content-workspace routes{why}. "
-        "It may be down, unreachable, refusing this sandbox's token, or on a build "
-        "older than this skill. This sandbox has no other way to publish; check the "
-        "credential-proxy pod and re-run this command."
-    )
 
 
 def refresh_credentials(repo: str | None = None) -> None:
@@ -15747,6 +15729,10 @@ class _GroupPush(NamedTuple):
 
     base: str
     proposable: bool
+    # The open pull request of this install the broker landing found on the
+    # branch when the labelled listing had missed it, for the pull-request
+    # step to refresh rather than ask for again; None otherwise.
+    adopted: dict | None = None
 
 
 def _land_group_via_clone(
@@ -15827,6 +15813,211 @@ def content_workspace_repo(repo: str) -> str:
     return repo
 
 
+def remove_stale_snapshots() -> None:
+    """Delete snapshot directories older than the vcs reaper's TTL.
+
+    Best effort, only directories with this script's prefix, never through a
+    link. A run that ends normally removes its own snapshot; these are the
+    ones a killed run left, which the reaper does not see because they have
+    no session record. A TTL that is not a positive finite number turns this
+    off, as it turns off the reaper.
+    """
+    import vcs_client
+
+    ttl = vcs_client.COPY_TTL_HOURS
+    if not (math.isfinite(ttl) and ttl > 0):
+        return
+    cutoff = time.time() - ttl * SECONDS_PER_HOUR
+    for path in vcs_client.ROOT.glob(SNAPSHOT_DIR_PREFIX + "*"):
+        try:
+            if path.is_symlink() or not path.is_dir() or path.stat().st_mtime >= cutoff:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+
+
+class RepositorySnapshot:
+    """One revision of `repo`, unpacked into a scratch directory, with no `.git`.
+
+    One `vcs_client.snapshot` call: the broker clones one revision, sends its
+    tree as a tar and keeps nothing. Every read here then runs on local files.
+    `close` (or leaving the `with` block) deletes the directory.
+    """
+
+    def __init__(self, repo: str, ref: str | None = None, paths: list[str] | None = None) -> None:
+        import vcs_client
+
+        remove_stale_snapshots()
+        vcs_client.ROOT.mkdir(parents=True, exist_ok=True)
+        self._scratch = Path(tempfile.mkdtemp(prefix=SNAPSHOT_DIR_PREFIX, dir=str(vcs_client.ROOT)))
+        try:
+            answer = vcs_client.snapshot(
+                repo, ref=ref, paths=paths, into=self._scratch / SNAPSHOT_TREE_DIR
+            )
+        except BaseException:
+            shutil.rmtree(self._scratch, ignore_errors=True)
+            raise
+        self.tree = Path(answer["path"])
+        self.revision = str(answer.get("revision") or "")
+
+    def __enter__(self) -> "RepositorySnapshot":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        shutil.rmtree(self._scratch, ignore_errors=True)
+
+    def files(self, prefix: str | None = None) -> list[str]:
+        """The tree's regular files under `prefix` (component-wise), sorted.
+
+        A symbolic link is not a file here, as it was not an entry in the
+        broker's listing, and no `.git` component is ever named.
+        """
+        under = PurePosixPath(prefix).parts if prefix else ()
+        names: list[str] = []
+        for path in self.tree.rglob("*"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            parts = path.relative_to(self.tree).parts
+            if any(part.lower() == GIT_DIR_NAME for part in parts):
+                continue
+            if parts[: len(under)] != under:
+                continue
+            names.append(PurePosixPath(*parts).as_posix())
+        return sorted(names)
+
+    def has_file(self, path: str) -> bool:
+        target = self.tree / path
+        return not target.is_symlink() and target.is_file()
+
+    def read_bytes(self, path: str) -> bytes:
+        target = self.tree / path
+        if target.is_symlink() or not target.is_file():
+            raise FileNotFoundError(f"{path} is not a file at {self.revision[:REVISION_SHOWN_CHARS]}")
+        return target.read_bytes()
+
+    def grep(
+        self, pattern: str, prefix: str | None = None, *, regex: bool = False, ignore_case: bool = False
+    ) -> dict:
+        """`git grep --no-index` over the tree, in the broker's answer shape.
+
+        The same flags the broker's search used: fixed-string unless `regex`
+        (then POSIX extended), binary files skipped, the pattern passed after
+        `-e`, the prefix as a literal path.
+        """
+        import vcs_client
+
+        if not pattern.strip() or any(character in pattern for character in ("\x00", "\n", "\r")):
+            raise ValidationError("the pattern must be non-empty and hold no control characters")
+        argv = ["--literal-pathspecs", "grep", "--no-index", "--no-color", "-I", "-n", "-z"]
+        argv.append("-E" if regex else "-F")
+        if ignore_case:
+            argv.append("-i")
+        argv += ["-e", pattern]
+        if prefix:
+            argv += ["--", prefix]
+        # The sandbox's local git, hardened by the vcs client, on a tree with no
+        # `.git`. Bytes, so only git's own newlines end a record: a lone `\r`
+        # in a matched line is content.
+        result = vcs_client.local_git(self.tree, *argv, check=False, text=False)
+        if result.returncode not in (0, GREP_NO_MATCH_EXIT_CODE):
+            raise ValidationError("git could not search for that pattern; check the expression")
+        try:
+            output = result.stdout.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValidationError(
+                f"a file that matches is not UTF-8 text ({exc.reason}); narrow the search with --prefix"
+            ) from exc
+        # A record is `path\0line\0text\n`. A file name can hold a newline
+        # too, so a chunk without the `\0<digits>\0` head is the start of the
+        # next record's path, not a record of its own.
+        records: list[str] = []
+        pending: str | None = None
+        chunks = output.split("\n")
+        for index, chunk in enumerate(chunks):
+            if pending is not None:
+                chunk, pending = f"{pending}\n{chunk}", None
+            if GREP_RECORD_HEAD.search(chunk):
+                records.append(chunk)
+            elif index < len(chunks) - 1:
+                pending = chunk
+        matches: list[dict] = []
+        total = 0
+        for record in records:
+            path, line, text = record.split("\0", 2)
+            total += 1
+            if len(matches) >= GREP_MAX_MATCHES:
+                continue
+            match: dict = {
+                "path": path,
+                "line": int(line) if line.isdigit() else 0,
+                "text": text[:GREP_MAX_MATCH_CHARS],
+            }
+            if len(text) > GREP_MAX_MATCH_CHARS:
+                match["truncated"] = True
+            matches.append(match)
+        return {"matches": matches, "total": total, "truncated": total > len(matches)}
+
+
+def snapshot_ref(repo: str, branch: str | None) -> str | None:
+    """The ref a read of `branch` takes: the branch when the remote has it, else the base.
+
+    A first round names a branch the remote does not have yet, and the base
+    is what it wants. A snapshot of a branch the remote lacks is a git error,
+    so the branch is looked up first.
+    """
+    if not branch:
+        return None
+    held = forge("branch-view", repo, {"branch": branch}).get("branch") or {}
+    return branch if held.get("exists") else None
+
+
+class _EmptyTree:
+    """What `prefix_snapshot` answers for a prefix that names nothing: no files, no matches."""
+
+    def __init__(self, revision: str) -> None:
+        self.revision = revision
+
+    def __enter__(self) -> "_EmptyTree":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def files(self, prefix: str | None = None) -> list[str]:
+        return []
+
+    def grep(self, pattern: str, prefix: str | None = None, **_options: bool) -> dict:
+        return {"matches": [], "total": 0, "truncated": False}
+
+
+def prefix_snapshot(repo: str, branch: str | None, prefix: str | None) -> "RepositorySnapshot | _EmptyTree":
+    """The snapshot `list` and `grep` read: only `prefix` when one is named.
+
+    Taking only the prefix is what lets `--prefix` get a large repository under
+    the snapshot's size limit. A prefix that names nothing at that revision is
+    an empty answer, as it was from the broker's own listing, with the
+    revision the broker read.
+    """
+    import vcs_client
+
+    try:
+        return RepositorySnapshot(repo, ref=snapshot_ref(repo, branch), paths=[prefix] if prefix else None)
+    except vcs_client.VcsError as exc:
+        if prefix and exc.code == SNAPSHOT_PATH_NOT_FOUND:
+            return _EmptyTree(exc.revision or "")
+        if exc.code == vcs_client.SNAPSHOT_TOO_LARGE:
+            # The broker's text names its own request field; the command's is --prefix.
+            raise ValidationError(
+                f"{prefix or 'the repository'} is too large for one snapshot ({exc}); "
+                "read a smaller directory with --prefix"
+            ) from exc
+        raise
+
+
 def _land_group_via_broker(
     repo: str,
     audit_id: str,
@@ -15834,53 +16025,139 @@ def _land_group_via_broker(
     branch: str,
     paths: list[str],
     snapshot: dict[str, bytes],
+    existing: dict | None = None,
     noun: str | None = None,
 ) -> _GroupPush:
-    """Hand the broker the group's bytes and let it own the branch.
+    """Land the group's bytes on `branch` through the broker's clone and publish.
 
-    Nothing here names a directory, which is the whole of the difference. The
-    bytes were read out of the agent's scratch tree before this call; what
-    crosses to the credential container is content and a commit message, so
-    there is no `.git` on this side to define a filter driver, an alias or a
-    hook path in, and no shared volume for the two containers to disagree about.
+    The copy comes down with `vcs_client.clone`, the files are written and
+    committed here with the sandbox's local git, and `vcs_client.publish` sends
+    the revision up. The broker owns the credential and the push; this
+    container never holds a remote.
 
-    One behaviour differs from the clone path on purpose. The clone recuts the
-    branch from the base every run, which discards any commit a reviewer pushed
-    to it; the broker continues the branch when the remote already has it. The
-    branch name is a digest of the exact path set (`group_branch_for`), so
-    continuing can never leave a stale file behind — a group whose files changed
-    is a different branch — and the only thing the recut was destroying was
-    somebody's work.
+    One behaviour differs from the directory-mode path on purpose. That path
+    recuts the branch from the base every run, which discards any commit a
+    reviewer pushed to it; this one adds to the branch when this install's
+    pull request is open on it. The branch name is a digest of the exact path
+    set (`group_branch_for`), so adding to it never leaves a stale file behind.
+
+    A branch the remote holds with no open pull request of ours is taken as
+    it is when it already carries these files. Otherwise the broker is asked
+    to delete it, which it does only for the tip of a closed or merged pull
+    request this install opened, and the branch is cut again from the base.
+    When the broker refuses, this group is refused by name: someone else's
+    commits may be on the branch.
     """
-    import credential_proxy_client
+    import vcs_client
 
-    changes = {path: snapshot[path] for path in paths}
-    with credential_proxy_client.Workspace.open(
-        proxy_endpoint(), content_workspace_repo(repo), branch=branch
-    ) as workspace:
-        continuing = workspace.started_from == f"origin/{branch}"
-        result = workspace.commit(
-            branch=branch,
-            message=group_commit_subject(audit_id, group),
-            changes=changes,
-        )
-        if not result["committed"]:
-            # Nothing to commit means two different things, and reporting the
-            # wrong one either hides a fix that is already up for review or
-            # claims one that was never opened.
-            if not continuing:
-                log(
-                    f"{branch}: the remediation is already present on "
-                    f"{workspace.base}; no pull request opened."
+    open_base = (
+        str(existing.get("baseRefName") or "")
+        if existing and str(existing.get("state", "")).upper() == "OPEN"
+        else ""
+    )
+    message = group_commit_subject(audit_id, group)
+    adopted: dict | None = None
+    try:
+        held = forge("branch-view", repo, {"branch": branch}).get("branch") or {}
+        if held.get("exists") and not open_base:
+            # An open pull request of this install that the labelled listing
+            # missed -- one an earlier run opened and failed to label -- is
+            # still this install's to add to.
+            adopted = open_proposal_on(repo, branch)
+            open_base = str((adopted or {}).get("baseRefName") or "")
+            if not open_base:
+                adopted = None
+        try:
+            if held.get("exists") and open_base:
+                cloned = vcs_client.clone(repo, branch=branch, force=True, key=branch)
+                if not _write_group(Path(cloned["path"]), paths, snapshot):
+                    log(
+                        f"{branch}: the branch already carries this fix; its pull "
+                        "request is refreshed without a push."
+                    )
+                    return _GroupPush(open_base, True, adopted)
+                vcs_client.commit(message, paths=paths, spec=repo, key=branch)
+                vcs_client.publish(repo, target=open_base, advance=True, key=branch)
+                return _GroupPush(open_base, True, adopted)
+
+            cloned = vcs_client.clone(repo, force=True, key=branch)
+            base = cloned["branch"]
+            if not _write_group(Path(cloned["path"]), paths, snapshot):
+                log(f"{branch}: the remediation is already present on {base}; no pull request opened.")
+                return _GroupPush(base, False)
+            if held.get("exists"):
+                if _branch_carries(repo, branch, paths, snapshot):
+                    log(
+                        f"{branch}: the branch already carries this fix; a pull "
+                        "request is opened from it without a push."
+                    )
+                    return _GroupPush(base, True)
+                try:
+                    forge(
+                        "branch-delete", repo,
+                        {"branch": branch, "revision": str(held.get("revision") or "")},
+                    )
+                except ForgeError as refused:
+                    raise ForgeError(
+                        f"{branch} already exists on {repo} with other content and no open "
+                        "pull request of this install on it, and the broker would not delete "
+                        f"it ({refused}). The fix stays unpublished until a person deletes or "
+                        "renames that branch."
+                    ) from refused
+            switched = vcs_client.branch(repo, branch, key=branch)
+            if switched["exitCode"] != 0:
+                raise ForgeError(
+                    f"{branch}: could not take the branch in the copy: "
+                    f"{switched['stderr'] or 'git exited ' + str(switched['exitCode'])}"
                 )
-                return _GroupPush(workspace.base, False)
-            log(
-                f"{branch}: the branch already carries this fix; its pull "
-                "request is refreshed without a push."
-            )
-            return _GroupPush(workspace.base, True)
-        workspace.push(branch)
-        return _GroupPush(workspace.base, True)
+            vcs_client.commit(message, paths=paths, spec=repo, key=branch)
+            vcs_client.publish(repo, target=base, key=branch)
+            return _GroupPush(base, True)
+        finally:
+            try:
+                vcs_client.discard(repo, key=branch)
+            except vcs_client.VcsError:
+                pass
+    except vcs_client.VcsError as exc:
+        code = f" [{exc.code}]" if exc.code else ""
+        if not exc.code and broker_lost(exc):
+            raise BrokerUnavailable(
+                f"landing {branch} on {repo}: the broker at {proxy_endpoint()} did not "
+                f"answer: {exc}. This sandbox has no other way to publish; check the "
+                "credential-proxy pod and re-run this command."
+            ) from exc
+        raise ForgeError(f"landing {branch} on {repo} failed{code}: {exc}") from exc
+
+
+def _write_group(tree: Path, paths: list[str], snapshot: dict[str, bytes]) -> bool:
+    """Write the group's files into the copy at `tree`; whether any of them changed it."""
+    import vcs_client
+
+    for path in paths:
+        target = resolve_inside_repo(tree, path, "broker copy")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(snapshot[path])
+    # `--ignored`, so a new file the repository ignores counts as a change; the
+    # commit then refuses it by name rather than the group closing as already applied.
+    status = vcs_client.local_git(
+        tree, "status", "--porcelain", "--ignored=matching", "--", *paths, check=False
+    )
+    if status.returncode != 0:
+        raise ForgeError(f"`git status` in the copy exited {status.returncode}: {status.stderr.strip()}")
+    return bool(status.stdout.strip())
+
+
+def _branch_carries(repo: str, branch: str, paths: list[str], snapshot: dict[str, bytes]) -> bool:
+    """Whether the remote's `branch` holds exactly these bytes at each of `paths`."""
+    import vcs_client
+
+    try:
+        with RepositorySnapshot(repo, ref=branch, paths=paths) as snap:
+            return all(snap.has_file(path) and snap.read_bytes(path) == snapshot[path] for path in paths)
+    except vcs_client.VcsError as exc:
+        if exc.code == SNAPSHOT_PATH_NOT_FOUND:
+            return False
+        raise
 
 
 def open_remediation_pr(
@@ -15906,10 +16183,10 @@ def open_remediation_pr(
     branch = assert_pushable(group_branch_for(audit_id, group))
     paths = group_paths(group)
     if content_mode():
-        # The broker's workspace continues the branch when the remote has it
-        # and takes no base, so nothing is derived or checked for one here.
+        # The broker's copy reports its base, and an open pull request keeps
+        # the base it targets, so nothing is derived or checked for one here.
         landed = _land_group_via_broker(
-            repo, audit_id, group, branch, paths, snapshot, noun=noun
+            repo, audit_id, group, branch, paths, snapshot, existing=existing, noun=noun
         )
     else:
         # The clone recuts the branch, so an open pull request's branch is cut
@@ -15938,6 +16215,8 @@ def open_remediation_pr(
     if not landed.proposable:
         return None
     base = landed.base
+    if landed.adopted is not None:
+        existing = landed.adopted
 
     # Known from `ensure_labels`, which every run calls first; a forge not yet
     # known is taken to have labels, and the label write below corrects it.
@@ -16711,23 +16990,22 @@ def _broker_outage(exc: BaseException) -> bool:
 class _RepositoryProbe:
     """What the repository already holds, for the fixes `finish` writes.
 
-    Directory mode reads the clone. Content mode asks the broker over one
-    session for the whole run, and an answer it cannot give -- an error, a
-    truncated listing -- is a yes, so `finish` never writes a file it could not
-    check.
+    Directory mode reads the clone. Content mode takes one snapshot of the
+    repository's base for the whole run and reads it locally. An answer it
+    cannot give -- no snapshot, an unreadable file -- is a yes, so `finish`
+    never writes a file it could not check.
     """
 
     def __init__(self, repo: str, root: Path) -> None:
         self.repo, self.root = repo, root
-        self._session = None
-        self._workspace = None
-        # Why the broker could not be asked, once it could not.
+        self._snapshot: RepositorySnapshot | None = None
+        # Why the snapshot could not be taken, once it could not.
         self.unavailable = ""
         # The first broker error that was an outage rather than a refusal:
         # no answer, or a status that says to try again (`_broker_outage`).
         self.outage: BaseException | None = None
-        # Why the last answer was a yes nobody saw: a call that failed or a
-        # listing that stopped short. Read and cleared by `take_unanswered`.
+        # Why the last answer was a yes nobody saw: no snapshot, or a read or a
+        # search that failed. Read and cleared by `take_unanswered`.
         self.unanswered = ""
         self._attempts = 0
         # The clone's YAML, read once for every `mentions` in directory mode,
@@ -16735,8 +17013,7 @@ class _RepositoryProbe:
         self._texts: list[tuple[str, str]] | None = None
         # Working-tree files the name search reads past (`demote_fixes_over_declarations`).
         self.ignored: set[str] = set()
-        # Content mode's answers to `has_path`, one broker call per path, with
-        # why an answer was a default yes.
+        # Content mode's answers to `has_path`, with why an answer was a default yes.
         self._paths: dict[str, tuple[bool, str]] = {}
         # Directory mode's answers to `committed`, filled by `ask_committed`.
         self._committed: dict[str, tuple[bool, str]] = {}
@@ -16744,31 +17021,28 @@ class _RepositoryProbe:
 
     @property
     def base_sha(self) -> str:
-        """The commit SHA of the already-opened broker workspace, or empty."""
-        return str(getattr(self._workspace, "base_sha", "") or "")
+        """The commit SHA of the snapshot already taken, or empty."""
+        return self._snapshot.revision if self._snapshot is not None else ""
 
     def known_absent(self, path: str) -> bool:
         """Whether an earlier `has_path` call already found `path` absent."""
         return path in self._paths and not self._paths[path][0]
 
-    def broker(self):
+    def broker(self) -> RepositorySnapshot | None:
         # Asked twice at most: once for the Config Connector scan and once
-        # more at planning, so one refused open does not end generation.
-        if self._workspace is None and self._attempts < PROBE_OPEN_ATTEMPTS:
+        # more at planning, so one refused snapshot does not end generation.
+        if self._snapshot is None and self._attempts < PROBE_OPEN_ATTEMPTS:
             self._attempts += 1
             self.unavailable = ""
             try:
-                import credential_proxy_client  # noqa: PLC0415 -- the content-mode client
-
-                self._session = credential_proxy_client.Workspace.open(proxy_endpoint(), self.repo)
-                self._workspace = self._session.__enter__()
-                # A retry that opened answers for the failed open before it.
+                self._snapshot = RepositorySnapshot(self.repo)
+                # A retry that worked answers for the failed one before it.
                 self.outage = None
-            except Exception as exc:  # noqa: BLE001 -- no broker: every question is a yes
+            except Exception as exc:  # noqa: BLE001 -- no snapshot: every question is a yes
                 self.unavailable = f"{type(exc).__name__}: {exc}"
                 self.note_outage(exc)
-                log(f"WARNING: could not open {self.repo} through the broker ({self.unavailable})")
-        return self._workspace
+                log(f"WARNING: could not take a snapshot of {self.repo} through the broker ({self.unavailable})")
+        return self._snapshot
 
     def note_outage(self, exc: BaseException) -> None:
         """Keep `exc` for `raise_if_lost` when it is an outage, not a refusal."""
@@ -16801,38 +17075,34 @@ class _RepositoryProbe:
     def has_path(self, path: str) -> bool:
         if not content_mode():
             return (self.root / path).exists()
-        # Every finding in one cluster tree asks about the same ancestors.
-        if path not in self._paths:
-            self.unanswered = ""
-            self._paths[path] = (self._broker_has_path(path), self.unanswered)
-        answer, self.unanswered = self._paths[path]
+        # Every finding in one cluster tree asks about the same ancestors. Only
+        # an answer the snapshot gave is kept: a default yes taken while there
+        # was none would outlive a retry that took one.
+        if path in self._paths:
+            answer, self.unanswered = self._paths[path]
+            return answer
+        self.unanswered = ""
+        answer = self._broker_has_path(path)
+        if self._snapshot is not None:
+            self._paths[path] = (answer, self.unanswered)
         return answer
 
     def _broker_has_path(self, path: str) -> bool:
-        workspace = self.broker()
-        if workspace is None:
+        snap = self.broker()
+        if snap is None:
             return True
-        try:
-            listing = workspace.list(prefix=path)
-        except Exception as exc:  # noqa: BLE001 -- an unanswered listing cannot rule the path out
-            self.unanswered = f"listing {path}: {type(exc).__name__}: {exc}"
-            self.note_outage(exc)
-            return True
-        if getattr(listing, "truncated", False):
-            self.unanswered = f"listing {path} was truncated"
-            return True
-        return path in {entry.get("path") if isinstance(entry, dict) else entry for entry in listing}
+        return snap.has_file(path)
 
     def committed(self, path: str) -> bool:
         """Whether `path` is a file at the audited commit, not only in the tree.
 
         Directory mode asks git about `HEAD`, because the worker writes its
-        fixes into the clone and `has_path` sees them there. Content mode asks
-        the broker, which lists only the base. An answer the probe cannot get
+        fixes into the clone and `has_path` sees them there. Content mode reads
+        the snapshot, which holds only the base. An answer the probe cannot get
         is a yes, and `unanswered` says why, as for `has_path`."""
         if content_mode():
             answer = self.has_path(path)
-            # A broker that did not open answers nothing, and `has_path`
+            # A snapshot that was not taken answers nothing, and `has_path`
             # records that only in `unavailable`.
             self.unanswered = self.unanswered or self.unavailable
             return answer
@@ -16843,7 +17113,7 @@ class _RepositoryProbe:
     def ask_committed(self, paths: list[str]) -> None:
         """Directory mode: ask git about each of `paths` in one call, for `committed`.
 
-        Content mode does nothing here: the broker answers one path a call."""
+        Content mode does nothing here: the snapshot answers each path locally."""
         wanted = [path for path in dict.fromkeys(paths) if path not in self._committed]
         if content_mode() or not wanted:
             return
@@ -16871,8 +17141,8 @@ class _RepositoryProbe:
 
         Directory mode reads `HEAD` and not the working tree: a remediation
         carries one file, so an edit the worker made to another file in the
-        clone does not go into the pull request. Content mode reads through
-        the broker session. On None, `unanswered` says why."""
+        clone does not go into the pull request. Content mode reads the
+        snapshot. On None, `unanswered` says why."""
         self.unanswered = ""
         if not content_mode():
             try:
@@ -16886,15 +17156,14 @@ class _RepositoryProbe:
                 self.unanswered = f"git show {AUDITED_REF}:{path}: exit {shown.returncode}"
                 return None
             return shown.stdout or ""
-        workspace = self.broker()
-        if workspace is None:
-            self.unanswered = self.unavailable or "the broker could not be opened"
+        snap = self.broker()
+        if snap is None:
+            self.unanswered = self.unavailable or "the snapshot could not be taken"
             return None
         try:
-            return workspace.read_text(path)
+            return snap.read_bytes(path).decode("utf-8")
         except Exception as exc:  # noqa: BLE001 -- an unread file cannot show the entry
             self.unanswered = f"reading {path}: {type(exc).__name__}: {exc}"
-            self.note_outage(exc)
             return None
 
     def mentions(self, name: str, prefix: str = "") -> bool:
@@ -16926,28 +17195,24 @@ class _RepositoryProbe:
                 for path, body in self._texts
                 if path.startswith(prefix) and path not in self.ignored
             )
-        workspace = self.broker()
-        if workspace is None:
+        snap = self.broker()
+        if snap is None:
             return True
         try:
-            # The broker refuses a path with an empty segment, so no trailing slash.
-            found = workspace.grep(expression, prefix=prefix.rstrip("/") or None, regex=True)
+            found = snap.grep(expression, prefix=prefix.rstrip("/") or None, regex=True)
         except Exception as exc:  # noqa: BLE001 -- an unanswered search cannot rule it out
             self.unanswered = f"searching for {name}: {type(exc).__name__}: {exc}"
             return True
-        return not isinstance(found, dict) or int(found.get("total", 1)) > 0
+        return int(found.get("total", 1)) > 0
 
     def close(self) -> None:
-        session, self._session, self._workspace = self._session, None, None
-        if session is not None:
-            try:
-                session.__exit__(None, None, None)
-            except Exception:  # noqa: BLE001 -- closing a lease is best effort
-                pass
+        snap, self._snapshot = self._snapshot, None
+        if snap is not None:
+            snap.close()
 
 
 class _WorkingTreeProbe(_RepositoryProbe):
-    """A probe for a dry run, which asks git nothing and opens no broker session.
+    """A probe for a dry run, which asks git nothing and takes no snapshot.
 
     It reads the clone's working tree, and it takes each file a finding names
     as new, because only git can say if the file is at the audited commit.
@@ -18271,83 +18536,46 @@ def _index_kcc_text(
         )
 
 
-class KccBrokerScan(NamedTuple):
-    """The declarations a content-mode read found, and whether it saw everything.
-
-    `truncated` is true when the broker's search stopped at its match ceiling
-    or withheld a matching file. The index is then a floor, not the answer: it
-    still degrades what it found, and a fix it did not catch says nothing about
-    whether the repository declares that object.
-    """
-
-    declarations: dict[KccKey, KccDeclaration]
-    truncated: bool
-
-
-def kcc_declarations_via_broker(repo: str, session=None) -> KccBrokerScan:
-    """Index the GitOps repository's Config Connector resources through the broker.
+def kcc_declarations_via_broker(
+    repo: str, snap: RepositorySnapshot | None = None
+) -> dict[KccKey, KccDeclaration]:
+    """Index the GitOps repository's Config Connector resources from a snapshot.
 
     Content mode's counterpart of `kcc_declarations`: there is no clone at
-    `finish`, so the broker searches its own tree for the API group and only
-    the matching YAML files are read. They are parsed in memory, never written
-    anywhere -- in particular not into the remediation workspace, whose every
-    file `finish` publishes. Paths are the repository-relative names the broker
-    reports, the same names the clone walk produces.
+    `finish`, so the YAML files of a snapshot of the base that name the API
+    group are parsed in memory. Nothing is written into the remediation
+    workspace, whose every file `finish` publishes. Paths are the
+    repository-relative names, the same names the clone walk produces.
 
-    Any broker failure returns an empty, untruncated scan, which disables the
-    check exactly as an unreadable clone does; the run never fails over it.
-    `session` is a broker workspace already open on `repo` (`_RepositoryProbe`),
-    so one `finish` clones the repository once.
+    A snapshot that cannot be taken or read returns an empty index, which
+    disables the check exactly as an unreadable clone does; the run never
+    fails over it. `snap` is the snapshot `_RepositoryProbe` already took, so
+    one `finish` takes one snapshot.
     """
     try:
         import yaml  # noqa: PLC0415 -- optional; absence disables the check
     except ImportError:
-        return KccBrokerScan({}, False)
+        return {}
     index: dict[KccKey, KccDeclaration] = {}
+    marker = KCC_CONTAINER_API_GROUP.encode("utf-8")
+    texts: dict[str, bytes] = {}
     try:
-        import credential_proxy_client
-
-        opened = (
-            contextlib.nullcontext(session)
-            if session is not None
-            else credential_proxy_client.Workspace.open(proxy_endpoint(), repo)
-        )
-        with opened as workspace:
-            result = workspace.grep(KCC_CONTAINER_API_GROUP)
-            truncated = bool(result.get("truncated"))
-            wanted = sorted(
-                {
-                    str(match.get("path") or "")
-                    for match in result.get("matches") or []
-                    if str(match.get("path") or "").endswith(_KCC_YAML_EXTENSIONS)
-                }
-            )
-            texts: dict[str, bytes] = {}
-            # `requestBudget` means ask again for the rest; stop when a round
-            # returns nothing, so a broker that never relents cannot spin this.
-            while wanted:
-                files, skipped = workspace.read_many(wanted)
-                texts.update(files)
-                retry = [
-                    str(entry.get("path") or "")
-                    for entry in skipped
-                    if entry.get("reason") == BROKER_SKIP_REQUEST_BUDGET
-                ]
-                if any(entry.get("reason") != BROKER_SKIP_REQUEST_BUDGET for entry in skipped):
-                    truncated = True
-                if retry and not files:
-                    truncated = True
-                    break
-                wanted = retry
+        with contextlib.nullcontext(snap) if snap is not None else RepositorySnapshot(repo) as taken:
+            for path in taken.files():
+                if not path.endswith(_KCC_YAML_EXTENSIONS):
+                    continue
+                data = taken.read_bytes(path)
+                if marker in data:
+                    texts[path] = data
     except Exception as exc:  # noqa: BLE001 -- the backstop is optional; the run is not
         log(
             f"WARNING: the Config Connector scan could not read {repo} through "
             f"the broker ({exc}); gcloud fixes publish as written"
         )
-        return KccBrokerScan({}, False)
+        return {}
     for path in sorted(texts):
         _index_kcc_text(index, yaml, texts[path].decode("utf-8", errors="replace"), "", path)
-    return KccBrokerScan(index, truncated)
+    return index
 
 
 def kcc_declaration_roots(
@@ -18553,7 +18781,7 @@ def ensure_workspace(repo: str, audit_id: str, *, reset: bool = False) -> Path:
     """
     import gitops_workspace
 
-    set_content_mode(detect_content_mode())
+    set_content_mode(bool(proxy_endpoint()))
     if content_mode():
         scratch = gitops_workspace.ensure_scratch_workspace(
             repo,
@@ -19312,25 +19540,14 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
     )
 
 
-def _tree_sha(workspace) -> str:
-    """The commit the broker's tree was read at.
-
-    The branch head when `--branch` named one the remote has, since that is
-    what the broker checked out; the base otherwise. Printed by every read so
-    a content-mode run has the sha its `declared_intent_searched` entry needs
-    without a `git` it does not have.
-    """
-    return workspace.branch_sha or workspace.base_sha
-
-
 def handle_fetch(args: argparse.Namespace) -> None:
     """Copy files out of the repository and into the workspace, content mode only.
 
     The read half. A remediation that rewrites an existing manifest has to start
     from what the manifest currently says, and in content mode the workspace
     holds nothing to read it out of — that is what removing the clone costs. So
-    the file comes back the same way the fix goes out: as content, over the
-    broker, with no path crossing between the two containers.
+    the file comes from a snapshot of the repository (`vcs_client.snapshot`),
+    with no path crossing between the two containers.
 
     Directory mode is refused rather than emulated. The file is already in the
     clone there, and a command that silently did nothing would teach an agent to
@@ -19346,43 +19563,60 @@ def handle_fetch(args: argparse.Namespace) -> None:
             f"mode, where {root} is a clone and the file is already in it"
         )
 
-    import credential_proxy_client
-
     # Resolved before anything is read, and against the same rule every
     # remediation path answers to: `..`, an absolute path, or a symlinked
     # ancestor is refused here rather than turned into a write somewhere else.
-    # The broker validates the path too, on its own tree; this one is about
-    # where the bytes land locally, which is a question only this side can ask.
+    # The broker validates the path too; this one is about where the bytes
+    # land locally, which is a question only this side can ask.
     targets = {path: resolve_inside_repo(root, path, "fetch") for path in args.path}
 
+    import vcs_client
+
     written: list[str] = []
-    with credential_proxy_client.Workspace.open(
-        proxy_endpoint(), content_workspace_repo(repo), branch=args.branch
-    ) as workspace:
+    # The `sha` printed is the revision the snapshot was taken at: the branch
+    # head when `--branch` names one the remote has, the base otherwise. A
+    # content-mode run needs it for its `declared_intent_searched` entry and
+    # has no `git` history to read it from.
+    try:
+        snap = RepositorySnapshot(repo, ref=snapshot_ref(repo, args.branch), paths=list(targets))
+    except vcs_client.VcsError as exc:
+        if exc.code == vcs_client.SNAPSHOT_TOO_LARGE:
+            raise ValidationError(
+                f"the files named by --path are too large for one snapshot ({exc}); fetch fewer at a time"
+            ) from exc
+        if exc.code == SNAPSHOT_PATH_NOT_FOUND:
+            # The broker names no path, so every one asked for is listed.
+            at = f" at {exc.revision[:REVISION_SHOWN_CHARS]}" if exc.revision else ""
+            raise ValidationError(
+                f"one of the --path values names no file in {repo}{at}: {', '.join(targets)}. "
+                "Fetch them one at a time to find it; a file only the remediation branch has "
+                "needs --branch."
+            ) from exc
+        raise
+    with snap:
         for path, target in targets.items():
-            content = workspace.read(path)
+            content = snap.read_bytes(path)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
             written.append(path)
-        sha = _tree_sha(workspace)
+        sha = snap.revision
     print(json.dumps({"workspace": str(root), "files": written, "sha": sha}))
 
 
 def handle_list(args: argparse.Namespace) -> None:
-    """Name the files in the broker's checkout, content mode only.
+    """Name the files in a snapshot of the repository, content mode only.
 
     The other half of the read. `fetch` needs a path, and the rule that a
     remediation path is discovered rather than invented means the path has to
     come from the repository — which in directory mode the audit finds by
     grepping the clone. There is no clone here, so this is where the names come
-    from: a walk of the broker's tree, prefix-narrowed, with anything named
-    `.git` filtered out at every depth so the one directory the agent must not
-    see cannot be listed however it is spelled.
+    from: a walk of a snapshot, prefix-narrowed, with anything named `.git`
+    filtered out at every depth.
 
     It answers with names and sizes, not content. Searching inside the files is
     `grep`, below; this is for narrowing by path when the name is the thing you
-    know. The broker caps how many entries it will return, so a bare listing of
-    a large repository is a truncated one — pass `--prefix`.
+    know. It returns at most `LIST_MAX_ENTRIES` entries, so a bare listing of a
+    large repository is a truncated one — pass `--prefix`.
     """
     audit_id = validate_audit_id(args.audit)
     repo = resolve_repo(audit_id=audit_id)
@@ -19394,25 +19628,25 @@ def handle_list(args: argparse.Namespace) -> None:
             f"mode, where {root} is a clone you can read directly"
         )
 
-    import credential_proxy_client
-
-    with credential_proxy_client.Workspace.open(
-        proxy_endpoint(), content_workspace_repo(repo), branch=args.branch
-    ) as workspace:
-        entries = workspace.list(args.prefix)
-        sha = _tree_sha(workspace)
+    with prefix_snapshot(repo, args.branch, args.prefix) as snap:
+        names = snap.files(args.prefix)
+        entries = [
+            {"path": name, "size": (snap.tree / name).stat().st_size}
+            for name in names[:LIST_MAX_ENTRIES]
+        ]
+        sha = snap.revision
     # `truncated` travels with the entries. A listing that stopped at the
-    # broker's ceiling looks complete otherwise, and the audit's next move is to
-    # read a path — one it saw, or one it inferred from a listing that ended
-    # early without saying so.
+    # ceiling looks complete otherwise, and the audit's next move is to read a
+    # path — one it saw, or one it inferred from a listing that ended early
+    # without saying so.
     print(
         json.dumps(
             {
                 "repo": repo,
                 "sha": sha,
                 "entries": entries,
-                "total": entries.total,
-                "truncated": entries.truncated,
+                "total": len(names),
+                "truncated": len(names) > len(entries),
             }
         )
     )
@@ -19536,14 +19770,14 @@ def handle_draft(args: argparse.Namespace) -> None:
 
 
 def handle_grep(args: argparse.Namespace) -> None:
-    """Search inside the files of the broker's checkout, content mode only.
+    """Search inside the files of a snapshot of the repository, content mode only.
 
     The directory-mode audit finds a remediation path by grepping the clone for
     `namespace: <namespace>`. There is no clone in content mode, and narrowing
     with `list --prefix` and reading the candidates only works when the path is
-    already most of the answer. This is the search itself: the broker runs it
-    over its own tree and sends back matching lines, so a path can still be
-    discovered from what a file says rather than from what it is called.
+    already most of the answer. This is the search itself, run over a
+    snapshot, so a path can still be discovered from what a file says rather
+    than from what it is called.
 
     It answers with matches, not files. Confirming a hit is still a `fetch` and
     a read — a match on `namespace: payments` is kind-blind and can be a label
@@ -19563,22 +19797,18 @@ def handle_grep(args: argparse.Namespace) -> None:
             f"mode, where {root} is a clone you can grep directly"
         )
 
-    import credential_proxy_client
-
-    with credential_proxy_client.Workspace.open(
-        proxy_endpoint(), content_workspace_repo(repo), branch=args.branch
-    ) as workspace:
-        result = workspace.grep(
+    with prefix_snapshot(repo, args.branch, args.prefix) as snap:
+        result = snap.grep(
             args.pattern,
             prefix=args.prefix,
             regex=args.regex,
             ignore_case=args.ignore_case,
         )
-        sha = _tree_sha(workspace)
+        sha = snap.revision
     # `truncated` travels with the matches, for the reason it does in `list`: a
-    # search that stopped at the broker's ceiling reads as "these are all the
-    # hits", and "the repository does not declare that namespace" is the
-    # conclusion an audit draws from it.
+    # search that stopped at the ceiling reads as "these are all the hits", and
+    # "the repository does not declare that namespace" is the conclusion an
+    # audit draws from it.
     print(
         json.dumps(
             {
@@ -19630,7 +19860,7 @@ def _handle_finish_dry_run(
         )
     # Only against the stream's own tree, never `dry_run_repo_root`'s fallback,
     # which is whatever checkout holds the working directory. Directory mode
-    # only: the dry run never opens a broker session, and starting one here
+    # only: the dry run never takes a snapshot, and taking one here
     # would make the preview the first thing in the run to need the broker.
     # A content-mode dry run therefore previews no Config Connector degrade.
     stream_tree = derived_workspace(audit_id, repo=repo)
@@ -19939,8 +20169,7 @@ def _open_promoted_prs(
                 log(f"WARNING: could not publish the fix for {fid}: {exc}")
                 continue
             except Exception as exc:
-                # The content workspace talks to the broker directly, so its
-                # transport failures arrive unwrapped.
+                # A transport failure the landing did not wrap arrives raw.
                 if broker_lost(exc):
                     raise BrokerUnavailable(
                         f"publishing the fix for {fid} on {repo}: the broker at "
@@ -20098,11 +20327,9 @@ def handle_remediate(args: argparse.Namespace) -> None:
     refusal_repo = _dry_run_repo(audit_id, opt_repo) if args.dry_run else repo_hint
     # Each `remediate` call is a new process, so no step has decided the mode
     # yet. `start` and `finish` decide it in `ensure_workspace`; this command
-    # reads it in the refusal below first. Decide it here from the endpoint
-    # alone, with no call to the broker: `detect_content_mode` answers False
-    # only when no endpoint is set, and True or a refusal when one is. Thus a
-    # dry run does not need the broker, and the real run still asks the broker
-    # in `ensure_workspace`, after the checks of the finding ids.
+    # reads it in the refusal below first. It is decided from the endpoint
+    # alone, as `ensure_workspace` decides it, so a dry run does not need the
+    # broker.
     set_content_mode(bool(proxy_endpoint()))
     # Resolved once for the whole preview, as `_handle_finish_dry_run` does: a
     # failed read falls back to "pull request", so a lookup per group could
@@ -21988,40 +22215,31 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         )
     # Every stream, not only drift: any `gcloud` fix against a declared field
     # is reverted the same way. Directory mode reads the clone; content mode
-    # has none and asks the broker, and only when a finding could match, so
+    # has none and reads a snapshot, and only when a finding could match, so
     # a run with no such fix costs no round trip.
     kcc_prebuilt: dict[KccKey, KccDeclaration] = {}
-    # One broker session for the run's repository questions; closed after the
+    # One snapshot for the run's repository questions; deleted after the
     # generated fixes are planned below.
     probe = _RepositoryProbe(repo, root)
     # The worker's budget is still in those files; it names nothing the
     # repository holds, so the name search reads past it.
     probe.ignored = set(on_declaration.values())
     # Closed after planning below, and at exit if anything between raises, so
-    # a failed `finish` does not hold a broker slot until the idle reclaim.
+    # a failed `finish` does not leave its snapshot on the disk.
     atexit.register(probe.close)
     if content_mode() and any(_kcc_candidate(finding) for finding in findings):
-        # The probe's open is the scan's, and a failed one is retried once on
-        # the probe's count: the backstop keeps its retry, and planning, which
-        # fails safe without the broker, takes none.
-        session = probe.broker() or probe.broker()
-        scan = (
-            kcc_declarations_via_broker(repo, session)
-            if session is not None
-            else KccBrokerScan({}, False)
-        )
-        if session is None:
+        # The probe's snapshot is the scan's, and a failed one is retried once
+        # on the probe's count: the backstop keeps its retry, and planning,
+        # which fails safe without the snapshot, takes none.
+        snap = probe.broker() or probe.broker()
+        if snap is None:
             log(
-                f"WARNING: the Config Connector scan could not open {repo} through the "
-                f"broker ({probe.unavailable}); gcloud fixes publish as written"
+                f"WARNING: the Config Connector scan could not take a snapshot of "
+                f"{repo} through the broker ({probe.unavailable}); gcloud fixes "
+                "publish as written"
             )
-        kcc_prebuilt = scan.declarations
-        if scan.truncated:
-            log(
-                "WARNING: the broker truncated the Config Connector scan of "
-                f"{repo}; gcloud fixes against declarations it did not return "
-                "publish as written, so their absence here proves nothing."
-            )
+        else:
+            kcc_prebuilt = kcc_declarations_via_broker(repo, snap)
     for fid in degrade_reverted_gcloud_remediations(
         findings, kcc_declaration_roots(audit_id, root, record), prebuilt=kcc_prebuilt
     ):
@@ -23587,12 +23805,11 @@ def _add_read_branch_argument(parser: argparse.ArgumentParser) -> None:
     that is the wrong file: the remediation branch already carries a commit,
     possibly a reviewer's, and an edit that starts from the base and is
     committed onto the branch reverts it. The revert fast-forwards, so nothing
-    anywhere objects. Naming the branch is what makes `read`, `list` and `grep`
-    answer with the file as the pull request has it — see Workspace.open in
-    credential_proxy_client.py, which was built for exactly this.
+    anywhere objects. Naming the branch is what makes `fetch`, `list` and
+    `grep` answer with the file as the pull request has it.
 
-    A branch the remote does not have yet is not an error: the broker falls
-    back to the base, which is what a first round wants anyway.
+    A branch the remote does not have yet is not an error: the read falls back
+    to the base (`snapshot_ref`), which is what a first round wants anyway.
     """
     parser.add_argument(
         "--branch",
@@ -23743,7 +23960,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_parser = subparsers.add_parser(
         "list",
-        help="Name the files in the broker's checkout, so a remediation path can be "
+        help="Name the files in a snapshot of the repository, so a remediation path can be "
         "discovered rather than invented (content mode only).",
     )
     list_parser.add_argument("--audit", required=True, help="Audit id.")
@@ -23751,14 +23968,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--prefix",
         default=None,
         metavar="REPO_PATH",
-        help="Restrict the listing to this directory. The broker caps the "
+        help="Restrict the listing to this directory. The listing caps the "
         "number of entries it returns, so a large repository needs one.",
     )
     _add_read_branch_argument(list_parser)
 
     grep_parser = subparsers.add_parser(
         "grep",
-        help="Search inside the files of the broker's checkout, so a remediation "
+        help="Search inside the files of a snapshot of the repository, so a remediation "
         "path can be discovered from what a file says (content mode only).",
     )
     grep_parser.add_argument("--audit", required=True, help="Audit id.")
@@ -23868,8 +24085,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except Exception as exc:  # noqa: BLE001 — one actionable line beats a traceback in cron logs
         if broker_lost(exc):
-            # Any command's own broker calls -- `fetch`, `list` and `grep` open
-            # the content workspace directly -- surface a lost broker raw. The
+            # Any command's own broker calls -- `fetch`, `list` and `grep` take
+            # their snapshots directly -- surface a lost broker raw. The
             # skill promises this line from any command, not from the ones
             # that happen to wrap their calls.
             log(
