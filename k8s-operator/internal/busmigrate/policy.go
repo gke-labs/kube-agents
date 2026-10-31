@@ -7,7 +7,6 @@ import (
 	"maps"
 	"reflect"
 	"slices"
-	"sort"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -39,7 +38,17 @@ type StreamPolicy struct {
 
 // Check lists every field on which cfg differs from the policy, and names a
 // source, mirror or republish, none of which a provisioned stream has.
-// Empty means cfg matches. Subjects compare as a set.
+// Empty means cfg matches.
+//
+// Subjects are a membership test, not equality: every subject cfg names
+// must be, string for string, one of the policy's, and there must be at
+// least one. String-exact, never wildcard coverage: `a2a.>` or
+// `a2a.topics.>` is refused against a policy listing `a2a.topics.x`, since
+// either captures more. Fewer subjects capture less, so a subset is
+// accepted; an install provisioned before a subject was added (TOPICS-STATE
+// before topology-skew, which the provision Job never edits in) restores
+// as it was, and MissingSubjects reports the gap as a warning. An empty
+// list is refused, because the server reads it as the stream's own name.
 func (p StreamPolicy) Check(cfg nats.StreamConfig) []string {
 	var diffs []string
 	field := func(name string, want, got any) {
@@ -48,7 +57,14 @@ func (p StreamPolicy) Check(cfg nats.StreamConfig) []string {
 		}
 	}
 	field("name", p.Name, cfg.Name)
-	field("subjects", sortedCopy(p.Subjects), sortedCopy(cfg.Subjects))
+	if len(cfg.Subjects) == 0 {
+		diffs = append(diffs, "subjects: want some of "+fmt.Sprint(p.Subjects)+", got none, which the server reads as the stream's name")
+	}
+	for _, subject := range cfg.Subjects {
+		if !slices.Contains(p.Subjects, subject) {
+			diffs = append(diffs, fmt.Sprintf("subjects: %q is not one of %v", subject, p.Subjects))
+		}
+	}
 	field("retention", p.Retention, cfg.Retention)
 	field("storage", p.Storage, cfg.Storage)
 	field("max_bytes", p.MaxBytes, cfg.MaxBytes)
@@ -72,13 +88,17 @@ func (p StreamPolicy) Check(cfg nats.StreamConfig) []string {
 	return diffs
 }
 
-func sortedCopy(s []string) []string {
-	c := slices.Clone(s)
-	sort.Strings(c)
-	if c == nil {
-		c = []string{}
+// MissingSubjects names each policy subject cfg lacks: a stream that
+// passes Check but captures less than a fresh install would. A warning,
+// never a refusal.
+func (p StreamPolicy) MissingSubjects(cfg nats.StreamConfig) []string {
+	var missing []string
+	for _, subject := range p.Subjects {
+		if !slices.Contains(cfg.Subjects, subject) {
+			missing = append(missing, fmt.Sprintf("stream %s: subject %s is missing; a fresh install has it", cfg.Name, subject))
+		}
 	}
-	return c
+	return missing
 }
 
 // withoutPolicyFields is cfg with every field a StreamPolicy decides cleared,

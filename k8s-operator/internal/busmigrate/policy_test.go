@@ -117,3 +117,50 @@ func TestDriftOutsideThePolicyIsNamed(t *testing.T) {
 		t.Errorf("unknown stream drift %v", d)
 	}
 }
+
+// Subject membership is string-exact: a wildcard that covers a policy
+// subject is refused, never read as a match, and so is an empty list; a
+// subset passes, with each missing subject named as a warning.
+func TestSubjectsMustBeExactlyAmongThePolicys(t *testing.T) {
+	p := StreamPolicy{Name: "TOPICS-STATE", Subjects: []string{"a2a.topics.x", "a2a.topics.y"}}
+	cfg := func(subjects ...string) nats.StreamConfig {
+		return nats.StreamConfig{Name: "TOPICS-STATE", Subjects: subjects}
+	}
+	subjectDiffs := func(c nats.StreamConfig) []string {
+		var d []string
+		for _, s := range p.Check(c) {
+			if strings.HasPrefix(s, "subjects:") {
+				d = append(d, s)
+			}
+		}
+		return d
+	}
+	for name, c := range map[string]nats.StreamConfig{
+		"a wildcard over the rendered subject": cfg("a2a.topics.>"),
+		"a wider wildcard":                     cfg("a2a.>"),
+		"a token wildcard":                     cfg("a2a.topics.*"),
+		"the full wildcard":                    cfg(">"),
+		"a rendered subject plus a wildcard":   cfg("a2a.topics.x", "a2a.topics.>"),
+		"a rewritten token":                    cfg("a2a.topics.z"),
+		"none":                                 cfg(),
+	} {
+		if len(subjectDiffs(c)) == 0 {
+			t.Errorf("%s (%v) passed the subject check", name, c.Subjects)
+		}
+	}
+	for name, c := range map[string]nats.StreamConfig{
+		"all of them":         cfg("a2a.topics.x", "a2a.topics.y"),
+		"all, another order":  cfg("a2a.topics.y", "a2a.topics.x"),
+		"a subset (narrower)": cfg("a2a.topics.x"),
+	} {
+		if d := subjectDiffs(c); len(d) != 0 {
+			t.Errorf("%s refused: %v", name, d)
+		}
+	}
+	if m := p.MissingSubjects(cfg("a2a.topics.x")); len(m) != 1 || !strings.Contains(m[0], "a2a.topics.y is missing") {
+		t.Errorf("MissingSubjects of a subset = %v", m)
+	}
+	if m := p.MissingSubjects(cfg("a2a.topics.y", "a2a.topics.x")); len(m) != 0 {
+		t.Errorf("MissingSubjects of the full set = %v", m)
+	}
+}
