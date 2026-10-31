@@ -594,3 +594,39 @@ func TestDiscoverThenSendRefusesToPickAmongSeveralDeployments(t *testing.T) {
 	cluster.discoverEntries = two[1:]
 	sendRefuses("after a prune", "beta, gamma")
 }
+
+// A "<namespace>/<alias>" whose namespace equals another kube context's name is still a base name:
+// on a collision it is qualified as "<context>/<namespace>/<alias>", and the bare key stays with
+// the install that holds it, so a selector naming that key never moves.
+func TestACollidingNamespaceAliasIsQualifiedEvenWhenItLooksQualified(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := DeploymentProfile{Name: "prod/pa", KubeContext: "ctx-2", Namespace: "prod", PlatformAgentName: "pa"}
+	if err := store.UpsertDeployments([]DeploymentProfile{first}); err != nil {
+		t.Fatal(err)
+	}
+	second := DeploymentProfile{Name: "prod/pa", KubeContext: "prod", Namespace: "prod", PlatformAgentName: "pa"}
+	if err := store.UpsertDeployments([]DeploymentProfile{second}); err != nil {
+		t.Fatal(err)
+	}
+	saved := store.Snapshot().Deployments
+	if p, ok := saved["prod/pa"]; !ok || p.KubeContext != "ctx-2" {
+		t.Fatalf("the bare key prod/pa: got %+v (present %v); want ctx-2's install", p, ok)
+	}
+	if p, ok := saved["prod/prod/pa"]; !ok || p.KubeContext != "prod" {
+		t.Fatalf("the newcomer from context prod: want key prod/prod/pa, have keys %v", keysOf(saved))
+	}
+	// Connecting to an already-qualified profile keeps its key rather than qualifying it again.
+	got, err := store.MarkDeploymentConnected(saved["prod/prod/pa"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "prod/prod/pa" {
+		t.Fatalf("MarkDeploymentConnected renamed prod/prod/pa to %q", got.Name)
+	}
+	if _, ok := store.Snapshot().Deployments["prod/prod/prod/pa"]; ok {
+		t.Fatalf("MarkDeploymentConnected qualified an already-qualified key twice: %v", keysOf(store.Snapshot().Deployments))
+	}
+}

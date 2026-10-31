@@ -463,12 +463,10 @@ func (s *ConfigStore) resolveDeploymentKeyLocked(p DeploymentProfile, batch []De
 		}
 	}
 	if collides {
-		disambiguated := p.KubeContext
-		if !strings.HasPrefix(baseName, p.KubeContext+"/") {
-			disambiguated = p.KubeContext + "/" + baseName
-		} else {
-			disambiguated = baseName
-		}
+		// Always qualify: a name that merely looks qualified (a "<namespace>/<alias>" whose
+		// namespace matches a kube context's name) must not be read as already qualified, or it
+		// keeps a bare key another install's selector names.
+		disambiguated := p.KubeContext + "/" + baseName
 		// If this deployment was previously stored under bare baseName before the collision
 		// appeared, migrate its key to the disambiguated name.
 		if existingKey == baseName && disambiguated != baseName {
