@@ -280,9 +280,11 @@ Status (amended 9/4, the callout armed; amended 9/8, sessions moved; amended 9/1
 `auth_callout` block, and a principal authenticates one of two ways. **Through the
 callout**, by presenting a projected ServiceAccount token: the bus provisioning Job,
 every spawned session pod, the platform agent container, the capability verifier, and
-(amended 10/28, #3655) the AgentProfile dispatcher when the operator has its image.
+(amended 10/28, #3655) the AgentProfile dispatcher, when the operator has its image
+(`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end).
 The dispatcher's grants name each profile durable it reads on `PROFILE_SUBMITS` and each
-profile it dispatches for; it reconnects when its config adds one. With a dispatcher the
+profile it dispatches for; it reconnects when its config adds one, and tasks it holds keep
+running across the reconnect. With a dispatcher the
 operator principal also creates and deletes those durables, and it is the only principal
 with a consumer verb on that stream. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops

@@ -1,0 +1,231 @@
+{{- if include "kube-agents.a2aDispatcherJobPolicyEnabled" . }}
+# GENERATED from k8s-operator/config/admission/a2a-dispatcher-job-policy.yaml — do not edit by hand; run `make chart-sync`.
+# Rendered where kube-agents.a2aDispatcherJobPolicyEnabled (_helpers.tpl) holds: the
+# admissionPolicy values gate, on Kubernetes >= 1.30. The operator's A2A_DISPATCHER_JOB_POLICY
+# is set from the same helper.
+# Admission control on the Jobs the profile dispatcher creates: one ValidatingAdmissionPolicy and
+# its binding (#3655 PR 6).
+#
+# This file is the source of truth. charts/kube-agents/templates/a2a-dispatcher-job-admission-policy.yaml
+# holds a generated copy (`make chart-sync`, verified by `make chart-check`), and the chart is what
+# the install engine applies. Edit it here. Like a2a-gateway-pod-policy.yaml beside it, it is not in
+# config/default's kustomization, so the manual install path applies it by hand.
+#
+# WHY. The dispatcher runs an unattended profile task as a Job in the profile namespace, so its Role
+# there grants `create` on jobs. RBAC cannot constrain a Job's pod template, so without this policy
+# a compromised dispatcher could run any image under any ServiceAccount in that namespace (another
+# profile's, at another tier), mount anything, schedule anywhere, or run privileged. This policy
+# holds every Job the dispatcher creates to the pod template the operator rendered for its profile.
+#
+# HOW. The operator renders, in `<ns>-profiles`, one DispatchJobTemplate (kubeagents.x-k8s.io) per
+# profile allowing the unattended tier, `kube-agents-dispatch-job-profile-<profile>`, holding the
+# template it gives the dispatcher as the API server defaults it (a server-side dry run of a
+# PodTemplate, so it compares field for field with a Job's defaulted pod template), and one index
+# DispatchJobTemplate, `kube-agents-dispatch-job-index`, whose spec.serviceAccounts lists the
+# ServiceAccounts those templates run as. Both carry the operator's labels, and the binding selects
+# them by those labels in the Job's own namespace. The API server evaluates the policy against every
+# selected param and admits only if every evaluation passes, so:
+#
+#   - against the index: the Job's pod runs as a listed ServiceAccount. A Job with no
+#     ServiceAccount, the namespace default, or one no template runs as is denied.
+#   - against each template: if the Job's pod runs as that template's ServiceAccount, its pod spec
+#     equals the template's exactly, and its pod labels are the template's plus only the ones the
+#     Job controller adds. Exact equality pins every field (images, staging init containers,
+#     volumes, runtimeClassName, resources, securityContext, scheduling) with no list to drift.
+#     Its pod annotations are the template's exactly too.
+#
+# The operator writes a template before listing its ServiceAccount in the index, and unlists it
+# before deleting the template, so the index never names a ServiceAccount whose template is missing.
+# Only the operator writes DispatchJobTemplates: no Role it renders grants the kind, and the
+# built-in admin and edit roles don't aggregate it.
+#
+# WHY A CRD. The API server's param cache for a built-in param kind (a PodTemplate, a ConfigMap)
+# freezes once the last binding using it is deleted and recreated, until the API server restarts
+# (kubernetes/kubernetes#141015, unreleased). A CRD param kind's informer is restarted properly.
+#
+# THE STATIC RULES, for every Job the dispatcher creates, whatever the params say: backoffLimit 0 (a
+# task is never re-run) and no podFailurePolicy (whose Ignore would re-run it anyway), one pod, a
+# deadline and a TTL, a generated selector (a manual one could adopt other pods), not indexed, not
+# suspended; Pod Security "restricted"; and no
+# tolerations but the architecture's, nodeSelector, affinity or priorityClassName, and the default scheduler. These hold
+# even before a template exists. Which ServiceAccount a Job may run as is the index's to say, not a
+# name pattern: a profile may name its own ServiceAccount (spec.identity).
+#
+# WHAT IT DOES NOT COVER — read before citing it as a control:
+#
+#   - It is installed only where the chart renders it (`admissionPolicy.enabled`, Kubernetes >= 1.30).
+#     Elsewhere the dispatcher's Job create is as wide as its Role.
+#   - It selects the requester by ServiceAccount name: any ServiceAccount named `*-a2a-dispatcher`
+#     creating a Job in `<its namespace>-profiles` is held to it. The binding is scoped to
+#     namespaces labelled `app.kubernetes.io/component: profiles` (the label the operator requires
+#     of a profile namespace), because params are resolved before matchConditions: any Job created
+#     in such a namespace while it has no params is denied, whoever creates it. Nothing but the
+#     dispatcher creates Jobs there.
+#   - It constrains Job CREATE only. The dispatcher's Role holds no update or patch on jobs; it
+#     does hold delete, on any Job in its profile namespace, which is the agent's alone.
+#   - No upper bound on the Job's deadline or TTL: the install's task deadline cap is tunable,
+#     and the dispatcher deletes a Job at its task's deadline.
+#   - A mutating webhook that changes a Job's pod template before validation breaks the equality
+#     and denies the Job: closed, but an outage. GKE Autopilot runs one; the operator renders the
+#     template with what it would fill in (every container's cpu, memory and ephemeral-storage,
+#     and the architecture toleration, the one toleration this policy allows), checked live. It
+#     also raises a cpu request that breaks its cpu-to-memory ratio, so on Autopilot such a
+#     profile's Jobs are refused.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-a2a-dispatcher-job
+  labels:
+    app.kubernetes.io/name: kube-agents
+    app.kubernetes.io/part-of: kube-agents
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: kubeagents.x-k8s.io/v1alpha1
+    kind: DispatchJobTemplate
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["jobs"]
+  matchConditions:
+    # The requester is system:serviceaccount:<ns>:<name>-a2a-dispatcher, creating the Job in
+    # <ns>-profiles.
+    - name: is-an-a2a-dispatcher-in-its-profile-namespace
+      expression: >-
+        request.userInfo.username.startsWith('system:serviceaccount:') &&
+        request.userInfo.username.split(':').size() == 4 &&
+        request.userInfo.username.split(':')[3].endsWith('-a2a-dispatcher') &&
+        request.namespace == request.userInfo.username.split(':')[2] + '-profiles'
+  variables:
+    - name: pod
+      expression: "object.spec.template.spec"
+    - name: account
+      expression: "has(object.spec.template.spec.serviceAccountName) ? object.spec.template.spec.serviceAccountName : ''"
+    - name: labels
+      expression: "has(object.spec.template.metadata) && has(object.spec.template.metadata.labels) ? object.spec.template.metadata.labels : {}"
+    - name: isIndex
+      expression: "params.metadata.name == 'kube-agents-dispatch-job-index'"
+    - name: listed
+      expression: >-
+        has(params.spec) && has(params.spec.serviceAccounts) ? params.spec.serviceAccounts : []
+    - name: templateAccount
+      expression: "has(params.spec) && has(params.spec.template) && has(params.spec.template.spec) && has(params.spec.template.spec.serviceAccountName) ? params.spec.template.spec.serviceAccountName : ''"
+    - name: templateLabels
+      expression: "has(params.spec) && has(params.spec.template) && has(params.spec.template.metadata) && has(params.spec.template.metadata.labels) ? params.spec.template.metadata.labels : {}"
+    - name: annotations
+      expression: "has(object.spec.template.metadata) && has(object.spec.template.metadata.annotations) ? object.spec.template.metadata.annotations : {}"
+    - name: templateAnnotations
+      expression: "has(params.spec) && has(params.spec.template) && has(params.spec.template.metadata) && has(params.spec.template.metadata.annotations) ? params.spec.template.metadata.annotations : {}"
+    # The labels the Job controller adds to a Job's pod template.
+    - name: controllerLabels
+      expression: "['batch.kubernetes.io/controller-uid', 'batch.kubernetes.io/job-name', 'controller-uid', 'job-name']"
+  validations:
+    # Against the index: the Job runs as a ServiceAccount some template runs as.
+    - expression: "!variables.isIndex || (variables.account != '' && variables.account in variables.listed)"
+      messageExpression: "'a Job the dispatcher creates must run as a profile ServiceAccount the operator rendered a Job template for, not ' + (variables.account == '' ? 'the namespace default' : variables.account)"
+      reason: Forbidden
+    # Against each template: a Job running as its ServiceAccount is that template, exactly.
+    - expression: "variables.isIndex || variables.account != variables.templateAccount || variables.pod == params.spec.template.spec"
+      messageExpression: "'a Job the dispatcher creates as ' + variables.account + ' must have exactly the pod spec of its operator-rendered template ' + params.metadata.name"
+      reason: Forbidden
+    - expression: >-
+        variables.isIndex || variables.account != variables.templateAccount ||
+        (variables.templateLabels.all(k, k in variables.labels && variables.labels[k] == variables.templateLabels[k]) &&
+         variables.labels.all(k, k in variables.templateLabels || k in variables.controllerLabels))
+      messageExpression: "'a Job the dispatcher creates must carry exactly the pod labels of its template ' + params.metadata.name + ', plus only the ones the Job controller adds'"
+      reason: Forbidden
+    # Annotations reach the kubelet and platform webhooks (AppArmor, sandboxing), so they are
+    # the template's too.
+    - expression: "variables.isIndex || variables.account != variables.templateAccount || variables.annotations == variables.templateAnnotations"
+      messageExpression: "'a Job the dispatcher creates must carry exactly the pod annotations of its template ' + params.metadata.name"
+      reason: Forbidden
+    # The Job's own labels: the dispatcher's marker and every agent label the params carry (all
+    # but the param marker), which are what the operator's teardown selects dispatcher Jobs by,
+    # so it finds every one; and no finalizer to outlive it.
+    - expression: >-
+        has(object.metadata.labels) &&
+        'kubeagents.x-k8s.io/dispatch-job' in object.metadata.labels &&
+        object.metadata.labels['kubeagents.x-k8s.io/dispatch-job'] == 'true' &&
+        has(params.metadata.labels) && 'app.kubernetes.io/instance' in params.metadata.labels &&
+        params.metadata.labels.all(k, k == 'kube-agents.dev/dispatch-job-template' ||
+          (k in object.metadata.labels && object.metadata.labels[k] == params.metadata.labels[k])) &&
+        (!has(object.metadata.finalizers) || size(object.metadata.finalizers) == 0)
+      message: "a Job the dispatcher creates must carry the dispatcher's marker and its agent's labels, and no finalizer"
+      reason: Forbidden
+    # The static rules, for every dispatcher Job.
+    - expression: >-
+        has(object.spec.backoffLimit) && object.spec.backoffLimit == 0 &&
+        (!has(object.spec.parallelism) || object.spec.parallelism == 1) &&
+        (!has(object.spec.completions) || object.spec.completions == 1) &&
+        has(object.spec.activeDeadlineSeconds) && object.spec.activeDeadlineSeconds > 0 &&
+        has(object.spec.ttlSecondsAfterFinished) &&
+        (!has(object.spec.manualSelector) || !object.spec.manualSelector) &&
+        !has(object.spec.podFailurePolicy) &&
+        (!has(object.spec.completionMode) || object.spec.completionMode == 'NonIndexed') &&
+        (!has(object.spec.suspend) || !object.spec.suspend)
+      message: "a Job the dispatcher creates must have backoffLimit 0, one pod, an activeDeadlineSeconds and a ttlSecondsAfterFinished, and no manual selector, podFailurePolicy, indexed completion or suspend"
+      reason: Forbidden
+    - expression: >-
+        (!has(variables.pod.tolerations) || variables.pod.tolerations.all(t,
+          has(t.key) && t.key == 'kubernetes.io/arch' && has(t.effect) && t.effect == 'NoSchedule')) &&
+        !has(variables.pod.nodeSelector) && !has(variables.pod.affinity) &&
+        !has(variables.pod.priorityClassName) &&
+        (!has(variables.pod.schedulerName) || variables.pod.schedulerName == 'default-scheduler')
+      message: "a Job the dispatcher creates may not set tolerations (but the architecture's), a nodeSelector, affinity, a priorityClassName or another scheduler"
+      reason: Forbidden
+    - expression: >-
+        has(variables.pod.automountServiceAccountToken) && variables.pod.automountServiceAccountToken == false &&
+        !(has(variables.pod.hostNetwork) && variables.pod.hostNetwork) &&
+        !(has(variables.pod.hostPID) && variables.pod.hostPID) &&
+        !(has(variables.pod.hostIPC) && variables.pod.hostIPC) &&
+        !has(variables.pod.nodeName) &&
+        has(variables.pod.securityContext) &&
+        has(variables.pod.securityContext.runAsNonRoot) && variables.pod.securityContext.runAsNonRoot &&
+        has(variables.pod.securityContext.seccompProfile) &&
+        variables.pod.securityContext.seccompProfile.type in ['RuntimeDefault', 'Localhost'] &&
+        variables.pod.containers.all(c,
+          has(c.securityContext) &&
+          (!has(c.securityContext.privileged) || !c.securityContext.privileged) &&
+          has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation &&
+          has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) &&
+          'ALL' in c.securityContext.capabilities.drop &&
+          (!has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0)) &&
+        (!has(variables.pod.initContainers) || variables.pod.initContainers.all(c,
+          has(c.securityContext) &&
+          (!has(c.securityContext.privileged) || !c.securityContext.privileged) &&
+          has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation &&
+          has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) &&
+          'ALL' in c.securityContext.capabilities.drop &&
+          (!has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0))) &&
+        (!has(variables.pod.volumes) || variables.pod.volumes.all(v, !has(v.hostPath) && !has(v.secret)))
+      message: "a Job the dispatcher creates must meet Pod Security restricted: no token automount, no host namespaces or nodeName, non-root with seccomp, unprivileged containers and init containers with every capability dropped, and no hostPath or Secret volume"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-a2a-dispatcher-job
+  labels:
+    app.kubernetes.io/name: kube-agents
+    app.kubernetes.io/part-of: kube-agents
+spec:
+  policyName: kube-agents-a2a-dispatcher-job
+  validationActions: ["Deny"]
+  # Profile namespaces only, by the label the operator requires of one (it uses no namespace
+  # without it). The API server finds params before it evaluates matchConditions, so without
+  # this every Job create in a namespace with no params would meet parameterNotFoundAction:
+  # Deny, the operator's own provisioning Jobs included. matchResources is evaluated first.
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        app.kubernetes.io/component: profiles
+  paramRef:
+    # No namespace: the Job's own. Only PodTemplates the operator rendered, by its labels.
+    selector:
+      matchLabels:
+        app.kubernetes.io/managed-by: platformagent-controller
+        kube-agents.dev/dispatch-job-template: "true"
+    parameterNotFoundAction: Deny
+{{- end }}

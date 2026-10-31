@@ -1,0 +1,244 @@
+{
+  "version": "deffb7c04adcc2ce",
+  "namespace": "test-ns",
+  "profileNamespace": "test-ns-profiles",
+  "ceiling": 6,
+  "interactiveReserve": 2,
+  "childReserve": 2,
+  "leaseSeconds": 90,
+  "renewSeconds": 20,
+  "restartGraceSeconds": 60,
+  "acceptTimeoutSeconds": 10,
+  "profiles": [
+    {
+      "name": "tse",
+      "tiers": [
+        "read",
+        "unattended"
+      ],
+      "concurrency": 2,
+      "queueTimeoutSeconds": 3600,
+      "activeDeadlineSeconds": 1800,
+      "durables": [
+        {
+          "tier": "read",
+          "kind": "top",
+          "name": "profile-tse-read-top"
+        },
+        {
+          "tier": "read",
+          "kind": "child",
+          "name": "profile-tse-read-child"
+        },
+        {
+          "tier": "unattended",
+          "kind": "top",
+          "name": "profile-tse-unattended-top"
+        },
+        {
+          "tier": "unattended",
+          "kind": "child",
+          "name": "profile-tse-unattended-child"
+        }
+      ],
+      "jobTemplate": {
+        "metadata": {
+          "labels": {
+            "kubeagents.x-k8s.io/a2a-component": "agentprofile-worker",
+            "kubeagents.x-k8s.io/agentprofile": "tse",
+            "kubeagents.x-k8s.io/agentprofile-tier": "unattended"
+          }
+        },
+        "spec": {
+          "volumes": [
+            {
+              "name": "scratch",
+              "emptyDir": {
+                "sizeLimit": "2Gi"
+              }
+            },
+            {
+              "name": "task-token",
+              "emptyDir": {
+                "medium": "Memory",
+                "sizeLimit": "1Mi"
+              }
+            },
+            {
+              "name": "a2a-bus-token",
+              "projected": {
+                "sources": [
+                  {
+                    "serviceAccountToken": {
+                      "audience": "a2a-bus",
+                      "expirationSeconds": 3600,
+                      "path": "token"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "name": "broker-token",
+              "projected": {
+                "sources": [
+                  {
+                    "serviceAccountToken": {
+                      "audience": "kubeagents-credential-proxy-profile",
+                      "expirationSeconds": 3600,
+                      "path": "token"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "name": "a2a-nats-ca",
+              "configMap": {
+                "name": "test-agent-a2a-nats-ca-bundle"
+              }
+            },
+            {
+              "name": "persona",
+              "emptyDir": {
+                "sizeLimit": "512Mi"
+              }
+            }
+          ],
+          "initContainers": [
+            {
+              "name": "stage-persona",
+              "image": "registry.example/persona-cluster:1",
+              "command": [
+                "/bin/sh",
+                "-c",
+                "set -e\nsrc=/files\ndst=\"/persona\"\n[ -d \"$src\" ] || { echo \"image has no $src directory; a persona or tools image keeps its payload there\" \u003e\u00262; exit 1; }\nfor item in \"$src\"/* \"$src\"/.[!.]* \"$src\"/..?*; do\n  [ -e \"$item\" ] || [ -L \"$item\" ] || continue\n  cp -a \"$item\" \"$dst\"/\ndone\n[ -n \"$(ls -A \"$dst\")\" ] || { echo \"$src is empty\" \u003e\u00262; exit 1; }"
+              ],
+              "resources": {
+                "limits": {
+                  "cpu": "500m",
+                  "ephemeral-storage": "576Mi",
+                  "memory": "128Mi"
+                },
+                "requests": {
+                  "cpu": "50m",
+                  "ephemeral-storage": "576Mi",
+                  "memory": "64Mi"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "name": "persona",
+                  "mountPath": "/persona"
+                }
+              ],
+              "imagePullPolicy": "IfNotPresent",
+              "securityContext": {
+                "capabilities": {
+                  "drop": [
+                    "ALL"
+                  ]
+                },
+                "readOnlyRootFilesystem": true,
+                "allowPrivilegeEscalation": false
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "worker",
+              "image": "ghcr.io/gke-labs/kube-agents/platform-agent:latest",
+              "env": [
+                {
+                  "name": "PROFILE_WORKER_ONE_SHOT",
+                  "value": "1"
+                },
+                {
+                  "name": "POD_NAME",
+                  "valueFrom": {
+                    "fieldRef": {
+                      "fieldPath": "metadata.name"
+                    }
+                  }
+                },
+                {
+                  "name": "POD_UID",
+                  "valueFrom": {
+                    "fieldRef": {
+                      "fieldPath": "metadata.uid"
+                    }
+                  }
+                }
+              ],
+              "resources": {
+                "limits": {
+                  "cpu": "1",
+                  "ephemeral-storage": "1Gi",
+                  "memory": "2Gi"
+                },
+                "requests": {
+                  "cpu": "250m",
+                  "ephemeral-storage": "1Gi",
+                  "memory": "512Mi"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "name": "scratch",
+                  "mountPath": "/workspace"
+                },
+                {
+                  "name": "task-token",
+                  "mountPath": "/run/task-token"
+                },
+                {
+                  "name": "a2a-nats-ca",
+                  "readOnly": true,
+                  "mountPath": "/etc/a2a-nats-ca"
+                },
+                {
+                  "name": "persona",
+                  "readOnly": true,
+                  "mountPath": "/persona"
+                }
+              ],
+              "securityContext": {
+                "capabilities": {
+                  "drop": [
+                    "ALL"
+                  ]
+                },
+                "allowPrivilegeEscalation": false
+              }
+            }
+          ],
+          "restartPolicy": "Never",
+          "serviceAccountName": "agentprofile-tse-unattended",
+          "automountServiceAccountToken": false,
+          "securityContext": {
+            "runAsNonRoot": true,
+            "seccompProfile": {
+              "type": "RuntimeDefault"
+            }
+          },
+          "tolerations": [
+            {
+              "key": "kubernetes.io/arch",
+              "operator": "Equal",
+              "value": "amd64",
+              "effect": "NoSchedule"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "jobLabels": {
+    "app.kubernetes.io/instance": "test-ns-test-agent",
+    "app.kubernetes.io/managed-by": "platformagent-controller",
+    "app.kubernetes.io/name": "platform-agent",
+    "app.kubernetes.io/part-of": "a2a-next",
+    "kubeagents.x-k8s.io/a2a-component": "dispatcher",
+    "kubeagents.x-k8s.io/dispatch-job": "true"
+  }
+}

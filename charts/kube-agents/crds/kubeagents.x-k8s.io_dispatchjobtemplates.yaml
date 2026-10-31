@@ -1,0 +1,69 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: dispatchjobtemplates.kubeagents.x-k8s.io
+spec:
+  group: kubeagents.x-k8s.io
+  names:
+    kind: DispatchJobTemplate
+    listKind: DispatchJobTemplateList
+    plural: dispatchjobtemplates
+    singular: dispatchjobtemplate
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: |-
+            DispatchJobTemplate holds what the dispatcher's Jobs in a profile namespace
+            are held to: a profile's Job template, or (the index) the accounts they run
+            as. A CRD rather than a core PodTemplate because the API server's param
+            cache for a built-in kind freezes once its last binding is deleted and
+            recreated (kubernetes/kubernetes#141015), and a CRD kind's does not.
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: |-
+                DispatchJobTemplateSpec is one param of the dispatcher Job admission
+                policy (config/admission/a2a-dispatcher-job-policy.yaml). The operator
+                alone writes these, in the profile namespace; they are not for hand
+                editing.
+              properties:
+                serviceAccounts:
+                  description: |-
+                    ServiceAccounts, on the index only, are the accounts the templates run
+                    as: a dispatcher Job must run as one of them.
+                  items:
+                    type: string
+                  type: array
+                template:
+                  description: |-
+                    Template is the pod template an unattended profile's Jobs must equal
+                    exactly: the operator's rendering, as the API server defaults it (a
+                    server-side dry run of a PodTemplate), so it compares field for field
+                    with a Job's defaulted pod template. Absent on the index.
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+              type: object
+          type: object
+      served: true
+      storage: true

@@ -25,6 +25,18 @@ import (
 // ProfileLeaseBucket is the KV bucket the leases live in.
 const ProfileLeaseBucket = "PROFILE_LEASES"
 
+// ProfileSubmitRetention is how long ProfileSubmitStream keeps a
+// submission, acked or not: it mirrors the operator's `--max-age=72h` on
+// PROFILE_SUBMITS (a limits-retention stream). A durable re-created with
+// DeliverAll replays everything inside it, so the dispatcher keeps a
+// finished task's tombstone (LeaseRecord.FinishedAt) at least this long.
+const ProfileSubmitRetention = 72 * time.Hour
+
+// ProfileLeaseRefusedPod is the pod token of the tombstone the dispatcher
+// writes for a submission it refused at admission, which no pod ever held.
+// It is not a DNS label, so it can't be a pod's name.
+const ProfileLeaseRefusedPod = "_refused"
+
 // DispatchSubject is where the dispatcher hands a task to one worker pod of
 // a (profile, tier) pool.
 func DispatchSubject(profile, tier, pod string) string {
@@ -182,8 +194,8 @@ type LeaseRenewal struct {
 	TaskID string `json:"taskId"`
 	// Final says the worker has published the task's terminal on .events.
 	// The dispatcher has no read on .events, so this is how it learns the
-	// task ended: it releases the slot, acks the submission and deletes the
-	// lease at once, rather than holding the slot for a lease and then
+	// task ended: it releases the slot, acks the submission and turns the
+	// lease into a tombstone at once, rather than holding the slot for a lease and then
 	// failing a task that finished. (A worker that dies between the two
 	// still gets a lease-expired terminal, which the fold drops as a write
 	// after the final event.)
@@ -218,13 +230,47 @@ type LeaseRecord struct {
 	Deadline     time.Time `json:"deadline"`
 	LeaseSeconds int       `json:"leaseSeconds"`
 	RenewSeconds int       `json:"renewSeconds"`
+	// FinishedAt, set, makes the record a tombstone: the task ended (its
+	// final renewal came, or the dispatcher wrote its terminal: failed, or
+	// rejected at admission) at this time. A submission stream keeps acked
+	// submissions for ProfileSubmitRetention, so a durable re-created with
+	// DeliverAll replays finished tasks; the tombstone, kept under the same
+	// key at least that long, is how the dispatcher knows a replay is one
+	// and acks it without running or failing it again. A tombstone holds no
+	// worker and is never re-adopted or renewed.
+	FinishedAt time.Time `json:"finishedAt,omitzero"`
 }
+
+// Finished reports whether the record is a tombstone.
+func (l LeaseRecord) Finished() bool { return !l.FinishedAt.IsZero() }
 
 // Expired reports whether the lease has run out at now, given grace on
 // top of ExpiresAt (zero in steady state; the restart grace while a
-// restarted dispatcher re-adopts).
+// restarted dispatcher re-adopts). A tombstone is expired at every time,
+// whatever its ExpiresAt says: its task is over, so it keeps no pod busy
+// and is never re-adopted. Expired is never how a tombstone is told from a
+// running lease (an expired running lease is still a task to fail); that
+// is Finished.
 func (l LeaseRecord) Expired(now time.Time, grace time.Duration) bool {
+	if l.Finished() {
+		return true
+	}
 	return now.After(l.ExpiresAt.Add(grace))
+}
+
+// Validate reports the first way l can't be written, or nil: every record
+// names its task and its pod (a tombstone of a refusal, its
+// ProfileLeaseRefusedPod), and a running lease has an expiry.
+func (l LeaseRecord) Validate() error {
+	switch {
+	case !ValidSubjectToken(l.TaskID):
+		return fmt.Errorf("lease record: task id %q is not one subject token", l.TaskID)
+	case !ValidSubjectToken(l.Pod) && !(l.Finished() && l.Pod == ProfileLeaseRefusedPod):
+		return fmt.Errorf("lease record for %s: pod %q is not one subject token", l.TaskID, l.Pod)
+	case !l.Finished() && l.ExpiresAt.IsZero():
+		return fmt.Errorf("lease record for %s: a running lease needs an expiry", l.TaskID)
+	}
+	return nil
 }
 
 // DispatchConfigKey is the key in the operator-rendered dispatch ConfigMap
@@ -271,6 +317,23 @@ type DispatchConfig struct {
 	RenewSeconds         int `json:"renewSeconds"`
 	RestartGraceSeconds  int `json:"restartGraceSeconds"`
 	AcceptTimeoutSeconds int `json:"acceptTimeoutSeconds"`
+	// BreakerThreshold lease expiries in a row on one (profile, tier) open
+	// its breaker, which holds new submissions there queued for
+	// BreakerCooldownSeconds. 0 takes the dispatcher's defaults (3 and 300).
+	BreakerThreshold       int `json:"breakerThreshold,omitempty"`
+	BreakerCooldownSeconds int `json:"breakerCooldownSeconds,omitempty"`
+	// JobStartSeconds is how long an unattended task's Job may take to have
+	// a Ready worker pod before the task is rejected no-worker. 0 takes the
+	// dispatcher's default (300).
+	JobStartSeconds int `json:"jobStartSeconds,omitempty"`
+	// StopGraceSeconds is how long a running task's executor has to stop on
+	// its own after a stop record (contract addendum 9) before the
+	// dispatcher ends it. 0 takes the dispatcher's default (30).
+	StopGraceSeconds int `json:"stopGraceSeconds,omitempty"`
+	// JobLabels go on every Job the dispatcher creates: the operator's
+	// agent labels, by which a teardown deletes only this install's Jobs,
+	// and DispatchJobLabel. Set when some profile has a JobTemplate.
+	JobLabels map[string]string `json:"jobLabels,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
 	// identity. A profile absent here has no durables to read.
 	Profiles []DispatchProfile `json:"profiles"`
@@ -288,7 +351,17 @@ type DispatchProfile struct {
 	// Durables are the shared durables the operator created for it, one
 	// per (tier, kind).
 	Durables []DispatchDurable `json:"durables"`
+	// JobTemplate is the pod template (a core/v1 PodTemplateSpec) the
+	// profile's unattended tasks run on as Jobs, rendered by the operator
+	// only where the chart installed the Job admission policy, which holds
+	// each Job to it exactly. The dispatcher uses it as it is. Absent, the
+	// profile's unattended tasks run on the warm pool.
+	JobTemplate json.RawMessage `json:"jobTemplate,omitempty"`
 }
+
+// DispatchJobLabel marks a Job the dispatcher created (the operator's
+// dispatchJobLabel).
+const DispatchJobLabel = "kubeagents.x-k8s.io/dispatch-job"
 
 // DispatchDurable names one shared durable on ProfileSubmitStream.
 type DispatchDurable struct {
@@ -312,6 +385,10 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: lease %ds must be at least three renewals of %ds", c.LeaseSeconds, c.RenewSeconds)
 	case c.RestartGraceSeconds < 2*c.RenewSeconds:
 		return fmt.Errorf("dispatch config: restart grace %ds must be at least two renewals of %ds", c.RestartGraceSeconds, c.RenewSeconds)
+	case c.JobStartSeconds < 0 || c.StopGraceSeconds < 0:
+		return fmt.Errorf("dispatch config: job start %ds and stop grace %ds may not be negative", c.JobStartSeconds, c.StopGraceSeconds)
+	case c.BreakerThreshold < 0 || c.BreakerCooldownSeconds < 0:
+		return fmt.Errorf("dispatch config: breaker threshold %d and cooldown %ds may not be negative", c.BreakerThreshold, c.BreakerCooldownSeconds)
 	case c.AcceptTimeoutSeconds <= 0:
 		return fmt.Errorf("dispatch config: acceptTimeoutSeconds %d", c.AcceptTimeoutSeconds)
 	}

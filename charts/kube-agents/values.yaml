@@ -15,7 +15,10 @@
 #
 # The same value installs templates/a2a-gateway-pod-admission-policy.yaml, which
 # holds the pods the A2A gateway creates to the session pod shape, and sets
-# A2A_GATEWAY_POD_POLICY=true on the operator; turning it off removes both.
+# A2A_GATEWAY_POD_POLICY=true on the operator; turning it off removes both. Likewise
+# templates/a2a-dispatcher-job-admission-policy.yaml, which holds the Jobs the A2A
+# dispatcher creates to the operator-rendered template, and A2A_DISPATCHER_JOB_POLICY=true,
+# without which the operator runs no dispatcher Job mode.
 #
 # What the policies do and do not enforce is in the header of
 # templates/agent-rbac-admission-policy.yaml. Read it before relying on them:

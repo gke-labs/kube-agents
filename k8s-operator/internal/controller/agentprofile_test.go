@@ -1671,3 +1671,36 @@ func TestAFailedDurableSyncDropsTheBusConnection(t *testing.T) {
 		t.Errorf("after the reconnect the durables = %+v, want read top and child", got)
 	}
 }
+
+// Dropping the unattended tier deletes the profile's unattended
+// ServiceAccount, and keeps its read one. The dispatcher Job policy's params
+// can be frozen by an upstream bug (kubernetes/kubernetes#141015); an index
+// frozen with the dropped account in it then admits a Job as an account that
+// no longer exists, which can't run.
+func TestDroppingTheUnattendedTierDeletesItsServiceAccount(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
+	})
+	h := newProfileHarness(t, agent, &p)
+	h.reconcile(agent.Namespace, "auditor")
+	pns := profileNamespaceName(agent)
+	for _, sa := range []string{"agentprofile-auditor-read", "agentprofile-auditor-unattended"} {
+		if _, ok := h.serviceAccount(pns, sa); !ok {
+			t.Fatalf("precondition: %s not created", sa)
+		}
+	}
+	live := h.profile(agent.Namespace, "auditor")
+	live.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	if err := h.c.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile(agent.Namespace, "auditor")
+	if _, ok := h.serviceAccount(pns, "agentprofile-auditor-unattended"); ok {
+		t.Error("the unattended ServiceAccount outlived the profile's unattended tier")
+	}
+	if _, ok := h.serviceAccount(pns, "agentprofile-auditor-read"); !ok {
+		t.Error("dropping the unattended tier deleted the read ServiceAccount")
+	}
+}
