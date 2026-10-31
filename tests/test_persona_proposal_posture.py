@@ -45,6 +45,18 @@ PROACTIVE_SCOPE = "what you observe on your own"
 WRITE_PATH_DEFERS = "under §3's rule"
 # The skill's own refusal, beside its other "when not to use".
 SKILL_REFUSAL = "Answering a request that asked for a diagnosis, not a change."
+# A platform worker on a "propose a remediation manifest" card opened the pull
+# request after kanban_complete, acting on its own [next: ...] line (#2610).
+CARD_PROPOSE_IN_RESULT = "only a card that asks for a change (open a pull request, submit, fix or install it) authorises one"
+NEXT_LINE_NOT_YOURS = "is the requester's to send, never yours to carry out, before or after `kanban_complete`"
+# The line a card filed for a request that asked for no change ends with.
+PROPOSE_ONLY_LINE = "Propose only: put the fix in result; do not open a pull request."
+# The skill's description opens on when it applies, and names the case it is not for.
+SKILL_DESCRIPTION_LEAD = "description: Open a pull request (a merge request on GitLab) when the request asked for one"
+SKILL_DESCRIPTION_NOT_PROPOSE = 'not for a request to "propose a manifest"'
+# The report-format stanza every card body carries: the step line is the requester's.
+REPORT_FORMAT = REPO_ROOT / "deploy/docker/patches/kanban_report_format.py"
+NEXT_STEP_NOT_ACTED_ON = "never act on it yourself"
 
 
 def _read(path: Path) -> str:
@@ -98,6 +110,29 @@ class PlatformPersonaProposesInTheReply(unittest.TestCase):
         skill = _read(SUBMIT_SKILL)
         when_not = skill.index("## When NOT to Use")
         self.assertIn(SKILL_REFUSAL, skill[when_not:], "submit-suggestion's 'When NOT to Use' lost the diagnostic-request bullet")
+
+    def test_a_propose_card_and_its_own_next_line_do_not_authorise_a_pull_request(self):
+        soul = _read(PLATFORM_SOUL)
+        rule = soul[soul.index(RULE_LEAD) : soul.index("\n4.  **", soul.index(RULE_LEAD))]
+        for phrase in (CARD_PROPOSE_IN_RESULT, NEXT_LINE_NOT_YOURS):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, rule, f"§3 item 3 lost {phrase!r}")
+
+    def test_a_card_for_a_request_that_asked_no_change_says_propose_only(self):
+        for path in (PLATFORM_SOUL, REPO_ROOT / "agents/platform/AGENTS.md", REPO_ROOT / "agents/chat/SOUL.md"):
+            with self.subTest(path=path.relative_to(REPO_ROOT)):
+                self.assertIn(PROPOSE_ONLY_LINE, _read(path))
+
+    def test_the_skill_description_opens_on_a_request_that_asked_for_a_pull_request(self):
+        skill = _read(SUBMIT_SKILL)
+        description = next(line for line in skill.splitlines() if line.startswith("description:"))
+        self.assertTrue(description.startswith(SKILL_DESCRIPTION_LEAD), description[:120])
+        self.assertIn(SKILL_DESCRIPTION_NOT_PROPOSE, description)
+
+    def test_the_report_format_keeps_the_offer_and_says_not_to_act_on_it(self):
+        text = _read(REPORT_FORMAT)
+        self.assertIn("[next: upgrade plan for seeded-c]", text, "the step line itself is kept")
+        self.assertIn(NEXT_STEP_NOT_ACTED_ON, text)
 
     def test_the_unattended_carve_out_names_finish_not_the_remediate_subcommand(self):
         # fleet-audit's scheduled run promotes findings into pull requests in

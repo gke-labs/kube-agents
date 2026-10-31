@@ -1091,6 +1091,42 @@ class ReadOnlyMintTest(unittest.TestCase):
         self.assertEqual("owner/repo1\nowner/repo2\n", out.getvalue())
 
 
+class SweepMintTest(unittest.TestCase):
+    """`--sweep`: one managed repository, the sweep scope, straight to Minty, nothing installed."""
+
+    def test_mint_sweep_token_asks_for_the_sweep_scope_for_one_repository(self):
+        with patch("github_token_refresh.broker_oidc_token", return_value="oidc"), \
+                patch("github_token_refresh.request_minty_token", return_value="fake-sweep-token") as minty, \
+                patch("gitops_workspace.get_managed_github_repos") as get_managed_github_repos, \
+                patch("github_token_refresh.subprocess.run") as run:
+            token = github_token_refresh.mint_sweep_token("acme/gitops")
+        self.assertEqual("fake-sweep-token", token)
+        minty.assert_called_once_with("oidc", "acme", ["gitops"], "platform-agent-sweep-scope")
+        self.assertEqual("platform-agent-sweep-scope", github_token_refresh.MINTY_SWEEP_SCOPE)
+        # Per repository, never widened to the managed list, and nothing installed.
+        get_managed_github_repos.assert_not_called()
+        run.assert_not_called()
+
+    def test_mint_sweep_token_refuses_anything_that_is_not_an_owner_slash_repo(self):
+        with patch("github_token_refresh.request_minty_token") as minty:
+            for repository in (None, "", "owner", "owner/repo/extra"):
+                with self.subTest(repository=repository):
+                    with self.assertRaises(RuntimeError):
+                        github_token_refresh.mint_sweep_token(repository)
+        minty.assert_not_called()
+
+    def test_main_sweep_flag_prints_the_bare_token(self):
+        out = io.StringIO()
+        with patch("github_token_refresh.mint_sweep_token", return_value="fake-sweep-token") as mint, \
+                patch("github_token_refresh.mint_read_only_token") as read_only:
+            with patch.object(sys, "argv", ["github_token_refresh.py", "--sweep", "acme/gitops"]):
+                with patch("sys.stdout", out):
+                    main()
+        self.assertEqual("fake-sweep-token", out.getvalue())
+        mint.assert_called_once_with("acme/gitops")
+        read_only.assert_not_called()
+
+
 class MetadataIdentityTest(unittest.TestCase):
     """The identity token comes from the metadata server directly; gcloud is the fallback."""
 

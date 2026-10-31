@@ -13,7 +13,10 @@
 #      VERSIONS for destruction, so even an imported key cannot encrypt and the
 #      cluster refuses to come back. `destroy` forgets them from state first so
 #      Terraform never touches them; `adopt-kms` imports them back and restores
-#      any version a bare `terraform destroy` already scheduled.
+#      any version a bare `terraform destroy` already scheduled. The key's grant
+#      to the GKE service agent is forgotten with them: the installs in the
+#      project that use the same key (same names, same region) share that one
+#      grant, so destroying it would cut off the other clusters.
 #   2. The PlatformAgent CR carries a finalizer only the operator can clear, and
 #      `terraform destroy` removes the CR and the operator together. The chart's
 #      pre-delete hook handles the ordinary case; this deletes the CR up front so
@@ -160,7 +163,7 @@ readonly CLUSTER_ADDRESSES
 # The cluster's CMEK resources, every one of which the gke-cluster module
 # manages only alongside a cluster it creates. The ring and the key are named
 # on their own because adopt_kms imports them and guard_kms_identity reads
-# them; the other two ride along in the list.
+# them; the other two ride along in the list (forget_kms says why).
 readonly CLUSTER_KMS_KEYRING_ADDRESS="module.gke_cluster.google_kms_key_ring.gke_keyring[0]"
 readonly CLUSTER_KMS_KEY_ADDRESS="module.gke_cluster.google_kms_crypto_key.gke_key[0]"
 CLUSTER_KMS_ADDRESSES=(
@@ -1498,20 +1501,24 @@ disable_deletion_protection() {
 # resource still schedules every version for destruction — leaving a key that
 # exists and cannot encrypt. Forgetting these before the destroy is what keeps
 # them genuinely untouched, so the next apply adopts a working key rather than a
-# hollow one. They are re-imported by adopt-kms.
+# hollow one. They are re-imported by adopt-kms. The key's grant to the GKE
+# service agent is forgotten too: the installs in the project that use the same
+# key use it through that one grant, and destroying it would cut off their
+# clusters. A grant left on a key that stays costs nothing. The agent's identity
+# rides along with it; its destroy does nothing in GCP. The next apply puts both
+# back in state with no import.
 forget_kms() {
   load_state
   local address
   for address in \
-    "$CLUSTER_KMS_KEY_ADDRESS" \
-    "$CLUSTER_KMS_KEYRING_ADDRESS" \
+    "${CLUSTER_KMS_ADDRESSES[@]}" \
     "$MINTER_KMS_KEY_ADDRESS" \
     "$MINTER_KMS_KEYRING_ADDRESS"; do
     in_state "$address" || continue
-    log "forgetting $address (kept in GCP; re-adopted on the next apply)"
+    log "forgetting $address (kept in GCP; back in state after the next apply)"
     state_changed
     terraform state rm "$address" >/dev/null 2>&1 ||
-      warn "could not forget $address; its key versions may be scheduled for destruction"
+      warn "could not forget $address; the destroy may act on it in GCP (a key's versions are scheduled for destruction; the key's grant is revoked for the other clusters that use the key)"
   done
 }
 
@@ -1701,13 +1708,16 @@ case "${1:-}" in
     # since destroy prints every release value going to null.
     terraform destroy -var="deletion_protection=false" "$@" | redact_helm_release_metadata
     log "done. The KMS key rings remain in the project by design — GCP cannot"
-    log "delete them. The next 'lifecycle.sh apply' adopts them automatically."
+    log "delete them — and so does the cluster key's grant to the GKE service"
+    log "agent when this install made it, which other installs that use the key"
+    log "need. The next 'lifecycle.sh apply' adopts the key rings and puts the"
+    log "grant back in state."
     ;;
   *)
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,84p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,87p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

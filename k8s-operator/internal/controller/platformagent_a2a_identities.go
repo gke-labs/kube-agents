@@ -571,7 +571,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		// a2aJetStreamSurfaceRationale above: $JS.API.> would let this
 		// principal create a
 		// consumer that delivers TASKS into its own inbox, and delete any
-		// stream on the bus. It provisions - it creates the four streams
+		// stream on the bus. It provisions - it creates the five streams
 		// and five buckets, idempotently, with an info-then-add - so it
 		// needs CREATE and INFO on exactly those and nothing else. A KV
 		// bucket is a stream named KV_<bucket>, which is why those appear

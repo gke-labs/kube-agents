@@ -320,6 +320,7 @@ PERSONA_SKILL_GROUPS: tuple[tuple[str, Path], ...] = (
 
 CRON_CADENCE = {
     "40 5 * * *": "Daily 05:40",
+    "50 5 * * *": "Daily 05:50",
     "20 6 * * *": "Daily 06:20",
     "50 6 * * *": "Daily 06:50",
     "50 8 * * *": "Daily 08:50",

@@ -114,6 +114,11 @@ const (
 	minterReadScope         = "platform-agent-read-scope"
 	minterScopeField        = "scope"
 	minterRepositoriesField = "repositories"
+	// minterSweepScope reads contents, pull requests and issues for a managed
+	// repository. renderRepoPolicy carries it over from default.yaml with the
+	// write scope; renderReadOnlyPolicy keeps minterReadScope alone, so a
+	// context repository's policy never carries it.
+	minterSweepScope = "platform-agent-sweep-scope"
 
 	// metadataLinkLocalIP is the address a workload dials for GCP metadata and Workload
 	// Identity tokens. It is only ever the pre-DNAT destination.
@@ -354,6 +359,19 @@ const (
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
+	// credentialBrokerDownMessageSuffix follows the Provisioning message
+	// while the credential broker is the workload (or one of them) with no
+	// ready replica: an eviction, a drain or a Recreate rollout of its one
+	// pod. The workload's name alone says what to describe, not what the
+	// install is doing meanwhile, and that is what the reader watching a
+	// silent chat needs. Brokered commands are the shell's kubectl, git, gh
+	// and gcloud, every one of which dials the broker's Service. The Chat
+	// clause is added only where googleChatEnabled: the A2A gateway pulls
+	// Chat through the broker's relay and the messages wait in Pub/Sub,
+	// whereas Slack on a next install is the gateway's own socket, and an
+	// install with no Chat has no such queue to name.
+	credentialBrokerDownMessageSuffix     = "; while the credential broker is away, brokered commands fail" // #nosec G101 -- Condition message, not a credential
+	credentialBrokerDownChatMessageSuffix = " and Google Chat messages wait in Pub/Sub"                     // #nosec G101 -- Condition message, not a credential
 	// conditionReasonInvalidCredentialProxyResources: the CR's
 	// spec.deployment.credentialProxy.resources fails
 	// ValidateCredentialProxyResources, so the override is ignored and the
@@ -422,6 +440,7 @@ type PlatformAgentReconciler struct {
 	prunedUsageStatus sync.Map
 	// prunedNewerFields records, per CR (usagePollKey) and per newer
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
+	// the proposal readings as one (usageNewerFieldReadings),
 	// lastHumanActiveTime, and each counter after the first schema by its
 	// name -- the last poll in which the usage counters poller wrote the field
 	// and it came back absent: a served CRD at a previous schema, which has
@@ -3055,6 +3074,9 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 		return err
 	}
 	objs = append(objs, proxy)
+	// The budget after the Deployment whose pods it selects, as the callout's
+	// and the verifier's are.
+	objs = append(objs, buildCredentialProxyPDB(agent))
 	objs = append(objs, withCredentialProxyProfilePeer(credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace), agent, profiles))
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
@@ -3063,6 +3085,14 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 		apply := r.applyManaged
 		if _, isDeployment := obj.(*appsv1.Deployment); isDeployment {
 			apply = r.applyCredentialProxyDeployment
+		}
+		// A hand-set minAvailable on the budget would make every apply merge
+		// to both fields and be refused, failing this step and the
+		// NetworkPolicy after it on every pass; the clear is the callout's.
+		if pdb, isPDB := obj.(*policyv1.PodDisruptionBudget); isPDB {
+			if err := r.clearForeignPDBBudgetField(ctx, pdb); err != nil {
+				return err
+			}
 		}
 		if err := apply(ctx, agent, obj); err != nil {
 			return fmt.Errorf("failed to apply credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
@@ -4307,9 +4337,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		return "", errSplit
 	}
 	notReady := make([]string, 0, len(splitWorkloads))
+	brokerNotReady := false
 	for _, w := range splitWorkloads {
 		if w.ready == 0 {
 			notReady = append(notReady, fmt.Sprintf("%s %s", w.kind, w.name))
+			if w.name == credentialBrokerName(agent) {
+				brokerNotReady = true
+			}
 		}
 	}
 
@@ -4346,6 +4380,12 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			// generic "waiting for replicas" message would point at the one
 			// workload that is fine. Say which of the other two is missing.
 			condMsg = fmt.Sprintf("Waiting for %s to become ready", strings.Join(notReady, " and "))
+			if brokerNotReady {
+				condMsg += credentialBrokerDownMessageSuffix
+				if googleChatEnabled(agent) {
+					condMsg += credentialBrokerDownChatMessageSuffix
+				}
+			}
 		}
 	}
 
