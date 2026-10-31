@@ -26,6 +26,7 @@ import (
 	"net"
 	"path"
 	"reflect"
+	"regexp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"slices"
@@ -8148,5 +8149,82 @@ func TestTheGatewayAlwaysArmsTheConsoleDoor(t *testing.T) {
 				t.Errorf("the render asks for %d replicas, want 1", *dep.Spec.Replicas)
 			}
 		})
+	}
+}
+
+// a2aJetStreamCapMargin is the store room the provisioned caps must leave
+// unreserved (#4476). NATS reserves every stream's and bucket's max_bytes against
+// max_file_store when it creates the stream and refuses a create past it, so
+// this is the room a new stream, a raised cap or a recreate has before
+// provisioning starts failing with "insufficient storage".
+const a2aJetStreamCapMargin = int64(2) << 30
+
+// TestProvisionedJetStreamCapsFitTheStore holds the provision script's byte caps,
+// summed, under the server's max_file_store less a2aJetStreamCapMargin (#4476).
+// Every create must carry a cap: one without reserves nothing, and then grows
+// into the room every other stream's reservation counted on.
+func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
+	agent := a2aTestAgent()
+	// One logical line per command: the creates are wrapped with `\` continuations.
+	script := strings.ReplaceAll(a2aProvisionScript(agent), "\\\n", " ")
+
+	caps := map[string]int64{}
+	for _, line := range strings.Split(script, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		for _, verb := range []string{"stream add ", "kv add "} {
+			idx := strings.Index(line, verb)
+			if idx < 0 {
+				continue
+			}
+			fields := strings.Fields(line[idx+len(verb):])
+			name, flag := fields[0], "--max-bytes="
+			if verb == "kv add " {
+				name, flag = "KV_"+name, "--max-bucket-size="
+			}
+			var found bool
+			for _, f := range fields[1:] {
+				if v, ok := strings.CutPrefix(f, flag); ok {
+					n, err := strconv.ParseInt(v, 10, 64)
+					if err != nil || n <= 0 {
+						t.Fatalf("%s: %s%s is not a positive byte count", name, flag, v)
+					}
+					caps[name], found = n, true
+				}
+			}
+			if !found {
+				t.Errorf("%s is created without %s: it reserves nothing, and grows into the room the other caps count on", name, flag)
+			}
+		}
+	}
+	// Not vacuous: every provisioned stream and bucket was found and counted.
+	for _, s := range a2aProvisionedStreams {
+		if _, ok := caps[s]; !ok {
+			t.Errorf("no capped create found for %s; the sum below would leave it out", s)
+		}
+	}
+
+	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+	m := regexp.MustCompile(`(?m)^\s*max_file_store:\s*(\d+)\s*$`).FindStringSubmatch(conf)
+	if m == nil {
+		t.Fatal("nats.conf renders no max_file_store")
+	}
+	store, _ := strconv.ParseInt(m[1], 10, 64)
+
+	var sum int64
+	names := make([]string, 0, len(caps))
+	for name, n := range caps {
+		sum += n
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	if sum > store-a2aJetStreamCapMargin {
+		var b strings.Builder
+		for _, name := range names {
+			fmt.Fprintf(&b, "\n  %-18s %8.3f GiB", name, float64(caps[name])/(1<<30))
+		}
+		t.Errorf("the provisioned caps reserve %.3f GiB of a %.3f GiB store, leaving %.3f GiB, under the %d GiB margin (#4476):%s",
+			float64(sum)/(1<<30), float64(store)/(1<<30), float64(store-sum)/(1<<30), a2aJetStreamCapMargin>>30, b.String())
 	}
 }
