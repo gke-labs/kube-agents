@@ -41,14 +41,27 @@ readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
 readonly EVAL_GHES_CASES_FILE="eval/ghes-cases.txt"
 readonly EVAL_CERTIFICATION_CASES_FILE="eval/certification-cases.txt"
-# The stack-bearing cases of the nightly's main part that run in main-b, when
-# EVAL_NIGHTLY_PART splits that part in two (#3384).
+# The stack-bearing cases of the nightly's main part that run in main-b,
+# main-c, main-d and main-e, when EVAL_NIGHTLY_PART splits that part in five
+# (#3384, #4238): a stack-bearing case on no list runs in main-a, which
+# otherwise holds only the onboarding cases' chain (unit_state_lock).
 readonly EVAL_NIGHTLY_MAIN_B_FILE="eval/nightly-main-b.txt"
-# Which bit of a name's cksum places a case without a stack in main-a or
-# main-b: any bit is a coin toss per name, and bit 2 splits the matrix of
-# 2026-10-19 near evenly where bit 0 did not. scripts/test_ci_eval_nightly.py
+readonly EVAL_NIGHTLY_MAIN_C_FILE="eval/nightly-main-c.txt"
+readonly EVAL_NIGHTLY_MAIN_D_FILE="eval/nightly-main-d.txt"
+readonly EVAL_NIGHTLY_MAIN_E_FILE="eval/nightly-main-e.txt"
+# The cases of the nightly's writers part that run in writers-b and in
+# writers-c, when EVAL_NIGHTLY_PART splits that part in three (#4238); a
+# writer on neither list runs in writers-a.
+readonly EVAL_NIGHTLY_WRITERS_B_FILE="eval/nightly-writers-b.txt"
+readonly EVAL_NIGHTLY_WRITERS_C_FILE="eval/nightly-writers-c.txt"
+# How many shards a name's cksum deals the main part's cases without a stack
+# into (the cksum shifted right by NIGHTLY_MAIN_CKSUM_SHIFT, modulo this: 0
+# main-a, 1 main-b, 2 main-c, 3 main-d, 4 main-e): a coin toss per name. The
+# shift picks the coin: shift 3 dealt the matrix of 2026-11-06 32/29/29/25/31
+# where no shift dealt it 37/38/21/30/20. scripts/test_ci_eval_nightly.py
 # holds the split within a fifth; if the matrix drifts past that, change it.
-readonly NIGHTLY_HALF_CKSUM_BIT=2
+readonly NIGHTLY_MAIN_SHARDS=5
+readonly NIGHTLY_MAIN_CKSUM_SHIFT=3
 # A fifth file, read beside them and applied on one lane only (#2039): the
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
@@ -3071,21 +3084,25 @@ case "${EVAL_TIER}" in
 esac
 
 # Which part of the nightly matrix this run takes, so the nightly can run as
-# two periodics on two leased projects: the cases that request a pull request
+# several periodics on leased projects of their own: the cases that request a pull request
 # run one unit at a time after every other unit (unit_phase, below), and on
 # one project that phase and the infra lock's stretch did not fit the then-480m
 # deadline together. "all", the default, is the whole matrix; "main" leaves
-# those cases out and "writers" runs them alone. "main-a" and "main-b" split
-# "main" again, so it can run as two periodics on two leased projects:
-# its length is set by the stack-bearing units, which run one at a time under
-# lock-infra, and each project has a lock of its own (#3384). The split is
+# those cases out and "writers" runs them alone. "main-a" to "main-e" split
+# "main" again, so it can run as five periodics on five leased projects: its
+# length is set by the stack-bearing units, which run one at a time under
+# lock-infra, and by the onboarding cases' chain under their state lock, and
+# each project has locks of its own (#3384, #4238). "writers-a",
+# "writers-b" and "writers-c" split "writers" in three the same way: its
+# units run one at a time, each after the project's one GitOps repository is
+# reset, and each project has a repository of its own (#4238). The split is
 # applied after the lane step, which is what names the writers. A part
 # outside the nightly would silently run a subset of the presubmit, so it
 # stops the job, as does any other value.
 EVAL_NIGHTLY_PART="${EVAL_NIGHTLY_PART:-all}"
 case "${EVAL_NIGHTLY_PART}" in
   all) ;;
-  main | main-a | main-b | writers)
+  main | main-a | main-b | main-c | main-d | main-e | writers | writers-a | writers-b | writers-c)
     if [ "${EVAL_TIER}" != "nightly" ]; then
       echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects part of the nightly matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the nightly." >&2
       exit 1
@@ -3096,7 +3113,7 @@ case "${EVAL_NIGHTLY_PART}" in
     fi
     ;;
   *)
-    echo "ERROR: EVAL_NIGHTLY_PART must be 'all', 'main', 'main-a', 'main-b' or 'writers', got '${EVAL_NIGHTLY_PART}'." >&2
+    echo "ERROR: EVAL_NIGHTLY_PART must be 'all', 'main', 'main-a', 'main-b', 'main-c', 'main-d', 'main-e', 'writers', 'writers-a', 'writers-b' or 'writers-c', got '${EVAL_NIGHTLY_PART}'." >&2
     exit 1
     ;;
 esac
@@ -3524,21 +3541,37 @@ fi
 # The "Nightly part:" line is the record of which part a night ran, and
 # names the cases the part left out.
 #
-# main-a and main-b halve the main part. A stack-bearing case (task_stack,
-# off infra_lock_exempt) runs in main-b when NIGHTLY_MAIN_B_FILE lists it and
-# in main-a otherwise: their one-at-a-time chain under lock-infra is what sets
-# the part's length, and that file is chosen to balance it. A case without a
-# stack goes by one bit of its name's cksum (NIGHTLY_HALF_CKSUM_BIT). The
-# onboarding cases (unit_state_lock) all go to main-a: they rewrite one
-# install's onboarding state, and only a run on one install keeps them apart.
-# No rule reads the matrix's order or size: a case's half follows from its
-# name, its task file's stack line, NIGHTLY_MAIN_B_FILE and the helpers below.
-# So the two halves, two periodics that each check out main for themselves,
-# agree on the split when a merge that adds or drops other cases lands between
-# their checkouts. A merge between them that edits one of those inputs for a
-# case can run that case in both halves, or in neither, for one night. The
-# three helpers are defined here, ahead of the fan-out further down that also
-# uses them, because the split runs first.
+# main-a to main-e shard the main part. Two chains set a shard's length: the
+# stack-bearing units' one-at-a-time chain under lock-infra, and the
+# onboarding cases' chain under their state lock (unit_state_lock), which
+# rewrite one install's onboarding state and so all run in main-a, the one
+# install that keeps them apart. The onboarding chain alone ran 380-480 min
+# of wall clock on the nights of 2026-11-04 to 11-06, and beside main-a's
+# half of the stack chain it put main-a at 672-843 min while main-b, with the
+# same number of stack cases and no onboarding chain, took 449-749. So main-a
+# carries the onboarding chain and no other stack case: a stack-bearing case
+# (task_stack, off infra_lock_exempt) runs in the shard whose list names it,
+# NIGHTLY_MAIN_B_FILE to NIGHTLY_MAIN_E_FILE, and in main-a otherwise (a new
+# one, until a list moves it); the four lists are chosen to balance the four
+# stack chains, each about a quarter of the old half, so a new stack case
+# has room. A case without a stack goes by its name's cksum (shifted by
+# NIGHTLY_MAIN_CKSUM_SHIFT, modulo NIGHTLY_MAIN_SHARDS). No rule reads the
+# matrix's order or size: a case's shard follows from its name, its task
+# file's stack line, the four lists and the helpers below. So the five shards,
+# five periodics that each check out main for themselves, agree on the split
+# when a merge that adds or drops other cases lands between their checkouts.
+# A merge between them that edits one of those inputs for a case can run that
+# case in two shards, or in none, for one night. The three helpers are
+# defined here, ahead of the fan-out further down that also uses them,
+# because the split runs first.
+#
+# writers-a, writers-b and writers-c third the writers part by name alone: a
+# writer runs in writers-b when NIGHTLY_WRITERS_B_FILE lists it, in writers-c
+# when NIGHTLY_WRITERS_C_FILE does, and in writers-a otherwise, so a new
+# writer (a requesting case, a stopped ask or a writes_alone case) lands in
+# writers-a until a list moves it.
+# The thirds agree between checkouts as the main shards do, with the same
+# one-night exception for a merge that edits a list.
 
 # Reads infrastructure.stack out of a task file. The nightly part split uses
 # it to tell a stack-bearing case, and the fan-out's loop to decide whether
@@ -3585,13 +3618,32 @@ unit_state_lock() { # <task-name>
 }
 
 NIGHTLY_MAIN_B_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_B_FILE}"
+NIGHTLY_MAIN_C_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_C_FILE}"
+NIGHTLY_MAIN_D_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_D_FILE}"
+NIGHTLY_MAIN_E_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_E_FILE}"
+NIGHTLY_WRITERS_B_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_WRITERS_B_FILE}"
+NIGHTLY_WRITERS_C_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_WRITERS_C_FILE}"
 NIGHTLY_PART_DROPPED=""
 if [ "${EVAL_TIER}" = "nightly" ]; then
   NIGHTLY_MATRIX_SIZE="${#TASKS[@]}"
   if [ "${EVAL_NIGHTLY_PART}" != "all" ]; then
     NIGHTLY_MAIN_B=""
+    NIGHTLY_MAIN_C=""
+    NIGHTLY_MAIN_D=""
+    NIGHTLY_MAIN_E=""
+    NIGHTLY_WRITERS_B=""
+    NIGHTLY_WRITERS_C=""
     case "${EVAL_NIGHTLY_PART}" in
-      main-a | main-b) NIGHTLY_MAIN_B="$(roster_entries "${NIGHTLY_MAIN_B_FILE}")" ;;
+      main-a | main-b | main-c | main-d | main-e)
+        NIGHTLY_MAIN_B="$(roster_entries "${NIGHTLY_MAIN_B_FILE}")"
+        NIGHTLY_MAIN_C="$(roster_entries "${NIGHTLY_MAIN_C_FILE}")"
+        NIGHTLY_MAIN_D="$(roster_entries "${NIGHTLY_MAIN_D_FILE}")"
+        NIGHTLY_MAIN_E="$(roster_entries "${NIGHTLY_MAIN_E_FILE}")"
+        ;;
+      writers-a | writers-b | writers-c)
+        NIGHTLY_WRITERS_B="$(roster_entries "${NIGHTLY_WRITERS_B_FILE}")"
+        NIGHTLY_WRITERS_C="$(roster_entries "${NIGHTLY_WRITERS_C_FILE}")"
+        ;;
     esac
     NIGHTLY_PART_KEPT=()
     for ENTRY in "${TASKS[@]}"; do
@@ -3601,15 +3653,38 @@ if [ "${EVAL_TIER}" = "nightly" ]; then
         *) ENTRY_PART="main" ;;
       esac
       case "${EVAL_NIGHTLY_PART}:${ENTRY_PART}" in
-        main-a:main | main-b:main)
+        main-a:main | main-b:main | main-c:main | main-d:main | main-e:main)
           if [ "$(unit_state_lock "${NAME}")" = "onboarding" ]; then
             ENTRY_PART="main-a"
           elif [ -n "$(task_stack "${BENCH_DIR}/${ENTRY}")" ] && ! infra_lock_exempt "${NAME}"; then
-            if grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_B}"; then ENTRY_PART="main-b"; else ENTRY_PART="main-a"; fi
-          elif [ $(( ($(printf '%s' "${NAME}" | cksum | cut -d' ' -f1) >> NIGHTLY_HALF_CKSUM_BIT) & 1 )) -eq 1 ]; then
-            ENTRY_PART="main-b"
+            if grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_B}"; then
+              ENTRY_PART="main-b"
+            elif grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_C}"; then
+              ENTRY_PART="main-c"
+            elif grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_D}"; then
+              ENTRY_PART="main-d"
+            elif grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_E}"; then
+              ENTRY_PART="main-e"
+            else
+              ENTRY_PART="main-a"
+            fi
           else
-            ENTRY_PART="main-a"
+            case $(( ($(printf '%s' "${NAME}" | cksum | cut -d' ' -f1) >> NIGHTLY_MAIN_CKSUM_SHIFT) % NIGHTLY_MAIN_SHARDS )) in
+              1) ENTRY_PART="main-b" ;;
+              2) ENTRY_PART="main-c" ;;
+              3) ENTRY_PART="main-d" ;;
+              4) ENTRY_PART="main-e" ;;
+              *) ENTRY_PART="main-a" ;;
+            esac
+          fi
+          ;;
+        writers-a:writers | writers-b:writers | writers-c:writers)
+          if grep -qxF -- "${NAME}" <<< "${NIGHTLY_WRITERS_B}"; then
+            ENTRY_PART="writers-b"
+          elif grep -qxF -- "${NAME}" <<< "${NIGHTLY_WRITERS_C}"; then
+            ENTRY_PART="writers-c"
+          else
+            ENTRY_PART="writers-a"
           fi
           ;;
       esac
@@ -4101,8 +4176,8 @@ fi
 
 # Launch-order hints, longest first, from measured runs (2026-08-27/28).
 # A wrong hint costs packing efficiency, never correctness. The hints also
-# price the main-a/main-b split, so scripts/test_ci_eval_nightly.py can fail
-# on a hint edit that leaves the two halves unbalanced.
+# price the main shards' split, so scripts/test_ci_eval_nightly.py can fail
+# on a hint edit that leaves the four stack chains unbalanced.
 unit_cost_hint() {
   case "$1" in
     # The two tofu incumbents, nightly-only since #1218: ~20 and ~15 min a
@@ -4197,8 +4272,8 @@ unit_cost_hint() {
     # repetitions (243s, 66-448s over the 15 on gemini-4-argon). Priced at
     # 600s rather than the 200s default it ran the nightly at: the
     # hint sets its launch order and its share of the presubmit wall estimate
-    # in scripts/eval_rosters.py, and the main-a/main-b balance test in
-    # scripts/test_ci_eval_nightly.py sums it into main-b's stack chain.
+    # in scripts/eval_rosters.py, and the main shards' balance test in
+    # scripts/test_ci_eval_nightly.py sums it into its shard's stack chain.
     monitoring-alert-policy-read) echo 600 ;;
     consistency-no-environment-label) echo 900 ;;
     # Not measured yet: the same stream as the case above, plus a stack that
@@ -5601,8 +5676,8 @@ profile_begin "record + final gate"
 # install today's window measures. `bench-gate record` refuses it too.
 #
 # A next-mode run on main does record. The main nightly
-# (ci-kube-agents-eval-nightly, its -main-b half and its -writers part,
-# EVAL_MODE_NEXT=1) is a periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
+# (ci-kube-agents-eval-nightly, its -main-b to -main-e shards and its
+# -writers, -writers-b and -writers-c thirds, EVAL_MODE_NEXT=1) is a periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
 # which `bench-gate` reads as the version key's `next` mode: its lines file
 # under a key of their own, never today's, and are the window an inject-lane
 # run at the same agent model (setupId) is compared with. No job records

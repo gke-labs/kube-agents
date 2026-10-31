@@ -1055,7 +1055,7 @@ It is `ci-kube-agents-eval-nightly` in
 export. Its schedule, budget and fan-out are the decisions recorded on
 [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491). The YAML is not
 reproduced here — a copy in a second repository is a copy that goes stale, and the shape below is
-the part that matters. It and its `-writers` part grade `spec.mode: next` (`EVAL_MODE_NEXT=1`) and
+the part that matters. It, its `-main-b` to `-main-e` shards and its three writers thirds grade `spec.mode: next` (`EVAL_MODE_NEXT=1`) and
 so record under the version key's `next` mode. No job in the file records under `today` now.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
@@ -1089,7 +1089,7 @@ merge-rate data:
   run.
 
 Three numbers in it are priced rather than measured. The repetition count is the script's default 3
-unless the job sets `EVAL_REPETITIONS`. The timeout is `840m` on the main halves (`720m` before the gemini-4-argon window), not the presubmit's `360m`: the
+unless the job sets `EVAL_REPETITIONS`. The timeout is `840m` on the main shards (`720m` before the gemini-4-argon window), not the presubmit's `360m`: the
 twenty-six-task matrix priced at ~532–552 serial minutes at three repetitions, and the presubmit
 realised only ~1.15× on whole-job wall clock against its serial matrix estimate on 2026-09-10 (the
 periodic's timeout comment; the fixed provision-and-deploy term is inside that figure, which is

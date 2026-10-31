@@ -27,7 +27,7 @@ import unittest.mock
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from eval_dashboard import render
+from eval_dashboard import nightly, render
 
 FIXTURE = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_classify" / "incidents.json.gz"
 PAGES_JS = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "template" / "pages.js"
@@ -119,6 +119,22 @@ def brief_view_anchors(pages_js: str) -> frozenset:
 
 
 BRIEF_VIEW_ANCHORS = brief_view_anchors(PAGES_JS.read_text())
+
+
+def night_part_words(pages_js: str) -> dict:
+    """PAGE.nightPartWords from pages.js's text, a flat object of quoted
+    or bare keys to quoted words."""
+    match = re.search(r"^\s*nightPartWords:\s*\{([^{}]*)\}", pages_js, re.MULTILINE)
+    if match is None:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.nightPartWords is not a flat object literal")
+    return dict(re.findall(r'"?([\w-]+)"?\s*:\s*"([^"]*)"', match.group(1)))
+
+
+class NightPartWordsTest(unittest.TestCase):
+    def test_the_pages_part_words_are_nightly_py_s(self):
+        # pages.js carries a hand copy of nightly.PART_WORDS; a part added to
+        # one alone would render as its raw id on the Nightly page.
+        self.assertEqual(night_part_words(PAGES_JS.read_text()), dict(nightly.PART_WORDS))
 # The Cases page's one polled call, in
 # test_cases_page_sorts_filters_and_the_hash_highlight: a row fragment,
 # the bare case name, under boot and two polls on the page's real clock.

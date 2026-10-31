@@ -168,6 +168,8 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertNotIn("--nightly-prefix", argv)
         self.assertNotIn("--nightly-writers-prefix", argv)
         self.assertNotIn("--nightly-main-b-prefix", argv)
+        for flag in ("--nightly-main-c-prefix", "--nightly-main-d-prefix", "--nightly-main-e-prefix", "--nightly-writers-b-prefix", "--nightly-writers-c-prefix"):
+            self.assertNotIn(flag, argv)
         self.assertNotIn("<base href", (self.target / "index.html").read_text())
 
     def test_bucket_target_emits_derived_base_href(self):
@@ -390,10 +392,12 @@ class RefreshScriptTest(unittest.TestCase):
             "gcloud storage ls failed", (artifacts / "eval-dashboard-refresh.log").read_text()
         )
         # The bucket path hands collect.py both sources, the nightly one with
-        # its default prefix and the nightly's writers and main-b periodics
-        # with their own; an empty EVAL_DASHBOARD_NIGHTLY_PREFIX,
-        # EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX or
-        # EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX drops that one.
+        # its default prefix and the nightly's writers, main-b, writers-b and
+        # writers-c periodics with their own; an empty
+        # EVAL_DASHBOARD_NIGHTLY_PREFIX, EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX,
+        # EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX,
+        # EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX or
+        # EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX drops that one.
         argv = collect_argv(argv_log)
         self.assertIn("--pr-glob", argv)
         self.assertIn("--nightly-prefix", argv)
@@ -409,6 +413,8 @@ class RefreshScriptTest(unittest.TestCase):
             argv[argv.index("--nightly-main-b-prefix") + 1],
             "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/",
         )
+        for flag, job in (("--nightly-main-c-prefix", "main-c"), ("--nightly-main-d-prefix", "main-d"), ("--nightly-main-e-prefix", "main-e"), ("--nightly-writers-b-prefix", "writers-b"), ("--nightly-writers-c-prefix", "writers-c")):
+            self.assertEqual(argv[argv.index(flag) + 1], f"gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-{job}/")
         argv_log.unlink()
         run_script(
             env={
@@ -417,6 +423,11 @@ class RefreshScriptTest(unittest.TestCase):
                 "EVAL_DASHBOARD_NIGHTLY_PREFIX": "",
                 "EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX": "",
                 "EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX": "",
+                "EVAL_DASHBOARD_NIGHTLY_MAIN_C_PREFIX": "",
+                "EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX": "",
+                "EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX": "",
+                "EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX": "",
+                "EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX": "",
             },
             path_prepend=str(stubs),
         )
@@ -425,6 +436,8 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertNotIn("--nightly-prefix", argv)
         self.assertNotIn("--nightly-writers-prefix", argv)
         self.assertNotIn("--nightly-main-b-prefix", argv)
+        for flag in ("--nightly-main-c-prefix", "--nightly-main-d-prefix", "--nightly-main-e-prefix", "--nightly-writers-b-prefix", "--nightly-writers-c-prefix"):
+            self.assertNotIn(flag, argv)
 
     @unittest.skipUnless(shutil.which("timeout"), "needs coreutils timeout")
     def test_a_hung_pipeline_times_out_red(self):

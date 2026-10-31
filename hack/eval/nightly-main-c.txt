@@ -1,0 +1,13 @@
+# The stack-bearing cases of the nightly's main part that run in main-c.
+# Read with nightly-main-b.txt, whose header says how the shards are placed
+# and what scripts/test_ci_eval_nightly.py holds the lists to.
+#
+# Dealt on 2026-11-06 (#4238) by unit_cost_hint, largest first into the
+# shortest chain: 6500s here.
+autoops-crashloop-config-triage
+autoops-quiet-followup
+first-install-hello-done
+fleet-audit-unchanged-finding-keeps-wording
+gitops-drift-load-bearing-change-triage
+gpu-stress-test-diagnosis
+obtainability-planted-orphan-service
