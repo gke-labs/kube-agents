@@ -95,7 +95,11 @@ Two chart blocks, both off by default, add a fallback alias and router retry lim
 
 `litellm.fallback.reasoningEffort` (`low`, `medium` or `high`) adds a fallback alias for the same model at its own reasoning effort, named `litellm.fallback.modelName` or `<model>-<effort>` by default. `"minimal"` is omitted because Vertex AI Gemini 3.x Flash rejects `thinkingLevel: "minimal"` with HTTP 400 and Claude maps it to a 1024-token thinking budget. It also renders a `router_settings.fallbacks` entry that routes each primary alias (`model-default`, `hermes-agent` and the model name) to the fallback once primary retries are spent.
 
-`litellm.fallback.timeoutSeconds` and `numRetries` render `router_settings.timeout` and `num_retries` (both default to `0`, omitting the keys). On Vertex `gemini-3.5-flash`, a `600`-second request cap covers `99.96%` of streams while `300` seconds covers `99.57%`. The render fails if `litellm.fallback.modelName` is set without `litellm.fallback.reasoningEffort` or matches a primary alias name. With `fallback.reasoningEffort: low` and `gemini-3.8-flash` on Vertex AI the result reads:
+`litellm.fallback.timeoutSeconds` and `numRetries` render `router_settings.timeout` and `num_retries` (both default to `0`, omitting the keys).
+
+`litellm.fallback.retryAfterSeconds` renders `router_settings.retry_after`, the shortest pause before each retry. LiteLLM's own pause starts at half a second and is clamped to eight, so a per-minute quota's 429 is retried inside the same closed minute. A value above eight also raises that clamp (`MAX_RETRY_DELAY` on the gateway). It needs `numRetries` above `0`; the render fails without it. The retries are a silent hold on the caller's stream, `numRetries + 1` pauses long. Keep that hold plus the model's time to first chunk under the caller's stale-stream bound, 120 s on the Platform and Cluster Agents, or the agent drops the stream and never sees the 429. On Vertex `gemini-3.5-flash`, a `600`-second request cap covers `99.96%` of streams while `300` seconds covers `99.57%`.
+
+The render fails if `litellm.fallback.modelName` is set without `litellm.fallback.reasoningEffort` or matches a primary alias name. With `fallback.reasoningEffort: low` and `gemini-3.8-flash` on Vertex AI the result reads:
 
 ```yaml
 model_list:
@@ -111,7 +115,11 @@ model_list:
 litellm_settings:
   drop_params: true
   callbacks:
-    ["prometheus", "litellm_thinking_replay_callback.proxy_handler_instance"]
+    [
+      "prometheus",
+      "litellm_thinking_replay_callback.proxy_handler_instance",
+      "litellm_cache_control_strip_callback.proxy_handler_instance",
+    ]
 router_settings:
   fallbacks:
     - model-default: ["gemini-3.8-flash-low"]
@@ -167,6 +175,8 @@ The system prompt takes the 1h tier because it is the largest static span, every
 
 Any other model gets no breakpoints. On Gemini, LiteLLM turns these markers into Vertex explicit context caching: before every model call it lists the project's cached contents, and it creates a new cache whenever the cached prefix is new. A create that Vertex is slow to finish fails the whole turn: in one case it surfaced as a 401 after a stall of more than ten minutes. Gemini's implicit caching needs no markers and still serves a repeated prefix from cache. The chart reads the same provider and model name as the sampling-key drop above, with one difference: a Claude model behind `sap` gets the drop and no breakpoints. Switching `MODEL_PROVIDER` re-renders both. The kustomize dev copy adds them for `MODEL_PROVIDER=anthropic` only, in its `anthropic` overlay; `vertex_ai` with a `claude-` model gets them only through the chart.
 
+A caller can also bring its own markers. Claude Code marks its prompt-cache breakpoints itself, and the A2A worker adapter points it at the gateway without telling it which model is behind `model-default`. On a Gemini model LiteLLM would turn those markers into the same explicit-caching create, and `gemini-4-argon`, which has no explicit caching, answers every such request 400. The chart loads a pre-call hook that removes a caller's `cache_control` markers from a request bound for a Gemini model and leaves a request to any other model as sent. The gateway log records each request it changed, as `kube_agents.litellm_cache_control_strip INFO cache markers: dropped N cache_control marker(s) bound for a Gemini model`. The kustomize dev copy does not load it.
+
 ### Gemini's thoughts
 
 Gemini thinks before it answers whether or not a request asks it to, but it returns those thoughts only when the request sets `thinkingConfig.includeThoughts`. With it off, Gemini 3.x has been seen writing its reasoning into the answer instead, under a first line `thought`, where nothing downstream can tell it from the answer. To give the thoughts a channel of their own, for a Gemini 2.5 or 3.x model through `gemini` or `vertex_ai` the chart renders `thinking` under every `model_list` alias:
@@ -187,7 +197,7 @@ No other model gets the key. LiteLLM refuses it on a model it does not treat as 
 
 A client that turns thinking on, as Claude Code does in the session pods of an install on the `spec.mode: next` stack, sends each earlier turn's thinking back in the next request. LiteLLM releases before v1.106.0 passed that thinking to a Gemini model as ordinary text rather than as a thought, so Gemini read its earlier thought summaries as things it said and opened its next answers with more of them: a bold step title and a line such as "I will now draft the report". No prompt reached that text. The release the install pins ([Container images](/kube-agents/deploy/docker-images/)) carries the upstream fix.
 
-Both the chart and the kustomize base still load a pre-call hook that drops replayed thinking blocks from earlier assistant turns before the request goes to a Gemini model. It removes more than the upstream fix does. Thinking still streams back, and requests to any other model, Claude above all, go out as sent. The gateway log records each request it changed, as `kube_agents.litellm_thinking_replay INFO thinking replay: dropped N replayed thinking block(s)`.
+Both the chart and the kustomize base still load a pre-call hook that drops replayed thinking blocks from earlier assistant turns before the request goes to a Gemini model. It removes more than the upstream fix does. Thinking still streams back, and requests to any other model, Claude above all, go out as sent. The gateway log records each request it changed, as `kube_agents.litellm_thinking_replay INFO thinking replay: dropped N replayed thinking block(s) bound for a Gemini model`.
 
 ### Redaction at the gateway
 

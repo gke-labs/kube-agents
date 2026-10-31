@@ -110,14 +110,15 @@ class ReasoningFallbackRenderTest(unittest.TestCase):
         explicit = """
 litellm:
   dropParams: false
-  fallback: {modelName: "", reasoningEffort: "", timeoutSeconds: 0, numRetries: 0}
+  fallback: {modelName: "", reasoningEffort: "", timeoutSeconds: 0, numRetries: 0, retryAfterSeconds: 0}
 """
         empty_cm, empty_deploy = self._documents(explicit)
         self.assertEqual(unset_cm["data"], empty_cm["data"])
         self.assertEqual(self._checksum(unset_deploy), self._checksum(empty_deploy))
         text = unset_cm["data"]["config.yaml"]
-        for key in ("reasoning_effort", "drop_params", "fallbacks", "num_retries", "timeout", "router_settings"):
+        for key in ("reasoning_effort", "drop_params", "fallbacks", "num_retries", "timeout", "retry_after", "router_settings"):
             self.assertNotIn(key, text)
+        self.assertNotIn("MAX_RETRY_DELAY", [e["name"] for e in self._container(unset_deploy)["env"]])
         base = yaml.safe_load(
             (_REPO_ROOT / "k8s-operator/config/integrations/litellm/base/config.yaml").read_text()
         )
@@ -143,7 +144,11 @@ litellm:
         self.assertTrue(config["litellm_settings"]["drop_params"])
         self.assertEqual(
             config["litellm_settings"]["callbacks"],
-            ["prometheus", "litellm_thinking_replay_callback.proxy_handler_instance"],
+            [
+                "prometheus",
+                "litellm_thinking_replay_callback.proxy_handler_instance",
+                "litellm_cache_control_strip_callback.proxy_handler_instance",
+            ],
         )
         router = config["router_settings"]
         primaries = ["model-default", "hermes-agent", _MODEL]
@@ -166,6 +171,22 @@ litellm:
         claude_router = self._config(claude_cm)["router_settings"]
         self.assertEqual(claude_router["timeout"], 300)
         self.assertIn("default_litellm_params", claude_router)
+
+    def test_retry_after_renders_the_floor_and_raises_the_clamp_only_above_eight(self) -> None:
+        """LiteLLM applies retry_after as the floor of its retry pause and then
+        clamps the pause to MAX_RETRY_DELAY, 8s unless the environment says
+        otherwise; a floor above that needs the ceiling raised with it."""
+        configmap, deployment = self._documents(_VERTEX_VALUES + "  fallback:\n    numRetries: 2\n    retryAfterSeconds: 30\n")
+        self.assertEqual(self._config(configmap)["router_settings"], {"num_retries": 2, "retry_after": 30})
+        env = {e["name"]: e.get("value") for e in self._container(deployment)["env"]}
+        self.assertEqual(env["MAX_RETRY_DELAY"], "30")
+
+        configmap, deployment = self._documents(_VERTEX_VALUES + "  fallback:\n    numRetries: 2\n    retryAfterSeconds: 5\n")
+        self.assertEqual(self._config(configmap)["router_settings"], {"num_retries": 2, "retry_after": 5})
+        self.assertNotIn("MAX_RETRY_DELAY", [e["name"] for e in self._container(deployment)["env"]])
+
+    def test_retry_after_without_retries_fails_the_render(self) -> None:
+        self._fails(_VERTEX_VALUES + "  fallback:\n    retryAfterSeconds: 30\n", "without litellm.fallback.numRetries")
 
     def test_named_fallback_alias(self) -> None:
         for alias in ("slow-lane", "claude-sonnet-4-5@20250929-low"):

@@ -143,8 +143,9 @@
 {{- end }}
 {{- end }}
 {{- /*
-  Rendered as the flow list LiteLLM's config expects, the same callbacks the
-  kustomize base names when otel is on. The redaction callback is a module
+  Rendered as the flow list LiteLLM's config expects, seeded with the
+  exporters the kustomize base names when otel is on; the hooks below are
+  appended to the seed. The redaction callback is a module
   path relative to the config directory, which is why its two files are
   mounted beside config.yaml below.
 */}}
@@ -159,6 +160,17 @@
 {{- fail "the chart's files/litellm_thinking_replay_callback.py is missing" }}
 {{- end }}
 {{- $callbackList = append $callbackList "litellm_thinking_replay_callback.proxy_handler_instance" }}
+{{- /*
+  The cache-marker hook runs on every install too: it drops a caller's own
+  cache_control markers from a request bound for a Gemini model, which LiteLLM
+  would otherwise turn into a Vertex explicit-caching create (a 400 on
+  gemini-4-argon, which has none). Its header says which caller sends them.
+*/}}
+{{- $cacheControlStripSource := .Files.Get "files/litellm_cache_control_strip_callback.py" }}
+{{- if empty $cacheControlStripSource }}
+{{- fail "the chart's files/litellm_cache_control_strip_callback.py is missing" }}
+{{- end }}
+{{- $callbackList = append $callbackList "litellm_cache_control_strip_callback.proxy_handler_instance" }}
 {{- if $redactionEnabled }}
 {{- $callbackList = append $callbackList "litellm_redaction_callback.proxy_handler_instance" }}
 {{- end }}
@@ -218,16 +230,16 @@
   concrete model gets routed rather than a 404 from the gateway.
 */}}
 {{- $fallback := .Values.litellm.fallback | default dict }}
-{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries) $configEndpoint) }}
+{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries "retryAfterSeconds" $fallback.retryAfterSeconds) $configEndpoint) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
-  hook, the rule file, the two redaction modules, the OAuth2 hook and the
+  and cache-marker hooks, the rule file, the two redaction modules, the OAuth2 hook and the
   optional trace logger are subPath mounts too, so an edit to any of them has
   to roll the pods the same way an edit to config.yaml does. With redaction or
   trace logging off their extras are empty strings, as is the OAuth2 hook's
   source while the hook is not shipped.
 */}}
-{{- $checksumInput := printf "%s%s%s%s%s%s%s" $config $thinkingReplaySource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource }}
+{{- $checksumInput := printf "%s%s%s%s%s%s%s%s" $config $thinkingReplaySource $cacheControlStripSource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -241,6 +253,8 @@ data:
     {{- $config | nindent 4 }}
   litellm_thinking_replay_callback.py: |
     {{- $thinkingReplaySource | nindent 4 }}
+  litellm_cache_control_strip_callback.py: |
+    {{- $cacheControlStripSource | nindent 4 }}
   {{- if $redactionEnabled }}
   redaction.yaml: |
     {{- $redactionConfig | nindent 4 }}
@@ -382,6 +396,16 @@ spec:
             # transport boundary rather than via LiteLLM's user-auth layer.
             - name: LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY
               value: "true"
+            {{- $retryAfter := int ($fallback.retryAfterSeconds | default 0) }}
+            {{- if gt $retryAfter 8 }}
+            # LiteLLM applies router_settings.retry_after as the floor of its pause
+            # before a retry and then clamps the pause to MAX_RETRY_DELAY, 8s by
+            # default (litellm/constants.py reads it from the environment at
+            # import). A floor above 8s is a no-op without the ceiling raised
+            # with it; this is the one retry pause the gateway has.
+            - name: MAX_RETRY_DELAY
+              value: {{ $retryAfter | quote }}
+            {{- end }}
             {{- if eq $provider "vertex_ai" }}
             - name: VERTEXAI_PROJECT
               {{- if $vertexProjectRef.name }}
@@ -506,6 +530,9 @@ spec:
             - name: config-volume
               mountPath: /app/litellm_thinking_replay_callback.py
               subPath: litellm_thinking_replay_callback.py
+            - name: config-volume
+              mountPath: /app/litellm_cache_control_strip_callback.py
+              subPath: litellm_cache_control_strip_callback.py
             {{- if $oauthHookEnabled }}
             - name: config-volume
               mountPath: /app/litellm_oauth2_callback.py

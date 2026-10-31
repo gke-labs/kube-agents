@@ -5,8 +5,11 @@ The gap
 ``compute_error_backoff`` in ``agent/turn_recovery.py`` (Hermes v2026.9.14;
 ``agent/conversation_loop.py`` before the split) honours two sources of "how
 long until the quota opens": the ``Retry-After`` response header and a
-``retry_after`` field in a dict error body, capped at 600 s. Everything else waits ``jittered_backoff(base_delay=2.0)``, which puts
-the default three retries roughly 2 to 3 s and 4 to 6 s apart.
+``retry_after`` field in a dict error body, capped at 600 s. Everything else
+waits ``jittered_backoff(base_delay=2.0)``, which puts the default three
+retries roughly 2 to 3 s, 4 to 6 s and 8 to 12 s apart; since the backoff-floor patch
+(``rate_limit_backoff_floor.py``) that stock wait is only a non-rate-limit
+error's, and a rate-limited error that names no delay waits the floor.
 
 Google does not send that header. A Gemini or Vertex 429 carries its reset
 window in the error *body*, as ``google.rpc.RetryInfo``::
