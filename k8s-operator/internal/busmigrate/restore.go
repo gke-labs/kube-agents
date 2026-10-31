@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"reflect"
 	"strings"
 	"time"
 
@@ -115,23 +114,32 @@ func Snapshot(ctx context.Context, nc *nats.Conn, name string, w io.Writer) (*Me
 // hashed.
 var ErrDigestMismatch = errors.New("snapshot digest does not match the operator's")
 
+// ErrOutsidePolicy is a snapshot config, or a restored stream's, that does
+// not pass the operator's policy for that stream.
+var ErrOutsidePolicy = errors.New("config is outside the operator's policy")
+
 // Opener opens a snapshot's data for one read from the start. The restore pod
 // reads the staging volume read-only, and it is the only pod holding that
 // volume (ReadWriteOncePod), so nothing writes it between two opens.
 type Opener func() (io.ReadCloser, error)
 
-// RestoreVerified restores one stream from its staged snapshot. It hashes the
-// data first and sends nothing when it is not the snapshot the operator
-// hashed (wantDigest), so a mismatch holds no name. It then restores, hashing
-// exactly the bytes it sends, and sends the restore's final message, the one
-// on which nats-server builds the stream, only when they match too. On a late
-// mismatch it withholds that message and deletes the name, which a
-// clustered server keeps reserved after a stalled restore. The stream is
-// created with cfg, the config the operator renders for it, never the
-// snapshot's own; state is the snapshot's, which the server uses only to size
-// the restore. The restored config is then read back, and a stream whose
-// config is not cfg is deleted.
-func RestoreVerified(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, open Opener, wantDigest string) error {
+// RestoreVerified restores one stream from its staged snapshot, sending
+// cfg, the snapshot's own config, pinned by the operator's digest of its
+// metadata. policy gates it twice, the same table both times: cfg must pass
+// policy.Check before anything is sent, and the restored stream's config is
+// read back and must pass it again, or the stream is deleted.
+//
+// It hashes the data first and sends nothing when it is not the snapshot the
+// operator hashed (wantDigest), so a mismatch holds no name. It then
+// restores, hashing exactly the bytes it sends, and sends the restore's
+// final message, the one on which nats-server builds the stream, only when
+// they match too. On a late mismatch it withholds that message and deletes
+// the name, which a clustered server keeps reserved after a stalled restore.
+// state is the snapshot's, which the server uses only to size the restore.
+func RestoreVerified(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, open Opener, wantDigest string, policy StreamPolicy) error {
+	if d := policy.Check(cfg); len(d) != 0 {
+		return fmt.Errorf("stream %s: %w: %s", cfg.Name, ErrOutsidePolicy, strings.Join(d, "; "))
+	}
 	pre, err := digestOf(open)
 	if err != nil {
 		return fmt.Errorf("stream %s: hashing the snapshot: %w", cfg.Name, err)
@@ -152,7 +160,7 @@ func RestoreVerified(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, 
 		}
 		return fmt.Errorf("stream %s: %w", cfg.Name, err)
 	}
-	return verifyOrDelete(ctx, nc, cfg)
+	return verifyOrDelete(ctx, nc, policy)
 }
 
 func digestOf(open Opener) (string, error) {
@@ -169,17 +177,17 @@ func digestOf(open Opener) (string, error) {
 }
 
 // verifyOrDelete reads a restored stream's config back and deletes the
-// stream when it is not want.
-func verifyOrDelete(ctx context.Context, nc *nats.Conn, want nats.StreamConfig) error {
-	info, err := streamInfo(ctx, nc, want.Name)
+// stream when it does not pass policy.
+func verifyOrDelete(ctx context.Context, nc *nats.Conn, policy StreamPolicy) error {
+	info, err := streamInfo(ctx, nc, policy.Name)
 	if err != nil {
-		return fmt.Errorf("stream %s: reading back the restored config: %w", want.Name, err)
+		return fmt.Errorf("stream %s: reading back the restored config: %w", policy.Name, err)
 	}
-	if diff := configDiff(want, info.Config); diff != "" {
-		if derr := request(ctx, nc, fmt.Sprintf(streamDeleteSubject, want.Name), nil, nil); derr != nil {
-			return fmt.Errorf("stream %s: restored config differs (%s), and deleting it failed: %w", want.Name, diff, derr)
+	if d := policy.Check(info.Config); len(d) != 0 {
+		if derr := request(ctx, nc, fmt.Sprintf(streamDeleteSubject, policy.Name), nil, nil); derr != nil {
+			return fmt.Errorf("stream %s: restored config is outside its policy (%s), and deleting it failed: %w", policy.Name, strings.Join(d, "; "), derr)
 		}
-		return fmt.Errorf("stream %s: restored config differs (%s); deleted", want.Name, diff)
+		return fmt.Errorf("stream %s: restored config is outside its policy (%s); deleted", policy.Name, strings.Join(d, "; "))
 	}
 	return nil
 }
@@ -254,74 +262,6 @@ func sendChunk(ctx context.Context, nc *nats.Conn, subject string, chunk []byte)
 		return fmt.Errorf("%s (%d)", e.Error.Description, e.Error.ErrCode)
 	}
 	return nil
-}
-
-// configDiff names the fields of the restored config that are not the ones
-// asked for: everything an operator render sets, which is everything that
-// decides where a stream's messages come from, which subjects it captures and
-// how much it may hold. "" when they match.
-func configDiff(want, got nats.StreamConfig) string {
-	want = withServerDefaults(want)
-	var diffs []string
-	check := func(field string, w, g any) {
-		if !reflect.DeepEqual(w, g) {
-			diffs = append(diffs, fmt.Sprintf("%s: want %v, got %v", field, w, g))
-		}
-	}
-	check("name", want.Name, got.Name)
-	check("subjects", want.Subjects, got.Subjects)
-	check("retention", want.Retention, got.Retention)
-	check("max_consumers", want.MaxConsumers, got.MaxConsumers)
-	check("max_msgs", want.MaxMsgs, got.MaxMsgs)
-	check("max_bytes", want.MaxBytes, got.MaxBytes)
-	check("max_age", want.MaxAge, got.MaxAge)
-	check("max_msgs_per_subject", want.MaxMsgsPerSubject, got.MaxMsgsPerSubject)
-	check("max_msg_size", want.MaxMsgSize, got.MaxMsgSize)
-	check("discard", want.Discard, got.Discard)
-	check("storage", want.Storage, got.Storage)
-	check("replicas", want.Replicas, got.Replicas)
-	check("duplicates", want.Duplicates, got.Duplicates)
-	check("allow_direct", want.AllowDirect, got.AllowDirect)
-	check("allow_rollup_hdrs", want.AllowRollup, got.AllowRollup)
-	check("deny_delete", want.DenyDelete, got.DenyDelete)
-	check("deny_purge", want.DenyPurge, got.DenyPurge)
-	check("sealed", false, got.Sealed)
-	check("mirror", (*nats.StreamSource)(nil), got.Mirror)
-	check("sources", 0, len(got.Sources))
-	check("republish", (*nats.RePublish)(nil), got.RePublish)
-	check("subject_transform", (*nats.SubjectTransformConfig)(nil), got.SubjectTransform)
-	return strings.Join(diffs, "; ")
-}
-
-// streamDefaultDuplicates is nats-server's duplicate window for a stream that
-// sets none (StreamDefaultDuplicatesWindow).
-const streamDefaultDuplicates = 2 * time.Minute
-
-// withServerDefaults fills the fields a config leaves zero the way
-// nats-server's checkStreamCfg does (2.10 and later): every limit to -1 for
-// none, and the duplicate window to two minutes, or the max age when that is
-// shorter. A config the operator renders leaves them zero; the read-back
-// compares what the server stored with this, so a zero field neither fails
-// every restore nor lets a restore set it to anything.
-func withServerDefaults(cfg nats.StreamConfig) nats.StreamConfig {
-	for _, limit := range []*int64{&cfg.MaxMsgs, &cfg.MaxMsgsPerSubject, &cfg.MaxBytes} {
-		if *limit == 0 {
-			*limit = -1
-		}
-	}
-	if cfg.MaxMsgSize == 0 {
-		cfg.MaxMsgSize = -1
-	}
-	if cfg.MaxConsumers == 0 {
-		cfg.MaxConsumers = -1
-	}
-	if cfg.Duplicates == 0 && cfg.Mirror == nil {
-		cfg.Duplicates = streamDefaultDuplicates
-		if cfg.MaxAge != 0 && cfg.MaxAge < streamDefaultDuplicates {
-			cfg.Duplicates = cfg.MaxAge
-		}
-	}
-	return cfg
 }
 
 // RaiseReplicas sets a restored stream to n replicas through an update that

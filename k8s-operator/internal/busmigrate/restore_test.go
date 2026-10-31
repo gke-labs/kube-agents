@@ -27,7 +27,7 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 
 	alone := startServer(t, "a2a-nats-0", d0, 0)
 	seedBus(t, alone.ClientURL(), 1)
-	rendered := streamConfigs(t, alone.ClientURL(), streams...) // the operator's render, in this test
+	rendered := streamConfigs(t, alone.ClientURL(), streams...) // the operator's policy, in this test
 	nc, err := nats.Connect(alone.ClientURL())
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +67,7 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 
 	tampered := append([]byte(nil), data["TASKS"]...)
 	tampered[len(tampered)/2] ^= 0xff
-	if err := RestoreVerified(ctx, nc, withReplicas(rendered["TASKS"], 1), metas["TASKS"].State, opener(tampered), digests["TASKS"]); !errors.Is(err, ErrDigestMismatch) {
+	if err := RestoreVerified(ctx, nc, metas["TASKS"].Config, metas["TASKS"].State, opener(tampered), digests["TASKS"], policyOf(withReplicas(rendered["TASKS"], 1))); !errors.Is(err, ErrDigestMismatch) {
 		t.Fatalf("a snapshot changed after hashing: %v, want ErrDigestMismatch", err)
 	}
 	if _, err := streamInfo(ctx, nc, "TASKS"); err == nil {
@@ -85,7 +85,7 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 		return io.NopCloser(bytes.NewReader(tampered)), nil
 	}
 	for i := 0; ; i++ {
-		err := RestoreVerified(ctx, nc, withReplicas(rendered["TASKS"], 1), metas["TASKS"].State, late, digests["TASKS"])
+		err := RestoreVerified(ctx, nc, metas["TASKS"].Config, metas["TASKS"].State, late, digests["TASKS"], policyOf(withReplicas(rendered["TASKS"], 1)))
 		if errors.Is(err, ErrDigestMismatch) {
 			break
 		}
@@ -102,7 +102,7 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 	for _, n := range streams {
 		var err error
 		for i := 0; i < 30; i++ {
-			if err = RestoreVerified(ctx, nc, withReplicas(rendered[n], 1), metas[n].State, opener(data[n]), digests[n]); err == nil {
+			if err = RestoreVerified(ctx, nc, metas[n].Config, metas[n].State, opener(data[n]), digests[n], policyOf(withReplicas(rendered[n], 1))); err == nil {
 				break
 			}
 			t.Logf("restore %s attempt %d: %v", n, i, err)
@@ -150,9 +150,9 @@ func withReplicas(cfg nats.StreamConfig, n int) nats.StreamConfig {
 	return cfg
 }
 
-// A restored stream whose config reads back as anything but the operator's is
-// deleted: here a stream capturing another subject.
-func TestARestoredStreamWithTheWrongConfigIsDeleted(t *testing.T) {
+// A restored stream whose config reads back outside its policy is deleted:
+// here a stream capturing another subject.
+func TestARestoredStreamOutsideItsPolicyIsDeleted(t *testing.T) {
 	ctx := context.Background()
 	s := startServer(t, "a2a-nats-0", t.TempDir(), 0)
 	defer shutdown(s)
@@ -166,41 +166,68 @@ func TestARestoredStreamWithTheWrongConfigIsDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := nats.StreamConfig{Name: "TASKS", Subjects: []string{"a2a.tasks.>"}, Replicas: 1}
-	if err := verifyOrDelete(ctx, nc, want); err == nil || !strings.Contains(err.Error(), "deleted") {
+	si, _ := js.StreamInfo("TASKS")
+	policy := policyOf(withReplicas(si.Config, 1))
+	policy.Subjects = want.Subjects
+	if err := verifyOrDelete(ctx, nc, policy); err == nil || !strings.Contains(err.Error(), "deleted") {
 		t.Fatalf("verifyOrDelete: %v, want the mismatch deleted", err)
 	}
 	if _, err := js.StreamInfo("TASKS"); err == nil {
 		t.Fatal("the mismatched stream is still there")
 	}
-	// And a matching one stands: zero fields compare as the server's defaults.
+	// And a matching one stands.
 	if _, err := js.AddStream(&want); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyOrDelete(ctx, nc, want); err != nil {
-		t.Fatalf("a stream with the operator's config: %v", err)
+	if err := verifyOrDelete(ctx, nc, policy); err != nil {
+		t.Fatalf("a stream inside its policy: %v", err)
 	}
 }
 
-// The defaults cut both ways: a field the operator's config leaves zero
-// compares as the server's default, so a restored stream that set it to
-// anything else (a consumer cap, a size limit, a short duplicate window) is
-// caught, not waved through as "unset".
-func TestAZeroFieldIsNotAWildcard(t *testing.T) {
-	want := nats.StreamConfig{Name: "TASKS", Subjects: []string{"a2a.tasks.>"}, Replicas: 1}
-	stored := withServerDefaults(want)
-	if d := configDiff(want, stored); d != "" {
-		t.Fatalf("the server's own defaults read as a difference: %s", d)
+// A snapshot config outside the policy sends nothing: no RESTORE, so no
+// stream and no held name, and the right snapshot restores straight after.
+func TestASnapshotConfigOutsideThePolicySendsNothing(t *testing.T) {
+	ctx := context.Background()
+	src := startServer(t, "a2a-nats-0", t.TempDir(), 0)
+	seedBus(t, src.ClientURL(), 1)
+	nc, err := nats.Connect(src.ClientURL())
+	if err != nil {
+		t.Fatal(err)
 	}
-	for field, tweak := range map[string]func(*nats.StreamConfig){
-		"max_consumers": func(c *nats.StreamConfig) { c.MaxConsumers = 1 },
-		"max_bytes":     func(c *nats.StreamConfig) { c.MaxBytes = 1024 },
-		"max_msgs":      func(c *nats.StreamConfig) { c.MaxMsgs = 10 },
-		"duplicates":    func(c *nats.StreamConfig) { c.Duplicates = time.Second },
-	} {
-		got := stored
-		tweak(&got)
-		if d := configDiff(want, got); !strings.Contains(d, field) {
-			t.Errorf("a stored %s other than the default passed the read-back (diff %q)", field, d)
-		}
+	var buf bytes.Buffer
+	meta, err := Snapshot(ctx, nc, "TASKS", &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc.Close()
+	shutdown(src)
+	policy := policyOf(meta.Config)
+
+	dst := startServer(t, "a2a-nats-0", t.TempDir(), 0)
+	defer shutdown(dst)
+	nc, err = nats.Connect(dst.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	sent := 0
+	sub, err := nc.Subscribe("$JS.API.STREAM.RESTORE.>", func(*nats.Msg) { sent++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+	widened := meta.Config
+	widened.Subjects = []string{"a2a.>"}
+	if err := RestoreVerified(ctx, nc, widened, meta.State, opener(buf.Bytes()), Digest(buf.Bytes()), policy); !errors.Is(err, ErrOutsidePolicy) {
+		t.Fatalf("a widened snapshot config: %v, want ErrOutsidePolicy", err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if sent != 0 {
+		t.Errorf("%d RESTORE requests sent for a config outside the policy", sent)
+	}
+	if err := RestoreVerified(ctx, nc, meta.Config, meta.State, opener(buf.Bytes()), Digest(buf.Bytes()), policy); err != nil {
+		t.Fatalf("the snapshot's own config, inside the policy: %v", err)
 	}
 }
