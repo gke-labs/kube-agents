@@ -317,7 +317,8 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # main (the main part's two halves, main-a and main-b, and the writers part),
 # which grade the full catalog under next (the nightly the dashboard and
 # the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
-# hack/eval/gitlab-cases.txt, beside the today-mode GitLab nightly); and the
+# hack/eval/gitlab-cases.txt) and the GHES lane's (EVAL_FORGE=ghes,
+# hack/eval/ghes-cases.txt), each beside its today-mode nightly; and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
 # new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
 # is optional, so Tide never batched it, and a pull request's run of it
@@ -333,7 +334,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
@@ -981,7 +982,7 @@ fi
 
 # The mode flip exists for the runs that grade next or roll it back: a pull
 # request's, or one of the jobs EVAL_MODE_NEXT_JOB_NAMES lists (the today
-# lane's periodic and the main and GitLab nightlies on main, the blocking presubmit
+# lane's periodic and the main, GitLab and GHES nightlies on main, the blocking presubmit
 # in a batch Tide ran, and the release-candidate eval).
 # A flagged run on main records under the version key's next mode, never into
 # today's window (bench-gate reads the mode off the transport; hack/ci-eval-pr.sh
@@ -1066,8 +1067,9 @@ fi
 # self-managed (a private host with a private CA the run supplies). A lane is a
 # row; a new forge is a new row, nothing else here changes. The self-managed
 # hosts can be overridden for a developer's own instance. hack/ci-eval-pr.sh
-# lifts this function, as it lifts the project tables, so both scripts read one
-# table; tests/test_ci_gitops_repo.py pins the rows.
+# and hack/ci-forge.sh lift this function, as the first lifts the project
+# tables, so the three scripts read one table; tests/test_ci_gitops_repo.py
+# pins the rows.
 EVAL_FORGE_DEFAULT_GHES_HOST="ghes.eval.internal"
 EVAL_FORGE_DEFAULT_GITLAB_CE_HOST="gitlab.eval.internal"
 forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no: self-managed>"; 1 unknown forge, 2 bad host override

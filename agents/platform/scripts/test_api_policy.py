@@ -8,6 +8,7 @@ a route is admitted with its rule id, and the same shape one word away is not.
 Run:  python3 agents/platform/scripts/test_api_policy.py
 """
 
+import json
 import re
 import unittest
 
@@ -225,6 +226,109 @@ class CloudTraceRoutesTest(unittest.TestCase):
         for trace_id in ("", "a" * 31, "a" * 33, A_TRACE_ID.upper(), "g" * 32, A_TRACE_ID + "\n"):
             with self.subTest(trace_id=trace_id):
                 self.assertIsNone(pattern.fullmatch(trace_id))
+
+
+CONTAINER = "container.googleapis.com"
+
+
+def _verdict(decision):
+    return decision.allowed, decision.rule_id
+
+
+class GkeClusterRoutesTest(unittest.TestCase):
+    """#3703: the reconcile's two GKE reads, approved as exactly these two, and projected."""
+
+    LIST = "v1/projects/kagents-dev/locations/-/clusters"
+    GET = "v1/projects/kagents-dev/locations/us-central1-a/clusters/seeded-a"
+
+    def test_each_cluster_route_is_allowed_with_its_rule_id(self):
+        for path, rule_id in (
+            (self.LIST, "gcp.api.container.clusters-list"),
+            ("v1/projects/123456789012/locations/us-central1/clusters", "gcp.api.container.clusters-list"),
+            (self.GET, "gcp.api.container.clusters-get"),
+            ("v1/projects/kagents-dev/locations/us-central1/clusters/a", "gcp.api.container.clusters-get"),
+            ("v1/projects/kagents-dev/locations/europe-west4-c/clusters/" + "a" * 40, "gcp.api.container.clusters-get"),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual((True, rule_id), _verdict(evaluate("GET", CONTAINER, path, "")))
+
+    def test_writes_on_the_cluster_paths_are_refused_on_method(self):
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            for path in (self.LIST, self.GET):
+                with self.subTest(method=method, path=path):
+                    self.assertEqual((False, "gcp.api.method"), _verdict(evaluate(method, CONTAINER, path, "")))
+
+    def test_every_other_container_path_is_refused(self):
+        for path in (
+            self.GET + "/nodePools",
+            self.GET + "/nodePools/default-pool",
+            self.GET + ":getJwks",
+            self.GET + ":setLabels",
+            self.LIST + "/",
+            self.GET + "/",
+            "v1/projects/kagents-dev/locations/-/operations",
+            "v1/projects/kagents-dev/locations/-/serverConfig",
+            "v1/projects/kagents-dev/zones/us-central1-a/clusters",
+            "v1beta1/projects/kagents-dev/locations/-/clusters",
+            "v1/projects/kagents-dev/locations/US-central1/clusters",
+            "v1/projects/kagents-dev/locations/us-central1:x/clusters",
+            "v1/projects/kagents-dev/locations/us-central1-ab/clusters",
+            "v1/projects/kagents-dev/locations/us-central123/clusters",
+            "v1/projects/kagents-dev/locations/uscentral1/clusters",
+            "v1/projects/kagents-dev/locations/global/clusters",
+            "v1/projects/kagents-dev/locations/--/clusters",
+            "v1/projects/kagents-dev/locations/us-central1-/clusters",
+            "v1/projects/kagents-dev/locations/us-central1/clusters/Seeded-a",
+            "v1/projects/kagents-dev/locations/us-central1/clusters/1a",
+            "v1/projects/kagents-dev/locations/us-central1/clusters/a-",
+            "v1/projects/kagents-dev/locations/us-central1/clusters/" + "a" * 41,
+            "v1/projects/kagents-dev/locations/us-central1/clusters/a/b",
+            "v1/projects/kagents-dev/locations/us-central1/clusters/a%2Fb",
+            "v1/projects/kagents-dev/locations/us-central1/clusters/a\n",
+            "v1/projects/kagents-dev/locations/-/clusters/../operations",
+            "v1/projects/kagents-dev/aggregated/usableSubnetworks",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(evaluate("GET", CONTAINER, path, "").allowed)
+
+    def test_the_cluster_shapes_are_not_reachable_on_another_host(self):
+        for host in (MONITORING, CLOUDTRACE, "gkehub.googleapis.com"):
+            with self.subTest(host=host):
+                self.assertFalse(evaluate("GET", host, self.GET, "").allowed)
+
+    def test_both_projections_drop_every_credential_field(self):
+        master_auth = {"clusterCaCertificate": "CA", "fieldOne": "CERT", "fieldTwo": "KEY",
+                       "fieldThree": "admin", "fieldFour": "hunter2"}
+        cluster = {"name": "a", "location": "l", "status": "RUNNING", "id": "1", "endpoint": "34.1.2.3",
+                   "masterAuth": master_auth, "privateClusterConfig": {"privateEndpoint": "10.0.0.2"}}
+        got_get = api_policy.project_gke_cluster(json.dumps(cluster).encode())
+        got_list = api_policy.project_gke_cluster_list(json.dumps({"clusters": [cluster]}).encode())
+        self.assertEqual({"name": "a", "location": "l", "status": "RUNNING", "id": "1"}, json.loads(got_get))
+        self.assertEqual({"clusters": [{"name": "a", "location": "l", "status": "RUNNING", "id": "1"}]},
+                         json.loads(got_list))
+        for body in (got_get, got_list):
+            for secret in (b"CERT", b"KEY", b"hunter2", b"masterAuth", b"endpoint", b"10.0.0.2"):
+                self.assertNotIn(secret, body)
+
+    def test_a_projection_refuses_what_it_cannot_read(self):
+        for raw in (b"not json", b"[]", b"7", b'"s"'):
+            with self.subTest(raw=raw):
+                self.assertIsNone(api_policy.project_gke_cluster(raw))
+                self.assertIsNone(api_policy.project_gke_cluster_list(raw))
+        self.assertIsNone(api_policy.project_gke_cluster_list(b'{"clusters": {"a": 1}}'))
+        self.assertIsNone(api_policy.project_gke_cluster_list(b'{"clusters": ["a"]}'))
+        self.assertEqual(b'{"clusters":[]}', api_policy.project_gke_cluster_list(b"{}"))
+
+    def test_a_list_keeps_no_top_level_key_but_clusters_and_missing_zones(self):
+        body = {"clusters": [], "missingZones": ["europe-west1-b"], "nextPageToken": "t", "fieldOne": "x"}
+        got = json.loads(api_policy.project_gke_cluster_list(json.dumps(body).encode()))
+        self.assertEqual({"clusters": [], "missingZones": ["europe-west1-b"]}, got)
+
+    def test_only_the_cluster_routes_carry_a_projection(self):
+        projected = {r.rule_id for r in api_policy.API_READ_ROUTES if r.project is not None}
+        self.assertEqual({"gcp.api.container.clusters-list", "gcp.api.container.clusters-get"}, projected)
+        self.assertIs(api_policy.project_gke_cluster, api_policy.response_projection("gcp.api.container.clusters-get"))
+        self.assertIsNone(api_policy.response_projection("gcp.api.monitoring.timeseries-list"))
 
 
 class TableValidatorTest(unittest.TestCase):

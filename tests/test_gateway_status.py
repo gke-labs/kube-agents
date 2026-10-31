@@ -109,14 +109,42 @@ class GatewayStatusTest(unittest.TestCase):
         conditions = api.patches[CLASS_PATH + "/status"]["status"]["conditions"]
         self.assertEqual([(c["type"], c["status"], c["observedGeneration"]) for c in conditions], [("Accepted", "True", 2)])
 
-    def test_the_token_is_taken_fresh_from_gcloud(self):
-        done = gateway_status.subprocess.CompletedProcess(["gcloud"], 0, stdout="ya29.fresh\n", stderr="")
-        with patch.object(gateway_status.subprocess, "run", return_value=done) as run:
-            self.assertEqual(gateway_status.access_token(), "ya29.fresh")
-        self.assertEqual(run.call_args.args[0], ["gcloud", "auth", "print-access-token"])
-        failed = gateway_status.subprocess.CompletedProcess(["gcloud"], 1, stdout="", stderr="not logged in")
-        with patch.object(gateway_status.subprocess, "run", return_value=failed), self.assertRaises(SystemExit):
-            gateway_status.access_token()
+    def _token(self, *answers):
+        replies = iter(answers)
+
+        def run(command, **kwargs):
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return gateway_status.subprocess.CompletedProcess(command, reply[0], stdout=reply[1], stderr=reply[2])
+
+        with patch.object(gateway_status.subprocess, "run", side_effect=run) as called:
+            try:
+                return gateway_status.access_token(), [c.args[0] for c in called.call_args_list]
+            except SystemExit as exc:
+                return exc, [c.args[0] for c in called.call_args_list]
+
+    def test_the_token_comes_from_application_default_credentials_first(self):
+        token, commands = self._token((0, "ya29.adc\n", ""))
+        self.assertEqual(token, "ya29.adc")
+        self.assertEqual(commands, [["gcloud", "auth", "application-default", "print-access-token"]])
+
+    def test_without_adc_the_token_comes_from_gcloud(self):
+        with patch("sys.stderr", io.StringIO()) as err:
+            token, commands = self._token((1, "", "no ADC configured"), (0, "ya29.user\n", ""))
+        self.assertEqual(token, "ya29.user")
+        self.assertIn("token from gcloud auth print-access-token after gcloud auth application-default print-access-token exited 1: no ADC configured", err.getvalue())
+        self.assertNotIn("ya29", err.getvalue())
+        self.assertEqual(commands[1], ["gcloud", "auth", "print-access-token"])
+        with patch("sys.stderr", io.StringIO()):
+            token, _ = self._token(OSError("gcloud not found"), (0, "ya29.user\n", ""))
+        self.assertEqual(token, "ya29.user")
+
+    def test_no_token_at_all_fails_the_apply_naming_both(self):
+        failed, _ = self._token((1, "", "no ADC configured"), (1, "", "not logged in"))
+        self.assertIsInstance(failed, SystemExit)
+        self.assertIn("no ADC configured", str(failed.code))
+        self.assertIn("not logged in", str(failed.code))
 
     def test_a_refused_write_fails_the_apply(self):
         with self.assertRaises(SystemExit) as raised:

@@ -1,0 +1,40 @@
+# The GHES lane's matrix: what pull-kube-agents-smoke-test-ghes runs on a
+# pull request and ci-kube-agents-eval-nightly-ghes runs once a night
+# (kube-agents#3684), and ci-kube-agents-eval-nightly-ghes-next runs once a
+# night under spec.mode next (EVAL_MODE_NEXT=1, through the inject door).
+# hack/ci-eval-pr.sh reads this file in place of the catalogue whenever
+# EVAL_FORGE is ghes, on either tier. The forge is the forwarding proxy in
+# hack/ghes-proxy at a private host with a private CA, stood up per run by
+# hack/ci-forge.sh in front of the pool project's github.com repository; the
+# cases below grade the forge the way gitlab-cases.txt's do, and the same rules
+# hold: one `./tasks/<id>/task.yaml` path per line, every entry a registered
+# case (presubmit-cases.txt or nightly-cases.txt) with a positive forge check,
+# pinned by scripts/test_eval_rosters.py. Neither nightly appends to the
+# evidence store.
+#
+# WHAT A PASS PROVES. The agent reached the forge at the GHES host: the pull
+# request it links is on https://<ghes-host>/..., which the proxy writes only
+# for a request it forwarded, and the grader reads the pull request back from
+# api.github.com with BENCH_GITHUB_HOST set to the host (pull_request_opened
+# accepts no github.com link on this lane). The token minter mints through
+# the host too, under the forge's CA.
+#
+# WHY THESE THREE. The GitLab lane's list, unchanged: the cases grade the
+# forge and not where it is, and all three passed on this lane on the dev
+# project on 2026-10-22 (3/3, 3/3, 2/3 with one quota miss). The GHES-only
+# case bench/tasks/ghes-pdb-remediation-pr (the same task plus a writes
+# safeguard the inject lane appends anyway) is not registered: a nightly
+# registration would run it on the github.com nightly as a second copy of
+# pdb-remediation-pr. It joins this list when the registration rules grow a
+# lane-only seat.
+#
+# BUDGET. Three cases, nine units at EVAL_REPETITIONS of 3, one at a time
+# (each requests a pull request): pdb-remediation-pr (1250s hinted; 8–26 min
+# per repetition measured under spec.mode next on a six-cluster fleet),
+# vcs-spent-branch-reuse (1000s) and vcs-review-feedback-read-back (700s),
+# plus the forge VM's ~2 minutes before the deploy. Inside the presubmit's
+# 360-minute deadline and the nightlies' 480.
+
+./tasks/vcs-spent-branch-reuse/task.yaml
+./tasks/vcs-review-feedback-read-back/task.yaml
+./tasks/pdb-remediation-pr/task.yaml

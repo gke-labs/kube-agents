@@ -4,7 +4,7 @@
 weekly_email.py writes the summary (``--chat-out``: ``{week_end, text,
 card}``) when the week's page passes every integrity check; a refused week writes
 none, so there is nothing to post. This script posts it on the first tick at
-or after POST_HOUR on the Monday after the week ends, Toronto time (9 AM
+or after POST_HOUR on the Monday after the week ends, Toronto time (11 AM
 ET), and records the week in a small state object (``--state``, a local path
 or a gs:// object, this script's only write) so a later tick, or a re-run of
 the same tick, posts nothing for that week. A Monday missed is retried
@@ -52,7 +52,7 @@ except ImportError:  # run as a script: scripts/eval_dashboard/weekly_chat.py
 # hour on the reader's clock (post_health.LOCAL_TZ, Toronto), the digest's
 # hour, so the week's summary follows Monday's digest.
 POST_DAYS_AFTER_WEEK_END = 1
-POST_HOUR = 9
+POST_HOUR = post_health.DEFAULT_DIGEST_HOUR
 
 MUTE_ENV = "CI_HEALTH_MUTE"
 MUTE_ON = "true"

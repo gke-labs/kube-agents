@@ -118,6 +118,7 @@ __all__ = [
     "BootstrapReportReadVerifier",
     "FindingsItemStateVerifier",
     "FleetResourcePropertyVerifier",
+    "ForgeIssueStateVerifier",
     "GitHubWritesVerifier",
     "LedgerIssueContainsVerifier",
     "PullRequestOpenedVerifier",
@@ -129,6 +130,17 @@ __all__ = [
     "ToolCalledVerifier",
     "WorkerCommandsVerifier",
 ]
+
+# Pages of issue comments ``forge_issue_state`` reads per issue. One run's
+# procedure posts a handful, a page holds a hundred, and GitHub's ``since``
+# narrows the pages to comments updated since the run.
+_ISSUE_COMMENT_PAGES = 3
+# Tolerance between a forge's stamps and the harness's run-start clock, two
+# different machines. The cap keeps the window short of the previous
+# repetition: in a presubmit the next one starts minutes after the last close,
+# and a wide allowance would hand the binding rule a stale issue.
+_DEFAULT_CLOCK_SKEW_SEC = 120.0
+_MAX_CLOCK_SKEW_SEC = 300.0
 
 _NO_TRANSCRIPT_REASON = (
     "no transcript stashed for this run: the harness did not complete an "
@@ -2132,6 +2144,13 @@ _NO_PR_RUN_CLOCK_REASON = (
     "is unset), so this check cannot tell a pull request this run opened from "
     "one left behind by a previous run, and refuses to grade it"
 )
+# The same absence, said for the issue forge_issue_state reads: without the
+# run's start there is no window to place its close and its comments in.
+_NO_ISSUE_RUN_CLOCK_REASON = (
+    "the run's transcript carries no start time (TranscriptSnapshot.started_at "
+    "is unset), so this check cannot tell an issue this run closed or commented "
+    "on from one an earlier run left behind, and refuses to grade it"
+)
 
 _NO_PR_URL_REASON = (
     "the run's report names no github.com pull request URL, so no fix was "
@@ -2252,8 +2271,9 @@ def _gitlab_path_key(value: str) -> str:
 
     Surrounding slashes off, as `GitHubWritesVerifier` takes them off the
     same variable on GitLab -- a path copied out of a URL often keeps one --
-    and case folded, because GitLab paths compare that way. Only GitLab's
-    callers use it; GitHub reads its repository exactly as given.
+    and case folded, because GitLab paths compare that way, and GitHub's
+    owner/name pairs compare case-insensitively too, so the repository
+    binding of ``forge_issue_state`` uses it on both forges.
     """
     return value.strip().strip("/").lower()
 
@@ -2262,6 +2282,46 @@ def _issue_api_url(forge: str, repo: str, number: int) -> str:
     if forge == forges.FORGE_GITLAB:
         return f"{forges.gitlab_api_root()}{forges.gitlab_project_path(repo)}/issues/{number}"
     return f"{forges.github_api_root()}/repos/{repo}/issues/{number}"
+
+
+def _issue_comments(
+    api_url: str,
+    token: str,
+    budget: float,
+    forge: str,
+    since: datetime,
+    pages: int = 1,
+) -> list[tuple[datetime | None, str]] | None:
+    """``(created_at, body)`` of an issue's comments; None when they could not be read.
+
+    GitHub's ``since`` filters on a comment's update stamp, which is never
+    earlier than its creation, so it only narrows the pages and the caller
+    decides on ``created_at``. GitLab's notes take no ``since``; they are
+    read newest first, one page, and its system notes (a label or state
+    change) are skipped, since nobody posted those. A non-200 answer or a
+    payload that is not a list is None; transport failures propagate as
+    :class:`OSError`, for the caller to name.
+    """
+    stamp = since.astimezone(timezone.utc).strftime(_GITHUB_SINCE_FORMAT)
+    if forge == forges.FORGE_GITLAB:
+        urls = [f"{api_url}/notes?sort=desc&order_by=created_at&per_page={_GITHUB_PAGE_SIZE}"]
+    else:
+        first = f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={stamp}"
+        urls = [first] + [f"{first}&page={page}" for page in range(2, pages + 1)]
+    comments: list[tuple[datetime | None, str]] = []
+    for url in urls:
+        status_code, payload = _http_get_json(url, token, budget)
+        if status_code != 200 or not isinstance(payload, list):
+            return None
+        for comment in payload:
+            if not isinstance(comment, dict) or comment.get("system"):
+                continue
+            comments.append(
+                (_parse_github_time(comment.get("created_at")), str(comment.get("body") or ""))
+            )
+        if len(payload) < _GITHUB_PAGE_SIZE:
+            break
+    return comments
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -4053,24 +4113,16 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         skipped, since the marker is a comment the reset posts.
         """
         closed_at = closed_at.astimezone(timezone.utc)
-        since = (closed_at - _RESET_COMMENT_LOOKBACK).strftime(_GITHUB_SINCE_FORMAT)
-        if forge == forges.FORGE_GITLAB:
-            url = f"{api_url}/notes?sort=desc&order_by=created_at&per_page={_GITHUB_PAGE_SIZE}"
-        else:
-            url = f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={since}"
         try:
-            status_code, payload = _http_get_json(url, token, budget)
+            comments = _issue_comments(
+                api_url, token, budget, forge, closed_at - _RESET_COMMENT_LOOKBACK
+            )
         except OSError:
             return None
-        if status_code != 200 or not isinstance(payload, list):
+        if comments is None:
             return None
-        for comment in payload:
-            if not isinstance(comment, dict) or comment.get("system"):
-                continue
-            if LEDGER_RESET_MARKER not in str(comment.get("body") or ""):
-                continue
-            created_at = _parse_github_time(comment.get("created_at"))
-            if created_at is None:
+        for created_at, body in comments:
+            if LEDGER_RESET_MARKER not in body or created_at is None:
                 continue
             if abs((closed_at - created_at).total_seconds()) <= self.max_clock_skew_sec:
                 return True
@@ -4412,6 +4464,238 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             f"{surface}, generated at {generated_at.isoformat()} by this run, "
             "contains " + ", ".join(satisfied),
             raw=raw,
+        )
+
+
+@VERIFIERS.register("forge_issue_state")
+class ForgeIssueStateVerifier(BaseVerifier):
+    """The state of the issue the run's reply names, read from the forge.
+
+    WHY THIS EXISTS. A procedure that ends on an issue -- claim it, comment
+    on it, label it, close it -- leaves its evidence on the issue; the reply
+    only describes it. A ``report_contains`` over a list of phrasings for
+    "the report was posted" grades the description: it fails a run that did
+    every step and worded the reply another way, and it passes one that wrote
+    the words and skipped the steps. This check reads the artifact.
+
+    HOW IT FINDS THE ISSUE. Every issue web URL the final message carries in
+    full (:func:`forges.issue_refs`), as ``ledger_issue_contains`` and
+    ``pull_request_opened`` find theirs. Each URL is a POINTER, never
+    evidence: everything asserted comes from what the forge returns for it.
+    The check passes when one named issue satisfies every assertion, and the
+    reason says why each other one did not.
+
+    WHICH REPOSITORY. Only the GitOps repository this job grades, read from
+    ``BENCH_GITOPS_REPO`` as ``github_writes`` reads it (``hack/ci-eval-pr.sh``
+    exports it on both lanes). The procedure under test works the ticket in
+    the repository the install manages; an issue anywhere else, however
+    well it matches, was not worked by that procedure and is rejected before
+    it is read. An unset variable is ``status="error"``.
+
+    WHAT IS ASSERTED, all from the API response. ``state``, when set.
+    ``labels``, every one present. ``min_comments`` comments created at or
+    after the run started, less ``max_clock_skew_sec``. That window is what
+    binds the issue to THIS run: a previous repetition leaves a closed,
+    labelled issue behind, and a reply pointing at it would otherwise pass
+    forever. For the same reason a ``closed`` assertion also requires
+    ``closed_at`` inside the window, and a spec must set ``state: closed``
+    or ``min_comments`` of at least 1: ``labels`` alone, or ``state: open``
+    alone, binds nothing and is refused at spec load. GitLab's system notes
+    (a label or state change) are not comments and are not counted.
+
+    AUTHENTICATION. The runner's read token, as ``ledger_issue_contains``
+    documents it, and never the agent's own credential. An absent token is
+    ``status="error"``, never a pass.
+    """
+
+    type: Literal["forge_issue_state"]
+    state: Literal["open", "closed"] | None = None
+    labels: list[str] = Field(default_factory=list)
+    min_comments: int = Field(default=0, ge=0)
+    max_clock_skew_sec: float = Field(default=_DEFAULT_CLOCK_SKEW_SEC, ge=0, le=_MAX_CLOCK_SKEW_SEC)
+
+    @model_validator(mode="after")
+    def _binds_the_issue_to_the_run(self) -> ForgeIssueStateVerifier:
+        if self.state != "closed" and self.min_comments < 1:
+            raise ValueError(
+                "forge_issue_state must bind the issue to this run: set state: closed "
+                "(the close must fall inside the run) or min_comments of at least 1 "
+                "(comments posted inside the run); labels alone, or state: open alone, "
+                "would pass on an issue an earlier run left behind"
+            )
+        return self
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+
+        def done(
+            success: bool,
+            reason: str,
+            *,
+            status: str | None = None,
+            raw: dict | None = None,
+        ) -> VerificationResult:
+            return VerificationResult(
+                success=success,
+                status=status,
+                elapsed_time=time.monotonic() - start,
+                reason=reason,
+                raw=raw,
+            )
+
+        snap = transcript.get()
+        if snap is None:
+            return done(False, _NO_TRANSCRIPT_REASON, status="error")
+        if not snap.started_at:
+            return done(False, _NO_ISSUE_RUN_CLOCK_REASON, status="error")
+        try:
+            forge = forges.forge_name()
+        except forges.UnknownForge as exc:
+            return done(False, str(exc), status="error")
+        token = forges.read_token(forge)
+        if not token:
+            return done(False, _no_token_reason(forge), status="error")
+        host = forges.web_host(forge)
+        label = _forge_label(forge)
+
+        seen = forges.issue_refs(snap.final_message, forge)
+        if not seen:
+            return done(
+                False,
+                f"the run's reply names no {host} issue URL in full, so there is "
+                "no issue to read the state of; a reply that completed the "
+                "procedure names the ticket it worked",
+            )
+        if len(seen) > _MAX_LEDGER_CANDIDATES:
+            return done(
+                False,
+                f"the run's reply names {len(seen)} distinct issue URLs; more than "
+                f"{_MAX_LEDGER_CANDIDATES} is a reply to read by hand, not a set of "
+                "candidates to resolve",
+            )
+
+        gitops_repo = os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip().strip("/")
+        if not gitops_repo or "/" not in gitops_repo:
+            return done(False, _NO_GITOPS_REPO_REASON, status="error")
+
+        started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
+        window_start = started - timedelta(seconds=self.max_clock_skew_sec)
+        budget = single_call_timeout(timeout_sec)
+        rejected: list[str] = []
+        for repo, number in seen:
+            slug = f"{repo}#{number}"
+            if _gitlab_path_key(repo) != _gitlab_path_key(gitops_repo):
+                rejected.append(
+                    f"{slug}: not in the GitOps repository this job grades ({gitops_repo})"
+                )
+                continue
+            url = _issue_api_url(forge, repo, number)
+            try:
+                status_code, payload = _http_get_json(url, token, budget)
+            except OSError as exc:
+                return done(
+                    False,
+                    f"could not reach the {label} API for {slug}: "
+                    f"{exc}; this check could not be evaluated",
+                    status="error",
+                )
+            if status_code == 404:
+                if forge == forges.FORGE_GITLAB and _is_configured_gitlab_project(repo):
+                    try:
+                        why = _gitlab_project_unseen(repo, token, budget)
+                    except OSError as exc:
+                        why = f"could not reach the GitLab API for {repo}: {exc}"
+                    if why:
+                        return done(False, why, status="error")
+                rejected.append(f"{slug}: no such issue (404)")
+                continue
+            if status_code in (401, 403):
+                return done(
+                    False,
+                    f"{label} returned {status_code} for {slug}: the configured token "
+                    "cannot read this repository's issues, so this check could not "
+                    "be evaluated",
+                    status="error",
+                )
+            if status_code != 200 or not isinstance(payload, dict):
+                return done(
+                    False,
+                    f"unexpected {label} response {status_code} for {slug}; "
+                    "this check could not be evaluated",
+                    status="error",
+                )
+            view = _issue_view(forge, payload)
+            closed_at: datetime | None = view["closed_at"]
+            faults: list[str] = []
+            if self.state is not None and view["state"] != self.state:
+                faults.append(f"is {view['state'] or 'in no readable state'}, not {self.state}")
+            elif self.state == "closed":
+                if closed_at is None:
+                    faults.append(
+                        "is closed with no readable closed_at, so the close cannot "
+                        "be placed inside this run"
+                    )
+                elif closed_at < window_start:
+                    faults.append(
+                        f"was closed at {closed_at.isoformat()}, "
+                        f"{(started - closed_at).total_seconds():.0f}s before this run "
+                        f"started ({started.isoformat()}): an earlier run's close"
+                    )
+            missing = [name for name in self.labels if name not in view["labels"]]
+            if missing:
+                faults.append(f"lacks the label(s) {missing} (labels: {sorted(view['labels'])})")
+            comments: int | None = None
+            if self.min_comments:
+                try:
+                    listed = _issue_comments(
+                        url, token, budget, forge, window_start, _ISSUE_COMMENT_PAGES
+                    )
+                except OSError as exc:
+                    return done(
+                        False,
+                        f"could not read the comments of {slug}: {exc}; "
+                        "this check could not be evaluated",
+                        status="error",
+                    )
+                if listed is None:
+                    return done(
+                        False,
+                        f"the comments of {slug} could not be read ({label} did not "
+                        "answer 200 with a list), so this check could not be evaluated",
+                        status="error",
+                    )
+                comments = sum(
+                    1 for created_at, _ in listed
+                    if created_at is not None and created_at >= window_start
+                )
+                if comments < self.min_comments:
+                    faults.append(
+                        f"carries {comments} comment(s) posted since this run started, "
+                        f"{self.min_comments} required"
+                    )
+            if faults:
+                rejected.append(f"{slug} " + ", ".join(faults))
+                continue
+            reason = f"{slug} is {view['state']}"
+            if closed_at is not None:
+                reason += f" (closed at {closed_at.isoformat()})"
+            reason += f", labelled {sorted(view['labels'])}"
+            if comments is not None:
+                reason += f", with {comments} comment(s) posted since this run started"
+            return done(
+                True,
+                reason,
+                raw={
+                    "issue": slug,
+                    "state": view["state"],
+                    "closed_at": closed_at.isoformat() if closed_at else None,
+                    "labels": sorted(view["labels"]),
+                    "comments_since_start": comments,
+                },
+            )
+        return done(
+            False,
+            "none of the issues the reply names satisfies the check: " + "; ".join(rejected),
         )
 
 
@@ -7590,7 +7874,10 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
     the Session KV server's own ``GET /v1/findings`` in the agent container
     (:mod:`kube_agents_bench.findings`). Passes when every row in
     ``finding_ids`` is in ``state``; a row in any other state fails, and the
-    reason names the state of each row not in ``state``.
+    reason names the state of each row not in ``state``. With ``not_state``
+    instead, passes when no row is in it, for a property a single state cannot
+    say: "not dismissed" holds while the install's own nudge moves a queued
+    row to surfaced. Exactly one of the two is set.
 
     A listed row the queue does not hold is ``status="error"``: the case's plant
     is missing, so there is nothing to grade. An unreadable pod or a queue that
@@ -7600,7 +7887,14 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
     type: Literal["findings_item_state"]
     project: str = Field(min_length=1)
     finding_ids: list[str] = Field(min_length=1)
-    state: FindingState
+    state: FindingState | None = None
+    not_state: FindingState | None = None
+
+    @model_validator(mode="after")
+    def _one_state(self) -> "FindingsItemStateVerifier":
+        if (self.state is None) == (self.not_state is None):
+            raise ValueError("set exactly one of state and not_state")
+        return self
 
     @field_validator("finding_ids")
     @classmethod
@@ -7625,6 +7919,20 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
                 "error",
                 f"the findings queue holds no row {missing} under project {self.project!r}: "
                 "the case's plant is missing, so there is nothing to grade",
+                raw,
+            )
+        if self.not_state is not None:
+            hit = {finding_id: states[finding_id] for finding_id in self.finding_ids if states[finding_id] == self.not_state}
+            if hit:
+                return (
+                    "fail",
+                    f"{len(hit)} of {len(self.finding_ids)} row(s) are {self.not_state}: " + ", ".join(hit),
+                    raw,
+                )
+            return (
+                "pass",
+                f"none of {len(self.finding_ids)} row(s) are {self.not_state}; "
+                + ", ".join(f"{finding_id} is {state}" for finding_id, state in raw["states"].items()),
                 raw,
             )
         wrong = {finding_id: states[finding_id] for finding_id in self.finding_ids if states[finding_id] != self.state}

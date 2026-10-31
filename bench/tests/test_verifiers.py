@@ -9760,3 +9760,269 @@ def test_client_addon_skew_case_refuses_what_is_not_a_finding_on_another_cluster
     _planted, rule, _cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
     report = _per_cluster_report(_CLIENT_CASE, others={"c": _per_cluster_line(_SLOT_NAMES["c"], rule, entry)})
     assert not _per_cluster_case_grades(_CLIENT_CASE, _others_objective(_CLIENT_CASE), report)
+
+
+# -------------------------------------------------- forge_issue_state
+
+_TICKET_REPO = "kube-agents-evals-31-infra"
+_TICKET_URL = f"https://github.com/gke-agentic/{_TICKET_REPO}/issues/708"
+# A reply shaped like a run that did the whole procedure and called the report
+# a "triage comment": no "posted", no "triage report" anywhere in it.
+_TICKET_REPLY = (
+    f"**Issue [`#708`]({_TICKET_URL}) was filed, claimed via `github-issue-resolver`, "
+    "answered, and transitioned to `status:resolved`.** Details are in "
+    f"[triage comment `6511966411`]({_TICKET_URL}#issuecomment-6511966411)."
+)
+# The run starts at _RUN_START (09:00:00Z); the window opens 120 s earlier.
+_TICKET_SINCE = "2026-08-21T08:58:00Z"
+
+
+def _ticket(state="closed", labels=("status:resolved",), closed_at="2026-08-21T09:06:55Z"):
+    return {
+        "number": 708,
+        "body": "which file pins the agent image?",
+        "state": state,
+        "state_reason": "completed" if state == "closed" else None,
+        "closed_at": closed_at if state == "closed" else None,
+        "labels": [{"name": n} for n in labels],
+    }
+
+
+def _ticket_comments(*created_at):
+    return [{"body": f"comment {i}", "created_at": stamp} for i, stamp in enumerate(created_at)]
+
+
+def _ticket_api(number=708):
+    return _api(number, _TICKET_REPO)
+
+
+def _ticket_comments_api(number=708, page=1):
+    url = f"{_ticket_api(number)}/comments?per_page=100&since={_TICKET_SINCE}"
+    return url if page == 1 else f"{url}&page={page}"
+
+
+@pytest.fixture
+def gitops_repo(monkeypatch):
+    """The GitOps repository the job grades, which the check binds the issue to."""
+    monkeypatch.setenv("BENCH_GITOPS_REPO", f"gke-agentic/{_TICKET_REPO}")
+
+
+def _state_check(**kw):
+    kw.setdefault("state", "closed")
+    kw.setdefault("labels", ["status:resolved"])
+    kw.setdefault("min_comments", 2)
+    return verifiers.ForgeIssueStateVerifier(type="forge_issue_state", **kw)
+
+
+def test_issue_state_pass_reads_the_issue_the_reply_names(token, gitops_repo, github):
+    _stash_report(final_message=_TICKET_REPLY)
+    github.routes[_ticket_api()] = (200, _ticket())
+    github.routes[_ticket_comments_api()] = (
+        200,
+        _ticket_comments("2026-08-21T09:01:45Z", "2026-08-21T09:06:51Z"),
+    )
+    res = _state_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.raw == {
+        "issue": f"gke-agentic/{_TICKET_REPO}#708",
+        "state": "closed",
+        "closed_at": "2026-08-21T09:06:55+00:00",
+        "labels": ["status:resolved"],
+        "comments_since_start": 2,
+    }
+    # The issue the reply named, then its comments, over the REST API, with
+    # the runner's token, and nothing else.
+    assert [c[0] for c in github.calls] == [_ticket_api(), _ticket_comments_api()]
+    assert all(c[1] == "ghs_fake" for c in github.calls)
+
+
+def test_issue_state_wording_of_the_reply_does_not_matter(token, gitops_repo, github):
+    _stash_report(final_message=f"Done: {_TICKET_URL}")
+    github.routes[_ticket_api()] = (200, _ticket())
+    github.routes[_ticket_comments_api()] = (
+        200,
+        _ticket_comments("2026-08-21T09:01:45Z", "2026-08-21T09:06:51Z"),
+    )
+    assert _state_check().verify(5.0).status == "pass"
+
+
+def test_issue_state_fails_an_open_unlabelled_ticket_with_one_comment(token, gitops_repo, github):
+    _stash_report(final_message=_TICKET_REPLY)
+    github.routes[_ticket_api()] = (200, _ticket(state="open", labels=("status:in-progress",)))
+    github.routes[_ticket_comments_api()] = (200, _ticket_comments("2026-08-21T09:01:45Z"))
+    res = _state_check().verify(5.0)
+    assert res.status == "fail"
+    assert "is open, not closed" in res.reason
+    assert "lacks the label(s) ['status:resolved']" in res.reason
+    assert "carries 1 comment(s) posted since this run started, 2 required" in res.reason
+
+
+def test_issue_state_fails_a_close_from_before_the_run(token, gitops_repo, github):
+    _stash_report(final_message=_TICKET_REPLY)
+    github.routes[_ticket_api()] = (200, _ticket(closed_at="2026-08-21T07:00:00Z"))
+    github.routes[_ticket_comments_api()] = (
+        200,
+        _ticket_comments("2026-08-21T09:01:45Z", "2026-08-21T09:06:51Z"),
+    )
+    res = _state_check().verify(5.0)
+    assert res.status == "fail"
+    assert "7200s before this run started" in res.reason
+    assert "an earlier run's close" in res.reason
+
+
+def test_issue_state_counts_only_comments_created_inside_the_run(token, gitops_repo, github):
+    _stash_report(final_message=_TICKET_REPLY)
+    github.routes[_ticket_api()] = (200, _ticket())
+    # GitHub's `since` filters on the update stamp, so an old comment edited
+    # today comes back on the page; its created_at keeps it out of the count.
+    github.routes[_ticket_comments_api()] = (
+        200,
+        _ticket_comments("2026-08-20T09:00:00Z", "2026-08-21T09:06:51Z"),
+    )
+    res = _state_check().verify(5.0)
+    assert res.status == "fail"
+    assert "carries 1 comment(s) posted since this run started, 2 required" in res.reason
+
+
+def test_issue_state_reads_a_second_page_when_the_first_is_full(token, gitops_repo, github):
+    _stash_report(final_message=_TICKET_URL)
+    github.routes[_ticket_api()] = (200, _ticket())
+    github.routes[_ticket_comments_api(page=1)] = (
+        200,
+        _ticket_comments(*(["2026-08-20T09:00:00Z"] * 100)),
+    )
+    github.routes[_ticket_comments_api(page=2)] = (
+        200,
+        _ticket_comments("2026-08-21T09:01:45Z", "2026-08-21T09:06:51Z"),
+    )
+    res = _state_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.raw["comments_since_start"] == 2
+
+
+def test_issue_state_without_a_run_clock_is_an_error_about_the_issue(token, gitops_repo, github):
+    # No start time, no window to place the close and the comments in: an
+    # error, not a grade, and a reason that names the issue this check reads.
+    _stash_report(final_message=_TICKET_REPLY, started_at=0.0)
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert "no start time" in res.reason
+    assert "issue this run closed or commented on" in res.reason
+    assert "ledger" not in res.reason
+    assert github.calls == []
+
+
+def test_issue_state_fails_a_reply_with_no_issue_url(token, gitops_repo, github):
+    _stash_report(final_message="Issue #708 was transitioned to status:resolved.")
+    res = _state_check().verify(5.0)
+    assert res.status == "fail"
+    assert "names no github.com issue URL" in res.reason
+    assert github.calls == []
+
+
+def test_issue_state_passes_on_one_good_issue_among_several_named(token, gitops_repo, github):
+    other = f"https://github.com/gke-agentic/{_TICKET_REPO}/issues/700"
+    _stash_report(final_message=f"Earlier ticket {other}; this run's: {_TICKET_URL}")
+    github.routes[_ticket_api(700)] = (200, _ticket(closed_at="2026-08-20T07:00:00Z"))
+    github.routes[_ticket_comments_api(700)] = (200, [])
+    github.routes[_ticket_api()] = (200, _ticket())
+    github.routes[_ticket_comments_api()] = (
+        200,
+        _ticket_comments("2026-08-21T09:01:45Z", "2026-08-21T09:06:51Z"),
+    )
+    res = _state_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.raw["issue"].endswith("#708")
+
+
+def test_issue_state_404_is_a_fail_naming_the_issue(token, gitops_repo, github):
+    _stash_report(final_message=_TICKET_REPLY)
+    res = _state_check().verify(5.0)
+    assert res.status == "fail"
+    assert "#708: no such issue (404)" in res.reason
+
+
+def test_issue_state_denied_read_is_an_error_not_a_fail(token, gitops_repo, github):
+    _stash_report(final_message=_TICKET_REPLY)
+    github.routes[_ticket_api()] = (403, {"message": "Forbidden"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert "403" in res.reason
+
+
+def test_issue_state_unreadable_comments_are_an_error(token, gitops_repo, github):
+    _stash_report(final_message=_TICKET_REPLY)
+    github.routes[_ticket_api()] = (200, _ticket())
+    github.routes[_ticket_comments_api()] = (500, {"message": "boom"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert "comments of" in res.reason
+
+
+def test_issue_state_missing_token_is_an_error_naming_the_variable(monkeypatch, github):
+    monkeypatch.delenv("BENCH_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    _stash_report(final_message=_TICKET_REPLY)
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert "BENCH_GITHUB_TOKEN" in res.reason
+    assert github.calls == []
+
+
+def test_issue_state_spec_refuses_unknown_keys_and_a_wide_clock_allowance():
+    with pytest.raises(ValidationError):
+        verifiers.ForgeIssueStateVerifier(type="forge_issue_state", state="closed", bogus=1)
+    # The clock allowance is capped: a wide one would reach the previous
+    # repetition's close and void the binding.
+    verifiers.ForgeIssueStateVerifier(type="forge_issue_state", state="closed", max_clock_skew_sec=300)
+    with pytest.raises(ValidationError):
+        verifiers.ForgeIssueStateVerifier(type="forge_issue_state", state="closed", max_clock_skew_sec=301)
+
+
+def test_issue_state_rejects_an_issue_outside_the_gitops_repository(token, gitops_repo, github):
+    elsewhere = "https://github.com/gke-agentic/kube-agents-evals-39-infra/issues/507"
+    _stash_report(final_message=f"Done: {elsewhere}")
+    res = _state_check().verify(5.0)
+    assert res.status == "fail"
+    assert "kube-agents-evals-39-infra#507: not in the GitOps repository this job grades" in res.reason
+    assert f"gke-agentic/{_TICKET_REPO}" in res.reason
+    # Rejected before it is read: no API call for it.
+    assert github.calls == []
+
+
+def test_issue_state_missing_gitops_repository_is_an_error(token, monkeypatch, github):
+    monkeypatch.delenv("BENCH_GITOPS_REPO", raising=False)
+    _stash_report(final_message=_TICKET_REPLY)
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert "BENCH_GITOPS_REPO" in res.reason
+    assert github.calls == []
+
+
+def test_issue_state_gitlab_skips_system_notes(monkeypatch, github):
+    monkeypatch.setenv("BENCH_FORGE", "gitlab")
+    monkeypatch.setenv("BENCH_GITLAB_TOKEN", "glpat_fake")
+    monkeypatch.setenv("BENCH_GITOPS_REPO", "group/evals")
+    _stash_report(final_message="Closed https://gitlab.com/group/evals/-/issues/5 as status:resolved")
+    api = "https://gitlab.com/api/v4/projects/group%2Fevals/issues/5"
+    github.routes[api] = (
+        200,
+        {
+            "iid": 5,
+            "state": "closed",
+            "closed_at": "2026-08-21T09:06:55.000Z",
+            "labels": ["status:resolved"],
+            "description": "",
+        },
+    )
+    github.routes[f"{api}/notes?sort=desc&order_by=created_at&per_page=100"] = (
+        200,
+        [
+            {"body": "closed", "system": True, "created_at": "2026-08-21T09:06:55.000Z"},
+            {"body": "report", "system": False, "created_at": "2026-08-21T09:06:51.000Z"},
+            {"body": "claim", "system": False, "created_at": "2026-08-21T09:01:45.000Z"},
+        ],
+    )
+    res = _state_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.raw["comments_since_start"] == 2

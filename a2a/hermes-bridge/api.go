@@ -396,6 +396,10 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// Only a recorded route lets a card's post reach the conversation, so only
 	// then may the terminal keep the ask for those posts to settle (cardsMark).
 	run.routeRecorded.Store(routeErr == nil)
+	// The opening turn only: a follow-up runs in a session that has already
+	// read the report, and the hook this mirrors reads the thread once per
+	// message a person sends, which the opening turn is.
+	prompt = b.attachPushedReport(taskCtx, sessionID, run.origin, prompt)
 
 	// The door's side of this task: attributed by the session id the hook
 	// payload carries, signed with the pod's shared secret, and only while

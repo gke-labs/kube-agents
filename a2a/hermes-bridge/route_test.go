@@ -30,6 +30,12 @@ func newRouteStore(t *testing.T, status int) *routeStore {
 	t.Helper()
 	s := &routeStore{status: status}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			// The pushed-report lookup (incident.go) reads the same store;
+			// this one holds no report and counts route writes alone.
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		raw, _ := io.ReadAll(r.Body)
 		var body conversationRoute
 		_ = json.Unmarshal(raw, &body)

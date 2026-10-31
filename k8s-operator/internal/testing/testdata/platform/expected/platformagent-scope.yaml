@@ -386,6 +386,9 @@ data:
         enabled: false
         extra:
           adaptive_cards: true
+    sessions:
+      auto_prune: true
+      retention_days: 90
     terminal:
       backend: ssh
       lifetime_seconds: 2592000
