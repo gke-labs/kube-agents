@@ -2468,6 +2468,32 @@ The defaults carry no ephemeral-storage request because the operator renders non
       {{- end -}}
     {{- end -}}
   {{- end -}}
+  {{- /* The MCP server (#3869): one more pod, rendered only while operator.extraEnv sets
+         A2A_MCP_DOOR to "true", so no golden renders it and footprint.yaml has no entry of
+         its own. The operator sizes it as the console (TestTheMCPPodIsSizedLikeTheConsole
+         holds the two equal) and rolls it Recreate at one replica, so it is counted once at
+         the console's figures and sizes no surge. An entry the chart cannot read -- a
+         valueFrom, a non-string value -- counts as on; a literal value other than "true",
+         or none, is what the operator reads as off, and leaves it out. */ -}}
+  {{- if $next -}}
+    {{- $mcpDoor := false -}}
+    {{- range $e := (.Values.operator.extraEnv | default list) -}}
+      {{- if eq (toString (index ($e | default dict) "name")) "A2A_MCP_DOOR" -}}
+        {{- $v := index $e "value" -}}
+        {{- $mcpDoor = or (hasKey $e "valueFrom") (and (hasKey $e "value") (not (kindIs "string" $v))) (eq (toString $v) "true") -}}
+      {{- end -}}
+    {{- end -}}
+    {{- if $mcpDoor -}}
+      {{- $mcp := $next.a2aConsole | default dict -}}
+      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (int64 1)) | int64 -}}
+      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($mcp.cpuMillisRequest | default 0 | int64)) | int64 -}}
+      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($mcp.cpuMillisLimit | default 0 | int64)) | int64 -}}
+      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($mcp.memoryBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($mcp.memoryBytesLimit | default 0 | int64)) | int64 -}}
+      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($mcp.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($mcp.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
+    {{- end -}}
+  {{- end -}}
   {{- with $next.storage -}}
     {{- $reqPvc = add $reqPvc (.persistentVolumeClaims | default 0 | int64) -}}
     {{- $reqStorage = add $reqStorage (.storageBytesRequest | default 0 | int64) -}}

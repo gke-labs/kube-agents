@@ -763,6 +763,55 @@ class PreflightDecisionTest(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(self._bridge_delta(env), cli)
 
+    def test_mode_next_counts_the_mcp_server_at_the_consoles_size_when_its_flag_is_on(self) -> None:
+        """The operator renders the MCP server only under A2A_MCP_DOOR=true (#3869), one
+        Recreate pod sized as the console, so no golden carries it and the chart adds it."""
+        console = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["a2aConsole"]
+        self.assertEqual(console["pods"], 1)
+        self.assertGreater(console["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
+        base = self._requirements(["platformAgent.mode=next"])
+        on = (
+            ("true", [{"name": "A2A_MCP_DOOR", "value": "true"}]),
+            ("by valueFrom", [{"name": "A2A_MCP_DOOR",
+                               "valueFrom": {"configMapKeyRef": {"name": "x", "key": "door"}}}]),
+            ("not a string", [{"name": "A2A_MCP_DOOR", "value": True}]),
+            ("last of two", [{"name": "A2A_MCP_DOOR", "value": "false"},
+                             {"name": "A2A_MCP_DOOR", "value": "true"}]),
+        )
+        for name, env in on:
+            with self.subTest(name):
+                req = self._requirements(
+                    ["platformAgent.mode=next"], values={"operator": {"extraEnv": env}}
+                )
+                for out, key in (
+                    ("requestsCpu", "cpuMillisRequest"), ("limitsCpu", "cpuMillisLimit"),
+                    ("requestsMemory", "memoryBytesRequest"), ("limitsMemory", "memoryBytesLimit"),
+                    ("requestsEphemeral", "ephemeralStorageBytesRequest"),
+                    ("limitsEphemeral", "ephemeralStorageBytesLimit"),
+                ):
+                    self.assertEqual(req[out] - base[out], console[key], out)
+                self.assertEqual(req["pods"] - base["pods"], 1)
+                self.assertEqual(req["surgeRequestsCpu"], base["surgeRequestsCpu"], "it rolls Recreate")
+
+    def test_the_mcp_server_is_not_counted_when_the_operator_reads_its_flag_as_off(self) -> None:
+        base = self._requirements(["platformAgent.mode=next"])
+        for name, env in (
+            ("false", [{"name": "A2A_MCP_DOOR", "value": "false"}]),
+            ("TRUE, which the operator does not take", [{"name": "A2A_MCP_DOOR", "value": "TRUE"}]),
+            ("no value", [{"name": "A2A_MCP_DOOR"}]),
+            ("last of two", [{"name": "A2A_MCP_DOOR", "value": "true"},
+                             {"name": "A2A_MCP_DOOR", "value": "false"}]),
+        ):
+            with self.subTest(name):
+                self.assertEqual(
+                    self._requirements(["platformAgent.mode=next"],
+                                       values={"operator": {"extraEnv": env}}),
+                    base,
+                )
+        # And never under today, where the operator renders no MCP server.
+        door = {"operator": {"extraEnv": [{"name": "A2A_MCP_DOOR", "value": "true"}]}}
+        self.assertEqual(self._requirements(values=door), self._requirements())
+
     def test_mode_next_counts_a_larger_a2a_bridge_resources_as_written(self) -> None:
         """A readable A2A_BRIDGE_RESOURCES above the agent container's size raises the count."""
         bridge = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridge"]
