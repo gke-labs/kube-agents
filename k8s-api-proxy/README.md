@@ -7,8 +7,18 @@ with credentials the sandbox never holds. So far it has the policy (`pkg/k8sapip
 and the HTTP handler around it (`handler.go`), which authenticates through a pluggable
 `CallerAuthenticator`, removes the caller's credentials (including a bearer token in
 `Sec-WebSocket-Protocol`), impersonation, `Audit-ID` and `Connection`-named headers, and forwards
-through a pluggable `UpstreamTransport`. Neither interface has an
-implementation yet, and nothing serves or deploys the handler.
+through a pluggable `UpstreamTransport`. `pkg/upstream` implements the transport, and nothing
+implements the authenticator yet or serves or deploys the handler.
+
+`pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
+`gke_` ID, to the API server through the pod's service account. Any other `gke_` cluster is reached
+with the proxy's Application Default Credentials: it describes the cluster through the Container
+API and picks its endpoint by rules 1, 2 and 4 of
+[`private-endpoint-selection.md`](../docs/designs/private-endpoint-selection.md) (the private
+endpoint of rule 3 is not chosen yet). A resolved endpoint is reused for ten minutes and a failed
+resolution for ten seconds; an endpoint that cannot be dialled is described again after ten
+seconds. An IP endpoint is verified against the cluster's own CA and never the system roots, an
+`http://` endpoint and a redirect are refused, and a `kind-` cluster has no upstream.
 
 The policy has three modes. `read-only` permits `get`, `list` and `watch` and the discovery
 paths. `read-only-dry-run`, the default and the mode kube-agents will run, also permits `create`,

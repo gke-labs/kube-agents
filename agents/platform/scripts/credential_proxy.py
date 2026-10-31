@@ -15,6 +15,7 @@ import io
 import functools
 import json
 import logging
+import math
 import os
 import posixpath
 import queue
@@ -41,7 +42,7 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, NamedTuple, TextIO
+from typing import Any, Callable, Iterator, Mapping, NamedTuple, Sequence, TextIO
 
 import api_policy
 import command_policy
@@ -50,9 +51,11 @@ import feedback_broker
 import mcp_policy
 import providers
 import repo_ref
+import scope_policy
 import scoped_sa_pool
 import task_confinement
 import vcs_broker
+import vcs_readings
 import watcher_policy
 
 # The verb words go onto a line protocol the agent runtime reads; see
@@ -94,6 +97,12 @@ LOGGER = logging.getLogger("credential-proxy")
 # The optional key, in the Secret a forge's credentialsRef names, that holds
 # its read-only token. Named in the log when a context clone presents none.
 FORGE_READ_TOKEN_KEY = vcs_broker.FORGE_READ_TOKEN_KEY
+# The process roles `resolve_role` accepts (CREDENTIAL_PROXY_ROLE), and the
+# ones that run the credential broker and so the readings sweep.
+ROLE_COMBINED = "combined"
+ROLE_BROKER = "broker"
+ROLE_API_PROXY = "api-proxy"
+BROKER_ROLES = (ROLE_BROKER, ROLE_COMBINED)
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
@@ -376,6 +385,13 @@ MEMORY_HIGH_WATER_LOG_STEP_BYTES = 64 * MEBIBYTE
 # knob, and the operator's spec.deployment.env reaches it.
 DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS = 2
 ENV_SESSION_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS"
+# The scope role's share, for the same reason: the publisher probes one project
+# per call, up to maxProjects calls a run, from the pool the shell uses. One
+# worker is enough for a run every 15 minutes. At serve() it is clamped after
+# the profile share, so session, profile and scope together leave the shell at
+# least one slot (scope_slot_limit_from_env); scope gives way first.
+DEFAULT_SCOPE_MAX_CONCURRENT_COMMANDS = 1
+ENV_SCOPE_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SCOPE_MAX_CONCURRENT_COMMANDS"
 # The profile role's share (#3889), the same mechanism as the session's: every
 # AgentProfile worker's calls together hold at most this many of the pool's
 # slots, counted before the pool is asked and refused at once past it.
@@ -442,6 +458,34 @@ KILL_POLL_SECONDS = 0.05
 # uninterruptible sleep or an orphan whose reaper is slow, since a zombie
 # keeps the group's id until it is reaped.
 KILL_SETTLE_SECONDS = 1
+# SIGTERM is the kubelet's warning that an eviction, a node drain or a
+# rollout is about to end the pod (terminationGracePeriodSeconds later, 30 s
+# unset). The one thing this process then holds that no other pod can pick
+# up is the ack id of each Chat message the gateway pulled and has not yet
+# settled. The gateway settles a pull as soon as it returns
+# (a2a/gateway/gchat.go, Run), so once new pulls are refused the settle routes
+# stay open this long for those acks to land; a receipt still unsettled after
+# it belongs to a pull whose answer never reached the gateway, and is handed
+# back to Pub/Sub so the replacement pod gets it at once rather than when its
+# ack deadline (60 s) runs out. Short on purpose: the window is the whole of
+# what a graceful stop adds to a Recreate rollout.
+SHUTDOWN_SETTLE_SECONDS = 3
+# How long the hand-back's one Pub/Sub call may take, with no retry. It runs
+# on the drain thread ahead of server.shutdown(), inside the entrypoint's
+# RUNTIME_DRAIN_SECONDS (10 s) after the settle window above; the client
+# library's defaults (60 s per call, retried for 60 s) would let a slow
+# Pub/Sub hold the stop past that budget and hand the process to SIGKILL with
+# the server still up, the ending this path exists to avoid. A call that does
+# not finish in this long is logged and the messages wait out their ack
+# deadline, as before.
+SHUTDOWN_NACK_TIMEOUT_SECONDS = 2
+# The body of the 503 a Chat pull gets during the window. The gateway logs the
+# 503 as "event pull failed ... answered 503: subscription <name>" (it renders
+# only the chat, pubsub and subscription keys of a relay error, never free
+# text), so the words reach the proxy's caller, not the gateway's line.
+SHUTDOWN_ERROR = "credential proxy shutting down"
+# The drain thread's name, for a reader of a thread dump mid-stop.
+SHUTDOWN_THREAD_NAME = "shutdown"
 
 # Bounds on the pre-authentication body drain in AgentAPIProxyHandler. The body has
 # to be read in full for the 401 to survive the close, so these bound what reading it
@@ -672,7 +716,7 @@ PROXY_REQUESTS_METRIC = "kubeagents_credential_proxy_requests_total"
 # request waited to be admitted and which bound held it, how many waited out
 # the bound and were refused, and what is in use against each cap. `bound` is
 # a closed vocabulary: the slot cap, the child memory budget, the forge
-# refresh lock, or the session role's own limit; anything else counts as
+# refresh lock, or the session or scope role's own limit; anything else counts as
 # `other`, so no message text ever opens a series.
 ADMISSION_WAIT_METRIC = "kubeagents_credential_proxy_admission_wait_seconds"
 ADMISSION_REFUSALS_METRIC = "kubeagents_credential_proxy_admission_refusals_total"
@@ -707,6 +751,7 @@ ADMISSION_BOUND_SLOT = "slot"
 ADMISSION_BOUND_BUDGET = "budget"
 ADMISSION_BOUND_REFRESH_LOCK = "refresh-lock"
 ADMISSION_BOUND_SESSION = "session"
+ADMISSION_BOUND_SCOPE = "scope"
 ADMISSION_BOUND_PROFILE = "profile"
 ADMISSION_BOUND_OTHER = "other"
 #: The histogram's label for a request admitted without a wait: nothing held
@@ -715,7 +760,7 @@ ADMISSION_BOUND_OTHER = "other"
 ADMISSION_BOUND_NONE = "none"
 ADMISSION_BOUNDS = frozenset(
     {ADMISSION_BOUND_SLOT, ADMISSION_BOUND_BUDGET, ADMISSION_BOUND_REFRESH_LOCK, ADMISSION_BOUND_SESSION,
-     ADMISSION_BOUND_PROFILE, ADMISSION_BOUND_NONE}
+     ADMISSION_BOUND_PROFILE, ADMISSION_BOUND_SCOPE, ADMISSION_BOUND_NONE}
 )
 # Edges where a reader wants them: 15 s is the cap the Cluster Agent preflight
 # (cluster_preflight.sh) puts on one brokered call, the shortest caller-side
@@ -745,15 +790,28 @@ VCS_PROVIDER_NONE = "none"
 # ships (providers.AVAILABLE), which is also the set the registry admits a
 # configured forge from, so a configured forge's name is always in it.
 VCS_PROVIDERS = frozenset(cls.name for cls in providers.AVAILABLE)
-# Proposals this install opened that the forge reports merged, counted once
-# each per broker process as the broker's reads show them
-# (vcs_broker.VcsBroker._count_outcomes); the series the operator reads
-# `status.usage.remediationsMergedTotal` from. No labels.
-VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
-# Proposals this install opened that the forge reports closed without a merge,
-# counted the same way beside the merged series; the series the operator reads
-# `status.usage.remediationsClosedUnmergedTotal` from. No labels.
-VCS_CLOSED_UNMERGED_METRIC = "kubeagents_vcs_proposals_closed_unmerged_total"
+# The label keys of the proposal readings the sweep sets (vcs_readings.py;
+# the series names live there, beside the vocabularies these keys carry). The
+# operator filters `state`, `actor`, `outcome`, `le` and `reading` by these
+# spellings (usage_counters_scrape.go).
+VCS_READINGS_STATE_LABEL = "state"
+VCS_READINGS_ACTOR_LABEL = "actor"
+VCS_READINGS_KIND_LABEL = "kind"
+VCS_READINGS_OUTCOME_LABEL = "outcome"
+VCS_READINGS_LE_LABEL = "le"
+VCS_READINGS_READING_LABEL = "reading"
+VCS_READINGS_REASON_LABEL = "reason"
+# The `le` value of the last edge of the per-proposal gauge, its count.
+VCS_READINGS_LE_INF = "+Inf"
+# The failure counter's closed `reason` vocabulary; any other word is `other`.
+VCS_READINGS_FAILURE_REASONS = frozenset({
+    vcs_readings.REASON_FORGE,
+    vcs_readings.REASON_IDENTITY,
+    vcs_readings.REASON_TRUNCATED,
+    vcs_readings.REASON_DETAIL_TRUNCATED,
+    vcs_readings.REASON_RATE_LIMITED,
+    vcs_readings.REASON_WARMING,
+})
 # The broker's own failures, by kind and, for a timeout, by the tool it ran:
 # work it took on and could not carry out
 # for a reason that is its own or its upstream's, never the command's exit
@@ -1113,6 +1171,13 @@ DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 # not known", rather than with some other role's reach.
 DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE = "kubeagents-credential-proxy-mcp"
 
+# The scope publisher's audience (#4119). A next-mode Job with no gcloud of its
+# own: it runs five read-only lookups through /v1/exec, and scope_policy holds
+# it to them. Bound to its callers both ways, and conferred to nobody when no
+# callers are named, as the mcp audience is.
+DEFAULT_CREDENTIAL_PROXY_SCOPE_AUDIENCE = "kubeagents-credential-proxy-scope"
+SCOPE_AUDIENCE_ENV = "CREDENTIAL_PROXY_SCOPE_AUDIENCE"
+SCOPE_CALLERS_ENV = "CREDENTIAL_PROXY_SCOPE_CALLERS"
 # The profile workers' audience (#3889). An AgentProfile's worker pod runs
 # model output and reaches this broker the way a session pod does, over the
 # ClusterIP with a projected token, and gets a role of its own: the exec route,
@@ -1147,6 +1212,10 @@ CALLER_ROLE_MCP = "mcp"
 # credential is mandatory for anything that reaches a cluster or a project: a
 # profile caller without a valid one runs local-only commands and nothing else.
 CALLER_ROLE_PROFILE = "profile"
+# The scope publisher Job. The exec route only, gcloud only, and within it the
+# five lookups scope_policy names, each on an argument scope.json declares or an
+# earlier lookup returned.
+CALLER_ROLE_SCOPE = "scope"
 
 # The TokenReview user.extra key under which the API server names the Pod a
 # projected token is bound to.
@@ -1172,6 +1241,7 @@ CALLER_ROLES = (
     CALLER_ROLE_WATCHER,
     CALLER_ROLE_MCP,
     CALLER_ROLE_PROFILE,
+    CALLER_ROLE_SCOPE,
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
@@ -1182,6 +1252,16 @@ CALLER_ROLES = (
 ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
     CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
     CALLER_ROLE_PROFILE: frozenset({"kubectl", "gcloud"}),
+    CALLER_ROLE_SCOPE: frozenset({"gcloud"}),
+}
+
+
+# The handler attribute holding each bounded role's share of the command pool
+# (`_session_slot`); a role absent here is counted against the session share,
+# which passes every role but the session's straight through.
+ROLE_SLOT_ATTRIBUTES: dict[str, str] = {
+    CALLER_ROLE_PROFILE: "profile_slots",
+    CALLER_ROLE_SCOPE: "scope_slots",
 }
 
 
@@ -1418,7 +1498,8 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (ADMISSION_PATH, (CALLER_ROLE_SHELL,)),
     # The profile role reaches this route and no other: the Cloud API relay,
     # the MCP relay, the watcher and Pub/Sub routes all stay closed to it.
-    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE)),
+    # The scope role reaches it alone too (scope_policy).
+    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE)),
     # The feedback form verb: the sandbox's one way to file a report about
     # kube-agents itself (feedback_broker.py). The shell alone: a session pod
     # files nothing on anyone's behalf.
@@ -2518,16 +2599,20 @@ class MemorySampler:
         return thread
 
 
-def session_slot_limit_from_env() -> int:
-    """The session role's concurrent-command bound, from the env or the default.
+def session_slot_limit_from_env(
+    env_name: str = ENV_SESSION_MAX_CONCURRENT_COMMANDS,
+    default: int = DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS,
+) -> int:
+    """A role's concurrent-command bound, from the env or the default.
 
-    Anything that is not a positive integer falls back to the default with a
-    warning, so a typo narrows rather than opens: the default is the small
-    number, and an unset or broken knob is never "unlimited".
+    The session role's by default; the scope role's with its own env name and
+    default. Anything that is not a positive integer falls back to the default
+    with a warning, so a typo narrows rather than opens: the default is the
+    small number, and an unset or broken knob is never "unlimited".
     """
-    raw = os.getenv(ENV_SESSION_MAX_CONCURRENT_COMMANDS, "").strip()
+    raw = os.getenv(env_name, "").strip()
     if not raw:
-        return DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS
+        return default
     try:
         value = int(raw)
     except ValueError:
@@ -2535,9 +2620,9 @@ def session_slot_limit_from_env() -> int:
     if value <= 0:
         LOGGER.warning(
             "%s=%r is not a positive integer; using the default of %d",
-            ENV_SESSION_MAX_CONCURRENT_COMMANDS, raw, DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS,
+            env_name, raw, default,
         )
-        return DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS
+        return default
     return value
 
 
@@ -2575,6 +2660,27 @@ def profile_slot_limit_from_env(pool: int, session_limit: int) -> int:
     return value
 
 
+def scope_slot_limit_from_env(pool: int, session_limit: int, profile_limit: int) -> int:
+    """The scope role's concurrent-command share, clamped to what the others leave.
+
+    Read like the session's, then held to ``pool - session_limit -
+    profile_limit - 1``, so that with every session, profile and scope slot
+    taken the shell still has one. Profile work keeps its priority: this is
+    decided after its share. Zero when nothing is left, with a warning: the
+    scope publisher is then answered busy, and the shell keeps its slot.
+    """
+    value = session_slot_limit_from_env(ENV_SCOPE_MAX_CONCURRENT_COMMANDS, DEFAULT_SCOPE_MAX_CONCURRENT_COMMANDS)
+    ceiling = max(0, pool - session_limit - profile_limit - 1)
+    if value > ceiling:
+        LOGGER.warning(
+            "the scope share of %d is more than the pool of %d less the session share of %d, the profile "
+            "share of %d and one slot for the shell; using %d",
+            value, pool, session_limit, profile_limit, ceiling,
+        )
+        value = ceiling
+    return value
+
+
 class SessionSlots:
     """A role's bounded share of the command pool: the session's by default.
 
@@ -2582,7 +2688,8 @@ class SessionSlots:
     unchanged. A caller at the bound is refused immediately with
     CommandSlotUnavailable, which the exec route already answers as busy, so
     the shim prints why and the model reports it rather than retrying. The
-    profile role has an instance of its own (``profile_slots``).
+    profile and scope roles have instances of their own (``profile_slots``,
+    ``scope_slots``).
     """
 
     def __init__(
@@ -2771,6 +2878,8 @@ class ServiceAccountAuthenticator:
     operator renders the audience without the callers, and an empty set
     confers the mcp role to nobody.
 
+    ``scope_callers`` binds the scope role exactly as ``mcp_callers`` binds
+    the mcp role, empty set included.
     ``profile_identities`` binds the profile role the way ``mcp_callers``
     binds the mcp one, empty meaning nobody: its keys are the profile workers'
     ServiceAccounts, each held to the profile audience and the only callers
@@ -2793,6 +2902,7 @@ class ServiceAccountAuthenticator:
         cache_seconds: float = 60.0,
         session_callers: frozenset[str] = frozenset(),
         mcp_callers: frozenset[str] = frozenset(),
+        scope_callers: frozenset[str] = frozenset(),
         profile_identities: Mapping[str, Any] | None = None,
     ) -> None:
         if not audience_roles or not all(audience_roles):
@@ -2805,6 +2915,7 @@ class ServiceAccountAuthenticator:
         self.allowed_callers = allowed_callers
         self.session_callers = session_callers
         self.mcp_callers = mcp_callers
+        self.scope_callers = scope_callers
         self.profile_identities = dict(profile_identities or {})
         self.profile_callers = frozenset(self.profile_identities)
         self.api_host = api_host
@@ -2944,6 +3055,10 @@ class ServiceAccountAuthenticator:
         # callers named the mcp audience confers nothing.
         if role == CALLER_ROLE_MCP and username not in self.mcp_callers:
             raise AuthenticationError("the mcp audience is only for mcp callers")
+        if username in self.scope_callers and role != CALLER_ROLE_SCOPE:
+            raise AuthenticationError("a scope caller may present only the scope audience")
+        if role == CALLER_ROLE_SCOPE and username not in self.scope_callers:
+            raise AuthenticationError("the scope audience is only for scope callers")
         # The profile binding, as the mcp one: empty names nobody.
         if username in self.profile_callers and role != CALLER_ROLE_PROFILE:
             raise AuthenticationError("a profile caller may present only the profile audience")
@@ -3150,6 +3265,13 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv("CREDENTIAL_PROXY_MCP_CALLERS", "").split(",")
         if caller.strip()
     )
+    # The scope publisher's ServiceAccounts, read the same way, with the mcp
+    # meaning: unset confers the scope role to nobody.
+    scope_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv(SCOPE_CALLERS_ENV, "").split(",")
+        if caller.strip()
+    )
     # The profile workers' identities, read only once the profile audience is
     # conferred below; an empty map confers the role on nobody.
     profile_identities: dict[str, Any] = {}
@@ -3217,6 +3339,23 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                     "is not; the mcp role is bound to the callers named there, so every "
                     "caller presenting the mcp audience is refused"
                 )
+        # The scope publisher's audience, read raw and refused on a collision
+        # for the mcp audience's reasons.
+        scope_audience = os.getenv(SCOPE_AUDIENCE_ENV, "").strip()
+        if scope_audience and scope_audience in audience_roles:
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_SCOPE_AUDIENCE equals the %s audience; the scope "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[scope_audience] or CALLER_ROLE_SHELL,
+            )
+        elif scope_audience:
+            audience_roles[scope_audience] = CALLER_ROLE_SCOPE
+            if not scope_callers:
+                LOGGER.warning(
+                    "CREDENTIAL_PROXY_SCOPE_AUDIENCE is set but CREDENTIAL_PROXY_SCOPE_CALLERS "
+                    "is not; the scope role is bound to the callers named there, so every "
+                    "caller presenting the scope audience is refused"
+                )
         # The profile workers' audience (#3889), read raw for the same reason,
         # and refused on a collision for the mcp one's. Its callers come from
         # the identity map rather than a list of their own: one rendering
@@ -3274,6 +3413,12 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                 "is not; the mcp role only exists once the chat audience split does, "
                 "so the mcp audience is ignored"
             )
+        if os.getenv(SCOPE_AUDIENCE_ENV, "").strip():
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_SCOPE_AUDIENCE is set but CREDENTIAL_PROXY_CHAT_AUDIENCE "
+                "is not; the scope role only exists once the chat audience split does, "
+                "so the scope audience is ignored"
+            )
         if os.getenv(PROFILE_AUDIENCE_ENV, "").strip():
             LOGGER.warning(
                 "%s is set but CREDENTIAL_PROXY_CHAT_AUDIENCE is not; the profile role only "
@@ -3285,6 +3430,7 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         allowed_callers=allowed,
         session_callers=session_callers,
         mcp_callers=mcp_callers,
+        scope_callers=scope_callers,
         profile_identities=profile_identities,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
@@ -3938,6 +4084,10 @@ class GoogleChatRelay:
         self._http_pool_size = int(os.getenv("GOOGLE_CHAT_HTTP_POOL_SIZE", "8"))
         self.num_retries = int(os.getenv("GOOGLE_CHAT_API_NUM_RETRIES", "3"))
         self._receipts: dict[str, Any] = {}
+        # Set by release_unsettled: from then on a pull that was already in
+        # flight at the hand-back nacks what it receives instead of holding a
+        # receipt nothing will settle.
+        self._closed = False
         self._lock = threading.Lock()
 
     def _build_http(self) -> Any:
@@ -3980,7 +4130,14 @@ class GoogleChatRelay:
         received = response.received_messages[0]
         receipt = str(uuid.uuid4())
         with self._lock:
-            self._receipts[receipt] = received.ack_id
+            closed = self._closed
+            if not closed:
+                self._receipts[receipt] = received.ack_id
+        if closed:
+            # Delivered to a long poll that outlived the hand-back; nobody
+            # will settle a receipt now, so hand this one back at once too.
+            self._nack([received.ack_id])
+            return None
         return {
             "receipt": receipt,
             "data": base64.b64encode(received.message.data).decode("ascii"),
@@ -4006,6 +4163,48 @@ class GoogleChatRelay:
                 }
             )
         return True
+
+    def _nack(self, ack_ids: list[Any]) -> bool:
+        """Hand ack_ids back to Pub/Sub now; False, and a log line, when that failed.
+
+        Best effort and bounded (SHUTDOWN_NACK_TIMEOUT_SECONDS, no retry): a
+        failure or a timeout leaves the messages to redeliver at their ack
+        deadline, which is what happened to them before the shutdown path.
+        """
+        try:
+            self.subscriber.modify_ack_deadline(
+                request={
+                    "subscription": self.subscription_path,
+                    "ack_ids": ack_ids,
+                    "ack_deadline_seconds": 0,
+                },
+                timeout=SHUTDOWN_NACK_TIMEOUT_SECONDS,
+                retry=None,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "shutdown: handing back %d unsettled receipt(s) failed type=%s; "
+                "they redeliver at their ack deadline",
+                len(ack_ids), type(exc).__name__,
+            )
+            return False
+        return True
+
+    def release_unsettled(self) -> int:
+        """Hand every unsettled receipt back to Pub/Sub; the count handed back.
+
+        The shutdown path's last act (install_shutdown_handler). Also closes
+        the relay: a pull in flight at this moment, which nothing interrupts,
+        nacks whatever it then receives rather than registering a receipt
+        after the clear (pull).
+        """
+        with self._lock:
+            self._closed = True
+            ack_ids = list(self._receipts.values())
+            self._receipts.clear()
+        if not ack_ids or not self._nack(ack_ids):
+            return 0
+        return len(ack_ids)
 
     def api_call(
         self, resource: list[str], method: str, arguments: dict[str, Any]
@@ -5302,6 +5501,27 @@ FORGE_REFRESH_HELPER_DIR = "/opt/defaults/scripts"
 # step by test rather than by import, because importing the helper here would
 # import its CLI side into the broker.
 FORGE_READ_ONLY_FLAG = "--read-only"
+
+# The flag that turns a forge's refresh helper into a sweep mint: the helper
+# prints a token that reads contents, pull requests and issues of the one
+# managed repository named, and installs nothing.
+# `github_token_refresh.SWEEP_FLAG` is the same string, kept in step by test
+# for FORGE_READ_ONLY_FLAG's reason.
+FORGE_SWEEP_FLAG = "--sweep"
+
+# Where the readings sweep reads github.com: the forge's own transport there is
+# the `gh` CLI on the write credential, so the sweep builds the in-process HTTP
+# transport GitHub Enterprise Server already has, at github.com's API, with its
+# own read token. An installation token cannot read `GET /user`, so the login
+# comes from GraphQL `viewer`.
+GITHUB_PROVIDER = "github"
+GITHUB_COM_API_URL = "https://api.github.com"
+GITHUB_COM_GRAPHQL_URL = "https://api.github.com/graphql"
+SWEEP_AUTHORIZATION_HEADER = "Authorization"
+SWEEP_AUTHORIZATION_FORMAT = "Bearer {token}"
+# A forge's declared transport, and the scheme that lets that transport speak plain HTTP.
+FORGE_HTTP_TRANSPORT = "http"
+FORGE_HTTP_SCHEME = "http"
 
 # The flag that turns a forge's refresh helper into a write mint for a forge
 # with no CLI behind it (GitHub Enterprise Server): the helper prints the
@@ -7728,7 +7948,8 @@ class CommandExecutor:
         # refused or would mint for a variable gcloud never reads. Non-kubectl
         # requests still resolve a named kubeconfig the way they did before
         # the pool existed -- regenerated on the ambient identity, never
-        # selected on.
+        # selected on. gcloud then runs with a kubeconfig of its own rather
+        # than the resolved one (`_gcloud_call_kubeconfig`).
         scoped = executable == "kubectl"
         # Bound the one-shot read; a command meant to block keeps kubectl's own
         # default. Decided here rather than in `_execute` because the argv
@@ -7871,7 +8092,8 @@ class CommandExecutor:
                 caller=caller,
             )
         # gcloud names its project in argv (injected); it reads no kubeconfig
-        # but get-credentials, which is handled above.
+        # but get-credentials, which is handled above, and runs with one of
+        # its own (`_gcloud_call_kubeconfig`).
         return self._execute(command, stdin=stdin, cwd=cwd, kubeconfig_path=None, caller=caller)
 
     def _with_host_hint(self, argv: list[str], result: ExecutionResult) -> ExecutionResult:
@@ -8114,6 +8336,23 @@ class CommandExecutor:
         if getattr(self, "_forge_write_mint_lock", None) is None:
             self._forge_write_mint_lock = threading.Lock()
         return self._forge_write_mint_lock
+
+    @property
+    def _sweep_mint_lock(self) -> threading.Lock:
+        if getattr(self, "_forge_sweep_mint_lock", None) is None:
+            self._forge_sweep_mint_lock = threading.Lock()
+        return self._forge_sweep_mint_lock
+
+    @property
+    def _sweep_tokens(self) -> dict[tuple[str, str, str], tuple[float, str]]:
+        """(provider, host, repository) -> (minted at, token): in memory only.
+
+        Apart from `_write_tokens`, because a sweep token reads and must never
+        be handed to a write, and one slot per repository, because the mint
+        covers the one repository it was asked for."""
+        if getattr(self, "_forge_sweep_tokens", None) is None:
+            self._forge_sweep_tokens = {}
+        return self._forge_sweep_tokens
 
     @property
     def _write_tokens(self) -> dict[tuple[str, str, str], tuple[float, frozenset[str], str]]:
@@ -8593,6 +8832,57 @@ class CommandExecutor:
             raise RuntimeError("read-only credential mint returned no token")
         return token
 
+    def mint_sweep_credential(self, provider: str, repository: str) -> str:
+        """A token that reads one managed repository's pull requests and issues, or raise.
+
+        The same helper `mint_read_credential` runs, with the flag that makes
+        it print a sweep-scope token: contents, pull requests and issues, read
+        only, for this one repository. A context repository is refused: its
+        read stays `contents: read` alone. The role check runs on every call,
+        cached token or not, so a repository unregistered since the last mint
+        is refused. A token is handed out again for
+        FORGE_WRITE_TOKEN_REUSE_SECONDS for the repository it was minted for.
+
+        The token comes back on stdout and is returned, never logged.
+        """
+        forge = _provider_forge(provider)
+        if repository_role(repository, forge) != ROLE_MANAGED:
+            raise PermissionError(f"{repository} is not a repository this install manages")
+        host = forge.hosts[0] if forge.hosts else ""
+        key = (provider, host, repository.strip().lower())
+
+        def cached() -> str | None:
+            entry = self._sweep_tokens.get(key)
+            if entry is None:
+                return None
+            minted_at, token = entry
+            if time.monotonic() - minted_at < FORGE_WRITE_TOKEN_REUSE_SECONDS:
+                return token
+            return None
+
+        token = cached()
+        if token:
+            return token
+        helper = self._forge_helper(provider)
+        with self._sweep_mint_lock:
+            token = cached()
+            if token:
+                return token
+            # The sweep runs on its own thread with no store lock, so its spawn
+            # is not covered by the content workspace's reserve the way the
+            # read and write mints are: it takes a reservation of its own and
+            # waits for admission like any route that spawns, which a
+            # background thread can afford.
+            with self.reserve_child_memory():
+                result = self._run_forge_helper(
+                    provider, helper, [FORGE_SWEEP_FLAG, repository], "sweep credential mint"
+                )
+            token = result.stdout.strip()
+            if not token:
+                raise RuntimeError("sweep credential mint returned no token")
+            self._sweep_tokens[key] = (time.monotonic(), token)
+        return token
+
     def mint_write_credential(self, provider: str, repository: str) -> str:
         """A write token for a managed repository on a forge with no CLI, or raise.
 
@@ -8658,6 +8948,20 @@ class CommandExecutor:
                 raise RuntimeError("write credential mint returned no token")
             self._write_tokens[key] = (time.monotonic(), covered | {clean_repo}, token)
         return token
+
+    def drop_sweep_credential(self, provider: str, repository: str) -> None:
+        """Forget the sweep token cached for ``repository``, so the next sweep mints anew.
+
+        Called when the forge refuses the token (401), as `drop_write_credential` is.
+        """
+        try:
+            forge = _provider_forge(provider)
+        except PermissionError:
+            return
+        host = forge.hosts[0] if forge.hosts else ""
+        key = (provider, host, repository.strip().lower())
+        if self._sweep_tokens.pop(key, None) is not None:
+            LOGGER.info("%s sweep token for %s dropped after the forge refused it", provider, repository)
 
     def drop_write_credential(self, provider: str) -> None:
         """Forget the write token cached for ``provider``'s forge, so the next use mints anew.
@@ -9143,6 +9447,7 @@ class CommandExecutor:
                         *_flags_of(decision),
                     ],
                     kubeconfig_path=scratch,
+                    authors_kubeconfig=True,
                     # The short deadline, as for the describe above. A
                     # credential fetch takes seconds when the API answers, and
                     # when it does not, five minutes of silence here -- ahead of
@@ -9246,7 +9551,8 @@ class CommandExecutor:
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
         try:
             result = self._execute(
-                command, stdin=stdin, cwd=cwd, kubeconfig_path=scratch, caller=caller
+                command, stdin=stdin, cwd=cwd, kubeconfig_path=scratch, caller=caller,
+                authors_kubeconfig=True,
             )
             if result.exit_code == 0 and scratch.is_file():
                 generated = scratch.read_text(encoding="utf-8")
@@ -9274,6 +9580,31 @@ class CommandExecutor:
         finally:
             scratch.unlink(missing_ok=True)
 
+    @contextlib.contextmanager
+    def _gcloud_call_kubeconfig(self, argv: list[str], authors_kubeconfig: bool) -> Iterator[Path | None]:
+        """A kubeconfig of its own for a gcloud call, or None.
+
+        gcloud has no need of the broker's kubeconfig outside get-credentials,
+        which already uses a scratch file; giving every gcloud call its own
+        keeps them independent of each other. So every gcloud call `_execute`
+        runs -- an agent's plain read, one that arrived with a forwarded
+        context, a profile's confined read, the endpoint describe -- runs with
+        `KUBECONFIG` naming an empty 0600 file in the state dir, made for this
+        call and removed when it ends, however it ends, much as git calls drop
+        `KUBECONFIG` in `_execute`. Any `kubeconfig_path` the call was handed
+        is set aside for it. The one exception is get-credentials
+        (`authors_kubeconfig`), which keeps its own `.pending-` scratch file.
+        """
+        if not argv or Path(argv[0]).name != "gcloud" or authors_kubeconfig:
+            yield None
+            return
+        scratch = self.kubeconfig_dir / f".gcloud-{uuid.uuid4().hex}.yaml"
+        try:
+            os.close(os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            yield scratch
+        finally:
+            scratch.unlink(missing_ok=True)
+
     def _execute(
         self,
         argv: list[str],
@@ -9286,6 +9617,7 @@ class CommandExecutor:
         caller: socket.socket | None = None,
         *,
         allow_http: bool = False,
+        authors_kubeconfig: bool = False,
         stop: Callable[[], bool] | None = None,
     ) -> ExecutionResult:
         """Run a command. `kubeconfig_path` is already resolved and trusted.
@@ -9305,6 +9637,10 @@ class CommandExecutor:
 
         `caller` is the connection the command answers, if it answers one; see
         `_capture_output`. Internal callers leave it unset.
+
+        `authors_kubeconfig` is set by the get-credentials paths only: their
+        gcloud writes into `kubeconfig_path`. Every other gcloud call runs with
+        a kubeconfig of its own (`_gcloud_call_kubeconfig`).
 
         No concurrency slot is taken here, and no reservation on a thread that
         already holds one: a slot and a child memory reservation are a
@@ -9400,7 +9736,9 @@ class CommandExecutor:
             if covered or self.children_budget_bytes is None
             else self.reserve_child_memory(caller=caller)
         )
-        with admission:
+        with admission, self._gcloud_call_kubeconfig(argv, authors_kubeconfig) as call_kubeconfig:
+            if call_kubeconfig is not None:
+                command_environment["KUBECONFIG"] = str(call_kubeconfig)
             started = time.monotonic()
             process = subprocess.Popen(
                 argv,
@@ -9553,11 +9891,6 @@ def build_vcs_broker(
         request_deadline=executor.request_deadline,
         pinned_bases=pinned_bases,
         tls_refusal=executor.tls_refusal,
-        # Looked up at call time: the handler's registry is a class attribute
-        # a test replaces per case, and this broker outlives none of them.
-        merge_observer=lambda count: CredentialProxyHandler.metrics.record_merged(count),
-        close_observer=lambda count: CredentialProxyHandler.metrics.record_closed_unmerged(count),
-        started_at=PROCESS_START_TIME_SECONDS,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -9568,6 +9901,113 @@ def build_vcs_broker(
     # broker's start, and the answer is a log line either way.
     threading.Thread(target=lambda: warn_on_credential_reach(broker), daemon=True).start()
     return broker
+
+
+class _SweepTransport:
+    """The sweep's GitHub transport: a refused token is dropped and the call asked once more.
+
+    The sweep token is cached for FORGE_WRITE_TOKEN_REUSE_SECONDS, so a
+    reinstalled App or a revoked token would otherwise fail every sweep until
+    the window ends. One retry, on a fresh mint; a second 401 is the answer.
+    """
+
+    def __init__(self, inner: providers.HttpTransport, drop: Callable[[], None]) -> None:
+        self._inner = inner
+        self._drop = drop
+
+    def api(self, method: str, path: str, **kwargs: Any) -> Any:
+        return self._retried(lambda: self._inner.api(method, path, **kwargs))
+
+    def whoami(self) -> str:
+        return self._retried(self._inner.whoami)
+
+    def _retried(self, call: Callable[[], Any]) -> Any:
+        try:
+            return call()
+        except providers.WorkspaceError as refused:
+            if refused.status != HTTPStatus.UNAUTHORIZED:
+                raise
+            self._drop()
+            return call()
+
+
+def sweep_transport_for(executor: CommandExecutor, forge, repo: str, *, opener: Callable[..., Any] | None = None):
+    """The transport the readings sweep reads `repo` through, never the write credential's.
+
+    GitHub, on either host: an in-process HTTP transport presenting the sweep
+    token (`mint_sweep_credential`), at api.github.com on github.com and the
+    instance's own API on GitHub Enterprise Server, with the login from
+    GraphQL `viewer`. GitLab and Gitea: the forge's own HTTP transport with
+    its static token, as every verb reads. Bounded by the numbers
+    `build_vcs_broker` hands the broker. `opener` is the broker's
+    `http_opener`, for tests.
+    """
+    if forge.name == GITHUB_PROVIDER:
+        api_url = forge.api_url or GITHUB_COM_API_URL
+        whoami_graphql = forge.whoami_graphql or GITHUB_COM_GRAPHQL_URL
+        transport = providers.HttpTransport(
+            api_url,
+            lambda: {
+                SWEEP_AUTHORIZATION_HEADER: SWEEP_AUTHORIZATION_FORMAT.format(
+                    token=executor.mint_sweep_credential(forge.name, repo)
+                )
+            },
+            forge.error_overrides,
+            timeout=executor.timeout_seconds,
+            max_bytes=executor.max_output_bytes,
+            opener=opener,
+            outer_deadline=executor.request_deadline,
+            ca_file=forge.ca_file,
+            ca_source=forge.ca_source,
+            whoami_graphql=whoami_graphql,
+        )
+        return _SweepTransport(transport, lambda: executor.drop_sweep_credential(forge.name, repo))
+    if forge.transport == FORGE_HTTP_TRANSPORT and forge.api_url:
+        return providers.HttpTransport(
+            forge.api_url,
+            lambda: forge.credential.headers(repo),
+            forge.error_overrides,
+            timeout=executor.timeout_seconds,
+            max_bytes=executor.max_output_bytes,
+            whoami_route=forge.whoami_route,
+            whoami_graphql=forge.whoami_graphql,
+            opener=opener,
+            outer_deadline=executor.request_deadline,
+            ca_file=forge.ca_file,
+            ca_source=forge.ca_source,
+            allow_http=(forge.scheme == FORGE_HTTP_SCHEME),
+        )
+    raise providers.ForgeUnsupported(f"{forge.name} has no HTTP transport for the readings sweep")
+
+
+def sweep_app_credential(forge) -> bool:
+    """Whether `forge`'s credential is a GitHub App installation token.
+
+    A minted or brokered credential is one; a configured static identity is
+    not. The sweep's author filter names an App as `app/<slug>`.
+    """
+    return forge.name == GITHUB_PROVIDER and isinstance(
+        forge.credential, (providers.BrokeredCredential, providers.MintedWriteCredential)
+    )
+
+
+def start_readings_sweep(executor: CommandExecutor, broker) -> None:
+    """Start the proposal readings sweep beside the listeners.
+
+    Always, in the roles that build the broker: the managed list is a
+    live-reloaded mount, so whether there is anything to read is decided on
+    each pass inside the sweep. A pass over an empty or unreadable list makes
+    no attempt and counts no failure, and a repository registered later is
+    read on the next interval.
+    """
+    vcs_readings.ReadingsSweep(
+        registry=broker.registry,
+        transport_for=lambda forge, repo: sweep_transport_for(executor, forge, repo),
+        metrics=CredentialProxyHandler.metrics,
+        managed_repositories=managed_repositories,
+        app_credential=sweep_app_credential,
+    ).start()
+    LOGGER.info("proposal readings sweep started")
 
 
 def warn_on_credential_reach(broker) -> None:
@@ -10013,15 +10453,18 @@ def _escape_label_value(value: str) -> str:
 class ProxyMetrics:
     """The broker's series in the Prometheus text exposition: the tool
     invocations counter and their latency histogram, the request counter, the
-    admission wait histogram and refusals counter by bound, and the slot and
-    child-memory gauges beside their caps when an executor is wired.
+    admission wait histogram and refusals counter by bound, the slot and
+    child-memory gauges beside their caps when an executor is wired, and the
+    proposal readings the readings sweep sets (`set_readings`) with its
+    failure counter.
 
     Hand-rolled: prometheus_client is not in the image, and what is needed is
     small enough that adding a dependency to the one container holding every
     credential is the worse trade. One lock, because the server is one thread
     per connection and a counter is read by the scrape while it is written.
     Series appear on first increment and are rendered in a fixed order, so
-    two scrapes of an idle broker are byte-identical.
+    two scrapes of an idle broker are byte-identical until the first reading,
+    whose age gauge moves with the clock.
     """
 
     def __init__(self) -> None:
@@ -10029,8 +10472,11 @@ class ProxyMetrics:
         self._tool_invocations: dict[tuple[str, str, str], int] = {}
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str, str], int] = {}
-        self._merged = 0
-        self._closed_unmerged = 0
+        # The sweep's last reading of each kind, None until the first; a
+        # withheld reading leaves the previous one here.
+        self._outcomes: vcs_readings.OutcomesReading | None = None
+        self._details: vcs_readings.DetailsReading | None = None
+        self._reading_failures: dict[str, int] = {}
         self._failures: dict[tuple[str, str], int] = {}
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
@@ -10135,13 +10581,110 @@ class ProxyMetrics:
         with self._lock:
             self._vcs[key] = self._vcs.get(key, 0) + 1
 
-    def record_merged(self, count: int) -> None:
+    def set_readings(
+        self,
+        outcomes: vcs_readings.OutcomesReading | None,
+        details: vcs_readings.DetailsReading | None,
+    ) -> None:
+        """The sweep's readings; None for a kind withheld, which keeps the last one."""
         with self._lock:
-            self._merged += count
+            if outcomes is not None:
+                self._outcomes = outcomes
+            if details is not None:
+                self._details = details
 
-    def record_closed_unmerged(self, count: int) -> None:
+    def record_reading_failure(self, reason: str) -> None:
+        reason = reason if reason in VCS_READINGS_FAILURE_REASONS else LABEL_OTHER
         with self._lock:
-            self._closed_unmerged += count
+            self._reading_failures[reason] = self._reading_failures.get(reason, 0) + 1
+
+    @staticmethod
+    def _render_readings(
+        lines: list[str],
+        outcomes: vcs_readings.OutcomesReading | None,
+        details: vcs_readings.DetailsReading | None,
+        failures: list[tuple[str, int]],
+        now: float,
+    ) -> None:
+        """The proposal readings (design section 4). A reading's series are
+        absent before it is first taken and once its age passes
+        VCS_READINGS_STALE_SECONDS; its age gauge stays from the first reading
+        on, so a stale reading shows as stale rather than as current."""
+
+        def fresh(reading: Any) -> bool:
+            return reading is not None and now - reading.taken_at <= vcs_readings.VCS_READINGS_STALE_SECONDS
+
+        if fresh(outcomes):
+            counts = {
+                vcs_readings.STATE_OPEN: outcomes.open,
+                vcs_readings.STATE_MERGED: outcomes.merged,
+                vcs_readings.STATE_CLOSED: outcomes.closed,
+            }
+            lines += [
+                f"# HELP {vcs_readings.VCS_PROPOSALS_METRIC} Proposals the install authored in its managed repositories, by state as the forge reports it now; closed is closed without a merge.",
+                f"# TYPE {vcs_readings.VCS_PROPOSALS_METRIC} gauge",
+            ]
+            for state in vcs_readings.STATES:
+                lines.append(f'{vcs_readings.VCS_PROPOSALS_METRIC}{{{VCS_READINGS_STATE_LABEL}="{state}"}} {counts[state]}')
+        if fresh(details):
+            lines += [
+                f"# HELP {vcs_readings.VCS_PROPOSALS_CLOSED_BY_METRIC} The install's proposals closed without a merge, by who closed them.",
+                f"# TYPE {vcs_readings.VCS_PROPOSALS_CLOSED_BY_METRIC} gauge",
+            ]
+            for actor in vcs_readings.CLOSERS:
+                lines.append(
+                    f'{vcs_readings.VCS_PROPOSALS_CLOSED_BY_METRIC}{{{VCS_READINGS_ACTOR_LABEL}="{actor}"}} '
+                    f"{details.closed_by.get(actor, 0)}"
+                )
+            lines += [
+                f"# HELP {vcs_readings.VCS_PROPOSAL_TOUCHES_METRIC} Events on the install's proposals by any account but the install's own, summed over every proposal, by kind and actor.",
+                f"# TYPE {vcs_readings.VCS_PROPOSAL_TOUCHES_METRIC} gauge",
+            ]
+            for touch, count in sorted(details.touches.items(), key=lambda item: (item[0].kind, item[0].actor)):
+                lines.append(
+                    f'{vcs_readings.VCS_PROPOSAL_TOUCHES_METRIC}{{{VCS_READINGS_KIND_LABEL}="{_escape_label_value(touch.kind)}",'
+                    f'{VCS_READINGS_ACTOR_LABEL}="{_escape_label_value(touch.actor)}"}} {count}'
+                )
+            lines += [
+                f"# HELP {vcs_readings.VCS_PROPOSAL_TOUCHES_PER_PROPOSAL_METRIC} The install's merged and closed proposals by how many human touches each carried, cumulative over le; the {VCS_READINGS_LE_INF} sample is the count of such proposals.",
+                f"# TYPE {vcs_readings.VCS_PROPOSAL_TOUCHES_PER_PROPOSAL_METRIC} gauge",
+            ]
+            for outcome in vcs_readings.OUTCOMES:
+                for edge, count in sorted(details.buckets.get(outcome, {}).items()):
+                    le = VCS_READINGS_LE_INF if math.isinf(edge) else f"{edge:g}"
+                    lines.append(
+                        f'{vcs_readings.VCS_PROPOSAL_TOUCHES_PER_PROPOSAL_METRIC}{{{VCS_READINGS_OUTCOME_LABEL}="{outcome}",'
+                        f'{VCS_READINGS_LE_LABEL}="{le}"}} {count}'
+                    )
+            lines += [
+                f"# HELP {vcs_readings.VCS_PROPOSALS_IGNORED_METRIC} Open proposals of the install older than {vcs_readings.VCS_READINGS_IGNORED_AFTER_SECONDS} seconds that carry no human touch.",
+                f"# TYPE {vcs_readings.VCS_PROPOSALS_IGNORED_METRIC} gauge",
+                f"{vcs_readings.VCS_PROPOSALS_IGNORED_METRIC} {details.ignored}",
+            ]
+        ages = [
+            (name, reading)
+            for name, reading in ((vcs_readings.READING_OUTCOMES, outcomes), (vcs_readings.READING_DETAILS, details))
+            if reading is not None
+        ]
+        if ages:
+            lines += [
+                f"# HELP {vcs_readings.VCS_READINGS_AGE_METRIC} Seconds since the reading was last taken in full; present from the first reading on, however old.",
+                f"# TYPE {vcs_readings.VCS_READINGS_AGE_METRIC} gauge",
+            ]
+            for name, reading in ages:
+                lines.append(
+                    f'{vcs_readings.VCS_READINGS_AGE_METRIC}{{{VCS_READINGS_READING_LABEL}="{name}"}} '
+                    f"{max(now - reading.taken_at, 0.0):.3f}"
+                )
+        if failures:
+            lines += [
+                f"# HELP {vcs_readings.VCS_READINGS_FAILURES_METRIC} Repository attempts by the readings sweep that produced less than a full reading, by cause.",
+                f"# TYPE {vcs_readings.VCS_READINGS_FAILURES_METRIC} counter",
+            ]
+            for reason, count in failures:
+                lines.append(
+                    f'{vcs_readings.VCS_READINGS_FAILURES_METRIC}{{{VCS_READINGS_REASON_LABEL}="{_escape_label_value(reason)}"}} {count}'
+                )
 
     def record_failure(self, kind: str, tool: str = BROKER_FAILURE_TOOL_NONE) -> None:
         kind = kind if kind in BROKER_FAILURE_KINDS else BROKER_FAILURE_OTHER_FAILED
@@ -10155,8 +10698,9 @@ class ProxyMetrics:
             invocations = sorted(self._tool_invocations.items())
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
-            merged = self._merged
-            closed_unmerged = self._closed_unmerged
+            outcomes = self._outcomes
+            details = self._details
+            reading_failures = sorted(self._reading_failures.items())
             failures = sorted(self._failures.items())
             durations = {
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
@@ -10263,14 +10807,8 @@ class ProxyMetrics:
                 f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}",'
                 f'{VCS_PROVIDER_LABEL}="{_escape_label_value(provider)}"}} {count}'
             )
-        lines += [
-            f"# HELP {VCS_MERGED_METRIC} Proposals this install opened that the forge reported merged, counted once each per process.",
-            f"# TYPE {VCS_MERGED_METRIC} counter",
-            f"{VCS_MERGED_METRIC} {merged}",
-            f"# HELP {VCS_CLOSED_UNMERGED_METRIC} Proposals this install opened that the forge reported closed without a merge, counted once each per process.",
-            f"# TYPE {VCS_CLOSED_UNMERGED_METRIC} counter",
-            f"{VCS_CLOSED_UNMERGED_METRIC} {closed_unmerged}",
-        ]
+        # Wall clock, as the readings' `taken_at` is.
+        self._render_readings(lines, outcomes, details, reading_failures, time.time())
         lines += [
             f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind (a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error) and, for a command past its deadline, the tool it ran; every other kind carries tool={BROKER_FAILURE_TOOL_NONE}.",
             f"# TYPE {BROKER_FAILURES_METRIC} counter",
@@ -10296,7 +10834,10 @@ class MetricsHandler(BaseHTTPRequestHandler):
     poller, hold no caller token; the operator's NetworkPolicy on this pod is
     what bounds who reaches the port. It serves the registry the credentialed handler writes and holds no
     route, credential or policy of its own, which is why it may bind a TCP
-    port the credential runtime otherwise refuses to (see serve). Bounded
+    port the credential runtime otherwise refuses to (see serve). The
+    proposal readings it serves come from the readings sweep, which runs on
+    the broker's own timer (start_readings_sweep), never on a scrape: no peer
+    that reaches this port can cause a forge read. Bounded
     because it shares the process with that handler: MetricsServer admits
     METRICS_MAX_CONNECTIONS at a time and handle() cuts every connection
     off at METRICS_CONNECTION_DEADLINE_SECONDS, so a peer that reaches the
@@ -10418,6 +10959,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # The session role's bounded share of the command pool, installed by main
     # beside the executor; None (the route tests' stand-ins) means unbounded.
     session_slots: "SessionSlots | None" = None
+    scope_slots: "SessionSlots | None" = None
+    # The scope role's member window: one per broker process (scope_policy).
+    scope_window: scope_policy.MemberWindow = scope_policy.MemberWindow()
     # The profile role's, the same way (profile_slot_limit_from_env).
     profile_slots: "SessionSlots | None" = None
     max_request_bytes: int
@@ -10433,6 +10977,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     a2a_chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
     teams_relay: TeamsRelay | None = None
+    # Set by the SIGTERM handler (install_shutdown_handler). While set, the
+    # two Chat event-pull routes answer 503 SHUTDOWN_ERROR and nothing else
+    # changes: the settle routes, the Slack pull and every other route serve
+    # until the server stops, so the gateway's acks for pulls already
+    # answered still land.
+    shutting_down = threading.Event()
     # The read-only Cloud API relay's credential and transport. Armed by
     # serve() unconditionally, like the exec route: the shell role always
     # exists. None only in a test that has not set it, where the route
@@ -10658,6 +11208,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             "session_cap": getattr(self.session_slots, "limit", DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS),
         }
 
+    def _refused_while_shutting_down(self, **fields: Any) -> bool:
+        """Answer a Chat event pull 503 SHUTDOWN_ERROR while the stop is under way."""
+        if not self.shutting_down.is_set():
+            return False
+        self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": SHUTDOWN_ERROR, **fields})
+        return True
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path != HEALTHZ_PATH and self._authenticated() is None:
             return
@@ -10690,6 +11247,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Slack relay disabled"}
                 )
                 return
+            # Served through the shutdown window on purpose: this queue is
+            # in-process and already acknowledged to Slack, so every event
+            # the gateway pulls now is one fewer lost with the pod. Only the
+            # Chat routes refuse (_refused_while_shutting_down), because only
+            # a Chat pull creates a Pub/Sub receipt the stop has to hand back.
             try:
                 self._json(HTTPStatus.OK, {"event": self.slack_relay.pull()})
             except Exception as exc:
@@ -10706,6 +11268,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # The subscription rides every answer, so the gateway can name
             # what it pulls: it is configured with the relay URL only.
             subscription = getattr(self.a2a_chat_relay, "subscription_path", "")
+            if self._refused_while_shutting_down(subscription=subscription):
+                return
             try:
                 event = self.a2a_chat_relay.pull()
                 self._json(HTTPStatus.OK, {"event": event, "subscription": subscription})
@@ -10739,6 +11303,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/v1/chat/events"):
             if self.chat_relay is None:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat relay disabled"})
+                return
+            if self._refused_while_shutting_down():
                 return
             try:
                 event = self.chat_relay.pull()
@@ -11016,6 +11582,34 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 )
                 return
             argv, kubeconfig_context = confined.argv, confined.kubeconfig_context
+        # The scope role's whole surface: five lookups, each on an argument
+        # scope.json declares or an earlier lookup returned (scope_policy).
+        scope_admitted = None
+        if principal.role == CALLER_ROLE_SCOPE:
+            scope_refusal, scope_admitted = scope_policy.check(
+                argv,
+                extras=stdin is not None or cwd is not None or kubeconfig_context is not None or wants_kubeconfig,
+                scope_file=os.getenv(scope_policy.SCOPE_FILE_ENV, ""),
+                window=self.scope_window,
+            )
+            if scope_refusal is not None:
+                LOGGER.warning(
+                    "scope request refused request_id=%s rule=%s",
+                    request_id,
+                    scope_refusal.rule,
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=scope_refusal.rule),
+                )
+                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "code": "SECURITY_POLICY_BLOCKED",
+                        "rule": scope_refusal.rule,
+                        "message": scope_refusal.message,
+                    },
+                )
+                return
         rule = self.policy.blocked_by(argv)
         if rule is not None:
             LOGGER.warning(
@@ -11138,8 +11732,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
             # One slot for the command and its response together; see
             # CommandExecutor.request_slot for why the response is inside it.
-            # The session role's own bound is taken first, so a session past
-            # its share never queues for the pool the shell shares.
+            # The session or scope role's own bound is taken first, so a caller
+            # past its share never queues for the pool the shell shares.
             with self._session_slot(principal.role), self._request_slot():
                 result = self.executor.execute(
                     exec_argv,
@@ -11192,6 +11786,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 if result.timed_out:
                     self.metrics.record_failure(BROKER_FAILURE_EXEC_TIMEOUT, tool=tool_label)
                 self.metrics.observe_duration(tool_label, result.duration_ms / MILLISECONDS_PER_SECOND)
+                if scope_admitted is not None and result.exit_code == 0 and not result.truncated and not result.timed_out:
+                    scope_policy.record(
+                        scope_admitted,
+                        result.stdout,
+                        scope_file=os.getenv(scope_policy.SCOPE_FILE_ENV, ""),
+                        window=self.scope_window,
+                    )
                 response = {
                     "status": "completed",
                     "exitCode": result.exit_code,
@@ -12965,8 +13566,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
 
     def _session_slot(self, role: str) -> contextlib.AbstractContextManager:
-        """The session or profile role's bounded share, or nothing for every other role."""
-        slots = getattr(self, "profile_slots" if role == CALLER_ROLE_PROFILE else "session_slots", None)
+        """The session, profile or scope role's bounded share, or nothing for every other role."""
+        slots = getattr(self, ROLE_SLOT_ATTRIBUTES.get(role, "session_slots"), None)
         if slots is None:
             return contextlib.nullcontext()
         return slots.acquire(role)
@@ -13154,8 +13755,8 @@ def resolve_role() -> str:
     are on the same loopback. Splitting the broker into its own Pod splits
     those two roles across two containers in two Pods.
     """
-    role = os.getenv("CREDENTIAL_PROXY_ROLE", "combined").strip().lower() or "combined"
-    if role not in {"combined", "broker", "api-proxy"}:
+    role = os.getenv("CREDENTIAL_PROXY_ROLE", ROLE_COMBINED).strip().lower() or ROLE_COMBINED
+    if role not in {ROLE_COMBINED, ROLE_BROKER, ROLE_API_PROXY}:
         raise RuntimeError(
             f"unsupported CREDENTIAL_PROXY_ROLE {role!r}; "
             "expected 'combined', 'broker' or 'api-proxy'"
@@ -13226,9 +13827,57 @@ def platform_pubsub_subscriptions() -> frozenset[str]:
     return frozenset(kept)
 
 
+def install_shutdown_handler(
+    server: socketserver.BaseServer,
+    relays: Sequence[GoogleChatRelay],
+    settle_seconds: float = SHUTDOWN_SETTLE_SECONDS,
+) -> None:
+    """Make SIGTERM a graceful stop of the credentialed server.
+
+    On the signal: refuse new Chat event pulls at once, keep every other route up
+    for settle_seconds so the gateway's acks for pulls already answered land,
+    hand what is still unsettled back to Pub/Sub, then stop the server so
+    serve() returns and the process exits 0 inside the pod's grace period.
+    Without this the default handler ends the process mid-request, and a
+    message pulled but not yet acked sits in Pub/Sub until its ack deadline
+    (SHUTDOWN_SETTLE_SECONDS has the argument). The Slack relay's queue is not
+    handed back: its envelopes were acknowledged to Slack on arrival, and the
+    gateway on a next install reads Slack itself. A second SIGTERM changes
+    nothing; the stop already under way finishes.
+
+    The drain runs on its own thread because server.shutdown() waits for
+    serve_forever() to return, and the handler runs on the thread that is
+    inside serve_forever(). Only the main thread may install a signal
+    handler; a caller on any other logs and keeps the default.
+    """
+    def drain() -> None:
+        time.sleep(settle_seconds)
+        released = sum(relay.release_unsettled() for relay in relays)
+        LOGGER.info(
+            "shutdown: settle window over, handed back %d unsettled receipt(s); stopping",
+            released,
+        )
+        server.shutdown()
+
+    def on_sigterm(signum: int, _frame: Any) -> None:
+        if CredentialProxyHandler.shutting_down.is_set():
+            return
+        CredentialProxyHandler.shutting_down.set()
+        LOGGER.info(
+            "SIGTERM: refusing new Chat event pulls; settling receipts for %ss before stopping",
+            settle_seconds,
+        )
+        threading.Thread(target=drain, name=SHUTDOWN_THREAD_NAME, daemon=True).start()
+
+    try:
+        signal.signal(signal.SIGTERM, on_sigterm)
+    except ValueError:
+        LOGGER.warning("not on the main thread; SIGTERM keeps its default handler")
+
+
 def serve(args: argparse.Namespace) -> None:
     role = resolve_role()
-    if role == "api-proxy":
+    if role == ROLE_API_PROXY:
         start_agent_api_proxy().serve_forever()
         return
 
@@ -13281,6 +13930,18 @@ def serve(args: argparse.Namespace) -> None:
         env_name=ENV_PROFILE_SLOTS,
         bound=ADMISSION_BOUND_PROFILE,
     )
+    # After the profile share, so the scope share takes only what profile and
+    # session work leave the shell's last slot.
+    CredentialProxyHandler.scope_slots = SessionSlots(
+        scope_slot_limit_from_env(
+            executor.max_concurrent_commands,
+            CredentialProxyHandler.session_slots.limit,
+            CredentialProxyHandler.profile_slots.limit,
+        ),
+        role=CALLER_ROLE_SCOPE,
+        env_name=ENV_SCOPE_MAX_CONCURRENT_COMMANDS,
+        bound=ADMISSION_BOUND_SCOPE,
+    )
     CredentialProxyHandler.base_branch = (
         getattr(args, "base_branch", "")
         or os.getenv("CREDENTIAL_PROXY_BASE_BRANCH", "")
@@ -13301,6 +13962,8 @@ def serve(args: argparse.Namespace) -> None:
         base_branch=CredentialProxyHandler.base_branch,
         pinned_bases=CredentialProxyHandler.pinned_bases,
     )
+    if role in BROKER_ROLES:
+        start_readings_sweep(executor, CredentialProxyHandler.vcs)
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
@@ -13375,7 +14038,7 @@ def serve(args: argparse.Namespace) -> None:
             teams_app_id,
             teams_tenant_id or "common",
         )
-    if role == "combined":
+    if role == ROLE_COMBINED:
         api_server = start_agent_api_proxy()
         threading.Thread(target=api_server.serve_forever, daemon=True).start()
     if args.unix_socket:
@@ -13420,7 +14083,16 @@ def serve(args: argparse.Namespace) -> None:
             )
         else:
             start_metrics_listener(args.host, metrics_port)
+    install_shutdown_handler(
+        server,
+        [
+            relay
+            for relay in (CredentialProxyHandler.chat_relay, CredentialProxyHandler.a2a_chat_relay)
+            if relay is not None
+        ],
+    )
     server.serve_forever()
+    LOGGER.info("credential proxy stopped")
 
 
 def _metrics_port_refusal(metrics_port: int, args: argparse.Namespace) -> str | None:

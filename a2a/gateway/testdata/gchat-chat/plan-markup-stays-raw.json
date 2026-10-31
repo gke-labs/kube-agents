@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "⚙️ see <!here> < https://evil.example|docs>\n  ◌ see <!here> < https://evil.example|docs>",
+    "widgets": null
+  }
+]

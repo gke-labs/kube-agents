@@ -135,6 +135,8 @@ func (c *Client) EnsureHeldConsumer(ctx context.Context, cfg HeldConsumerConfig)
 		case old.AckWait != cfg.ackWait():
 			return fmt.Errorf("held consumer %s has AckWait %v; refusing to change it to %v under bound workers, whose heartbeats keep the old pace (re-create it)",
 				cfg.Durable, old.AckWait, cfg.ackWait())
+		case old.Metadata[heldMarkerKey] != heldMarkerValue || heldConfigTampered(old) != "":
+			return fmt.Errorf("held consumer %s exists but this call didn't make it (no %s mark, or a setting it never sets); refusing to adopt it", cfg.Durable, heldMarkerKey)
 		}
 	}
 	_, err = js.CreateOrUpdateConsumer(ctx, cfg.Stream, jetstream.ConsumerConfig{
@@ -286,11 +288,54 @@ func (h *heldState) bind(ctx context.Context, js jetstream.JetStream, cfg Subscr
 		return nil, fmt.Errorf("%w: held durable %s has no AckWait; refusing to bind", ErrHeldBindRefused, cfg.Durable)
 	case cc.Metadata[heldMarkerKey] != heldMarkerValue:
 		return nil, fmt.Errorf("%w: held durable %s was not made by EnsureHeldConsumer (no %s metadata); refusing to bind", ErrHeldBindRefused, cfg.Durable, heldMarkerKey)
+	case heldConfigTampered(cc) != "":
+		return nil, fmt.Errorf("%w: held durable %s %s, which EnsureHeldConsumer never sets; refusing to bind", ErrHeldBindRefused, cfg.Durable, heldConfigTampered(cc))
 	}
 	h.mu.Lock()
 	h.ackWait = cc.AckWait
 	h.mu.Unlock()
 	return cons, nil
+}
+
+// heldConfigTampered names the first field of a held durable's stored config
+// that EnsureHeldConsumer leaves at its default and something else changed,
+// or "". The marker is a public constant, so a consumer created under a
+// durable's name with the marker, the filter and the caps right could still
+// carry a setting that quietly breaks held delivery: a push deliver subject,
+// headers-only deliveries with no envelope, an inactivity reaper that deletes
+// the durable during a dispatcher restart, a delivery limit that drops a task
+// after one failed offer, a start position or backoff that skips or delays
+// submissions, a pause, a priority pin, pull limits, or memory storage. Each
+// of these refuses the bind. MaxWaiting isn't checked: the server fills its
+// own default in, so a stored value can't tell an edit from that default.
+func heldConfigTampered(cc jetstream.ConsumerConfig) string {
+	switch {
+	case cc.DeliverSubject != "":
+		return "pushes to " + cc.DeliverSubject
+	case cc.HeadersOnly:
+		return "delivers headers only"
+	case cc.InactiveThreshold != 0:
+		return "is deleted after " + cc.InactiveThreshold.String() + " inactive"
+	case cc.MaxDeliver > 0:
+		return fmt.Sprintf("stops redelivering after %d deliveries", cc.MaxDeliver)
+	case cc.DeliverPolicy != jetstream.DeliverAllPolicy:
+		return "does not start at the first submission"
+	case cc.ReplayPolicy != jetstream.ReplayInstantPolicy:
+		return "replays at the original rate"
+	case len(cc.BackOff) > 0:
+		return "backs off redeliveries"
+	case cc.RateLimit != 0:
+		return "is rate limited"
+	case cc.PauseUntil != nil && !cc.PauseUntil.IsZero():
+		return "is paused until " + cc.PauseUntil.String()
+	case cc.PriorityPolicy != jetstream.PriorityPolicyNone || len(cc.PriorityGroups) > 0:
+		return "pins or overflows deliveries to a priority group"
+	case cc.MaxRequestBatch != 0 || cc.MaxRequestExpires != 0 || cc.MaxRequestMaxBytes != 0:
+		return "limits pull requests"
+	case cc.MemoryStorage:
+		return "keeps its state in memory, lost on a server restart"
+	}
+	return ""
 }
 
 func (h *heldState) beat() time.Duration {

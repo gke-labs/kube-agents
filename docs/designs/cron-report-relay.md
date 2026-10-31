@@ -580,7 +580,8 @@ relay introduced — but it should be fixed, and the fix is known. It belongs in
 adapter, where routing is decided before the event is handed up: the in-process
 sender (`_create_message`) already seeds the counter on outbound, with a comment
 naming this exact symptom, and the out-of-process sender (`_standalone_send`, the
-path `hermes send` takes) does not. Bringing the two to parity fixes every
+path `hermes send` takes, or `google_chat_relay_patch`'s relayed stand-in for it
+when `GOOGLE_CHAT_RELAY_URL` is set) does not. Bringing the two to parity fixes every
 bot-opened thread rather than the ones this repository happens to hold a report
 row for — paired with a reload-on-mtime in `_ThreadCountStore.incr`, since that
 store rewrites the whole dict from memory and would otherwise erase a peer
@@ -736,8 +737,10 @@ and a run that emphasised it (`**[SILENT]**`, where the SOP asked for the bare
 marker as the whole response) reached both senders. The adapter therefore
 carries its own `is_silent_report`, which undresses the marker before testing,
 and the Slack sender imports the same predicate so the two ends agree. The
-scheduler's direct Google Chat leg, which a job on `"all"` uses, is upstream's
-sender and carries no such guard; no roster job uses `"all"`.
+scheduler's direct Google Chat leg, which a job on `"all"` uses, is the
+standalone sender: the relayed stand-in, when `GOOGLE_CHAT_RELAY_URL` is set,
+drops a dressed marker with the Slack sender's predicate, and upstream's, on an
+install without the relay, carries no such guard; no roster job uses `"all"`.
 
 The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`.
 That sentence controls silence, not delivery: a prompt without it only makes the job noisier

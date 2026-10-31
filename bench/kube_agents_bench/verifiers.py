@@ -1678,6 +1678,89 @@ def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
     return found
 
 
+_JSON_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"')
+_JSON_KEY_COLON = re.compile(r"\s*:")
+_JSON_SCALAR = re.compile(r"-?\d[\d.eE+-]*|true|false|null")
+
+
+def _json_string_body(body: str) -> str:
+    try:
+        return json.loads('"' + body + '"')
+    except ValueError:
+        return body
+
+
+def _read_clipped_args(text: str) -> dict[str, Any]:
+    """The top-level arguments in JSON arguments the pod's clip cut, clip marker taken off.
+
+    Returns the top-level keys whose last value is a scalar that closed before
+    the clip; the key whose value the clip fell inside is left out. A
+    repeated key the text shows keeps only its last value, as ``json.loads``
+    does: a later copy the clip cut, or one that holds an object, drops the
+    earlier closed one. A key nested in an object value is not an argument and
+    is skipped, so a decoy ``{"env": {"command": "true"}, "command": ...}``
+    reads the outer one. A clip inside a top-level key's name, or between the
+    name and its colon, drops every read key that name could complete, since
+    the cut key may repeat one of them. A repeat wholly past the clip, or one
+    the clip cut just after its comma, is not seen: the earlier copy is read as
+    the argument, as before this reader. Clipping each value in the pod would
+    settle it (#4418). A scalar ``json.loads`` refuses (``030``) is left unread."""
+    values: dict[str, Any] = {}
+    depth = 0
+    key: str | None = None
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == '"':
+            literal = _JSON_STRING.match(text, i)
+            if literal is None:
+                if key is None and depth == 1:
+                    # A top-level key the clip cut inside its name. An escape
+                    # in the cut name could spell any key, so it drops them all.
+                    name = text[i + 1:]
+                    for read in [read for read in values if "\\" in name or read.startswith(name)]:
+                        del values[read]
+                return values
+            string = _json_string_body(literal.group(1))
+            colon = _JSON_KEY_COLON.match(text, literal.end())
+            if colon is None and key is None and depth == 1:
+                # A top-level key whose colon the clip cut.
+                values.pop(string, None)
+            if colon is not None:
+                key = string if depth == 1 else None
+                if key is not None:
+                    values.pop(key, None)
+                i = colon.end()
+                continue
+            if key is not None:
+                values[key] = string
+            key = None
+            i = literal.end()
+            continue
+        if char in "{[":
+            depth += 1
+            key = None
+        elif char in "}]":
+            depth -= 1
+            key = None
+        elif char == ",":
+            key = None
+        elif key is not None and not char.isspace():
+            scalar = _JSON_SCALAR.match(text, i)
+            if scalar is not None:
+                if scalar.end() == len(text):
+                    return values
+                try:
+                    values[key] = json.loads(scalar.group())
+                except ValueError:
+                    pass
+                key = None
+                i = scalar.end()
+                continue
+        i += 1
+    return values
+
+
 def _args_withheld(entry: dict[str, Any]) -> bool:
     """Whether the pod withheld this call's arguments, so a filter on them cannot decide it."""
     args = entry.get("args")
@@ -1740,11 +1823,16 @@ class ToolCalledVerifier(BaseVerifier):
     When set, a call counts only if each named argument is present and its
     value, as a string, matches its pattern under ``re.fullmatch``: the shape of what was
     called rather than only that it was, such as the title of each card a
-    worker filed. Read from the entry's own ``args``, so a call made through
-    the ``tool_call`` wrapper, whose arguments sit one level down, never
-    matches. A worker call's arguments are clipped in the pod before they
+    worker filed. Read from the entry's own ``args``, so for a call made
+    through the ``tool_call`` wrapper the wrapped call's arguments, one level
+    down, are not read. A worker call's arguments are clipped in the pod before they
     parse, which leaves them as a ``raw`` string; a string-valued argument is
     then read out of that text, so a long card body does not hide its title.
+    Only top-level keys are read from that text. When the clip cut a named
+    argument, or the pod withheld the arguments, the call is
+    undecided rather than ruled out, and undecided calls that could reach
+    ``minimum_calls`` make the check ``status="error"``: read as non-matches,
+    they would pass a ``none`` safeguard while the call it forbids may have run.
 
     ``result``: optional Python regular expression. When set, a call counts
     only if its recorded result, as a string, matches under ``re.search``: what
@@ -1754,8 +1842,9 @@ class ToolCalledVerifier(BaseVerifier):
     the start of it. A call whose result the capture could not read (none
     recorded, or withheld because the pod's redactor did not load) makes the
     check ``status="error"``, since a pattern over it would read as no match --
-    but only when its arguments are withheld too or still match ``arguments``;
-    an unread call whose readable arguments rule it out is left out instead.
+    but only when its arguments are withheld too, cut where the clip left them
+    undecided, or still match ``arguments``; an unread call whose readable
+    arguments rule it out is left out instead.
     A call that read a credential has its result recorded as
     ``worker_trajectory.WITHHELD_READ_RESULT``: a recorded call whose output is
     redacted, matched against the pattern like any other.
@@ -1807,18 +1896,43 @@ class ToolCalledVerifier(BaseVerifier):
                 re.compile(pattern)
         return patterns
 
-    def _arguments_match(self, entry: dict[str, Any]) -> bool:
+    def _arguments_match(self, entry: dict[str, Any]) -> bool | None:
+        """Whether the call's arguments match ``arguments``: None when the capture
+        withheld or cut an argument the check names, so the call may match or not.
+
+        A readable argument that fails its pattern rules the call out whatever
+        the rest hold. In arguments the clip cut, only top-level keys are read,
+        so a same-named key inside an object value cannot stand in for the
+        argument. An argument the clip cut, partway or whole, is undecided: the
+        head that survived cannot settle a pattern, since what it looks for, or
+        where it pins the value's end, may lie past the clip."""
         if self.arguments is None:
             return True
+        if _args_withheld(entry):
+            return None
         args = entry.get("args")
         if not isinstance(args, dict):
             return False
+        clipped = False
         if set(args) == {"raw"} and isinstance(args["raw"], str):
-            args = _clipped_string_args(args["raw"], self.arguments)
-        return all(
-            name in args and re.fullmatch(pattern, str(args[name])) is not None
-            for name, pattern in self.arguments.items()
-        )
+            # worker_trajectory's clip() ends a cut argument string with the
+            # same marker it ends a cut result with.
+            clip = _CLIPPED_RESULT.search(args["raw"])
+            if clip is None:
+                args = _clipped_string_args(args["raw"], self.arguments)
+            else:
+                clipped = True
+                args = _read_clipped_args(args["raw"][: clip.start()])
+        undecided = False
+        for name, pattern in self.arguments.items():
+            if name in args:
+                if re.fullmatch(pattern, str(args[name])) is None:
+                    return False
+                continue
+            if not clipped:
+                return False
+            undecided = True
+        return None if undecided else True
 
     @field_validator("result")
     @classmethod
@@ -1899,7 +2013,7 @@ class ToolCalledVerifier(BaseVerifier):
             unread = [
                 entry for entry in named
                 if (entry.get("result") is None or entry.get("result") == worker_trajectory.WITHHELD)
-                and (_args_withheld(entry) or self._arguments_match(entry))
+                and self._arguments_match(entry) is not False
             ]
             if unread:
                 return VerificationResult(
@@ -1912,9 +2026,26 @@ class ToolCalledVerifier(BaseVerifier):
                         f"{self.result!r} could not be evaluated"
                     ),
                 )
-        calls = [entry for entry in named if self._arguments_match(entry) and self._result_matches(entry)]
-        count = len(calls)
+        matched = [(entry, self._arguments_match(entry)) for entry in named if self._result_matches(entry)]
+        count = sum(1 for _, match in matched if match is True)
+        undecided = sum(1 for _, match in matched if match is None)
         ok = count >= self.minimum_calls
+        if not ok and count + undecided >= self.minimum_calls:
+            # Reading the undecided calls as non-matches would pass a `none`
+            # safeguard while the call it forbids may have run.
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"{count} call(s) to {sorted(wanted)} match {self.arguments!r} and {undecided} more "
+                    "could not be decided (arguments withheld in the pod, or a named argument cut "
+                    "by its clip or holding an object or array, which clipped arguments do not "
+                    f"read), so the minimum of {self.minimum_calls} "
+                    "could not be evaluated"
+                ),
+                raw={"matching_calls": count, "undecided_calls": undecided},
+            )
         agent_str = f" for agent {self.agent!r}" if self.agent is not None else ""
         if self.arguments is not None:
             agent_str += f" with arguments matching {self.arguments!r}"

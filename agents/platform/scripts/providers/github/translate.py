@@ -15,6 +15,15 @@ from __future__ import annotations
 
 from typing import Any
 
+#: GitHub's review states, as the neutral ones. `PENDING` is a review its
+#: author has not submitted, which nobody else can see; it is no review yet.
+REVIEW_STATES = {
+    "APPROVED": "approved",
+    "CHANGES_REQUESTED": "changes_requested",
+    "COMMENTED": "commented",
+    "DISMISSED": "dismissed",
+}
+
 
 def actor(node: dict[str, Any] | None) -> str:
     """A login, with the App suffix removed.
@@ -162,15 +171,67 @@ def commit(node: dict[str, Any]) -> dict[str, Any]:
     the author date of a commit written weeks ago, and the question a caller
     asks of this list is "did it land after the request", which only the
     committer date answers.
+
+    `email` is the git author email, which is all that says a commit is the
+    install's own: its address is one GitHub links to no account, so `author`
+    falls back to the git name. `bot` is whether the linked account is an
+    automation, False when no account is linked.
     """
     inner = node.get("commit") or {}
+    git_author = inner.get("author") or {}
     return {
         "sha": node.get("sha") or "",
-        "author": actor(node.get("author")) or ((inner.get("author") or {}).get("name") or ""),
+        "author": actor(node.get("author")) or (git_author.get("name") or ""),
+        "email": git_author.get("email") or "",
+        "bot": is_automation(node.get("author")),
         "committed": ((inner.get("committer") or {}).get("date")) or "",
         "message": inner.get("message") or "",
         "url": node.get("html_url") or "",
     }
+
+
+def authored(node: dict[str, Any]) -> dict[str, Any]:
+    """A search hit for a pull request, as one of an author's proposals.
+
+    The search API answers in the issue shape, which carries the merge time
+    under `pull_request.merged_at` rather than at the top, so merged is read
+    from there: a merged proposal is also `state: closed`.
+    """
+    user = node.get("user")
+    merged = node.get("merged_at") or (node.get("pull_request") or {}).get("merged_at")
+    if merged:
+        state = "merged"
+    else:
+        state = "open" if node.get("state") == "open" else "closed"
+    return {
+        "number": node.get("number"),
+        "state": state,
+        "author": actor(user),
+        "authorBot": is_automation(user),
+        "created": node.get("created_at") or "",
+        "updated": node.get("updated_at") or "",
+        "closed": node.get("closed_at") or "",
+    }
+
+
+def review(node: dict[str, Any]) -> dict[str, Any] | None:
+    """A submitted review, body or not; None for one not yet submitted."""
+    state = REVIEW_STATES.get(str(node.get("state") or "").upper())
+    if state is None:
+        return None
+    return {
+        "id": node.get("id"),
+        "state": state,
+        "author": actor(node.get("user")),
+        "bot": is_automation(node.get("user")),
+        "created": node.get("submitted_at") or "",
+    }
+
+
+def closer(node: dict[str, Any] | None) -> dict[str, Any]:
+    """Who an issue event names as its actor; "" when nobody."""
+    who = (node or {}).get("actor")
+    return {"actor": actor(who), "bot": is_automation(who)}
 
 
 def label(node: dict[str, Any]) -> dict[str, Any]:
