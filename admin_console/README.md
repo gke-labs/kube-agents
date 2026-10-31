@@ -178,6 +178,31 @@ Helm. See the
 [inference gateway guide](../docs/site/src/content/docs/concepts/inference-gateway.md)
 for provider behavior.
 
+## Harness limits
+
+Setup's **Harness limits** page reads the load measurements of the agent
+harness from the repository, `bench/scale/harness-limits.json`, so it needs no
+connection. Until that file exists, the page shows
+`bench/scale/harness-limits.sample.json` under a banner that marks it as a
+sample. The plan, metrics and thresholds are those of the
+[harness bottlenecks design](../docs/designs/agent-harness-bottlenecks.md).
+
+For the selected commit and mode, the page plots each metric against one
+factor, one operation at a time. A factor sits at its measured value from the
+run's totals, per cluster for nodes and objects; churn sits at the rate the
+fixture achieved; any other factor sits at the run's planned value. Each chart has a straight-line fit and
+its dashed prediction. A line through two distinct planned points is a two-point
+estimate; past the largest measured value it is predicted, not measured. A run
+with a provider 429, a failed prompt or an unfinished one (the record's
+`excluded_from`) stays out of the response-time fit.
+
+For the fleet entered on the page, the page answers the design's two questions:
+are the container limits enough, and which limits, machine type and node count
+does the fleet need. The machine type is the smallest that holds the largest
+pod's recommended requests; the node count holds every long-running pod,
+replicas included (a Job's or an init container's peak holds no node).
+The raw records, with each run's errors, are in a collapsed section.
+
 ## Chat
 
 Chat is always available in navigation. Without a verified target it provides a
