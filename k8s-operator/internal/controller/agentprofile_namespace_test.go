@@ -269,9 +269,10 @@ func TestWithoutProfilePeer(t *testing.T) {
 	agent := a2aTestAgent()
 	nats := buildA2ANATSNetworkPolicy(agent)
 	before := len(nats.Spec.Ingress[0].From)
+	rulesBefore := len(nats.Spec.Ingress)
 	withoutProfilePeer(nats, agent)
-	if len(nats.Spec.Ingress) != 2 || len(nats.Spec.Ingress[0].From) != before-1 {
-		t.Errorf("NATS fence after: %d rules, %d peers on 4222 (was %d), want 2 rules and one peer fewer", len(nats.Spec.Ingress), len(nats.Spec.Ingress[0].From), before)
+	if len(nats.Spec.Ingress) != rulesBefore || len(nats.Spec.Ingress[0].From) != before-1 {
+		t.Errorf("NATS fence after: %d rules (was %d), %d peers on 4222 (was %d), want the same rules and one peer fewer", len(nats.Spec.Ingress), rulesBefore, len(nats.Spec.Ingress[0].From), before)
 	}
 	for _, peer := range nats.Spec.Ingress[0].From {
 		if reflect.DeepEqual(peer, profileNamespacePeer(agent)) {

@@ -25,6 +25,50 @@ Production guidance is a 3-node cluster with stream replicas R3. Dev and CI run 
 node with R1 under the same config surface - the conformance suite runs against `kind`, so
 nothing here may depend on a managed control plane.
 
+**Amended 10/29 (#3274):** the production posture is the default for a new bus. The
+operator renders `spec.harness.tuning.busReplicas` servers. When the field is unset, an
+install keeps the server count its bus already runs (an install from before this change
+stays on one server), and a new bus gets three. Every stream and bucket the provision Job
+creates takes `min(3, servers)` replicas. The servers find each other through a headless
+routes Service on 6222, authenticated to each other by mutual TLS under the bus CA (the callout does not govern routes, and no route password is rendered). A `maxUnavailable: 1` budget and
+a hostname topology spread keep one drain to one server, and a lame-duck `preStop` moves
+clients off a stopping server rather than dropping them.
+
+**Changing the server count empties the bus.** A server that restarts in cluster mode
+finds its standalone streams unassigned in the new metadata layer and deletes them as
+orphans; going back, a standalone server refuses to load an R3 stream. Either way the
+provision Job then recreates every stream and bucket empty. So setting `busReplicas` on
+an install whose bus already runs another count is a conversion, and its cost is the
+bus's contents: task history, the topics journal, and the KV buckets. Converting without
+that loss is #4225 (a copy into a new cluster before the switch).
+
+**Amended 10/30 (#3274):** so the operator does not convert. An existing bus keeps the
+count it runs: a `busReplicas` that asks for another count is held to the running one,
+with an `A2ABusConversionRefused` condition and Warning, and the admission webhook
+refuses the edit with the same message. #4225 lifts that refusal in the same change that
+adds the migration, so no release can convert without it.
+
+**Amended 10/31 (#4225):** the refusal is gone, and a change between one server and three
+starts a migration that keeps the bus's data. The operator runs it as phases on
+`status.busMigration`, reported by the `A2ABusMigrating` condition, and the webhook refuses
+another `busReplicas` change while one runs.
+
+- **Three to one**, in place: the operator's pin Job moves every stream's leader to server 0
+  and scales it to one replica while the bus is still a cluster, then the bus renders one
+  server. Writes keep flowing.
+- **One to three**, by copy: writes are frozen (only the migration reaches the bus; console
+  and web logins drop, and the gateway and bridge cannot publish), the operator's pods
+  snapshot every stream to a one-pod staging volume, a pod with no bus identity digests the
+  snapshots, the bus renders three servers, and the operator's restore pod restores each
+  stream, checked against the operator's policy for it before and after, and raises it to
+  three replicas.
+- **A failure** turns the run back: before the shrink, the pinned streams go back to three
+  replicas; after the conversion, the bus renders one server again and the same snapshot is
+  restored into it. Only a failed undo stops for a person, and the condition names the step.
+  A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
+  it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
+  does neither.
+
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than
 any other input.
@@ -572,9 +616,10 @@ Layout:
   happens, because established connections are already authorized and keep working
   while the fabric silently accepts no new client. Still owed as they arm: the audit
   exporter, the janitor, and the metrics scrape (the alert set above is scraped
-  series), and the NATS pods themselves on their route port the moment the deployment
-  leaves the single-node dev shape - a 3-node cluster's servers dial each other, and a
-  fence without the route peer prevents the cluster from ever forming. The topic-grant corollary that two edits
+  series). The NATS pods' own route peer, which this list used to carry as owed, landed
+  with the three-server default (amended 10/29, #3274): a separate rule admits 6222 from
+  the bus's servers and nothing else, since a fence without it keeps the cluster from
+  ever forming. The topic-grant corollary that two edits
   travel together, applied to the fence. A second policy in the same amendment
   fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has no
   other legitimate destination, save the credential broker on its one port when the

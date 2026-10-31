@@ -875,6 +875,29 @@ type TuningSpec struct {
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
 
+	// BusReplicas is how many NATS servers run the A2A bus under mode: next,
+	// and so how many copies JetStream keeps of every stream and bucket: 3
+	// runs a cluster with R3 streams, which keeps the bus up through a node
+	// drain, upgrade or eviction that moves one server; 1 runs a single
+	// server with R1 streams, which is down for as long as its pod restarts.
+	// 1 is for a throwaway, single-node or cost-bound install that accepts
+	// that outage; it saves two NATS pods and two 40Gi volumes.
+	//
+	// Unset, an install keeps the count its bus already runs, so an install
+	// from before the three-server default stays on one server, and a new bus
+	// gets three (status.busReplicas shows which applies).
+	//
+	// Set, it decides the count of a bus that does not exist yet. On an
+	// existing bus, a change between 1 and 3 starts a migration that keeps
+	// the bus's data (status.busMigration, the A2ABusMigrating condition):
+	// the bus keeps the count it runs until the migration converts it, and
+	// the admission webhook refuses another change while one runs. One server
+	// to three freezes writes for the window, since it copies the streams
+	// (docs/designs/spec-nats-deployment.md).
+	// +kubebuilder:validation:Enum=1;3
+	// +optional
+	BusReplicas *int `json:"busReplicas,omitempty"`
+
 	// Profiles sizes AgentProfile work (#3655): the install-wide ceiling on
 	// concurrent profile tasks and the warm workers kept per interactive
 	// (profile, tier). Until the sizing budget exists these are fixed,
@@ -968,6 +991,11 @@ type ProfileTuning struct {
 	// +optional
 	WarmReplicas *int `json:"warmReplicas,omitempty"`
 }
+
+// DefaultBusReplicas is the NATS server count of a new bus when
+// spec.harness.tuning.busReplicas is absent: a three-server cluster with R3
+// streams. An existing bus keeps its own count.
+const DefaultBusReplicas = 3
 
 // MaxProfileCeiling is ProfileTuning.Ceiling's maximum, which the ceiling
 // also holds to when it defaults to maxInProgress.
@@ -2312,6 +2340,22 @@ type AgentStatus struct {
 	// +optional
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
 
+	// BusReplicas is the A2A bus's NATS server count under spec.mode: next:
+	// the count the bus already runs, which spec.harness.tuning.busReplicas
+	// does not change; for a new bus, that field, or 3. Re-derived from the
+	// cluster on every reconcile, so it is a reading of the bus rather than a
+	// setting.
+	// +optional
+	BusReplicas int32 `json:"busReplicas,omitempty"`
+
+	// BusMigration is the A2A bus's server-count migration under spec.mode:
+	// next, while one runs or since the last one ended: setting
+	// spec.harness.tuning.busReplicas to another count on an existing bus
+	// starts one, and it converts the bus without emptying it. Unset when no
+	// migration has run.
+	// +optional
+	BusMigration *BusMigrationStatus `json:"busMigration,omitempty"`
+
 	// Note, deliberately not a doc comment — the blank line below keeps it out of the
 	// CRD description that `kubectl explain` prints. As on the three status structs
 	// above, omitempty does nothing here: encoding/json has no notion of an empty
@@ -2344,6 +2388,94 @@ type AgentStatus struct {
 	// aggregate counters of what it has done.
 	// +optional
 	Usage AgentUsageStatus `json:"usage,omitempty"`
+}
+
+// BusMigrationRetry is one retry of a Failed bus migration run: when it was
+// asked for, and the failure it retried.
+type BusMigrationRetry struct {
+	At       metav1.Time `json:"at"`
+	FailedIn string      `json:"failedIn"`
+	// +optional
+	Cause string `json:"cause,omitempty"`
+}
+
+// BusMigrationStatus is one migration of the A2A bus between one NATS server
+// and three.
+type BusMigrationStatus struct {
+	// Leg is the direction: OneToThree (snapshot and restore, behind a write
+	// freeze) or ThreeToOne (in place).
+	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne
+	Leg string `json:"leg"`
+
+	// RunID names this migration's own Jobs, pods, ServiceAccounts and bus
+	// principals.
+	RunID string `json:"runID"`
+
+	// Phase is where the migration is. Done converted the bus with its data;
+	// Abandoned left it at its old count with its data; Failed stopped where
+	// a person has to act, and Message says what.
+	Phase string `json:"phase"`
+
+	// Abandoning is set once the migration is on its way back to the old
+	// count.
+	// +optional
+	Abandoning bool `json:"abandoning,omitempty"`
+
+	// StartedAt is when the migration began.
+	StartedAt metav1.Time `json:"startedAt"`
+
+	// Deadline is when an unfinished phase counts as failed, and when the
+	// migration's bus credentials stop working. Its Jobs stop a few minutes
+	// before it.
+	Deadline metav1.Time `json:"deadline"`
+
+	// Message is the manual step a Failed migration names.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// Cause is why the run turned back: the phase that failed, and whether
+	// it was still running at Deadline. Set at the first failure and kept.
+	// +optional
+	Cause string `json:"cause,omitempty"`
+
+	// FailedIn is the phase a Failed run failed in. A run that failed inside
+	// the one to three leg's write freeze keeps the freeze, with its
+	// snapshot, until a person retries it or gives it up, each with an
+	// annotation on the PlatformAgent naming this run (the A2ABusMigrating
+	// condition says which). A Failed run blocks any new migration until
+	// then.
+	// +optional
+	FailedIn string `json:"failedIn,omitempty"`
+
+	// Retries records each retry of a Failed run, oldest first, at most
+	// three.
+	// +optional
+	// +kubebuilder:validation:MaxItems=3
+	Retries []BusMigrationRetry `json:"retries,omitempty"`
+
+	// GivenUp is set when a person gave a Failed run up: its freeze is
+	// lifted, and streams it did not put back are recreated empty.
+	// +optional
+	GivenUp bool `json:"givenUp,omitempty"`
+
+	// FreezeConfirmed is set once every callout replica serves the write
+	// freeze's identity map, and only then does the bus render without its
+	// static application users and restart into the freeze.
+	// +optional
+	FreezeConfirmed bool `json:"freezeConfirmed,omitempty"`
+
+	// Warnings are what the restore found and restored anyway: a stream
+	// lacking a subject a fresh install has, or a field outside the
+	// restore's policy that differs from a fresh install. Each is also
+	// reported as one Warning Event. At most 4 KiB of them; the last says
+	// how many more there were.
+	// +optional
+	Warnings []string `json:"warnings,omitempty"`
+
+	// ObservedGeneration is the PlatformAgent generation that started this
+	// migration. A migration that ended without converting is not started
+	// again until the spec changes.
+	ObservedGeneration int64 `json:"observedGeneration"`
 }
 
 // AgentUsageStatus is the non-sensitive activity summary of an agent. Static

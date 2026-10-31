@@ -1,0 +1,102 @@
+{
+  "version": "637de779729fdb96",
+  "identities": [
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-bus-stream-3-1",
+      "user": "migrate-stream-3-1",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "$JS.API.STREAM.INFO.TASKS",
+          "$JS.API.STREAM.SNAPSHOT.TASKS",
+          "$JS.API.STREAM.RESTORE.TASKS",
+          "$JS.API.STREAM.UPDATE.TASKS",
+          "$JS.API.STREAM.DELETE.TASKS",
+          "$JS.SNAPSHOT.ACK.TASKS.>",
+          "$JS.SNAPSHOT.RESTORE.TASKS.>",
+          "$JS.API.STREAM.INFO.DIRECTORY",
+          "$JS.API.STREAM.SNAPSHOT.DIRECTORY",
+          "$JS.API.STREAM.RESTORE.DIRECTORY",
+          "$JS.API.STREAM.UPDATE.DIRECTORY",
+          "$JS.API.STREAM.DELETE.DIRECTORY",
+          "$JS.SNAPSHOT.ACK.DIRECTORY.>",
+          "$JS.SNAPSHOT.RESTORE.DIRECTORY.>",
+          "$JS.API.STREAM.INFO.TOPICS-STATE",
+          "$JS.API.STREAM.SNAPSHOT.TOPICS-STATE",
+          "$JS.API.STREAM.RESTORE.TOPICS-STATE",
+          "$JS.API.STREAM.UPDATE.TOPICS-STATE",
+          "$JS.API.STREAM.DELETE.TOPICS-STATE",
+          "$JS.SNAPSHOT.ACK.TOPICS-STATE.>",
+          "$JS.SNAPSHOT.RESTORE.TOPICS-STATE.>",
+          "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+          "$JS.API.STREAM.SNAPSHOT.TOPICS-JOURNAL",
+          "$JS.API.STREAM.RESTORE.TOPICS-JOURNAL",
+          "$JS.API.STREAM.UPDATE.TOPICS-JOURNAL",
+          "$JS.API.STREAM.DELETE.TOPICS-JOURNAL",
+          "$JS.SNAPSHOT.ACK.TOPICS-JOURNAL.>",
+          "$JS.SNAPSHOT.RESTORE.TOPICS-JOURNAL.>",
+          "$JS.API.STREAM.INFO.KV_runtime-state",
+          "$JS.API.STREAM.SNAPSHOT.KV_runtime-state",
+          "$JS.API.STREAM.RESTORE.KV_runtime-state",
+          "$JS.API.STREAM.UPDATE.KV_runtime-state",
+          "$JS.API.STREAM.DELETE.KV_runtime-state",
+          "$JS.SNAPSHOT.ACK.KV_runtime-state.>",
+          "$JS.SNAPSHOT.RESTORE.KV_runtime-state.>",
+          "$JS.API.STREAM.INFO.KV_session-state",
+          "$JS.API.STREAM.SNAPSHOT.KV_session-state",
+          "$JS.API.STREAM.RESTORE.KV_session-state",
+          "$JS.API.STREAM.UPDATE.KV_session-state",
+          "$JS.API.STREAM.DELETE.KV_session-state",
+          "$JS.SNAPSHOT.ACK.KV_session-state.>",
+          "$JS.SNAPSHOT.RESTORE.KV_session-state.>",
+          "$JS.API.STREAM.INFO.KV_cap",
+          "$JS.API.STREAM.SNAPSHOT.KV_cap",
+          "$JS.API.STREAM.RESTORE.KV_cap",
+          "$JS.API.STREAM.UPDATE.KV_cap",
+          "$JS.API.STREAM.DELETE.KV_cap",
+          "$JS.SNAPSHOT.ACK.KV_cap.>",
+          "$JS.SNAPSHOT.RESTORE.KV_cap.>",
+          "$JS.API.STREAM.INFO.KV_feedback",
+          "$JS.API.STREAM.SNAPSHOT.KV_feedback",
+          "$JS.API.STREAM.RESTORE.KV_feedback",
+          "$JS.API.STREAM.UPDATE.KV_feedback",
+          "$JS.API.STREAM.DELETE.KV_feedback",
+          "$JS.SNAPSHOT.ACK.KV_feedback.>",
+          "$JS.SNAPSHOT.RESTORE.KV_feedback.>",
+          "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.SNAPSHOT.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.RESTORE.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.UPDATE.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.DELETE.KV_PROFILE_LEASES",
+          "$JS.SNAPSHOT.ACK.KV_PROFILE_LEASES.>",
+          "$JS.SNAPSHOT.RESTORE.KV_PROFILE_LEASES.>",
+          "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+          "$JS.API.STREAM.SNAPSHOT.PROFILE_SUBMITS",
+          "$JS.API.STREAM.RESTORE.PROFILE_SUBMITS",
+          "$JS.API.STREAM.UPDATE.PROFILE_SUBMITS",
+          "$JS.API.STREAM.DELETE.PROFILE_SUBMITS",
+          "$JS.SNAPSHOT.ACK.PROFILE_SUBMITS.>",
+          "$JS.SNAPSHOT.RESTORE.PROFILE_SUBMITS.>"
+        ],
+        "subscribe": [
+          "_INBOX.migrate-stream-3-1.>"
+        ]
+      },
+      "notAfter": "2099-01-01T00:00:00Z"
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-bus-frozen-3-1",
+      "user": "migrate-frozen-3-1",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "_INBOX.migrate-frozen-3-1.>"
+        ],
+        "subscribe": [
+          "_INBOX.migrate-frozen-3-1.>"
+        ]
+      },
+      "notAfter": "2099-01-01T00:00:00Z"
+    }
+  ]
+}

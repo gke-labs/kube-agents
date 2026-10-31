@@ -1343,10 +1343,13 @@ delete_agent_cr() {
       "kubeagents:minimal:${namespace}:${agent_name}" \
       "kubeagents:tokenreview:${namespace}:${agent_name}" \
       --ignore-not-found >/dev/null 2>&1 || true
-    kubectl --context "$CLUSTER_CONTEXT" delete pvc -n "$namespace" \
-      -l "app.kubernetes.io/instance=${inst_label}" \
-      --field-selector "metadata.name=data-${agent_name}-a2a-nats-0" \
-      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    # One JetStream claim per bus server, up to three (spec.harness.tuning.busReplicas).
+    for ordinal in 0 1 2; do
+      kubectl --context "$CLUSTER_CONTEXT" delete pvc -n "$namespace" \
+        -l "app.kubernetes.io/instance=${inst_label}" \
+        --field-selector "metadata.name=data-${agent_name}-a2a-nats-${ordinal}" \
+        --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    done
   done <<<"$names"
 }
 

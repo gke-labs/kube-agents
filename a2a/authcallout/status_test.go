@@ -154,3 +154,22 @@ func TestLivenessDoesNotDependOnTheBusEither(t *testing.T) {
 		t.Errorf("liveness = %d while detached from the bus, want 200", code)
 	}
 }
+
+// With an expected version, a replica serving any other version is not
+// ready, and serving it, it is; without one, any map will do.
+func TestReadinessCanRequireTheExpectedMapVersion(t *testing.T) {
+	s := quietStore()
+	if err := s.Update([]byte(mapWithVersion("frozen1", "gateway"))); err != nil {
+		t.Fatal(err)
+	}
+	served := s.Version()
+	if code, body := get(t, StatusHandlerExpecting(s, nil, "some-other-version"), ReadyPath); code != http.StatusServiceUnavailable || !strings.Contains(body, "not the expected some-other-version") {
+		t.Errorf("serving %s, expecting another: %d %q", served, code, body)
+	}
+	if code, _ := get(t, StatusHandlerExpecting(s, nil, served), ReadyPath); code != http.StatusOK {
+		t.Errorf("serving the expected version: %d", code)
+	}
+	if code, _ := get(t, StatusHandlerExpecting(s, nil, ""), ReadyPath); code != http.StatusOK {
+		t.Errorf("no expected version: %d", code)
+	}
+}

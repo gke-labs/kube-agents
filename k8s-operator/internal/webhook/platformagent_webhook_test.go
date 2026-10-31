@@ -1286,3 +1286,42 @@ func TestWebhookRejectsForgeCredentialVolumeAndEnvOverrides(t *testing.T) {
 		})
 	}
 }
+
+// busReplicas cannot change while the bus's migration is under way; before
+// and after one, changing it is how a migration starts, so it passes.
+func TestBusReplicasCannotChangeMidMigration(t *testing.T) {
+	agent := func(spec *int, phase string) *agentv1alpha1.PlatformAgent {
+		pa := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "kubeagents-system"}}
+		pa.Spec.Mode = ptr.To("next")
+		if spec != nil {
+			pa.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: spec}}
+		}
+		if phase != "" {
+			pa.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: "OneToThree", Phase: phase}
+		}
+		pa.Status.BusReplicas = 1
+		return pa
+	}
+	for _, tc := range []struct {
+		name     string
+		old, new *agentv1alpha1.PlatformAgent
+		refused  bool
+	}{
+		{"starting a migration", agent(nil, ""), agent(ptr.To(3), ""), false},
+		{"turning a running migration around", agent(ptr.To(3), "Restoring"), agent(ptr.To(1), "Restoring"), true},
+		{"removing the field mid-migration", agent(ptr.To(3), "Hashing"), agent(nil, "Hashing"), true},
+		{"other edits mid-migration", agent(ptr.To(3), "Hashing"), agent(ptr.To(3), "Hashing"), false},
+		{"after a migration ended", agent(ptr.To(3), "Abandoned"), agent(ptr.To(1), "Abandoned"), false},
+		{"a create", nil, agent(ptr.To(3), ""), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validateBusReplicas(tc.old, tc.new)
+			if tc.refused != (len(errs) == 1) {
+				t.Fatalf("errors %v, want refused = %v", errs, tc.refused)
+			}
+		})
+	}
+	if _, err := (&PlatformAgentCustomValidator{}).ValidateUpdate(context.Background(), agent(ptr.To(3), "Restoring"), agent(ptr.To(1), "Restoring")); err == nil || !strings.Contains(err.Error(), "migration is under way") {
+		t.Errorf("ValidateUpdate turning a migration around: %v, want the refusal", err)
+	}
+}
