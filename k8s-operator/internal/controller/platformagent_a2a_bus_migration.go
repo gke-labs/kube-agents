@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -11,6 +13,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -311,6 +315,9 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 		if step.manual != "" {
 			run.Message = step.manual
 		}
+		if err := r.ensureBusMigrationWorkload(ctx, agent, run, now); err != nil {
+			return 0, err
+		}
 	}
 	return busMigrationReplicas(leg, busMigrationPhase(run.Phase), run.Abandoning), nil
 }
@@ -439,4 +446,168 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 // inbox prefix.
 func busMigrationPrincipal(step, runID string) string {
 	return "migrate-" + step + "-" + runID
+}
+
+const (
+	// busMigrationStageMount is where the staging volume is mounted in the
+	// snapshot Job and the hashing pod.
+	busMigrationStageMount = "/stage"
+	// busMigrationStageVolume names that volume in their pod specs.
+	busMigrationStageVolume = "stage"
+	// busMigrationBinary is the operator image's entrypoint, which runs the
+	// migration's subcommands (cmd/main.go).
+	busMigrationBinary = "/manager"
+)
+
+// busMigrationStageClaim is the run's staging volume claim.
+func busMigrationStageClaim(agent *agentv1alpha1.PlatformAgent, runID string) string {
+	return busMigrationWorkloadName(agent, "stage", runID)
+}
+
+// busMigrationImage is the image the migration's pods run: the operator's
+// own (OPERATOR_IMAGE), so their version is the operator's. "" when the
+// manager was deployed without it, and then no run starts its pods.
+func busMigrationImage() string {
+	return os.Getenv(operatorImageEnvVar)
+}
+
+// busMigrationPodSpec is what every migration pod shares: its own
+// ServiceAccount with no token mounted (the bus token is projected
+// separately and only where a pod connects), the hardened pod and container
+// security, and no restarts, so a failure is the phase's failure.
+func busMigrationPodSpec(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, step string, command []string, volumes []corev1.Volume, mounts []corev1.VolumeMount) corev1.PodSpec {
+	return corev1.PodSpec{
+		ServiceAccountName:           busMigrationWorkloadName(agent, step, run.RunID),
+		AutomountServiceAccountToken: ptr.To(false),
+		RestartPolicy:                corev1.RestartPolicyNever,
+		SecurityContext: &corev1.PodSecurityContext{
+			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			RunAsNonRoot:   ptr.To(true),
+			RunAsUser:      ptr.To(int64(65532)),
+			FSGroup:        ptr.To(int64(65532)),
+		},
+		Volumes: volumes,
+		Containers: []corev1.Container{{
+			Name:                     "bus-" + step,
+			Image:                    busMigrationImage(),
+			Command:                  command,
+			SecurityContext:          hardenedSecurityContext(),
+			Resources:                a2aProvisionResources(),
+			VolumeMounts:             mounts,
+			TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+		}},
+	}
+}
+
+// buildBusMigrationJob is a run's pin, unpin or snapshot Job: bus-migrate
+// connecting as the step's own principal with its projected bus token, over
+// TLS verified against the bus CA, bounded by the run's deadline.
+func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, step string, now time.Time) *batchv1.Job {
+	command := []string{busMigrationBinary, "bus-migrate", step,
+		"--server", a2aNATSTLSScheme + a2aNATSAddress(agent),
+		"--ca-file", a2aNATSCAFile(),
+		"--user", busMigrationPrincipal(step, run.RunID),
+		"--token-file", a2aBusTokenPath + "/" + a2aBusTokenFile,
+		"--streams", strings.Join(a2aProvisionedStreams, ","),
+	}
+	volumes := []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent)}
+	mounts := []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount()}
+	switch step {
+	case "pin":
+		command = append(command, "--target", a2aNATSName(agent)+"-0")
+	case "unpin":
+		command = append(command, "--replicas", "3")
+	case "snapshot":
+		command = append(command, "--dir", busMigrationStageMount)
+		volumes = append(volumes, corev1.Volume{Name: busMigrationStageVolume, VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: busMigrationStageClaim(agent, run.RunID)},
+		}})
+		mounts = append(mounts, corev1.VolumeMount{Name: busMigrationStageVolume, MountPath: busMigrationStageMount})
+	}
+	deadline := int64(run.Deadline.Sub(now).Seconds())
+	if deadline < 1 {
+		deadline = 1
+	}
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      busMigrationWorkloadName(agent, step, run.RunID),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "bus-migration"),
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit:            ptr.To(int32(2)),
+			ActiveDeadlineSeconds:   ptr.To(deadline),
+			TTLSecondsAfterFinished: ptr.To(int32(86400)),
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: a2aLabels(agent, "bus-migration")},
+				Spec:       busMigrationPodSpec(agent, run, step, command, volumes, mounts),
+			},
+		},
+	}
+}
+
+// buildBusHashPod is a run's hashing pod: bus-hash over the staging volume,
+// mounted read-only, writing the digests to its termination message for the
+// operator to read. It holds no bus credential at all.
+func buildBusHashPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) *corev1.Pod {
+	command := []string{busMigrationBinary, "bus-hash", "--dir", busMigrationStageMount, "--streams", strings.Join(a2aProvisionedStreams, ",")}
+	volumes := []corev1.Volume{{Name: busMigrationStageVolume, VolumeSource: corev1.VolumeSource{
+		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: busMigrationStageClaim(agent, run.RunID), ReadOnly: true},
+	}}}
+	mounts := []corev1.VolumeMount{{Name: busMigrationStageVolume, MountPath: busMigrationStageMount, ReadOnly: true}}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      busMigrationWorkloadName(agent, "hash", run.RunID),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "bus-migration"),
+		},
+		Spec: busMigrationPodSpec(agent, run, "hash", command, volumes, mounts),
+	}
+}
+
+// busMigrationPhaseWorkload names the workload a phase runs, "" for the
+// phases that run none of their own (rollouts, and the restore pod's, which
+// is on hold).
+func busMigrationPhaseWorkload(phase busMigrationPhase) string {
+	switch phase {
+	case busMigrationPinning:
+		return "pin"
+	case busMigrationUnpinning:
+		return "unpin"
+	case busMigrationSnapshot:
+		return "snapshot"
+	case busMigrationHashing:
+		return "hash"
+	}
+	return ""
+}
+
+// ensureBusMigrationWorkload creates the current phase's ServiceAccount and
+// then its Job or pod, both owned by the CR, if they are not there yet. The
+// ServiceAccount is the identity the callout resolves the pod's token to, so
+// it comes first; it holds no RBAC. Nothing is created without
+// OPERATOR_IMAGE, and the phase then waits out the run's deadline.
+func (r *PlatformAgentReconciler) ensureBusMigrationWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, now time.Time) error {
+	step := busMigrationPhaseWorkload(busMigrationPhase(run.Phase))
+	if step == "" || busMigrationImage() == "" {
+		return nil
+	}
+	name := busMigrationWorkloadName(agent, step, run.RunID)
+	if err := ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, name, agent.Namespace, nil, commonLabels(agent), fieldOwner); err != nil {
+		return err
+	}
+	var obj client.Object
+	if step == "hash" {
+		obj = buildBusHashPod(agent, run)
+	} else {
+		obj = buildBusMigrationJob(agent, run, step, now)
+	}
+	if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+		return err
+	}
+	withCommonLabels(obj, agent)
+	if err := r.Create(ctx, obj); err != nil && !errors.IsAlreadyExists(err) {
+		return err
+	}
+	return nil
 }

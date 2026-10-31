@@ -10,6 +10,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -236,8 +237,10 @@ func (m *migrationRig) pass(wantPhase busMigrationPhase, wantReplicas int32) {
 func (m *migrationRig) finishJob(step string, cond batchv1.JobConditionType) {
 	m.t.Helper()
 	j := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, step, "3-1"), Namespace: m.agent.Namespace}}
-	if err := m.cl.Create(context.Background(), j); err != nil {
-		m.t.Fatal(err)
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(j), j); err != nil {
+		if err := m.cl.Create(context.Background(), j); err != nil {
+			m.t.Fatal(err)
+		}
 	}
 	j.Status.Conditions = []batchv1.JobCondition{{Type: cond, Status: corev1.ConditionTrue}}
 	if err := m.cl.Status().Update(context.Background(), j); err != nil {
@@ -515,5 +518,196 @@ func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
 		if ids := busMigrationIdentities(agent); len(ids) != 0 {
 			t.Errorf("%s: %d migration principals, want none", phase, len(ids))
 		}
+	}
+}
+
+// workload reads back the pod spec of a phase's Job or pod.
+func (m *migrationRig) workload(step string) (corev1.PodSpec, metav1.ObjectMeta, bool) {
+	m.t.Helper()
+	key := client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationWorkloadName(m.agent, step, "3-1")}
+	if step == "hash" {
+		pod := &corev1.Pod{}
+		if err := m.cl.Get(context.Background(), key, pod); err != nil {
+			return corev1.PodSpec{}, metav1.ObjectMeta{}, false
+		}
+		return pod.Spec, pod.ObjectMeta, true
+	}
+	j := &batchv1.Job{}
+	if err := m.cl.Get(context.Background(), key, j); err != nil {
+		return corev1.PodSpec{}, metav1.ObjectMeta{}, false
+	}
+	return j.Spec.Template.Spec, j.ObjectMeta, true
+}
+
+func ownedByAgent(meta metav1.ObjectMeta, agent *agentv1alpha1.PlatformAgent) bool {
+	for _, o := range meta.OwnerReferences {
+		if o.Kind == "PlatformAgent" && o.Name == agent.Name && o.Controller != nil && *o.Controller {
+			return true
+		}
+	}
+	return false
+}
+
+// The pin Job is created when its phase runs: its own ServiceAccount (owned
+// by the CR, bound to no Role), no API token, the bus token projected for the
+// bus audience, connecting as the step's principal over TLS, bounded by the
+// run's deadline, on the operator's image.
+func TestAPhaseCreatesItsJobAndIdentity(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	m.pass(busMigrationPinning, 3)
+	spec, meta, ok := m.workload("pin")
+	if !ok {
+		t.Fatal("no pin Job after a pass in Pinning")
+	}
+	name := busMigrationWorkloadName(m.agent, "pin", "3-1")
+	if !ownedByAgent(meta, m.agent) {
+		t.Errorf("pin Job owners %v", meta.OwnerReferences)
+	}
+	sa := &corev1.ServiceAccount{}
+	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: name}, sa); err != nil {
+		t.Fatalf("no ServiceAccount %s: %v", name, err)
+	}
+	if !ownedByAgent(sa.ObjectMeta, m.agent) {
+		t.Errorf("ServiceAccount owners %v", sa.OwnerReferences)
+	}
+	rbs := &rbacv1.RoleBindingList{}
+	if err := m.cl.List(context.Background(), rbs); err != nil {
+		t.Fatal(err)
+	}
+	for _, rb := range rbs.Items {
+		for _, s := range rb.Subjects {
+			if s.Name == name {
+				t.Errorf("RoleBinding %s binds the migration identity", rb.Name)
+			}
+		}
+	}
+	if spec.ServiceAccountName != name || spec.AutomountServiceAccountToken == nil || *spec.AutomountServiceAccountToken {
+		t.Errorf("serviceAccount %q automount %v", spec.ServiceAccountName, spec.AutomountServiceAccountToken)
+	}
+	if spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Errorf("restartPolicy %s", spec.RestartPolicy)
+	}
+	c := spec.Containers[0]
+	if c.Image != "registry.example/operator:v1" {
+		t.Errorf("image %q", c.Image)
+	}
+	if c.SecurityContext == nil || c.SecurityContext.ReadOnlyRootFilesystem == nil || !*c.SecurityContext.ReadOnlyRootFilesystem ||
+		c.SecurityContext.AllowPrivilegeEscalation == nil || *c.SecurityContext.AllowPrivilegeEscalation {
+		t.Errorf("container security %+v", c.SecurityContext)
+	}
+	args := strings.Join(c.Command, " ")
+	for _, want := range []string{
+		"/manager bus-migrate pin ",
+		"--server " + a2aNATSTLSScheme + a2aNATSAddress(m.agent),
+		"--ca-file " + a2aNATSCAFile(),
+		"--user " + busMigrationPrincipal("pin", "3-1"),
+		"--token-file " + a2aBusTokenPath + "/" + a2aBusTokenFile,
+		"--streams " + strings.Join(a2aProvisionedStreams, ","),
+		"--target " + a2aNATSName(m.agent) + "-0",
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("command %q lacks %q", args, want)
+		}
+	}
+	var token bool
+	for _, v := range spec.Volumes {
+		if v.Projected == nil {
+			continue
+		}
+		for _, src := range v.Projected.Sources {
+			if src.ServiceAccountToken != nil {
+				token = src.ServiceAccountToken.Audience == a2aBusTokenAudience
+			}
+		}
+	}
+	if !token {
+		t.Error("no bus-audience token projected")
+	}
+	j := &batchv1.Job{}
+	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: name}, j); err != nil {
+		t.Fatal(err)
+	}
+	if d := j.Spec.ActiveDeadlineSeconds; d == nil || *d > 3600 || *d < 3500 {
+		t.Errorf("activeDeadlineSeconds %v, want the hour left", d)
+	}
+}
+
+// A transition creates the next phase's workload in the same pass: a failed
+// pin starts the unpin Job, which raises the streams back to three.
+func TestATransitionCreatesTheNextPhasesJob(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	m.finishJob("pin", batchv1.JobFailed)
+	m.pass(busMigrationUnpinning, 3)
+	spec, _, ok := m.workload("unpin")
+	if !ok {
+		t.Fatal("no unpin Job after the pin failed")
+	}
+	if args := strings.Join(spec.Containers[0].Command, " "); !strings.Contains(args, "bus-migrate unpin ") || !strings.Contains(args, "--replicas 3") ||
+		!strings.Contains(args, "--user "+busMigrationPrincipal("unpin", "3-1")) {
+		t.Errorf("unpin command %q", args)
+	}
+}
+
+// The snapshot Job writes the staging claim; the hashing pod reads it
+// read-only and holds no bus credential, no token and no API access.
+func TestTheSnapshotWritesTheStageAndTheHashReadsIt(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationSnapshot, 1, time.Now().Add(time.Hour))
+	m.pass(busMigrationSnapshot, 1)
+	stage := func(spec corev1.PodSpec) (claim *corev1.PersistentVolumeClaimVolumeSource, mount *corev1.VolumeMount) {
+		for i := range spec.Volumes {
+			if spec.Volumes[i].PersistentVolumeClaim != nil {
+				claim = spec.Volumes[i].PersistentVolumeClaim
+				for j := range spec.Containers[0].VolumeMounts {
+					if spec.Containers[0].VolumeMounts[j].Name == spec.Volumes[i].Name {
+						mount = &spec.Containers[0].VolumeMounts[j]
+					}
+				}
+			}
+		}
+		return claim, mount
+	}
+	snap, _, ok := m.workload("snapshot")
+	if !ok {
+		t.Fatal("no snapshot Job")
+	}
+	claim, mount := stage(snap)
+	if claim == nil || claim.ClaimName != busMigrationStageClaim(m.agent, "3-1") || claim.ReadOnly || mount == nil || mount.ReadOnly {
+		t.Errorf("snapshot stage claim %+v mount %+v, want %s read-write", claim, mount, busMigrationStageClaim(m.agent, "3-1"))
+	}
+	if args := strings.Join(snap.Containers[0].Command, " "); !strings.Contains(args, "bus-migrate snapshot ") || !strings.Contains(args, "--dir "+busMigrationStageMount) {
+		t.Errorf("snapshot command %q", args)
+	}
+
+	m.finishJob("snapshot", batchv1.JobComplete)
+	m.pass(busMigrationHashing, 1)
+	hash, meta, ok := m.workload("hash")
+	if !ok {
+		t.Fatal("no hashing pod")
+	}
+	if !ownedByAgent(meta, m.agent) {
+		t.Errorf("hashing pod owners %v", meta.OwnerReferences)
+	}
+	claim, mount = stage(hash)
+	if claim == nil || !claim.ReadOnly || mount == nil || !mount.ReadOnly {
+		t.Errorf("hashing stage claim %+v mount %+v, want read-only", claim, mount)
+	}
+	if len(hash.Volumes) != 1 || len(hash.Containers[0].Env) != 0 || *hash.AutomountServiceAccountToken {
+		t.Errorf("hashing pod carries more than the stage: volumes %v env %v", hash.Volumes, hash.Containers[0].Env)
+	}
+	if args := strings.Join(hash.Containers[0].Command, " "); !strings.HasPrefix(args, "/manager bus-hash --dir "+busMigrationStageMount) || strings.Contains(args, "--token-file") {
+		t.Errorf("hash command %q", args)
+	}
+}
+
+// Without OPERATOR_IMAGE nothing runs, and the phase waits out the deadline.
+func TestNoOperatorImageRunsNothing(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "")
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	m.pass(busMigrationPinning, 3)
+	if _, _, ok := m.workload("pin"); ok {
+		t.Error("a pin Job with no image")
 	}
 }
