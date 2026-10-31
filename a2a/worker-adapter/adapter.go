@@ -499,7 +499,21 @@ func dialBus(ctx context.Context, cfg Config) (*busConns, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect (lib): %w", err)
 	}
-	nc, err := nats.Connect(cfg.NATSURL, append(natsOpts, lib.TLSOptions()...)...)
+	// The raw connection takes the library's dial timeout, as the lib client
+	// above does. nats.go gives the TCP dial that long, then the TLS and
+	// CONNECT handshake that long again, on every reconnect, and under the
+	// auth callout that handshake holds the server's TokenReview round
+	// trip. This connection reconnects at every
+	// grant expiry of a reused session pod, idle or not, and nats.go's
+	// two-second default was the difference between the lib client
+	// re-authenticating on a slow bus and the consumers on this connection
+	// — the session's task watcher among them — never coming back, so the
+	// next turn was never taken (gke-labs#4122, gke-labs#3401). The server's
+	// own authorization.timeout still caps the callout's share of the
+	// handshake (spec-nats-deployment.md); what the longer value buys is
+	// the dial, TLS and scheduling share of an attempt on a loaded host.
+	rawOpts := append(natsOpts, nats.Timeout(lib.DialTimeout))
+	nc, err := nats.Connect(cfg.NATSURL, append(rawOpts, lib.TLSOptions()...)...)
 	if err != nil {
 		c.Close()
 		return nil, nil, fmt.Errorf("connect (raw): %w", err)
