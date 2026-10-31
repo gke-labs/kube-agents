@@ -337,7 +337,10 @@ paths:
 - A top-level task's results and progress go back through the gateway relay to the asking
   conversation, whichever door it came in on. A child's terminal goes to its parent task.
 - Stop on a conversation cancels its task tree through the supervisor path: the dispatcher
-  tells warm workers to abandon the task (and resets them) or deletes the Job.
+  tells warm workers to abandon the task (and resets them) or deletes the Job. It learns of the
+  stop from a stop record the gateway writes beside each profile task's cancel
+  (`a2a.stop.<profile>.<task>` on `DISPATCH_STOPS`), so a task it still holds queued is dropped
+  rather than admitted later.
 
 ### What this spec leaves to the build
 

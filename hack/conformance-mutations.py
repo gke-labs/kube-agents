@@ -2291,6 +2291,36 @@ Mutation(
         "infrastructure",
     ),
     Mutation(
+        "A3-bridge-writes-stop-records",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.stop.*.*",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_stop_record_has_exactly_one_writer",
+        "grant the static bridge publish on profiles' stop records, so the "
+        "platform agent can stop a profile task it delegated. It can then stop "
+        "tasks other requesters started",
+    ),
+    Mutation(
+        "A3-bridge-submits-profile-tasks",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.submit.*.*.*.*",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_submit_subject_has_exactly_one_writer",
+        "grant the static bridge publish on profiles' submit subject, so the "
+        "platform agent can hand a profile work without a gateway hop. It "
+        "then starts tasks under grants the gateway never minted for them",
+    ),
+    Mutation(
+        "A3-session-submits-profile-tasks",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.TaskSubmitSubject("*", "*", "*", "*"),\n\t\t},'),
+        "test_A3_the_submit_subject_has_exactly_one_writer",
+        "derive every executor a grant on profiles' submit subject, the "
+        "shortcut a worker delegating straight to a profile would take. A "
+        "worker can then start tasks of its own outside the gateway's checks",
+    ),
+    Mutation(
         "A3-bridge-sends-a-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',

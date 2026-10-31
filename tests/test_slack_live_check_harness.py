@@ -67,6 +67,7 @@ NOT_STARTED_NOTICES = (
     "⚠️ not started: can't count the running session workers right now — try again in a moment",
     "⚠️ not started: could not mint this task's capability",
     "⚠️ not started: could not close the previous task on the bus; try again in a moment",
+    "⚠️ not started: a task is still running here; stop it or wait for it before asking an agent profile",
 )
 # Far above any timeout a test sets: a poll that passes it is unbounded.
 SLEEP_BUDGET_SECONDS = 10_000
@@ -1371,6 +1372,9 @@ class UnitTest(unittest.TestCase):
         for fmt in formats:
             self.assertTrue(harness.NOT_STARTED_PATTERN.match(fmt), fmt)
             literal = re.escape(fmt).replace("%d", "%s").replace("%s", ".+")
+            if fmt.endswith(": "):
+                # A bare prefix constant: the gateway appends the reason.
+                literal += ".+"
             matching = [n for n in NOT_STARTED_NOTICES if re.fullmatch(literal, n, re.DOTALL)]
             self.assertTrue(matching, f"no test rendering of {fmt!r}")
             rendered.update(matching)

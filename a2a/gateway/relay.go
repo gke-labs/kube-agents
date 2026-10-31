@@ -847,8 +847,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		g.observeEnded(rec, taskID, s.Status.State, source, reason)
 	}
 
-	// A delegated child's end wakes the session that asked.
-	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
+	// A delegated child's end wakes the session that asked, or reaches a
+	// parent addressed to an AgentProfile, which waits open, on its .in.
+	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild && !g.deliverChildResult(ctx, rec, ref, s.Status.State, result, reason) {
 		// Only the wake's copy carries the stand-in: the room and the
 		// observers have the result and the reason as they are.
 		wakeResult, wakeReason := result, reason

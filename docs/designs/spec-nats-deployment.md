@@ -387,7 +387,10 @@ Layout:
   callout and reaches only its own pod's `…events`. `spec-a2a-payloads.md` states the
   consumer rule that rests on all of this and enumerates what is not yet decision-grade -
   including a redirection route onto `…supervisor` that no assertion pins. Read that
-  section before treating any class as closed.
+  section before treating any class as closed. A profile task's submission has a subject of its own,
+  `a2a.submit.<profile>.<tier>.<kind>.<task>` on the `PROFILE_SUBMITS` stream, and the gateway is its one writer: the
+  dispatcher reads it through its durables, and no executor's grant reaches it
+  (`test_A3_the_submit_subject_has_exactly_one_writer`).
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
   grants are part of being a JetStream client at all: the `$JS.API` subjects a role's
   streams and buckets need, enumerated per stream and per verb where the caller set is

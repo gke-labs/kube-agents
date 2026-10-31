@@ -343,8 +343,8 @@ func TestDelegateRefusalsWithANotice(t *testing.T) {
 		notice    string
 		rule      string
 	}{
-		{name: "addressee other than platform", addressee: "chat-other-1",
-			notice: "⚠️ delegation refused: only platform can be delegated to today", rule: ruleDelegationTarget},
+		{name: "addressee that is no agent profile", addressee: "chat-other-1",
+			notice: `⚠️ delegation refused: there is no agent profile named "chat-other-1"`, rule: ruleDelegationTarget},
 		{name: "depth at the bound", addressee: "platform",
 			edit: func(rec *SessionRecord, parent string) {
 				for i := range rec.Tasks {
@@ -647,6 +647,11 @@ func TestAnOversizedAddresseeIsCappedInTheAuditLines(t *testing.T) {
 	}
 	waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationTarget, origin.TaskID))
 	want := truncateRunes(long, delegateAddresseeLogCap)
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, strings.Repeat("p", delegateAddresseeLogCap+1)) {
+			t.Fatalf("a post carries the addressee past the cap (%d bytes)", len(p))
+		}
+	}
 	for _, line := range strings.Split(r.logs.String(), "\n") {
 		if !strings.Contains(line, origin.TaskID) || !strings.Contains(line, "delegation") {
 			continue
@@ -731,7 +736,7 @@ func postIndex(r *rig, needle string) int {
 // session's "delegated to platform" and then the refusal, so the notice waits
 // for the delegating turn's terminal, from the executor or the supervisor.
 func TestARefusalFollowsTheDelegatingTurnsAnswer(t *testing.T) {
-	const notice = "only platform can be delegated to today"
+	const notice = `there is no agent profile named "chat-other-1"`
 	for _, supervisor := range []bool{false, true} {
 		name := "executor terminal"
 		if supervisor {
@@ -2936,4 +2941,46 @@ func TestAHandoffAckedBeforeARestartIsReadOffTheReplay(t *testing.T) {
 	if got := envText(t, wake); !strings.Contains(got, wakeCardsPendingNote) {
 		t.Fatalf("wake text after a restart = %q, want the cards-pending note read off the replay", got)
 	}
+}
+
+// TestADelegationToAProfileIsSubmittedForTheResolvedProfile: a session turn
+// that delegates to the generic cluster profile with a pinned cluster as its
+// target gets a child on the pinned profile's child queue, at the requester's
+// tier, with the target as its parameters.
+func TestADelegationToAProfileIsSubmittedForTheResolvedProfile(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	scope := filepath.Join(t.TempDir(), "scope.json")
+	if err := os.WriteFile(scope, []byte(`{"present":true,"projects":["p1"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.g.cfg.ScopeFile = scope
+	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams})
+	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	ctx := context.Background()
+	exec, origin, _ := sessionTurn(t, r, spawn, "discord:g1/t-profile", "why is prod unhappy?")
+	data, err := json.Marshal(lib.DelegateRequest{Addressee: "cluster", Text: "diagnose prod", Parameters: targetParams("p1", "us-east1", "prod")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: "artifact-x-" + lib.ArtifactDelegate, Name: lib.ArtifactDelegate,
+		Parts: []lib.Part{{Kind: "data", Data: data}}}); err != nil {
+		t.Fatal(err)
+	}
+	var got []subjectEnvelope
+	waitFor(t, "the child on the pinned profile's child queue", func() bool {
+		got = streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"prod-east.>")
+		return len(got) == 1
+	})
+	profile, tier, kind, _, ok := lib.ParseSubmitSubject(got[0].subject)
+	if !ok || profile != "prod-east" || tier != "read" || kind != lib.SubmitKindChild {
+		t.Fatalf("subject = %q, want prod-east's read child .submit", got[0].subject)
+	}
+	if got[0].env.CorrelationID != origin.CorrelationID {
+		t.Fatalf("the child's correlationId %q is not the parent's %q", got[0].env.CorrelationID, origin.CorrelationID)
+	}
+	if params, found, _ := lib.TaskParametersOf(messageParts(t, got[0].env)); !found || params.Parameters["cluster"] != "prod" {
+		t.Fatalf("parameters = %+v (found %v)", params, found)
+	}
+	waitFor(t, "the profile line note", postedContaining(r, "(delegated to prod-east)"))
 }
