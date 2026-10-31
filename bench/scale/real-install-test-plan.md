@@ -171,6 +171,9 @@ A change to these fields restarts the gateway Pod and the credential proxy Pod. 
 
 ### Step 5: Ask heavy questions
 
+Run both plan files with `--only-factor combined`. Without it, the runner first runs the `base`
+level of 2 clusters, which deletes 38 test clusters.
+
 <!-- prettier-ignore-start -->
 | Parameter | Value | What it controls | Why this value | How to set it |
 | --- | --- | --- | --- | --- |
