@@ -428,7 +428,8 @@ BOT=$(md bot-login); BOT_EMAIL=$(md bot-email); TOKEN_DAYS=$(md token-days)
 # private directory is that user's and nobody else's, so rails can read the
 # tokens and nothing else on the VM can.
 GIT_UID=998
-mkdir -p /var/gitlab/config/ssl /var/gitlab/logs /var/gitlab/data /var/gitlab/private /var/gitlab/seed
+mkdir -p /var/gitlab/config/ssl /var/gitlab/logs /var/gitlab/private /var/gitlab/seed
+echo "FORGE mounts $(findmnt -no TARGET,OPTIONS -T /var/gitlab 2>/dev/null | tr '\n' ' ')| $(findmnt -no TARGET,OPTIONS -T /var/lib/docker 2>/dev/null | tr '\n' ' ')"
 md manifest-path > /var/gitlab/seed/path; md manifest-message > /var/gitlab/seed/message; md manifest-content > /var/gitlab/seed/content
 # First boot copies the secrets out of metadata; `up` then removes them from
 # metadata, so a reboot keeps the copies on disk.
@@ -450,8 +451,13 @@ else
   # The root password is used by nothing after the first boot: the rails call
   # below runs as root inside the container, and sign-up is off.
   ROOT_PW=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)
+  # The data directory is a docker volume, not a bind mount: Container-Optimized
+  # OS mounts the stateful partition noexec, Gitaly runs git from its runtime
+  # directory under /var/opt/gitlab, and on a noexec mount it never comes up
+  # (every readiness check green but gitaly_check, for as long as one waits).
+  # Docker's own directory is exec, and a named volume lives there.
   docker run -d --name gitlab --hostname "$HOST" --restart unless-stopped -p 443:443 --shm-size 256m \
-    -v /var/gitlab/config:/etc/gitlab -v /var/gitlab/logs:/var/log/gitlab -v /var/gitlab/data:/var/opt/gitlab -v /var/gitlab/private:/var/gitlab/private:ro -v /var/gitlab/seed:/var/gitlab/seed:ro \
+    -v /var/gitlab/config:/etc/gitlab -v /var/gitlab/logs:/var/log/gitlab -v gitlab-data:/var/opt/gitlab -v /var/gitlab/private:/var/gitlab/private:ro -v /var/gitlab/seed:/var/gitlab/seed:ro \
     -e GITLAB_OMNIBUS_CONFIG="external_url 'https://${HOST}'; letsencrypt['enable']=false; nginx['redirect_http_to_https']=false; nginx['ssl_certificate']='/etc/gitlab/ssl/${HOST}.crt'; nginx['ssl_certificate_key']='/etc/gitlab/ssl/${HOST}.key'; gitlab_rails['initial_root_password']='${ROOT_PW}'; gitlab_rails['gitlab_signup_enabled']=false; prometheus_monitoring['enable']=false; gitlab_kas['enable']=false" \
     "$IMAGE" >/dev/null && mark container-started
 fi
@@ -475,10 +481,10 @@ probe() { docker exec gitlab "$CCURL" -sk --resolve "${HOST}:443:127.0.0.1" --ma
 for i in $(seq 1 120); do
   code=$(probe -o /dev/null -w '%{http_code}')
   [ "$code" = "200" ] && { mark gitaly-ready; break; }
-  [ $(( i % 12 )) -eq 1 ] && echo "FORGE gitaly-wait code=${code:-none} t=$(( $(date +%s) - T0 ))s $(probe | head -c 300)"
+  [ $(( i % 12 )) -eq 1 ] && echo "FORGE gitaly-wait code=${code:-none} t=$(( $(date +%s) - T0 ))s $(probe | grep -o '"gitaly_check":\[[^]]*\]' | head -c 300)"
   sleep 5
 done
-[ "${code:-}" = "200" ] || { echo "FORGE failed never-gitaly-ready code=${code:-none} $(probe | head -c 600)"; exit 1; }
+[ "${code:-}" = "200" ] || { echo "FORGE failed never-gitaly-ready code=${code:-none} $(probe | grep -o '"gitaly_check":\[[^]]*\]' | head -c 400)"; docker exec gitlab tail -n 12 /var/log/gitlab/gitaly/current 2>/dev/null | cut -c1-300; exit 1; }
 if [ ! -e /var/gitlab/private/seeded ]; then
   # One rails call as root makes what only rails can: the bot (a Developer,
   # as on gitlab.com), its two tokens and root's own token set to the values
