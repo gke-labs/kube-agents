@@ -1216,7 +1216,7 @@ never mistaken for a retry, and each status turn of the harness's delegation wai
 `<run>/<case>/<rep>/status-<n>`, so the dedupe does not fold it into the opening task.
 
 The gateway tells the adapter a task's ends through an optional `TaskObserver` interface that
-Discord and Google Chat do not implement: a human reads the chat, so rendered text is their
+Discord and Google Chat do not implement: a human reads the chat, so the rendered message is their
 whole interface, while a program must not have to parse `✅ **completed**` to know a task is
 over. (The Slack adapter implements it for one reason of its own, given in its section: a task
 starting or ending in a thread is what its session-thread cache keys on.) The
@@ -1381,7 +1381,9 @@ keeps the destructive-method denylist and the error-scrubbing in force for the n
 path without new code.
 
 **Two wire shapes, one decoder.** A Chat app publishes one of two event layouts to its
-topic, and which one is a property of how the app was registered, not of the message.
+topic, and which one is a property of how the app was registered, not of the message (with
+one exception measured live: an app that sends messages in the add-on layout sent a button
+click in the legacy one, so the click decoder reads both).
 The Chat-API registration sends `{"type":"MESSAGE","space":…,"message":…}` — the layout
 `tests/e2e/gchat_agent_test.py` forges. An app configured through the Google Workspace
 add-on surface sends the add-on event object: `{"commonEventObject":…,"chat":{"user":…,
@@ -1644,7 +1646,7 @@ rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back
 gateway refuses any block that carries a mention (`<!channel>`, `<!here>`, `<!subteam^…>`,
 `<@U…>`, a bare `@here`, `@channel` or `@everyone`, which a mrkdwn text object may parse into one, or a rich_text `broadcast`, `user` or `usergroup` element), and the caller posts the
 escaped text instead. The gateway answers clicks only on the choice buttons and rating controls
-it draws itself (the Slack adapter section), so a button on such a card would be clicked into
+it draws itself (the Slack adapter section, and "Chat messages on Google Chat"), so a button on such a card would be clicked into
 nothing, or, as a rating block, rate under a task id the sender chose: the gateway refuses any
 interactive block or element in raw blocks (an `actions` or `input` block, a button, a select, a
 date or time picker, a text input, a `context_actions` block and its `feedback_buttons` and
@@ -1689,6 +1691,59 @@ message from that human, through the usual ingress checks, and starts a conversa
 own: nothing binds it to the investigation that raised the alert. (On Slack the bot rooted
 a notify thread, so a reply there is a turn with or without a mention; see "Which messages
 become turns" below and #3246.)
+
+**Chat messages on Google Chat (added 10/29).** The adapter renders a `kube-agents.chat/v1`
+message (spec-a2a-payloads.md, "Chat messages") as a Chat text message with accessory
+buttons, in the spec's fixed order: the headline in bold with the note after it, the detail,
+the rows as a bulleted list (the severity as inline code, the detail after the text on its line, a
+row's own list marker shed),
+the after lines, the fold open under its title in bold with its table as a monospace block,
+and the buttons as one accessory button list, choices before links, the primary one filled. A
+plain field the schema caps but does not hold to one line (a table cell, a column name, a plan
+item's title, a fold's title) is flattened onto the line it is drawn on.
+In a progress message the plan takes the rows' place, one line per item led by a status
+glyph with its steps under it. It is text and not a card because Chat's card text has no
+monospace and no code, which a table or a command in an answer needs, while a text message
+carries every form the schema uses and accessory widgets draw the same buttons under it
+with app authentication. Every markdown field goes through the adapter's text translation,
+so a mention or a `<url|text>` in one is defanged as in any post; a plain field in the text
+takes the defang alone, and a button label is widget text Chat parses nothing out of. A
+message whose text runs past the room Chat's 32,000-byte message cap leaves for its buttons,
+or one that lays nothing out, is refused before any call, and a `400` from the API is a refused
+layout too; both fall back to the text. The golden layouts of the shared cases are
+`a2a/gateway/testdata/gchat-chat/`, beside Slack's. An edit
+without a chat message replaces the layout, the widgets patched empty. A `mark` draws
+nothing: Chat's reaction API takes user credentials, and the relay holds the app's.
+
+A click on a choice button arrives on the same subscription as a message, as a
+`CARD_CLICKED` interaction, in either wire layout: the add-on one (`chat.buttonClickedPayload`
+with the clicked message and its space, `chat.user` the clicker, `commonEventObject` the
+button's function and parameters) or the legacy one (`message`, `user`, `space`, `action` and
+`common` at the top level), which is the layout the one install measured so far delivers
+clicks in while its messages arrive in the add-on layout; both are read the same.
+The adapter turns it into a text turn from the clicker whose text is the
+choice's reply, bound to the conversation the clicked message sits in by the rule a message
+takes, marked as a click, and handed over like a typed message, so the allowlist decides.
+Once the gateway says the clicker is verified it rewrites the clicked message, off the inbox
+worker: the choice buttons go, the link buttons stay, and `✓ <display name>: <label>` is added
+under the text, defanged like every other string, the clicker "Someone" when Chat names them
+nowhere, never their address; a later edit of the message that lays out no choices keeps the
+line, and one that lays choices out opens the question anew, the earlier answer forgotten,
+while one that lays none out closes it. A typed message in the conversation of an open
+question that asks (not a next step), other than a command, answers it the same way once its
+sender is verified, with the reply's first words as the label. A question is answered once,
+whichever way comes first (a typed reply awaiting verification does not block a click), a
+redelivered click is a duplicate like a redelivered message, and a click or reply from a
+sender the gateway drops changes
+nothing. A remembered question binds its click to the conversation it was posted in; the
+event's surface binds only a click on one the adapter does not remember. A question posted
+to the home channel (chat.notify) has no conversation at post time, so its click is bound by
+the event and a typed reply in its thread does not answer it; its buttons do. A
+rewrite that fails posts the line in the conversation instead. The questions and answers
+are held in the process: after a restart a question keeps its buttons until clicked, the click
+is still a turn, and the rewrite reads the message the event carries, its text, its link
+buttons and the clicked button's label. A click on a button the adapter did not draw is
+logged and acked.
 
 ## The Slack adapter (added 9/4)
 
@@ -2016,11 +2071,11 @@ syntax for: a heading, ATX or setext, becomes a bold line (shedding any bold pai
 inside it, and left plain when a `**` that is not half of a pair remains), a
 thematic break is dropped, a list marker
 becomes `•`, and a pipe table becomes a fenced block with its columns padded (a cell
-keeps a code span's content without its backticks, sheds the marks of closed bold pairs, and shows a link as
-its label and URL, since a code block renders no link; only an escaped `\|` stays inside
-a cell). A table the chunker cuts gets its header and delimiter rows again at the head of the next chunk, so each part renders as a table. A
+keeps a code span's content without its backticks, sheds the marks of closed bold pairs, and shows a link,
+markdown or `<url|text>`, as its label and URL, since a code block renders no link; only an
+escaped `\|` and the pipe of a `<url|text>` link stay inside a cell). A table the chunker cuts gets its header and delimiter rows again at the head of the next chunk, so each part renders as a table. A
 heading run onto the end of a sentence with no line break is moved to its own line
-first. Bold and links are translated after it. The translation leaves
+first, in prose: a `.#` inside a link's label, markdown or `<url|text>`, is the label's. Bold and links are translated after it. The translation leaves
 code spans as written, converts bold only on a closed `**` pair, never alters a
 link's destination, and refuses a link whose label carries a URL naming a host other
 than the one it opens. A link the agent already wrote in the surfaces' own `<url|text>`
@@ -2033,8 +2088,13 @@ to unfurl links or media: an answer cites console and documentation links, and e
 unfurled into a preview card under it. Everything else posted is escaped first (`&`,
 `<`, `>`), a kept link's URL and text included - relayed text is executor-authored, ie
 model output, and an unescaped `<!channel>` in a result would ping the room. The Google
-Chat adapter applies the same markdown rules, and keeps the same links, behind its own
-defang, in two halves: the link defang reads prose, link text and an unclosed fence but
+Chat adapter runs the same line pass first, with `- ` for a list marker, since Chat draws
+a bulleted list from that marker itself; its mention defang runs before the pass, so a
+table's cells are measured as they post. The pass is measured after it runs: a padded table
+can take a chunk the relay cut under 1,900 bytes past Chat's 32,000-byte message cap, which
+Chat would refuse along with the rest of the answer, so a chunk whose rendering runs past
+30,000 bytes is rendered again with its tables left as written. It then applies the same markdown rules, and
+keeps the same links, behind its own defang, in two halves: the link defang reads prose, link text and an unclosed fence but
 not a closed code span, a fenced block or a kept link; the mention defang reads
 everything, code included, but a kept link, whose URL and text hold no `<`. The adapters translate each chunk of a result alone, so the chunker closes a
 fenced block it cuts and reopens it with a bare fence at the start of the next chunk,
@@ -2060,9 +2120,10 @@ counted (`chat_messages_total{outcome="invalid"}`, under Metrics), and its text 
 would have; a bad `mark` drops alone, and a chat message that carries only a `mark` lays
 nothing out. A result recovered by replaying the stream after a restart arrives folded, which loses the chunk a chat message rode on, so the last-chunk rule is not applied to it. What survives reaches the adapter as a message value,
 `PostMessage` and `EditMessage` with the text and the chat message, beside the string `Post`
-and `Edit`. Discord, Google Chat, the inject door, the console and the A2A door answer
+and `Edit`. Discord, the inject door, the console and the A2A door answer
 `ErrTextOnly`, and the relay posts the text through `Post`, chunked under the cap, so each of
-them posts exactly what it posted before chat messages existed. The relay never hands the
+them posts exactly what it posted before chat messages existed; Slack and Google Chat lay the
+message out ("Chat messages on Google Chat" under the Google Chat adapter). The relay never hands the
 adapter a chat message without its text, and a backend that cannot hold one, or whose API
 refuses it, gets the text instead, once. Every carrier's `mark`, the terminal's included, is
 the gateway's to apply (`mark.go`): only from the chain's newest task, with the terminal
@@ -2121,8 +2182,8 @@ text answer. `a2a/gateway/testdata/slack-chat/` holds the layout of every chat
 message the shared cases in `tests/conformance/chat/` expect, checked on every run.
 
 A conversation notify request (below) reads its `chat` field and `update` key the same way.
-The `chat` object, with the request's `text` as its fallback, is laid out on Slack and posted as
-the text elsewhere. The first request with an `update` key posts one message, its text cut to one
+The `chat` object, with the request's `text` as its fallback, is laid out on Slack and Google
+Chat and posted as the text elsewhere. The first request with an `update` key posts one message, its text cut to one
 chunk since an edit reaches only one message, and a later request with the same key in the same
 conversation edits it, laid out or as text, on Google Chat too. A key with no message here
 (another conversation's, one forgotten, one lost to a restart) or a message the backend says can no longer be edited posts anew. A laid-out edit that fails otherwise (a rate limit, an outage) is tried once more, laid out, and failing again leaves the message as it was and answers the request with the error: a text edit would strip the card and close an open question.

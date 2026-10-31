@@ -363,7 +363,7 @@ type DispatchProfile struct {
 // dispatchJobLabel).
 const DispatchJobLabel = "kubeagents.x-k8s.io/dispatch-job"
 
-// DispatchDurable names one shared durable on TASKS.
+// DispatchDurable names one shared durable on ProfileSubmitStream.
 type DispatchDurable struct {
 	Tier string `json:"tier"`
 	Kind string `json:"kind"`
