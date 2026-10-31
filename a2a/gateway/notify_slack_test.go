@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -369,28 +371,181 @@ func TestSlackNotifyTextPostsDoNotUnfurl(t *testing.T) {
 var _ notifyPoster = (*SlackAdapter)(nil)
 var _ notifyBlocksPoster = (*SlackAdapter)(nil)
 
-func TestSlackNotifySetHomeArmsHomePosts(t *testing.T) {
+// TestSlackNotifyHomeSourceArmsHomePosts: with no CR home channel, home
+// posts follow the home source, the operator's projected file read on every
+// request: no home while it names none, posts into it once it does, and a
+// thread of that channel is a thread of home.
+func TestSlackNotifyHomeSourceArmsHomePosts(t *testing.T) {
 	home := &fakeNotifyPoster{}
 	n, err := NewSlackNotifier(home, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var value string
+	present := false
+	n.SetHomeSource(func() (string, bool) { return value, present })
 	if got := serveJSON(t, n, lib.NotifyRequest{Text: "drift"}); got.Error != notifyNoHome {
-		t.Fatalf("home post before SetHome = %+v, want %q", got, notifyNoHome)
+		t.Fatalf("home post with the projection absent = %+v, want %q", got, notifyNoHome)
 	}
-	if err := n.SetHome("D0DM"); err == nil {
-		t.Error("a DM was accepted as the home channel")
+	present = true
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "drift"}); got.Error != notifyNoHome {
+		t.Fatalf("home post with the projection empty = %+v, want %q", got, notifyNoHome)
 	}
-	if err := n.SetHome(testSlackHome); err != nil {
+	value = testSlackHome
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "drift"}); got.Error != "" {
+		t.Fatalf("home post with the projection set = %+v", got)
+	}
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "reply", Thread: testSlackHome + "/1.2"}); got.Error != "" {
+		t.Fatalf("thread post into the projected home = %+v", got)
+	}
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "reply", Thread: "C0OTHER/1.2"}); got.Error == "" {
+		t.Fatal("a thread of another channel was posted")
+	}
+	if posts := home.all(); len(posts) != 2 || posts[0].space != testSlackHome || posts[1].space != testSlackHome {
+		t.Errorf("posts = %+v, want two in %s", posts, testSlackHome)
+	}
+}
+
+// TestSlackNotifyAFileHomeIsCheckedBeforeEachPost: a home the file named is
+// checked once per job before the post. A definite refusal answers with the
+// word and posts nothing; a check that cannot be made posts as before; the
+// CR's home is never checked.
+func TestSlackNotifyAFileHomeIsCheckedBeforeEachPost(t *testing.T) {
+	cases := []struct {
+		name     string
+		refused  string
+		err      error
+		wantPost bool
+		wantErr  string
+	}{
+		{"shared since the learn", homeRefusedShared, nil, false, "home channel refused: shared"},
+		{"archived since the learn", homeRefusedArchived, nil, false, "home channel refused: archived"},
+		{"a check that cannot be made", "", errors.New("429"), true, ""},
+		{"a healthy home", "", nil, true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &fakeNotifyPoster{}
+			n, err := NewSlackNotifier(p, "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n.SetHomeSource(func() (string, bool) { return testSlackHome, true })
+			calls := 0
+			n.SetHomeVerifier(func(_ context.Context, home string) (string, error) {
+				calls++
+				if home != testSlackHome {
+					t.Errorf("checked %q, want the job's home %s", home, testSlackHome)
+				}
+				return tc.refused, tc.err
+			})
+			reply := serveJSON(t, n, lib.NotifyRequest{Text: strings.Repeat("alert ", 900)})
+			if calls != 1 {
+				t.Errorf("checks = %d, want one per job, not per chunk", calls)
+			}
+			if posted := len(p.all()) > 0; posted != tc.wantPost {
+				t.Errorf("posted = %v, want %v (reply %+v)", posted, tc.wantPost, reply)
+			}
+			if tc.wantErr != "" && reply.Error != tc.wantErr {
+				t.Errorf("reply = %+v, want error %q", reply, tc.wantErr)
+			}
+			if tc.wantErr == "" && reply.Error != "" {
+				t.Errorf("reply = %+v, want a posted answer", reply)
+			}
+		})
+	}
+	// The CR's home is the install's word: no check.
+	p := &fakeNotifyPoster{}
+	n, err := NewSlackNotifier(p, testSlackHome, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
+	called := false
+	n.SetHomeVerifier(func(context.Context, string) (string, error) { called = true; return homeRefusedShared, nil })
+	if reply := serveJSON(t, n, lib.NotifyRequest{Text: "drift"}); reply.Error != "" || called {
+		t.Errorf("a CR home was checked or refused: called=%v reply=%+v", called, reply)
+	}
+}
+
+// TestSlackNotifyHomePostHintNamesTheSource: a post Slack refuses because
+// the home channel is gone or closed is logged with where the value came
+// from, so an admin finds a bad record edit or CR value; other errors carry
+// no hint.
+func TestSlackNotifyHomePostHintNamesTheSource(t *testing.T) {
+	n, err := NewSlackNotifier(&fakeNotifyPoster{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.SetHomeSource(func() (string, bool) { return testSlackHome, true })
+	for _, code := range homePostChannelErrors {
+		hint := n.homePostHint(errors.New("slack: " + code))
+		if !strings.Contains(hint, code) || !strings.Contains(hint, "file") {
+			t.Errorf("hint for %s = %q, want the code and the source", code, hint)
+		}
+	}
+	if hint := n.homePostHint(errors.New("relay answered 403")); hint != "" {
+		t.Errorf("hint for an unrelated error = %q, want none", hint)
+	}
+	if hint := n.homePostHint(nil); hint != "" {
+		t.Errorf("hint for no error = %q, want none", hint)
+	}
+	cr, err := NewSlackNotifier(&fakeNotifyPoster{}, testSlackHome, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hint := cr.homePostHint(errors.New("is_archived")); !strings.Contains(hint, "cr") {
+		t.Errorf("hint with a CR home = %q, want the cr source", hint)
+	}
+}
+
+// TestSlackNotifyCRHomeWinsOverTheSource: a CR home channel is the home
+// whatever the projection says.
+func TestSlackNotifyCRHomeWinsOverTheSource(t *testing.T) {
+	home := &fakeNotifyPoster{}
+	n, err := NewSlackNotifier(home, testSlackHome, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.SetHomeSource(func() (string, bool) { return "C0OTHER", true })
 	if got := serveJSON(t, n, lib.NotifyRequest{Text: "drift"}); got.Error != "" {
-		t.Fatalf("home post after SetHome = %+v", got)
+		t.Fatalf("home post = %+v", got)
 	}
 	if posts := home.all(); len(posts) != 1 || posts[0].space != testSlackHome {
 		t.Errorf("posts = %+v, want one in %s", posts, testSlackHome)
 	}
-	if !n.slackThreadOK(testSlackHome + "/1.2") {
-		t.Error("a thread of the learned home was refused")
+}
+
+// TestSlackNotifyPostsWithTheHomeValidateSaw: the home is read once per
+// request, so a projection that changes between the request's admission and
+// its post does not move the post.
+func TestSlackNotifyPostsWithTheHomeValidateSaw(t *testing.T) {
+	home := &fakeNotifyPoster{}
+	n, err := NewSlackNotifier(home, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reads := 0
+	n.SetHomeSource(func() (string, bool) {
+		reads++
+		if reads == 1 {
+			return testSlackHome, true
+		}
+		return "C0LATER", true
+	})
+	long := strings.Repeat("x ", discordChunk)
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: long}); got.Error != "" {
+		t.Fatalf("home post = %+v", got)
+	}
+	posts := home.all()
+	if len(posts) < 2 {
+		t.Fatalf("posts = %d, want a report of several chunks", len(posts))
+	}
+	for i, p := range posts {
+		if p.space != testSlackHome {
+			t.Errorf("chunk %d posted into %s, want %s", i+1, p.space, testSlackHome)
+		}
+	}
+	if reads != 1 {
+		t.Errorf("the projection was read %d times for one request, want 1", reads)
 	}
 }

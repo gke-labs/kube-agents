@@ -850,7 +850,10 @@ class CiDeployForgeCaSecretTest(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             f'printf "%s\\n" "$*" >> "{log}/kubectl.argv"\n'
             'case "$*" in\n'
-            '  "create secret"*) printf "kind: Secret\\ndata:\\n  ca.crt: $(base64 < "${5#*=}" 2>/dev/null | tr -d \'\\n\')\\n" ;;\n'
+            # The CA file is the --from-file word, wherever it sits; a fixed word read
+            # the wrong argument and rendered an empty Secret the test never noticed.
+            '  "create secret"*) for a in "$@"; do case "$a" in --from-file=*) f="${a#*=}"; f="${f#*=}" ;; esac; done\n'
+            '    printf "kind: Secret\\ndata:\\n  ca.crt: $(base64 < "$f" | tr -d \'\\n\')\\n" ;;\n'
             '  "create namespace"*) printf "kind: Namespace\\n" ;;\n'
             '  "label --local"*) cat; printf "  labels:\\n    %s\\n" "$(printf "%s" "$5" | sed "s/=/: /")" ;;\n'
             f'  "apply -f -") cat >> "{log}/applied.yaml" ;;\n'
@@ -880,6 +883,9 @@ class CiDeployForgeCaSecretTest(unittest.TestCase):
                 self.assertIn(f"create secret generic {name} -n ns-test --from-file=ca.crt={ca} --dry-run=client -o yaml", kubectl_argv)
                 self.assertIn("kind: Namespace", applied)
                 self.assertIn("kind: Secret", applied)
+                encoded = base64.b64encode(ca.read_bytes()).decode("ascii")
+                self.assertIn(f"ca.crt: {encoded}", applied, "the Secret carries the CA file's bytes under ca.crt")
+                self.assertIn(_TEARDOWN_SELECTOR.replace("=", ": "), applied, "the Secret carries the teardown label")
                 self.assertIn(f"Forge CA: Secret ns-test/{name} (key ca.crt) from {ca}, for forge.eval.internal", proc.stdout)
 
 

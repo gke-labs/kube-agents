@@ -1,9 +1,9 @@
 # Proposal Outcomes and Human Touches as Readings from the Forge
 
-**Status:** design of record, not yet implemented. Epic: gke-labs/kube-agents#4120, Workstreams 1
+**Status:** implemented 2026-10-29. Epic: gke-labs/kube-agents#4120, Workstreams 1
 and 2. Owner of the producer side: [`usage-counters-producer.md`](usage-counters-producer.md), which
 this document amends; the rows there for `remediationsMergedTotal` and
-`remediationsClosedUnmergedTotal` are replaced by the readings below once this ships.
+`remediationsClosedUnmergedTotal` point here.
 
 ## 1. Intent
 
@@ -14,14 +14,15 @@ know how much human work it took: reviews, comments, commits a person added. Lat
 to an hour is fine. Missing a merge is not: a ratio that under-counts merges makes the agent look
 worse than it is, and that error compounds over a quarter.
 
-Today's merged and closed counters are event counts the credential broker keeps in memory. A merge
-is counted only when one of the broker's own reads, a `proposal-list` or `proposal-view`, happens to
-show it, only once per broker process, and only when it happened after the process started. On
-2026-10-28 on the gkedemos3 install both series stayed at zero after a merge and a close until a
-person issued a `proposal view` by hand (#4120, first comment). A watch list would fix that with a
-store, and the broker keeps no store by design: PR #2919 rejected a persisted seen-set because "the
-broker keeps no state across requests by design", and the `VcsBroker` class docstring names the
-in-memory seen-sets and identity cache as the one cross-request memory, on which no answer depends.
+Before this design, the merged and closed counters were event counts the credential broker kept in
+memory. A merge was counted only when one of the broker's own reads, a `proposal-list` or
+`proposal-view`, happened to show it, only once per broker process, and only when it happened after
+the process started. On 2026-10-28 on the gkedemos3 install both series stayed at zero after a merge
+and a close until a person issued a `proposal view` by hand (#4120, first comment). A watch list
+would have fixed that with a store, and the broker keeps no store by design: PR #2919 rejected a
+persisted seen-set because "the broker keeps no state across requests by design", and the
+`VcsBroker` class docstring then named the in-memory seen-sets and identity cache as the one
+cross-request memory, on which no answer depended.
 
 The decision this document records: stop counting events and read the state. The forge already
 holds every proposal the install opened, authored by the install's own login, in a repository the
@@ -83,11 +84,11 @@ Anti-goals, what would make this a failure even if it works:
    never lets a total fall (`usage_counters_fold.go`, `usageBranch`). Readings therefore bypass the
    fold, as `clustersRegistered` and `clustersMonitored` do, and are projected as the latest poll's
    reading.
-3. **Forge cost.** GitHub's search index answers a count in one call per state; GitLab and Gitea
-   answer with a total header on a one-item page. Per-proposal detail costs four or five calls per
+3. **Forge cost.** GitHub's search index answers a count in one call per terminal state and one for every state together; GitLab and Gitea
+   answer with a total header on a one-item page. Per-proposal detail costs about seven calls per
    proposal and must not be paid for every proposal on every sweep.
 4. **Identity.** The install's login is the credential's `whoami`, cached per repository for the
-   life of the process as `_merged_viewer_for` caches it today, but the sweep does not ask through
+   life of the process as the removed `_merged_viewer_for` did, but the sweep does not ask through
    that path: `Binding.whoami()` runs the forge credential's `ensure()` first, which on github.com
    refreshes the write credential and on GitHub Enterprise Server mints a write token when the
    cached one is old, so the first sweep after a restart would mint the write token the sweep
@@ -108,15 +109,15 @@ All on the existing metrics-only listener, port 8766, rendered by `ProxyMetrics`
 families it already serves. No login, repository name, URL or proposal number appears in any
 label.
 
-| Series                                         | Type    | Labels                                                                                               | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| ---------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kubeagents_vcs_proposals`                     | gauge   | `state` = `open` \| `merged` \| `closed`                                                             | Proposals authored by the install's login in its managed repositories, by state, as the forge reports now. `closed` is closed without a merge.                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `kubeagents_vcs_proposals_closed_by`           | gauge   | `actor` = `install` \| `human` \| `bot`                                                              | The `closed` proposals split by who closed them. A close the install made itself (the fleet audit tidying a stale proposal) is `install`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `kubeagents_vcs_proposal_touches`              | gauge   | `kind`, `actor` = `human` \| `bot`                                                                   | Events on the install's proposals by anyone other than the install's own login, summed over every proposal.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `kubeagents_vcs_proposal_touches_per_proposal` | gauge   | `outcome` = `merged` \| `closed`, `le`                                                               | How many human touches each terminal proposal carried, rebuilt from scratch each sweep: one gauge family with a cumulative `le` label over the edges `0, 1, 2, 3, 5, 8, 13, 21, +Inf`, the `+Inf` sample being the count of such proposals. A plain gauge with its own name and no `_bucket` or `_count` suffix, because the text format the broker renders attaches `histogram` samples by suffix and a gauge family would not own them; `histogram_quantile()` needs only `le`. A proposal with zero touches is in the first bucket, so "merged without any human touch" is `le="0"` on `outcome="merged"`. |
-| `kubeagents_vcs_proposals_ignored`             | gauge   | none                                                                                                 | Open proposals of the install older than `VCS_READINGS_IGNORED_AFTER_SECONDS` (fourteen days) that carry no human touch of any kind: proposals nobody is looking at. Part of the details reading.                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `kubeagents_vcs_readings_age_seconds`          | gauge   | `reading` = `outcomes` \| `details`                                                                  | Seconds since that reading was last taken in full. Two readings: `outcomes` is step 1 (`kubeagents_vcs_proposals`), `details` is step 2 (`closed_by`, the touch series, the per-proposal gauge). Each is absent until its first reading and never omitted after it, however old.                                                                                                                                                                                                                                                                                                                              |
-| `kubeagents_vcs_readings_failures_total`       | counter | `reason` = `forge` \| `identity` \| `truncated` \| `detail_truncated` \| `rate_limited` \| `warming` | Repository attempts, one per managed repository per sweep, that produced less than a full reading, by cause: `warming` is a partial reading (state counts only, details not yet taken); `truncated` is a partial reading too (state counts exact, details from the thousand most recently updated proposals and the cache); the other four are none. Two repositories rate-limited in one sweep are two.                                                                                                                                                                                                      |
+| Series                                         | Type    | Labels                                                                                               | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ---------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kubeagents_vcs_proposals`                     | gauge   | `state` = `open` \| `merged` \| `closed`                                                             | Proposals authored by the install's login in its managed repositories, by state, as the forge reports now. `closed` is closed without a merge.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `kubeagents_vcs_proposals_closed_by`           | gauge   | `actor` = `install` \| `human` \| `bot`                                                              | The `closed` proposals split by who closed them. A close the install made itself (the fleet audit tidying a stale proposal) is `install`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `kubeagents_vcs_proposal_touches`              | gauge   | `kind`, `actor` = `human` \| `bot`                                                                   | Events on the install's proposals by anyone other than the install's own login, summed over every proposal.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `kubeagents_vcs_proposal_touches_per_proposal` | gauge   | `outcome` = `merged` \| `closed`, `le`                                                               | How many human touches each terminal proposal carried, rebuilt from scratch each sweep: one gauge family with a cumulative `le` label over the edges `0, 1, 2, 3, 5, 8, 13, 21, +Inf`, the `+Inf` sample being the count of such proposals. A plain gauge with its own name and no `_bucket` or `_count` suffix, because the text format the broker renders attaches `histogram` samples by suffix and a gauge family would not own them; `histogram_quantile()` needs only `le`. A proposal with zero touches is in the first bucket, so "merged without any human touch" is `le="0"` on `outcome="merged"`.                                                                                                                                                                                                                                                             |
+| `kubeagents_vcs_proposals_ignored`             | gauge   | none                                                                                                 | Open proposals of the install older than `VCS_READINGS_IGNORED_AFTER_SECONDS` (fourteen days) that carry no human touch of any kind: proposals nobody is looking at. Part of the details reading.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `kubeagents_vcs_readings_age_seconds`          | gauge   | `reading` = `outcomes` \| `details`                                                                  | Seconds since that reading was last taken in full. Two readings: `outcomes` is step 1 (`kubeagents_vcs_proposals`), `details` is step 2 (`closed_by`, the touch series, the per-proposal gauge). Each is absent until its first reading and never omitted after it, however old.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `kubeagents_vcs_readings_failures_total`       | counter | `reason` = `forge` \| `identity` \| `truncated` \| `detail_truncated` \| `rate_limited` \| `warming` | Failures recorded while a sweep reads a repository, by cause; a repository records each cause it produced, so one past the walk bound that is still warming records `truncated` and `warming`, and a failed tally beside them. `warming` is a partial reading (state counts, details not yet taken); `truncated` is a partial reading too (state counts from the tally, details from the thousand most recently updated proposals and the cache); `detail_truncated` is counted per proposal whose conversation passed its bound, and the details reading is still published from what was read; `identity` leaves that repository out, once per process; `forge` and `rate_limited` withhold the reading whose step failed: both readings when the listing failed, the outcomes reading alone when the tally failed. Two repositories rate-limited in one sweep are two. |
 
 `kind` is a closed vocabulary:
 
@@ -208,13 +209,22 @@ so a merge reaches `status.usage` within two poll intervals end to end.
      parameter (a Gitea release from before `poster`, say) returns everyone's proposals and the
      walk would truncate on theirs; the first foreign author ends the sweep for that repository
      with `reason="forge"` and nothing published, rather than a wrong count.
+   - **A walk that ends inside its bound holds the forge's total.** The walk goes on while the
+     total says more remain, whatever a page's `truncated` says, since a clamped Gitea page can
+     look like the last. A walk that still ends short of the total (a proposal that updated
+     mid-walk and moved to a page already read, or a GitHub page marked `incomplete_results`) is
+     walked once more; short again, the repository's outcomes reading is withheld with
+     `reason="forge"`. A page that adds no new proposal (a server that ignores `page`) ends the walk short at
+     once, and a clamped walk also stops at a page ceiling read from its smallest page.
    - The walk is bounded by `VCS_READINGS_MAX_PAGES` (10), which on GitHub is also the search
      API's own ceiling of a thousand results, so it cannot be raised there. A repository whose
      own proposals exceed the bound is `truncated`, and truncation is a property of the
      repository, so it recurs every sweep and must not silence anything for good. Its state counts
-     are read exactly with one query per state (`is:open`, `is:merged`, `is:unmerged is:closed`
-     on GitHub; `state=opened|merged|closed` on GitLab), queries a complete walk does not need
-     and does not make, so the outcomes reading is whole. Gitea's `state` is open or closed and
+     are read with one query per terminal state and one for every state together, open being the
+     remainder, since separate queries are not one snapshot (`is:merged`,
+     `is:unmerged is:closed` and the unqualified query on GitHub; `state=merged|closed|all` on
+     GitLab), queries a complete walk does not need and does not make, so the outcomes reading is
+     whole. Gitea's `state` is open or closed and
      merged is a flag on the item, so a header total cannot split merged from closed, and Gitea
      has no search ceiling either: its walk bound is therefore stated and enforced in proposals,
      not pages, `VCS_READINGS_MAX_PROPOSALS_GITEA` (1000): the walk continues while fewer than
@@ -231,7 +241,8 @@ so a merge reaches `status.usage` within two poll intervals end to end.
      older ones are unknown, an under-count that begins only past a thousand own proposals per
      repository. `kubeagents_vcs_readings_failures_total{reason="truncated"}` moves every sweep
      the repository is past the bound, which is the signal. A forge that raises
-     `ForgeUnsupported` for the method publishes nothing and counts `reason="forge"`.
+     `ForgeUnsupported` for the listing publishes nothing and counts `reason="forge"`; one that
+     raises it for the tally withholds the outcomes reading alone.
 2. For each proposal whose `(number, updated)` is not in the detail cache: reviews, review
    comments, conversation comments and commits, through a new provider method `proposal_reviews`,
    the existing `proposal_commits`, and the comment readers the providers already have, plus, for
@@ -258,13 +269,13 @@ so a merge reaches `status.usage` within two poll intervals end to end.
 `updated` and the record. It is written per proposal as each is read, whatever the sweep's
 outcome, so an attempt cut short by a rate limit keeps what it read and the next one continues
 rather than starting over. It is derived data: a restart empties it and the sweeps after refill
-it at the cost of step 2 for every proposal once, four or five core-API calls for an ordinary
+it at the cost of step 2 for every proposal once, about seven core-API calls for an ordinary
 proposal and more for one whose conversation runs past a page, against the installation token's
 hourly quota, which the agent's own verbs share. So step 2 is budgeted by the hour and in calls,
 not in proposals: `VCS_READINGS_DETAIL_CALLS_PER_HOUR` (1000, a fifth of GitHub's five-thousand-call
 installation quota) spread evenly over the sweeps in an hour, about sixty calls a sweep at the
-default TTL, twelve ordinary proposals or fewer long ones, so a refill of a thousand proposals
-takes about five hours and never starves the agent's own verbs. The details reading is taken only
+default TTL, about nine ordinary proposals or fewer long ones, so a refill of a thousand proposals
+takes about seven hours and never starves the agent's own verbs. The details reading is taken only
 once every listed proposal is current in the cache; until then its series keep their previous
 values, or stay absent after a restart, with `reason="warming"` on the failure counter, while
 the outcomes reading is taken from the first complete listing. The cache's eviction rule is one
@@ -298,10 +309,10 @@ accepted, and the operator's two-miss clear bounds it.
 **Cost.** Steady state per managed repository per sweep: one author-filtered page per hundred of
 the install's own proposals, and step 2 only for proposals that changed since the last sweep. A
 repository where the install has opened 300 proposals and people add two reviews an hour costs
-three listing calls a sweep and, on the sweeps where a proposal changed, four or five more.
-GitHub's search quota is thirty calls a minute per token, so an install with many managed
-repositories spreads the per-repository work across consecutive sweeps rather than exceeding it;
-the builder sizes that.
+three listing calls a sweep and, on the sweeps where a proposal changed, about seven more.
+GitHub's search quota is thirty calls a minute per token, so the sweep paces its search calls at
+`VCS_READINGS_SEARCH_CALLS_PER_MINUTE` (25): an install with many managed repositories gets a
+sweep longer than the TTL and older readings, not a rate-limited tail that never completes.
 
 **The token.** The sweep does not ride the write token: an idle install would otherwise mint a
 write-capable installation token every TTL on the CLI transport, whose refresh runs before every
@@ -337,7 +348,7 @@ transient child memory the same way.
 ## 6. What the operator does
 
 A new reading slot beside the cluster gauges, generic rather than a third special case: a declared
-list of reading series (`usageReadingSeries`) with, for each, the status field it lands in, its
+list of reading series (`usageReadingSpecs`) with, for each, the status field it lands in, its
 label filter, the reading it belongs to (`outcomes` or `details`) and the aggregation across pods
 (`max`, the cluster gauges' rule; the broker is one pod by design, with a `Recreate` strategy, so
 the rule is for form). The scrape parses them from the broker body into `usageReading.Readings`;
@@ -351,8 +362,8 @@ series in one body.
   reading's fields as they were. The second in a row clears them to absent. The broker's own
   staleness rule above makes an hour-old reading absent on the broker side first.
 - The fields are pointers, so a zero is written as a reading.
-- They do not move `lastActiveTime` or `lastHumanActiveTime`. This is a change: today a merge
-  the broker happens to read moves `lastActiveTime`. A reading cannot say when a merge happened,
+- They do not move `lastActiveTime` or `lastHumanActiveTime`. This is a change: before this design
+  a merge the broker happened to read moved `lastActiveTime`. A reading cannot say when a merge happened,
   only that a count differs from the last poll, which is a poor timestamp, and a merge is a
   person's or a forge rule's act, where the field's meaning is the agent at work. The field
   comments, the CRD docs and the producer design's `lastActiveTime` row say so in the
@@ -382,9 +393,9 @@ Field names are this document's call: the two kept names carry `Total` for a rea
 renaming them breaks the chart's health rules and the feedback summary for nothing a reader
 gains; the four new ones do not say `Total`, because they are not.
 
-**Health rules.** `charts/kube-agents/templates/platform-agent-health-rules.yaml` computes
+**Health rules.** Before this design `charts/kube-agents/templates/platform-agent-health-rules.yaml` computed
 `proposals_rejected_ratio_14d` and `proposals_merge_rate_14d` with `increase()` over the operator's
-usage gauges, and the merge rate divides by `remediationsProposedTotal`, the event counter.
+usage gauges, and the merge rate divided by `remediationsProposedTotal`, the event counter.
 `increase()` reads a fall in a reading as a counter reset and inflates the result, and a reading
 over a counter is the mixed-source ratio section 4 rules out. Both recording rules and the
 alerts' minimum-count guards are rewritten over readings alone, keeping their fourteen-day
@@ -393,9 +404,9 @@ fields, and the `KubeAgentsProposalsUnmerged` guard, which applies it to
 `remediationsProposedTotal` and moves to `proposalsAuthored`, keeping the threshold's name and
 its meaning of proposals opened in the window. An operator roll-over splits a window across two
 series of the usage gauge, which is why the template sums `increase()` and maxes instants; a
-`delta()` has neither aggregation right, so each reading field first gets a recording rule that
-takes `max by (agent_namespace, agent)` of the gauge, and the window deltas are taken over those
-recorded series. With `merged_14d = clamp_min(delta(<recorded merged>[14d]), 0)`, `closed_14d`
+`delta()` has neither aggregation right, so one recording rule (`usage_reading:max`, keyed by
+`field`) first takes `max by (agent_namespace, agent, field)` of the gauge over the reading fields,
+and the window deltas are taken over that recorded series. With `merged_14d = clamp_min(delta(<recorded merged>[14d]), 0)`, `closed_14d`
 and `authored_14d` likewise: `proposals_rejected_ratio_14d = closed_14d / (closed_14d + merged_14d)`,
 the share of decided proposals a person rejected, as today; and
 `proposals_merge_rate_14d = merged_14d / authored_14d`, the share of proposals opened that merged,
@@ -435,7 +446,7 @@ each.
 `agents/platform/scripts/feedback_summary.py` behind `scripts/feedback-summary.sh`, and
 `usageSummaryCounters` in `a2a/gateway/feedback_summary.go` behind the gateway's `/feedback
 summary`. Both print `remediationsMergedTotal` and keep doing so; both add `proposalsAuthored`,
-`remediationsOpen`, `remediationsClosedUnmergedTotal` and `proposalHumanTouches` so the one block
+`remediationsOpen`, `remediationsClosedUnmergedTotal`, `proposalHumanTouches` and `proposalsMergedUntouched` so the one block
 answers the three questions. The wording in the block says "as the forge reports" for those lines, and a field with
 no reading prints as "no reading", never as 0, which changes the "a missing one prints 0" contract
 of both copies; their vocabulary audits are computed from a render and follow.
@@ -465,7 +476,7 @@ Python, beside the broker in `agents/platform/scripts/` (`test_vcs_broker.py`,
   install, a human and a bot, asserting every series and every bucket, where the install's own
   commits carry no linked login and only its author email, as on a real forge, and land under
   neither actor;
-- a repository past the walk bound publishes its state counts exactly and its details from the
+- a repository past the walk bound publishes its state counts from the tally (merged and closed as counted, open the remainder of the one count) and its details from the
   thousand most recently updated proposals and the cache; a Gitea repository past its own bound,
   counted in proposals under a server that clamps the page size, withholds the install's
   outcomes reading;

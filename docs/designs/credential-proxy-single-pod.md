@@ -53,6 +53,17 @@ the first reason for one replica; this document owns the decision now.
 The `Recreate` strategy follows from the same state: two pods behind the Service during a
 rollout split traffic that assumes one pod.
 
+What one pod costs is a gap on every eviction, drain and rollout, and the gap is bounded rather
+than removed. On SIGTERM the broker refuses new Chat event pulls, keeps the settle routes open for a few
+seconds so the gateway's acks for pulls already answered land, hands any receipt still unsettled
+back to Pub/Sub, and exits; without that the message waits out its 60 s ack deadline on the
+replacement. The operator writes a `maxUnavailable: 1` budget with `unhealthyPodEvictionPolicy:
+AlwaysAllow`, which on one replica refuses no eviction and holds no drain; a budget that would
+protect the pod is the one the obtainability audit reports as blocking. While the pod is away the
+`PlatformAgent` reads `Provisioning` and, when its pod scan names no other fault, the `Ready` message
+names the Deployment and what waits on it. The pause that remains under one pod, and what would
+shorten or remove it, is tracked in gke-labs/kube-agents#4409.
+
 ## 3. Measured: two replicas behind today's Service
 
 A spike on 2026-10-08 on a Standard GKE install (image `main-d817b3b2`) scaled the broker to

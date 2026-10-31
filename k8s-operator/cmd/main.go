@@ -45,9 +45,30 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 	agentwebhook "github.com/gke-labs/kube-agents/k8s-operator/internal/webhook"
 	"k8s.io/apimachinery/pkg/api/meta"
 	// +kubebuilder:scaffold:imports
+)
+
+const (
+	// operatorMemoryLimitEnv carries the manager container's memory limit in
+	// bytes. Both install paths set it through the Downward API from the
+	// container's own limits.memory (charts/kube-agents/templates/
+	// operator-deployment.yaml and config/manager/manager.yaml;
+	// tests/test_operator_memory_limit_env.py holds the three together), so
+	// the soft limit follows whatever limit the cluster admitted, an Autopilot
+	// clamp included, with no second number to keep in step with
+	// operator.resources.
+	operatorMemoryLimitEnv = "OPERATOR_MEMORY_LIMIT_BYTES"
+	// operatorMemoryLimitFraction is the share of the container limit the
+	// manager takes as its soft limit. The manager is alone in its container,
+	// so the tenth left over is headroom for what the cgroup counts and the
+	// heap does not: goroutine stacks, the runtime's own structures, and the
+	// kernel's accounting. The event watcher takes half, because it shares
+	// its container; a soft limit makes the collector work harder as the heap
+	// approaches it, it does not cap live heap.
+	operatorMemoryLimitFraction = 0.9
 )
 
 var (
@@ -115,6 +136,18 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Before the manager and its cache exist: the soft limit paces the
+	// collector against the container's limit from the first informer sync,
+	// which is where a cache sized for a larger cluster than the limit was
+	// previously OOM-killed with the default pacing (GOGC=100 lets the heap
+	// double between collections, whatever the cgroup says).
+	if limitBytes, applied, reason := memlimit.Apply(operatorMemoryLimitEnv, operatorMemoryLimitFraction); applied {
+		setupLog.Info("Go soft memory limit set from the container's memory limit",
+			"bytes", limitBytes, "source", operatorMemoryLimitEnv, "fraction", operatorMemoryLimitFraction)
+	} else {
+		setupLog.Info("Go soft memory limit not derived; the runtime default applies", "reason", reason)
+	}
 
 	// Reject an out-of-range --webhook-port rather than letting controller-runtime
 	// silently substitute its own default: webhook.Options.Port <= 0 falls back to 9443

@@ -746,7 +746,9 @@ get-credentials`, which already runs in the broker. The proxy reads exactly one
 string out of the caller's file — `current-context` — accepts it only if it is a
 well-formed `gke_<project>_<location>_<cluster>` name, and regenerates the
 kubeconfig itself into a directory backed by a broker-only `emptyDir`. That
-regenerated file is what every proxied command runs against. No field the
+regenerated file is what every proxied `kubectl` command runs against. A gcloud
+call gets an empty per-call file instead (get-credentials fetches into its own
+scratch file). No field the
 sandbox wrote is ever interpreted, and there is no check-then-open window,
 because the sandbox never had a handle on the document that is opened.
 
