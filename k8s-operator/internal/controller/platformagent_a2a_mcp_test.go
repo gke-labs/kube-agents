@@ -666,8 +666,17 @@ func parseGoMemLimit(v string) (int64, error) {
 // quota refuses after the preflight passed.
 func TestTheMCPPodIsSizedLikeTheConsole(t *testing.T) {
 	agent := a2aTestAgent()
-	mcp := buildA2AMCPDeployment(agent).Spec.Template.Spec.Containers[0].Resources
-	console := buildA2AConsoleDeployment(agent).Spec.Template.Spec.Containers[0].Resources
+	mcpPod := buildA2AMCPDeployment(agent).Spec.Template.Spec
+	consolePod := buildA2AConsoleDeployment(agent).Spec.Template.Spec
+	// One container each and no init containers, or the console's figures
+	// would no longer be the MCP pod's whole size.
+	for name, pod := range map[string]corev1.PodSpec{"MCP": mcpPod, "console": consolePod} {
+		if len(pod.Containers) != 1 || len(pod.InitContainers) != 0 {
+			t.Fatalf("%s pod has %d containers and %d init containers, want 1 and 0; the preflight counts the MCP at the console's single container", name, len(pod.Containers), len(pod.InitContainers))
+		}
+	}
+	mcp := mcpPod.Containers[0].Resources
+	console := consolePod.Containers[0].Resources
 	for _, side := range []struct {
 		name      string
 		mcp, cons corev1.ResourceList

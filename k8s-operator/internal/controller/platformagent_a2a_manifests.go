@@ -3788,8 +3788,10 @@ const defaultA2AMaxSessions = 10
 // finished pod counts against no quota), rollout surge doubling a
 // Deployment for a moment, and the gateway's count-then-create overshoot. Fifteen covered roughly ten standing pods plus
 // surge; the console server made it eleven, hence sixteen, and the
-// kube-proxy's second replica seventeen. If the base install grows again,
-// raise this before anything user-visible starts failing admission.
+// kube-proxy's second replica seventeen. The MCP server, rendered only under
+// A2A_MCP_DOOR, is one more while the flag is on, and buildA2ASessionQuota adds
+// one for it then (#3869). If the base install grows again, raise this before
+// anything user-visible starts failing admission.
 const a2aQuotaHeadroom = 17
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
@@ -4259,6 +4261,9 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // every pod in the namespace, which is not this bound's mandate.
 func buildA2ASessionQuota(agent *agentv1alpha1.PlatformAgent) *corev1.ResourceQuota {
 	limit := int64(resolveA2AMaxSessions(agent) + a2aQuotaHeadroom)
+	if a2aMCPDoorEnabled() {
+		limit++
+	}
 	return &corev1.ResourceQuota{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ResourceQuota"},
 		ObjectMeta: metav1.ObjectMeta{
