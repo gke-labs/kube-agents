@@ -75,6 +75,14 @@ operations:
     prompt: Prepare an upgrade readiness report for my whole fleet. Which clusters are behind, what blocks their upgrade, and in what order should they be upgraded?
     follow_up: Analyse my fleet's health. Which clusters and workloads carry the heaviest traffic, is the load skewed toward one zone, and what looks anomalous?
   # Step 5 (B): fleet health, alone (3 runs) on the first point.
+  upgrade_report_long:
+    # One run with the harness's delegation wait raised: set AGENT_DELEGATION_TIMEOUT=5400 for this
+    # run only, so the report's full duration is measured instead of the default 1800 s wait.
+    kind: prompt
+    factors: [combined]
+    runs: 1
+    timeout_seconds: 7200
+    prompt: Prepare an upgrade readiness report for my whole fleet. Which clusters are behind, what blocks their upgrade, and in what order should they be upgraded?
   fleet_health:
     kind: prompt
     factors: [combined]
