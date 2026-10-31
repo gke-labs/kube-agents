@@ -47,9 +47,10 @@ func TestTheOperatorsMigrationMapParses(t *testing.T) {
 
 // What the stream identity may publish, against the rendered grants, and
 // the nearest things it may not: every verb only on the provisioned streams
-// by name, restore chunks only on those names (the server derives the
-// chunk subject from the config's stream name, so this is what keeps a
-// RESTORE request naming another stream from receiving data), no purge,
+// by name, restore chunks only on those names (a restore's data travels on
+// the chunk subject, which the server derives from the request's stream
+// name, so a request can only deliver data to a stream whose chunk subject
+// it is granted), no purge,
 // leader step-down, stream create or message delete, no task subject.
 func TestTheRenderedStreamIdentityReachesItsWorkAndNothingNear(t *testing.T) {
 	h := startHarness(t, renderedMigrationMap(t), map[string]Attested{

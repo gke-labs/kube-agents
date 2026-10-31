@@ -506,9 +506,10 @@ func setBusMigratingCondition(agent *agentv1alpha1.PlatformAgent, now metav1.Tim
 // stream leaders and replica counts. The one to three leg's stream identity
 // is the operator's own pods, which take the snapshot, restore it and roll
 // it back: the only principal holding SNAPSHOT, RESTORE or DELETE, each per
-// stream name, its chunk subjects per name too (a RESTORE API request names
-// its stream in the config, not only in the subject; the chunk subject is
-// the one the server derives from the config, and that is what bounds it).
+// stream name, its chunk subjects per name too (a restore's data travels on
+// the chunk subject, which the server derives from the request's stream
+// name, so a request can only deliver data to a stream whose chunk subject
+// it is granted).
 // The hashing pod between them has no bus identity at all.
 func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 	run := agent.Status.BusMigration
