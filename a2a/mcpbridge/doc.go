@@ -34,14 +34,14 @@
 //	                               kube context, namespace and direct URL,
 //	                               never to a connection that overrides them
 //	KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT
-//	                               the exact saved key of the profile the
-//	                               token belongs to (<context>/<name> once a
-//	                               same-named install in another context has
-//	                               qualified it; the bare name then names
-//	                               nothing, and a bare name another saved
-//	                               key shares is ambiguous); set, it decides even with one
-//	                               deployment saved, and naming no saved key
-//	                               sends the token nowhere; unset, the token
+//	                               the saved key of the profile the token
+//	                               belongs to, matched exactly (never by
+//	                               base name or kube context); set, it
+//	                               decides even with one deployment saved,
+//	                               and naming no saved key sends the token
+//	                               nowhere, so after a rename (<context>/<name>)
+//	                               or a prune the old value names nothing
+//	                               until it is updated; unset, the token
 //	                               goes to the only saved deployment, or
 //	                               nowhere with several
 //	GH_TOKEN / GITHUB_TOKEN        GitHub token for inspect_pr; when neither is

@@ -33,10 +33,10 @@ const (
 	// that deployment's saved target, never to a connection that overrides it.
 	EnvMCPToken = "KUBE_AGENTS_MCP_TOKEN"
 	// EnvMCPTokenDeployment names the saved deployment profile EnvMCPToken belongs to by its exact
-	// saved key ("<kubeContext>/<name>" once a cross-context collision has qualified it, never
-	// the bare name then). Set, it decides even with one deployment configured; naming no saved
-	// key, the token is sent nowhere. Unset, the token goes to the only deployment configured,
-	// or nowhere with several.
+	// saved key, compared byte for byte and never parsed. Set, it decides even with one deployment
+	// configured; naming no saved key (including the old key after a rename or a prune), the token
+	// is sent nowhere. Unset, the token goes to the only deployment configured, or nowhere with
+	// several.
 	EnvMCPTokenDeployment = "KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT"
 
 	// DefaultUpstreamRepoURL and friends are the canonical upstream GitHub documentation links.
@@ -590,14 +590,13 @@ var (
 
 // EnvMCPTokenFor returns the KUBE_AGENTS_MCP_TOKEN override when it belongs to prof, and ""
 // otherwise. saved holds the saved deployment profiles by name. With
-// KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT set, the token is the profile whose saved key is exactly the
-// selector, however many are saved; naming no saved key, the token is sent nowhere. The bare
-// name does not follow a cross-context rename to "<kubeContext>/<name>": after one, the selector
-// names nothing until it is set to the qualified key, so neither a rename nor a prune of one
-// namesake hands the token to another. A bare name that another saved key shares as its base
-// name is ambiguous and names nothing; "<kubeContext>/<name>" also names the profile that kept
-// the bare key (envTokenSelectorKey). With the selector unset, the token is the only saved
-// profile's, and is sent nowhere when several are saved.
+// KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT set, the token goes only to the saved profile whose key equals
+// the selector exactly, however many are saved; a selector that is no saved key sends it nowhere.
+// The selector is never parsed or matched by base name, so saved keys being unique makes it
+// unambiguous. It fails closed: when the deployment is renamed (a cross-context collision
+// re-saves it as "<kubeContext>/<name>") or pruned, the old selector names nothing until it is
+// set to the new key, and the token never moves to another install. With the selector unset,
+// the token is the only saved profile's, and is sent nowhere when several are saved.
 //
 // The token is bound to its profile's saved target, not its name: prof gets it only when it
 // still points where the saved profile does (kube context, namespace, and direct MCP URL). A
@@ -625,7 +624,7 @@ func EnvMCPTokenFor(prof DeploymentProfile, saved map[string]DeploymentProfile) 
 
 // envTokenOwner names the saved profile KUBE_AGENTS_MCP_TOKEN belongs to (see EnvMCPTokenFor).
 // A set selector always decides, even with one profile saved: the token then goes only to the
-// profile it names, never to a different lone one.
+// profile whose key it is, never to a different lone one.
 func envTokenOwner(saved map[string]DeploymentProfile) (string, bool) {
 	scope := strings.TrimSpace(os.Getenv(EnvMCPTokenDeployment))
 	if scope == "" && len(saved) == 1 {
@@ -633,8 +632,8 @@ func envTokenOwner(saved map[string]DeploymentProfile) (string, bool) {
 			return name, true
 		}
 	}
-	if key, ok := envTokenSelectorKey(scope, saved); ok {
-		return key, true
+	if _, ok := saved[scope]; ok && scope != "" {
+		return scope, true
 	}
 	envTokenNotSentWarning.Do(func() {
 		if scope == "" {
@@ -643,46 +642,9 @@ func envTokenOwner(saved map[string]DeploymentProfile) (string, bool) {
 			return
 		}
 		slog.Warn(EnvMCPToken+" is not sent to any deployment: "+
-			EnvMCPTokenDeployment+" does not name exactly one saved deployment: use its saved key, or <kube-context>/<name> when two kube contexts share the name", "deployment_selector", scope)
+			EnvMCPTokenDeployment+" is not a saved deployment key; set it to the exact key discover_deployments shows", "deployment_selector", scope)
 	})
 	return "", false
-}
-
-// envTokenSelectorKey returns the saved key scope names, and false when it names none or is
-// ambiguous. A bare name never settles which install gets the credential when another saved key
-// shares that base name; the caller must qualify it as "<kube-context>/<name>", which also names
-// a profile that kept the bare key (its own kube context qualifies it).
-func envTokenSelectorKey(scope string, saved map[string]DeploymentProfile) (string, bool) {
-	if scope == "" {
-		return "", false
-	}
-	if p, ok := saved[scope]; ok {
-		// A key stored bare (not qualified by its own kube context) never settles which install
-		// gets the credential when another saved key shares it as its base name. Whether a key is
-		// bare comes from its profile, never from the characters in the selector.
-		if deploymentBaseName(scope, p) == scope {
-			for key, other := range saved {
-				if key != scope && deploymentBaseName(key, other) == scope {
-					return "", false
-				}
-			}
-		}
-		return scope, true
-	}
-	// "<kube-context>/<name>" also names the profile that kept the bare key, whatever characters
-	// the context name holds (an EKS ARN or an OpenShift context has slashes of its own). With
-	// slashes on both sides two profiles can spell the same string (context "a" with key "b/c",
-	// context "a/b" with key "c"), so it names a profile only when exactly one matches.
-	match := ""
-	for key, p := range saved {
-		if ctx := strings.TrimSpace(p.KubeContext); ctx != "" && scope == ctx+"/"+key {
-			if match != "" {
-				return "", false
-			}
-			match = key
-		}
-	}
-	return match, match != ""
 }
 
 // deploymentBaseName is the name a profile saved as name had before a cross-context collision
