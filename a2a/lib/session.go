@@ -57,6 +57,22 @@ const (
 	// session pod whose spawner dropped its session name still fails at
 	// startup rather than publishing as its profile.
 	EnvProfileExecutor = "A2A_PROFILE_EXECUTOR"
+	// EnvProfileWorker runs the adapter as a profile worker, which takes its
+	// tasks from the dispatcher (worker-adapter/profile.go), not one task
+	// named at start. Literal "true" is on, and it needs
+	// EnvProfileExecutor and EnvProfileTier too. The operator renders it on
+	// every pool and Job pod.
+	EnvProfileWorker = "A2A_PROFILE_WORKER"
+	// EnvProfileTier is the tier a profile worker's pool serves, which with
+	// the profile and the pod names its dispatch subject.
+	EnvProfileTier = "A2A_PROFILE_TIER"
+	// EnvProfileWorkerOneShot ends a profile worker after its first task: a
+	// Job's pod. Literal "1" or "true" is on.
+	EnvProfileWorkerOneShot = "PROFILE_WORKER_ONE_SHOT"
+	// EnvProfileHarness names the persona adapter a profile worker renders
+	// its persona with (persona.ClaudeCode is the default and, for now, the
+	// only one written).
+	EnvProfileHarness = "PROFILE_HARNESS"
 	// EnvPrimerFile names the file the spawner mounts the conversation's
 	// transcript primer at (the pod's rehydration-primer annotation, through
 	// the downward API). A pod spawned cold for a conversation that already
@@ -106,3 +122,20 @@ var SessionConsumerRoles = []string{SessionConsumerOrigin, SessionConsumerIn, Se
 func SessionConsumerName(session, role string) string {
 	return session + "-" + role
 }
+
+// ProfileWorkerStatusPort is the pod-local port a profile worker answers
+// /readyz and /healthz on. The operator's readiness probe names it, so the
+// two ends share this number.
+const ProfileWorkerStatusPort = 8080
+
+// ProfilePersonaDir is where a profile pod mounts its persona, read-only
+// (#3662). The operator's profilepod.PersonaMountPath is the same path.
+const ProfilePersonaDir = "/persona"
+
+// EnvProfileConfigRoot is where a profile worker makes each task's harness
+// config directory: its own emptyDir, apart from the working directory.
+// ProfileConfigRoot is the path the operator mounts it at.
+const (
+	EnvProfileConfigRoot = "A2A_PROFILE_CONFIG_ROOT"
+	ProfileConfigRoot    = "/var/run/kube-agents/harness-config"
+)

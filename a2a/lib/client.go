@@ -145,6 +145,9 @@ const (
 	// subscribeBindWindow bounds how long the FIRST bind of a durable retries
 	// before the error reaches the caller; see durableSub.startWithRetry.
 	subscribeBindWindow = 45 * time.Second
+
+	// reconnectPoll paces Reconnect's wait for the rebuild to complete.
+	reconnectPoll = 20 * time.Millisecond
 )
 
 // fullJitterBackoff returns a delay drawn uniformly from [0, min(cap,
@@ -187,6 +190,9 @@ type Client struct {
 	// rebuilds counts terminal-close recoveries (NR-2); exposed for tests and
 	// health.
 	rebuilds atomic.Int64
+	// reconnecting marks a close Reconnect asked for, so the close is logged
+	// as the deliberate step it is.
+	reconnecting atomic.Bool
 	// protocolViolations counts surfaced-and-dropped protocol errors (poison
 	// envelopes, envelope-subject disagreements, post-final events). Advisory
 	// disagreements count here too: they are the one protocol error this
@@ -304,8 +310,12 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 				c.log.Info("nats connection closed", "reason", "client shutdown")
 				return
 			}
-			// Terminal (NR-1): the connection will never come back on its own.
-			c.log.Error("nats connection closed", "err", nc.LastError())
+			if c.reconnecting.Load() {
+				c.log.Info("nats connection closed", "reason", "reconnect for fresh grants")
+			} else {
+				// Terminal (NR-1): the connection will never come back on its own.
+				c.log.Error("nats connection closed", "err", nc.LastError())
+			}
 			// Only the client's current connection triggers a rebuild; an
 			// abandoned connection dying late must not schedule another one.
 			c.mu.RLock()
@@ -366,6 +376,7 @@ func (c *Client) rebuild() {
 		// Core subscriptions first: they need no JetStream, so they are not
 		// held behind a durable whose stream is still recovering.
 		if c.resubscribeCore(cores, nc) && c.resubscribe(subs, js, nc) {
+			c.reconnecting.Store(false)
 			c.rebuilds.Add(1)
 			c.log.Info("nats rebuild complete")
 			return
@@ -412,6 +423,38 @@ func (c *Client) resubscribe(subs []*durableSub, js jetstream.JetStream, nc *nat
 		time.Sleep(fullJitterBackoff(attempt))
 	}
 	return !nc.IsClosed()
+}
+
+// Reconnect replaces the client's connection with a fresh dial and
+// re-subscribes every durable and core subscription on it: the path a
+// terminal close takes (rebuild), asked for on purpose. It is for a
+// principal whose connect-time grants changed, since the auth callout fixes
+// grants per connection and only a new connection carries new ones. The old
+// connection is drained first, so deliveries it already holds reach their
+// handlers. Held deliveries are untouched: their acks and in-progress acks
+// follow the client's current connection, so none is given back, and one
+// whose disposition fails in the gap is retried by its handler. It returns
+// once the rebuild completes, or with ctx's error (the rebuild carries on).
+func (c *Client) Reconnect(ctx context.Context) error {
+	c.mu.RLock()
+	nc := c.nc
+	c.mu.RUnlock()
+	if nc == nil || c.closing.Load() {
+		return errors.New("Reconnect: not connected")
+	}
+	before := c.rebuilds.Load()
+	c.reconnecting.Store(true)
+	if err := nc.Drain(); err != nil {
+		nc.Close()
+	}
+	for c.rebuilds.Load() == before {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("Reconnect: the rebuild had not completed: %w", ctx.Err())
+		case <-time.After(reconnectPoll):
+		}
+	}
+	return nil
 }
 
 // Close shuts the client down deliberately; no rebuild follows.

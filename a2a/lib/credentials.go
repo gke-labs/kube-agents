@@ -137,6 +137,46 @@ func KSATokenNATSOptions(path, inboxOwner string) ([]nats.Option, error) {
 	}, nil
 }
 
+// TaskConsumerStem names a profile worker's task connection: its inbox
+// (_INBOX.<stem>) and its consumers (<stem>-origin and the rest). It is
+// taskcred.ConsumerStem, which the callout grants by; the two are held equal
+// by a test, because lib can't import taskcred.
+func TaskConsumerStem(pod, task string) string {
+	return pod + "_" + task
+}
+
+// TaskCredentialNATSOptions dials a profile worker's task connection (#3889,
+// contract addendum 8): the pod's bus token in the token field, re-read on
+// every connect like KSATokenNATSOptions, and the dispatcher's task
+// credential in the password. The callout matches the credential to the pod
+// the token attests and grants that one task's subjects, under the stem
+// TaskConsumerStem(pod, task). The credential isn't the JWT field, which the
+// server would echo into advisories.
+func TaskCredentialNATSOptions(path, credential, pod, task string) ([]nats.Option, error) {
+	switch {
+	case path == "":
+		return nil, fmt.Errorf("task connection: no bus token path")
+	case credential == "":
+		return nil, fmt.Errorf("task connection: no task credential")
+	case !ValidSubjectToken(pod) || !ValidSubjectToken(task):
+		return nil, fmt.Errorf("task connection: pod %q and task %q must each be one subject token", pod, task)
+	}
+	if _, err := readToken(path); err != nil {
+		return nil, fmt.Errorf("task connection: %w", err)
+	}
+	return []nats.Option{
+		nats.TokenHandler(func() string {
+			tok, err := readToken(path)
+			if err != nil {
+				return ""
+			}
+			return tok
+		}),
+		nats.UserInfo("", credential),
+		nats.CustomInboxPrefix("_INBOX." + TaskConsumerStem(pod, task)),
+	}, nil
+}
+
 // readToken reads and trims a token file. The kubelet writes the token with no
 // trailing newline; a hand-written one may carry it, and a newline inside a
 // CONNECT frame is a protocol error rather than an auth failure.

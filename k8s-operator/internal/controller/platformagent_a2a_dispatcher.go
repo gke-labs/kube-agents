@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"os"
 	"slices"
@@ -45,12 +46,16 @@ import (
 // only reader of the profiles' shared durables and the only writer of
 // PROFILE_LEASES. This file renders what it runs on. The binary is PR 3's.
 const (
-	// a2aDispatcherImageEnvVar names the dispatcher's image. Unset, the
-	// operator renders no dispatcher at all, not its identity and not its
-	// Deployment: the image isn't in the release set yet, and a Deployment
-	// with no image to pull would leave every next install with a pod stuck
-	// in ImagePullBackOff. The dispatcher's PR adds the image to the release
-	// set and makes it the default.
+	// a2aDispatcherImageEnvVar names the dispatcher's image, and setting it
+	// is the only way to turn the dispatcher on. Unset, the operator renders
+	// no dispatcher at all, not its identity, its grants nor its
+	// Deployment: until profiles dispatch end to end (the worker's side is
+	// #3655's PR 5) it would be an idle component that costs every next
+	// install a principal and a pod.
+	// a2aDispatcherImageName is its name in the release set, which it is
+	// built and published under already; a2aDispatcherReleaseImage resolves
+	// it, so turning the default on is one line in a2aDispatcherImage.
+	a2aDispatcherImageName   = "a2a-dispatcher"
 	a2aDispatcherImageEnvVar = "A2A_DISPATCHER_IMAGE"
 
 	// a2aDispatcherUser is the dispatcher's NATS user, and so its inbox
@@ -61,7 +66,8 @@ const (
 	a2aDispatcherStatusPort    = 8080
 
 	// a2aDispatchConfigKey is lib.DispatchConfigKey; this module can't
-	// import lib, and no test holds the two equal.
+	// import lib, and the dispatch-config test decodes the rendered
+	// ConfigMap into lib's type to hold the two equal.
 	a2aDispatchConfigKey = "dispatch.json"
 
 	a2aDispatcherCPURequest    = "50m"
@@ -75,9 +81,21 @@ const (
 	agentProfileWorkerComponent = "agentprofile-worker"
 )
 
+// a2aDispatcherImage is the dispatcher's image: A2A_DISPATCHER_IMAGE, or
+// nothing. It is off by default until profiles dispatch end to end.
 func a2aDispatcherImage() string { return strings.TrimSpace(os.Getenv(a2aDispatcherImageEnvVar)) }
 
-// a2aDispatcherEnabled reports whether this operator renders the dispatcher.
+// a2aDispatcherReleaseImage is the dispatcher's image as the release set
+// resolves it, the way the verifier's is (a2aReleaseImage), with
+// A2A_DISPATCHER_IMAGE still the override. Nothing calls it yet: rendering
+// the dispatcher by default is a2aDispatcherImage returning this.
+func a2aDispatcherReleaseImage() string {
+	return strings.TrimSpace(a2aReleaseImage(a2aDispatcherImageEnvVar, a2aDispatcherImageName))
+}
+
+// a2aDispatcherEnabled reports whether this operator renders the dispatcher:
+// only when A2A_DISPATCHER_IMAGE is set, so an empty image never renders a
+// Deployment with nothing to pull.
 func a2aDispatcherEnabled() bool { return a2aDispatcherImage() != "" }
 
 func a2aDispatcherName(agent *agentv1alpha1.PlatformAgent) string {
@@ -578,6 +596,12 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 			return fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
 		}
 	}
+	// The warm pools the dispatcher hands interactive tasks to
+	// (agentprofile_pool.go). A failure there is the profile namespace's,
+	// like the quota's.
+	if err := r.reconcileProfilePools(ctx, agent, profiles, resolved); err != nil {
+		return err, nil
+	}
 	return nil, nil
 }
 
@@ -599,10 +623,19 @@ func (r *PlatformAgentReconciler) removeA2ADispatcher(ctx context.Context, agent
 	return r.deleteDispatcherPodsRBAC(ctx, agent), nil
 }
 
-// deleteDispatcherPodsRBAC removes the dispatcher's pod-read Role and binding
-// from the profile namespace, if they carry this agent's labels. Read
-// uncached: Role is a kind this controller doesn't watch.
+// deleteDispatcherPodsRBAC removes what the dispatcher left in the profile
+// namespace: its pod-read Role and binding, and this agent's warm pools.
 func (r *PlatformAgentReconciler) deleteDispatcherPodsRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	// The warm pools go whatever happens to the RBAC: they have no owner
+	// reference, so nothing else would reclaim pods holding bus and broker
+	// tokens.
+	return goerrors.Join(r.deleteDispatcherPodReadRBAC(ctx, agent), r.deleteProfilePools(ctx, agent))
+}
+
+// deleteDispatcherPodReadRBAC removes the dispatcher's pod-read Role and
+// binding from the profile namespace, if they carry this agent's labels.
+// Read uncached: Role is a kind this controller doesn't watch.
+func (r *PlatformAgentReconciler) deleteDispatcherPodReadRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	key := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: a2aDispatcherName(agent)}
 	for _, obj := range []client.Object{&rbacv1.RoleBinding{}, &rbacv1.Role{}} {
 		if err := r.a2aReader().Get(ctx, key, obj); err != nil {
@@ -642,7 +675,13 @@ func (r *PlatformAgentReconciler) deleteIfControlled(ctx context.Context, agent 
 // agentLabelsMark reports whether obj carries this agent's a2a labels, the
 // ownership test for objects in the profile namespace.
 func agentLabelsMark(obj client.Object, agent *agentv1alpha1.PlatformAgent) bool {
-	want := a2aLabels(agent, "dispatcher")
+	return agentLabelsMarkComponent(obj, agent, "dispatcher")
+}
+
+// agentLabelsMarkComponent is agentLabelsMark for an object of another
+// component: it carries this agent's labels with that component.
+func agentLabelsMarkComponent(obj client.Object, agent *agentv1alpha1.PlatformAgent, component string) bool {
+	want := a2aLabels(agent, component)
 	got := obj.GetLabels()
 	for k, v := range want {
 		if got[k] != v {
