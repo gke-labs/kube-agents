@@ -237,8 +237,8 @@ stall watch finds its card. It writes no ledger row, claims no quota and starts 
 happened, something stopped happening. The line says what it is, silence and not a confirmed recovery,
 since the watcher reads events only. A session with a card but no thread, every session on an install
 without a chat surface, gets the line on its card alone, written before the answer; while the card is still to come (triage queued or running), or the board will not answer, the answer is a 503 the watcher retries each sweep, for an hour from the daemon's first attempt (`FOLLOWUP_CARD_WAIT_SECONDS`); past that, and for a session with
-neither, it is answered `unrouted`. It is a reply rather than an edit of the alert: the gateway edits by update key only inside a
-conversation request, and the alert was a home-channel post whose key was never bound.
+neither, it is answered `unrouted`. It is a reply rather than an edit of the alert: the alert's update key names whatever message last
+took it, the triage report once that landed, so a keyed send here would overwrite it.
 
 An alert whose investigation never starts gets the same thread's line from `_triage_watchdog`,
 armed by `trigger_agent_troubleshooter` as soon as the alert is routed to its thread and before the

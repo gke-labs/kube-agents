@@ -242,8 +242,8 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
     ``wait_seconds`` bounds how long `a2a notify` waits for the gateway, for a
     caller with a deadline shorter than the CLI's default. ``update`` names the
     message on the gateway path (``a2a notify --update``), so a later notify
-    with the same key in the same conversation edits it; the Hermes path has
-    no such key and ignores it.
+    with the same key in the same conversation or home thread edits it; the
+    Hermes path has no such key and ignores it.
     """
     platform, _, rest = target.partition(":")
     if not routes(platform):
