@@ -178,6 +178,57 @@ Helm. See the
 [inference gateway guide](../docs/site/src/content/docs/concepts/inference-gateway.md)
 for provider behavior.
 
+## Harness limits
+
+Setup's **Harness limits** page reads the load measurements of the agent
+harness from the repository, `bench/scale/harness-limits.json`, so it needs no
+connection. Until that file exists, the page shows
+`bench/scale/harness-limits.sample.json` under a banner that marks it as a
+sample. The plan, metrics and thresholds are those of the
+[harness bottlenecks design](../docs/designs/agent-harness-bottlenecks.md).
+
+The page has two parts. **Part 1, Limits forecast**, starts from a fleet size and a container
+size, each picked as a T-shirt size. The fleet sizes are S (4 clusters), M (45), L (250) and XL
+(2,500, the benchmark size), built from customer fleets with rounded figures and no names. The
+container sizes are S (what GKE Autopilot without bursting gives: each request becomes the limit),
+M (the defaults of a Standard install), L (raised for a large fleet) and XL (the most a container
+can practically get on GKE Standard, one n2-standard-128 node: 120 CPU and 480 GB), or the sizes
+recommended for the fleet; both can be changed. One verdict follows, green or red: how many
+installs the fleet needs because of the limits no setting raises (the sandbox shell's CPU, which
+the operator fixes at 2 cores, the credential proxy's 8 command slots, the 10 run slots, and
+Stall Watch reading one cluster at a time), counted from the largest measured fleet that held,
+and whether the chosen container size is enough for each install. The page then lists what each
+install needs: the containers' sizes, the node pool and the data volume. A chart
+shows each key limit as a share of the chosen limit as the fleet grows and marks where each is
+reached. An option assumes an operator change that lets the shell be sized too. **Part 2,
+Empirical evidence**, takes no input: memory, CPU, the credential proxy's longest wait and the
+response time in their own units, every measured run against the default limits, then each
+metric run by run.
+
+The collapsed **Measured runs** section plots each metric against one factor, one operation
+at a time. A factor sits at its measured value from the run's totals, per cluster for nodes
+and objects; churn sits at the rate the fixture achieved; any other factor sits at the run's
+planned value. Each chart has a straight-line fit and its dashed prediction; past the largest
+measured value it is predicted, not measured. A run with a provider 429, a failed prompt or an
+unfinished one stays out of the response-time fit, a run that shared the broker with other
+work stays out of the resource fits (both from the record's `excluded_from`), and a CPU peak at
+90% or more of the container's CPU limit stays out of the CPU fit: it shows the limit, not
+what the container needed. The page's limits default to the ones most runs had.
+
+`python3 -m admin_console.estimate` prints the same model as Markdown:
+
+- for each check, the cluster count at which it fails for clusters shaped like
+  the base point, and the value at which it fails for each factor alone;
+- the limits and node pool for 8 to 128 clusters;
+- the measured onset of each count that has to stay at zero;
+- the credential proxy's throughput, the commands each operation sent, and its
+  CPU per operation and fleet size.
+
+`--against requests` checks against the requests instead, which is what an
+Autopilot cluster without bursting gives each container; `--limits` reads other
+limits from a JSON or YAML file; `--data`, `--commit` and `--mode` pick the data
+file, the build and the mode.
+
 ## Chat
 
 Chat is always available in navigation. Without a verified target it provides a

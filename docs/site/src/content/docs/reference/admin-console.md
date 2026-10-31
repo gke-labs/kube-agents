@@ -1,6 +1,6 @@
 ---
 title: Admin console
-description: The Kube Agents Console, a local Streamlit prototype started from a repository checkout that chats with the agent, browses its activity, and shows the inference gateway's status. The install does not deploy it.
+description: The Kube Agents Console, a local Streamlit prototype started from a repository checkout that chats with the agent, browses its activity, shows the inference gateway's status, and sizes an install for a fleet. The install does not deploy it.
 sidebar:
   order: 10
 ---
@@ -29,8 +29,9 @@ Past the launcher, you need an account with read access to the project and the c
 
 In navigation order:
 
-- **Setup → Connection.** Pick the project, then the cluster. Project Connect verifies the gcloud identity, project access and GKE discovery; Cluster Connect verifies the kube-agents runtime. A single cluster labelled `kube-agents-host=true` is preselected. Every other page reads the target verified here and points back to this page until both levels connect.
+- **Setup → Connection.** Pick the project, then the cluster. Project Connect verifies the gcloud identity, project access and GKE discovery; Cluster Connect verifies the kube-agents runtime. A single cluster labelled `kube-agents-host=true` is preselected. Every other page except Harness limits reads the target verified here and points back to this page until both levels connect.
 - **Setup → LLM Gateway.** Reads the install's LiteLLM resources and runs one bounded request from the Platform Agent through `model-default`, the same path the agents use. The LiteLLM this repository's install deploys is Helm-owned, and the console refuses to change a Helm-owned release, so on a stock install the page shows live status with its configuration form disabled; provider changes go through the installer, Terraform or Helm ([Inference gateway](/kube-agents/concepts/inference-gateway/)).
+- **Setup → Harness limits.** Sizing from the repository's load measurements (`bench/scale/harness-limits.json`), with no connection needed. Pick an example fleet (S, M, L or XL) or enter your own. The page answers whether the container limits hold that fleet, and which limits, node pool, data volume and number of installs it needs. A chart shows each key limit as the fleet grows, and the measured runs are in a collapsed section. Predictions past the measured fleet sizes are labelled as such. Until measurements are committed, the page shows a labelled sample.
 - **Agentic → Chat.** A table of recent agent sessions, with the selected session's transcript and a composer below it. A message sent here goes to the Planning Agent, the front door Google Chat and Slack use, so it is planned and delegated the same way, and the kanban tasks it spawns render inline in the thread. Google Chat and Slack sessions are visible but read-only; a follow-up from the console opens a separate `portal_*` session rather than posting into someone else's thread. When the agent asks for a tool approval, the choices are Approve once or Deny.
 - **Observability → Overview.** Activity volume, the split between human-initiated and autonomous work, attention items, attribution coverage and recent outcomes for a time window chosen on the page.
 - **Observability → Activity Explorer.** Structured audit events from Cloud Logging and agent traces from Cloud Trace for the selected window: an aggregate flow diagram, a per-interaction timeline, and a paginated ledger with a Google Cloud evidence link on every record. Truncated or failed source reads are shown as partial rather than treated as complete.
