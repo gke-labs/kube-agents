@@ -299,7 +299,8 @@ SOURCES: dict[str, Source] = {
     # The A2A gateway's rendered ingress: its three fences and the gateway
     # container's declared ports, written by an operator Go test
     # (TestRenderedA2AGatewayIngressMatchesTheConformanceFixture) because no
-    # golden renders mode next. The anchors are the collector's namespace and
+    # golden renders mode next with both doors armed (the next-mode golden is
+    # the example CR, which arms neither). The anchors are the collector's namespace and
     # the metrics port's name: lose either and C1's assertion has nothing to
     # hold the fences to.
     "a2a_gateway_ingress_fixture": Source(
