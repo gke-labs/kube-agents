@@ -271,7 +271,9 @@ optionally followed by its recorded location, bounded on both sides by the expan
 name looks like; a placeholder naming a slot the runner recorded no cluster for returns
 `status: "error"`, like an unreached `fixture_roles` slot, and because an unreached slot is absent
 from `{cluster:any}` rather than forbidden, a case that forbids through it lists a `fixture_roles`
-entry for every slot it means; its `fixture_roles` names the seeded-fleet
+entry for every slot it means; `{model}` in any of the three lists stands for the backing model the runner
+recorded in its environment (`MODEL_DEFAULT_NAME`, `AGENT_MODEL`, or `AGENT_MODEL_NAME`), returning
+`status: "error"` when none is recorded; its `fixture_roles` names the seeded-fleet
 roles whose clusters the patterns require a line about, each resolved to its slot's own
 credential (`clusters/<slot>.kubeconfig`, written for every seeded cluster the runner reached,
 before any role on it is confirmed), and a slot the runner did not reach returns

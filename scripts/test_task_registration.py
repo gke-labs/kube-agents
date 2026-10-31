@@ -946,6 +946,34 @@ class TestTheRulesReject(unittest.TestCase):
             verification_spec=self._entry(check={"type": "report_contains", "forbidden_patterns": ["{cluster: a}: no"]}),
         )
 
+    def test_model_placeholder_is_accepted_only_in_report_contains_pattern_lists(self):
+        for key in ("forbidden_patterns", "any_of_patterns"):
+            with self.subTest(valid_key=key):
+                self.assertEqual(
+                    self._validate(verification_spec=self._entry(check={"type": "report_contains", key: ["{model}"]})),
+                    [],
+                )
+        for key in ("required_phrases", "forbidden_phrases", "any_of_phrases"):
+            with self.subTest(phrase_key=key):
+                problem = self._only(
+                    "which only report_contains expands",
+                    verification_spec=self._entry(check={"type": "report_contains", key: ["{model}"]}),
+                )
+                self.assertIn(repr(key), problem)
+        for bad_check in (
+            {"type": "worker_commands", "forbidden_patterns": ["{model}"]},
+            {"type": "tool_called", "tool_names": ["x"], "scope": "workers", "agent": "cluster-{model}"},
+            {"type": "tool_called", "tool_names": ["x"], "arguments": {"assignee": "{model}"}},
+        ):
+            with self.subTest(bad_check=bad_check):
+                self._only("which only report_contains expands", verification_spec=self._entry(check=bad_check))
+        for malformed in ("{ model }", "{Model}", "{model:default}"):
+            with self.subTest(malformed=malformed):
+                self._only(
+                    "malformed model placeholder",
+                    verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": [malformed]}),
+                )
+
     def test_a_slotless_overlay_role_is_rejected_in_fixture_roles(self):
         # `orphan-disks` is in the overlay with no slot, so `fixtures:` takes
         # it; the plural asks for a slot the runner never records.

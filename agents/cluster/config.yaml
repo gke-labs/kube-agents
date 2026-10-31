@@ -156,6 +156,7 @@ plugins:
   enabled:
     - hermes_otel
     - tool_call_audit
+    - model_identity
 
 # This template is copied verbatim into /opt/cluster-template rather than merged
 # with deploy/shared/defaults/config.yaml, so the probe has to be turned off

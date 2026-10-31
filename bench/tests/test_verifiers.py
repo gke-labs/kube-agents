@@ -10169,3 +10169,30 @@ def test_issue_state_gitlab_skips_system_notes(monkeypatch, github):
     res = _state_check().verify(5.0)
     assert res.status == "pass", res.reason
     assert res.raw["comments_since_start"] == 2
+
+
+def test_report_contains_expands_model_placeholder_from_runner_env(monkeypatch):
+    with pytest.raises(ValidationError, match="carries a model placeholder"):
+        ReportContainsVerifier(type="report_contains", required_phrases=["{model}"])
+    with pytest.raises(ValidationError, match="malformed model placeholder"):
+        ReportContainsVerifier(type="report_contains", required_patterns=["{model:default}"])
+
+    check = ReportContainsVerifier(type="report_contains", required_patterns=["{model}"])
+    monkeypatch.delenv("MODEL_DEFAULT_NAME", raising=False)
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.setenv("AGENT_MODEL_NAME", "model-default")
+    _stash("I run on gemini-3.1-pro-preview.")
+    err = check.verify(timeout_sec=5.0)
+    assert err.status == "error"
+    assert "MODEL_DEFAULT_NAME" in err.reason
+
+    monkeypatch.setenv("MODEL_PROVIDER", "vertex_ai")
+    monkeypatch.setenv("MODEL_DEFAULT_NAME", "gemini-3.1-pro-preview")
+    _stash("I am running on `gemini-3.1-pro-preview` via Google Cloud Vertex AI.")
+    assert check.verify(timeout_sec=5.0).success
+    _stash("I am running on Gemini 3.1 Pro Preview.")
+    assert check.verify(timeout_sec=5.0).success
+    _stash("I am running on gemini-2.5-flash.")
+    miss = check.verify(timeout_sec=5.0)
+    assert not miss.success
+    assert "model placeholder resolved to 'gemini-3.1-pro-preview'" in miss.reason

@@ -922,6 +922,12 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# The front door answers "what model are you running on?" from its
+# [RUNTIME MODEL IDENTITY] block, never with the router alias (model-default,
+# hermes-agent) or the `custom` placeholder, and files no card (#3295).
+# deployer: noop, transcript-only, one front-door turn with no card.
+./tasks/chat-model-identity-truth/task.yaml
+
 # A card the AI model's rate limit blocked is not promised a retry: the wake
 # reply says it will not run again on its own and offers to try again (SOUL
 # §2 step 5, #3766). Plants its own card through card_wake.py; one front-door

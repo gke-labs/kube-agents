@@ -1,0 +1,5 @@
+name: model_identity
+version: 0.1.0
+kind: standalone
+description: Injects the backing model and provider identity from the profile's LiteLLM gateway into every turn.
+provides_hooks: [pre_llm_call]

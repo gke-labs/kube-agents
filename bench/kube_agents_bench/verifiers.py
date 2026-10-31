@@ -257,6 +257,57 @@ _NO_RECORDED_SLOT_REASON = (
     "cluster was reached before the run"
 )
 _PATTERN_EXPANSION_REASON = "a pattern does not compile once its cluster placeholders are expanded"
+_MODEL_PLACEHOLDER = re.compile(r"\{model\}")
+_MODEL_PLACEHOLDER_LOOSE = re.compile(r"\{[^}\n]*model[^}\n]*\}", re.IGNORECASE)
+_MODEL_PLACEHOLDER_STAND_IN = "stand-in-model-1.0"
+_NO_RECORDED_MODEL_REASON = (
+    "a pattern names {model} and the runner has no backing model recorded in "
+    "MODEL_DEFAULT_NAME, AGENT_MODEL, or AGENT_MODEL_NAME"
+)
+_ROUTER_MODEL_ALIASES = frozenset(
+    {"model-default", "hermes-agent", "model-fast", "model-reasoning", "custom"}
+)
+_KNOWN_PROVIDER_PREFIXES = frozenset(
+    {
+        "vertex_ai",
+        "gemini",
+        "anthropic",
+        "openai",
+        "openai_compatible",
+        "hosted_vllm",
+        "custom",
+        "sap",
+        "azure",
+        "bedrock",
+        "databricks",
+        "chatgpt",
+    }
+)
+
+
+def recorded_model() -> str:
+    """Resolve the backing model from the runner's environment.
+
+    ``hack/ci-deploy.sh`` exports ``MODEL_PROVIDER`` and ``MODEL_DEFAULT_NAME``;
+    ``hack/ci-eval-pr.sh`` exports ``AGENT_MODEL``; ``harness.py`` reads
+    ``AGENT_MODEL_NAME``.
+    """
+    env_provider = os.environ.get("MODEL_PROVIDER", "").strip().casefold()
+    for key in ("MODEL_DEFAULT_NAME", "AGENT_MODEL", "AGENT_MODEL_NAME"):
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            continue
+        if "/" in raw:
+            prefix, rest = raw.split("/", 1)
+            folded_prefix = prefix.strip().casefold()
+            if rest.strip() and (
+                folded_prefix in _KNOWN_PROVIDER_PREFIXES
+                or (env_provider and folded_prefix == env_provider)
+            ):
+                raw = rest.strip()
+        if raw and raw.casefold() not in _ROUTER_MODEL_ALIASES:
+            return raw
+    raise LookupError(_NO_RECORDED_MODEL_REASON)
 
 
 # Emphasis and code markers, dropped before matching. The agent answers in
@@ -562,6 +613,11 @@ class ReportContainsVerifier(BaseVerifier):
                     f"{info.field_name} entry {phrase!r} carries a cluster placeholder, which only "
                     "the pattern lists expand; as a phrase it is literal text that never matches"
                 )
+            if _MODEL_PLACEHOLDER_LOOSE.search(phrase):
+                raise ValueError(
+                    f"{info.field_name} entry {phrase!r} carries a model placeholder, which only "
+                    "the pattern lists expand; as a phrase it is literal text that never matches"
+                )
         return phrases
 
     @field_validator("required_patterns", "forbidden_patterns", "any_of_patterns")
@@ -576,12 +632,19 @@ class ReportContainsVerifier(BaseVerifier):
                     f"pattern {pattern!r} carries a malformed cluster placeholder; the form is "
                     f"{{cluster:<slot>}} or {{cluster:{_CLUSTER_ANY}}}, lowercase, no spaces"
                 )
+            if _MODEL_PLACEHOLDER_LOOSE.search(_MODEL_PLACEHOLDER.sub("", pattern)):
+                raise ValueError(
+                    f"pattern {pattern!r} carries a malformed model placeholder; the form is "
+                    "{model}, lowercase, no spaces"
+                )
             # A placeholder expands to a frame at verify time, so what has to
             # compile now is the pattern around a frame, not around a letter:
             # a lookbehind or a character class that is legal around `x` is
             # not around a variable-width group.
             try:
-                re.compile(cls.expand_cluster_placeholders(pattern, cls._stand_in_records(pattern)))
+                expanded = cls.expand_cluster_placeholders(pattern, cls._stand_in_records(pattern))
+                expanded = cls.expand_model_placeholders(expanded, _MODEL_PLACEHOLDER_STAND_IN)
+                re.compile(expanded)
             except re.error as exc:
                 # Re-raised as the same type, so a caller that catches re.error
                 # for a pattern that does not compile still does.
@@ -632,19 +695,56 @@ class ReportContainsVerifier(BaseVerifier):
             return cls._cluster_frame(*clusters[slot])
         return _CLUSTER_PLACEHOLDER.sub(frame_for, pattern)
 
-    def _expanded_patterns(self) -> tuple[list[str], list[str], list[str], dict[str, tuple[str, str]] | None]:
-        """The three pattern lists with their cluster placeholders expanded from
-        the runner's record, and the record used (None when no pattern asked,
-        so the record is read only then)."""
-        if not any(_CLUSTER_PLACEHOLDER.search(p) for p in self.forbidden_patterns + self.required_patterns + self.any_of_patterns):
-            return self.forbidden_patterns, self.required_patterns, self.any_of_patterns, None
-        clusters = recorded_clusters()
-        return (
-            [self.expand_cluster_placeholders(p, clusters) for p in self.forbidden_patterns],
-            [self.expand_cluster_placeholders(p, clusters) for p in self.required_patterns],
-            [self.expand_cluster_placeholders(p, clusters) for p in self.any_of_patterns],
-            clusters,
-        )
+    @staticmethod
+    def _model_frame(model: str) -> str:
+        """The regex for the recorded backing model, matching hyphenated or spaced tokens."""
+        norm = _normalize(model).strip()
+        prefix_part = ""
+        leaf = norm
+        if "/" in norm:
+            prefix, rest = norm.split("/", 1)
+            if prefix.strip() and rest.strip():
+                prefix_part = f"(?:{re.escape(prefix.strip())}/)?"
+                leaf = rest.strip()
+        elif "--" in norm:
+            prefix, rest = norm.split("--", 1)
+            if prefix.strip() and rest.strip():
+                prefix_part = f"(?:{re.escape(prefix.strip())}--)?"
+                leaf = rest.strip()
+        tokens = [re.escape(tok) for tok in re.split(r"[- ]+", leaf) if tok]
+        body = r"[- ]+".join(tokens) if tokens else re.escape(leaf)
+        return f"(?:(?<![a-z0-9-])(?<![a-z0-9][.]){prefix_part}{body}(?![a-z0-9-]|[.][a-z0-9]))"
+
+    @classmethod
+    def expand_model_placeholders(cls, pattern: str, model: str) -> str:
+        """``pattern`` with every ``{model}`` replaced by the recorded model frame."""
+        if not _MODEL_PLACEHOLDER.search(pattern):
+            return pattern
+        frame = cls._model_frame(model)
+        return _MODEL_PLACEHOLDER.sub(lambda _: frame, pattern)
+
+    def _expanded_patterns(
+        self,
+    ) -> tuple[list[str], list[str], list[str], dict[str, tuple[str, str]] | None, str | None]:
+        """The three pattern lists with their cluster and model placeholders
+        expanded from the runner's records (None when no pattern asked)."""
+        all_patterns = self.forbidden_patterns + self.required_patterns + self.any_of_patterns
+        forbidden = list(self.forbidden_patterns)
+        required = list(self.required_patterns)
+        any_of = list(self.any_of_patterns)
+        clusters: dict[str, tuple[str, str]] | None = None
+        model: str | None = None
+        if any(_CLUSTER_PLACEHOLDER.search(p) for p in all_patterns):
+            clusters = recorded_clusters()
+            forbidden = [self.expand_cluster_placeholders(p, clusters) for p in forbidden]
+            required = [self.expand_cluster_placeholders(p, clusters) for p in required]
+            any_of = [self.expand_cluster_placeholders(p, clusters) for p in any_of]
+        if any(_MODEL_PLACEHOLDER.search(p) for p in all_patterns):
+            model = recorded_model()
+            forbidden = [self.expand_model_placeholders(p, model) for p in forbidden]
+            required = [self.expand_model_placeholders(p, model) for p in required]
+            any_of = [self.expand_model_placeholders(p, model) for p in any_of]
+        return forbidden, required, any_of, clusters, model
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -660,7 +760,7 @@ class ReportContainsVerifier(BaseVerifier):
                     success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_UNRESOLVED_ROLES_REASON}: {exc}"
                 )
         try:
-            forbidden_patterns, required_patterns, any_of_patterns, clusters = self._expanded_patterns()
+            forbidden_patterns, required_patterns, any_of_patterns, clusters, model = self._expanded_patterns()
         except KeyError as exc:
             return VerificationResult(
                 success=False, status="error", elapsed_time=time.monotonic() - start,
@@ -729,6 +829,8 @@ class ReportContainsVerifier(BaseVerifier):
                 # can be read against what the agent wrote.
                 resolved = {slot: f"{name} ({location})" if location else name for slot, (name, location) in sorted(clusters.items())}
                 parts.append(f"cluster placeholders resolved to {resolved}")
+            if model is not None and (pattern_hits or pattern_missing or any_of_miss):
+                parts.append(f"model placeholder resolved to {model!r}")
             return VerificationResult(
                 success=False,
                 elapsed_time=time.monotonic() - start,

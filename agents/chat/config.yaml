@@ -471,6 +471,9 @@ plugins:
     # DefaultBuiltInPlugins (platformagent_manifests.go) is only the roster an
     # AgentPlugin may not shadow; keep the two in step.
     - agent_roster
+    # Injects the backing model and provider identity resolved from the profile's
+    # LiteLLM gateway (`model.base_url`) into `[RUNTIME MODEL IDENTITY]`.
+    - model_identity
 
 # Per-file character cap on context files (SOUL.md, AGENTS.md) in the system
 # prompt. Without it Hermes falls back to 20,000 whenever the model window is

@@ -5042,6 +5042,9 @@ func TestIncidentContextStaysABuiltIn(t *testing.T) {
 	if !IsBuiltInPlugin("incident_context") {
 		t.Errorf("incident_context must remain a built-in so an AgentPlugin cannot shadow it")
 	}
+	if !IsBuiltInPlugin("model_identity") {
+		t.Errorf("model_identity must remain a built-in so an AgentPlugin cannot shadow it")
+	}
 }
 
 func TestRenderProfileOverlayYAML(t *testing.T) {

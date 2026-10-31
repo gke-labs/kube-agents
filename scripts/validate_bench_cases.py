@@ -824,6 +824,10 @@ CLUSTER_PLACEHOLDER_ANY = "any"
 # The two lists report_contains expands a placeholder in; every other list on
 # every check (its phrase lists included) is searched or matched as written.
 EXPANDING_PATTERN_KEYS = ("forbidden_patterns", "any_of_patterns")
+EXPANDING_MODEL_PATTERN_KEYS = ("forbidden_patterns", "required_patterns", "any_of_patterns")
+MODEL_PLACEHOLDER = re.compile(r"\{model\}")
+MODEL_PLACEHOLDER_LOOSE = re.compile(r"\{[^}\n]*model[^}\n]*\}", re.IGNORECASE)
+MODEL_PLACEHOLDER_TOKEN = "{model}"
 REPORT_CHECK_TYPE = "report_contains"
 
 
@@ -884,6 +888,42 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
                         )
     for child in node.get("checks") or []:
         _cluster_placeholders(child, where, problems, slots, parked)
+
+
+def _model_placeholders(node: Any, where: str, problems: list[str]) -> None:
+    """Every `{model}` in a check subtree is well-formed and sits in one of
+    `report_contains`'s three pattern lists (`forbidden_patterns`,
+    `required_patterns`, `any_of_patterns`); elsewhere it would be treated as
+    literal text and never match."""
+    if not isinstance(node, dict):
+        return
+    for key, raw in node.items():
+        if isinstance(raw, list):
+            values = raw
+        elif isinstance(raw, dict):
+            values = list(raw.values())
+        else:
+            values = [raw]
+        expands = node.get("type") == REPORT_CHECK_TYPE and key in EXPANDING_MODEL_PATTERN_KEYS
+        for pattern in values:
+            if not isinstance(pattern, str):
+                continue
+            if not expands:
+                if MODEL_PLACEHOLDER_LOOSE.search(pattern):
+                    problems.append(
+                        f"{where}: {key!r} on a {node.get('type')!r} check carries {MODEL_PLACEHOLDER_TOKEN}, "
+                        f"which only {REPORT_CHECK_TYPE} expands, and only in its "
+                        f"{', '.join(repr(k) for k in EXPANDING_MODEL_PATTERN_KEYS)}; elsewhere it is literal text "
+                        "that never matches"
+                    )
+                continue
+            if MODEL_PLACEHOLDER_LOOSE.search(MODEL_PLACEHOLDER.sub("", pattern)):
+                problems.append(
+                    f"{where}: {key!r} carries a malformed model placeholder; the form is "
+                    f"{MODEL_PLACEHOLDER_TOKEN}, lowercase, no spaces"
+                )
+    for child in node.get("checks") or []:
+        _model_placeholders(child, where, problems)
 
 
 def _catalog_roles() -> dict[str, Any]:
@@ -1390,6 +1430,7 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 _check_types(entry["check"], used_types)
                 _fixture_roles(entry["check"], used_roles, slot_roles)
                 _cluster_placeholders(entry["check"], where, problems, _catalog_slots(), name in FIXTURE_NOT_READY)
+                _model_placeholders(entry["check"], where, problems)
 
         # `fixture_roles:` asks whether a role's slot was reached, which the
         # runner records for catalogue roles only; an overlay role with no
