@@ -23,6 +23,11 @@ move those files are still there and the model can no longer see them, which
 from a user's point of view is an upgrade that deleted their work. This copies
 them over once.
 
+**Removal.** ``--remove-profile NAME`` is the layout push's inverse, for a
+profile delete_profile has just removed from the agent pod (#4389): its home
+in the sandbox goes too, and the name is refused while anything of it is left
+on the agent side.
+
 Neither step is fatal on its own. The sandbox is a separate pod with no ordering
 against this one, so "not up yet" is an ordinary outcome; both steps are
 idempotent and the next container start retries. That includes a copy that ran
@@ -1039,7 +1044,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--skeleton-only",
         action="store_true",
-        help="create the directory layout and skip the one-shot migration",
+        help="create the directory layout and skip the one-shot migration; "
+        "--remove-profile also needs it, and creates nothing",
     )
     parser.add_argument(
         "--profile",

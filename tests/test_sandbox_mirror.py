@@ -367,7 +367,9 @@ class RemoveProfile(unittest.TestCase):
                 self.assertEqual(self.removals(), [])
 
     def test_a_name_that_is_not_one_deleted_profile_is_refused(self):
-        for bad in ("../cluster-a", "cluster-a/workspace", ".hidden", ".", "..", "", "platform"):
+        # "no-such/x": nothing exists there and it has no leading dot, so only the
+        # one-component rule refuses it.
+        for bad in ("../cluster-a", "cluster-a/workspace", "no-such/x", ".hidden", ".", "..", "", "platform"):
             with self.subTest(name=bad):
                 # No platform on this volume, so only the fixed-home rule refuses it.
                 code = self.drive("--skeleton-only", "--remove-profile", bad, profiles=("cluster-a",))

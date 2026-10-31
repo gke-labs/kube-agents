@@ -297,6 +297,15 @@ class DeleteProfileTest(unittest.TestCase):
             worker.join(10)
         self.assertEqual(len(entered), 1)
 
+    def test_a_scaffold_without_the_lock_is_refused(self):
+        entered = []
+        (self.home_root / cap.PROFILE_LOCKS_DIRNAME).write_text("a file where the lock dir goes")
+        with mock.patch.object(cap, "_create_profile", lambda *a: entered.append(a) or self.NAME), \
+             redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as refused:
+            cap.create_profile("proj", "clu", "us-east1")
+        self.assertIn("could not take the profile lock", str(refused.exception))
+        self.assertEqual(entered, [])
+
     def test_other_names_do_not_wait(self):
         with cap._profile_lock("cluster-two"):
             worker = threading.Thread(target=self.delete)

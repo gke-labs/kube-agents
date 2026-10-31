@@ -556,7 +556,12 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     for field, value in (("project", project), ("cluster", cluster), ("location", location)):
         _validate(value, field)
     name = profile_name(project, cluster, location)
-    with _profile_lock(name):
+    with _profile_lock(name) as locked:
+        if not locked:
+            # Refused rather than run unlocked: a delete of this name that does hold the
+            # lock could remove the sandbox home this scaffold is about to push and fetch
+            # its kubeconfig into. The reconcile retries a failed scaffold on its next run.
+            raise SystemExit(f"ERROR: could not take the profile lock for '{name}'; not scaffolding it")
         return _create_profile(project, cluster, location, name)
 
 
