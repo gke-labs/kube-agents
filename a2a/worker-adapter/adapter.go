@@ -819,6 +819,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 
 	var (
 		canceled    bool
+		abandoned   bool
 		deadlineHit bool
 		sawResult   bool
 		exited      bool
@@ -965,10 +966,16 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// The dispatcher took the task back (deadline, lease expiry, a
 			// stop) and writes its terminal. Publishing one here too would
 			// put two finals on the task, so the harness is killed and
-			// nothing more goes out.
+			// nothing more goes out. The loop still waits for it to exit and
+			// drain, as cancel does: the worker frees the pod for the next
+			// task when this returns, and nothing of this task's may still be
+			// running then.
+			if abandoned {
+				continue
+			}
+			abandoned = true
 			log.Info("the dispatcher abandoned the task; stopping the harness", "task", a.taskID, "reason", reason)
 			proc.kill(0)
-			return Result{Abandoned: true}, nil
 
 		case <-cancelCh:
 			if canceled {
@@ -1011,6 +1018,8 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	// race, legal per the payload spec), then deadline, then cancel, then
 	// failure with evidence.
 	switch {
+	case abandoned:
+		return Result{Abandoned: true}, nil
 	case sawResult && resultErr == "":
 		return a.completeWith(resultText)
 	case sawResult:
