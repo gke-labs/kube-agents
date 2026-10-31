@@ -129,21 +129,6 @@
   "reference/admin-console.md": {
     "long-sentence": 4
   },
-  "reference/config.md": {
-    "long-paragraph": 8,
-    "long-sentence": 24
-  },
-  "reference/credential-isolation.md": {
-    "banned-word": 1,
-    "antithesis": 1,
-    "long-paragraph": 16,
-    "long-sentence": 42
-  },
-  "reference/cron-jobs.md": {
-    "banned-word": 1,
-    "long-paragraph": 5,
-    "long-sentence": 13
-  },
   "reference/examples.md": {
     "long-sentence": 1
   },
