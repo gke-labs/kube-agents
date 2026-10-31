@@ -3128,6 +3128,17 @@ class ClassAdmissionTest(unittest.TestCase):
         late.thread.join(5)
         self.assertIsNotNone(late.refused)
 
+    def test_an_interactive_request_at_its_cap_is_refused_as_a_slot_with_its_own_reason(self):
+        for executor in (self.executor(), self.budgeted(4)):
+            with self.subTest(admitted=executor.admitted_requests()):
+                self.hold(executor, self.I, executor.class_cap(self.I))
+                late = self.queue(executor, self.I)
+                late.thread.join(5)
+                self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, late.refused.bound)
+                self.assertIn("for background work", str(late.refused))
+                self.assertNotIn("memory budget", str(late.refused))
+                self._release_all()
+
     def test_an_interactive_request_goes_ahead_of_queued_background_ones(self):
         executor = self.executor()
         background = self.hold(executor, self.B, 6)
@@ -3152,17 +3163,29 @@ class ClassAdmissionTest(unittest.TestCase):
         self.assertFalse(second.admitted.is_set())
 
     def test_the_reserve_is_budget_room_as_well_as_slots(self):
-        # The budget admits 4: B = 2, I = 3. With one interactive and one
-        # background request in, a second background request is under its cap
-        # of two, and slots are free, but the budget would then have room for
-        # one more request, not the reserve's two.
+        # The budget admits 4 and binds before the 8 slots: B = 2, I = 3.
+        # Background work takes its two, and the budget's last two admissions
+        # stay free for interactive work although slots are free too.
         executor = self.budgeted(4)
-        self.hold(executor, self.I)
-        self.hold(executor, self.B)
+        self.hold(executor, self.B, 2)
         late = self.queue(executor, self.B)
         late.thread.join(5)
         self.assertEqual(credential_proxy.ADMISSION_BOUND_BACKGROUND, late.refused.bound)
-        self.hold(executor, self.I, 2)  # the reserve is interactive work's
+        self.hold(executor, self.I, 2)
+
+    def test_running_interactive_work_uses_its_own_reserve(self):
+        # Interactive work already running counts against the reserve, not
+        # against the background share: with one interactive request in, two
+        # background requests still fit (1 + 2 + the reserve's unused 1 = 4).
+        executor = self.budgeted(4)
+        self.hold(executor, self.I)
+        self.hold(executor, self.B, 2)
+        self.hold(executor, self.I)
+
+    def test_with_the_budget_on_interactive_work_still_leaves_one_admission_to_background(self):
+        executor = self.budgeted(4)
+        self.hold(executor, self.I, 3)
+        self.hold(executor, self.B)
 
     def test_a_freed_admission_goes_to_interactive_work_first(self):
         # The background request queued first is under its cap, but an

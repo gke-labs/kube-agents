@@ -96,9 +96,10 @@ and each caller routes to the right one.**
   and 4 on Autopilot without bursting (limit clamped to the 1 GiB request). The smaller of the
   two numbers binds.
 - Session role: its own cap of 2, refused at once and not queued (`credential_proxy.py:322`).
-- Admission is one arrival-order queue with a 60 s timeout, then `503 CREDENTIAL_PROXY_BUSY`
-  (`_admit`, `credential_proxy.py:6354`).
-- **No priority.** A caller authenticates with a projected ServiceAccount token. The broker
+- Admission is one queue with a 60 s timeout, then `503 CREDENTIAL_PROXY_BUSY` (`_admit`).
+  Inside it the classes of §4.2 apply: the profile and `scope` roles are background, and every
+  other role is interactive.
+- **No priority inside the shell role.** A caller authenticates with a projected ServiceAccount token. The broker
   learns the workload and a role (shell, chat, a2a-chat, session, watcher, mcp) from it. The
   `caller` field of `Principal` is always `None` (`credential_proxy.py:2182`). Background work
   reaches the broker as the shell role, the same as an interactive command:
@@ -109,7 +110,7 @@ and each caller routes to the right one.**
     the hourly reconcile run through `sandbox_exec` and then the shim. `sandbox_exec` also runs
     the platform MCP server's interactive tools (`platform_mcp_server.py:590`).
 
-  **The broker cannot tell interactive work from background work today.**
+  **The broker cannot tell the shell's interactive work from its background work today.**
 
 ### 2.2 What blocks more replicas [doc, `credential-proxy-single-pod.md` §2 and §3]
 
@@ -871,7 +872,8 @@ on: the sandbox restarts with the variable before an exec replica is ready.
 ## 12. Implementation contract
 
 The names and shapes that the implementation shares. The operator, the broker, the shim and the
-chart will use these exact values; on `main` today, none of them does yet. A Python block in `credential_proxy_client.py` holds the broker's
+chart use these exact values. The broker's priority admission (§4.2) uses the classes, the
+`background` bound and the nice value; the other items arrive with the changes that need them. A Python block in `credential_proxy_client.py` holds the broker's
 and the shim's copies, and `test_exec_tier_contract.py` checks that they match this section.
 
 | Item                  | Value                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |

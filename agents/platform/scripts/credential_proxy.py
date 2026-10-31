@@ -408,7 +408,8 @@ ENV_SCOPE_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SCOPE_MAX_CONCURRENT_COMMA
 #     (P = min(this, B)), so with the defaults (8 admitted, B = 6, P = 4) the
 #     shell and session pods always find two admissions.
 #   * Interactive work holds at most the admitted count less one, so a shell
-#     holding everything it may still leaves one admission for background.
+#     holding everything it may still leaves one admission, in slots and in
+#     budget room, for background work.
 # Operator-unset: the broker default applies, and spec.deployment.env can set
 # it, as it can the session share; the clamp holds whatever value arrives.
 DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS = 4
@@ -759,6 +760,13 @@ ADMISSION_BOUNDS = frozenset(
     {ADMISSION_BOUND_SLOT, ADMISSION_BOUND_BUDGET, ADMISSION_BOUND_REFRESH_LOCK, ADMISSION_BOUND_SESSION,
      ADMISSION_BOUND_PROFILE, ADMISSION_BOUND_SCOPE, ADMISSION_BOUND_BACKGROUND, ADMISSION_BOUND_NONE}
 )
+# What a caller that hung up while queued was waiting for, by the bound that
+# held it, for the hang-up log line.
+HANG_UP_WAITED_FOR = {
+    ADMISSION_BOUND_SLOT: "a slot",
+    ADMISSION_BOUND_BUDGET: "the memory budget",
+    ADMISSION_BOUND_BACKGROUND: "the background share",
+}
 # Priority admission by class (credential-broker-exec-tier.md §4.2, §12). Of
 # the requests one pod admits at once (`CommandExecutor.admitted_requests`),
 # background work may hold all but INTERACTIVE_RESERVE, so a session or shell
@@ -7157,9 +7165,10 @@ class CommandExecutor:
         if max_concurrent_commands < 1:
             raise ValueError(f"{ENV_MAX_CONCURRENT_COMMANDS} must be at least 1")
         self.max_concurrent_commands = max_concurrent_commands
-        # The slots are handed out in arrival order: a request holds a ticket
-        # in this queue while it waits, and only the ticket at the head may
-        # take a free slot. A semaphore would not do -- a waiter whose timed
+        # The slots are handed out in arrival order inside each admission
+        # class: a request holds a ticket in this queue while it waits, and
+        # only the first ticket of its class that may go ahead of the others
+        # (`_ahead_may_be_passed`) may take a free slot. A semaphore would not do -- a waiter whose timed
         # acquire lapses rejoins the wait at the back, so under sustained
         # saturation the caller that had waited longest was as likely to be
         # refused as one that had just arrived.
@@ -7562,9 +7571,11 @@ class CommandExecutor:
             )
 
     def _held_bound(self, takes_slot: bool, saw_slots_full: bool) -> str:
-        """Which bound held a request through its wait: the one rule behind
-        the wait log, the histogram label, the hang-up text, the refusal's
-        bound and the refusal's text, so none of them can split from another.
+        """Which bound held a request through its wait: the rule behind the wait
+        log, the histogram label, the hang-up text, the refusal's bound and the
+        refusal's text, so none of them can split from another. `_admit` puts
+        its class caps ahead of it (`background`, and `slot` for the interactive
+        cap); this decides between the slot cap and the budget.
         A slot-taker that ever found the slot cap full (`saw_slots_full`), or
         that waits with the budget off, was held by the slot cap; any other
         wait, a slot-taker's behind a budget-held queue or a slot-less
@@ -7598,7 +7609,9 @@ class CommandExecutor:
         reservation to fit the budget (`_fits_budget`), in the same queue and
         under the same wait.
 
-        Slots go in arrival order. The wait is woken every
+        Slots go in arrival order inside each admission class (`klass`), with
+        interactive requests ahead of queued background ones and each class
+        held to its cap (`_admit`, §4.2). The wait is woken every
         COMMAND_SLOT_POLL_SECONDS at the latest and `caller`, when given, is
         checked each time: one that has hung up while queued raises
         `CallerHungUp` before anything is started, rather than taking the slot
@@ -7787,18 +7800,21 @@ class CommandExecutor:
         """Whether one more background slot-taker still leaves the budget room
         for the interactive reserve (§4.2: the reserve is budget room as well
         as slots), so a background child cannot take the memory an
-        interactive request needs. The reserve is the admissions the
-        background cap withholds, so a pod too small to reserve two reserves
-        what it can. Always true with the budget off: the cap is then the
-        whole reserve. Called under `_slot_condition`."""
+        interactive request needs. Interactive work already running uses its
+        reserve, so only the part of the reserve it does not use is held back.
+        The reserve is the admissions the background cap withholds, so a pod
+        too small to reserve two reserves what it can. Always true with the
+        budget off: the cap is then the whole reserve. Called under
+        `_slot_condition`."""
         if self.children_budget_bytes is None:
             return True
         reserve = self.admitted_requests() - self.class_cap(CLASS_BACKGROUND)
+        unused_reserve = max(0, reserve - self._slots_by_class[CLASS_INTERACTIVE])
         cost = self._request_cost_bytes(takes_slot=True)
         needed = (
             self._reserved_bytes
             + OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes * self._slots_in_use
-            + cost * (1 + reserve)
+            + cost * (1 + unused_reserve)
         )
         return needed <= self.children_budget_bytes
 
@@ -7813,8 +7829,10 @@ class CommandExecutor:
         klass: str = CLASS_INTERACTIVE,
     ) -> Iterator[None]:
         """Admit one request: a slot if `takes_slot`, and a child memory
-        reservation whenever the budget is on. One arrival-order queue for
-        both kinds, with one exception: a slot-less reserver that fits the
+        reservation whenever the budget is on. One queue for both kinds, in
+        arrival order inside each class (`_ahead_may_be_passed` says when a
+        ticket goes ahead of another class; `klass` caps each class), with one
+        more exception: a slot-less reserver that fits the
         budget is admitted past tickets ahead of it that are all slot-takers
         held by a full slot cap, because it competes with them for nothing.
         Behind a ticket the budget holds, order is kept, since a reserver
@@ -7859,11 +7877,26 @@ class CommandExecutor:
         # by the interactive reserve's budget room: its refusal and its wait
         # then name the background bound, which the shim retries elsewhere.
         held_by_class = False
+        # Set if this interactive slot-taker was ever held by the interactive
+        # cap, the one admission kept for background work. Counted as `slot`,
+        # the bound the shim retries, with its own wording.
+        held_by_interactive_cap = False
 
         def held_bound() -> str:
             if held_by_class:
                 return ADMISSION_BOUND_BACKGROUND
+            if held_by_interactive_cap:
+                return ADMISSION_BOUND_SLOT
             return self._held_bound(takes_slot, saw_slots_full)
+
+        def refusal_text(bound: str) -> str:
+            if held_by_interactive_cap and bound == ADMISSION_BOUND_SLOT:
+                return (
+                    f"the credential proxy keeps one of its {self.admitted_requests()} admissions for "
+                    f"background work, interactive work holds the other {self.class_cap(CLASS_INTERACTIVE)}, "
+                    f"and this request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching one; retry shortly"
+                )
+            return self._refusal_text(takes_slot, bound)
 
         with self._slot_condition:
             self._slot_queue.append(ticket)
@@ -7879,20 +7912,23 @@ class CommandExecutor:
                         break
                     if takes_slot and self._slots_in_use >= self.max_concurrent_commands:
                         saw_slots_full = True
-                    if takes_slot and klass == CLASS_BACKGROUND and not (class_free and reserve_free):
+                    # A class flag only when the class rule alone holds the
+                    # request: a slot is free and the budget fits. On a pod
+                    # whose cap equals the slot cap or the budget, that bound
+                    # keeps its own name.
+                    held_by_class_rule = slot_free and self._fits_budget(takes_slot)
+                    if takes_slot and klass == CLASS_BACKGROUND and not (class_free and reserve_free) and held_by_class_rule:
                         held_by_class = True
+                    if takes_slot and klass == CLASS_INTERACTIVE and not class_free and held_by_class_rule:
+                        held_by_interactive_cap = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         bound = held_bound()
-                        raise CommandSlotUnavailable(self._refusal_text(takes_slot, bound), bound=bound, klass=klass)
+                        raise CommandSlotUnavailable(refusal_text(bound), bound=bound, klass=klass)
                     waited = True
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
-                        held_by_slots = held_bound() == ADMISSION_BOUND_SLOT
-                        raise CallerHungUp(
-                            "the caller disconnected while queued for "
-                            + ("a slot" if held_by_slots else "the memory budget")
-                        )
+                        raise CallerHungUp("the caller disconnected while queued for " + HANG_UP_WAITED_FOR[held_bound()])
                     if yield_when is not None and yield_when():
                         raise AdmissionYielded("another caller needs to go first", queued_at)
                 if takes_slot:
@@ -7932,6 +7968,14 @@ class CommandExecutor:
                         "background request waited %dms for the background share (%d of %d admissions)",
                         waited_ms,
                         self.class_cap(CLASS_BACKGROUND),
+                        self.admitted_requests(),
+                    )
+                elif held_by_interactive_cap:
+                    LOGGER.info(
+                        "interactive request waited %dms for the interactive share (%d of %d admissions; "
+                        "one is kept for background work)",
+                        waited_ms,
+                        self.class_cap(CLASS_INTERACTIVE),
                         self.admitted_requests(),
                     )
                 else:

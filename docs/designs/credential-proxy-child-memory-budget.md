@@ -232,7 +232,11 @@ metric status, the audit record and the site's troubleshooting entry see the sam
 slot refusal, with a different sentence in it. A wait of a second or more logs, as a slot wait does:
 `request waited %dms for memory budget (… MiB in use of … MiB: … MiB reserved for children, … MiB of output allowance for … requests)`, the figure the admission check compares.
 
-The queue keeps arrival order with one exception. A slot-less reserver that fits the budget is
+The queue keeps arrival order inside each admission class: interactive requests go ahead of queued
+background ones, and each class is held to its share
+([`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) §4.2). A slot-less reserver
+is interactive work, so it goes ahead of queued background tickets too. Among the rest there is one
+exception. A slot-less reserver that fits the budget is
 admitted past the tickets ahead of it when every one of them takes a slot and the slots are full:
 those wait on the slot cap, not the budget, and the reserver competes with them for nothing, so
 eight `kubectl logs -f` holding every slot and a ninth exec queued behind them do not keep a forge
@@ -402,7 +406,7 @@ hold, which the second check would need to know first.
 Unit, in `agents/platform/scripts/test_credential_proxy.py`: the budget is derived from the
 variable, from the cgroup file, and disabled when neither is readable or the file says `max`; a
 request waits when the sum would exceed the budget and is admitted when a reservation is
-released; the wait is in arrival order, except that a slot-less reservation that fits passes slot takers
+released; the wait is in arrival order inside a class, except that a slot-less reservation that fits passes slot takers
 the full slot cap holds and keeps its place behind one the budget holds, and drops a caller that
 hangs up while queued; a request
 still waiting at the bound raises `CommandSlotUnavailable` naming the budget, and the exec, vcs
