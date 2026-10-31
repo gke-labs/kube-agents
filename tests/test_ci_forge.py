@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 from tests.testing.common import get_isolated_test_env
@@ -87,7 +88,7 @@ STUB_KUBECTL = textwrap.dedent(
     #!/usr/bin/env bash
     printf 'kubectl %s\\n' "$*" >> "${STUB_CALLS}"
     case "$*" in
-      "port-forward "*) exec sleep 600 ;;
+      "port-forward "*|"--context "*" port-forward "*) exec sleep 600 ;;
       "wait "*|"delete pod "*|"--context "*|"run forge-relay "*) exit 0 ;;
       "config current-context") echo host-ctx; exit 0 ;;
     esac
@@ -453,7 +454,7 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertIn("--image=alpine/socat:1.8.1.3@sha256:", relay)
         self.assertIn(f"TCP-LISTEN:8443,fork,reuseaddr TCP:{FORGE_IP}:443", relay)
         self.assertTrue(self.calls_of("kubectl wait --for=condition=Ready pod/forge-relay"))
-        self.assertTrue(self.calls_of("kubectl port-forward -n default pod/forge-relay --address 127.0.0.1 443:8443"))
+        self.assertTrue(self.calls_of("kubectl --context host-ctx port-forward -n default pod/forge-relay --address 127.0.0.1 443:8443"), "the keeper restarts in the context up recorded")
         pid = int((self.state_dir / "forge-tunnel-pid").read_text().strip())
         os.kill(pid, 0)  # the keeper is alive after up returns: the deploy and the eval use its port-forward
         self.assertEqual((self.state_dir / "forge-tunnel-context").read_text().strip(), "host-ctx", "the context the relay lives in, for down")
@@ -473,10 +474,24 @@ class ForgeScriptTest(unittest.TestCase):
         self.provision()
         self.assertEqual(self.run_forge("up", forge="gitlab-ce").returncode, 0)
         pid = int((self.state_dir / "forge-tunnel-pid").read_text().strip())
+        held = []
+        for _ in range(50):  # the keeper's first port-forward, which down must not orphan
+            held = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split()
+            if held:
+                break
+            time.sleep(0.1)
+        self.assertTrue(held, "the keeper holds a port-forward after up")
         proc = self.run_forge("down", forge="gitlab-ce")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(pid, 0)
+        for gone in [pid, *map(int, held)]:
+            for _ in range(50):  # a killed process is reaped by init, not by this test
+                try:
+                    os.kill(gone, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(gone, 0)
         self.assertNotIn("gitlab.eval.internal", self.hosts.read_text())
         self.assertIn("127.0.0.1 localhost", self.hosts.read_text(), "the rest of the hosts file is left alone")
         self.assertTrue(self.calls_of("kubectl --context host-ctx delete pod forge-relay"), "the relay is deleted in the context up recorded")
