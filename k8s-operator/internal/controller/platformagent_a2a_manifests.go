@@ -6064,10 +6064,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err != nil {
 			return state, err
 		}
-		if hold := calloutHold || busHold; hold {
+		migrationHold := busMigrationHoldsProvision(agent)
+		if hold := calloutHold || busHold || migrationHold; hold {
 			state.jobHeld = true
-			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready and the bus has rolled out",
-				"job", job.Name, "callout", a2aCalloutName(agent), "waitingOnCallout", calloutHold, "waitingOnBus", busHold)
+			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready, the bus has rolled out and no bus migration is under way",
+				"job", job.Name, "callout", a2aCalloutName(agent), "waitingOnCallout", calloutHold, "waitingOnBus", busHold, "waitingOnMigration", migrationHold)
 		} else if err := r.Create(ctx, job); err != nil {
 			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
 		}

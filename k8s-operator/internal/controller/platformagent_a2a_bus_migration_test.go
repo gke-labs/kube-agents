@@ -303,3 +303,54 @@ func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
 	late := newMigrationRig(t, busMigrationGrow, busMigrationConverting, 3, time.Now().Add(-time.Minute))
 	late.pass(busMigrationRollingBack, 1)
 }
+
+// No provision Job is created while a migration runs: on one to three it
+// would create the streams empty ahead of the restore. After the run ends
+// the Job runs as usual.
+func TestAMigrationHoldsTheProvisionJob(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "1-1", Phase: string(busMigrationRestoring),
+		StartedAt: metav1.Now(), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+	agent.Status.BusReplicas = 3
+	// The bus has rolled out, the callout serves: only the migration holds.
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
+		t.Fatal(err)
+	}
+	sts.Spec.Replicas = ptr.To(int32(3))
+	if err := cl.Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
+	sts.Status = appsv1.StatefulSetStatus{ObservedGeneration: sts.Generation + 1, Replicas: 3, ReadyReplicas: 3, UpdatedReplicas: 3, CurrentReplicas: 3}
+	if err := cl.Status().Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs := &batchv1.JobList{}
+	if err := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range jobs.Items {
+		if j.Name == buildA2AProvisionJob(agent).Name {
+			t.Fatalf("the provision Job %s was created while a migration is restoring", j.Name)
+		}
+	}
+	if !state.jobHeld {
+		t.Error("the pass does not report the Job held")
+	}
+	done := a2aTestAgent()
+	done.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Phase: string(busMigrationDone)}
+	if busMigrationHoldsProvision(done) {
+		t.Error("a finished migration still holds the provision Job")
+	}
+}

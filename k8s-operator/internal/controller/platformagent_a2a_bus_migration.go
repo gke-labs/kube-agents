@@ -312,3 +312,14 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 	}
 	return busMigrationReplicas(leg, busMigrationPhase(run.Phase), run.Abandoning), nil
 }
+
+// busMigrationHoldsProvision reports a migration under way, during which the
+// provision Job is not created: on one to three it would create the streams
+// empty on the new cluster ahead of the restore, which then finds every name
+// taken, and on three to one there is nothing for it to do until the bus is
+// one server. Once the run ends, a Job for the bus's new shape runs as usual
+// and finds every stream there.
+func busMigrationHoldsProvision(agent *agentv1alpha1.PlatformAgent) bool {
+	run := agent.Status.BusMigration
+	return run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase))
+}
