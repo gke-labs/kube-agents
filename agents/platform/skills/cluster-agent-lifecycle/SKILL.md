@@ -65,7 +65,7 @@ python3 /opt/data/scripts/cluster_agent_profile.py delete \
   --project "<project>" --cluster "<cluster>" --location "<location>"
 ```
 
-This deregisters the profile and removes its home directory. Do not delete a profile while its cluster still exists.
+This deregisters the profile and removes its home directory, here and in the shell sandbox. Do not delete a profile while its cluster still exists.
 
 To stop managing a cluster that still exists, exclude it instead; the reconcile below recreates a deleted profile for every in-scope cluster. Follow `manage-cluster`, "Stop managing": the exclusion is declared where the install's scope is declared (`SCOPE_EXCLUDE_CLUSTERS` in `install.env` on an install made with `install.sh`, applied with `./upgrade.sh --upgrade-mode=full`), and that section says how to tell the install shapes apart.
 

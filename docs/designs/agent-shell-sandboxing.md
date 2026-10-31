@@ -1386,7 +1386,11 @@ scaffolded later, so a cluster onboarded at 3am does not wait for a pod restart 
 directories. The scaffold passes `--profile <name>` and pushes that home plus the machine
 home and `profiles/platform`, the two roots the sandbox creates bare; the start pushes
 every home. Re-sending every home on every scaffold made onboarding N clusters
-cost O(N²) (#3701). Nothing about it is ordered against the sandbox starting: the Deployment and
+cost O(N²) (#3701). A profile delete runs it the other way: `--remove-profile <name>`
+removes that home from the sandbox once the agent pod's copy is gone, over the same
+SSH hop, and refuses a name that still has anything under the agent pod's `profiles/`.
+Create and delete hold a per-profile lock, so a delete cannot remove the sandbox home a
+concurrent scaffold of the same name has just pushed (#4389). Nothing about it is ordered against the sandbox starting: the Deployment and
 the StatefulSet come up independently, so the script waits for sshd and, failing that,
 leaves the agent pod's files untouched and lets the next start retry.
 
@@ -1652,8 +1656,8 @@ worker on the default profile sends and is silent — the root is matched by val
 a data root with a `profiles` component in its own path is not read as a profile; a name
 that is not one component is refused with a line on stderr; a well-formed name with no
 home here is a profile the mirror has not
-delivered yet, so the wrapper says so and falls back to the cwd. `sandbox_mirror.py` runs
-on the agent pod's start and when a profile is scaffolded, and a card dispatched inside
+delivered yet, so the wrapper says so and falls back to the cwd. `sandbox_mirror.py` pushes
+the layout on the agent pod's start and when a profile is scaffolded, and a card dispatched inside
 that window would otherwise fail the same way with nothing beside the failure to say why.
 Nothing evaluates the value; every use is a quoted expansion.
 

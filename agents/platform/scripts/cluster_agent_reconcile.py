@@ -1609,7 +1609,10 @@ def _exclusive_run():
     apart. Overlapping runs would call `create_profile` and `delete_profile` against
     the same profile home: interleaved read-modify-writes of `config.yaml` and
     `.env`, or an rmtree under a scaffold in progress. The lock lives here rather
-    than in either caller because it has to cover both.
+    than in either caller because it has to cover both. create_profile and
+    delete_profile also hold a per-profile lock of their own, which is what keeps a
+    `create` run outside the reconcile (by hand in the agent pod, or bench seeding)
+    apart from this run's PRUNE of the same name (#4389).
     """
     path = _hermes_home() / RECONCILE_LOCK
     try:
