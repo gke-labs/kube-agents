@@ -2048,11 +2048,11 @@ merged over it, per key, as resolveCredentialProxyResources does in the operator
 carries replaces that number, a key it omits keeps footprint.yaml's -- with one exception
 that follows the API server rather than the operator. The operator renders a CPU and a
 memory request explicitly, so an override that raises only the limit leaves the request where
-the operator put it. It renders no ephemeral-storage request at all: the 2Gi request in
+the operator put it. It renders no ephemeral-storage request at all: the 8Gi request in
 footprint.yaml is the API server defaulting an absent request to the limit
 (scripts/generate_chart_footprint.py models the same rule), and that defaulting follows the
 override's limit, so `limits: {ephemeral-storage: 10Gi}` alone is a 10Gi request too. Summing
-it at 2Gi would pass a quota the pod is then refused on. kube-agents.workloadResources
+it at 8Gi would pass a quota the pod is then refused on. kube-agents.workloadResources
 applies the request-follows-limit rule to every key, which is right for a chart workload
 whose requests the values own and wrong for the two the operator renders, so it is not
 reused here. Takes (dict "workload" <footprint entry> "override" <resources block>) and
@@ -2116,7 +2116,7 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- define "kube-agents.credentialProxyDefaults" -}}
 {{- dict
       "requests" (dict "cpu" "500m" "memory" "1Gi")
-      "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "2Gi")
+      "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "8Gi")
    | toJson -}}
 {{- end }}
 

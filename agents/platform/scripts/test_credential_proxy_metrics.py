@@ -33,6 +33,7 @@ from unittest import mock
 import command_policy
 import credential_proxy
 import scoped_sa_pool
+import vcs_readings
 from credential_proxy import (
     CommandExecutor,
     CredentialProxyHandler,
@@ -1197,32 +1198,152 @@ class VcsRequestCountingTest(_BrokerFixture):
         self.assertEqual(set(credential_proxy.vcs_broker.route_table(mock.Mock())), set(credential_proxy.vcs_broker.VCS_VERBS))
 
 
-class MergedProposalMetricTest(_BrokerFixture):
-    def test_merged_proposals_render_as_one_unlabelled_counter(self):
-        CredentialProxyHandler.metrics.record_merged(2)
-        CredentialProxyHandler.metrics.record_merged(1)
+class ReadingsMetricTest(_BrokerFixture):
+    """The sweep's two readings and its failure counter, as the broker renders them."""
+
+    def outcomes(self, taken_at=None):
+        return vcs_readings.OutcomesReading(
+            open=3, merged=5, closed=2, taken_at=time.time() if taken_at is None else taken_at
+        )
+
+    def details(self, taken_at=None):
+        inf = float("inf")
+        return vcs_readings.DetailsReading(
+            closed_by={"install": 1, "human": 1, "bot": 0},
+            touches={
+                vcs_readings.Touch("review_approved", "human"): 4,
+                vcs_readings.Touch("commit", "bot"): 1,
+            },
+            buckets={
+                "merged": {0.0: 2, 1.0: 3, 2.0: 3, 3.0: 4, 5.0: 4, 8.0: 5, 13.0: 5, 21.0: 5, inf: 5},
+                "closed": {0.0: 1, 1.0: 1, 2.0: 2, 3.0: 2, 5.0: 2, 8.0: 2, 13.0: 2, 21.0: 2, inf: 2},
+            },
+            ignored=1,
+            taken_at=time.time() if taken_at is None else taken_at,
+        )
+
+    def test_set_readings_renders_the_outcomes_and_details_families_as_gauges(self):
+        metrics = CredentialProxyHandler.metrics
+        before = metrics.render()
+        for name in ("kubeagents_vcs_proposals", "kubeagents_vcs_readings_age_seconds", "kubeagents_vcs_readings_failures_total"):
+            self.assertNotIn(name, before, "a family rendered before its first reading")
+        metrics.set_readings(self.outcomes(), self.details())
+        text = metrics.render()
+        families = _parse(text)
+        for state, value in (("open", 3), ("merged", 5), ("closed", 2)):
+            self.assertEqual(value, _series(families, "kubeagents_vcs_proposals", state=state))
+        for actor, value in (("install", 1), ("human", 1), ("bot", 0)):
+            self.assertEqual(value, _series(families, "kubeagents_vcs_proposals_closed_by", actor=actor))
+        self.assertEqual(4, _series(families, "kubeagents_vcs_proposal_touches", kind="review_approved", actor="human"))
+        self.assertEqual(1, _series(families, "kubeagents_vcs_proposal_touches", kind="commit", actor="bot"))
+        per = "kubeagents_vcs_proposal_touches_per_proposal"
+        self.assertEqual(2, _series(families, per, outcome="merged", le="0"))
+        self.assertEqual(4, _series(families, per, outcome="merged", le="3"))
+        self.assertEqual(5, _series(families, per, outcome="merged", le="+Inf"))
+        self.assertEqual(2, _series(families, per, outcome="closed", le="+Inf"))
+        self.assertEqual(9, len([k for k in families[per] if ("outcome", "merged") in k]))
+        self.assertEqual(1, _series(families, "kubeagents_vcs_proposals_ignored"))
+        for reading in ("outcomes", "details"):
+            age = _series(families, "kubeagents_vcs_readings_age_seconds", reading=reading)
+            self.assertIsNotNone(age)
+            self.assertGreaterEqual(age, 0)
+            self.assertLess(age, 60)
+        for name in (
+            "kubeagents_vcs_proposals",
+            "kubeagents_vcs_proposals_closed_by",
+            "kubeagents_vcs_proposal_touches",
+            per,
+            "kubeagents_vcs_proposals_ignored",
+            "kubeagents_vcs_readings_age_seconds",
+        ):
+            self.assertIn(f"# TYPE {name} gauge", text)
+        self.assertNotIn(f"{per}_bucket", text)
+        self.assertNotIn(f"{per}_count", text)
+
+    def test_a_withheld_reading_keeps_the_previous_one(self):
+        metrics = CredentialProxyHandler.metrics
+        metrics.set_readings(self.outcomes(), self.details())
+        metrics.set_readings(vcs_readings.OutcomesReading(open=4, merged=6, closed=2, taken_at=time.time()), None)
         families = self.families()
-        self.assertEqual(3, _series(families, "kubeagents_vcs_proposals_merged_total"))
-        self.assertIn("# TYPE kubeagents_vcs_proposals_merged_total counter", CredentialProxyHandler.metrics.render())
+        self.assertEqual(6, _series(families, "kubeagents_vcs_proposals", state="merged"))
+        self.assertEqual(1, _series(families, "kubeagents_vcs_proposals_ignored"), "a withheld details reading was dropped")
 
-    def test_the_broker_built_for_the_handler_reports_merges_into_its_metrics(self):
-        broker = credential_proxy.build_vcs_broker(CredentialProxyHandler.executor)
-        broker.merge_observer(2)
-        self.assertEqual(2, _series(self.families(), "kubeagents_vcs_proposals_merged_total"))
-        self.assertEqual(credential_proxy.PROCESS_START_TIME_SECONDS, broker.started_at)
-
-    def test_proposals_closed_unmerged_render_as_one_unlabelled_counter(self):
-        CredentialProxyHandler.metrics.record_closed_unmerged(1)
-        CredentialProxyHandler.metrics.record_closed_unmerged(2)
+    def test_a_withheld_outcomes_reading_keeps_the_previous_one(self):
+        # The other half of the rule: a sweep whose tally failed publishes the
+        # details alone, and the last outcomes reading stays served until it
+        # is an hour old, not blanked at once.
+        metrics = CredentialProxyHandler.metrics
+        metrics.set_readings(self.outcomes(), self.details())
+        metrics.set_readings(None, self.details())
         families = self.families()
-        self.assertEqual(3, _series(families, "kubeagents_vcs_proposals_closed_unmerged_total"))
-        self.assertEqual(0, _series(families, "kubeagents_vcs_proposals_merged_total"), "a close moved the merged series")
-        self.assertIn("# TYPE kubeagents_vcs_proposals_closed_unmerged_total counter", CredentialProxyHandler.metrics.render())
+        self.assertEqual(5, _series(families, "kubeagents_vcs_proposals", state="merged"))
+        self.assertIsNotNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="outcomes"))
 
-    def test_the_broker_built_for_the_handler_reports_closes_into_its_metrics(self):
+    def test_an_unknown_failure_reason_is_counted_as_other(self):
+        metrics = CredentialProxyHandler.metrics
+        metrics.record_reading_failure("a-reason-nobody-declared")
+        families = self.families()
+        self.assertEqual(1, _series(families, "kubeagents_vcs_readings_failures_total", reason="other"))
+        labels = {dict(key).get("reason") for key in families["kubeagents_vcs_readings_failures_total"]}
+        self.assertIn("other", labels)
+        self.assertNotIn("a-reason-nobody-declared", labels, "an undeclared reason must never become a label")
+
+    def test_only_the_reading_taken_is_rendered(self):
+        CredentialProxyHandler.metrics.set_readings(self.outcomes(), None)
+        families = self.families()
+        self.assertEqual(5, _series(families, "kubeagents_vcs_proposals", state="merged"))
+        self.assertIsNotNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="outcomes"))
+        self.assertIsNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="details"))
+        for name in ("kubeagents_vcs_proposals_closed_by", "kubeagents_vcs_proposal_touches", "kubeagents_vcs_proposals_ignored"):
+            self.assertNotIn(name, families)
+
+    def test_a_stale_reading_is_omitted_and_its_age_gauge_is_not(self):
+        stale = time.time() - vcs_readings.VCS_READINGS_STALE_SECONDS - 10
+        CredentialProxyHandler.metrics.set_readings(self.outcomes(taken_at=stale), self.details())
+        families = self.families()
+        self.assertNotIn("kubeagents_vcs_proposals", families, "an hour-old outcomes reading was rendered as current")
+        age = _series(families, "kubeagents_vcs_readings_age_seconds", reading="outcomes")
+        self.assertGreaterEqual(age, vcs_readings.VCS_READINGS_STALE_SECONDS)
+        self.assertEqual(1, _series(families, "kubeagents_vcs_proposals_ignored"), "a fresh details reading went with the stale one")
+
+        CredentialProxyHandler.metrics.set_readings(None, self.details(taken_at=stale))
+        families = self.families()
+        for name in (
+            "kubeagents_vcs_proposals_closed_by",
+            "kubeagents_vcs_proposal_touches",
+            "kubeagents_vcs_proposal_touches_per_proposal",
+            "kubeagents_vcs_proposals_ignored",
+        ):
+            self.assertNotIn(name, families)
+        self.assertIsNotNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="details"))
+
+    def test_the_failure_counter_carries_every_reason(self):
+        metrics = CredentialProxyHandler.metrics
+        reasons = ("forge", "identity", "truncated", "detail_truncated", "rate_limited", "warming")
+        for reason in reasons:
+            metrics.record_reading_failure(reason)
+        metrics.record_reading_failure("rate_limited")
+        text = metrics.render()
+        families = _parse(text)
+        self.assertIn("# TYPE kubeagents_vcs_readings_failures_total counter", text)
+        for reason in reasons:
+            expected = 2 if reason == "rate_limited" else 1
+            self.assertEqual(expected, _series(families, "kubeagents_vcs_readings_failures_total", reason=reason))
+        self.assertNotIn("kubeagents_vcs_readings_age_seconds", families, "a failure rendered an age with no reading")
+
+    def test_the_two_old_counters_are_gone(self):
+        metrics = CredentialProxyHandler.metrics
+        metrics.set_readings(self.outcomes(), self.details())
+        text = metrics.render()
+        self.assertNotIn("kubeagents_vcs_proposals_merged_total", text)
+        self.assertNotIn("kubeagents_vcs_proposals_closed_unmerged_total", text)
+        for name in ("VCS_MERGED_METRIC", "VCS_CLOSED_UNMERGED_METRIC"):
+            self.assertFalse(hasattr(credential_proxy, name), name)
+        for name in ("record_merged", "record_closed_unmerged"):
+            self.assertFalse(hasattr(metrics, name), name)
         broker = credential_proxy.build_vcs_broker(CredentialProxyHandler.executor)
-        broker.close_observer(3)
-        self.assertEqual(3, _series(self.families(), "kubeagents_vcs_proposals_closed_unmerged_total"))
+        for name in ("merge_observer", "close_observer", "started_at"):
+            self.assertFalse(hasattr(broker, name), name)
 
 
 class MetricsListenerTest(unittest.TestCase):
@@ -1264,6 +1385,21 @@ class MetricsListenerTest(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as caught:
                     urllib.request.urlopen(self.endpoint + path)
                 self.assertEqual(404, caught.exception.code)
+
+    def test_a_scrape_starts_nothing(self):
+        """The readings are taken on the sweep's timer; a scrape only renders
+        what the last attempt left, so it never starts an attempt or a forge call."""
+        with mock.patch.object(vcs_readings.ReadingsSweep, "run_once", autospec=True) as run_once, \
+                mock.patch.object(vcs_readings.ReadingsSweep, "start", autospec=True) as start, \
+                mock.patch.object(credential_proxy, "sweep_transport_for") as transport_for:
+            before = {thread.name for thread in threading.enumerate()}
+            for _ in range(3):
+                urllib.request.urlopen(self.endpoint + "/metrics").read()
+            after = {thread.name for thread in threading.enumerate()}
+        run_once.assert_not_called()
+        start.assert_not_called()
+        transport_for.assert_not_called()
+        self.assertNotIn(vcs_readings.THREAD_NAME, after - before)
 
     def test_a_scrape_writes_no_access_log_line(self):
         captured = io.StringIO()

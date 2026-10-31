@@ -74,10 +74,11 @@ _DEFAULT_LIMITS_CPU_MILLIS = 10200
 # together with a green `--check` (both sides move at once) and nothing would catch it.
 _DEFAULT_REQUESTS_MEMORY_BYTES = 8896 * 1024**2
 _DEFAULT_LIMITS_MEMORY_BYTES = 23424 * 1024**2
-# Ephemeral-storage requests: the footprint's 5Gi, LiteLLM's 1280Mi per replica (its tmp
-# emptyDir's sizeLimit plus logs) on two replicas, and the cleanup hook's 1088Mi.
+# Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
+# proxy's 8Gi), LiteLLM's 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two
+# replicas, and the cleanup hook's 1088Mi.
 _LITELLM_EPHEMERAL_REQUEST_BYTES = 1280 * 1024**2
-_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (5 * 1024 + 2 * 1280 + 1088) * 1024**2
+_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (11 * 1024 + 2 * 1280 + 1088) * 1024**2
 # The same three additions, because each sets its limit equal to its request.
 _DEFAULT_LIMITS_EPHEMERAL_BYTES = _DEFAULT_REQUESTS_EPHEMERAL_BYTES
 # Cleanup hook Job: 50m requested / 200m limit, 64Mi requested / 128Mi limit, 1 pod.
@@ -140,9 +141,9 @@ _PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 2000
 _PROXY_FLOAT_CPU_LIMIT = 1.5
 _PROXY_FLOAT_CPU_LIMIT_MILLIS = 1500
 # The operator renders no ephemeral-storage request on the proxy, so the API server sets it
-# to the limit: footprint.yaml's 2Gi request is that defaulting, and it follows an override
+# to the limit: footprint.yaml's 8Gi request is that defaulting, and it follows an override
 # of the limit alone.
-_PROXY_EPHEMERAL_LIMIT_BYTES = 2 * 1024**3
+_PROXY_EPHEMERAL_LIMIT_BYTES = 8 * 1024**3
 _PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _PROXY_VALUE = "platformAgent.deployment.credentialProxy.resources"
 
@@ -356,7 +357,7 @@ class PreflightDecisionTest(unittest.TestCase):
         """An override of limits.ephemeral-storage alone is counted as a request of the same size.
 
         The operator renders no ephemeral-storage request, so the API server defaults it to
-        the limit; counting the footprint's 2Gi against a 10Gi limit passes a quota with 2
+        the limit; counting the footprint's 8Gi against a 10Gi limit passes a quota with 8
         to 10Gi of request headroom that then refuses the pod.
         """
         base = self._requirements()
@@ -1224,8 +1225,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small limits.ephemeral-storage quota must fail"
         )
         self.assertIn("  - limits.ephemeral-storage:", res.stderr)
-        # The release's 8768Mi plus one LiteLLM surge Pod's 1280Mi.
-        self.assertIn('"limits.ephemeral-storage":"10048Mi"', res.stderr)
+        # The release's 14912Mi plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"limits.ephemeral-storage":"16192Mi"', res.stderr)
 
     def test_shorthand_cpu_spelling_is_enforced(self) -> None:
         """`cpu` is the shorthand spelling for `requests.cpu` and must be checked."""
@@ -1255,8 +1256,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small ephemeral-storage shorthand quota must fail"
         )
         self.assertIn("  - ephemeral-storage:", res.stderr)
-        # The release's 8768Mi plus one LiteLLM surge Pod's 1280Mi.
-        self.assertIn('"ephemeral-storage":"10048Mi"', res.stderr)
+        # The release's 14912Mi plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"ephemeral-storage":"16192Mi"', res.stderr)
 
     def test_shorthand_storage_spelling_is_enforced(self) -> None:
         """`storage` is the shorthand spelling for `requests.storage`."""
@@ -1331,13 +1332,13 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["dashboard"]["ephemeralStorageBytesLimit"], 0)
         self.assertEqual(op["shellSandbox"]["ephemeralStorageBytesLimit"], 0)
         self.assertEqual(
-            op["credentialProxy"]["ephemeralStorageBytesLimit"], 2 * 1024**3
+            op["credentialProxy"]["ephemeralStorageBytesLimit"], 8 * 1024**3
         )
         self.assertEqual(op["agentPod"]["base"]["ephemeralStorageBytesRequest"], 3 * 1024**3)
         self.assertEqual(op["agentPod"]["dashboard"]["ephemeralStorageBytesRequest"], 0)
         self.assertEqual(op["shellSandbox"]["ephemeralStorageBytesRequest"], 0)
         self.assertEqual(
-            op["credentialProxy"]["ephemeralStorageBytesRequest"], 2 * 1024**3
+            op["credentialProxy"]["ephemeralStorageBytesRequest"], 8 * 1024**3
         )
 
         self.assertEqual(op["storage"]["persistentVolumeClaims"], _OPERATOR_PVC_COUNT)

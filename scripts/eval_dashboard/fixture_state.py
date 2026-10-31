@@ -7,7 +7,7 @@ that would have failed, and this is where it runs on a schedule rather than
 per lease: once an hour the CI health workflow (.github/workflows/ci-health.yml,
 job `fixture-state-scan`) runs it against every pool project and publishes
 `fixture-state.json` beside health.json. health.py reads that file for its
-`fixture_drift` condition and post_health.py puts one line of it in the 9 AM
+`fixture_drift` condition and post_health.py puts one line of it in the 11 AM
 digest (docs/ci-health.md, "The seeded-fleet scan").
 
 Per project, in a temporary directory of its own:

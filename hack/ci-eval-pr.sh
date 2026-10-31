@@ -734,7 +734,7 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
 }
 
 # ─── The cut-off report ──────────────────────────────────────────────────────
-# A Prow deadline (the nightly's 720m, the presubmit's 360m) arrives as
+# A Prow deadline (the nightly's 840m, the presubmit's 360m) arrives as
 # SIGTERM, which the trap below turns into an exit before the suite step ever
 # runs. The nights of 2026-09-18 and 09-21 (builds 2101099042170736640 and
 # 2102186223282950144) had finished 105 and 122 units when it arrived and

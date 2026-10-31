@@ -1525,7 +1525,7 @@ possibly posted, so the gateway logs it as lost, at error, with its first line. 
 route is not there (no gateway subscribed, or the bus unreachable) `a2a notify` exits with
 a third status, nothing posted; the alert path, which has one shot, waits through about
 half a minute of those before giving up. The agent-side callers
-(`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
+(`agents/platform/scripts/chat_notify.py`) switch on `routed_platform()`, `A2A_NOTIFY_PLATFORM` when set, else the projected file; the env is what the operator
 renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, and send to every
 other platform through `hermes send` as before. The kanban notifier's report back to a gateway
 conversation (below), and onboarding's first report into the conversation the user first wrote in,
@@ -1595,30 +1595,38 @@ that makes the operator render the agent's `SLACK_HOME_CHANNEL` and `A2A_NOTIFY_
 CR, else the record" and the switch that arms the gateway's learn ship as one, so no release holds a
 signal nothing answers. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
 switch, `A2A_HOME_CHANNEL_LEARN=true`, which only the operator change that admits the record renders;
-that change merges after the gateway code, never before it. With the switch set, the policy `auto`
-and `homeChannel` empty, the gateway reads the record at boot: a recorded channel is checked again
-with `conversations.info` and adopted, with `reader` re-stamped to the gateway's own image and a stale
-`slack.refused` cleared; one that is shared, archived, not joined, or not a channel id is written to
-`slack.refused` as one of the four words the operator matches, `shared`, `archived`, `not-member` or
-`malformed`, nothing is adopted and the learn is armed, so the first mention that passes replaces the
-channel (one archived after it was learned is the ordinary case); one whose check cannot be made (a
-Slack API error) is adopted in memory for that boot with no re-stamp, so `reader` never claims a check
-that did not happen. An empty record arms the learn: the first verified, top-level channel mention that is not a command, whose
-channel passes the same check, is written once (`slack`, `slack.setBy`, `slack.setAt`, `writer`,
-`reader`), the gateway's notify route is armed on it, and one line in the learning thread names the
-channel; a candidate the check refuses is written to `slack.refused` while the record names no
-channel and does not name that reason already (a write that fails is tried again at the next
-refusal; while a channel is recorded, `slack.refused` describes it, only the boot check writes it,
-and a refused candidate writes nothing) and the next mention may learn; a record another writer
-filled first is adopted after the same check, with `reader` re-stamped, or replaced when that check
+that change merges after the gateway code, never before it. The gateway keeps no copy of the home
+channel. It reads one file, `/etc/a2a/chat-home/slack_home`: the projection of the home channel the
+operator admits (the CR field, else the record), which the operator change that admits the record
+mounts as a directory in the gateway pod; the notify route reads that file once per request, in
+`validate`, and the request posts
+into the channel it read, so a projection that changes while a report posts does not split the report
+across two channels; a value that is not a channel id reads as empty until the operator rewrites it,
+and a directory that is not mounted (an operator older than the projection) reads as absent: no home
+and no learn. The CR's own value, `A2A_SLACK_HOME_CHANNEL`, wins when set and is not checked. A home
+the file named is checked once per post job, on the worker, with `conversations.info` (5 s): a channel
+Slack refuses now (shared, archived, the app not a member, not a channel) is written to `slack.refused`
+beside the record while the record still names it, the post is answered "home channel refused" with
+the word and goes nowhere, and the operator empties the projection; a check that cannot be made posts
+as before and logs once. A post Slack still refuses (`channel_not_found`, `is_archived`,
+`not_in_channel`) is logged with where the value came from. With the switch set, the policy `auto` and `homeChannel`
+empty, a verified, top-level channel mention that is not a command is a candidate only while the file
+names no home, or while the home it names is one Slack now refuses (checked once per such mention
+outside it): its channel is checked with `conversations.info` (a channel id, not shared through
+Slack Connect, not archived, the app a member) and written once (`slack`, `slack.setBy`,
+`slack.setAt`, `writer`; `slack.refused` cleared), and one line in the learning thread names the
+channel; the gateway's own home posts follow within one kubelet sync, about a minute, during which a
+home post is refused as having no home. A candidate the check refuses is written to `slack.refused`
+as one of the four words the operator matches, `shared`, `archived`, `not-member` or `malformed`,
+while the record names no channel and does not name that reason already (a write that fails is tried
+again at the next refusal; while a channel is recorded, a refusal beside it is the post-time check's
+or an older gateway's, and a learn that adopts or replaces the channel clears it) and the next
+mention may learn; a record another writer filled first, or the record of a learn the file has not
+caught up with, is adopted after the same check with no line posted, or replaced when that check
 refuses it; a group direct message is refused without a call and a direct message is never a
-candidate. One hand-reachable
-state exists: `kubectl set env` of that switch on the gateway Deployment survives the operator's
-server-side apply, and the gateway then learns, writes and posts while the agent env stays unrouted
-and `HomeChannelUnset` stays True. `reader` compares the image reference only: under a floating tag
-such as `latest` the same tag can name a different image, which the key cannot tell. `patch` on the
-object is the RBAC bound; data-only merge patches with the read `resourceVersion` as the precondition
-are the gateway's contract.
+candidate. The hand-reachable state, `kubectl set env` of the switch on the gateway Deployment, learns
+nothing without the operator's projection. `patch` on the object is the RBAC bound; data-only merge
+patches with the read `resourceVersion` as the precondition are the gateway's contract.
 
 A conversation request carries no `blocks`; its layout is the `chat` field instead ("Chat messages" under the Slack adapter). A Slack `thread` is `<channel>/<ts>`, admitted only when the channel is the home channel
 and posted on the `ts`, or a bare `ts`, which names no channel, so the gateway checks it only for

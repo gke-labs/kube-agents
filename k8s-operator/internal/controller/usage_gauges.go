@@ -39,6 +39,14 @@ const (
 	// The two cluster gauges' field names, which share one pruning record.
 	usageExportClustersRegistered = "clustersRegistered"
 	usageExportClustersMonitored  = "clustersMonitored"
+	// The six proposal readings' field names (usageReadingSpecs), which share
+	// one pruning record (usageNewerFieldReadings).
+	usageExportRemediationsMerged         = "remediationsMergedTotal"
+	usageExportRemediationsOpen           = "remediationsOpen"
+	usageExportProposalsAuthored          = "proposalsAuthored"
+	usageExportRemediationsClosedUnmerged = "remediationsClosedUnmergedTotal"
+	usageExportProposalHumanTouches       = "proposalHumanTouches"
+	usageExportProposalsMergedUntouched   = "proposalsMergedUntouched"
 	// usageCreatedTimeField is the one time sample that is not status.usage's:
 	// the CR's creation timestamp, so a rule can read an install's age before
 	// anyone has spoken to it. Published beside the phase, outside every hold.
@@ -61,7 +69,8 @@ var usagePhases = []string{pendingPhase, provisioningPhase, readyPhase, degraded
 type usageExportField struct {
 	name string
 	read func(*agentv1alpha1.AgentUsageStatus) (int64, bool)
-	// pointer marks a cluster gauge, whose presence at 0 is a reading.
+	// pointer marks a cluster gauge or a proposal reading, whose presence at
+	// 0 is a reading.
 	pointer bool
 }
 
@@ -90,17 +99,20 @@ var usageExportFields = []usageExportField{
 	{name: "eventsIngestedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.EventsIngestedTotal })},
 	{name: "toolExecutionsTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ToolExecutionsTotal })},
 	{name: "remediationsProposedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.RemediationsProposedTotal })},
-	{name: "remediationsAppliedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.RemediationsAppliedTotal })},
-	{name: "remediationsMergedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.RemediationsMergedTotal })},
 	{name: "chatMessagesInboundTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ChatMessagesInboundTotal })},
 	{name: "toolExecutionsBlockedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ToolExecutionsBlockedTotal })},
 	{name: "brokerFailuresTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.BrokerFailuresTotal })},
 	{name: "chatTurnsErroredTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ChatTurnsErroredTotal })},
 	{name: "backgroundTasksGaveUpTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.BackgroundTasksGaveUpTotal })},
 	{name: "negativeFeedbackTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.NegativeFeedbackTotal })},
-	{name: "remediationsClosedUnmergedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.RemediationsClosedUnmergedTotal })},
 	usageGaugeField(usageExportClustersRegistered, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ClustersRegistered }),
 	usageGaugeField(usageExportClustersMonitored, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ClustersMonitored }),
+	usageGaugeField(usageExportRemediationsMerged, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.RemediationsMergedTotal }),
+	usageGaugeField(usageExportRemediationsOpen, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.RemediationsOpen }),
+	usageGaugeField(usageExportProposalsAuthored, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsAuthored }),
+	usageGaugeField(usageExportRemediationsClosedUnmerged, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.RemediationsClosedUnmergedTotal }),
+	usageGaugeField(usageExportProposalHumanTouches, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalHumanTouches }),
+	usageGaugeField(usageExportProposalsMergedUntouched, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsMergedUntouched }),
 }
 
 type usageExportTimeField struct {
@@ -223,11 +235,19 @@ func usageExportFieldSet(extra []string) map[string]bool {
 }
 
 // usageExportFieldsOfRecord maps one of the poller's per-field pruning records
-// to the exported fields it covers: the cluster gauges share one record, and
-// every other record is named for its field.
+// to the exported fields it covers: the cluster gauges share one record, the
+// six proposal readings another, and every other record is named for its
+// field.
 func usageExportFieldsOfRecord(record string) []string {
-	if record == usageNewerFieldGauges {
+	switch record {
+	case usageNewerFieldGauges:
 		return []string{usageExportClustersRegistered, usageExportClustersMonitored}
+	case usageNewerFieldReadings:
+		fields := make([]string, 0, len(usageReadingSpecs))
+		for _, spec := range usageReadingSpecs {
+			fields = append(fields, spec.field)
+		}
+		return fields
 	}
 	return []string{record}
 }

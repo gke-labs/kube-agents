@@ -712,9 +712,9 @@ githubMinter:
   # KSA the chart renders.
   ksaName: kubeagents-github-minter
   gsaName: kubeagents-github-minter-gsa
-  # The GSA email allowed to request tokens from either scope in the minty
-  # rule (platform-agent-scope and platform-agent-read-scope). Empty
-  # derives kubeagents-platform-gsa@<harness.projectId>.iam.gserviceaccount.com.
+  # The GSA email allowed to request tokens from any of the three scopes in
+  # the minty rule (platform-agent-scope, platform-agent-read-scope and
+  # platform-agent-sweep-scope). Empty derives kubeagents-platform-gsa@<harness.projectId>.iam.gserviceaccount.com.
   allowedServiceAccount: ""
   kms:
     # Defaults mirror terraform/modules/github-minter.
@@ -889,6 +889,10 @@ platformAgent:
       # Friction
       stalledOnboardingDays: 5
       stalledOnboardingSilentDays: 30
+      # The proposal floors and ratios read the forge's readings over 14 days:
+      # proposals closed unmerged, merged, and authored (opened). A fall in
+      # proposals authored within the window removes both proposal ratios
+      # until it leaves the window; see the chart README's upgrade notes.
       proposalsRejectedMin14d: 3
       proposalsDecidedMin14d: 4
       proposalsRejectedRatio: 0.75
@@ -1128,7 +1132,7 @@ platformAgent:
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
     # merges over the operator's defaults (500m CPU and 1Gi requests; 1 CPU,
-    # 2Gi memory and 2Gi ephemeral-storage limits), so
+    # 2Gi memory and 8Gi ephemeral-storage limits), so
     #
     #   credentialProxy:
     #     resources:

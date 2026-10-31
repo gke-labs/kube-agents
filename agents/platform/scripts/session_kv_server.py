@@ -59,6 +59,11 @@ logger = logging.getLogger("session_kv_server")
 # `.env` is agent-writable (`save_env_value`), and `load_dotenv` adds any key the
 # container env lacks, which on an install that did not opt in is exactly these.
 _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST",)
+# The home channel a today-era `/sethome` or first chat mirrored into that
+# `.env` (Hermes' persist_home_channel). Under `next` with the operator's
+# projection mounted, the projected file is the channel the gateway posts
+# into, so the mirror must not fill the key the container env lacks.
+_PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
 
 
 def _load_dotenv_ignoring_operator_switches(path: str) -> None:
@@ -79,6 +84,9 @@ def _load_dotenv_ignoring_operator_switches(path: str) -> None:
             continue
         if key in _OPERATOR_ONLY_ENV_KEYS:
             logger.info(f"Ignoring operator-only switch {key} in {path}")
+            continue
+        if key in _PROJECTED_HOME_ENV_KEYS and chat_notify.home_file()[1]:
+            logger.info(f"Ignoring {key} in {path}: the operator projects the home channel")
             continue
         if key not in os.environ:
             os.environ[key] = val
@@ -2215,11 +2223,19 @@ def _slack_home_channel() -> str:
 
     Environment first, so an install whose CR sets the channel resolves exactly
     as it did before; the files are consulted only when it is absent, which is
-    the case that was broken.
+    the case that was broken. Under `spec.mode: next` a channel the gateway
+    learned is never rendered into the pod: the operator projects it into a
+    file the kubelet refreshes in place (chat_notify.home_file). A mounted file
+    decides, empty or not, so this answer is the channel the gateway posts
+    into; the config files `/sethome` writes in today mode count only where no
+    file is mounted, since the data volume keeps them across a mode switch.
     """
     env = os.environ.get("SLACK_HOME_CHANNEL", "").strip()
     if env:
         return env
+    projected, mounted = chat_notify.home_file()
+    if mounted:
+        return projected
     for path in (MANAGED_CONFIG_PATH, CONFIG_PATH):
         value = _platform_setting_in(path, "slack", "home_channel")
         if value:
@@ -2252,8 +2268,9 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
-    One thing outranks all three: the platform the operator names in
-    ``A2A_NOTIFY_PLATFORM`` (chat_notify.py). Under ``spec.mode: next`` the
+    One thing outranks all three: the platform ``chat_notify.routed_platform()``
+    names, from ``A2A_NOTIFY_PLATFORM`` or the projected home-channel file. Under
+    ``spec.mode: next`` the
     managed scope says that platform's Hermes consumer is off because the A2A
     gateway holds the backend, and posts to it go through the gateway instead,
     so it is still a platform this install posts to. The operator renders the
@@ -2302,7 +2319,8 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
 
     Checks `chat_notify.routes(name)` first so `spec.mode: next` installs where
     the operator renders `platforms.<p>.enabled: false` into `/etc/hermes/config.yaml`
-    while routing notifications through `A2A_NOTIFY_PLATFORM` resolve that
+    while routing notifications through the gateway (`A2A_NOTIFY_PLATFORM` or the
+    projected home-channel file) resolve that
     platform as enabled in both `enabled_chat_platforms` and `_chat_platforms_disabled`.
     """
     from_managed = _platforms_enabled_in(MANAGED_CONFIG_PATH)
@@ -2339,7 +2357,7 @@ def _chat_platforms_disabled() -> bool:
 
     On a chat-less install (`install.sh` chat choice "None", or a CR with
     `googleChat.enabled: false` and `slack.enabled: false` and no routed
-    `A2A_NOTIFY_PLATFORM`), `renderConfigYAML` emits `enabled: false` for both
+    platform), `renderConfigYAML` emits `enabled: false` for both
     platforms in `/etc/hermes/config.yaml`. `enabled_chat_platforms` falls back
     to `DEFAULT_CHAT_PLATFORM` when nothing resolves so legacy callers never
     address an empty string; this helper uses the same `_resolve_chat_platforms`
