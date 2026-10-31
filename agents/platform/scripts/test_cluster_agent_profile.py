@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import yaml
 import sys
 import tempfile
@@ -182,6 +183,127 @@ class PushSandboxLayoutTest(unittest.TestCase):
             self.push()
         run.assert_not_called()
 
+
+
+class RemoveSandboxLayoutTest(PushSandboxLayoutTest):
+    """delete_profile's half of the mirror: the same script, the same bounds (#4389)."""
+
+    def push(self):
+        with redirect_stderr(io.StringIO()) as err:
+            cap._remove_sandbox_layout("cluster-one")
+        return err.getvalue()
+
+    def test_the_mirror_call_is_bounded(self):
+        with mock.patch.object(subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, "", "")
+            self.push()
+        self.assertEqual(run.call_args.kwargs["timeout"], cap.SANDBOX_MIRROR_TIMEOUT_SECONDS)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[1], str(self.mirror))
+        self.assertIn("--skeleton-only", argv)
+        self.assertEqual(argv[argv.index("--remove-profile") + 1], "cluster-one")
+        self.assertNotIn("--profile", argv)
+        self.assertLess(float(argv[argv.index("--wait") + 1]), cap.SANDBOX_MIRROR_TIMEOUT_SECONDS)
+
+    def test_a_mirror_that_hangs_does_not_fail_the_scaffold(self):
+        timed_out = subprocess.TimeoutExpired(cmd=[str(self.mirror)], timeout=cap.SANDBOX_MIRROR_TIMEOUT_SECONDS)
+        with mock.patch.object(subprocess, "run", side_effect=timed_out):
+            self.assertIn("could not remove the profile layout", self.push())
+
+    def test_a_mirror_that_exits_non_zero_does_not_fail_the_scaffold(self):
+        failed = subprocess.CalledProcessError(1, [str(self.mirror)], "", "no route")
+        with mock.patch.object(subprocess, "run", side_effect=failed):
+            self.assertIn("could not remove the profile layout", self.push())
+
+
+class DeleteProfileTest(unittest.TestCase):
+    """A delete removes the sandbox home too, and never a live profile's (#4389)."""
+
+    NAME = "cluster-one"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.home_root = self.tmp / "data"
+        self.home = self.home_root / "profiles" / self.NAME
+        (self.home / "workspace").mkdir(parents=True)
+        for attr, value in (("HERMES_HOME", self.home_root), ("PROFILES_BASE", self.home_root / "profiles")):
+            original = getattr(cap, attr)
+            setattr(cap, attr, value)
+            self.addCleanup(setattr, cap, attr, original)
+        self.removed = []
+        for target, replacement in (
+            ("_remove_sandbox_layout", self.removed.append),
+            # `hermes profile delete` is tolerated failing; here it is absent.
+            ("HERMES_BIN", str(self.tmp / "no-hermes")),
+        ):
+            patcher = mock.patch.object(cap, target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def delete(self):
+        with redirect_stderr(io.StringIO()):
+            cap.delete_profile(self.NAME)
+
+    def test_a_delete_removes_the_home_here_and_then_in_the_sandbox(self):
+        self.delete()
+        self.assertFalse(self.home.exists())
+        self.assertEqual(self.removed, [self.NAME])
+
+    def test_a_home_still_here_after_the_delete_keeps_its_sandbox_home(self):
+        # rmtree(ignore_errors=True) can leave the home behind; whatever is left, the
+        # profile is not gone, and its sandbox home is not this code's to remove.
+        with mock.patch.object(cap.shutil, "rmtree", lambda *a, **k: None):
+            self.delete()
+        self.assertTrue(self.home.exists())
+        self.assertEqual(self.removed, [])
+
+    def test_without_the_lock_the_sandbox_home_stays(self):
+        # A stale skeleton costs disk; a removed live one costs a profile its kubeconfig.
+        (self.home_root / cap.PROFILE_LOCKS_DIRNAME).write_text("a file where the lock dir goes")
+        self.delete()
+        self.assertFalse(self.home.exists())
+        self.assertEqual(self.removed, [])
+
+    def test_a_delete_waits_for_a_scaffold_of_the_same_name(self):
+        # Held here as create_profile holds it: the delete must not touch either home
+        # until the scaffold is done, or it removes the sandbox home the scaffold's
+        # kubeconfig is about to land in.
+        started = threading.Event()
+        worker = threading.Thread(target=lambda: (started.set(), self.delete()))
+        with cap._profile_lock(self.NAME) as locked:
+            self.assertTrue(locked)
+            worker.start()
+            started.wait(5)
+            worker.join(0.5)
+            self.assertTrue(worker.is_alive(), "the delete ran while a scaffold held the lock")
+            self.assertTrue(self.home.exists())
+            self.assertEqual(self.removed, [])
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.removed, [self.NAME])
+
+    def test_a_scaffold_waits_for_a_delete_of_the_same_name(self):
+        entered = []
+        with mock.patch.object(cap, "_create_profile", lambda *a: entered.append(a) or self.NAME), \
+             mock.patch.object(cap, "TEMPLATE_DIR", self.tmp):
+            worker = threading.Thread(target=cap.create_profile, args=("proj", "clu", "us-east1"))
+            name = cap.profile_name("proj", "clu", "us-east1")
+            with cap._profile_lock(name):
+                worker.start()
+                worker.join(0.5)
+                self.assertTrue(worker.is_alive(), "the scaffold ran while a delete held the lock")
+                self.assertEqual(entered, [])
+            worker.join(10)
+        self.assertEqual(len(entered), 1)
+
+    def test_other_names_do_not_wait(self):
+        with cap._profile_lock("cluster-two"):
+            worker = threading.Thread(target=self.delete)
+            worker.start()
+            worker.join(10)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(self.removed, [self.NAME])
 
 # --- The runtime scaffold path --------------------------------------------------
 #

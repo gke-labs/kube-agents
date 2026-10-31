@@ -302,6 +302,140 @@ class OneProfile(unittest.TestCase):
                 self.assertTrue(any("not a profile directory" in m for m in self.logged))
 
 
+
+class RemoveProfile(unittest.TestCase):
+    """--remove-profile: a deleted profile's home leaves the sandbox too (#4389)."""
+
+    def drive(self, *extra, profiles=("platform", "cluster-a"), prepare=lambda root: None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        build_home(root, profiles=profiles)
+        prepare(root)
+        config = root / "managed.yaml"
+        config.write_text("terminal:\n  backend: ssh\n  ssh_host: sandbox.invalid\n")
+        self.commands = []
+        self.pushed = []
+        self.logged = []
+
+        def remote(ssh, command, check=True):
+            self.commands.append(command)
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        patches = [
+            unittest.mock.patch.object(sm, "remote", remote),
+            unittest.mock.patch.object(sm, "wait_for_sandbox", lambda *a, **k: True),
+            unittest.mock.patch.object(sm, "push_skeleton", lambda ssh, rr, homes: self.pushed.append(homes)),
+            unittest.mock.patch.object(sm, "push_cluster_identities", lambda *a, **k: self.pushed.append("identities")),
+            unittest.mock.patch.object(sm, "log", self.logged.append),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return sm.main(["--agent-home", str(root), "--config", str(config), *extra])
+
+    def removals(self):
+        return [c for c in self.commands if c.startswith("rm ")]
+
+    def test_a_deleted_profile_s_home_is_removed_and_nothing_is_pushed(self):
+        code = self.drive("--skeleton-only", "--remove-profile", "cluster-gone")
+        self.assertEqual(code, sm.EXIT_OK)
+        self.assertEqual(self.removals(), ["rm -rf -- /opt/data/profiles/cluster-gone"])
+        self.assertEqual(self.pushed, [])
+
+    def test_a_profile_that_still_exists_keeps_its_sandbox_home(self):
+        # The race the profile lock closes, refused here as well: a scaffold of the
+        # same name has recreated the home, and its kubeconfig lands in the sandbox one.
+        code = self.drive("--skeleton-only", "--remove-profile", "cluster-a")
+        self.assertEqual(code, sm.EXIT_RETRY)
+        self.assertEqual(self.removals(), [])
+        self.assertTrue(any("left in place" in m for m in self.logged), self.logged)
+
+    def test_anything_left_under_the_name_counts_as_still_there(self):
+        # lexists, not is_dir: a file, or a dangling symlink, is still a name in use.
+        leftovers = {
+            "file": lambda path: path.write_text("x"),
+            "dangling symlink": lambda path: path.symlink_to(path.parent / "nowhere"),
+        }
+        for kind, make in leftovers.items():
+            with self.subTest(leftover=kind):
+                code = self.drive(
+                    "--skeleton-only", "--remove-profile", "cluster-x",
+                    prepare=lambda root: make(root / "profiles" / "cluster-x"),
+                )
+                self.assertEqual(code, sm.EXIT_RETRY)
+                self.assertEqual(self.removals(), [])
+
+    def test_a_name_that_is_not_one_deleted_profile_is_refused(self):
+        for bad in ("../cluster-a", "cluster-a/workspace", ".hidden", ".", "..", "", "platform"):
+            with self.subTest(name=bad):
+                # No platform on this volume, so only the fixed-home rule refuses it.
+                code = self.drive("--skeleton-only", "--remove-profile", bad, profiles=("cluster-a",))
+                self.assertEqual(code, sm.EXIT_RETRY)
+                self.assertEqual(self.removals(), [])
+
+    def test_removal_is_its_own_mode(self):
+        for extra in (("--remove-profile", "cluster-gone"),
+                      ("--skeleton-only", "--remove-profile", "cluster-gone", "--profile", "cluster-a")):
+            with self.subTest(extra=extra):
+                self.assertEqual(self.drive(*extra), sm.EXIT_RETRY)
+                self.assertEqual(self.removals(), [])
+                self.assertEqual(self.pushed, [])
+
+
+class RemoveProfileOnDisk(unittest.TestCase):
+    """The removal and the next full layout push, on a real filesystem with `sh -c` as the hop."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        self.agent = root / "agent"
+        self.sandbox = root / "sandbox"
+        self.agent.mkdir()
+        self.sandbox.mkdir()
+        (self.sandbox / sm.SANDBOX_MARKER).write_text("")
+        build_home(self.agent, profiles=("platform", "cluster-a", "cluster-b"))
+        self.config = root / "managed.yaml"
+        self.config.write_text("terminal:\n  backend: ssh\n  ssh_host: sandbox.invalid\n")
+        patches = [
+            unittest.mock.patch.object(sm, "ssh_base_command", lambda terminal: ["sh", "-c"]),
+            unittest.mock.patch.object(sm, "wait_for_sandbox", lambda *a, **k: True),
+            unittest.mock.patch.object(sm, "log", lambda message: None),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def mirror(self, *extra):
+        return sm.main(["--agent-home", str(self.agent), "--remote-root", str(self.sandbox),
+                        "--config", str(self.config), "--skeleton-only", *extra])
+
+    def test_after_a_delete_the_layout_push_leaves_no_directory_for_the_profile(self):
+        self.assertEqual(self.mirror(), sm.EXIT_OK)
+        self.assertTrue((self.sandbox / "profiles" / "cluster-b" / "workspace").is_dir())
+
+        # delete_profile's order: the agent's home first, then the sandbox's.
+        import shutil
+
+        shutil.rmtree(self.agent / "profiles" / "cluster-b")
+        self.assertEqual(self.mirror("--remove-profile", "cluster-b"), sm.EXIT_OK)
+        # The entrypoint's start-time pass, every home on the volume.
+        self.assertEqual(self.mirror(), sm.EXIT_OK)
+
+        self.assertFalse(os.path.lexists(self.sandbox / "profiles" / "cluster-b"))
+        self.assertTrue((self.sandbox / "profiles" / "cluster-a" / "workspace").is_dir())
+        self.assertTrue((self.sandbox / "profiles" / "platform" / "workspace").is_dir())
+
+    def test_a_home_the_model_swapped_for_a_symlink_is_unlinked_not_followed(self):
+        precious = self.sandbox / "profiles" / "cluster-a"
+        precious.mkdir(parents=True)
+        (precious / "kubeconfig").write_text("live")
+        (self.sandbox / "profiles" / "cluster-gone").symlink_to(precious)
+        sm.remove_profile_homes(["sh", "-c"], str(self.sandbox), ["profiles/cluster-gone"])
+        self.assertFalse(os.path.lexists(self.sandbox / "profiles" / "cluster-gone"))
+        self.assertEqual((precious / "kubeconfig").read_text(), "live")
+
 class Candidates(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

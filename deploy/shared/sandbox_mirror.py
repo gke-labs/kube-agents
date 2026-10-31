@@ -629,6 +629,45 @@ def named_profile_homes(agent_home: Path, names: list[str]) -> tuple[list[str], 
     return homes, rejected
 
 
+def removable_profile_homes(agent_home: Path, names: list[str]) -> tuple[list[str], list[str]]:
+    """The homes for ``--remove-profile``: (profiles/<name> for each deleted profile, the rest).
+
+    The inverse of named_profile_homes: a name qualifies only when nothing is
+    left of it under the agent's profiles/, so a profile that still exists --
+    one a concurrent scaffold has just recreated -- never loses its sandbox
+    home to this. The same single-component rule, and never a fixed home: the
+    platform profile is a mount point the sandbox's own entrypoint creates.
+    """
+    homes: list[str] = []
+    rejected: list[str] = []
+    for name in names:
+        rel = f"{PROFILES_DIR}/{name}"
+        if (
+            not name
+            or "/" in name
+            or name.startswith(".")
+            or rel in FIXED_HOMES
+            or os.path.lexists(agent_home / PROFILES_DIR / name)
+        ):
+            rejected.append(name)
+        else:
+            homes.append(rel)
+    return homes, rejected
+
+
+def remove_profile_homes(ssh: list[str], remote_root: str, homes: list[str]) -> None:
+    """Remove each deleted profile's home from the sandbox, in one remote call.
+
+    Over the same SSH hop and account the skeleton push uses, so the sandbox
+    side gains no new route and this can remove nothing the model in the
+    sandbox could not remove itself. No trailing slash on any path: a home the
+    model replaced with a symlink is unlinked, and what it points at is left.
+    """
+    targets = " ".join(shlex.quote(f"{remote_root}/{home}") for home in homes)
+    remote(ssh, f"rm -rf -- {targets}")
+    log(f"removed {len(homes)} deleted profile home(s) from the sandbox: {', '.join(homes)}")
+
+
 def push_skeleton(ssh: list[str], remote_root: str, homes: list[str]) -> None:
     """Make every home's working directories exist, whatever is there now.
 
@@ -1011,6 +1050,14 @@ def main(argv: list[str] | None = None) -> int:
         "Without it every home is pushed, as the entrypoint does at start",
     )
     parser.add_argument(
+        "--remove-profile",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="remove this deleted profile's home from the sandbox (repeatable); refused for "
+        "a profile that still exists on the agent's volume. Pushes and migrates nothing",
+    )
+    parser.add_argument(
         "--force-migrate",
         action="store_true",
         help="migrate even if the sandbox already carries the marker",
@@ -1036,7 +1083,25 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     ssh = ssh_base_command(terminal)
-    if args.profile:
+    removing: list[str] = []
+    if args.remove_profile:
+        # Its own mode: a removal that also pushed or migrated would be two
+        # decisions in one call. EXIT_RETRY on every refusal, as for --profile:
+        # only delete_profile passes this, and it reads non-zero as "not removed".
+        if args.profile or not args.skeleton_only:
+            log("--remove-profile needs --skeleton-only and no --profile; refusing")
+            return EXIT_RETRY
+        removing, rejected = removable_profile_homes(agent_home, args.remove_profile)
+        if rejected:
+            log(
+                f"not a deleted profile (one path component, no leading dot, not a fixed "
+                f"home, and nothing left under {agent_home / PROFILES_DIR}): "
+                f"{', '.join(rejected)}; left in place"
+            )
+        if not removing:
+            return EXIT_RETRY
+        homes = []
+    elif args.profile:
         # The migration reads every home, so a partial set there would copy part
         # of the model's files and then write the marker that stops the rest.
         # EXIT_RETRY, not EXIT_OK, on both refusals here: the scaffold reads a zero
@@ -1056,6 +1121,10 @@ def main(argv: list[str] | None = None) -> int:
         homes = fixed + [h for h in named if h not in fixed]
     else:
         homes = home_relative_paths(agent_home)
+
+    if args.dry_run and removing:
+        print(json.dumps({"would_remove": removing}, indent=2, sort_keys=True))
+        return EXIT_OK
 
     if args.dry_run:
         include, skipped = migration_candidates(agent_home, homes)
@@ -1098,6 +1167,14 @@ def main(argv: list[str] | None = None) -> int:
             "removed from it. Refusing to write, and leaving it for the next start."
         )
         return EXIT_RETRY
+
+    if removing:
+        try:
+            remove_profile_homes(ssh, args.remote_root, removing)
+        except RuntimeError as exc:
+            log(f"could not remove {', '.join(removing)} from the sandbox: {exc}; left in place")
+            return EXIT_RETRY
+        return EXIT_OK
 
     # Not fatal, and this is the one call where that distinction earns its keep.
     # The sandbox has no start ordering against this pod, so it can be
