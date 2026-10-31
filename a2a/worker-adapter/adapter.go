@@ -778,6 +778,17 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	return turnOutcome{res: res, err: err, launched: true, harnessSession: a.harnessSession}
 }
 
+// evictedReason is the terminal's reason when the pod is stopped mid-task.
+// A profile worker is stopped by a rollout or a scale-down of its pool,
+// which the requester can't see, so its text says so and that the task can
+// be sent again.
+func (a *adapter) evictedReason() string {
+	if a.dispatched {
+		return "reason: worker-evicted - the task was interrupted because its worker restarted (an upgrade or a scale-down); it can be resubmitted"
+	}
+	return "reason: worker-evicted - infrastructure delivered SIGTERM before the task finished"
+}
+
 // dispatchedOr is check's refusal for a task that came through the stream,
 // and "" for a dispatched one, whose grant the dispatcher already checked.
 func (a *adapter) dispatchedOr(check func(context.Context, *nats.Conn, *lib.Envelope) string, ctx context.Context, origin *lib.Envelope) string {
@@ -1003,7 +1014,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				return a.completeWith(resultText)
 			}
 			state := lib.StateFailed
-			err := a.finalize(state, "reason: worker-evicted - infrastructure delivered SIGTERM before the task finished", resultText)
+			err := a.finalize(state, a.evictedReason(), resultText)
 			return Result{State: state, Evicted: true}, err
 
 		case reap := <-waitDone:

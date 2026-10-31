@@ -661,3 +661,33 @@ func TestALateConfirmRunsNothing(t *testing.T) {
 		t.Errorf("%d events for a task confirmed too late to finish", len(evs))
 	}
 }
+
+// A dispatched task cut short by its worker stopping says why, and that it
+// can be resubmitted: a rollout or a scale-down the requester can't see.
+func TestAnInterruptedTaskSaysItCanBeResubmitted(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startProfileWorker(t, ctx, profileWorkerConfig(t, url, stub(t, `
+echo '{"type":"system","subtype":"init","session_id":"pw-evict"}'
+read first || exit 1
+sleep 30
+`)), false)
+	const task = "task-evicted"
+	d.offer(task, profileSubmission(t, task, "long", nil), 5)
+	d.nextAccept(5 * time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
+	waitState(t, testClient(t, url), pwProfile, task, lib.StateWorking)
+	cancel() // SIGTERM
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the worker didn't stop")
+	}
+	events := replayEvents(t, url, pwProfile, task)
+	last := statusOf(t, events[len(events)-1])
+	if !last.Final || last.Status.State != lib.StateFailed || last.Status.Message == nil ||
+		!strings.Contains(last.Status.Message.Parts[0].Text, "can be resubmitted") {
+		t.Errorf("the interrupted task's terminal %+v; want failed, saying it can be resubmitted", last)
+	}
+}
