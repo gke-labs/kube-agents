@@ -657,3 +657,32 @@ func parseGoMemLimit(v string) (int64, error) {
 	}
 	return n * mult, nil
 }
+
+// The chart's quota preflight counts the MCP pod at the console's size when
+// operator.extraEnv sets A2A_MCP_DOOR (#3869): the pod is behind that flag,
+// so no golden renders it and the footprint has no entry of its own for it.
+// That only holds while the two containers ask for the same, so this pins it:
+// resizing either without the other fails here, not as a pod a namespace
+// quota refuses after the preflight passed.
+func TestTheMCPPodIsSizedLikeTheConsole(t *testing.T) {
+	agent := a2aTestAgent()
+	mcp := buildA2AMCPDeployment(agent).Spec.Template.Spec.Containers[0].Resources
+	console := buildA2AConsoleDeployment(agent).Spec.Template.Spec.Containers[0].Resources
+	for _, side := range []struct {
+		name      string
+		mcp, cons corev1.ResourceList
+	}{{"requests", mcp.Requests, console.Requests}, {"limits", mcp.Limits, console.Limits}} {
+		if len(side.mcp) != len(side.cons) {
+			t.Errorf("%s: MCP declares %v, console %v; the preflight counts the MCP at the console's size", side.name, side.mcp, side.cons)
+			continue
+		}
+		for name, want := range side.cons {
+			if got, ok := side.mcp[name]; !ok || got.Cmp(want) != 0 {
+				t.Errorf("%s %s: MCP %v, console %v; the preflight counts the MCP at the console's size", side.name, name, got.String(), want.String())
+			}
+		}
+	}
+	if lim := mcp.Limits.Cpu(); lim.IsZero() {
+		t.Errorf("MCP declares no CPU limit; a namespace ResourceQuota on limits.cpu refuses it")
+	}
+}

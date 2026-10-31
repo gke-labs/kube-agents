@@ -103,9 +103,14 @@ const (
 	a2aMCPStartupFailure = 60
 
 	// Sized like the console: GKE Autopilot raises a CPU request under 50m.
+	// The chart's quota preflight counts this pod at the console's size when
+	// A2A_MCP_DOOR is set (#3869), so the two are held equal by
+	// TestTheMCPPodIsSizedLikeTheConsole. The CPU limit is there because a
+	// namespace ResourceQuota on limits.cpu refuses a container with none.
 	a2aMCPCPURequest    = "50m"
 	a2aMCPMemoryRequest = "64Mi"
 	a2aMCPMemoryLimit   = "128Mi"
+	a2aMCPCPULimit      = "500m"
 )
 
 // a2aMCPGoMemLimit is the MCP container's GOMEMLIMIT: a2aMCPGoMemLimitPercent
@@ -249,6 +254,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 								corev1.ResourceMemory: resource.MustParse(a2aMCPMemoryRequest),
 							},
 							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse(a2aMCPCPULimit),
 								corev1.ResourceMemory: resource.MustParse(a2aMCPMemoryLimit),
 							},
 						},
