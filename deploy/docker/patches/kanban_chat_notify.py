@@ -82,7 +82,8 @@ they can: instead of ``chat.postMessage``/``chat.update`` they compose the same
 state into a chat message (``agents/platform/scripts/chat_message.py``) and
 hand it to :meth:`ChatNotifyAdapter.send_chat`, with an ``update`` key for a
 message that is edited in place (the thread's plan, a card's question, the
-alert). :meth:`ChatNotifyAdapter.send` forwards both as ``a2a notify
+alert; the gateway edits by key in a conversation, and posts anew in a
+home-channel thread). :meth:`ChatNotifyAdapter.send` forwards both as ``a2a notify
 --chat-file`` and ``--update``; the text stays the fallback, and a gateway that
 does not read them posts the text. A failure wake's reply with a Try again
 offer (``slack_ux_failure.chat_for``) is laid out the same way.
@@ -230,6 +231,24 @@ def _on_event_loop() -> bool:
     except RuntimeError:
         return False
     return True
+
+
+def _chat_ux_platforms() -> tuple:
+    """The platforms whose cards the stand-in lays out (kanban_notifier.CHAT_UX_PLATFORMS).
+
+    A stand-in exists only where the gateway serves the platform, so a Google
+    Chat one is always under ``spec.mode: next``, where the gateway renders the
+    message. Read when a send runs, as the notifier module is elsewhere; an
+    image without it lays out Slack's alone, as before.
+    """
+    try:
+        try:
+            from gateway import kanban_notifier
+        except ImportError:  # Unit tests import the patch modules flat.
+            import kanban_notifier
+        return tuple(kanban_notifier.CHAT_UX_PLATFORMS)
+    except Exception:  # noqa: BLE001 - presentation must not fail a delivery
+        return (SLACK_PLATFORM,)
 
 
 def routed_platform() -> str:
@@ -598,7 +617,7 @@ def _folds_into_row(conn: Any, sub: dict) -> bool:
         except ImportError:  # Unit tests import the patch modules flat.
             import kanban_notifier
             import kanban_progress_lines
-        if not kanban_notifier.slack_ux_on(sub.get("platform")):
+        if not kanban_notifier.chat_ux_on(sub.get("platform")):
             return False
         params = (
             sub["task_id"], kanban_progress_lines.FOLD_ANCESTOR_DEPTH,
@@ -823,7 +842,8 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         """:meth:`send` laid out by ``chat``, a ``kube-agents.chat/v1`` object, with ``content`` its fallback.
 
         ``update`` names the message: a later send with the same key, in the
-        same conversation, edits it in place.
+        same conversation, edits it in place; in a home-channel thread the
+        gateway reads no key and posts again.
         """
         extra = {CHAT_METADATA_KEY: chat, UPDATE_METADATA_KEY: update}
         return await self.send(chat_id, content, metadata={**(metadata or {}), **extra})
@@ -837,7 +857,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         meta = metadata or {}
         chat = meta.get(CHAT_METADATA_KEY)
         update = str(meta.get(UPDATE_METADATA_KEY) or "").strip()
-        if chat is None and self.platform.value == SLACK_PLATFORM:
+        if chat is None and self.platform.value in _chat_ux_platforms():
             chat = _failure_chat(content)
         argv, path = [], ""
         if isinstance(chat, dict) and str(content or "").strip():

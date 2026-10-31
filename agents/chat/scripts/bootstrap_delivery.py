@@ -234,6 +234,9 @@ REMOTE_MV = "/bin/mv"
 
 # The only surface the reshaped report is written for; every other one gets it as written.
 PRESENTED_PLATFORM = "slack"
+# Google Chat's platform name. Its card goes only through the gateway (spec.mode: next),
+# which lays the chat message out; Hermes's own Chat adapter under today takes text.
+GCHAT_PLATFORM = "google_chat"
 # Why the first report went as text and not as the card, one line in the oobe stage log
 # (_stage_note), which an operator reads; the scheduler keeps a zero-exit run's stderr nowhere.
 # No name here reads CARD_NO or CARD_NUM: CodeQL's private-data heuristic takes that for a card
@@ -242,6 +245,7 @@ TEXT_REPORT_NOTE = "the first report went as text: {reason}"
 CARD_FLAG_OFF = "KAGE_SLACK_UX is off"
 CARD_PLATFORM_TAKES_TEXT = "the report goes to {platform}, which takes text"
 CARD_PLATFORM_UNRECORDED = "a chat whose platform is not recorded"
+CARD_HOME_UNROUTED = "the gateway routes no home posts to {platform}"
 CARD_MARKER_UNREAD = "the hand-off marker could not be read, so the files beside the report may be an earlier sweep's"
 CARD_RANKING_MISSING = "the hand-off filed no prioritization card, so the files beside the report are an earlier sweep's"
 CARD_FILE_UNUSABLE = "{name} could not be read: {problem}"
@@ -1014,6 +1018,14 @@ def _origin() -> dict:
         return {}
 
 
+def _card_platform(platform: str | None) -> bool:
+    """Whether the first report's card goes to ``platform``: Slack, or Google Chat where the
+    gateway serves it (``spec.mode: next``), home posts or conversations, and lays the card out."""
+    if platform == PRESENTED_PLATFORM:
+        return True
+    return platform == GCHAT_PLATFORM and (chat_notify.routes(platform) or chat_notify.gateway_platform() == platform)
+
+
 def _origin_platform() -> str | None:
     """The platform the plugin bound this job's delivery to, or None if unknown."""
     return _origin().get(PLATFORM_KEY)
@@ -1349,7 +1361,8 @@ def _first_report_card(
     """The first report as the card ``inventory_card`` builds from the stage's files, or None and
     why the text goes instead.
 
-    The card needs all of: ``KAGE_SLACK_UX`` on; a Slack destination (``platform``); a hand-off
+    The card needs all of: ``KAGE_SLACK_UX`` on; a card platform as the destination (``platform``:
+    Slack, or Google Chat through the gateway under ``spec.mode: next``); a hand-off
     that filed a prioritization card (``no_ranking`` False: otherwise the files beside the report
     are an earlier sweep's, or that cannot be told); the items and shown files there and readable,
     and the scores file readable when an item is listed; and a card the builder accepts, which recomputes
@@ -1358,7 +1371,7 @@ def _first_report_card(
     """
     if not slack_presenter.enabled():
         return None, CARD_FLAG_OFF
-    if platform != PRESENTED_PLATFORM:
+    if not _card_platform(platform):
         return None, CARD_PLATFORM_TAKES_TEXT.format(platform=platform or CARD_PLATFORM_UNRECORDED)
     if no_ranking is None:
         return None, CARD_MARKER_UNREAD
@@ -1389,10 +1402,11 @@ def _first_report_card(
 
 
 def _posted_as_blocks(data_dir: Path, card: inventory_card.Card | None) -> bool:
-    """Whether the report was posted to Slack as the card; False posts nothing.
+    """Whether the report was posted as the card, to Slack or to Google Chat through
+    the gateway under ``spec.mode: next``; False posts nothing.
 
     False, and the caller prints the text, with no card (``_first_report_card``
-    said why), an origin that is not Slack with a chat id, or no relay. Any
+    said why), an origin that is not a card platform with a chat id, or no relay. Any
     failure is False too, including one that may have posted (a timeout once
     the request was sent): this report is sent once per install, and a second
     copy of it is a smaller loss than none. Each goes to the stage log.
@@ -1403,11 +1417,16 @@ def _posted_as_blocks(data_dir: Path, card: inventory_card.Card | None) -> bool:
         origin = _origin()
         channel = str(origin.get(CHAT_ID_KEY) or "")
         thread = str(origin.get(THREAD_ID_KEY) or "")
-        if origin.get(PLATFORM_KEY) != PRESENTED_PLATFORM or not channel:
+        platform = str(origin.get(PLATFORM_KEY) or "")
+        if not _card_platform(platform) or not channel:
             _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_CHAT_ID_MISSING))
             return False
-        if chat_notify.routes(PRESENTED_PLATFORM):
-            return _posted_through_gateway(data_dir, card, channel, thread)
+        if chat_notify.routes(platform):
+            return _posted_through_gateway(data_dir, card, platform, channel, thread)
+        if platform != PRESENTED_PLATFORM:
+            # Google Chat's card goes only through the gateway; the relay below is Slack's.
+            _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_HOME_UNROUTED.format(platform=platform)))
+            return False
         import slack_blocks_post
 
         if not slack_blocks_post.configured():
@@ -1425,13 +1444,15 @@ def _posted_as_blocks(data_dir: Path, card: inventory_card.Card | None) -> bool:
     return False
 
 
-def _posted_through_gateway(data_dir: Path, card: inventory_card.Card, channel: str, thread: str) -> bool:
+def _posted_through_gateway(data_dir: Path, card: inventory_card.Card, platform: str, channel: str, thread: str) -> bool:
     """Under ``spec.mode: next``, whether the card posted as a chat message through the gateway.
 
-    The gateway holds Slack there and the broker's relay is gone, so the card
-    goes as ``a2a notify --chat-file`` (``inventory_card.chat``) into the
-    origin's thread, which the gateway posts only when it is a thread of its
-    home channel. False, and the caller prints the text, with no thread to
+    The gateway holds the chat platform there, Slack or Google Chat, and the
+    broker's relay is gone, so the card goes as ``a2a notify --chat-file``
+    (``inventory_card.chat``) into the origin's thread, which the gateway posts
+    only when it is a thread of its home channel. A Slack thread goes
+    channel-qualified, as chat_notify's send does; a Chat thread is a resource
+    name that names its space already. False, and the caller prints the text, with no thread to
     reply on (a bare post would land in the home channel, wherever the origin
     is) or any failure, including one that may have posted, for the reason
     ``_posted_as_blocks`` gives.
@@ -1447,7 +1468,8 @@ def _posted_through_gateway(data_dir: Path, card: inventory_card.Card, channel: 
             path = handle.name
         res = subprocess.run(
             chat_notify.chat_command(
-                PRESENTED_PLATFORM, f"{channel}/{thread}", text, path, chat_notify.NOTIFY_WAIT_SECONDS
+                platform, f"{channel}/{thread}" if platform == PRESENTED_PLATFORM else thread, text, path,
+                chat_notify.NOTIFY_WAIT_SECONDS,
             ),
             capture_output=True,
             text=True,

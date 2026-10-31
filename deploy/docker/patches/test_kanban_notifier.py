@@ -49,6 +49,7 @@ from apply_kanban_progress_lines import SEND_ANCHOR, SEND_PATCHED
 from kanban_handoff_clip import DEFAULT_LIMIT, ELLIPSIS, clip_handoff
 from kanban_notifier import (
     COMPLETION_HEAD,
+    chat_ux_on,
     DEFAULT_WAKE_KINDS,
     EXPLAINED_KINDS,
     HELD_ATTR,
@@ -1638,6 +1639,12 @@ def upstream_completion(head, title, handoff):
     return f"✔ {head} done — {title}{handoff}"
 
 
+def kanban_notifier_envs():
+    import kanban_notifier
+
+    return tuple(kanban_notifier.GATEWAY_PLATFORM_ENVS)
+
+
 class CompletionTextTest(unittest.TestCase):
     def test_the_head_line_constant_is_upstreams(self):
         self.assertEqual(COMPLETION_HEAD.format(head=HEAD, title=TITLE),
@@ -1658,12 +1665,54 @@ class CompletionTextTest(unittest.TestCase):
                          upstream_completion(HEAD, TITLE, HANDOFF))
 
     def test_flag_on_leaves_other_platforms_alone(self):
+        # Under today Google Chat is Hermes's own adapter, which takes text as upstream wrote it.
         _SlackUxFlag(self, True)
-        self.assertEqual(completion_text(HEAD, TITLE, HANDOFF, "google_chat"),
-                         upstream_completion(HEAD, TITLE, HANDOFF))
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            self.assertEqual(completion_text(HEAD, TITLE, HANDOFF, "google_chat"),
+                             upstream_completion(HEAD, TITLE, HANDOFF))
+
+    def test_flag_on_shapes_google_chat_under_next_as_slack(self):
+        # Under next the gateway lays the report out on Google Chat, so its head line
+        # goes as on Slack: the report's own first sentence is the headline.
+        _SlackUxFlag(self, True)
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}):
+            self.assertEqual(completion_text(HEAD, TITLE, HANDOFF, "google_chat"),
+                             completion_text(HEAD, TITLE, HANDOFF, "slack"))
+
+    def test_the_gateway_env_names_are_the_notify_modules(self):
+        # kanban_notifier reads the two variables by name (kanban_chat_notify needs Hermes to
+        # import), so the names are read off that module's source here to keep the two in step.
+        source = ast.parse((Path(__file__).with_name("kanban_chat_notify.py")).read_text(encoding="utf-8"))
+        names = {
+            node.targets[0].id: node.value.value
+            for node in source.body
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in ("NOTIFY_PLATFORM_ENV", "NOTIFY_CONVERSATIONS_ENV")
+        }
+        self.assertEqual(kanban_notifier_envs(), (names["NOTIFY_PLATFORM_ENV"], names["NOTIFY_CONVERSATIONS_ENV"]))
+
+    def test_chat_ux_is_on_for_google_chat_only_where_the_gateway_serves_it(self):
+        # Under spec.mode: next the gateway lays chat messages out on Google Chat, so the
+        # cards' layouts go to it as to Slack; under today (nothing served) it takes text.
+        _SlackUxFlag(self, True)
+        served = {"A2A_NOTIFY_PLATFORM": "google_chat", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}
+        with mock.patch.dict(os.environ, served):
+            self.assertTrue(chat_ux_on("google_chat"))
+            self.assertTrue(chat_ux_on("slack"))
+            self.assertFalse(chat_ux_on("discord"))
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "slack", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            self.assertFalse(chat_ux_on("google_chat"), "the gateway holds Slack: Google Chat is Hermes's, which takes text")
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            self.assertFalse(chat_ux_on("google_chat"))
+        _SlackUxFlag(self, False)
+        with mock.patch.dict(os.environ, served):
+            self.assertFalse(chat_ux_on("google_chat"), "the flag governs Google Chat as it governs Slack")
 
     def test_a_platform_no_presenter_reads_gets_no_step_line(self):
-        # The [next: ...] line is plumbing: Google Chat, and Slack with the flag off, show the report alone.
+        # The [next: ...] line is plumbing: Google Chat under today, and Slack with the flag off, show the report alone.
+        unserved = mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""})
+        unserved.start()
+        self.addCleanup(unserved.stop)
         stepped = HANDOFF + "\n\n[next: check seeded-a]"
         # In the image slack_moments sits beside the gateway; here the scripts directory stands in.
         scripts = mock.patch.object(sys, "path", [str(Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts"), *sys.path])
@@ -1716,8 +1765,17 @@ class ExplainedByWakeTest(unittest.TestCase):
             self.assertFalse(explained_by_wake(_sub(), kind, loader({"wake_on_events": FAILURE_ONLY})), kind)
 
     def test_other_platforms_are_never_explained(self):
+        # Under today: Google Chat takes the failure line as text, the wake does not explain it.
         _SlackUxFlag(self, True)
-        self.assertFalse(explained_by_wake(_sub("google_chat"), "gave_up", loader({"wake_on_events": FAILURE_ONLY})))
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            self.assertFalse(explained_by_wake(_sub("google_chat"), "gave_up", loader({"wake_on_events": FAILURE_ONLY})))
+
+    def test_google_chat_under_next_is_explained_as_slack(self):
+        # Under next the wake's reply is laid out on Google Chat too, so the failure line
+        # is held for it as on Slack rather than posted beside it.
+        _SlackUxFlag(self, True)
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}):
+            self.assertTrue(explained_by_wake(_sub("google_chat"), "gave_up", loader({"wake_on_events": FAILURE_ONLY})))
 
     def test_completion_and_review_kinds_always_post(self):
         _SlackUxFlag(self, True)

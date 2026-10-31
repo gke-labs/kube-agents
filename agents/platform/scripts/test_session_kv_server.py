@@ -1204,6 +1204,13 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         self.assertEqual([c.args for c in alert.call_args_list], [("google_chat", "alert", "s1")])
         session_kv_server._record_alert_title.assert_not_called()
 
+    def test_under_next_a_google_chat_thread_gets_the_title(self):
+        # The title heads the plan the cards draw, which the gateway lays out on
+        # Google Chat under next.
+        with patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat"}):
+            self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
+        session_kv_server._record_alert_title.assert_called_once()
+
 
 class TestAlertTitleRecord(unittest.TestCase):
     def setUp(self):
@@ -5488,6 +5495,21 @@ class TestBoardHealthCardRelay(unittest.TestCase):
         ])
         self.assertEqual(self._stored(), [(self.HOME, self.BLOCKS_TS, self.REPORT)])
 
+    def test_under_next_the_card_goes_to_the_gateway_on_google_chat_too(self):
+        # The gateway lays the card out on Google Chat under next; under today the
+        # report goes as text there (test_flag_off_another_job_or_google_chat_posts_the_report).
+        os.environ["A2A_NOTIFY_PLATFORM"] = "google_chat"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("spaces/H/threads/T")
+        ) as via:
+            response, calls = self._post(platforms=("google_chat",))
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        self.assertEqual(via.call_args.args[0], "google_chat")
+        chat, text = via.call_args.args[3:5]
+        self.assertEqual(chat["rows"][0]["actions"], ["retry", "drop"])
+        self.assertEqual(text, self.REPORT)
+
     def test_under_next_the_card_goes_to_the_gateway_with_its_rows_actions(self):
         os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
         with patch.object(
@@ -5496,7 +5518,7 @@ class TestBoardHealthCardRelay(unittest.TestCase):
             response, calls = self._post()
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(calls, [])
-        chat, text = via.call_args.args[2:4]
+        chat, text = via.call_args.args[3:5]
         self.assertEqual(chat["rows"][0]["tasks"], ["t_1"])
         self.assertEqual(chat["rows"][0]["actions"], ["retry", "drop"])
         self.assertEqual(text, self.REPORT)
@@ -5766,7 +5788,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
             response, calls = self._post(composed=self.FAILED, job_id="reliability")
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(calls, [])
-        chat, text = via.call_args.args[2:4]
+        chat, text = via.call_args.args[3:5]
         self.assertEqual(chat["detail"], self.FAILED_LINE)
         self.assertEqual(chat["fold"], {"title": "why", "text": self.FAILED.strip()})
         self.assertEqual(text, self.FAILED.strip())
@@ -5857,11 +5879,43 @@ class TestSlackAuditHeadline(unittest.TestCase):
             self.assertIsNone(session_kv_server._fetch_ledger_issue(ref))
 
     def test_flag_on_leaves_google_chat_alone(self):
+        # Under today Google Chat is Hermes's own adapter, which takes text.
         os.environ["KAGE_SLACK_UX"] = "1"
         os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
         _, calls = self._post(platforms=("google_chat", "slack"))
         gchat = [c.args for c in calls if c.args[0] == "google_chat"]
         self.assertEqual(gchat, [("google_chat", self.COMPOSED, "", "")])
+
+    def test_under_next_a_slack_leg_with_no_home_channel_or_thread_still_sends_the_card(self):
+        # The gateway holds the home channel for the platform it routes, so a routed
+        # Slack leg needs neither a thread nor SLACK_HOME_CHANNEL to send the card;
+        # before, it fell back to text without one.
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        os.environ.pop("SLACK_HOME_CHANNEL", None)
+        with patch.object(session_kv_server, "_slack_home_channel", return_value=""), patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("7.7")
+        ) as via:
+            response, calls = self._post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        self.assertEqual(via.call_args.args[0], "slack")
+
+    def test_under_next_the_headline_card_goes_to_the_gateway_on_google_chat(self):
+        # The gateway lays the card out on Google Chat under next, as on Slack, and
+        # posts into its home space itself, so no home channel env is needed here.
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["A2A_NOTIFY_PLATFORM"] = "google_chat"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("spaces/H/threads/T")
+        ) as via:
+            response, calls = self._post(platforms=("google_chat",))
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        self.assertEqual(via.call_args.args[0], "google_chat")
+        chat, text = via.call_args.args[3:5]
+        self.assertEqual(chat["schema"], "kube-agents.chat/v1")
+        self.assertTrue(text)
 
     def test_flag_on_a_report_that_is_not_an_audit_is_unchanged(self):
         os.environ["KAGE_SLACK_UX"] = "1"
@@ -5924,7 +5978,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
             response, calls = self._post(composed=self.SUMMARY)
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(calls, [])
-        chat, text = via.call_args.args[2:4]
+        chat, text = via.call_args.args[3:5]
         self.assertEqual(chat["rows"], [{"text": "seeded-a: control plane is public", "severity": "critical"}])
         self.assertEqual(text, session_kv_server.slack_audit_report.headline_from_summary(self.SUMMARY))
 

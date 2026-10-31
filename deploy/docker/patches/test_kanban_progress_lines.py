@@ -50,6 +50,14 @@ from kanban_progress_lines import (
 RUN_URL = "https://github.com/gke-agentic/adamparco-infra/actions/runs/9912345678"
 
 
+
+def _unserved(test):
+    """Clear the gateway's served-platform env, so a Google Chat subscription reads as
+    today's (text) whatever the runner's shell carries."""
+    env = mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""})
+    env.start()
+    test.addCleanup(env.stop)
+
 class ProgressNoteTest(unittest.TestCase):
     def test_a_deliberate_note_is_delivered(self):
         self.assertEqual(
@@ -835,6 +843,13 @@ SLACK_SUB = {
     "thread_id": "1790717879.123899",
     "delivery_mode": "notify+wake",
 }
+GCHAT_SUB = {
+    "task_id": "t_e0c1",
+    "platform": "google_chat",
+    "chat_id": "spaces/H",
+    "thread_id": "spaces/H/threads/T",
+    "delivery_mode": "notify+wake",
+}
 
 
 class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
@@ -842,10 +857,12 @@ class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
     failure the creator's wake explains is held for the wake step, not posted.
 
     ``gateway.slack_ux_reactions`` is faked as in :class:`SettleReactionHookTest`;
-    ``kanban_notifier`` is the real module, imported flat.
+    ``kanban_notifier`` is the real module, imported flat. The gateway's served
+    platform is cleared, so a Google Chat subscription reads as today's.
     """
 
     def setUp(self):
+        _unserved(self)
         self.calls = []
         self.flag = True
         test = self
@@ -1033,6 +1050,19 @@ class ChatNotifyAnswerTest(SlackQuietTerminalTest):
         self.assertEqual(adapter.metadata[-1]["kage_chat"],
                          {"schema": "kube-agents.chat/v1", "headline": "Both pods are up.", "detail": "Seeded-a runs two."})
 
+    async def test_a_google_chat_card_under_next_carries_its_answer_too(self):
+        # The gateway lays the answer out on Google Chat under next; under today
+        # (nothing served) the report goes as text, as before.
+        served = {"A2A_NOTIFY_PLATFORM": "google_chat", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}
+        with mock.patch.dict(os.environ, served):
+            adapter = _ChatNotifyStandIn()
+            await self._run(adapter, GCHAT_SUB, "completed", "Both pods are up. Seeded-a runs two.")
+        self.assertEqual(adapter.metadata[-1]["kage_chat"]["headline"], "Both pods are up.")
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            adapter = _ChatNotifyStandIn()
+            await self._run(adapter, GCHAT_SUB, "completed", "Both pods are up. Seeded-a runs two.")
+        self.assertNotIn("kage_chat", adapter.metadata[-1] or {})
+
     def _plan(self, settled):
         async def settle_row(adapter, sub, kind, result="", title=""):
             return True
@@ -1117,6 +1147,18 @@ class ChatNotifyAnswerTest(SlackQuietTerminalTest):
         self.assertEqual(adapter.sent[-1][1], "No cluster named seeded-z. It has seeded-a.")
         self.assertEqual(adapter.metadata[-1]["kage_chat"]["headline"], "No cluster named seeded-z.")
         self.assertEqual(self.calls, [("t_e0c1", "gave_up")])
+
+    async def test_a_give_up_on_a_conversation_posts_its_line_rather_than_holding_it(self):
+        # The wake's reply goes nowhere on a conversation card, so a give-up held for it
+        # would never be told: it posts as its own line.
+        class Conversation(_ChatNotifyStandIn):
+            pass
+
+        sys.modules["gateway.kanban_chat_notify"].ConversationNotifyAdapter = Conversation
+        adapter = Conversation()
+        result = await self._run(adapter, SLACK_SUB, "gave_up", "✖ gave up")
+        self.assertIsNotNone(result)
+        self.assertEqual(adapter.sent[-1][1], "✖ gave up")
 
     async def test_a_hard_wall_block_on_any_other_stand_in_is_still_held(self):
         sys.modules["gateway.kanban_chat_notify"].ConversationNotifyAdapter = type("Conversation", (), {})
@@ -1269,6 +1311,7 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
     """
 
     def setUp(self):
+        _unserved(self)
         self.rows = []
         self.moves = []
         self.settled = []
@@ -1652,6 +1695,7 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
     PR_NOTE = "Opened https://github.com/acme/fleet/pull/7 raising the limit."
 
     def setUp(self):
+        _unserved(self)
         self.flag = True
         self.asked = []
         self.announced = []
