@@ -595,6 +595,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          for Cluster Agent domain audits (#3285)
 #   audit_certificates.py  single-pass cert-manager CRD, Certificate, Issuer, and GKE
 #                          ManagedCertificate collector (#3285)
+#   kcc_fleet_audit.py     batched parallel Config Connector (KCC) CRD and custom
+#                          resource auditor for Cluster Agent KCC audits (#3142)
 #   inventory_findings.py  the onboarding ranking card's bridge from
 #                          INVENTORY.raw.md to the findings queue
 #                          (governance/inventory_prioritize_sop.md). `extract`
@@ -644,6 +646,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/audit_storage.py \
      agents/platform/scripts/audit_networking.py \
      agents/platform/scripts/audit_certificates.py \
+     agents/platform/scripts/kcc_fleet_audit.py \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
      agents/platform/scripts/untrusted_text.py \

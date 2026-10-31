@@ -967,6 +967,13 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# A Cluster Agent answers a Config Connector audit with the batched KCC
+# collector SOUL.md names (#3142): graded on a Cluster Agent doing the work,
+# running /opt/data/scripts/kcc_fleet_audit.py, no later turn's result showing
+# the script missing, and a report naming Config Connector status. deployer:
+# noop, read-only, no fixture, 200s default until it has a record.
+./tasks/cluster-agent-kcc-audit-collector/task.yaml
+
 # The silence case for a deliberate scale to zero (#4098): an in-cluster
 # gateway whose proxy and backend are both at replicas 0 reports
 # Programmed=False, and the stall check must not report it. Reads the
