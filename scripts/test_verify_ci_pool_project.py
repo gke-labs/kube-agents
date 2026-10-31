@@ -83,8 +83,9 @@ class DenialClassifierTest(unittest.TestCase):
         # The DNS API's form, from the same scan.
         "ERROR: (gcloud.dns.managed-zones.describe) HTTPError 403: Forbidden. This command is "
         "authenticated as x@y.iam.gserviceaccount.com using the credentials in ...",
-        # The gRPC form the KMS and Service Usage APIs print, as the checks'
-        # own tests below stub it.
+        # The KMS and Service Usage entries are the gRPC form those APIs
+        # print, as the checks' own tests below stub it; the scan has not met
+        # either refusal, so these are the stubs and not observed lines.
         "ERROR: (gcloud.kms.keys.versions.list) PERMISSION_DENIED: Permission denied on resource",
         "ERROR: (gcloud.services.list) PERMISSION_DENIED: Permission denied to list services",
         "ERROR: (gcloud.projects.describe) User [x] does not have permission to access projects "
@@ -108,6 +109,12 @@ class DenialClassifierTest(unittest.TestCase):
         "ERROR: (gcloud.storage.buckets.describe) HTTPError 404: The specified bucket does not exist.",
         "ERROR: (gcloud.artifacts.repositories.describe) NOT_FOUND: Repository does not exist",
         "ERROR: (gcloud.kms.keys.describe) NOT_FOUND: CryptoKey not found",
+        # The Compute and DNS not-found forms, which the Compute refusal
+        # pattern must not reach.
+        "ERROR: (gcloud.compute.addresses.describe) Could not fetch resource:\n"
+        " - The resource 'projects/kube-agents-evals-6/regions/us-central1/addresses/forge-ghes' was not found",
+        "ERROR: (gcloud.dns.managed-zones.describe) HTTPError 404: The 'parameters.managedZone' "
+        "resource named 'eval-internal' does not exist.",
         # Observed on 2026-08-27. An absent service account answers NOT_FOUND
         # even when the caller cannot read the project it would live in, so the
         # two SA checks may still report a genuinely missing GSA as missing.
@@ -5675,7 +5682,7 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
                 self.assertTrue(roles or surface == "auth", f"{surface} names no role")
                 self.assertLessEqual(set(roles), checker.POOL_STATE_READER_ROLES)
                 if surface != "auth":
-                    # One observed refusal per API, so the denial patterns are
+                    # A refusal fixture per API, so the denial patterns are
                     # checked against that API's wording and not assumed.
                     self.assertTrue(
                         any(f"(gcloud.{surface}." in err for err in DenialClassifierTest.REFUSALS),

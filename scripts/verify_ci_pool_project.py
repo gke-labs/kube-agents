@@ -864,7 +864,8 @@ POOL_STATE_READER_ROLES = {
 # checked" at best, and as drift when the API's refusal text is one the
 # denial patterns below have not seen. `auth` reads the local credential
 # store, not the project. `projects describe` needs projects.get, which
-# securityReviewer lacks and clusterViewer carries.
+# securityReviewer lacks and clusterViewer carries. The `kms` surface also
+# covers the KMS sign in check_ledger_read_credential, which the scan does not run.
 GCLOUD_SURFACE_READ_ROLES = {
     "artifacts": ("roles/artifactregistry.reader",),
     "auth": (),
