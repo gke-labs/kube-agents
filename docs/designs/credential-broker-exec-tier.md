@@ -745,9 +745,9 @@ cache contract.
      nothing there: the operator raises the broker's CPU request with its limit, and the footprint
      and the quota preflight count that.
      Because it is one operator value, it is the fastest single relief for current installs.
-   - **Graceful shutdown.** Today `serve()` runs `serve_forever()` with no SIGTERM handler, and
-     the Deployment sets no `terminationGracePeriodSeconds` and no `preStop`, so a pod stop drops
-     the commands in flight. The broker gets a SIGTERM handler that stops admitting (new requests
+   - **Graceful shutdown.** Before this step `serve()` ran `serve_forever()` with no SIGTERM
+     handler, and the Deployment set no `terminationGracePeriodSeconds` and no `preStop`, so a pod
+     stop dropped the commands in flight. The broker gets a SIGTERM handler that stops admitting (new requests
      get a 503 with the new bound `draining`, which §4.3's retry sends to another replica) and
      drains the commands in flight. The drain depends
      on the Deployment:
@@ -755,7 +755,10 @@ cache contract.
        the new one, so every route is down while the pod drains. There the drain is short and
        bounded: it finishes commands for up to 30 s, then ends the rest. The pod drains its relays
        in the same window, and its `terminationGracePeriodSeconds` is 45 s, so the kubelet does
-       not kill it before the drain and the exit end, and events are not lost.
+       not kill it before the drain and the exit end. Chat receipts still unsettled go back to
+       Pub/Sub; Slack and Teams events the gateway did not pull before the exit end with the
+       process, and the Slack count is logged. This half is implemented (`install_shutdown_handler`
+       in `credential_proxy.py`, the broker role only).
      - On the exec tier, `RollingUpdate` keeps another replica serving, so the drain is long: a
        `terminationGracePeriodSeconds` longer than the longest command it admits. A
        PodDisruptionBudget with `maxUnavailable: 1` applies only when replicas are 2 or more; at 1

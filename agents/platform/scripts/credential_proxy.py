@@ -467,12 +467,14 @@ KILL_SETTLE_SECONDS = 1
 # stay open this long for those acks to land; a receipt still unsettled after
 # it belongs to a pull whose answer never reached the gateway, and is handed
 # back to Pub/Sub so the replacement pod gets it at once rather than when its
-# ack deadline (60 s) runs out. Short on purpose: the window is the whole of
-# what a graceful stop adds to a Recreate rollout.
+# ack deadline (60 s) runs out. Short on purpose: outside the broker role the
+# window is the whole of what a graceful stop adds to a Recreate rollout; the
+# broker's drain (SHUTDOWN_DRAIN_SECONDS) holds it inside a longer wait.
 SHUTDOWN_SETTLE_SECONDS = 3
 # How long the hand-back's one Pub/Sub call may take, with no retry. It runs
 # on the drain thread ahead of server.shutdown(), inside the entrypoint's
-# RUNTIME_DRAIN_SECONDS (10 s) after the settle window above; the client
+# RUNTIME_DRAIN_SECONDS (10 s), or BROKER_RUNTIME_DRAIN_SECONDS (40 s) in the
+# broker role, after the settle window above; the client
 # library's defaults (60 s per call, retried for 60 s) would let a slow
 # Pub/Sub hold the stop past that budget and hand the process to SIGKILL with
 # the server still up, the ending this path exists to avoid. A call that does
@@ -486,6 +488,27 @@ SHUTDOWN_NACK_TIMEOUT_SECONDS = 2
 SHUTDOWN_ERROR = "credential proxy shutting down"
 # The drain thread's name, for a reader of a thread dump mid-stop.
 SHUTDOWN_THREAD_NAME = "shutdown"
+# In the broker role the stop is a drain (install_shutdown_handler): new
+# requests are refused with the `draining` bound, and the requests already in
+# flight get this long to finish before the commands still running are ended.
+# The pod's terminationGracePeriodSeconds (45 s, the operator's
+# credentialProxyTerminationGraceSeconds) holds this, SHUTDOWN_END_WAIT_SECONDS,
+# the hand-back and the entrypoint's kill of Envoy after it; the entrypoint
+# waits BROKER_RUNTIME_DRAIN_SECONDS (40 s) for the runtime to exit.
+SHUTDOWN_DRAIN_SECONDS = 30
+# After the drain, how long the stop waits for the requests whose commands it
+# ended to write their answers: KILL_GRACE_SECONDS and KILL_SETTLE_SECONDS for
+# the process group, the poll that notices the stop, and the write. A request
+# still open after it is cut with the process.
+SHUTDOWN_END_WAIT_SECONDS = 5
+# The error a new request gets while the broker drains, beside the `draining`
+# bound. No instruction to the model: the shim prints it, and a retry after the
+# stop reaches the replacement pod.
+SHUTDOWN_DRAINING_ERROR = "the credential broker is stopping; retry"
+# What a command ended by the drain reads as: SIGTERM's conventional exit code,
+# and a line appended to its stderr after the bound, as the kubectl timeout's is.
+DRAINED_COMMAND_EXIT_CODE = 143
+DRAINED_COMMAND_NOTE = "\n[credential-proxy] command ended: the credential broker stopped before it finished\n"
 
 # Bounds on the pre-authentication body drain in AgentAPIProxyHandler. The body has
 # to be read in full for the 401 to survive the close, so these bound what reading it
@@ -674,6 +697,37 @@ HEALTHZ_PATH = "/healthz"
 # effective limit: on GKE Autopilot without bursting it is the memory request,
 # rewritten after the operator rendered the pod.
 ADMISSION_PATH = "/v1/exec/admission"
+# Requests that keep serving while the broker drains (SHUTDOWN_DRAIN_SECONDS),
+# by method and path: the health probe; a relay's settle routes, so the
+# gateway's acks for pulls already answered land; and the event pulls. Slack's
+# and Teams' queues are in-process and already acknowledged upstream, so every
+# event taken now is one fewer lost with the pod; the Chat pulls keep their own
+# refusal (_refused_while_shutting_down), which hands nothing new out of
+# Pub/Sub. None of them is counted in flight: a pull is a long poll, and the
+# drain would wait it out for nothing.
+DRAIN_OPEN_ROUTES = frozenset({
+    ("GET", HEALTHZ_PATH),
+    ("GET", "/v1/chat/events"),
+    ("GET", "/v1/chat/a2a/events"),
+    ("GET", "/v1/chat/slack/events"),
+    ("GET", "/v1/chat/teams/events"),
+    ("POST", "/v1/chat/events/ack"),
+    ("POST", "/v1/chat/events/nack"),
+    ("POST", "/v1/chat/a2a/events/ack"),
+    ("POST", "/v1/chat/a2a/events/nack"),
+    ("POST", "/v1/chat/slack/events/ack"),
+    ("POST", "/v1/chat/slack/events/nack"),
+    ("POST", "/v1/chat/teams/events/ack"),
+    ("POST", "/v1/chat/teams/events/nack"),
+})
+# The Pub/Sub verbs relayed under the watcher's and the platform's Google
+# prefixes (WATCHER_GCP_PREFIX, PLATFORM_PUBSUB_PREFIX), by the suffix of the
+# path. A settle stays open while the broker drains, as a Chat relay's does: its
+# ack id is the subscription's, so forwarding it is safe, and refusing it would
+# redeliver, to the replacement pod, a message its caller already handled. A
+# pull is a long poll: it leaves the in-flight count, and a new one is refused.
+DRAIN_OPEN_PUBSUB_SUFFIXES = (":acknowledge", ":modifyAckDeadline")
+UNCOUNTED_PUBSUB_SUFFIXES = (":pull",)
 METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 METRICS_SERVER_HEADER = "credential-proxy-metrics"
 # The metrics listener shares the process with the credentialed handler, so a
@@ -753,6 +807,8 @@ ADMISSION_BOUND_REFRESH_LOCK = "refresh-lock"
 ADMISSION_BOUND_SESSION = "session"
 ADMISSION_BOUND_SCOPE = "scope"
 ADMISSION_BOUND_PROFILE = "profile"
+#: A new request refused because the broker is stopping (SHUTDOWN_DRAIN_SECONDS).
+ADMISSION_BOUND_DRAINING = "draining"
 ADMISSION_BOUND_OTHER = "other"
 #: The histogram's label for a request admitted without a wait: nothing held
 #: it, so neither bound is blamed, and the label does not flip with the memory
@@ -760,7 +816,7 @@ ADMISSION_BOUND_OTHER = "other"
 ADMISSION_BOUND_NONE = "none"
 ADMISSION_BOUNDS = frozenset(
     {ADMISSION_BOUND_SLOT, ADMISSION_BOUND_BUDGET, ADMISSION_BOUND_REFRESH_LOCK, ADMISSION_BOUND_SESSION,
-     ADMISSION_BOUND_PROFILE, ADMISSION_BOUND_SCOPE, ADMISSION_BOUND_NONE}
+     ADMISSION_BOUND_PROFILE, ADMISSION_BOUND_SCOPE, ADMISSION_BOUND_DRAINING, ADMISSION_BOUND_NONE}
 )
 # Edges where a reader wants them: 15 s is the cap the Cluster Agent preflight
 # (cluster_preflight.sh) puts on one brokered call, the shortest caller-side
@@ -2726,6 +2782,40 @@ class SessionSlots:
                 self._in_flight -= 1
 
 
+class InFlight:
+    """The requests the broker is serving, for the drain to wait on.
+
+    Counted per request in CredentialProxyHandler.handle_one_request. An open
+    route or a long poll (_refused_while_draining) leaves the count as soon as
+    its path is known, so the drain does not wait out a pull that would answer
+    nothing.
+    """
+
+    def __init__(self) -> None:
+        self._count = 0
+        self._idle = threading.Condition()
+
+    def enter(self) -> None:
+        with self._idle:
+            self._count += 1
+
+    def leave(self) -> None:
+        with self._idle:
+            self._count -= 1
+            if self._count <= 0:
+                self._idle.notify_all()
+
+    def wait_idle(self, deadline: float) -> int:
+        """Wait until nothing is in flight or `deadline` passes; the count left."""
+        with self._idle:
+            while self._count > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._idle.wait(remaining)
+            return self._count
+
+
 class CallerHungUp(Exception):
     """The caller closed its connection while its request waited for admission
     (a slot, room under the child memory budget, or both).
@@ -4455,6 +4545,23 @@ class SlackRelay:
                     return False
             del self._receipts[receipt]
             return True
+
+    def stop_intake(self) -> None:
+        """Close the Socket Mode connection: the drain's first act on this relay.
+
+        Slack holds what it sends meanwhile for the replacement pod's
+        connection; the events already queued here stay for the gateway to
+        pull and settle while the broker drains.
+        """
+        try:
+            self.socket_client.close()
+        except Exception as exc:
+            LOGGER.warning("Slack relay: closing Socket Mode failed type=%s", type(exc).__name__)
+
+    def undelivered(self) -> int:
+        """Events queued or pulled and not yet settled: what is lost if the process exits now."""
+        with self._lock:
+            return self._events.qsize() + len(self._receipts)
 
     def bootstrap(self) -> list[dict[str, str]]:
         return self.workspaces
@@ -6773,6 +6880,9 @@ class _CapturedOutput:
     # The child's own peak resident set from the rusage its reap returned, in
     # bytes; None when the reap did not go through `_reap` (already reaped).
     peak_rss_bytes: int | None = None
+    # Killed because `stop` answered true while it still ran, not for a
+    # hang-up or the deadline; `abandoned` is set with it.
+    stopped: bool = False
 
 
 def _caller_has_gone(caller: Any) -> bool:
@@ -6960,7 +7070,9 @@ def _capture_output(
 
     `stop`, when given, is asked about every `STOP_POLL_SECONDS` while the
     command runs; a true answer kills it as a caller's hang-up does. The
-    snapshot clone uses it to stop at the clone ceiling while it writes.
+    snapshot clone uses it to stop at the clone ceiling while it writes; the
+    broker's drain, through `_execute`, to end the commands still running when
+    the drain's time is up.
 
     Returns once the command has exited. `process.returncode` is set.
     """
@@ -6969,6 +7081,7 @@ def _capture_output(
     truncated = False
     pending = memoryview(stdin) if stdin else None
     written = 0
+    stopped = False
     selector = selectors.DefaultSelector()
     for stream in outputs:
         selector.register(stream, selectors.EVENT_READ)
@@ -7003,7 +7116,11 @@ def _capture_output(
             remaining = until - time.monotonic()
             if remaining <= 0:
                 return True, False
-            if watch_caller and stop is not None and stop():
+            if watch_caller and stop is not None and process.poll() is None and stop():
+                # Only while it still runs: a command that exited just now
+                # finished, and gets its own exit code.
+                nonlocal stopped
+                stopped = True
                 return False, True
             wait = min(remaining, STOP_POLL_SECONDS) if stop is not None else remaining
             for key, _ in selector.select(wait):
@@ -7067,7 +7184,7 @@ def _capture_output(
                 elif caller is not None and _caller_has_gone(caller):
                     abandoned = True
                 elif stop is not None and stop():
-                    abandoned = True
+                    abandoned = stopped = True
                 else:
                     time.sleep(min(PIPES_CLOSED_POLL_SECONDS, remaining))
                     continue
@@ -7092,6 +7209,7 @@ def _capture_output(
         timed_out=timed_out,
         abandoned=abandoned,
         peak_rss_bytes=getattr(process, REAPED_PEAK_RSS_ATTRIBUTE, None),
+        stopped=stopped,
     )
 
 
@@ -7135,6 +7253,10 @@ class CommandExecutor:
         # saturation the caller that had waited longest was as likely to be
         # refused as one that had just arrived.
         self._slot_condition = threading.Condition()
+        # Set by the broker's drain when its time is up (install_shutdown_handler):
+        # every command still running is ended through `_capture_output`'s stop
+        # check, and answers DRAINED_COMMAND_EXIT_CODE.
+        self.end_commands = threading.Event()
         self._slots_in_use = 0
         self._slot_queue: collections.deque[_AdmissionTicket] = collections.deque()
         # The deadline the commands of the request on this thread share; set by
@@ -9737,6 +9859,17 @@ class CommandExecutor:
             else self.reserve_child_memory(caller=caller)
         )
         with admission, self._gcloud_call_kubeconfig(argv, authors_kubeconfig) as call_kubeconfig:
+            if self.end_commands.is_set():
+                # Admitted after the drain ended the commands in flight: the
+                # broker is stopping, so it starts nothing new.
+                return ExecutionResult(
+                    exit_code=DRAINED_COMMAND_EXIT_CODE,
+                    stdout="",
+                    stderr=DRAINED_COMMAND_NOTE.lstrip("\n"),
+                    duration_ms=0,
+                    truncated=False,
+                    timed_out=False,
+                )
             if call_kubeconfig is not None:
                 command_environment["KUBECONFIG"] = str(call_kubeconfig)
             started = time.monotonic()
@@ -9755,7 +9888,9 @@ class CommandExecutor:
                 limit=self.max_output_bytes,
                 timeout=effective_timeout,
                 caller=caller,
-                stop=stop,
+                # The caller's own check (the snapshot clone's ceiling), or
+                # the broker's drain ending the commands still running.
+                stop=lambda: self.end_commands.is_set() or (stop is not None and stop()),
             )
             # What the child's tree peaked at came back with its reap, the one
             # measurement the flat reserve above cannot make. argv[0] is the
@@ -9781,15 +9916,24 @@ class CommandExecutor:
                 f"({target_str})\n"
             )
 
+        # Ended by the drain, not by a hang-up: the caller is still there, so it
+        # gets an answer, with an exit code and a line that say why. A stop the
+        # caller asked for (the snapshot clone's ceiling) stays abandoned, as
+        # that caller expects.
+        drained = captured.stopped and self.end_commands.is_set()
+        if drained:
+            stderr_text += DRAINED_COMMAND_NOTE
         duration_ms = int((time.monotonic() - started) * 1000)
         return ExecutionResult(
-            exit_code=124 if captured.timed_out else process.returncode,
+            exit_code=(124 if captured.timed_out
+                       else DRAINED_COMMAND_EXIT_CODE if drained
+                       else process.returncode),
             stdout=stdout_text,
             stderr=stderr_text,
             duration_ms=duration_ms,
             truncated=captured.truncated or stdout_cut or stderr_cut,
             timed_out=captured.timed_out,
-            abandoned=captured.abandoned,
+            abandoned=captured.abandoned and not drained,
         )
 
     def _truncate(self, value: bytes) -> tuple[bytes, bool]:
@@ -10983,6 +11127,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # until the server stops, so the gateway's acks for pulls already
     # answered still land.
     shutting_down = threading.Event()
+    # Set by the SIGTERM handler in the broker role, where the stop is a drain
+    # (install_shutdown_handler): a request outside DRAIN_OPEN_ROUTES is refused
+    # with the `draining` bound before its route runs, so no command is refused
+    # half-way and a retry never runs one twice; the drain waits on in_flight.
+    draining = threading.Event()
+    in_flight = InFlight()
     # The read-only Cloud API relay's credential and transport. Armed by
     # serve() unconditionally, like the exec route: the shell role always
     # exists. None only in a test that has not set it, where the route
@@ -11218,6 +11368,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path != HEALTHZ_PATH and self._authenticated() is None:
             return
+        if self._refused_while_draining("GET"):
+            return
         if self.path == ADMISSION_PATH:
             self._json(HTTPStatus.OK, self._admission_report())
             return
@@ -11322,6 +11474,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         principal = self._authenticated()
         if principal is None:
+            return
+        if self._refused_while_draining("POST"):
             return
         if self.path.startswith(API_RELAY_PREFIX):
             # Reaches the relay so that the refusal is the policy's
@@ -13439,17 +13593,62 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_GATEWAY, body)
 
     def handle_one_request(self) -> None:
-        # A peer that resets the connection while its request is being read,
-        # or before an error page is on the wire, is a debug line and a closed
-        # connection, as on the metrics listener; the exception would
-        # otherwise leave the handler and reach the server's error hook. No
-        # audit record is lost: every site logs before its response is
-        # written, and _json guards its own writes.
+        # Counted in flight from here until its answer is written, for the
+        # broker's drain (install_shutdown_handler); _refused_while_draining
+        # lets a long poll or a watch out of the count once its path is known.
+        self._counted_in_flight = True
+        self.in_flight.enter()
         try:
-            super().handle_one_request()
-        except OSError as exc:
-            self.close_connection = True
-            LOGGER.debug("request not answered type=%s", type(exc).__name__)
+            # A peer that resets the connection while its request is being read,
+            # or before an error page is on the wire, is a debug line and a closed
+            # connection, as on the metrics listener; the exception would
+            # otherwise leave the handler and reach the server's error hook. No
+            # audit record is lost: every site logs before its response is
+            # written, and _json guards its own writes.
+            try:
+                super().handle_one_request()
+            except OSError as exc:
+                self.close_connection = True
+                LOGGER.debug("request not answered type=%s", type(exc).__name__)
+        finally:
+            self._leave_in_flight()
+
+    def _leave_in_flight(self) -> None:
+        if getattr(self, "_counted_in_flight", False):
+            self._counted_in_flight = False
+            self.in_flight.leave()
+
+    def _refused_while_draining(self, method: str) -> bool:
+        """Answer a new request 503 with the `draining` bound while the broker drains.
+
+        Runs after authentication, so an unknown caller still reads 401, and
+        before any route, so a request already past it never sees the drain.
+        The routes that stay open (DRAIN_OPEN_ROUTES, and the relayed Pub/Sub
+        settles) and the long polls (a relayed Pub/Sub pull, the watcher's
+        Kubernetes watch) leave the in-flight count here: a long poll holds its
+        connection for as long as it is let, and the drain would wait it out.
+        """
+        parts = urllib.parse.urlsplit(self.path)
+        pubsub = method == "POST" and parts.path.startswith(
+            (watcher_policy.WATCHER_GCP_PREFIX, watcher_policy.PLATFORM_PUBSUB_PREFIX)
+        )
+        open_route = (method, parts.path) in DRAIN_OPEN_ROUTES or (
+            pubsub and parts.path.endswith(DRAIN_OPEN_PUBSUB_SUFFIXES)
+        )
+        long_poll = (pubsub and parts.path.endswith(UNCOUNTED_PUBSUB_SUFFIXES)) or (
+            method == "GET"
+            and parts.path.startswith(watcher_policy.WATCHER_K8S_PREFIX)
+            and watcher_policy.is_watch(urllib.parse.parse_qs(parts.query, keep_blank_values=True))
+        )
+        if open_route or long_poll:
+            self._leave_in_flight()
+        if open_route or not self.draining.is_set():
+            return False
+        if method == "POST":
+            # Read first, so the refusal is not lost to a connection reset.
+            drain_request_body(self, self.max_request_bytes)
+        self._busy(CommandSlotUnavailable(SHUTDOWN_DRAINING_ERROR, bound=ADMISSION_BOUND_DRAINING))
+        return True
 
     def _handle_teams_post(self) -> None:
         if self.teams_relay is None:
@@ -13598,10 +13797,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         failure. Counted here, once per route that answers it, under the bound
         the exception carries.
         """
-        self.metrics.record_refusal(getattr(exc, "bound", ADMISSION_BOUND_OTHER))
+        bound = getattr(exc, "bound", ADMISSION_BOUND_OTHER)
+        self.metrics.record_refusal(bound)
+        # `bound` names which limit refused it, so a caller can tell a
+        # stopping broker (`draining`) from one at a cap.
         self._json(
             HTTPStatus.SERVICE_UNAVAILABLE,
-            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc)},
+            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc), "bound": bound},
         )
 
 
@@ -13831,6 +14033,9 @@ def install_shutdown_handler(
     server: socketserver.BaseServer,
     relays: Sequence[GoogleChatRelay],
     settle_seconds: float = SHUTDOWN_SETTLE_SECONDS,
+    executor: "CommandExecutor | None" = None,
+    drain_seconds: float = 0,
+    end_wait_seconds: float = SHUTDOWN_END_WAIT_SECONDS,
 ) -> None:
     """Make SIGTERM a graceful stop of the credentialed server.
 
@@ -13845,13 +14050,50 @@ def install_shutdown_handler(
     gateway on a next install reads Slack itself. A second SIGTERM changes
     nothing; the stop already under way finishes.
 
+    With drain_seconds (the broker role, SHUTDOWN_DRAIN_SECONDS), the stop is
+    a drain as well: every new request outside DRAIN_OPEN_ROUTES is refused
+    503 with the `draining` bound, the Slack relay stops taking events from
+    Slack, and the requests already in flight get up to drain_seconds from the
+    signal to finish. The commands still running then are ended through
+    executor.end_commands and answer DRAINED_COMMAND_EXIT_CODE; their requests
+    get end_wait_seconds to write it. Only then are the Chat receipts handed
+    back and the server stopped. The other roles keep the short stop: their
+    pods' grace periods do not hold a drain.
+
     The drain runs on its own thread because server.shutdown() waits for
     serve_forever() to return, and the handler runs on the thread that is
     inside serve_forever(). Only the main thread may install a signal
     handler; a caller on any other logs and keeps the default.
     """
+    def finish_in_flight(started: float) -> None:
+        slack = CredentialProxyHandler.slack_relay
+        if slack is not None:
+            slack.stop_intake()
+        left = CredentialProxyHandler.in_flight.wait_idle(started + drain_seconds)
+        if left and executor is not None:
+            LOGGER.warning(
+                "shutdown: %d request(s) still in flight after %ss; ending their commands",
+                left, drain_seconds,
+            )
+            executor.end_commands.set()
+            left = CredentialProxyHandler.in_flight.wait_idle(time.monotonic() + end_wait_seconds)
+        if left:
+            LOGGER.warning("shutdown: %d request(s) still open; they end with the process", left)
+        # Read again: a relay that connected during the drain closed itself
+        # (initialize_slack_relay) and may hold events all the same.
+        slack = CredentialProxyHandler.slack_relay
+        if slack is not None:
+            lost = slack.undelivered()
+            if lost:
+                LOGGER.warning(
+                    "shutdown: %d Slack event(s) queued or unsettled end with the process", lost
+                )
+
     def drain() -> None:
+        started = time.monotonic()
         time.sleep(settle_seconds)
+        if drain_seconds > 0:
+            finish_in_flight(started)
         released = sum(relay.release_unsettled() for relay in relays)
         LOGGER.info(
             "shutdown: settle window over, handed back %d unsettled receipt(s); stopping",
@@ -13863,10 +14105,18 @@ def install_shutdown_handler(
         if CredentialProxyHandler.shutting_down.is_set():
             return
         CredentialProxyHandler.shutting_down.set()
-        LOGGER.info(
-            "SIGTERM: refusing new Chat event pulls; settling receipts for %ss before stopping",
-            settle_seconds,
-        )
+        if drain_seconds > 0:
+            CredentialProxyHandler.draining.set()
+            LOGGER.info(
+                "SIGTERM: refusing new requests and Chat event pulls; draining requests in "
+                "flight for up to %ss before stopping",
+                drain_seconds,
+            )
+        else:
+            LOGGER.info(
+                "SIGTERM: refusing new Chat event pulls; settling receipts for %ss before stopping",
+                settle_seconds,
+            )
         threading.Thread(target=drain, name=SHUTDOWN_THREAD_NAME, daemon=True).start()
 
     try:
@@ -13999,7 +14249,10 @@ def serve(args: argparse.Namespace) -> None:
     slack_app_token = os.getenv("SLACK_APP_TOKEN", "").strip()
     if slack_bot_tokens and slack_app_token:
         def initialize_slack_relay() -> None:
-            while CredentialProxyHandler.slack_relay is None:
+            while (
+                CredentialProxyHandler.slack_relay is None
+                and not CredentialProxyHandler.shutting_down.is_set()
+            ):
                 try:
                     relay = SlackRelay(
                         slack_bot_tokens,
@@ -14018,6 +14271,12 @@ def serve(args: argparse.Namespace) -> None:
                     time.sleep(30)
                 else:
                     CredentialProxyHandler.slack_relay = relay
+                    # Published before the check, and the drain sets the flag
+                    # before it reads the relay, so one of the two closes a
+                    # relay that connects while the broker drains.
+                    if CredentialProxyHandler.draining.is_set():
+                        relay.stop_intake()
+                        break
                     LOGGER.info(
                         "Slack relay enabled workspaces=%d",
                         len(relay.bootstrap()),
@@ -14090,6 +14349,11 @@ def serve(args: argparse.Namespace) -> None:
             for relay in (CredentialProxyHandler.chat_relay, CredentialProxyHandler.a2a_chat_relay)
             if relay is not None
         ],
+        executor=executor,
+        # Only the standalone broker pod drains: the operator gives it the grace
+        # period for one (credentialProxyTerminationGraceSeconds), and the
+        # sidecar roles' pods keep the short stop.
+        drain_seconds=SHUTDOWN_DRAIN_SECONDS if role == "broker" else 0,
     )
     server.serve_forever()
     LOGGER.info("credential proxy stopped")

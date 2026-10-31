@@ -401,17 +401,28 @@ clamp_at_least DRIFT_SHORT_EXIT_ALERT_COUNT
 # bounded by the settle, not by how often it is checked.
 readonly SHUTDOWN_DRAIN_SECONDS=15
 readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
-# The credential runtime's own drain budget. In the broker role the runtime
+# The credential runtime's own drain budget. In the combined role the runtime
 # leaves on SIGTERM (install_shutdown_handler in
 # agents/platform/scripts/credential_proxy.py): it refuses new Chat event pulls,
 # keeps the settle routes open for its 3s window so the gateway's acks land,
 # hands any unsettled Chat receipt back to Pub/Sub, and exits. Killing it and
 # returning, as terminate() once did, delivered the signal and not that
 # shutdown, because terminate() returning is PID 1 exiting. Ten seconds is the
-# window plus margin, inside the broker pod's 30s default grace with the Envoy
-# kill after it. In the api-proxy role the runtime installs no handler and
-# exits on the signal, so the wait there is one poll.
+# window plus margin, inside a 30s default grace with the Envoy kill after it.
+# In the api-proxy role the runtime installs no handler and exits on the
+# signal, so the wait there is one poll. The broker role drains longer and
+# waits BROKER_RUNTIME_DRAIN_SECONDS instead (below).
 readonly RUNTIME_DRAIN_SECONDS=10
+# The standalone broker pod's runtime drains longer: it refuses new requests and
+# gives those in flight up to credential_proxy.py's own SHUTDOWN_DRAIN_SECONDS
+# (30s from the signal, the 3s settle inside it), then ends the commands still
+# running, waits its SHUTDOWN_END_WAIT_SECONDS (5s) for their answers, and hands
+# the Chat receipts back (SHUTDOWN_NACK_TIMEOUT_SECONDS, 2s, per relay; two
+# relays). Forty seconds holds those 39s and one poll
+# (tests/test_credential_proxy_drain_budget.py), inside the 45s
+# terminationGracePeriodSeconds the operator gives the broker pod
+# (credentialProxyTerminationGraceSeconds), Envoy's kill after it.
+readonly BROKER_RUNTIME_DRAIN_SECONDS=40
 
 # Where the watcher keeps its dedup snapshots. Without them the cache starts
 # empty on every restart, and an empty cache is not a neutral state: the
@@ -679,7 +690,9 @@ terminate() {
   [[ "${#supervisors[@]}" -eq 0 ]] || drain_supervised "${SHUTDOWN_DRAIN_SECONDS}" "${supervisors[@]}"
 
   # Drained, not just signalled: see RUNTIME_DRAIN_SECONDS and drain_runtime.
-  [[ -z "${runtime_pid}" ]] || drain_runtime "${RUNTIME_DRAIN_SECONDS}" "${runtime_pid}"
+  local runtime_budget="${RUNTIME_DRAIN_SECONDS}"
+  [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" ]] || runtime_budget="${BROKER_RUNTIME_DRAIN_SECONDS}"
+  [[ -z "${runtime_pid}" ]] || drain_runtime "${runtime_budget}" "${runtime_pid}"
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
 }
 trap terminate EXIT INT TERM
