@@ -126,7 +126,7 @@ func TestTheMCPBrokerAccessIsInertOutsideModeNext(t *testing.T) {
 	if a2aMCPBrokerEnabled(agent) {
 		t.Fatal("enabled outside mode next")
 	}
-	if strings.Contains(allowedBrokerCallers(agent, true), a2aMCPName(agent)) {
+	if strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), a2aMCPName(agent)) {
 		t.Error("MCP caller named on a today install")
 	}
 	broker := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
@@ -143,7 +143,7 @@ func TestTheBrokerConfersTheMCPAudienceOnlyUnderTheFlag(t *testing.T) {
 	caller := "system:serviceaccount:test-ns:test-agent-a2a-mcp"
 
 	t.Setenv(a2aMCPDoorEnvVar, "")
-	if strings.Contains(allowedBrokerCallers(agent, true), caller) {
+	if strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), caller) {
 		t.Fatal("the MCP ServiceAccount is a broker caller with the flag unset")
 	}
 	off := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
@@ -155,10 +155,10 @@ func TestTheBrokerConfersTheMCPAudienceOnlyUnderTheFlag(t *testing.T) {
 	}
 
 	t.Setenv(a2aMCPDoorEnvVar, "true")
-	if got := allowedBrokerCallers(agent, true); !strings.HasSuffix(got, ","+caller) {
+	if got := allowedBrokerCallers(agent, allBrokerCallersOwned); !strings.HasSuffix(got, ","+caller) {
 		t.Fatalf("callers = %q, want it to end with %q", got, caller)
 	}
-	if strings.Contains(allowedBrokerCallers(agent, true), ":default") {
+	if strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), ":default") {
 		t.Error("the namespace default ServiceAccount is a broker caller")
 	}
 	on := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
@@ -576,13 +576,13 @@ func TestTheBrokerAdmitsTheMCPAccountOnlyWhenOwned(t *testing.T) {
 	agent := mcpBrokerAgent()
 	caller := "system:serviceaccount:test-ns:test-agent-a2a-mcp"
 	t.Setenv(a2aMCPDoorEnvVar, "true")
-	if got := allowedBrokerCallers(agent, false); strings.Contains(got, caller) {
+	if got := allowedBrokerCallers(agent, brokerCallerOwnership{scope: true}); strings.Contains(got, caller) {
 		t.Errorf("callers = %q: the MCP account is admitted while somebody else owns it", got)
 	}
 	if env := a2aMCPBrokerEnv(agent, false); len(env) != 0 {
 		t.Errorf("the MCP audience binding is rendered while somebody else owns the account: %+v", env)
 	}
-	unowned := buildCredentialProxyDeploymentForPlugins(agent, "policy-hash", nil, false, credentialProxyProfileConfig{}).Spec.Template.Spec.Containers[0]
+	unowned := buildCredentialProxyDeploymentForPlugins(agent, "policy-hash", nil, brokerCallerOwnership{scope: true}, credentialProxyProfileConfig{}).Spec.Template.Spec.Containers[0]
 	if _, found := brokerEnvValue(unowned.Env, "CREDENTIAL_PROXY_MCP_CALLERS"); found {
 		t.Error("CREDENTIAL_PROXY_MCP_CALLERS is rendered while somebody else owns the account")
 	}
