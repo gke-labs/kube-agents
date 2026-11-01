@@ -114,6 +114,15 @@ class SkillCommandsTest(unittest.TestCase):
             with self.subTest(command):
                 self.assertFalse(any(pattern.search(command) for pattern in PATTERNS))
 
+    def test_remediation_pr_terminology_and_audit_gates_preserved(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn(
+            'Use `"capacity constraint"` or `"scale-up failure"` in the Pull Request title, description, YAML comments, and chat notifications — do NOT call the diagnosis a `"stockout"`.',
+            text,
+        )
+        self.assertIn("- **Checks Performed**:", text)
+        self.assertIn("platform-agent/remediate-stockout-<workload_name>", text)
+
 
 if __name__ == "__main__":
     unittest.main()

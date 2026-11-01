@@ -137,7 +137,7 @@ spec:
               # now warns at startup if a route pairs it with `dispatch: kanban`.
               prompt: 'GKE Scale-up Failure Alert.
 
-                Judge whether this is a real, active stockout or a duplicate/stale signal,
+                Judge whether this is a real, active capacity constraint or scale-up failure or a duplicate/stale signal,
                 and if it is real, diagnose it and propose a GitOps remediation PR.
 
                 Alert Details:
