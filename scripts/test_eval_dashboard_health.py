@@ -338,6 +338,14 @@ class SharedBreak(unittest.TestCase):
         thin_retest = run(2, 11, T0 - timedelta(hours=3), tasks=[task("agent-kanban-smoke", "ifi")] + passing, result="FAILURE")
         solid_alone = run(1, 11, T0 - timedelta(hours=2), tasks=[task("agent-kanban-smoke", "iff")] + passing, result="FAILURE")
         self.assertFalse([line for line in assess(data(thin_retest, solid_alone, run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set()))), T0)["evidence"] if line.startswith("PR-caused")])
+        # Two solid runs beside a thin one: the line counts the solid two, and
+        # the digest counts the solid runs only, the thin one on the gate's side.
+        second = run(4, 11, T0 - timedelta(hours=4), tasks=[task("agent-kanban-smoke", "fff")] + passing, result="FAILURE")
+        passer = run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set()))
+        self.assertIn("PR-caused: agent-kanban-smoke failing on 2 runs of #11 (passing on 1 other PRs)", assess(data(thin_retest, solid_alone, second, passer), T0)["evidence"])
+        metrics = adjudicate(data(thin_retest, solid_alone, second, passer), T0)["metrics"]
+        self.assertEqual((metrics["pr_caused_reds"], metrics["infra_reds"]), (2, 1))
+        self.assertEqual(adjudicate(data(thin, solid, other), T0)["metrics"]["pr_caused_reds"], 1, "a thin run beside a same-base solid one is the gate's")
 
     def test_nothing_is_pr_caused_while_a_storm_fires(self):
         # A solid same-base collapse on #11 beside a storm's reps: the storm

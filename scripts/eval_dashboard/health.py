@@ -1080,7 +1080,7 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
             )
         elif path == PR_CAUSED_REPEATED:
             pr_caused.append(
-                f"PR-caused: {case} failing on {len(runs)} runs of #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs)"
+                f"PR-caused: {case} failing on {len(solid)} runs of #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs)"
             )
         if path is not None:
             pr_caused_latest.append(max(run.finished for run in solid))
@@ -1560,7 +1560,9 @@ def pr_caused_reds(full_runs, roster: Roster) -> int:
         if run.result != RUN_FAILURE or run.deadline_kill or run.not_evaluated:
             continue
         mine = run.collapsed_cases() & roster.at(run.started or run.finished)
-        if mine and all(pr_caused_path(case, collapses[case], full_runs)[0] is not None for case in mine):
+        # The run itself must be one of the case's solid runs: a thin run of
+        # a pull request that also has a real collapse is still the gate's.
+        if mine and all(run in pr_caused_path(case, collapses[case], full_runs)[2] for case in mine):
             count += 1
     return count
 
