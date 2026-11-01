@@ -237,7 +237,11 @@ resources from the connected target and returns only that canonical resource.
 If it is absent, discovery fails and lists the names it did find; it never uses
 the cluster, Deployment, Service, gateway container, or Hermes profile as an
 agent ID. The gateway container is separately discovered from the live pod
-spec as the container that owns the named `api` port.
+spec as the container that owns the named `api` port. Both answers are held per
+console process for `ADMIN_CONSOLE_RUNTIME_CACHE_TTL_SECONDS` (default 30 s) and
+dropped after a chat action, an LLM gateway change or a failed discovery; a read
+that fails against the held pod discovers again and retries once if the pod has
+moved. The read behind each page is never held.
 
 The public interaction and session resources retain `agentId` for stable stored
 records and URLs. Portal clients populate it from discovery rather than asking

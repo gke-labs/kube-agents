@@ -1140,7 +1140,7 @@ class FakeClock:
         return self.now
 
 
-def kubectl_stdout(command: list[str]) -> tuple[int, str]:
+def kubectl_stdout(command: list[str], pod: str) -> tuple[int, str]:
     """Answer the three commands a runtime read spawns, as kubectl would."""
     if "platformagents" in command:
         return 0, json.dumps({"items": [{"metadata": {"name": "platform-agent"}}]})
@@ -1149,7 +1149,7 @@ def kubectl_stdout(command: list[str]) -> tuple[int, str]:
             {
                 "items": [
                     {
-                        "metadata": {"name": "platform-agent-gateway-1"},
+                        "metadata": {"name": pod},
                         "spec": {
                             "containers": [
                                 {
@@ -1163,6 +1163,8 @@ def kubectl_stdout(command: list[str]) -> tuple[int, str]:
             }
         )
     if "exec" in command:
+        if command[command.index("exec") + 1] != pod:
+            return 1, ""
         return 0, json.dumps({"tasks": [], "truncated": False})
     return 1, ""
 
@@ -1174,8 +1176,10 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
 
     def setUp(self) -> None:
         agent_runtime.invalidate()
+        self.addCleanup(agent_runtime.invalidate)
         self.spawned: list[list[str]] = []
         self.failing: set[str] = set()
+        self.pod = "platform-agent-gateway-1"
         self.spawn_lock = threading.Lock()
         self.clock = FakeClock()
         self.cache = RuntimeDiscoveryCache(clock=self.clock)
@@ -1192,11 +1196,18 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
         if "exec" not in command:
             # Widen the window in which concurrent readers could each discover.
             time.sleep(0.01)
-        returncode, stdout = kubectl_stdout(command)
+        returncode, stdout = kubectl_stdout(command, self.pod)
         verb = next((word for word in command if word in self.failing), None)
         if verb is not None:
             return subprocess.CompletedProcess(command, 1, "", f"{verb} failed")
-        return subprocess.CompletedProcess(command, returncode, stdout, "")
+        return subprocess.CompletedProcess(command, returncode, stdout, "pod gone")
+
+    def exec_pods(self) -> list[str]:
+        return [
+            command[command.index("exec") + 1]
+            for command in self.spawned
+            if "exec" in command
+        ]
 
     def spawns(self, *verbs: str) -> int:
         return sum(
@@ -1262,7 +1273,7 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
         self.assertEqual(self.spawns("platformagents"), 2)
         self.assertEqual(self.spawns("pods"), 1)
 
-    def test_failed_read_evicts_the_target_so_the_next_read_rediscovers(self):
+    def test_failed_read_against_a_current_pod_rediscovers_and_reports(self):
         self.read()
         self.failing = {"exec"}
         with self.assertRaisesRegex(AgentRuntimeError, "Agent runtime read failed"):
@@ -1271,8 +1282,30 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
 
         self.read()
 
+        # The failed read discovered again, found the same pod, and did not
+        # retry; the read after it used the answers that discovery refreshed.
         self.assertEqual(self.spawns("platformagents"), 2)
         self.assertEqual(self.spawns("pods"), 2)
+        self.assertEqual(self.spawns("exec"), 3)
+
+    def test_failed_read_against_a_replaced_pod_retries_once_on_the_new_pod(self):
+        self.read()
+        self.pod = "platform-agent-gateway-2"
+
+        self.read()
+        self.read()
+
+        self.assertEqual(self.spawns("platformagents"), 2)
+        self.assertEqual(self.spawns("pods"), 2)
+        self.assertEqual(
+            self.exec_pods(),
+            [
+                "platform-agent-gateway-1",
+                "platform-agent-gateway-1",
+                "platform-agent-gateway-2",
+                "platform-agent-gateway-2",
+            ],
+        )
 
     def test_targets_do_not_share_answers(self):
         other = DeploymentTarget("test-project-02", "test-cluster-01", "us-east4")

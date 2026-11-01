@@ -49,11 +49,17 @@ which stays in `.streamlit/config.toml` at the repository root. The theme
 changes colours only; it adds no Google Cloud logo or font.
 
 Every runtime read first asks the cluster which PlatformAgent is canonical and
-which gateway pod runs it. The console holds those two answers for 30 seconds,
-shared by every page, the API and the chat poll, and forgets them after a chat
-action or an LLM Gateway change. The data read itself is never held. To change
+which gateway pod runs it. Each console process holds those two answers for 30
+seconds: the API server's copy serves the API, the chat poll and the Chat, LLM
+Gateway and Google Chat pages, and is dropped after a chat action or an LLM
+Gateway change; the Streamlit process's copy serves Task Kanban, Scheduled Cron
+and the Connection check, and lasts the window. Either copy is dropped when a
+discovery fails, and a read that fails against the held pod discovers again and
+retries once if the pod has moved. The data read itself is never held. To change
 the window, set `ADMIN_CONSOLE_RUNTIME_CACHE_TTL_SECONDS` in seconds; `0`
-disables the cache, and an unparsable value keeps the default.
+disables the cache, and an unparsable value keeps the default. The console
+processes read it directly; the launcher does not validate it as it does its
+`ADMIN_PORTAL_*` settings.
 
 This loopback-only launcher is the authentication boundary for the prototype.
 A remotely deployed console still requires application-level authentication

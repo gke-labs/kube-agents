@@ -38,11 +38,13 @@ _K8S_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
 _KANBAN_TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 GATEWAY_PYTHON = "/opt/hermes/.venv/bin/python3"
 # Every runtime read starts with the same two discovery questions, which
-# PlatformAgent is canonical and which gateway pod runs it, and every page,
-# the API and the task-settlement poll build their own provider, so an active
-# session asked the cluster hundreds of times a minute. The answers are held
-# console-wide for this long. 0 disables the cache; an unparsable or negative
-# value falls back to the default.
+# PlatformAgent is canonical and which gateway pod runs it. Before this cache
+# every provider answered them afresh, and the pages build a provider on each
+# rerun, so an active session asked the cluster hundreds of times a minute.
+# The answers are now held for this long, shared by every provider in one
+# process (the API server and the Streamlit pages are two processes, so each
+# holds its own copy). 0 disables the cache; an unparsable or negative value
+# falls back to the default.
 RUNTIME_CACHE_TTL_ENV = "ADMIN_CONSOLE_RUNTIME_CACHE_TTL_SECONDS"
 DEFAULT_RUNTIME_CACHE_TTL_SECONDS = 30.0
 _CANONICAL_AGENT_KEY = "canonical_agent"
@@ -1152,8 +1154,23 @@ class AgentRuntimeProvider:
         return self.gateway_pod(agent)
 
     def _read(self, agent: str, arguments: list[str], *, timeout: int = 25) -> dict:
-        pod, container = self.gateway_endpoint(agent)
-        result = self.runner.run(
+        endpoint = self.gateway_endpoint(agent)
+        result = self._exec(endpoint, arguments, timeout)
+        if result.returncode != 0:
+            # The held pod may have been replaced under the exec. Discover
+            # again and, only when the answer moved, read once from the new
+            # pod; a failure against a pod that is still current is reported.
+            self._cache.invalidate(self.target)
+            current = self.gateway_endpoint(agent)
+            if current != endpoint:
+                result = self._exec(current, arguments, timeout)
+        return self._parse_read(result)
+
+    def _exec(
+        self, endpoint: tuple[str, str], arguments: list[str], timeout: int
+    ) -> KubeCommandResult:
+        pod, container = endpoint
+        return self.runner.run(
             [
                 *self._base(),
                 "exec",
@@ -1168,13 +1185,6 @@ class AgentRuntimeProvider:
             ],
             timeout=timeout,
         )
-        try:
-            return self._parse_read(result)
-        except AgentRuntimeError:
-            # The held pod may have gone away under the exec; the next read
-            # discovers again instead of failing for the rest of the window.
-            self._cache.invalidate(self.target)
-            raise
 
     def _parse_read(self, result: KubeCommandResult) -> dict:
         framed = _unframe(result.stdout)

@@ -82,6 +82,7 @@ class FakeKube:
 class LlmGatewayServiceTest(unittest.TestCase):
     def setUp(self) -> None:
         agent_runtime.invalidate()
+        self.addCleanup(agent_runtime.invalidate)
 
     def test_inspect_returns_raw_results_without_classification(self):
         results = [

@@ -721,6 +721,7 @@ class InteractionApiTest(unittest.TestCase):
         self.assertIs(bound(), bound())
 
     def test_chat_actions_drop_the_held_runtime_discovery(self):
+        self.addCleanup(agent_runtime.invalidate)
         target = DeploymentTarget("test-project-01", "test-cluster-01", "us-east4")
         with patch("admin_console.chat.backend.agent_chat.AgentChatProvider"), patch(
             "admin_console.chat.backend.agent_runtime.AgentRuntimeProvider"
