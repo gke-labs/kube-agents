@@ -29,7 +29,7 @@ SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template chart-sync chart-check iac-parity-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -862,7 +862,11 @@ iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy c
 # against the schema init_db() builds, and fails on a full scan of an unbounded
 # table that scripts/sqlite_query_plan_baseline.txt does not already carry
 # (CI runs this via scripts/test_check_sqlite_query_plans.py).
-sqlite-plan-check: ## Fail when a session-server SQL statement would full-scan an unbounded table (baseline: scripts/sqlite_query_plan_baseline.txt; needs the test-python deps).
+sqlite-plan-check: ## Fail when a SQL statement on the session server's tables would full-scan an unbounded one (baseline: scripts/sqlite_query_plan_baseline.txt; needs the test-python deps).
+	@python3 -c "import fastapi" 2>/dev/null || { \
+		echo "sqlite-plan-check imports the session server, which needs the test deps: make test-python-deps"; \
+		exit 1; \
+	}
 	@python3 scripts/check_sqlite_query_plans.py
 
 # The unit tests stub `terraform`, so only this puts lifecycle.sh's tfvar()
