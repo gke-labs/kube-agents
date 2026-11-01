@@ -114,6 +114,11 @@ const (
 	minterReadScope         = "platform-agent-read-scope"
 	minterScopeField        = "scope"
 	minterRepositoriesField = "repositories"
+	// minterSweepScope reads contents, pull requests and issues for a managed
+	// repository. renderRepoPolicy carries it over from default.yaml with the
+	// write scope; renderReadOnlyPolicy keeps minterReadScope alone, so a
+	// context repository's policy never carries it.
+	minterSweepScope = "platform-agent-sweep-scope"
 
 	// metadataLinkLocalIP is the address a workload dials for GCP metadata and Workload
 	// Identity tokens. It is only ever the pre-DNAT destination.
@@ -354,6 +359,19 @@ const (
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
+	// credentialBrokerDownMessageSuffix follows the Provisioning message
+	// while the credential broker is the workload (or one of them) with no
+	// ready replica: an eviction, a drain or a Recreate rollout of its one
+	// pod. The workload's name alone says what to describe, not what the
+	// install is doing meanwhile, and that is what the reader watching a
+	// silent chat needs. Brokered commands are the shell's kubectl, git, gh
+	// and gcloud, every one of which dials the broker's Service. The Chat
+	// clause is added only where googleChatEnabled: the A2A gateway pulls
+	// Chat through the broker's relay and the messages wait in Pub/Sub,
+	// whereas Slack on a next install is the gateway's own socket, and an
+	// install with no Chat has no such queue to name.
+	credentialBrokerDownMessageSuffix     = "; while the credential broker is away, brokered commands fail" // #nosec G101 -- Condition message, not a credential
+	credentialBrokerDownChatMessageSuffix = " and Google Chat messages wait in Pub/Sub"                     // #nosec G101 -- Condition message, not a credential
 	// conditionReasonInvalidCredentialProxyResources: the CR's
 	// spec.deployment.credentialProxy.resources fails
 	// ValidateCredentialProxyResources, so the override is ignored and the
@@ -422,6 +440,7 @@ type PlatformAgentReconciler struct {
 	prunedUsageStatus sync.Map
 	// prunedNewerFields records, per CR (usagePollKey) and per newer
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
+	// the proposal readings as one (usageNewerFieldReadings),
 	// lastHumanActiveTime, and each counter after the first schema by its
 	// name -- the last poll in which the usage counters poller wrote the field
 	// and it came back absent: a served CRD at a previous schema, which has
@@ -943,7 +962,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 11. Reconcile the credential proxy: its own Deployment, its Service and the
 	// NetworkPolicy narrowing who may reach it.
-	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash, agentPlugins); err != nil {
+	// Whether the broker may admit the MCP pod's ServiceAccount: read here
+	// because the broker renders before the A2A stack that would otherwise
+	// answer it (a2aMCPIdentityOwned).
+	mcpIdentityOwned, err := r.a2aMCPIdentityOwned(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash, agentPlugins, mcpIdentityOwned); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1247,6 +1273,16 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// until the chart's uninstall deletes the namespace. Removing the
 		// quota on deletion, and what a refused delete should do to the
 		// finalizer, is #3827.
+		//
+		// The dispatcher's pod-read binding there is removed, for the
+		// ClusterRoleBinding's reason above: left behind, anyone who later
+		// creates a ServiceAccount of the dispatcher's name inherits pod read
+		// in that namespace. A failure is logged and never holds the
+		// finalizer, under the profile-namespace rule (#3827 settles what a
+		// refused delete should do).
+		if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
+			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's pod-read Role on deletion", err)
+		}
 
 		// Delete managed litellm-policy during finalizer teardown only if Deployment/litellm
 		// is absent or terminating. litellm-policy is owned by Deployment/litellm (via OwnerReference)
@@ -2567,6 +2603,12 @@ func (r *PlatformAgentReconciler) heldEnabledProfiles(ctx context.Context, agent
 // Service and the NetworkPolicy, so what the failure blocked was
 // updateStatusReady: the CR's status silently stopped tracking reality while
 // an admin followed the documented deletion path straight onto the error path.
+//
+// The guard itself no longer fails the reconcile either: an object under one
+// of the two names that this PlatformAgent does not control is skipped and
+// logged, as the A2A removals skip theirs (#3871). It is not ours to delete,
+// and this runs on every reconcile in both modes, so refusing would stop
+// everything after it until a person deleted the object.
 func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	resources := []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
@@ -2580,7 +2622,9 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 			continue
 		}
 		if !metav1.IsControlledBy(resource, agent) {
-			return fmt.Errorf("refusing to delete unowned legacy %T %s/%s", resource, resource.GetNamespace(), resource.GetName())
+			logf.FromContext(ctx).V(1).Info("skipping unowned legacy object under a reserved name",
+				"kind", fmt.Sprintf("%T", resource), "namespace", resource.GetNamespace(), "name", resource.GetName())
+			continue
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, resource)); err != nil {
 			return err
@@ -2974,7 +3018,7 @@ func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key 
 // and the sandbox's wrapped CLIs both dial the Service, and neither has any
 // business knowing where the relays run. credential_proxy_manifests.go carries
 // the reasoning for why the pod is its own.
-func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) error {
+func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool) error {
 	objs := []client.Object{buildCredentialProxyService(agent)}
 	// The resources override is checked here as well as at admission, because
 	// the chart installs with the webhook off. Rendered, an override under the
@@ -3019,12 +3063,21 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	// reaching a container that never restarts. (On a Slack-armed next install
 	// the Slack pair is read by the A2A gateway instead, which reconcileA2A
 	// stamps.)
-	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins)
+	// The profile role (#3889): the AgentProfile identities and the
+	// task-signing public key, or nothing on an install without profiles.
+	profiles, err := r.credentialProxyProfileConfigFor(ctx, agent)
+	if err != nil {
+		return err
+	}
+	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, mcpIdentityOwned, profiles)
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
 	objs = append(objs, proxy)
-	objs = append(objs, credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace))
+	// The budget after the Deployment whose pods it selects, as the callout's
+	// and the verifier's are.
+	objs = append(objs, buildCredentialProxyPDB(agent))
+	objs = append(objs, withCredentialProxyProfilePeer(credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace), agent, profiles))
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return fmt.Errorf("failed to set controller reference on credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
@@ -3032,6 +3085,14 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 		apply := r.applyManaged
 		if _, isDeployment := obj.(*appsv1.Deployment); isDeployment {
 			apply = r.applyCredentialProxyDeployment
+		}
+		// A hand-set minAvailable on the budget would make every apply merge
+		// to both fields and be refused, failing this step and the
+		// NetworkPolicy after it on every pass; the clear is the callout's.
+		if pdb, isPDB := obj.(*policyv1.PodDisruptionBudget); isPDB {
+			if err := r.clearForeignPDBBudgetField(ctx, pdb); err != nil {
+				return err
+			}
 		}
 		if err := apply(ctx, agent, obj); err != nil {
 			return fmt.Errorf("failed to apply credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
@@ -3136,18 +3197,6 @@ func (r *PlatformAgentReconciler) reconcileCredentialBrokerTokenReviewRBAC(ctx c
 		return fmt.Errorf("failed to reconcile credential broker TokenReview ClusterRoleBinding: %w", err)
 	}
 	return nil
-}
-
-// deleteIfOwned removes a namespaced object this controller created, refusing
-// to touch one it does not own.
-func (r *PlatformAgentReconciler) deleteIfOwned(ctx context.Context, agent *agentv1alpha1.PlatformAgent, object client.Object) error {
-	if err := r.Get(ctx, client.ObjectKeyFromObject(object), object); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	if !metav1.IsControlledBy(object, agent) {
-		return fmt.Errorf("refusing to delete unowned %T %s/%s", object, object.GetNamespace(), object.GetName())
-	}
-	return client.IgnoreNotFound(r.Delete(ctx, object))
 }
 
 // deleteIfManaged removes a cluster-scoped object this controller created.
@@ -3968,6 +4017,37 @@ func a2aGatewayConditionStands(agent *agentv1alpha1.PlatformAgent) bool {
 		(existing.Reason == a2aGatewayLegacyDarkReason || existing.Reason == a2aGatewayWakingReason)
 }
 
+// a2aMCPIdentityConditionCurrent and setA2AMCPIdentityCondition carry the
+// MCP server condition (a2aMCPIdentityConditionType): present, True, with
+// the reason a2aProvisionState.mcpNotRendered names, while the door is on
+// and an unowned object holds one of the server's reserved names; absent
+// otherwise. Same shape as the gateway's, and written by both status
+// writers (updateStatusReady and syncA2AConditions), so the ordinary Ready
+// pass and a Degraded park both carry it.
+func a2aMCPIdentityConditionCurrent(agent *agentv1alpha1.PlatformAgent, reason string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aMCPIdentityConditionType)
+	if reason == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == reason && existing.Message == a2aMCPNotRenderedMessage(agent, reason)
+}
+
+func setA2AMCPIdentityCondition(agent *agentv1alpha1.PlatformAgent, reason string, now metav1.Time) {
+	if reason == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aMCPIdentityConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               a2aMCPIdentityConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             reason,
+		Message:            a2aMCPNotRenderedMessage(agent, reason),
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
 // setA2AGatewayCondition writes the A2AGateway condition on the EventWatcher
 // pattern: present while the state holds, removed the pass it stops holding.
 // The only state is the way back on an upgraded install (a gateway an older
@@ -4125,13 +4205,15 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	homeMsg := homeChannelUnsetMessage(agent)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
-		homeChannelUnsetConditionCurrent(agent, homeMsg) {
+		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
+		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) {
 		return nil
 	}
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
-			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live))
+			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live)) &&
+			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered)
 	}) {
 		return nil
 	}
@@ -4140,6 +4222,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
+	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	return r.Status().Update(ctx, agent)
 }
 
@@ -4254,9 +4337,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		return "", errSplit
 	}
 	notReady := make([]string, 0, len(splitWorkloads))
+	brokerNotReady := false
 	for _, w := range splitWorkloads {
 		if w.ready == 0 {
 			notReady = append(notReady, fmt.Sprintf("%s %s", w.kind, w.name))
+			if w.name == credentialBrokerName(agent) {
+				brokerNotReady = true
+			}
 		}
 	}
 
@@ -4293,6 +4380,12 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			// generic "waiting for replicas" message would point at the one
 			// workload that is fine. Say which of the other two is missing.
 			condMsg = fmt.Sprintf("Waiting for %s to become ready", strings.Join(notReady, " and "))
+			if brokerNotReady {
+				condMsg += credentialBrokerDownMessageSuffix
+				if googleChatEnabled(agent) {
+					condMsg += credentialBrokerDownChatMessageSuffix
+				}
+			}
 		}
 	}
 
@@ -4451,6 +4544,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// reason.
 	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
 	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
+	a2aMCPServerUnchanged := a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered)
 
 	// A data claim its StorageClass cannot expand, from what growDataClaim
 	// recorded on this pass, compared on its message like VolumesDropped.
@@ -4499,7 +4593,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
-		a2aVerifierUnchanged &&
+		a2aVerifierUnchanged && a2aMCPServerUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
@@ -4577,6 +4671,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setA2AGatewayCondition(agent, a2aGatewayMsg, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
+	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
 	if err := r.Status().Update(ctx, agent); err != nil {
@@ -5649,13 +5744,18 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 			).Watches(
 				// Whether a profile gets a map entry also depends on its
-				// operator-created ServiceAccount (a foreign one under that
-				// name keeps it out: agentProfileServiceAccountIsForeign),
-				// and that ServiceAccount is the profile's, not the agent's,
-				// so Owns() above never fires for it.
+				// operator-created ServiceAccounts (a foreign one under
+				// such a name keeps it out: agentProfileServiceAccountIsForeign),
+				// and those are the profile's, not the agent's, so Owns()
+				// above never fires for them. They live in the profile
+				// namespace, which maps to the agent beside it.
 				&corev1.ServiceAccount{},
 				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+					agentNS, ok := agentNamespaceOfProfileServiceAccount(obj.GetNamespace())
+					if !ok {
+						return nil
+					}
+					return enqueueAgentsInNamespace(ctx, agentNS)
 				}),
 				builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 					return strings.HasPrefix(obj.GetName(), agentProfileServiceAccountPrefix)

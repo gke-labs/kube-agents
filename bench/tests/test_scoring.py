@@ -473,8 +473,8 @@ def status_event(state, final):
 def give_it_an_a2a_terminal(rec):
     """Null token buckets plus an executor's lifecycle ending in a final event.
 
-    What an inject-transport run legitimately looks like: the gateway reports
-    no usage, so every bucket is None, and the evidence that a run happened is
+    What an inject-transport run legitimately looks like when its gateway
+    reports no usage: every bucket is None, and the evidence that a run happened is
     the executor's final status event in the trajectory.
     """
     rec["tokens"] = {k: None for k in rec["tokens"]}
@@ -488,7 +488,7 @@ def give_it_an_a2a_terminal(rec):
 def test_rung_3_accepts_null_tokens_when_a_task_terminated(noop_spec, make_run):
     """The one record that legitimately has no token accounting.
 
-    The A2A gateway reports no usage, so an inject-transport run's buckets are
+    A gateway that reports no usage leaves an inject-transport run's buckets
     all null -- which rung 3 reads as "no agent ran" everywhere else, and
     would red every case run through the customer's front door.
     """

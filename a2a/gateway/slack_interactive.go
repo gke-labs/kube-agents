@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
@@ -38,11 +39,11 @@ const (
 	// but the ack, since Slack has opened the url.
 	slackChoiceActionPrefix = slackChatActionPrefix + "." + slackChatChoiceAction + "."
 
-	// slackAnsweredLine is the line an answer leaves on its question.
-	slackAnsweredLine = "✓ %s: %s"
-	// slackNamelessClicker stands in for a clicker Slack names nowhere:
+	// answeredLine is the line an answer leaves on its question.
+	answeredLine = "✓ %s: %s"
+	// namelessClicker stands in for a clicker the backend names nowhere:
 	// never their raw id.
-	slackNamelessClicker = "Someone"
+	namelessClicker = "Someone"
 	// slackTypedAnswerMax clips a typed answer's words on its line (today's
 	// TYPED_ANSWER_MAX).
 	slackTypedAnswerMax = 80
@@ -55,8 +56,8 @@ const (
 	slackPlainText     = "plain_text"
 	slackMrkdwnText    = "mrkdwn"
 
-	// slackUXCap bounds each of the click and question maps, oldest first.
-	slackUXCap = 512
+	// uxCap bounds each of the click and question maps, oldest first.
+	uxCap = 512
 
 	// slackDMChannelPrefix is a DM channel id's first letter.
 	slackDMChannelPrefix = "D"
@@ -123,11 +124,14 @@ type slackQuestion struct {
 // the thread, and whose responseURL reaches its clicker alone.
 type slackPending struct {
 	conversation, author, text string
-	click                      bool
-	label                      string
-	question                   slackQuestion
-	shortcut                   bool
-	responseURL                string
+	// homeType is the channel_type of a top-level channel mention, the one
+	// shape that can set the home channel (noteHomeCandidate); "" otherwise.
+	homeType    string
+	click       bool
+	label       string
+	question    slackQuestion
+	shortcut    bool
+	responseURL string
 	// clicker is a shortcut clicker's Slack name, for the credit line.
 	clicker string
 }
@@ -171,12 +175,12 @@ func (s *SlackAdapter) uxLocked() *slackUX {
 // A key keeps one slot: one already in the ring moves to the newest end
 // rather than gaining a second slot, whose older twin's eviction would
 // otherwise drop the live entry (a map entry deleted without retiring its
-// slot, then added again). The rings hold at most slackUXCap keys, so the
+// slot, then added again). The rings hold at most uxCap keys, so the
 // scan is bounded.
 func remember(order *[]string, key string, drop func(string)) {
 	forget(order, key)
 	*order = append(*order, key)
-	if len(*order) > slackUXCap {
+	if len(*order) > uxCap {
 		drop((*order)[0])
 		*order = (*order)[1:]
 	}
@@ -344,6 +348,25 @@ func (s *SlackAdapter) notePending(msg InboundMessage) {
 		slackPending{conversation: msg.Conversation, author: slackMemberOf(msg.AuthorID), text: msg.Text})
 }
 
+// noteHomeCandidate marks a pending turn that could set the home channel: a
+// top-level message in a channel, a private channel or a group direct message
+// (Kind "group"; a DM is never one). A top-level channel message that reached
+// here mentioned the bot (inboundEvent). InboundVerified acts on the mark
+// once the gateway has verified the sender.
+func (s *SlackAdapter) noteHomeCandidate(msg InboundMessage, m *slackevents.MessageEvent) {
+	if msg.Kind != slackKindGroup || m.ThreadTimeStamp != "" || msg.Unaddressed {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ux := s.uxLocked()
+	key := slackPendingKey(msg.Conversation, msg.MessageID)
+	if p, ok := ux.pending[key]; ok {
+		p.homeType = m.ChannelType
+		ux.pending[key] = p
+	}
+}
+
 // slackMemberOf is the Slack member id behind an author id: the id itself for
 // our own member, the part after the workspace for an admitted guest's
 // "T…:U…" (slackGuestEntry). A pending turn keeps this raw id, because what it
@@ -410,6 +433,11 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	if action.ActionID == slackFeedbackAction {
 		// A rating: never a turn.
 		s.feedbackClick(p, action.Type, action.BlockID, action.Value)
+		return InboundMessage{}, false
+	}
+	if strings.HasPrefix(action.ActionID, slackBoardActionPrefix) {
+		// A board-health row's Retry or Drop: never a turn (slack_board.go).
+		s.boardClick(p, action.ActionID, action.BlockID, action.Value)
 		return InboundMessage{}, false
 	}
 	if !strings.HasPrefix(action.ActionID, slackChoiceActionPrefix) {
@@ -511,6 +539,12 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 		// still waiting for its task is not about the task this turn may
 		// start. A shortcut arms its own below.
 		s.uncreditLocked(conversation)
+	}
+	if verified && p.homeType != "" && !p.click && !p.shortcut && !chattext.IsCommand(p.text) {
+		// A verified ask typed at the top of a channel: the one turn that can
+		// set the home channel (slack_home_channel.go). A command is not an
+		// ask, and a click or a shortcut is not typed there.
+		s.homeCandidate(conversation, p.homeType, p.author)
 	}
 	if p.shortcut {
 		// A shortcut answers no question: it is an ask about a message, so
@@ -646,21 +680,21 @@ func (s *SlackAdapter) slackNameOf(userID string, u *slack.User, err error) stri
 		if err != nil {
 			s.log.Debug("slack: users.info failed; naming the answer generically", "user", userID, "err", err)
 		}
-		return slackNamelessClicker
+		return namelessClicker
 	}
 	for _, name := range []string{u.Profile.DisplayName, u.RealName, u.Profile.RealName, u.Name} {
 		if name = strings.TrimSpace(name); name != "" {
 			return name
 		}
 	}
-	return slackNamelessClicker
+	return namelessClicker
 }
 
 // rewriteAnswered rewrites a question as answered by userID with label. If
 // Slack refuses the rewrite, the line is posted in the question's thread
 // instead, so an answer always shows once.
 func (s *SlackAdapter) rewriteAnswered(q slackQuestion, userID, label string) {
-	line := fmt.Sprintf(slackAnsweredLine, s.slackUserName(userID), label)
+	line := fmt.Sprintf(answeredLine, s.slackUserName(userID), label)
 	blocks, attachments, err := slackAnsweredLayout(q.blocks, q.attachments, line)
 	if err == nil {
 		opts := []slack.MsgOption{slack.MsgOptionText(q.text, false), slack.MsgOptionBlocks(blocks.BlockSet...)}

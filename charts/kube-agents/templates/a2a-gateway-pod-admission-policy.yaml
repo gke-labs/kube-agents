@@ -1,0 +1,192 @@
+{{- if include "kube-agents.a2aGatewayPodPolicyEnabled" . }}
+# GENERATED from k8s-operator/config/admission/a2a-gateway-pod-policy.yaml — do not edit by hand; run `make chart-sync`.
+# Rendered where kube-agents.a2aGatewayPodPolicyEnabled (_helpers.tpl) holds: the
+# admissionPolicy values gate, on Kubernetes >= 1.30. The operator's A2A_GATEWAY_POD_POLICY
+# is set from the same helper.
+# Admission control on the pods the A2A gateway creates: one ValidatingAdmissionPolicy and its
+# binding.
+#
+# This file is the source of truth. charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml
+# holds a generated copy (`make chart-sync`, verified by `make chart-check`), and the chart is what
+# the install engine applies. Edit it here. Like agent-rbac-policy.yaml beside it, it is not in
+# config/default's kustomization, so the manual install path (INSTALL.md Method 2) applies it by
+# hand.
+#
+# WHY. The gateway's Role (buildA2AGatewayRole in platformagent_a2a_manifests.go) grants `create`
+# on pods in its namespace, one session pod per delegated task. RBAC cannot constrain a PodSpec, so
+# without this policy a compromised or steered gateway can create a pod that runs as any
+# ServiceAccount in the namespace (the platform agent's, whose Workload Identity binding then
+# resolves for it, or the credential broker callers'), projects a token for any audience, mounts
+# any Secret, runs privileged on a node it picks, or changes the labels the NetworkPolicies select
+# on. This policy holds every pod the gateway creates to the shape of the session pod
+# a2a/gateway/spawn.go builds, on the fields below; a test in a2a/gateway pins spawn.go's real pods
+# to a fixture that the envtest admits, so the two cannot drift apart.
+#
+# WHAT IT CHECKS, for a pod CREATE whose requester is a ServiceAccount named `<name>-a2a-gateway`
+# in the pod's own namespace (the gateway's identity; `<name>` is the PlatformAgent's name):
+#
+#   1. The pod runs as `<name>-a2a-session`, the session ServiceAccount, which holds no RBAC.
+#   2. automountServiceAccountToken is set and false, so no default-audience token is mounted.
+#   3. Volumes are emptyDir, downwardAPI, configMap or projected only, and a projected volume holds
+#      only serviceAccountToken, downwardAPI and configMap sources. No Secret, hostPath, PVC or
+#      other source.
+#   4. Every projected ServiceAccount token names an audience, and the audience is the bus's
+#      (`a2a-bus`) or the credential broker's session audience. A token with no audience would be
+#      valid against the API server.
+#   5. No host network, PID or IPC namespace, host port, nodeName, hostname or subdomain, and no
+#      init or ephemeral containers.
+#   6. Pod Security "restricted" for the pod and its containers, which spawn.go already meets:
+#      non-root, seccomp RuntimeDefault or Localhost, no Unconfined AppArmor, no sysctls,
+#      allowPrivilegeEscalation false, all capabilities dropped and none added, the default
+#      procMount, no privileged container. Without it a pod under the session account could still
+#      reach the node, and the other pods' tokens on it.
+#   7. No environment variable read from a Secret.
+#   8. Exactly the two session labels the gateway stamps (part-of a2a-next, component a2a-session):
+#      without one the session NetworkPolicy does not select the pod; with another workload's label
+#      added, that workload's policies and Services would.
+#
+# WHAT IT DOES NOT COVER — read before citing it as a control:
+#
+#   - It is installed only where the chart renders it: `admissionPolicy.enabled` (values.yaml) and
+#     Kubernetes >= 1.30. Elsewhere the gateway's pod create is as wide as its Role. The chart sets
+#     A2A_GATEWAY_POD_POLICY=true on the operator from the same condition: a signal for operator
+#     features that must run only where this policy is installed. It says the chart rendered the
+#     policy, not that the API server still enforces it.
+#   - It selects the requester by ServiceAccount name. Any ServiceAccount named `*-a2a-gateway` is
+#     held to it, in any namespace; a gateway that ran under another name would not be.
+#   - configMap volumes are allowed whatever their name: the session pod mounts the bus's CA from
+#     one, and ConfigMaps hold no credentials in this install.
+#   - It constrains pod CREATE only. The gateway holds no update, patch or ephemeralcontainers verb
+#     on pods, so CREATE is the whole of what its Role lets it shape.
+#
+# Requires Kubernetes >= 1.30, where ValidatingAdmissionPolicy reached v1. The names are fixed
+# rather than release-scoped: these are cluster singletons, and one policy serves every install in
+# the cluster because it derives `<name>` from the requester.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-a2a-gateway-pod
+  labels:
+    app.kubernetes.io/name: kube-agents
+    app.kubernetes.io/part-of: kube-agents
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    # The requester is system:serviceaccount:<namespace>:<name>-a2a-gateway, in the pod's own
+    # namespace.
+    - name: is-an-a2a-gateway
+      expression: >-
+        request.userInfo.username.startsWith('system:serviceaccount:') &&
+        request.userInfo.username.split(':').size() == 4 &&
+        request.userInfo.username.split(':')[2] == request.namespace &&
+        request.userInfo.username.split(':')[3].endsWith('-a2a-gateway')
+  variables:
+    - name: gateway
+      expression: "request.userInfo.username.split(':')[3]"
+    - name: sessionAccount
+      expression: "variables.gateway.substring(0, variables.gateway.size() - size('-a2a-gateway')) + '-a2a-session'"
+    - name: volumes
+      expression: "has(object.spec.volumes) ? object.spec.volumes : []"
+    - name: containers
+      expression: "object.spec.containers"
+  validations:
+    - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == variables.sessionAccount"
+      messageExpression: "'a pod the A2A gateway creates must run as ' + variables.sessionAccount"
+      reason: Forbidden
+    - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
+      message: "a pod the A2A gateway creates must set automountServiceAccountToken: false"
+      reason: Forbidden
+    - expression: >-
+        variables.volumes.all(v,
+          has(v.emptyDir) || has(v.downwardAPI) || has(v.configMap) ||
+          (has(v.projected) &&
+            (!has(v.projected.sources) ||
+             v.projected.sources.all(s, has(s.serviceAccountToken) || has(s.downwardAPI) || has(s.configMap)))))
+      message: "a pod the A2A gateway creates may mount only emptyDir, downwardAPI, configMap and projected (token, downwardAPI, configMap) volumes"
+      reason: Forbidden
+    - expression: >-
+        variables.volumes.all(v,
+          !has(v.projected) || !has(v.projected.sources) ||
+          v.projected.sources.all(s,
+            !has(s.serviceAccountToken) ||
+            (has(s.serviceAccountToken.audience) &&
+             s.serviceAccountToken.audience in ['a2a-bus', 'kubeagents-credential-proxy-session'])))
+      message: "a pod the A2A gateway creates may project ServiceAccount tokens only for the a2a-bus and kubeagents-credential-proxy-session audiences"
+      reason: Forbidden
+    - expression: >-
+        !(has(object.spec.hostNetwork) && object.spec.hostNetwork) &&
+        !(has(object.spec.hostPID) && object.spec.hostPID) &&
+        !(has(object.spec.hostIPC) && object.spec.hostIPC) &&
+        !has(object.spec.nodeName) && !has(object.spec.hostname) && !has(object.spec.subdomain) &&
+        (!has(object.spec.initContainers) || size(object.spec.initContainers) == 0) &&
+        (!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0) &&
+        variables.containers.all(c, !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))
+      message: "a pod the A2A gateway creates may not use host namespaces, a host port, nodeName, hostname or subdomain, or init or ephemeral containers"
+      reason: Forbidden
+    # Pod Security "restricted", as spawn.go already sets it: without these a pod
+    # under the session account could still reach the node and the tokens on it.
+    - expression: >-
+        has(object.spec.securityContext) &&
+        has(object.spec.securityContext.runAsNonRoot) && object.spec.securityContext.runAsNonRoot &&
+        (!has(object.spec.securityContext.runAsUser) || object.spec.securityContext.runAsUser != 0) &&
+        has(object.spec.securityContext.seccompProfile) &&
+        object.spec.securityContext.seccompProfile.type in ['RuntimeDefault', 'Localhost'] &&
+        (!has(object.spec.securityContext.appArmorProfile) || object.spec.securityContext.appArmorProfile.type != 'Unconfined') &&
+        !has(object.spec.securityContext.sysctls) &&
+        (!has(object.metadata.annotations) ||
+         object.metadata.annotations.all(k,
+           !k.startsWith('container.apparmor.security.beta.kubernetes.io/') ||
+           object.metadata.annotations[k] != 'unconfined'))
+      message: "a pod the A2A gateway creates must run as non-root with seccomp RuntimeDefault or Localhost, no Unconfined AppArmor, and no sysctls"
+      reason: Forbidden
+    - expression: >-
+        variables.containers.all(c,
+          has(c.securityContext) &&
+          (!has(c.securityContext.privileged) || !c.securityContext.privileged) &&
+          has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation &&
+          has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) &&
+          'ALL' in c.securityContext.capabilities.drop &&
+          (!has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0) &&
+          (!has(c.securityContext.procMount) || c.securityContext.procMount == 'Default') &&
+          (!has(c.securityContext.runAsNonRoot) || c.securityContext.runAsNonRoot) &&
+          (!has(c.securityContext.runAsUser) || c.securityContext.runAsUser != 0) &&
+          (!has(c.securityContext.seccompProfile) || c.securityContext.seccompProfile.type != 'Unconfined') &&
+          (!has(c.securityContext.appArmorProfile) || c.securityContext.appArmorProfile.type != 'Unconfined'))
+      message: "a pod the A2A gateway creates must run its containers unprivileged: allowPrivilegeEscalation false, all capabilities dropped and none added, the default procMount, non-root, and no Unconfined seccomp or AppArmor"
+      reason: Forbidden
+    - expression: >-
+        variables.containers.all(c,
+          (!has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef))) &&
+          (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef))))
+      message: "a pod the A2A gateway creates may not read environment from a Secret"
+      reason: Forbidden
+    # Exactly the two session labels: a missing one drops the pod out of the
+    # session NetworkPolicy, and an extra one (another workload's app label, the
+    # leader label) adds it to that workload's policies and Services.
+    - expression: >-
+        has(object.metadata.labels) && size(object.metadata.labels) == 2 &&
+        'app.kubernetes.io/part-of' in object.metadata.labels &&
+        object.metadata.labels['app.kubernetes.io/part-of'] == 'a2a-next' &&
+        'app.kubernetes.io/component' in object.metadata.labels &&
+        object.metadata.labels['app.kubernetes.io/component'] == 'a2a-session'
+      message: "a pod the A2A gateway creates must carry exactly the session labels app.kubernetes.io/part-of=a2a-next and app.kubernetes.io/component=a2a-session"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-a2a-gateway-pod
+  labels:
+    app.kubernetes.io/name: kube-agents
+    app.kubernetes.io/part-of: kube-agents
+spec:
+  policyName: kube-agents-a2a-gateway-pod
+  validationActions: ["Deny"]
+  # No paramRef / matchResources selector: every namespace; the matchCondition selects the requester.
+{{- end }}

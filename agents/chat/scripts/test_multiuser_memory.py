@@ -1096,5 +1096,39 @@ class TestInputValidationAndSanitization(MultiUserMemoryTestCase):
         self.assertEqual(p._read_entries("memory"), ["Default region: us-central1", "Backup region: us-east1"])
 
 
+class TextFilterPinTest(unittest.TestCase):
+    """The plugin's own character filter must agree with the shared one.
+
+    The MCP server and the issue resolver import `agents/platform/scripts/untrusted_text.py`;
+    this plugin keeps its copy because the gateway process that loads it has its own
+    import path. A copy nobody checks is how three filters drifted by three code points.
+    """
+
+    # Every code point there is, the tag block and the planes above it included.
+    CODE_POINT_COUNT = 0x110000
+
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts" / "untrusted_text.py"
+        spec = importlib.util.spec_from_file_location("untrusted_text_under_test", path)
+        cls.untrusted_text = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.untrusted_text)
+
+    def test_is_safe_char_agrees_with_the_shared_filter_on_every_code_point(self):
+        disagreements = [
+            hex(code)
+            for code in range(self.CODE_POINT_COUNT)
+            if mum._is_safe_char(chr(code)) != self.untrusted_text.is_safe_char(chr(code))
+        ]
+        self.assertEqual(disagreements, [])
+
+    def test_the_ansi_pattern_is_the_shared_definition(self):
+        self.assertEqual(mum.ANSI_ESCAPE_RE.pattern, self.untrusted_text.ANSI_ESCAPE_RE.pattern)
+
+    def test_strip_unsafe_chars_agrees_with_the_shared_filter(self):
+        dirty = "line\r\n\x1b[31mred\x1b[0m \x9b1mcsi\u200bzero\u2028sep\U000e0041tag\x00"
+        self.assertEqual(mum._strip_unsafe_chars(dirty), self.untrusted_text.strip_unsafe(dirty))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

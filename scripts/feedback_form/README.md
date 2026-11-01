@@ -115,20 +115,23 @@ that lost Issues: write (422 minting the token), and a GitHub outage.
   form off at once without affecting the bot service, which signs with a different key.
 - **Rotating the key.** Generate a new private key on the App, replace the
   `GITHUB_APP_PRIVATE_KEY` script property, then revoke the old key. Nothing else changes.
-- **Retiring it.** Close the form to responses, delete the trigger, revoke the key, remove
-  the redirect from `docs/site/astro.config.mjs`, and remove the links from the contributing
+- **Retiring it.** Close the form to responses, delete the trigger, revoke the key, remove the
+  redirect from `docs/site/astro.config.mjs`, and remove the links from the contributing
   guide, the root `README.md` and the `/feedback` section of
-  `docs/site/src/content/docs/concepts/chatops.md`, which quotes the gateway's notice. The agents hand the short link out too, and none of that
-  is reached by editing the site: drop the "Reporting a Problem with kube-agents Itself"
-  bullet from `agents/platform/SOUL.md` and `agents/cluster/SOUL.md`, the routing row and
-  the `/feedback <text>` bullet from `agents/chat/SOUL.md`, the `kube-agents-feedback` skill
-  under `agents/platform/skills/` and the broker verb behind it
-  (`agents/platform/scripts/feedback_broker.py`, `POST /v1/feedback/submit`), and the two
-  link constants in `a2a/lib/chattext/commands.go` with the gateway's `/feedback` notice
-  (`docs/designs/chat-feedback-command.md`); ship the `feedback-prompt` cron job with `enabled: false`
-  (the retirement path in `agents/platform/cron/README.md`), since
-  `agents/platform/scripts/feedback_prompt.py` posts the link once to every install, and
-  remove `FORM_URL` from that script; then delete `tests/test_feedback_reference.py`, which
-  fails until the rest of that is done. Running installs keep answering with the link until
-  they take an image built after the change. If this directory goes too, drop its mention
-  from the tree at the top of `docs/README.md`.
+  `docs/site/src/content/docs/concepts/chatops.md`, which quotes the gateway's notice. The
+  agents hand the short link out too, and none of that is reached by editing the site: drop
+  the "Reporting a Problem with kube-agents Itself" bullet from `agents/platform/SOUL.md` and
+  `agents/cluster/SOUL.md`, the routing row and the `/feedback <text>` bullet from
+  `agents/chat/SOUL.md`, the `kube-agents-feedback` skill under `agents/platform/skills/` and
+  the broker verb behind it (`agents/platform/scripts/feedback_broker.py`,
+  `POST /v1/feedback/submit`), and the two link constants in `a2a/lib/chattext/commands.go`
+  with the gateway's `/feedback` notice (`docs/designs/chat-feedback-command.md`); ship the
+  `feedback-prompt` cron job with `enabled: false` (the retirement path in
+  `agents/platform/cron/README.md`), since `agents/platform/scripts/feedback_prompt.py` posts
+  the link once to every install, and remove `FORM_URL` from that script; drop the feedback
+  form from the refused requester's hand-over in `.agents/skills/upgrade-kube-agents/SKILL.md`
+  and from its two pins in `tests/test_upgrade_skill_contract.py` (`DRAFT_DESTINATIONS` and
+  `SECTION_SENTENCES`); then delete `tests/test_feedback_reference.py`, which fails until the
+  rest of that is done. Running installs keep answering with the link until they take an image
+  built after the change. If this directory goes too, drop its mention from the tree at the
+  top of `docs/README.md`.

@@ -93,7 +93,7 @@ NIGHTLY_AT_SPLIT = [
     "obtainability-planted-pdb",
     "stockout-pinned-pool",
     "upgrade-readiness-lagging-cluster",
-    "consistency-drift-outlier",
+    "consistency-drift-outlier",  # promoted 2026-10-26 on its nightly record, consistency's roster seat after its probe's demotion (#3598)
     "obtainability-direct-query",
     "gpu-stress-test-diagnosis",
     "autoops-warning-event-triage",
@@ -114,6 +114,7 @@ ADDED_AFTER_THE_SPLIT = [
     "incident-triage-oom-event-probe",  # #1023's incident-triage second case, PR #1625; promoted 2026-09-22
     "ai-security-planted-model-audit",  # #1023's fleet-audits second case, PR #1103
     "autoops-crashloop-config-triage",  # #1023's other incident-triage second case, PR #1103
+    "autoops-missing-service-triage",  # gke-labs#3078: a triage worker reports a found cause, not a source hunt
     "consistency-no-environment-label",  # the drift collector's §4.14 check, with fleet_drift.py
     "gitops-drift-out-of-band-triage",  # the drift half of incident-triage, PR #1827
     "cluster-agent-delegation-profile-lookup",  # #1840's delegation route, PR #1917
@@ -239,6 +240,8 @@ ADMITTED_AFTER_THE_SPLIT = [
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),
     # 2026-10-23: 42/42 on the fourteen writers nightlies 10-09 to 10-22 (12/12 since the claude-opus-5-5 key of 10-19), the store at collecting.
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),
+    # 2026-10-26: 33/34 on the twelve graded main nightlies 10-13 to 10-26 (14/14 since the claude-opus-5-5 key of 10-19, 5/5 under spec.mode next), the store at collecting.
+    ("consistency-drift-outlier", "cost-idle-pool-probe"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
 # (case, the presubmit line it follows); the same case leaves the nightly
@@ -248,6 +251,7 @@ PROMOTED_AFTER_THE_SPLIT = [
     ("incident-triage-oom-event-probe", "cluster-agent-healthy-workload-no-finding"),  # 2026-09-22 (#1023)
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),  # 2026-10-14 (#2016), from its held-out seat; again 2026-10-26, from the nightly file (#3120)
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),  # 2026-10-23, from the nightly file's frozen part
+    ("consistency-drift-outlier", "cost-idle-pool-probe"),  # 2026-10-26, from the nightly file's frozen part
 ]
 # Moved from the presubmit file to the end of the nightly one on 2026-09-22
 # (#1023), when the eval crew decided the presubmit runs the blocking roster
@@ -609,6 +613,30 @@ def positive_check_types(node, negations: int = 0) -> set:
     return set()
 
 
+class GHESLaneTest(unittest.TestCase):
+    """hack/eval/ghes-cases.txt: what the GHES lane runs (kube-agents#3684),
+    under the GitLab lane's rules: registered cases that grade the forge."""
+
+    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains"}
+    PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual(eval_rosters.ghes_cases(), self.PINNED)
+
+    def test_every_lane_case_is_registered_and_grades_the_forge(self):
+        import yaml
+
+        registered = eval_rosters.presubmit_cases() + eval_rosters.nightly_cases()
+        for case in eval_rosters.ghes_cases():
+            with self.subTest(case=case):
+                self.assertIn(case, registered, "the lane picks from the catalogue, it does not register")
+                doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertTrue(positive_check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge")
+
+    def test_no_commented_out_case_path(self):
+        self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GHES_CASES_FILE.read_text(encoding="utf-8")), [])
+
+
 class GitLabLaneTest(unittest.TestCase):
     """hack/eval/gitlab-cases.txt: what the GitLab lane's presubmit
     runs (kube-agents#2394). Registered cases only, every entry a case that
@@ -728,6 +756,7 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 API_LANE_EXCLUDED = [
     "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
+    "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
 ]
 
 
@@ -774,6 +803,24 @@ class ApiLaneExclusionsTest(unittest.TestCase):
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} is a stopped ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
 
+    def test_every_registered_reply_under_pushed_report_is_excluded(self):
+        # The same rule for the pushed-report replay: it errors on the api
+        # transport, and its directive is read from the harness's module.
+        import yaml
+
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench.pushed_report import is_reply_under_pushed_report
+
+        excluded = eval_rosters.api_lane_exclusions()
+        found = []
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            if is_reply_under_pushed_report(str(doc.get("prompt") or "")):
+                found.append(case)
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} replays a pushed report but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
+        self.assertIn("chat-reply-under-pushed-report", found)
+
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the
 # one entry every case on the lane carries beside its own. An edit to the
@@ -784,7 +831,7 @@ INJECT_LANE_SAFEGUARDS = [
 ]
 # The registered cases whose checks request a pull request, at the
 # safeguard's introduction: what hack/ci-eval-pr.sh runs in the fan-out's
-# second phase on the inject lane, after every other unit has finished. A
+# second phase on both lanes, after every other unit has finished. A
 # new requesting case edits this set in the same pull request; the check
 # types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
@@ -829,12 +876,11 @@ def _leaf_types(node) -> list[str]:
 
 class InjectLaneSafeguardsTest(unittest.TestCase):
     """hack/eval/inject-lane-safeguards.yaml: the entries hack/ci-eval-pr.sh
-    appends to every case it runs on the inject lane (#2079).
+    appends to every case it runs, on the api and inject lanes alike (#2079,
+    #2611).
 
-    A lane-level list rather than fifty per-case edits, for the reason the
-    exclusions are: a per-case entry would change what the api lane grades.
-    What has to hold: the file is the pinned set; every entry is a
-    none-wrapped `github_writes` safeguard at catastrophic severity (a leaf
+    A lane-level list rather than fifty per-case edits. What has to hold:
+    the file is the pinned set; every entry is a none-wrapped `github_writes` safeguard at catastrophic severity (a leaf
     that PASSES on a write, so `none` is what makes it a safeguard); no
     registered case declares an entry of the same name, since devops-bench
     refuses a duplicate name as a parse error on every repetition of that

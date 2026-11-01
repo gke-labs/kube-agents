@@ -193,7 +193,7 @@ class UnreadyObjectsTest(unittest.TestCase):
 class ReadObjectsTest(unittest.TestCase):
     """`read_objects`: discovery, then one list request per Config Connector
     kind (every kind for the compliance collector, `CONTAINER_KINDS` for the
-    others), with no more than `PROXY_SLOTS` requests in flight."""
+    others), with no more than `proxy_slots()` requests in flight."""
 
     def read(self, run, **kwargs):
         return kcc_health.read_objects(Path("kubeconfig"), run=run, deadline=kwargs.pop("deadline", 1e9), clock=kwargs.pop("clock", lambda: 0.0), **kwargs)
@@ -249,7 +249,7 @@ class ReadObjectsTest(unittest.TestCase):
     def test_the_kinds_are_listed_in_parallel_on_a_bounded_pool(self):
         lock = threading.Lock()
         running = [0, 0]
-        kinds = [f"Kind{n}" for n in range(3 * kcc_health.KIND_READ_WORKERS)]
+        kinds = [f"Kind{n}" for n in range(3 * kcc_health.proxy_slots())]
 
         def run(argv, *, env=None, timeout=None):
             if is_discovery(argv):
@@ -265,7 +265,7 @@ class ReadObjectsTest(unittest.TestCase):
         read = self.read(run)
         self.assertEqual(read.status, kcc_health.READ_LISTED)
         self.assertGreater(running[1], 1)
-        self.assertLessEqual(running[1], kcc_health.KIND_READ_WORKERS)
+        self.assertLessEqual(running[1], kcc_health.proxy_slots())
 
     def test_one_kind_that_does_not_list_makes_the_read_unknown(self):
         for answer, status, words in (
@@ -310,9 +310,9 @@ class ReadObjectsTest(unittest.TestCase):
         self.assertIn("not known", fields["kcc_unread"])
 
     def test_no_more_than_the_proxy_slots_run_at_once_across_clusters(self):
-        """Four clusters read at once, each with its own kind pool: the
-        requests in flight never exceed `PROXY_SLOTS`, the proxy's admitted
-        count."""
+        """As many clusters read at once as the broker's width, each with its
+        own kind pool: the requests in flight never exceed `proxy_slots()`,
+        the broker's sweep width."""
         lock = threading.Lock()
         running = [0, 0]
         kinds = [f"Kind{n}" for n in range(12)]
@@ -328,25 +328,27 @@ class ReadObjectsTest(unittest.TestCase):
                 return kcc_health.Result(0, "".join(crd_line(kind) + "\n" for kind in kinds), "")
             return listing()
 
-        with ThreadPoolExecutor(max_workers=collect.MAX_WORKERS) as pool:
-            reads = list(pool.map(lambda _: self.read(run), range(collect.MAX_WORKERS)))
+        width = kcc_health.proxy_slots()
+        with ThreadPoolExecutor(max_workers=width) as pool:
+            reads = list(pool.map(lambda _: self.read(run), range(width)))
         self.assertTrue(all(read.status == kcc_health.READ_LISTED for read in reads))
         self.assertGreater(running[1], 1)
-        self.assertLessEqual(running[1], kcc_health.PROXY_SLOTS)
+        self.assertLessEqual(running[1], kcc_health.proxy_slots())
 
     def test_a_step_that_gets_no_slot_before_the_deadline_does_not_start(self):
         calls = []
-        kcc_health._PROXY_SLOT_POOL.acquire()
+        slots = kcc_health._proxy_slot_pool()
+        slots.acquire()
         try:
-            for _ in range(kcc_health.PROXY_SLOTS - 1):
-                kcc_health._PROXY_SLOT_POOL.acquire()
+            for _ in range(kcc_health.proxy_slots() - 1):
+                slots.acquire()
             now = [0.0]
             read = kcc_health.read_objects(
                 Path("kubeconfig"), run=lambda argv, **kw: calls.append(argv), deadline=0.05, clock=lambda: now[0]
             )
         finally:
-            for _ in range(kcc_health.PROXY_SLOTS):
-                kcc_health._PROXY_SLOT_POOL.release()
+            for _ in range(kcc_health.proxy_slots()):
+                slots.release()
         self.assertEqual(calls, [])
         self.assertEqual(read.status, kcc_health.READ_TIMED_OUT)
         self.assertIn("no proxy slot", read.detail)
@@ -781,7 +783,9 @@ class DeadlineTest(unittest.TestCase):
         `READ_TIMEOUT_S`."""
         run, timeouts = self.slow_run(0, 1, 10, kinds=[f"Kind{n}" for n in range(50)], deadline=kcc_health.READ_TIMEOUT_S)
         manifest = self.entries("a")
-        with mock.patch.object(kcc_health, "KIND_READ_WORKERS", 1):
+        with mock.patch.object(kcc_health, "proxy_slots", return_value=1), mock.patch.object(
+            kcc_health, "_slot_pool", threading.BoundedSemaphore(1)
+        ):
             kcc_health.annotate_manifest(manifest, deadline=kcc_health.run_deadline(0.0), run=run, clock=self.clock)
         self.assertLessEqual(self.now, kcc_health.READ_TIMEOUT_S)
         self.assertIn(f"did not finish in {kcc_health.READ_TIMEOUT_S}s", manifest["clusters"][0]["kcc_unread"])
@@ -817,7 +821,6 @@ class CopiedConstantsTest(unittest.TestCase):
             "CREDENTIALS_TIMEOUT_S": collect.DEFAULT_TIMEOUT_S,
             "MAX_WHY_CHARS": collect.MAX_KCC_WEDGE_MESSAGE_CHARS,
             "TIMEOUT_RC": collect.TIMEOUT_RC,
-            "PROXY_SLOTS": collect.MAX_WORKERS,
             "KCC_CATEGORY": collect.KCC_CATEGORY,
             "KCC_READY_CONDITION": collect.KCC_READY_CONDITION,
         }

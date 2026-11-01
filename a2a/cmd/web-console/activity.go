@@ -666,6 +666,7 @@ var knownPlatformSkills = []string{
 	"kube-agents-feedback",
 	"upgrade-readiness-brief",
 	"support-escalation-bundle",
+	"topology-drift",
 }
 
 var (

@@ -226,7 +226,7 @@ readonly REVALIDATION_OVERRIDE_CANCEL_PREFIX="Override cancelled by"
 # comment-URL event is always there (#2464's head carries both).
 readonly REVALIDATION_PULL_URL_PREFIX="https://github.com/gke-labs/kube-agents/pull"
 # How many of the newest builds to inspect for a green one. Each costs one
-# gsutil cat (~1s); an active PR rarely stacks this many pushes between
+# gcloud storage cat (~1s); an active PR rarely stacks this many pushes between
 # greens, and a bound keeps the fall-through path seconds long.
 readonly REVALIDATION_HISTORY_LIMIT=20
 # A green from before the job changed what it grades is not a verdict this
@@ -569,7 +569,7 @@ revalidate_from_green_history() {
 
   local history_dir="${REVALIDATION_HISTORY_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}"
   local listing
-  if ! listing="$(gsutil ls "${history_dir}/*/finished.json" 2>/dev/null)"; then
+  if ! listing="$(gcloud storage ls "${history_dir}/*/finished.json" 2>/dev/null)"; then
     _revalidation_no_green "no finished ${REVALIDATION_JOB_NAME} build for PR #${pull_number} (first run on this PR, or GCS unreadable)"
     return 1
   fi
@@ -598,7 +598,7 @@ revalidate_from_green_history() {
   local build prev_green="" finished_revision="" candidate_parsed candidate_revision
   while read -r build; do
     [ -n "${build}" ] || continue
-    candidate_parsed="$(gsutil cat "${history_dir}/${build}/finished.json" 2>/dev/null | python3 -c '
+    candidate_parsed="$(gcloud storage cat "${history_dir}/${build}/finished.json" 2>/dev/null | python3 -c '
 import json
 import sys
 
@@ -634,7 +634,7 @@ EOF_REVALIDATION_CANDIDATES
   # the same Refs.String() shape as PULL_REFS, so a pull entry may carry a
   # third ":<ref>" field; only the first two are read.
   local started shas prev_base prev_head
-  if ! started="$(gsutil cat "${history_dir}/${prev_green}/started.json" 2>/dev/null)"; then
+  if ! started="$(gcloud storage cat "${history_dir}/${prev_green}/started.json" 2>/dev/null)"; then
     _revalidation_no_green "green build ${prev_green} of PR #${pull_number} has no readable started.json"
     return 1
   fi
@@ -835,11 +835,11 @@ revalidate_against_green_history() {
     echo "Step 0: full run: EVAL_SKIP_REVALIDATION=1 (escape hatch)"
     return 1
   fi
-  if ! command -v gsutil >/dev/null 2>&1; then
-    echo "Step 0: full run: no gsutil on PATH to read the job history with"
+  if ! command -v gcloud >/dev/null 2>&1; then
+    echo "Step 0: full run: no gcloud on PATH to read the job history with"
     return 1
   fi
-  # Preflighted like gsutil so a missing interpreter logs its own reason
+  # Preflighted like gcloud so a missing interpreter logs its own reason
   # instead of every finished.json silently classifying as not-green.
   if ! command -v python3 >/dev/null 2>&1; then
     echo "Step 0: full run: no python3 on PATH to parse the job records with"
@@ -852,7 +852,7 @@ revalidate_against_green_history() {
   # shell's) cannot narrow a batch to one pull; a serial presubmit names its
   # one pull in PULL_NUMBER and PULL_PULL_SHA.
   # Prow's decoration exports 40-hex SHAs. The ones this run was handed are
-  # held to that shape before any of them reaches gsutil or git, as the
+  # held to that shape before any of them reaches gcloud storage or git, as the
   # recovered ones are: a value shaped like an option would otherwise reach
   # `git diff` as one, and an empty file list reads as an inert delta.
   if [ -n "${PULL_BASE_SHA:-}" ] && ! [[ "${PULL_BASE_SHA}" =~ ${REVALIDATION_SHA_RE} ]]; then

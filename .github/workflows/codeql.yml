@@ -125,8 +125,8 @@ jobs:
         with:
           go-version-file: "k8s-operator/go.mod"
           cache: true
-          # Every module's go.sum, however many modules there are; one of
-          # them has no dependencies and so no go.sum, which the glob skips.
+          # Every module's go.sum, however many modules there are; a module
+          # with no dependencies has no go.sum, which the glob skips.
           cache-dependency-path: "**/go.sum"
 
       - name: Initialize CodeQL

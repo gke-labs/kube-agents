@@ -250,8 +250,12 @@ collect_bench_results() {
   mkdir -p "${artifact_dir}" || true
 
   # Devops-bench Evaluation Results (if run in eval script)
-  if [ -d "${SCRIPT_DIR}/../bench/results" ]; then
-    cp -r "${SCRIPT_DIR}/../bench/results/"* "${artifact_dir}/" 2>/dev/null || true
+  # BENCH_DIR, when the caller set one: on a pull request hack/ci-eval-pr.sh
+  # runs devops-bench from a copy of main's bench/, which is where its
+  # relative results/ lands.
+  local results_dir="${BENCH_DIR:-${SCRIPT_DIR}/../bench}/results"
+  if [ -d "${results_dir}" ]; then
+    cp -r "${results_dir}/"* "${artifact_dir}/" 2>/dev/null || true
   elif [ -d "/app/results" ]; then
     cp -r /app/results/* "${artifact_dir}/" 2>/dev/null || true
   fi

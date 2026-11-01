@@ -149,16 +149,29 @@ func sessionGrants(pod string) (Grants, error) {
 // are separate arguments because they are separate things for a profile pod:
 // every pod of one profile publishes as the profile, but two of them running at
 // once must not share a consumer name or an inbox. A session pod passes its
-// pod name for both. The stem is always the attested pod name, so the
-// exactness argument in sessionGrants' comment holds for both shapes.
+// pod name for both. The stem is the attested pod name, or on a profile
+// worker's task connection that name and the verified task joined by
+// taskcred.ConsumerStem, so the exactness argument in sessionGrants' comment
+// holds for every shape.
 //
 // The executor's own inbox is not in the publish list here; callers append it
 // last, after anything narrowing-specific, so the order of a minted grant set
 // stays stable for the tests that read it.
+//
+// A session holds every task id under its addressee ("*"), turn after turn; a
+// profile worker's task connection holds one (executorTaskGrants, #3889).
 func executorGrants(addressee, stem string) Grants {
+	return executorTaskGrants(addressee, "*", stem)
+}
+
+// executorTaskGrants is executorGrants for the task ids task covers: "*" for
+// every task of the addressee, or one task id, which makes the events publish
+// and all three consumer filters exact on that task. The task is a subject
+// token the caller has validated, or "*".
+func executorTaskGrants(addressee, task, stem string) Grants {
 	g := Grants{
 		Publish: []string{
-			lib.TaskEventsSubject(addressee, "*"),
+			lib.TaskEventsSubject(addressee, task),
 		},
 		Subscribe: []string{"_INBOX." + stem + ".>"},
 	}
@@ -167,9 +180,9 @@ func executorGrants(addressee, stem string) Grants {
 	}
 	for _, role := range lib.SessionConsumerRoles {
 		name := lib.SessionConsumerName(stem, role)
-		filter := lib.TaskInSubject(addressee, "*")
+		filter := lib.TaskInSubject(addressee, task)
 		if role == lib.SessionConsumerEvents {
-			filter = lib.TaskEventsSubject(addressee, "*")
+			filter = lib.TaskEventsSubject(addressee, task)
 		}
 		g.Publish = append(g.Publish,
 			consumerAPI("CREATE", name)+"."+filter,

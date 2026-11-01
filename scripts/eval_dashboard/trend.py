@@ -66,10 +66,11 @@ is today, as every record before the component existed is), exactly what
 it was before next-mode records existed; ``next`` holds the same per-case
 and per-domain blocks built from the next-mode records, or null when the
 store holds none (a mode this module does not know is in neither).
-Latency stays top-level: it is read from the main nightly's runs, the ones
-the collector gathers, which grade next. The harness times the opening turn
-on the api transport only, so on those nights the turn-1 series is empty and
-only the agent time is drawn.
+Latency stays top-level: it is read from the main nightly's runs (tier
+``nightly``), which grade next through the inject door, where the harness
+times the opening task from the door accepting it to its terminal. Nights
+graded before it did carry no turn-1 time, so only the agent time is drawn
+for them.
 
 Only stdlib, like ``nightly.py``.
 """

@@ -72,7 +72,7 @@ func TestCredentialProxyResourcesDefaultToTheOperatorsValues(t *testing.T) {
 		assertQuantity(t, got.Requests, corev1.ResourceMemory, "1Gi")
 		assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
 		assertQuantity(t, got.Limits, corev1.ResourceMemory, "2Gi")
-		assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "2Gi")
+		assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "8Gi")
 		if len(got.Requests) != 2 || len(got.Limits) != 3 {
 			t.Errorf("default render carries %d requests and %d limits, want 2 and 3", len(got.Requests), len(got.Limits))
 		}
@@ -96,7 +96,7 @@ func TestCredentialProxyMemoryLimitOverrideKeepsTheOtherDefaults(t *testing.T) {
 	assertQuantity(t, got.Requests, corev1.ResourceCPU, "500m")
 	assertQuantity(t, got.Requests, corev1.ResourceMemory, "1Gi")
 	assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
-	assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "2Gi")
+	assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "8Gi")
 }
 
 // TestCredentialProxyFullOverrideReplacesEveryKey: a CR that states every key
@@ -118,6 +118,29 @@ func TestCredentialProxyFullOverrideReplacesEveryKey(t *testing.T) {
 	assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "8Gi")
 }
 
+// TestCredentialProxyEphemeralStorageLimitCoversItsEmptyDirs: the kubelet
+// sums the pod's disk-backed emptyDirs, writable layer and logs against the
+// container's ephemeral-storage limit, so a limit under the state and /tmp
+// sizeLimits together evicts the pod before either volume reaches its own cap
+// (three evictions on a hyperscale fleet at the old 2Gi, #4314). The limit
+// holds the two caps plus the declared headroom for the writable layer and
+// the container's logs, and stays inside the 10Gi GKE Autopilot admits per
+// pod, because Autopilot sets the ephemeral-storage limit equal to the request
+// and the operator declares no request, so the API server defaults the request
+// to this limit.
+func TestCredentialProxyEphemeralStorageLimitCoversItsEmptyDirs(t *testing.T) {
+	limit := resource.MustParse(credentialProxyEphemeralStorageLimit)
+	needed := resource.MustParse(credentialProxyStateSizeLimit)
+	needed.Add(resource.MustParse(credentialProxyTmpSizeLimit))
+	needed.Add(resource.MustParse(credentialProxyEphemeralStorageHeadroom))
+	if limit.Cmp(needed) < 0 {
+		t.Errorf("ephemeral-storage limit %s is under the state and /tmp sizeLimits plus the %s headroom (%s): the kubelet evicts the pod before the state volume can fill, or the writable layer and logs have no room", limit.String(), credentialProxyEphemeralStorageHeadroom, needed.String())
+	}
+	if autopilotCeiling := resource.MustParse("10Gi"); limit.Cmp(autopilotCeiling) > 0 {
+		t.Errorf("ephemeral-storage limit %s is above the %s Autopilot admits per pod, and the request defaults to the limit", limit.String(), autopilotCeiling.String())
+	}
+}
+
 func emptyDirSizeLimits(volumes []corev1.Volume) map[string]string {
 	sizes := map[string]string{}
 	for _, vol := range volumes {
@@ -130,17 +153,23 @@ func emptyDirSizeLimits(volumes []corev1.Volume) map[string]string {
 
 // TestCredentialProxyEmptyDirsFollowARaisedEphemeralStorageLimit: the kubelet
 // evicts the pod when an emptyDir passes its sizeLimit, so a limit raised past
-// the /tmp (2Gi) and state (5Gi) defaults widens both, a limit under them moves
-// neither, and the gateway pod's /tmp, which shares the volume's definition but
-// not the broker's container, keeps its default.
+// the container's 8Gi default gives the excess to the state volume (5Gi) and
+// leaves /tmp at its 2Gi cap, so the two caps and the 1Gi headroom still add
+// up to the limit; a limit at or under the default moves neither, the default
+// render included, because the kubelet sums the two volumes against the
+// container's limit and each cap keeps a runaway in one volume out of the
+// other's share; and the gateway pod's /tmp, which shares the volume's
+// definition but not the broker's container, keeps its default.
 func TestCredentialProxyEmptyDirsFollowARaisedEphemeralStorageLimit(t *testing.T) {
 	cases := []struct {
 		limit, tmp, state string
 	}{
 		{"", "2Gi", "5Gi"},
 		{"1Gi", "2Gi", "5Gi"},
-		{"3Gi", "3Gi", "5Gi"},
-		{"8Gi", "8Gi", "8Gi"},
+		{"6Gi", "2Gi", "5Gi"},
+		{"8Gi", "2Gi", "5Gi"},
+		{"10Gi", "2Gi", "7Gi"},
+		{"16Gi", "2Gi", "13Gi"},
 	}
 	for _, tc := range cases {
 		var override *corev1.ResourceRequirements

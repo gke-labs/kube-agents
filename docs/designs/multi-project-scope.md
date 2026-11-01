@@ -201,8 +201,11 @@ per-project outcome. It runs inside the existing reconcile job under the agent's
 the credential broker, because that is the only process in the install that talks to GCP on a
 schedule and the operator deliberately holds no GCP credential.
 
-**Explicit projects** use the call the script makes today, once per project:
-`gcloud container clusters list --project <P> --format=value(name,location)`.
+**Explicit projects** are listed once per project. Since #3703 this is the GKE API's
+`projects.locations.clusters` list (`v1/projects/<P>/locations/-/clusters`), read through the
+broker's Cloud API relay, with
+`gcloud container clusters list --project <P> --format=value(name,location)` as the fallback
+when the relay cannot be used. PRUNE's describes take the same path, through the relay's get route.
 
 **Folders and organisations** use Cloud Asset Inventory rather than walking the tree:
 
@@ -365,6 +368,28 @@ mounted file rather than an environment variable: the lists are unbounded and th
 carries `spec.deployment.env` (`common_types.go:368-372`) only as a generic passthrough. The
 rendered file's hash joins the ConfigMap hash that rolls the agent workload, so editing the scope
 takes effect at the next pod start and the next reconcile tick, whichever is later.
+
+Under `spec.mode: next` the A2A gateway also needs the membership, to check a delegated task's
+target cluster before it mints a grant, and it cannot read this volume. The design adds a
+separate publisher for it. `scope_publisher.py` ships in the agent image: it runs the reconcile's
+own lookups, exclusion rules and cap with a runner that sends each gcloud command to the
+credential broker, probes each container and selector member with `container clusters list`, and
+merge-patches the result into the `<name>-resolved-scope` ConfigMap as one compact JSON document.
+The document holds the schema version, `resolvedAt` (the last run in which at least one source
+lookup answered), a `memberHash` of the declaration's membership fields (so a reader can tell a
+document resolved for an older declaration), a `state` (`ok`; `too-large` past 900 KiB; `error`
+when the declaration cannot be read, or when every source lookup failed and no earlier run
+resolved), the members an `exclude.projects` entry dropped, and one row per container or selector
+member with its `via`, its probe `outcome`, and `confirmedAt`, the last run in which a source
+listed it and its probe answered `ok`. Explicit projects and the management project have no rows.
+A failed source carries its members' rows forward with their outcome and `confirmedAt`, and two
+fields the gateway does not read carry the rest of what the reconcile's own snapshot carries: the
+number-to-ID memo and the members counted against the cap that have no row. The operator starts
+it as a Job every 15 minutes, when the membership fields change, and at creation. Two parts do not
+ship yet: the broker's `scope` caller role, whose only commands are the lookups' five argv
+shapes; and the gateway's check of the document, which admits explicit projects and the
+management project from the declaration and its own environment. The reconcile, its snapshot and
+today-mode installs do not change.
 
 Whether the snapshot should also be lifted into `.status` is open (§11). It would make `kubectl get
 platformagent -o yaml` answer "which projects does this install manage" without a pod exec, but the
@@ -542,9 +567,10 @@ retire it on that reading alone, because the index lags a move by minutes and a 
 would otherwise retire a project that merely moved: the member is kept, with `absentSince` stamped on
 its row, for a day (`INDEX_LAG_GRACE_SECONDS`), and only after that does it retire over the ordinary
 two clean runs; the declaration speaking, an `exclude.projects` entry or the container removed from
-the CR, retires it sooner, on the ordinary two runs. PRUNE's per-profile `describe --project=<P>`
-meanwhile returns a 403, because the folder binding no longer covers it, which `_cluster_exists`
-classifies as unknown and keeps. Moved to a different declared folder: no change, because resolution
+the CR, retires it sooner, on the ordinary two runs. PRUNE's per-profile lookup in `<P>` (the relayed
+`clusters.get`, or `describe --project=<P>` on the gcloud fallback) meanwhile returns a 403, because
+the folder binding no longer covers it, which `_read_get` or `_cluster_exists` classifies as unknown
+and keeps. Moved to a different declared folder: no change, because resolution
 is by project; the `via` field records the new path and any placement clears the stamp, including a
 placement during the lag by the folder the project left. Dropped from `projects`, or from a folder the same edit removes, in the edit that
 declares the folder it moved into, a project is held the same day, since the index may not place it yet

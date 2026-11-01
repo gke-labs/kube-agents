@@ -40,6 +40,7 @@ import json
 import os
 import pathlib
 import re
+import ssl
 import sys
 import time
 import urllib.error
@@ -50,6 +51,12 @@ import ci_reset_audit_ledgers as ledgers
 
 DEFAULT_HOST = "gitlab.com"
 USER_AGENT = "kube-agents-ci-eval-gitlab"
+# A self-managed instance (kube-agents#3682) presents a certificate from a
+# private CA; its PEM file comes in this variable (the eval script exports it
+# from the run's forge state directory) or through configure_ca, and every
+# call here then verifies against it. Unset, the system trust store applies,
+# which is what gitlab.com needs.
+CA_FILE_ENV = "GITLAB_CA_FILE"
 REQUEST_TIMEOUT_SECONDS = 30
 PER_PAGE = 100
 MAX_PAGES = 20
@@ -127,6 +134,34 @@ class RateLimited(Exception):
 
 pause = time.sleep
 ResetError = ledgers.ResetError
+_ca_file: str | None = None
+
+
+def configure_ca(path: str | None) -> None:
+    """Trust `path` (a PEM CA) for every call from here on; None clears it."""
+    global _ca_file
+    _ca_file = path or None
+
+
+_contexts: dict[str, ssl.SSLContext] = {}
+
+
+def ssl_context() -> ssl.SSLContext | None:
+    """The context api() verifies with: the private CA when one is configured
+    (configure_ca, else CA_FILE_ENV), otherwise None for the system store. A
+    CA file that does not load is a ResetError naming it, not a traceback at
+    the first call. Built once per path; every page of every listing reuses it."""
+    path = _ca_file or os.environ.get(CA_FILE_ENV) or None
+    if not path:
+        return None
+    if path not in _contexts:
+        context = ssl.create_default_context()
+        try:
+            context.load_verify_locations(cafile=path)
+        except (OSError, ssl.SSLError) as exc:
+            raise ResetError(f"the forge CA file {path} did not load: {exc}") from exc
+        _contexts[path] = context
+    return _contexts[path]
 
 
 def api_root(host: str = DEFAULT_HOST) -> str:
@@ -162,7 +197,7 @@ def api(method: str, path: str, token: str, body: dict | None = None, host: str 
         data = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(api_root(host) + path, method=method, headers=headers, data=data)
-    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS, context=ssl_context()) as response:
         raw = response.read()
     if not raw:
         return None

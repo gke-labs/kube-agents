@@ -17,7 +17,10 @@
 # and ci-kube-agents-eval-nightly-main-b with EVAL_NIGHTLY_PART=main-b, and
 # ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
 # cases that request a pull request (the variable's comment in the script
-# says why).
+# says why). The writers part also waits EVAL_GITHUB_WRITE_SETTLE_SECONDS
+# (30 s) before each of its units, which run one at a time: with six
+# requesting cases at three repetitions, nine minutes a night of pure waiting,
+# beside the 90 s the 5 s stagger cost.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -76,11 +79,16 @@
 #      transport failures; the worker filed its ledger issue even so.
 #   -- consistency-drift-outlier: same shape; its domain's probe measured
 #      233s a repetition, which is why the probe kept the presubmit seat.
-# All four hinted at 900s in unit_cost_hint so a nightly launches them first.
+#      Registered here after upgrade-readiness-lagging-cluster until
+#      2026-10-26, when it moved to presubmit-cases.txt and the blocking
+#      roster on its nightly record (docs/eval-gate-roster.md, "Admitted on
+#      the record since the split"), the consistency probe being nightly.
+# All four hinted at 900s in unit_cost_hint so a nightly launches them first
+# (consistency-drift-outlier, now from presubmit-cases.txt, at 600s since
+# 2026-10-26 on its measured cost).
 ./tasks/obtainability-planted-pdb/task.yaml
 ./tasks/stockout-pinned-pool/task.yaml
 ./tasks/upgrade-readiness-lagging-cluster/task.yaml
-./tasks/consistency-drift-outlier/task.yaml
 
 # Superseded in the presubmit by reliability-pdb-probe (same planted defect,
 # same question), not by any doubt: 1.0 on #984's live validation.
@@ -178,12 +186,19 @@
 ./tasks/ai-security-planted-model-audit/task.yaml
 ./tasks/autoops-crashloop-config-triage/task.yaml
 
+# gke-labs#3078 (2026-10-15): autoops-missing-service-triage, the same tofu
+# pipeline with a missing-Service plant, grading that a triage worker reports
+# a found cause instead of hunting for the workload's GitOps source. Takes
+# the incumbent's 900s band (~45min at three) until it has a record.
+./tasks/autoops-missing-service-triage/task.yaml
+
 # The drift stream's second full audit, nightly from the start (2026-09-18):
 # the same SOP-faithful shape and 900s band as consistency-drift-outlier
-# above, grading the collector-only `no-environment-label` check (SOP §4.14)
-# against the install's own unlabelled host cluster beside the labelled
-# seeded trio. Its domain's presubmit seat stayed with the probe (nightly
-# since 2026-10-21, #3598).
+# (registered above until its roster seat of 2026-10-26), grading the
+# collector-only `no-environment-label` check (SOP §4.14) against the
+# install's own unlabelled host cluster beside the labelled seeded trio. Its
+# domain's presubmit seat was the probe's until 2026-10-21 (#3598) and is
+# consistency-drift-outlier's since 2026-10-26.
 ./tasks/consistency-no-environment-label/task.yaml
 
 # The third tofu-provisioned case, and the drift half of incident triage
@@ -765,7 +780,8 @@
 # drift audit's collector (#2386), and answers in chat without publishing.
 # deployer: noop; reads the seeded fleet's drift-outlier role (slot c).
 # Nightly rather than presubmit: consistency-authorized-networks-probe held
-# the domain's presubmit seat (nightly too since 2026-10-21, #3598). Green on
+# the domain's presubmit seat (nightly too since 2026-10-21, #3598;
+# consistency-drift-outlier holds it since 2026-10-26). Green on
 # the SOUL.md drift row (#3398, #3609); ran as expected_fail from #3135 until
 # then.
 ./tasks/drift-chat-request-runs-collector/task.yaml
@@ -883,6 +899,14 @@
 # provisioning the preferred tier. deployer: noop, transcript-only.
 ./tasks/autoscaler-zonal-stockout-cooldown-scope-probe/task.yaml
 
+# #3702: the onboarding sweep under a first-run cluster card cap of 2, below the
+# eval fleet's roster so it binds. Cards for the first two Cluster Agents by
+# profile name only, and the raw report shows the rest audited by the sweep
+# itself. The bootstrap-discovery stack, as bootstrap-discovery-fanout runs it
+# with a cap of 2 where the fan-out pins 24; the onboarding lock, so main-a.
+# Priced with the fan-out.
+./tasks/bootstrap-discovery-capped/task.yaml
+
 # #3090: the first onboarding report opens with the scan counts and the line
 # `inventory_findings.py select` prints, graded by equality. The
 # bootstrap-ranking stack with a planted report that has no critical finding;
@@ -897,6 +921,21 @@
 # issue every night. deployer: noop, no fixtures. Nightly from its first
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
+
+# A card the AI model's rate limit blocked is not promised a retry: the wake
+# reply says it will not run again on its own and offers to try again (SOUL
+# §2 step 5, #3766). Plants its own card through card_wake.py; one front-door
+# turn, no card round trip, no fixture: +3 units at the 200s default. It runs
+# on the inject lane too: next posts the wake's reply nowhere, but the same
+# SOUL sentence writes it, so the nightly still measures the rule (#4004).
+./tasks/chat-rate-limit-block-promises-no-retry/task.yaml
+
+# A reply typed under a pushed report is answered with the report (#4059):
+# the harness stores the report for the conversation as the kanban notifier
+# would, then sends the reply on it; the hermes-bridge attaches the stored
+# report to the turn. deployer: noop, two front-door turns, reads no cluster;
+# inject lane only (api-lane-exclusions.txt).
+./tasks/chat-reply-under-pushed-report/task.yaml
 
 # The front door routes "which namespaces exist in this cluster?" to the host
 # cluster's agent (or platform) without asking which cluster (#3286).
@@ -928,17 +967,37 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# The silence case for a deliberate scale to zero (#4098): an in-cluster
+# gateway whose proxy and backend are both at replicas 0 reports
+# Programmed=False, and the stall check must not report it. Reads the
+# scaled-zero-gateway role on seeded-a (`deployer: noop`, read-only), graded
+# on the contracted "stalled resources: 0" line with two safeguards against
+# scaling the environment back up. Red on main without the rule, green with it.
+./tasks/cluster-agent-scaled-zero-gateway-silence/task.yaml
+
+# A Cluster Agent answers a storage audit with the single-pass collector SOUL.md
+# names (#3285): graded on a Cluster Agent doing the work, running
+# /opt/data/scripts/audit_storage.py, no later turn's result showing the script
+# missing, and a report naming the storage kinds. deployer: noop, read-only, no
+# fixture, 200s default until it has a record.
+./tasks/cluster-agent-storage-audit-collector/task.yaml
+
 # #3598: consistency-authorized-networks-probe demoted 2026-10-21. On the
 # Gemini setup it failed about 30% of repetitions on unrelated pull requests
 # and on main's eval-next (37 of 126 across 42 runs; the store's record
-# 18/21, would-demote). 15 of the 37 were Vertex 429s (#3399, fix open in
-# #3448); 22 were real misses: the agent read seeded-c's leftover
+# 18/21, would-demote). 15 of the 37 were Vertex 429s (#3399, a fix proposed
+# in #3448); 22 were real misses: the agent read seeded-c's leftover
 # masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} (no
 # `enabled`) as configured or open and said seeded-c matches its peers, or
 # named the wrong facet, or (once) a tool error. The Claude nightlies pass
-# it. Back on the roster once #3448 has merged, the agent-side fix (#3605)
-# lands, and the case passes the roster's bar, 90% over 20 runs, on the
-# Gemini nightly (#3598).
+# it. The fix landed in #3609 (2026-10-23); #3448 closed unmerged. Measured
+# 19/19 on #3975's two lanes, then 10/10 on the inject lane with the route
+# reverted (#4116), so a presubmit seat could not fail when the fix is undone:
+# the case stays nightly by the decision on #3975's review thread. No CI lane
+# grades its route check today (the nightly halves run through the inject
+# door; since #3969 the api-lane jobs carry the presubmit list, not this file).
+# Enters again once a lane grades that route and the record holds (#3598).
+# The domain's roster seat is consistency-drift-outlier since 2026-10-26.
 ./tasks/consistency-authorized-networks-probe/task.yaml
 
 # A request cut on named workloads names the dependency each cut would change
@@ -947,6 +1006,35 @@
 # not run the waste collector. Red on main before the change, on a dev
 # install. One case, three units. deployer: noop, read-only over the seeded fleet.
 ./tasks/cost-rightsizing-names-dependencies/task.yaml
+
+# gke-labs#2610: a request to propose a fix, delegated to a platform card, is
+# answered in the card's result with the PodDisruptionBudget manifest, and no
+# worker runs submit_suggestion.py, during its run or after kanban_complete.
+# The prompt is the card body the gate's failing repetitions carried. About
+# one gate repetition in 25 failed on main, so a night's three are a sample;
+# on a dev lane main failed 8 of 20 end to end (#4105). deployer: noop, read-only, the no-pdb-workload fixture plus
+# the pool repository's checkout-gateway declaration (#3145); first phase,
+# like obtainability-remediation-proposal. Nightly from its first merge.
+./tasks/delegated-proposal-stays-in-reply/task.yaml
+
+# The findings queue's item-wide decision when a sweep has added a finding to
+# the line since the nudge named it: the named rows are dismissed, the row no
+# message has named stays queued, and the other lines stay open.
+# prebuilt/findings-item plants findings-unnamed.json under its own project
+# through the Session KV server's findings routes and resolves the rows on
+# destroy. No fixture; the host install only.
+./tasks/findings-decision-leaves-unnamed-open/task.yaml
+
+# A fleet audit on an install whose scope excludes as many clusters as it
+# manages runs, rather than cancelling with "every managed cluster is
+# excluded" (#3933). The runner excludes slots b and d plus one cluster that
+# does not exist (scope_exclude, absent: 1): three excluded against the three
+# a pool install still manages. One stream by its SOP (compliance-audit), so
+# the session runs it and the report store shows the outcome. Not reproduced
+# on demand (three passes on main on a dev install); a red is #3933 evidence
+# only when its answer reads the managed clusters as excluded (the case header
+# says how to read one). deployer: noop; an audit, so 3000 s of delegation wait.
+./tasks/fleet-audit-as-many-excluded-as-managed/task.yaml
 
 # An on-demand audit that moved nothing still reports its ledger URL (#1929).
 # prebuilt/stale-audit-ledger with ledger_kind "gap" opens an ai-security-audit
@@ -1022,6 +1110,13 @@
 # closed. Its first nightly is its first observation outside a dev install.
 ./tasks/gitops-drift-load-bearing-change-triage/task.yaml
 
+# A drift to an object git does not declare (#3972): a namespace created by
+# hand, its Pod Security level loosened, and no GitOps marker on it. Every
+# sibling's object is GitOps-managed, so an agent that offers "revert to what
+# git declares" for every drift passed them all. Holds the infra lock; 900s,
+# the drift band; listed in nightly-main-b.txt to balance the halves.
+./tasks/gitops-drift-unmanaged-object-triage/task.yaml
+
 # A general fleet health question ("check if my clusters are all healthy") runs
 # fleet_health.py once and files no per-cluster cards (#3302): on a 209-cluster
 # fleet the per-cluster fan-out queued behind the board's five user slots for
@@ -1055,10 +1150,25 @@
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
 
+# A fleet question on an install whose spec.scope.exclude.clusters names
+# seeded-b: the answer names seeded-a and seeded-c and does not report on
+# seeded-b (#3081, #3100). The runner excludes slot b for this case's
+# repetitions alone, after every other unit, and restores the scope after them
+# (scope_exclude, #3213); deployer: noop, read-only.
+./tasks/scope-excluded-cluster-not-listed/task.yaml
+
 # A gcloud write the command policy refuses for a flag it cannot read: the
 # report claims no success and no delegated worker re-runs the write without
 # the flag after it (#2979, #3260). deployer: noop, transcript-only.
 ./tasks/stop-on-unknown-flag-write-refusal/task.yaml
+
+# Topology drift and zonal skew attribution probe (#1356, #3415): grades
+# root-cause attribution across the three planted zonal-skew roles on slot d
+# (zonal-skew-scheduling, zonal-skew-volume, zonal-skew-capacity in namespace
+# seeded-topology) plus the capacity role's sponge, the single-zone node-pool
+# case leeway reports nothing for, and that `leeway report` ran. deployer:
+# noop, read-only, off the infra lock.
+./tasks/topology-zonal-skew-probe/task.yaml
 
 # Twenty image-pull Warnings at once: every alert the daemon admits starts its
 # triage turn within the product's 20-minute queue limit, graded by the

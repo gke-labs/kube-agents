@@ -27,18 +27,20 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as futures_wait
-from contextlib import ExitStack, closing, nullcontext
+from contextlib import ExitStack, asynccontextmanager, closing, nullcontext
 from pathlib import Path
 
 import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import board_health_card
 import board_snapshot
 import chat_notify
 import cron_schedule
 import findings_queue
 import gitops_workspace
+import kanban_board_health
 import slack_audit_report
 import slack_blocks_post
 import slack_presenter
@@ -57,6 +59,11 @@ logger = logging.getLogger("session_kv_server")
 # `.env` is agent-writable (`save_env_value`), and `load_dotenv` adds any key the
 # container env lacks, which on an install that did not opt in is exactly these.
 _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST",)
+# The home channel a today-era `/sethome` or first chat mirrored into that
+# `.env` (Hermes' persist_home_channel). Under `next` with the operator's
+# projection mounted, the projected file is the channel the gateway posts
+# into, so the mirror must not fill the key the container env lacks.
+_PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
 
 
 def _load_dotenv_ignoring_operator_switches(path: str) -> None:
@@ -78,6 +85,9 @@ def _load_dotenv_ignoring_operator_switches(path: str) -> None:
         if key in _OPERATOR_ONLY_ENV_KEYS:
             logger.info(f"Ignoring operator-only switch {key} in {path}")
             continue
+        if key in _PROJECTED_HOME_ENV_KEYS and chat_notify.home_file()[1]:
+            logger.info(f"Ignoring {key} in {path}: the operator projects the home channel")
+            continue
         if key not in os.environ:
             os.environ[key] = val
 
@@ -87,10 +97,35 @@ _load_dotenv_ignoring_operator_switches(DOTENV_PATH)
 # The schema is not published: this server has exactly three known callers, all
 # of them inside this pod, and an interactive /docs page on a port that carries
 # chat identifiers is a browsable index of them.
-app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # The data volume check runs on its own thread for the life of the server;
+    # see check_data_volume.
+    threading.Thread(target=_data_volume_monitor, name="data-volume-monitor", daemon=True).start()
+    yield
+
+
+app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None, lifespan=_lifespan)
 
 SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
 CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
+
+# The data volume warning. A full volume fails every kanban and session write
+# with a bare `disk I/O error` and nothing in chat says why, so this server, the
+# one long-running process of the agent's that already posts to the home
+# channel, checks the volume and says so once per crossing: at
+# DATA_VOLUME_WARN_PERCENT used, and not again until usage has dropped below
+# DATA_VOLUME_REARM_PERCENT. The operator reports the same reading on the CR as
+# the DataVolumeNearlyFull condition; this is the half a chat user sees.
+DATA_VOLUME_PATH = os.getenv("PLATFORM_AGENT_HOME", "/opt/data")
+DATA_VOLUME_CHECK_INTERVAL_SECONDS = 300
+DATA_VOLUME_WARN_PERCENT = 90
+DATA_VOLUME_REARM_PERCENT = 85
+DATA_VOLUME_WARNING = (
+    "The agent's data volume is {percent}% full ({used:.1f} of {total:.1f} GiB). "
+    "Remove unused cluster profiles, or ask an admin to raise spec.storage.size on the PlatformAgent."
+)
+BYTES_PER_GIB = 1 << 30
 
 # Bounds on the index `/v1/incidents/recent` returns. Both axes matter because
 # its caller prepends the result to messages that carry no report of their own,
@@ -441,6 +476,24 @@ MANAGED_DOTENV_PATH = os.path.join(
 # Resolved from HERMES_MANAGED_DIR the same way, and for the same reason.
 MANAGED_CONFIG_PATH = os.path.join(
     os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes", "config.yaml"
+)
+
+# How a Cluster Agent describes a fix on an event or stall triage card. (The
+# drift card keeps its own wording: its report compares the live object with
+# the declared state, which it reads from the object's field ownership.) A
+# Cluster Agent has no GitOps repository: the Platform Agent finds the file
+# when it opens the Pull Request. Without this, "precisely
+# enough that someone can open the Pull Request from your report alone" sent a
+# worker that had its cause in the first minute on a 21-minute hunt for the
+# workload's source, and it never answered (gke-labs#3078).
+TRIAGE_FIX_AGAINST_LIVE_OBJECT = (
+    "Describe each change against the live object you read: its kind, namespace and name, the field, and the "
+    "current and proposed value, or for a missing object, what to create and the fields it needs. You have no "
+    "GitOps repository and need none, because the agent that opens the Pull Request finds the file. Do not look "
+    "for the workload's source, whether in this pod's files, with git, or through any repository tool: a source "
+    "file you haven't seen is not a gap in the report. The cause is the evidenced dependency or setting the failure "
+    "points to, not the command or log line that reports it, so check that it exists before you call the "
+    "investigation done. Then complete the card. "
 )
 
 
@@ -856,6 +909,25 @@ INCIDENT_FOLD_DB_TIMEOUT_S = 5.0
 # arriving together cannot both find no anchor and both open a triage. The
 # route is a sync def served on a threadpool, so they can.
 _WORKLOAD_FOLD_LOCK = threading.Lock()
+# A workload that breaks again while the fix for its last incident waits for
+# review (_open_fix_pull_request): the event is recorded against that incident
+# with the pull request's URL instead of opening a second investigation. A pull
+# request a card opened is a `pr_opened` event on that card in kanban.db
+# (agents/platform/plugins/pr_opened). Same pattern as that plugin's
+# PROPOSAL_URL, copied because a plugin is loaded by file path: the repository
+# forge.call takes, then the number.
+PR_OPENED_EVENT_KIND = "pr_opened"
+PROPOSAL_URL_RE = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
+PROPOSAL_OPEN_STATE = "open"
+# How many of the workload's most recent incidents are searched for a fix.
+FIX_PR_INCIDENTS_SCANNED = 5
+# The forge lookup's budget for the whole search; past it the event is
+# announced as a new incident, the same answer as no fix at all.
+FIX_PR_LOOKUP_TIMEOUT_S = 8.0
+# session_metadata key on the held incident's session: when its thread was last
+# reminded that the fix is waiting, so it is reminded at most once per window.
+FIX_PR_REMINDED_AT_KEY = "fix_pr_reminded_at"
+FIX_PR_REMINDER_SEND_TIMEOUT_S = 30.0
 
 # The `kind` a drift record carries, set by the drift detector
 # (`injectKindDrift` in k8s-operator/cmd/drift-detector/inject.go). It is the
@@ -1309,6 +1381,12 @@ def init_db() -> None:
                 # Deployment's pod, or a non-Pod object's own name. Empty on
                 # every row that can neither fold nor anchor.
                 ("fold_key", "fold_key TEXT NOT NULL DEFAULT ''"),
+                # The workload an incident's fix belongs to (_incident_branch_workload),
+                # which, unlike fold_key, nothing clears: the search for an open
+                # fix reaches back past restarts (_open_fix_pull_request).
+                ("workload_key", "workload_key TEXT NOT NULL DEFAULT ''"),
+                # The open pull request a row was held for; '' on every other row.
+                ("pull_request", "pull_request TEXT NOT NULL DEFAULT ''"),
                 # When the row's turn was dispatched: stamped by the dispatcher
                 # as it creates the gateway session, on every path, and by the
                 # carding of a drift-backlog row. created_at is the row's
@@ -1409,6 +1487,19 @@ def init_db() -> None:
                     sent       INTEGER NOT NULL DEFAULT 0,
                     suppressed INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (day, severity)
+                )
+                """
+            )
+            # One row: whether the data volume warning has been posted for the
+            # current crossing. On this database rather than in memory so that a
+            # restart while the volume is still full does not post it again, and
+            # on this database rather than the data volume, which is the one that
+            # is full.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS data_volume_warning (
+                    id     INTEGER PRIMARY KEY CHECK (id = 1),
+                    warned INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -1517,6 +1608,8 @@ def record_intercepted_event(
     session_id: str = "",
     duplicate_of: Optional[int] = None,
     fold_key: str = "",
+    workload_key: str = "",
+    pull_request: str = "",
 ) -> Optional[int]:
     """Append one forwarded event to the ledger the daily recap reads.
 
@@ -1562,8 +1655,8 @@ def record_intercepted_event(
                 cursor = conn.execute(
                     "INSERT INTO intercepted_events "
                     "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
-                    "occurrences, notified, session_id, duplicate_of, fold_key) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "occurrences, notified, session_id, duplicate_of, fold_key, workload_key, pull_request) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         cluster,
                         namespace,
@@ -1578,6 +1671,8 @@ def record_intercepted_event(
                         session_id,
                         duplicate_of,
                         fold_key,
+                        workload_key,
+                        pull_request,
                     ),
                 )
                 return cursor.lastrowid
@@ -1673,6 +1768,182 @@ def mark_triage_state(event_row_id: Optional[int], state: str) -> None:
                 )
     except Exception as exc:
         logger.error(f"Failed to record triage state {state} for ledger row {event_row_id}: {exc}")
+
+
+class FixPullRequest(NamedTuple):
+    """An incident whose fix is open for review: its ledger row, its session, and the pull request."""
+
+    anchor_id: int
+    session_id: str
+    url: str
+
+
+def _incident_pull_request_urls(session_id: str) -> list[str]:
+    """The pull requests cards filed in an incident's own session opened, newest first.
+
+    The card the front door files in the incident's own session
+    (INCIDENT_TRIAGE_OPEN_PULL_REQUEST; Hermes stamps the filing session on
+    `tasks.session_id`) opens the fix, and a card that opened one has a
+    `pr_opened` event (agents/platform/plugins/pr_opened). Not the cards
+    subscribed to the incident's thread: anything asked for in the thread
+    files one, so a pull request found that way need not be the fix.
+    Best-effort: an unreadable board, or one without a table or column these
+    read, contributes nothing.
+    """
+    sql = (
+        "SELECT e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
+        "WHERE e.kind = ? AND t.session_id = ? ORDER BY e.created_at DESC, e.id DESC"
+    )
+    urls: list[str] = []
+    try:
+        with closing(_read_only(_kanban_db_path())) as conn:
+            for (payload,) in conn.execute(sql, (PR_OPENED_EVENT_KIND, session_id)).fetchall():
+                try:
+                    data = json.loads(payload) if isinstance(payload, str) else payload
+                except ValueError:
+                    continue
+                url = data.get("url") if isinstance(data, dict) else None
+                if isinstance(url, str) and PROPOSAL_URL_RE.match(url) and url not in urls:
+                    urls.append(url)
+    except Exception as exc:
+        logger.warning(f"Could not read the board for session {session_id}'s pull requests: {exc!r}")
+    return urls
+
+
+def _proposal_state(url: str, timeout: float) -> Optional[str]:
+    """The forge's state for the pull request at `url`, or None when it cannot say in time."""
+    match = PROPOSAL_URL_RE.match(url)
+    if match is None or timeout <= 0:
+        return None
+    # A daemon thread, not a ThreadPoolExecutor: a forge call that outlives the
+    # budget is abandoned, and an executor's worker would hold a restart until
+    # it ends (forge's own hop allows FORWARD_TIMEOUT_S an attempt).
+    answer: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def _view() -> None:
+        try:
+            import forge
+
+            view = forge.call("proposal-view", {"number": int(match.group(2))}, match.group(1), retry_transient=True)
+            answer.put((True, view))
+        except Exception as exc:
+            answer.put((False, exc))
+
+    threading.Thread(target=_view, name="fix-pr-lookup", daemon=True).start()
+    try:
+        ok, result = answer.get(timeout=timeout)
+    except queue.Empty:
+        logger.warning(f"Could not read the state of {url} within {timeout:.1f}s")
+        return None
+    if not ok:
+        logger.warning(f"Could not read the state of {url}: {result!r}")
+        return None
+    proposal = (result.get("proposal") if isinstance(result, dict) else None) or {}
+    state = proposal.get("state") if isinstance(proposal, dict) else None
+    return state if isinstance(state, str) else None
+
+
+def _open_fix_pull_request(
+    cluster: str, namespace: str, object_kind: str, workload_key: str, reason: str, severity: str
+) -> Optional[FixPullRequest]:
+    """The workload's latest incident whose fix pull request is still open, or None.
+
+    Searches the workload's most recent admitted incidents (same cluster,
+    namespace, kind, workload_key and reason), newest first, for a pull request a card
+    opened for it (_incident_pull_request_urls) that the forge still reports
+    open. A merged or closed one is not a fix in review: a merged fix that did
+    not hold, or a rejected one, is a new incident. A Critical event is held
+    only by a Critical incident, as the fold holds it (_workload_incident_anchor).
+    The event's reason has to be one the incident showed, its own or one folded
+    into it (a cascade such as `Failed` then `BackOff` is one fault): another
+    reason is another fault, which the open fix may not touch, so it is triaged
+    rather than reminded.
+
+    Fails open: an unreadable ledger or board, a forge that refuses or is slow
+    past FIX_PR_LOOKUP_TIMEOUT_S for the whole search, all answer None, and the
+    event is announced as a new incident.
+    """
+    if INCIDENT_WORKLOAD_DEDUP_SECONDS <= 0 or not workload_key:
+        return None
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            incidents = conn.execute(
+                "SELECT id, session_id FROM intercepted_events "
+                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND workload_key = ? "
+                "AND (reason = ? OR id IN (SELECT duplicate_of FROM intercepted_events WHERE reason = ? AND duplicate_of > 0)) "
+                "AND (? != ? OR severity = ?) "
+                "AND duplicate_of IS NULL AND (notified != 0 OR delivery_error != '') AND session_id != '' "
+                "ORDER BY id DESC LIMIT ?",
+                (
+                    cluster,
+                    namespace,
+                    object_kind,
+                    workload_key,
+                    reason,
+                    reason,
+                    severity,
+                    CRITICAL_SEVERITY,
+                    CRITICAL_SEVERITY,
+                    FIX_PR_INCIDENTS_SCANNED,
+                ),
+            ).fetchall()
+    except Exception as exc:
+        logger.error(f"Failed to look up {namespace}/{workload_key}'s incidents for an open fix: {exc}")
+        return None
+    deadline = time.monotonic() + FIX_PR_LOOKUP_TIMEOUT_S
+    for anchor_id, session_id in incidents:
+        for url in _incident_pull_request_urls(session_id):
+            if _proposal_state(url, deadline - time.monotonic()) == PROPOSAL_OPEN_STATE:
+                return FixPullRequest(int(anchor_id), session_id, url)
+            if time.monotonic() >= deadline:
+                return None
+    return None
+
+
+def _claim_fix_pull_request_reminder(session_id: str) -> bool:
+    """Whether the held incident's thread may be reminded now; records the reminder when it may.
+
+    At most once per INCIDENT_WORKLOAD_DEDUP_SECONDS per incident, so a workload
+    that keeps breaking while its fix waits reminds the thread once a window
+    rather than once an event. The check and the stamp share one transaction.
+    """
+    now = time.time()
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            meta = json.loads(row[0] or "{}")
+            last = meta.get(FIX_PR_REMINDED_AT_KEY)
+            if isinstance(last, (int, float)) and now - last < INCIDENT_WORKLOAD_DEDUP_SECONDS:
+                conn.rollback()
+                return False
+            meta[FIX_PR_REMINDED_AT_KEY] = now
+            conn.execute(
+                "UPDATE session_metadata SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (json.dumps(meta), session_id),
+            )
+            conn.commit()
+            return True
+    except Exception as exc:
+        logger.warning(f"Could not claim a fix reminder for session {session_id}: {exc!r}")
+        return False
+
+
+def _remind_fix_pull_request(session_id: str, workload: str, reason: str, url: str) -> None:
+    """Remind the held incident's thread that its fix is still waiting for review.
+
+    Background task. Nothing when the incident has no thread (an install with
+    no chat platform), or when the thread was reminded within the window.
+    """
+    platform, chat_id, thread_id = _lookup_session_routing(session_id)
+    if not (platform and thread_id) or not _claim_fix_pull_request_reminder(session_id):
+        return
+    message = f"`{workload}` is still failing ({reason}). The fix is waiting for review: {url}"
+    if _send_to_chat(platform, message, chat_id, thread_id, timeout=FIX_PR_REMINDER_SEND_TIMEOUT_S) is None:
+        logger.warning(f"Could not remind session {session_id}'s thread that {url} is waiting for review")
 
 
 def mark_triage_not_started(event_row_id: Optional[int]) -> None:
@@ -1990,11 +2261,19 @@ def _slack_home_channel() -> str:
 
     Environment first, so an install whose CR sets the channel resolves exactly
     as it did before; the files are consulted only when it is absent, which is
-    the case that was broken.
+    the case that was broken. Under `spec.mode: next` a channel the gateway
+    learned is never rendered into the pod: the operator projects it into a
+    file the kubelet refreshes in place (chat_notify.home_file). A mounted file
+    decides, empty or not, so this answer is the channel the gateway posts
+    into; the config files `/sethome` writes in today mode count only where no
+    file is mounted, since the data volume keeps them across a mode switch.
     """
     env = os.environ.get("SLACK_HOME_CHANNEL", "").strip()
     if env:
         return env
+    projected, mounted = chat_notify.home_file()
+    if mounted:
+        return projected
     for path in (MANAGED_CONFIG_PATH, CONFIG_PATH):
         value = _platform_setting_in(path, "slack", "home_channel")
         if value:
@@ -2027,8 +2306,9 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
-    One thing outranks all three: the platform the operator names in
-    ``A2A_NOTIFY_PLATFORM`` (chat_notify.py). Under ``spec.mode: next`` the
+    One thing outranks all three: the platform ``chat_notify.routed_platform()``
+    names, from ``A2A_NOTIFY_PLATFORM`` or the projected home-channel file. Under
+    ``spec.mode: next`` the
     managed scope says that platform's Hermes consumer is off because the A2A
     gateway holds the backend, and posts to it go through the gateway instead,
     so it is still a platform this install posts to. The operator renders the
@@ -2077,7 +2357,8 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
 
     Checks `chat_notify.routes(name)` first so `spec.mode: next` installs where
     the operator renders `platforms.<p>.enabled: false` into `/etc/hermes/config.yaml`
-    while routing notifications through `A2A_NOTIFY_PLATFORM` resolve that
+    while routing notifications through the gateway (`A2A_NOTIFY_PLATFORM` or the
+    projected home-channel file) resolve that
     platform as enabled in both `enabled_chat_platforms` and `_chat_platforms_disabled`.
     """
     from_managed = _platforms_enabled_in(MANAGED_CONFIG_PATH)
@@ -2114,7 +2395,7 @@ def _chat_platforms_disabled() -> bool:
 
     On a chat-less install (`install.sh` chat choice "None", or a CR with
     `googleChat.enabled: false` and `slack.enabled: false` and no routed
-    `A2A_NOTIFY_PLATFORM`), `renderConfigYAML` emits `enabled: false` for both
+    platform), `renderConfigYAML` emits `enabled: false` for both
     platforms in `/etc/hermes/config.yaml`. `enabled_chat_platforms` falls back
     to `DEFAULT_CHAT_PLATFORM` when nothing resolves so legacy callers never
     address an empty string; this helper uses the same `_resolve_chat_platforms`
@@ -2300,6 +2581,91 @@ def _claim_alert_quota(severity: str) -> tuple[bool, int]:
     except Exception as exc:
         logger.error(f"Alert quota check failed for severity {severity} (allowing the alert through): {exc}")
         return True, 0
+
+
+def _data_volume_usage(path: str) -> Optional[tuple[int, int]]:
+    """The volume holding `path` as (total, free) bytes, free being what a
+    non-root writer can still use; None when it cannot be read."""
+    try:
+        st = os.statvfs(path)
+    except OSError as exc:
+        logger.debug(f"Cannot read the data volume at {path}: {exc}")
+        return None
+    total = st.f_blocks * st.f_frsize
+    if total <= 0:
+        return None
+    return total, st.f_bavail * st.f_frsize
+
+
+def _data_volume_warned() -> bool:
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        row = conn.execute("SELECT warned FROM data_volume_warning WHERE id = 1").fetchone()
+    return bool(row and row[0])
+
+
+def _set_data_volume_warned(warned: bool) -> bool:
+    """Move the flag to `warned`. True only for the caller that changed it."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        with conn:
+            conn.execute("INSERT OR IGNORE INTO data_volume_warning (id, warned) VALUES (1, 0)")
+            cur = conn.execute(
+                "UPDATE data_volume_warning SET warned = ? WHERE id = 1 AND warned != ?",
+                (int(warned), int(warned)),
+            )
+            return cur.rowcount == 1
+
+
+def _post_data_volume_warning(message: str) -> bool:
+    """Post the warning to the home channel. True once it is delivered, or once
+    there is nowhere to deliver it, so the caller stops trying; False when every
+    enabled platform refused, so the next check tries again."""
+    platforms = enabled_chat_platforms()
+    if platforms == [DEFAULT_CHAT_PLATFORM] and _chat_platforms_disabled():
+        logger.warning("No chat platform is enabled, so the data volume warning is in this log and nowhere else")
+        return True
+    for candidate in platforms:
+        if _post_initial_alert(candidate, message):
+            return True
+    logger.warning(
+        "The data volume warning was not accepted by any enabled chat platform; "
+        "check the home channel setting. It is tried again at the next check"
+    )
+    return False
+
+
+def check_data_volume() -> None:
+    """Post the data volume warning if the volume has crossed the line, and
+    re-arm it once usage is back below the lower one."""
+    usage = _data_volume_usage(DATA_VOLUME_PATH)
+    if usage is None:
+        return
+    total, free = usage
+    percent = (total - free) * 100 // total
+    warned = _data_volume_warned()
+    if warned:
+        if percent < DATA_VOLUME_REARM_PERCENT:
+            _set_data_volume_warned(False)
+            logger.info(f"The data volume is back to {percent}% used; the full-volume warning is re-armed")
+        return
+    if percent < DATA_VOLUME_WARN_PERCENT:
+        return
+    message = DATA_VOLUME_WARNING.format(
+        percent=percent, used=(total - free) / BYTES_PER_GIB, total=total / BYTES_PER_GIB
+    )
+    logger.warning(message)
+    # Set only after the post is delivered. A process killed during the send
+    # (a pod roll) then posts at the next check instead of never.
+    if _post_data_volume_warning(message):
+        _set_data_volume_warned(True)
+
+
+def _data_volume_monitor() -> None:
+    while True:
+        try:
+            check_data_volume()
+        except Exception as exc:
+            logger.error(f"Data volume check failed: {exc}")
+        time.sleep(DATA_VOLUME_CHECK_INTERVAL_SECONDS)
 
 
 def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
@@ -2712,7 +3078,8 @@ def _triage_who_acts(open_pull_request: bool) -> str:
     if not open_pull_request:
         return (
             "A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
-            "Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+            "Your job is to make that possible: name the change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+            f"{TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
             "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
             "(no `kubectl scale`, `patch`, or `apply`)."
         )
@@ -2722,8 +3089,10 @@ def _triage_who_acts(open_pull_request: bool) -> str:
         "complete this card (`done`), reads your report, and opens the Pull Request for the option you marked ✅ Recommended, or for "
         "the single Proposed fix — not you, and not from this card (if this card ends `blocked`, the follow-up card stays held in "
         "`todo` until this card is unblocked and completed or archived). "
-        "Your job is to make that possible: name the manifest change each option needs precisely enough that the Pull Request can be "
-        "opened from your report alone, and with two or more options mark exactly one Recommended. Keep the `- **To authorize:**` bullet "
+        "Your job is to make that possible: name the change each option needs precisely enough that the Pull Request can be "
+        "opened from your report alone, and with two or more options mark exactly one Recommended. "
+        f"{TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
+        "Keep the `- **To authorize:**` bullet "
         "label as the template above writes it (the notifier keys on that label to store your report for thread follow-ups), telling "
         f"the reader that a GitOps Pull Request for the recommended fix {TRIAGE_OPEN_PR_MARKER} (and with two or more options, "
         "that they can reply **'apply Option B'** to request an alternative option instead) — do not tell the reader to reply "
@@ -3283,6 +3652,17 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     establishing whether the state git declares still runs before proposing that
     the change be undone.
 
+    The detector does not consult git, so the object may be one git does not
+    declare at all, and then there is no declared state to revert to
+    (docs/designs/drift-detection.md, "Resources not in Git at all"). The
+    worker has no repository to check, so the body tells it to read that off
+    the live object's GitOps markers, which the skill lists, and widens the
+    options and the **Done when** line to codifying it. Deleting it is sound
+    too, but no pull request can delete what git does not hold, so it is an
+    unlettered **Manual step** bullet: slack_ux_incident.parse_triage turns
+    every lettered option into an 'apply Option X' button, and a lettered
+    delete would become a button for a pull request that cannot exist. bench/tasks/gitops-drift-unmanaged-object-triage grades it.
+
     On an install with no usable GitOps repository the card is
     :func:`_drift_task_body_without_gitops` instead: an explanation with no
     options. The bench contract above binds only this, the registered path.
@@ -3304,6 +3684,21 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"one a revert would take down, while a change nothing depends on is one a codify would write somebody's "
         f"accident into git. The skill says where the evidence for that lives for each kind of change, and "
         f"whichever way it comes out belongs in the report.\n\n"
+        f"**Before any of that, establish whether git declares this object at all.** You have no access to the "
+        f"repository; the live object tells you. A GitOps tool marks what it applies — its field manager, or its "
+        f"tracking label or annotation — and the skill lists them. If the object still exists, carries none of "
+        f"them, and its only field managers are a person's `kubectl` subcommands (`kubectl-create`, "
+        f"`kubectl-edit`, `kubectl-label`, `kubectl-patch` and the like), say it is probably not in git and what "
+        f"you checked. There is then no declared state to revert to, so do not offer one: codify it in git, saying "
+        f"whether the manifest keeps the change or undoes it — that is the option, or the two options, to letter. "
+        f"Deleting it is also sound, since git declares nothing, but no pull request can do it, so it is never a "
+        f"lettered option, never the recommendation, and never named in the 'apply' line: where it is worth "
+        f"naming, add one bullet after the lettered options, `- **Manual step (<title>):** <why, and the command a "
+        f"person runs>`, and do not call it an option. If its only markers are ones the skill calls ambiguous, "
+        f"which a person's `kubectl apply` or `helm install` leaves too, or a field manager you do not recognise, "
+        f"which may be a pipeline's, keep the revert beside those options and say what would decide between them. "
+        f"A deleted object carries nothing to read, so its absence of markers is no evidence: say whether git "
+        f"declares it could not be read off the cluster, and keep the revert.\n\n"
         f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
         f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
         f"the alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` "
@@ -3312,7 +3707,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"says whether the change still stands or was already reconciled away, with the evidence; and proposes "
         f"either reverting it to the declared state or codifying it in git, with the consequence of each — a "
         f"revert's consequence being whether the state git declares would still run, read off this cluster or "
-        f"reported as not established. "
+        f"reported as not established — or, for an object git does not declare, proposes codifying it, naming "
+        f"deletion by hand as a manual step where it is worth naming. "
         f"Nothing else is a condition of finishing. State those three things in `summary`'s one line as well: "
         f"a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it** — "
@@ -3323,7 +3719,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"the declared state is the one that should win.\n\n"
         f"Propose as many options as the situation genuinely warrants. Usually there are two — revert to what git "
         f"declares, or change git to declare what is now live — and both are worth stating even when one is "
-        f"obviously right, because the reader is deciding which state wins.\n\n"
+        f"obviously right, because the reader is deciding which state wins. For an object git does not declare "
+        f"they are the ones above.\n\n"
         f"**With two or more options:** label them 'Option A', 'Option B', ... in order, name those same letters "
         f"in the call to action, and mark exactly one of them '✅ **Recommended: Option <letter>**'. "
         f"The template below shows that shape; repeat its Option line once for each further option.\n\n"
@@ -3332,7 +3729,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"else, replacing the ones in the template below:\n"
         f"- **Proposed fix (<Action Title>):** <1-sentence description of the GitOps fix>.\n"
         f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
-        f"No Recommended line, and nothing after **'apply'** in the call to action.\n\n"
+        f"No Recommended line, and nothing after **'apply'** in the call to action. The one exception is the "
+        f"**Manual step** bullet for an object git does not declare, which may follow them.\n\n"
         f"**If the change was already reconciled away and nothing is left to do,** make 'What to do' this one "
         f"bullet: '- **No action needed:** the object already matches the declared state.' No Proposed fix, and "
         f"keep the 'To authorize:' bullet off entirely. Do not invent a fix to fill the section.\n\n"
@@ -3343,7 +3741,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"## What's wrong\n\n"
         f"<1 sentence: who changed what, and whether it is still live>\n\n"
         f"## Why\n\n"
-        f"- <What the live object shows now, and how it differs from what git declares, with the evidence>\n"
+        f"- <What the live object shows now, and how it differs from what git declares (or that git declares "
+        f"nothing for it), with the evidence>\n"
         f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
         f"## What to do\n\n"
         f"- **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.\n"
@@ -3566,8 +3965,9 @@ def _stall_task_body(payload: Dict[str, Any]) -> str:
         f"---"
         f"\n\n**Who acts on this:**\n"
         f"A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not "
-        f"you, and not from this card. Name the manifest change each option needs precisely enough that someone can "
-        f"open the Pull Request from your report alone: the object, the field, and the value. Two things are true "
+        f"you, and not from this card. Name the change each option needs precisely enough that someone can "
+        f"open the Pull Request from your report alone. {TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
+        f"Two things are true "
         f"whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written "
         f"to the live cluster directly (no `kubectl create`, `patch`, or `apply`)."
     )
@@ -4709,6 +5109,41 @@ def _slack_summary_text(platform: str, report: str, chat_id: str, profile: str, 
     return text
 
 
+def _board_health_card(platform: str, report: str, chat_id: str, job_id: str) -> dict | None:
+    """With ``KAGE_SLACK_UX`` on, the board-health card the report was said with (:mod:`board_health_card`).
+
+    None, and the leg posts the report as written, unless the leg is Slack, the
+    flag is on, a channel is known (the leg's chat id or the Slack home
+    channel), the job is ``kanban-board-health``, and its card file was written
+    for this very report. Never raises: a card that cannot be read posts as
+    text.
+    """
+    if platform != SLACK_PLATFORM or job_id != kanban_board_health.JOB_ID or not slack_presenter.enabled():
+        return None
+    if not (chat_id or _slack_home_channel()):
+        return None
+    try:
+        return board_health_card.load(kanban_board_health.agent_home(), report)
+    except Exception as exc:  # noqa: BLE001 - the report still posts, as text
+        logger.warning(f"Relay for {job_id}: board-health card unreadable, posting text: {exc!r}")
+        return None
+
+
+def _post_board_health_card(
+    profile: str, job_id: str, card: dict, chat_id: str, thread_id: str, deadline: float
+) -> AuditPost | None:
+    """Post the board-health card; where it landed, or None to post the report as text.
+
+    Block Kit through the Slack relay, or under ``spec.mode: next`` a chat
+    message through the gateway, with the outcomes of :func:`_post_audit_card`.
+    """
+    routed = chat_notify.routes(SLACK_PLATFORM)
+    if not (routed or slack_blocks_post.configured()):
+        return None
+    built = board_health_card.chat_from_card(card) if routed else board_health_card.blocks_from_card(card)
+    return _post_audit_card(profile, job_id, built, routed, chat_id, thread_id, deadline)
+
+
 def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
     """With ``KAGE_SLACK_UX`` on, the one line a fleet-audit report that could not complete posts in Slack.
 
@@ -5210,7 +5645,14 @@ def relay_cron_report(
         summary = None
         # A truncated report keeps its notice, which the blocks have no place for,
         # and the rest of it.
-        if headline and not truncation_notice:
+        board = None if truncation_notice else _board_health_card(platform, report, leg_chat_id, job_id)
+        if board is not None:
+            # The stuck tasks alone, as a card with Retry and Drop on each row;
+            # where it does not post, the report goes out as written.
+            posted = _post_board_health_card(
+                profile, job_id, board, leg_chat_id, leg_thread_id, blocks_deadline
+            )
+        elif headline and not truncation_notice:
             posted = _post_audit_blocks(
                 profile, job_id, headline, message, leg_chat_id, leg_thread_id, blocks_deadline
             )
@@ -5235,8 +5677,9 @@ def relay_cron_report(
         if posted is not None:
             new_thread_id = posted.thread_id or None
         else:
-            # Under next a reply cannot bring the report back, so a failed audit
-            # whose folded card did not post goes out whole.
+            # A failed audit whose folded card did not post goes out whole: under
+            # next the hermes-bridge attaches the stored report to a reply, but
+            # the card was the one place the failure line was readable.
             if headline:
                 leg_message = truncation_notice + headline.text
             elif summary:
@@ -6228,13 +6671,31 @@ def inject_message(
     #
     # The workload fold comes between the two for the same reason: a duplicate
     # is never going to post, so it must not spend a budget either.
+    #
+    # Past the fold window, a workload whose last incident's fix pull request is
+    # still open for review is held against that incident too
+    # (_open_fix_pull_request): the fault is diagnosed and its fix waits on a
+    # human, so a second investigation would only repeat the first. The forge
+    # lookup is made before the lock, and only when no fold applies, because it
+    # can take seconds and a burst inside the window never needs it.
     quota_denied = False
     suppressed_today = 0
     anchor_id = None
+    held_for: Optional[FixPullRequest] = None
+    fold_key = _fold_key(object_kind, object_name)
+    workload_key = _incident_branch_workload(object_kind, object_name) if object_name else ""
+    fix: Optional[FixPullRequest] = None
+    if (
+        not suppressed
+        and INCIDENT_WORKLOAD_DEDUP_SECONDS > 0
+        and _workload_incident_anchor(event_cluster, namespace, object_kind, fold_key, severity_label) is None
+    ):
+        fix = _open_fix_pull_request(event_cluster, namespace, object_kind, workload_key, event_reason, severity_label)
     with _WORKLOAD_FOLD_LOCK if INCIDENT_WORKLOAD_DEDUP_SECONDS > 0 else nullcontext():
-        fold_key = _fold_key(object_kind, object_name)
         if not suppressed:
             anchor_id = _workload_incident_anchor(event_cluster, namespace, object_kind, fold_key, severity_label)
+            if anchor_id is None and fix is not None:
+                anchor_id, held_for = fix.anchor_id, fix
         if not suppressed and anchor_id is None:
             allowed, suppressed_today = _claim_alert_quota(severity_label)
             quota_denied = not allowed
@@ -6258,7 +6719,19 @@ def inject_message(
             session_id=session_id,
             duplicate_of=anchor_id,
             fold_key=fold_key,
+            workload_key=workload_key,
+            pull_request=held_for.url if held_for is not None else "",
         )
+
+    if held_for is not None:
+        # Answered "folded" for the reason the fold is: the watcher keeps its
+        # entry, so the pod is not re-offered while the fix waits.
+        logger.info(
+            f"Held {severity_label} event {event_reason} for {namespace}/{object_kind}/{object_name} against "
+            f"ledger row {anchor_id}, whose fix {held_for.url} is open for review (no new triage session)"
+        )
+        background_tasks.add_task(_remind_fix_pull_request, held_for.session_id, clean_name, event_reason, held_for.url)
+        return {"status": FEED_STATUS_FOLDED, "duplicate_of": str(anchor_id), "pull_request": held_for.url}
 
     if anchor_id is not None:
         # Neither "filtered" nor "suppressed", both of which reopen. The watcher
@@ -6957,7 +7430,7 @@ def list_intercepted_events(
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
-        "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state"
+        "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state, pull_request"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
         if since_id is not None:
@@ -6987,6 +7460,7 @@ def list_intercepted_events(
             ),
             "message": row["message"],
             "duplicate_of": row["duplicate_of"],
+            "pull_request": row["pull_request"],
         }
         for row in rows[:limit]
     ]
@@ -8837,6 +9311,124 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
         ", deadline reached" if budget.hit else "",
     )
     return result
+
+
+# --------------------------------------------------------------------------
+# Retry and Drop on the board-health card (kanban_board_health.py,
+# board_health_card.py). Each row of the stuck-task card carries the ids of
+# the cards it stands for, and a tap on either button reaches here: from the
+# Slack adapter's click handler under today (slack_ux_clicks.py), and from the
+# gateway through the hermes-bridge's board route under next
+# (a2a/hermes-bridge/board.go). Who may press is decided before this call, by
+# whichever of the two the click came through; this route checks the card.
+#
+# Only a card still `blocked` is touched, so a stale button does not retry a
+# card that finished or archive one that is running again. Retry is Hermes'
+# `unblock_task`, which checks the card is blocked inside its own write and
+# returns it to `ready` for the dispatcher. Drop is the card stop's
+# `_archive_card`, Hermes' `archive_task` with our worker kill; the blocked
+# check is the read just before it, so a card unblocked and claimed in that
+# instant would be archived as a running card, its worker killed, as a card
+# stop would. Nothing here writes a card's status itself. Every card is
+# started inside the card stop's deadline, and one the deadline leaves
+# unstarted answers `failed`, so the answer comes before the callers give up.
+# --------------------------------------------------------------------------
+
+BOARD_ACTION_RETRY = "retry"
+BOARD_ACTION_DROP = "drop"
+BOARD_ACTIONS = frozenset({BOARD_ACTION_RETRY, BOARD_ACTION_DROP})
+# The one status either button acts on.
+BOARD_ACTION_STUCK_STATUS = "blocked"
+# A row is one card, or the cards sharing its title; the card caps its rows.
+BOARD_ACTION_MAX_TASKS = 50
+BOARD_ACTION_TASK_ID_MAX_CHARS = 64
+# Who pressed, for the log line: a display name or a member id.
+BOARD_ACTION_BY_MAX_CHARS = 200
+# Each card's outcome in the answer.
+BOARD_OUTCOME_DONE = "done"
+BOARD_OUTCOME_MOVED = "moved"
+BOARD_OUTCOME_GONE = "gone"
+BOARD_OUTCOME_FAILED = "failed"
+
+
+def _board_action_one(kanban_db, conn: sqlite3.Connection, action: str, task_id: str, budget: _Budget) -> Dict[str, Any]:
+    """One card's Retry or Drop: its outcome, title and the status it holds now."""
+    row = conn.execute("SELECT title, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row[1] == "archived":
+        return {"id": task_id, "outcome": BOARD_OUTCOME_GONE}
+    entry: Dict[str, Any] = {"id": task_id, "title": row[0] or "", "status": row[1]}
+    if row[1] != BOARD_ACTION_STUCK_STATUS:
+        return {**entry, "outcome": BOARD_OUTCOME_MOVED}
+    if action == BOARD_ACTION_RETRY:
+        if kanban_db.unblock_task(conn, task_id):
+            return {**entry, "status": "ready", "outcome": BOARD_OUTCOME_DONE}
+    else:
+        outcome, _detail = _archive_card(kanban_db, conn, task_id, budget)
+        if outcome == "stopped":
+            return {**entry, "status": "archived", "outcome": BOARD_OUTCOME_DONE}
+        if outcome == "gone":
+            return {"id": task_id, "outcome": BOARD_OUTCOME_GONE}
+    after = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return {**entry, "status": after[0] if after else None, "outcome": BOARD_OUTCOME_MOVED}
+
+
+@app.post("/v1/board/actions", dependencies=[Depends(verify_api_key)])
+def board_action(request_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Retry or Drop the stuck cards one row of the board-health card names; see the section comment.
+
+    Body: ``action`` (``retry`` or ``drop``), ``tasks`` (the row's card ids)
+    and ``by`` (who pressed, logged). Answers each card's ``outcome``:
+    ``done``, ``moved`` (no longer blocked: someone or something got there
+    first), ``gone`` (no such card, or archived) or ``failed`` (Hermes raised;
+    the message stays in this log). A board that is not there answers every
+    card ``gone``.
+    """
+    action = str(request_data.get("action") or "").strip().lower()
+    tasks = request_data.get("tasks")
+    by = str(request_data.get("by") or "").strip()[:BOARD_ACTION_BY_MAX_CHARS]
+    if action not in BOARD_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"action must be one of {sorted(BOARD_ACTIONS)}")
+    if (
+        not isinstance(tasks, list)
+        or not tasks
+        or len(tasks) > BOARD_ACTION_MAX_TASKS
+        or not all(isinstance(t, str) and t.strip() and len(t) <= BOARD_ACTION_TASK_ID_MAX_CHARS for t in tasks)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"tasks must be 1 to {BOARD_ACTION_MAX_TASKS} card ids of at most {BOARD_ACTION_TASK_ID_MAX_CHARS} characters",
+        )
+    ids = list(dict.fromkeys(t.strip() for t in tasks))
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        return {"action": action, "results": [{"id": i, "outcome": BOARD_OUTCOME_GONE} for i in ids]}
+    try:
+        kanban_db, connect_tracked = _hermes_kanban()
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=f"Hermes' kanban module is not importable: {exc}") from None
+    budget = _Budget()
+    results = []
+    try:
+        conn = _card_stop_connect(connect_tracked, board)
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail=f"the kanban board could not be read: {exc}") from None
+    with closing(conn):
+        for task_id in ids:
+            if not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
+                results.append({"id": task_id, "outcome": BOARD_OUTCOME_FAILED})
+                continue
+            try:
+                results.append(_board_action_one(kanban_db, conn, action, task_id, budget))
+            except Exception as exc:  # noqa: BLE001 - one card's failure must not leave the rest untried
+                logger.error("board action: %s on %s failed: %s", action, task_id, exc)
+                results.append({"id": task_id, "outcome": BOARD_OUTCOME_FAILED})
+    logger.info(
+        "board action %s by %s: %s",
+        action,
+        by or "someone",
+        ", ".join(f"{r['id']} {r['outcome']}" for r in results),
+    )
+    return {"action": action, "results": results}
 
 
 # --------------------------------------------------------------------------

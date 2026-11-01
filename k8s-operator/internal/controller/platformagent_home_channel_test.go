@@ -218,8 +218,8 @@ func TestPlatformAgentReconciler_Reconcile_HomeChannelUnsetOnADegradedPark(t *te
 // no data (the gateway owns the keys), rendered on every next stack, Slack on
 // the gateway or not, torn down with the stack; the gateway Role reaches that
 // one name with get and patch only; the gateway Deployment carries the policy,
-// the record's name and its own image. Nothing in this release reads the
-// record: the agent env and the condition follow the CR field alone.
+// the record's name and its own image. The operator does not read the
+// record yet: the agent env and the condition follow the CR field alone.
 func TestHomeChannelRecordObjectAndRole(t *testing.T) {
 	a := slackTestAgent("next", true)
 	cm := buildHomeChannelRecord(a)

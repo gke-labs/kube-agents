@@ -74,7 +74,7 @@ skill set:
 | `gke-cost-analysis`                                                                              |        ✅        |                 |                  |
 | `github-issue-resolver`                                                                          |        ✅        |                 |                  |
 | `kube-agents-observability` (harness self-obs)                                                   |        ✅        |                 |                  |
-| `gke-multi-tenancy`                                                                              | ✅ defines model |   ✅ applies    |                  |
+| `gke-multitenancy`                                                                               | ✅ defines model |   ✅ applies    |                  |
 | `gke-compute-classes`, `gke-networking-edge`, `gke-storage`, `gke-backup-dr`, `gke-reliability`  |                  |       ✅        |                  |
 | `gke-app-onboarding`, `gke-manifest-generation`, `gke-productionize`, `gke-inference-quickstart` |                  |                 |        ✅        |
 | `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`                  |                  |                 |        ✅        |

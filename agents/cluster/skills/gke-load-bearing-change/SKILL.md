@@ -19,6 +19,37 @@ It does not try to learn why the change was made. An operator unblocking a deplo
 
 Skip it when the live object already matches the declared state: a GitOps controller reconciled the change away and there is nothing left to decide.
 
+## First: does git declare this object at all?
+
+Everything below assumes git holds a copy of the object to put back. Check that first: the drift detector forwards a change to an object nobody ever put in git exactly as it forwards one to an object a GitOps tool syncs.
+
+**This needs a live object.** A deleted object carries nothing to read, so no markers is no evidence there: say whether git declares it could not be read off the cluster, and go on to the method with the revert still an option. The same holds when the object is gone by the time you look.
+
+You cannot read the repository, so read what a GitOps tool leaves on the objects it applies:
+
+| Tool | Field manager in `managedFields` | Label or annotation |
+| --- | --- | --- |
+| Argo CD | `argocd-controller` | annotation `argocd.argoproj.io/tracking-id` |
+| Flux | `kustomize-controller`, `helm-controller` | labels `kustomize.toolkit.fluxcd.io/name`, `helm.toolkit.fluxcd.io/name` |
+| Config Sync | `configsync.gke.io` | annotations `configmanagement.gke.io/managed`, `configsync.gke.io/resource-id` |
+
+Read the managers and the markers by name rather than dumping every annotation: `last-applied-configuration` on a Secret or ConfigMap carries its data.
+
+```bash
+kubectl get <kind> <name> [-n <namespace>] -o jsonpath='{range .metadata.managedFields[*]}{.manager}{" "}{end}{"\n"}{.metadata.labels}{"\n"}{.metadata.annotations.argocd\.argoproj\.io/tracking-id}{"\n"}{.metadata.annotations.configmanagement\.gke\.io/managed}'
+```
+
+- **Any of them present:** a tool syncs it from git. Go on to the method.
+- **Only an ambiguous one:** `kubectl-client-side-apply` as a manager, the labels `app.kubernetes.io/instance` and `app.kubernetes.io/managed-by: Helm`, or a field manager this table does not name and that is not a person's `kubectl-*` subcommand, which may be a pipeline's own. A person's `kubectl apply -f` and `helm install` leave the first two too, and so can Argo CD under client-side sync or label tracking. Say the object was applied from a manifest, a chart or a tool whose source the cluster does not show, name the manager, and keep both the revert and the options below, saying which depends on where that source lives.
+- **None present, and every field manager is a person's `kubectl-*` subcommand** (`kubectl-create`, `kubectl-edit`, `kubectl-label`, `kubectl-patch`, `kubectl-replace`, `kubectl-annotate`): say the object is probably not declared in git, and list what you checked. Probably, not certainly: a pipeline that only ever creates and patches imperatively leaves the same managers.
+
+An object git does not declare has no declared state, so there is nothing to revert to, and the method below does not apply. Do not offer "revert to the declared state". The choices are:
+
+- **Codify it.** This is the option the card letters; it is the only one a pull request can carry. Add a manifest for it to git. Say whether the manifest keeps the change or undoes it: weigh that the way "What you conclude" weighs a revert against a codify, so a loosening nothing depends on is codified with the change undone, and one something depends on is codified as it is now, with its durable fix named.
+- **Delete it.** Git declares nothing, so deleting it brings the cluster in line with git. No pull request can delete an object git never held, so it is a manual step a person runs, never a lettered option and never the recommendation: a lettered option becomes an "apply" button on Slack. Where the evidence says the object should not exist (nothing uses it, nothing suggests it was meant to), name it in the one unlettered bullet the card describes, `- **Manual step (<title>):**`, with the command, and do not call it an option.
+
+Do not offer to undo the change by hand. Relabelling or patching it back leaves the object as unmanaged as before, which is the out-of-band fix the card rules out.
+
 ## The method
 
 Four steps, and they do not depend on what kind of object changed. Step 3 is where the evidence location varies, and the table below is for that step.

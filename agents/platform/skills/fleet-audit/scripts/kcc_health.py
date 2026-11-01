@@ -14,8 +14,8 @@ the collectors do the reading. This module is the one read they share
 server's discovery once (`kubectl api-resources`, which needs no RBAC grant) to
 find the Config Connector kinds (a group that ends in `.cnrm.cloud.google.com`,
 in the `gcp` category), then makes one list request per kind (`kubectl get
---raw /apis/<group>/<version>/<plural>`), on a pool of `KIND_READ_WORKERS`
-with no more than `PROXY_SLOTS` requests in flight in the process, and puts
+--raw /apis/<group>/<version>/<plural>`), with no more requests in flight in
+the process than the credential broker admits (`proxy_slots`), and puts
 the result on that cluster's manifest entry. `kubectl get gcp -A` does the same work one kind after another, and
 through the credential proxy its 230 requests took longer than the read's
 time limit on a cluster with the add-on.
@@ -132,22 +132,22 @@ PARTIAL_DISCOVERY_MARKER = "unable to retrieve the complete list of server APIs"
 # cut to the time left.
 DISCOVERY_TIMEOUT_S = 60
 KIND_READ_TIMEOUT_S = 60
-# How many kinds one cluster's read lists at once. Each request is its own
-# `kubectl` process and its own response, so no response nears the proxy's
-# output cap.
-KIND_READ_WORKERS = 4
 # How many Config Connector requests run at once in this process, across all
-# clusters: the credential proxy's admitted count at its default limit, which
-# every pool in this directory pins (collect.py's `MAX_WORKERS`, held equal by
-# test_collect.py). The collectors read several clusters at once, each with
-# its own kind pool, so without this bound 4 x 4 requests would queue in the
-# proxy, which refuses a request that waits past its slot wait and so makes a
-# host's read unknown. Every `kubectl` call of the read takes a slot first
-# (`_with_proxy_slot`). Other reads of the compliance sweep threads at the
-# same time are not counted here, so the proxy's queue can still hold up to
-# `PROXY_SLOTS - 1` more requests than this bound.
-PROXY_SLOTS = 4
-_PROXY_SLOT_POOL = threading.BoundedSemaphore(PROXY_SLOTS)
+# clusters (`proxy_slots`): the sweep width the credential broker admits, as
+# every pool in this directory reads it (`broker_admission.sweep_width`), and
+# `FALLBACK_SLOTS` when that module cannot be imported. The collectors read
+# several clusters at once, each with its own kind pool, so without this bound
+# width x width requests would queue in the broker, which refuses a request
+# that waits past its slot wait and so makes a host's read unknown. Every
+# `kubectl` call of the read takes a slot first (`_with_proxy_slot`), and one
+# cluster's kind pool is as wide as the slots. Other reads of the compliance
+# sweep threads at the same time are not counted here, so the broker's queue
+# can still hold up to one sweep width less one more requests than this bound.
+# Each request is its own `kubectl` process and its own response, so no
+# response nears the broker's output cap.
+FALLBACK_SLOTS = 4
+_slot_pool: "threading.BoundedSemaphore | None" = None
+_slot_pool_lock = threading.Lock()
 # What a step says when no slot or no time was left before the deadline.
 NO_SLOT_DETAIL = "no proxy slot was free before the read's deadline"
 # What the API server says for a kind whose CRD went away after the discovery:
@@ -234,8 +234,8 @@ class Result(NamedTuple):
 RunFn = Callable[..., Result]
 # How `annotate_manifest` maps its read over the clusters: the builtin `map`,
 # one at a time, or the `map` of a `ThreadPoolExecutor` that the collector
-# opens after its sweep. That pool is a new one, with the sweep's size
-# (`MAX_WORKERS`), so the reads stay inside the broker's admitted count.
+# opens after its sweep. That pool is a new one, with the sweep's width
+# (`broker_admission.sweep_width`), and `proxy_slots` bounds the requests.
 MapFn = Callable[[Callable[[dict], dict], Iterable[dict]], Iterator[dict]]
 # The kubeconfig a collector already fetched for an entry, or None. With one,
 # `annotate_manifest` does not run `get-credentials` again.
@@ -419,13 +419,34 @@ def kcc_kinds(discovery: str) -> list[KccKind]:
     return sorted(set(kinds))
 
 
+def proxy_slots() -> int:
+    """How many Config Connector requests may run at once in this process:
+    the broker's sweep width (`broker_admission.sweep_width`, read once per
+    process), or `FALLBACK_SLOTS` when that module is not on the path."""
+    try:
+        import broker_admission  # noqa: PLC0415 -- in agents/platform/scripts, which the collectors put on the path
+    except ImportError:
+        return FALLBACK_SLOTS
+    return broker_admission.sweep_width()
+
+
+def _proxy_slot_pool() -> "threading.BoundedSemaphore":
+    """The process's one slot pool, made at its first use with `proxy_slots()`."""
+    global _slot_pool
+    with _slot_pool_lock:
+        if _slot_pool is None:
+            _slot_pool = threading.BoundedSemaphore(proxy_slots())
+        return _slot_pool
+
+
 def _with_proxy_slot(
     run: RunFn, argv: list[str], kubeconfig: Path, timeout_s: int, deadline: float, clock: ClockFn
 ) -> "Result | None":
-    """`run(argv)` while holding one of the `PROXY_SLOTS`, or None when no
+    """`run(argv)` while holding one of the `proxy_slots`, or None when no
     slot is free, or no step's time is left, before `deadline`."""
     wait = deadline - clock()
-    if wait <= 0 or not _PROXY_SLOT_POOL.acquire(timeout=wait):
+    slots = _proxy_slot_pool()
+    if wait <= 0 or not slots.acquire(timeout=wait):
         return None
     try:
         left = _time_left(deadline, clock)
@@ -433,7 +454,7 @@ def _with_proxy_slot(
             return None
         return run(argv, env={**os.environ, "KUBECONFIG": str(kubeconfig)}, timeout=min(timeout_s, left))
     finally:
-        _PROXY_SLOT_POOL.release()
+        slots.release()
 
 
 def _excerpt(stderr: str) -> str:
@@ -454,7 +475,7 @@ def read_objects(
     Discovery (`kubectl api-resources`) finds the kinds (only those in
     `kinds`, as `(group, kind)`, when it is given; none served is
     `READ_ABSENT`), then one list
-    request per kind runs on a pool of `workers` (`KIND_READ_WORKERS` when
+    request per kind runs on a pool of `workers` (`proxy_slots()` when
     not given). Every `kubectl` call takes a proxy slot first
     (`_with_proxy_slot`). Each step's timeout is cut to the time left, and a
     step that cannot start in time is not run, so the read ends by
@@ -495,7 +516,7 @@ def read_objects(
         items = [{"kind": kind.kind, **item} if isinstance(item, dict) and not item.get("kind") else item for item in parsed["items"]]
         return READ_LISTED, items, ""
 
-    workers = workers or KIND_READ_WORKERS
+    workers = workers or proxy_slots()
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(kinds)))) as pool:
         results = list(pool.map(one, kinds))
     for status in (READ_FAILED, READ_UNREADABLE, READ_TIMED_OUT):

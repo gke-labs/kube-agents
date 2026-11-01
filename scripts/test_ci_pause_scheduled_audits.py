@@ -414,7 +414,7 @@ class RunnerTest(unittest.TestCase):
         # And again right before the fan-out, which catches a restart in between.
         again = [m.start() for m in re.finditer(r'^scheduled_audits pause "fan-out"$', text, re.M)]
         self.assertEqual(len(again), 1)
-        self.assertLess(again[0], text.index('# Two phases on the inject lane'))
+        self.assertLess(again[0], text.index('# Two phases on both lanes'))
         lease_reset = text.index('reset_agent_pulls "lease"')
         first_unit = re.search(r'^\s+run_one_unit "\$\{TASKS', text, re.M).start()
         self.assertLess(lease_reset, calls[0])

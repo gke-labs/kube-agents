@@ -253,10 +253,10 @@ func TestBusCredentialRoutes(t *testing.T) {
 	}
 	// The Secrets the render writes bus credentials or keys into, spelled as the
 	// render spells them (a2aTestCreds, buildA2ANATSConfigSecret, ensureA2ACalloutKeys,
-	// ensureA2ANATSTLS).
+	// ensureA2ANATSTLS, ensureA2ATaskSigningKeySecret).
 	if got := A2ACredentialSecretNames("test-agent"); !reflect.DeepEqual(got, []string{
 		"test-agent-a2a-nats-creds", "test-agent-a2a-nats-config", "test-agent-a2a-callout-keys",
-		"test-agent-a2a-nats-tls", "test-agent-a2a-nats-ca"}) {
+		"test-agent-a2a-nats-tls", "test-agent-a2a-nats-ca", "test-agent-a2a-task-signing-key"}) {
 		t.Fatalf("A2ACredentialSecretNames(test-agent) = %v", got)
 	}
 	if A2ABusTokenAudience != "a2a-bus" {
@@ -293,6 +293,9 @@ func TestBusCredentialRoutes(t *testing.T) {
 		{"the callout keys Secret, which holds the issuer seed", corev1.Volume{Name: "cache", VolumeSource: corev1.VolumeSource{
 			Secret: &corev1.SecretVolumeSource{SecretName: "test-agent-a2a-callout-keys"}}},
 			[]BusCredentialRoute{{Kind: BusCredentialRouteSecret, Source: BusCredentialRouteVolumeSource, Secret: "test-agent-a2a-callout-keys"}}},
+		{"the task-signing key Secret, which holds the dispatcher's seed", corev1.Volume{Name: "cache", VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{SecretName: "test-agent-a2a-task-signing-key"}}},
+			[]BusCredentialRoute{{Kind: BusCredentialRouteSecret, Source: BusCredentialRouteVolumeSource, Secret: "test-agent-a2a-task-signing-key"}}},
 		{"another Secret", corev1.Volume{Name: "tls", VolumeSource: corev1.VolumeSource{
 			Secret: &corev1.SecretVolumeSource{SecretName: "my-tls"}}}, nil},
 		{"the creds Secret of a different agent", corev1.Volume{Name: "cache", VolumeSource: corev1.VolumeSource{

@@ -325,7 +325,9 @@ written to the live cluster directly.
 - **The write boundary** — the fix ships as a Pull Request; nothing is written to the live cluster. The
   triaging agent does not open that PR itself — the reply arrives as chat ingress on the front door, and
   the agent holding the GitOps write path acts on it — which is why the prompt asks for options named
-  precisely enough to act on from the report alone. This is the safety property of the whole
+  precisely enough to act on from the report alone. It asks for each change against the live object
+  (kind, name, field, value, or the object to create), because the triaging Cluster Agent has no GitOps
+  repository and the agent opening the PR finds the file. This is the safety property of the whole
   architecture, and it is stated in the prompt.
 
 A domain also registers a **skill** ([Plugging in a new domain](#plugging-in-a-new-domain) says where), which supplies the
@@ -399,9 +401,10 @@ The GKE-events path is live end to end:
   `OOMKilled`, `FailedScheduling`. The same list admits two more, cluster-autoscaler's
   `TriggeredScaleUp` and `NotTriggerScaleUp`, which the watcher records against the pod and never
   forwards: a `FailedScheduling` is held while a scale-up for its pod is in progress, passed at any
-  count once the autoscaler has declined to help, and otherwise held until its fifth repeat, so a
-  pod waiting for a node the cluster is already adding opens no card and a pod nothing will place
-  opens one. On an Autopilot cluster the event is also held, at any count, when the message is
+  count once the autoscaler has declined to help, and otherwise held until its fifth repeat and
+  two minutes between its first and last sighting. A pod waiting for a node the cluster is
+  already adding opens no card, nor does the replacement for a pod a node scale-down evicted,
+  placed seconds later; a pod nothing will place opens one. On an Autopilot cluster the event is also held, at any count, when the message is
   `no nodes available to schedule pods` and the autoscaler has recorded no verdict on the pod — an
   Autopilot cluster with no user workloads scales to zero nodes and leaves GKE's own system pods
   `Pending` by design, which is not an incident. Whether the cluster is Autopilot comes from the

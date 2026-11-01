@@ -14,8 +14,8 @@
 
 """Offline tests for `bench/tf/modules/drift-inject/drift_inject.sh` (#3478).
 
-`drift_inject.sh` holds the shell scaffolding that three `gitops-drift-*`
-stacks share. Its Python siblings -- `test_drift_inject_payload.py` and
+`drift_inject.sh` holds the shell scaffolding shared by the
+`gitops-drift-*` stacks that inject straight to the daemon. Its Python siblings -- `test_drift_inject_payload.py` and
 `test_drift_inject_call_sites.py` -- test the payload generator and the
 Terraform invocation contracts, but the shell library itself was previously
 untested.

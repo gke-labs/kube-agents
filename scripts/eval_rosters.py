@@ -45,6 +45,9 @@ BLOCKING_ROSTER_FILE = EVAL_DIR / "blocking-roster.txt"
 # The GitLab lane's presubmit matrix (kube-agents#2394): what EVAL_FORGE=gitlab
 # runs on a pull request, a subset of presubmit-cases.txt.
 GITLAB_CASES_FILE = EVAL_DIR / "gitlab-cases.txt"
+# The GHES lane's matrix (kube-agents#3684): what EVAL_FORGE=ghes runs, the
+# same rules as the GitLab lane's.
+GHES_CASES_FILE = EVAL_DIR / "ghes-cases.txt"
 # The inject lane's exclusions (#2039): case ids the script drops from TASKS
 # under AGENT_TRANSPORT=inject, each with its reason as the comment block
 # directly above it.
@@ -52,8 +55,9 @@ INJECT_LANE_EXCLUSIONS_FILE = EVAL_DIR / "inject-lane-exclusions.txt"
 # Its mirror (#3263): the cases every lane but the inject one drops, because
 # their premise needs the inject door. Same shape, same reason rule.
 API_LANE_EXCLUSIONS_FILE = EVAL_DIR / "api-lane-exclusions.txt"
-# The inject lane's safeguards (#2079): the verification_spec entries the
-# script appends to every case it runs on that lane. YAML, so this
+# The lane safeguards (#2079): the verification_spec entries the script
+# appends to every case it runs, on the api and inject lanes alike (#2611;
+# the file keeps the inject lane's name). YAML, so this
 # stdlib-only module names the path and bench/kube_agents_bench/lane.py
 # reads it; scripts/test_eval_rosters.py pins its shape.
 INJECT_LANE_SAFEGUARDS_FILE = EVAL_DIR / "inject-lane-safeguards.yaml"
@@ -154,6 +158,10 @@ def blocking_roster(path: pathlib.Path = BLOCKING_ROSTER_FILE) -> list[str]:
 
 
 def gitlab_cases(path: pathlib.Path = GITLAB_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
+
+
+def ghes_cases(path: pathlib.Path = GHES_CASES_FILE) -> list[str]:
     return case_names(path.read_text(encoding="utf-8"))
 
 
@@ -370,6 +378,7 @@ def summary(repetitions: int = 3) -> dict[str, int]:
         "nightly matrix units": (len(presubmit) + len(nightly)) * repetitions,
         "presubmit units": len(presubmit) * repetitions,
         "gitlab lane cases": len(gitlab_cases()),
+        "ghes lane cases": len(ghes_cases()),
         "inject lane exclusions": len(inject_lane_exclusions()),
         "presubmit serial-phase cases": len(wall["requesting"]),
         "presubmit wall estimate, minutes": -(-wall["total"] // 60),

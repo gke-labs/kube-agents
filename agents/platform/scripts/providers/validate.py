@@ -28,6 +28,12 @@ from workspace_paths import WorkspaceError
 # validates repositories and never sees a branch.
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# An account a listing is filtered on: a login, an automation's `[bot]`
+# spelling, or an `app/<slug>` search form. No space, colon or quote, because a
+# forge may read it from inside a search query, where any of them would start
+# another qualifier -- and a second repository qualifier widens the search to
+# that repository too.
+LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\[\]-]{0,99}$")
 
 #: The one spelling of a branch, besides the bare name, that is stripped before
 #: it is compared: `refs/heads/x` names the branch `x`. `heads/x` is not read as
@@ -129,6 +135,12 @@ def validate_number(value: Any, field: str = "number") -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise WorkspaceError(f"{field} must be a positive item number")
     return value
+
+
+def validate_login(value: Any, field: str = "author") -> str:
+    if not isinstance(value, str) or not LOGIN_RE.match(value.strip()):
+        raise WorkspaceError(f"{field} is not an acceptable account name")
+    return value.strip()
 
 
 def validate_limit(value: Any) -> int:

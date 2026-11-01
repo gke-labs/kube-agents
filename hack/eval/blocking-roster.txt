@@ -51,6 +51,7 @@ capacity-pinned-pool-probe
 security-overgrant-probe
 upgrades-lagging-master-probe
 cost-idle-pool-probe
+consistency-drift-outlier
 obtainability-remediation-proposal
 pdb-remediation-pr
 cluster-agent-crashloop-debug

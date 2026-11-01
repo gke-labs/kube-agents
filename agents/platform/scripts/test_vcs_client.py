@@ -9,6 +9,7 @@ never builds an argparse namespace. These tests are that caller.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import io
 import json
@@ -16,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -191,6 +193,18 @@ class ForgeCallTest(unittest.TestCase):
                 vcs_client.call("publish", {})
         self.assertEqual(caught.exception.code, "PROTECTED_BRANCH")
         self.assertEqual(caught.exception.as_json(), {"error": "no", "code": "PROTECTED_BRANCH", "detail": "d"})
+
+    def test_a_path_refusal_keeps_the_revision_the_broker_read(self):
+        error = vcs_client.credential_proxy_client.WorkspaceRequestError(
+            "refused", payload={"error": "no", "code": "PATH_NOT_FOUND", "revision": "a" * 40}
+        )
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}), mock.patch.object(
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
+        ):
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("snapshot", {})
+        self.assertEqual(caught.exception.revision, "a" * 40)
+        self.assertEqual(caught.exception.as_json()["revision"], "a" * 40)
 
 
     def test_a_broker_too_old_for_a_verb_is_not_a_broker_that_is_down(self):
@@ -868,6 +882,313 @@ class WorkingCopyTest(unittest.TestCase):
             vcs_client.publish("acme/infra", advance=True)
         self.assertIn("branch and target are both", str(caught.exception))
         self.assertEqual(self.published, [])
+
+
+def build_tar(*members: tuple[tarfile.TarInfo, bytes | None]) -> bytes:
+    """A tar holding `members`, each a header and, for a regular file, its bytes."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for info, data in members:
+            if data is not None:
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+            else:
+                archive.addfile(info)
+    return buffer.getvalue()
+
+
+def regular(name: str, data: bytes = b"x\n") -> tuple[tarfile.TarInfo, bytes]:
+    return tarfile.TarInfo(name), data
+
+
+def special(name: str, kind: bytes, linkname: str = "") -> tuple[tarfile.TarInfo, None]:
+    info = tarfile.TarInfo(name)
+    info.type = kind
+    info.linkname = linkname
+    return info, None
+
+
+class SnapshotTest(unittest.TestCase):
+    """`snapshot`: one broker call, and a tar that is checked whole before it is written."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.into = self.tmp / "repos" / "acme__infra"
+        self.sent: list[tuple[str, dict]] = []
+
+    def answer(self, tar: bytes) -> dict:
+        return {
+            "forge": "github",
+            "repo": "acme/infra",
+            "role": "unregistered",
+            "ref": "main",
+            "revision": "0" * 40,
+            "size": len(tar),
+            "archiveBase64": base64.b64encode(tar).decode("ascii"),
+            "history": "none",
+        }
+
+    def snapshot(self, tar: bytes, **kwargs):
+        def fake_call(verb, payload):
+            self.sent.append((verb, payload))
+            return self.answer(tar)
+
+        kwargs.setdefault("into", self.into)
+        with mock.patch.object(vcs_client, "call", fake_call):
+            return vcs_client.snapshot("acme/infra", **kwargs)
+
+    def refused(self, tar: bytes, code: str = vcs_client.SNAPSHOT_MEMBER_REFUSED, **kwargs):
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            self.snapshot(tar, **kwargs)
+        self.assertEqual(code, caught.exception.code, str(caught.exception))
+        # Nothing was written: no destination, and no staging directory left.
+        self.assertFalse(self.into.exists())
+        self.assertEqual([], list(self.into.parent.iterdir()) if self.into.parent.exists() else [])
+        return caught.exception
+
+    def test_a_tree_is_unpacked_and_described(self):
+        tar = build_tar(
+            special("manifests", tarfile.DIRTYPE),
+            regular("manifests/app.yaml", b"kind: app\n"),
+            regular("README.md", b"hello\n"),
+            special("link", tarfile.SYMTYPE, "manifests/app.yaml"),
+        )
+        answer = self.snapshot(tar, ref="main", paths=["manifests", "README.md", "link"])
+        self.assertEqual(
+            [("snapshot", {"repository": "acme/infra", "ref": "main", "paths": ["manifests", "README.md", "link"]})],
+            self.sent,
+        )
+        self.assertEqual("kind: app\n", (self.into / "manifests/app.yaml").read_text())
+        self.assertEqual("kind: app\n", (self.into / "link").read_text())
+        self.assertEqual(
+            {"forge": "github", "repo": "acme/infra", "role": "unregistered", "ref": "main",
+             "revision": "0" * 40, "path": str(self.into), "files": 2, "bytes": 16,
+             "skipped": [], "archiveBytes": len(tar), "history": "none"},
+            answer,
+        )
+        self.assertFalse((self.into / ".git").exists())
+        self.assertEqual(["acme__infra"], [p.name for p in self.into.parent.iterdir()])
+
+    def test_an_empty_directory_may_be_the_destination(self):
+        self.into.mkdir(parents=True)
+        self.snapshot(build_tar(regular("a.txt")))
+        self.assertTrue((self.into / "a.txt").is_file())
+
+    def test_no_ref_and_no_paths_send_neither(self):
+        self.snapshot(build_tar(regular("a.txt")))
+        self.assertEqual([("snapshot", {"repository": "acme/infra"})], self.sent)
+
+    def test_a_destination_that_is_not_empty_is_refused_before_the_call(self):
+        self.into.mkdir(parents=True)
+        (self.into / "keep.txt").write_text("mine\n")
+        target = self.tmp / "elsewhere"
+        target.mkdir()
+        link = self.tmp / "link"
+        link.symlink_to(target)
+        afile = self.tmp / "afile"
+        afile.write_text("x")
+        for into in (self.into, link, afile):
+            with self.subTest(into=into), self.assertRaises(vcs_client.VcsError) as caught:
+                self.snapshot(build_tar(regular("a.txt")), into=into)
+            self.assertEqual(vcs_client.DESTINATION_NOT_EMPTY, caught.exception.code)
+        self.assertEqual([], self.sent)
+        self.assertEqual("mine\n", (self.into / "keep.txt").read_text())
+
+    def test_a_git_component_is_refused_in_any_case_and_at_any_depth(self):
+        for name in (".git/config", ".GIT/config", "sub/.Git/HEAD", ".git", "a/b/.git/hooks/post-checkout", ".git./config", ".git /x"):
+            with self.subTest(name=name):
+                self.refused(build_tar(regular("ok.txt"), regular(name)))
+
+    def test_a_tar_git_archive_wrote_from_a_crafted_tree_is_refused(self):
+        # The tree a hostile repository could carry, written by real git:
+        # `git archive` itself refuses a `.git` path, so the tar is assembled
+        # from the files it would have held. The check must not depend on
+        # which tool wrote the tar.
+        repo = self.tmp / "crafted"
+        repo.mkdir()
+        git(repo, "init", "--quiet")
+        blob = subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"], cwd=repo, input="[core]\n\thooksPath = /tmp\n",
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        sub = subprocess.run(
+            ["git", "mktree"], cwd=repo, input=f"100644 blob {blob}\tconfig\n",
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        tree = subprocess.run(
+            ["git", "mktree"], cwd=repo, input=f"040000 tree {sub}\t.GIT\n100644 blob {blob}\tok.txt\n",
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        listing = git(repo, "ls-tree", "-r", "--name-only", tree).stdout.split()
+        self.assertIn(".GIT/config", listing)
+        members = [regular(name, git(repo, "cat-file", "blob", f"{tree}:{name}").stdout.encode()) for name in listing]
+        self.refused(build_tar(*members))
+
+    def test_absolute_paths_and_parent_components_are_refused(self):
+        for name in ("/etc/passwd", "../escape.txt", "a/../../escape.txt", "a/.."):
+            with self.subTest(name=name):
+                self.refused(build_tar(regular(name)))
+
+    def test_symbolic_links_that_leave_the_tree_are_skipped_and_named(self):
+        # Real repositories hold such links (`-> /dev/null`); one of them must
+        # not cost the caller every other file, and none of them is written.
+        for member, reason in (
+            (special("abs", tarfile.SYMTYPE, "/etc/passwd"), "absolute or empty target"),
+            (special("up", tarfile.SYMTYPE, "../outside"), "out of the tree"),
+            (special("a/deep", tarfile.SYMTYPE, "../../outside"), "out of the tree"),
+            (special("empty", tarfile.SYMTYPE, ""), "absolute or empty target"),
+            (special("intogit", tarfile.SYMTYPE, "sub/../.git/config"), "into a `.git` path"),
+        ):
+            name = member[0].name
+            with self.subTest(name=name):
+                shutil.rmtree(self.into, ignore_errors=True)
+                answer = self.snapshot(build_tar(regular("ok.txt"), member))
+                self.assertTrue((self.into / "ok.txt").is_file())
+                self.assertFalse(os.path.lexists(self.into / name))
+                ((skipped),) = answer["skipped"]
+                self.assertEqual(name, skipped["path"])
+                self.assertIn(reason, skipped["reason"])
+
+    def test_hard_links_that_leave_the_tree_are_refused(self):
+        for member in (
+            special("hard", tarfile.LNKTYPE, "../outside"),
+            special("hardabs", tarfile.LNKTYPE, "/etc/passwd"),
+            special("hardgit", tarfile.LNKTYPE, "a/../.git/config"),
+        ):
+            with self.subTest(name=member[0].name):
+                self.refused(build_tar(regular("ok.txt"), member))
+
+    def test_a_chain_through_a_symbolic_link_is_caught_by_these_checks_and_not_only_the_filter(self):
+        # `a -> .` makes `a/x -> ../outside` normalise to `outside` but resolve
+        # above the tree. The refusal names the link, which the `data` filter's
+        # own message does not.
+        caught = self.refused(build_tar(
+            special("a", tarfile.SYMTYPE, "."),
+            special("a/x", tarfile.SYMTYPE, "../outside"),
+        ))
+        self.assertIn("through a symbolic link", str(caught))
+        # A file written through a link is refused the same way.
+        caught = self.refused(build_tar(special("a", tarfile.SYMTYPE, "."), regular("a/f.txt")))
+        self.assertIn("through a symbolic link", str(caught))
+        # A link whose target passes through another link is not written:
+        # `d/a -> ..` is the top of the tree, so `d/a/../x` is above it.
+        answer = self.snapshot(build_tar(
+            special("d", tarfile.DIRTYPE),
+            special("d/a", tarfile.SYMTYPE, ".."),
+            special("b", tarfile.SYMTYPE, "d/a/../x"),
+            regular("x"),
+        ))
+        self.assertEqual([{"path": "b", "reason": "a link that passes through another link"}], answer["skipped"])
+        self.assertFalse(os.path.lexists(self.into / "b"))
+        # A hard link to a symbolic link is refused.
+        shutil.rmtree(self.into)
+        caught = self.refused(build_tar(
+            regular("x"), special("s", tarfile.SYMTYPE, "x"), special("h", tarfile.LNKTYPE, "s"),
+        ))
+        self.assertIn("hard link to a symbolic link", str(caught))
+
+    def test_a_directory_laid_out_as_a_bare_repository_is_skipped_and_listed(self):
+        # git discovers such a directory as a repository and reads its config,
+        # so none of it is written; git tooling commits such fixtures, so the
+        # rest of the tree still is.
+        for prefix in ("sub/", "a/b/"):
+            for names in (
+                ("HEAD", "config", "objects/pack/x", "refs/heads/main"),
+                ("head", "Objects/x", "REFS/x"),
+                ("HEAD", "commondir"),
+            ):
+                with self.subTest(prefix=prefix, names=names):
+                    if self.into.exists():
+                        shutil.rmtree(self.into)
+                    answer = self.snapshot(build_tar(regular("ok.txt"), *(regular(prefix + name) for name in names)))
+                    self.assertTrue((self.into / "ok.txt").is_file())
+                    self.assertFalse((self.into / prefix.rstrip("/")).exists())
+                    [entry] = answer["skipped"]
+                    self.assertEqual(prefix.rstrip("/"), entry["path"])
+                    self.assertIn("bare repository", entry["reason"])
+        # The whole tree laid out so: nothing of it is written.
+        shutil.rmtree(self.into)
+        answer = self.snapshot(build_tar(regular("HEAD"), regular("objects/x"), regular("refs/y")))
+        self.assertEqual([], list(self.into.iterdir()))
+        self.assertEqual(".", answer["skipped"][0]["path"])
+        shutil.rmtree(self.into)
+        # Paired: the names alone, or two of the three, are ordinary files.
+        self.snapshot(build_tar(regular("HEAD"), regular("objects/x"), regular("docs/refs/y")))
+        self.assertTrue((self.into / "HEAD").is_file())
+
+    def test_a_tar_git_archive_wrote_from_a_bare_repository_layout_writes_none_of_it(self):
+        # The tree a hostile public repository can commit: a bare repository's
+        # files, as plain files, whose `config` would run a program on `git log`.
+        repo = self.tmp / "layout"
+        repo.mkdir()
+        git(repo, "init", "--quiet")
+        (repo / "HEAD").write_text("ref: refs/heads/main\n")
+        (repo / "config").write_text("[core]\n\tbare = true\n[log]\n\tshowSignature = true\n")
+        (repo / "objects" / "info").mkdir(parents=True)
+        (repo / "objects" / "info" / "keep").write_text("")
+        (repo / "refs" / "heads").mkdir(parents=True)
+        (repo / "refs" / "heads" / "keep").write_text("")
+        git(repo, "add", "-A")
+        git(repo, "commit", "--quiet", "-m", "looks like docs")
+        tar = subprocess.run(
+            ["git", "archive", "--format=tar", "HEAD"], cwd=str(repo), capture_output=True, check=True,
+        ).stdout
+        answer = self.snapshot(tar)
+        self.assertEqual([], list(self.into.iterdir()))
+        self.assertIn("bare repository", answer["skipped"][0]["reason"])
+
+    def test_a_hard_link_into_a_skipped_bare_layout_is_skipped_too(self):
+        answer = self.snapshot(build_tar(
+            regular("ok.txt"), regular("fx/HEAD"), regular("fx/objects/x"), regular("fx/refs/y"),
+            special("config-copy", tarfile.LNKTYPE, "fx/HEAD"),
+        ))
+        self.assertTrue((self.into / "ok.txt").is_file())
+        self.assertFalse((self.into / "config-copy").exists())
+        self.assertFalse((self.into / "fx").exists())
+        self.assertEqual(["fx", "config-copy"], [entry["path"] for entry in answer["skipped"]])
+
+    def test_local_git_does_not_open_a_bare_repository_it_was_not_named(self):
+        bare = self.tmp / "bare"
+        git(self.tmp, "init", "--quiet", "--bare", str(bare))
+        with mock.patch.object(vcs_client, "LOCAL_GIT", REAL_GIT), mock.patch.object(vcs_client, "ROOT", self.tmp / "root"):
+            done = vcs_client.local_git(bare, "rev-parse", "--git-dir", check=False)
+        self.assertNotEqual(0, done.returncode)
+        self.assertIn("safe.bareRepository", done.stderr)
+
+    def test_a_link_inside_the_tree_is_kept(self):
+        tar = build_tar(
+            special("a", tarfile.DIRTYPE),
+            regular("a/file.txt", b"in\n"),
+            special("a/sibling", tarfile.SYMTYPE, "file.txt"),
+            special("a/up", tarfile.SYMTYPE, "../a/file.txt"),
+        )
+        self.snapshot(tar)
+        self.assertEqual("in\n", (self.into / "a/sibling").read_text())
+        self.assertEqual("in\n", (self.into / "a/up").read_text())
+
+    def test_device_files_and_fifos_are_refused(self):
+        for kind in (tarfile.CHRTYPE, tarfile.BLKTYPE, tarfile.FIFOTYPE):
+            with self.subTest(kind=kind):
+                self.refused(build_tar(regular("ok.txt"), special("dev", kind)))
+
+    def test_a_tree_over_the_unpacked_ceiling_is_refused(self):
+        tar = build_tar(regular("a.txt", b"a" * 10), regular("b.txt", b"b" * 10))
+        self.refused(tar, code=vcs_client.SNAPSHOT_TOO_LARGE, max_bytes=15)
+        # Paired: at the ceiling it is unpacked.
+        self.snapshot(tar, max_bytes=20)
+        self.assertTrue((self.into / "b.txt").is_file())
+
+    def test_a_tar_that_does_not_parse_is_refused(self):
+        self.refused(b"not a tar at all" * 64)
+
+    def test_a_broker_refusal_writes_nothing(self):
+        def refusing(verb, payload):
+            raise vcs_client.VcsError("too large", code="SNAPSHOT_TOO_LARGE")
+
+        with mock.patch.object(vcs_client, "call", refusing), self.assertRaises(vcs_client.VcsError):
+            vcs_client.snapshot("acme/infra", into=self.into)
+        self.assertFalse(self.into.exists())
 
 
 if __name__ == "__main__":

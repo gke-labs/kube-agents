@@ -21,7 +21,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -66,7 +65,7 @@ func boundAgentProfiles(ctx context.Context, c client.Reader, agent *agentv1alph
 		if err != nil {
 			return nil, err
 		}
-		if !foreign {
+		if foreign == "" {
 			bound = append(bound, profiles.Items[i])
 		}
 	}
@@ -74,21 +73,40 @@ func boundAgentProfiles(ctx context.Context, c client.Reader, agent *agentv1alph
 }
 
 // agentProfileServiceAccountIsForeign reports whether a profile with no
-// spec.identity would land on a ServiceAccount that already exists and is not
-// the profile's: one someone created by hand, with whatever RoleBindings they
-// gave it. The operator neither adopts it nor renders a bus identity for it.
-// A ServiceAccount spec.identity names is foreign on purpose and not checked.
-func agentProfileServiceAccountIsForeign(ctx context.Context, c client.Reader, p *agentv1alpha1.AgentProfile) (bool, error) {
+// spec.identity would land on a ServiceAccount, in the profile namespace, that
+// already exists and is not the profile's: one someone created by hand, with
+// whatever RoleBindings they gave it. The operator neither adopts it nor
+// renders a bus identity for it. It returns the first such name, or "". A
+// ServiceAccount spec.identity names is foreign on purpose and not checked.
+func agentProfileServiceAccountIsForeign(ctx context.Context, c client.Reader, p *agentv1alpha1.AgentProfile) (string, error) {
+	profilesNS := profileNamespaceOf(p)
 	if p.Spec.Identity.ServiceAccountName != "" {
-		return false, nil
+		return "", nil
 	}
-	var sa corev1.ServiceAccount
-	err := c.Get(ctx, types.NamespacedName{Namespace: p.Namespace, Name: agentProfileServiceAccountPrefix + p.Name}, &sa)
-	if apierrors.IsNotFound(err) {
-		return false, nil
+	for _, tier := range p.AllowedTierList() {
+		name := agentProfileServiceAccountName(p, tier)
+		var sa corev1.ServiceAccount
+		err := c.Get(ctx, types.NamespacedName{Namespace: profilesNS, Name: name}, &sa)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if !agentProfileOwnsServiceAccount(&sa, p) {
+			return name, nil
+		}
 	}
-	if err != nil {
-		return false, err
-	}
-	return !metav1.IsControlledBy(&sa, p), nil
+	return "", nil
+}
+
+// agentProfileOwnsServiceAccount reports whether a ServiceAccount in the
+// profile namespace is this profile's. It can't carry an owner reference (the
+// profile is in the agent's namespace, and owner references don't cross
+// namespaces), so the operator marks the ones it creates with the profile's
+// name label and UID annotation. Whoever can create ServiceAccounts in the
+// profile namespace could copy them, which is the same trust the namespace
+// already rests on (agentprofile_namespace.go).
+func agentProfileOwnsServiceAccount(sa *corev1.ServiceAccount, p *agentv1alpha1.AgentProfile) bool {
+	return sa.Labels[agentProfileNameLabel] == p.Name && p.UID != "" && sa.Annotations[agentProfileUIDAnnotation] == string(p.UID)
 }

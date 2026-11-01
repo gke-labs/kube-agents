@@ -429,6 +429,11 @@ type Bridge struct {
 	// part the last chunk carries: the kube-agents.chat/v1 DataPart (chat.go)
 	// for a turn, or the cardStop result part (cardstop.go) for a control.
 	resultPublish func(ctx context.Context, run *taskRun, output string, chat []byte) error
+	// chatPart folds a completed task's answer into the chat message its
+	// result carries, resultChatPart by default; a field so a test can see
+	// when the fold returns against the publish window finalizeResult opens
+	// after it, without an answer whose fold is slow enough to time.
+	chatPart func(answer string) (lib.Part, bool)
 
 	// apiClient is the API executor's HTTP client (api.go).
 	apiClient *http.Client
@@ -479,6 +484,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }
 	b.deliver = b.handle
 	b.resultPublish = b.publishResult
+	b.chatPart = resultChatPart
 	b.publishTurn = func(ctx context.Context, run *taskRun, artifactID, text string) error {
 		return b.publishTextArtifact(ctx, run, artifactID, lib.ArtifactTurn, text)
 	}
@@ -1780,17 +1786,23 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	// complete and nothing of it can follow the final event.
 	b.drainActivity(run)
 	run.state = stateDone
-	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	// The answer folded for a chat renderer, on a completed task only: any
+	// other state's result is a copy beside the terminal's reason. A
+	// caller's own data part (finalizeData) takes its place. Folded before
+	// the publish window opens: the fold is CPU only, and scanning an answer
+	// at the read cap under load would otherwise spend the window the
+	// result and terminal publishes need.
+	var chat []byte
 	if resultOutput != nil {
-		// The answer folded for a chat renderer, on a completed task only:
-		// any other state's result is a copy beside the terminal's reason.
-		// A caller's own data part (finalizeData) takes its place.
-		chat := data
+		chat = data
 		if chat == nil && state == lib.StateCompleted {
-			if part, ok := resultChatPart(*resultOutput); ok {
+			if part, ok := b.chatPart(*resultOutput); ok {
 				chat = part.Data
 			}
 		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	if resultOutput != nil {
 		// The chat message is read from the answer as the agent wrote it; the text a
 		// person sees carries no step line (visibleText).
 		if err := b.resultPublish(ctx, run, visibleOr(*resultOutput), chat); err != nil && copyOnly {

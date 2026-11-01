@@ -700,7 +700,7 @@ func TestSlackWaitingClickOutlivesVerifiedMessages(t *testing.T) {
 	if !ok {
 		t.Fatal("click is a turn")
 	}
-	for i := 0; i < slackUXCap+10; i++ {
+	for i := 0; i < uxCap+10; i++ {
 		m := InboundMessage{Conversation: "slack:C2/1.0", AuthorID: "U1", MessageID: fmt.Sprintf("m-%d", i), Text: "hi"}
 		a.notePending(m)
 		a.InboundVerified(m.Conversation, m.MessageID, true)

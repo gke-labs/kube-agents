@@ -118,8 +118,17 @@ def route_recorded(gitlab) -> None:
     route_heads(gitlab, PREDATING_HEADS)
 
 
+# The repetition's own pushes, on the branches the recorded project's writes
+# sit on: stash() hands them over by default so a write in the window is this
+# repetition's, as tests/test_github_writes.py does (#2611).
+OWN_CALLS = [
+    {"name": "terminal", "args": {"command": f"git push origin {b}"}}
+    for b in ("platform-agent/writes-mr", "platform-agent/writes-orphan")
+]
+
+
 def stash(final_message: str = "Diagnosis complete.", started_at: float = RUN_START.timestamp()):
-    transcript.set("full output", [], final_message=final_message, started_at=started_at)
+    transcript.set("full output", OWN_CALLS, final_message=final_message, started_at=started_at)
 
 
 def check(**kw) -> GitHubWritesVerifier:

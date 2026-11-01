@@ -750,8 +750,9 @@ class LongLivedAllowlistGuardTest(GithubMinterInputsTest):
 class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
     """A GitHub variable a human typed still means what it meant in install.env.
 
-    These settings reach install.sh as `--enable-*` flags, whose validator
-    matches exactly true|false and exits 1 naming the flag. The same variables
+    These settings reach install.sh as boolean flags (`--enable-*`,
+    `--vertex-manage-serving-project`), whose validators match exactly
+    true|false and exit 1 naming the flag. The same variables
     also reach it through the rendered install.env, where is_truthy accepts
     True/yes/y/1/on. An environment spelled `True` deployed fine on the file
     route, so it has to keep deploying on the flag route.
@@ -765,6 +766,8 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
         "ENABLE_GVISOR": "--enable-gvisor",
         "HERMES_DASHBOARD_ENABLED": "--enable-hermes-dashboard",
         "WEB_CONSOLE_ENABLED": "--enable-web-console",
+        "ENABLE_DRIFT_DETECTOR": "--enable-drift-detector",
+        "VERTEX_MANAGE_SERVING_PROJECT": "--vertex-manage-serving-project",
     }
 
     def _install_call(self, tmp_dir):
@@ -940,6 +943,17 @@ class SlackTokensAreRequiredBeforeTheTeardownTest(GithubMinterInputsTest):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("install:", (tmp_dir / MOCK_CALLS_LOG).read_text())
+
+    def test_the_home_channel_policy_flag_follows_the_variable(self):
+        """Set, it reaches install.sh as the flag; unset, no flag at all, so
+        install.sh's own default (auto) stays in charge."""
+        tokens = {**self._ENABLED, "SLACK_BOT_TOKEN": self._BOT, "SLACK_APP_TOKEN": self._APP}
+        proc, tmp_dir = self._run_recording({**tokens, "SLACK_HOME_CHANNEL_POLICY": "manual"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("--slack-home-channel-policy=manual", (tmp_dir / MOCK_CALLS_LOG).read_text())
+        proc, tmp_dir = self._run_recording(tokens)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("--slack-home-channel-policy", (tmp_dir / MOCK_CALLS_LOG).read_text())
 
     def test_an_environment_without_slack_is_never_asked_for_tokens(self):
         """Which is every environment but the ones that opt in."""

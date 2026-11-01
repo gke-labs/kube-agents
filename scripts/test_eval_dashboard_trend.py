@@ -456,8 +456,8 @@ class StoreStatesTest(unittest.TestCase):
     def test_no_store_an_error_and_odd_records_all_yield_a_document(self):
         empty = trend.trend_document(None, data_with_nightly(DOMAINS))
         self.assertEqual((empty["source"], empty["read_at"], empty["records"], empty["cases"], empty["domains"], empty["metrics"], empty["default_metric"]), (None, None, 0, {}, {}, [], None))
-        failed = trend.trend_document(store_doc(night_one_records(), error="2026-09-17T14:30:00Z: gsutil ls: 403", truncated={"rca-remediation-pr": 2}, warnings=["x:1: not valid JSON"], partial={"fetched": 3, "remaining": 1}), data_with_nightly(DOMAINS))
-        self.assertEqual((failed["error"], failed["truncated"], failed["warnings"], failed["records"], failed["partial"]), ("2026-09-17T14:30:00Z: gsutil ls: 403", {"rca-remediation-pr": 2}, ["x:1: not valid JSON"], 4, {"fetched": 3, "remaining": 1}))
+        failed = trend.trend_document(store_doc(night_one_records(), error="2026-09-17T14:30:00Z: gcloud storage ls: 403", truncated={"rca-remediation-pr": 2}, warnings=["x:1: not valid JSON"], partial={"fetched": 3, "remaining": 1}), data_with_nightly(DOMAINS))
+        self.assertEqual((failed["error"], failed["truncated"], failed["warnings"], failed["records"], failed["partial"]), ("2026-09-17T14:30:00Z: gcloud storage ls: 403", {"rca-remediation-pr": 2}, ["x:1: not valid JSON"], 4, {"fetched": 3, "remaining": 1}))
         self.assertIsNone(empty["partial"])
         self.assertIsNone(trend.trend_document(store_doc(night_one_records(), partial={"fetched": 4, "remaining": 0}), data_with_nightly(DOMAINS))["partial"], "nothing left is not partial")
         # A non-finite mean is what json.loads makes of a `NaN` or `Infinity`
@@ -528,7 +528,7 @@ class TrendPageTest(unittest.TestCase):
             cls.bare = render_to(root / "bare", data, health=health_doc("GREEN"))
             # A read that failed this tick: the prior document with error set,
             # a cap that trimmed one case and a line that would not parse.
-            stale = store_doc(records, error="2026-09-17T14:30:00Z: gsutil ls gs://kube-agents-evals-bench/evidence: AccessDeniedException: 403",
+            stale = store_doc(records, error="2026-09-17T14:30:00Z: gcloud storage ls gs://kube-agents-evals-bench/evidence: HTTPError 403",
                               truncated={"rca-remediation-pr": 2}, warnings=["gs://kube-agents-evals-bench/evidence/x/1.jsonl: not valid JSON: Expecting value"],
                               partial={"fetched": 800, "remaining": 2600})
             (root / "stale.json").write_text(json.dumps(stale))
