@@ -344,6 +344,22 @@
       "deliver": "chat"
     },
     {
+      "id": "leeway-watch",
+      "name": "Topology Skew & Leeway Watch",
+      "schedule": {
+        "kind": "cron",
+        "expr": "30 8 * * *",
+        "display": "30 8 * * *"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "leeway_watch.py",
+      "risk": "high",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "chat-delivery-watch",
       "name": "Chat Delivery Watch",
       "schedule": {
