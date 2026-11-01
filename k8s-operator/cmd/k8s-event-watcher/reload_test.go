@@ -149,8 +149,11 @@ func TestReconcileProfiles_RetriesAProfileWhoseDescribeWasRefused(t *testing.T) 
 }
 
 // The direct cluster's own profile, written by the first reconcile tick after
-// a fresh install, starts no second watcher for it; a profile with the same
-// name in another project or location is another cluster and does.
+// a fresh install, starts no second watcher for it. A second profile with the
+// same name in another project or location makes the bare-name match a guess,
+// as it does at boot: the direct entry is dropped and both clusters are
+// watched through their profiles, the second on the read that found it and
+// the first on the read after, once its identity is no longer excluded.
 func TestReconcileProfiles_AbsorbsTheDirectClustersProfile(t *testing.T) {
 	fx := newReloadFixture(t, "host")
 	if err := fx.set.start(fx.ctx, targetCluster{Name: "host", Profile: directProfile, Client: fake.NewClientset()}); err != nil {
@@ -170,11 +173,87 @@ func TestReconcileProfiles_AbsorbsTheDirectClustersProfile(t *testing.T) {
 	if got := testutil.ToFloat64(fx.set.m.clusterDiscoveryErrors.WithLabelValues("cluster-host")); got != 0 {
 		t.Fatalf("the absorbed profile was described again (%v discovery errors)", got)
 	}
+	delete(fx.failures, "proj/us-central1/host")
 
 	writeClusterProfile(t, fx.dir, "cluster-host-eu", "proj2", "host", "europe-west1")
 	fx.set.reconcileProfiles(fx.ctx, fx.dir)
-	if got, want := fx.profiles(), []string{"cluster-host-eu", directProfile}; strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("running after a same-named profile in another location = %v; want %v", got, want)
+	if got, want := fx.profiles(), []string{"cluster-host-eu"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("running after a same-named profile in another location = %v; want %v (direct dropped)", got, want)
+	}
+	fx.set.reconcileProfiles(fx.ctx, fx.dir)
+	if got, want := fx.profiles(), []string{"cluster-host", "cluster-host-eu"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("running one read later = %v; want both same-named clusters through their profiles", got)
+	}
+	if got := fx.set.directIdentity; got != (clusterprofiles.Identity{}) {
+		t.Errorf("directIdentity = %q after the ambiguity; want cleared", got)
+	}
+}
+
+// The order the first reconcile tick can produce on a fresh install: the
+// foreign same-named profile is read first and absorbed on the guess, and the
+// host's own profile arrives after. The guess is undone the same way, so the
+// foreign cluster is not left unwatched and the host is not watched twice.
+func TestReconcileProfiles_UndoesAWrongAbsorptionWhenTheHostsProfileArrives(t *testing.T) {
+	fx := newReloadFixture(t, "host")
+	if err := fx.set.start(fx.ctx, targetCluster{Name: "host", Profile: directProfile, Client: fake.NewClientset()}); err != nil {
+		t.Fatal(err)
+	}
+	writeClusterProfile(t, fx.dir, "cluster-host-eu", "proj2", "host", "europe-west1")
+	fx.set.reconcileProfiles(fx.ctx, fx.dir)
+	if got, want := fx.profiles(), []string{directProfile}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("running after the foreign profile = %v; want %v (absorbed on the guess)", got, want)
+	}
+	writeClusterProfile(t, fx.dir, "cluster-host", "proj", "host", "us-central1")
+	fx.set.reconcileProfiles(fx.ctx, fx.dir)
+	fx.set.reconcileProfiles(fx.ctx, fx.dir)
+	if got, want := fx.profiles(), []string{"cluster-host", "cluster-host-eu"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("running after the host's profile and one more read = %v; want %v, no direct entry", got, want)
+	}
+	// Both profiles present in one read, direct identity unknown: the same
+	// two-step outcome whichever is read first.
+	fx2 := newReloadFixture(t, "host")
+	if err := fx2.set.start(fx2.ctx, targetCluster{Name: "host", Profile: directProfile, Client: fake.NewClientset()}); err != nil {
+		t.Fatal(err)
+	}
+	writeClusterProfile(t, fx2.dir, "cluster-a-host", "a-proj", "host", "europe-west1")
+	writeClusterProfile(t, fx2.dir, "cluster-b-host", "b-proj", "host", "us-central1")
+	fx2.set.reconcileProfiles(fx2.ctx, fx2.dir)
+	fx2.set.reconcileProfiles(fx2.ctx, fx2.dir)
+	if got, want := fx2.profiles(), []string{"cluster-a-host", "cluster-b-host"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("running after both same-named profiles in one read = %v; want %v, no direct entry", got, want)
+	}
+}
+
+// A stop running on the reload goroutine when shutdown begins is joined by
+// wait, so its snapshot is written before the process exits; a stop that
+// arrives after wait has closed the set leaves the run to the shutdown
+// snapshot.
+func TestClusterSet_WaitJoinsAStopInProgress(t *testing.T) {
+	fx := newReloadFixture(t, "host")
+	if err := fx.set.start(fx.ctx, targetCluster{Name: "host", Profile: directProfile, Client: fake.NewClientset()}); err != nil {
+		t.Fatal(err)
+	}
+	stopDone := make(chan struct{})
+	go func() {
+		fx.set.stop(directProfile)
+		close(stopDone)
+	}()
+	fx.cancel()
+	fx.set.wait(fx.ctx)
+	select {
+	case <-stopDone:
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("wait returned while a stop was still in progress")
+	}
+	// As realMain does after wait. Whichever won, the stop's own snapshot or
+	// the shutdown's over a run the closed set kept, the file is there.
+	fx.set.snapshotAll()
+	if _, err := os.Stat(dedupPersistPath(fx.persist, directProfile)); err != nil {
+		t.Errorf("the stopped cluster's snapshot is missing: %v", err)
+	}
+	// After close, a stop is a no-op and the run is left for snapshotAll.
+	if err := fx.set.start(fx.ctx, targetCluster{Name: "late", Profile: "cluster-late", Client: fake.NewClientset()}); err == nil {
+		t.Fatal("start after shutdown must be refused")
 	}
 }
 

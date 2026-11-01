@@ -96,43 +96,36 @@ func (g *listGate) size() int {
 }
 
 // gatedWatch holds a slot across a watch-list stream's initial events: it
-// forwards the stream unchanged and calls release at the bookmark that ends
-// the initial events, when the upstream channel closes, or when the reflector
-// stops the watch, whichever is first. Built on observeWatch so the
-// forwarding goroutine cannot be left blocked behind a stopped reflector.
-func gatedWatch(wi watch.Interface, release func()) watch.Interface {
+// forwards the stream unchanged through one observeWatch layer, calling
+// observe on every event (the watcher's mark recorder) and release at the
+// bookmark that ends the initial events, when the upstream channel closes,
+// or when the reflector stops the watch, whichever is first. One layer, not
+// an observer stacked on the mark recorder's: the stream carries live events
+// for minutes after the bookmark, and every one would pay the second hop.
+func gatedWatch(wi watch.Interface, observe func(watch.Event), release func()) watch.Interface {
 	ow := observeWatch(wi, func(in watch.Event) {
+		observe(in)
 		if in.Type == watch.Bookmark && isInitialEventsEnd(in.Object) {
 			release()
 		}
 	})
-	gw := &gatedWatchInterface{Interface: ow, release: release}
 	go func() {
-		// observeWatch closes its result channel once the upstream closes
-		// or the watch is stopped; a stream that ends before its bookmark
-		// (an error mid-stream, a 410) releases here.
-		<-gw.done()
+		// A stream that ends before its bookmark (an error mid-stream, a
+		// 410, a stop) releases here; ended closes without draining result.
+		<-ow.ended
 		release()
 	}()
-	return gw
+	return &gatedWatchInterface{observedWatch: ow, release: release}
 }
 
 // gatedWatchInterface releases the slot on Stop as well, which is how the
 // reflector ends a stream it gives up on before the bookmark.
 type gatedWatchInterface struct {
-	watch.Interface
+	*observedWatch
 	release func()
 }
 
-// done returns a channel closed once the forwarded stream has ended. The
-// observedWatch underneath closes its result channel in that case, but a
-// reader draining it would steal the reflector's events, so this drains
-// nothing: it waits on a channel the observedWatch closes for the purpose.
-func (gw *gatedWatchInterface) done() <-chan struct{} {
-	return gw.Interface.(*observedWatch).ended
-}
-
 func (gw *gatedWatchInterface) Stop() {
-	gw.Interface.Stop()
+	gw.observedWatch.Stop()
 	gw.release()
 }

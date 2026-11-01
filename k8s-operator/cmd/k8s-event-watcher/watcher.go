@@ -306,7 +306,13 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 	// One delivery goroutine per cluster, so a cluster's events reach its
 	// dispatcher in the order the API server handed them over, which the
 	// dedup window and the scale-up marks both rely on.
+	// Run joins it before returning, so a caller that deletes the cluster's
+	// metric series once Run has returned (clusterSet.stop) is behind the
+	// last dispatch that could write one.
+	delivered := make(chan struct{})
+	defer func() { <-delivered }()
 	go func() {
+		defer close(delivered)
 		for {
 			select {
 			case <-ctx.Done():
@@ -553,7 +559,7 @@ func (w *watcher) newListWatch() cache.ListerWatcher {
 			}
 			w.watchEstablished()
 			if initial {
-				wi = gatedWatch(w.recordMarksFromStream(wi), release)
+				wi = gatedWatch(wi, w.markObserver(), release)
 			}
 			return wi, nil
 		},
@@ -779,8 +785,15 @@ func (w *watcher) recordMarksFromList(list *corev1.EventList) {
 // so every mark is on record before any of the batch is delivered; the count
 // is logged at that bookmark. Events pass through unchanged and in order.
 func (w *watcher) recordMarksFromStream(wi watch.Interface) watch.Interface {
+	return observeWatch(wi, w.markObserver())
+}
+
+// markObserver is the per-stream observer recordMarksFromStream installs,
+// on its own so gatedWatch can compose it with the slot release on one
+// forwarding layer rather than stacking a second.
+func (w *watcher) markObserver() func(watch.Event) {
 	recorded := 0
-	return observeWatch(wi, func(in watch.Event) {
+	return func(in watch.Event) {
 		switch in.Type {
 		case watch.Added, watch.Modified:
 			if ev, ok := in.Object.(*corev1.Event); ok && w.recordMark(ev) {
@@ -792,7 +805,7 @@ func (w *watcher) recordMarksFromStream(wi watch.Interface) watch.Interface {
 				recorded = 0
 			}
 		}
-	})
+	}
 }
 
 // isInitialEventsEnd reports whether a bookmark is the one the API server

@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build soak
-
 // The startup soak: a fleet of fake API servers, each with a large Event
 // backlog, watched from one process, with the gate and the wire format the
-// binary ships. Not in CI (the build tag keeps it out); run it by hand to put
-// numbers beside a change to the start path:
+// binary ships. Compiled with the package's tests so a rename cannot break it
+// unnoticed, and skipped unless SOAK=1, so CI never runs it; run it by hand
+// to put numbers beside a change to the start path:
 //
-//	go test -tags soak -run TestSoak_StartupBurst -v ./cmd/k8s-event-watcher/
+//	SOAK=1 go test -run TestSoak_StartupBurst -v ./cmd/k8s-event-watcher/
 //
 // Knobs, all environment variables: SOAK_CLUSTERS (29), SOAK_EVENTS per
 // cluster (50000), SOAK_GATE slots (4; 0 ungated), SOAK_JSON=1 to force JSON
@@ -60,6 +59,9 @@ const (
 	soakSyncTimeout     = 15 * time.Minute
 	soakSampleInterval  = 25 * time.Millisecond
 	soakEventsPath      = "/api/v1/events"
+	// soakEnabledEnv set to soakEnabledValue runs the soak; otherwise it skips.
+	soakEnabledEnv   = "SOAK"
+	soakEnabledValue = "1"
 )
 
 func soakInt(name string, def int) int {
@@ -193,6 +195,9 @@ func rssHighWater() int64 {
 }
 
 func TestSoak_StartupBurst(t *testing.T) {
+	if os.Getenv(soakEnabledEnv) != soakEnabledValue {
+		t.Skipf("the startup soak runs only with %s=%s", soakEnabledEnv, soakEnabledValue)
+	}
 	clusters := soakInt("SOAK_CLUSTERS", soakDefaultClusters)
 	events := soakInt("SOAK_EVENTS", soakDefaultEvents)
 	slots := soakInt("SOAK_GATE", soakDefaultGate)

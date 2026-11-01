@@ -260,7 +260,7 @@ func TestGatedWatch_ReleasesOnStopAndOnUpstreamClose(t *testing.T) {
 				t.Fatal(err)
 			}
 			fw := watch.NewFakeWithChanSize(1, false)
-			gw := gatedWatch(fw, release)
+			gw := gatedWatch(fw, func(watch.Event) {}, release)
 			if got := gate.inFlight(); got != 1 {
 				t.Fatalf("inFlight before the end = %d; want 1", got)
 			}

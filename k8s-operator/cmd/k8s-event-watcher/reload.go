@@ -61,10 +61,18 @@ type clusterSet struct {
 	// buildWatchSet absorbed at boot, or one absorbed on a rescan (see
 	// reconcileProfiles). Empty while no profile has named it.
 	directIdentity clusterprofiles.Identity
+	// stopping counts stops in progress, which wait joins through stopped
+	// before it snapshots; closed is set by wait once ctx is done, after which
+	// stop leaves a run to the shutdown snapshot rather than racing it.
+	stopping int
+	stopped  *sync.Cond
+	closed   bool
 }
 
 func newClusterSet(f *flags, filter *filter, inj *injector, m *metrics, gate *listGate) *clusterSet {
-	return &clusterSet{f: f, filter: filter, inj: inj, m: m, gate: gate, running: map[string]*clusterRun{}}
+	s := &clusterSet{f: f, filter: filter, inj: inj, m: m, gate: gate, running: map[string]*clusterRun{}}
+	s.stopped = sync.NewCond(&s.mu)
+	return s
 }
 
 // start begins watching tc: a dedup cache of its own (restored from its
@@ -85,10 +93,21 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 	disp.cluster = tc
 	cctx, cancel := context.WithCancel(ctx)
 	run := &clusterRun{cluster: tc, cache: cache, cancel: cancel, done: make(chan struct{})}
-	if s.f.dedupPersist != "" && s.f.snapshotInterval > 0 {
-		go runSnapshotLoop(cctx, cache, s.f.snapshotInterval)
-	}
-	go runSweepLoop(cctx, disp, sweepInterval)
+	// done closes once the watcher and both loops have returned, so a stop
+	// that waits on it deletes the cluster's series after the last goroutine
+	// that could write one. Local to this start, so the group is never reused.
+	var loops sync.WaitGroup
+	loops.Add(2)
+	go func() {
+		defer loops.Done()
+		if s.f.dedupPersist != "" && s.f.snapshotInterval > 0 {
+			runSnapshotLoop(cctx, cache, s.f.snapshotInterval)
+		}
+	}()
+	go func() {
+		defer loops.Done()
+		runSweepLoop(cctx, disp, sweepInterval)
+	}()
 
 	// Registered under the lock that wait takes once ctx is done, so a start
 	// racing shutdown either lands in wait's snapshot or is refused here.
@@ -110,8 +129,13 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 	// plane was unreachable — those block inside Run forever rather than
 	// failing, so liveness of the goroutine proves nothing.
 	s.m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
+	loops.Add(1)
 	go func() {
-		defer close(run.done)
+		loops.Wait()
+		close(run.done)
+	}()
+	go func() {
+		defer loops.Done()
 		defer s.m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
 		w := newWatcher(tc.Client, disp, tc)
 		w.gate = s.gate
@@ -157,16 +181,31 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 // its labels, so a torn-down cluster does not read as a cluster at
 // cluster_up=0 for the life of the process. A profile that is not running is
 // a no-op.
+//
+// Once wait has begun shutting the set down (closed), a stop is a no-op: the
+// run stays in the set, wait joins it and the shutdown snapshot writes it,
+// which is what a removal would have done. A stop already in progress is
+// joined by wait before it snapshots, so no removal's snapshot is cut by the
+// process exiting.
 func (s *clusterSet) stop(profile string) {
 	s.mu.Lock()
 	run, ok := s.running[profile]
-	if ok {
+	if ok && !s.closed {
 		delete(s.running, profile)
+		s.stopping++
+	} else {
+		ok = false
 	}
 	s.mu.Unlock()
 	if !ok {
 		return
 	}
+	defer func() {
+		s.mu.Lock()
+		s.stopping--
+		s.stopped.Broadcast()
+		s.mu.Unlock()
+	}()
 	run.cancel()
 	<-run.done
 	if err := run.cache.Snapshot(); err != nil {
@@ -179,11 +218,15 @@ func (s *clusterSet) stop(profile string) {
 // Watchers return only once their context, derived from ctx, ends (see
 // watcher.Run), so there is nothing to wait for before then; and once ctx is
 // done start refuses, under the same lock, so the snapshot taken here is
-// every watcher there will be. One removed by stop meanwhile is waited for
-// by stop.
+// every watcher there will be. A stop in progress is joined first, and a
+// stop that arrives later finds the set closed and leaves its run here.
 func (s *clusterSet) wait(ctx context.Context) {
 	<-ctx.Done()
 	s.mu.Lock()
+	s.closed = true
+	for s.stopping > 0 {
+		s.stopped.Wait()
+	}
 	runs := make([]*clusterRun, 0, len(s.running))
 	for _, run := range s.running {
 		runs = append(runs, run)
@@ -317,8 +360,12 @@ func (s *clusterSet) reconcileProfiles(ctx context.Context, dir string) {
 		if ctx.Err() != nil {
 			return
 		}
-		if s.absorbIntoDirect(tc) {
+		absorbed, ambiguous := s.absorbIntoDirect(tc)
+		if absorbed {
 			continue
+		}
+		if ambiguous {
+			s.stop(directProfile)
 		}
 		s.mu.Lock()
 		_, replacing := s.running[tc.Profile]
@@ -336,24 +383,41 @@ func (s *clusterSet) reconcileProfiles(ctx context.Context, dir string) {
 	}
 }
 
-// absorbIntoDirect reports whether a discovered profile is the direct
-// cluster's and, if so, records its identity. The match is the one
-// buildWatchSet makes at boot, on --cluster-name against the profile's
-// cluster name, with one more fact available here: once a profile has named
-// the direct cluster, a second profile with the same name and a different
-// project or location is another cluster, and is started.
-func (s *clusterSet) absorbIntoDirect(tc targetCluster) bool {
+// absorbIntoDirect decides what a discovered profile named like the direct
+// cluster is. The match is the one buildWatchSet makes at boot, on
+// --cluster-name against the profile's cluster name, and it is a guess: the
+// in-cluster client reads no cluster_identity, so a bare name is all there is
+// to compare, and a fleet may run two clusters of that name in different
+// projects or locations. Boot resolves the guess by count: one same-named
+// profile is absorbed, two or more and the direct entry is dropped and every
+// one of them watched through its profile. The rescan sees the profiles one
+// at a time, so the same rule plays out in two steps.
+//
+// absorbed: no profile has named the direct cluster yet, or this one names
+// the identity already recorded; the identity is recorded and the caller
+// starts nothing. ambiguous: a profile has already been absorbed and this one
+// carries a different project or location, so the earlier absorption was a
+// guess between two clusters. The recorded identity is cleared and the caller
+// stops the direct entry and starts this profile; the one absorbed earlier is
+// no longer excluded by identity, so the next read discovers it and starts it
+// too, which leaves both watched through their profiles and the direct entry
+// gone, as at boot. Neither is true when no direct entry is running or the
+// name differs.
+func (s *clusterSet) absorbIntoDirect(tc targetCluster) (absorbed, ambiguous bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, direct := s.running[directProfile]; !direct || tc.Name != s.f.clusterName {
-		return false
+		return false, false
 	}
 	id := clusterprofiles.Identity{Project: tc.ProjectID, Location: tc.Location, Cluster: tc.Name}
 	if s.directIdentity != (clusterprofiles.Identity{}) && s.directIdentity != id {
-		return false
+		log.Printf("k8s-event-watcher: profiles name both %s and %s %q, and the in-cluster client cannot say which one it is; watching both through their profiles and dropping the direct entry",
+			s.directIdentity, id, s.f.clusterName)
+		s.directIdentity = clusterprofiles.Identity{}
+		return false, true
 	}
 	s.directIdentity = id
 	log.Printf("k8s-event-watcher: profile %s names %s, which the direct client already watches as %s; starting no second watcher for it",
 		tc.Profile, id, s.f.clusterName)
-	return true
+	return true, false
 }
