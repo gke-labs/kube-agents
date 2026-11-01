@@ -175,7 +175,7 @@ reports a posture as a finding. They are read and nothing else: the key is separ
 resolver and the sweep never see them. The list is empty when nothing is registered or the key
 could not be read, which `start` says on stderr; the GitOps clone is searched either way. A private
 context repository is readable through the broker's content-mode clone only (`inspect_repository.py
-clone` and `open`): the broker mints a `contents: read` token for it per clone and installs it
+clone`): the broker mints a `contents: read` token for it per clone and installs it
 nowhere. The sandbox's own CLI credential and the directory-mode clone cover managed repositories
 alone.
 

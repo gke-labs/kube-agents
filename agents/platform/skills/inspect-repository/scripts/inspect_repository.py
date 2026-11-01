@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Read a GitHub repository this pod has no checkout of.
+"""Read a repository this pod has no checkout of.
 
 Content-passing took the agent's `.git` away, and with it the ad-hoc `git clone`
 that used to be how a question about somebody else's code got answered. The
 clone itself was never the point — the point was having the source to read — so
-this script gets the source a different way: the broker clones, and the agent
-pulls file content out of it over the workspace protocol.
+this script gets the source a different way: the broker clones one revision and
+sends its files back as a tar (`/v1/vcs/snapshot`, `vcs_client.snapshot`).
 
 What lands locally is a tree of files with no `.git` in it. That is the whole
 difference from the old path, and it is deliberate: a directory with no
@@ -13,32 +13,23 @@ repository in it has no `.git/config`, so none of the config-driven ways to make
 git execute something exist in it. See docs/designs/agent-shell-sandboxing.md,
 "Content-passing removes the shared tree".
 
-Two shapes of use, and they answer different questions.
-
     inspect_repository.py clone --repo kubernetes-sigs/kustomize
-        The whole tree (or a `--prefix` of it) copied into a scratch directory.
-        Use it when the analysis is "read this code" and the repository is small
-        enough to be worth having on disk.
+        One revision's tree (or a `--prefix` of it) copied into a scratch
+        directory. A repository over the snapshot cap is refused whole; name a
+        `--prefix` to take the part that matters.
 
-    inspect_repository.py open --repo kubernetes-sigs/kustomize
-    inspect_repository.py grep --handle <h> --pattern 'func NewCmd'
-    inspect_repository.py fetch --handle <h> --into ./scratch <paths…>
-    inspect_repository.py close --handle <h>
-        Search first, then take only the files the search named. Use it on a
-        repository too large to copy, which is most of them.
+The command prints one JSON object on stdout.
 
-Every subcommand prints one JSON object on stdout.
+There are no silent caps anywhere in here. A copy over a bound is refused, not
+cut short, and a symbolic link that would point out of the tree comes back in
+`skipped` with the reason. A tool that quietly returns nine tenths of a
+repository is worse than one that fails, because the analysis reads as complete.
 
-There are no silent caps anywhere in here. A listing that ended at the broker's
-ceiling says `truncated` and the caller pages with a cursor; a file the broker
-would not send comes back in `skipped` with the reason. A tool that quietly
-returns nine tenths of a repository is worse than one that fails, because the
-analysis reads as complete.
-
-On an install whose broker has not been armed for content-passing, `clone` falls
-back to a leased checkout on the shared volume — the arrangement that predates
-this script — and reports `"mode": "directory"`. The other subcommands need a
-broker handle and say so rather than pretending.
+On an install with no broker, `clone` falls back to a leased checkout on the
+shared volume — the arrangement that predates this script — and reports
+`"mode": "directory"`. A broker older than the snapshot verb is an error, not a
+fallback: the sandbox's `git` has no transport, so that checkout cannot work
+there, and the broker's answer says which image to roll forward.
 """
 
 from __future__ import annotations
@@ -46,9 +37,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
-import urllib.error
+import tempfile
 from pathlib import Path
 
 # Append global scripts path to allow importing the shared helpers
@@ -57,38 +49,18 @@ sys.path.append("/opt/data/scripts")
 # The same directory in a source checkout, where nothing is staged into /opt.
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
-import credential_proxy_client
 import gitops_workspace
-import workspace_paths
+import vcs_client
 
 OWNER = "inspect-repository"
 
-# Under the broker's own per-request ceilings (256 paths, 8 MiB), with room to
-# spare: the broker counts the encoded bytes and this counts the file sizes the
-# listing reported, and the two are not the same number.
-BATCH_PATHS = 100
-BATCH_BYTES = 6 << 20
-
 # Bounds on a `clone`, so a repository nobody sized cannot fill the agent's
-# volume. Both are reported when they bite.
+# volume. A copy past either one is refused whole, and the refusal says which.
 DEFAULT_MAX_FILES = 5000
-DEFAULT_MAX_BYTES = 64 << 20
+DEFAULT_MAX_BYTES = vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES
 
-
-def proxy_endpoint() -> str:
-    return os.environ.get("CREDENTIAL_PROXY_URL", "").strip()
-
-
-def content_mode_available() -> bool:
-    """Asked of the broker rather than read from a local flag.
-
-    The two mechanisms run side by side during the migration and the switch is
-    not in this container: the broker either serves the routes or it does not.
-    """
-    endpoint = proxy_endpoint()
-    if not endpoint:
-        return False
-    return credential_proxy_client.workspaces_available(endpoint)
+# The broker's refusal of a `paths` entry that names nothing at the revision.
+PATH_NOT_FOUND = "PATH_NOT_FOUND"
 
 
 def scratch_root() -> Path:
@@ -126,202 +98,91 @@ def prepare_destination(into: Path, force: bool) -> Path:
     return into
 
 
-def write_files(into: Path, files: dict[str, bytes]) -> int:
-    """Materialise broker content under `into`, refusing any name that escapes it.
+def copy_over(staging: Path, into: Path) -> None:
+    """Copy a checked snapshot over `into`; an entry already there gives way.
 
-    The paths came from the broker and the broker already validated them, so
-    this is a second check of the same property against a different filesystem.
-    That is on purpose: this is the boundary where a name becomes a write, and
-    the check that matters is the one next to the effect.
+    `--force` adds a second `--prefix` to a tree, and the two can overlap.
+    `copytree` cannot replace a symbolic link that is already there, and it
+    writes a file or a directory through one. So each name the snapshot holds
+    is removed from `into` first, unless both are directories.
     """
-    written = 0
-    for path, data in files.items():
-        relative = workspace_paths.validate_path(path)
-        target = into / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        written += 1
-    return written
-
-
-def open_workspace(args) -> credential_proxy_client.Workspace:
-    return credential_proxy_client.Workspace.open(
-        proxy_endpoint(),
-        args.repo,
-        base=getattr(args, "ref", None),
-        depth=getattr(args, "depth", None),
-    )
-
-
-def rebind(handle: str) -> credential_proxy_client.Workspace:
-    """A client-side Workspace around a handle an earlier turn printed.
-
-    The agent's shell does not survive between turns; the broker's tree does.
-    The handle is the whole of the state that has to travel, which is the
-    property that makes this protocol usable from a shell at all.
-    """
-    return credential_proxy_client.Workspace(
-        proxy_endpoint(),
-        {"handle": handle, "repo": "", "base": "", "baseSha": ""},
-    )
-
-
-def require_content_mode(command: str) -> None:
-    if not content_mode_available():
-        raise SystemExit(
-            f"{command} needs the content-passing broker, which this install "
-            "has not armed. Use `clone`, which falls back to a leased checkout "
-            "you can read with ordinary tools."
-        )
-
-
-def handle_open(args) -> int:
-    require_content_mode("open")
-    workspace = open_workspace(args)
-    print(
-        json.dumps(
-            {
-                "mode": "content",
-                "handle": workspace.handle,
-                "repo": workspace.repo,
-                "base": workspace.base,
-                # The commit the tree was cloned at. A caller that has to say
-                # which commit it read — the fleet-audit declared-intent record
-                # names each repository as `owner/name@sha` — takes it from
-                # here, since there is no `.git` on this side to ask.
-                "sha": workspace.base_sha,
-                "shallow": workspace.shallow,
-            }
-        )
-    )
-    return 0
-
-
-def handle_list(args) -> int:
-    require_content_mode("list")
-    listing = rebind(args.handle).list(args.prefix, after=args.after)
-    print(
-        json.dumps(
-            {
-                "entries": list(listing),
-                "total": listing.total,
-                "truncated": listing.truncated,
-                "next": listing[-1]["path"] if listing and listing.truncated else None,
-            }
-        )
-    )
-    return 0
-
-
-def handle_grep(args) -> int:
-    require_content_mode("grep")
-    print(
-        json.dumps(
-            rebind(args.handle).grep(
-                args.pattern,
-                prefix=args.prefix,
-                regex=args.regex,
-                ignore_case=args.ignore_case,
-            )
-        )
-    )
-    return 0
-
-
-def handle_fetch(args) -> int:
-    require_content_mode("fetch")
-    if not args.paths:
-        raise SystemExit("name at least one repository-relative path to fetch")
-    # No empty-directory check, unlike `clone`. Fetching is how a caller builds
-    # a directory up over several turns — a search, then the files it named, then
-    # the ones those turned out to reference — so a non-empty destination is the
-    # normal case rather than the suspicious one.
-    into = Path(args.into).expanduser()
-    into.mkdir(parents=True, exist_ok=True)
-    files, skipped = rebind(args.handle).read_many(args.paths)
-    written = write_files(into, files)
-    print(json.dumps({"into": str(into), "written": written, "skipped": skipped}))
-    return 0
-
-
-def handle_close(args) -> int:
-    """No availability probe. This is the command that releases the clone.
-
-    A handle exists only because an `open` succeeded, so the probe can tell the
-    caller nothing it does not already know -- and a probe that fails on a
-    broker having a bad few seconds refuses the close, leaving the clone on the
-    broker's volume with nothing left holding its handle. Send the close and let
-    the broker answer.
-    """
-    rebind(args.handle).close()
-    print(json.dumps({"closed": True}))
-    return 0
+    for root, dirs, files in os.walk(staging):
+        for name in dirs + files:
+            new = Path(root) / name
+            old = into / new.relative_to(staging)
+            old_is_dir = old.is_dir() and not old.is_symlink()
+            if not old_is_dir and not old.is_symlink() and not old.exists():
+                continue
+            if old_is_dir and new.is_dir() and not new.is_symlink():
+                continue
+            if old_is_dir:
+                shutil.rmtree(old)
+            else:
+                old.unlink()
+    shutil.copytree(staging, into, symlinks=True, dirs_exist_ok=True)
 
 
 def clone_content(args) -> int:
-    """Page the listing, batch the reads, write the tree, drop the handle."""
+    """Take one snapshot into a fresh directory, check it, then copy it into place.
+
+    The snapshot unpacks only into an empty directory, and `--force` is how a
+    caller adds a second `--prefix` to a tree it is building (the fleet audit
+    does). So the snapshot lands beside `into` and is copied over it.
+    """
     into = prepare_destination(
         Path(args.into) if args.into else default_into(args.repo), args.force
     )
-    skipped: list[dict] = []
-    written = 0
-    total_bytes = 0
-    stopped = None
-    with open_workspace(args) as workspace:
-        cursor: str | None = None
-        batch: list[str] = []
-        batch_bytes = 0
-
-        def flush() -> None:
-            nonlocal batch, batch_bytes, written
-            if not batch:
-                return
-            files, missed = workspace.read_many(batch)
-            written += write_files(into, files)
-            skipped.extend(missed)
-            batch = []
-            batch_bytes = 0
-
-        while stopped is None:
-            listing = workspace.list(args.prefix, after=cursor)
-            if not listing:
-                break
-            for entry in listing:
-                if written + len(batch) >= args.max_files:
-                    stopped = "maxFiles"
-                    break
-                if total_bytes + entry["size"] > args.max_bytes:
-                    stopped = "maxBytes"
-                    break
-                total_bytes += entry["size"]
-                batch.append(entry["path"])
-                batch_bytes += entry["size"]
-                if len(batch) >= BATCH_PATHS or batch_bytes >= BATCH_BYTES:
-                    flush()
-            flush()
-            if not listing.truncated:
-                break
-            cursor = listing[-1]["path"]
-        base = workspace.base
-        repo = workspace.repo
-        sha = workspace.base_sha
-    result = {
+    paths = [args.prefix] if args.prefix else None
+    staging = Path(tempfile.mkdtemp(dir=str(into.parent), prefix=f".{into.name}."))
+    try:
+        try:
+            copy = vcs_client.snapshot(
+                args.repo, args.ref, paths, into=staging, max_bytes=args.max_bytes
+            )
+        except vcs_client.VcsError as exc:
+            if exc.code != PATH_NOT_FOUND or not paths:
+                raise
+            # The prefix names nothing at this revision: an empty copy of it,
+            # as a listing of the prefix would have been. The refusal carries
+            # the revision the broker read, so the caller still has the commit.
+            print(json.dumps({
+                "mode": "content", "forge": None, "repo": args.repo, "role": None,
+                "base": args.ref, "sha": exc.revision or "", "into": str(into),
+                "written": 0, "bytes": 0, "skipped": [], "stopped": None,
+                "complete": True, "history": "none", "missing": args.prefix,
+            }))
+            return 0
+        if copy["files"] > args.max_files:
+            raise SystemExit(
+                f"{args.repo} holds {copy['files']} files, over --max-files "
+                f"{args.max_files}. Nothing was written. Name a --prefix to "
+                "take part of the tree."
+            )
+        copy_over(staging, into)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    print(json.dumps({
         "mode": "content",
-        "repo": repo,
-        "base": base,
-        # The commit the copy was taken from; see `handle_open`.
-        "sha": sha,
+        "forge": copy["forge"],
+        "repo": copy["repo"],
+        "role": copy["role"],
+        "base": copy["ref"],
+        # The commit the copy was taken from. A caller that has to say which
+        # commit it read — the fleet-audit declared-intent record names each
+        # repository as `owner/name@sha` — takes it from here, since there is
+        # no `.git` on this side to ask.
+        "sha": copy["revision"],
         "into": str(into),
-        "written": written,
-        "bytes": total_bytes,
-        "skipped": skipped,
-        # `stopped` is the honest name for what a bound did. A caller that gets
-        # `maxBytes` back has a partial tree and needs to know before it
-        # concludes anything about what the repository does not contain.
-        "stopped": stopped,
-        "complete": stopped is None and not skipped,
-    }
-    print(json.dumps(result))
+        "written": copy["files"],
+        "bytes": copy["bytes"],
+        "skipped": copy["skipped"],
+        # A bound refuses the whole copy, so nothing is ever cut short. Kept so
+        # that a caller that reads the key sees no bound bit.
+        "stopped": None,
+        "complete": not copy["skipped"],
+        # One revision, always: `--depth` changes nothing in this mode.
+        "history": copy["history"],
+    }))
     return 0
 
 
@@ -345,12 +206,11 @@ def clone_directory(args) -> int:
                 "workspace": str(workspace),
                 "lease": lease,
                 "complete": True,
-                # Said rather than silently done. `--depth` is a broker-side
-                # clone option; this path is a plain local `git clone`, which
-                # takes the full history, so a caller that asked for a shallow
-                # read got something else and should know which. In the sandbox
-                # that `git` has no transport, so this fallback cannot clone
-                # there at all.
+                # Said rather than silently done. This path is a plain local
+                # `git clone`, which takes the full history, so a caller that
+                # asked for a shallow read got something else and should know
+                # which. In the sandbox that `git` has no transport, so this
+                # fallback cannot clone there at all.
                 "depthIgnored": bool(args.depth),
             }
         )
@@ -359,9 +219,9 @@ def clone_directory(args) -> int:
 
 
 def handle_clone(args) -> int:
-    if content_mode_available():
-        return clone_content(args)
-    return clone_directory(args)
+    if not os.environ.get(vcs_client.BROKER_ENDPOINT_VAR, "").strip():
+        return clone_directory(args)
+    return clone_content(args)
 
 
 def _runner(cmd: list, *, cwd=None, check: bool = True):
@@ -370,59 +230,28 @@ def _runner(cmd: list, *, cwd=None, check: bool = True):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Read a GitHub repository through the credential broker."
+        description="Read a repository through the credential broker."
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    def add_repo(sub):
-        sub.add_argument(
-            "--repo", required=True,
-            help="owner/name on GitHub, or <host>/<path> on another forge this install serves",
-        )
-        sub.add_argument("--ref", help="branch to read; defaults to the base the broker pins the repository to, else the remote's HEAD")
-        sub.add_argument(
-            "--depth",
-            type=int,
-            help="shallow clone of this many commits; read-only and much smaller",
-        )
-
-    clone = commands.add_parser("clone", help="copy a repository into a scratch tree")
-    add_repo(clone)
+    clone = commands.add_parser("clone", help="copy one revision of a repository into a scratch tree")
+    clone.add_argument(
+        "--repo", required=True,
+        help="owner/name on GitHub, or <host>/<path> on another forge this install serves",
+    )
+    clone.add_argument("--ref", help="branch or tag to read; defaults to the base the broker pins the repository to, else the remote's HEAD")
+    clone.add_argument(
+        "--depth",
+        type=int,
+        help="accepted for older callers; a content copy is always one revision",
+    )
     clone.add_argument("--into", help="destination directory")
-    clone.add_argument("--prefix", help="copy only this subtree")
+    clone.add_argument("--prefix", help="copy only this directory or file, a path rather than a glob")
     clone.add_argument("--force", action="store_true", help="write into a non-empty directory")
     clone.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES)
     clone.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     clone.add_argument("--lease", help="directory mode only: the lease to work under")
     clone.set_defaults(func=handle_clone)
-
-    opener = commands.add_parser("open", help="open a broker-side workspace")
-    add_repo(opener)
-    opener.set_defaults(func=handle_open)
-
-    lister = commands.add_parser("list", help="one page of tracked paths")
-    lister.add_argument("--handle", required=True)
-    lister.add_argument("--prefix")
-    lister.add_argument("--after", help="the `next` value from the previous page")
-    lister.set_defaults(func=handle_list)
-
-    searcher = commands.add_parser("grep", help="search the tracked files")
-    searcher.add_argument("--handle", required=True)
-    searcher.add_argument("--pattern", required=True)
-    searcher.add_argument("--prefix", help="a directory or file, a path rather than a glob")
-    searcher.add_argument("--regex", action="store_true", help="POSIX extended regex")
-    searcher.add_argument("--ignore-case", action="store_true")
-    searcher.set_defaults(func=handle_grep)
-
-    fetcher = commands.add_parser("fetch", help="copy named files into a directory")
-    fetcher.add_argument("--handle", required=True)
-    fetcher.add_argument("--into", required=True)
-    fetcher.add_argument("paths", nargs="*")
-    fetcher.set_defaults(func=handle_fetch)
-
-    closer = commands.add_parser("close", help="drop the broker-side tree")
-    closer.add_argument("--handle", required=True)
-    closer.set_defaults(func=handle_close)
 
     return parser
 
@@ -433,29 +262,25 @@ def dispatch(argv: list[str]) -> int:
 
 
 def main() -> int:
-    """Every way a broker call can fail, as a sentence and an exit code.
+    """Every way a broker call can fail, as JSON on stderr and an exit code.
 
-    The two workspace exceptions are the broker answering. The other two are it
-    not answering at all: `TokenUnavailable` is the projected ServiceAccount
-    token missing or empty, which `_workspace_call` raises before it opens a
-    socket, and a bare `URLError` is the connection itself -- the broker Pod
-    down, the Service not resolving. Both used to reach the terminal as
-    tracebacks, which reads to the agent as this script being broken rather than
-    the broker being unreachable, and sends it to fix the wrong thing.
+    `vcs_client` turns each failure -- the broker refusing, the token missing,
+    the connection down -- into one `VcsError`. A traceback reads to the agent
+    as this script being broken rather than the broker answering, and sends it
+    to fix the wrong thing.
     """
     try:
         return dispatch(sys.argv[1:])
-    except credential_proxy_client.WorkspaceUnavailable as exc:
-        print(f"the broker has no content workspaces: {exc}", file=sys.stderr)
+    except vcs_client.VcsError as exc:
+        answer = exc.as_json()
+        if exc.code == vcs_client.SNAPSHOT_TOO_LARGE:
+            answer["hint"] = "Name a --prefix to take part of the tree."
+        print(json.dumps(answer), file=sys.stderr)
         return 1
-    except credential_proxy_client.WorkspaceRequestError as exc:
-        print(json.dumps({"error": str(exc), "status": exc.status}), file=sys.stderr)
-        return 1
-    except credential_proxy_client.TokenUnavailable as exc:
-        print(f"no credential to call the broker with: {exc}", file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"the broker is unreachable: {exc.reason}", file=sys.stderr)
+    except OSError as exc:
+        # The copy into `--into` failed part way: a name taken by something
+        # the snapshot cannot replace, or a full disk.
+        print(json.dumps({"error": f"the copy into the destination failed: {exc}"}), file=sys.stderr)
         return 1
 
 

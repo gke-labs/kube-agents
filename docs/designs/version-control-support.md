@@ -8,13 +8,10 @@
 > `providers/github/` and `providers/gitlab/` behind it; the `version-control` skill drives those verbs from a
 > sandbox that holds a credential-free git; and the consumers reach the forge
 > through those verbs rather than by naming GitHub. The sandbox carries no `gh`
-> and no credential shim named `git`. One thing is deliberately left behind and
-> is not a scheduling slip: `inspect_repository.py` stays on the broker's
-> content-workspace route rather than moving to the verbs, because it reads
-> repositories this install does not manage and does it with a shallow clone —
-> neither of which `clone` offers, the second on purpose
-> ([The seam](#3-the-seam)). The `snapshot` verb now offers both; the move is
-> not made yet. The CRD declares forges and repositories in `spec.integration.forges`
+> and no credential shim named `git`. `inspect_repository.py` reads repositories
+> this install does not manage, and context repositories, through the `snapshot`
+> verb: one revision with no history, which `clone` does not offer, on purpose
+> ([The seam](#3-the-seam)). The CRD declares forges and repositories in `spec.integration.forges`
 > and `spec.integration.repositories`; each provider states its own hosts, grammar and credential.
 > This is the design for driving any forge, and the order the rest has to
 > happen in.
@@ -132,12 +129,11 @@ The coupling runs through five layers, each with a different owner and a differe
    `forge.py`; three shelled `gh` directly — `resolver.py`, `submit_suggestion.py` and
    `audit_report.py`, two behind a private runner of their own and one inline. A seventh,
    `inspect_repository.py`, reaches a repository rather than an API, and does it through the
-   broker's content-workspace route, which clones on the credential side and honours `--depth`.
+   `snapshot` verb, which clones one revision on the credential side and sends its tree.
    (`github_token_refresh.py` and
    `credential_proxy.py` also run `gh`, but for credentials rather than for forge work; they are
-   layer 3.) All six go through the verbs, and `forge.py` with them — it holds typed values and
-   three policy rules and no forge implementation. `inspect_repository.py` does not move: see the
-   status banner.
+   layer 3.) All seven go through the verbs, and `forge.py` with them — it holds typed values and
+   three policy rules and no forge implementation.
 2. **Repository identity.** `owner/repo` — exactly two path segments — was asserted in seven places
    across Python and Go, one regex expressing it copy-pasted into six modules. The widest assumption
    and the one least visible from any single file. Each language now runs its assertions through
@@ -939,7 +935,7 @@ thing, and the contract test holds them together. The issue verbs come as one
 group in the same way, all or none.
 
 The rows down to `issue-create` except `snapshot`, and the two branch rows, are the version-control skill's;
-`snapshot` is served to library callers (`vcs_client.snapshot`). The rest are the union of
+`snapshot` is served to library callers (`vcs_client.snapshot`), which `inspect-repository` is. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
