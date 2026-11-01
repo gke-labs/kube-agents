@@ -658,7 +658,12 @@ class AnnotateManifestTest(unittest.TestCase):
         }
         root = Path(self.dir).parent / "repo"
         (root / "topics").mkdir(parents=True)
+        # The file declares the topic's Namespace with its project: a
+        # `PubSubTopic` finding is on the Config Connector host, so only the
+        # file can say which project the topic manages.
         (root / "topics" / "events.yaml").write_text(
+            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: infra\n  annotations:\n"
+            "    cnrm.cloud.google.com/project-id: acme\n---\n"
             "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n"
         )
 

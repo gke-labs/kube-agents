@@ -23103,10 +23103,14 @@ metadata:
                 self.assertEqual(self.disclose([finding], manifest), expected)
 
     def test_the_namespace_project_brings_the_note_back(self):
-        """With an unreachable hub-2, the object's project (from its
-        namespace) agrees with the finding's, and the note is certain."""
+        """With an unreachable hub-2, the object's recorded project (from its
+        namespace) agrees with the project the file declares through its
+        Namespace, and the note is certain. A `PubSubTopic` finding is on the
+        Config Connector host, so the finding's own cluster gives no project."""
         self.write(
             "topics/events.yaml",
+            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: infra\n  annotations:\n"
+            "    cnrm.cloud.google.com/project-id: acme\n---\n"
             "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n",
         )
         finding = kcc_finding(path="topics/events.yaml")
@@ -23257,6 +23261,33 @@ metadata:
         finding = kcc_finding()
         self.disclose([finding], kcc_manifest(KCC_CLUSTER))
         self.assertNotIn("which waits on", finding["remediation"]["note"])
+
+    FIREWALL = (
+        "apiVersion: compute.cnrm.cloud.google.com/v1beta1\nkind: ComputeFirewall\nmetadata:\n"
+        "  name: allow-ssh\n  namespace: app\nspec:\n  networkRef:\n    name: default\n"
+    )
+
+    def firewall_fix(self, text):
+        self.write("network/allow-ssh.yaml", text)
+        return make_finding(fid="fw", cluster="hub-proj/us-central1/hub", obj="ComputeFirewall/allow-ssh",
+                            remediation={"kind": "manifest", "path": "network/allow-ssh.yaml", "note": "Close port 22."})
+
+    def test_a_config_connector_kind_finding_takes_its_project_from_the_declaration_not_the_host(self):
+        """The hub in hub-proj holds ComputeFirewall app/allow-ssh, which manages
+        app-proj. The finding's cluster is the hub, which says nothing about
+        the project the object manages."""
+        stall = {"kind": "ComputeFirewall", "namespace": "app", "name": "allow-ssh", "why": "UpdateFailed", "project": "app-proj"}
+        finding = self.firewall_fix(self.FIREWALL)
+        self.assertEqual(self.disclose([finding], kcc_manifest(stall)), ["fw"])
+        # With two hosts the project must be known: the file's Namespace gives it.
+        two = self.two_hosts(("hub-proj/us-central1/hub", [stall]), ("hub-proj/us-east1/hub-2", []))
+        finding = self.firewall_fix(self.FIREWALL)
+        self.assertEqual(self.disclose([finding], two), [])
+        namespace = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: app\n  annotations:\n    cnrm.cloud.google.com/project-id: app-proj\n---\n"
+        finding = self.firewall_fix(namespace + self.FIREWALL)
+        self.assertEqual(self.disclose([finding], two), ["fw"])
+        finding = self.firewall_fix(namespace.replace("app-proj", "other-proj") + self.FIREWALL)
+        self.assertEqual(self.disclose([finding], kcc_manifest(stall)), [])
 
     def test_the_copied_constants_equal_the_collectors(self):
         """audit_report.py does not import the collectors, so it copies two of

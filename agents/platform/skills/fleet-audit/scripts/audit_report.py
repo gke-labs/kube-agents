@@ -2154,6 +2154,9 @@ KCC_DEPENDENCY_NOT_READY_REASON = "DependencyNotReady"
 KCC_TRANSIENT_REASONS = frozenset({"Updating", "Deleting"})
 # The annotation that names the GCP project a Config Connector object manages.
 KCC_PROJECT_ANNOTATION = "cnrm.cloud.google.com/project-id"
+# The kind of a Namespace, whose project annotation a Config Connector
+# object in it takes when it names none.
+KCC_NAMESPACE_KIND = "Namespace"
 # How many segments a `project/location/name` cluster target has.
 CLUSTER_TARGET_SEGMENTS = 3
 # What a cluster entry of a collector that reads Config Connector needs to
@@ -18838,7 +18841,34 @@ def _remediation_file_index(finding: dict, root: Path) -> dict[KccKey, KccDeclar
         return {}
     index: dict[KccKey, KccDeclaration] = {}
     _index_kcc_text(index, yaml, text, "", relative)
-    return index
+    # A declaration with no project annotation takes its namespace's, as
+    # Config Connector does, when the same file declares that Namespace.
+    namespace_projects = _namespace_projects(yaml, text)
+    return {
+        key: declaration._replace(project=namespace_projects.get(declaration.namespace, ""))
+        if not declaration.project and declaration.namespace in namespace_projects
+        else declaration
+        for key, declaration in index.items()
+    }
+
+
+def _namespace_projects(yaml: Any, text: str) -> dict[str, str]:
+    """The `cnrm.cloud.google.com/project-id` annotation of each Namespace a
+    file declares, by namespace name."""
+    try:
+        docs = list(yaml.safe_load_all(text))
+    except (yaml.YAMLError, ValueError, RecursionError):
+        return {}
+    projects: dict[str, str] = {}
+    for doc in docs:
+        if not isinstance(doc, dict) or doc.get("kind") != KCC_NAMESPACE_KIND:
+            continue
+        meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
+        annotations = meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}
+        project = str(annotations.get(KCC_PROJECT_ANNOTATION) or "")
+        if meta.get("name") and project:
+            projects[str(meta["name"])] = project
+    return projects
 
 
 def _fix_declarations(finding: dict, index: dict[KccKey, KccDeclaration]) -> dict[KccKey, KccDeclaration]:
@@ -18931,7 +18961,12 @@ def _remediation_file_stalls(
         # The index keys a node pool on its `clusterRef`, every other kind on
         # its own name.
         file_ref = cluster_ref if kind in _KCC_OBJECT_KINDS["NodePool"] else ""
-        project = declaration.project or _finding_project(finding)
+        # A cluster or a node pool finding is about the managed cluster, so its
+        # project is the one the object manages. Any other Config Connector
+        # finding (compliance's `kcc-object-wedged`) is on the cluster that
+        # runs Config Connector, which says nothing about the project its
+        # object manages: only the declaration can give that.
+        project = declaration.project or (_finding_project(finding) if kind in cluster_kinds else "")
         # The file's `spec.location`, else, for a cluster or a node pool, the
         # location of the finding's cluster.
         location = file_location or (_finding_location(finding) if kind in cluster_kinds else "")
