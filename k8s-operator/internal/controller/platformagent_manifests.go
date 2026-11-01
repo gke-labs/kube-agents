@@ -113,9 +113,15 @@ const (
 	// file into Cloud Logging. The metadata claim rather than the agent's data
 	// claim because the agent and the dashboard mount that one at its root: a
 	// cursor file they rewrite into something SQLite cannot open makes the sidecar
-	// exit at every start. Every other mount of system-metadata uses subPath
-	// session (TestFluentBitKeepsItsCursorsOnTheMetadataClaim holds it there), so
-	// no container that runs model-authored code can reach this directory.
+	// exit at every start. Every other mount of system-metadata the operator
+	// renders uses subPath session (TestFluentBitKeepsItsCursorsOnTheMetadataClaim
+	// holds it there), so no rendered container that runs model-authored code can
+	// reach this directory; spec.deployment.extraVolumeMounts can still name the
+	// claim, and validateExtraVolumeMounts does not refuse it. Both databases are
+	// rendered with DB.journal_mode sqliteJournalModeDelete: the claim is the
+	// gofer-backed mount under a runtime class, where WAL mode corrupts
+	// (sqliteJournalModeDelete says why), and a corrupt cursor here outlives the
+	// pod where the emptyDir reset it.
 	fluentBitStateMount = "/var/lib/fluent-bit"
 	// fluentBitStateSubPathPrefix is the directory on the system-metadata claim
 	// under which each agent's cursor directory sits. The claim is one per
@@ -5771,8 +5777,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		// above buffers in memory (Mem_Buf_Limit, no storage.path) and outputs to
 		// stdout, so it writes nothing to the root filesystem. Its one writable path
 		// is the cursor directory on the system-metadata claim (fluentBitStateMount),
-		// which no container running model-authored code mounts: the agent and the
-		// dashboard reach that claim only through subPath session. Handing it the
+		// which no other container the operator renders mounts: the agent and the
+		// dashboard reach that claim only through subPath session, and only a CR's
+		// spec.deployment.extraVolumeMounts could hand them its root. Handing it the
 		// agent's tmp-scratch would only give an LLM-driven container a path into the
 		// log shipper.
 		SecurityContext: hardenedSecurityContext(),
@@ -6147,6 +6154,7 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Path              ` + fluentBitDataMount + `/logs/*.log
     DB                ` + fluentBitStateMount + `/` + fluentBitLogsDBFile + `
     DB.locking        true
+    DB.journal_mode   ` + sqliteJournalModeDelete + `
     Refresh_Interval  5
     Rotate_Wait       30
     Mem_Buf_Limit     20MB
@@ -6161,6 +6169,7 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Parser            audit_json
     DB                ` + fluentBitStateMount + `/` + fluentBitAuditDBFile + `
     DB.locking        true
+    DB.journal_mode   ` + sqliteJournalModeDelete + `
     Refresh_Interval  5
     Rotate_Wait       30
     Mem_Buf_Limit     20MB

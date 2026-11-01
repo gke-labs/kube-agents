@@ -430,6 +430,7 @@ data:
         Path              /opt/data/logs/*.log
         DB                /var/lib/fluent-bit/fluent-bit.db
         DB.locking        true
+        DB.journal_mode   delete
         Refresh_Interval  5
         Rotate_Wait       30
         Mem_Buf_Limit     20MB
@@ -444,6 +445,7 @@ data:
         Parser            audit_json
         DB                /var/lib/fluent-bit/fluent-bit-audit.db
         DB.locking        true
+        DB.journal_mode   delete
         Refresh_Interval  5
         Rotate_Wait       30
         Mem_Buf_Limit     20MB

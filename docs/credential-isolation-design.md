@@ -1008,7 +1008,8 @@ file and never a `.git` it can write into.
 - Every container the operator builds — the credential-cleanup init container,
   the agent, the dashboard, `agent-api-auth`, the log shipper — has a read-only
   root filesystem;
-  writable state uses bounded `emptyDir` volumes. The sandbox and dashboard
+  writable state uses bounded `emptyDir` volumes, bar the log shipper's cursor
+  directory on the `system-metadata` claim, described below. The sandbox and dashboard
   share a 2Gi `/tmp` scratch volume: the entrypoint runs several hermes
   invocations with `HOME=/tmp` before the agent starts, and those two
   containers already share the data PVC, so the shared volume is not a new
@@ -1036,9 +1037,14 @@ file and never a `.git` it can write into.
   used for it because the agent and the dashboard mount that claim at its root,
   and a cursor file rewritten into something SQLite cannot open stops the
   shipper at every start; the `system-metadata` claim is reached by those two
-  containers only through `subPath: session`, so the cursors are outside what
-  model-authored code can write. The shipper's own container is the only one
-  with a mount under `fluent-bit-state/`.
+  containers only through `subPath: session`, so no container the operator
+  renders for model-authored code can write the cursors. Of the rendered
+  containers the shipper is the only one with a mount under `fluent-bit-state/`;
+  a CR's `spec.deployment.extraVolumeMounts` can still name the claim without a
+  `subPath`, and the operator does not refuse it. The databases use the rollback
+  journal rather than WAL: the claim is the gofer-backed mount under a runtime
+  class, where WAL-mode SQLite corrupts, and a corrupt cursor on a claim
+  outlives the Pod.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
 - The operator reports Ready only when every workload it renders is ready, with

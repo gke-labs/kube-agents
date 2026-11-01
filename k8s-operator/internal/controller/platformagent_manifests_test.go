@@ -2613,7 +2613,10 @@ func TestFluentBitKeepsItsCursorsOnTheMetadataClaim(t *testing.T) {
 
 	// Both inputs keep their positions under the mount, each in its own locked
 	// file; a DB on the read-only root or on a path that is not mounted would
-	// fail to open at start.
+	// fail to open at start. The journal mode is the rollback journal, not WAL:
+	// the claim is a gofer-backed mount under a runtime class, where WAL mode
+	// corrupts (sqliteJournalModeDelete), and a corrupt cursor on a claim
+	// outlives the pod.
 	fbConf := buildFluentBitConfigMap(agent).Data["fluent-bit.conf"]
 	inputs := fluentBitSections(fbConf, "[INPUT]")
 	if len(inputs) != 2 {
@@ -2630,6 +2633,9 @@ func TestFluentBitKeepsItsCursorsOnTheMetadataClaim(t *testing.T) {
 		}
 		if locking := fluentBitField(section, "DB.locking"); locking != "true" {
 			t.Errorf("the %s input's DB.locking is %q, want true:\n%s", tag, locking, section)
+		}
+		if mode := fluentBitField(section, "DB.journal_mode"); mode != "delete" {
+			t.Errorf("the %s input's DB.journal_mode is %q, want delete:\n%s", tag, mode, section)
 		}
 	}
 }
