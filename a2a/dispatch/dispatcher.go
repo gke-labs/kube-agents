@@ -69,6 +69,10 @@ const (
 	// verifier a call per retry delay, short enough that a revoked grant
 	// stops admitting soon.
 	verifiedFor = time.Minute
+	// reportAfterStop is how long a refusal already recorded keeps trying
+	// to publish its terminal after the dispatcher starts stopping (inside
+	// shutdownWait).
+	reportAfterStop = 5 * time.Second
 	// tombstoneMargin is how long past the submit stream's retention a
 	// tombstone is kept: a replay can come no later than the retention, and
 	// the margin covers a clock or a stream's age check running late.
@@ -655,27 +659,38 @@ func (d *Dispatcher) followHolder(ctx context.Context, log *slog.Logger, del lib
 	_ = del.Nak(d.cfg.RetryDelay)
 }
 
-// reject publishes a refusal's terminal, writes the task's tombstone (under
-// ProfileLeaseRefusedPod: no pod ever held it) and terminates the
-// submission, so it is never redelivered, nor run or refused again if a
-// re-created durable replays it (a grant given since would otherwise run a
-// task once refused). A terminal or tombstone that can't be written leaves
-// the delivery to come back and be refused again (the terminal's envelope id
-// is fixed, so a repeat is a duplicate the stream drops).
+// reject writes a refusal's tombstone (under ProfileLeaseRefusedPod: no pod
+// ever held it), then publishes its terminal and terminates the submission,
+// so it is never redelivered, nor run or refused again if a re-created
+// durable replays it (a grant given since would otherwise run a task once
+// refused). The tombstone comes first: a refusal reported but not recorded
+// could run after all, on the next instance's fresh admission, once its
+// cause cleared. A tombstone that can't be written leaves the delivery to
+// come back and be decided afresh, with nothing reported. Once it is
+// written the refusal stands, so its terminal is owed even to a stop, for up
+// to reportAfterStop; one still unpublished then (or lost to a crash) stays
+// unpublished, since the redelivery finds the tombstone and is acked as a
+// replay. A repeat terminal is a duplicate the stream drops (its envelope id
+// is fixed).
 func (d *Dispatcher) reject(ctx context.Context, log *slog.Logger, del lib.Delivery, hk holdKey, ref *refusal) {
+	key := lib.ProfileLeaseKey(hk.profile, hk.tier, lib.ProfileLeaseRefusedPod, hk.taskID)
+	if !d.entomb(ctx, log, key, lib.LeaseRecord{TaskID: hk.taskID, Pod: lib.ProfileLeaseRefusedPod, Kind: hk.kind}) {
+		return
+	}
+	pctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
+	// A stop leaves the terminal reportAfterStop more to land.
+	defer context.AfterFunc(ctx, func() { time.AfterFunc(reportAfterStop, cancel) })()
 	for {
-		err := d.publishTerminal(ctx, hk.profile, del.Envelope(), lib.StateRejected, ref.reason, ref.detail)
+		err := d.publishTerminal(pctx, hk.profile, del.Envelope(), lib.StateRejected, ref.reason, ref.detail)
 		if err == nil {
 			break
 		}
 		log.Warn("publish the rejection terminal; retrying", "err", err)
-		if !sleepCtx(ctx, settleRetry) {
+		if !sleepCtx(pctx, settleRetry) {
+			log.Error("a recorded refusal's terminal was not published before the stop", "err", err)
 			return
 		}
-	}
-	key := lib.ProfileLeaseKey(hk.profile, hk.tier, lib.ProfileLeaseRefusedPod, hk.taskID)
-	if !d.entomb(ctx, log, key, lib.LeaseRecord{TaskID: hk.taskID, Pod: lib.ProfileLeaseRefusedPod, Kind: hk.kind}) {
-		return
 	}
 	for del.Term() != nil {
 		if !sleepCtx(ctx, settleRetry) {

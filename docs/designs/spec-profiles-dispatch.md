@@ -355,7 +355,8 @@ leave open:
   outcome the dispatcher sees or writes is final: a `final` renewal, a `lease-expired` or
   `deadline-exceeded` failure, a refusal at admission. On each it writes a tombstone before
   it acks: the lease record under the same key with `finishedAt` set
-  (`LeaseRecord.FinishedAt`); a refusal, which no pod held, under the pod token `_refused`.
+  (`LeaseRecord.FinishedAt`); a refusal, which no pod held, under the pod token `_refused`,
+  and before its `rejected` terminal, so a restart never re-admits a refusal already reported.
   A submission that finds a tombstone is acked and nothing else: it is never offered,
   adopted or given a second terminal, so a grant given since never runs a task once refused.
   A tombstone keeps no pod busy and is never renewed or re-adopted; it is told from a

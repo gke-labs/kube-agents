@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	natsserver "github.com/nats-io/nats-server/v2/server"
+
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -236,5 +238,42 @@ func TestATombstoneDoesNotKeepItsPodBusy(t *testing.T) {
 	}
 	if w.offerCount() != 1 {
 		t.Errorf("offered %d times", w.offerCount())
+	}
+}
+
+// A refusal is recorded before it is reported. A dispatcher that refuses a
+// submission and is stopped before its tombstone lands (here it can't write
+// the lease bucket at all) must not have published the rejection: the next
+// instance finds no record, admits the submission afresh, and, the grant
+// having been given since, runs it. A task the user saw rejected never runs.
+func TestARefusalIsRecordedBeforeItIsReported(t *testing.T) {
+	noLeases := []*natsserver.User{{Username: "disp-nokv", Password: dispPass, Permissions: &natsserver.Permissions{
+		Publish: &natsserver.SubjectPermission{Allow: []string{">"}, Deny: []string{"$KV." + lib.ProfileLeaseBucket + ".>"}}}}}
+	b := newBusWith(t, noLeases, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, 200*time.Millisecond)
+	ti := oneProfile("tse", 2, "tse-0")
+	var g grantSwitch
+	g.set("disp-nokv")
+	refusing := &fakeVerifier{refuse: map[string]bool{"cap-ok": true}}
+	_, stop1 := b.runDispatcherOn(b.connectAs(&g), testConfig(), ti, refusing)
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "the refusal", func() bool { return len(refusing.callList()) > 0 })
+	time.Sleep(time.Second)
+	stop1()
+
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	waitFor(t, 15*time.Second, "the task to end", func() bool {
+		for _, ts := range b.terminalsOf("task-1") {
+			if ts.state == lib.StateCompleted {
+				return true
+			}
+		}
+		return false
+	})
+	for _, ts := range b.terminalsOf("task-1") {
+		if ts.state == lib.StateRejected {
+			t.Errorf("the task ran (%d starts) after it was reported rejected: %+v", w.startedCount(), b.terminalsOf("task-1"))
+		}
 	}
 }
