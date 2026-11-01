@@ -507,6 +507,49 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.assertGreaterEqual(elapsed, _SHORT_BUSY_TIMEOUT_SECONDS * 0.9)
         self.assertLess(elapsed, _SHORT_BUSY_TIMEOUT_SECONDS * 2)
 
+    def test_an_unbindable_candidate_does_not_end_a_state_db_visit(self):
+        # A lone surrogate (what a JSON `\ud800` escape decodes to) cannot be
+        # bound as a query parameter, so testing it raises before any read.
+        # That is the id's own failure, not the file's: the child beside it
+        # is still tested whichever order the ids iterate in. An ordered list
+        # pins the order the request's set would leave to chance.
+        self._seed_state_db_sessions(
+            [
+                ("a2a-ctx-decoy", None, "compression"),
+                ("20261101_110000_decoychild", "a2a-ctx-decoy", None),
+            ]
+        )
+        decoy = "\ud800decoy"
+        child = "20261101_110000_decoychild"
+        names_child = credential_proxy.AgentAPIProxyHandler._names_bridge_session_child
+        self.assertTrue(names_child([decoy, child], self.workspace_dir.name))
+        self.assertTrue(names_child([child, decoy], self.workspace_dir.name))
+        self.assertFalse(names_child([decoy], self.workspace_dir.name))
+
+    def test_refuses_a_bridge_child_hidden_among_unbindable_body_decoys(self):
+        # The request shape of the bypass: the most short strings the check
+        # reads, all but one of them unbindable, and the bridge child under a
+        # named key. Whichever id iterates first, the request is refused and
+        # nothing reaches upstream.
+        self._seed_state_db_sessions(
+            [
+                ("a2a-ctx-hidden", None, "compression"),
+                ("20261101_120000_hiddenchild", "a2a-ctx-hidden", None),
+            ]
+        )
+        body = {f"k{i}": f"\ud800{i}" for i in range(credential_proxy.AGENT_API_MAX_CHECKED_BODY_STRINGS - 1)}
+        body["session_id"] = "20261101_120000_hiddenchild"
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy.server_port}/v1/runs",
+            headers={"Authorization": "Bearer external-secret", "Content-Type": "application/json"},
+            data=json.dumps(body).encode(),
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request)
+        self.assertEqual(403, raised.exception.code)
+        self.assertEqual("", self.received_authorization)
+
     def test_free_text_body_keys_are_forwarded_and_never_looked_up(self):
         # A chat message that happens to equal a bridge child's id is message
         # text: it is forwarded, and it never reaches a state.db query. The
