@@ -198,13 +198,13 @@ func restore(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state na
 		return err
 	}
 	var resp struct {
-		DeliverSubject string `json:"deliver_subject"`
+		ChunkSubject string `json:"deliver_subject"`
 	}
 	if err := request(ctx, nc, fmt.Sprintf(streamRestoreSubject, cfg.Name), body, &resp); err != nil {
 		return err
 	}
-	if resp.DeliverSubject == "" {
-		return errors.New("restore answered with no deliver subject")
+	if resp.ChunkSubject == "" {
+		return errors.New("restore answered with no chunk subject")
 	}
 	hash := sha256.New()
 	chunk := make([]byte, restoreChunkSize)
@@ -212,7 +212,7 @@ func restore(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state na
 		n, err := io.ReadFull(data, chunk)
 		if n > 0 {
 			hash.Write(chunk[:n])
-			if err := sendChunk(ctx, nc, resp.DeliverSubject, chunk[:n]); err != nil {
+			if err := sendChunk(ctx, nc, resp.ChunkSubject, chunk[:n]); err != nil {
 				return fmt.Errorf("sending a chunk: %w", err)
 			}
 		}
@@ -228,7 +228,7 @@ func restore(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state na
 	}
 	fctx, cancel := context.WithTimeout(ctx, restoreFinishTimeout)
 	defer cancel()
-	msg, err := nc.RequestWithContext(fctx, resp.DeliverSubject, nil)
+	msg, err := nc.RequestWithContext(fctx, resp.ChunkSubject, nil)
 	if err != nil {
 		return fmt.Errorf("finishing: %w", err)
 	}

@@ -46,6 +46,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -5642,6 +5643,18 @@ type a2aProvisionState struct {
 	// compare against the in-memory copy, so this is what tells them the
 	// resolved count still has to be written.
 	busReplicasPersisted int32
+	// busMigrationPersisted is status.busMigration as the CR carried it
+	// before this pass advanced it, and busMigrationCaptured says the pass
+	// took it. A phase can change the run's status without changing the
+	// A2ABusMigrating condition or the count (freezeConfirmed is one), so
+	// the writers compare this too, or the change is never written.
+	busMigrationPersisted *agentv1alpha1.BusMigrationStatus
+	busMigrationCaptured  bool
+}
+
+// busMigrationStatusCurrent reports the run's status unchanged by this pass.
+func busMigrationStatusCurrent(agent *agentv1alpha1.PlatformAgent, a2a a2aProvisionState) bool {
+	return !a2a.busMigrationCaptured || reflect.DeepEqual(agent.Status.BusMigration, a2a.busMigrationPersisted)
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -5776,6 +5789,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// First: everything below renders from the server count, and a count
 	// read before this would be last pass's, or the default.
 	state.busReplicasPersisted = agent.Status.BusReplicas
+	state.busMigrationPersisted, state.busMigrationCaptured = agent.Status.BusMigration.DeepCopy(), true
 	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 		return state, fmt.Errorf("resolving the A2A bus's server count: %w", err)
 	}

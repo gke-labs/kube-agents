@@ -4237,7 +4237,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
 		retiredConversionRefusedAbsent(agent) &&
-		busMigratingConditionCurrent(agent) &&
+		busMigratingConditionCurrent(agent) && busMigrationStatusCurrent(agent, a2a) &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) {
 		return nil
 	}
@@ -4676,7 +4676,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		eventWatcherUnchanged &&
 		homeChannelUnsetUnchanged &&
 		conversionRefusedUnchanged &&
-		busMigratingUnchanged &&
+		busMigratingUnchanged && busMigrationStatusCurrent(agent, a2a) &&
 		hostPathDroppedUnchanged &&
 		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&

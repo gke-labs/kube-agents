@@ -1857,3 +1857,38 @@ func TestARetryRunsFreshWorkNotTheFailedAttempts(t *testing.T) {
 		t.Errorf("no fresh unpin Job for the retry: %v", err)
 	}
 }
+
+// A run's status change that moves neither the A2ABusMigrating condition nor
+// the count (the freeze confirmed, here) is still written: the next pass
+// reads the stored status, and an unwritten confirmation would leave
+// Freezing waiting until its deadline.
+func TestARunStatusChangeAloneIsWritten(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(busMigrationFreezing),
+		Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	ctx := context.Background()
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{}); err != nil { // bring the conditions current
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	state := a2aProvisionState{busReplicasPersisted: agent.Status.BusReplicas, busMigrationPersisted: agent.Status.BusMigration.DeepCopy(), busMigrationCaptured: true}
+	agent.Status.BusMigration.FreezeConfirmed = true // what this pass's advance did
+	if err := r.syncA2AConditions(ctx, agent, state); err != nil {
+		t.Fatal(err)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatal(err)
+	}
+	if !stored.Status.BusMigration.FreezeConfirmed {
+		t.Error("the freeze's confirmation was not written")
+	}
+}
