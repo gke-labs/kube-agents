@@ -11,6 +11,7 @@ they do for the repository.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import sys
 import tempfile
@@ -24,9 +25,12 @@ if str(_REPO_ROOT) not in sys.path:
 
 from scripts.check_cluster_reads import (  # noqa: E402
     ALLOWLIST,
+    FLAGS_WITH_VALUE,
     RULE_MULTI_KIND,
     RULE_UNPAGED,
+    RULE_UNRESOLVED,
     SCAN_ROOT,
+    SKIP_PATH_PREFIXES,
     check,
     count_lines,
     judge,
@@ -62,6 +66,14 @@ class JudgeTest(unittest.TestCase):
         self.assertIsNone(judge(_tokens("kubectl get pods -A --chunk-size 500 -o json"), python_argv=False))
         self.assertEqual(judge(_tokens("kubectl get pods,svc -A -o json --chunk-size=500"), python_argv=False), RULE_MULTI_KIND)
 
+    def test_chunk_size_zero_disables_paging(self):
+        self.assertEqual(judge(_tokens("kubectl get pods -A -o json --chunk-size=0"), python_argv=False), RULE_UNPAGED)
+        self.assertEqual(judge(_tokens("kubectl get pods -A --chunk-size 0 -o json"), python_argv=False), RULE_UNPAGED)
+
+    def test_all_is_several_kinds(self):
+        self.assertEqual(judge(_tokens("kubectl get all -A -o json"), python_argv=False), RULE_MULTI_KIND)
+        self.assertEqual(judge(_tokens("kubectl get all -A -o json --chunk-size=500"), python_argv=False), RULE_MULTI_KIND)
+
     def test_projections_pass(self):
         for line in (
             "kubectl get pods -A -o jsonpath={.items[*].metadata.name}",
@@ -76,22 +88,60 @@ class JudgeTest(unittest.TestCase):
     def test_raw_with_limit_passes(self):
         self.assertIsNone(judge(_tokens("kubectl get --raw /api/v1/pods?limit=500"), python_argv=False))
         self.assertIsNone(judge(_tokens("kubectl get --raw=/api/v1/pods?limit=500"), python_argv=False))
+        self.assertIsNone(judge(_tokens("kubectl get --raw '/apis/apps/v1/deployments?limit=500&continue=abc'"), python_argv=False))
+
+    def test_raw_whole_cluster_collection_without_limit_is_unpaged(self):
+        for url in ("/api/v1/pods", "/apis/apps/v1/deployments", "/api/v1/namespaces", "/apis/metrics.k8s.io/v1beta1/nodes"):
+            with self.subTest(url=url):
+                self.assertEqual(judge(_tokens(f"kubectl get --raw {url}"), python_argv=False), RULE_UNPAGED)
+                self.assertEqual(judge(["kubectl", "get", "--raw", url], python_argv=True), RULE_UNPAGED)
+
+    def test_raw_namespaced_object_discovery_and_health_paths_pass(self):
+        for url in (
+            "/api/v1/namespaces/kube-system/pods",
+            "/api/v1/nodes/gke-node-1",
+            "/apis/apps/v1",
+            "/api",
+            "/healthz",
+            "/metrics",
+        ):
+            with self.subTest(url=url):
+                self.assertIsNone(judge(_tokens(f"kubectl get --raw {url}"), python_argv=False))
 
     def test_namespaced_and_single_object_reads_pass(self):
         for line in (
             "kubectl get pods -n kube-system -o json",
             "kubectl get deploy/web -o json",
             "kubectl get pods web -o json",
-            "kubectl get pods -A -o json web",
+            "kubectl get pods web -n kube-system -o json",
         ):
             with self.subTest(line=line):
                 self.assertIsNone(judge(_tokens(line), python_argv=False))
+
+    def test_an_unknown_flag_value_after_the_kinds_does_not_hide_the_read(self):
+        for line in (
+            "kubectl get pods -A -o json -v 6",
+            "kubectl get pods -A -o json --timeout 10s",
+            "kubectl get pods -A -o json --some-new-flag value",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(judge(_tokens(line), python_argv=False), RULE_UNPAGED)
+        self.assertEqual(judge(["kubectl", "get", "pods", "-A", "-o", "json", None], python_argv=True), RULE_UNPAGED)
 
     def test_global_flags_and_env_prefix(self):
         self.assertEqual(judge(_tokens("kubectl --context $CTX get gcp -A -o json"), python_argv=False), RULE_UNPAGED)
         self.assertEqual(judge(_tokens("kubectl --kubeconfig /k get a,b -A -o json"), python_argv=False), RULE_MULTI_KIND)
         self.assertEqual(judge(_tokens("KUBECONFIG=$KC kubectl get a,b -A -o json"), python_argv=False), RULE_MULTI_KIND)
         self.assertEqual(judge(_tokens("env KUBECONFIG=$KC kubectl get a,b -A -o json"), python_argv=False), RULE_MULTI_KIND)
+
+    def test_a_command_word_before_kubectl_does_not_hide_the_read(self):
+        for line in (
+            "timeout 30 kubectl get pods -A -o json",
+            "time kubectl get pods -A -o json",
+            "sudo /usr/local/bin/kubectl get pods -A -o json",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(judge(_tokens(line), python_argv=False), RULE_UNPAGED)
 
     def test_other_subcommands_and_other_commands_pass(self):
         for line in (
@@ -105,15 +155,19 @@ class JudgeTest(unittest.TestCase):
 
     def test_python_reading_bare_get_and_implicit_output(self):
         self.assertEqual(judge(["get", "svc", "-A"], python_argv=True), RULE_UNPAGED)
+        self.assertEqual(judge([None, "get", "svc", "-A"], python_argv=True), RULE_UNPAGED)
+        self.assertIsNone(judge([None, "-o", "json"], python_argv=True))
         self.assertEqual(judge(["get", "svc,ing", "-A"], python_argv=True), RULE_MULTI_KIND)
         self.assertEqual(judge(["kubectl", "get", "svc", "-A"], python_argv=True), RULE_UNPAGED)
         self.assertIsNone(judge(["get", "svc", "-A", "-o", "custom-columns=NAME:.metadata.name"], python_argv=True))
         self.assertIsNone(judge(["get", "svc"], python_argv=True))
         self.assertIsNone(judge(["get", "list", "watch"], python_argv=True))
 
-    def test_unknown_kinds_token_is_a_dump(self):
-        self.assertEqual(judge(["kubectl", "get", None, "-A", "-o", "json"], python_argv=True), RULE_MULTI_KIND)
-        self.assertEqual(judge(["kubectl", "get", "{}", "-A", "-o", "json"], python_argv=True), RULE_MULTI_KIND)
+    def test_unknown_kinds_token_has_its_own_rule_and_no_flag_clears_it(self):
+        self.assertEqual(judge(["kubectl", "get", None, "-A", "-o", "json"], python_argv=True), RULE_UNRESOLVED)
+        self.assertEqual(judge(["kubectl", "get", "{}", "-A", "-o", "json"], python_argv=True), RULE_UNRESOLVED)
+        self.assertEqual(judge(["kubectl", "get", None, "-A", "-o", "json", "--chunk-size=500"], python_argv=True), RULE_UNRESOLVED)
+        self.assertIsNone(judge(["kubectl", "get", None, "-n", "x", "-o", "json"], python_argv=True))
 
     def test_unknown_output_format_passes(self):
         self.assertIsNone(judge(["kubectl", "get", "pods", "-A", "-o", None], python_argv=True))
@@ -161,10 +215,53 @@ class PythonReadingTest(unittest.TestCase):
                 return [KUBECTL, "get", resources, *([ALL_NAMESPACES_FLAG] if namespaced else []), *JSON_OUTPUT_ARGS]
             '''
         )
-        self.assertEqual([(f.line, f.rule) for f in found], [(6, RULE_MULTI_KIND)])
+        self.assertEqual([(f.line, f.rule) for f in found], [(6, RULE_UNRESOLVED)])
         self.assertEqual(found[0].text, "kubectl get {} -A -o json")
 
-    def test_fstring_projection_passes_and_fstring_kinds_is_a_dump(self):
+    def test_loop_variable_is_judged_once_per_element_of_the_enclosing_loop(self):
+        found = self._findings(
+            '''
+            SYNC_KINDS = ("rootsyncs.configsync.gke.io", "reposyncs.configsync.gke.io")
+            CRDS = ("a.example.io", "b.example.io", "c.example.io")
+            def run(run_and_gate):
+                for kind in CRDS:
+                    pass
+                for kind in SYNC_KINDS:
+                    run_and_gate(["kubectl", "get", kind, "-A", "-o", "json", "--chunk-size=500"])
+                for kind in SYNC_KINDS:
+                    run_and_gate(["kubectl", "get", kind, "-A", "-o", "json"])
+            '''
+        )
+        self.assertEqual(
+            [(f.line, f.rule, f.text) for f in found],
+            [
+                (10, RULE_UNPAGED, "kubectl get rootsyncs.configsync.gke.io -A -o json"),
+                (10, RULE_UNPAGED, "kubectl get reposyncs.configsync.gke.io -A -o json"),
+            ],
+        )
+
+    def test_spliced_helper_prefix_and_shell_strings_are_read(self):
+        found = self._findings(
+            '''
+            import subprocess
+            def _kubectl(kc):
+                return ["kubectl", "--kubeconfig", kc]
+            def run(kc):
+                """Docstring: kubectl get pods,svc -A -o json is not read here."""
+                a = [*_kubectl(kc), "get", "pods,svc", "-A", "-o", "json"]
+                b = _kubectl(kc) + ["get", "pods,svc", "-A", "-o", "json"]
+                c = subprocess.run("kubectl get pods,svc -A -o json", shell=True)
+                d = subprocess.run("KUBECONFIG=x kubectl get pods -A -o json 2>/dev/null".split())
+                e = "the read `kubectl get pods -A` answered nothing"
+                return a, b, c, d, e
+            '''
+        )
+        self.assertEqual(
+            [(f.line, f.rule) for f in found],
+            [(7, RULE_MULTI_KIND), (8, RULE_MULTI_KIND), (9, RULE_MULTI_KIND), (10, RULE_UNPAGED)],
+        )
+
+    def test_fstring_projection_passes_and_fstring_kinds_is_unresolved(self):
         found = self._findings(
             '''
             TEMPLATE = "{.items[*].metadata.name}"
@@ -174,7 +271,7 @@ class PythonReadingTest(unittest.TestCase):
                 return a, b
             '''
         )
-        self.assertEqual([(f.line, f.rule) for f in found], [(5, RULE_MULTI_KIND)])
+        self.assertEqual([(f.line, f.rule) for f in found], [(5, RULE_UNRESOLVED)])
 
     def test_single_kind_with_and_without_chunk_size(self):
         found = self._findings(
@@ -216,10 +313,15 @@ class ShellAndMarkdownReadingTest(unittest.TestCase):
                   -A -o json > "$OUT"
                 kubectl get pods -A | grep -v Running
                 kubectl get pods -A -o json | jq '.items[]'
+                kubectl get deploy,sts -A -o json 2>/dev/null > state.json
+                kubectl get pods -A -o json 2>&1 | head
                 '''
             ),
         )
-        self.assertEqual([(f.line, f.rule) for f in found], [(4, RULE_MULTI_KIND), (7, RULE_UNPAGED)])
+        self.assertEqual(
+            [(f.line, f.rule) for f in found],
+            [(4, RULE_MULTI_KIND), (7, RULE_UNPAGED), (8, RULE_MULTI_KIND), (9, RULE_UNPAGED)],
+        )
 
     def test_markdown_fence_and_span_fail_and_prose_does_not(self):
         found = markdown_findings(
@@ -243,6 +345,18 @@ class ShellAndMarkdownReadingTest(unittest.TestCase):
             [(f.line, f.rule) for f in found],
             [(5, RULE_MULTI_KIND), (8, RULE_MULTI_KIND), (9, RULE_UNPAGED), (9, RULE_UNPAGED)],
         )
+
+    def test_fence_on_a_numbered_list_line(self):
+        page = textwrap.dedent(
+            '''
+            1. ```bash
+               kubectl get pods,svc -A -o json
+               ```
+            2. Then read the file; kubectl get pods -A -o json is prose here.
+            '''
+        )
+        found = markdown_findings(Path("agents/x.md"), page)
+        self.assertEqual([(f.line, f.rule) for f in found], [(3, RULE_MULTI_KIND)])
 
     def test_stray_backtick_does_not_pair_across_a_blank_line(self):
         page = "A stray ` here.\n\nNever run kubectl get pods -A -o json on a big cluster` again.\n"
@@ -402,6 +516,25 @@ class RepositoryGateTest(unittest.TestCase):
         self.assertEqual(errors, [], "\n".join(errors))
         self.assertGreater(files, 0)
         self.assertGreater(pinned, 0)
+
+
+class SiblingVocabularyTest(unittest.TestCase):
+    """The two facts this check copies from elsewhere in the tree stay equal to their owners."""
+
+    def test_flags_with_value_cover_the_transcript_readers_table(self):
+        spec = importlib.util.spec_from_file_location(
+            "worker_transcript", _REPO_ROOT / "agents" / "platform" / "scripts" / "worker_transcript.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        owned = module.KUBECTL_VALUE_FLAGS | module.KUBECTL_FILE_FLAGS
+        self.assertEqual(owned - FLAGS_WITH_VALUE, set(), "add the flag to FLAGS_WITH_VALUE in check_cluster_reads.py")
+
+    def test_skip_prefix_is_the_overlay_tools_mirrored_skill_path(self):
+        from scripts import skill_overlay
+
+        mirrored = skill_overlay.SKILLS_ROOT.relative_to(SCAN_ROOT).as_posix() + "/" + skill_overlay.UPSTREAM_SKILL_PREFIX
+        self.assertEqual(SKIP_PATH_PREFIXES, (mirrored,))
 
 
 if __name__ == "__main__":

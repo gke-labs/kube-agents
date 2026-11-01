@@ -2,8 +2,8 @@
 # scripts/check_cluster_reads.py arrived, pinned at the count each file had
 # that day. One entry per line: `<path> <rule> <count> <reason>`, the path
 # relative to the repository root, the rule as the check reports it
-# (`multi-kind-dump` or `unpaged-list`), the count above zero, the reason the
-# rest of the line.
+# (`multi-kind-dump`, `unpaged-list` or `unresolved-kinds`), the count above
+# zero, the reason the rest of the line.
 #
 # The list only shrinks. The check fails when a file has more findings than
 # its entry (a rise), when it has fewer (lower the count, or remove the entry
@@ -32,14 +32,15 @@ agents/platform/governance/stockout_prevention_sop.md multi-kind-dump 2 the stoc
 agents/platform/scripts/audit_certificates.py unpaged-list 3 the certificate collector lists Certificates, Issuers and ManagedCertificates one kind per call; its helper appends -o json
 agents/platform/scripts/audit_networking.py unpaged-list 6 the networking collector lists Services, Ingresses, Gateways, HTTPRoutes, BackendConfigs and HealthCheckPolicies one kind per call; its helper appends -o json
 agents/platform/scripts/audit_storage.py unpaged-list 1 the storage collector's PVC list; its helper appends -o json
-agents/platform/skills/fleet-audit/scripts/collect.py multi-kind-dump 6 the fleet-audit collector's shared workload dump, the compliance dumps of workloads, RBAC objects and NetworkPolicies, and the per-kind Config Sync loop whose kind is a loop variable
-agents/platform/skills/fleet-audit/scripts/collect.py unpaged-list 6 the fleet-audit collector's single-kind Service, ccnp, Config Connector, ServiceAccount and ComputeClass reads
+agents/platform/skills/capacity-obtainability/SKILL.md unpaged-list 1 the skill's raw read of the metrics API's node list, one entry per node
+agents/platform/skills/fleet-audit/scripts/collect.py multi-kind-dump 5 the fleet-audit collector's shared workload dump and the compliance dumps of workloads (twice), RBAC objects and NetworkPolicies
+agents/platform/skills/fleet-audit/scripts/collect.py unpaged-list 8 the fleet-audit collector's single-kind Service (twice), ccnp, Config Connector, ServiceAccount and ComputeClass reads, and the Config Sync loop's RootSync and RepoSync reads
 agents/platform/skills/fleet-audit/scripts/fleet_stockout.py multi-kind-dump 1 the stockout collector's one dump of ComputeClasses, workloads, StorageClasses and Nodes per cluster
 agents/platform/skills/fleet-audit/scripts/fleet_waste.py multi-kind-dump 1 the waste collector's fifteen-kind dump per cluster
 agents/platform/skills/fleet-audit/scripts/upgrade_retrospective.py multi-kind-dump 2 the retrospective's owner (ReplicaSet, Job) and workload (Deployment, DaemonSet, StatefulSet, CronJob) reads per cluster
 agents/platform/skills/fleet-audit/scripts/upgrade_retrospective.py unpaged-list 4 the retrospective's Pod, warning Event, PDB and EndpointSlice reads per cluster
 agents/platform/skills/fleet-upgrade-verification/SKILL.md multi-kind-dump 3 the skill's description of the report script's grouped reads: PDBs with workloads, the webhook group, the per-entry-rule group
 agents/platform/skills/fleet-upgrade-verification/SKILL.md unpaged-list 1 the skill's description of the report script's Pod read, taken apart so a cut read costs only the rules that need Pods
-agents/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py multi-kind-dump 1 the report script's one read helper takes the kinds as a parameter, so the helper is the site and every grouped read counts once
+agents/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py unresolved-kinds 1 the report script's one read helper takes the kinds as a parameter, so the helper is the site and every grouped read counts once
 agents/platform/skills/gitops-helm-chart/SKILL.md unpaged-list 4 the GitOps controller discovery reads (Argo CD Applications, Flux Kustomizations, Config Sync RootSyncs and RepoSyncs) the skill tells the model to run
 agents/platform/skills/submit-suggestion/SKILL.md unpaged-list 4 the same GitOps controller discovery reads, run against the target cluster's kubeconfig

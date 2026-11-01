@@ -5,20 +5,31 @@ A ``kubectl get <kinds> -A -o json`` returns every object of every kind named,
 in every namespace, as one reply. In the agent's shell that reply crosses the
 credential proxy, which cuts it at its output cap, so on a large cluster the
 read fails and the collector or the model that issued it works from nothing.
-Seven collectors and the upgrade scripts read clusters that way today, and
-the SOPs and skills tell the model to run the same shape. Nothing stopped a
-new one being added; this check does. Two rules:
+The collectors and the upgrade scripts read clusters that way when this
+check arrived (``scripts/cluster_reads_allowlist.txt`` lists them), and the
+SOPs and skills tell the model to run the same shape. Nothing stopped a new
+one being added; this check does. Three rules:
 
 * ``multi-kind-dump``: a ``get`` whose kinds token names several kinds (holds
-  a comma) or a kinds token the check cannot resolve to a string, with
-  ``-A``/``--all-namespaces`` and full objects out (``-o json`` or ``yaml``).
-* ``unpaged-list``: one kind, the same flags, with neither ``--chunk-size``
-  nor a ``limit=`` query, so the list is asked for in one page.
+  a comma, or is ``all``), with ``-A``/``--all-namespaces`` and full objects
+  out (``-o json`` or ``yaml``).
+* ``unpaged-list``: one kind, the same flags, with no ``--chunk-size`` above
+  zero, so the list is asked for in one page; and a ``get --raw`` of a
+  whole-cluster collection (``/api/v1/<kind>``, ``/apis/<group>/<version>/<kind>``)
+  with no ``limit=`` in the URL.
+* ``unresolved-kinds``: the same flags with a kinds token the check cannot
+  read (a parameter, an f-string), so it cannot show the read is one kind,
+  and no flag on the line clears it.
 
-Reads that pass: a namespaced ``get``; a ``-o jsonpath=``, ``custom-columns=``,
-``name`` or ``wide`` projection; a table read with no ``-o`` at all on a
-shell line; a single object (``kind/name`` or a name after the kind); and
-``kubectl get --raw <url>`` with ``limit=`` in the URL.
+``--chunk-size`` pages the requests kubectl makes and not the reply it
+prints, so it bounds nothing the credential proxy sees; it passes the
+``unpaged-list`` rule because the issue that asked for this check names it as
+the paged form, and the remedies that bound the reply are the ones the hint
+names first. Reads that pass: a namespaced ``get``; a ``-o jsonpath=``,
+``custom-columns=``, ``name`` or ``wide`` projection; a table read with no
+``-o`` at all on a shell line; a single object (``kind/name``, or a name
+after the kind without ``-A``); and a ``--raw`` URL that names a namespace or
+carries ``limit=``.
 
 What is read, under ``agents/`` with the mirrored ``gke-*`` skills skipped
 (their text changes on sync and is edited through the overlay):
@@ -26,14 +37,18 @@ What is read, under ``agents/`` with the mirrored ``gke-*`` skills skipped
 * ``*.py`` through ``ast``: every list and tuple literal is walked and judged
   as the argv it builds. Names resolve against the module's top-level string
   and sequence constants, a starred name or literal splices its elements, a
-  starred conditional splices both branches, and an f-string resolves to its
-  constant text with ``{}`` where a value goes. A token that resolves to
-  nothing is unknown; an unknown kinds token is a multi-kind dump, since the
-  check cannot show it is one kind. A list that opens with ``get`` and
-  carries ``-A`` with no ``-o`` is judged full-object: the audit scripts pass
-  such lists to a helper that appends ``-o json``. Test files (``test_*.py``)
-  and ``testdata/`` trees are not read.
-* ``*.sh``: every command line, continuations joined, comments dropped.
+  starred conditional splices both branches, a starred call splices one
+  unknown token (a helper's prefix, stepped over as ``kubectl`` would be), an
+  f-string resolves to its constant text with ``{}`` where a value goes, and
+  a ``for`` loop over a literal sequence judges its body once per element. A
+  list that opens with ``get`` and carries ``-A`` with no ``-o`` is judged
+  full-object: the audit scripts pass such lists to a helper that appends
+  ``-o json``. A string literal that carries ``kubectl`` is read as a shell
+  line (``shell=True``, ``.split()``), docstrings excepted. Test files
+  (``test_*.py``) and ``testdata/`` trees are not read.
+* ``*.sh``: every command line, continuations joined, comments dropped, each
+  simple command of a pipeline on its own, ``kubectl`` found wherever it
+  stands in it (after ``KUBECONFIG=... ``, ``env``, ``timeout 60``).
 * ``*.md``: the fenced code blocks and the inline code spans. Prose is not
   read, so a sentence that names the shape to warn against it is not a hit.
 
@@ -86,10 +101,18 @@ TESTDATA_DIR = "testdata"
 # The two rules, named as the report and the allow-list spell them.
 RULE_MULTI_KIND = "multi-kind-dump"
 RULE_UNPAGED = "unpaged-list"
-RULES = (RULE_MULTI_KIND, RULE_UNPAGED)
+RULE_UNRESOLVED = "unresolved-kinds"
+RULES = (RULE_MULTI_KIND, RULE_UNPAGED, RULE_UNRESOLVED)
 RULE_HINTS = {
-    RULE_MULTI_KIND: "several kinds across every namespace as full objects: read one kind per call, paged",
-    RULE_UNPAGED: "one kind across every namespace as full objects in one page: add --chunk-size, or limit= on a --raw URL",
+    RULE_MULTI_KIND: "several kinds across every namespace as full objects: read one kind per call",
+    RULE_UNPAGED: (
+        "one kind across every namespace as full objects in one reply: project the fields (-o jsonpath=, "
+        "custom-columns=), read per namespace, or page it (--chunk-size above 0; limit= on a --raw URL)"
+    ),
+    RULE_UNRESOLVED: (
+        "the kinds are not a literal this check can read, so it cannot show the read is one kind: "
+        "pass a literal kind per call, or pin the site with a reason"
+    ),
 }
 
 # The kubectl vocabulary the rules read.
@@ -105,24 +128,40 @@ OUTPUT_LONG_FLAG = "--output"
 OUTPUT_FLAGS = (OUTPUT_SHORT_FLAG, OUTPUT_LONG_FLAG)
 FULL_OBJECT_FORMATS = ("json", "yaml")
 CHUNK_SIZE_FLAG = "--chunk-size"
+# kubectl documents `--chunk-size=0` as "disable chunking".
+CHUNK_SIZE_DISABLED = "0"
 RAW_FLAG = "--raw"
 LIMIT_QUERY = "limit="
+# A `--raw` URL that lists a whole-cluster collection: the core or a group
+# API, a version, one resource segment and nothing after it but a query. A
+# namespaced path (`/api/v1/namespaces/<ns>/pods`), a single object
+# (`/api/v1/nodes/<name>`) and a discovery or health path have another shape.
+RAW_COLLECTION_RE = re.compile(r"^/(?:api/v1|apis/[^/]+/[^/]+)/[^/?]+(?:\?|$)")
 KIND_SEPARATOR = ","
+# `kubectl get all` expands to several kinds on the server.
+ALL_KINDS_ALIAS = "all"
 NAME_SEPARATOR = "/"
 FLAG_PREFIX = "-"
+LONG_FLAG_PREFIX = FLAG_PREFIX * 2
 FLAG_VALUE_SEPARATOR = "="
 # `-o` is a short flag; `-ojson` is the same flag with its value glued on.
 SHORT_FLAG_LENGTH = 2
+# A flag that took the next token as its value spans two tokens.
+FLAG_WITH_VALUE_WIDTH = 2
 # Flags that take the next token as their value when not written with `=`,
-# so that value is never mistaken for the kinds. kubectl's own `get` flags,
-# the global ones a command line carries, and the ones its tests have seen.
+# so that value is never mistaken for the kinds: kubectl's `get` flags and
+# the global ones a command line carries. The credential proxy's transcript
+# reader keeps the same table (`KUBECTL_VALUE_FLAGS` and `KUBECTL_FILE_FLAGS`
+# in agents/platform/scripts/worker_transcript.py); the test holds this set
+# to be a superset of those two, so a flag added there is added here.
 FLAGS_WITH_VALUE = frozenset(
     {
         "-n", "--namespace", "-l", "--selector", "--field-selector", "-L", "--label-columns",
-        "--sort-by", "--template", "--chunk-size", "--request-timeout", "--context", "--kubeconfig",
-        "--cluster", "--user", "--token", "-s", "--server", "--as", "--as-group", "--as-uid",
-        "--cache-dir", "--certificate-authority", "--client-certificate", "--client-key",
-        "--tls-server-name", "--output-watch-events", "--subresource", "--raw",
+        "--sort-by", "--template", "--chunk-size", "--request-timeout", "--timeout", "--context",
+        "--kubeconfig", "--cluster", "--user", "--token", "-s", "--server", "--as", "--as-group",
+        "--as-uid", "--cache-dir", "--certificate-authority", "--client-certificate", "--client-key",
+        "--tls-server-name", "--output-watch-events", "--subresource", "--raw", "-f", "--filename",
+        "-k", "--kustomize", "-v", "--v", "--field-manager", "--profile", "--profile-output",
         OUTPUT_SHORT_FLAG, OUTPUT_LONG_FLAG,
     }
 )
@@ -133,8 +172,11 @@ FLAGS_WITH_VALUE = frozenset(
 # as their own argv. A line the lexer refuses (an unbalanced quote in an SOP
 # fragment) is split on whitespace instead, so it is still read.
 SHELL_PUNCTUATION = set("|&;<>()")
-# What may stand before the command word: `KUBECONFIG=$KC kubectl ...`, with
-# or without `env`.
+# The file descriptor of a redirection (`2>/dev/null`, `2>&1`) comes off the
+# lexer as its own word before the `>`; it is not an argument.
+REDIRECT_CHARS = set("<>")
+# What may stand before a bare `get` in the Python reading: a `NAME=value`
+# assignment, `env`, or a spliced helper prefix the check could not read.
 ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 ENV_COMMAND = "env"
 # An SOP's `<ctx>` or `<target kubeconfig>` is a placeholder, not a pair of
@@ -149,12 +191,13 @@ SHELL_CONTINUATION = "\\"
 FORMAT_PLACEHOLDER = "{}"
 
 # Markdown reading: a fence opens on a line whose first non-blank characters
-# (after list or quote markers) are three backticks or tildes and closes on
-# the next such line; the lines between are shell lines. Outside fences, a
-# code span is a run of backticks closed by a run of the same length, and may
-# wrap onto the next line but not across a blank one (a paragraph ends there,
-# so a stray backtick pairs with nothing past it).
-FENCE_RE = re.compile(r"^[\s>*+-]*(?:```|~~~)")
+# (after quote markers and a bullet or numbered list marker) are three
+# backticks or tildes and closes on the next such line; the lines between are
+# shell lines. Outside fences, a code span is a run of backticks closed by a
+# run of the same length, and may wrap onto the next line but not across a
+# blank one (a paragraph ends there, so a stray backtick pairs with nothing
+# past it).
+FENCE_RE = re.compile(r"^[\s>*+-]*(?:\d+[.)]\s+)?(?:```|~~~)")
 CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(?P<code>(?:(?!\n\n).)+?)(?<!`)\1(?!`)", re.DOTALL)
 LINE_BREAK = "\n"
 SPACE = " "
@@ -231,14 +274,14 @@ def is_flag(token: Token) -> bool:
 
 def flag_name(token: str) -> str:
     """`--output=json` -> `--output`; `-ojson` -> `-o`; a long flag is itself."""
-    if token.startswith(FLAG_PREFIX * 2):
+    if token.startswith(LONG_FLAG_PREFIX):
         return token.split(FLAG_VALUE_SEPARATOR, 1)[0]
     return token[:SHORT_FLAG_LENGTH]
 
 
 def flag_value(token: str, following: Token) -> tuple[Token, bool]:
     """The value a flag carries and whether it consumed the following token."""
-    if token.startswith(FLAG_PREFIX * 2):
+    if token.startswith(LONG_FLAG_PREFIX):
         if FLAG_VALUE_SEPARATOR in token:
             return token.split(FLAG_VALUE_SEPARATOR, 1)[1], False
         return following, True
@@ -247,24 +290,31 @@ def flag_value(token: str, following: Token) -> tuple[Token, bool]:
     return following, True
 
 
+def is_kubectl(token: Token) -> bool:
+    return token == KUBECTL or (token is not None and token.endswith(KUBECTL_PATH_SUFFIX))
+
+
 def get_argv_start(tokens: list[Token], bare_get: bool) -> int | None:
     """Index of the `get` verb when the tokens are a `kubectl get` argv, else None.
 
-    Leading `NAME=value` assignments and an `env` word are stepped over
-    (`KUBECONFIG=$KC kubectl get ...`). Between `kubectl` and `get` only flags
+    `kubectl` may stand anywhere in the simple command (`KUBECONFIG=$KC
+    kubectl ...`, `timeout 60 kubectl ...`). Between it and `get` only flags
     and their values may sit (`--kubeconfig x get ...`); any other word is
-    another subcommand. With `bare_get`, a list that opens with `get` is an
-    argv too: the Python reading, where a helper prepends `kubectl`.
+    another subcommand. With `bare_get`, the Python reading, a list that
+    opens with `get` after assignments, `env` or tokens the check could not
+    read (a spliced helper prefix) is an argv too: a helper prepends
+    `kubectl`.
     """
-    index = 0
-    while index < len(tokens) and (tokens[index] == ENV_COMMAND or ENV_ASSIGNMENT_RE.match(tokens[index] or "")):
-        index += 1
-    if index >= len(tokens):
-        return None
-    if bare_get and tokens[index] == GET:
-        return index
-    if tokens[index] != KUBECTL and not (tokens[index] or "").endswith(KUBECTL_PATH_SUFFIX):
-        return None
+    index = next((i for i, token in enumerate(tokens) if is_kubectl(token)), None)
+    if index is None:
+        if not bare_get:
+            return None
+        index = 0
+        while index < len(tokens) and (
+            tokens[index] is None or tokens[index] == ENV_COMMAND or ENV_ASSIGNMENT_RE.match(tokens[index])
+        ):
+            index += 1
+        return index if index < len(tokens) and tokens[index] == GET else None
     index += 1
     while index < len(tokens):
         token = tokens[index]
@@ -273,7 +323,7 @@ def get_argv_start(tokens: list[Token], bare_get: bool) -> int | None:
         if not is_flag(token):
             return None
         _, consumed = flag_value(token, None)
-        index += 2 if consumed and flag_name(token) in FLAGS_WITH_VALUE else 1
+        index += FLAG_WITH_VALUE_WIDTH if consumed and flag_name(token) in FLAGS_WITH_VALUE else 1
     return None
 
 
@@ -316,24 +366,30 @@ def judge(tokens: list[Token], python_argv: bool) -> str | None:
             if name in OUTPUT_FLAGS:
                 output, output_named = value, True
             elif name == CHUNK_SIZE_FLAG:
-                paged = True
+                paged = value is not None and value != CHUNK_SIZE_DISABLED
             elif name == RAW_FLAG:
                 raw_url = value
-            index += 2 if consumed and name in FLAGS_WITH_VALUE else 1
+            index += FLAG_WITH_VALUE_WIDTH if consumed and name in FLAGS_WITH_VALUE else 1
             continue
         positionals.append(token)
         index += 1
-    if raw_url is not None and LIMIT_QUERY in raw_url:
+    if raw_url is not None:
+        if LIMIT_QUERY in raw_url or not RAW_COLLECTION_RE.match(raw_url):
+            return None
+        return RULE_UNPAGED
+    if not all_namespaces or not positionals:
         return None
-    if not all_namespaces or len(positionals) != 1:
-        return None
+    # kubectl refuses a name with -A, so the first positional is the kinds
+    # and anything after it is the value of a flag this check does not know.
     kinds = positionals[0]
-    if kinds is not None and NAME_SEPARATOR in kinds:
-        return None
     full_object = output in FULL_OBJECT_FORMATS if output_named else python_argv
     if not full_object:
         return None
-    if kinds is None or KIND_SEPARATOR in kinds or FORMAT_PLACEHOLDER in kinds:
+    if kinds is None or FORMAT_PLACEHOLDER in kinds:
+        return RULE_UNRESOLVED
+    if NAME_SEPARATOR in kinds:
+        return None
+    if KIND_SEPARATOR in kinds or kinds == ALL_KINDS_ALIAS:
         return RULE_MULTI_KIND
     if paged:
         return None
@@ -358,12 +414,25 @@ class ModuleConstants:
             elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.value is not None:
                 self.nodes[statement.target.id] = statement.value
         self.resolving: set[str] = set()
+        # A loop variable bound to each element of a literal sequence in turn
+        # (`for kind in KINDS:`), so the body is judged once per element: the
+        # loop's first and last line, its variable and the elements. The
+        # element in force while a literal is resolved sits in `bound`.
+        self.loops: list[tuple[int, int, str, list[str]]] = []
+        self.bound: dict[str, str] = {}
+        for node in ast.walk(module):
+            if isinstance(node, ast.For) and isinstance(node.target, ast.Name):
+                values = self.sequence(node.iter)
+                if values and all(isinstance(value, str) for value in values):
+                    self.loops.append((node.lineno, node.end_lineno or node.lineno, node.target.id, values))
 
     def string(self, node: ast.expr) -> Token:
         """The string a node resolves to, or None."""
         if isinstance(node, ast.Constant):
             return node.value if isinstance(node.value, str) else None
         if isinstance(node, ast.Name):
+            if node.id in self.bound:
+                return self.bound[node.id]
             return self.named_string(node.id)
         if isinstance(node, ast.JoinedStr):
             parts = []
@@ -416,6 +485,31 @@ class ModuleConstants:
         resolved = self.sequence(node)
         return [None] if resolved is None else resolved
 
+    def bindings(self, node: ast.expr) -> Iterator[dict[str, str]]:
+        """Each binding of the loop variable a literal names directly, from the innermost loop enclosing it.
+
+        One empty binding when it names none; a loop variable that shadows a
+        module constant is read as the constant.
+        """
+        names = {element.id for element in node.elts if isinstance(element, ast.Name) and element.id not in self.nodes}
+        enclosing = [loop for loop in self.loops if loop[2] in names and loop[0] <= node.lineno <= loop[1]]
+        if not enclosing:
+            yield {}
+            return
+        _, _, name, values = max(enclosing, key=lambda loop: loop[0])
+        for value in values:
+            yield {name: value}
+
+
+def docstring_ids(module: ast.Module) -> set[int]:
+    """The ids of the string constants that are docstrings."""
+    ids = set()
+    for node in ast.walk(module):
+        body = getattr(node, "body", None)
+        if isinstance(body, list) and body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            ids.add(id(body[0].value))
+    return ids
+
 
 def python_findings(path: Path, text: str) -> list[Finding]:
     try:
@@ -423,16 +517,27 @@ def python_findings(path: Path, text: str) -> list[Finding]:
     except SyntaxError:
         return []
     constants = ModuleConstants(module)
+    docstrings = docstring_ids(module)
     findings = []
     for node in ast.walk(module):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and KUBECTL in node.value and id(node) not in docstrings:
+            for offset, line in enumerate(node.value.splitlines()):
+                for argv in commands(line):
+                    rule = judge(argv, python_argv=False)
+                    if rule is not None:
+                        findings.append(Finding(path, node.lineno + offset, rule, render(argv)))
+            continue
         if not isinstance(node, (ast.List, ast.Tuple)):
             continue
-        tokens = constants.sequence(node)
-        if tokens is None:
-            continue
-        rule = judge(tokens, python_argv=True)
-        if rule is not None:
-            findings.append(Finding(path, node.lineno, rule, render(tokens)))
+        for binding in constants.bindings(node):
+            constants.bound = binding
+            tokens = constants.sequence(node)
+            constants.bound = {}
+            if tokens is None:
+                continue
+            rule = judge(tokens, python_argv=True)
+            if rule is not None:
+                findings.append(Finding(path, node.lineno, rule, render(tokens)))
     return findings
 
 
@@ -452,8 +557,11 @@ def shell_tokens(line: str) -> list[str]:
 def commands(line: str) -> Iterator[list[Token]]:
     """Each simple command on a shell line, as its tokens."""
     current: list[Token] = []
-    for token in shell_tokens(line):
+    tokens = shell_tokens(line)
+    for index, token in enumerate(tokens):
         if token and set(token) <= SHELL_PUNCTUATION:
+            if current and token[0] in REDIRECT_CHARS and current[-1].isdecimal():
+                current.pop()
             if current:
                 yield current
             current = []
