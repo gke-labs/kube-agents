@@ -12,6 +12,8 @@ import re
 import stat
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -65,6 +67,57 @@ MAX_KUBECONFIG_BYTES = 1 << 20
 # module both import; `credential_proxy` re-exports it. `ApiSession` below is
 # the client; `api_policy.API_READ_ROUTES` on the broker is what it may reach.
 API_RELAY_PREFIX = "/v1/gcp/"
+
+# The exec tier's shared names, here for the same reason as the relay prefix:
+# the broker and the shim both spell them, and this is the module both import.
+# docs/designs/credential-broker-exec-tier.md §12 is the contract, and
+# test_exec_tier_contract.py checks that these match it.
+EXEC_ROLE = "exec"
+EXEC_URL_ENV = "CREDENTIAL_PROXY_EXEC_URL"
+EXEC_REPLICAS_FILE_ENV = "CREDENTIAL_PROXY_EXEC_REPLICAS_FILE"
+EXEC_REPLICAS_FILE = "/etc/credential-proxy-exec-tier/replicas"
+BUSY_BOUND_KEY = "bound"
+ADMISSION_BOUND_DRAINING = "draining"
+ADMISSION_BOUND_BACKGROUND = "background"
+# A busy answer under one of these bounds is retried once on a new connection;
+# another replica can admit it. The session cap is a caller's own limit, and
+# the others name no replica-local shortage.
+RETRYABLE_BUSY_BOUNDS = frozenset(
+    {"slot", "budget", ADMISSION_BOUND_BACKGROUND, ADMISSION_BOUND_DRAINING, "profile"}
+)
+CLASS_INTERACTIVE = "interactive"
+CLASS_BACKGROUND = "background"
+CLASS_LABEL = "class"
+BACKGROUND_NICE = 10
+BROKER_TIER_EXEC = "exec"
+BROKER_TIER_STATEFUL = "stateful"
+AUDIT_BROKER_TIER = "broker_tier"
+AUDIT_CLASS = "class"
+AUDIT_BROKER_POD = "broker_pod"
+
+# The shim's own names for exec-tier routing; not part of the contract above.
+# The stateful broker's URL, which an exec-role call falls back on when the exec
+# tier cannot be reached, and every other call uses. The exec URL is plain http,
+# as the broker's Service is: only `BrokerConnection` bounds the connect and
+# tells "nothing was sent" apart.
+BROKER_URL_ENV = "CREDENTIAL_PROXY_URL"
+# A refusal at admission, before the command starts: HTTP 503 with this code.
+# Only these are retried, and only under a bound in RETRYABLE_BUSY_BOUNDS.
+BUSY_CODE = "CREDENTIAL_PROXY_BUSY"
+BUSY_STATUS = 503
+# The one line a fallback writes. No "credential proxy" prefix and no low-level
+# cause: kubectl's failure classifiers read the whole stderr, and either would
+# make a real cluster connection failure after the fallback look like the
+# shim's own (cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE) or a broker
+# refusal look like the cluster's (CONNECTIVITY_FAILURE_RE).
+EXEC_FALLBACK_NOTICE = "exec tier not reachable; this command went to the stateful broker"
+# A connection that closed once the request was sent: the command may have run,
+# so it is never sent again. The `credential proxy error` prefix marks the line
+# as the shim's own for kubectl's failure classifiers.
+_DROPPED_LINE = "credential proxy error: the connection dropped {cause}; the command may have run"
+# The least read time a relay fallback is worth sending with; less, and the
+# caller's budget is already spent, so the error is raised instead.
+RELAY_FALLBACK_MIN_SECONDS = 1.0
 
 # Where a `get-credentials` that named no destination leaves its file:
 # `$HERMES_HOME/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
@@ -144,8 +197,36 @@ class BrokerConnection(http.client.HTTPConnection):
 
     def connect(self) -> None:
         self.timeout = BROKER_CONNECT_TIMEOUT_SECONDS
-        super().connect()
+        try:
+            super().connect()
+        except OSError as exc:
+            # The one point where "nothing was sent" is certain. urllib wraps
+            # this in a URLError as before, so a caller that reads only that
+            # sees no change.
+            raise BrokerUnreachable(str(exc)) from exc
         self.sock.settimeout(None)
+
+
+class BrokerUnreachable(OSError):
+    """No connection to the broker could be made, so no request reached it."""
+
+
+def exec_endpoints() -> tuple[str | None, str | None]:
+    """The broker an exec-role call goes to, and the one it falls back on.
+
+    The exec tier when the operator set its URL, with the stateful broker as
+    the fallback; else the stateful broker alone, as before the exec tier. A
+    fallback is only taken when no connection to the exec tier could be made
+    (`BrokerUnreachable`): then no request reached a broker, and nothing ran.
+    """
+    # Spelled out, not BROKER_URL_ENV: tests/conformance/test_C_enforcement.py
+    # (C1) pins that the shim reads this name, across the module boundary to
+    # the operator and the gateway that set it.
+    stateful = os.getenv("CREDENTIAL_PROXY_URL")
+    exec_url = os.getenv(EXEC_URL_ENV, "").strip()
+    if exec_url:
+        return exec_url, stateful or None
+    return stateful, None
 
 
 class _BrokerHTTPHandler(urllib.request.HTTPHandler):
@@ -170,7 +251,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 # A private opener rather than urllib.request.install_opener: this module is
 # imported by github_token_refresh and the two relay patches, and a global
 # opener would strip the total timeouts their own urlopen calls rely on.
-_BROKER_OPENER = urllib.request.build_opener(_BrokerHTTPHandler, _NoRedirect())
+# No proxy from the environment: the broker is an in-cluster Service, and a
+# proxy in between would make every connect succeed, so a broker that cannot
+# be reached could not be told apart from one that dropped the request.
+_BROKER_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _BrokerHTTPHandler, _NoRedirect()
+)
 
 
 def open_broker_request(request: urllib.request.Request):
@@ -868,10 +954,68 @@ def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None
     return stripped, Path(destination) if destination else None
 
 
+def _busy_reply(exc: urllib.error.HTTPError) -> dict | None:
+    """The JSON body of a refusal, or None when it has none.
+
+    The proxy's own errors are JSON, but the error can also come from whatever
+    sits between shim and proxy: an Envoy restarting mid-request answers 503
+    with an HTML body. The body is read once and kept on the error, because a
+    retry decision and the message printed after it both need it.
+    """
+    exc.shim_dropped = False
+    try:
+        payload = json.load(exc)
+    except (ValueError, TypeError):
+        exc.shim_payload = None
+        return None
+    except (http.client.HTTPException, OSError):
+        # The connection closed while the refusal's body was read.
+        exc.shim_payload = None
+        exc.shim_dropped = True
+        return None
+    exc.shim_payload = payload if isinstance(payload, dict) else None
+    if exc.shim_payload is None or exc.shim_payload.get("code") != BUSY_CODE:
+        return None
+    return exc.shim_payload
+
+
+def _exec_refused(exc: urllib.error.HTTPError, busy: dict | None) -> int:
+    """Print a refusal from `/v1/exec` the way the agent reads it, and its exit code."""
+    payload = busy if busy is not None else getattr(exc, "shim_payload", None)
+    if payload is None:
+        # A traceback here would turn a transient sidecar blip into a shim
+        # crash the agent cannot read.
+        print(
+            f"credential proxy error (HTTP {exc.code}): non-JSON response",
+            file=sys.stderr,
+        )
+        return 1
+    if payload.get("code") == "SECURITY_POLICY_BLOCKED":
+        print(
+            payload.get("message", "Command blocked for security reasons."),
+            file=sys.stderr,
+        )
+        print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
+        # The verb the policy resolved and whether this was a local render:
+        # the agent runtime's refusal stop reads these two lines.
+        if payload.get("verb"):
+            # Each word is an argv token the agent chose; keep it to one line
+            # and to the characters a verb or resource name is made of.
+            words = (_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in payload["verb"])
+            print(f"policy verb: {' '.join(words)}", file=sys.stderr)
+        if payload.get("local_render"):
+            print("policy render: local", file=sys.stderr)
+        return EXIT_SECURITY_POLICY_BLOCKED
+    print(payload.get("error", str(exc)), file=sys.stderr)
+    return 1
+
+
 def execute(
     endpoint: str,
     argv: list[str],
     stdin: str | None = None,
+    *,
+    fallback: str | None = None,
 ) -> int:
     # No `cwd`. The broker resolves a path against its own filesystem, and it
     # has no view of this one — so a directory sent from here would name either
@@ -945,49 +1089,56 @@ def execute(
         # hide the real fault, which is a broken token projection.
         print(f"credential proxy token unavailable: {exc}", file=sys.stderr)
         return 1
-    request = urllib.request.Request(
-        endpoint.rstrip("/") + "/v1/exec",
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with open_broker_request(request) as response:
-            payload = json.load(response)
-    except urllib.error.HTTPError as exc:
-        # The proxy's own errors are JSON, but the error can also come from
-        # whatever sits between shim and proxy — an Envoy restarting mid-request
-        # answers 503 with an HTML body, and a traceback here turns a transient
-        # sidecar blip into a shim crash the agent cannot read.
+    targets = [endpoint] + ([fallback] if fallback and fallback != endpoint else [])
+    retried = False
+    while True:
+        # The same bytes, `requestId` included, to whichever broker this round
+        # reaches: a fallback or a retry is the same request again.
+        request = urllib.request.Request(
+            targets[0].rstrip("/") + "/v1/exec",
+            data=body,
+            headers=headers,
+            method="POST",
+        )
         try:
-            payload = json.load(exc)
-        except (ValueError, TypeError):
-            print(
-                f"credential proxy error (HTTP {exc.code}): non-JSON response",
-                file=sys.stderr,
-            )
+            with open_broker_request(request) as response:
+                payload = json.load(response)
+            break
+        except urllib.error.HTTPError as exc:
+            reply = _busy_reply(exc)
+            if getattr(exc, "shim_dropped", False):
+                print(_DROPPED_LINE.format(cause="while the refusal was read"), file=sys.stderr)
+                return 1
+            if (
+                reply is not None
+                and fallback is not None
+                and exc.code == BUSY_STATUS
+                and not retried
+                and reply.get(BUSY_BOUND_KEY) in RETRYABLE_BUSY_BOUNDS
+            ):
+                # Refused at admission, before the command started, under a
+                # bound another replica may not be at: one retry on a new
+                # connection. Only with exec routing on: with no exec tier, or
+                # a named endpoint, the one stateful pod would refuse again,
+                # and the command path stays as it was. A fallback is not a
+                # retry (nothing ran), so this is the one retry whichever
+                # broker answered.
+                retried = True
+                exc.close()
+                continue
+            return _exec_refused(exc, reply)
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, BrokerUnreachable) and len(targets) > 1:
+                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                targets = targets[1:]
+                continue
+            print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)
             return 1
-        if payload.get("code") == "SECURITY_POLICY_BLOCKED":
-            print(
-                payload.get("message", "Command blocked for security reasons."),
-                file=sys.stderr,
-            )
-            print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
-            # The verb the policy resolved and whether this was a local render:
-            # the agent runtime's refusal stop reads these two lines.
-            if payload.get("verb"):
-                # Each word is an argv token the agent chose; keep it to one line
-                # and to the characters a verb or resource name is made of.
-                words = (_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in payload["verb"])
-                print(f"policy verb: {' '.join(words)}", file=sys.stderr)
-            if payload.get("local_render"):
-                print("policy render: local", file=sys.stderr)
-            return EXIT_SECURITY_POLICY_BLOCKED
-        print(payload.get("error", str(exc)), file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)
-        return 1
+        except (http.client.HTTPException, OSError) as exc:
+            # The request was sent and the connection dropped: the command may
+            # have run, so it is never sent again.
+            print(_DROPPED_LINE.format(cause=f"after the request was sent ({exc!r})"), file=sys.stderr)
+            return 1
 
     sys.stdout.write(payload.get("stdout", ""))
     sys.stderr.write(payload.get("stderr", ""))
@@ -1469,34 +1620,107 @@ class ApiSession:
     """
 
     def __init__(self, endpoint: str | None = None, http=None) -> None:
-        endpoint = endpoint or os.environ.get("CREDENTIAL_PROXY_URL", "")
+        # A named endpoint is used as given. Otherwise the relay is an exec-tier
+        # route, with the stateful broker as the fallback (`exec_endpoints`).
+        fallback = None
+        if not endpoint:
+            endpoint, fallback = exec_endpoints()
         if not endpoint:
             raise RuntimeError(
-                "CREDENTIAL_PROXY_URL is not set; the credential broker is the only "
+                f"{BROKER_URL_ENV} is not set; the credential broker is the only "
                 "path from here to a Google API"
             )
         self._endpoint = endpoint.rstrip("/")
+        self._fallback = fallback.rstrip("/") if fallback else None
+        # Fleet collectors share one session across a thread pool.
+        self._lock = threading.Lock()
         if http is None:
             import requests
 
             http = requests.Session()
+            # No proxy from the environment, as for the broker opener: through
+            # a proxy every connect succeeds, and the fallback would never fire.
+            http.trust_env = False
         self._http = http
 
-    def relay_url(self, url: str) -> str:
+    def relay_url(self, url: str, endpoint: str | None = None) -> str:
         """The broker URL that stands for `url`; the query is kept where it was."""
         parsed = urllib.parse.urlsplit(url)
-        relayed = f"{self._endpoint}{API_RELAY_PREFIX}{parsed.netloc}{parsed.path}"
+        relayed = f"{endpoint or self._endpoint}{API_RELAY_PREFIX}{parsed.netloc}{parsed.path}"
         if parsed.query:
             relayed += f"?{parsed.query}"
         return relayed
 
     def get(self, url: str, *, params=None, timeout=None):
-        return self._http.get(
-            self.relay_url(url),
-            params=params,
-            headers=authorization_headers(),
-            timeout=timeout,
-        )
+        caller_timeout = timeout
+        started = time.monotonic()
+        with self._lock:
+            endpoint, exec_attempt = self._endpoint, self._fallback is not None
+        if exec_attempt:
+            # The exec tier gets the shim's connect bound, as `BrokerConnection`
+            # gives it, whatever the caller's timeout; the read keeps the
+            # caller's. A missing egress peer hangs the dial rather than
+            # refusing it.
+            timeout = _exec_connect_bound(timeout)
+        try:
+            return self._http.get(
+                self.relay_url(url, endpoint),
+                params=params,
+                headers=authorization_headers(),
+                timeout=timeout,
+            )
+        except _connection_errors() as exc:
+            with self._lock:
+                if self._endpoint == endpoint and self._fallback is not None:
+                    # The first reader to fail moves the session. Every relay
+                    # call is a GET, so sending it again is safe even when the
+                    # error came after the request left, and the rest of the
+                    # session stays on the stateful broker: a missing exec
+                    # Service would otherwise cost each read its connect bound.
+                    self._endpoint, self._fallback = self._fallback, None
+                    print(f"{EXEC_FALLBACK_NOTICE} for the Cloud API relay ({exc})", file=sys.stderr)
+                moved = self._endpoint != endpoint
+            if not moved:
+                raise
+            # The caller sized its timeout for one attempt; the fallback gets
+            # what the exec attempt left of it.
+            left = _time_left(caller_timeout, time.monotonic() - started)
+            if left is False:
+                raise
+            return self.get(url, params=params, timeout=left)
+
+
+def _exec_connect_bound(timeout):
+    """A `requests` timeout whose connect part is at most the shim's connect bound."""
+    if isinstance(timeout, tuple):
+        connect, read = timeout
+    else:
+        connect, read = timeout, timeout
+    bound = BROKER_CONNECT_TIMEOUT_SECONDS if connect is None else min(connect, BROKER_CONNECT_TIMEOUT_SECONDS)
+    return (bound, read)
+
+
+def _time_left(timeout, spent: float):
+    """`timeout` less `spent` seconds of read time, or False when too little is left."""
+    if timeout is None:
+        return None
+    if isinstance(timeout, tuple):
+        connect, read = timeout
+        if read is None:
+            return timeout
+        left = read - spent
+        return (connect, left) if left >= RELAY_FALLBACK_MIN_SECONDS else False
+    left = timeout - spent
+    return left if left >= RELAY_FALLBACK_MIN_SECONDS else False
+
+
+def _connection_errors() -> tuple[type[BaseException], ...]:
+    """The errors a `requests` session raises when the relay cannot be reached."""
+    try:
+        import requests
+    except ImportError:
+        return (ConnectionError,)
+    return (requests.exceptions.ConnectionError, ConnectionError)
 
 
 def read_stdin_if_requested(argv: list[str]) -> str | None:
@@ -1518,10 +1742,12 @@ def read_stdin_if_requested(argv: list[str]) -> str | None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    # No default: a named endpoint is used as given, with no exec routing and
+    # no fallback, and an unnamed one is resolved by `exec_endpoints`.
     parser.add_argument(
         "--endpoint",
-        default=os.getenv("CREDENTIAL_PROXY_URL"),
-        required=os.getenv("CREDENTIAL_PROXY_URL") is None,
+        default=None,
+        required=exec_endpoints()[0] is None,
     )
     parser.add_argument(
         "executable",
@@ -1533,16 +1759,19 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     invoked_as = os.path.basename(sys.argv[0])
+    fallback = None
     if invoked_as in set(SUPPORTED_EXECUTABLES):
-        endpoint = os.getenv("CREDENTIAL_PROXY_URL")
+        endpoint, fallback = exec_endpoints()
         if endpoint is None:
-            print("CREDENTIAL_PROXY_URL is not configured", file=sys.stderr)
+            print(f"{BROKER_URL_ENV} is not configured", file=sys.stderr)
             raise SystemExit(1)
         argv = [invoked_as, *sys.argv[1:]]
         stdin = read_stdin_if_requested(argv)
     else:
         args = parse_args()
         endpoint = args.endpoint
+        if endpoint is None:
+            endpoint, fallback = exec_endpoints()
         argv = [args.executable, *args.arguments]
         stdin = read_stdin_if_requested(argv)
     raise SystemExit(
@@ -1550,5 +1779,6 @@ if __name__ == "__main__":
             endpoint,
             argv,
             stdin=stdin,
+            fallback=fallback,
         )
     )

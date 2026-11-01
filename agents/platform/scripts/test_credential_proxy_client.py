@@ -18,6 +18,8 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -1708,6 +1710,472 @@ class ApiSessionTest(unittest.TestCase):
         )
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertEqual("http://b/v1/gcp/h/p", completed.stdout.strip())
+
+
+def busy_error(bound, url="http://broker/v1/exec"):
+    """A 503 CREDENTIAL_PROXY_BUSY refusal as the broker sends it, `bound` omitted when None."""
+    reply = {"status": "busy", "code": credential_proxy_client.BUSY_CODE, "error": f"busy at {bound}"}
+    if bound is not None:
+        reply[credential_proxy_client.BUSY_BOUND_KEY] = bound
+    return urllib.error.HTTPError(
+        url=url, code=503, msg="Service Unavailable", hdrs=http.client.HTTPMessage(),
+        fp=io.BytesIO(json.dumps(reply).encode("utf-8")),
+    )
+
+
+def unreachable():
+    """What the opener raises when no connection to the broker could be made."""
+    return urllib.error.URLError(credential_proxy_client.BrokerUnreachable("[Errno 111] Connection refused"))
+
+
+class TestExecTierRouting(unittest.TestCase):
+    """Exec-role calls go to the exec tier, fall back when it cannot be reached,
+    and retry a refusal at admission once. docs/designs/credential-broker-exec-tier.md
+    §3.2, §4.3 and §12."""
+
+    EXEC = "http://agent-credential-proxy-exec-tier.kubeagents-system.svc.cluster.local:8765"
+    STATEFUL = "http://agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+    OK = {"exitCode": 0, "stdout": "pods\n"}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        (self.tmp / "token").write_text("caller-token\n", encoding="utf-8")
+        self.environ = {
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(self.tmp / "token"),
+            "KUBECONFIG": "",
+            "HERMES_HOME": str(self.tmp),
+        }
+
+    def run_shim(self, answers, endpoint=EXEC, fallback=STATEFUL):
+        """Send one kubectl through `execute`, answering each call from `answers` in turn."""
+        calls = []
+        answers = list(answers)
+
+        def fake_open(request, *args, **kwargs):
+            calls.append((request.full_url, json.loads(request.data)["requestId"]))
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return RecordingResponse(json.dumps(answer).encode("utf-8"))
+
+        stderr = io.StringIO()
+        with patch.dict("os.environ", self.environ, clear=False), \
+                patch.object(credential_proxy_client, "open_broker_request", fake_open), \
+                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+            code = credential_proxy_client.execute(endpoint, ["kubectl", "get", "pods"], fallback=fallback)
+        self.assertEqual([], answers, "every planned answer is used")
+        return code, calls, stderr.getvalue()
+
+    def test_the_exec_tier_is_the_target_when_its_url_is_set(self):
+        cases = {
+            "both": ({"CREDENTIAL_PROXY_EXEC_URL": self.EXEC, "CREDENTIAL_PROXY_URL": self.STATEFUL}, (self.EXEC, self.STATEFUL)),
+            "stateful only": ({"CREDENTIAL_PROXY_EXEC_URL": "", "CREDENTIAL_PROXY_URL": self.STATEFUL}, (self.STATEFUL, None)),
+            "blank exec": ({"CREDENTIAL_PROXY_EXEC_URL": "  ", "CREDENTIAL_PROXY_URL": self.STATEFUL}, (self.STATEFUL, None)),
+            "exec only": ({"CREDENTIAL_PROXY_EXEC_URL": self.EXEC}, (self.EXEC, None)),
+        }
+        for name, (environ, expected) in cases.items():
+            with self.subTest(name), patch.dict("os.environ", environ, clear=False):
+                if "CREDENTIAL_PROXY_URL" not in environ:
+                    os.environ.pop("CREDENTIAL_PROXY_URL", None)
+                self.assertEqual(expected, credential_proxy_client.exec_endpoints())
+
+    def test_an_unreachable_exec_tier_falls_back_with_one_line_and_the_same_request(self):
+        code, calls, stderr = self.run_shim([unreachable(), self.OK])
+        self.assertEqual(0, code)
+        self.assertEqual([self.EXEC + "/v1/exec", self.STATEFUL + "/v1/exec"], [url for url, _ in calls])
+        self.assertEqual(1, len({request_id for _, request_id in calls}), "the fallback is the same request")
+        self.assertEqual(1, stderr.count(credential_proxy_client.EXEC_FALLBACK_NOTICE), stderr)
+
+    def test_with_no_fallback_an_unreachable_broker_is_reported_as_before(self):
+        code, calls, stderr = self.run_shim([unreachable()], fallback=None)
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("credential proxy unavailable", stderr)
+
+    def test_a_failure_after_the_connection_is_made_does_not_fall_back(self):
+        """A send that fails part way may have reached the broker."""
+        code, calls, stderr = self.run_shim([urllib.error.URLError(BrokenPipeError("broken pipe"))])
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("credential proxy unavailable", stderr)
+
+    def test_each_retryable_bound_is_retried_once_on_a_new_connection(self):
+        for bound in sorted(credential_proxy_client.RETRYABLE_BUSY_BOUNDS):
+            with self.subTest(bound=bound):
+                code, calls, _ = self.run_shim([busy_error(bound), self.OK])
+                self.assertEqual(0, code)
+                self.assertEqual([self.EXEC + "/v1/exec"] * 2, [url for url, _ in calls])
+                self.assertEqual(1, len({request_id for _, request_id in calls}))
+
+    def test_a_refusal_under_any_other_bound_is_not_retried(self):
+        for bound in ("session", "refresh-lock", "other", "scope", None):
+            with self.subTest(bound=bound):
+                code, calls, stderr = self.run_shim([busy_error(bound)])
+                self.assertEqual(1, code)
+                self.assertEqual(1, len(calls))
+                self.assertIn(f"busy at {bound}", stderr)
+
+    def test_without_exec_routing_a_busy_refusal_is_not_retried(self):
+        """With no exec tier, or a named endpoint, the one stateful pod would
+        refuse again: the command path stays as it was."""
+        code, calls, stderr = self.run_shim([busy_error("slot")], endpoint=self.STATEFUL, fallback=None)
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("busy at slot", stderr)
+
+    def test_a_drop_while_the_refusal_is_read_is_reported_not_raised(self):
+        class TornBody(io.BytesIO):
+            def read(self, *args):
+                raise http.client.IncompleteRead(b'{"status": "bu')
+
+        torn = urllib.error.HTTPError(
+            url="http://broker/v1/exec", code=503, msg="Service Unavailable",
+            hdrs=http.client.HTTPMessage(), fp=TornBody(),
+        )
+        code, calls, stderr = self.run_shim([torn])
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("the connection dropped while the refusal was read", stderr)
+
+    def test_a_second_refusal_is_printed_not_retried(self):
+        code, calls, stderr = self.run_shim([busy_error("slot"), busy_error("slot")])
+        self.assertEqual(1, code)
+        self.assertEqual(2, len(calls))
+        self.assertIn("busy at slot", stderr)
+
+    def test_a_fallback_is_not_a_retry_and_one_retry_is_the_most(self):
+        code, calls, _ = self.run_shim([unreachable(), busy_error("slot"), self.OK])
+        self.assertEqual(0, code)
+        self.assertEqual(
+            [self.EXEC + "/v1/exec", self.STATEFUL + "/v1/exec", self.STATEFUL + "/v1/exec"],
+            [url for url, _ in calls],
+        )
+        code, calls, _ = self.run_shim([busy_error("slot"), unreachable(), self.OK])
+        self.assertEqual(0, code, "the retry may still fall back: nothing ran")
+        self.assertEqual(3, len(calls))
+        code, calls, stderr = self.run_shim([unreachable(), busy_error("budget"), busy_error("budget")])
+        self.assertEqual(1, code)
+        self.assertEqual(3, len(calls))
+        self.assertIn("busy at budget", stderr)
+
+    def test_a_503_that_is_not_the_brokers_is_not_retried(self):
+        envoy = urllib.error.HTTPError(
+            url="http://broker/v1/exec", code=503, msg="Service Unavailable",
+            hdrs=http.client.HTTPMessage(), fp=io.BytesIO(b"<html>upstream connect error</html>"),
+        )
+        code, calls, stderr = self.run_shim([envoy])
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("non-JSON response", stderr)
+
+    def test_a_policy_block_still_exits_77(self):
+        refusal = {"code": "SECURITY_POLICY_BLOCKED", "message": "no", "rule": "kubernetes.read-only"}
+        blocked = urllib.error.HTTPError(
+            url="http://broker/v1/exec", code=403, msg="Forbidden", hdrs=http.client.HTTPMessage(),
+            fp=io.BytesIO(json.dumps(refusal).encode("utf-8")),
+        )
+        code, calls, stderr = self.run_shim([blocked])
+        self.assertEqual(credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("policy rule: kubernetes.read-only", stderr)
+
+    def test_a_busy_body_on_another_status_is_not_retried(self):
+        """Only the broker's admission refusal, a 503, is known not to have run."""
+        reply = {"status": "busy", "code": credential_proxy_client.BUSY_CODE, "bound": "slot", "error": "odd"}
+        odd = urllib.error.HTTPError(
+            url="http://broker/v1/exec", code=500, msg="Internal Server Error", hdrs=http.client.HTTPMessage(),
+            fp=io.BytesIO(json.dumps(reply).encode("utf-8")),
+        )
+        code, calls, stderr = self.run_shim([odd])
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("odd", stderr)
+
+    def test_the_two_new_lines_keep_kubectls_failure_classifiers_right(self):
+        """A fallback line must not hide a real cluster connection failure that
+        follows it, nor look like one; a dropped connection is the shim's own."""
+        import cluster_agent_profile
+
+        notice = credential_proxy_client.EXEC_FALLBACK_NOTICE
+        self.assertIsNone(cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE.search(notice))
+        self.assertIsNone(cluster_agent_profile.CONNECTIVITY_FAILURE_RE.search(notice))
+        _, _, stderr = self.run_shim([ConnectionResetError(104, "Connection reset by peer")])
+        self.assertIsNotNone(cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE.search(stderr), stderr)
+
+    def test_a_connection_dropped_after_the_request_was_sent_is_never_sent_again(self):
+        """The command may have run: no retry, and no fallback, whichever broker it was."""
+        drops = (
+            http.client.RemoteDisconnected("Remote end closed connection without response"),
+            http.client.IncompleteRead(b"{"),
+            ConnectionResetError(104, "Connection reset by peer"),
+        )
+        for drop in drops:
+            with self.subTest(drop=type(drop).__name__):
+                code, calls, stderr = self.run_shim([drop])
+                self.assertEqual(1, code)
+                self.assertEqual(1, len(calls))
+                self.assertIn("the command may have run", stderr)
+
+
+class TestBrokerUnreachable(unittest.TestCase):
+    """The one exact signal that no request reached the broker."""
+
+    def test_a_failed_connect_raises_it_with_the_same_message(self):
+        def refuse(self):
+            raise ConnectionRefusedError(111, "Connection refused")
+
+        connection = credential_proxy_client.BrokerConnection("broker", 8765)
+        with patch.object(credential_proxy_client.http.client.HTTPConnection, "connect", refuse):
+            with self.assertRaises(credential_proxy_client.BrokerUnreachable) as caught:
+                connection.connect()
+        self.assertIsInstance(caught.exception, OSError)
+        self.assertIn("Connection refused", str(caught.exception))
+
+    def test_the_opener_wraps_it_in_a_url_error_as_before(self):
+        """A caller that reads only the URLError (vcs, workspaces) sees no change."""
+        import socket
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/exec", data=b"{}", method="POST")
+        with self.assertRaises(urllib.error.URLError) as caught:
+            credential_proxy_client.open_broker_request(request)
+        self.assertIsInstance(caught.exception.reason, credential_proxy_client.BrokerUnreachable)
+
+
+class TestApiSessionExecTier(unittest.TestCase):
+    """The Cloud API relay is an exec-tier route; its GETs fall back on the stateful broker."""
+
+    EXEC = "http://exec-tier:8765"
+    STATEFUL = "http://stateful:8765"
+    URL = "https://container.googleapis.com/v1/projects/p/locations/-/clusters"
+
+    class FlakyHttp:
+        def __init__(self, unreachable_hosts=()):
+            self.calls = []
+            self.unreachable_hosts = set(unreachable_hosts)
+
+        def get(self, url, *, params=None, headers=None, timeout=None):
+            self.calls.append(url)
+            if urllib.parse.urlsplit(url).netloc in self.unreachable_hosts:
+                raise ConnectionError(f"cannot connect to {url}")
+            return "upstream-response"
+
+    def setUp(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "token").write_text("caller-token\n", encoding="utf-8")
+        patcher = patch.dict(os.environ, {
+            "CREDENTIAL_PROXY_URL": self.STATEFUL,
+            "CREDENTIAL_PROXY_EXEC_URL": self.EXEC,
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(directory / "token"),
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_exec_tier_serves_the_relay_when_its_url_is_set(self):
+        http_ = self.FlakyHttp()
+        credential_proxy_client.ApiSession(http=http_).get(self.URL)
+        self.assertTrue(http_.calls[0].startswith(self.EXEC + credential_proxy_client.API_RELAY_PREFIX))
+
+    def test_an_unreachable_exec_tier_falls_back_once_and_stays_there(self):
+        http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
+        session = credential_proxy_client.ApiSession(http=http_)
+        stderr = io.StringIO()
+        with patch("sys.stderr", new=stderr):
+            self.assertEqual("upstream-response", session.get(self.URL))
+            self.assertEqual("upstream-response", session.get(self.URL))
+        self.assertEqual(
+            ["exec-tier:8765", "stateful:8765", "stateful:8765"],
+            [urllib.parse.urlsplit(url).netloc for url in http_.calls],
+        )
+        self.assertEqual(1, stderr.getvalue().count(credential_proxy_client.EXEC_FALLBACK_NOTICE))
+
+    def test_the_exec_attempt_gets_the_shims_connect_bound_and_the_callers_read_timeout(self):
+        seen = []
+
+        class Recording(self.FlakyHttp):
+            def get(inner, url, *, params=None, headers=None, timeout=None):
+                seen.append((urllib.parse.urlsplit(url).netloc, timeout))
+                return super().get(url, params=params, headers=headers, timeout=timeout)
+
+        bound = credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS
+        http_ = Recording(unreachable_hosts={"exec-tier:8765"})
+        session = credential_proxy_client.ApiSession(http=http_)
+        with patch("sys.stderr", new=io.StringIO()):
+            session.get(self.URL, timeout=120)
+        self.assertEqual(("exec-tier:8765", (bound, 120)), seen[0])
+        self.assertEqual("stateful:8765", seen[1][0])
+        self.assertTrue(119 < seen[1][1] <= 120, "the fallback gets what the exec attempt left")
+        self.assertEqual((bound, None), credential_proxy_client._exec_connect_bound(None))
+        self.assertEqual((3, 50), credential_proxy_client._exec_connect_bound((3, 50)))
+
+    def test_readers_sharing_a_session_all_fall_back_when_the_exec_tier_is_down(self):
+        """Fleet collectors share one session across a thread pool: every reader
+        must land on the stateful broker, and the session must stay usable."""
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        barrier = threading.Barrier(8)
+
+        class Racing(self.FlakyHttp):
+            def get(inner, url, *, params=None, headers=None, timeout=None):
+                if urllib.parse.urlsplit(url).netloc == "exec-tier:8765":
+                    barrier.wait(timeout=10)
+                return super().get(url, params=params, headers=headers, timeout=timeout)
+
+        for _ in range(20):
+            barrier.reset()
+            http_ = Racing(unreachable_hosts={"exec-tier:8765"})
+            session = credential_proxy_client.ApiSession(http=http_)
+            with patch("sys.stderr", new=io.StringIO()) as stderr, ThreadPoolExecutor(8) as pool:
+                results = list(pool.map(lambda _: session.get(self.URL), range(8)))
+            self.assertEqual(["upstream-response"] * 8, results)
+            self.assertEqual(1, stderr.getvalue().count(credential_proxy_client.EXEC_FALLBACK_NOTICE))
+            self.assertEqual("upstream-response", session.get(self.URL))
+
+    def test_a_requests_connection_error_falls_back(self):
+        try:
+            import requests
+        except ImportError:
+            self.skipTest("requests is not installed here; the sandbox image has it")
+
+        class RequestsLike(self.FlakyHttp):
+            def get(inner, url, *, params=None, headers=None, timeout=None):
+                inner.calls.append(url)
+                if urllib.parse.urlsplit(url).netloc == "exec-tier:8765":
+                    raise requests.exceptions.ConnectionError("Max retries exceeded")
+                return "upstream-response"
+
+        session = credential_proxy_client.ApiSession(http=RequestsLike())
+        with patch("sys.stderr", new=io.StringIO()):
+            self.assertEqual("upstream-response", session.get(self.URL))
+
+    def test_the_fallback_gets_only_the_time_the_exec_attempt_left(self):
+        left = credential_proxy_client._time_left
+        self.assertIsNone(left(None, 5.0))
+        self.assertEqual(15.0, left(25.0, 10.0))
+        self.assertEqual((10, 5.0), left((10, 15), 10.0))
+        self.assertEqual((10, None), left((10, None), 10.0))
+        self.assertIs(False, left(25.0, 24.5))
+        self.assertIs(False, left((10, 15), 14.5))
+
+    def test_a_fallback_with_no_time_left_raises_the_error(self):
+        http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
+        session = credential_proxy_client.ApiSession(http=http_)
+        clock = iter([100.0, 130.0])
+        with patch.object(credential_proxy_client.time, "monotonic", lambda: next(clock)), \
+                patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(ConnectionError):
+                session.get(self.URL, timeout=25)
+        self.assertEqual(1, len(http_.calls))
+
+    def test_the_built_session_ignores_a_proxy_from_the_environment(self):
+        try:
+            import requests  # noqa: F401
+        except ImportError:
+            self.skipTest("requests is not installed here; the sandbox image has it")
+        self.assertFalse(credential_proxy_client.ApiSession()._http.trust_env)
+
+    def test_a_named_endpoint_has_no_fallback(self):
+        http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
+        session = credential_proxy_client.ApiSession(self.EXEC, http=http_)
+        with self.assertRaises(ConnectionError):
+            session.get(self.URL)
+        self.assertEqual(1, len(http_.calls))
+
+
+class TestShimEntryRouting(unittest.TestCase):
+    """The shim run as `kubectl`, and with `--endpoint`, against brokers on loopback."""
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+        import threading
+
+        cls.answers = []
+        cls.requests = []
+
+        class Broker(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                cls.requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                status, body = cls.answers.pop(0) if cls.answers else (200, {"exitCode": 0, "stdout": "ok\n"})
+                data = json.dumps(body).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Broker)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        import socket
+
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.shim = self.root / "credential-proxy-exec"
+        shutil.copy(credential_proxy_client.__file__, self.shim)
+        (self.root / "kubectl").symlink_to(self.shim)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            self.closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
+        self.live = f"http://127.0.0.1:{self.server.server_address[1]}"
+        type(self).answers.clear()
+        type(self).requests.clear()
+
+    def run_shim(self, args, environ):
+        env = {"PATH": os.environ["PATH"], "HERMES_HOME": str(self.root / "home"), **environ}
+        return subprocess.run(
+            [sys.executable, *args], env=env, capture_output=True, text=True, timeout=60
+        )
+
+    def test_kubectl_falls_back_from_an_unreachable_exec_tier_and_retries_a_busy_slot(self):
+        type(self).answers.append((503, {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "bound": "slot", "error": "busy"}))
+        completed = self.run_shim(
+            [str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_EXEC_URL": self.closed, "CREDENTIAL_PROXY_URL": self.live},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("ok\n", completed.stdout)
+        self.assertEqual(1, completed.stderr.count(credential_proxy_client.EXEC_FALLBACK_NOTICE), completed.stderr)
+        self.assertEqual(2, len(self.requests), "the busy slot was retried once")
+        self.assertEqual(1, len({r["requestId"] for r in self.requests}))
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_broker(self):
+        """A proxy in between would accept every connect, so an unreachable broker
+        could not be told apart from one that dropped the request."""
+        completed = self.run_shim(
+            [str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live, "http_proxy": self.closed, "HTTP_PROXY": self.closed},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(1, len(self.requests))
+
+    def test_a_named_endpoint_wins_over_the_exec_tier(self):
+        completed = self.run_shim(
+            [str(self.shim), "--endpoint", self.live, "kubectl", "get", "pods"],
+            {"CREDENTIAL_PROXY_EXEC_URL": self.closed},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertNotIn("exec tier", completed.stderr)
+        named = self.run_shim(
+            [str(self.shim), "--endpoint", self.closed, "kubectl", "get", "pods"],
+            {"CREDENTIAL_PROXY_EXEC_URL": self.closed, "CREDENTIAL_PROXY_URL": self.live},
+        )
+        self.assertEqual(1, named.returncode)
+        self.assertIn("credential proxy unavailable", named.stderr, "no fallback for a named endpoint")
 
 
 @unittest.skipUnless(Path("/proc/self/stat").exists() and shutil.which("bash"), "needs /proc and bash")
