@@ -574,6 +574,13 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 
 	now := d.now()
 	ref, err := d.admit(ctx, del, snap, prof, hk, now)
+	if errors.Is(err, ErrVerifierUnreachable) {
+		// No verdict: the submission stays queued and is asked about
+		// again, until a verdict or its queue timeout ends it.
+		log.Warn("the verifier could not be reached; the submission stays queued", "err", err)
+		_ = del.Nak(d.cfg.RetryDelay)
+		return
+	}
 	if err != nil {
 		return // stopping: the lib gives the delivery back
 	}

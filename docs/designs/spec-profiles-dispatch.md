@@ -286,7 +286,9 @@ paths:
   permits running the resolved profile at tier T for the target in scope, checks the tier
   against the profile's allowed tiers, and checks the message's age against
   `spec.queueTimeoutSeconds` (default 3600; the stream's own age limit is stream-wide). It
-  fails a task that fails any check with a visible notice.
+  fails a task that fails any check with a visible notice. A verifier nobody answers gives no
+  verdict: the submission stays queued and is asked about again, until a verdict or its queue
+  timeout ends it.
 - It then **holds the message unacknowledged for the task's whole life**, with periodic
   in-progress acks, and hands the task to an executor: a warm worker for interactive tiers, a
   Job for the unattended tier. Workers get tasks only from the dispatcher; they have no fetch
