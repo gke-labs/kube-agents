@@ -263,3 +263,8 @@ cost efficiency without impacting production safety:
   deleting a cluster without naming the workloads you counted on it.
 - **Stay inside the install's scope.** Read `fleet_scope()` first, and leave out every cluster it
   lists in `excluded_clusters` (#3081).
+- **GKE Autopilot Headroom Invariant.** `kube-system/gke-system-balloon-pod` pods and GKE system
+  reservation pods in `kube-system` or `gke-managed-*` hold low-priority spare scheduling headroom
+  that GKE preempts automatically when user workloads need capacity. Never report them as idle waste
+  or rightsizing candidates, never run per-pod `kubectl` queries or documentation/web searches on
+  `balloon` pods, and scope workload optimization reads to non-system user namespaces (#3141).

@@ -967,6 +967,12 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# An Autopilot compute-optimization audit recognizes gke-system-balloon-pod as
+# normal GKE Autopilot scheduling headroom without per-pod kubectl inspection or
+# documentation/web search loops (#3141). deployer: noop, read-only, no fixture,
+# 200s default until it has a record.
+./tasks/cluster-agent-autopilot-headroom-invariant/task.yaml
+
 # The silence case for a deliberate scale to zero (#4098): an in-cluster
 # gateway whose proxy and backend are both at replicas 0 reports
 # Programmed=False, and the stall check must not report it. Reads the
