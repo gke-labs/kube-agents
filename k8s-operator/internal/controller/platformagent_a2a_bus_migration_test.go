@@ -2108,3 +2108,26 @@ func TestTheMigrationsPodsAreAdmittedToTheBus(t *testing.T) {
 		}
 	}
 }
+
+// A migration's Jobs and pods are not watched, so the pass that reads their
+// outcome is scheduled while a run is under way, or a Failed run holds its
+// freeze; never otherwise. (Found live: a finished hashing pod sat unread.)
+func TestAMigrationUnderWayIsRequeued(t *testing.T) {
+	agent := a2aTestAgent()
+	if d := busMigrationRequeue(agent); d != 0 {
+		t.Errorf("no run: requeue %v", d)
+	}
+	for phase, want := range map[busMigrationPhase]bool{
+		busMigrationHashing: true, busMigrationSnapshot: true, busMigrationPinning: true,
+		busMigrationDone: false, busMigrationAbandoned: false,
+	} {
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "1-1", Phase: string(phase)}
+		if got := busMigrationRequeue(agent) > 0; got != want {
+			t.Errorf("%s: requeued %v, want %v", phase, got, want)
+		}
+	}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "1-1", Phase: string(busMigrationFailed), FailedIn: string(busMigrationRollbackRestoring)}
+	if busMigrationRequeue(agent) == 0 {
+		t.Error("a Failed run holding its freeze is not requeued")
+	}
+}

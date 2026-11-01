@@ -1214,6 +1214,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// event — the same pairing rbacDegraded has above. Without this the record
 	// would expire and sit until the fifteen-minute requeue.
 	requeueAfter = min(requeueAfter, r.usageStatusRequeue(instance))
+	// A bus migration's Jobs and pods are not watched, so while one runs the
+	// pass that reads their outcome has to be scheduled.
+	if d := busMigrationRequeue(instance); d > 0 {
+		requeueAfter = min(requeueAfter, d)
+	}
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 

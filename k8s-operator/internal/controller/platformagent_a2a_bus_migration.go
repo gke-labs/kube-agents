@@ -1344,3 +1344,22 @@ func busMigrationFailedActions(agent *agentv1alpha1.PlatformAgent) string {
 	b.WriteString(". Until then no other migration starts, and spec changes leave the bus as it is.")
 	return b.String()
 }
+
+// busMigrationRequeueInterval is how often a pass runs while a migration is
+// under way: its Jobs and pods are outside the controller's watch set, so
+// their finishing wakes nothing.
+const busMigrationRequeueInterval = 10 * time.Second
+
+// busMigrationRequeue is the requeue a pass asks for while a migration is
+// under way, or a Failed run holds its freeze waiting for a person's
+// annotation; 0 otherwise.
+func busMigrationRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
+	run := agent.Status.BusMigration
+	if run == nil {
+		return 0
+	}
+	if !busMigrationTerminal(busMigrationPhase(run.Phase)) || busMigrationFreezeActive(agent) {
+		return busMigrationRequeueInterval
+	}
+	return 0
+}
