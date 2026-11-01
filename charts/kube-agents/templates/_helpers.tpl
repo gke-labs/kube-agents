@@ -2059,9 +2059,32 @@ reused here. Takes (dict "workload" <footprint entry> "override" <resources bloc
 returns the entry's six numbers and pod count as JSON.
 */}}
 {{- define "kube-agents.credentialProxyFootprint" -}}
+{{- include "kube-agents.credentialProxyResourcesCheck" .override -}}
+{{- include "kube-agents.overriddenPodFootprint" . -}}
+{{- end }}
+
+{{/*
+The shell sandbox's footprint entry with platformAgent.harness.experimental.shellSandbox.resources
+merged over it, per key, as resolveShellSandboxResources does in the operator
+(k8s-operator/internal/controller/shell_sandbox_manifests.go). The same accounting as
+the credential proxy's, including the ephemeral-storage rule: the shell declares no
+ephemeral-storage at all (footprint.yaml carries 0 on both sides), so an override of
+limits.ephemeral-storage alone is a request of that size too, by the API server's
+defaulting. Takes (dict "workload" <footprint entry> "override" <resources block>) and
+returns the entry's six numbers and pod count as JSON.
+*/}}
+{{- define "kube-agents.shellSandboxFootprint" -}}
+{{- include "kube-agents.shellSandboxResourcesCheck" .override -}}
+{{- include "kube-agents.overriddenPodFootprint" . -}}
+{{- end }}
+
+{{- /* The arithmetic behind the two footprint helpers above: a footprint entry with a
+       per-key resources override merged over it, the ephemeral-storage request following
+       an override of the limit unless set explicitly. The caller has run the container's
+       shape check on the override first, so every quantity here parses. */ -}}
+{{- define "kube-agents.overriddenPodFootprint" -}}
 {{- $workload := .workload | default dict -}}
 {{- $override := .override | default dict -}}
-{{- include "kube-agents.credentialProxyResourcesCheck" $override -}}
 {{- $req := (index $override "requests") | default dict -}}
 {{- $lim := (index $override "limits") | default dict -}}
 {{- $cpuReq := $workload.cpuMillisRequest | default 0 | int64 -}}
@@ -2133,6 +2156,10 @@ The defaults carry no ephemeral-storage request because the operator renders non
 
 {{- define "kube-agents.agentAPIAuthResourcesCheck" -}}
 {{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.agentAPIAuth.resources" "container" "agent-api-auth" "pod" "gateway pod" "consumer" "event watcher") -}}
+{{- end }}
+
+{{- define "kube-agents.shellSandboxResourcesCheck" -}}
+{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.harness.experimental.shellSandbox.resources" "container" "shell" "pod" "shell sandbox pod" "consumer" "kubelet") -}}
 {{- end }}
 
 {{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}
@@ -2406,20 +2433,27 @@ The defaults carry no ephemeral-storage request because the operator renders non
          generic keys here ensures that any workload summed into extract_footprint is
          automatically counted by the preflight without requiring manual template edits.
          agentPod and storage are handled separately above and below. */ -}}
-  {{- /* The credential proxy is the one operator-rendered workload of its own pod with a
-         sizing override: its footprint entry takes platformAgent.deployment.credentialProxy.resources
-         over it per key (kube-agents.credentialProxyFootprint) before it is summed, so a
-         raised memory limit is counted here as the pod the operator will write, rather than
-         the preflight passing a quota the release will not fit. An ephemeral-storage limit
-         set alone is counted as a request of that size too: the operator renders no
-         ephemeral-storage request and the API server defaults it to the limit. The
-         agent-api-auth sidecar has a sizing override too, but it is a container of the agent
-         pod, so its delta is added to agentPod above rather than counted here. */ -}}
+  {{- /* The credential proxy and the shell sandbox are the operator-rendered workloads of
+         their own pod with a sizing override: each footprint entry takes its override
+         (platformAgent.deployment.credentialProxy.resources,
+         platformAgent.harness.experimental.shellSandbox.resources) over it per key
+         (kube-agents.credentialProxyFootprint, kube-agents.shellSandboxFootprint) before it
+         is summed, so a raised memory limit is counted here as the pod the operator will
+         write, rather than the preflight passing a quota the release will not fit. An
+         ephemeral-storage limit set alone is counted as a request of that size too: the
+         operator renders no ephemeral-storage request and the API server defaults it to
+         the limit. The agent-api-auth sidecar has a sizing override too, but it is a
+         container of the agent pod, so its delta is added to agentPod above rather than
+         counted here. */ -}}
   {{- $proxyOverride := (((.Values.platformAgent.deployment | default dict).credentialProxy | default dict).resources) | default dict -}}
+  {{- $sandboxOverride := ((((.Values.platformAgent.harness | default dict).experimental | default dict).shellSandbox | default dict).resources) | default dict -}}
   {{- range $key, $workload := $op -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
       {{- if and (eq $key "credentialProxy") $proxyOverride -}}
         {{- $workload = include "kube-agents.credentialProxyFootprint" (dict "workload" $workload "override" $proxyOverride) | fromJson -}}
+      {{- end -}}
+      {{- if and (eq $key "shellSandbox") $sandboxOverride -}}
+        {{- $workload = include "kube-agents.shellSandboxFootprint" (dict "workload" $workload "override" $sandboxOverride) | fromJson -}}
       {{- end -}}
       {{- /* satAdd: a total above may already be the saturated ceiling from a huge
              agent-pod override, which a plain add here would wrap back negative. */ -}}

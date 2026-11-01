@@ -251,13 +251,70 @@ spec:
     {{- if and (kindIs "bool" $sandbox.enabled) (not $sandbox.enabled) }}
     {{- fail "platformAgent.harness.experimental.shellSandbox.enabled: false is not supported -- the operator refuses it. Remove the key or set it true." }}
     {{- end }}
-    {{- with include "kube-agents.compactFields" (dict
+    {{- /*
+      The shell container's requests and limits, forwarded to the CR as
+      spec.harness.experimental.shellSandbox.resources. Lean, as the
+      agentAPIAuth block below: the operator and its webhook validate the
+      override (floor-free), so the chart forwards it and guards only the shape
+      it can catch cheaply through the shared check, which the quota preflight
+      calls too. Emitted only when a key is set, each quantity quoted and
+      trimmed, for the reasons the credentialProxy block below gives.
+    */}}
+    {{- $sandboxResources := $sandbox.resources | default dict }}
+    {{- include "kube-agents.shellSandboxResourcesCheck" $sandboxResources }}
+    {{- $sandboxQuantities := dict }}
+    {{- range $side := list "limits" "requests" }}
+      {{- $set := dict }}
+      {{- range $name, $quantity := (index $sandboxResources $side) | default dict }}
+        {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) }}
+          {{- $_ := set $set $name (toString $quantity | trim) }}
+        {{- end }}
+      {{- end }}
+      {{- if $set }}
+        {{- $_ := set $sandboxQuantities $side $set }}
+      {{- end }}
+    {{- end }}
+    {{- /*
+      The same CRD guard as credentialProxy's below: `helm upgrade` never
+      applies crds/, and an API server serving a CRD from before the field
+      admits the CR with the block pruned, the shell at the operator's defaults
+      while the release record carries the override. `lookup` is empty under
+      `helm template`, so the guard fires only against a live install.
+    */}}
+    {{- if $sandboxQuantities }}
+    {{- $sandboxCrd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+    {{- if $sandboxCrd }}
+    {{- $sandboxProps := dict }}
+    {{- range $sandboxCrd.spec.versions }}
+    {{- if .storage }}
+    {{- $sandboxProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "experimental" "properties" "shellSandbox" "properties" (dict) . }}
+    {{- end }}
+    {{- end }}
+    {{- if not (hasKey $sandboxProps "resources") }}
+    {{- fail "platformAgent.harness.experimental.shellSandbox.resources is set, but the installed PlatformAgent CRD predates spec.harness.experimental.shellSandbox.resources and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- $sandboxFields := include "kube-agents.compactFields" (dict
           "enabled" $sandbox.enabled
           "image" $sandbox.image
           "runtimeClassName" $sandbox.runtimeClassName) }}
+    {{- if or $sandboxFields $sandboxQuantities }}
     experimental:
       shellSandbox:
+        {{- with $sandboxFields }}
         {{- . | nindent 8 }}
+        {{- end }}
+        {{- if $sandboxQuantities }}
+        resources:
+          {{- range $side := keys $sandboxQuantities | sortAlpha }}
+          {{ $side }}:
+            {{- $set := index $sandboxQuantities $side }}
+            {{- range $name := keys $set | sortAlpha }}
+            {{ $name }}: {{ index $set $name | quote }}
+            {{- end }}
+          {{- end }}
+        {{- end }}
     {{- end }}
   deployment:
     image: {{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) | quote }}

@@ -1012,6 +1012,36 @@ platformAgent:
         # reports Degraded rather than leaving the pod Pending if the named
         # class does not exist.
         runtimeClassName: ""
+        # The shell container's requests and limits, forwarded to the CR as
+        # spec.harness.experimental.shellSandbox.resources when any key is set.
+        # Each key merges over the operator's defaults (200m CPU and 512Mi
+        # requests; 2 CPU and 2Gi memory limits), so
+        #
+        #   shellSandbox:
+        #     resources:
+        #       requests:
+        #         memory: 1Gi
+        #       limits:
+        #         memory: 3Gi
+        #
+        # raises the memory pair and keeps the CPU pair. The shell is where
+        # every model-authored command runs, so a fleet sweep that fans out
+        # many kubectl calls at once is bounded by this container's memory;
+        # raise it when the shell pod is OOM-killed. On GKE Autopilot without
+        # bursting the limits are set equal to the requests, so there
+        # requests.memory is the figure that counts, with limits.memory to
+        # match. The quota preflight counts the override. The operator refuses
+        # a request above its limit, a negative quantity, a zero limit,
+        # claims, and any resource name other than cpu, memory and
+        # ephemeral-storage, whether or not its webhook is enabled: it ignores
+        # the override, renders the shell at its defaults and reports Degraded
+        # with reason InvalidShellSandboxResources, the agent staying Ready.
+        # The webhook, where enabled, refuses the override at apply, and warns
+        # on the Autopilot memory-per-vCPU band and on a limit set without its
+        # request. There is no memory floor. A change rolls the shell pod. On
+        # an existing install the chart fails the upgrade when the installed
+        # CRD predates the field; apply crds/ first (upgrade.sh does).
+        resources: {}
     # Execution limits per agent persona. Empty omits the field so CRD/Hermes
     # defaults apply. When plugins.stockoutInvestigator.enabled=true, the chart
     # automatically applies tuning (maxInProgress: 3, platform.maxTurns: 200,

@@ -582,6 +582,36 @@ type ShellSandboxSpec struct {
 	// taint toleration itself, so nothing else has to be set here.
 	// +optional
 	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
+
+	// Resources overrides the shell container's requests and limits. Each key
+	// set here replaces the operator's default for that key and the rest keep
+	// their defaults, as spec.deployment.credentialProxy.resources and
+	// spec.deployment.agentAPIAuth.resources do and unlike
+	// spec.deployment.resources, which replaces the agent container's block
+	// wholesale: a CR that sets only requests.memory keeps the default 200m CPU
+	// request, 2 CPU limit and 2Gi memory limit. The shell is where every
+	// model-authored command runs, so a fleet sweep that fans out many kubectl
+	// calls at once is bounded by this container's memory; on GKE Autopilot
+	// without bursting the limits are set equal to the requests, so there
+	// requests.memory is the figure to raise when the shell pod is OOM-killed,
+	// with limits.memory to match. Only cpu, memory and ephemeral-storage are
+	// accepted, the quantities the container declares. The operator refuses a
+	// request above its limit, a negative quantity, a zero limit, an
+	// unrepresentable byte or CPU count and claims, because the sandbox pod
+	// declares no resourceClaims. A refused override, including an edit of one
+	// that was valid, renders the shell at the operator's defaults until it is
+	// corrected, and the operator reports Degraded with reason
+	// InvalidShellSandboxResources when no higher-ranked Degraded cause is
+	// present, the agent staying Ready, whether or not the validating webhook
+	// is enabled. Where the webhook is on, it refuses the edit at apply. The
+	// webhook warns when memory per CPU on the requests pair leaves the band
+	// GKE Autopilot admits unchanged, and when a cpu or memory limit is set
+	// without the same key under requests, for the reasons the credential-proxy
+	// field documents. A change rolls the shell pod, as an image change does.
+	// The image-trees init container and the gateway's sandbox sidecars keep
+	// their own fixed figures.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // EventWatcherSpec configures the k8s-event-watcher, which runs as a peer service
