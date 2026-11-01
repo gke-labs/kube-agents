@@ -1,0 +1,51 @@
+# Full table scans scripts/check_sqlite_query_plans.py knows about.
+#
+# One statement per entry, whitespace collapsed to single spaces, under the
+# comment lines that say why it still scans and which issue owns the fix. The
+# file only shrinks: an entry whose statement stops scanning (an index landed,
+# the statement changed) fails the check until it is removed, and a new scan
+# is never added here without a reason a reviewer can act on.
+
+# The fold lookup: no index covers (cluster, namespace, object_kind,
+# workload_key), so every admitted event reads the whole ledger. #4331 adds
+# the fold-column index; delete this entry with it.
+SELECT id, session_id FROM intercepted_events WHERE cluster = ? AND namespace = ? AND object_kind = ? AND workload_key = ? AND (reason = ? OR id IN (SELECT duplicate_of FROM intercepted_events WHERE reason = ? AND duplicate_of > 0)) AND (? != ? OR severity = ?) AND duplicate_of IS NULL AND (notified != 0 OR delivery_error != '') AND session_id != '' ORDER BY id DESC LIMIT ?
+
+# Retention: session_metadata has no index on updated_at, so the sweep that
+# runs on every POST /sessions reads every session. #3567 owns the index;
+# delete this entry with it.
+DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)
+
+# The same sweep over incidents, which has no index on created_at; the table
+# is bounded by the same retention window it is being trimmed to, and the
+# index belongs with the session_metadata one above.
+DELETE FROM incidents WHERE created_at < datetime('now', ?)
+
+# Startup, once per process: stamp rows the previous process admitted and
+# never dispatched. dispatched_at has no index, and the statement runs before
+# the server takes traffic.
+UPDATE intercepted_events SET dispatched_at = created_at WHERE dispatched_at IS NULL
+
+# Startup, once per process: release the fold anchors a dead process left.
+# fold_key has no index, and the statement runs before the server takes
+# traffic.
+UPDATE intercepted_events SET fold_key = '' WHERE fold_key != ''
+
+# Startup, once per process: the plaintext-identity purge reads every
+# session's metadata blob by design, since what it looks for is inside the
+# JSON.
+SELECT session_id, metadata FROM session_metadata
+
+# GET /v1/sessions sorts every session by updated_at for the newest N; the
+# updated_at index under #3567 turns this into an index walk.
+SELECT session_id, metadata, updated_at FROM session_metadata ORDER BY updated_at DESC LIMIT ?
+
+# The incident-report lookup joins thread ids held inside the metadata JSON,
+# so it reads every blob in Python; the comment at the call site accepts the
+# scan as bounded by retention.
+SELECT metadata FROM session_metadata
+
+# The ledger's newest-first page: ORDER BY id DESC LIMIT walks the rowid in
+# reverse and stops at the limit, so the planner's SCAN reads at most LIMIT
+# rows. The column list is a local variable, hence the ? projection.
+SELECT ? FROM intercepted_events ORDER BY id DESC LIMIT ?
