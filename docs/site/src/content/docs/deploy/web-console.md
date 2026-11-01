@@ -5,9 +5,13 @@ sidebar:
   order: 9
 ---
 
-The web console is a browser workspace for reviewing incident triage and talking to the agent inside your cluster. Use it on evaluation clusters, workshops, or environments where Slack or Google Chat is not set up yet. It is off by default and reached over `kubectl port-forward`. It is distinct from the A2A console, which a `spec.mode: next` install serves without a flag; [User interfaces](/kube-agents/reference/user-interfaces/) compares the two and the other browser pages.
+The web console is a browser workspace for reviewing incident triage and talking to the agent inside your cluster. Use it on evaluation clusters, workshops, or environments where Slack or Google Chat is not set up yet. It is off by default and reached over `kubectl port-forward`.
 
 <video controls loop muted playsinline preload="metadata" style="width: 100%; border-radius: 8px; border: 1px solid var(--sl-color-hairline);" src="/kube-agents/web-console-demo.mp4"></video>
+
+:::note
+The web console is distinct from the A2A console, which a `spec.mode: next` install serves without a flag. See [User interfaces](/kube-agents/reference/user-interfaces/) for a comparison of the browser pages.
+:::
 
 ## Turn it on and open it
 
