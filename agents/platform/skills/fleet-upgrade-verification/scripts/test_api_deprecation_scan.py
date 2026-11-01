@@ -4,9 +4,10 @@
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
-import types
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -46,46 +47,33 @@ def write_tree(root, files):
         path.write_bytes(data)
 
 
-class FakeListing(list):
-    def __init__(self, entries, truncated=False):
-        super().__init__(entries)
-        self.total = len(entries)
-        self.truncated = truncated
+class FakeSnapshot:
+    """vcs_client.snapshot with the broker replaced: writes `files` into `into`."""
 
-
-class FakeWorkspace:
-    """The subset of credential_proxy_client.Workspace the scan uses, over an in-memory tree."""
-
-    page_size = 2
-
-    def __init__(self, files, sha="abc1234", unreadable=()):
+    def __init__(self, files, sha="abc1234", links=None, skipped=None):
         self.files = files
-        self.base_sha = sha
-        self.unreadable = set(unreadable)
-        self.closed = False
-        self.read_batches = []
+        self.sha = sha
+        self.links = links or {}
+        self.skipped = skipped or []
+        self.calls = []
 
-    def list(self, prefix=None, after=None):
-        paths = sorted(self.files)
-        if after:
-            paths = [p for p in paths if p > after]
-        page = paths[: self.page_size]
-        return FakeListing([{"path": p, "size": len(self.files[p])} for p in page], truncated=len(paths) > self.page_size)
+    def __call__(self, repo, into=None, **kwargs):
+        self.calls.append((repo, into))
+        Path(into).mkdir(parents=True, exist_ok=True)
+        write_tree(into, self.files)
+        for relative, target in self.links.items():
+            (Path(into) / relative).symlink_to(target)
+        return {"revision": self.sha, "path": str(into), "skipped": list(self.skipped)}
 
-    def read_many(self, paths):
-        self.read_batches.append(list(paths))
-        files = {p: self.files[p] for p in paths if p not in self.unreadable}
-        skipped = [{"path": p, "reason": "tooLarge"} for p in paths if p in self.unreadable]
-        return files, skipped
 
-    def close(self):
-        self.closed = True
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
+def patch_vcs_root(case):
+    """Point vcs_client's copies root at a directory the test owns."""
+    tmp = tempfile.TemporaryDirectory()
+    case.addCleanup(tmp.cleanup)
+    patcher = patch.object(scan.vcs_client, "ROOT", Path(tmp.name) / "vcs")
+    patcher.start()
+    case.addCleanup(patcher.stop)
+    return Path(tmp.name)
 
 
 class TableTest(unittest.TestCase):
@@ -329,81 +317,131 @@ class ScanAndRenderTest(unittest.TestCase):
 
 
 class ContentModeTest(unittest.TestCase):
-    def test_a_client_without_workspace_routes_is_not_armed(self):
-        # Observed live: an agent image built before content-passing has a
-        # credential_proxy_client with no workspaces_available at all.
-        with patch.object(scan, "credential_proxy_client", types.SimpleNamespace()):
-            self.assertFalse(scan.content_mode_available("http://broker"))
-        self.assertFalse(scan.content_mode_available(""))
+    def setUp(self):
+        self.base = patch_vcs_root(self)
 
-    def test_pages_filters_batches_and_reports_broker_skips(self):
+    def test_reads_a_snapshot_in_a_private_directory_and_deletes_it(self):
         files = {
             "README.md": b"# nope",
             "apps/a.yaml": PDB_V1BETA1,
             "apps/b.yml": CRONJOB_V1BETA1,
             "apps/c.json": HPA_V2BETA2_LIST_JSON,
-            "apps/huge.yaml": b"x" * 10,
+            ".git/x.yaml": CRONJOB_V1BETA1,
             "img/logo.png": b"\x89PNG",
         }
-        fake = FakeWorkspace(files, sha="feedbeef", unreadable={"apps/huge.yaml"})
-        opened = []
-
-        def open_workspace(endpoint, repo, depth=None, **kwargs):
-            opened.append((endpoint, repo, depth))
-            return fake
-
-        snapshot = scan.read_repo_content("acme/infra", "http://broker", open_workspace=open_workspace)
-        self.assertEqual(opened, [("http://broker", "acme/infra", 1)])
+        fake = FakeSnapshot(files, sha="feedbeef")
+        snapshot = scan.read_repo_content("acme/infra", snapshot=fake)
+        [(repo, destination)] = fake.calls
+        self.assertEqual(repo, "acme/infra")
+        self.assertEqual(destination.name, scan.SNAPSHOT_TREE_NAME)
+        self.assertEqual(destination.parent.parent, scan.vcs_client.ROOT)
+        self.assertTrue(destination.parent.name.startswith(scan.CLONE_DIR_PREFIX))
+        self.assertFalse(destination.parent.exists())
         self.assertEqual(sorted(snapshot.files), ["apps/a.yaml", "apps/b.yml", "apps/c.json"])
-        self.assertEqual(snapshot.skipped, [{"path": "apps/huge.yaml", "reason": "tooLarge"}])
+        self.assertEqual(snapshot.skipped, [])
         self.assertEqual(snapshot.sha, "feedbeef")
         self.assertEqual(snapshot.source, "repo manifests as of feedbeef")
         self.assertIsNone(snapshot.stopped)
-        self.assertTrue(fake.closed)
-        self.assertEqual(sum(len(b) for b in fake.read_batches), 4)
 
-    def test_request_budget_deferrals_are_asked_for_again(self):
-        files = {"a.yaml": PDB_V1BETA1, "b.yaml": CRONJOB_V1BETA1, "c.yaml": CRONJOB_V1}
+    def test_a_symlink_in_the_repository_is_skipped_not_followed(self):
+        outside = self.base / "outside.yaml"
+        outside.write_bytes(PDB_V1BETA1)
+        left_out = {"path": "apps/escape.yaml", "reason": "symbolic link out of the tree"}
+        fake = FakeSnapshot({"apps/a.yaml": CRONJOB_V1}, links={"apps/link.yaml": outside}, skipped=[left_out])
+        snapshot = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual(list(snapshot.files), ["apps/a.yaml"])
+        self.assertEqual(snapshot.skipped, [left_out, {"path": "apps/link.yaml", "reason": scan.REASON_SYMLINK}])
 
-        class BudgetedWorkspace(FakeWorkspace):
-            page_size = 10
+    def test_every_entry_the_snapshot_left_out_is_listed(self):
+        """A dotted name does not prove a file: `overlays/prod.eu` can be a
+        directory of manifests the section would otherwise call clean."""
+        left_out = [
+            {"path": "apps/escape.yaml", "reason": "out of the tree"},
+            {"path": "docs/logo.png", "reason": "out of the tree"},
+            {"path": "overlays/prod.eu", "reason": "out of the tree"},
+            {"path": "vendored", "reason": "out of the tree"},
+        ]
+        fake = FakeSnapshot({"apps/a.yaml": CRONJOB_V1}, skipped=left_out)
+        snapshot = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual(
+            [entry["path"] for entry in snapshot.skipped],
+            ["apps/escape.yaml", "docs/logo.png", "overlays/prod.eu", "vendored"],
+        )
 
-            def read_many(self, paths):
-                self.read_batches.append(list(paths))
-                if len(self.read_batches) == 1:
-                    # The broker served the first path and deferred the rest.
-                    return {paths[0]: self.files[paths[0]]}, [{"path": p, "reason": "requestBudget"} for p in paths[1:]]
-                return {p: self.files[p] for p in paths}, []
+    def test_a_snapshot_whose_tree_is_gone_is_an_error_not_a_clean_section(self):
+        class Vanishing(FakeSnapshot):
+            def __call__(self, repo, into=None, **kwargs):
+                answer = super().__call__(repo, into=into, **kwargs)
+                shutil.rmtree(into)
+                return answer
 
-        fake = BudgetedWorkspace(files)
-        snapshot = scan.read_repo_content("acme/infra", "http://broker", open_workspace=lambda *a, **k: fake)
-        self.assertEqual(sorted(snapshot.files), ["a.yaml", "b.yaml", "c.yaml"])
-        self.assertEqual(snapshot.skipped, [])
-        self.assertEqual(fake.read_batches, [["a.yaml", "b.yaml", "c.yaml"], ["b.yaml", "c.yaml"]])
+        with self.assertRaises(FileNotFoundError):
+            scan.read_repo_content("acme/infra", snapshot=Vanishing({"a.yaml": CRONJOB_V1}))
 
-    def test_a_deferral_that_never_clears_is_recorded_once_and_ends(self):
-        class StuckWorkspace(FakeWorkspace):
-            page_size = 10
+    def test_a_ttl_that_is_not_a_finite_number_keeps_every_scan_directory(self):
+        root = scan.vcs_client.ROOT
+        stale = root / (scan.CLONE_DIR_PREFIX + "killed")
+        stale.mkdir(parents=True)
+        for ttl in (float("nan"), float("inf")):
+            with self.subTest(ttl=ttl), patch.object(scan.vcs_client, "COPY_TTL_HOURS", ttl):
+                scan.read_repo_content("acme/infra", snapshot=FakeSnapshot({"a.yaml": CRONJOB_V1}))
+            self.assertTrue(stale.exists())
 
-            def read_many(self, paths):
-                self.read_batches.append(list(paths))
-                return {}, [{"path": p, "reason": "requestBudget"} for p in paths]
+    def test_a_refused_snapshot_leaves_no_directory_behind(self):
+        def refuse(repo, into=None, **kwargs):
+            (into.parent / ".tree.staging").mkdir()
+            raise scan.vcs_client.VcsError("snapshot is over the 33554432-byte ceiling")
 
-        fake = StuckWorkspace({"a.yaml": PDB_V1BETA1, "b.yaml": CRONJOB_V1})
-        snapshot = scan.read_repo_content("acme/infra", "http://broker", open_workspace=lambda *a, **k: fake)
-        self.assertEqual(snapshot.files, {})
-        self.assertEqual([k["path"] for k in snapshot.skipped], ["a.yaml", "b.yaml"])
-        self.assertEqual(len(fake.read_batches), 1)
+        with self.assertRaises(scan.vcs_client.VcsError):
+            scan.read_repo_content("acme/infra", snapshot=refuse)
+        self.assertEqual(list(scan.vcs_client.ROOT.iterdir()), [])
+
+    def test_a_run_deletes_scan_directories_a_killed_run_left_behind(self):
+        root = scan.vcs_client.ROOT
+        root.mkdir(parents=True)
+        stale = root / (scan.CLONE_DIR_PREFIX + "killed")
+        fresh = root / (scan.CLONE_DIR_PREFIX + "running")
+        other = root / "github__acme__infra__main"
+        for path in (stale, fresh, other):
+            (path / "a.yaml").parent.mkdir(parents=True)
+            (path / "a.yaml").write_bytes(CRONJOB_V1)
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "keep.yaml").write_bytes(CRONJOB_V1)
+        link = root / (scan.CLONE_DIR_PREFIX + "link")
+        link.symlink_to(outside)
+        ttl = patch.object(scan.vcs_client, "COPY_TTL_HOURS", 24.0)
+        ttl.start()
+        self.addCleanup(ttl.stop)
+        old = time.time() - 25 * 3600
+        for path in (stale, other):
+            os.utime(path, (old, old))
+        os.utime(link, (old, old), follow_symlinks=False)
+        scan.read_repo_content("acme/infra", snapshot=FakeSnapshot({"a.yaml": CRONJOB_V1}))
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())
+        self.assertTrue(other.exists())
+        self.assertTrue((outside / "keep.yaml").exists())
+
+    def test_a_ttl_of_zero_keeps_every_scan_directory(self):
+        root = scan.vcs_client.ROOT
+        stale = root / (scan.CLONE_DIR_PREFIX + "killed")
+        stale.mkdir(parents=True)
+        old = time.time() - 48 * 3600
+        os.utime(stale, (old, old))
+        with patch.object(scan.vcs_client, "COPY_TTL_HOURS", 0):
+            scan.read_repo_content("acme/infra", snapshot=FakeSnapshot({"a.yaml": CRONJOB_V1}))
+        self.assertTrue(stale.exists())
 
     def test_file_cap_is_reported(self):
-        fake = FakeWorkspace({f"m{i}.yaml": CRONJOB_V1 for i in range(5)})
-        snapshot = scan.read_repo_content("acme/infra", "http://broker", max_files=3, open_workspace=lambda *a, **k: fake)
+        fake = FakeSnapshot({f"m{i}.yaml": CRONJOB_V1 for i in range(5)})
+        snapshot = scan.read_repo_content("acme/infra", max_files=3, snapshot=fake)
         self.assertEqual(len(snapshot.files), 3)
         self.assertEqual(snapshot.stopped, scan.STOPPED_MAX_FILES)
 
     def test_byte_cap_is_reported(self):
-        fake = FakeWorkspace({"a.yaml": b"x" * 40, "b.yaml": b"y" * 40})
-        snapshot = scan.read_repo_content("acme/infra", "http://broker", max_bytes=50, open_workspace=lambda *a, **k: fake)
+        fake = FakeSnapshot({"a.yaml": b"x" * 40, "b.yaml": b"y" * 40})
+        snapshot = scan.read_repo_content("acme/infra", max_bytes=50, snapshot=fake)
         self.assertEqual(list(snapshot.files), ["a.yaml"])
         self.assertEqual(snapshot.stopped, scan.STOPPED_MAX_BYTES)
 
@@ -440,6 +478,9 @@ class DirectoryModeTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
+    def setUp(self):
+        patch_vcs_root(self)
+
     def run_main(self, argv):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
@@ -545,16 +586,16 @@ class MainTest(unittest.TestCase):
         self.assertIn("not scanned", out)
 
     def test_no_managed_repos_is_a_clean_empty_report(self):
-        with patch.object(scan.gitops_workspace, "get_managed_repos", return_value=[]), patch.object(scan, "content_mode_available", return_value=False):
+        with patch.object(scan.gitops_workspace, "get_managed_repos", return_value=[]), patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}):
             rc, out, _ = self.run_main(["--current-version", "1.24", "--target-version", "1.27"])
         self.assertEqual(rc, scan.EXIT_OK)
         self.assertIn(scan.NO_REPOS_HEADING, out)
 
-    def test_managed_repos_go_through_the_broker_when_armed(self):
-        fake = FakeWorkspace({"apps/pdb.yaml": PDB_V1BETA1}, sha="0123abc")
+    def test_managed_repos_go_through_the_broker_snapshot(self):
+        fake = FakeSnapshot({"apps/pdb.yaml": PDB_V1BETA1}, sha="0123abc")
         with patch.object(scan.gitops_workspace, "get_managed_repos", return_value=["acme/infra"]), patch.object(
-            scan, "content_mode_available", return_value=True
-        ), patch.object(scan.credential_proxy_client.Workspace, "open", return_value=fake), patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}):
+            scan.vcs_client, "snapshot", fake
+        ), patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}):
             rc, out, _ = self.run_main(["--current-version", "1.24", "--target-version", "1.27"])
         self.assertEqual(rc, scan.EXIT_OK)
         self.assertIn("## acme/infra — repo manifests as of 0123abc", out)
@@ -568,23 +609,16 @@ class MainTest(unittest.TestCase):
             {"type": "github", "url": "https://github.com/acme/infra"},
             {"type": "gitlab", "url": "https://gitlab.com/acme/platform/fleet"},
         ]
-        opened = []
-
-        def open_workspace(endpoint, repo, **kwargs):
-            opened.append(repo)
-            return FakeWorkspace({"apps/pdb.yaml": PDB_V1BETA1}, sha="0123abc")
-
+        fake = FakeSnapshot({"apps/pdb.yaml": PDB_V1BETA1}, sha="0123abc")
         with patch.object(scan.gitops_workspace, "get_managed_repo_entries", return_value=entries), patch.object(
-            scan, "content_mode_available", return_value=True
-        ), patch.object(scan.credential_proxy_client.Workspace, "open", side_effect=open_workspace), patch.dict(
-            os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}
-        ):
+            scan.vcs_client, "snapshot", fake
+        ), patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}):
             rc, out, _ = self.run_main(["--current-version", "1.24", "--target-version", "1.27"])
         self.assertEqual(rc, scan.EXIT_OK)
-        self.assertEqual(["acme/infra", "gitlab.com/acme/platform/fleet"], opened)
+        self.assertEqual(["acme/infra", "gitlab.com/acme/platform/fleet"], [repo for repo, _ in fake.calls])
         self.assertIn("## gitlab.com/acme/platform/fleet — repo manifests as of 0123abc", out)
 
-    def test_a_gitlab_repository_without_content_mode_is_an_error_not_a_silent_skip(self):
+    def test_a_gitlab_repository_without_a_broker_is_an_error_not_a_silent_skip(self):
         entries = [
             {"type": "github", "url": "https://github.com/acme/infra"},
             {"type": "gitlab", "url": "https://gitlab.com/acme/fleet"},
@@ -607,10 +641,10 @@ class MainTest(unittest.TestCase):
                 return Path(tmp)
 
             with patch.object(scan.gitops_workspace, "get_managed_repo_entries", return_value=entries), patch.object(
-                scan, "content_mode_available", return_value=False
-            ), patch.object(scan, "_runner", runner), patch.object(
-                scan.gitops_workspace, "ensure_workspace", side_effect=ensure
-            ), patch.dict(os.environ, {"HERMES_SESSION_ID": "session-7", "HERMES_KANBAN_TASK": ""}):
+                scan, "_runner", runner
+            ), patch.object(scan.gitops_workspace, "ensure_workspace", side_effect=ensure), patch.dict(
+                os.environ, {"HERMES_SESSION_ID": "session-7", "HERMES_KANBAN_TASK": "", "CREDENTIAL_PROXY_URL": ""}
+            ):
                 rc, out, _ = self.run_main(["--current-version", "1.24", "--target-version", "1.27"])
         self.assertEqual(rc, scan.EXIT_PARTIAL)
         self.assertIn("## acme/infra — repo manifests as of d00d", out)
@@ -618,15 +652,23 @@ class MainTest(unittest.TestCase):
         self.assertIn("reaches GitHub only", out)
 
     def test_a_host_qualified_repo_flag_is_accepted(self):
-        fake = FakeWorkspace({"apps/pdb.yaml": PDB_V1BETA1}, sha="0123abc")
-        with patch.object(scan, "content_mode_available", return_value=True), patch.object(
-            scan.credential_proxy_client.Workspace, "open", return_value=fake
-        ), patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}):
+        fake = FakeSnapshot({"apps/pdb.yaml": PDB_V1BETA1}, sha="0123abc")
+        with patch.object(scan.vcs_client, "snapshot", fake), patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}):
             rc, out, err = self.run_main(
                 ["--repo", "gitlab.com/acme/fleet", "--current-version", "1.24", "--target-version", "1.27"]
             )
         self.assertEqual(rc, scan.EXIT_OK, err)
         self.assertIn("## gitlab.com/acme/fleet — repo manifests as of 0123abc", out)
+
+    def test_a_repo_the_broker_cannot_snapshot_is_an_error_with_its_reason(self):
+        def refuse(repo, into=None, **kwargs):
+            raise scan.vcs_client.VcsError(f"{repo}: the snapshot is over the 33554432-byte ceiling")
+
+        with patch.object(scan.vcs_client, "snapshot", refuse), patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}):
+            rc, out, _ = self.run_main(["--repo", "acme/huge", "--current-version", "1.24", "--target-version", "1.27"])
+        self.assertEqual(rc, scan.EXIT_PARTIAL)
+        self.assertIn("## acme/huge — not scanned", out)
+        self.assertIn("acme/huge: the snapshot is over the 33554432-byte ceiling", out)
 
     def test_named_repo_falls_back_to_a_leased_checkout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -642,9 +684,9 @@ class MainTest(unittest.TestCase):
 
                 return Result()
 
-            with patch.object(scan, "content_mode_available", return_value=False), patch.object(scan, "_runner", runner), patch.object(
+            with patch.object(scan, "_runner", runner), patch.object(
                 scan.gitops_workspace, "ensure_workspace", return_value=Path(tmp)
-            ) as ensure, patch.dict(os.environ, {"HERMES_SESSION_ID": "session-7", "HERMES_KANBAN_TASK": ""}):
+            ) as ensure, patch.dict(os.environ, {"HERMES_SESSION_ID": "session-7", "HERMES_KANBAN_TASK": "", "CREDENTIAL_PROXY_URL": ""}):
                 rc, out, _ = self.run_main(["--repo", "acme/infra", "--current-version", "1.24", "--target-version", "1.27"])
         self.assertEqual(rc, scan.EXIT_OK)
         self.assertIn("## acme/infra — repo manifests as of d00d", out)
@@ -659,7 +701,7 @@ class MainTest(unittest.TestCase):
         # only that owner and name are non-empty, so a name carrying `..` would
         # aim ensure_workspace(reset=True) at a tree outside the scan's lease.
         for repo in ("acme/../../etc", "acme", "../x", "acme/infra;rm", "acme/infra.git"):
-            with self.subTest(repo=repo), patch.object(scan, "content_mode_available") as probe, patch.object(
+            with self.subTest(repo=repo), patch.object(scan.vcs_client, "snapshot") as probe, patch.object(
                 scan.gitops_workspace, "ensure_workspace"
             ) as ensure:
                 rc, out, err = self.run_main(["--repo", repo, "--current-version", "1.24", "--target-version", "1.27"])
