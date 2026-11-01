@@ -572,7 +572,7 @@ func TestAMissingEntryAndARefusedEntryAreNotDistinguishable(t *testing.T) {
 		t.Fatal(err)
 	}
 	ask := func(ref Ref) Response {
-		b, err := json.Marshal(Request{Ref: ref, Verb: VerbTaskExecute, Resource: "project/P"})
+		b, err := json.Marshal(Request{Ref: ref, Verb: VerbTaskExecute, Resource: "project/P", RequestID: testRequestID(t)})
 		if err != nil {
 			t.Fatal(err)
 		}

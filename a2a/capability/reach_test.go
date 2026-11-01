@@ -319,8 +319,8 @@ func TestALateAnswerToAnEarlierAskIsUsed(t *testing.T) {
 		if asks.Add(1) != 1 {
 			return // only the first ask is ever answered, and late
 		}
-		reply := m.Reply
-		time.AfterFunc(slowAnswer, func() { _ = nc.Publish(reply, []byte(`{"allowed":true}`)) })
+		reply, answer := m.Reply, echoAnswer(t, m.Data, Response{Allowed: true})
+		time.AfterFunc(slowAnswer, func() { _ = nc.Publish(reply, answer) })
 	})
 	if err != nil {
 		t.Fatal(err)

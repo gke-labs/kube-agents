@@ -96,7 +96,7 @@ Only once that policy is in place does the operator admit the namespace on the b
 
 The profile's ServiceAccounts live there too. While the namespace is missing, or doesn't carry the chart's markers, a profile renders no identity and withdraws its card, and `IdentityReady` says `ProfileNamespaceAbsent`.
 
-Nothing runs a pod from a profile yet. The dispatcher and the warm workers come later.
+Nothing runs a pod from a profile yet. The dispatcher, `<agent>-a2a-dispatcher`, which reads the profiles' submissions and hands each to a ready worker, is off by default until profiles dispatch end to end: a `mode: next` install runs it only when the operator's `A2A_DISPATCHER_IMAGE` names its image. The warm workers come later.
 
 ## Status
 
