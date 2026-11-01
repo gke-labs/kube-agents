@@ -2131,3 +2131,44 @@ func TestAMigrationUnderWayIsRequeued(t *testing.T) {
 		t.Error("a Failed run holding its freeze is not requeued")
 	}
 }
+
+// A run's end deletes the pods that mount its stage, every attempt's, along
+// with the claim: a claim stays bound while a finished pod names it, so
+// leaving them would pin 32Gi per run. (Found live.) Another run's pods are
+// left alone; a Failed run that keeps its stage keeps them.
+func TestARunsEndDeletesThePodsHoldingItsStage(t *testing.T) {
+	ctx := context.Background()
+	for _, failed := range []bool{false, true} {
+		m := newMigrationRig(t, busMigrationGrow, busMigrationReleasing, 1, time.Now().Add(time.Hour))
+		m.agent.Status.BusMigration.Abandoning = true
+		mk := func(name string) *corev1.Pod {
+			p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: m.agent.Namespace, Labels: map[string]string{a2aComponentLabel: busMigrationComponent}}}
+			m.own(p)
+			if err := m.cl.Create(ctx, p); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}
+		ours := []*corev1.Pod{mk(busMigrationWorkloadName(m.agent, "snapshot", "3-1")), mk(busMigrationWorkloadName(m.agent, "hash", "3-1")),
+			mk(busMigrationWorkloadName(m.agent, "rollback", "3-1")), mk(busMigrationWorkloadName(m.agent, "rollback", "3-1") + "-r2")}
+		other := mk(busMigrationWorkloadName(m.agent, "snapshot", "9-9"))
+		if failed {
+			m.agent.Status.BusMigration.Phase, m.agent.Status.BusMigration.FailedIn = string(busMigrationFailed), string(busMigrationRollbackRestoring)
+		}
+		if err := m.r.cleanupBusMigration(ctx, m.agent, m.agent.Status.BusMigration); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range ours {
+			err := m.cl.Get(ctx, client.ObjectKeyFromObject(p), &corev1.Pod{})
+			if failed && err != nil {
+				t.Errorf("a Failed run's stage pod %s was deleted", p.Name)
+			}
+			if !failed && err == nil {
+				t.Errorf("%s still holds the stage after the run ended", p.Name)
+			}
+		}
+		if err := m.cl.Get(ctx, client.ObjectKeyFromObject(other), &corev1.Pod{}); err != nil {
+			t.Error("another run's pod was deleted")
+		}
+	}
+}

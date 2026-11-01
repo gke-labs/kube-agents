@@ -1085,16 +1085,29 @@ func buildBusStagePVC(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bus
 // cleanupBusMigration removes what a run made once it has ended: every
 // per-run ServiceAccount, and, unless the run Failed and was not given up,
 // the staging volume and the run Secret. A Failed run keeps those two for a
-// retry, which needs the snapshot and its digests; its
-// ServiceAccounts go regardless, since the map no longer names them. Jobs
-// and pods stay, owned by the CR, for their logs; they hold no credential
-// once their ServiceAccount is gone.
+// retry, which needs the snapshot and its digests; its ServiceAccounts go
+// regardless, since the map no longer names them. With the stage go the
+// run's pods that mount it (snapshot, hash, restore and rollback, every
+// attempt): a claim stays bound while a pod that names it exists, finished
+// or not, so leaving them would pin the stage for good. Their outcomes are
+// already in status. The pin and unpin Jobs stay for their logs until their
+// TTL.
 func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) error {
 	var objs []client.Object
 	for _, identity := range []string{"pin", "unpin", "hash", busMigrationStreamIdentity} {
 		objs = append(objs, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(agent, identity, run.RunID), Namespace: agent.Namespace}})
 	}
 	if busMigrationPhase(run.Phase) != busMigrationFailed || run.GivenUp {
+		pods := &corev1.PodList{}
+		if err := r.List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels{a2aComponentLabel: busMigrationComponent}); err != nil {
+			return err
+		}
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			if metav1.IsControlledBy(pod, agent) && busMigrationPodOfRun(agent, run, pod.Name) {
+				objs = append(objs, pod)
+			}
+		}
 		objs = append(objs,
 			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(agent, run.RunID), Namespace: agent.Namespace}},
 			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(agent, run.RunID), Namespace: agent.Namespace}})
@@ -1362,4 +1375,16 @@ func busMigrationRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
 		return busMigrationRequeueInterval
 	}
 	return 0
+}
+
+// busMigrationPodOfRun reports a pod name as one of the run's stage-mounting
+// pods, any attempt.
+func busMigrationPodOfRun(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, name string) bool {
+	for _, kind := range []string{"snapshot", "hash", "restore", "rollback"} {
+		base := busMigrationWorkloadName(agent, kind, run.RunID)
+		if name == base || strings.HasPrefix(name, base+"-r") {
+			return true
+		}
+	}
+	return false
 }
