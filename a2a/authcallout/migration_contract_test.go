@@ -15,10 +15,11 @@ import (
 // restore and rollback pods, and the only principal holding SNAPSHOT,
 // RESTORE or DELETE.
 const (
-	migrationFixturePath   = "testdata/rendered-identity-map-migration.json"
-	renderedMigrationSA    = "system:serviceaccount:kubeagents-system:agent-bus-stream-3-1"
-	renderedMigrationUser  = "migrate-stream-3-1"
-	tokenMigrationSnapshot = "token-for-the-rendered-migration-stream-serviceaccount-padded"
+	migrationFixturePath        = "testdata/rendered-identity-map-migration.json"
+	migrationRestoreFixturePath = "testdata/rendered-identity-map-migration-restore.json"
+	renderedMigrationSA         = "system:serviceaccount:kubeagents-system:agent-bus-stream-3-1"
+	renderedMigrationUser       = "migrate-stream-3-1"
+	tokenMigrationSnapshot      = "token-for-the-rendered-migration-stream-serviceaccount-padded"
 )
 
 func renderedMigrationMap(t *testing.T) string {
@@ -45,27 +46,17 @@ func TestTheOperatorsMigrationMapParses(t *testing.T) {
 	}
 }
 
-// What the stream identity may publish, against the rendered grants, and
-// the nearest things it may not: every verb only on the provisioned streams
-// by name, restore chunks only on those names (a restore's data travels on
-// the chunk subject, which the server derives from the request's stream
-// name, so a request can only deliver data to a stream whose chunk subject
-// it is granted), no purge,
-// leader step-down, stream create or message delete, no task subject.
-func TestTheRenderedStreamIdentityReachesItsWorkAndNothingNear(t *testing.T) {
-	h := startHarness(t, renderedMigrationMap(t), map[string]Attested{
-		tokenMigrationSnapshot: {ServiceAccount: renderedMigrationSA},
-	})
-	nc, violations := h.connectAs(t, renderedMigrationUser, tokenMigrationSnapshot)
-	checkPublish(t, nc, violations, map[string]bool{
-		"$JS.API.STREAM.INFO.TASKS":            false,
-		"$JS.API.STREAM.SNAPSHOT.TASKS":        false,
-		"$JS.API.STREAM.SNAPSHOT.KV_cap":       false,
-		"$JS.SNAPSHOT.ACK.TASKS.abc":           false,
-		"$JS.API.STREAM.RESTORE.TASKS":         false,
-		"$JS.SNAPSHOT.RESTORE.TASKS.abc":       false,
-		"$JS.API.STREAM.UPDATE.KV_cap":         false,
-		"$JS.API.STREAM.DELETE.TASKS":          false,
+// What the stream identity may publish in each phase, against the rendered
+// grants, and the nearest things it may not. In Snapshotting it reads and
+// acks only; in Restoring it restores, sends chunks, raises replicas and
+// deletes, and no longer snapshots. In both, every verb only on the
+// provisioned streams by name, restore chunks only on those names (a
+// restore's data travels on the chunk subject, which the server derives
+// from the request's stream name, so a request can only deliver data to a
+// stream whose chunk subject it is granted), no purge, leader step-down,
+// stream create or message delete, no task subject.
+func TestTheRenderedStreamIdentityReachesItsPhasesWorkAndNothingNear(t *testing.T) {
+	never := map[string]bool{
 		"$JS.API.STREAM.RESTORE.OTHER":         true,
 		"$JS.SNAPSHOT.RESTORE.OTHER.abc":       true,
 		"$JS.API.STREAM.DELETE.OTHER":          true,
@@ -76,7 +67,46 @@ func TestTheRenderedStreamIdentityReachesItsWorkAndNothingNear(t *testing.T) {
 		"$JS.API.STREAM.CREATE.TASKS":          true,
 		"$JS.API.STREAM.MSG.DELETE.TASKS":      true,
 		"a2a.tasks.x":                          true,
-	})
+	}
+	for name, tc := range map[string]struct {
+		fixture string
+		cases   map[string]bool
+	}{
+		"Snapshotting": {migrationFixturePath, map[string]bool{
+			"$JS.API.STREAM.INFO.TASKS":      false,
+			"$JS.API.STREAM.SNAPSHOT.TASKS":  false,
+			"$JS.API.STREAM.SNAPSHOT.KV_cap": false,
+			"$JS.SNAPSHOT.ACK.TASKS.abc":     false,
+			"$JS.API.STREAM.RESTORE.TASKS":   true,
+			"$JS.SNAPSHOT.RESTORE.TASKS.abc": true,
+			"$JS.API.STREAM.UPDATE.TASKS":    true,
+			"$JS.API.STREAM.DELETE.TASKS":    true,
+		}},
+		"Restoring": {migrationRestoreFixturePath, map[string]bool{
+			"$JS.API.STREAM.INFO.TASKS":      false,
+			"$JS.API.STREAM.RESTORE.TASKS":   false,
+			"$JS.SNAPSHOT.RESTORE.TASKS.abc": false,
+			"$JS.API.STREAM.UPDATE.KV_cap":   false,
+			"$JS.API.STREAM.DELETE.TASKS":    false,
+			"$JS.API.STREAM.SNAPSHOT.TASKS":  true,
+			"$JS.SNAPSHOT.ACK.TASKS.abc":     true,
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := os.ReadFile(tc.fixture)
+			if err != nil {
+				t.Fatalf("reading %s: %v", tc.fixture, err)
+			}
+			h := startHarness(t, string(raw), map[string]Attested{
+				tokenMigrationSnapshot: {ServiceAccount: renderedMigrationSA},
+			})
+			nc, violations := h.connectAs(t, renderedMigrationUser, tokenMigrationSnapshot)
+			for k, v := range never {
+				tc.cases[k] = v
+			}
+			checkPublish(t, nc, violations, tc.cases)
+		})
+	}
 }
 
 // Past its notAfter the same identity does not connect at all.

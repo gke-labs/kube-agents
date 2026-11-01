@@ -682,14 +682,16 @@ func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
 		banned []string
 	}
 	shrinkBanned := []string{"SNAPSHOT", "RESTORE", "DELETE", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE"}
-	stream := grant{busMigrationGrow, []string{"INFO", "SNAPSHOT", "RESTORE", "UPDATE", "DELETE"},
-		[]string{"$JS.SNAPSHOT.ACK.%s.>", "$JS.SNAPSHOT.RESTORE.%s.>"}, []string{"PURGE", "CREATE", "CONSUMER", "MSG.DELETE", "LEADER.STEPDOWN"}}
+	snapshot := grant{busMigrationGrow, []string{"INFO", "SNAPSHOT"}, []string{"$JS.SNAPSHOT.ACK.%s.>"},
+		[]string{"RESTORE", "RESTORE-CHUNK", "UPDATE", "DELETE", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE", "LEADER.STEPDOWN"}}
+	restore := grant{busMigrationGrow, []string{"INFO", "RESTORE", "UPDATE", "DELETE"}, []string{"$JS.SNAPSHOT.RESTORE.%s.>"},
+		[]string{"SNAPSHOT", "ACK", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE", "LEADER.STEPDOWN"}}
 	want := map[busMigrationPhase]grant{
 		busMigrationPinning:           {busMigrationShrink, []string{"INFO", "LEADER.STEPDOWN", "UPDATE"}, nil, shrinkBanned},
 		busMigrationUnpinning:         {busMigrationShrink, []string{"INFO", "UPDATE"}, nil, shrinkBanned},
-		busMigrationSnapshot:          stream,
-		busMigrationRestoring:         stream,
-		busMigrationRollbackRestoring: stream,
+		busMigrationSnapshot:          snapshot,
+		busMigrationRestoring:         restore,
+		busMigrationRollbackRestoring: restore,
 	}
 	streamUsers := map[string]bool{}
 	for phase, g := range want {
@@ -719,7 +721,14 @@ func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
 				t.Errorf("%s: wildcard over stream names: %s", phase, p)
 			}
 			for _, banned := range g.banned {
-				if strings.Contains(p, "."+banned+".") {
+				pattern := map[string]string{
+					"SNAPSHOT": "$JS.API.STREAM.SNAPSHOT.", "RESTORE": "$JS.API.STREAM.RESTORE.",
+					"ACK": "$JS.SNAPSHOT.ACK.", "RESTORE-CHUNK": "$JS.SNAPSHOT.RESTORE.",
+				}[banned]
+				if pattern == "" {
+					pattern = "." + banned + "."
+				}
+				if strings.Contains(p, pattern) {
 					t.Errorf("%s grants %s: %s", phase, banned, p)
 				}
 			}
@@ -905,7 +914,10 @@ func TestNoOperatorImageRunsNothing(t *testing.T) {
 	}
 }
 
-const busMigrationMapFixturePath = "../../../a2a/authcallout/testdata/rendered-identity-map-migration.json"
+const (
+	busMigrationMapFixturePath        = "../../../a2a/authcallout/testdata/rendered-identity-map-migration.json"
+	busMigrationRestoreMapFixturePath = "../../../a2a/authcallout/testdata/rendered-identity-map-migration-restore.json"
+)
 
 // The map mid-snapshot, as the callout reads it (a2a/authcallout:
 // migration_contract_test.go). The snapshot runs inside the write freeze, so
@@ -939,6 +951,15 @@ func TestRenderedBusMigrationFixture(t *testing.T) {
 		t.Errorf("the frozen map holds %v, want exactly %v", users, want)
 	}
 	checkFixture(t, busMigrationMapFixturePath, rendered)
+
+	// The same run in Restoring: the same identity, with the restore's
+	// grants instead of the snapshot's.
+	agent.Status.BusMigration.Phase = string(busMigrationRestoring)
+	cm, _, err = buildA2AAuthMapConfigMap(agent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkFixture(t, busMigrationRestoreMapFixturePath, cm.Data[a2aAuthMapKey])
 }
 
 // The freeze holds from Freezing until Releasing begins: in every phase in

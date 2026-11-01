@@ -528,7 +528,7 @@ func setBusMigratingCondition(agent *agentv1alpha1.PlatformAgent, now metav1.Tim
 // stream leaders and replica counts. The one to three leg's stream identity
 // is the operator's own pods, which take the snapshot, restore it and roll
 // it back: the only principal holding SNAPSHOT, RESTORE or DELETE, each per
-// stream name, its chunk subjects per name too (a restore's data travels on
+// stream name and each only in the phase that sends it, its chunk subjects per name too (a restore's data travels on
 // the chunk subject, which the server derives from the request's stream
 // name, so a request can only deliver data to a stream whose chunk subject
 // it is granted).
@@ -546,13 +546,16 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		step, verbs = "pin", []string{"INFO", "LEADER.STEPDOWN", "UPDATE"}
 	case busMigrationUnpinning:
 		step, verbs = "unpin", []string{"INFO", "UPDATE"}
-	case busMigrationSnapshot, busMigrationRestoring, busMigrationRollbackRestoring:
-		step, verbs = busMigrationStreamIdentity, []string{"INFO", "SNAPSHOT", "RESTORE", "UPDATE", "DELETE"}
-		// A snapshot's chunks arrive on the identity's inbox and are acked
-		// on the first; a restore's are sent on the second.
-		extra = func(stream string) []string {
-			return []string{"$JS.SNAPSHOT.ACK." + stream + ".>", "$JS.SNAPSHOT.RESTORE." + stream + ".>"}
-		}
+	case busMigrationSnapshot:
+		// One identity for the leg's pods, its grants narrowed to the phase:
+		// the snapshot reads, and acks the chunks it receives.
+		step, verbs = busMigrationStreamIdentity, []string{"INFO", "SNAPSHOT"}
+		extra = func(stream string) []string { return []string{"$JS.SNAPSHOT.ACK." + stream + ".>"} }
+	case busMigrationRestoring, busMigrationRollbackRestoring:
+		// The restores create each stream, send its chunks, raise its
+		// replicas, and delete a stream whose restore went wrong.
+		step, verbs = busMigrationStreamIdentity, []string{"INFO", "RESTORE", "UPDATE", "DELETE"}
+		extra = func(stream string) []string { return []string{"$JS.SNAPSHOT.RESTORE." + stream + ".>"} }
 	default:
 		return nil
 	}
