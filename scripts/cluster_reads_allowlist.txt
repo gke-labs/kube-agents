@@ -1,0 +1,45 @@
+# Whole-cluster kubectl reads under agents/ that were there when
+# scripts/check_cluster_reads.py arrived, pinned at the count each file had
+# that day. One entry per line: `<path> <rule> <count> <reason>`, the path
+# relative to the repository root, the rule as the check reports it
+# (`multi-kind-dump` or `unpaged-list`), the count above zero, the reason the
+# rest of the line.
+#
+# The list only shrinks. The check fails when a file has more findings than
+# its entry (a rise), when it has fewer (lower the count, or remove the entry
+# once the file is clean), when an entry names a file the check does not
+# scan, repeats a file and rule, names another rule, or is not an entry. A
+# file with no entry is held at zero, so a new whole-cluster read anywhere is
+# a failure, never a new line here.
+#
+# Every read below is one the pagination conversion of the collectors and
+# the SOPs replaces with a paged or per-kind read; an entry leaves this file
+# when its read is converted. `python3 scripts/check_cluster_reads.py --counts`
+# prints the first three fields for the tree as it stands.
+
+agents/cluster/SOUL.md unpaged-list 1 the persona's example of a large output the model must filter at the source; the span warns against the shape rather than prescribing it
+agents/cluster/persona/instructions.md unpaged-list 1 the same filter-at-the-source example, in the Cluster Agent's instructions
+agents/platform/AGENTS.md unpaged-list 1 the same filter-at-the-source example, in the Platform Agent's operating rules
+agents/platform/governance/ai_security_audit_sop.md multi-kind-dump 1 the AI-workload audit's per-cluster dump of Deployments, StatefulSets, DaemonSets, CronJobs and Pods
+agents/platform/governance/ai_security_audit_sop.md unpaged-list 1 the AI-workload audit's per-cluster Service read
+agents/platform/governance/cluster_inventory_audit_sop.md unpaged-list 1 names the Deployment dump as a read the collector must not skip over; the step runs through collect.py's shared dump
+agents/platform/governance/compliance_audit_sop.md unpaged-list 4 the compliance audit's Config Connector, Config Sync (RootSync, RepoSync) and Service reads per cluster
+agents/platform/governance/fleet_wide_cost_analysis_sop.md multi-kind-dump 2 the cost SOP's fifteen-kind dump per cluster and the Deployment-and-StatefulSet read the age check joins against
+agents/platform/governance/fleet_wide_cost_analysis_sop.md unpaged-list 7 the Pod, PVC and Job reads the cost SOP's checks join against the dump
+agents/platform/governance/obtainability_audit_sop.md multi-kind-dump 1 the obtainability audit's thirteen-kind dump per cluster
+agents/platform/governance/obtainability_audit_sop.md unpaged-list 1 the obtainability audit's ComputeClass read
+agents/platform/governance/stockout_prevention_sop.md multi-kind-dump 2 the stockout SOP's dump of ComputeClasses, workloads and StorageClasses, and the ComputeClass check's own read
+agents/platform/scripts/audit_certificates.py unpaged-list 3 the certificate collector lists Certificates, Issuers and ManagedCertificates one kind per call; its helper appends -o json
+agents/platform/scripts/audit_networking.py unpaged-list 6 the networking collector lists Services, Ingresses, Gateways, HTTPRoutes, BackendConfigs and HealthCheckPolicies one kind per call; its helper appends -o json
+agents/platform/scripts/audit_storage.py unpaged-list 1 the storage collector's PVC list; its helper appends -o json
+agents/platform/skills/fleet-audit/scripts/collect.py multi-kind-dump 6 the fleet-audit collector's shared workload dump, the compliance dumps of workloads, RBAC objects and NetworkPolicies, and the per-kind Config Sync loop whose kind is a loop variable
+agents/platform/skills/fleet-audit/scripts/collect.py unpaged-list 6 the fleet-audit collector's single-kind Service, ccnp, Config Connector, ServiceAccount and ComputeClass reads
+agents/platform/skills/fleet-audit/scripts/fleet_stockout.py multi-kind-dump 1 the stockout collector's one dump of ComputeClasses, workloads, StorageClasses and Nodes per cluster
+agents/platform/skills/fleet-audit/scripts/fleet_waste.py multi-kind-dump 1 the waste collector's fifteen-kind dump per cluster
+agents/platform/skills/fleet-audit/scripts/upgrade_retrospective.py multi-kind-dump 2 the retrospective's owner (ReplicaSet, Job) and workload (Deployment, DaemonSet, StatefulSet, CronJob) reads per cluster
+agents/platform/skills/fleet-audit/scripts/upgrade_retrospective.py unpaged-list 4 the retrospective's Pod, warning Event, PDB and EndpointSlice reads per cluster
+agents/platform/skills/fleet-upgrade-verification/SKILL.md multi-kind-dump 3 the skill's description of the report script's grouped reads: PDBs with workloads, the webhook group, the per-entry-rule group
+agents/platform/skills/fleet-upgrade-verification/SKILL.md unpaged-list 1 the skill's description of the report script's Pod read, taken apart so a cut read costs only the rules that need Pods
+agents/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py multi-kind-dump 1 the report script's one read helper takes the kinds as a parameter, so the helper is the site and every grouped read counts once
+agents/platform/skills/gitops-helm-chart/SKILL.md unpaged-list 4 the GitOps controller discovery reads (Argo CD Applications, Flux Kustomizations, Config Sync RootSyncs and RepoSyncs) the skill tells the model to run
+agents/platform/skills/submit-suggestion/SKILL.md unpaged-list 4 the same GitOps controller discovery reads, run against the target cluster's kubeconfig
