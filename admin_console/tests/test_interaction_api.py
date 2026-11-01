@@ -12,14 +12,21 @@ from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from admin_console import agent_runtime
 from admin_console.agent_chat import ChatRunResult, MAX_HISTORY_MESSAGES
 from admin_console.agent_runtime import AgentTaskUpdate, TaskUpdateResult
 from admin_console.api.authorization import portal_api_headers
-from admin_console.api.app import create_app
+from admin_console.api.app import (
+    _persisted_runtime_factory,
+    create_app,
+    target_runtime_factory,
+)
+from admin_console.chat.backend import RuntimeChatBackend
 from admin_console.chat.service import ChatService
 from admin_console.chat.models import Interaction, InteractionStatus, TaskProjection
 from admin_console.chat.store import SQLiteInteractionStore
@@ -687,6 +694,53 @@ class InteractionApiTest(unittest.TestCase):
             [(card.block_kind, card.gave_up, card.has_pr) for card in result.tasks],
             [("capability", False, False), ("", True, False), ("", False, True)],
         )
+
+    def test_default_runtime_factories_keep_one_provider_per_target(self):
+        target = DeploymentTarget("test-project-01", "test-cluster-01", "us-east4")
+        other = DeploymentTarget("test-project-02", "test-cluster-01", "us-east4")
+        connection = SimpleNamespace(usable=True, target=target)
+        with patch(
+            "admin_console.api.app.load_connection", return_value=connection
+        ) as loader:
+            factory = _persisted_runtime_factory("admin@example.com")
+            first = factory()
+            self.assertIs(factory(), first)
+            self.assertEqual(first.target, target)
+
+            loader.return_value = SimpleNamespace(usable=True, target=other)
+            moved = factory()
+            self.assertIsNot(moved, first)
+            self.assertEqual(moved.target, other)
+            self.assertIs(factory(), moved)
+
+            loader.return_value = None
+            with self.assertRaisesRegex(RuntimeError, "No verified portal connection"):
+                factory()
+
+        bound = target_runtime_factory(target)
+        self.assertIs(bound(), bound())
+
+    def test_chat_actions_drop_the_held_runtime_discovery(self):
+        target = DeploymentTarget("test-project-01", "test-cluster-01", "us-east4")
+        with patch("admin_console.chat.backend.agent_chat.AgentChatProvider"), patch(
+            "admin_console.chat.backend.agent_runtime.AgentRuntimeProvider"
+        ):
+            backend = RuntimeChatBackend(target)
+        for action in (
+            lambda: backend.run("platform-agent", prompt="hi"),
+            lambda: backend.resolve_approval("platform-agent", run_id="run-1"),
+            lambda: backend.stop("platform-agent", run_id="run-1"),
+        ):
+            agent_runtime._discovery_cache.lookup(
+                target, "canonical_agent", lambda: "held-agent"
+            )
+            action()
+            self.assertEqual(
+                agent_runtime._discovery_cache.lookup(
+                    target, "canonical_agent", lambda: "fresh-agent"
+                ),
+                "fresh-agent",
+            )
 
     def test_client_explains_api_validation_errors(self):
         client, _ = client_for(ScriptedBackend())

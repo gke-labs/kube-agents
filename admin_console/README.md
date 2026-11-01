@@ -48,6 +48,13 @@ The palettes live in `theme.py`, except Streamlit's base theme for `default`,
 which stays in `.streamlit/config.toml` at the repository root. The theme
 changes colours only; it adds no Google Cloud logo or font.
 
+Every runtime read first asks the cluster which PlatformAgent is canonical and
+which gateway pod runs it. The console holds those two answers for 30 seconds,
+shared by every page, the API and the chat poll, and forgets them after a chat
+action or an LLM Gateway change. The data read itself is never held. To change
+the window, set `ADMIN_CONSOLE_RUNTIME_CACHE_TTL_SECONDS` in seconds; `0`
+disables the cache, and an unparsable value keeps the default.
+
 This loopback-only launcher is the authentication boundary for the prototype.
 A remotely deployed console still requires application-level authentication
 and authorization as described in the design.

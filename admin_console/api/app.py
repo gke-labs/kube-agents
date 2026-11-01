@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import secrets
+import threading
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
@@ -43,23 +44,40 @@ def _error(code: str, message: str, *, retryable: bool = False) -> dict:
     return {"error": {"code": code, "message": message, "retryable": retryable}}
 
 
-def _persisted_runtime_factory(account: str) -> RuntimeProviderFactory:
+def _shared_runtime_factory(
+    resolve_target: Callable[[], DeploymentTarget],
+) -> RuntimeProviderFactory:
+    """Keep one provider per target, rebuilt only when the target changes."""
+    lock = threading.Lock()
+    held: list[tuple[DeploymentTarget, agent_runtime.AgentRuntimeProvider]] = []
+
     def build() -> agent_runtime.AgentRuntimeProvider:
+        target = resolve_target()
+        with lock:
+            if not held or held[0][0] != target:
+                held[:] = [(target, agent_runtime.AgentRuntimeProvider(target))]
+            return held[0][1]
+
+    return build
+
+
+def _persisted_runtime_factory(account: str) -> RuntimeProviderFactory:
+    def resolve_target() -> DeploymentTarget:
         connection = load_connection(account)
         if connection is None or not connection.usable:
             raise RuntimeError(
                 "No verified portal connection is available. Open Connection and connect "
                 "to a kube-agents host first."
             )
-        return agent_runtime.AgentRuntimeProvider(connection.target)
+        return connection.target
 
-    return build
+    return _shared_runtime_factory(resolve_target)
 
 
 def target_runtime_factory(target: DeploymentTarget) -> RuntimeProviderFactory:
-    """Build providers lazily so UI tests and callers can substitute adapters."""
+    """Build the provider lazily so UI tests and callers can substitute adapters."""
 
-    return lambda: agent_runtime.AgentRuntimeProvider(target)
+    return _shared_runtime_factory(lambda: target)
 
 
 def create_app(

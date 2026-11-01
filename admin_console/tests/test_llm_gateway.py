@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from admin_console import agent_runtime
 from admin_console.api.authorization import portal_api_headers
 from admin_console.api.app import create_app
 from admin_console.tests.interaction_state import isolate_interaction_state
@@ -79,6 +80,8 @@ class FakeKube:
 
 
 class LlmGatewayServiceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        agent_runtime.invalidate()
 
     def test_inspect_returns_raw_results_without_classification(self):
         results = [
@@ -122,6 +125,32 @@ class LlmGatewayServiceTest(unittest.TestCase):
         patch_call = kube.calls[1]
         self.assertIn("super-secret", patch_call[1])
         self.assertIn("custom-credentials", patch_call[0])
+
+    def test_configure_drops_the_held_runtime_discovery(self):
+        agent_runtime._discovery_cache.lookup(
+            TARGET, "canonical_agent", lambda: "held-agent"
+        )
+        kube = FakeKube(
+            [
+                KubeCommandResult(0, json.dumps(deployment())),
+                KubeCommandResult(0, "secret patched"),
+                KubeCommandResult(0, "resources applied"),
+                KubeCommandResult(0, json.dumps(deployment())),
+                KubeCommandResult(0, "deployment patched"),
+                KubeCommandResult(0, "rollout complete"),
+            ]
+        )
+        service = LlmGatewayService(TARGET, kube=kube)
+
+        with patch.object(service, "_render", return_value="rendered manifest"):
+            service.configure("gemini", "gemini-3.5-flash", credential="credential")
+
+        self.assertEqual(
+            agent_runtime._discovery_cache.lookup(
+                TARGET, "canonical_agent", lambda: "fresh-agent"
+            ),
+            "fresh-agent",
+        )
 
 
     def test_helm_owned_deployment_is_not_modified(self):

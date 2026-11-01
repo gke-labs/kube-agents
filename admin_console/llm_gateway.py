@@ -16,6 +16,7 @@ from admin_console.agent_runtime import (
     GATEWAY_PYTHON,
     AgentRuntimeProvider,
     KubectlRunner,
+    invalidate as invalidate_runtime_discovery,
 )
 from admin_console.kube_access import GKEKubeAccess, KubeCommandResult
 from admin_console.project_config import (
@@ -824,6 +825,10 @@ except urllib.error.HTTPError as error:
                 timeout=60,
             )
         )
+        # The apply and the rollout below change pods in the agent's
+        # namespace; the next runtime read discovers again rather than trust
+        # answers held from before.
+        invalidate_runtime_discovery(self.target)
         if evidence[-1].returncode != 0:
             return {
                 "configurationApplied": False,

@@ -50,17 +50,29 @@ class RuntimeChatBackend:
     """One target-bound facade over the existing chat and runtime providers."""
 
     def __init__(self, target: DeploymentTarget) -> None:
+        self._target = target
         self._chat = agent_chat.AgentChatProvider(target)
         self._runtime = agent_runtime.AgentRuntimeProvider(target)
 
     def run(self, *args, **kwargs) -> ChatRunResult:
-        return self._chat.run(*args, **kwargs)
+        # Each action that changes the runtime drops the held discovery
+        # answers, so the reads that follow it look at the cluster again.
+        try:
+            return self._chat.run(*args, **kwargs)
+        finally:
+            agent_runtime.invalidate(self._target)
 
     def resolve_approval(self, *args, **kwargs) -> ChatRunResult:
-        return self._chat.resolve_approval(*args, **kwargs)
+        try:
+            return self._chat.resolve_approval(*args, **kwargs)
+        finally:
+            agent_runtime.invalidate(self._target)
 
     def stop(self, *args, **kwargs) -> None:
-        self._chat.stop(*args, **kwargs)
+        try:
+            self._chat.stop(*args, **kwargs)
+        finally:
+            agent_runtime.invalidate(self._target)
 
     def get_task_updates(self, *args, **kwargs) -> TaskUpdateResult:
         return self._runtime.get_task_updates(*args, **kwargs)
