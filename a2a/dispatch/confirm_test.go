@@ -28,7 +28,8 @@ func TestALostAcceptIsAbandonedBeforeTheReoffer(t *testing.T) {
 		t.Fatalf("terminal %+v, want tse-1's completed", ts)
 	}
 	if lost.offerCount() != 1 || lost.abandonCount() != 1 {
-		t.Errorf("tse-0: %d offers, %d abandons; want its timed-out offer abandoned once", lost.offerCount(), lost.abandonCount())
+		// Fatal: the reason check below indexes the first abandon.
+		t.Fatalf("tse-0: %d offers, %d abandons; want its timed-out offer abandoned once", lost.offerCount(), lost.abandonCount())
 	}
 	if lost.confirmCount() != 0 || lost.startedCount() != 0 {
 		t.Errorf("tse-0 was confirmed (%d) or started (%d) after its accept was lost", lost.confirmCount(), lost.startedCount())
