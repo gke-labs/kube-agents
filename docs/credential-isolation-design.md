@@ -1016,8 +1016,8 @@ file and never a `.git` it can write into.
   container's own writable layer, discarded whenever that container restarted.
   An `emptyDir` is scoped to the Pod, so its contents now survive a container
   crash or restart and are visible to both containers' next boot. The log
-  shipper gets no `/tmp`: it buffers in memory
-  and keeps its tail database on its own volume. Containers supplied through
+  shipper gets no `/tmp`: it buffers in memory, and its one writable path is
+  the directory below. Containers supplied through
   `spec.deployment.sidecars`/`initContainers` are appended to the Pod
   substantially as written; the webhook does not require a read-only root of
   them, so a CR can still add a writable container to this Pod. "As written"
@@ -1028,6 +1028,17 @@ file and never a `.git` it can write into.
   that discards a CR value, `POD_NAMESPACE` as a default a CR value beats.
   Neither edit touches the container's filesystem posture, which is what this
   bullet is about.
+- The log shipper's tail cursors, the two SQLite files that record how far it
+  has read each log, live in a per-agent directory on the namespace's
+  `system-metadata` claim, mounted into the shipper alone at a `subPath` of its
+  own. A cursor on an `emptyDir` died with the Pod, and every replacement
+  shipped each file again from its first line. The agent's data claim was not
+  used for it because the agent and the dashboard mount that claim at its root,
+  and a cursor file rewritten into something SQLite cannot open stops the
+  shipper at every start; the `system-metadata` claim is reached by those two
+  containers only through `subPath: session`, so the cursors are outside what
+  model-authored code can write. The shipper's own container is the only one
+  with a mount under `fluent-bit-state/`.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
 - The operator reports Ready only when every workload it renders is ready, with

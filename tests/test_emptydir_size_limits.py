@@ -52,8 +52,9 @@ SIZE_LIMIT_FIELD = re.compile(r"\bSizeLimit:\s*(?!nil\b)\S")
 GO_COMMENTS = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
 # Forms that build an emptyDir with no literal to carry a SizeLimit.
 UNBOUNDED_GO_FORMS = re.compile(r"new\(\s*(?:corev1\.)?EmptyDirVolumeSource\s*\)|var\s+\w+\s+(?:corev1\.)?EmptyDirVolumeSource\b")
-# The literals in tree when this was written (2026-10-22): 12.
-MIN_GO_EMPTYDIRS = 12
+# The literals in tree when this was written (2026-10-22): 12; 11 since the
+# fluent-bit tail cursors moved from an emptyDir to the system-metadata claim.
+MIN_GO_EMPTYDIRS = 11
 
 # YAML: the chart, rendered, and the operator's kustomize manifests, parsed. The
 # CRD schemas name `emptyDir` as a property, not a volume, so they are skipped.
