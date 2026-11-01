@@ -2686,14 +2686,19 @@ def main(argv: list[str] | None = None) -> int:
     # scheduled or on demand, passes it; a chat fleet question does not.
     if args.config_connector:
         # After the sweep, in a new pool of the sweep's size: one Config Connector
-        # read (a CRD list and one list request per kind, `kcc_health.read_objects`)
-        # per collected cluster, as `kcc_unready` or `kcc_unread` on its entry,
-        # with the kubeconfig the sweep fetched for that cluster
-        # (`fetch_credentials`). The reads end inside the collector's time budget
+        # read (discovery, then one list request per container kind,
+        # `kcc_health.CONTAINER_KINDS`, `kcc_health.read_objects`) per collected
+        # cluster, as `kcc_unready` or `kcc_unread` on its entry, with the
+        # kubeconfig the sweep fetched for that cluster (`fetch_credentials`).
+        # The reads end inside the collector's time budget
         # (`kcc_health.RUN_DEADLINE_S`), so the manifest always prints.
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             kcc_health.annotate_manifest(
-                manifest, deadline=kcc_health.run_deadline(started), mapper=pool.map, kubeconfig_for=swept_kubeconfig
+                manifest,
+                deadline=kcc_health.run_deadline(started),
+                mapper=pool.map,
+                kubeconfig_for=swept_kubeconfig,
+                kinds=kcc_health.CONTAINER_KINDS,
             )
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0

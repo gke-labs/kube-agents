@@ -2139,6 +2139,10 @@ KCC_REVERTED_NOTE_MARK = "Config Connector holds that field against out-of-band 
 # cluster gave no answer.
 KCC_UNREADY_FIELD = "kcc_unready"
 KCC_UNREAD_FIELD = "kcc_unread"
+# The key that names the kinds a read listed when it listed only some (the
+# drift, patch readiness and stockout collectors read the container kinds
+# alone): an object of another kind was not read, which is not "ready".
+KCC_KINDS_READ_FIELD = "kcc_kinds_read"
 # The `Ready=False` reason of an object that waits on another object, and the
 # reference its message names (`reference PubSubTopic infra/events is not
 # ready`). collect.py's `KCC_DEPENDENCY_NOT_READY_REASON` spells the reason.
@@ -2211,6 +2215,9 @@ KCC_STALLED_NAMED = 2
 KCC_STALLED_OBJECT = "`Ready=False` on {name} ({why})"
 KCC_STALLED_SEPARATOR = "; "
 KCC_STALLED_WAITS_ON = ", which waits on "
+# What the list says in place of a reason for an object the read did not
+# list: its kind was not read on that host, so its state is not known.
+KCC_STALLED_NOT_READ = "its state was not read"
 # How the list counts the other unready objects in a dependency chain: it
 # names only the deepest one, the root cause, so a long chain cannot push
 # the note past `MAX_NOTE_CHARS`.
@@ -18655,6 +18662,9 @@ class KccStall(NamedTuple):
     `cnrm.cloud.google.com/project-id` annotation, else its namespace's
     annotation, else the namespace's name), `""` when not known.
     `location` is the object's `spec.location`, `""` when it has none.
+    `host_kinds` holds the kinds the host's read listed when it listed only
+    some (`kcc_kinds_read`), and `read` is False for an object that a
+    `DependencyNotReady` message names and that the read did not list.
     """
 
     kind: str
@@ -18666,6 +18676,11 @@ class KccStall(NamedTuple):
     host: str = ""
     project: str = ""
     location: str = ""
+    # The kinds the host's read listed, when it listed only some; empty when
+    # it listed every kind.
+    host_kinds: frozenset[str] = frozenset()
+    # False for an object the chain names that the read did not list.
+    read: bool = True
 
 
 class KccHealth(NamedTuple):
@@ -18713,6 +18728,7 @@ def kcc_health(manifest: dict | None) -> KccHealth:
             hosts += 1
         elif reads_kcc and _kcc_never_read(entry):
             hosts += 1
+        host_kinds = frozenset(str(kind) for kind in entry.get(KCC_KINDS_READ_FIELD) or [])
         for record in entry.get(KCC_UNREADY_FIELD) or []:
             if not isinstance(record, dict) or not record.get("kind") or not record.get("name"):
                 continue
@@ -18728,6 +18744,7 @@ def kcc_health(manifest: dict | None) -> KccHealth:
                     host,
                     str(record.get("project") or ""),
                     str(record.get("location") or ""),
+                    host_kinds,
                 )
             )
     return KccHealth(stalled, unread, hosts, tuple(targets))
@@ -18752,7 +18769,10 @@ def _kcc_dependencies(stall: KccStall, stalled: list[KccStall]) -> list[KccStall
 
     Only an object the collector also recorded on the same host cluster
     counts: a reference to an object that is ready, or to an object of the
-    same name that another host's Config Connector holds, is not named.
+    same name that another host's Config Connector holds, is not named. When
+    the host's read listed only some kinds and the reference is of another
+    kind, the referenced object ends the chain with `read` False: the note
+    names it and says that its state was not read.
     """
     found: list[KccStall] = []
     current = stall
@@ -18771,6 +18791,22 @@ def _kcc_dependencies(stall: KccStall, stalled: list[KccStall]) -> list[KccStall
             ),
             None,
         )
+        if nxt is None and current.host_kinds and reference.group("kind") not in current.host_kinds:
+            # The read did not list that kind on this host: name the object
+            # the message names, and say that its state was not read.
+            found.append(
+                KccStall(
+                    reference.group("kind"),
+                    reference.group("namespace") or current.namespace,
+                    reference.group("name"),
+                    "",
+                    "",
+                    "",
+                    current.host,
+                    read=False,
+                )
+            )
+            break
         if nxt is None or nxt == stall or nxt in found:
             break
         found.append(nxt)
@@ -18993,7 +19029,7 @@ def kcc_stalled_objects(matched: list[KccStall], stalled: list[KccStall]) -> str
         chain = _kcc_dependencies(stall, stalled)
         if chain:
             root = chain[-1]
-            text += f"{KCC_STALLED_WAITS_ON}{_kcc_name(root)} ({_kcc_why(root)})"
+            text += f"{KCC_STALLED_WAITS_ON}{_kcc_name(root)} ({_kcc_why(root) if root.read else KCC_STALLED_NOT_READ})"
             if len(chain) > 1:
                 text += KCC_STALLED_WAITS_MORE.format(rest=len(chain) - 1)
         joined = KCC_STALLED_SEPARATOR.join([*parts, text])

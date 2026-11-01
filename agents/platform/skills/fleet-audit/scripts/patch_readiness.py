@@ -2358,12 +2358,15 @@ def main(argv: list[str] | None = None) -> int:
     # scheduled or on demand, passes it; the chat route does not.
     if args.config_connector:
         # After the sweep, in a new pool of the sweep's size: a credential fetch
-        # and one Config Connector read per collected cluster (a CRD list and one
-        # list request per kind, `kcc_health.read_objects`), as `kcc_unready` or
+        # and one Config Connector read per collected cluster (discovery, then one
+        # list request per container kind, `kcc_health.CONTAINER_KINDS`,
+        # `kcc_health.read_objects`), as `kcc_unready` or
         # `kcc_unread` on its entry. The reads end inside the collector's time
         # budget (`kcc_health.RUN_DEADLINE_S`), so the manifest always prints.
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            kcc_health.annotate_manifest(manifest, deadline=kcc_health.run_deadline(started), mapper=pool.map)
+            kcc_health.annotate_manifest(
+                manifest, deadline=kcc_health.run_deadline(started), mapper=pool.map, kinds=kcc_health.CONTAINER_KINDS
+            )
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):
         log(f"WARNING: {manifest['error']}")

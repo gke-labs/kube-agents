@@ -23242,6 +23242,22 @@ metadata:
         self.assertEqual(self.disclose([finding], manifest), [])
         self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
 
+    def test_a_dependency_of_a_kind_the_read_did_not_list_is_named_as_not_read(self):
+        """The flag collectors read only the container kinds. The cluster waits
+        on a PubSubTopic, which the read did not list: the note names the
+        topic from the message and says its state was not read, and never
+        claims a reason for it."""
+        manifest = kcc_manifest(KCC_CLUSTER)
+        manifest["clusters"][0]["kcc_kinds_read"] = ["ContainerCluster", "ContainerNodePool"]
+        finding = kcc_finding()
+        self.disclose([finding], manifest)
+        note = finding["remediation"]["note"]
+        self.assertIn("which waits on `PubSubTopic infra/fleet-events` (its state was not read)", note)
+        # With every kind read, a ready topic is not named.
+        finding = kcc_finding()
+        self.disclose([finding], kcc_manifest(KCC_CLUSTER))
+        self.assertNotIn("which waits on", finding["remediation"]["note"])
+
     def test_the_copied_constants_equal_the_collectors(self):
         """audit_report.py does not import the collectors, so it copies two of
         kcc_health.py's constants; this holds the copies equal."""
@@ -23251,6 +23267,7 @@ metadata:
         self.assertEqual(audit_report.KCC_PROJECT_ANNOTATION, kcc_health.KCC_PROJECT_ANNOTATION)
         self.assertEqual(audit_report.KCC_UNREADY_FIELD, kcc_health.UNREADY_FIELD)
         self.assertEqual(audit_report.KCC_UNREAD_FIELD, kcc_health.UNREAD_FIELD)
+        self.assertEqual(audit_report.KCC_KINDS_READ_FIELD, kcc_health.KINDS_READ_FIELD)
         self.assertEqual(audit_report.KCC_CLUSTER_STATUS_FIELD, kcc_health.CLUSTER_STATUS_FIELD)
         self.assertEqual(audit_report.KCC_READABLE_STATUSES, kcc_health.READABLE_STATUSES)
         self.assertEqual(audit_report.KCC_PROJECT_TARGET_PREFIX, kcc_health.PROJECT_TARGET_PREFIX)

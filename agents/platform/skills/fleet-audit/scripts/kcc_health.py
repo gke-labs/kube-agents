@@ -104,6 +104,19 @@ KCC_GROUP_SUFFIX = ".cnrm.cloud.google.com"
 # requests. `-o wide` adds the verbs and the categories; `--no-headers` leaves
 # one resource per line.
 DISCOVERY_ARGV = ("kubectl", "api-resources", "-o", "wide", "--no-headers")
+# The kinds the drift, patch readiness and stockout collectors read: their
+# findings are on `Cluster/` and `NodePool/` objects, and a finding's note
+# names only its own object, so no other kind can change a note. From the
+# agent each list request through the credential proxy takes seconds, and
+# listing all ~230 kinds of an install does not fit the time budget. The
+# compliance collector reads every kind (`kinds=None`), because its
+# `kcc-object-wedged` check needs them all. As `(group, kind)`.
+CONTAINER_GROUP = "container.cnrm.cloud.google.com"
+CONTAINER_KINDS = frozenset({(CONTAINER_GROUP, "ContainerCluster"), (CONTAINER_GROUP, KCC_NODE_POOL_KIND)})
+# The entry key that names the kinds a read listed, when it listed only some
+# (`CONTAINER_KINDS`): `finish` then knows that an object of another kind
+# was not read, rather than read and ready.
+KINDS_READ_FIELD = "kcc_kinds_read"
 # The words of an `api-resources -o wide` line after NAME and SHORTNAMES:
 # APIVERSION, NAMESPACED, KIND, VERBS, CATEGORIES. SHORTNAMES can be empty, so
 # a line is read from its NAMESPACED column (`true` or `false`).
@@ -433,10 +446,13 @@ def read_objects(
     deadline: float,
     clock: ClockFn = time.monotonic,
     workers: int | None = None,
+    kinds: "frozenset[tuple[str, str]] | None" = None,
 ) -> KccRead:
     """List every Config Connector object on one cluster before `deadline`.
 
-    Discovery (`kubectl api-resources`) finds the kinds, then one list
+    Discovery (`kubectl api-resources`) finds the kinds (only those in
+    `kinds`, as `(group, kind)`, when it is given; none served is
+    `READ_ABSENT`), then one list
     request per kind runs on a pool of `workers` (`KIND_READ_WORKERS` when
     not given). Every `kubectl` call takes a proxy slot first
     (`_with_proxy_slot`). Each step's timeout is cut to the time left, and a
@@ -453,7 +469,8 @@ def read_objects(
     partial = found.rc != 0 and PARTIAL_DISCOVERY_MARKER in found.stderr and KCC_GROUP_SUFFIX not in found.stderr
     if found.rc != 0 and not partial:
         return KccRead(READ_FAILED, [], f"the discovery exited {found.rc} ({_excerpt(found.stderr)})", 0, timeout_s)
-    kinds = kcc_kinds(found.stdout)
+    wanted = kinds
+    kinds = [kind for kind in kcc_kinds(found.stdout) if wanted is None or (kind.group, kind.kind) in wanted]
     if not kinds:
         return KccRead(READ_ABSENT, [], "", 0, timeout_s)
 
@@ -500,9 +517,20 @@ def read_fields(read: KccRead) -> dict:
     return {UNREAD_FIELD: f"The Config Connector read failed ({read.detail}), {unknown}"}
 
 
-def read_cluster(kubeconfig: Path, *, run: RunFn = default_run, deadline: float, clock: ClockFn = time.monotonic) -> dict:
-    """Read one cluster and return its entry keys (`read_fields`)."""
-    return read_fields(read_objects(kubeconfig, run=run, deadline=deadline, clock=clock))
+def read_cluster(
+    kubeconfig: Path,
+    *,
+    run: RunFn = default_run,
+    deadline: float,
+    clock: ClockFn = time.monotonic,
+    kinds: "frozenset[tuple[str, str]] | None" = None,
+) -> dict:
+    """Read one cluster and return its entry keys (`read_fields`). A read of
+    only some `kinds` that listed them also names them (`KINDS_READ_FIELD`)."""
+    fields = read_fields(read_objects(kubeconfig, run=run, deadline=deadline, clock=clock, kinds=kinds))
+    if kinds is not None and UNREADY_FIELD in fields:
+        fields[KINDS_READ_FIELD] = sorted(kind for _, kind in kinds)
+    return fields
 
 
 def add_flag(parser) -> None:
@@ -533,7 +561,12 @@ def _time_left(deadline: float, clock: ClockFn) -> int:
 
 
 def _annotate_entry(
-    entry: dict, run: RunFn, deadline: float, clock: ClockFn, kubeconfig_for: KubeconfigFn | None
+    entry: dict,
+    run: RunFn,
+    deadline: float,
+    clock: ClockFn,
+    kubeconfig_for: KubeconfigFn | None,
+    kinds: "frozenset[tuple[str, str]] | None" = None,
 ) -> dict:
     """Fetch one cluster's credentials and read it; the keys for its entry.
 
@@ -570,7 +603,7 @@ def _annotate_entry(
     left = _time_left(deadline, clock)
     if not left:
         return _budget_spent()
-    fields = read_cluster(kubeconfig, run=run, deadline=min(deadline, clock() + READ_TIMEOUT_S), clock=clock)
+    fields = read_cluster(kubeconfig, run=run, deadline=min(deadline, clock() + READ_TIMEOUT_S), clock=clock, kinds=kinds)
     if _needs_namespace_projects(fields):
         left = _time_left(deadline, clock)
         if left:
@@ -586,8 +619,14 @@ def annotate_manifest(
     mapper: MapFn = map,
     clock: ClockFn = time.monotonic,
     kubeconfig_for: KubeconfigFn | None = None,
+    kinds: "frozenset[tuple[str, str]] | None" = None,
 ) -> None:
     """Read every collected cluster in `manifest` once and add its keys.
+
+    `kinds` limits the read to those `(group, kind)` pairs; the drift, patch
+    readiness and stockout collectors pass `CONTAINER_KINDS`. A cluster that
+    serves none of them gets neither key, as a cluster with no Config
+    Connector does: for these collectors it holds no object a note can name.
 
     Only `collected` cluster entries that name a project and a location are
     read: a `project/<id>` entry at location `global` is not a cluster, and
@@ -625,7 +664,7 @@ def annotate_manifest(
 
     def one(entry: dict) -> dict:
         try:
-            return _annotate_entry(entry, run, deadline, clock, kubeconfig_for)
+            return _annotate_entry(entry, run, deadline, clock, kubeconfig_for, kinds)
         except Exception as exc:  # noqa: BLE001 -- the manifest stands without this read
             return {UNREAD_FIELD: f"the read raised {type(exc).__name__}: {exc}"[:MAX_ERROR_CHARS]}
 

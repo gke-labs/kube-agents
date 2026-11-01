@@ -2689,6 +2689,9 @@ class CandidateSummaryTest(unittest.TestCase):
 
         def annotate(found, *, mapper, deadline, **kwargs):
             self.assertGreater(deadline, 0)
+            # Only the kinds this stream's findings can own: from the agent, all
+            # ~230 kinds do not fit the time budget.
+            self.assertEqual(kwargs["kinds"], fd.kcc_health.CONTAINER_KINDS)
             found["clusters"][0]["kcc_unready"] = list(mapper(lambda entry: {"seen": entry["name"]}, found["clusters"]))
 
         out = io.StringIO()

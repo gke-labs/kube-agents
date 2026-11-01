@@ -3683,6 +3683,9 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
 
         def annotate(found, *, mapper, deadline, **kwargs):
             self.assertGreater(deadline, 0)
+            # Only the kinds this stream's findings can own: from the agent, all
+            # ~230 kinds do not fit the time budget.
+            self.assertEqual(kwargs["kinds"], fs.kcc_health.CONTAINER_KINDS)
             self.assertEqual(kwargs["kubeconfig_for"](found["clusters"][0]), fs.kubeconfig_path("acme", "hub", "us-central1"))
             found["clusters"][0]["kcc_unread"] = "".join(mapper(lambda entry: entry["name"], found["clusters"]))
 

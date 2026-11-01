@@ -191,8 +191,9 @@ class UnreadyObjectsTest(unittest.TestCase):
 
 
 class ReadObjectsTest(unittest.TestCase):
-    """`read_objects`: a CRD list, then one list request per Config Connector
-    kind, in parallel."""
+    """`read_objects`: discovery, then one list request per Config Connector
+    kind (every kind for the compliance collector, `CONTAINER_KINDS` for the
+    others), with no more than `PROXY_SLOTS` requests in flight."""
 
     def read(self, run, **kwargs):
         return kcc_health.read_objects(Path("kubeconfig"), run=run, deadline=kwargs.pop("deadline", 1e9), clock=kwargs.pop("clock", lambda: 0.0), **kwargs)
@@ -349,6 +350,46 @@ class ReadObjectsTest(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(read.status, kcc_health.READ_TIMED_OUT)
         self.assertIn("no proxy slot", read.detail)
+
+    def test_the_flag_collectors_list_only_the_container_kinds(self):
+        """From the agent each request takes seconds, so the drift, patch
+        readiness and stockout collectors list only the kinds their findings
+        can own."""
+        calls = []
+        served = ("ContainerCluster", "ContainerNodePool", "PubSubTopic", "ComputeFirewall")
+
+        def run(argv, *, env=None, timeout=None):
+            calls.append(argv)
+            if is_discovery(argv):
+                return kcc_health.Result(0, "".join(
+                    crd_line(kind, group="container.cnrm.cloud.google.com" if kind.startswith("Container") else FAKE_GROUP) + "\n"
+                    for kind in served
+                ), "")
+            return listing()
+
+        read = self.read(run, kinds=kcc_health.CONTAINER_KINDS)
+        self.assertEqual(read.status, kcc_health.READ_LISTED)
+        self.assertEqual(read.kinds, 2)
+        listed = sorted(argv[3] for argv in calls if argv[:3] == ["kubectl", "get", "--raw"])
+        self.assertEqual(listed, [
+            "/apis/container.cnrm.cloud.google.com/v1beta1/containerclusters",
+            "/apis/container.cnrm.cloud.google.com/v1beta1/containernodepools",
+        ])
+        # With no kinds named, the compliance collector's read lists them all.
+        calls.clear()
+        self.assertEqual(self.read(run).kinds, len(served))
+
+    def test_a_cluster_with_no_container_kind_is_absent_for_the_flag_collectors(self):
+        """Config Connector runs there, but serves no container kind: no object
+        a drift, patch readiness or stockout note can name, so neither key."""
+        def run(argv, *, env=None, timeout=None):
+            if is_discovery(argv):
+                return kcc_health.Result(0, crd_line("PubSubTopic") + "\n", "")
+            return listing()
+
+        read = self.read(run, kinds=kcc_health.CONTAINER_KINDS)
+        self.assertEqual(read.status, kcc_health.READ_ABSENT)
+        self.assertEqual(kcc_health.read_fields(read), {})
 
     def test_a_kind_that_went_away_after_the_discovery_is_skipped(self):
         def run(argv, *, env=None, timeout=None):
@@ -631,6 +672,15 @@ class AnnotateManifestTest(unittest.TestCase):
                 run = FakeRun({"hub": listing(bare)}, namespaces=namespaces)
                 kcc_health.annotate_manifest(read, deadline=self.deadline, run=run, clock=self.clock)
                 self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding()], read, root), expected)
+
+    def test_a_read_of_some_kinds_names_them_on_the_entry(self):
+        run = FakeRun({"hub": listing(kcc_object("ContainerCluster", "prod", status="False", reason="UpdateFailed"))})
+        manifest = {"clusters": [self.manifest()["clusters"][0]]}
+        kinds = frozenset({(FAKE_GROUP, "ContainerCluster"), (FAKE_GROUP, "ContainerNodePool")})
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock, kinds=kinds)
+        entry = manifest["clusters"][0]
+        self.assertEqual([r["name"] for r in entry["kcc_unready"]], ["prod"])
+        self.assertEqual(entry["kcc_kinds_read"], ["ContainerCluster", "ContainerNodePool"])
 
     def test_clusters_with_the_add_on_are_read_first(self):
         run = FakeRun({"hub": listing(), "edge": listing(), "slow": listing()})
