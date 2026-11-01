@@ -20,7 +20,7 @@
 agents/cluster/SOUL.md unpaged-list 1 the persona's example of a large output the model must filter at the source; the span warns against the shape rather than prescribing it
 agents/cluster/persona/instructions.md unpaged-list 1 the same filter-at-the-source example, in the Cluster Agent's instructions
 agents/platform/AGENTS.md unpaged-list 1 the same filter-at-the-source example, in the Platform Agent's operating rules
-agents/platform/governance/ai_security_audit_sop.md multi-kind-dump 1 the AI-workload audit's per-cluster dump of Deployments, StatefulSets, DaemonSets, CronJobs and Pods
+agents/platform/governance/ai_security_audit_sop.md multi-kind-dump 2 the AI-workload audit's per-cluster dump of Deployments, StatefulSets, DaemonSets, CronJobs and Pods, and the same dump as the checks_run example's command
 agents/platform/governance/ai_security_audit_sop.md unpaged-list 1 the AI-workload audit's per-cluster Service read
 agents/platform/governance/cluster_inventory_audit_sop.md unpaged-list 1 names the Deployment dump as a read the collector must not skip over; the step runs through collect.py's shared dump
 agents/platform/governance/compliance_audit_sop.md unpaged-list 4 the compliance audit's Config Connector, Config Sync (RootSync, RepoSync) and Service reads per cluster
@@ -29,11 +29,13 @@ agents/platform/governance/fleet_wide_cost_analysis_sop.md unpaged-list 7 the Po
 agents/platform/governance/obtainability_audit_sop.md multi-kind-dump 1 the obtainability audit's thirteen-kind dump per cluster
 agents/platform/governance/obtainability_audit_sop.md unpaged-list 1 the obtainability audit's ComputeClass read
 agents/platform/governance/stockout_prevention_sop.md multi-kind-dump 2 the stockout SOP's dump of ComputeClasses, workloads and StorageClasses, and the ComputeClass check's own read
+agents/platform/governance/stockout_prevention_sop.md unpaged-list 1 the ComputeClass read the checks_run example shows as its command
+agents/platform/governance/upgrade_retrospective_sop.md unpaged-list 1 the Pod read the checks_run example shows as its command
 agents/platform/scripts/audit_certificates.py unpaged-list 3 the certificate collector lists Certificates, Issuers and ManagedCertificates one kind per call; its helper appends -o json
 agents/platform/scripts/audit_networking.py unpaged-list 6 the networking collector lists Services, Ingresses, Gateways, HTTPRoutes, BackendConfigs and HealthCheckPolicies one kind per call; its helper appends -o json
 agents/platform/scripts/audit_storage.py unpaged-list 1 the storage collector's PVC list; its helper appends -o json
 agents/platform/skills/capacity-obtainability/SKILL.md unpaged-list 1 the skill's raw read of the metrics API's node list, one entry per node
-agents/platform/skills/fleet-audit/scripts/collect.py multi-kind-dump 5 the fleet-audit collector's shared workload dump and the compliance dumps of workloads (twice), RBAC objects and NetworkPolicies
+agents/platform/skills/fleet-audit/scripts/collect.py multi-kind-dump 6 the fleet-audit collector's shared workload dump and the record label that writes the same dump's command into the report, and the compliance dumps of workloads (twice), RBAC objects and NetworkPolicies
 agents/platform/skills/fleet-audit/scripts/collect.py unpaged-list 8 the fleet-audit collector's single-kind Service (twice), ccnp, Config Connector, ServiceAccount and ComputeClass reads, and the Config Sync loop's RootSync and RepoSync reads
 agents/platform/skills/fleet-audit/scripts/fleet_stockout.py multi-kind-dump 1 the stockout collector's one dump of ComputeClasses, workloads, StorageClasses and Nodes per cluster
 agents/platform/skills/fleet-audit/scripts/fleet_waste.py multi-kind-dump 1 the waste collector's fifteen-kind dump per cluster

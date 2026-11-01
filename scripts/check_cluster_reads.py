@@ -39,16 +39,23 @@ What is read, under ``agents/`` with the mirrored ``gke-*`` skills skipped
   and sequence constants, a starred name or literal splices its elements, a
   starred conditional splices both branches, a starred call splices one
   unknown token (a helper's prefix, stepped over as ``kubectl`` would be), an
-  f-string resolves to its constant text with ``{}`` where a value goes, and
-  a ``for`` loop over a literal sequence judges its body once per element. A
-  list that opens with ``get`` and carries ``-A`` with no ``-o`` is judged
-  full-object: the audit scripts pass such lists to a helper that appends
-  ``-o json``. A string literal that carries ``kubectl`` is read as a shell
-  line (``shell=True``, ``.split()``), docstrings excepted. Test files
-  (``test_*.py``) and ``testdata/`` trees are not read.
+  f-string resolves to its constant text with each ``{name}`` replaced by the
+  module constant or loop element it names and ``{}`` where a value cannot
+  be read, and a ``for`` loop over a literal sequence judges its body once
+  per element. A list that opens with ``get`` (no ``kubectl`` before it) and
+  carries ``-A`` with no ``-o`` is judged full-object: the audit scripts pass
+  such lists to a helper that appends ``-o json``; a list that opens with
+  ``kubectl`` and names no ``-o`` is a table, as on a shell line. A string
+  literal, an f-string or a ``+`` of strings that carries ``kubectl`` is read
+  as a shell line (``shell=True``, ``.split()``), docstrings excepted. Test
+  files (``test_*.py``) and ``testdata/`` trees are not read.
 * ``*.sh``: every command line, continuations joined, comments dropped, each
   simple command of a pipeline on its own, ``kubectl`` found wherever it
-  stands in it (after ``KUBECONFIG=... ``, ``env``, ``timeout 60``).
+  stands in it (after ``KUBECONFIG=... ``, ``env``, ``timeout 60``). A quoted
+  word that holds a whole command (``bash -c "kubectl ..."``, the
+  ``"command": "kubectl ..."`` of a JSON example) is read as a line of its
+  own. A kinds token that is a shell expansion (``"$KINDS"``) cannot be shown
+  to be one kind and falls under ``unresolved-kinds``.
 * ``*.md``: the fenced code blocks and the inline code spans. Prose is not
   read, so a sentence that names the shape to warn against it is not a hit.
 
@@ -153,14 +160,16 @@ FLAG_WITH_VALUE_WIDTH = 2
 # the global ones a command line carries. The credential proxy's transcript
 # reader keeps the same table (`KUBECTL_VALUE_FLAGS` and `KUBECTL_FILE_FLAGS`
 # in agents/platform/scripts/worker_transcript.py); the test holds this set
-# to be a superset of those two, so a flag added there is added here.
+# to be a superset of those two and disjoint from its `KUBECTL_BOOLEAN_FLAGS`
+# (a boolean flag listed here would eat the token after it), so a flag added
+# there is added here and a boolean one never is.
 FLAGS_WITH_VALUE = frozenset(
     {
         "-n", "--namespace", "-l", "--selector", "--field-selector", "-L", "--label-columns",
         "--sort-by", "--template", "--chunk-size", "--request-timeout", "--timeout", "--context",
         "--kubeconfig", "--cluster", "--user", "--token", "-s", "--server", "--as", "--as-group",
         "--as-uid", "--cache-dir", "--certificate-authority", "--client-certificate", "--client-key",
-        "--tls-server-name", "--output-watch-events", "--subresource", "--raw", "-f", "--filename",
+        "--tls-server-name", "--subresource", "--raw", "-f", "--filename",
         "-k", "--kustomize", "-v", "--v", "--field-manager", "--profile", "--profile-output",
         OUTPUT_SHORT_FLAG, OUTPUT_LONG_FLAG,
     }
@@ -173,8 +182,15 @@ FLAGS_WITH_VALUE = frozenset(
 # fragment) is split on whitespace instead, so it is still read.
 SHELL_PUNCTUATION = set("|&;<>()")
 # The file descriptor of a redirection (`2>/dev/null`, `2>&1`) comes off the
-# lexer as its own word before the `>`; it is not an argument.
+# lexer as its own word before the `>`; it is not an argument, unless the
+# word before it is a flag that takes the next token (`--chunk-size 500 >`).
 REDIRECT_CHARS = set("<>")
+# A word with a blank inside it came off the lexer from one quoted string; one
+# that carries `kubectl` is a command of its own (`bash -c "kubectl ..."`).
+QUOTED_COMMAND_RE = re.compile(r"\s")
+# A shell expansion where the kinds should be (`"$KINDS"`, `${KINDS}`): the
+# check cannot show it is one kind.
+SHELL_EXPANSION_MARK = "$"
 # What may stand before a bare `get` in the Python reading: a `NAME=value`
 # assignment, `env`, or a spliced helper prefix the check could not read.
 ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -331,13 +347,15 @@ def judge(tokens: list[Token], python_argv: bool) -> str | None:
     """The rule a `kubectl get` argv breaks, or None.
 
     `python_argv` is the Python reading: a list may open with `get` (a helper
-    prepends `kubectl`), and one that names no `-o` is handed to a helper
-    that appends `-o json`, so it counts as full objects. A shell line needs
-    the `kubectl` word, and one with no `-o` is a table.
+    prepends `kubectl`), and such a list that names no `-o` is handed to a
+    helper that appends `-o json`, so it counts as full objects. A shell
+    line, or a list that opens with `kubectl`, needs the `-o`; with none it
+    is a table.
     """
     start = get_argv_start(tokens, bare_get=python_argv)
     if start is None:
         return None
+    helper_argv = python_argv and not any(is_kubectl(token) for token in tokens[:start])
     positionals: list[Token] = []
     all_namespaces = False
     output: Token = None
@@ -366,7 +384,9 @@ def judge(tokens: list[Token], python_argv: bool) -> str | None:
             if name in OUTPUT_FLAGS:
                 output, output_named = value, True
             elif name == CHUNK_SIZE_FLAG:
-                paged = value is not None and value != CHUNK_SIZE_DISABLED
+                # Only a literal `0` disables chunking; a value the check
+                # cannot read (`str(CHUNK_SIZE)`, a parameter) was still written.
+                paged = value != CHUNK_SIZE_DISABLED
             elif name == RAW_FLAG:
                 raw_url = value
             index += FLAG_WITH_VALUE_WIDTH if consumed and name in FLAGS_WITH_VALUE else 1
@@ -382,10 +402,10 @@ def judge(tokens: list[Token], python_argv: bool) -> str | None:
     # kubectl refuses a name with -A, so the first positional is the kinds
     # and anything after it is the value of a flag this check does not know.
     kinds = positionals[0]
-    full_object = output in FULL_OBJECT_FORMATS if output_named else python_argv
+    full_object = output in FULL_OBJECT_FORMATS if output_named else helper_argv
     if not full_object:
         return None
-    if kinds is None or FORMAT_PLACEHOLDER in kinds:
+    if kinds is None or FORMAT_PLACEHOLDER in kinds or SHELL_EXPANSION_MARK in kinds:
         return RULE_UNRESOLVED
     if NAME_SEPARATOR in kinds:
         return None
@@ -439,12 +459,18 @@ class ModuleConstants:
             for value in node.values:
                 if isinstance(value, ast.Constant) and isinstance(value.value, str):
                     parts.append(value.value)
+                elif isinstance(value, ast.FormattedValue) and (text := self.string(value.value)) is not None:
+                    parts.append(text)
                 else:
                     parts.append(FORMAT_PLACEHOLDER)
             return "".join(parts)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            # A side the check cannot read stands as `{}`, as in an f-string,
+            # so the literal half of `"kubectl get ... " + rest` is still read.
             left, right = self.string(node.left), self.string(node.right)
-            return None if left is None or right is None else left + right
+            if left is None and right is None:
+                return None
+            return (FORMAT_PLACEHOLDER if left is None else left) + (FORMAT_PLACEHOLDER if right is None else right)
         return None
 
     def named_string(self, name: str) -> Token:
@@ -489,9 +515,10 @@ class ModuleConstants:
         """Each binding of the loop variable a literal names directly, from the innermost loop enclosing it.
 
         One empty binding when it names none; a loop variable that shadows a
-        module constant is read as the constant.
+        module constant is read as the constant. A list or tuple names its
+        elements; an f-string the values it formats.
         """
-        names = {element.id for element in node.elts if isinstance(element, ast.Name) and element.id not in self.nodes}
+        names = {element.id for element in direct_names(node) if element.id not in self.nodes}
         enclosing = [loop for loop in self.loops if loop[2] in names and loop[0] <= node.lineno <= loop[1]]
         if not enclosing:
             yield {}
@@ -499,6 +526,28 @@ class ModuleConstants:
         _, _, name, values = max(enclosing, key=lambda loop: loop[0])
         for value in values:
             yield {name: value}
+
+
+def direct_names(node: ast.expr) -> list[ast.Name]:
+    """The names a list, tuple, f-string or `+` of strings refers to directly."""
+    if isinstance(node, ast.Name):
+        return [node]
+    if isinstance(node, ast.BinOp):
+        return direct_names(node.left) + direct_names(node.right)
+    if isinstance(node, ast.JoinedStr):
+        elements = [value.value for value in node.values if isinstance(value, ast.FormattedValue)]
+    else:
+        elements = list(getattr(node, "elts", ()))
+    return [element for element in elements if isinstance(element, ast.Name)]
+
+
+def is_string_expression(node: ast.AST) -> bool:
+    """A string literal, an f-string, or a `+` of them: text a shell line may be written as."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return is_string_expression(node.left) or is_string_expression(node.right)
+    return isinstance(node, ast.JoinedStr)
 
 
 def docstring_ids(module: ast.Module) -> set[int]:
@@ -518,14 +567,26 @@ def python_findings(path: Path, text: str) -> list[Finding]:
         return []
     constants = ModuleConstants(module)
     docstrings = docstring_ids(module)
+    # The fragments of an f-string or a concatenation already read as one
+    # text are not read again on their own.
+    read_as_text: set[int] = set()
     findings = []
     for node in ast.walk(module):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and KUBECTL in node.value and id(node) not in docstrings:
-            for offset, line in enumerate(node.value.splitlines()):
-                for argv in commands(line):
-                    rule = judge(argv, python_argv=False)
-                    if rule is not None:
-                        findings.append(Finding(path, node.lineno + offset, rule, render(argv)))
+        if id(node) in read_as_text:
+            continue
+        if is_string_expression(node) and id(node) not in docstrings:
+            read_as_text.update(id(inner) for inner in ast.walk(node))
+            for binding in constants.bindings(node):
+                constants.bound = binding
+                text = constants.string(node)
+                constants.bound = {}
+                if text is None or KUBECTL not in text:
+                    continue
+                for offset, line in enumerate(text.splitlines()):
+                    for argv in commands(line):
+                        rule = judge(argv, python_argv=False)
+                        if rule is not None:
+                            findings.append(Finding(path, node.lineno + offset, rule, render(argv)))
             continue
         if not isinstance(node, (ast.List, ast.Tuple)):
             continue
@@ -538,7 +599,8 @@ def python_findings(path: Path, text: str) -> list[Finding]:
             rule = judge(tokens, python_argv=True)
             if rule is not None:
                 findings.append(Finding(path, node.lineno, rule, render(tokens)))
-    return findings
+    # `ast.walk` is breadth-first; the report reads in line order.
+    return sorted(findings, key=lambda finding: finding.line)
 
 
 # --- shell lines and Markdown code -----------------------------------------
@@ -554,18 +616,34 @@ def shell_tokens(line: str) -> list[str]:
         return line.split()
 
 
+def takes_next_token(token: Token) -> bool:
+    """A flag written without `=` whose value is the token after it."""
+    return is_flag(token) and FLAG_VALUE_SEPARATOR not in token and flag_name(token) in FLAGS_WITH_VALUE
+
+
 def commands(line: str) -> Iterator[list[Token]]:
-    """Each simple command on a shell line, as its tokens."""
+    """Each simple command on a shell line, as its tokens.
+
+    A quoted word that holds a whole command (`bash -c "kubectl ..."`, a
+    JSON example's `"command": "kubectl ..."`) is read as a line of its own
+    as well as standing in the command it is an argument of.
+    """
     current: list[Token] = []
-    tokens = shell_tokens(line)
-    for index, token in enumerate(tokens):
+    for token in shell_tokens(line):
         if token and set(token) <= SHELL_PUNCTUATION:
-            if current and token[0] in REDIRECT_CHARS and current[-1].isdecimal():
+            if (
+                current
+                and token[0] in REDIRECT_CHARS
+                and current[-1].isdecimal()
+                and not (len(current) > 1 and takes_next_token(current[-2]))
+            ):
                 current.pop()
             if current:
                 yield current
             current = []
         else:
+            if KUBECTL in token and QUOTED_COMMAND_RE.search(token):
+                yield from commands(token)
             current.append(token)
     if current:
         yield current

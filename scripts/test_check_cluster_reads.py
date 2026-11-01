@@ -70,6 +70,25 @@ class JudgeTest(unittest.TestCase):
         self.assertEqual(judge(_tokens("kubectl get pods -A -o json --chunk-size=0"), python_argv=False), RULE_UNPAGED)
         self.assertEqual(judge(_tokens("kubectl get pods -A --chunk-size 0 -o json"), python_argv=False), RULE_UNPAGED)
 
+    def test_chunk_size_value_the_check_cannot_read_is_still_paged(self):
+        self.assertIsNone(judge(["kubectl", "get", "pods", "-A", "-o", "json", "--chunk-size", None], python_argv=True))
+        self.assertIsNone(judge(["kubectl", "get", "pods", "-A", "-o", "json", "--chunk-size={}"], python_argv=True))
+        self.assertIsNone(judge(_tokens("kubectl get pods -A -o json --chunk-size $PAGE"), python_argv=False))
+
+    def test_shell_expansion_as_the_kinds_is_unresolved(self):
+        for line in (
+            'kubectl get "$KINDS" -A -o json --chunk-size=500',
+            "kubectl get ${KINDS} -A -o json",
+            "kubectl get $kind -A -o yaml",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(judge(_tokens(line), python_argv=False), RULE_UNRESOLVED)
+        self.assertIsNone(judge(_tokens('kubectl get "$KIND" -n "$NS" -o json'), python_argv=False))
+
+    def test_a_boolean_watch_flag_does_not_eat_the_token_after_it(self):
+        self.assertEqual(judge(_tokens("kubectl get --output-watch-events pods -A -o json --watch"), python_argv=False), RULE_UNPAGED)
+        self.assertEqual(judge(_tokens("kubectl get pods --output-watch-events -A -o json -w"), python_argv=False), RULE_UNPAGED)
+
     def test_all_is_several_kinds(self):
         self.assertEqual(judge(_tokens("kubectl get all -A -o json"), python_argv=False), RULE_MULTI_KIND)
         self.assertEqual(judge(_tokens("kubectl get all -A -o json --chunk-size=500"), python_argv=False), RULE_MULTI_KIND)
@@ -158,7 +177,10 @@ class JudgeTest(unittest.TestCase):
         self.assertEqual(judge([None, "get", "svc", "-A"], python_argv=True), RULE_UNPAGED)
         self.assertIsNone(judge([None, "-o", "json"], python_argv=True))
         self.assertEqual(judge(["get", "svc,ing", "-A"], python_argv=True), RULE_MULTI_KIND)
-        self.assertEqual(judge(["kubectl", "get", "svc", "-A"], python_argv=True), RULE_UNPAGED)
+        # A list that opens with `kubectl` and names no `-o` is a table, as on a shell line.
+        self.assertIsNone(judge(["kubectl", "get", "svc", "-A"], python_argv=True))
+        self.assertIsNone(judge(["kubectl", "get", "svc", "-A", "--no-headers"], python_argv=True))
+        self.assertEqual(judge(["kubectl", "get", "svc", "-A", "-o", "json"], python_argv=True), RULE_UNPAGED)
         self.assertIsNone(judge(["get", "svc", "-A", "-o", "custom-columns=NAME:.metadata.name"], python_argv=True))
         self.assertIsNone(judge(["get", "svc"], python_argv=True))
         self.assertIsNone(judge(["get", "list", "watch"], python_argv=True))
@@ -261,6 +283,54 @@ class PythonReadingTest(unittest.TestCase):
             [(7, RULE_MULTI_KIND), (8, RULE_MULTI_KIND), (9, RULE_MULTI_KIND), (10, RULE_UNPAGED)],
         )
 
+    def test_fstring_and_concatenated_shell_lines_are_read(self):
+        found = self._findings(
+            '''
+            import subprocess
+            KINDS = "deploy,sts,ds"
+            SYNC_KINDS = ("rootsyncs", "reposyncs")
+            def run(kc, kind, paged):
+                a = subprocess.run(f"KUBECONFIG={kc} kubectl get {KINDS} -A -o json", shell=True)
+                b = subprocess.run(f"kubectl get {kind} -A -o json".split())
+                c = subprocess.run("kubectl get pods,svc" + " -A -o json", shell=True)
+                d = f"kubectl get pods -A -o json --chunk-size={paged}"
+                for sync in SYNC_KINDS:
+                    subprocess.run(f"kubectl get {sync} -A -o json", shell=True)
+                e = "kubectl get pods,svc -A -o json " + kc
+                g = "kubectl get " + kind + " -A -o json"
+                for sync in SYNC_KINDS:
+                    subprocess.run("kubectl get " + sync + " -A -o json", shell=True)
+                return a, b, c, d, e, g
+            '''
+        )
+        self.assertEqual(
+            [(f.line, f.rule, f.text) for f in found],
+            [
+                (6, RULE_MULTI_KIND, "KUBECONFIG={} kubectl get deploy,sts,ds -A -o json"),
+                (7, RULE_UNRESOLVED, "kubectl get {} -A -o json"),
+                (8, RULE_MULTI_KIND, "kubectl get pods,svc -A -o json"),
+                (11, RULE_UNPAGED, "kubectl get rootsyncs -A -o json"),
+                (11, RULE_UNPAGED, "kubectl get reposyncs -A -o json"),
+                (12, RULE_MULTI_KIND, "kubectl get pods,svc -A -o json {}"),
+                (13, RULE_UNRESOLVED, "kubectl get {} -A -o json"),
+                (15, RULE_UNPAGED, "kubectl get rootsyncs -A -o json"),
+                (15, RULE_UNPAGED, "kubectl get reposyncs -A -o json"),
+            ],
+        )
+
+    def test_chunk_size_from_a_non_string_expression_is_paged(self):
+        found = self._findings(
+            '''
+            CHUNK_SIZE = 500
+            def run():
+                a = ["kubectl", "get", "pods", "-A", "-o", "json", "--chunk-size", str(CHUNK_SIZE)]
+                b = ["kubectl", "get", "pods", "-A", "-o", "json", f"--chunk-size={CHUNK_SIZE}"]
+                c = ["kubectl", "get", "pods", "-A", "-o", "json", "--chunk-size", "0"]
+                return a, b, c
+            '''
+        )
+        self.assertEqual([(f.line, f.rule) for f in found], [(6, RULE_UNPAGED)])
+
     def test_fstring_projection_passes_and_fstring_kinds_is_unresolved(self):
         found = self._findings(
             '''
@@ -315,13 +385,43 @@ class ShellAndMarkdownReadingTest(unittest.TestCase):
                 kubectl get pods -A -o json | jq '.items[]'
                 kubectl get deploy,sts -A -o json 2>/dev/null > state.json
                 kubectl get pods -A -o json 2>&1 | head
+                kubectl get pods -A -o json --chunk-size 500 > "$OUT"
+                kubectl get pods -A -o json --chunk-size 500 2>/dev/null
+                kubectl get pods -A -o json -v 6 > "$OUT"
+                bash -c "kubectl get pods -A -o json"
                 '''
             ),
         )
         self.assertEqual(
-            [(f.line, f.rule) for f in found],
-            [(4, RULE_MULTI_KIND), (7, RULE_UNPAGED), (8, RULE_MULTI_KIND), (9, RULE_UNPAGED)],
+            [(f.line, f.rule, f.text) for f in found],
+            [
+                (4, RULE_MULTI_KIND, "KUBECONFIG=$KC kubectl get pods,svc -A -o json"),
+                (7, RULE_UNPAGED, "kubectl get pods -A -o json"),
+                (8, RULE_MULTI_KIND, "kubectl get deploy,sts -A -o json"),
+                (9, RULE_UNPAGED, "kubectl get pods -A -o json"),
+                (12, RULE_UNPAGED, "kubectl get pods -A -o json -v 6"),
+                (13, RULE_UNPAGED, "kubectl get pods -A -o json"),
+            ],
         )
+
+    def test_a_json_example_command_in_a_fence_is_read(self):
+        found = markdown_findings(
+            Path("agents/x.md"),
+            textwrap.dedent(
+                '''
+                ```json
+                {
+                  "check": "model-image-floating-tag",
+                  "command": "kubectl --context gke_<project>_<location>_<cluster> get deploy,sts,ds -A -o json"
+                }
+                ```
+                ```json
+                {"check": "pdb", "command": "kubectl --context prod get pdb -A -o custom-columns=NS:.metadata.namespace --no-headers"}
+                ```
+                '''
+            ),
+        )
+        self.assertEqual([(f.line, f.rule, f.text) for f in found], [(5, RULE_MULTI_KIND, "kubectl --context gke_project_location_cluster get deploy,sts,ds -A -o json")])
 
     def test_markdown_fence_and_span_fail_and_prose_does_not(self):
         found = markdown_findings(
@@ -529,6 +629,9 @@ class SiblingVocabularyTest(unittest.TestCase):
         spec.loader.exec_module(module)
         owned = module.KUBECTL_VALUE_FLAGS | module.KUBECTL_FILE_FLAGS
         self.assertEqual(owned - FLAGS_WITH_VALUE, set(), "add the flag to FLAGS_WITH_VALUE in check_cluster_reads.py")
+        self.assertEqual(
+            FLAGS_WITH_VALUE & module.KUBECTL_BOOLEAN_FLAGS, set(), "a boolean flag in FLAGS_WITH_VALUE eats the token after it"
+        )
 
     def test_skip_prefix_is_the_overlay_tools_mirrored_skill_path(self):
         from scripts import skill_overlay
