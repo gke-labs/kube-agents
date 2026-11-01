@@ -378,7 +378,8 @@ leave open:
   subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
-  the gateway's relay already reads `.supervisor` beside `.events`. The codes are
+  the gateway's relay reads `.supervisor` beside `.events`, under an agreement policy that
+  names the dispatcher (`lib.DispatcherSession`) as a supervisor beside the gateway. The codes are
   `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
   admission, and `lease-expired` and `deadline-exceeded` while it holds.
 

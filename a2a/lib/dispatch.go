@@ -37,6 +37,13 @@ const ProfileSubmitRetention = 72 * time.Hour
 // It is not a DNS label, so it can't be a pod's name.
 const ProfileLeaseRefusedPod = "_refused"
 
+// DispatcherSession is the `from.session` of the terminals the profile
+// dispatcher writes on a profile task's `…supervisor` subject (a refusal at
+// admission, a lease or deadline failure). A consumer that names its
+// supervisor (AgreementPolicy.Supervisor) lists it in OtherSupervisors to
+// read them.
+const DispatcherSession = "dispatcher"
+
 // DispatchSubject is where the dispatcher hands a task to one worker pod of
 // a (profile, tier) pool.
 func DispatchSubject(profile, tier, pod string) string {

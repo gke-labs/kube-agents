@@ -141,8 +141,9 @@ const (
 // authority: what makes a supervisor terminal the supervisor's is the subject
 // it is published on (`…supervisor`, which only the gateway's grant reaches),
 // and from is checked for agreement with that subject by every consumer -
-// a terminal on `…supervisor` whose from is not this party is a protocol
-// error, and so is one on an executor's `…events` wearing it. That is how
+// a terminal on `…supervisor` whose from is not this party (or the profile
+// dispatcher, SupervisorAgreement) is a protocol error, and so is one on an
+// executor's `…events` wearing it. That is how
 // replay distinguishes "the worker said failed" from "the supervisor declared
 // it dead" without trusting a field the publisher writes.
 var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
@@ -151,7 +152,10 @@ var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
 // gateway's own consumers, and the one main hands the bus client so that
 // tasks/get replay and the relay agree about who the supervisor is. The
 // gateway is the supervisor for every session it spawned, so the
-// `…supervisor` writer check is exact rather than the negative form.
+// `…supervisor` writer check is exact rather than the negative form. The
+// profile dispatcher is named beside it: it writes the terminal of a profile
+// task it refuses or fails on that task's `…supervisor`, a subject its grant
+// reaches only for the profiles it dispatches.
 //
 // The strict flag is config, not code, on purpose. The `…events` writer-class
 // check ships advisory because for one TASKS retention window after an
@@ -163,6 +167,7 @@ var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
 func SupervisorAgreement(cfg *Config) lib.AgreementPolicy {
 	return lib.AgreementPolicy{
 		Supervisor:         gatewayParty.Session,
+		OtherSupervisors:   []string{lib.DispatcherSession},
 		StrictEventsWriter: cfg != nil && cfg.StrictEventsWriter,
 	}
 }
