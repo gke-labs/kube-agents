@@ -26,7 +26,7 @@ from admin_console.api.app import (
     create_app,
     target_runtime_factory,
 )
-from admin_console.chat.backend import RuntimeChatBackend
+from admin_console.chat.backend import RuntimeChatBackend, persisted_backend_factory
 from admin_console.chat.service import ChatService
 from admin_console.chat.models import Interaction, InteractionStatus, TaskProjection
 from admin_console.chat.store import SQLiteInteractionStore
@@ -719,6 +719,35 @@ class InteractionApiTest(unittest.TestCase):
 
         bound = target_runtime_factory(target)
         self.assertIs(bound(), bound())
+
+    def test_persisted_backend_factory_keeps_one_backend_per_target(self):
+        target = DeploymentTarget("test-project-01", "test-cluster-01", "us-east4")
+        other = DeploymentTarget("test-project-02", "test-cluster-01", "us-east4")
+        connection = SimpleNamespace(usable=True, target=target)
+        with patch(
+            "admin_console.chat.backend.load_connection", return_value=connection
+        ) as loader, patch(
+            "admin_console.chat.backend.agent_chat.AgentChatProvider"
+        ), patch(
+            "admin_console.chat.backend.agent_runtime.AgentRuntimeProvider"
+        ) as runtime_provider:
+            factory = persisted_backend_factory("admin@example.com")
+            first = factory()
+            # The settlement poll calls the factory every iteration; the
+            # backend, and the provider under it, are built once per target.
+            self.assertIs(factory(), first)
+            self.assertIs(factory(), first)
+            self.assertEqual(runtime_provider.call_count, 1)
+
+            loader.return_value = SimpleNamespace(usable=True, target=other)
+            moved = factory()
+            self.assertIsNot(moved, first)
+            self.assertEqual(runtime_provider.call_count, 2)
+            self.assertIs(factory(), moved)
+
+            loader.return_value = None
+            with self.assertRaisesRegex(RuntimeError, "No verified portal connection"):
+                factory()
 
     def test_chat_actions_drop_the_held_runtime_discovery(self):
         self.addCleanup(agent_runtime.invalidate)

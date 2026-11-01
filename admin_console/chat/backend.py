@@ -82,15 +82,19 @@ BackendFactory = Callable[[], ChatBackend]
 
 
 def persisted_backend_factory(account: str) -> BackendFactory:
-    """Resolve the portal's verified connection when an interaction starts."""
+    """Resolve the portal's verified connection and keep one backend per target.
 
-    def build() -> ChatBackend:
+    The settlement poll calls the factory every iteration; a fresh backend each
+    time spawned the kubeconfig probe before every read.
+    """
+
+    def resolve_target() -> DeploymentTarget:
         connection = load_connection(account)
         if connection is None or not connection.usable:
             raise RuntimeError(
                 "No verified portal connection is available. Open Connection and connect "
                 "to a kube-agents host first."
             )
-        return RuntimeChatBackend(connection.target)
+        return connection.target
 
-    return build
+    return agent_runtime.held_per_target(resolve_target, RuntimeChatBackend)

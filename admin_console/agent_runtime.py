@@ -17,6 +17,7 @@ from typing import Protocol, TypeVar
 from admin_console.kube_access import (
     GKEKubeAccess,
     KubeCommandResult,
+    KubeFailure,
     kube_failure_guidance,
 )
 from admin_console.project_config import (
@@ -633,6 +634,7 @@ class KubeRunner(Protocol):
 
 
 _T = TypeVar("_T")
+_Held = TypeVar("_Held")
 
 
 def runtime_cache_ttl_seconds() -> float:
@@ -665,12 +667,24 @@ class _CacheEntry:
     expires_at: float
 
 
+class _Flight:
+    """One key's single-flight state: its lock, and how its last attempt ended."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.attempts = 0
+        self.error: Exception | None = None
+
+
 class RuntimeDiscoveryCache:
     """Thread-safe TTL cache of discovery answers, keyed by target and method.
 
     Only successful answers are stored. Concurrent lookups of one key wait for
-    the first to finish rather than each asking the cluster, while lookups of
-    different keys never block each other on a kubectl call.
+    the first to finish rather than each asking the cluster: when that attempt
+    succeeds they share its answer, and when it fails the lookups queued behind
+    it get its error rather than each asking in turn. A lookup that arrives
+    after a failure asks again. Lookups of different keys never block each
+    other on a kubectl call.
     """
 
     def __init__(
@@ -683,7 +697,7 @@ class RuntimeDiscoveryCache:
         self._clock = clock
         self._lock = threading.Lock()
         self._entries: dict[tuple, _CacheEntry] = {}
-        self._in_flight: dict[tuple, threading.Lock] = {}
+        self._in_flight: dict[tuple, _Flight] = {}
 
     def ttl_seconds(self) -> float:
         if self._ttl_seconds is None:
@@ -714,15 +728,29 @@ class RuntimeDiscoveryCache:
             entry = self._fresh(cache_key)
             if entry is not None:
                 return entry.value  # type: ignore[return-value]
-            key_lock = self._in_flight.setdefault(cache_key, threading.Lock())
-        with key_lock:
+            flight = self._in_flight.setdefault(cache_key, _Flight())
+            joined_at = flight.attempts
+        with flight.lock:
             with self._lock:
                 entry = self._fresh(cache_key)
                 if entry is not None:
                     return entry.value  # type: ignore[return-value]
-            value = compute()
+                if flight.attempts != joined_at and flight.error is not None:
+                    # The attempt this lookup queued behind failed; its error
+                    # is the answer, and asking again would only queue the
+                    # same failure behind it.
+                    raise flight.error
+            try:
+                value = compute()
+            except Exception as exc:
+                with self._lock:
+                    flight.attempts += 1
+                    flight.error = exc
+                raise
             with self._lock:
                 self._entries[cache_key] = _CacheEntry(value, self._clock() + ttl)
+                flight.attempts += 1
+                flight.error = None
             return value
 
     def invalidate(self, target: DeploymentTarget | None = None) -> None:
@@ -740,8 +768,42 @@ _discovery_cache = RuntimeDiscoveryCache()
 
 
 def invalidate(target: DeploymentTarget | None = None) -> None:
-    """Drop the console-wide discovery answers after an action that may change them."""
+    """Drop this process's discovery answers after an action that may change them."""
     _discovery_cache.invalidate(target)
+
+
+def held_per_target(
+    resolve_target: Callable[[], DeploymentTarget],
+    build: Callable[[DeploymentTarget], _Held],
+) -> Callable[[], _Held]:
+    """Keep one built object per target, rebuilt only when the target changes.
+
+    The console's providers and chat backends are safe to share across request
+    threads (each kubectl call is its own subprocess, prepared under the
+    kubeconfig store's lock), and building one per call spawned the kubeconfig
+    probe every time.
+    """
+    lock = threading.Lock()
+    held: list[tuple[DeploymentTarget, _Held]] = []
+
+    def get() -> _Held:
+        target = resolve_target()
+        with lock:
+            if not held or held[0][0] != target:
+                held[:] = [(target, build(target))]
+            return held[0][1]
+
+    return get
+
+
+def answered_by_cluster(result: KubeCommandResult) -> bool:
+    """Whether a failed kubectl call was answered by the cluster.
+
+    A timeout or a kubeconfig-preparation failure says nothing about the pod
+    the call was aimed at, so discovering again on one would only lengthen the
+    failure it reports.
+    """
+    return not result.timed_out and result.failure is KubeFailure.NONE
 
 
 class KubectlRunner:
@@ -1154,17 +1216,34 @@ class AgentRuntimeProvider:
         return self.gateway_pod(agent)
 
     def _read(self, agent: str, arguments: list[str], *, timeout: int = 25) -> dict:
+        _endpoint, result = self.exec_on_gateway(
+            agent, lambda endpoint: self._exec(endpoint, arguments, timeout)
+        )
+        return self._parse_read(result)
+
+    def exec_on_gateway(
+        self,
+        agent: str,
+        run: Callable[[tuple[str, str]], KubeCommandResult],
+    ) -> tuple[tuple[str, str], KubeCommandResult]:
+        """Run `run` against the held gateway endpoint; once more if the pod moved.
+
+        A failure the cluster answered may mean the held pod was replaced under
+        the call, so the target is discovered again and, only when the answer
+        moved, `run` is repeated on the new pod. A failure against a pod that
+        is still current is returned as it is, and so is a timeout or a
+        preparation failure, which say nothing about the pod. Returns the
+        endpoint the returned result ran against.
+        """
         endpoint = self.gateway_endpoint(agent)
-        result = self._exec(endpoint, arguments, timeout)
-        if result.returncode != 0:
-            # The held pod may have been replaced under the exec. Discover
-            # again and, only when the answer moved, read once from the new
-            # pod; a failure against a pod that is still current is reported.
+        result = run(endpoint)
+        if result.returncode != 0 and answered_by_cluster(result):
             self._cache.invalidate(self.target)
             current = self.gateway_endpoint(agent)
             if current != endpoint:
-                result = self._exec(current, arguments, timeout)
-        return self._parse_read(result)
+                endpoint = current
+                result = run(current)
+        return endpoint, result
 
     def _exec(
         self, endpoint: tuple[str, str], arguments: list[str], timeout: int

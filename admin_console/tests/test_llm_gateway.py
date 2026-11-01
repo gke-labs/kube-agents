@@ -66,6 +66,28 @@ def deployment(provider: str = "gemini", model: str = "gemini-3.5-flash"):
     }
 
 
+def platform_agents() -> dict:
+    return {"items": [{"metadata": {"name": "platform-agent"}}]}
+
+
+def gateway_pods(pod: str) -> dict:
+    return {
+        "items": [
+            {
+                "metadata": {"name": pod},
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "runtime",
+                            "ports": [{"name": "api", "containerPort": 8642}],
+                        }
+                    ]
+                },
+            }
+        ]
+    }
+
+
 class FakeKube:
     def __init__(self, results: list[KubeCommandResult]) -> None:
         self.results = list(results)
@@ -154,6 +176,45 @@ class LlmGatewayServiceTest(unittest.TestCase):
         )
 
 
+    def test_verify_retries_once_on_the_new_pod_when_the_held_pod_moved(self):
+        kube = FakeKube(
+            [
+                KubeCommandResult(0, json.dumps(platform_agents())),
+                KubeCommandResult(0, json.dumps(gateway_pods("gateway-1"))),
+                KubeCommandResult(1, stderr='pods "gateway-1" not found'),
+                KubeCommandResult(0, json.dumps(platform_agents())),
+                KubeCommandResult(0, json.dumps(gateway_pods("gateway-2"))),
+                KubeCommandResult(0, stdout="200\n{}"),
+            ]
+        )
+        service = LlmGatewayService(TARGET, kube=kube)
+
+        evidence = service.verify()["evidence"]
+
+        self.assertEqual(evidence["returncode"], 0)
+        self.assertEqual(evidence["stdout"], "200\n{}")
+        self.assertIn("gateway-2", evidence["command"])
+        self.assertEqual(
+            [call[0][call[0].index("exec") + 1] for call in kube.calls if "exec" in call[0]],
+            ["gateway-1", "gateway-2"],
+        )
+
+    def test_timed_out_verify_is_reported_without_rediscovery(self):
+        kube = FakeKube(
+            [
+                KubeCommandResult(0, json.dumps(platform_agents())),
+                KubeCommandResult(0, json.dumps(gateway_pods("gateway-1"))),
+                KubeCommandResult(124, timed_out=True),
+            ]
+        )
+        service = LlmGatewayService(TARGET, kube=kube)
+
+        evidence = service.verify()["evidence"]
+
+        self.assertEqual(evidence["returncode"], 124)
+        self.assertTrue(evidence["timed_out"])
+        self.assertEqual(len(kube.calls), 3)
+
     def test_helm_owned_deployment_is_not_modified(self):
         live_deployment = deployment()
         live_deployment["metadata"]["labels"] = {
@@ -235,6 +296,10 @@ class LlmGatewayServiceTest(unittest.TestCase):
                 ),
                 KubeCommandResult(0, json.dumps(pods)),
                 KubeCommandResult(1, "401\nraw upstream response"),
+                # The failed call makes the runtime discover again; the pod
+                # is unchanged, so the error is reported without a retry.
+                KubeCommandResult(0, json.dumps(platform_agents())),
+                KubeCommandResult(0, json.dumps(pods)),
             ]
         )
         service = LlmGatewayService(TARGET, kube=kube)
@@ -245,6 +310,7 @@ class LlmGatewayServiceTest(unittest.TestCase):
         self.assertIn("http://inference-gateway:80/v1/chat/completions", script)
         self.assertIn("platform-agent-pod", kube.calls[2][0])
         self.assertIn("runtime-from-pod", kube.calls[2][0])
+        self.assertEqual(len([call for call in kube.calls if "exec" in call[0]]), 1)
         self.assertEqual(result["evidence"]["returncode"], 1)
         self.assertEqual(result["evidence"]["stdout"], "401\nraw upstream response")
 

@@ -28,7 +28,7 @@ from admin_console.agent_runtime import (
     runtime_cache_ttl_seconds,
 )
 from admin_console.kanban_view import display_status
-from admin_console.kube_access import GKEKubeAccess
+from admin_console.kube_access import GKEKubeAccess, KubeCommandResult, KubeFailure
 from admin_console.project_config import DeploymentTarget
 
 # A result that cites a status page and a log path. It does not link a PR.
@@ -1179,6 +1179,7 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
         self.addCleanup(agent_runtime.invalidate)
         self.spawned: list[list[str]] = []
         self.failing: set[str] = set()
+        self.timing_out: set[str] = set()
         self.pod = "platform-agent-gateway-1"
         self.spawn_lock = threading.Lock()
         self.clock = FakeClock()
@@ -1196,6 +1197,8 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
         if "exec" not in command:
             # Widen the window in which concurrent readers could each discover.
             time.sleep(0.01)
+        if any(word in self.timing_out for word in command):
+            raise subprocess.TimeoutExpired(command, 1)
         returncode, stdout = kubectl_stdout(command, self.pod)
         verb = next((word for word in command if word in self.failing), None)
         if verb is not None:
@@ -1305,6 +1308,75 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
                 "platform-agent-gateway-2",
                 "platform-agent-gateway-2",
             ],
+        )
+
+    def test_timed_out_read_is_reported_without_rediscovery(self):
+        self.read()
+        self.timing_out = {"exec"}
+        with self.assertRaisesRegex(AgentRuntimeError, "Agent runtime read failed"):
+            self.read()
+        self.timing_out = set()
+
+        self.read()
+
+        # A timeout says nothing about the held pod, so the read is reported
+        # as it is and the next read still uses the held answers.
+        self.assertEqual(self.spawns("platformagents"), 1)
+        self.assertEqual(self.spawns("pods"), 1)
+        self.assertEqual(self.spawns("exec"), 3)
+
+    def test_read_refused_before_kubectl_ran_is_reported_without_rediscovery(self):
+        self.read()
+        refused = KubeCommandResult(
+            127, stderr="gcloud missing", failure=KubeFailure.GCLOUD_MISSING
+        )
+        with patch.object(GKEKubeAccess, "prepare", return_value=refused):
+            with self.assertRaisesRegex(AgentRuntimeError, "Agent runtime read failed"):
+                self.read()
+
+        self.read()
+
+        self.assertEqual(self.spawns("platformagents"), 1)
+        self.assertEqual(self.spawns("pods"), 1)
+        self.assertEqual(self.spawns("exec"), 2)
+
+    def test_concurrent_lookups_share_one_failed_attempt(self):
+        attempts: list[int] = []
+        first_started = threading.Event()
+        release_first = threading.Event()
+
+        def compute() -> str:
+            attempts.append(1)
+            first_started.set()
+            release_first.wait(timeout=5)
+            raise AgentRuntimeError("PlatformAgent discovery failed.")
+
+        def lookup() -> str:
+            return self.cache.lookup(self.TARGET, "canonical_agent", compute)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(lookup) for _ in range(8)]
+            self.assertTrue(first_started.wait(timeout=5))
+            time.sleep(0.1)  # let the other seven queue behind the first
+            release_first.set()
+            errors = [future.exception(timeout=5) for future in futures]
+
+        # One attempt served every lookup queued behind it; each got its error.
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(len(errors), 8)
+        self.assertTrue(all(isinstance(error, AgentRuntimeError) for error in errors))
+        self.assertEqual(len({id(error) for error in errors}), 1)
+
+        # A lookup that arrives after the failure asks again, and a success
+        # after it is held as usual.
+        with self.assertRaises(AgentRuntimeError):
+            lookup()
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(
+            self.cache.lookup(self.TARGET, "canonical_agent", lambda: "fresh"), "fresh"
+        )
+        self.assertEqual(
+            self.cache.lookup(self.TARGET, "canonical_agent", lambda: "later"), "fresh"
         )
 
     def test_targets_do_not_share_answers(self):

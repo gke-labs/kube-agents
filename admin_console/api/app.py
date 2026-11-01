@@ -6,7 +6,6 @@ import asyncio
 import json
 import os
 import secrets
-import threading
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
@@ -48,17 +47,9 @@ def _shared_runtime_factory(
     resolve_target: Callable[[], DeploymentTarget],
 ) -> RuntimeProviderFactory:
     """Keep one provider per target, rebuilt only when the target changes."""
-    lock = threading.Lock()
-    held: list[tuple[DeploymentTarget, agent_runtime.AgentRuntimeProvider]] = []
-
-    def build() -> agent_runtime.AgentRuntimeProvider:
-        target = resolve_target()
-        with lock:
-            if not held or held[0][0] != target:
-                held[:] = [(target, agent_runtime.AgentRuntimeProvider(target))]
-            return held[0][1]
-
-    return build
+    return agent_runtime.held_per_target(
+        resolve_target, agent_runtime.AgentRuntimeProvider
+    )
 
 
 def _persisted_runtime_factory(account: str) -> RuntimeProviderFactory:

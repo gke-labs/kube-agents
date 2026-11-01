@@ -54,9 +54,14 @@ seconds: the API server's copy serves the API, the chat poll and the Chat, LLM
 Gateway and Google Chat pages, and is dropped after a chat action or an LLM
 Gateway change; the Streamlit process's copy serves Task Kanban, Scheduled Cron
 and the Connection check, and lasts the window. Either copy is dropped when a
-discovery fails, and a read that fails against the held pod discovers again and
-retries once if the pod has moved. The data read itself is never held. To change
-the window, set `ADMIN_CONSOLE_RUNTIME_CACHE_TTL_SECONDS` in seconds; `0`
+discovery fails, and lookups queued behind a failed discovery get its error
+rather than each asking in turn. A read, or the LLM Gateway page's verification
+call, that the cluster fails against the held pod discovers again and retries
+once if the pod has moved; a timeout, or a failure before kubectl ran, is
+reported as it is, since neither says the pod moved. The data read itself is
+never held. The API server also keeps one runtime provider and one chat backend
+per target, so the settlement poll does not rebuild them every two seconds. To
+change the window, set `ADMIN_CONSOLE_RUNTIME_CACHE_TTL_SECONDS` in seconds; `0`
 disables the cache, and an unparsable value keeps the default. The console
 processes read it directly; the launcher does not validate it as it does its
 `ADMIN_PORTAL_*` settings.
