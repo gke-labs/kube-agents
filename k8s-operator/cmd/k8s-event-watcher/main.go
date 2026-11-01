@@ -536,6 +536,15 @@ func discoverClusterProfilesWanting(ctx context.Context, dir string, m *metrics,
 			m.clusterDiscoveryErrors.WithLabelValues(profile).Inc()
 		},
 	}, func(c clusterprofiles.Cluster) (targetCluster, error) {
+		// The running set is keyed by profile and the direct entry's key is
+		// directProfile, so a profile directory of that name would share the
+		// key, and the snapshot file, with the direct cluster: on a rescan it
+		// would read as the direct entry's identity changing and stop the
+		// host's watcher. Discover admits any directory carrying a complete
+		// cluster_identity, so the name is refused here, as a skip.
+		if c.Profile == directProfile {
+			return targetCluster{}, fmt.Errorf("the profile directory name %q is reserved for the directly reached cluster; rename the profile", directProfile)
+		}
 		client, err := newClusterClient(c.Config)
 		if err != nil {
 			return targetCluster{}, err

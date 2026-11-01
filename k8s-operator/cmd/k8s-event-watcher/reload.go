@@ -61,6 +61,15 @@ type clusterSet struct {
 	// buildWatchSet absorbed at boot, or one absorbed on a rescan (see
 	// reconcileProfiles). Empty while no profile has named it.
 	directIdentity clusterprofiles.Identity
+	// directSource is the profile directIdentity was read from: the one the
+	// rescan absorbed, or for boot's absorption the first profile naming it in
+	// directory order, which is the one Discover let claim it (see
+	// reportClaimedDuplicates). Empty with directIdentity.
+	directSource string
+	// wrapDispatcher, when set, wraps each started cluster's dispatcher before
+	// its watcher is built. nil in the binary; a test sets it to hold a
+	// delivery in flight while it stops the cluster.
+	wrapDispatcher func(eventDispatcher) eventDispatcher
 	// stopping counts stops in progress, which wait joins through stopped
 	// before it snapshots; closed is set by wait once ctx is done, after which
 	// stop leaves a run to the shutdown snapshot rather than racing it.
@@ -137,7 +146,11 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 	go func() {
 		defer loops.Done()
 		defer s.m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
-		w := newWatcher(tc.Client, disp, tc)
+		var delivery eventDispatcher = disp
+		if s.wrapDispatcher != nil {
+			delivery = s.wrapDispatcher(delivery)
+		}
+		w := newWatcher(tc.Client, delivery, tc)
 		w.gate = s.gate
 		log.Printf("k8s-event-watcher: [%s] starting: preflight, then informer (source=%s project=%s location=%s)",
 			tc.Name, tc.Profile, tc.ProjectID, tc.Location)
@@ -317,9 +330,12 @@ func runProfileReload(ctx context.Context, s *clusterSet, dir string, interval t
 //     boot; a profile already running under a different identity is replaced;
 //   - a profile naming the direct cluster is absorbed as buildWatchSet absorbs
 //     it at boot: the direct entry keeps the watch and the profile starts
-//     nothing. The identity is recorded for the rescan's own bookkeeping; the
-//     running direct entry's labels and payloads carry it from the next start,
-//     since a dispatcher's cluster is fixed when it is built.
+//     nothing. The direct entry is restarted under the profile's project,
+//     location and Autopilot bit (see restartDirect), since a dispatcher's
+//     cluster is fixed when it is built;
+//   - a profile naming a cluster another profile already watches is logged
+//     and counted as a skip, as Discover reports it at boot (see
+//     reportClaimedDuplicates).
 //
 // A discovery error on a tick (the directory gone, the credential proxy
 // unreachable) is logged and the running set is left as it is, never an exit:
@@ -348,6 +364,7 @@ func (s *clusterSet) reconcileProfiles(ctx context.Context, dir string) {
 		s.stop(run.cluster.Profile)
 	}
 
+	s.reportClaimedDuplicates(dir)
 	watched := s.watchedIdentities()
 	discovered, err := discoverClusterProfilesWanting(ctx, dir, s.m, func(id clusterprofiles.Identity) bool {
 		return !watched[id.String()]
@@ -360,11 +377,13 @@ func (s *clusterSet) reconcileProfiles(ctx context.Context, dir string) {
 		if ctx.Err() != nil {
 			return
 		}
-		absorbed, ambiguous := s.absorbIntoDirect(tc)
-		if absorbed {
+		switch s.absorbIntoDirect(tc) {
+		case absorbedNow:
+			s.restartDirect(ctx, tc)
 			continue
-		}
-		if ambiguous {
+		case absorbedBefore:
+			continue
+		case ambiguous:
 			s.stop(directProfile)
 		}
 		s.mu.Lock()
@@ -383,6 +402,29 @@ func (s *clusterSet) reconcileProfiles(ctx context.Context, dir string) {
 	}
 }
 
+// absorption is what absorbIntoDirect decided about a discovered profile.
+type absorption int
+
+const (
+	// notAbsorbed: the profile is unrelated to the direct entry (no direct
+	// entry is running, or the name differs); the caller starts it as any
+	// other profile.
+	notAbsorbed absorption = iota
+	// absorbedNow: the first profile to name the direct cluster. Its identity
+	// is recorded, the caller restarts the direct entry under it (see
+	// restartDirect) and starts nothing for the profile.
+	absorbedNow
+	// absorbedBefore: the profile names the identity already recorded; the
+	// caller starts nothing. The rescan's Want excludes a recorded identity
+	// before any describe, so this is reached only if that exclusion is
+	// bypassed.
+	absorbedBefore
+	// ambiguous: a profile has been absorbed and this one carries a different
+	// project or location. The recorded identity is cleared and the caller
+	// stops the direct entry and starts this profile.
+	ambiguous
+)
+
 // absorbIntoDirect decides what a discovered profile named like the direct
 // cluster is. The match is the one buildWatchSet makes at boot, on
 // --cluster-name against the profile's cluster name, and it is a guess: the
@@ -391,33 +433,123 @@ func (s *clusterSet) reconcileProfiles(ctx context.Context, dir string) {
 // projects or locations. Boot resolves the guess by count: one same-named
 // profile is absorbed, two or more and the direct entry is dropped and every
 // one of them watched through its profile. The rescan sees the profiles one
-// at a time, so the same rule plays out in two steps.
-//
-// absorbed: no profile has named the direct cluster yet, or this one names
-// the identity already recorded; the identity is recorded and the caller
-// starts nothing. ambiguous: a profile has already been absorbed and this one
-// carries a different project or location, so the earlier absorption was a
-// guess between two clusters. The recorded identity is cleared and the caller
-// stops the direct entry and starts this profile; the one absorbed earlier is
-// no longer excluded by identity, so the next read discovers it and starts it
-// too, which leaves both watched through their profiles and the direct entry
-// gone, as at boot. Neither is true when no direct entry is running or the
-// name differs.
-func (s *clusterSet) absorbIntoDirect(tc targetCluster) (absorbed, ambiguous bool) {
+// at a time, so the same rule plays out in two steps: the first is absorbed
+// (absorbedNow), and a second with a different project or location makes
+// the earlier absorption a guess between two clusters (ambiguous): the one
+// absorbed earlier is no longer excluded by identity, so the next read
+// discovers it and starts it too, which leaves both watched through their
+// profiles and the direct entry gone, as at boot.
+func (s *clusterSet) absorbIntoDirect(tc targetCluster) absorption {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, direct := s.running[directProfile]; !direct || tc.Name != s.f.clusterName {
-		return false, false
+		return notAbsorbed
 	}
 	id := clusterprofiles.Identity{Project: tc.ProjectID, Location: tc.Location, Cluster: tc.Name}
-	if s.directIdentity != (clusterprofiles.Identity{}) && s.directIdentity != id {
+	switch {
+	case s.directIdentity == (clusterprofiles.Identity{}):
+		s.directIdentity, s.directSource = id, tc.Profile
+		log.Printf("k8s-event-watcher: profile %s names %s, which the direct client already watches as %s; starting no second watcher for it",
+			tc.Profile, id, s.f.clusterName)
+		return absorbedNow
+	case s.directIdentity == id:
+		return absorbedBefore
+	default:
 		log.Printf("k8s-event-watcher: profiles name both %s and %s %q, and the in-cluster client cannot say which one it is; watching both through their profiles and dropping the direct entry",
 			s.directIdentity, id, s.f.clusterName)
-		s.directIdentity = clusterprofiles.Identity{}
-		return false, true
+		s.directIdentity, s.directSource = clusterprofiles.Identity{}, ""
+		return ambiguous
 	}
-	s.directIdentity = id
-	log.Printf("k8s-event-watcher: profile %s names %s, which the direct client already watches as %s; starting no second watcher for it",
-		tc.Profile, id, s.f.clusterName)
-	return true, false
+}
+
+// restartDirect restarts the direct entry carrying the project, location and
+// Autopilot bit of the profile just absorbed, as buildWatchSet stamps them on
+// it at boot. A dispatcher's cluster is fixed when it is built, so without the
+// restart the running entry's payloads and cluster_up series would carry an
+// empty project and location, and its FailedScheduling gate would read the
+// host as Standard, for the life of the process; on a fresh install that is
+// every host, since its profile is written by the first reconcile tick, after
+// the watcher has started. The stop snapshots the entry's dedup cache and the
+// start restores it from the same file (the snapshot is named by profile, and
+// the profile is still directProfile), so the relist replays no incident; the
+// series under the unlabelled triple go with the stop and the labelled ones
+// come with the start.
+func (s *clusterSet) restartDirect(ctx context.Context, absorbed targetCluster) {
+	s.mu.Lock()
+	run, ok := s.running[directProfile]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	direct := run.cluster
+	direct.ProjectID, direct.Location, direct.Autopilot = absorbed.ProjectID, absorbed.Location, absorbed.Autopilot
+	log.Printf("k8s-event-watcher: restarting the direct watcher as %s, so its payloads and series carry the project and location profile %s names", direct.identity(), absorbed.Profile)
+	s.stop(directProfile)
+	if ctx.Err() != nil {
+		// Shutting down: the stop above was a no-op on the closed set and
+		// wait snapshots the run as it is.
+		return
+	}
+	if err := s.start(ctx, direct); err != nil {
+		log.Printf("k8s-event-watcher: [%s] %v, this cluster will NOT be watched", direct.Name, err)
+		s.m.clusterUp.WithLabelValues(direct.Name, direct.ProjectID, direct.Location).Set(0)
+	}
+}
+
+// reportClaimedDuplicates logs and counts, as Discover does at boot, every
+// profile that names a cluster another profile already watches. Discover
+// applies Want before its own duplicate check, so on a rescan a second
+// profile for a running cluster would otherwise be dropped in silence: its
+// identity is excluded as watched before the check that would have called it
+// a duplicate, and the README's promise that every skip logs and increments
+// cluster_discovery_errors_total would hold at boot and not after. The
+// identities come from the profiles' config files alone, the directory read
+// the tick pays anyway; nothing is described. A directory that cannot be read
+// is left to discovery, which reports it on the same tick.
+//
+// A running profile cluster's identity is owned by its profile. The direct
+// cluster's is owned by directSource; when boot absorbed it the source is not
+// yet known, and the first profile naming it in directory order is taken,
+// which is the one Discover let claim it at boot. A directory named
+// directProfile is left out: discoverClusterProfilesWanting refuses it with a
+// skip of its own.
+func (s *clusterSet) reportClaimedDuplicates(dir string) {
+	ids, err := clusterprofiles.ReadIdentities(dir, nil)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	owners := make(map[string]string, len(s.running))
+	for profile, run := range s.running {
+		if profile == directProfile {
+			continue
+		}
+		tc := run.cluster
+		owners[clusterprofiles.Identity{Project: tc.ProjectID, Location: tc.Location, Cluster: tc.Name}.String()] = profile
+	}
+	for _, pi := range ids {
+		if pi.Profile == directProfile {
+			continue
+		}
+		if s.directIdentity != (clusterprofiles.Identity{}) && pi.Identity == s.directIdentity {
+			if s.directSource == "" {
+				s.directSource = pi.Profile
+			}
+			if pi.Profile != s.directSource {
+				s.reportSkip(pi.Profile, fmt.Errorf("cluster %s is already claimed by profile %s, which the direct client watches as %s", pi.Identity, s.directSource, s.f.clusterName))
+			}
+			continue
+		}
+		if owner, claimed := owners[pi.Identity.String()]; claimed && owner != pi.Profile {
+			s.reportSkip(pi.Profile, fmt.Errorf("cluster %s is already claimed by profile %s", pi.Identity, owner))
+		}
+	}
+}
+
+// reportSkip logs and counts a profile skipped by the rescan itself, in the
+// form clusterprofiles.DiscoverAndBuild uses for the skips it reports.
+func (s *clusterSet) reportSkip(profile string, err error) {
+	log.Printf("%s: skipping profile %s, its cluster will NOT be %s: %v", componentName, profile, skipConsequence, err)
+	s.m.clusterDiscoveryErrors.WithLabelValues(profile).Inc()
 }

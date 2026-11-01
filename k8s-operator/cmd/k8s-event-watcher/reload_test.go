@@ -21,12 +21,16 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	container "google.golang.org/api/container/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
 )
@@ -105,8 +109,14 @@ func TestReconcileProfiles_StartsAProfileWrittenAfterBootAndStopsOneRemoved(t *t
 		t.Fatalf("cluster_up series = %d; want 1 for the started cluster", got)
 	}
 	// A second rescan with nothing changed starts nothing twice: the running
-	// cluster is excluded by identity before any describe.
+	// cluster is excluded by identity before any describe, so a describe of
+	// it, which would restart the watcher and flap its series, is a failure.
+	fx.failures["proj/us-central1/a"] = errors.New("must not be described again")
 	fx.set.reconcileProfiles(fx.ctx, fx.dir)
+	delete(fx.failures, "proj/us-central1/a")
+	if got := testutil.ToFloat64(fx.set.m.clusterDiscoveryErrors.WithLabelValues("cluster-a")); got != 0 {
+		t.Fatalf("the running profile was described again on an unchanged rescan (%v discovery errors)", got)
+	}
 	if got := fx.set.count(); got != 1 {
 		t.Fatalf("running after an unchanged rescan = %d; want 1", got)
 	}
@@ -156,6 +166,7 @@ func TestReconcileProfiles_RetriesAProfileWhoseDescribeWasRefused(t *testing.T) 
 // the first on the read after, once its identity is no longer excluded.
 func TestReconcileProfiles_AbsorbsTheDirectClustersProfile(t *testing.T) {
 	fx := newReloadFixture(t, "host")
+	autopilotClusters(t, "host")
 	if err := fx.set.start(fx.ctx, targetCluster{Name: "host", Profile: directProfile, Client: fake.NewClientset()}); err != nil {
 		t.Fatal(err)
 	}
@@ -166,6 +177,24 @@ func TestReconcileProfiles_AbsorbsTheDirectClustersProfile(t *testing.T) {
 	}
 	if got := fx.set.directIdentity.String(); got != "proj/us-central1/host" {
 		t.Fatalf("directIdentity = %q; want the absorbed profile's", got)
+	}
+	// Absorbed as at boot: the direct entry now runs under the profile's
+	// project, location and Autopilot bit, so its payloads and series carry
+	// them, and the series it had under the empty triple are gone.
+	fx.set.mu.Lock()
+	direct := fx.set.running[directProfile].cluster
+	fx.set.mu.Unlock()
+	if direct.ProjectID != "proj" || direct.Location != "us-central1" || !direct.Autopilot {
+		t.Fatalf("the direct entry runs as %s autopilot=%v after absorption; want proj/us-central1/host autopilot=true", direct.identity(), direct.Autopilot)
+	}
+	if got := fx.clusterUpSeries(); got != 1 {
+		t.Fatalf("cluster_up series after absorption = %d; want 1 (the unlabelled series deleted, the labelled one present)", got)
+	}
+	if got := testutil.ToFloat64(fx.set.m.clusterUp.WithLabelValues("host", "proj", "us-central1")); got != 0 {
+		t.Fatalf("cluster_up{host,proj,us-central1} = %v right after the restart; want 0 until its list completes", got)
+	}
+	if _, err := os.Stat(dedupPersistPath(fx.persist, directProfile)); err != nil {
+		t.Fatalf("the restart did not snapshot the direct entry's dedup cache: %v", err)
 	}
 	// Absorbed, and so watched: excluded from the next read's describes.
 	fx.failures["proj/us-central1/host"] = errors.New("must not be described again")
@@ -186,6 +215,105 @@ func TestReconcileProfiles_AbsorbsTheDirectClustersProfile(t *testing.T) {
 	}
 	if got := fx.set.directIdentity; got != (clusterprofiles.Identity{}) {
 		t.Errorf("directIdentity = %q after the ambiguity; want cleared", got)
+	}
+}
+
+// A profile directory named like the direct entry's key would share that key
+// in the running set, and its snapshot file, with the host's watcher: started
+// at boot it would make one of the two an orphan, and found on a rescan it
+// would read as the direct entry's identity changing and stop the host's
+// watcher. It is refused as a skip, on the boot read and on a rescan alike,
+// and the host's entry is untouched.
+func TestReconcileProfiles_RefusesAProfileNamedDirect(t *testing.T) {
+	fx := newReloadFixture(t, "host")
+	if err := fx.set.start(fx.ctx, targetCluster{Name: "host", Profile: directProfile, Client: fake.NewClientset()}); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureLog(t)
+	writeClusterProfile(t, fx.dir, directProfile, "elsewhere", "impostor", "europe-west1")
+	fx.set.reconcileProfiles(fx.ctx, fx.dir)
+	fx.set.reconcileProfiles(fx.ctx, fx.dir)
+	if got, want := fx.profiles(), []string{directProfile}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("running after a profile named %q appeared = %v; want %v (the host's own entry) only", directProfile, got, want)
+	}
+	fx.set.mu.Lock()
+	direct := fx.set.running[directProfile].cluster
+	fx.set.mu.Unlock()
+	if direct.Name != "host" || direct.ProjectID != "" {
+		t.Fatalf("the direct entry runs as %s; want the host, untouched", direct.identity())
+	}
+	if got := fx.set.directIdentity; got != (clusterprofiles.Identity{}) {
+		t.Fatalf("directIdentity = %q; want none recorded from the refused profile", got)
+	}
+	if got := testutil.ToFloat64(fx.set.m.clusterDiscoveryErrors.WithLabelValues(directProfile)); got != 2 {
+		t.Fatalf("cluster_discovery_errors_total{profile=direct} = %v; want 2, one skip per read", got)
+	}
+	if !strings.Contains(logs.String(), "skipping profile direct, its cluster will NOT be watched: the profile directory name \"direct\" is reserved") {
+		t.Errorf("no skip line naming the reserved directory in:\n%s", logs.String())
+	}
+
+	// The boot read goes through the same build function and refuses it the
+	// same way, so buildWatchSet never sees it beside the direct entry.
+	clusters, err := discoverClusterProfiles(fx.ctx, fx.dir, fx.set.m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clusters) != 0 {
+		t.Fatalf("boot discovery with a profile named %q = %s; want nothing", directProfile, identities(clusters))
+	}
+	if got := testutil.ToFloat64(fx.set.m.clusterDiscoveryErrors.WithLabelValues(directProfile)); got != 3 {
+		t.Fatalf("cluster_discovery_errors_total{profile=direct} after the boot read = %v; want 3", got)
+	}
+}
+
+// A second profile naming a cluster another profile already watches is a
+// duplicate on a rescan as it is at boot: logged, counted, and never started.
+// Discover excludes a watched identity before its own duplicate check, so the
+// rescan reports it itself; the same holds for the direct cluster's identity,
+// whose owner is the profile it was absorbed from.
+func TestReconcileProfiles_ReportsADuplicateProfileWrittenAfterBoot(t *testing.T) {
+	fx := newReloadFixture(t, "host")
+	logs := captureLog(t)
+	writeClusterProfile(t, fx.dir, "cluster-a", "proj", "a", "us-central1")
+	fx.set.reconcileProfiles(fx.ctx, fx.dir)
+	if got := fx.set.count(); got != 1 {
+		t.Fatalf("running = %d; want 1", got)
+	}
+	writeClusterProfile(t, fx.dir, "cluster-a-copy", "proj", "a", "us-central1")
+	fx.set.reconcileProfiles(fx.ctx, fx.dir)
+	if got, want := fx.profiles(), []string{"cluster-a"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("running after a duplicate profile = %v; want %v only", got, want)
+	}
+	if got := testutil.ToFloat64(fx.set.m.clusterDiscoveryErrors.WithLabelValues("cluster-a-copy")); got != 1 {
+		t.Fatalf("cluster_discovery_errors_total{profile=cluster-a-copy} = %v; want 1", got)
+	}
+	if got := testutil.ToFloat64(fx.set.m.clusterDiscoveryErrors.WithLabelValues("cluster-a")); got != 0 {
+		t.Fatalf("the profile that owns the cluster was counted as a skip (%v)", got)
+	}
+	if !strings.Contains(logs.String(), "skipping profile cluster-a-copy, its cluster will NOT be watched: cluster proj/us-central1/a is already claimed by profile cluster-a") {
+		t.Errorf("no duplicate line for cluster-a-copy in:\n%s", logs.String())
+	}
+
+	// The direct cluster's identity, absorbed from cluster-host: a copy of
+	// that profile is a duplicate of it, and cluster-host itself is not.
+	if err := fx.set.start(fx.ctx, targetCluster{Name: "host", Profile: directProfile, Client: fake.NewClientset()}); err != nil {
+		t.Fatal(err)
+	}
+	writeClusterProfile(t, fx.dir, "cluster-host", "proj", "host", "us-central1")
+	fx.set.reconcileProfiles(fx.ctx, fx.dir)
+	writeClusterProfile(t, fx.dir, "cluster-host-copy", "proj", "host", "us-central1")
+	fx.set.reconcileProfiles(fx.ctx, fx.dir)
+	if got, want := fx.profiles(), []string{"cluster-a", directProfile}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("running after a copy of the host's profile = %v; want %v", got, want)
+	}
+	if got := testutil.ToFloat64(fx.set.m.clusterDiscoveryErrors.WithLabelValues("cluster-host-copy")); got != 1 {
+		t.Fatalf("cluster_discovery_errors_total{profile=cluster-host-copy} = %v; want 1", got)
+	}
+	if got := testutil.ToFloat64(fx.set.m.clusterDiscoveryErrors.WithLabelValues("cluster-host")); got != 0 {
+		t.Fatalf("the absorbed profile was counted as a skip (%v)", got)
+	}
+	if !strings.Contains(logs.String(), "cluster proj/us-central1/host is already claimed by profile cluster-host, which the direct client watches as host") {
+		t.Errorf("no duplicate line for cluster-host-copy in:\n%s", logs.String())
 	}
 }
 
@@ -227,33 +355,148 @@ func TestReconcileProfiles_UndoesAWrongAbsorptionWhenTheHostsProfileArrives(t *t
 // A stop running on the reload goroutine when shutdown begins is joined by
 // wait, so its snapshot is written before the process exits; a stop that
 // arrives after wait has closed the set leaves the run to the shutdown
-// snapshot.
+// snapshot. The stop is held in progress by a watcher whose preflight waits
+// on a channel the test controls, ignoring its context, so stop cannot pass
+// <-run.done until the test lets it: wait, entered meanwhile, must not
+// return before that.
 func TestClusterSet_WaitJoinsAStopInProgress(t *testing.T) {
 	fx := newReloadFixture(t, "host")
-	if err := fx.set.start(fx.ctx, targetCluster{Name: "host", Profile: directProfile, Client: fake.NewClientset()}); err != nil {
+	held := fake.NewClientset()
+	allowPreflight(held)
+	releasePreflight := make(chan struct{})
+	// Prepended after allowPreflight, so it runs first and falls through to it.
+	held.PrependReactor("create", "selfsubjectaccessreviews", func(k8stesting.Action) (bool, runtime.Object, error) {
+		<-releasePreflight
+		return false, nil, nil
+	})
+	if err := fx.set.start(fx.ctx, targetCluster{Name: "host", Profile: directProfile, Client: held}); err != nil {
 		t.Fatal(err)
 	}
-	stopDone := make(chan struct{})
+	if err := fx.set.start(fx.ctx, targetCluster{Name: "b", Profile: "cluster-b", Client: fake.NewClientset()}); err != nil {
+		t.Fatal(err)
+	}
+	stopped := make(chan struct{})
 	go func() {
 		fx.set.stop(directProfile)
-		close(stopDone)
+		close(stopped)
 	}()
+	eventually(t, 10*time.Second, func() bool { return fx.set.count() == 1 }, "the stop to take the run out of the set")
+
 	fx.cancel()
-	fx.set.wait(fx.ctx)
+	waited := make(chan struct{})
+	go func() {
+		fx.set.wait(fx.ctx)
+		close(waited)
+	}()
 	select {
-	case <-stopDone:
-	case <-time.After(50 * time.Millisecond):
+	case <-waited:
 		t.Fatal("wait returned while a stop was still in progress")
+	case <-stopped:
+		t.Fatal("the stop completed while its watcher was held at preflight")
+	case <-time.After(syncHoldProbe):
 	}
-	// As realMain does after wait. Whichever won, the stop's own snapshot or
-	// the shutdown's over a run the closed set kept, the file is there.
-	fx.set.snapshotAll()
+	close(releasePreflight)
+	for _, c := range []struct {
+		name string
+		ch   chan struct{}
+	}{{"stop", stopped}, {"wait", waited}} {
+		select {
+		case <-c.ch:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s did not return within 10s of the held preflight being released", c.name)
+		}
+	}
 	if _, err := os.Stat(dedupPersistPath(fx.persist, directProfile)); err != nil {
 		t.Errorf("the stopped cluster's snapshot is missing: %v", err)
 	}
-	// After close, a stop is a no-op and the run is left for snapshotAll.
+
+	// After close, a stop is a no-op: the run stays for the shutdown
+	// snapshot, which realMain takes after wait, and a start is refused.
+	fx.set.stop("cluster-b")
+	if got := fx.set.count(); got != 1 {
+		t.Fatalf("a stop after shutdown removed its run; running = %d, want 1 left for the shutdown snapshot", got)
+	}
+	fx.set.snapshotAll()
+	if _, err := os.Stat(dedupPersistPath(fx.persist, "cluster-b")); err != nil {
+		t.Errorf("the run left to the shutdown snapshot has no snapshot: %v", err)
+	}
 	if err := fx.set.start(fx.ctx, targetCluster{Name: "late", Profile: "cluster-late", Client: fake.NewClientset()}); err == nil {
 		t.Fatal("start after shutdown must be refused")
+	}
+}
+
+// holdingDispatcher holds every Dispatch until release is closed, ignoring
+// the context, then hands it to the cluster's real dispatcher, whose first
+// act is to write events_seen for the cluster.
+type holdingDispatcher struct {
+	inner   eventDispatcher
+	release chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (d *holdingDispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
+	d.once.Do(func() { close(d.entered) })
+	<-d.release
+	d.inner.Dispatch(ctx, ev)
+}
+
+func (d *holdingDispatcher) RecordScaleUpMark(ev TriageEvent) bool {
+	return d.inner.RecordScaleUpMark(ev)
+}
+
+// stop deletes a removed cluster's metric series after the last dispatch
+// that could write one: Run joins its delivery goroutine before returning,
+// and the run's done closes only after Run has. A dispatch held in flight
+// while the cluster is stopped therefore holds stop too, and the write it
+// makes once released lands before the deletion, not after it, so no series
+// of the cluster survives the stop.
+func TestClusterSet_StopDeletesSeriesAfterTheLastDispatch(t *testing.T) {
+	fx := newReloadFixture(t, "host")
+	hold := &holdingDispatcher{release: make(chan struct{}), entered: make(chan struct{})}
+	fx.set.wrapDispatcher = func(d eventDispatcher) eventDispatcher {
+		hold.inner = d
+		return hold
+	}
+	client := fake.NewClientset()
+	allowPreflight(client)
+	client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, listOf(1), nil
+	})
+	client.PrependWatchReactor("events", func(k8stesting.Action) (bool, watch.Interface, error) {
+		return true, watch.NewFakeWithChanSize(1, false), nil
+	})
+	tc := targetCluster{Name: "a", ProjectID: "proj", Location: "us-central1", Profile: "cluster-a", Client: client}
+	if err := fx.set.start(fx.ctx, tc); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-hold.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no delivery entered the dispatcher")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		fx.set.stop("cluster-a")
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("stop returned while a dispatch was still in flight")
+	case <-time.After(syncHoldProbe):
+	}
+	close(hold.release)
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stop did not return within 10s of the dispatch being released")
+	}
+	if got := testutil.CollectAndCount(fx.set.m.eventsSeen); got != 0 {
+		t.Errorf("events_seen series after the stop = %d; want 0 (the released dispatch wrote one after the deletion)", got)
+	}
+	if got := fx.clusterUpSeries(); got != 0 {
+		t.Errorf("cluster_up series after the stop = %d; want 0", got)
 	}
 }
 

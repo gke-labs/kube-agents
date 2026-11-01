@@ -47,6 +47,7 @@ import (
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer/protobuf"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 )
@@ -135,8 +136,11 @@ func soakEncode(t *testing.T, list *corev1.EventList) (jsonBody, protoBody []byt
 // soakAPIServer is a fake control plane: the Event list in whichever format
 // the client accepts, a watch that stays open and carries nothing, 404 for
 // everything else (the preflight, which then reads as inconclusive and
-// builds the informer, as it does through the credential proxy).
-func soakAPIServer(t *testing.T, jsonBody, protoBody []byte, inFlight, peak *atomic.Int64) *httptest.Server {
+// builds the informer, as it does through the credential proxy). Every list
+// whose Accept header asks for the other wire format than the run was
+// configured for (wantProtobuf) counts on wrongWire, so a run reports the
+// format that was actually on the wire.
+func soakAPIServer(t *testing.T, jsonBody, protoBody []byte, wantProtobuf bool, inFlight, peak, wrongWire *atomic.Int64) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != soakEventsPath {
@@ -164,7 +168,11 @@ func soakAPIServer(t *testing.T, jsonBody, protoBody []byte, inFlight, peak *ato
 				break
 			}
 		}
-		if strings.Contains(r.Header.Get("Accept"), k8sruntime.ContentTypeProtobuf) {
+		protobufAsked := strings.Contains(r.Header.Get("Accept"), k8sruntime.ContentTypeProtobuf)
+		if protobufAsked != wantProtobuf {
+			wrongWire.Add(1)
+		}
+		if protobufAsked {
 			w.Header().Set("Content-Type", k8sruntime.ContentTypeProtobuf)
 			_, _ = w.Write(protoBody)
 			return
@@ -211,25 +219,28 @@ func TestSoak_StartupBurst(t *testing.T) {
 	runtime.ReadMemStats(&base)
 	rssBefore := rssHighWater()
 
-	var inFlight, peakInFlight atomic.Int64
+	var inFlight, peakInFlight, wrongWire atomic.Int64
 	gate := newListGate(slots)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var synced atomic.Int64
 	start := time.Now()
 	for i := 0; i < clusters; i++ {
-		srv := soakAPIServer(t, jsonBody, protoBody, &inFlight, &peakInFlight)
+		srv := soakAPIServer(t, jsonBody, protoBody, !forceJSON, &inFlight, &peakInFlight, &wrongWire)
 		cfg := &rest.Config{Host: srv.URL}
-		client, err := newClusterClient(cfg)
+		var client kubernetes.Interface
+		var err error
+		if forceJSON {
+			// Built directly: newClusterClient sets the binary's
+			// protobuf-first pair on every config it is given, which is the
+			// point of it and the opposite of what this run asks for.
+			cfg.ContentType, cfg.AcceptContentTypes = k8sruntime.ContentTypeJSON, k8sruntime.ContentTypeJSON
+			client, err = kubernetes.NewForConfig(cfg)
+		} else {
+			client, err = newClusterClient(cfg)
+		}
 		if err != nil {
 			t.Fatal(err)
-		}
-		if forceJSON {
-			cfg.ContentType, cfg.AcceptContentTypes = k8sruntime.ContentTypeJSON, k8sruntime.ContentTypeJSON
-			if client, err = newClusterClient(cfg); err != nil {
-				t.Fatal(err)
-			}
-			cfg.ContentType, cfg.AcceptContentTypes = k8sruntime.ContentTypeJSON, k8sruntime.ContentTypeJSON
 		}
 		w := newWatcher(client, nopDispatcher{}, targetCluster{Name: fmt.Sprintf("soak-%02d", i)})
 		w.gate = gate
@@ -278,11 +289,16 @@ func TestSoak_StartupBurst(t *testing.T) {
 	t.Logf("SOAK RSS high-water mark: %d MiB (was %d MiB before the start; includes the encoded backlogs the fake servers hold)", rssAfter>>20, rssBefore>>20)
 	t.Logf("SOAK all %d clusters synced in %s", clusters, elapsed.Round(time.Millisecond))
 
+	if n := wrongWire.Load(); n != 0 {
+		t.Errorf("%d list request(s) asked for the other wire format; this run did not go over %s as configured", n, wire)
+	}
 	if slots > 0 {
 		if got := peakInFlight.Load(); got > int64(slots) {
 			t.Errorf("peak lists in flight = %d; want at most the gate's %d", got, slots)
 		}
-		if rssAfter > maxRSS {
+		if rssAfter == 0 {
+			t.Errorf("RSS high-water mark unreadable (no VmHWM in /proc/self/status), so the %d-byte ceiling was not checked", maxRSS)
+		} else if rssAfter > maxRSS {
 			t.Errorf("RSS high-water mark %d bytes exceeds %d", rssAfter, maxRSS)
 		}
 	}
