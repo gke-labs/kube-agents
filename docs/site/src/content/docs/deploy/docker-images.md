@@ -15,23 +15,28 @@ The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker, the 
 the capability verifier, the console server and the Hermes bridge sidecar, and each is in the
 tables below. The first-party ones (`a2a-gateway`, `a2a-worker`, `a2a-authcallout`,
 `a2a-verifier`, `a2a-console`, `hermes-bridge`) are built and tagged with the rest of the
-release. The operator derives the five it renders from its own image (`OPERATOR_IMAGE`, which
-the chart sets beside `PLATFORM_AGENT_IMAGE`) when it carries a tag, else from the agent image it
-resolves for itself:
-the same registry and tag, so an install at a release pulls them at that release and a mirrored
-install pulls them from the mirror. A `PlatformAgent`'s own `spec.deployment.image` does not move
-them;
-`A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE`, `A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE` and
-`A2A_CONSOLE_IMAGE` on the operator override one at a time. `A2A_DISPATCHER_IMAGE` is
-different: the AgentProfile dispatcher's image is not in the release set yet, so nothing is
-derived for it, and with it unset the operator renders no dispatcher at all. The Hermes bridge sidecar the
-operator renders into the agent pod under `next` is built from the `platform-agent` image of the
-same commit, so the operator takes its registry and tag from the agent image instead, and
-`A2A_BRIDGE_IMAGE` on the operator overrides it. A `PlatformAgent` that declares its own
-`hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the resource names. NATS and nats-box are ordinary third-party pins, in the
-table as `nats` and `nats-box`, so `make mirror-images` copies them; the chart does not set their
-env vars, so a mirrored `next` install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at
-the copies itself, through the operator's environment
+release.
+
+The operator derives the five it renders from its own image (`OPERATOR_IMAGE`, which the chart
+sets beside `PLATFORM_AGENT_IMAGE`) when it carries a tag, else from the agent image it resolves
+for itself. They get the same registry and tag, so an install at a release pulls them at that
+release and a mirrored install pulls them from the mirror. A `PlatformAgent`'s own
+`spec.deployment.image` does not move them; `A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE`,
+`A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE` and `A2A_CONSOLE_IMAGE` on the operator override one at
+a time. `A2A_DISPATCHER_IMAGE` is different: the AgentProfile dispatcher's image is not in the
+release set yet, so nothing is derived for it, and with it unset the operator renders no
+dispatcher at all.
+
+The Hermes bridge sidecar the operator renders into the agent pod under `next` is built from the
+`platform-agent` image of the same commit. The operator therefore takes its registry and tag from
+the agent image instead, and `A2A_BRIDGE_IMAGE` on the operator overrides it. A `PlatformAgent`
+that declares its own `hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the
+resource names.
+
+NATS and nats-box are ordinary third-party pins, in the table as `nats` and `nats-box`, so
+`make mirror-images` copies them. The chart does not set their env vars, so a mirrored `next`
+install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at the copies itself, through the
+operator's environment
 ([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows how).
 
 The bases those images are built from are inventory entries too. `golang`, `node` and
@@ -109,23 +114,29 @@ Needed only to rebuild the images above from source, not to run an install. Each
 
 ## Published images
 
-Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each push to `main`, and when a merge lands on a `release/<X.Y>` branch whose commit has no images yet, tagged with the pushed commit's SHA; `:latest` follows `main` alone. A push to `main` also publishes `platform-agent`, `credential-proxy`, `replay-proxy`, `agent-sandbox`, `pubsub-platform` and `gke-stockout-investigator` — not `k8s-operator`, and not the A2A `next`-stack images, which are published to GHCR alone (the [image inventory](#built-and-published-by-this-repo) above lists every first-party image) — to a Google Artifact Registry repository through [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml), built there by Cloud Build. Production SemVer release tags (`X.Y.Z`) are promoted from the GHCR commit images without rebuilding — see [Release versioning](/kube-agents/deploy/release-versioning/).
+Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each push to `main`, and when a merge lands on a `release/<X.Y>` branch whose commit has no images yet, tagged with the pushed commit's SHA; `:latest` follows `main` alone. A push to `main` also publishes `platform-agent`, `credential-proxy`, `replay-proxy`, `agent-sandbox`, `pubsub-platform` and `gke-stockout-investigator` to a Google Artifact Registry repository through [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml), built there by Cloud Build. `k8s-operator` and the A2A `next`-stack images are published to GHCR alone (the [image inventory](#built-and-published-by-this-repo) above lists every first-party image). Production SemVer release tags (`X.Y.Z`) are promoted from the GHCR commit images without rebuilding — see [Release versioning](/kube-agents/deploy/release-versioning/).
 
 ### `platform-agent`
 
-The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus three specialist profile templates: the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint; the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`; and the optional GKE Support Agent at `/opt/tse-template`, scaffolded into the `tse` profile at startup when `KUBE_AGENTS_ENABLED_PROFILES` contains `tse`.
+The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus three specialist profile templates:
 
-There is no cluster or forge tooling in this image, in any form, and a build guard fails if any reappears. The agent's shell runs in the `agent-sandbox` image. `kubectl` and `gcloud` there are credential-proxy shims — symlinks to a client that forwards a command to the broker holding the credential — and `helm`, `yq`, `leeway`, and OpenTofu's `tofu` are native. The agent runs `tofu` for one subcommand, `fmt`: `tofu fmt -check -diff` to check the syntax of Terraform it writes for a pull request, then `tofu fmt` to apply the formatting. Its `git` holds no credential and reaches no forge, and there is no `gh`: repositories are fetched and changed through the version-control skill's verbs, which the broker serves. Agent-pod code that needs one of them reaches the sandbox over SSH through `agents/platform/scripts/sandbox_exec.py`, and the sandbox reaches the broker at the `<name>-credential-proxy` Service.
+- the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint;
+- the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`;
+- the optional GKE Support Agent at `/opt/tse-template`, scaffolded into the `tse` profile at startup when `KUBE_AGENTS_ENABLED_PROFILES` contains `tse`.
+
+There is no cluster or forge tooling in this image, in any form, and a build guard fails if any reappears. The agent's shell runs in the `agent-sandbox` image. `kubectl` and `gcloud` there are credential-proxy shims — symlinks to a client that forwards a command to the broker holding the credential — and `helm`, `yq`, `leeway`, and OpenTofu's `tofu` are native. The agent runs `tofu` for one subcommand, `fmt`: `tofu fmt -check -diff` to check the syntax of Terraform it writes for a pull request, then `tofu fmt` to apply the formatting.
+
+Its `git` holds no credential and reaches no forge, and there is no `gh`: repositories are fetched and changed through the version-control skill's verbs, which the broker serves. Agent-pod code that needs one of them reaches the sandbox over SSH through `agents/platform/scripts/sandbox_exec.py`, and the sandbox reaches the broker at the `<name>-credential-proxy` Service.
 
 What is installed is the debugging set the agent's own processes use: `curl`, `jq`, `dnsutils`, `iputils-ping`, `patch`, `wget`, `nano`, `vim`.
 
 It also builds two Go binaries in a builder stage and copies them into the image: the `k8s-event-watcher` from `k8s-operator/cmd/k8s-event-watcher/` and the `drift-detector` from `k8s-operator/cmd/drift-detector/`. Both land in the shared `agent-base` stage, so the `credential-proxy` image below carries them too — which is the image that actually runs them, in the gateway pod's `agent-api-auth` sidecar.
 
-A late build step precompiles the Python tree — `/opt/hermes`, its venv, and the stdlib — to `.pyc`. The base image ships almost none, sets `PYTHONDONTWRITEBYTECODE=1`, and `/opt/hermes` is read-only to the runtime user, so without this every short-lived process recompiled its imports from source and threw the result away. Each kanban worker is exactly such a process: a fresh `hermes -p <profile> --cli chat -q`. Shipping the bytecode costs ~170MB of image and takes about 6s off a worker's startup. It has to run after everything the Dockerfile writes into `/opt/hermes` — its patches and its bundled plugins alike — because `compileall` stamps each `.pyc` with its source's mtime and size, so bytecode written before the write would simply be discarded at import.
+A late build step precompiles the Python tree — `/opt/hermes`, its venv, and the stdlib — to `.pyc`. The base image ships almost none, sets `PYTHONDONTWRITEBYTECODE=1`, and `/opt/hermes` is read-only to the runtime user, so without this every short-lived process recompiled its imports from source and threw the result away. Each kanban worker is exactly such a process: a fresh `hermes -p <profile> --cli chat -q`. Shipping the bytecode costs ~170MB of image and takes about 6s off a worker's startup. It has to run after everything the Dockerfile writes into `/opt/hermes`, its patches and its bundled plugins alike. `compileall` stamps each `.pyc` with its source's mtime and size, so bytecode written before the write would be discarded at import.
 
 ### `credential-proxy`
 
-The Envoy-based credential broker runtime, which runs as the `envoy-credential-proxy` container in its own `<name>-credential-proxy` Deployment. The same image also runs the gateway pod's `agent-api-auth` sidecar, with `CREDENTIAL_PROXY_ROLE=api-proxy` starting neither Envoy nor the executor there. Built from the `credential-proxy` target of the same [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile), on the shared `agent-base` stage rather than on `platform`: it adds the real `gcloud`, `kubectl`, `gh` and `git` that the sandbox image deliberately lacks, the `envoy` binary and its config, and `/opt/defaults/scripts`, which is where `start-services.sh` finds `credential_proxy.py`. It carries none of what the `platform` stage adds on top — no kube-agents personas, skills, cron entries or profile templates — because nothing that runs from this image reads them.
+The Envoy-based credential broker runtime, which runs as the `envoy-credential-proxy` container in its own `<name>-credential-proxy` Deployment. The same image also runs the gateway pod's `agent-api-auth` sidecar, with `CREDENTIAL_PROXY_ROLE=api-proxy` starting neither Envoy nor the executor there. Built from the `credential-proxy` target of the same [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile), on the shared `agent-base` stage rather than on `platform`. It adds the real `gcloud`, `kubectl`, `gh` and `git` that the sandbox image deliberately lacks, the `envoy` binary and its config, and `/opt/defaults/scripts`, which is where `start-services.sh` finds `credential_proxy.py`. It carries none of what the `platform` stage adds on top — no kube-agents personas, skills, cron entries or profile templates — because nothing that runs from this image reads them.
 
 Building it from `agent-base` rather than `platform` is also what keeps a one-file agent change cheap. The stage copies `agents/*/scripts/` itself, so an edit there still rebuilds that copy and the layers after it — but no longer the whole `platform` chain, whose output the sidecar does not use.
 
@@ -139,9 +150,9 @@ The Kubebuilder-generated operator manager image. Built from `k8s-operator/Docke
 
 ## Container entrypoint
 
-`platform-agent` — and `credential-proxy`, which inherits it from the shared `agent-base` stage — run [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh) as their `ENTRYPOINT`, with `CMD ["hermes", "gateway", "run"]`. Neither container built from that image reaches it under this operator: for both `envoy-credential-proxy` and `agent-api-auth` the operator sets `command` to `/usr/local/bin/start-services`, which replaces the image's `ENTRYPOINT` outright. Before it `exec`s whatever command it was handed, the entrypoint converts Hermes' SQLite databases out of WAL when the managed config pins `database.journal_mode: delete` (see `availability.runtimeClassName` on the [CRD reference](/kube-agents/operator/platformagent-crd/#specdeployment)), seeds `$HERMES_HOME` from `/opt/defaults`, scaffolds the `platform` profile, reconciles optional built-in profiles (`KUBE_AGENTS_ENABLED_PROFILES`), links profile-targeted plugin volumes, merges the operator-rendered config overlays, copies the managed terminal settings into every profile's `.env`, and starts the Session KV server.
+`platform-agent` — and `credential-proxy`, which inherits it from the shared `agent-base` stage — run [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh) as their `ENTRYPOINT`, with `CMD ["hermes", "gateway", "run"]`. Neither container built from that image reaches it under this operator: for both `envoy-credential-proxy` and `agent-api-auth` the operator sets `command` to `/usr/local/bin/start-services`, which replaces the image's `ENTRYPOINT` outright. Before it `exec`s whatever command it was handed, the entrypoint does its setup. It converts Hermes' SQLite databases out of WAL when the managed config pins `database.journal_mode: delete` (see `availability.runtimeClassName` on the [CRD reference](/kube-agents/operator/platformagent-crd/#specdeployment)), and seeds `$HERMES_HOME` from `/opt/defaults`. It then scaffolds the `platform` profile, reconciles optional built-in profiles (`KUBE_AGENTS_ENABLED_PROFILES`), links profile-targeted plugin volumes, merges the operator-rendered config overlays, copies the managed terminal settings into every profile's `.env`, and starts the Session KV server.
 
-Every one of those writes to the data volume, and a Pod runs this image in more than one container against a single copy of it. Exactly one container may do the setup. A second pass from a container that lacks the plugin volumes and the overlay ConfigMap does not merely duplicate the work — it reads the first container's fresh plugin links as dangling and unlinks them, and reverts the overlay whose source it cannot see. `AGENT_SHARED_STATE_SETUP` decides which container that is:
+Every one of those writes to the data volume, and a Pod runs this image in more than one container against a single copy of it. Exactly one container may do the setup. A second pass from a container that lacks the plugin volumes and the overlay ConfigMap does worse than duplicate the work. It reads the first container's fresh plugin links as dangling and unlinks them, and reverts the overlay whose source it cannot see. `AGENT_SHARED_STATE_SETUP` decides which container that is:
 
 | Value                 | Effect                                                                                                |
 | --------------------- | ----------------------------------------------------------------------------------------------------- |
@@ -153,7 +164,7 @@ An unrecognised value falls back to `auto` and logs a warning rather than guessi
 
 The operator sets the variable explicitly on every container it builds — `owner` on the gateway, `skip` on the dashboard — so `auto` never runs under a `PlatformAgent`. Auto-detection exists for deployments with no operator to ask: Compose, plain manifests, `docker run`. Set it by hand in those if the owning container's own argv does not contain `gateway`. Above one replica the operator's gateway would itself be such a case, running `leader_elect.py`, which starts `hermes gateway run` as a child process, so the word never appears in the container's own arguments. The operator runs the gateway as a single replica today, so it does not render that shape.
 
-A Dockerfile stage built on every pull request, `entrypoint-gate-test`, verifies every case in that table against the real entrypoint (`deploy/shared/entrypoint_gate_check.sh`): it runs the entrypoint once per case against a scratch `$PLATFORM_AGENT_HOME` and checks the decision the gate announces against what it then writes to disk. A build that targets a runtime image does not run it. The script is not shipped in the runtime image, but it is safe to pipe into a running pod when diagnosing one:
+A Dockerfile stage built on every pull request, `entrypoint-gate-test`, verifies every case in that table against the real entrypoint (`deploy/shared/entrypoint_gate_check.sh`). It runs the entrypoint once per case against a scratch `$PLATFORM_AGENT_HOME` and checks the decision the gate announces against what it then writes to disk. A build that targets a runtime image does not run it. The script is not shipped in the runtime image, but it is safe to pipe into a running pod when diagnosing one:
 
 ```bash
 kubectl exec -i deploy/platform-agent-gateway -c platform-agent -- \
@@ -162,11 +173,21 @@ kubectl exec -i deploy/platform-agent-gateway -c platform-agent -- \
 
 Confining it takes more than a scratch `$PLATFORM_AGENT_HOME`, because two of the setup's effects are not derived from it. Step 4 points `$HOME/.hermes/plugins/hermes_otel/config.yaml` at the config it generates — `hermes-otel` resolves its config below `~/.hermes` whatever `HERMES_HOME` says — and `$HOME` in the gateway is `/opt/data/home`, on the data PVC. Step 5 starts the Session KV server on port 8699, which is pod-wide and scoped by nothing. So each case also gets a scratch `$HOME`, and the server it spawns is killed by its scratch path as the case returns. The run ends by asserting both: that the pod's real compat symlink is byte-for-byte what it was, and that no process from the run is still alive.
 
-Three things the entrypoint does can stop the container rather than warn: the skill manifest check, the terminal check (step 4b), and a failed move of the model's files into the shell sandbox (step 5.7). The first: before the setup copies anything to the data volume — in the container that owns the shared state, since a `skip` container has already `exec`ed the command by this point — it checks each skill tree baked into the image (`/opt/hermes/skills`, `/opt/platform-template/skills`, `/opt/cluster-template/skills`, `/opt/tse-template/skills`, `/opt/a2a-template/skills`) against the SHA-256 manifest the build wrote into it, and exits non-zero if a tree no longer matches — naming the offending file on stderr, with both digests when its content is what changed. Almost every other step here degrades with a `WARN` — the exceptions are step 1, which runs upstream's `stage2-hook.sh` and inherits `set -e` from the script, and the three named above. The manifest check is a deliberate exception, for the reason [Security &amp; IAM](/kube-agents/reference/security-and-iam/#change-control--safety) gives. A pod crash-looping with `does not match the manifest baked beside it at build time` is reporting a corrupted or altered image, not a misconfiguration: reinstate the image the manifest belongs to rather than looking for a setting to change.
+Three things the entrypoint does can stop the container rather than warn: the skill manifest check, the terminal check (step 4b), and a failed move of the model's files into the shell sandbox (step 5.7).
 
-The manifest, not the checker, is what makes the check mandatory: a tree carrying one is verified or the container refuses to start. Both sides of that pairing are root-owned in the image — the manifest inside the tree it describes, the verifier in `/opt/defaults/scripts` — so `carries a build-time manifest but nothing here can check it` is not something the agent's own uid can arrange, and it is read the same way as a mismatch: an altered or truncated image, not a setting. A tree with no manifest inside it is skipped, which is how the same entrypoint stays a no-op in images that never reached the stage where manifests are written.
+The first runs before the setup copies anything to the data volume, in the container that owns the shared state, since a `skip` container has already `exec`ed the command by this point. It checks each skill tree baked into the image (`/opt/hermes/skills`, `/opt/platform-template/skills`, `/opt/cluster-template/skills`, `/opt/tse-template/skills`, `/opt/a2a-template/skills`) against the SHA-256 manifest the build wrote into it. If a tree no longer matches it exits non-zero, naming the offending file on stderr, with both digests when its content is what changed.
 
-The second is the terminal check, step 4b. Hermes builds the terminal a scheduled run or a kanban wake turn uses from the profile's own settings, not from the managed config the operator renders to `/etc/hermes/config.yaml`, so the entrypoint copies every `terminal:` setting Hermes maps to a `TERMINAL_*` variable (all but `workspace_root`) into the `TERMINAL_*` lines of every profile's `.env` ([`deploy/shared/terminal_env_pin.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/terminal_env_pin.py)) and then asks Hermes what each profile resolves. If a profile would resolve any of those settings differently — a backend other than the `ssh` sandbox, another host — the container exits non-zero naming the profile and the `TERMINAL_*` variables Hermes resolves differently. A cluster profile scaffolded after start-up gets the same check from `cluster_agent_profile.py`, which leaves a profile that fails it unfinished for the next reconcile to retry. In a pod crash-looping with `would not use the managed ssh terminal`, the `[TERMINAL-ENV-PIN] ERROR:` lines above it name the cause. A key in a profile's own `config.yaml` that sets one of those settings to another value, such as `terminal.backend: local`, outranks `.env`, so the step deletes it and leaves the rest of the file as it was, as Hermes' own save does; if it cannot, the error names the keys to delete by hand. Any other error names the file or directory to fix, except `this Hermes does not map terminal.backend`, which means the image ships a Hermes the copy does not support; the image build fails on that first. At start-up, a profile whose `.env` took the copy but whose `config.yaml` Hermes cannot read or parse gets a `WARN` instead: Hermes refuses that profile's terminal, so its scheduled runs fail until the file is fixed. Without `HERMES_MANAGED_DIR`, which only the operator sets, the step copies a `terminal:` block from `/etc/hermes/config.yaml` if one is there, skipping with a `WARN` any value `.env` cannot hold as a plain line and ignoring, with a `WARN`, a file it cannot read or parse, as Hermes does; with no block it does nothing. What it copies is still checked.
+Almost every other step here degrades with a `WARN`; the exceptions are step 1, which runs upstream's `stage2-hook.sh` and inherits `set -e` from the script, and the three named above. The manifest check is a deliberate exception, for the reason [Security &amp; IAM](/kube-agents/reference/security-and-iam/#change-control--safety) gives. A pod crash-looping with `does not match the manifest baked beside it at build time` is reporting a corrupted or altered image, not a misconfiguration: reinstate the image the manifest belongs to rather than looking for a setting to change.
+
+The manifest, not the checker, is what makes the check mandatory: a tree carrying one is verified or the container refuses to start. Both sides of that pairing are root-owned in the image: the manifest inside the tree it describes, the verifier in `/opt/defaults/scripts`. So `carries a build-time manifest but nothing here can check it` is not something the agent's own uid can arrange, and it is read the same way as a mismatch: an altered or truncated image, not a setting. A tree with no manifest inside it is skipped, which is how the same entrypoint stays a no-op in images that never reached the stage where manifests are written.
+
+The second is the terminal check, step 4b. Hermes builds the terminal a scheduled run or a kanban wake turn uses from the profile's own settings, not from the managed config the operator renders to `/etc/hermes/config.yaml`. So the entrypoint copies every `terminal:` setting Hermes maps to a `TERMINAL_*` variable (all but `workspace_root`) into the `TERMINAL_*` lines of every profile's `.env` ([`deploy/shared/terminal_env_pin.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/terminal_env_pin.py)) and then asks Hermes what each profile resolves. If a profile would resolve any of those settings differently — a backend other than the `ssh` sandbox, another host — the container exits non-zero naming the profile and the `TERMINAL_*` variables Hermes resolves differently.
+
+A cluster profile scaffolded after start-up gets the same check from `cluster_agent_profile.py`, which leaves a profile that fails it unfinished for the next reconcile to retry. In a pod crash-looping with `would not use the managed ssh terminal`, the `[TERMINAL-ENV-PIN] ERROR:` lines above it name the cause.
+
+A key in a profile's own `config.yaml` that sets one of those settings to another value, such as `terminal.backend: local`, outranks `.env`. The step therefore deletes it and leaves the rest of the file as it was, as Hermes' own save does; if it cannot, the error names the keys to delete by hand. Any other error names the file or directory to fix, except `this Hermes does not map terminal.backend`, which means the image ships a Hermes the copy does not support; the image build fails on that first.
+
+At start-up, a profile whose `.env` took the copy but whose `config.yaml` Hermes cannot read or parse gets a `WARN` instead: Hermes refuses that profile's terminal, so its scheduled runs fail until the file is fixed. Without `HERMES_MANAGED_DIR`, which only the operator sets, the step copies a `terminal:` block from `/etc/hermes/config.yaml` if one is there. It skips with a `WARN` any value `.env` cannot hold as a plain line and ignores, with a `WARN`, a file it cannot read or parse, as Hermes does; with no block it does nothing. What it copies is still checked.
 
 The third, step 5.7, stops the container with `the shell sandbox migration failed` when the model's files could not be moved into the sandbox, followed by the last lines of `logs/sandbox_mirror.log`.
 
@@ -192,7 +213,7 @@ The `ARG` has no default, so every build path has to pass it — the image-build
 
 Bumping Hermes means editing `tags.env` and rebuilding both agent images: the pin is a build-time base, so nothing changes in a cluster until `platform-agent` and `credential-proxy` are rebuilt and rolled out.
 
-The tool-call audit trail does not depend on Hermes' log line format: the `tool_call_audit` plugin and the `chat_message_audit` hook write their records to a file of their own that the `fluent-bit` sidecar tails as JSON ([Concepts → Observability](/kube-agents/concepts/observability/#tool-call-audit)). What a bump can still change is the plugin and hook interfaces the two emitters are loaded through. Once a bumped `platform-agent` is running, has made a tool call and has answered a chat turn, query `jsonPayload.audit_event:*` in Logs Explorer: a `tool_call_start` record with a `jsonPayload.file_path` ending in `audit.jsonl` means the plugin still loads and writes, and a `chat_message_start` record means the hook does; none means the plugin or the hook no longer registers, which the agent container's startup output and `agent.log` name.
+The tool-call audit trail does not depend on Hermes' log line format: the `tool_call_audit` plugin and the `chat_message_audit` hook write their records to a file of their own that the `fluent-bit` sidecar tails as JSON ([Concepts → Observability](/kube-agents/concepts/observability/#tool-call-audit)). What a bump can still change is the plugin and hook interfaces the two emitters are loaded through. Once a bumped `platform-agent` is running, has made a tool call and has answered a chat turn, query `jsonPayload.audit_event:*` in Logs Explorer. A `tool_call_start` record with a `jsonPayload.file_path` ending in `audit.jsonl` means the plugin still loads and writes, and a `chat_message_start` record means the hook does. None means the plugin or the hook no longer registers, which the agent container's startup output and `agent.log` name.
 
 ## Private / custom registry
 
@@ -238,9 +259,11 @@ one for the images it does not.
 
 The rows are one path in three coats: `install.sh` generates the Terraform composition's
 `terraform.tfvars` from its flags, and the composition passes both values to the chart's
-`global.*` keys, so "third party" covers the same set everywhere — LiteLLM, fluent-bit, the
-GitHub token minter, and Hindsight. cert-manager is the chart row's exception: the chart never
-renders it — it expects one to be present already. The composition installs it as a separate
+`global.*` keys. So "third party" covers the same set everywhere: LiteLLM, fluent-bit, the
+GitHub token minter, and Hindsight.
+
+The chart row's exception is cert-manager: the chart never renders it, and expects one to be
+present already. The composition installs it as a separate
 `helm_release` of the upstream chart and passes the third-party prefix to that release's image
 repositories, so a mirrored install pulls every image — cert-manager's five included — from the
 mirror. On a cluster whose cert-manager comes from somewhere else, set
@@ -275,7 +298,8 @@ when a prefix is in effect:
 by swapping the trailing name (`platform-agent` to `credential-proxy`), which lands on the mirror
 on its own. The A2A `next` images the operator renders (`a2a-gateway`, `a2a-worker`,
 `a2a-authcallout`, `a2a-verifier`, `a2a-console`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
-no env of their own on a mirror. The sandbox is a separate repository, so it gets no such derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
+no env of their own on a mirror. The sandbox is a separate repository, so it gets no such
+derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset. One
 explicit value pins the sidecar for every agent in the cluster, and the per-CR derivation is what
 otherwise keeps each sidecar in step with its own agent's image.
 
@@ -301,9 +325,9 @@ make docker-build-agents \
 Unset args keep their upstream defaults, so an ordinary build is unchanged. Mirror the base
 images first with `INCLUDE=build-time`, and use `crane` or `skopeo` rather than `docker` — the
 Hermes pin is by digest, and a `docker pull`/`push` round trip changes it. A mirrored `golang` copy
-is frozen at whichever patch it was copied at, and the builder stages run with `GOTOOLCHAIN=local`,
-so a later bump of the `go` directive in `k8s-operator/go.mod` past that patch fails the rebuild
-instead of downloading a toolchain: re-mirror, or pass a patch-pinned `GOLANG_VERSION`.
+is frozen at whichever patch it was copied at, and the builder stages run with `GOTOOLCHAIN=local`.
+A later bump of the `go` directive in `k8s-operator/go.mod` past that patch therefore fails the
+rebuild instead of downloading a toolchain: re-mirror, or pass a patch-pinned `GOLANG_VERSION`.
 
 ### Registry authentication
 

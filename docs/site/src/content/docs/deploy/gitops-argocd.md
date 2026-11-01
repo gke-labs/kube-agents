@@ -55,7 +55,7 @@ kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.pas
 
 ## Give ArgoCD read-only access to the repo
 
-**Do not reuse Minty's GitHub App for this.** [Minty](/kube-agents/deploy/token-minter/) brokers `contents: write`, `pull_requests: write`, and `issues: write` so the agent can open PRs and publish audit ledgers. ArgoCD only ever reads. Sharing one App would hand the reconciler write access it has no use for, and hand the agent's credential path a second consumer — two changes in the wrong direction for a design whose whole point is that proposing and applying are separate privileges.
+**Do not reuse Minty's GitHub App for this.** [Minty](/kube-agents/deploy/token-minter/) brokers `contents: write`, `pull_requests: write`, and `issues: write` so the agent can open PRs and publish audit ledgers. ArgoCD only ever reads. Sharing one App would hand the reconciler write access it has no use for, and hand the agent's credential path a second consumer. Both changes run against a design whose whole point is that proposing and applying are separate privileges.
 
 Create a **second, org-owned GitHub App** with **Repository permissions → Contents: Read-only**, no webhook, installed on the GitOps repo only. Then:
 
@@ -199,13 +199,13 @@ Two independent brakes give you a safe default:
 
 Together, destroying a cluster takes two deliberate acts that cannot happen by accident: a reviewed PR flipping the annotation to `delete`, and then a confirmed prune. Leave workload Applications on plain auto-prune; reserve the brakes for the path that touches cloud resources.
 
-One related note on the KCC annotation `cnrm.cloud.google.com/state-into-spec`. Under `merge`, Config Connector writes the live values of every field a manifest omits back into the object's `spec`; ArgoCD then sees an object that no longer matches git and reports the Application out of sync for as long as the annotation stands, and with self-heal on it re-applies against KCC's writes. Set it to `absent` on every KCC resource, acquired or created, so omitted fields stay externally managed and the file stays the source of truth. It is immutable once set, so it goes on the first commit; the agent's skill writes it on every manifest it authors.
+One related note on the KCC annotation `cnrm.cloud.google.com/state-into-spec`. Under `merge`, Config Connector writes the live values of every field a manifest omits back into the object's `spec`. ArgoCD then sees an object that no longer matches git and reports the Application out of sync for as long as the annotation stands, and with self-heal on it re-applies against KCC's writes. Set it to `absent` on every KCC resource, acquired or created, so omitted fields stay externally managed and the file stays the source of truth. It is immutable once set, so it goes on the first commit; the agent's skill writes it on every manifest it authors.
 
 ## Auto-merge and this pipeline
 
 If you have auto-merge on agent-authored PRs, understand what ArgoCD changes about it: nothing, and that is the problem. Under a push pipeline, an auto-merged PR already reached the cluster without a human. Under ArgoCD it still does — but now the same repo can also provision cloud resources.
 
-Scope the auto-merge guard by path so that PRs touching cloud resources, cluster registrations, or the bootstrap manifests always require a person. Registering a cluster grants the reconciler write access to it; that is a human decision, not a lint check.
+Scope the auto-merge guard by path so that PRs touching cloud resources, cluster registrations, or the bootstrap manifests always require a person. Registering a cluster grants the reconciler write access to it, so it needs a person's approval.
 
 ## Gotchas
 
