@@ -19,8 +19,9 @@ import (
 // dispatcher, the bucket's only writer, persists it under a key that starts
 // with that (profile, tier, pod). Workers hold no grant on the bucket at all:
 // a KV bucket allows rollup headers, so a put grant on any key would let a
-// worker purge every lease in it. After a restart the dispatcher lists a
-// (profile, tier)'s keys to rebuild which workers are busy.
+// worker purge every lease in it. Before each hand-off the dispatcher reads
+// a (profile, tier)'s records to know which workers are busy, held here or
+// not (a restart's redeliveries come up to an AckWait later).
 
 // ProfileLeaseBucket is the KV bucket the leases live in.
 const ProfileLeaseBucket = "PROFILE_LEASES"

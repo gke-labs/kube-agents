@@ -1,7 +1,9 @@
 package dispatch
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -276,4 +278,52 @@ func TestARefusalIsRecordedBeforeItIsReported(t *testing.T) {
 			t.Errorf("the task ran (%d starts) after it was reported rejected: %+v", w.startedCount(), b.terminalsOf("task-1"))
 		}
 	}
+}
+
+// Every hand-off reads which pods of its (profile, tier) hold a live lease,
+// and the bucket keeps every task's tombstone there for the submit stream's
+// retention. The read must cost one pass over the records, not a round trip
+// per record, or a busy (profile, tier) outgrows the read's budget and stops
+// dispatching. Here it gets a budget a round trip per record can't meet.
+func TestLeasedPodsReadsTheTombstonesInOnePass(t *testing.T) {
+	const tombstones = 20000
+	b := newBus(t, "tse-0")
+	finished := time.Now().Add(-time.Minute)
+	for i := range tombstones {
+		data, _ := json.Marshal(lib.LeaseRecord{TaskID: fmt.Sprintf("old-%d", i), Pod: "tse-old", Kind: lib.SubmitKindTop,
+			ConfirmedAt: finished, RenewedAt: finished, ExpiresAt: finished, FinishedAt: finished})
+		if _, err := b.js.PublishAsync("$KV."+lib.ProfileLeaseBucket+"."+lib.ProfileLeaseKey("tse", "read", "tse-old", fmt.Sprintf("old-%d", i)), data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-b.js.PublishAsyncComplete():
+	case <-time.After(30 * time.Second):
+		t.Fatal("seeding the tombstones")
+	}
+	now := time.Now()
+	live, _ := json.Marshal(lib.LeaseRecord{TaskID: "task-live", Pod: "tse-live", Kind: lib.SubmitKindTop,
+		ConfirmedAt: now, RenewedAt: now, ExpiresAt: now.Add(time.Hour)})
+	if _, err := b.js.Publish(b.ctx, "$KV."+lib.ProfileLeaseBucket+"."+lib.ProfileLeaseKey("tse", "read", "tse-live", "task-live"), live); err != nil {
+		t.Fatal(err)
+	}
+	ti := oneProfile("tse", 2, "tse-0")
+	d, err := New(testConfig(), b.connect("dispatcher"), ti.src, ti.pool, &fakeVerifier{}, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 20000 round trips take about 800ms on an idle laptop's embedded
+	// server, one pass about 30ms; a clustered bus's round trip is longer.
+	ctx, cancel := context.WithTimeout(b.ctx, 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	pods, err := d.leasedPods(ctx, "tse", "read", 0)
+	took := time.Since(start)
+	if err != nil {
+		t.Fatalf("leasedPods over %d tombstones: %v after %v", tombstones, err, took)
+	}
+	if !pods["tse-live"] || pods["tse-old"] || len(pods) != 1 {
+		t.Errorf("leased pods %v, want only tse-live", pods)
+	}
+	t.Logf("leasedPods over %d tombstones took %v", tombstones, took)
 }

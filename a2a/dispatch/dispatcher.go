@@ -83,6 +83,10 @@ const (
 	tombstoneMargin = time.Hour
 )
 
+// errWatchEnded is a lease-bucket watch that closed before its initial
+// values were all read.
+var errWatchEnded = errors.New("the lease watch ended before its initial values")
+
 // The kinds a profile's submissions come in; one durable per tier each.
 var submitKinds = []string{lib.SubmitKindTop, lib.SubmitKindChild}
 
@@ -1608,7 +1612,10 @@ func (d *Dispatcher) findLease(ctx context.Context, profile, tier, taskID string
 // tier): one not expired, given grace. A record past that is no worker's
 // current task (its worker died, or it is garbage the sweep has yet to
 // remove), so it doesn't keep its pod from new work; nor does a tombstone,
-// which Expired always reports expired.
+// which Expired always reports expired. Every hand-off asks, and the bucket
+// keeps every finished task's tombstone for the submit stream's retention,
+// so the records are read in one pass (a watch's initial values), never one
+// round trip each.
 func (d *Dispatcher) leasedPods(ctx context.Context, profile, tier string, grace time.Duration) (map[string]bool, error) {
 	kctx, cancel := context.WithTimeout(ctx, kvOpTimeout)
 	defer cancel()
@@ -1616,30 +1623,32 @@ func (d *Dispatcher) leasedPods(ctx context.Context, profile, tier string, grace
 	if err != nil {
 		return nil, err
 	}
-	lister, err := kv.ListKeysFiltered(kctx, lib.ProfileLeaseKeyFilter(profile, tier, "*"))
+	w, err := kv.WatchFiltered(kctx, []string{lib.ProfileLeaseKeyFilter(profile, tier, "*")}, jetstream.IgnoreDeletes())
 	if err != nil {
 		return nil, err
 	}
-	var keys []string
-	for k := range lister.Keys() {
-		keys = append(keys, k)
-	}
-	if kctx.Err() != nil {
-		return nil, kctx.Err()
-	}
+	defer func() { _ = w.Stop() }()
 	now := d.now()
 	pods := map[string]bool{}
-	for _, k := range keys {
-		pod := keyPod(k)
+	for {
+		var entry jetstream.KeyValueEntry
+		var open bool
+		select {
+		case entry, open = <-w.Updates():
+		case <-kctx.Done():
+			return nil, kctx.Err()
+		}
+		if !open {
+			// The watch ended before its initial values did.
+			return nil, errors.Join(errWatchEnded, kctx.Err())
+		}
+		if entry == nil {
+			// The initial values are all in.
+			return pods, nil
+		}
+		pod := keyPod(entry.Key())
 		if pod == "" || pods[pod] {
 			continue
-		}
-		entry, err := kv.Get(kctx, k)
-		if errors.Is(err, jetstream.ErrKeyNotFound) {
-			continue
-		}
-		if err != nil {
-			return nil, err
 		}
 		var rec lib.LeaseRecord
 		if err := json.Unmarshal(entry.Value(), &rec); err == nil && rec.Expired(now, grace) {
@@ -1647,7 +1656,6 @@ func (d *Dispatcher) leasedPods(ctx context.Context, profile, tier string, grace
 		}
 		pods[pod] = true
 	}
-	return pods, nil
 }
 
 func (d *Dispatcher) putLease(ctx context.Context, key string, rec lib.LeaseRecord) error {
