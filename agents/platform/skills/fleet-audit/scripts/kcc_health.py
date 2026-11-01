@@ -35,9 +35,10 @@ time limit on a cluster with the add-on.
   is ready, not yet reached, or still updating or deleting.
 - `kcc_unread`: why the read did not give an answer (a timeout, a forbidden
   read, output that is not a list). This is "unknown", never "healthy".
-- Neither key on a `collected` entry: the cluster serves no Config Connector
-  kind in the `gcp` category, so Config Connector does not run on that
-  cluster.
+- Neither key on a `collected` entry: the cluster serves none of the kinds
+  this collector reads: for compliance, no Config Connector kind in the
+  `gcp` category; for drift, patch readiness and stockout, neither of
+  `CONTAINER_KINDS`.
 
 The reads start after the sweep and must end inside the collector's time
 budget (`RUN_DEADLINE_S` from the collector's start), so the manifest prints

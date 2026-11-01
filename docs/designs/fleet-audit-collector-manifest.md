@@ -134,7 +134,7 @@ flight in the process across clusters. The compliance collector lists every kind
 gcp -A` can. The drift, patch readiness and stockout collectors list only
 `kcc_health.CONTAINER_KINDS` (`ContainerCluster` and `ContainerNodePool`): their findings are on
 `Cluster/` and `NodePool/` objects, a note names only the finding's own object, and from the agent a
-list request through the proxy takes seconds, so all ~230 kinds do not fit the time budget. Their
+list request through the proxy takes seconds, so the kinds of a whole install do not fit the time budget. Their
 entries name the kinds read (`kcc_kinds_read`), and when a `DependencyNotReady` message names an
 object of another kind, the note names it and says its state was not read. For these collectors a
 cluster that serves neither container kind gets neither key and is not a host: it holds no object
@@ -162,11 +162,13 @@ namespace annotations; when it fails, the project stays unknown. These reads end
 
 Some entries are not read and get neither key: an entry with no project or no location, a
 `project/<id>` entry at location `global`, and an entry whose `cluster_status` is not `RUNNING` or
-`RECONCILING`. The drift collector records `cluster_status` on every entry, because it marks every
-listed cluster `collected`; the stockout and compliance collectors record it on the entries of
-clusters that are not running. An entry with no kubeconfig file gets `kcc_unread`. On a `collected`
-cluster entry that is read, neither key means that the cluster's discovery serves no Config
-Connector kind in the `gcp` category, so Config Connector does not run there.
+`RECONCILING`. The drift and patch readiness collectors record `cluster_status` on every collected
+entry, because drift marks every listed cluster `collected` and patch readiness removes its own
+status field; the stockout and compliance collectors record it on the entries of clusters that are
+not running. An entry with no kubeconfig file gets `kcc_unread`. On a `collected` cluster entry
+that is read, neither key means that the cluster's discovery serves none of the kinds this
+collector reads: for compliance, no Config Connector kind in the `gcp` category; for drift, patch
+readiness and stockout, neither container kind.
 
 `finish` counts the possible Config Connector hosts: the entries with either key, and, when any
 entry carries either key, each cluster entry that the collector never read
