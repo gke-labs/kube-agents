@@ -364,11 +364,10 @@ per cluster hit it on a large fleet. `deploy/sandbox/sshd_config` sets `MaxSessi
 and raises `MaxStartups` to `64:30:256` for the moment several agent processes open a
 master at once after a sandbox restart; the image's smoke test opens one master and runs
 64 sessions over it. More sessions mean more shells in the one pod, so the container's
-memory is the counterpart: `spec.harness.experimental.shellSandbox.resources` overrides
-the shell container's requests and limits per key over the operator's 200m/512Mi
-requests and 2 CPU/2Gi limits, the shape `spec.deployment.credentialProxy.resources` has.
-On Autopilot without bursting the limits are clamped to the requests, so `requests.memory`
-is the figure a sweep is bounded by there.
+memory is the counterpart: `spec.harness.experimental.shellSandbox.resources` sizes the
+shell container, and the
+[CRD reference](../site/src/content/docs/operator/platformagent-crd.md#shellsandbox) owns
+its defaults, merge rule and refusals.
 
 ### What the credential proxy is for
 
