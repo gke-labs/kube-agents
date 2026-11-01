@@ -657,3 +657,55 @@ func parseGoMemLimit(v string) (int64, error) {
 	}
 	return n * mult, nil
 }
+
+// The chart's quota preflight counts the MCP pod at the console's size when
+// operator.extraEnv sets A2A_MCP_DOOR (#3869): the pod is behind that flag,
+// so no golden renders it and the footprint has no entry of its own for it.
+// That only holds while the two containers ask for the same, so this pins it:
+// resizing either without the other fails here, not as a pod a namespace
+// quota refuses after the preflight passed.
+func TestTheMCPPodIsSizedLikeTheConsole(t *testing.T) {
+	agent := a2aTestAgent()
+	mcpPod := buildA2AMCPDeployment(agent).Spec.Template.Spec
+	consolePod := buildA2AConsoleDeployment(agent).Spec.Template.Spec
+	// One container each and no init containers, or the console's figures
+	// would no longer be the MCP pod's whole size.
+	for name, pod := range map[string]corev1.PodSpec{"MCP": mcpPod, "console": consolePod} {
+		if len(pod.Containers) != 1 || len(pod.InitContainers) != 0 {
+			t.Fatalf("%s pod has %d containers and %d init containers, want 1 and 0; the preflight counts the MCP at the console's single container", name, len(pod.Containers), len(pod.InitContainers))
+		}
+	}
+	mcp := mcpPod.Containers[0].Resources
+	console := consolePod.Containers[0].Resources
+	for _, side := range []struct {
+		name      string
+		mcp, cons corev1.ResourceList
+	}{{"requests", mcp.Requests, console.Requests}, {"limits", mcp.Limits, console.Limits}} {
+		if len(side.mcp) != len(side.cons) {
+			t.Errorf("%s: MCP declares %v, console %v; the preflight counts the MCP at the console's size", side.name, side.mcp, side.cons)
+			continue
+		}
+		for name, want := range side.cons {
+			if got, ok := side.mcp[name]; !ok || got.Cmp(want) != 0 {
+				t.Errorf("%s %s: MCP %v, console %v; the preflight counts the MCP at the console's size", side.name, name, got.String(), want.String())
+			}
+		}
+	}
+	if lim := mcp.Limits.Cpu(); lim.IsZero() {
+		t.Errorf("MCP declares no CPU limit; a namespace ResourceQuota on limits.cpu refuses it")
+	}
+}
+
+// The namespace pod quota counts the MCP server's pods only while its flag is
+// on (#3869); a derived headroom absorbs this helper as one more standing part.
+func TestA2AMCPStandingPodsFollowTheFlag(t *testing.T) {
+	agent := a2aTestAgent()
+	t.Setenv(a2aMCPDoorEnvVar, "")
+	if got := a2aMCPStandingPods(agent); got != 0 {
+		t.Errorf("flag off: %d MCP pods, want 0", got)
+	}
+	t.Setenv(a2aMCPDoorEnvVar, "true")
+	if got := a2aMCPStandingPods(agent); got != 1 {
+		t.Errorf("flag on: %d MCP pods, want 1, the Deployment's replicas", got)
+	}
+}

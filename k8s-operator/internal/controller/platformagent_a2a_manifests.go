@@ -3737,9 +3737,10 @@ const defaultA2AMaxSessions = 10
 // agent pod, gateway, NATS, LiteLLM, dashboard), Job pods (provision, seed),
 // rollout surge doubling a Deployment for a moment, and the gateway's
 // count-then-create overshoot. Fifteen covered roughly ten standing pods plus
-// surge; the console server made it eleven, hence sixteen. If the base
-// install grows again, raise this before anything user-visible starts failing
-// admission.
+// surge; the console server made it eleven, hence sixteen. The MCP server,
+// rendered only under A2A_MCP_DOOR, is counted apart (a2aMCPStandingPods). If
+// the base install grows again, raise this before anything user-visible starts
+// failing admission.
 const a2aQuotaHeadroom = 16
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
@@ -4208,7 +4209,7 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // compute-resource key (requests.*) would force resource requests onto
 // every pod in the namespace, which is not this bound's mandate.
 func buildA2ASessionQuota(agent *agentv1alpha1.PlatformAgent) *corev1.ResourceQuota {
-	limit := int64(resolveA2AMaxSessions(agent) + a2aQuotaHeadroom)
+	limit := int64(resolveA2AMaxSessions(agent)+a2aQuotaHeadroom) + a2aMCPStandingPods(agent)
 	return &corev1.ResourceQuota{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ResourceQuota"},
 		ObjectMeta: metav1.ObjectMeta{

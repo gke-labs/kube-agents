@@ -2266,6 +2266,18 @@ The defaults carry no ephemeral-storage request because the operator renders non
          whole template exists to prevent. An absent value means the operator's own
          default of 1; an explicit 0 means 0, and the CRD allows it. */ -}}
   {{- $agentReplicas := include "kube-agents.replicaCount" (((.Values.platformAgent.deployment | default dict).availability | default dict).replicas) | int64 -}}
+  {{- /* platformAgent.mode: next renders the A2A stack beside the today-mode one, and
+         footprint.yaml's nextMode holds exactly what it adds (the generator refuses a
+         next-mode golden whose today-mode part differs). The mode is read from the values,
+         as platform-agent-cr.yaml writes it: a mode set on the CR by hand while this stays
+         null is not seen here. */ -}}
+  {{- $next := dict -}}
+  {{- if eq (toString (.Values.platformAgent.mode | default "")) "next" -}}
+    {{- $next = (index $footprint "nextMode") | default dict -}}
+    {{- if not $next -}}
+      {{- fail "quota preflight: platformAgent.mode is next but footprint.yaml has no nextMode section, so the A2A stack cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+  {{- end -}}
   {{- $base := (index $op "agentPod" "base") | default dict -}}
   {{- $podReqCpu := $base.cpuMillisRequest | default 0 | int64 -}}
   {{- $podLimCpu := $base.cpuMillisLimit | default 0 | int64 -}}
@@ -2372,6 +2384,77 @@ The defaults carry no ephemeral-storage request because the operator renders non
     {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" ($dash.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
   {{- end -}}
 
+  {{- /* Next mode's hermes-bridge is another container of the agent pod, so like the
+         dashboard it scales with the agent's replicas and adds no pod. The operator sizes it
+         from its own env (a2aRenderedBridgeResources), which this chart sets through
+         operator.extraEnv. The chart does not re-implement that reader -- its JSON decoding,
+         refusal rules and valueFrom are the operator's -- it bounds it from above. With
+         neither A2A_BRIDGE_EXECUTOR nor A2A_BRIDGE_RESOURCES set, the bridge is the api
+         default (hermesBridge). With either set, in any form, it is counted at no less than
+         the agent container's size (hermesBridgeCli), the operator's fallback under cli; and
+         an A2A_BRIDGE_RESOURCES whose figures read cleanly as quantities can only raise that,
+         per key, never lower it, since a value the operator refuses falls back. Nothing here
+         fails the render: a figure it cannot read is left out, and the agent-size floor
+         stands. Over-counting is this preflight's direction of error. */ -}}
+  {{- $bridge := index ($next.agentPod | default dict) "hermesBridge" -}}
+  {{- if $next -}}
+    {{- $overridden := false -}}
+    {{- $bridgeResources := "" -}}
+    {{- range $e := (.Values.operator.extraEnv | default list) -}}
+      {{- $name := toString (index ($e | default dict) "name") -}}
+      {{- if or (eq $name "A2A_BRIDGE_EXECUTOR") (eq $name "A2A_BRIDGE_RESOURCES") -}}
+        {{- $overridden = true -}}
+      {{- end -}}
+      {{- if and (eq $name "A2A_BRIDGE_RESOURCES") (kindIs "string" (index $e "value")) -}}
+        {{- $bridgeResources = index $e "value" -}}
+      {{- end -}}
+    {{- end -}}
+    {{- if $overridden -}}
+      {{- $bridge = deepCopy (index $next.agentPod "hermesBridgeCli" | default dict) -}}
+      {{- with $bridgeResources -}}
+        {{- $parsed := fromJson . -}}
+        {{- if not (hasKey $parsed "Error") -}}
+          {{- /* The CRD's quantity grammar, as agentAPIAuthResourcesCheck holds an override
+                 to: parseCpuMillis and parseBytes read every form it admits, so a figure
+                 that matches never reaches their fail. A JSON number arrives as a float,
+                 which toString may print with an exponent; the grammar admits that too. */ -}}
+          {{- $quantity := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
+          {{- $requested := index $parsed "requests" -}}
+          {{- if not (kindIs "map" $requested) -}}{{- $requested = dict -}}{{- end -}}
+          {{- range $side := list "limits" "requests" -}}
+            {{- $list := index $parsed $side -}}
+            {{- if kindIs "map" $list -}}
+              {{- range $key, $field := dict "cpu" "cpuMillis" "memory" "memoryBytes" "ephemeral-storage" "ephemeralStorageBytes" -}}
+                {{- $raw := trimPrefix "+" (trim (toString (index $list $key))) -}}
+                {{- if regexMatch $quantity $raw -}}
+                  {{- $n := 0 -}}
+                  {{- if eq $key "cpu" -}}{{- $n = include "kube-agents.parseCpuMillis" $raw | int64 -}}{{- else -}}{{- $n = include "kube-agents.parseBytes" $raw | int64 -}}{{- end -}}
+                  {{- /* A limit also floors the request: the API server defaults an omitted
+                         request to its limit. */ -}}
+                  {{- $targets := list (printf "%sRequest" $field) -}}
+                  {{- if eq $side "limits" -}}{{- $targets = list (printf "%sLimit" $field) (printf "%sRequest" $field) -}}{{- end -}}
+                  {{- range $target := $targets -}}
+                    {{- if or (ne $side "limits") (eq $target (printf "%sLimit" $field)) (not (hasKey $requested $key)) -}}
+                      {{- $_ := set $bridge $target (max (index $bridge $target | default 0 | int64) $n) -}}
+                    {{- end -}}
+                  {{- end -}}
+                {{- end -}}
+              {{- end -}}
+            {{- end -}}
+          {{- end -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- with $bridge -}}
+    {{- $podReqCpu = include "kube-agents.satAdd" (dict "a" $podReqCpu "b" (.cpuMillisRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimCpu = include "kube-agents.satAdd" (dict "a" $podLimCpu "b" (.cpuMillisLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqMem = include "kube-agents.satAdd" (dict "a" $podReqMem "b" (.memoryBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimMem = include "kube-agents.satAdd" (dict "a" $podLimMem "b" (.memoryBytesLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqEph = include "kube-agents.satAdd" (dict "a" $podReqEph "b" (.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" (.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
+  {{- end -}}
+
   {{- /* satMul/satAdd: the pod sum times the replica count is where an admitted
          override most easily passes int64 -- a figure under 2^63 doubles over it at
          two replicas -- so both the multiply and the accumulation saturate. */ -}}
@@ -2433,6 +2516,63 @@ The defaults carry no ephemeral-storage request because the operator renders non
     {{- end -}}
   {{- end -}}
 
+  {{- /* Next mode's own workloads: NATS, the auth callouts, the verifiers, the console,
+         the A2A gateway and the provisioning Job, each a total over its replicas, plus the
+         JetStream claim. None has a sizing override in the chart. An entry marked `surges`
+         (the callouts and verifiers, which roll RollingUpdate with maxUnavailable 0) sizes
+         the patch's surge room by one of its pods: with LiteLLM off, the chart's own
+         workloads may leave less room than a callout needs to roll. */ -}}
+  {{- range $key, $workload := $next -}}
+    {{- if and (ne $key "agentPod") (ne $key "storage") -}}
+      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.replicaCount" $workload.pods | int64)) | int64 -}}
+      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($workload.cpuMillisRequest | default 0 | int64)) | int64 -}}
+      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($workload.cpuMillisLimit | default 0 | int64)) | int64 -}}
+      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($workload.memoryBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($workload.memoryBytesLimit | default 0 | int64)) | int64 -}}
+      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($workload.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($workload.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
+      {{- $pods := $workload.pods | default 0 | int64 -}}
+      {{- if and $workload.surges (gt $pods (int64 0)) -}}
+        {{- $surgeCpuReq = max $surgeCpuReq (div ($workload.cpuMillisRequest | default 0 | int64) $pods) -}}
+        {{- $surgeCpuLim = max $surgeCpuLim (div ($workload.cpuMillisLimit | default 0 | int64) $pods) -}}
+        {{- $surgeMemReq = max $surgeMemReq (div ($workload.memoryBytesRequest | default 0 | int64) $pods) -}}
+        {{- $surgeMemLim = max $surgeMemLim (div ($workload.memoryBytesLimit | default 0 | int64) $pods) -}}
+        {{- $surgeEphReq = max $surgeEphReq (div ($workload.ephemeralStorageBytesRequest | default 0 | int64) $pods) -}}
+        {{- $surgeEphLim = max $surgeEphLim (div ($workload.ephemeralStorageBytesLimit | default 0 | int64) $pods) -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- /* The MCP server (#3869): one more pod, rendered only while operator.extraEnv sets
+         A2A_MCP_DOOR to "true", so no golden renders it and footprint.yaml has no entry of
+         its own. The operator sizes it as the console (TestTheMCPPodIsSizedLikeTheConsole
+         holds the two equal) and rolls it Recreate at one replica, so it is counted once at
+         the console's figures and sizes no surge. An entry the chart cannot read -- a
+         valueFrom, a non-string value -- counts as on; a literal value other than "true",
+         or none or null, is what the operator reads as off, and leaves it out. */ -}}
+  {{- if $next -}}
+    {{- $mcpDoor := false -}}
+    {{- range $e := (.Values.operator.extraEnv | default list) -}}
+      {{- if eq (toString (index ($e | default dict) "name")) "A2A_MCP_DOOR" -}}
+        {{- $v := index $e "value" -}}
+        {{- $mcpDoor = or (hasKey $e "valueFrom") (and (hasKey $e "value") (not (kindIs "string" $v)) (not (kindIs "invalid" $v))) (eq (toString $v) "true") -}}
+      {{- end -}}
+    {{- end -}}
+    {{- if $mcpDoor -}}
+      {{- $mcp := $next.a2aConsole | default dict -}}
+      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (int64 1)) | int64 -}}
+      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($mcp.cpuMillisRequest | default 0 | int64)) | int64 -}}
+      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($mcp.cpuMillisLimit | default 0 | int64)) | int64 -}}
+      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($mcp.memoryBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($mcp.memoryBytesLimit | default 0 | int64)) | int64 -}}
+      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($mcp.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($mcp.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
+    {{- end -}}
+  {{- end -}}
+  {{- with $next.storage -}}
+    {{- $reqPvc = add $reqPvc (.persistentVolumeClaims | default 0 | int64) -}}
+    {{- $reqStorage = add $reqStorage (.storageBytesRequest | default 0 | int64) -}}
+  {{- end -}}
+
   {{- /* Claims are release-scoped rather than per-replica, so they are not multiplied. */ -}}
   {{- $storage := (index $op "storage") | default dict -}}
   {{- $reqPvc = add $reqPvc ($storage.persistentVolumeClaims | default 0 | int64) -}}
@@ -2477,7 +2617,18 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $spec := index $quota "spec" | default dict -}}
   {{- $scopes := index $spec "scopes" -}}
   {{- $scopeSelector := index $spec "scopeSelector" -}}
-  {{- if or $scopes $scopeSelector -}}
+  {{- /* A quota a PlatformAgent owns is the operator's next-mode session-pod bound
+         (pods: maxSessions plus a headroom, buildA2ASessionQuota), which it puts back on every
+         reconcile (server-side apply), so a patch printed against it would be reverted and the
+         upgrade refused again. Its size is spec.harness.tuning.maxSessions's to raise, and the
+         headroom's to cover the release (gke-labs#3848), not this check's to diagnose. */ -}}
+  {{- $operatorOwned := false -}}
+  {{- range $ref := (index ($quota.metadata | default dict) "ownerReferences" | default list) -}}
+    {{- if and (eq (toString $ref.kind) "PlatformAgent") (hasPrefix "kubeagents.x-k8s.io/" (toString $ref.apiVersion)) -}}
+      {{- $operatorOwned = true -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if or $scopes $scopeSelector $operatorOwned -}}
     {{- /* Scoped quota: it applies to a subset of pods this template cannot identify, so
            comparing the whole release against it would be wrong in both directions. */ -}}
   {{- else -}}

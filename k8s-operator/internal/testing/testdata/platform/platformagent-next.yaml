@@ -1,0 +1,130 @@
+# The default example CR with spec.mode: next, so the golden carries the A2A stack
+# (NATS, the A2A gateway, the auth callout, the verifier, the console, the hermes
+# bridge and the provisioning Job) that charts/kube-agents/files/footprint.yaml counts
+# for a next-mode install.
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: platformagent
+  namespace: kubeagents-system
+spec:
+  mode: next
+  # Harness configures the core execution environment and framework-level settings.
+  # +optional
+  harness:
+    # ClusterName is the logical name of the cluster where the agent is running.
+    # +required
+    clusterName: "cluster-a"
+    # Location is the geographical location or cloud region.
+    # +required
+    location: "us-central1-a"
+    # ProjectID is the GCP Project ID of the cluster. Required: the credential
+    # proxy only bootstraps a kubectl context when clusterName, location, and
+    # projectId are all present. Omit it and kubectl resolves to localhost:8080.
+    # +required
+    projectId: "example-project"
+    # Hermes configures the internal event-routing or agent framework.
+    # +optional
+    hermes:
+      # DashboardEnabled toggles the PLATFORM_AGENT_DASHBOARD environment variable.
+      # Default: true
+      # +optional
+      dashboardEnabled: true
+      # PluginsDebug toggles the PLATFORM_AGENT_PLUGINS_DEBUG environment variable.
+      # Default: false
+      # +optional
+      pluginsDebug: false
+      # ApiServerSecretRef references a Secret holding API_SERVER_EXTERNAL_KEY, the
+      # credential outside callers present to the credential-proxy sidecar. It does
+      # NOT set API_SERVER_KEY: the value the Hermes API server itself validates is
+      # the non-secret loopback sentinel the operator pins, and pointing this at a
+      # Secret does not replace it.
+      # +optional
+      apiServerSecretRef:
+        name: "platformagent-secrets"
+        key: "api-key"
+    # EventWatcher controls cluster event ingestion. Left unset — and therefore
+    # on — on purpose: the watcher is how a fleet notices its own incidents, so
+    # only an explicit false turns it off. That false is an emergency stop for an
+    # event storm, not a tuning knob: it stops new events from arriving (it does
+    # not touch cards already on the board), it rolls the pod, and nothing turns
+    # it back on. Throttle a merely busy board with tuning.maxInProgress instead.
+    # +optional
+    # eventWatcher:
+    #   enabled: false # RED BUTTON: no cluster event reaches the agent at all
+    # Tuning bounds what the harness may consume. Left unset on purpose: the per-run
+    # fields under it are a deployment trade, not a default the operator can pick for
+    # you. `maxInProgress` is the exception — unset renders the operator's cap of 6,
+    # one slot of it held for each class of card, because uncapped dispatch loses cards
+    # silently rather than merely running them unbounded. The credential
+    # proxy's slot cap of 8 commands is the ceiling past about eight workers;
+    # no CR field moves it, so more proxy memory does not help there. See the
+    # field docs on TuningSpec in
+    # api/v1alpha1/common_types.go (`kubectl explain platformagent.spec.harness.tuning`).
+    # +optional
+    # tuning:
+    #   maxInProgress: 8 # raises the operator's default of 6
+  # Deployment abstracts the Kubernetes Pod/Deployment configuration,
+  # decoupling the compute payload from the agent's application logic.
+  # +optional
+  deployment:
+    # Image is optional and omitted here on purpose so this example is safe to
+    # copy-paste on any install. When unset, the operator uses its
+    # PLATFORM_AGENT_IMAGE env var (set for private-registry / behind-the-firewall
+    # installs; see config/manager/manager.yaml) and otherwise the public
+    # ghcr.io default. Uncomment and set this only to pin a specific image or
+    # registry for THIS agent (a mirror, a fork, or a digest):
+    #   image: "registry.example.com/kube-agents/platform-agent"
+    imagePullPolicy: "IfNotPresent"
+  security:
+    serviceAccountName: "kubeagents-platform-agent"
+    # WorkloadIdentity maps external IAM to the KSA securely.
+    # +optional
+    serviceAccountAnnotations:
+      iam.gke.io/gcp-service-account: "kubeagents-platform-gsa@kube-agents-gkedemos.iam.gserviceaccount.com"
+
+  # Integration configures platform-specific external connections.
+  # +optional
+  integration:
+    # GoogleChat configures the Google Chat integration.
+    # +optional
+    googleChat:
+      # Enabled toggles the Google Chat integration.
+      # Default: false
+      # +optional
+      enabled: true
+      # Mode controls output verbosity in Google Chat ("default" or "debug").
+      # Default: "default"
+      # +optional
+      mode: "default"
+      # ProjectID is the target GCP Project ID for Pub/Sub. Required if enabled.
+      # +optional
+      projectId: "kube-agents-gkedemos"
+      # TopicName is the GCP Chat Topic Name. Required if enabled.
+      # +optional
+      topicName: "kubeagents-google-chat-events"
+      # SubscriptionName is the GCP Chat Subscription Name. Required if enabled.
+      # +optional
+      subscriptionName: "kubeagents-google-chat-events-sub"
+    # Slack configures the Slack integration.
+    # +optional
+    slack:
+      # Enabled toggles the Slack integration.
+      # Default: false
+      # +optional
+      enabled: false
+      # BotToken is the Slack bot token (xoxb-...).
+      # +optional
+      botToken: ""
+      # AppToken is the Slack app token for Socket Mode (xapp-...).
+      # +optional
+      appToken: ""
+      # AllowedUsers is a list of allowed member IDs.
+      # +optional
+      allowedUsers: []
+      # HomeChannel is the default channel ID for scheduled messages.
+      # +optional
+      homeChannel: ""
+      # HomeChannelName is the human-readable channel name.
+      # +optional
+      homeChannelName: ""
