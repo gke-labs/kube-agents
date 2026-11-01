@@ -2077,7 +2077,56 @@ returns the entry's six numbers and pod count as JSON.
 */}}
 {{- define "kube-agents.shellSandboxFootprint" -}}
 {{- include "kube-agents.shellSandboxResourcesCheck" .override -}}
+{{- if include "kube-agents.shellSandboxOverrideRefused" . -}}
+{{- include "kube-agents.overriddenPodFootprint" (dict "workload" .workload "override" dict) -}}
+{{- else -}}
 {{- include "kube-agents.overriddenPodFootprint" . -}}
+{{- end -}}
+{{- end }}
+
+{{- /* Whether the operator would refuse the shell override on a rule the shape check leaves
+       to it: a zero limit, or a request above its limit on any name (validateContainerResources
+       in k8s-operator/internal/controller/credential_proxy_validation.go). The sandbox CR
+       block is lean, as the agent-api-auth one is: it does not fail the render on these, the
+       operator refuses them and renders the shell at its defaults, Degraded. So the preflight
+       counts such an override at the defaults, as the agent-api-auth delta does
+       (kube-agents.quotaRequirements), or a zero memory limit would sum the shell at nothing
+       and pass a quota that then refuses the pod, and a request raised alone past the default
+       limit would charge the quota for a pod the operator never writes. Decided on the merged
+       exact figures through kube-agents.quantityExact, not the rounded integers the sum uses,
+       for the reason given at the agent-api-auth gate. The defaults are read from the footprint
+       entry, which restates the operator's shellSandbox* constants
+       (tests/test_chart_shell_sandbox_resources.py holds it to them). The shell declares no
+       ephemeral-storage, so that pair is compared only where the override sets it: a request
+       set alone has no limit to cross. Takes (dict "workload" <footprint entry> "override"
+       <resources block>) and answers "true" or "". */ -}}
+{{- define "kube-agents.shellSandboxOverrideRefused" -}}
+{{- $workload := .workload | default dict -}}
+{{- $override := .override | default dict -}}
+{{- $req := (index $override "requests") | default dict -}}
+{{- $lim := (index $override "limits") | default dict -}}
+{{- $prefix := "platformAgent.harness.experimental.shellSandbox.resources" -}}
+{{- $refused := false -}}
+{{- range $name, $isCpu := (dict "cpu" true "memory" false) -}}
+{{- $defReq := ternary (printf "%dm" ($workload.cpuMillisRequest | default 0 | int64)) (printf "%d" ($workload.memoryBytesRequest | default 0 | int64)) $isCpu -}}
+{{- $defLim := ternary (printf "%dm" ($workload.cpuMillisLimit | default 0 | int64)) (printf "%d" ($workload.memoryBytesLimit | default 0 | int64)) $isCpu -}}
+{{- $reqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $req $name) "fallback" $defReq) -}}
+{{- $limRaw := include "kube-agents.declaredQuantity" (dict "value" (index $lim $name) "fallback" $defLim) -}}
+{{- $xReq := include "kube-agents.quantityExact" (dict "raw" $reqRaw "cpu" $isCpu "key" (printf "%s.requests.%s" $prefix $name)) | float64 -}}
+{{- $xLim := include "kube-agents.quantityExact" (dict "raw" $limRaw "cpu" $isCpu "key" (printf "%s.limits.%s" $prefix $name)) | float64 -}}
+{{- if or (eq $xLim 0.0) (gt $xReq $xLim) -}}{{- $refused = true -}}{{- end -}}
+{{- end -}}
+{{- $ephLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $lim "ephemeral-storage") "fallback" "") -}}
+{{- $ephReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $req "ephemeral-storage") "fallback" "") -}}
+{{- if $ephLimRaw -}}
+{{- $xEphLim := include "kube-agents.quantityExact" (dict "raw" $ephLimRaw "cpu" false "key" (printf "%s.limits.ephemeral-storage" $prefix)) | float64 -}}
+{{- if eq $xEphLim 0.0 -}}{{- $refused = true -}}{{- end -}}
+{{- if $ephReqRaw -}}
+{{- $xEphReq := include "kube-agents.quantityExact" (dict "raw" $ephReqRaw "cpu" false "key" (printf "%s.requests.ephemeral-storage" $prefix)) | float64 -}}
+{{- if gt $xEphReq $xEphLim -}}{{- $refused = true -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $refused -}}true{{- end -}}
 {{- end }}
 
 {{- /* The arithmetic behind the two footprint helpers above: a footprint entry with a
@@ -2518,7 +2567,10 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          platformAgent.harness.experimental.shellSandbox.resources) over it per key
          (kube-agents.credentialProxyFootprint, kube-agents.shellSandboxFootprint) before it
          is summed, so a raised memory limit is counted here as the pod the operator will
-         write, rather than the preflight passing a quota the release will not fit. An
+         write, rather than the preflight passing a quota the release will not fit. The
+         proxy's CR block fails the render on a zero limit or a crossed pair; the sandbox's
+         leaves both to the operator, so kube-agents.shellSandboxFootprint counts such an
+         override at the defaults the operator then renders. An
          ephemeral-storage limit set alone is counted as a request of that size too: the
          operator renders no ephemeral-storage request and the API server defaults it to
          the limit. The agent-api-auth sidecar has a sizing override too, but it is a

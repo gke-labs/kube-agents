@@ -250,6 +250,41 @@ class ShellSandboxFootprintTest(unittest.TestCase):
         explicit = self._requirements([f"{_VALUE_PATH}.limits.ephemeral-storage=10Gi", f"{_VALUE_PATH}.requests.ephemeral-storage=4Gi"])
         self.assertEqual(explicit["requestsEphemeral"] - base["requestsEphemeral"], 4 * _GIB)
 
+    def test_a_refused_override_counts_the_defaults(self):
+        """The sandbox CR block leaves the zero-limit and crossed-pair refusals to the
+        operator, which renders the shell at its defaults, Degraded. The preflight has to
+        count that pod: a zero memory limit summed as written would pass a quota that then
+        refuses the StatefulSet's pod, and a request raised alone past the default limit
+        would charge the quota for a pod the operator never writes."""
+        base = self._requirements()
+        for override in (
+            [f"{_VALUE_PATH}.limits.memory=0"],
+            [f"{_VALUE_PATH}.limits.cpu=0"],
+            [f"{_VALUE_PATH}.limits.ephemeral-storage=0"],
+            # Crossed against the operator's default on the other side.
+            [f"{_VALUE_PATH}.requests.memory=3Gi"],
+            [f"{_VALUE_PATH}.limits.memory=256Mi"],
+            [f"{_VALUE_PATH}.requests.cpu=3"],
+            # Crossed within the override.
+            [f"{_VALUE_PATH}.requests.ephemeral-storage=5Gi", f"{_VALUE_PATH}.limits.ephemeral-storage=4Gi"],
+            # A rounding step under the default request: parseBytes and parseCpuMillis
+            # ceil an m quantity back onto the default, the operator's exact comparison
+            # refuses it, and the gate decides on the exact figure.
+            [f"{_VALUE_PATH}.limits.memory=536870911999m"],
+            [f"{_VALUE_PATH}.limits.cpu=199.5m"],
+        ):
+            got = self._requirements(override)
+            self.assertEqual(got, base, f"a refused override {override} moved the footprint; it must count the defaults")
+
+    def test_an_ephemeral_request_alone_is_counted(self):
+        # The shell declares no ephemeral-storage limit, so a request set alone has nothing
+        # to cross and the operator renders it; the gate must not read the footprint's 0 as
+        # a limit under it.
+        base = self._requirements()
+        raised = self._requirements([f"{_VALUE_PATH}.requests.ephemeral-storage=4Gi"])
+        self.assertEqual(raised["requestsEphemeral"] - base["requestsEphemeral"], 4 * _GIB)
+        self.assertEqual(raised["limitsEphemeral"], base["limitsEphemeral"])
+
     def test_a_null_override_key_keeps_the_default(self):
         base = self._requirements()
         nulled = self._requirements([f"{_VALUE_PATH}.limits.memory=null"])

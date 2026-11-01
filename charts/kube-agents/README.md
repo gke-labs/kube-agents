@@ -879,7 +879,8 @@ canonical for the defaults and the refusals. The chart fails the render on the
 same shape faults (a key other than `requests`, `limits` and `claims`, a name
 the container does not declare, a quantity it cannot read) and leaves the
 crossed-pair and zero-limit refusals to the operator; the quota preflight counts
-the override, and the same CRD guard fails the upgrade when the installed CRD
+the override, at the defaults when the operator would refuse it (it then renders
+the shell at them), and the same CRD guard fails the upgrade when the installed CRD
 predates the field.
 
 `platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
@@ -1116,7 +1117,9 @@ summed at the raised figure, and an override setting only `limits.ephemeral-stor
 as a request of that size too, because the operator renders no ephemeral-storage request and
 the API server defaults it to the limit. The shell sandbox is counted the same way with
 `platformAgent.harness.experimental.shellSandbox.resources` merged over its footprint entry, the
-ephemeral-storage rule included, since the shell declares no ephemeral-storage of its own. A
+ephemeral-storage rule included, since the shell declares no ephemeral-storage of its own; an
+override the operator refuses (a zero limit, a request above its limit) is counted at the defaults
+the operator renders in its place, because the chart does not fail the render on those. A
 `PlatformAgent` edited by hand after the install is outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as

@@ -1030,7 +1030,8 @@ platformAgent:
         # raise it when the shell pod is OOM-killed. On GKE Autopilot without
         # bursting the limits are set equal to the requests, so there
         # requests.memory is the figure that counts, with limits.memory to
-        # match. The quota preflight counts the override. The operator refuses
+        # match. The quota preflight counts the override, at the defaults
+        # when the operator would refuse it. The operator refuses
         # a request above its limit, a negative quantity, a zero limit,
         # claims, and any resource name other than cpu, memory and
         # ephemeral-storage, whether or not its webhook is enabled: it ignores
