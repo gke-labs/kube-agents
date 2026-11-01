@@ -282,3 +282,27 @@ func TestTheRestoreLegTakesAStreamItAlreadyRestoredAsDone(t *testing.T) {
 		}
 	}
 }
+
+// The clear leg deletes every named stream and reports each; a stream
+// already gone counts as cleared, so a second clear (a retry) succeeds.
+func TestTheClearLegDeletesTheStreamsAndCanRunAgain(t *testing.T) {
+	s := startServer(t, "a2a-nats-0", t.TempDir(), 0)
+	defer shutdown(s)
+	seedBus(t, s.ClientURL(), 1)
+	for i := 1; i <= 2; i++ {
+		log := filepath.Join(t.TempDir(), "log")
+		var e bytes.Buffer
+		if code := Main(context.Background(), []string{"clear", "--server", s.ClientURL(), "--streams", "TASKS,KV_cap,NEVER_MADE", "--termination-log", log}, &e); code != 0 {
+			t.Fatalf("clear run %d exited %d: %s", i, code, e.String())
+		}
+		r := readReport(t, log)
+		if strings.Join(r.Cleared, ",") != "TASKS,KV_cap,NEVER_MADE" || r.Error != "" {
+			t.Errorf("clear run %d report %+v", i, r)
+		}
+	}
+	for _, n := range []string{"TASKS", "KV_cap"} {
+		if streamExists(t, s.ClientURL(), n) {
+			t.Errorf("%s survived the clear", n)
+		}
+	}
+}

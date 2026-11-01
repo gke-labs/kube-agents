@@ -78,7 +78,7 @@ func splitStreams(s string) ([]string, error) {
 // process's exit code.
 func Main(ctx context.Context, args []string, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: bus-migrate pin|unpin|snapshot|restore [flags]")
+		fmt.Fprintln(stderr, "usage: bus-migrate pin|unpin|snapshot|restore|clear [flags]")
 		return 2
 	}
 	leg, args := args[0], args[1:]
@@ -91,7 +91,7 @@ func Main(ctx context.Context, args []string, stderr io.Writer) int {
 	replicas := fs.Int("replicas", 3, "unpin, restore: the replica count each stream ends at")
 	dir := fs.String("dir", "", "snapshot, restore: the staging directory")
 	runFile := fs.String("run-file", "", "restore: the operator's digests and policies (RunFile JSON)")
-	report := fs.String("termination-log", DefaultTerminationLog, "restore: where its report is written")
+	report := fs.String("termination-log", DefaultTerminationLog, "restore, clear: where its report is written")
 	settle := fs.Duration("settle", 2*time.Second, "pin: the wait after each step-down or update")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -102,7 +102,7 @@ func Main(ctx context.Context, args []string, stderr io.Writer) int {
 		return 2
 	}
 	switch {
-	case leg != "pin" && leg != "unpin" && leg != "snapshot" && leg != "restore":
+	case leg != "pin" && leg != "unpin" && leg != "snapshot" && leg != "restore" && leg != "clear":
 		fmt.Fprintf(stderr, "unknown leg %q\n", leg)
 		return 2
 	case leg == "pin" && *target == "":
@@ -143,6 +143,16 @@ func Main(ctx context.Context, args []string, stderr io.Writer) int {
 		var warnings []string
 		warnings, err = restoreAll(ctx, nc, streams, *dir, run, *replicas)
 		r := Report{Warnings: warnings}
+		if err != nil {
+			r.Error = err.Error()
+		}
+		if werr := writeReport(*report, r); werr != nil && err == nil {
+			err = werr
+		}
+	case "clear":
+		var cleared []string
+		cleared, err = ClearStreams(ctx, nc, streams)
+		r := Report{Cleared: cleared}
 		if err != nil {
 			r.Error = err.Error()
 		}
@@ -197,6 +207,8 @@ type RunFile struct {
 // (fields outside the policy that differ from a fresh install, rendered
 // subjects a stream lacks) and, when it failed, why.
 type Report struct {
+	// Cleared lists the streams a clear deleted, or found already gone.
+	Cleared  []string `json:"cleared,omitempty"`
 	Warnings []string `json:"warnings,omitempty"`
 	Error    string   `json:"error,omitempty"`
 }
@@ -308,6 +320,21 @@ func alreadyRestored(ctx context.Context, nc *nats.Conn, policy StreamPolicy, st
 		return false
 	}
 	return len(policy.Check(info.Config)) == 0 && info.State.Msgs == state.Msgs && info.State.LastSeq == state.LastSeq
+}
+
+// ClearStreams deletes every named stream, ahead of a conversion or a
+// rollback, so no server holds a copy the next shape cannot use: a stream
+// already gone counts as cleared, so a retry continues where a failed clear
+// stopped. The staged snapshot is what these streams are restored from.
+func ClearStreams(ctx context.Context, nc *nats.Conn, streams []string) ([]string, error) {
+	var cleared []string
+	for _, name := range streams {
+		if err := request(ctx, nc, fmt.Sprintf(streamDeleteSubject, name), nil, nil); err != nil && !isStreamNotFound(err) {
+			return cleared, fmt.Errorf("stream %s: %w", name, err)
+		}
+		cleared = append(cleared, name)
+	}
+	return cleared, nil
 }
 
 // HashMain runs `bus-hash --dir D --streams S`: the digests of every staged

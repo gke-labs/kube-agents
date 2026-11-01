@@ -98,6 +98,26 @@ type apiError struct {
 	} `json:"error,omitempty"`
 }
 
+// jsAPIError is an error the JetStream API answered with.
+type jsAPIError struct {
+	subject, description string
+	code                 int
+}
+
+func (e *jsAPIError) Error() string {
+	return fmt.Sprintf("%s: %s (%d)", e.subject, e.description, e.code)
+}
+
+// jsStreamNotFound is the JetStream API's error code for a stream that does
+// not exist.
+const jsStreamNotFound = 10059
+
+// isStreamNotFound reports the API answering that the stream does not exist.
+func isStreamNotFound(err error) bool {
+	var e *jsAPIError
+	return errors.As(err, &e) && e.code == jsStreamNotFound
+}
+
 func request(ctx context.Context, nc *nats.Conn, subject string, body []byte, into any) error {
 	rctx, cancel := context.WithTimeout(ctx, apiTimeout)
 	defer cancel()
@@ -110,7 +130,7 @@ func request(ctx context.Context, nc *nats.Conn, subject string, body []byte, in
 		return err
 	}
 	if e.Error != nil {
-		return fmt.Errorf("%s: %s (%d)", subject, e.Error.Description, e.Error.ErrCode)
+		return &jsAPIError{subject: subject, description: e.Error.Description, code: e.Error.ErrCode}
 	}
 	if into != nil {
 		return json.Unmarshal(msg.Data, into)
