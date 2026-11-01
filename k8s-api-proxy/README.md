@@ -20,6 +20,17 @@ resolution for ten seconds; an endpoint that cannot be dialled is described agai
 seconds. An IP endpoint is verified against the cluster's own CA and never the system roots, an
 `http://` endpoint and a redirect are refused, and a `kind-` cluster has no upstream.
 
+The handler hands one `AuditEvent` per request to an `AuditSink` (`audit.go`) when the request
+ends, so a watch or an `exec` session is recorded when it closes. The event holds the caller, the
+cluster, the API server's classification of the request, the outcome (`forwarded`,
+`unauthenticated`, `refused` with its reason, `upstream_error`, `canceled` when the caller gives
+up, or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 cannot be written),
+the status and the duration. An upgraded session that breaks off after its 101 is recorded as
+`forwarded`, because the reverse proxy reports nothing about the stream itself. The handler
+puts no body, query or credential in it, but an authentication or transport error is recorded as
+returned. The caller never sees that error, because it can name the upstream. The default sink
+writes each event as one `slog` record, and the reverse proxy's own errors go to the same logger.
+
 The policy has three modes. `read-only` permits `get`, `list` and `watch` and the discovery
 paths. `read-only-dry-run`, the default and the mode kube-agents will run, also permits `create`,
 `update` and `patch` carrying `dryRun=All`. `read-write` permits writes. Every mode refuses
