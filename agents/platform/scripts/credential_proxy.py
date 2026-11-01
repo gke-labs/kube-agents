@@ -3526,27 +3526,15 @@ AGENT_API_FREE_TEXT_BODY_KEYS = (
     "system_prompt",
     "system_message",
 )
-
-
-class _BridgeSessionDbs:
-    """The state.db connections one request's bridge-session checks share,
-    opened on first use and closed with the request."""
-
-    def __init__(self, workspace_root: str | Path | None = None) -> None:
-        self.workspace_root = workspace_root
-        self._stack = contextlib.ExitStack()
-        self._connections: list[sqlite3.Connection] | None = None
-
-    def connections(self) -> list[sqlite3.Connection]:
-        if self._connections is None:
-            self._connections = AgentAPIProxyHandler._open_bridge_session_dbs(self._stack, self.workspace_root)
-        return self._connections
-
-    def __enter__(self) -> "_BridgeSessionDbs":
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self._stack.close()
+# Request headers Hermes reads a session id or key from.
+AGENT_API_SESSION_HEADERS = ("X-Hermes-Session-Id", "X-Hermes-Session-Key")
+# Session ids the A2A bridge owns start with this (`a2a-<contextId>`). A request
+# naming one is refused on the prefix alone; a child of one is found in state.db.
+AGENT_API_BRIDGE_SESSION_PREFIX = "a2a-"
+# How long one read-only state.db open waits on a writer's lock before the
+# lookup skips that file. Hermes holds short write transactions; two seconds
+# outlasts them without stalling a request behind a stuck one.
+AGENT_API_STATE_DB_BUSY_TIMEOUT_SECONDS = 2.0
 
 
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
@@ -3587,19 +3575,20 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         self._proxy()
 
     def _proxy(self) -> None:
-        with _BridgeSessionDbs(self.workspace_root) as dbs:
-            self._proxy_with(dbs)
-
-    def _proxy_with(self, dbs: "_BridgeSessionDbs") -> None:
         supplied = self.headers.get("Authorization", "")
         expected = f"Bearer {self.external_key}"
         if not hmac.compare_digest(supplied, expected):
             self._drain_request_body()
             self.send_error(HTTPStatus.UNAUTHORIZED)
             return
-        if self._targets_bridge_session(
-            self.path, self.headers, workspace_root=self.workspace_root, dbs=dbs
-        ):
+        # The bridge-session refusal runs in two halves. What the request line
+        # and headers say on their own (a literal `a2a-*`) is answered before the
+        # body is read; what they, and the body, name in a state.db is looked up
+        # once, after the body, in _names_bridge_session_child. One pass per
+        # request, one file open at a time, and every handle closed before the
+        # upstream turn below, which can stream for minutes.
+        refused, candidates = self._bridge_session_candidates(self.path, self.headers)
+        if refused:
             self._drain_request_body()
             self.send_error(HTTPStatus.FORBIDDEN)
             return
@@ -3620,9 +3609,13 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
             return
         body = self.rfile.read(content_length) if content_length else None
-        if body and self._targets_bridge_session(
-            self.path, self.headers, body=body, workspace_root=self.workspace_root, dbs=dbs
-        ):
+        if body:
+            refused, body_candidates = self._bridge_session_body_candidates(body)
+            if refused:
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            candidates |= body_candidates
+        if self._names_bridge_session_child(candidates, self.workspace_root):
             self.send_error(HTTPStatus.FORBIDDEN)
             return
         headers = {
@@ -3685,27 +3678,127 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         drain_request_body(self, self.max_request_bytes)
 
     @classmethod
-    def _is_bridge_session_id(
-        cls,
-        raw_session_id: Any,
-        workspace_root: str | Path | None = None,
-        connections: list[sqlite3.Connection] | None = None,
-    ) -> bool:
+    def _collect_session_id(cls, raw_session_id: Any, candidates: set[str]) -> bool:
+        """Normalise one session id the way Hermes reads it and file it for lookup.
+
+        Returns True when the id is a bridge session's on its face
+        (AGENT_API_BRIDGE_SESSION_PREFIX, after every layer of percent-encoding
+        is removed), which refuses the request with no state.db read. Any other
+        non-empty id goes into `candidates` for _names_bridge_session_child.
+        """
         val = str(raw_session_id or "").strip()
         while (unquoted := urllib.parse.unquote(val)) != val:
             val = unquoted
         sid = val.strip()
         if not sid:
             return False
-        if sid.lower().startswith("a2a-"):
+        if sid.lower().startswith(AGENT_API_BRIDGE_SESSION_PREFIX):
             return True
-        if connections is not None:
-            return any(cls._descends_from_bridge_session(conn, sid) for conn in connections)
-        with contextlib.ExitStack() as stack:
-            return any(
-                cls._descends_from_bridge_session(conn, sid)
-                for conn in cls._open_bridge_session_dbs(stack, workspace_root)
+        candidates.add(sid)
+        return False
+
+    @classmethod
+    def _bridge_session_candidates(cls, path: str, headers: Any) -> tuple[bool, set[str]]:
+        """What the request line and headers say about bridge sessions, read without a state.db.
+
+        `hermes-bridge` talks to Hermes on loopback (`127.0.0.1:8642`), never
+        through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths,
+        headers, request-body session ids, and `state.db` child continuations
+        on the external proxy stops a holder of `API_SERVER_EXTERNAL_KEY` from
+        running a turn in a bridge-owned `a2a-<contextId>` session and
+        inheriting its `session_kv` caller identity.
+
+        Returns `(refused, candidates)`: refused when a session header or a path
+        segment names an `a2a-*` session literally; candidates are the other
+        session ids the headers and the `/api/sessions/<id>` segment carry, for
+        _names_bridge_session_child to test once the body's are known too.
+        """
+        candidates: set[str] = set()
+        for header in AGENT_API_SESSION_HEADERS:
+            raw_values = (
+                headers.get_all(header, [])
+                if hasattr(headers, "get_all")
+                else [headers.get(header, "")]
             )
+            for raw_val in raw_values:
+                if cls._collect_session_id(raw_val, candidates):
+                    return True, candidates
+        raw_path = urllib.parse.urlsplit(path).path
+        while (unquoted := urllib.parse.unquote(raw_path)) != raw_path:
+            raw_path = unquoted
+        normalized = posixpath.normpath(raw_path.replace("\\", "/"))
+        raw_segments = [seg for seg in normalized.split("/") if seg]
+        segments = [seg.lower() for seg in raw_segments]
+        for idx, seg in enumerate(segments):
+            if seg.startswith(AGENT_API_BRIDGE_SESSION_PREFIX):
+                return True, candidates
+            if seg == "sessions" and idx > 0 and segments[idx - 1] == "api":
+                if idx + 1 < len(raw_segments) and cls._collect_session_id(raw_segments[idx + 1], candidates):
+                    return True, candidates
+        return False, candidates
+
+    @classmethod
+    def _bridge_session_body_candidates(cls, body: bytes) -> tuple[bool, set[str]]:
+        """What a request body says about bridge sessions, read without a state.db.
+
+        Returns `(refused, candidates)`: refused when a body that is not JSON
+        carries `a2a-`, when a named session-id key holds a non-string, when
+        there are more short strings than the check reads, or when any checked
+        string is an `a2a-*` id literally; candidates are the rest, for
+        _names_bridge_session_child.
+        """
+        candidates: set[str] = set()
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            unquoted_body = urllib.parse.unquote_to_bytes(body).lower()
+            return AGENT_API_BRIDGE_SESSION_PREFIX.encode() in unquoted_body, candidates
+        if not isinstance(parsed, dict):
+            return False, candidates
+        named = [parsed[key] for key in AGENT_API_SESSION_BODY_KEYS if parsed.get(key) is not None]
+        if any(not isinstance(value, str) for value in named):
+            return True, candidates
+        # Any other top-level string short enough to be a session id is
+        # checked too, so a field the harness reads an id from doesn't
+        # need to be named here first.
+        checked = set(named) | {
+            value
+            for key, value in parsed.items()
+            if key not in AGENT_API_SESSION_BODY_KEYS
+            and key not in AGENT_API_FREE_TEXT_BODY_KEYS
+            and isinstance(value, str)
+            and len(value) <= AGENT_API_SESSION_ID_MAX_LEN
+        }
+        if len(checked) > AGENT_API_MAX_CHECKED_BODY_STRINGS:
+            return True, candidates
+        for value in checked:
+            if cls._collect_session_id(value, candidates):
+                return True, candidates
+        return False, candidates
+
+    @classmethod
+    def _names_bridge_session_child(
+        cls, session_ids: set[str], workspace_root: str | Path | None = None
+    ) -> bool:
+        """True when any of the ids is a state.db child of an `a2a-*` session.
+
+        The root state.db and every profile's are visited one at a time: open,
+        test every id, close. The peak is one open database per in-flight
+        request whatever the fleet size, each file is opened once per request,
+        and nothing stays open when this returns. Holding all of them for the
+        request's lifetime ran the broker out of file descriptors at a few
+        hundred profiles, because the upstream turn can stream for minutes.
+        """
+        if not session_ids:
+            return False
+        for db_path in cls._bridge_session_dbs(workspace_root):
+            conn = cls._open_bridge_session_db(db_path)
+            if conn is None:
+                continue
+            with contextlib.closing(conn):
+                if any(cls._descends_from_bridge_session(conn, sid) for sid in session_ids):
+                    return True
+        return False
 
     @classmethod
     def _bridge_session_dbs(cls, workspace_root: str | Path | None = None) -> list[Path]:
@@ -3723,20 +3816,15 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         return [db_path for db_path in db_paths if db_path.is_file()]
 
     @classmethod
-    def _open_bridge_session_dbs(
-        cls, stack: contextlib.ExitStack, workspace_root: str | Path | None = None
-    ) -> list[sqlite3.Connection]:
-        connections = []
-        for db_path in cls._bridge_session_dbs(workspace_root):
-            try:
-                connections.append(
-                    stack.enter_context(
-                        contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0))
-                    )
-                )
-            except Exception as exc:
-                LOGGER.debug("could not open %s: %s", db_path, exc)
-        return connections
+    def _open_bridge_session_db(cls, db_path: Path) -> sqlite3.Connection | None:
+        """Open one state.db read-only, or None when it cannot be opened; the caller closes it."""
+        try:
+            return sqlite3.connect(
+                f"file:{db_path}?mode=ro", uri=True, timeout=AGENT_API_STATE_DB_BUSY_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            LOGGER.debug("could not open %s: %s", db_path, exc)
+            return None
 
     @staticmethod
     def _descends_from_bridge_session(conn: sqlite3.Connection, sid: str) -> bool:
@@ -3757,79 +3845,6 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                 cur = parent
         except Exception as exc:
             LOGGER.debug("could not inspect a state.db for session %s: %s", sid, exc)
-        return False
-
-    @classmethod
-    def _targets_bridge_session(
-        cls,
-        path: str,
-        headers: Any,
-        body: bytes | None = None,
-        workspace_root: str | Path | None = None,
-        dbs: "_BridgeSessionDbs | None" = None,
-    ) -> bool:
-        """Return True when an external request names an `a2a-*` bridge session or child.
-
-        `hermes-bridge` talks to Hermes on loopback (`127.0.0.1:8642`), never
-        through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths,
-        headers, request-body session ids, and `state.db`
-        child continuations on the external proxy stops a holder of
-        `API_SERVER_EXTERNAL_KEY` from running a turn in a bridge-owned
-        `a2a-<contextId>` session and inheriting its `session_kv` caller identity.
-        """
-        if dbs is None:
-            with _BridgeSessionDbs(workspace_root) as own:
-                return cls._targets_bridge_session(path, headers, body, workspace_root, own)
-        for header in ("X-Hermes-Session-Id", "X-Hermes-Session-Key"):
-            raw_values = (
-                headers.get_all(header, [])
-                if hasattr(headers, "get_all")
-                else [headers.get(header, "")]
-            )
-            for raw_val in raw_values:
-                if cls._is_bridge_session_id(raw_val, connections=dbs.connections()):
-                    return True
-        raw_path = urllib.parse.urlsplit(path).path
-        while (unquoted := urllib.parse.unquote(raw_path)) != raw_path:
-            raw_path = unquoted
-        normalized = posixpath.normpath(raw_path.replace("\\", "/"))
-        raw_segments = [seg for seg in normalized.split("/") if seg]
-        segments = [seg.lower() for seg in raw_segments]
-        for idx, seg in enumerate(segments):
-            if seg.startswith("a2a-"):
-                return True
-            if seg == "sessions" and idx > 0 and segments[idx - 1] == "api":
-                if idx + 1 < len(raw_segments) and cls._is_bridge_session_id(
-                    raw_segments[idx + 1], connections=dbs.connections()
-                ):
-                    return True
-        if body:
-            try:
-                parsed = json.loads(body)
-            except Exception:
-                unquoted_body = urllib.parse.unquote_to_bytes(body).lower()
-                if b"a2a-" in unquoted_body:
-                    return True
-            else:
-                if isinstance(parsed, dict):
-                    named = [parsed[key] for key in AGENT_API_SESSION_BODY_KEYS if parsed.get(key) is not None]
-                    if any(not isinstance(value, str) for value in named):
-                        return True
-                    # Any other top-level string short enough to be a session id is
-                    # checked too, so a field the harness reads an id from doesn't
-                    # need to be named here first.
-                    candidates = set(named) | {
-                        value
-                        for key, value in parsed.items()
-                        if key not in AGENT_API_SESSION_BODY_KEYS
-                        and key not in AGENT_API_FREE_TEXT_BODY_KEYS
-                        and isinstance(value, str)
-                        and len(value) <= AGENT_API_SESSION_ID_MAX_LEN
-                    }
-                    if len(candidates) > AGENT_API_MAX_CHECKED_BODY_STRINGS:
-                        return True
-                    if any(cls._is_bridge_session_id(value, connections=dbs.connections()) for value in candidates):
-                        return True
         return False
 
     @staticmethod

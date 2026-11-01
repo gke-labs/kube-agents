@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -77,6 +78,26 @@ _SHORT_DRAIN_TIMEOUT_SECONDS = 0.25
 # over _SHORT_DRAIN_TIMEOUT_SECONDS and under the shipped deadline, so a handler
 # that ignored the patch runs out of read budget here instead of passing.
 _STALLED_CLIENT_READ_TIMEOUT_SECONDS = 5
+
+# Profile directories the descriptor test seeds, each with its own state.db.
+# Handles held open across a streamed turn would show here as hundreds of
+# state.db entries, and at 1024 RLIMIT_NOFILE the fleet this stands for ran the
+# broker out of descriptors.
+_FD_TEST_PROFILE_COUNT = 500
+
+# Descriptors a held stream may add over the idle baseline: the client socket,
+# the proxy's accepted side, its upstream connection and the fake upstream's
+# accepted side, with room for the servers' own bookkeeping. An order of
+# magnitude under _FD_TEST_PROFILE_COUNT, so one state.db handle per profile
+# fails it.
+_FD_TEST_ALLOWED_DELTA = 16
+
+# What a state.db descriptor resolves to in the process's descriptor table: the
+# database, or the WAL and shared-memory files a writer leaves beside it.
+_STATE_DB_FD_SUFFIXES = ("state.db", "state.db-wal", "state.db-shm")
+
+# The process's own descriptor table, one symlink per open descriptor.
+_SELF_FD_DIR = Path("/proc/self/fd")
 
 # A body announced in Content-Length but never sent in full. Large enough that
 # the handler is still waiting on it when the client stops, small enough to stay
@@ -347,15 +368,16 @@ class AgentAPIProxyTest(unittest.TestCase):
 
     def test_one_request_opens_each_state_db_once(self):
         self._seed_state_db_sessions([("plain-parent", None, None)])
+        self._seed_state_db_sessions([("plain-prof-parent", None, None)], profile="chat")
         opened = []
-        real = credential_proxy.AgentAPIProxyHandler._open_bridge_session_dbs.__func__
+        real = credential_proxy.AgentAPIProxyHandler._open_bridge_session_db.__func__
 
-        def counting(cls, stack, workspace_root=None):
-            opened.append(1)
-            return real(cls, stack, workspace_root)
+        def counting(cls, db_path):
+            opened.append(Path(db_path))
+            return real(cls, db_path)
 
         with mock.patch.object(
-            credential_proxy.AgentAPIProxyHandler, "_open_bridge_session_dbs", classmethod(counting)
+            credential_proxy.AgentAPIProxyHandler, "_open_bridge_session_db", classmethod(counting)
         ):
             request = urllib.request.Request(
                 f"http://127.0.0.1:{self.proxy.server_port}/api/sessions/plain-parent/chat",
@@ -369,7 +391,115 @@ class AgentAPIProxyTest(unittest.TestCase):
             )
             with urllib.request.urlopen(request) as response:
                 self.assertEqual(b"proxied", response.read())
-        self.assertEqual(1, len(opened))
+        root = Path(self.workspace_dir.name)
+        self.assertEqual(
+            sorted([root / "state.db", root / "profiles" / "chat" / "state.db"]),
+            sorted(opened),
+        )
+
+    def _fd_targets(self):
+        targets = []
+        for entry in _SELF_FD_DIR.iterdir():
+            try:
+                targets.append(os.readlink(entry))
+            except OSError:
+                # The listing's own descriptor, or one closed meanwhile.
+                continue
+        return targets
+
+    @unittest.skipUnless(_SELF_FD_DIR.is_dir(), "needs the process's descriptor table")
+    def test_a_held_stream_holds_no_state_db_descriptor_at_fleet_scale(self):
+        # The issue's shape: hundreds of profiles, one streamed turn, a body
+        # string short enough to be checked as a session id. The check may open
+        # every state.db, but one at a time, and none may still be open while
+        # the upstream's frames are held.
+        self._seed_state_db_sessions([("plain-parent", None, None)])
+        root = Path(self.workspace_dir.name)
+        for index in range(_FD_TEST_PROFILE_COUNT):
+            profile_dir = root / "profiles" / f"cluster-{index:04d}"
+            profile_dir.mkdir(parents=True)
+            shutil.copyfile(root / "state.db", profile_dir / "state.db")
+
+        lock = threading.Lock()
+        counts = {"open": 0, "peak": 0, "total": 0}
+        real_connect = sqlite3.connect
+
+        class TrackedConnection:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+            def close(self):
+                with lock:
+                    counts["open"] -= 1
+                self._conn.close()
+
+        def tracking_connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            with lock:
+                counts["open"] += 1
+                counts["total"] += 1
+                counts["peak"] = max(counts["peak"], counts["open"])
+            return TrackedConnection(conn)
+
+        baseline = len(self._fd_targets())
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy.server_port}/stream",
+            headers={"Authorization": "Bearer external-secret", "Content-Type": "application/json"},
+            data=json.dumps({"message": "hi", "note": "plain-other"}).encode(),
+            method="POST",
+        )
+        with mock.patch.object(credential_proxy.sqlite3, "connect", tracking_connect):
+            with urllib.request.urlopen(request, timeout=30) as response:
+                self.assertEqual(b"event: run.started\n", response.readline())
+                held = self._fd_targets()
+                self.release_second_chunk.set()
+                rest = response.read()
+        self.assertTrue(self.second_chunk_released)
+        self.assertIn(b"event: done\n", rest)
+        self.assertEqual([], [target for target in held if target.endswith(_STATE_DB_FD_SUFFIXES)])
+        self.assertLessEqual(len(held) - baseline, _FD_TEST_ALLOWED_DELTA)
+        self.assertEqual(_FD_TEST_PROFILE_COUNT + 1, counts["total"])
+        self.assertEqual(1, counts["peak"])
+        self.assertEqual(0, counts["open"])
+
+    def test_free_text_body_keys_are_forwarded_and_never_looked_up(self):
+        # A chat message that happens to equal a bridge child's id is message
+        # text: it is forwarded, and it never reaches a state.db query. The
+        # named id beside it is looked up, which is how the recorder proves
+        # the request queried at all.
+        self._seed_state_db_sessions(
+            [
+                ("a2a-ctx-free", None, "compression"),
+                ("20261101_090000_freechild", "a2a-ctx-free", None),
+            ]
+        )
+        looked_up = []
+        real = credential_proxy.AgentAPIProxyHandler._descends_from_bridge_session
+
+        def recording(conn, sid):
+            looked_up.append(sid)
+            return real(conn, sid)
+
+        with mock.patch.object(
+            credential_proxy.AgentAPIProxyHandler, "_descends_from_bridge_session", staticmethod(recording)
+        ):
+            for key in credential_proxy.AGENT_API_FREE_TEXT_BODY_KEYS:
+                with self.subTest(key=key):
+                    self.received_authorization = ""
+                    looked_up.clear()
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{self.proxy.server_port}/v1/runs",
+                        headers={"Authorization": "Bearer external-secret", "Content-Type": "application/json"},
+                        data=json.dumps({key: "20261101_090000_freechild", "session_id": "web-console-free"}).encode(),
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request) as response:
+                        self.assertEqual(b"proxied", response.read())
+                    self.assertEqual("Bearer internal-sentinel", self.received_authorization)
+                    self.assertEqual(["web-console-free"], looked_up)
 
     def test_allows_body_keys_that_name_no_bridge_session(self):
         for path, body in (
