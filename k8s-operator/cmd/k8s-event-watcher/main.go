@@ -26,11 +26,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -97,6 +97,25 @@ const (
 	followupOutcomeSent     = "sent"
 	followupOutcomeUnrouted = "unrouted"
 	followupOutcomeError    = "error"
+
+	// wireContentType and wireAcceptContentTypes are what every config this
+	// binary builds asks the API server for (see preferProtobuf): protobuf
+	// first, JSON when the server cannot. The initial Event list of a large
+	// cluster is the biggest body this process ever receives, and protobuf
+	// is a fraction of the JSON size on the wire and in the decoder.
+	wireContentType        = k8sruntime.ContentTypeProtobuf
+	wireAcceptContentTypes = k8sruntime.ContentTypeProtobuf + "," + k8sruntime.ContentTypeJSON
+
+	// defaultInitialListConcurrency is how many clusters may receive their
+	// initial Event state at once (see listGate). Four keeps the startup burst
+	// to a handful of backlogs in flight while a fleet of thirty still syncs
+	// in a few minutes; the gate costs the queued clusters time, not events.
+	defaultInitialListConcurrency = 4
+	// defaultProfilesRescan is how often the profiles directory is read again
+	// after boot (see runProfileReload): a minute is well inside the two in
+	// which a newly onboarded cluster is expected to be watched, and far above
+	// the cost of a directory read plus a describe per new profile.
+	defaultProfilesRescan = time.Minute
 )
 
 // flags holds the CLI-based configurations parsed once during startup.
@@ -134,17 +153,24 @@ type flags struct {
 	settle     time.Duration
 	quietAfter time.Duration
 
-	inCluster        bool
-	kubeconfig       string
-	profilesDir      string
-	clusterName      string
-	logLevel         string
-	dryRun           bool
-	metricsAddr      string
-	dataVolume       string
-	snapshotInterval time.Duration
-	gatewayURL       string
-	gatewayWait      time.Duration
+	inCluster   bool
+	kubeconfig  string
+	profilesDir string
+	// profilesRescan is how often --profiles-dir is read again after boot, to
+	// start watchers for profiles written since and stop those for profiles
+	// removed; 0 reads it once, as before the reload existed.
+	profilesRescan time.Duration
+	// initialListConcurrency is the slot count of the process-wide listGate;
+	// 0 is ungated.
+	initialListConcurrency int
+	clusterName            string
+	logLevel               string
+	dryRun                 bool
+	metricsAddr            string
+	dataVolume             string
+	snapshotInterval       time.Duration
+	gatewayURL             string
+	gatewayWait            time.Duration
 }
 
 // parseFlags reads command-line arguments into the flags struct.
@@ -183,6 +209,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "", "Explicit kubeconfig path (single cluster). Used outside a pod.")
 	fs.StringVar(&f.profilesDir, "profiles-dir", "", "Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile found becomes a watched cluster, addressed by asking the GKE API about that profile's cluster_identity. Combines with --in-cluster / --kubeconfig, which add one directly-reachable cluster on top; that combination also requires --cluster-name to name it.")
+	fs.DurationVar(&f.profilesRescan, "profiles-rescan", defaultProfilesRescan, "How often --profiles-dir is read again after startup. A Cluster Agent profile written since the last read starts a watcher, one skipped on an earlier read (a GKE lookup refused with 429 or 5xx) is tried again, and one removed stops its watcher and snapshots its dedup cache. 0 = read the directory once, at startup.")
+	fs.IntVar(&f.initialListConcurrency, "initial-list-concurrency", defaultInitialListConcurrency, "How many clusters may receive their initial Event state at once: the reflector's first list, or the initial events of its watch-list stream, and the relist after a 410 or a hold. Bounds the startup burst a fleet of large clusters makes on this container's memory; the rest wait their turn. 0 = no bound.")
 	fs.StringVar(&f.clusterName, "cluster-name", "", "Human-readable cluster name included in every inject payload (single-cluster mode only; with --profiles-dir the name comes from each profile's cluster_identity).")
 
 	// Operational.
@@ -296,6 +324,12 @@ func (f *flags) validate() error {
 	if f.gatewayURL != "" && f.gatewayWait <= 0 {
 		return errors.New("--gateway-wait must be > 0 when --gateway-url is set")
 	}
+	if f.profilesRescan < 0 {
+		return errors.New("--profiles-rescan must be >= 0 (0 = read the directory once)")
+	}
+	if f.initialListConcurrency < 0 {
+		return errors.New("--initial-list-concurrency must be >= 0 (0 = no bound)")
+	}
 	if strings.HasSuffix(f.gatewayURL, "/") {
 		return fmt.Errorf("--gateway-url must not end with '/' (got %q)", f.gatewayURL)
 	}
@@ -382,6 +416,24 @@ func buildKubeClient(f *flags) (kubernetes.Interface, error) {
 			return nil, fmt.Errorf("default kubeconfig: %w", err)
 		}
 	}
+	return newClusterClient(cfg)
+}
+
+// preferProtobuf makes cfg ask for protobuf and fall back to JSON. Done here,
+// in the one binary whose traffic is dominated by the Event list, rather than
+// in clusterprofiles: the drift detector builds a dynamic client from the same
+// configs, and the unstructured types it reads carry no protobuf. The
+// credential proxy forwards the Accept header on its Kubernetes route, so the
+// negotiation reaches the control plane through it unchanged.
+func preferProtobuf(cfg *rest.Config) {
+	cfg.ContentType = wireContentType
+	cfg.AcceptContentTypes = wireAcceptContentTypes
+}
+
+// newClusterClient builds the clientset every watched cluster is read with,
+// from a config preferring protobuf (see preferProtobuf).
+func newClusterClient(cfg *rest.Config) (kubernetes.Interface, error) {
+	preferProtobuf(cfg)
 	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("kubernetes client: %w", err)
@@ -466,16 +518,27 @@ var discovery clusterprofiles.Discoverer
 // "this cluster is not being watched" stays visible and alertable without
 // being fatal.
 func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]targetCluster, error) {
-	scan, err := clusterprofiles.DiscoverAndBuild(ctx, discovery, dir, clusterprofiles.ScanOptions{
+	return discoverClusterProfilesWanting(ctx, dir, m, nil)
+}
+
+// discoverClusterProfilesWanting is discoverClusterProfiles with a Want: the
+// rescan (reconcileProfiles) passes one that excludes every cluster already
+// watched, so a profile it has already turned into a watcher costs no describe
+// on the next read and is never started twice. nil wants every cluster, which
+// is the boot scan.
+func discoverClusterProfilesWanting(ctx context.Context, dir string, m *metrics, want func(clusterprofiles.Identity) bool) ([]targetCluster, error) {
+	d := discovery
+	d.Want = want
+	scan, err := clusterprofiles.DiscoverAndBuild(ctx, d, dir, clusterprofiles.ScanOptions{
 		Component:   componentName,
 		Consequence: skipConsequence,
 		OnSkip: func(profile string, _ error) {
 			m.clusterDiscoveryErrors.WithLabelValues(profile).Inc()
 		},
 	}, func(c clusterprofiles.Cluster) (targetCluster, error) {
-		client, err := kubernetes.NewForConfig(c.Config)
+		client, err := newClusterClient(c.Config)
 		if err != nil {
-			return targetCluster{}, fmt.Errorf("kubernetes client: %w", err)
+			return targetCluster{}, err
 		}
 		return targetCluster{
 			Name:      c.Identity.Cluster,
@@ -1156,86 +1219,48 @@ func realMain(argv []string) error {
 		len(clusters), f.daemonURL, f.mode, f.owner)
 
 	// One watcher goroutine per cluster, each with its own dedup cache and
-	// dispatcher so a noisy cluster cannot evict a quiet one's incidents.
-	caches := make([]*dedupCache, 0, len(clusters))
-	var wg sync.WaitGroup
-	// started counts clusters that got as far as launching an informer; synced
-	// counts those whose initial list actually completed. The gap between them
-	// is the whole problem: an informer that never syncs never returns either,
-	// so "still running" says nothing about whether a cluster is being watched.
-	// Only synced does.
+	// dispatcher so a noisy cluster cannot evict a quiet one's incidents; the
+	// set holds them so the reload loop below can add and remove clusters
+	// through the same start. The gate is one per process: it bounds the
+	// heap, not any one cluster.
+	gate := newListGate(f.initialListConcurrency)
+	if gate != nil {
+		log.Printf("k8s-event-watcher: initial Event lists are gated to %d cluster(s) at a time (--initial-list-concurrency)", gate.size())
+	} else {
+		log.Printf("k8s-event-watcher: initial Event lists are not gated (--initial-list-concurrency=0)")
+	}
+	set := newClusterSet(f, filter, inj, m, gate)
+	// started counts clusters that got as far as launching an informer; the
+	// set's synced counts those whose initial list actually completed. The gap
+	// between them is the whole problem: an informer that never syncs never
+	// returns either, so "still running" says nothing about whether a cluster
+	// is being watched. Only synced does.
 	started := 0
-	var synced atomic.Int64
 	for _, tc := range clusters {
-		// Suffixed with the profile, not the cluster name: two clusters can
-		// share a name across locations, and they must not share a snapshot.
-		cache, err := newDedupCache(f.dedupWindow, dedupPersistPath(f.dedupPersist, tc.Profile))
-		if err != nil {
+		if err := set.start(ctx, tc); err != nil {
 			// Same reasoning as profile discovery: one cluster failing to start
 			// must not take the fleet down with it. Each cluster has its own
 			// snapshot file, so an unreadable one is a per-cluster problem.
-			log.Printf("k8s-event-watcher: [%s] dedup cache failed, this cluster will NOT be watched: %v", tc.Name, err)
+			log.Printf("k8s-event-watcher: [%s] %v, this cluster will NOT be watched", tc.Name, err)
 			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
 			continue
 		}
-		caches = append(caches, cache)
 		started++
-		clusterDisp := newDispatcher(f, filter, cache, inj, m)
-		clusterDisp.cluster = tc
-		if f.dedupPersist != "" && f.snapshotInterval > 0 {
-			go runSnapshotLoop(ctx, cache, f.snapshotInterval)
-		}
-		go runSweepLoop(ctx, clusterDisp, sweepInterval)
-		wg.Add(1)
-		go func(tc targetCluster, disp *dispatcher) {
-			defer wg.Done()
-			w := newWatcher(tc.Client, disp, tc)
-			log.Printf("k8s-event-watcher: [%s] starting: preflight, then informer (source=%s project=%s location=%s)",
-				tc.Name, tc.Profile, tc.ProjectID, tc.Location)
-			// Starts at 0 and only reaches 1 once the initial list completes.
-			// Setting it before Run would have reported every cluster up the
-			// instant its goroutine started, including ones whose control plane
-			// was unreachable — those block inside Run forever rather than
-			// failing, so liveness of the goroutine proves nothing.
-			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
-			defer m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
-			// The gauge follows every transition the watcher reports: 1 on the
-			// initial sync and again when a held cluster recovers, 0 while a
-			// 403 holds it. Only the first 1 counts toward synced — a recovery
-			// is the same cluster coming back, not another one syncing — and
-			// the guard is atomic because the watcher calls in from its own
-			// goroutines.
-			var counted atomic.Bool
-			onWatching := func(watching bool) {
-				if !watching {
-					m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
-					// Blind again: nothing it does not see can be called quiet.
-					disp.readyAt.Store(0)
-					log.Printf("k8s-event-watcher: [%s] events are not being delivered (the watch was refused or failed), no longer watching until the next successful attempt", tc.Name)
-					return
-				}
-				m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(1)
-				disp.readyAt.Store(disp.clock().UnixNano())
-				if !counted.Swap(true) {
-					synced.Add(1)
-					log.Printf("k8s-event-watcher: [%s] informer synced, now watching", tc.Name)
-					return
-				}
-				log.Printf("k8s-event-watcher: [%s] events permitted again, watching resumed", tc.Name)
-			}
-			if err := w.Run(ctx, onWatching); err != nil {
-				// Log and continue — one cluster's informer failing
-				// must not blind the rest. The peer goroutines keep
-				// running.
-				log.Printf("k8s-event-watcher: [%s] informer exited: %v", tc.Name, err)
-			}
-		}(tc, clusterDisp)
 	}
 	if started == 0 {
 		// Every cluster failed before its informer began. Exiting non-zero
-		// matters because the alternative is wg.Wait() returning immediately
-		// and the process reporting success while watching nothing.
+		// matters because the alternative is a process with nothing to wait
+		// for reporting success while watching nothing.
 		return fmt.Errorf("no clusters could be started: all %d failed to build a dedup cache", len(clusters))
+	}
+
+	// The directory was read once above; from here it is read again every
+	// --profiles-rescan, so a cluster onboarded after boot, or one whose GKE
+	// lookup was refused at boot, is watched without a restart, and one torn
+	// down stops being watched (see reconcileProfiles).
+	if f.profilesDir != "" && f.profilesRescan > 0 {
+		log.Printf("k8s-event-watcher: re-reading %s every %s for profiles added, retried or removed (--profiles-rescan)", f.profilesDir, f.profilesRescan)
+		go runProfileReload(ctx, set, f.profilesDir, f.profilesRescan)
 	}
 
 	// Refuse to sit there watching nothing. Individual informers deliberately
@@ -1258,7 +1283,7 @@ func realMain(argv []string) error {
 		select {
 		case <-ctx.Done():
 		case <-t.C:
-			if synced.Load() == 0 {
+			if set.synced.Load() == 0 {
 				log.Printf("k8s-event-watcher: no cluster synced within %s — check cross-cluster RBAC and API server reachability; exiting so the supervisor retries", initialSyncGrace)
 				close(syncFailed)
 				cancel()
@@ -1266,12 +1291,8 @@ func realMain(argv []string) error {
 		}
 	}()
 
-	wg.Wait()
-	for _, cache := range caches {
-		if snapErr := cache.Snapshot(); snapErr != nil {
-			log.Printf("dedup snapshot on shutdown: %v", snapErr)
-		}
-	}
+	set.wait(ctx)
+	set.snapshotAll()
 	select {
 	case <-syncFailed:
 		return fmt.Errorf("no cluster synced within %s; %d cluster(s) started but none completed an initial list (a cluster denied at preflight never attempts one; see its preflight line)", initialSyncGrace, started)

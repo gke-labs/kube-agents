@@ -168,6 +168,10 @@ type watcher struct {
 	// awaitPermitted after a denied preflight; it is forbiddenRetryInterval
 	// everywhere except tests, which shorten it.
 	forbiddenHold time.Duration
+	// gate bounds how many clusters receive their initial Event state at
+	// once (see listGate). Shared across every watcher in the process; nil
+	// admits everything.
+	gate *listGate
 
 	// onWatching is Run's callback, kept on the watcher so that
 	// handleWatchError and the watch func of the ListWatch can report a
@@ -252,7 +256,7 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 	// cluster_up and the no-cluster-synced exit in main.go still say that
 	// events have reached the daemon, not merely this process.
 	deliveries := make(chan delivery, deliveryQueueDepth)
-	queue := cache.NewDeltaFIFOWithOptions(cache.DeltaFIFOOptions{})
+	queue := cache.NewDeltaFIFOWithOptions(cache.DeltaFIFOOptions{Transformer: stripManagedFields})
 	tracker := synctrack.NewSingleFileTracker(syncTrackerName)
 	controller := cache.New(&cache.Config{
 		Queue:                        queue,
@@ -508,9 +512,22 @@ func (w *watcher) whoAmI(ctx context.Context) string {
 // may never call List at all; and in the classic mode an identity that may
 // list but not watch would otherwise read as up for the instant between each
 // relist and the refused watch that follows it.
+//
+// Both calls that bring a cluster's initial state into the process go through
+// the gate (see listGate): the List holds a slot for the length of the call,
+// and a watch opened with sendInitialEvents holds one until the bookmark that
+// ends its initial events, or until the stream fails or is stopped before
+// that. A watch without sendInitialEvents carries live events only and is not
+// gated. A slot refused because ctx ended returns ctx's error, which is what
+// the reflector sees from a cancelled request anyway.
 func (w *watcher) newListWatch() cache.ListerWatcher {
 	return cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
 		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (k8sruntime.Object, error) {
+			release, err := w.gate.acquire(ctx)
+			if err != nil {
+				return nil, err
+			}
+			defer release()
 			list, err := w.client.CoreV1().Events(metav1.NamespaceAll).List(ctx, opts)
 			if err == nil {
 				w.listCompleted()
@@ -521,14 +538,24 @@ func (w *watcher) newListWatch() cache.ListerWatcher {
 			return list, err
 		},
 		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-			wi, err := w.client.CoreV1().Events(metav1.NamespaceAll).Watch(ctx, opts)
-			if err == nil {
-				w.watchEstablished()
-				if opts.SendInitialEvents != nil && *opts.SendInitialEvents {
-					wi = w.recordMarksFromStream(wi)
+			initial := opts.SendInitialEvents != nil && *opts.SendInitialEvents
+			release := func() {}
+			if initial {
+				var err error
+				if release, err = w.gate.acquire(ctx); err != nil {
+					return nil, err
 				}
 			}
-			return wi, err
+			wi, err := w.client.CoreV1().Events(metav1.NamespaceAll).Watch(ctx, opts)
+			if err != nil {
+				release()
+				return wi, err
+			}
+			w.watchEstablished()
+			if initial {
+				wi = gatedWatch(w.recordMarksFromStream(wi), release)
+			}
+			return wi, nil
 		},
 	}, w.client)
 }
@@ -656,6 +683,19 @@ func (w *watcher) handleWatchError(ctx context.Context, r *cache.Reflector, err 
 	holdOrDone(ctx, w.forbiddenHold)
 }
 
+// stripManagedFields is the queue's transformer: it drops managedFields from
+// every object before it is queued. An Event's managedFields are a copy of
+// its own field paths and are read by nothing here, and the queue holds a
+// whole initial batch until the delivery goroutine has popped it, so the
+// bytes saved are multiplied by the backlog of the largest cluster. An object
+// the accessor cannot read (a DeletedFinalStateUnknown) is queued as it is.
+func stripManagedFields(obj any) (any, error) {
+	if accessor, err := meta.Accessor(obj); err == nil {
+		accessor.SetManagedFields(nil)
+	}
+	return obj, nil
+}
+
 // eventFromDelta returns the Event a delta should deliver, or ok=false when it
 // carries nothing to dispatch. A Deleted delta is dropped: an Event expiring
 // says nothing about whether its incident is resolved, and dispatching the
@@ -776,11 +816,17 @@ type observedWatch struct {
 	result   chan watch.Event
 	stop     chan struct{}
 	stopOnce sync.Once
+	// ended is closed once the forwarding goroutine has returned, whether
+	// because the upstream closed or because Stop was called: the signal a
+	// holder of something tied to the stream's life (gatedWatch's slot) waits
+	// on without draining result.
+	ended chan struct{}
 }
 
-func observeWatch(wi watch.Interface, observe func(watch.Event)) watch.Interface {
-	ow := &observedWatch{incoming: wi, result: make(chan watch.Event), stop: make(chan struct{})}
+func observeWatch(wi watch.Interface, observe func(watch.Event)) *observedWatch {
+	ow := &observedWatch{incoming: wi, result: make(chan watch.Event), stop: make(chan struct{}), ended: make(chan struct{})}
 	go func() {
+		defer close(ow.ended)
 		defer close(ow.result)
 		for ev := range wi.ResultChan() {
 			observe(ev)

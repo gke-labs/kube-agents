@@ -243,6 +243,27 @@ func newMetrics() *metrics {
 	return m
 }
 
+// deleteClusterSeries drops every series labelled with one cluster's triple,
+// across every vector that carries it, when the cluster's profile is removed
+// (clusterSet.stop). Without it a torn-down cluster would read as a cluster at
+// cluster_up=0 for the life of the process, and the operator's count of
+// clustersRegistered, which is the number of cluster_up series, would keep it.
+// clusterDiscoveryErrors is labelled by profile, not cluster, and is kept:
+// what it counted happened.
+func (m *metrics) deleteClusterSeries(cluster, project, location string) {
+	labels := prometheus.Labels{"cluster": cluster, "project": project, "location": location}
+	for _, vec := range []interface {
+		DeletePartialMatch(prometheus.Labels) int
+	}{
+		m.eventsSeen, m.eventsFiltered, m.eventsInjected, m.eventsDedupSuppress,
+		m.eventsQuotaSuppress, m.eventsPolicyFiltered, m.eventsFolded, m.eventsPolicyReopened,
+		m.settleOutcomes, m.followups, m.injectErrors, m.sessionCreates,
+		m.triageSessions, m.activeIncidents, m.clusterUp,
+	} {
+		vec.DeletePartialMatch(labels)
+	}
+}
+
 // processStartSeconds is t as the gauge exports it: seconds since the epoch,
 // with the sub-second part kept.
 func processStartSeconds(t time.Time) float64 {
