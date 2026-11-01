@@ -1269,21 +1269,7 @@ func (d *Dispatcher) onRenewal(msg *nats.Msg) {
 	elsewhere := h == nil && d.heldAnywhereLocked(profile, tier, r.TaskID)
 	d.mu.Unlock()
 	if h != nil {
-		rn := renewal{pod: pod, final: r.Final}
-		select {
-		case h.renewals <- rn:
-		default:
-			// A full buffer drops a plain renewal (the next one renews);
-			// a final one must land, by one goroutine per hold at most.
-			if rn.final && h.finalQueued.CompareAndSwap(false, true) {
-				go func() {
-					select {
-					case h.renewals <- rn:
-					case <-h.done:
-					}
-				}()
-			}
-		}
+		deliverRenewal(h, renewal{pod: pod, final: r.Final})
 		return
 	}
 	allowed, logIt := d.allowUnknown(profile, tier, pod)
@@ -1325,16 +1311,36 @@ func (d *Dispatcher) onRenewal(msg *nats.Msg) {
 			d.mu.Unlock()
 			<-d.orphanSem
 		}()
-		d.renewOrphan(key, r, logIt)
+		d.renewOrphan(profile, tier, pod, key, r, logIt)
 	}()
+}
+
+// deliverRenewal hands a renewal to its hold. A full buffer drops a plain
+// renewal (the next one renews); a final one must land, by one goroutine per
+// hold at most.
+func deliverRenewal(h *holding, rn renewal) {
+	select {
+	case h.renewals <- rn:
+	default:
+		if rn.final && h.finalQueued.CompareAndSwap(false, true) {
+			go func() {
+				select {
+				case h.renewals <- rn:
+				case <-h.done:
+				}
+			}()
+		}
+	}
 }
 
 // renewOrphan handles a renewal for a task not held here: refreshed (by
 // compare-and-set, so a record deleted meanwhile stays deleted) when the
 // bucket holds it under this pod's key, ignored otherwise. A final one is
 // remembered, so the task is settled, not failed, when its submission comes
-// back. A tombstone is never renewed: its task is over.
-func (d *Dispatcher) renewOrphan(key string, r lib.LeaseRenewal, logIt bool) {
+// back, unless a hold took the task during the lookup (adopt registers it
+// and reads released under one lock): then the final is that hold's. A
+// tombstone is never renewed: its task is over.
+func (d *Dispatcher) renewOrphan(profile, tier, pod, key string, r lib.LeaseRenewal, logIt bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), kvOpTimeout)
 	defer cancel()
 	kv, err := d.bus.KV(ctx, lib.ProfileLeaseBucket)
@@ -1362,8 +1368,14 @@ func (d *Dispatcher) renewOrphan(key string, r lib.LeaseRenewal, logIt bool) {
 	}
 	if r.Final {
 		d.mu.Lock()
-		d.released[key] = d.now()
+		h := d.heldOnLocked(profile, tier, pod, r.TaskID)
+		if h == nil {
+			d.released[key] = d.now()
+		}
 		d.mu.Unlock()
+		if h != nil {
+			deliverRenewal(h, renewal{pod: pod, final: true})
+		}
 		return
 	}
 	if err := recErr; err != nil {

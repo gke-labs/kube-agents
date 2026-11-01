@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -200,5 +201,41 @@ func TestAnUnreadableRecordIsReadoptedWithTheRestartGrace(t *testing.T) {
 	}
 	if n := w.offerCount(); n != 0 {
 		t.Errorf("a task its record says started was offered %d times", n)
+	}
+}
+
+// A final renewal for a task not held here is looked up off onRenewal's
+// lock, and the task's submission can come back and be re-adopted in
+// between. The final then belongs to that hold: delivered to it, not left
+// in released for an adoption that has already happened (the hold would
+// wait out the grace and the lease and fail a task that completed).
+func TestAFinalRacingAReadoptionReachesTheHold(t *testing.T) {
+	b := newBus(t, "tse-0")
+	ti := oneProfile("tse", 2, "tse-0")
+	d, err := New(testConfig(), b.connect("dispatcher"), ti.src, ti.pool, &fakeVerifier{}, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1")
+	now := time.Now()
+	rec, _ := json.Marshal(lib.LeaseRecord{TaskID: "task-1", Pod: "tse-0", Kind: lib.SubmitKindTop,
+		ConfirmedAt: now, RenewedAt: now, ExpiresAt: now.Add(time.Hour)})
+	if _, err := b.js.Publish(b.ctx, "$KV."+lib.ProfileLeaseBucket+"."+key, rec); err != nil {
+		t.Fatal(err)
+	}
+	// onRenewal found no hold; adopt registers one before the lookup ends.
+	h := &holding{profile: "tse", tier: "read", kind: lib.SubmitKindTop, taskID: "task-1", pod: "tse-0", confirmed: true,
+		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
+	d.mu.Lock()
+	d.active[h.key()] = h
+	d.mu.Unlock()
+	d.renewOrphan("tse", "read", "tse-0", key, lib.LeaseRenewal{TaskID: "task-1", Final: true}, true)
+	select {
+	case r := <-h.renewals:
+		if !r.final || r.pod != "tse-0" {
+			t.Errorf("the hold got %+v, want tse-0's final", r)
+		}
+	case <-time.After(2 * time.Second):
+		t.Errorf("the final never reached the hold that re-adopted the task (released: %v)", d.released)
 	}
 }
