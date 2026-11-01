@@ -1957,7 +1957,9 @@ these have passed.
        arithmetic cannot represent (a value float64 reads as zero, a byte count over an
        int64, a CPU past the millicore range) fails the render naming the key, rather
        than being pruned silently or reaching the footprint math as garbage. Caller
-       passes resources, prefix, container, pod and consumer (the Downward API reader). */ -}}
+       passes resources, prefix, container, pod and consumerClause: the clause the
+       byte-overflow refusal ends on, naming who reads the limit as an int64 (the Downward
+       API hands it to the broker and the event watcher; the kubelet enforces the shell's). */ -}}
 {{- /* The CRD's quantity grammar, the sign already stripped, with the exponent
        narrowed to the integer form resource.ParseQuantity reads. parseCpuMillis,
        parseBytes and quantityExact read every form this admits. One definition
@@ -1973,7 +1975,7 @@ these have passed.
 {{- $prefix := .prefix -}}
 {{- $container := .container -}}
 {{- $pod := .pod -}}
-{{- $consumer := .consumer -}}
+{{- $consumerClause := .consumerClause -}}
 {{- $unknown := keys (omit $resources "limits" "requests" "claims") | sortAlpha -}}
 {{- if $unknown -}}
 {{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $prefix (join ", " $unknown)) -}}
@@ -2016,11 +2018,11 @@ these have passed.
 {{- if eq $name "cpu" -}}
 {{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero, and its millicore value exceeds the 9223372036854775807 an int64 holds, so the operator refuses it" $prefix $side $name $raw) -}}
 {{- else -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the %s, and the operator refuses it" $prefix $side $name $raw $consumer) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, %s, and the operator refuses it" $prefix $side $name $raw $consumerClause) -}}
 {{- end -}}
 {{- end -}}
 {{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $raw) -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the %s, and the operator refuses it" $prefix $side $name $raw $consumer) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, %s, and the operator refuses it" $prefix $side $name $raw $consumerClause) -}}
 {{- end -}}
 {{- /* The operator reads a CPU quantity in millicores (MilliValue), which wraps past
        2^63; it refuses one there, so the render does too. A suffix that carries a
@@ -2038,7 +2040,7 @@ these have passed.
 {{- end }}
 
 {{- define "kube-agents.credentialProxyResourcesCheck" -}}
-{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.credentialProxy.resources" "container" "credential-proxy" "pod" "credential-proxy pod" "consumer" "broker") -}}
+{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.credentialProxy.resources" "container" "credential-proxy" "pod" "credential-proxy pod" "consumerClause" "which is what the Downward API hands the broker") -}}
 {{- end }}
 
 {{/*
@@ -2155,11 +2157,88 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- end }}
 
 {{- define "kube-agents.agentAPIAuthResourcesCheck" -}}
-{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.agentAPIAuth.resources" "container" "agent-api-auth" "pod" "gateway pod" "consumer" "event watcher") -}}
+{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.agentAPIAuth.resources" "container" "agent-api-auth" "pod" "gateway pod" "consumerClause" "which is what the Downward API hands the event watcher") -}}
 {{- end }}
 
 {{- define "kube-agents.shellSandboxResourcesCheck" -}}
-{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.harness.experimental.shellSandbox.resources" "container" "shell" "pod" "shell sandbox pod" "consumer" "kubelet") -}}
+{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.harness.experimental.shellSandbox.resources" "container" "shell" "pod" "shell sandbox pod" "consumerClause" "which is what the kubelet enforces the shell's memory limit in") -}}
+{{- end }}
+
+{{/*
+The set leaves of a container resources override, side-keyed, each quantity a trimmed
+string, as JSON: `{"limits": {"memory": "3Gi"}}`. An unset leaf is skipped by
+kube-agents.compactFields' rule, null (`memory: null`, Helm's way to drop a key) or the empty
+string, which the CRD's quantity pattern refuses; a side holding nothing else is dropped, and
+an override holding nothing renders `{}`, which `fromJson` reads as an empty dict. Trimmed
+because the checks read the trimmed value and the CRD's anchored pattern refuses padding.
+Quantities are strings rather than passed through toYaml: a values file's `cpu: 1.5` arrives
+as a float, and the CRD types a quantity as int-or-string, so the API server refuses the bare
+number. The three sizing overrides on the CR go through this, so the rule lives once.
+Takes the resources map.
+*/}}
+{{- define "kube-agents.resourcesOverrideQuantities" -}}
+{{- $resources := . | default dict -}}
+{{- $out := dict -}}
+{{- range $side := list "limits" "requests" -}}
+{{- $set := dict -}}
+{{- range $name, $quantity := (index $resources $side) | default dict -}}
+{{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
+{{- $_ := set $set $name (toString $quantity | trim) -}}
+{{- end -}}
+{{- end -}}
+{{- if $set -}}
+{{- $_ := set $out $side $set -}}
+{{- end -}}
+{{- end -}}
+{{- $out | toJson -}}
+{{- end }}
+
+{{/*
+The YAML body of a resources block from the dict kube-agents.resourcesOverrideQuantities
+returns: sides and names sorted so the CR reads the same on every render, each quantity
+quoted. The caller indents it under its `resources:` key with nindent. Takes the dict.
+*/}}
+{{- define "kube-agents.resourcesOverrideBlock" -}}
+{{- $quantities := . -}}
+{{- $lines := list -}}
+{{- range $side := keys $quantities | sortAlpha -}}
+{{- $lines = append $lines (printf "%s:" $side) -}}
+{{- $set := index $quantities $side -}}
+{{- range $name := keys $set | sortAlpha -}}
+{{- $lines = append $lines (printf "  %s: %s" $name (index $set $name | quote)) -}}
+{{- end -}}
+{{- end -}}
+{{- join "\n" $lines -}}
+{{- end }}
+
+{{/*
+Fails the render when the installed PlatformAgent CRD does not declare a field a set value
+needs. `helm upgrade` never applies crds/, and an API server serving a CRD from before the
+field admits the CR with the value pruned, so the operator reads nothing while the release
+record carries the override, and nothing says so. Reads the storage version's schema, walks
+the given property path under spec and checks the field is among its properties. `lookup` is
+empty under `helm template`, so the guard fires only against a live install.
+Takes (dict "value" <the values key, for the message> "path" <list of property names under
+spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that must exist>).
+*/}}
+{{- define "kube-agents.crdFieldGuard" -}}
+{{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" -}}
+{{- if $crd -}}
+{{- $props := dict -}}
+{{- range $crd.spec.versions -}}
+{{- if .storage -}}
+{{- $node := dig "schema" "openAPIV3Schema" "properties" "spec" "properties" (dict) . -}}
+{{- range $segment := $.path -}}
+{{- $node = dig $segment "properties" (dict) $node -}}
+{{- end -}}
+{{- $props = $node -}}
+{{- end -}}
+{{- end -}}
+{{- if not (hasKey $props .field) -}}
+{{- $crdPath := join "." (append (prepend .path "spec") .field) -}}
+{{- fail (printf "%s is set, but the installed PlatformAgent CRD predates %s and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" .value $crdPath) -}}
+{{- end -}}
+{{- end -}}
 {{- end }}
 
 {{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}

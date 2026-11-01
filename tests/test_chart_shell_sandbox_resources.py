@@ -80,14 +80,14 @@ class SchemaDeclaresTheKeyTest(unittest.TestCase):
         self.assertIs(node["additionalProperties"], False)
         self.assertEqual(node["properties"]["resources"], {"type": "object"})
 
-    def test_the_crd_guard_names_the_field_and_the_remedy(self):
+    def test_the_crd_guard_is_called_on_the_field(self):
         # `lookup` is empty under `helm template`, so the guard against a CRD that
-        # predates the field cannot fire here; the message it would fail with is pinned.
+        # predates the field cannot fire here; the call is pinned, and the shared
+        # kube-agents.crdFieldGuard body is pinned by test_chart_credential_proxy_resources.
         text = (_CHART / _CR_TEMPLATE).read_text()
         self.assertIn(
-            f"{_VALUE_PATH} is set, but the installed PlatformAgent CRD predates "
-            "spec.harness.experimental.shellSandbox.resources", text)
-        self.assertIn('"shellSandbox" "properties" (dict)', text)
+            '{{- include "kube-agents.crdFieldGuard" (dict "value" "' + _VALUE_PATH + '" '
+            '"path" (list "harness" "experimental" "shellSandbox") "field" "resources") }}', text)
 
 
 @unittest.skipUnless(_HELM, "helm is not installed")

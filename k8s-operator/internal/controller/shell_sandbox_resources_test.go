@@ -346,36 +346,53 @@ func TestReconcileInvalidShellSandboxResources(t *testing.T) {
 }
 
 // TestShellSandboxRefusalRanksAfterTheOtherResourceRefusals: with a refused
-// credential-proxy override beside a refused sandbox one, Degraded carries the
-// proxy's reason; the sandbox's is reported once the higher-ranked one clears.
+// sandbox override beside a refused credential-proxy one, or beside a refused
+// agent-api-auth one, Degraded carries the other field's reason; the sandbox's
+// is reported once the higher-ranked one clears.
 func TestShellSandboxRefusalRanksAfterTheOtherResourceRefusals(t *testing.T) {
 	crossed := &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("5Gi")},
 		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
 	}
-	agent := sandboxAgentWithResources(crossed)
-	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{AgentAPIAuth: &agentv1alpha1.AgentAPIAuthSpec{Resources: crossed}}
-	scheme := setupScheme()
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(agent, shellSandboxKeysSecret(agent)).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
-		Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
-	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
-	ctx := context.Background()
-	for i := range 2 {
-		if _, err := r.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile %d failed: %v", i+1, err)
-		}
+	cases := []struct {
+		name       string
+		deployment *agentv1alpha1.DeploymentSpec
+		wantReason string
+	}{
+		{"credential proxy outranks the sandbox", &agentv1alpha1.DeploymentSpec{
+			CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: crossed},
+		}, conditionReasonInvalidCredentialProxyResources},
+		{"agent-api-auth outranks the sandbox", &agentv1alpha1.DeploymentSpec{
+			AgentAPIAuth: &agentv1alpha1.AgentAPIAuthSpec{Resources: crossed},
+		}, conditionReasonInvalidAgentAPIAuthResources},
 	}
-	updated := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
-		t.Fatalf("get agent: %v", err)
-	}
-	degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
-	if degraded == nil || degraded.Reason != conditionReasonInvalidAgentAPIAuthResources {
-		t.Fatalf("Degraded = %v, want the higher-ranked %s", degraded, conditionReasonInvalidAgentAPIAuthResources)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := sandboxAgentWithResources(crossed)
+			agent.Spec.Deployment = tc.deployment
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent, shellSandboxKeysSecret(agent)).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+			ctx := context.Background()
+			for i := range 2 {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d failed: %v", i+1, err)
+				}
+			}
+			updated := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+				t.Fatalf("get agent: %v", err)
+			}
+			degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+			if degraded == nil || degraded.Reason != tc.wantReason {
+				t.Fatalf("Degraded = %v, want the higher-ranked %s", degraded, tc.wantReason)
+			}
+		})
 	}
 }
