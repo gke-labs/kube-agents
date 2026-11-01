@@ -695,6 +695,16 @@ func (d *dispatcher) RecordScaleUpMark(ev TriageEvent) bool {
 	return true
 }
 
+// workloadOf names the workload an event belongs to for the suppressed
+// counter: the controller reference when the event carries one, else the
+// object's own name.
+func workloadOf(ev TriageEvent) string {
+	if ev.ControllerRef != "" {
+		return ev.ControllerRef
+	}
+	return ev.Name
+}
+
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason).Inc()
@@ -788,6 +798,19 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	sid := d.targetSid
 	opened := false
 	if d.mode == "per-incident" && !d.dryRun {
+		if _, held := d.injector.SessionCreatesSuppressedUntil(); held {
+			// The daemon answered POST /sessions with 429 or 5xx three
+			// times running and the breaker is holding creates until
+			// the cooldown ends (sessionBreaker). Same rollback as a
+			// failed create below, for the same reason: nobody was
+			// told, so the first sighting after the cooldown must open
+			// the incident. No log line per held event: the breaker
+			// logs once on open and once on close, and the counter
+			// below carries the per-workload record.
+			d.dedup.Forget(ev.Key, ev.Message)
+			d.metrics.sessionCreatesSuppressed.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Namespace, ev.KindOfObject, workloadOf(ev)).Inc()
+			return
+		}
 		newSid, err := d.injector.CreateSession(ctx)
 		if err != nil {
 			// Roll back the entry Observe just wrote. Nobody was told

@@ -1741,3 +1741,137 @@ func TestDispatcherScaleUpMarkFromAnotherReporterRecordsNoVerdict(t *testing.T) 
 		t.Fatalf("FailedScheduling after cluster-autoscaler's decline: injects = %d; want 2", *injectCount)
 	}
 }
+
+// TestDispatcherHoldsSessionCreatesWhileTheBreakerIsOpen is the acceptance
+// test the breaker was asked for: the daemon answers POST /sessions 503
+// three times, the next 20 events in the bucket make no HTTP call inside the
+// 60s fake-clock window and each is counted as suppressed with the bucket's
+// labels, and the next event POSTs once the clock has advanced 61s. The
+// breaker is one per process, so a second cluster's dispatcher sharing the
+// injector is held too, with its own labels on the counter.
+func TestDispatcherHoldsSessionCreatesWhileTheBreakerIsOpen(t *testing.T) {
+	const sessionID = "sess-1"
+	var createCalls, injectCalls int
+	createStatus := http.StatusServiceUnavailable
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			createCalls++
+			w.WriteHeader(createStatus)
+			if createStatus == http.StatusCreated {
+				_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: sessionID})
+			}
+			return
+		}
+		injectCalls++
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(injectResponse{Status: "injected"})
+	}))
+	defer server.Close()
+
+	inj, err := newInjector(injectorConfig{
+		daemonURL:   server.URL,
+		bearerToken: "mock-token",
+		httpClient:  server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("build injector: %v", err)
+	}
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	inj.breaker.now = clock
+	m := newMetrics()
+	newDisp := func() *dispatcher {
+		dedup, err := newDedupCache(24*time.Hour, "")
+		if err != nil {
+			t.Fatalf("build cache: %v", err)
+		}
+		return &dispatcher{
+			filter:   newFilter(newFilterConfig(nil, nil, nil, filterThresholds{})),
+			dedup:    dedup,
+			injector: inj,
+			metrics:  m,
+			mode:     "per-incident",
+			now:      clock,
+		}
+	}
+	disp := newDisp()
+	ev := TriageEvent{
+		Key:           EventKey{UID: "pod-1", Reason: "CrashLoopBackOff"},
+		Cluster:       "test-cluster",
+		Project:       "proj",
+		Location:      "us-central1",
+		Namespace:     "default",
+		KindOfObject:  "Pod",
+		Name:          "billing-service-7d9f",
+		ControllerRef: "billing-service",
+		LastSeen:      now,
+		Message:       "back-off restarting failed container",
+	}
+	suppressed := func(cluster, workload string) float64 {
+		return testutil.ToFloat64(m.sessionCreatesSuppressed.WithLabelValues(cluster, "proj", "us-central1", "default", "Pod", workload))
+	}
+
+	// Three 503s: each rolls back its dedup entry and is counted as a
+	// create error, and the third opens the breaker.
+	for i := 0; i < 3; i++ {
+		disp.Dispatch(context.Background(), ev)
+	}
+	if createCalls != 3 {
+		t.Fatalf("got %d POST /sessions before the breaker opened; want 3", createCalls)
+	}
+	if got := testutil.ToFloat64(m.sessionCreates.WithLabelValues("test-cluster", "proj", "us-central1", "error")); got != 3 {
+		t.Errorf("session_creates_total{outcome=error} = %v; want 3", got)
+	}
+
+	// The next 20 events in the bucket, spread across the 60s window: no
+	// HTTP call, no dedup entry left behind, 20 on the counter.
+	for i := 0; i < 20; i++ {
+		now = now.Add(2 * time.Second)
+		ev.LastSeen = now
+		disp.Dispatch(context.Background(), ev)
+	}
+	if createCalls != 3 || injectCalls != 0 {
+		t.Fatalf("got %d creates and %d injects inside the cooldown; want 3 and 0", createCalls, injectCalls)
+	}
+	if disp.dedup.Len() != 0 {
+		t.Errorf("a held dispatch left %d dedup entries; want 0, so the next sighting after the cooldown opens the incident", disp.dedup.Len())
+	}
+	if got := suppressed("test-cluster", "billing-service"); got != 20 {
+		t.Errorf("session_creates_suppressed_total for the bucket = %v; want 20", got)
+	}
+	if got := testutil.ToFloat64(m.sessionCreates.WithLabelValues("test-cluster", "proj", "us-central1", "error")); got != 3 {
+		t.Errorf("session_creates_total{outcome=error} = %v after the hold; want it unchanged at 3", got)
+	}
+
+	// Process-wide: another cluster's dispatcher, built on the same
+	// injector, is held by the same breaker and counted under its own
+	// labels; a pod with no controller reference is named by itself.
+	other := newDisp()
+	otherEv := ev
+	otherEv.Cluster = "other-cluster"
+	otherEv.Name = "cron-job-abc"
+	otherEv.ControllerRef = ""
+	other.Dispatch(context.Background(), otherEv)
+	if createCalls != 3 {
+		t.Fatalf("a second cluster POSTed through the open breaker (%d creates); want the hold to be process-wide", createCalls)
+	}
+	if got := suppressed("other-cluster", "cron-job-abc"); got != 1 {
+		t.Errorf("session_creates_suppressed_total for the other cluster = %v; want 1", got)
+	}
+
+	// 61s past the opening failure, the daemon is back: the next event POSTs
+	// once and the incident opens.
+	now = now.Add(61*time.Second - 40*time.Second)
+	ev.LastSeen = now
+	createStatus = http.StatusCreated
+	disp.Dispatch(context.Background(), ev)
+	if createCalls != 4 || injectCalls != 1 {
+		t.Fatalf("got %d creates and %d injects after the cooldown; want 4 and 1", createCalls, injectCalls)
+	}
+	if disp.dedup.Len() != 1 {
+		t.Errorf("the dispatch after the cooldown left %d dedup entries; want 1", disp.dedup.Len())
+	}
+	if got := suppressed("test-cluster", "billing-service"); got != 20 {
+		t.Errorf("session_creates_suppressed_total moved to %v after the cooldown; want it at 20", got)
+	}
+}

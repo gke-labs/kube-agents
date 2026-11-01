@@ -93,6 +93,14 @@ type metrics struct {
 	followups      *prometheus.CounterVec
 	injectErrors   *prometheus.CounterVec
 	sessionCreates *prometheus.CounterVec
+	// sessionCreatesSuppressed counts the per-incident creates the
+	// dispatcher did not attempt because the session breaker was open
+	// (sessionBreaker in injector.go). Not a sessionCreates outcome: nothing
+	// was POSTed, and the operator's usage poller reads that series as
+	// attempts. Each one is an incident whose alert waits for its next
+	// sighting after the cooldown, so the labels name the workload it
+	// held, where the breaker itself, one per process, cannot.
+	sessionCreatesSuppressed *prometheus.CounterVec
 	// triageSessions counts the sessions this process opened whose event the
 	// daemon then delivered: one per injected event in per-incident mode,
 	// incremented after the inject returns delivered and never on the
@@ -185,6 +193,13 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_session_creates_total",
 			Help: "Total POST /sessions attempts, labeled by outcome.",
 		}, []string{"cluster", "project", "location", "outcome"}),
+		// namespace, kind and workload are the daemon's own incident key.
+		// The series exist only while the breaker is open, and name the
+		// workloads whose alerts it held.
+		sessionCreatesSuppressed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_session_creates_suppressed_total",
+			Help: "Total per-incident session creates the watcher did not attempt because the daemon had answered POST /sessions with 429 or 5xx three times running and the cooldown breaker was open. No HTTP call was made; the dedup entry is rolled back so the next sighting after the cooldown opens the incident. workload is the controller reference when known, else the object name.",
+		}, []string{"cluster", "project", "location", "namespace", "kind", "workload"}),
 		triageSessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_triage_sessions_total",
 			Help: "Total triage sessions opened: sessions this watcher created whose event the daemon then delivered (per-incident mode, one per injected event). A session whose inject was filtered, suppressed or failed is not counted.",
@@ -234,6 +249,7 @@ func newMetrics() *metrics {
 		m.followups,
 		m.injectErrors,
 		m.sessionCreates,
+		m.sessionCreatesSuppressed,
 		m.triageSessions,
 		m.activeIncidents,
 		m.clusterDiscoveryErrors,
