@@ -992,6 +992,25 @@ class GcloudReadOnlyTest(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.read-only", decision.rule_id)
 
+    def test_a_help_flag_with_a_false_value_grants_nothing(self):
+        """Only a bare --help/-h, or one valued true, is a help request."""
+        for flag in ("--help=false", "--help=0", "--help=no", "-h=false", "--help="):
+            with self.subTest(flag=flag):
+                decision = evaluate(["gcloud", "container", "clusters", "delete", "c", flag])
+                self.assertFalse(decision.allowed)
+                self.assertEqual("gcp.read-only", decision.rule_id)
+        for flag in ("--help", "-h", "--help=true", "--help=True"):
+            with self.subTest(flag=flag):
+                self.assertTrue(evaluate(["gcloud", "container", "clusters", "delete", "c", flag]).allowed)
+
+    def test_a_false_help_past_an_unknown_flag_does_not_invite_a_retry(self):
+        """A --help=false past an unknown flag is no help request, so the refusal doesn't hold the retry open."""
+        argv = ["gcloud", "container", "clusters", "delete", "c", "--async-x", "--timeout-x=5", "--help=false"]
+        self.assertTrue(command_policy._gcloud_prefix_write(argv))
+        self.assertIn("still refused", evaluate(argv).message)
+        with_help = argv[:-1] + ["--help"]
+        self.assertFalse(command_policy._gcloud_prefix_write(with_help))
+
     def test_help_after_an_unknown_flag_is_still_unreadable(self):
         """An unknown flag's arity is unknown, so nothing after it is trusted.
 
