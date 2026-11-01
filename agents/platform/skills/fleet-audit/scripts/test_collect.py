@@ -16,10 +16,10 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import textwrap
+import types
 import unittest
 import os
 from contextlib import contextmanager, redirect_stderr
@@ -10045,117 +10045,42 @@ class TestWorkloadDeclarations(unittest.TestCase):
         self.assertEqual(collect.workload_declarations(Path("/nonexistent-clone")), {})
 
 
-class _FakeListing(list):
-    def __init__(self, entries, truncated=False, symlinks=(), symlinked_directories=()):
-        super().__init__(entries)
-        self.truncated = truncated
-        self.symlinks = list(symlinks)
-        self.symlinked_directories = list(symlinked_directories)
+class _SnapshotRefused(Exception):
+    """A refusal shaped like `vcs_client.VcsError`: a message and the broker's code."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
-class _FakeBrokerWorkspace:
-    """The slice of `credential_proxy_client.Workspace` the mirror calls.
+class _FakeSnapshot:
+    """`vcs_client.snapshot` with the broker replaced.
 
-    `pages` is the listing the broker returns page by page; `budget` is how many
-    paths one `read_many` answers before deferring the rest as `requestBudget`;
-    `refuse` maps a path to the reason the broker will never send it; `symlinks`
-    and `symlinked_directories` are names the listing reports apart from its
-    entries, all on the first page.
-    `grep` searches `files`, refused or not, as the broker searches its checkout;
-    `grep_error` makes it raise instead, and a path in `grep_binary` matches
-    nothing, as `git grep -I` answers for a file git treats as binary.
+    It writes `files` and the `links` (path -> target) into `into`, as the
+    client unpacks a tar, and answers `skipped` as the entries the snapshot
+    left out. `error` makes it refuse instead.
     """
 
-    def __init__(
-        self,
-        files,
-        page_size=2,
-        budget=None,
-        refuse=None,
-        fail_open=None,
-        symlinks=(),
-        symlinked_directories=(),
-    ):
+    def __init__(self, files, links=None, skipped=None, error=None):
         self.files = files
-        self.symlinks = list(symlinks)
-        self.symlinked_directories = list(symlinked_directories)
-        self.page_size = page_size
-        self.budget = budget
-        self.refuse = refuse or {}
-        self.fail_open = fail_open
-        self.opened = []
-        self.reads = []
-        self.extra = {}
-        self.greps = []
-        self.grep_error = None
-        self.grep_binary = set()
-        self.stall = set()
-        self.single_reads = []
-        self.read_error = None
+        self.links = links or {}
+        self.skipped = skipped or []
+        self.error = error
+        self.calls = []
 
-    def open(self, endpoint, repo, depth=None):
-        if self.fail_open:
-            raise self.fail_open
-        self.opened.append((endpoint, repo))
-        return self
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_exc):
-        return False
-
-    def list(self, after=None):
-        names = sorted(self.files)
-        if after is not None:
-            names = [n for n in names if n > after]
-        page = names[: self.page_size]
-        entries = [{"path": n, "size": len(self.files[n])} for n in page]
-        return _FakeListing(
-            entries,
-            truncated=len(names) > self.page_size,
-            symlinks=self.symlinks if after is None else (),
-            symlinked_directories=self.symlinked_directories if after is None else (),
-        )
-
-    def read_many(self, paths):
-        self.reads.append(list(paths))
-        got, skipped = {}, []
-        exhausted = False
-        for i, path in enumerate(paths):
-            # The broker defers a file over one request's budget, and every
-            # path after it, even when nothing was sent before it.
-            exhausted = exhausted or path in self.stall
-            if exhausted:
-                skipped.append({"path": path, "reason": collect.BROKER_SKIP_REQUEST_BUDGET})
-            elif path in self.refuse:
-                skipped.append({"path": path, "reason": self.refuse[path]})
-            elif self.budget is not None and i >= self.budget:
-                skipped.append({"path": path, "reason": collect.BROKER_SKIP_REQUEST_BUDGET})
-            else:
-                got[path] = self.files[path]
-        got.update(self.extra)
-        return got, skipped
-
-    def read(self, path):
-        self.single_reads.append(path)
-        if self.read_error:
-            raise self.read_error
-        return self.files[path]
-
-    def grep(self, pattern, prefix=None, regex=False, ignore_case=False):
-        self.greps.append((pattern, prefix, regex))
-        if self.grep_error:
-            raise self.grep_error
-        expression = re.compile(pattern if regex else re.escape(pattern))
-        matches = [
-            {"path": path, "line": number, "text": line}
-            for path, content in sorted(self.files.items())
-            if (prefix is None or path == prefix) and path not in self.grep_binary
-            for number, line in enumerate(content.decode().splitlines(), 1)
-            if expression.search(line)
-        ]
-        return {"matches": matches, "total": len(matches), "truncated": False}
+    def __call__(self, repository, ref=None, paths=None, *, into, max_bytes=None):
+        self.calls.append((repository, Path(into), max_bytes))
+        if self.error:
+            raise self.error
+        root = Path(into)
+        root.mkdir(parents=True, exist_ok=True)
+        for relative, content in self.files.items():
+            (root / relative).parent.mkdir(parents=True, exist_ok=True)
+            (root / relative).write_bytes(content)
+        for relative, target in self.links.items():
+            (root / relative).parent.mkdir(parents=True, exist_ok=True)
+            (root / relative).symlink_to(target)
+        return {"revision": "0a1b2c3", "files": len(self.files), "skipped": list(self.skipped)}
 
 
 class TestBrokerMirror(unittest.TestCase):
@@ -10171,6 +10096,7 @@ class TestBrokerMirror(unittest.TestCase):
     DEPLOYMENT = TestWorkloadDeclarations.DEPLOYMENT
     ENDPOINT = "http://broker.test"
     REPO = "example-org/infra"
+    LINKED = "clusters/other/apps/linked.yaml"
 
     def setUp(self):
         env = patch.dict("os.environ", {collect.CREDENTIAL_PROXY_URL_ENV: self.ENDPOINT})
@@ -10185,6 +10111,17 @@ class TestBrokerMirror(unittest.TestCase):
             "provisioning/cluster.yml": b"kind: ConfigMap\n",
         }
 
+    def two_clusters(self):
+        other = self.DEPLOYMENT.replace("waste-unsized", "other-app")
+        return {
+            **self.files(),
+            "clusters/other/apps/other.yaml": other.encode(),
+            "clusters/other/apps/vendored.yaml": b"kind: List\n",
+        }
+
+    def left_out(self, path, reason="a link whose target is out of the tree"):
+        return [{"path": path, "reason": reason}]
+
     def indexes(self, root):
         declarations = collect.workload_declarations(root)
         releases = collect.release_declarations(root)
@@ -10197,273 +10134,51 @@ class TestBrokerMirror(unittest.TestCase):
             "apps/podinfo.yaml": overlay.OVERLAY.encode(),
             "overlays/shared/podinfo/kustomization.yaml": overlay.KUSTOMIZATION.encode(),
         }
-        link = {"path": "overlays/prod-usc1/podinfo", "target": "../shared/podinfo"}
-        broker = _FakeBrokerWorkspace(files, symlinked_directories=[link])
+        links = {"overlays/prod-usc1/podinfo": "../shared/podinfo"}
+        snapshot = _FakeSnapshot(files, links=links)
         with TemporaryDirectory() as mirror, TemporaryDirectory() as clone:
-            for relative, content in files.items():
-                (Path(clone) / relative).parent.mkdir(parents=True, exist_ok=True)
-                (Path(clone) / relative).write_bytes(content)
-            (Path(clone) / link["path"]).parent.mkdir(parents=True)
-            (Path(clone) / link["path"]).symlink_to(link["target"], target_is_directory=True)
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(mirror), broker.open))
-            mirrored, cloned = self.indexes(Path(mirror)), self.indexes(Path(clone))
+            _FakeSnapshot(files, links=links)(self.REPO, into=clone)
+            self.assertTrue(collect.broker_mirror(self.REPO, Path(mirror) / "tree", snapshot))
+            mirrored, cloned = self.indexes(Path(mirror) / "tree"), self.indexes(Path(clone))
         self.assertEqual(mirrored, cloned)
         self.assertTrue(all(mirrored))
 
-    def test_the_mirror_writes_only_the_yaml(self):
-        broker = _FakeBrokerWorkspace(self.files(), page_size=2, budget=1)
-        with TemporaryDirectory() as tmp:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            index = collect.workload_declarations(Path(tmp))
+    def test_the_snapshot_is_asked_for_the_repository_under_the_byte_cap(self):
+        snapshot = _FakeSnapshot(self.files())
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
             found = collect.declaration_for(
-                index, "spot-capacity-test", "waste-canary", "Deployment/waste-unsized"
+                collect.workload_declarations(dest), "spot-capacity-test", "waste-canary", "Deployment/waste-unsized"
             )
-            written = sorted(str(p.relative_to(tmp)) for p in Path(tmp).rglob("*") if p.is_file())
+        self.assertEqual(snapshot.calls, [(self.REPO, dest, collect.MIRROR_MAX_BYTES)])
         self.assertEqual(found["path"], "clusters/spot-capacity-test/workloads/fixture.yaml")
-        self.assertEqual(
-            written,
-            [
-                "clusters/spot-capacity-test/workloads/fixture.yaml",
-                "clusters/spot-capacity-test/workloads/kustomization.yaml",
-                "provisioning/cluster.yml",
-            ],
-        )
-        self.assertEqual(broker.opened, [(self.ENDPOINT, self.REPO)])
+        self.assertIn(f"mirrored 3 YAML file(s) of {self.REPO} at 0a1b2c3", err.getvalue())
 
-    def two_clusters(self):
-        other = self.DEPLOYMENT.replace("waste-unsized", "other-app")
-        return {
-            **self.files(),
-            "clusters/other/apps/other.yaml": other.encode(),
-            "clusters/other/apps/vendored.yaml": b"kind: List\n",
-        }
-
-    def test_a_file_the_broker_will_not_send_withholds_only_its_cluster(self):
-        """A missing file can hide a second declaration in its own cluster's
-        tree, so that tree goes; the other clusters' trees are whole and stay.
-        The broker's search finds no release kind in it, so releases stay."""
-        broker = _FakeBrokerWorkspace(
-            self.two_clusters(),
-            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
-        )
+    def test_a_yaml_entry_the_snapshot_left_out_withholds_its_cluster(self):
+        """A clone's walk would have read it, so its cluster's tree is
+        incomplete and goes; the other clusters' trees are whole and stay."""
+        snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out(self.LINKED))
         with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            index = collect.workload_declarations(Path(tmp))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-        self.assertRegex(err.getvalue(), r"clusters/other/apps/vendored.yaml from .* \(tooLarge\); no candidate on cluster other")
-        self.assertNotIn("release_declaration", err.getvalue())
-        self.assertIn(collect.BROKER_MAX_FILE_BYTES_ENV, err.getvalue())
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            index = collect.workload_declarations(dest)
+            withheld = (dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+            clusters = collect._withheld_clusters(dest)
+            left = sorted(str(p.relative_to(dest)) for p in (dest / "clusters/other").rglob("*.yaml"))
+        self.assertRegex(
+            err.getvalue(),
+            r"left clusters/other/apps/linked.yaml out of .*\(a link whose target is out of the tree\); "
+            r"no candidate on cluster other will carry a declaration, and no candidate will carry a release_declaration",
+        )
         self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
-        self.assertFalse(withheld)
-        self.assertEqual(
-            [pattern for pattern, _prefix, _regex in broker.greps],
-            [collect.RELEASE_DECLARING_PATTERN, collect.COLUMN_ZERO_KIND_PATTERN],
-        )
-
-    # A CRD bundle names release kinds under `spec.names`, indented; a release
-    # is a document's own `kind`.
-    CRD_BUNDLE = textwrap.dedent(
-        """\
-        apiVersion: apiextensions.k8s.io/v1
-        kind: CustomResourceDefinition
-        spec:
-          names:
-            kind: HelmRelease
-            listKind: HelmReleaseList
-          versions:
-          - schema:
-              openAPIV3Schema:
-                properties:
-                  kind: {type: string}
-        ---
-        kind: CustomResourceDefinition
-        spec:
-          names: {kind: ApplicationSet, listKind: ApplicationSetList}
-        """
-    )
-    # The search's over-charge: a flow `names:` block reads as a flow release.
-    FLOW_CRD = "kind: CustomResourceDefinition\nspec:\n  names: {kind: Application, listKind: ApplicationList}\n"
-    DECLARING = {
-        "block": "kind: Application\n",
-        "quoted-crlf": "'kind': \"HelmRelease\"\r\n",
-        "commented": "kind: AppProject  # the hub's\n",
-        "flow": "{apiVersion: v1, kind: HelmRepository, metadata: {name: x}}\n",
-        "json": '{\n  "apiVersion": "argoproj.io/v1alpha1",\n  "kind": "Application"\n}\n',
-        "secret": "kind: Secret\nmetadata:\n  labels:\n    argocd.argoproj.io/secret-type: cluster\n",
-        "bom": "\ufeffkind: Application\n",
-        "next-line": "kind:\n  Application\n",
-        "next-line-crlf": "kind:\r\n  Application\r\n",
-        "tagged": "kind: !!str Application\n",
-        "alias": "kind: *k\n",
-        "folded": "kind: >-\n  Application\n",
-        "complex-key": "? kind\n: Application\n",
-        "json-next-line": '{\n  "kind":\n    "Application"\n}\n',
-        "comment-then-next-line": "kind: # the hub's\n  Application\n",
-    }
-    # A schema's `kind` property is no document's `kind`.
-    SCHEMA = '{\n  "properties": {\n    "kind": {\n      "type": "string"\n    },\n    "items": {"kind": [1]}\n  }\n}\n'
-    # Each reads line by line as an indented CRD block does, so the release
-    # search lets them through; with no column-0 `kind` beside them the
-    # withheld-file probe still charges them, and a sent file is parsed.
-    INDENTED = {
-        "indented": "  apiVersion: argoproj.io/v1alpha1\n  kind: AppProject\n",
-        "flow-spread": "{\n  kind: Application,\n}\n",
-    }
-    # The miss that remains: an indented release beside a column-0 document.
-    MIXED = "kind: ConfigMap\n---\n  kind: Application\n  metadata: {name: x}\n"
-
-    def test_the_release_search_tells_a_release_from_a_crd_that_names_one(self):
-        """The broker's `git grep -E` runs line by line over a withheld file;
-        a sent file is parsed, as `release_declarations` reads it."""
-        # name: (text, the release search matches, a sent file declares)
-        cases = {
-            **{name: (text, True, True) for name, text in self.DECLARING.items()},
-            **{name: (text, False, True) for name, text in self.INDENTED.items()},
-            "mixed": (self.MIXED, False, True),
-            "crd": (self.CRD_BUNDLE, False, False),
-            "flow-crd": (self.FLOW_CRD, True, False),
-            "schema": (self.SCHEMA, False, False),
-        }
-        for name, (text, searched, sent) in cases.items():
-            with self.subTest(name):
-                self.assertIs(collect._sent_file_declares_release("a/b.yaml", text.encode()), sent)
-                self.assertIs(
-                    any(re.search(collect.RELEASE_DECLARING_PATTERN, line) for line in text.split("\n")),
-                    searched,
-                )
-        if shutil.which("git") is None:
-            self.skipTest("git is not available")
-        with TemporaryDirectory() as tmp:
-            for name, (text, _, _) in cases.items():
-                (Path(tmp) / f"{name}.yaml").write_bytes(text.encode())
-            subprocess.run(["git", "init", "-q", tmp], check=True)
-            found = {
-                pattern: subprocess.run(
-                    ["git", "-C", tmp, "grep", "--no-index", "-I", "-l", "-E", "-e", pattern],
-                    capture_output=True, text=True, check=False,
-                ).stdout.split()
-                for pattern in (collect.RELEASE_DECLARING_PATTERN, collect.COLUMN_ZERO_KIND_PATTERN)
-            }
-        self.assertEqual(
-            sorted(found[collect.RELEASE_DECLARING_PATTERN]),
-            sorted(f"{name}.yaml" for name, (_, searched, _) in cases.items() if searched),
-        )
-        # The files with no column-0 `kind` key: the indented ones, the JSON
-        # and flow ones, and `? kind`, which the release search already caught.
-        self.assertEqual(
-            sorted(set(f"{name}.yaml" for name in cases) - set(found[collect.COLUMN_ZERO_KIND_PATTERN])),
-            sorted(f"{name}.yaml" for name in [*self.INDENTED, "schema", "json", "json-next-line", "flow", "complex-key"]),
-        )
-
-    def test_a_sent_file_the_parser_cannot_read_falls_back_to_the_search(self):
-        not_yaml = b"kind: Application\n: : [\n"
-        self.assertTrue(collect._sent_file_declares_release("a/b.yaml", not_yaml))
-        self.assertFalse(collect._sent_file_declares_release("a/b.yaml", b"kind: ConfigMap\n: : [\n"))
-        with patch.dict("sys.modules", {"yaml": None}):
-            self.assertTrue(collect._sent_file_declares_release("a/b.yaml", b"kind: Application\n"))
-            self.assertFalse(collect._sent_file_declares_release("a/b.yaml", self.CRD_BUNDLE.encode()))
-
-    def test_a_sent_file_is_read_as_the_release_index_reads_it(self):
-        """Invalid UTF-8 decodes with replacement, as `release_declarations`
-        reads it; a Secret counts only as a cluster registration."""
-        latin1 = b"# caf\xe9\n" + self.MIXED.encode()
-        self.assertTrue(collect._sent_file_declares_release("a/b.yaml", latin1))
-        repository = self.DECLARING["secret"].replace(": cluster", ": repository")
-        self.assertFalse(collect._sent_file_declares_release("a/b.yaml", repository.encode()))
-        self.assertFalse(collect._sent_file_declares_release("a/b.yaml", b"a: &a [1, 1]\nkind: *a\n"))
-
-    def test_an_indented_release_in_a_dropped_tree_withholds_the_release_index(self):
-        files = {**self.two_clusters(), "clusters/other/apps/projects.yaml": self.MIXED.encode()}
-        broker = _FakeBrokerWorkspace(
-            files, refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE}
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
         self.assertTrue(withheld)
-
-    def test_a_large_indented_release_withholds_the_release_index(self):
-        """No column-0 `kind` at all: not a CRD bundle, so not ruled out."""
-        for name, text in self.INDENTED.items():
-            with self.subTest(name):
-                big = "bootstrap/projects.yaml"
-                broker = _FakeBrokerWorkspace(
-                    {**self.two_clusters(), big: text.encode()},
-                    refuse={big: collect.BROKER_SKIP_TOO_LARGE},
-                )
-                with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-                    self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-                    withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-                self.assertTrue(withheld)
-                self.assertIn("release_declaration", err.getvalue())
-
-    def flux_bootstrap(self):
-        """What `flux bootstrap` commits under `clusters/<c>/flux-system/`,
-        with the bundle over the broker's per-file limit."""
-        root = "clusters/other/flux-system"
-        files = {
-            **self.two_clusters(),
-            f"{root}/gotk-components.yaml": self.CRD_BUNDLE.encode(),
-            f"{root}/gotk-sync.yaml": b"kind: GitRepository\n---\nkind: Kustomization\n",
-            f"{root}/kustomization.yaml": b"resources:\n- gotk-components.yaml\n- gotk-sync.yaml\n",
-        }
-        return files, {f"{root}/gotk-components.yaml": collect.BROKER_SKIP_TOO_LARGE}
-
-    def mirror_withholds(self, files, refuse, links=()):
-        broker = _FakeBrokerWorkspace(files, refuse=refuse, symlinked_directories=list(links))
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            return (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists(), err.getvalue()
-
-    def test_a_large_crd_bundle_keeps_the_release_index(self):
-        """The bootstrap's own Kustomization goes with the dropped tree, but
-        no Application renders it, so it costs nothing beyond that tree."""
-        withheld, err = self.mirror_withholds(*self.flux_bootstrap())
-        self.assertNotIn("release_declaration", err)
-        self.assertFalse(withheld)
-
-    def test_a_dropped_kustomization_an_application_renders_withholds_the_release_index(self):
-        """The overlay check would find it on disk in a clone; the mirror
-        has no file there."""
-        files, refuse = self.flux_bootstrap()
-        application = TestKustomizeOverlayDeclarations.OVERLAY
-        for name, named, links in (
-            ("direct", "clusters/other/flux-system", ()),
-            ("through a link", "overlays/flux", [{"path": "overlays/flux", "target": "../clusters/other/flux-system"}]),
-        ):
-            with self.subTest(name):
-                apps = {"apps/app.yaml": application.replace("overlays/prod-usc1/podinfo", named).encode()}
-                withheld, _ = self.mirror_withholds({**files, **apps}, refuse, links)
-                self.assertTrue(withheld)
-        with self.subTest("unreadable Applications"), patch.dict("sys.modules", {"yaml": None}):
-            self.assertTrue(self.mirror_withholds(files, refuse)[0])
-        with self.subTest("escaped kind"):
-            escaped = application.replace("kind: Application", 'kind: "\\u0041pplication"')
-            apps = {"apps/app.yaml": escaped.replace("overlays/prod-usc1/podinfo", "clusters/other/flux-system").encode()}
-            self.assertTrue(self.mirror_withholds({**files, **apps}, refuse)[0])
-        with self.subTest("a path that is not a string"):
-            apps = {"apps/app.yaml": application.replace("overlays/prod-usc1/podinfo", "2024").encode()}
-            links = [{"path": "2024", "target": "clusters/other/flux-system"}]
-            self.assertTrue(self.mirror_withholds({**files, **apps}, refuse, links)[0])
-
-    def test_a_link_into_itself_is_followed_a_bounded_number_of_times(self):
-        links = [{"path": "x", "target": "x/y"}]
-        files = {"apps/app.yaml": TestKustomizeOverlayDeclarations.OVERLAY.replace("overlays/prod-usc1/podinfo", "x").encode()}
-        self.assertIsNone(collect._application_source_paths(files, links))
-
-    def test_a_kustomization_file_nothing_renders_is_still_read_for_releases(self):
-        """`release_declarations` reads every `*.yaml`, `kustomization.yaml` included."""
-        project = b"kind: AppProject\nmetadata: {name: p}\nspec: {destinations: [{namespace: a}]}\n"
-        self.assertTrue(collect._sent_file_declares_release("clusters/other/kustomization.yaml", project, set()))
-        self.assertFalse(collect._sent_file_declares_release("clusters/other/kustomization.yaml", b"resources: []\n", set()))
+        self.assertEqual(clusters, {"other"})
+        self.assertEqual(left, [])
 
     def test_a_dropped_tree_names_its_cluster_to_the_namespace_index(self):
         """With `clusters/other/` gone, an overlay elsewhere rendering into
         `other` would answer where the sibling arm would have won."""
-        broker = _FakeBrokerWorkspace(
-            self.two_clusters(),
-            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
-        )
         releases = {
             (cluster, collect.RELEASE_KEY_NAMESPACE, "payments"): {
                 "chart": f"overlays/{cluster}/payments",
@@ -10471,16 +10186,18 @@ class TestBrokerMirror(unittest.TestCase):
             }
             for cluster in ("other", "spot-capacity-test")
         }
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            index = collect.workload_declarations(Path(tmp))
-            directories = collect.namespace_directories(index, releases, Path(tmp))
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            _FakeSnapshot(self.files())(self.REPO, into=dest)
+            marker = dest / collect.MIRROR_CLUSTERS_WITHHELD_MARKER
+            marker.parent.mkdir()
+            marker.write_text("other\n", encoding="utf-8")
+            directories = collect.namespace_directories(collect.workload_declarations(dest), releases, dest)
         self.assertNotIn(("other", "payments"), directories)
         self.assertEqual(
             directories[("spot-capacity-test", "payments")]["source"],
             collect.NAMESPACE_DIRECTORY_OVERLAY,
         )
-        self.assertRegex(err.getvalue(), r"cluster other will carry a declaration or namespace_directory;")
 
     def test_a_withheld_cluster_name_with_a_space_reads_back_whole(self):
         with TemporaryDirectory() as tmp:
@@ -10494,274 +10211,6 @@ class TestBrokerMirror(unittest.TestCase):
         would switch its indexes off with no WARNING saying why."""
         for marker in (collect.MIRROR_RELEASES_WITHHELD_MARKER, collect.MIRROR_CLUSTERS_WITHHELD_MARKER):
             self.assertEqual(PurePosixPath(marker).parts[0], collect.GIT_DIR_NAME)
-
-    def test_a_large_file_git_will_not_search_withholds_the_release_index(self):
-        """`git grep -I` answers "no match" for a file marked binary."""
-        broker = _FakeBrokerWorkspace(
-            self.two_clusters(),
-            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
-        )
-        broker.grep_binary = {"clusters/other/apps/vendored.yaml"}
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertTrue((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
-
-    def test_a_release_in_the_dropped_tree_withholds_the_release_index(self):
-        """The withheld file names no release, but its cluster's tree goes with
-        it, and that tree held a hub's Application for another cluster."""
-        files = self.two_clusters()
-        files["clusters/other/apps/spoke.yaml"] = b"apiVersion: argoproj.io/v1alpha1\nkind: Application\n"
-        broker = _FakeBrokerWorkspace(
-            files, refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE}
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertTrue((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
-        self.assertRegex(err.getvalue(), r"vendored.yaml from .* no candidate will carry a release_declaration")
-
-    def test_a_large_file_naming_a_release_kind_withholds_the_release_index(self):
-        """An Application can live in any file and target any cluster."""
-        files = self.two_clusters()
-        files["clusters/other/apps/vendored.yaml"] = b"apiVersion: argoproj.io/v1alpha1\nkind: Application\n"
-        broker = _FakeBrokerWorkspace(
-            files, refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE}
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-            releases = collect.release_declarations(Path(tmp))
-        self.assertRegex(err.getvalue(), r"cluster other will carry a declaration, and no candidate will carry a release_declaration")
-        self.assertTrue(withheld)
-        self.assertEqual(releases, {})
-
-    def test_a_large_file_the_broker_cannot_search_withholds_the_release_index(self):
-        broker = _FakeBrokerWorkspace(
-            self.two_clusters(),
-            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
-        )
-        broker.grep_error = RuntimeError("unknown op grep")
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertTrue((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
-
-    def test_a_large_kustomization_withholds_the_release_index_unsearched(self):
-        """`namespace_directories` reads a Kustomization file by its name."""
-        name = "clusters/spot-capacity-test/workloads/kustomization.yaml"
-        broker = _FakeBrokerWorkspace(self.files(), refuse={name: collect.BROKER_SKIP_TOO_LARGE})
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertTrue((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
-        self.assertEqual(broker.greps, [])
-
-    def test_a_withheld_file_outside_the_cluster_trees_keeps_every_declaration(self):
-        files = self.two_clusters()
-        files["provisioning/cluster.yml"] = b"kind: AppProject\n"
-        broker = _FakeBrokerWorkspace(
-            files, refuse={"provisioning/cluster.yml": collect.BROKER_SKIP_TOO_LARGE}
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            index = collect.workload_declarations(Path(tmp))
-            directories = collect.namespace_directories(
-                index, collect.release_declarations(Path(tmp)), Path(tmp)
-            )
-        self.assertRegex(err.getvalue(), r"provisioning/cluster.yml from .* \(tooLarge\); no candidate will carry a release_declaration")
-        self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
-        # Without the release index a directory inside an overlay would read as
-        # a plain sibling, and the withheld file may be a restrictive AppProject.
-        self.assertEqual(directories, {})
-
-    def test_a_listed_symlink_withholds_its_cluster(self):
-        """`read` refuses a symlink, so `list` names it apart; a clone's walk
-        would have read it, so its cluster's tree is incomplete."""
-        broker = _FakeBrokerWorkspace(
-            self.two_clusters(), symlinks=["clusters/other/apps/linked.yaml", "docs/link.md"]
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            index = collect.workload_declarations(Path(tmp))
-        self.assertRegex(err.getvalue(), r"linked.yaml from .* \(symlink\)")
-        self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
-
-    def test_the_release_marker_alone_empties_the_release_index(self):
-        """The hub's Application is outside every cluster tree, so it is copied
-        and indexable; only the marker the withheld symlink sets hides it."""
-        files = self.two_clusters()
-        files["apps/hub.yaml"] = TestReleaseDeclarations.APPLICATION.encode()
-        broker = _FakeBrokerWorkspace(files, symlinks=["clusters/other/apps/linked.yaml"])
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            marked = collect.release_declarations(Path(tmp))
-            (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).unlink()
-            unmarked = collect.release_declarations(Path(tmp))
-        self.assertEqual(marked, {})
-        self.assertNotEqual(unmarked, {})
-
-    def test_a_directory_link_is_recreated_so_an_overlay_through_it_resolves(self):
-        """Neither walk enters the link, but the overlay check resolves the
-        Application's path through it in a clone, so the mirror holds it too."""
-        overlay = TestKustomizeOverlayDeclarations
-        files = {
-            "apps/podinfo.yaml": overlay.OVERLAY.encode(),
-            "overlays/shared/podinfo/kustomization.yaml": overlay.KUSTOMIZATION.encode(),
-        }
-        broker = _FakeBrokerWorkspace(
-            files,
-            symlinked_directories=[{"path": "overlays/prod-usc1/podinfo", "target": "../shared/podinfo"}],
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-            found = collect.release_declaration_for(
-                collect.release_declarations(Path(tmp)), "prod-usc1", overlay.TRACKED
-            )
-        self.assertNotIn("WARNING", err.getvalue())
-        self.assertFalse(withheld)
-        self.assertEqual(found, overlay.EXPECTED)
-
-    def test_a_directory_link_in_a_dropped_tree_still_resolves_an_overlay(self):
-        """The tree's files go, but an Application elsewhere may name a path
-        through a link in it, and a clone would resolve that path."""
-        overlay = TestKustomizeOverlayDeclarations
-        through = "clusters/other/overlay"
-        files = {
-            **self.two_clusters(),
-            "apps/podinfo.yaml": overlay.OVERLAY.replace(overlay.EXPECTED["chart"], through).encode(),
-            "overlays/shared/podinfo/kustomization.yaml": overlay.KUSTOMIZATION.encode(),
-        }
-        broker = _FakeBrokerWorkspace(
-            files,
-            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
-            symlinked_directories=[{"path": through, "target": "../../overlays/shared/podinfo"}],
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-            found = collect.release_declaration_for(
-                collect.release_declarations(Path(tmp)), "prod-usc1", overlay.TRACKED
-            )
-        self.assertFalse(withheld)
-        self.assertEqual(found, {**overlay.EXPECTED, "chart": through})
-
-    def test_a_directory_link_the_mirror_cannot_hold_withholds_the_release_index(self):
-        for target in ("/etc", "../../..", "../.git", ""):
-            with self.subTest(target=target):
-                links = [{"path": "overlays/x", "target": target}]
-                broker = _FakeBrokerWorkspace(self.two_clusters(), symlinked_directories=links)
-                with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-                    self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-                    withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-                    linked = [p for p in Path(tmp).rglob("*") if p.is_symlink()]
-                    index = collect.workload_declarations(Path(tmp))
-                self.assertRegex(err.getvalue(), r"directory link .* cannot hold; no candidate will carry a release_declaration")
-                self.assertTrue(withheld)
-                self.assertEqual(linked, [])
-                self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
-
-    def test_a_directory_link_in_a_dropped_tree_the_mirror_cannot_hold_withholds_the_release_index(self):
-        """Handled like any other link: an Application may name a path through it."""
-        broker = _FakeBrokerWorkspace(
-            self.two_clusters(),
-            refuse={"clusters/other/apps/vendored.yaml": collect.BROKER_SKIP_TOO_LARGE},
-            symlinked_directories=[{"path": "clusters/other/vendor", "target": ""}],
-        )
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            withheld = (Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
-        self.assertRegex(err.getvalue(), r"directory link clusters/other/vendor .* cannot hold")
-        self.assertTrue(withheld)
-
-    def test_a_directory_link_named_outside_the_repository_fails_the_mirror(self):
-        """The broker should never send such a name, as for a file entry."""
-        for link in ({"path": "../up", "target": "."}, {"path": ".git/x", "target": "."}, "bare"):
-            with self.subTest(link=link):
-                broker = _FakeBrokerWorkspace(self.two_clusters(), symlinked_directories=[link])
-                with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-                    self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-                self.assertIn("not a path inside the repository", err.getvalue())
-
-    def test_more_directory_links_than_the_cap_fails_the_mirror(self):
-        links = [{"path": f"links/{n}", "target": "."} for n in range(3)]
-        broker = _FakeBrokerWorkspace(self.two_clusters(), symlinked_directories=links)
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err, patch.object(
-            collect, "MIRROR_MAX_FILES", 2
-        ):
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-        self.assertIn("more directory links than the collector mirrors", err.getvalue())
-
-    def test_directory_links_together_cannot_reach_out_of_the_mirror(self):
-        """Each link stays inside alone. In the first set `z` turns `a/f`, made
-        before it, into a climb one above the mirror; in the second `a/f`
-        climbs from the start, and `a/f/g/h` would create `g` up there."""
-        sets = {
-            "redirected": [
-                {"path": "a/f", "target": "../z/.."},
-                {"path": "z", "target": "."},
-            ],
-            "through": [
-                {"path": "0", "target": "."},
-                {"path": "a/f", "target": "../0/.."},
-                {"path": "a/f/g/h", "target": "."},
-            ],
-        }
-        for name, links in sets.items():
-            with self.subTest(name), TemporaryDirectory() as outer:
-                broker = _FakeBrokerWorkspace(self.two_clusters(), symlinked_directories=links)
-                tmp = Path(outer) / "mirror"
-                tmp.mkdir()
-                with patch("sys.stderr", new_callable=io.StringIO) as err:
-                    self.assertTrue(collect.broker_mirror(self.REPO, tmp, broker.open))
-                root = tmp.resolve()
-                escaped = [
-                    p for p in tmp.rglob("*")
-                    if p.is_symlink() and root not in (p.resolve(), *p.resolve().parents)
-                ]
-                self.assertEqual(escaped, [])
-                self.assertEqual(sorted(p.name for p in Path(outer).iterdir()), ["mirror"])
-                self.assertTrue((tmp / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
-                self.assertIn("directory link a/f ", err.getvalue())
-
-    def test_a_symlink_that_is_not_yaml_withholds_nothing(self):
-        broker = _FakeBrokerWorkspace(self.two_clusters(), symlinks=["docs/link.md"])
-        with TemporaryDirectory() as tmp:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertFalse((Path(tmp) / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
-
-    def test_an_unknown_skip_still_abandons_the_mirror(self):
-        broker = _FakeBrokerWorkspace(
-            self.files(), refuse={"provisioning/cluster.yml": "somethingNew"}
-        )
-        with TemporaryDirectory() as tmp:
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertEqual(list(Path(tmp).iterdir()), [])
-
-    def test_a_repository_over_the_cap_abandons_the_mirror(self):
-        broker = _FakeBrokerWorkspace(self.files())
-        with TemporaryDirectory() as tmp, patch.object(collect, "MIRROR_MAX_FILES", 1):
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertEqual(list(Path(tmp).iterdir()), [])
-
-    def test_a_broker_failure_abandons_the_mirror(self):
-        broker = _FakeBrokerWorkspace(self.files(), fail_open=RuntimeError("503"))
-        with TemporaryDirectory() as tmp:
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-
-    def test_a_name_outside_the_tree_abandons_the_mirror(self):
-        for name in ("../escape.yaml", ".git/config.yaml"):
-            with self.subTest(name=name), TemporaryDirectory() as tmp:
-                broker = _FakeBrokerWorkspace({name: b"kind: X\n", **self.files()})
-                mirror = Path(tmp) / "mirror"
-                mirror.mkdir()
-                self.assertFalse(collect.broker_mirror(self.REPO, mirror, broker.open))
-                self.assertFalse((Path(tmp) / "escape.yaml").exists())
-                self.assertEqual(list(mirror.iterdir()), [])
-
-    def test_reads_are_batched_under_the_byte_limit(self):
-        batches = collect._batches([("a.yaml", 4), ("b.yaml", 4), ("c.yaml", 4)])
-        self.assertEqual(len(batches), 1)
-        with patch.object(collect, "MIRROR_BATCH_BYTES", 8):
-            batches = collect._batches([("a.yaml", 4), ("b.yaml", 4), ("c.yaml", 4)])
-        self.assertEqual(batches, [["a.yaml", "b.yaml"], ["c.yaml"]])
 
     def test_the_repository_comes_from_the_lease_marker(self):
         with TemporaryDirectory() as tmp:
@@ -10782,83 +10231,12 @@ class TestBrokerMirror(unittest.TestCase):
             (holder / ".lease").write_text(json.dumps({"lease": "x", "repo": "other-org/apps"}))
             self.assertEqual(collect.broker_repo(scratch), self.REPO)
 
-    def test_a_file_over_one_requests_budget_is_read_alone(self):
-        """Above the request budget but under the per-file limit, a file stalls
-        every batch that starts with it; a single read has no request budget."""
-        broker = _FakeBrokerWorkspace(self.files(), page_size=10)
-        broker.stall = {"clusters/spot-capacity-test/workloads/fixture.yaml"}
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            index = collect.workload_declarations(Path(tmp))
-        self.assertEqual(broker.single_reads, ["clusters/spot-capacity-test/workloads/fixture.yaml"])
-        self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
-
-    def test_batches_that_never_relent_end_in_single_reads(self):
-        broker = _FakeBrokerWorkspace(self.files(), budget=0)
-        with TemporaryDirectory() as tmp:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-        self.assertEqual(len(broker.single_reads), len([p for p in self.files() if collect._mirrored(p)]))
-
     def test_a_copy_run_near_the_root_imports_without_a_checkout(self):
         """`parents[3]` does not exist for `/x/collect.py`."""
         with patch.object(collect, "__file__", "/x/collect.py"), \
                 patch.object(collect, "PLATFORM_SCRIPT_DIRS", ()), \
                 patch.object(sys, "path", list(sys.path)):
             self.assertIsNone(collect._import_platform_script("no_such_platform_script"))
-
-    def test_a_broker_that_never_relents_abandons_the_mirror(self):
-        """Every path deferred as `requestBudget`, round after round, and the
-        single read refused too: stop, do not spin."""
-        broker = _FakeBrokerWorkspace(self.files(), budget=0)
-        broker.read_error = RuntimeError("503")
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-            self.assertEqual(list(Path(tmp).iterdir()), [])
-        self.assertIn(f"{collect.BROKER_SKIP_REQUEST_BUDGET}, then 503", err.getvalue())
-
-    def test_an_unset_endpoint_abandons_the_mirror_with_a_warning(self):
-        broker = _FakeBrokerWorkspace(self.files())
-        with TemporaryDirectory() as tmp, \
-                patch.dict("os.environ", {collect.CREDENTIAL_PROXY_URL_ENV: ""}), \
-                patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-        self.assertEqual(broker.opened, [])
-        self.assertIn("WARNING", err.getvalue())
-
-    def test_a_failed_write_abandons_the_mirror(self):
-        """A write that fails halfway leaves part of the tree; the caller must not index it."""
-        broker = _FakeBrokerWorkspace(self.files())
-        real_write = Path.write_bytes
-        calls = []
-
-        def write_once(path, data):
-            calls.append(path)
-            if len(calls) > 1:
-                raise OSError("disk full")
-            return real_write(path, data)
-
-        with TemporaryDirectory() as tmp, \
-                patch.object(Path, "write_bytes", write_once), \
-                patch("sys.stderr", new_callable=io.StringIO):
-            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-
-    def test_reads_stay_under_the_brokers_page_length(self):
-        """A broker configured below MIRROR_BATCH_PATHS refuses a larger read whole."""
-        broker = _FakeBrokerWorkspace(self.files(), page_size=2)
-        with TemporaryDirectory() as tmp:
-            self.assertTrue(collect.broker_mirror(self.REPO, Path(tmp), broker.open))
-        self.assertTrue(broker.reads)
-        self.assertLessEqual(max(len(r) for r in broker.reads), 2)
-
-    def test_a_name_the_listing_did_not_carry_abandons_the_mirror(self):
-        broker = _FakeBrokerWorkspace(self.files())
-        broker.extra = {"../escape.yaml": b"kind: X\n"}
-        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
-            mirror = Path(tmp) / "mirror"
-            mirror.mkdir()
-            self.assertFalse(collect.broker_mirror(self.REPO, mirror, broker.open))
-            self.assertEqual(list(mirror.iterdir()), [])
-            self.assertFalse((Path(tmp) / "escape.yaml").exists())
 
     def test_a_directory_no_lease_holds_is_walked_quietly(self):
         """A local run or an exported tree: no broker, no warning, the tree itself."""
@@ -10896,38 +10274,6 @@ class TestBrokerMirror(unittest.TestCase):
                 self.assertIsNone(indexed)
         self.assertIn("WARNING", err.getvalue())
 
-    def test_main_indexes_the_mirror_in_content_mode(self):
-        """End to end through `main`: the scratch path in, the mirror's tree indexed."""
-        seen = {}
-
-        def fake_collect_fleet(audit, project, workspace=None):
-            seen["declarations"] = collect.workload_declarations(workspace)
-            return {"clusters": []}
-
-        broker = _FakeBrokerWorkspace(self.files())
-        client = type("Client", (), {"Workspace": type("W", (), {"open": staticmethod(broker.open)})})
-        with TemporaryDirectory() as tmp:
-            holder = Path(tmp) / "lease"
-            scratch = holder / "example-org" / "infra"
-            scratch.mkdir(parents=True)
-            (holder / ".lease").write_text(json.dumps({"lease": "x", "repo": self.REPO}))
-            real_import = collect._import_platform_script
-            with patch.object(collect, "collect_fleet", side_effect=fake_collect_fleet), \
-                    patch.object(
-                        collect,
-                        "_import_platform_script",
-                        side_effect=lambda n: client if n == "credential_proxy_client" else real_import(n),
-                    ), \
-                    patch("sys.stdout", new_callable=io.StringIO), \
-                    patch("sys.stderr", new_callable=io.StringIO):
-                collect.main(["obtainability-audit", "--workspace", str(scratch)])
-            self.assertEqual(list(scratch.iterdir()), [], "nothing lands in the remediation workspace")
-        self.assertIn(
-            ("spot-capacity-test", "Deployment", "waste-canary", "waste-unsized"),
-            seen["declarations"],
-        )
-
-
     def test_main_does_not_index_a_failed_mirror(self):
         seen = {}
 
@@ -10945,6 +10291,278 @@ class TestBrokerMirror(unittest.TestCase):
                     patch("sys.stderr", new_callable=io.StringIO):
                 collect.main(["obtainability-audit", "--workspace", str(scratch)])
         self.assertIsNone(seen["workspace"], "a failed mirror indexes nothing, not the scratch")
+
+    def test_an_entry_left_out_outside_the_cluster_trees_keeps_every_declaration(self):
+        snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out("provisioning/linked.yml"))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            index = collect.workload_declarations(dest)
+            directories = collect.namespace_directories(index, collect.release_declarations(dest), dest)
+        self.assertRegex(err.getvalue(), r"left provisioning/linked.yml out of .*; no candidate will carry a release_declaration")
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+        # Without the release index a directory inside an overlay would read as
+        # a plain sibling, and the entry left out may be a restrictive AppProject.
+        self.assertEqual(directories, {})
+
+    def test_the_release_marker_alone_empties_the_release_index(self):
+        """The hub's Application is outside every cluster tree, so it is copied
+        and indexable; only the marker the left-out link sets hides it."""
+        files = self.two_clusters()
+        files["apps/hub.yaml"] = TestReleaseDeclarations.APPLICATION.encode()
+        snapshot = _FakeSnapshot(files, skipped=self.left_out(self.LINKED))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            marked = collect.release_declarations(dest)
+            (dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).unlink()
+            unmarked = collect.release_declarations(dest)
+        self.assertEqual(marked, {})
+        self.assertNotEqual(unmarked, {})
+
+    def test_a_directory_link_inside_the_tree_resolves_an_overlay_through_it(self):
+        """Neither walk enters the link, but the overlay check resolves the
+        Application's path through it in a clone, and the snapshot keeps it."""
+        overlay = TestKustomizeOverlayDeclarations
+        files = {
+            "apps/podinfo.yaml": overlay.OVERLAY.encode(),
+            "overlays/shared/podinfo/kustomization.yaml": overlay.KUSTOMIZATION.encode(),
+        }
+        snapshot = _FakeSnapshot(files, links={"overlays/prod-usc1/podinfo": "../shared/podinfo"})
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            withheld = (dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+            found = collect.release_declaration_for(collect.release_declarations(dest), "prod-usc1", overlay.TRACKED)
+        self.assertNotIn("WARNING", err.getvalue())
+        self.assertFalse(withheld)
+        self.assertEqual(found, overlay.EXPECTED)
+
+    def test_a_dropped_tree_keeps_its_directory_links_and_loses_its_file_links(self):
+        """An Application elsewhere may name a path through a directory link in
+        the tree, and no walk enters one; a file link is read like a file."""
+        files = {**self.two_clusters(), "overlays/shared/podinfo/kustomization.yaml": b"resources: []\n"}
+        links = {
+            "clusters/other/overlay": "../../overlays/shared/podinfo",
+            "clusters/other/apps/alias.yaml": "other.yaml",
+        }
+        snapshot = _FakeSnapshot(files, links=links, skipped=self.left_out(self.LINKED))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            self.assertTrue((dest / "clusters/other/overlay").is_symlink())
+            self.assertFalse((dest / "clusters/other/apps/alias.yaml").is_symlink())
+            self.assertTrue((dest / "overlays/shared/podinfo/kustomization.yaml").exists())
+
+    def test_an_entry_with_no_suffix_left_out_withholds_the_release_index(self):
+        """A directory link out of the tree, or a bare-repository layout: either
+        may hold what an Application names."""
+        snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out("overlays/x", "an absolute target"))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            withheld = (dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+            index = collect.workload_declarations(dest)
+        self.assertRegex(err.getvalue(), r"left overlays/x out of .*\(an absolute target\); no candidate will carry a release_declaration")
+        self.assertTrue(withheld)
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+
+    BARE = collect.BARE_LAYOUT_SKIPPED_PREFIX + " (HEAD, objects, refs), whose config git would read"
+
+    def test_a_bare_layout_left_out_of_a_cluster_tree_drops_that_tree_whatever_its_name(self):
+        """The snapshot leaves the layout out whole, YAML and all."""
+        for name in ("clusters/other/vendor", "clusters/other/fixture.git"):
+            with self.subTest(name), TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+                dest = Path(tmp) / "tree"
+                snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out(name, self.BARE))
+                self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+                self.assertEqual({key[0] for key in collect.workload_declarations(dest)}, {"spot-capacity-test"})
+                self.assertTrue((dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
+
+    def test_a_link_with_no_suffix_left_out_of_a_cluster_tree_keeps_that_tree(self):
+        """It may be a directory an Application names, so the release index
+        goes; no walk enters a directory link, so the declarations stay."""
+        snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out("clusters/other/vendor"))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            index = collect.workload_declarations(dest)
+            withheld = (dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists()
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+        self.assertTrue(withheld)
+
+    def test_a_file_link_into_a_dropped_tree_drops_its_own_tree_too(self):
+        """Left dangling, the link would make its cluster's region partial: a
+        clone indexes both files and refuses, the mirror would name one."""
+        other = self.DEPLOYMENT.replace("spot-capacity-test", "other")
+        files = {**self.files(), "clusters/other/apps/web.yaml": other.encode()}
+        links = {"clusters/spot-capacity-test/workloads/shared.yaml": "../../other/apps/web.yaml"}
+        snapshot = _FakeSnapshot(files, links=links, skipped=self.left_out("clusters/other/vendor", self.BARE))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            index = collect.workload_declarations(dest)
+            clusters = collect._withheld_clusters(dest)
+        self.assertEqual(index, {})
+        self.assertEqual(clusters, {"other", "spot-capacity-test"})
+        self.assertIn(f"shared.yaml in {self.REPO} links to a file the mirror dropped; no candidate on cluster spot-capacity-test", err.getvalue())
+        self.assertIn("mirrored 1 YAML file(s)", err.getvalue())  # provisioning/cluster.yml
+
+    def test_the_copied_snapshot_names_match_the_client_and_the_broker(self):
+        client = collect._import_platform_script("vcs_client")
+        self.assertIsNotNone(client)
+        self.assertTrue(client.BARE_LAYOUT_SKIPPED.startswith(collect.BARE_LAYOUT_SKIPPED_PREFIX))
+        self.assertEqual(client.SNAPSHOT_TOO_LARGE, collect.SNAPSHOT_TOO_LARGE_CODE)
+        broker = Path(client.__file__).with_name("vcs_broker.py").read_text(encoding="utf-8")
+        for spelled in (
+            f'MAX_SNAPSHOT_BYTES_ENV = "{collect.BROKER_MAX_SNAPSHOT_BYTES_ENV}"',
+            f'"{collect.BROKER_MAX_CLONE_BYTES_ENV}"',
+            f'code="{collect.CLONE_TOO_LARGE_CODE}"',
+        ):
+            self.assertIn(spelled, broker)
+
+    def test_an_entry_left_out_that_is_not_yaml_withholds_only_the_release_index(self):
+        """The snapshot does not say whether a link was to a file or to a
+        directory, and `overlays/team.payments` is a directory an Application
+        can name; a dotted name is no proof of a file."""
+        for name in ("docs/link.md", "overlays/team.payments"):
+            with self.subTest(name), TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+                dest = Path(tmp) / "tree"
+                snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out(name))
+                self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+                self.assertTrue((dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
+                index = collect.workload_declarations(dest)
+            self.assertIn(f"left {name} out of", err.getvalue())
+            self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+
+    def test_a_link_the_repository_left_with_no_target_costs_nothing(self):
+        """A clone reads the same unreadable link."""
+        snapshot = _FakeSnapshot(self.two_clusters(), links={"clusters/other/apps/stale.yaml": "gone.yaml"})
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            self.assertFalse((dest / collect.MIRROR_RELEASES_WITHHELD_MARKER).exists())
+            index = collect.workload_declarations(dest)
+        self.assertNotIn("WARNING", err.getvalue())
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
+
+    def test_a_chain_of_links_into_dropped_trees_drops_every_tree_on_it(self):
+        """a's tree goes for its bare layout, so b's link into it dangles and b
+        goes, so c's link into b dangles and c goes: one pass per link."""
+        deployment = self.DEPLOYMENT
+        files = {
+            f"clusters/{c}/apps/web.yaml": deployment.replace("spot-capacity-test", c).encode() for c in ("a", "b", "c")
+        }
+        links = {"clusters/b/apps/y.yaml": "../../a/apps/web.yaml", "clusters/c/apps/z.yaml": "../../b/apps/y.yaml"}
+        snapshot = _FakeSnapshot(files, links=links, skipped=self.left_out("clusters/a/vendor", self.BARE))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            left = sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*.yaml"))
+            clusters = collect._withheld_clusters(dest)
+        self.assertEqual(left, [])
+        self.assertEqual(clusters, {"a", "b", "c"})
+
+    def test_a_refused_snapshot_abandons_the_mirror(self):
+        """A tree over the broker's ceiling, a name it will not write, an older
+        broker without the verb: the run goes on with nothing indexed."""
+        cases = {
+            "too-large": (_SnapshotRefused("over the ceiling", collect.SNAPSHOT_TOO_LARGE_CODE), [collect.BROKER_MAX_SNAPSHOT_BYTES_ENV, "MIRROR_MAX_BYTES"]),
+            "clone": (_SnapshotRefused("over the clone ceiling", collect.CLONE_TOO_LARGE_CODE), [collect.BROKER_MAX_CLONE_BYTES_ENV]),
+            "member": (_SnapshotRefused("a .git component", "SNAPSHOT_MEMBER_REFUSED"), []),
+            "transport": (RuntimeError("503"), []),
+        }
+        knobs = (collect.BROKER_MAX_SNAPSHOT_BYTES_ENV, collect.BROKER_MAX_CLONE_BYTES_ENV, "MIRROR_MAX_BYTES")
+        for name, (error, named) in cases.items():
+            with self.subTest(name), TemporaryDirectory() as tmp, \
+                    patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp) / "tree", _FakeSnapshot({}, error=error)))
+            self.assertIn("no candidate will carry a declaration", err.getvalue())
+            self.assertEqual([k for k in knobs if k in err.getvalue()], named)
+
+    def test_a_repository_over_the_file_cap_abandons_the_mirror(self):
+        with TemporaryDirectory() as tmp, patch.object(collect, "MIRROR_MAX_FILES", 2), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp) / "tree", _FakeSnapshot(self.files())))
+        self.assertIn("more YAML than the collector mirrors (2 files)", err.getvalue())
+
+    def test_an_unset_endpoint_abandons_the_mirror_with_a_warning(self):
+        snapshot = _FakeSnapshot(self.files())
+        with TemporaryDirectory() as tmp, \
+                patch.dict("os.environ", {collect.CREDENTIAL_PROXY_URL_ENV: ""}), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp) / "tree", snapshot))
+        self.assertEqual(snapshot.calls, [])
+        self.assertIn("WARNING", err.getvalue())
+
+    def test_without_the_vcs_client_the_mirror_is_abandoned(self):
+        with TemporaryDirectory() as tmp, \
+                patch.object(collect, "_import_platform_script", return_value=None), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp) / "tree"))
+        self.assertIn("no broker client", err.getvalue())
+
+    def test_a_failed_marker_write_abandons_the_mirror(self):
+        """The tree is on disk but its markers are not: indexing it would read
+        a dropped cluster as whole."""
+        snapshot = _FakeSnapshot(self.two_clusters(), skipped=self.left_out(self.LINKED))
+        with TemporaryDirectory() as tmp, \
+                patch.object(Path, "touch", side_effect=OSError("disk full")), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertFalse(collect.broker_mirror(self.REPO, Path(tmp) / "tree", snapshot))
+        self.assertIn("could not prepare", err.getvalue())
+
+    def test_the_mirror_is_a_subdirectory_of_a_private_directory_removed_afterwards(self):
+        """The snapshot stages its files beside the directory it is given, so
+        that directory sits inside one the context manager removes."""
+        seen = []
+
+        def mirror(repo, dest):
+            seen.append(dest)
+            dest.mkdir()
+            return True
+
+        with TemporaryDirectory() as tmp, \
+                patch.object(collect, "broker_repo", return_value=self.REPO), \
+                patch.object(collect, "broker_mirror", side_effect=mirror):
+            with collect.indexed_workspace(Path(tmp)) as indexed:
+                self.assertEqual(indexed, seen[0])
+        self.assertEqual(seen[0].name, collect.MIRROR_TREE_NAME)
+        self.assertTrue(seen[0].parent.name.startswith(collect.MIRROR_DIR_PREFIX))
+        self.assertFalse(seen[0].parent.exists())
+
+    def test_main_indexes_the_mirror_in_content_mode(self):
+        """End to end through `main`: the scratch path in, the mirror's tree indexed."""
+        seen = {}
+
+        def fake_collect_fleet(audit, project, workspace=None):
+            seen["declarations"] = collect.workload_declarations(workspace)
+            return {"clusters": []}
+
+        snapshot = _FakeSnapshot(self.files())
+        client = types.SimpleNamespace(snapshot=snapshot)
+        with TemporaryDirectory() as tmp:
+            holder = Path(tmp) / "lease"
+            scratch = holder / "example-org" / "infra"
+            scratch.mkdir(parents=True)
+            (holder / ".lease").write_text(json.dumps({"lease": "x", "repo": self.REPO}))
+            real_import = collect._import_platform_script
+            with patch.object(collect, "collect_fleet", side_effect=fake_collect_fleet), \
+                    patch.object(
+                        collect,
+                        "_import_platform_script",
+                        side_effect=lambda n: client if n == "vcs_client" else real_import(n),
+                    ), \
+                    patch("sys.stdout", new_callable=io.StringIO), \
+                    patch("sys.stderr", new_callable=io.StringIO):
+                collect.main(["obtainability-audit", "--workspace", str(scratch)])
+            self.assertEqual(list(scratch.iterdir()), [], "nothing lands in the remediation workspace")
+        self.assertEqual([repo for repo, _into, _cap in snapshot.calls], [self.REPO])
+        self.assertIn(
+            ("spot-capacity-test", "Deployment", "waste-canary", "waste-unsized"),
+            seen["declarations"],
+        )
+
 
 class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
     """The annotation has to reach the candidate, or the model never sees it.
