@@ -347,9 +347,10 @@ leave open:
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
   has published the task's terminal it sends a renewal with `final` set (`LeaseRenewal.Final`).
   The dispatcher has no read on `.events`, so that renewal is how it learns the task ended:
-  it turns the record into a tombstone, acks the submission, waits for the server to confirm
-  the ack, then frees the slot. An expired lease or a passed deadline also tells the worker
-  to abandon the task.
+  it turns the record into a tombstone and frees the slot, then acks the submission and waits
+  for the server to confirm the ack (an ack that never lands, as on a durable the operator
+  deleted, leaves the tombstone to answer the redelivery). An expired lease or a passed
+  deadline also tells the worker to abandon the task.
 - **Tombstones.** `PROFILE_SUBMITS` keeps acked submissions for its 72h max age (limits
   retention), so a durable re-created with DeliverAll replays every task it ever held. Every
   outcome the dispatcher sees or writes is final: a `final` renewal, a `lease-expired` or

@@ -39,6 +39,10 @@ const (
 	// settleRetry paces retries of a terminal publish or an ack that
 	// failed: the task's outcome is decided, only its delivery is owed.
 	settleRetry = 500 * time.Millisecond
+	// ackConfirmWindow bounds the retries of an ack the server hasn't
+	// confirmed; past it the tombstone already written answers the
+	// redelivery.
+	ackConfirmWindow = time.Minute
 	// shutdownWait bounds Run's wait for handlers to return on shutdown.
 	shutdownWait = 10 * time.Second
 	// The abandon reasons.
@@ -1070,22 +1074,24 @@ func (d *Dispatcher) fail(ctx context.Context, log *slog.Logger, del lib.Deliver
 
 // settle ends a task whose outcome is decided (its final renewal came, or
 // its failure terminal is written): it turns the lease record into a
-// tombstone, acks the submission and waits for the server to confirm the
-// ack, then frees the slot. The tombstone comes first, so the submission is
+// tombstone, frees the slot, then acks the submission and waits for the
+// server to confirm the ack. The tombstone comes first, so the submission is
 // never without a record: one that comes back before the ack lands (a lost
-// ack, a crash) or long after (a durable re-created with DeliverAll replays
-// the stream's retention) finds the tombstone and is acked as a replay,
-// never offered again or failed a second time. A fire-and-forget ack can be
-// lost, so the ack is confirmed. The sweep deletes the tombstone once no
-// replay can come.
+// ack, a crash, a durable the operator deleted with the task still held) or
+// long after (a durable re-created with DeliverAll replays the stream's
+// retention) finds the tombstone and is acked as a replay, never offered
+// again or failed a second time. So the slot is freed once the tombstone is
+// written, whether or not the ack ever lands. A fire-and-forget ack can be
+// lost, so the ack is confirmed, for up to ackConfirmWindow. The sweep
+// deletes the tombstone once no replay can come.
 func (d *Dispatcher) settle(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord) {
 	if !d.entomb(ctx, log, key, rec) {
 		return
 	}
-	if !d.ackSyncRetry(ctx, del) {
-		return
-	}
 	d.release(h, true)
+	if !d.ackSyncRetry(ctx, del) && ctx.Err() == nil {
+		log.Warn("the settled submission's ack was not confirmed; its tombstone answers a redelivery", "key", key)
+	}
 }
 
 // entomb writes rec under key as a tombstone, finished now, until the write
@@ -1112,10 +1118,13 @@ func (d *Dispatcher) entomb(ctx context.Context, log *slog.Logger, key string, r
 	}
 }
 
-// ackSyncRetry acks del until the server confirms it. A repeat ack of a
-// message already acked is confirmed too, so a retry after a lost reply
-// ends.
+// ackSyncRetry acks del until the server confirms it, for up to
+// ackConfirmWindow (a durable deleted under a held delivery never answers).
+// A repeat ack of a message already acked is confirmed too, so a retry after
+// a lost reply ends.
 func (d *Dispatcher) ackSyncRetry(ctx context.Context, del lib.Delivery) bool {
+	ctx, cancel := context.WithTimeout(ctx, ackConfirmWindow)
+	defer cancel()
 	for {
 		actx, cancel := context.WithTimeout(ctx, kvOpTimeout)
 		err := del.AckSync(actx)
