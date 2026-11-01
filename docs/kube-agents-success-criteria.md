@@ -158,8 +158,6 @@ Follow-up turns in the same conversations (the retry criterion):
 | a question about a cluster that does not exist                              | ack 24 s; the card ended `blocked` after 143 s with the reason (no such cluster, the names that exist)                                                                                 |
 | "try again" after that failure                                              | 12 s, in turn: restated the blocker and asked which cluster to check; no blind retry                                                                                                   |
 
-Re-test of 2026-11-01, the same four turns in fresh conversations: "try again" after a delivered answer was answered in 8 s with one line restating the card's completion marker (that the card was done and its result posted) and no new card, so the retry neither re-ran nor restated the answer; "kube-agents" after the install question ended `blocked` after 119 s for the same reason as before; the missing-cluster question ended `blocked` after 142 s; "try again" after that failure was answered in 15 s with the blocker and a question, as before.
-
 #### Re-test of 2026-11-01
 
 Same requests, same install and build, 49 clusters in scope, one sample each; the baseline re-run the same way.
@@ -170,6 +168,8 @@ Same requests, same install and build, 49 clusters in scope, one sample each; th
 | Audit, and discover any zonal skew or anomaly that may cause issues soon | ack 18 s / answer 298 s (card ran 278 s)                       | 134 s, 9 turns  | 2.2x                                | kube-agents again reported version skew by channel and configuration drift, and did not look at zone placement. Claude found the skew that another test had set up on `signal-skew` (all six replicas of its `checkout` Deployment on one node in one zone), the GPU outage, and the stuck upgrade                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 The zonal-skew answer was three times faster than on 2026-10-29 and no better: the ratio moved from 4.7x to 2.2x because the card ran with less beside it, and the answer still misread the question. The upgrade audit never answered: it took the gateway down twice on the way and its retry gave up after three hours and ten minutes, so on this day the user would have had an acknowledgement and, three hours later, at best the front door's announcement that the card gave up (the wake it depends on was not observed in this run).
+
+The same four follow-up turns, in fresh conversations: "try again" after a delivered answer was answered in 8 s with one line restating the card's completion marker (that the card was done and its result posted) and no new card, so the retry neither re-ran nor restated the answer; "kube-agents" after the install question ended `blocked` after 119 s for the same reason as before; the missing-cluster question ended `blocked` after 142 s; "try again" after that failure was answered in 15 s with the blocker and a question, as before.
 
 #### Gaps found
 
@@ -187,14 +187,14 @@ The zonal-skew answer was three times faster than on 2026-10-29 and no better: t
 
 ## Closing the gaps
 
-One issue per change, in the order the numbers above argue for, tracked from #4354; the table rows link them once they exist.
+One issue per change, in the order the two measurement days argue for (the re-test put the readiness report and the memory request first), tracked from #4354; the table rows link them once they exist.
 
-1. A latency series for chat turns (ack and answer, per backend) exported by the gateway, and a 60 s budget for the simple set above as a nightly case that fails on time, not only on content.
-2. The roster answers the fleet facts it already holds in the turn: cluster names, versions, the last sweep's health, the deployed harness version and the model behind `model-default`; with the reconcile's prune making the roster trustworthy, or the answer labelled with the roster's age.
-3. The readiness report on request reads clusters in parallel under the proxy's cap, keeps one copy per request, and answers from the daily watch's last report when it is fresh.
-4. Zonal skew and anomaly discovery built as designed in `docs/designs/fleet-anomaly-detection-checks.md`, and routed by name.
-5. "try again" bound to the last card: resume or re-file once, with the card's own result, never a second interpretation.
-6. The agent container's memory request sized from the scale data (the sizing epic, #3753), with a restart alert on by default.
+1. The readiness report on request reads clusters in parallel under the proxy's cap, keeps one copy per request, and answers from the daily watch's last report when it is fresh.
+2. The agent container's memory request sized from the scale data (the sizing epic, #3753), with a restart alert on by default.
+3. A latency series for chat turns (ack and answer, per backend) exported by the gateway, and a 60 s budget for the simple set above as a nightly case that fails on time, not only on content.
+4. The roster answers the fleet facts it already holds in the turn: cluster names, versions, the last sweep's health, the deployed harness version and the model behind `model-default`; with the reconcile's prune making the roster trustworthy, or the answer labelled with the roster's age.
+5. Zonal skew and anomaly discovery built as designed in `docs/designs/fleet-anomaly-detection-checks.md`, and routed by name.
+6. "try again" bound to the last card: resume or re-file once, with the card's own result, never a second interpretation.
 7. Scheduled reports reach the Google Chat channel on a Workload Identity install, and a delivery failure surfaces in chat within the hour, not only in a log.
 8. An install self-check at the end of `install.sh`: the agent answers one question before the installer reports success, and the time is recorded.
 9. A bare-model baseline run beside the eval judge for the two audits above, so the ratio in the table is tracked per release.
