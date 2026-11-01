@@ -2424,9 +2424,11 @@ type BusMigrationStatus struct {
 	// StartedAt is when the migration began.
 	StartedAt metav1.Time `json:"startedAt"`
 
-	// Deadline is when an unfinished phase counts as failed, and when the
-	// migration's bus credentials stop working. Its Jobs stop a few minutes
-	// before it.
+	// Deadline is the deadline of the stretch the run is on: when an
+	// unfinished phase counts as failed, and when the migration's bus
+	// credentials stop working. Its Jobs stop a few minutes before it. A
+	// run that turns back gets one fresh deadline for its way back
+	// (ForwardDeadline keeps the first), and a retry another.
 	Deadline metav1.Time `json:"deadline"`
 
 	// Message is the manual step a Failed migration names.
@@ -2437,6 +2439,11 @@ type BusMigrationStatus struct {
 	// it was still running at Deadline. Set at the first failure and kept.
 	// +optional
 	Cause string `json:"cause,omitempty"`
+
+	// ForwardDeadline is the deadline the run went forward under, kept once
+	// it turned back and Deadline became its way back's.
+	// +optional
+	ForwardDeadline *metav1.Time `json:"forwardDeadline,omitempty"`
 
 	// FailedIn is the phase a Failed run failed in. A run that failed inside
 	// the one to three leg's write freeze keeps the freeze, with its

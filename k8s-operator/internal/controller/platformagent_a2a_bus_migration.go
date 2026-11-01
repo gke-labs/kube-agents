@@ -409,6 +409,13 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 		if step.next == busMigrationFailed && busMigrationPhase(run.Phase) != busMigrationFailed {
 			run.FailedIn = run.Phase
 		}
+		if step.abandoning && !run.Abandoning && run.ForwardDeadline == nil {
+			// Turning back: the way back gets its own deadline, once per
+			// run, so an undo that starts at the forward deadline has the
+			// time to run, with credentials that last it.
+			run.ForwardDeadline = run.Deadline.DeepCopy()
+			run.Deadline = metav1.NewTime(now.Add(busMigrationRunDeadline))
+		}
 		run.Phase, run.Abandoning = string(step.next), step.abandoning
 		if step.manual != "" {
 			run.Message = step.manual
@@ -471,7 +478,7 @@ func busMigratingCondition(agent *agentv1alpha1.PlatformAgent) (cond metav1.Cond
 		return metav1.Condition{}, false
 	case busMigrationAbandoned:
 		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Abandoned",
-			Message: fmt.Sprintf("the migration from %d NATS servers to %d did not complete and was undone (%s); the bus runs %d servers with its data. Change the spec to try again.", from, to, run.Cause, from)}, true
+			Message: fmt.Sprintf("the migration from %d NATS servers to %d did not complete and was undone (%s); the bus runs %d servers with its data. To try again, annotate the PlatformAgent %s=%s.", from, to, run.Cause, from, a2aBusMigrationStartAnnotation, run.RunID)}, true
 	case busMigrationFailed:
 		return metav1.Condition{Type: a2aBusMigratingConditionType, Status: metav1.ConditionFalse, Reason: "Failed",
 			Message: fmt.Sprintf("the migration from %d NATS servers to %d stopped (%s): %s.%s", from, to, run.Cause, run.Message, busMigrationFailedActions(agent))}, true

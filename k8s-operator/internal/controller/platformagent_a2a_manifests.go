@@ -4093,6 +4093,19 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 	return nil
 }
 
+// a2aBusMigrationStartAnnotation, set on the PlatformAgent to the last run's
+// ID, starts another run toward the same count after one ended without
+// converting the bus.
+const a2aBusMigrationStartAnnotation = "kubeagents.x-k8s.io/bus-migration-start"
+
+// busMigrationTarget is the server count a run set out to reach.
+func busMigrationTarget(run *agentv1alpha1.BusMigrationStatus) int {
+	if busMigrationLeg(run.Leg) == busMigrationGrow {
+		return 3
+	}
+	return 1
+}
+
 // reasonA2ABusMigrationUnavailable is the Warning when a busReplicas change
 // cannot start a migration because the operator has no image of its own.
 const reasonA2ABusMigrationUnavailable = "A2ABusMigrationUnavailable"
@@ -4113,7 +4126,12 @@ func startBusMigration(agent *agentv1alpha1.PlatformAgent, running, want int, no
 			// A Failed run waits for a person to retry or give it up.
 			return
 		}
-		if run.ObservedGeneration == agent.Generation {
+		// The last run ended without converting the bus (or converted it
+		// and the count was asked back). A new one starts only when the
+		// field asks for a count other than the last run's target, or a
+		// person asks for another try at the same one by naming the last
+		// run: an edit to anything else, or a GitOps sync, starts nothing.
+		if want == busMigrationTarget(run) && agent.Annotations[a2aBusMigrationStartAnnotation] != run.RunID {
 			return
 		}
 	}

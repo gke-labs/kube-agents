@@ -11630,9 +11630,11 @@ spec:
                       type: string
                     deadline:
                       description: |-
-                        Deadline is when an unfinished phase counts as failed, and when the
-                        migration's bus credentials stop working. Its Jobs stop a few minutes
-                        before it.
+                        Deadline is the deadline of the stretch the run is on: when an
+                        unfinished phase counts as failed, and when the migration's bus
+                        credentials stop working. Its Jobs stop a few minutes before it. A
+                        run that turns back gets one fresh deadline for its way back
+                        (ForwardDeadline keeps the first), and a retry another.
                       format: date-time
                       type: string
                     failedIn:
@@ -11643,6 +11645,12 @@ spec:
                         annotation on the PlatformAgent naming this run (the A2ABusMigrating
                         condition says which). A Failed run blocks any new migration until
                         then.
+                      type: string
+                    forwardDeadline:
+                      description: |-
+                        ForwardDeadline is the deadline the run went forward under, kept once
+                        it turned back and Deadline became its way back's.
+                      format: date-time
                       type: string
                     freezeConfirmed:
                       description: |-

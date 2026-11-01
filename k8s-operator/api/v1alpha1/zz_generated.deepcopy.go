@@ -687,6 +687,10 @@ func (in *BusMigrationStatus) DeepCopyInto(out *BusMigrationStatus) {
 	*out = *in
 	in.StartedAt.DeepCopyInto(&out.StartedAt)
 	in.Deadline.DeepCopyInto(&out.Deadline)
+	if in.ForwardDeadline != nil {
+		in, out := &in.ForwardDeadline, &out.ForwardDeadline
+		*out = (*in).DeepCopy()
+	}
 	if in.Retries != nil {
 		in, out := &in.Retries, &out.Retries
 		*out = make([]BusMigrationRetry, len(*in))

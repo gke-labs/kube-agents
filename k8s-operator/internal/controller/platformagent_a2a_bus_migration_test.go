@@ -1063,7 +1063,10 @@ func TestATurnedBackRunNamesItsCause(t *testing.T) {
 	late := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(-time.Minute))
 	late.pass(busMigrationUnpinning, 3)
 	run := late.agent.Status.BusMigration
-	if want := "the Pinning phase was still running at the run's deadline, " + run.Deadline.UTC().Format(time.RFC3339); run.Cause != want {
+	if run.ForwardDeadline == nil {
+		t.Fatal("turning back kept no forward deadline")
+	}
+	if want := "the Pinning phase was still running at the run's deadline, " + run.ForwardDeadline.UTC().Format(time.RFC3339); run.Cause != want {
 		t.Errorf("late pin cause %q, want %q", run.Cause, want)
 	}
 
@@ -1745,9 +1748,11 @@ func TestOnlyAnAbandonNamingTheRunLiftsAFailedFreeze(t *testing.T) {
 	if !frozen() {
 		t.Fatal("an abandon naming another run lifted the freeze")
 	}
-	// Given up while the spec asks for three: the run is let go and the
-	// migration the spec asks for starts, as a new run.
+	// Given up while the spec asks for three, the run's own target: nothing
+	// new starts until a person asks, naming the run.
 	m.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
+	m.pass(busMigrationFailed, 1)
+	m.agent.Annotations[a2aBusMigrationStartAnnotation] = "3-1"
 	m.pass(busMigrationFreezing, 1)
 	if m.agent.Status.BusMigration.RunID == "3-1" {
 		t.Error("no new run after giving the failed one up")
@@ -1890,5 +1895,38 @@ func TestARunStatusChangeAloneIsWritten(t *testing.T) {
 	}
 	if !stored.Status.BusMigration.FreezeConfirmed {
 		t.Error("the freeze's confirmation was not written")
+	}
+}
+
+// A run that hits its deadline after the conversion turns back with time to
+// roll back: the way back gets one fresh deadline (the forward one kept),
+// the rollback pod's deadline is from it, and so is its identity's expiry.
+// A failure on the way back does not renew it again.
+func TestTheWayBackGetsItsOwnDeadline(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(-time.Minute))
+	forward := m.agent.Status.BusMigration.Deadline
+	m.pass(busMigrationRollingBack, 1)
+	run := m.agent.Status.BusMigration
+	if run.ForwardDeadline == nil || !run.ForwardDeadline.Equal(&forward) {
+		t.Fatalf("forward deadline %v, want %v kept", run.ForwardDeadline, forward)
+	}
+	if time.Until(run.Deadline.Time) < busMigrationRunDeadline-time.Minute {
+		t.Fatalf("the way back's deadline %v is not fresh", run.Deadline)
+	}
+	m.rollOut(1)
+	m.pass(busMigrationRollbackRestoring, 1)
+	spec, _, ok := m.workload("rollback")
+	if !ok || spec.ActiveDeadlineSeconds == nil || *spec.ActiveDeadlineSeconds < 3600 {
+		t.Fatalf("rollback pod deadline %v, want the way back's", spec.ActiveDeadlineSeconds)
+	}
+	if ids := busMigrationIdentities(m.agent); len(ids) != 1 || !ids[0].notAfter.Equal(run.Deadline.Time) {
+		t.Errorf("the rollback identity's expiry %v, want the way back's deadline", ids)
+	}
+	undo := run.Deadline
+	run.Deadline = metav1.NewTime(time.Now().Add(-time.Minute)) // the way back runs out too
+	m.pass(busMigrationFailed, 1)
+	if !m.agent.Status.BusMigration.ForwardDeadline.Equal(&forward) || m.agent.Status.BusMigration.Deadline.After(undo.Time) {
+		t.Error("a failure on the way back renewed its deadline")
 	}
 }

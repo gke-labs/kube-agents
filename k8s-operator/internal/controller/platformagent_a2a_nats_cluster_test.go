@@ -1324,9 +1324,11 @@ func TestAFieldChangeStartsAMigration(t *testing.T) {
 	}
 }
 
-// A migration under way is not restarted, and one that ended without
-// converting is not started again until the spec changes.
-func TestAMigrationStartsOncePerSpecChange(t *testing.T) {
+// A migration under way is not restarted. One that ended without converting
+// is not started again by an unrelated spec change or a GitOps sync (a new
+// generation asking the same count): only by a different count, or a
+// person naming the last run in the start annotation.
+func TestAMigrationStartsOnlyOnANewTargetOrWhenAsked(t *testing.T) {
 	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
 	agent := a2aTestAgent()
 	agent.Generation = 7
@@ -1338,14 +1340,36 @@ func TestAMigrationStartsOncePerSpecChange(t *testing.T) {
 		t.Error("a migration under way was restarted")
 	}
 	agent.Status.BusMigration.Phase = string(busMigrationAbandoned)
-	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(2*time.Minute)))
-	if agent.Status.BusMigration.Phase != string(busMigrationAbandoned) {
-		t.Error("an abandoned migration was started again at the same generation")
+	for gen := int64(7); gen <= 9; gen++ { // the same generation, then unrelated edits
+		agent.Generation = gen
+		startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(time.Duration(gen)*time.Minute)))
+		if agent.Status.BusMigration.RunID != first {
+			t.Fatalf("generation %d asking the same count started run %s", gen, agent.Status.BusMigration.RunID)
+		}
 	}
-	agent.Generation = 8
-	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(3*time.Minute)))
-	if agent.Status.BusMigration.Phase != string(busMigrationFreezing) || agent.Status.BusMigration.ObservedGeneration != 8 {
-		t.Errorf("after a spec change: %+v, want a new run from Freezing", agent.Status.BusMigration)
+	agent.Annotations = map[string]string{a2aBusMigrationStartAnnotation: "9-999"}
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(10*time.Minute)))
+	if agent.Status.BusMigration.RunID != first {
+		t.Fatal("a start annotation naming another run started one")
+	}
+	agent.Annotations = map[string]string{a2aBusMigrationStartAnnotation: first}
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(11*time.Minute)))
+	second := agent.Status.BusMigration
+	if second.RunID == first || busMigrationPhase(second.Phase) != busMigrationFreezing {
+		t.Fatalf("the start annotation naming the last run: %+v, want a new run from Freezing", second)
+	}
+	// The annotation, left in place, names the old run now: once only.
+	second.Phase = string(busMigrationAbandoned)
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(12*time.Minute)))
+	if agent.Status.BusMigration.RunID != second.RunID {
+		t.Error("a start annotation left in place started a third run")
+	}
+	// A different count starts one with no annotation.
+	agent.Annotations = nil
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "x", Phase: string(busMigrationAbandoned)}
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(13*time.Minute)))
+	if agent.Status.BusMigration.RunID == "x" {
+		t.Error("a new count after a three to one run did not start a migration")
 	}
 }
 
