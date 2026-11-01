@@ -1,7 +1,7 @@
 # Real-install test results: one install at the L container size
 
-Status on 2026-11-01: Steps 1 to 4 and the one-at-a-time part of Step 5 are complete. The rest of Step 5 is in progress. Steps 6 to 8 are not
-started. The plan is [`real-install-test-plan.md`](real-install-test-plan.md).
+Status on 2026-11-01: Steps 1 to 5 and the Step 6 restart and failing-Pod checks are complete. Step 7 is
+re-running after its first try proved invalid. The 12-hour soak is running, and Step 8 follows.
 
 ## High level summary
 
@@ -33,6 +33,11 @@ Model tokens are the largest running cost. The first five hours used 288 million
 which 84% were cached. At the list price this is about $111, or about $22 per hour. One install
 on GKE costs about $0.40 per hour. The 40-cluster test fleet costs about $15 per hour.
 
+The event watcher watched no cluster during the first run. It builds its watch list when it
+starts, and the first run's cluster profiles appeared five minutes later. After a restart it
+watches every cluster, and its session quota then suppresses about 100 to 250 triage sessions per
+minute.
+
 The onboarding report has two defects. It says "Scanned 6 clusters", but the agent examined all
 40 clusters. The agent also could not register its findings, because the connection was refused.
 
@@ -48,8 +53,8 @@ the Result column says whether the data confirms the prediction.
 | 2b  | 5    | The report's time is a fixed part plus a part per cluster. For 1 cluster it takes 5 to 12 minutes, for 10 clusters 15 to 25 minutes, for 42 clusters 40 to 60 minutes. The per-cluster part is 50 to 70 s.                                       | The fixed part is the skill read, the fleet listing and the answer. Phase 4 measured 51 to 72 s per cluster for an audit. The 1- and 10-cluster runs name their clusters in the prompt, so the install keeps all 42 clusters in scope. | Disproved: 8 minutes for 1 cluster, 26 to 37 for 10 named clusters, 16 for the whole fleet of 42. The fixed part is about 8 minutes; above it, the agent's path sets the time, not the cluster count. |
 | 3   | 5    | The fleet health answer names the hot Deployment on `scale-07`, and the upgrade answer names `signal-old` as behind. The zone skew on `signal-skew` is found less reliably.                                                                      | Both are visible with one `kubectl top` or one cluster list. The skew needs Pod-to-zone joins.                                                                                                                                         | Confirmed: the zone pin was named in 3 of 3 fleet health answers, the hot Deployment in 2 of 3, and `signal-old` in the 42-cluster upgrade report.                                                    |
 | 4   | 5    | With 2 and 3 questions at once, containers stay inside their limits. The shell CPU reaches its 2-core limit, and each answer takes longer in proportion to the number of questions. At 3 at once, at least one answer passes the 30-minute wait. | All work goes through the one sandbox shell, which already peaked at 1.26 cores.                                                                                                                                                       | Pending                                                                                                                                                                                               |
-| 5   | 6    | After an agent restart, the event watcher watches all clusters again within 10 to 15 minutes.                                                                                                                                                    | The runner's gateway restarts took about 11 minutes to settle.                                                                                                                                                                         | Pending                                                                                                                                                                                               |
-| 6   | 6    | A window with 20 failing Pods does not start a session storm. The event watcher's quota holds new sessions, and the triage queue clears within 1 hour.                                                                                           | 15 triage tasks at 21:18 ran 2 to 3 at a time and cleared in 37 minutes.                                                                                                                                                               | Pending                                                                                                                                                                                               |
+| 5   | 6    | After an agent restart, the event watcher watches all clusters again within 10 to 15 minutes.                                                                                                                                                    | The runner's gateway restarts took about 11 minutes to settle.                                                                                                                                                                         | Disproved, faster: all 43 clusters watched again about 3 minutes after the restart.                                                                                                                   |
+| 6   | 6    | A window with 20 failing Pods does not start a session storm. The event watcher's quota holds new sessions, and the triage queue clears within 1 hour.                                                                                           | 15 triage tasks at 21:18 ran 2 to 3 at a time and cleared in 37 minutes.                                                                                                                                                               | Confirmed for sessions: the quota suppressed all 11,683 session starts in the hour, and no container restarted. The hour still cost $69.5 in tokens.                                                  |
 | 7   | 6    | Stall Watch reads every cluster once in each 30-minute cycle at 42 clusters, with less than 15% margin.                                                                                                                                          | 25 minutes per run at 40 clusters, about 37 s per cluster.                                                                                                                                                                             | Pending                                                                                                                                                                                               |
 | 8   | 6    | The steady token cost after onboarding is $15 to $20 per hour, or $360 to $480 per day, and the agent's memory stays under 3 GB for 12 hours.                                                                                                    | $111 in the first 5 hours, which include the onboarding burst.                                                                                                                                                                         | Pending                                                                                                                                                                                               |
 | 9   | 7    | High Pod churn does not harm the install. The test cluster cannot reach 3,000 Pods per minute before the install shows strain. The event watcher stays under 0.5 CPU and 1 GB.                                                                   | The event watcher reacts to warnings and failures, not to normal Pod creation.                                                                                                                                                         | Pending                                                                                                                                                                                               |
@@ -159,8 +164,10 @@ The session store truncates a tool result at its own limit, so a size is the sto
 
 ### Verdict
 
-Safe. Every check passed, and the first-run flow finished without intervention by the install.
-The one manual step, the unblock at 16:54, repaired a fault in the test environment.
+Safe, with one gap. Every check passed, and the first-run flow finished without intervention by the
+install. The one manual step, the unblock at 16:54, repaired a fault in the test environment. The
+gap: the event watcher watched no test cluster in this window (Step 6, finding 9), so the window
+holds none of the event watcher's load. Every window after 21:16 holds it, and all of them were safe.
 
 ### Findings
 
@@ -266,10 +273,59 @@ excluded clusters, as run 3 did (finding 5).
    10 named clusters, 16 minutes for 42. The upgrade skill's script reads the whole fleet, and the
    agent spends turns trying to narrow it.
 
-## Steps 6 to 8 (not started)
+## Step 6: restart recovery and 20 failing Pods
 
-Restart recovery, the 20-failing-Pod window, Stall Watch coverage, the overnight soak, the high
-Pod churn steps and the S-size red test are not run yet.
+| Run                | Window (UTC)   | Events seen per minute | Session starts asked | Suppressed by quota | Events injected | Agent memory peak | Agent CPU peak | Token cost           |
+| ------------------ | -------------- | ---------------------- | -------------------- | ------------------- | --------------- | ----------------- | -------------- | -------------------- |
+| `restart_recovery` | 03:46 to 04:18 | 664                    | 6,972                | 6,805               | 49              | 2.43 GB           | 2.27           | $40.6 ($78 per hour) |
+| `failing_20`       | 04:34 to 05:34 | 575                    | 11,683               | 11,683              | 0               | 2.79 GB           | 1.65           | $69.5 ($70 per hour) |
+
+No run had a restart other than the planned one, an OOMKill or a refused command.
+
+**Restart recovery.** The gateway restarted at 03:46:42. The event watcher reported 7 clusters up at
+03:48:00, 25 at 03:49:18 and all 43 at 03:49:57: about 3 minutes.
+
+**20 failing Pods.** The session quota held. The event watcher asked for 11,683 triage sessions in
+the hour and the quota suppressed all of them. The token cost of the hour was $69.5, so work other
+than triage sessions also ran in it; the soak gives the baseline to compare.
+
+### The event watcher was not watching during the first run
+
+The event watcher builds its watch list once, when it starts, from the Cluster Agent profiles that
+exist then. A profile created later is not watched until the watcher restarts. The first-run window
+started from a reset that deleted the profiles. The watcher started at about 16:06, and the
+reconcile created the 40 profiles at 16:11. So the watcher watched no test cluster for the whole
+first-run window, which is why it saw only 2.7 events per minute.
+
+The runner restarted the gateway at 21:16 before Step 5. From then on the watcher watched all
+clusters and saw 560 to 660 events per minute in every window. It asked for 1,700 to 11,700 session
+starts per window and the quota suppressed almost all of them.
+
+### Findings
+
+9. **A new install does not watch the clusters it registers after start.** On a new install the
+   event watcher starts before the first reconcile creates the Cluster Agent profiles, so it watches
+   none of them until the gateway restarts. The first-run measurement therefore under-counts the
+   event watcher's load.
+10. **At 40 clusters the session quota carries the event load.** With the watcher watching every
+    cluster, it asked for about 100 to 250 triage sessions per minute, mostly for the 785 Pods that
+    the test fleet cannot schedule. The quota suppressed nearly all of them.
+
+## Step 7: high Pod churn (re-run pending)
+
+The first try is invalid. Its churn Job targeted `scale-01`'s `churn-pool`, which the runner's
+fixture Pods had already filled ("Too many pods"), so every churn Pod stayed Pending and no churn
+happened. Its records leave the data file. The re-run uses a pool of its own, `churn-fast`
+(6 × e2-standard-4, 110 Pods per node), tainted so that only churn Pods run on it. A check with
+10 Pods at once completed 105 Pods in about 80 seconds. The re-run sets 65, 130 and 400 Pods at once
+for about 500, 1,000 and 3,000 Pods per minute.
+
+## Steps 6 and 8 (pending)
+
+The 12-hour soak runs from 07:17 to about 19:20 UTC. It covers the daily audits from 07:45 to 10:10
+but not the compliance (06:20) and obtainability (06:50) audits, which ran during the first try of
+Step 7; their durations are in the first-run timeline. The red test at the S size follows the
+Step 7 re-run.
 
 ## Cost
 
