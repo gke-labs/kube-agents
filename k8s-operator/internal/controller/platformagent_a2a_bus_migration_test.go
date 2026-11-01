@@ -352,7 +352,7 @@ func (m *migrationRig) snapshotKept() {
 func (m *migrationRig) clearedAll() {
 	m.t.Helper()
 	b, _ := json.Marshal(busmigrate.Report{Cleared: a2aProvisionedStreams})
-	m.finishPod("clear", corev1.PodSucceeded, string(b), "")
+	m.finishPod(busMigrationRunWork(m.agent.Status.BusMigration).name, corev1.PodSucceeded, string(b), "")
 }
 
 // validDigests is a hashing pod's report for every provisioned stream.
@@ -828,7 +828,7 @@ func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
 // workload reads back the pod spec of a phase's Job or pod.
 func (m *migrationRig) workload(step string) (corev1.PodSpec, metav1.ObjectMeta, bool) {
 	m.t.Helper()
-	key := client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationWorkloadName(m.agent, step, "3-1")}
+	key := client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationWorkName(m.agent, m.agent.Status.BusMigration, step)}
 	if step != "pin" && step != "unpin" {
 		pod := &corev1.Pod{}
 		if err := m.cl.Get(context.Background(), key, pod); err != nil {
@@ -2255,7 +2255,7 @@ func TestClearingRefusesWithoutTheSnapshot(t *testing.T) {
 		if !strings.Contains(run.Cause, "the snapshot is not intact, so nothing was cleared") || run.FailedIn != string(busMigrationClearing) {
 			t.Errorf("%s: cause %q failedIn %q", tc.name, run.Cause, run.FailedIn)
 		}
-		if _, _, ok := m.workload("clear"); ok {
+		if _, _, ok := m.workload(busMigrationRunWork(m.agent.Status.BusMigration).name); ok {
 			t.Errorf("%s: a clear pod was created without the snapshot", tc.name)
 		}
 	}
@@ -2288,7 +2288,7 @@ func TestAClearFailingPartwayIsRetriedToTheEnd(t *testing.T) {
 	m := newMigrationRig(t, busMigrationGrow, busMigrationClearing, 3, time.Now().Add(time.Hour))
 	m.agent.Status.BusMigration.Abandoning = true
 	m.snapshotKept()
-	m.finishPod("clear", corev1.PodFailed, `{"cleared":["TASKS","DIRECTORY"],"error":"stream TOPICS-STATE: timeout"}`, "")
+	m.finishPod(busMigrationClearBackWork, corev1.PodFailed, `{"cleared":["TASKS","DIRECTORY"],"error":"stream TOPICS-STATE: timeout"}`, "")
 	m.pass(busMigrationFailed, 3)
 	run := m.agent.Status.BusMigration
 	if !slices.Equal(run.Cleared, []string{"TASKS", "DIRECTORY"}) || !strings.Contains(run.Cause, "the Clearing phase failed: stream TOPICS-STATE: timeout") {
@@ -2302,11 +2302,11 @@ func TestAClearFailingPartwayIsRetriedToTheEnd(t *testing.T) {
 	if !slices.Equal(m.agent.Status.BusMigration.Cleared, []string{"TASKS", "DIRECTORY"}) {
 		t.Errorf("the retry forgot what was cleared: %v", m.agent.Status.BusMigration.Cleared)
 	}
-	if _, _, ok := m.workload("clear"); !ok {
+	if _, _, ok := m.workload(busMigrationRunWork(m.agent.Status.BusMigration).name); !ok {
 		t.Fatal("no fresh clear pod for the retry")
 	}
 	b, _ := json.Marshal(busmigrate.Report{Cleared: a2aProvisionedStreams})
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkName(m.agent, m.agent.Status.BusMigration, "clear"), Namespace: m.agent.Namespace}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkName(m.agent, m.agent.Status.BusMigration, busMigrationClearBackWork), Namespace: m.agent.Namespace}}
 	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(pod), pod); err != nil {
 		t.Fatal(err)
 	}
@@ -2347,7 +2347,7 @@ func TestEnteringClearingChecksTheSnapshotFirst(t *testing.T) {
 	m := newMigrationRig(t, busMigrationGrow, busMigrationHashing, 1, time.Now().Add(time.Hour))
 	m.finishPod("hash", corev1.PodSucceeded, validDigests(), "") // the run Secret is written; no stage claim
 	m.pass(busMigrationClearing, 1)
-	if _, _, ok := m.workload("clear"); ok {
+	if _, _, ok := m.workload(busMigrationRunWork(m.agent.Status.BusMigration).name); ok {
 		t.Fatal("entering Clearing created a clear pod with no staging claim")
 	}
 }
@@ -2362,4 +2362,60 @@ func TestEachClearingStartsItsOwnRecord(t *testing.T) {
 	if len(m.agent.Status.BusMigration.Cleared) != 0 || busMigrationClearedAll(m.agent.Status.BusMigration) {
 		t.Errorf("the way back's Clearing starts with %v cleared", m.agent.Status.BusMigration.Cleared)
 	}
+}
+
+// Every Job or pod a run creates has a name no other work of the run uses:
+// per phase, per direction (the clear before the conversion and the one on
+// the way back) and per attempt (each retry), so no work is ever read off
+// another's finished object. (Found live twice: a retry reading the failed
+// attempt's pod, and the way back's clear reading the forward one's.)
+func TestEveryRunWorkNameIsUnique(t *testing.T) {
+	agent := a2aTestAgent()
+	seen := map[string]string{}
+	for _, leg := range []busMigrationLeg{busMigrationShrink, busMigrationGrow} {
+		for _, phase := range []busMigrationPhase{busMigrationPinning, busMigrationUnpinning, busMigrationFreezing, busMigrationSnapshot, busMigrationHashing,
+			busMigrationClearing, busMigrationConverting, busMigrationRestoring, busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationReleasing} {
+			for _, abandoning := range []bool{false, true} {
+				for attempt := 0; attempt <= busMigrationMaxRetries; attempt++ {
+					run := &agentv1alpha1.BusMigrationStatus{Leg: string(leg), RunID: "7-1", Phase: string(phase), Abandoning: abandoning,
+						Retries: make([]agentv1alpha1.BusMigrationRetry, attempt)}
+					work := busMigrationRunWork(run)
+					if work.name == "" {
+						continue
+					}
+					// The same work in the same direction and attempt is the
+					// same object; anything else must differ.
+					key := fmt.Sprintf("%s/dir=%v/attempt=%d", work.name, work.name == busMigrationClearBackWork, attempt)
+					name := busMigrationWorkName(agent, run, work.name)
+					if other, ok := seen[name]; ok && other != key {
+						t.Errorf("%s is the name of both %s and %s", name, other, key)
+					}
+					seen[name] = key
+				}
+			}
+		}
+	}
+	if len(seen) < 8*(busMigrationMaxRetries+1) {
+		t.Errorf("only %d distinct work names; want every work, direction and attempt", len(seen))
+	}
+}
+
+// The live case: the forward clear's pod finished, all cleared, and is still
+// there when the way back's Clearing starts. The way back waits for its own
+// clear; it does not take the forward one's as done.
+func TestTheWayBacksClearIsNotTheForwardOnes(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	m.snapshotKept()
+	b, _ := json.Marshal(busmigrate.Report{Cleared: a2aProvisionedStreams})
+	m.finishPod(busMigrationClearWork, corev1.PodSucceeded, string(b), "") // the forward clear's pod
+	m.finishPod("restore", corev1.PodFailed, `{"error":"boom"}`, "")
+	m.pass(busMigrationClearing, 3)
+	m.pass(busMigrationClearing, 3)
+	m.pass(busMigrationClearing, 3)
+	if _, _, ok := m.workload(busMigrationClearBackWork); !ok {
+		t.Fatal("no clear pod of the way back's own")
+	}
+	m.clearedAll()
+	m.pass(busMigrationRollingBack, 1)
 }

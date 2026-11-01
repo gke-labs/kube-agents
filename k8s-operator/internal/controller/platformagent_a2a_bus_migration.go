@@ -356,7 +356,7 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 			return busMigrationErred, false, nil
 		}
 	}
-	if work := busMigrationPhaseWorkload(phase); work.name != "" {
+	if work := busMigrationRunWork(run); work.name != "" {
 		// The phase's identity must be this PlatformAgent's own: a
 		// ServiceAccount someone else made under its name is never adopted.
 		sa := &corev1.ServiceAccount{}
@@ -839,7 +839,7 @@ func busMigrationRunSecret(agent *agentv1alpha1.PlatformAgent, runID string) str
 // and policies from the run Secret. Each is bounded by the run's deadline
 // less the margin.
 func buildBusStreamPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, kind string, now time.Time) *corev1.Pod {
-	leg := map[string]string{"snapshot": "snapshot", "restore": "restore", "rollback": "restore", "clear": "clear"}[kind]
+	leg := map[string]string{"snapshot": "snapshot", "restore": "restore", "rollback": "restore", busMigrationClearWork: "clear", busMigrationClearBackWork: "clear"}[kind]
 	command := []string{busMigrationBinary, "bus-migrate", leg,
 		"--server", a2aNATSTLSScheme + a2aNATSAddress(agent),
 		"--ca-file", a2aNATSCAFile(),
@@ -849,7 +849,7 @@ func buildBusStreamPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bu
 	}
 	volumes := []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent)}
 	mounts := []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount()}
-	if kind != "clear" {
+	if leg != "clear" {
 		// The clear needs no stage: it deletes by name.
 		readOnly := kind != "snapshot"
 		command = append(command, "--dir", busMigrationStageMount)
@@ -890,6 +890,23 @@ type busMigrationWork struct {
 
 // busMigrationPhaseWorkload is the work a phase runs, zero for the phases
 // that run none of their own (rollouts).
+// The two clears' work names: one for the clear before the conversion, one
+// for the clear on the way back, so the way back's never reads the forward
+// one's finished pod as its own.
+const (
+	busMigrationClearWork     = "clear"
+	busMigrationClearBackWork = "clear-back"
+)
+
+// busMigrationRunWork is the work the run's current phase runs.
+func busMigrationRunWork(run *agentv1alpha1.BusMigrationStatus) busMigrationWork {
+	work := busMigrationPhaseWorkload(busMigrationPhase(run.Phase))
+	if work.name == busMigrationClearWork && run.Abandoning {
+		work.name = busMigrationClearBackWork
+	}
+	return work
+}
+
 func busMigrationPhaseWorkload(phase busMigrationPhase) busMigrationWork {
 	switch phase {
 	case busMigrationPinning:
@@ -901,7 +918,7 @@ func busMigrationPhaseWorkload(phase busMigrationPhase) busMigrationWork {
 	case busMigrationHashing:
 		return busMigrationWork{name: "hash", identity: "hash", pod: true}
 	case busMigrationClearing:
-		return busMigrationWork{name: "clear", identity: busMigrationStreamIdentity, pod: true}
+		return busMigrationWork{name: busMigrationClearWork, identity: busMigrationStreamIdentity, pod: true}
 	case busMigrationRestoring:
 		return busMigrationWork{name: "restore", identity: busMigrationStreamIdentity, pod: true}
 	case busMigrationRollbackRestoring:
@@ -916,7 +933,7 @@ func busMigrationPhaseWorkload(phase busMigrationPhase) busMigrationWork {
 // it comes first; it holds no RBAC. Nothing is created without
 // OPERATOR_IMAGE, and the phase then waits out the run's deadline.
 func (r *PlatformAgentReconciler) ensureBusMigrationWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, now time.Time) error {
-	return r.ensureBusMigrationWorkloadFor(ctx, agent, run, busMigrationPhaseWorkload(busMigrationPhase(run.Phase)), now)
+	return r.ensureBusMigrationWorkloadFor(ctx, agent, run, busMigrationRunWork(run), now)
 }
 
 // ensureBusMigrationWorkloadFor is ensureBusMigrationWorkload for one work.
@@ -950,7 +967,7 @@ func (r *PlatformAgentReconciler) ensureBusMigrationWorkloadFor(ctx context.Cont
 	if err := ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, nil, commonLabels(agent), fieldOwner); err != nil {
 		return err
 	}
-	if work.name == "clear" {
+	if work.name == busMigrationClearWork || work.name == busMigrationClearBackWork {
 		if refused, err := r.busMigrationSnapshotKept(ctx, agent, run); err != nil || refused != "" {
 			// Nothing is deleted unless the snapshot that replaces it is
 			// there (observeBusMigration fails the phase on it).
@@ -1097,7 +1114,7 @@ const busMigrationEventLimit = 1024
 // restore accepted outside its policy goes unreported; its error, when it
 // failed, is returned for the run's cause.
 func (r *PlatformAgentReconciler) recordRestoreReport(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (failure string, err error) {
-	pod, err := r.busMigrationPod(ctx, agent, run, busMigrationPhaseWorkload(busMigrationPhase(run.Phase)).name)
+	pod, err := r.busMigrationPod(ctx, agent, run, busMigrationRunWork(run).name)
 	if goerrors.Is(err, errBusMigrationForeign) {
 		return "the restore pod is not this PlatformAgent's", nil
 	}
@@ -1465,7 +1482,7 @@ func busMigrationRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
 // busMigrationPodOfRun reports a pod name as one of the run's stage-mounting
 // pods, any attempt.
 func busMigrationPodOfRun(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, name string) bool {
-	for _, kind := range []string{"snapshot", "hash", "restore", "rollback"} {
+	for _, kind := range []string{"snapshot", "hash", "restore", "rollback", busMigrationClearWork, busMigrationClearBackWork} {
 		base := busMigrationWorkloadName(agent, kind, run.RunID)
 		if name == base || strings.HasPrefix(name, base+"-r") {
 			return true
@@ -1526,7 +1543,7 @@ func busMigrationClearedAll(run *agentv1alpha1.BusMigrationStatus) bool {
 // status: each stream it deleted, kept across a retry (a stream deleted
 // once stays deleted), and its error, returned for the cause.
 func (r *PlatformAgentReconciler) recordClearReport(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (failure string, err error) {
-	pod, err := r.busMigrationPod(ctx, agent, run, "clear")
+	pod, err := r.busMigrationPod(ctx, agent, run, busMigrationRunWork(run).name)
 	if goerrors.Is(err, errBusMigrationForeign) {
 		return "the clear pod is not this PlatformAgent's", nil
 	}
