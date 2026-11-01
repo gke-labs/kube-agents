@@ -18956,20 +18956,20 @@ def _remediation_file_stalls(
     it must also be known (`_project_certain`).
     """
     matched: list[KccStall] = []
-    cluster_kinds = _KCC_OBJECT_KINDS["Cluster"] + _KCC_OBJECT_KINDS["NodePool"]
+    # Decided by the finding, not by the object: a `Cluster/` or `NodePool/`
+    # finding is about the managed cluster, so the finding's own project and
+    # location stand in when the file gives none. Any other finding,
+    # compliance's `kcc-object-wedged` on a `ContainerCluster/<n>` object
+    # included, is on the cluster that runs Config Connector, which says
+    # nothing about the project or the location its object manages: only the
+    # declaration can give those.
+    about_managed_cluster = str(finding.get("object") or "").partition("/")[0] in _KCC_OBJECT_KINDS
     for (kind, _, cluster_ref, file_location), declaration in index.items():
         # The index keys a node pool on its `clusterRef`, every other kind on
         # its own name.
         file_ref = cluster_ref if kind in _KCC_OBJECT_KINDS["NodePool"] else ""
-        # A cluster or a node pool finding is about the managed cluster, so its
-        # project is the one the object manages. Any other Config Connector
-        # finding (compliance's `kcc-object-wedged`) is on the cluster that
-        # runs Config Connector, which says nothing about the project its
-        # object manages: only the declaration can give that.
-        project = declaration.project or (_finding_project(finding) if kind in cluster_kinds else "")
-        # The file's `spec.location`, else, for a cluster or a node pool, the
-        # location of the finding's cluster.
-        location = file_location or (_finding_location(finding) if kind in cluster_kinds else "")
+        project = declaration.project or (_finding_project(finding) if about_managed_cluster else "")
+        location = file_location or (_finding_location(finding) if about_managed_cluster else "")
         fits = [
             stall
             for stall in stalled

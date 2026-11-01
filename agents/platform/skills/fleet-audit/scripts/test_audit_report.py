@@ -23289,6 +23289,21 @@ metadata:
         finding = self.firewall_fix(namespace.replace("app-proj", "other-proj") + self.FIREWALL)
         self.assertEqual(self.disclose([finding], kcc_manifest(stall)), [])
 
+    def test_a_kcc_object_wedged_finding_on_a_container_cluster_takes_nothing_from_the_host(self):
+        """Compliance's finding on `ContainerCluster/prod` sits on the hub in
+        hub-proj/us-central1; the object manages app-proj in europe-west1.
+        The hub's project and location say nothing about the object."""
+        self.write(
+            "clusters/prod.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
+            "  name: prod\n  namespace: app-proj\nspec:\n  location: europe-west1\n",
+        )
+        finding = make_finding(fid="w", check="kcc-object-wedged", cluster="hub-proj/us-central1/hub", obj="ContainerCluster/prod",
+                               remediation={"kind": "manifest", "path": "clusters/prod.yaml", "note": "Fix the reference."})
+        stall = {"kind": "ContainerCluster", "namespace": "app-proj", "name": "prod", "why": "UpdateFailed",
+                 "project": "app-proj", "location": "europe-west1"}
+        self.assertEqual(self.disclose([finding], kcc_manifest(stall)), ["w"])
+
     def test_the_copied_constants_equal_the_collectors(self):
         """audit_report.py does not import the collectors, so it copies two of
         kcc_health.py's constants; this holds the copies equal."""
