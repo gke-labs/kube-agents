@@ -1,0 +1,61 @@
+# Stress beyond fair use for real-install-test-plan.md: 5 and 8 questions at once on the Step 1 fleet
+# at the L size, with the harness's delegation wait raised (AGENT_DELEGATION_TIMEOUT=5400), so the
+# run shows how long the answers take and what breaks first. Run with --only-factor combined.
+phase: real-install-stress
+target:
+  host_cluster: scale-host
+  host_location: us-central1-c
+  namespace: kubeagents-system
+  zone: us-central1-f
+  cluster_prefix: scale-
+  cluster_label: purpose=harness-scale
+  mode: next
+  data_file: harness-limits.json
+
+base:
+  clusters: 2
+  nodes: 2
+  objects: 100
+  churn_per_minute: 10
+  failing_pods: 1
+  concurrent: 1
+  listing_pods: 100
+  proxy_concurrency: 1
+
+factors:
+  combined: [1, 2]
+
+combined:
+  - clusters: 40
+    objects: 1200
+    churn_per_minute: 3
+    failing_pods: 5
+    concurrent: 5
+  - clusters: 40
+    objects: 1200
+    churn_per_minute: 3
+    failing_pods: 5
+    concurrent: 8
+
+settings:
+  settle_seconds: 180
+  pods_per_node: 60
+  fixture_pool: scale-pool
+  fixture_machine_type: e2-small
+  default_pool_pods: 150
+  test_cluster_machine_type: e2-standard-2
+  churn_pod_lifetime_seconds: 30
+  cluster_registration_timeout_seconds: 5400
+  trigger_reconcile: true
+  cluster_create_parallelism: 10
+  watcher_wait_seconds: 600
+  lease_ttl_minutes: 1440
+
+operations:
+  stress_questions:
+    kind: prompt
+    factors: [combined]
+    runs: 1
+    timeout_seconds: 7200
+    prompt: Prepare an upgrade readiness report for my whole fleet. Which clusters are behind, what blocks their upgrade, and in what order should they be upgraded?
+    follow_up: Analyse my fleet's health. Which clusters and workloads carry the heaviest traffic, is the load skewed toward one zone, and what looks anomalous?

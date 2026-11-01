@@ -1,19 +1,82 @@
-"""Plotly visualizations for normalized activity."""
+"""Plotly visualizations for normalized activity and harness measurements."""
 
 from __future__ import annotations
 
+import math
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from html import escape
 
 import plotly.graph_objects as go
 
 from admin_console.causal_flow import CausalSource
 from admin_console.domain import ActivityEvent
+from admin_console.harness_limits import (
+    LEAST_SQUARES_LABEL,
+    LIMIT_LABEL,
+    PREDICTED_LABEL,
+    TWO_POINT_LABEL,
+    CHURN,
+    CLUSTERS,
+    CONCURRENT,
+    FAILING_PODS,
+    LISTING_PODS,
+    NODES,
+    OBJECTS,
+    BottleneckSeries,
+    FleetProfile,
+    MetricChart,
+)
 from admin_console.ui import ATTRIBUTION_COLORS, PALETTE, STATUS_COLORS, TRIGGER_COLORS
 
 PLOT_BG = "rgba(0,0,0,0)"
 GRID = PALETTE.border
 TEXT = PALETTE.chart_text
+HARNESS_CHART_HEIGHT = 360
+HARNESS_MARKER_SIZE = 9
+HARNESS_LINE_WIDTH = 2
+THRESHOLD_LINE_WIDTH = 1
+PREDICTION_DASH = "dash"
+THRESHOLD_DASH = "dot"
+FLEET_DASH = "dashdot"
+MEASURED_SYMBOL = "circle"
+EXCLUDED_SYMBOL = "circle-open"
+EXCLUDED_LABEL = "excluded from fit"
+FLEET_LABEL = "this fleet"
+CONTAINER_LIMIT_KEY = "container limit"
+THRESHOLD_KEY = "threshold"
+CROSSING_KEY = "reaches its limit"
+CLUSTER_AXIS_TITLE = "Clusters × nodes each"
+SHARE_LIMIT_TEXT = "the limit (100%)"
+# Every label at a place on the x axis reads as the axis does: clusters × nodes each.
+SIZE_TEXT = "{clusters:,.0f} × {nodes:g}"
+MEASURED_RANGE_TEXT = "measured: up to {size}"
+PROFILE_TEXT = "{name}: {size}"
+FLEET_KEY = "this fleet: {size}"
+PREDICTION_KEY = "solid line: predicted peak"
+LIMIT_LABEL_SEPARATOR = "limit: "
+LIMIT_LABEL_FONT_SIZE = 11
+CROSSING_SYMBOL = "x"
+CROSSING_MARKER_SIZE = 13
+BOTTLENECK_CHART_HEIGHT = 440
+# The share axis stops at 4 times the limit: past that, every line has long since failed.
+BOTTLENECK_SHARE_CEILING = 4.0
+LIMIT_SHARE = 1.0
+LIMIT_SHARE_LABEL = "limit"
+MEASURED_RANGE_LABEL = "measured"
+MEASURED_RANGE_OPACITY = 0.12
+PROFILE_LINE_WIDTH = 1
+MEASURED_KEY = "measured run, at its own fleet shape"
+BREAKDOWN_CHART_HEIGHT = 460
+BREAKDOWN_LEGEND_Y = -0.3
+BREAKDOWN_TOP_MARGIN = 30
+# A breakdown chart's value axis stops at twice the largest limit, so a line is seen crossing its limit.
+BREAKDOWN_LIMIT_HEADROOM = 2.0
+# Above the largest measured run by a quarter, so the dots sit inside the plot.
+BREAKDOWN_MEASURED_HEADROOM = 1.25
+# Narrow charts label each tenfold step only.
+BREAKDOWN_TICKS = (1, 10, 100, 1000, 10000)
+BOTTLENECK_TICKS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000)
 
 
 def _base_layout(figure: go.Figure, *, height: int) -> go.Figure:
@@ -264,3 +327,343 @@ def interaction_timeline(events: list[ActivityEvent]) -> go.Figure:
         categoryarray=list(reversed(ordered_agents)),
     )
     return _base_layout(figure, height=max(260, 80 + len(ordered_agents) * 48))
+
+
+def _style_key(figure: go.Figure, name: str, *, dash: str = "", symbol: str = "") -> None:
+    """A legend entry that explains a line or marker style, with no data."""
+    figure.add_trace(
+        go.Scatter(
+            x=[None],
+            y=[None],
+            name=name,
+            mode="markers" if symbol else "lines",
+            line={"color": PALETTE.neutral, "width": HARNESS_LINE_WIDTH, "dash": dash or None},
+            marker={"color": PALETTE.neutral, "size": HARNESS_MARKER_SIZE, "symbol": symbol or None},
+            hoverinfo="skip",
+        )
+    )
+
+
+def harness_limit_chart(chart: MetricChart, colors: Mapping[str | None, str]) -> go.Figure:
+    """One metric against one factor: the runs, the fitted lines, and the thresholds."""
+    figure = go.Figure()
+    scale = chart.scale
+    unit = f" {chart.unit}" if chart.unit else ""
+    for series in chart.series:
+        color = colors.get(series.container, PALETTE.accent)
+        name = escape(series.name)
+        for excluded in (False, True):
+            points = [point for point in series.points if point.excluded is excluded]
+            if not points:
+                continue
+            figure.add_trace(
+                go.Scatter(
+                    x=[point.x for point in points],
+                    y=[point.y / scale for point in points],
+                    mode="markers",
+                    name=f"{series.name} ({EXCLUDED_LABEL})" if excluded else series.name,
+                    legendgroup=series.name,
+                    showlegend=not excluded,
+                    marker={
+                        "color": color,
+                        "size": HARNESS_MARKER_SIZE,
+                        "symbol": EXCLUDED_SYMBOL if excluded else MEASURED_SYMBOL,
+                    },
+                    customdata=[[point.key, point.run] for point in points],
+                    hovertemplate=(
+                        f"<b>{name}</b><br>%{{x:,.1f}} · %{{y:,.2f}}{unit}"
+                        "<br>run %{customdata[1]} · %{customdata[0]}<extra></extra>"
+                    ),
+                )
+            )
+        fit = series.fit
+        if fit is not None:
+            segments = [((fit.x_min, fit.x_max), fit.label, None)]
+            if chart.x_end > fit.x_max:
+                segments.append(((fit.x_max, chart.x_end), PREDICTED_LABEL, PREDICTION_DASH))
+            for (start, end), label, dash in segments:
+                figure.add_trace(
+                    go.Scatter(
+                        x=[start, end],
+                        y=[fit.at(start) / scale, fit.at(end) / scale],
+                        mode="lines",
+                        name=f"{series.name} · {label}",
+                        legendgroup=series.name,
+                        showlegend=False,
+                        line={"color": color, "width": HARNESS_LINE_WIDTH, "dash": dash},
+                        hovertemplate=(
+                            f"<b>{name}</b> · {label}<br>%{{x:,.1f}} · %{{y:,.2f}}{unit}"
+                            "<extra></extra>"
+                        ),
+                    )
+                )
+        if series.limit is not None:
+            # A trace, not a labelled shape: it toggles with its container and
+            # names itself on hover instead of covering the base runs with text.
+            limit_name = LIMIT_LABEL.format(container=series.name)
+            figure.add_trace(
+                go.Scatter(
+                    x=[0, chart.x_end],
+                    y=[series.limit / scale] * 2,
+                    mode="lines",
+                    name=limit_name,
+                    legendgroup=series.name,
+                    showlegend=False,
+                    line={"color": color, "width": THRESHOLD_LINE_WIDTH, "dash": THRESHOLD_DASH},
+                    hovertemplate=(
+                        f"<b>{escape(limit_name)}</b><br>%{{y:,.2f}}{unit}<extra></extra>"
+                    ),
+                )
+            )
+    for line in chart.lines:
+        figure.add_hline(
+            y=line.value / scale,
+            line={
+                "color": PALETTE.danger if line.critical else PALETTE.warning,
+                "width": THRESHOLD_LINE_WIDTH,
+                "dash": THRESHOLD_DASH,
+            },
+            annotation_text=escape(line.label),
+            annotation_position="top right",
+            annotation_font_color=TEXT,
+        )
+    if chart.fleet_x is not None:
+        figure.add_vline(
+            x=chart.fleet_x,
+            line={"color": PALETTE.neutral, "width": THRESHOLD_LINE_WIDTH, "dash": FLEET_DASH},
+        )
+        _style_key(figure, FLEET_LABEL, dash=FLEET_DASH)
+    if any(series.limit is not None for series in chart.series):
+        _style_key(figure, CONTAINER_LIMIT_KEY, dash=THRESHOLD_DASH)
+    fits = [series.fit for series in chart.series if series.fit is not None]
+    if fits:
+        two_point = all(fit.two_point for fit in fits)
+        _style_key(figure, TWO_POINT_LABEL if two_point else LEAST_SQUARES_LABEL)
+        if any(chart.x_end > fit.x_max for fit in fits):
+            _style_key(figure, PREDICTED_LABEL, dash=PREDICTION_DASH)
+    if any(point.excluded for series in chart.series for point in series.points):
+        _style_key(figure, EXCLUDED_LABEL, symbol=EXCLUDED_SYMBOL)
+    figure.update_xaxes(
+        title=chart.x_title, showgrid=True, gridcolor=GRID, rangemode="tozero", zeroline=False
+    )
+    figure.update_yaxes(
+        title=chart.y_title, showgrid=True, gridcolor=GRID, rangemode="tozero", zeroline=False
+    )
+    return _base_layout(figure, height=HARNESS_CHART_HEIGHT)
+
+
+def _size(clusters: float, nodes_per_cluster: float) -> str:
+    """A fleet size as the x axis writes it: clusters × nodes each."""
+    return SIZE_TEXT.format(clusters=clusters, nodes=round(nodes_per_cluster, 1))
+
+
+def _fleet_hover(fleet: Mapping[str, float]) -> str:
+    """The fleet behind one point of the bottleneck chart, as tooltip lines."""
+    clusters = fleet[CLUSTERS]
+    return "<br>".join(
+        (
+            f"{_size(clusters, fleet[NODES])} ({clusters * fleet[NODES]:,.0f} nodes)",
+            f"{clusters * fleet[OBJECTS]:,.0f} objects ({fleet[OBJECTS]:,.0f} per cluster)",
+            f"{fleet[CHURN]:,.0f} Pods created per minute, {fleet[FAILING_PODS]:,.0f} failing at once",
+            f"{fleet[CONCURRENT]:,.0f} concurrent requests, {fleet[LISTING_PODS]:,.0f} Pods in the largest listing",
+        )
+    )
+
+
+def bottleneck_chart(
+    series: list[BottleneckSeries],
+    profiles: tuple[FleetProfile, ...],
+    measured: float,
+    fleet_clusters: float,
+    colors: list[str],
+    nodes_per_cluster: float,
+    log_axis: bool = True,
+    crossings: list[float | None] | None = None,
+) -> go.Figure:
+    """Each key check against its limit as the fleet grows, with the runs and the example fleets marked.
+
+    ``crossings`` marks, per line, the cluster count where it reaches its limit.
+    """
+    figure = _growth_chart(series, profiles, measured, fleet_clusters, colors, nodes_per_cluster, log_axis,
+                           value_format=".0%", value_suffix=" of its limit")
+    for index, (item, at) in enumerate(zip(series, crossings or [])):
+        if at is None:
+            continue
+        figure.add_trace(
+            go.Scatter(
+                x=[at],
+                y=[LIMIT_SHARE],
+                mode="markers",
+                name=f"{item.label} reaches its limit",
+                legendgroup=item.label,
+                showlegend=False,
+                marker={"color": colors[index % len(colors)], "size": CROSSING_MARKER_SIZE, "symbol": CROSSING_SYMBOL,
+                        "line": {"color": TEXT, "width": THRESHOLD_LINE_WIDTH}},
+                hovertemplate=(
+                    f"<b>{escape(item.label)}</b> reaches its limit at about "
+                    f"{_size(at, nodes_per_cluster)}<extra></extra>"
+                ),
+            )
+        )
+    if crossings and any(at is not None for at in crossings):
+        _style_key(figure, CROSSING_KEY, symbol=CROSSING_SYMBOL)
+    figure.add_hline(
+        y=LIMIT_SHARE,
+        line={"color": PALETTE.danger, "width": THRESHOLD_LINE_WIDTH, "dash": THRESHOLD_DASH},
+        annotation_text=SHARE_LIMIT_TEXT,
+        annotation_position="bottom right",
+        annotation_font_color=TEXT,
+    )
+    figure.update_yaxes(title="Share of the limit", tickformat=".0%", range=[0, BOTTLENECK_SHARE_CEILING])
+    return _base_layout(figure, height=BOTTLENECK_CHART_HEIGHT)
+
+
+def breakdown_chart(
+    series: list[BottleneckSeries],
+    title: str,
+    unit: str,
+    profiles: tuple[FleetProfile, ...],
+    measured: float,
+    fleet_clusters: float | None,
+    colors: Mapping[str | None, str],
+    nodes_per_cluster: float,
+    log_axis: bool = True,
+) -> go.Figure:
+    """One metric in its own unit as the fleet grows, one line per owner with its limit dotted in its colour."""
+    palette = [colors.get(item.label, PALETTE.accent) for item in series]
+    suffix = f" {unit}" if unit else ""
+    figure = _growth_chart(series, profiles, measured, fleet_clusters, palette, nodes_per_cluster, log_axis,
+                           value_format=",.2f", value_suffix=suffix, ticks=BREAKDOWN_TICKS)
+    # One labelled line per limit value: containers that share a size share a line and a label.
+    shared: dict[float, list[tuple[BottleneckSeries, str]]] = {}
+    for item, color in zip(series, palette):
+        if item.limit is not None:
+            shared.setdefault(item.limit, []).append((item, color))
+    for value, owners in shared.items():
+        color = owners[0][1] if len(owners) == 1 else PALETTE.neutral
+        if len(owners) == 1:
+            text = owners[0][0].limit_label
+        else:
+            size = owners[0][0].limit_label.split(LIMIT_LABEL_SEPARATOR, 1)[-1]
+            text = f"{', '.join(item.label for item, _ in owners)} limit: {size}"
+        figure.add_hline(
+            y=value,
+            line={"color": color, "width": THRESHOLD_LINE_WIDTH, "dash": THRESHOLD_DASH},
+            annotation_text=escape(text),
+            annotation_position="top left",
+            annotation_font={"color": color, "size": LIMIT_LABEL_FONT_SIZE},
+        )
+    limits = [item.limit for item in series if item.limit is not None]
+    if limits:
+        owned = any(item.label in colors for item in series)
+        _style_key(figure, CONTAINER_LIMIT_KEY if owned else THRESHOLD_KEY, dash=THRESHOLD_DASH)
+        # Tall enough to show every line cross its limit, every measured run, and a line that starts above its limit.
+        seen = [point.share for item in series for point in item.measured]
+        starts = [item.shares[0] for item in series if not math.isnan(item.shares[0])]
+        top = max(
+            max(limits) * BREAKDOWN_LIMIT_HEADROOM,
+            max(seen, default=0.0) * BREAKDOWN_MEASURED_HEADROOM,
+            max(starts, default=0.0) * BREAKDOWN_LIMIT_HEADROOM,
+        )
+        figure.update_yaxes(range=[0, top])
+    figure.update_yaxes(title=f"{title} ({unit})" if unit else title, rangemode="tozero")
+    _base_layout(figure, height=BREAKDOWN_CHART_HEIGHT)
+    # Below the plot, so the legend does not cover the example fleets' and the limits' labels.
+    figure.update_layout(
+        legend={"orientation": "h", "yanchor": "top", "y": BREAKDOWN_LEGEND_Y, "xanchor": "left", "x": 0},
+        margin={"t": BREAKDOWN_TOP_MARGIN},
+    )
+    return figure
+
+
+def _growth_chart(
+    series: list[BottleneckSeries],
+    profiles: tuple[FleetProfile, ...],
+    measured: float,
+    fleet_clusters: float | None,
+    colors: list[str],
+    nodes_per_cluster: float,
+    log_axis: bool,
+    *,
+    value_format: str,
+    value_suffix: str,
+    ticks: tuple[float, ...] = (),
+) -> go.Figure:
+    """The lines, the measured runs, the measured range and the example fleets, shared by the growth charts."""
+    figure = go.Figure()
+    for index, item in enumerate(series):
+        color = colors[index % len(colors)]
+        label = escape(item.label)
+        figure.add_trace(
+            go.Scatter(
+                x=list(item.clusters),
+                y=list(item.shares),
+                mode="lines",
+                name=item.label,
+                legendgroup=item.label,
+                line={"color": color, "width": HARNESS_LINE_WIDTH},
+                customdata=[_fleet_hover(fleet) for fleet in item.fleets],
+                hovertemplate=f"<b>{label}</b>: %{{y:{value_format}}}{value_suffix}<br>%{{customdata}}<extra></extra>",
+            )
+        )
+        for excluded in (False, True):
+            points = [point for point in item.measured if point.excluded is excluded]
+            if not points:
+                continue
+            figure.add_trace(
+                go.Scatter(
+                    x=[point.clusters for point in points],
+                    y=[point.share for point in points],
+                    mode="markers",
+                    name=f"{item.label} (measured)",
+                    legendgroup=item.label,
+                    showlegend=False,
+                    marker={"color": color, "size": HARNESS_MARKER_SIZE, "symbol": EXCLUDED_SYMBOL if excluded else MEASURED_SYMBOL},
+                    customdata=[[_size(point.clusters, point.nodes_per_cluster), point.key] for point in points],
+                    hovertemplate=(
+                        f"<b>{label}</b>, measured: %{{y:{value_format}}}{value_suffix}"
+                        "<br>%{customdata[0]} · %{customdata[1]}"
+                        + (f" ({EXCLUDED_LABEL})" if excluded else "")
+                        + "<extra></extra>"
+                    ),
+                )
+            )
+    first = series[0].clusters[0] if series else LIMIT_SHARE
+    # On a log axis, shapes take data values and annotations take their logarithm.
+    position = math.log10 if log_axis else (lambda value: value)
+    figure.add_vrect(x0=first, x1=max(measured, first), fillcolor=PALETTE.neutral, opacity=MEASURED_RANGE_OPACITY, line_width=0)
+    figure.add_annotation(
+        x=position(max(measured, first)), y=1, xref="x", yref="paper",
+        text=MEASURED_RANGE_TEXT.format(size=_size(measured, nodes_per_cluster)),
+        showarrow=False, xanchor="right", yanchor="top", font={"color": TEXT, "size": LIMIT_LABEL_FONT_SIZE},
+    )
+    for profile in profiles:
+        figure.add_vline(
+            x=profile.clusters,
+            line={"color": PALETTE.neutral, "width": PROFILE_LINE_WIDTH, "dash": PREDICTION_DASH},
+        )
+        figure.add_annotation(
+            x=position(profile.clusters), y=1, xref="x", yref="paper",
+            text=escape(PROFILE_TEXT.format(name=profile.name, size=_size(profile.clusters, nodes_per_cluster))),
+            showarrow=False, yanchor="bottom", font={"color": TEXT},
+        )
+    if fleet_clusters is not None:
+        figure.add_vline(
+            x=max(fleet_clusters, first),
+            line={"color": PALETTE.accent, "width": HARNESS_LINE_WIDTH, "dash": FLEET_DASH},
+        )
+        _style_key(figure, FLEET_KEY.format(size=_size(fleet_clusters, nodes_per_cluster)), dash=FLEET_DASH)
+    _style_key(figure, PREDICTION_KEY)
+    _style_key(figure, MEASURED_KEY, symbol=MEASURED_SYMBOL)
+    ticks = [value for value in (ticks or BOTTLENECK_TICKS) if first <= value <= series[0].clusters[-1]] if series else []
+    figure.update_xaxes(
+        title=CLUSTER_AXIS_TITLE,
+        type="log" if log_axis else "linear",
+        tickvals=ticks,
+        ticktext=[_size(value, nodes_per_cluster) for value in ticks],
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+    )
+    figure.update_yaxes(showgrid=True, gridcolor=GRID, zeroline=False)
+    return figure
