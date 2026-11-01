@@ -36,6 +36,14 @@ readonly IMAGE_TREE_HOMES=("" profiles/platform)
 readonly IMAGE_TREE_PINS=(profiles profiles/platform)
 # shellSandboxImageTreesMode: what the operator sets SANDBOX_IMAGE_TREES to.
 readonly IMAGE_TREES_MODE=read-only-mounts
+# Section 4g: the limits sshd_config sets, the sessions opened on one shared
+# connection (the issue's acceptance figure, under the limit with room for the
+# sessions the agent's own tools hold), and how long each holds its channel so
+# that all of them overlap.
+readonly CHANNEL_SESSION_LIMIT=128
+readonly CHANNEL_STARTUP_LIMIT=64:30:256
+readonly CHANNEL_FANOUT=64
+readonly CHANNEL_HOLD_SECONDS=3
 
 IMAGE="${1:-agent-sandbox:latest}"
 PORT="${2:-12222}"
@@ -818,6 +826,45 @@ else
   echo "SKIP  $AGENT_IMAGE is not loaded; docker-build.yml loads it before this script and runs these there"
 fi
 "${SSH[@]}" "rm -rf $CP $SWS $PP/kanban /opt/data/scratch/smoke-$$" >/dev/null 2>&1
+
+echo
+echo "== 4g. channels on one shared connection =="
+# Every ssh the agent image spawns rides one ControlMaster connection per
+# user@host:port, so concurrent commands are sessions on a single connection
+# and sshd's MaxSessions is the ceiling on fan-out. OpenSSH's default is 10;
+# the eleventh concurrent command fails with exit 255 and nothing on stderr.
+# sshd_config sets 128, and this opens one master, runs 64 sessions over it at
+# once, each holding its channel open long enough to overlap the rest, and
+# counts the ones that returned. A failure here is the default back in force
+# (a dropped line, an Include that overrides it), or a MaxStartups so low that
+# the master itself is refused.
+check "sshd reports the raised session limit" "maxsessions $CHANNEL_SESSION_LIMIT" \
+  "$(docker exec "$NAME" sshd -T 2>&1 | grep -i '^maxsessions')"
+check "and the raised startup limit" "maxstartups $CHANNEL_STARTUP_LIMIT" \
+  "$(docker exec "$NAME" sshd -T 2>&1 | grep -i '^maxstartups')"
+CONTROL_PATH="$WORK/cm-%C"
+MASTER_OPTS=(-o ControlMaster=auto -o "ControlPath=$CONTROL_PATH" -o ControlPersist=60)
+ssh "${SSH_OPTS[@]}" "${MASTER_OPTS[@]}" agent@127.0.0.1 true 2>&1
+check "a master opens over the control socket" "Master running" \
+  "$(ssh "${SSH_OPTS[@]}" -o "ControlPath=$CONTROL_PATH" -O check agent@127.0.0.1 2>&1)"
+CHANNEL_OUT="$WORK/channels"
+mkdir -p "$CHANNEL_OUT"
+for i in $(seq 1 "$CHANNEL_FANOUT"); do
+  (
+    ssh "${SSH_OPTS[@]}" "${MASTER_OPTS[@]}" agent@127.0.0.1 \
+      "sleep $CHANNEL_HOLD_SECONDS; echo channel-$i"
+    echo "rc=$?"
+  ) > "$CHANNEL_OUT/$i" 2>&1 &
+done
+wait
+returned=$(grep -l '^channel-' "$CHANNEL_OUT"/* | wc -l)
+check "all $CHANNEL_FANOUT concurrent sessions on the one connection returned" \
+  "returned=$CHANNEL_FANOUT" "returned=$returned"
+# A session the master refuses is the client exiting 255 with nothing else
+# said, which is the failure the limit exists to end.
+check_absent "and none was refused by the master" "rc=255" \
+  "$(cat "$CHANNEL_OUT"/*)"
+ssh "${SSH_OPTS[@]}" -o "ControlPath=$CONTROL_PATH" -O exit agent@127.0.0.1 2>/dev/null
 
 echo
 echo "== 5. credential-proxy wrappers =="
