@@ -97,6 +97,50 @@ operations:
     runs: 2
     timeout_seconds: 7200
     prompt: Prepare an upgrade readiness report for the clusters scale-01 to scale-10 only. Which of them are behind, what blocks their upgrade, and in what order should they be upgraded?
+  restart_recovery:
+    # Step 6: restart the gateway with every cluster registered; a poller outside the runner times
+    # how long the event watcher takes to report each cluster up again.
+    kind: restart_soak
+    factors: [combined]
+    runs: 1
+    window_seconds: 1800
+  churn_500:
+    # Step 7: a Job on scale-01's churn pool creates and deletes Pods at about 500, 1,000 and 3,000
+    # per minute during the window; it is started before the run and deleted after.
+    kind: soak
+    factors: [combined]
+    runs: 1
+    window_seconds: 900
+  churn_1000:
+    kind: soak
+    factors: [combined]
+    runs: 1
+    window_seconds: 900
+  churn_3000:
+    kind: soak
+    factors: [combined]
+    runs: 1
+    window_seconds: 900
+  soak_12h:
+    # Step 6: the overnight soak, run last, for the daily token cost and memory growth.
+    kind: soak
+    factors: [combined]
+    runs: 1
+    window_seconds: 43200
+  first_run_s:
+    # Step 8, the red test: the same fleet with every sizable container at its request (agent 1 CPU
+    # and 2 GiB, credential proxy 0.5 CPU and 1 GiB, event watcher 0.15 CPU and 384 MiB), set on the
+    # PlatformAgent before the run; the sandbox shell keeps its fixed size. Restore the L size after.
+    kind: reset_soak
+    factors: [combined]
+    runs: 1
+    window_seconds: 7200
+  upgrade_report_s:
+    kind: prompt
+    factors: [combined]
+    runs: 1
+    timeout_seconds: 3600
+    prompt: Prepare an upgrade readiness report for my whole fleet. Which clusters are behind, what blocks their upgrade, and in what order should they be upgraded?
   fleet_health:
     kind: prompt
     factors: [combined]
