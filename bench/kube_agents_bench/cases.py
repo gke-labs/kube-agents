@@ -124,9 +124,10 @@ TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TY
 # Entries the harness writes on the trajectory itself (``stop_hook.py``,
 # ``pushed_report.py``), not calls read off the door's trace, so a lossy
 # trace says nothing about them: a ``tool_called`` leaf naming only these is
-# graded on every record.
+# graded on every record, a ``result`` pattern included, since the harness
+# writes the result too.
 HARNESS_WRITTEN_ENTRIES = frozenset(
-    {stop_hook.STOP_ENTRY, stop_hook.CARDS_STOPPED_ENTRY, pushed_report.PLANT_ENTRY}
+    {stop_hook.STOP_ENTRY, stop_hook.CARDS_STOPPED_ENTRY, stop_hook.STOP_REPLY_ENTRY, pushed_report.PLANT_ENTRY}
 )
 _TOOL_CALLED_NAMES_KEY = "tool_names"
 # ``tool_called``'s scope key and the one scope the door's trace serves
@@ -217,7 +218,8 @@ class CaseSpec:
     """The entries in ``transport_blind_checks`` with any leaf that reads the
     delegated workers -- ``worker_commands``, ``worker_agents``,
     ``worker_budget``, or a ``tool_called`` in the ``workers`` or ``all`` scope -- or any
-    ``tool_called`` with a ``result`` pattern. Blind on every inject record,
+    ``tool_called`` with a ``result`` pattern, bar one over harness-written
+    entries only (:data:`HARNESS_WRITTEN_ENTRIES`). Blind on every inject record,
     trace or none: the trace carries no results, so no card id can be read
     from it and no result pattern can match. The delegation wait reads the
     workers from the pod when the turn ran under the bridge's api executor;
@@ -251,11 +253,10 @@ def _leaves(node: Any) -> list[dict[str, Any]]:
 
 def _harness_written(leaf: dict[str, Any]) -> bool:
     """Whether a leaf is a ``tool_called`` over harness-written entries
-    only, which no transport blinds."""
+    only, which no transport blinds, whatever its ``result`` pattern."""
     names = leaf.get(_TOOL_CALLED_NAMES_KEY) or []
     return (
         str(leaf.get("type") or "") in TRACE_GRADABLE_CHECK_TYPES
-        and leaf.get(_TOOL_CALLED_RESULT_KEY) is None
         and bool(names)
         and set(names) <= HARNESS_WRITTEN_ENTRIES
     )

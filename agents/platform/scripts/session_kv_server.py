@@ -8559,6 +8559,78 @@ CARD_STOP_SQL_CHUNK = 500
 # Test hook, `None` in production: the state.db to read.
 CARD_STOP_STATE_DB_PATH: Optional[str] = None
 PROC_ROOT = "/proc"
+# The pull requests the conversation's cards opened, as the platform profile's
+# `pr_opened` plugin records them (agents/platform/plugins/pr_opened): a
+# `pr_opened` event on the card, written only once the forge has confirmed
+# the pull request is open, new, on a repository this install manages and
+# authored by the agent's own account. The answer carries them as `writes`, so
+# a stop can name a pull request that landed before it; at most
+# CARD_STOP_MAX_WRITES, and only a url the gateway can link safely.
+CARD_STOP_PR_OPENED_KIND = "pr_opened"
+CARD_STOP_MAX_WRITES = 20
+CARD_WRITE_KIND_PULL_REQUEST = "pull_request"
+CARD_WRITE_VERB_OPENED = "opened"
+CARD_WRITES_ASK_WINDOW_S = 900.0
+# A pull request (`/pull/<n>`) or GitLab merge request (`/-/merge_requests/<n>`)
+# url with nothing a chat surface could read as markup in it.
+CARD_WRITE_PR_URL_RE = re.compile(
+    r"\Ahttps://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/[A-Za-z0-9._~/-]{1,300}?/(?:pull|-/merge_requests)/([0-9]{1,9})\Z"
+)
+
+
+def _latest_ask(settled: Dict[str, Any], seen: Dict[str, Dict[str, Any]], unfinished: Sequence[str]) -> list:
+    """The finished cards whose writes the stop names: those of the latest ask
+    (CARD_WRITES_ASK_WINDOW_S). A card no collection described is left out."""
+    created = {i: card["created_at"] for i, card in seen.items()}
+    roots = [created[i] for i, card in seen.items() if card["via"] != "child"]
+    if not roots:
+        return []
+    since = max(roots) - CARD_WRITES_ASK_WINDOW_S
+    still_open = [created[i] for i in unfinished if i in created]
+    if still_open:
+        since = min(since, min(still_open))
+    return [i for i in settled if i in created and created[i] >= since]
+
+
+def _card_writes(board: str, card_ids: Sequence[str]) -> list:
+    """The pull requests the cards opened, oldest first, one per url, at most
+    CARD_STOP_MAX_WRITES, from their `pr_opened` events. A malformed event is
+    skipped; a board that cannot be read answers none with a warning, since a
+    stop never fails over what it can only add to its answer."""
+    ids = list(dict.fromkeys(card_ids))
+    if not ids:
+        return []
+    try:
+        with closing(_read_only(board)) as conn:
+            rows = _ids_where_in(
+                conn,
+                "SELECT task_id, payload, created_at FROM task_events WHERE kind = ? AND task_id IN ({marks})",
+                ids,
+                (CARD_STOP_PR_OPENED_KIND,),
+            )
+    except sqlite3.Error as exc:
+        logger.warning("card stop: the pull requests the cards opened could not be read: %s", exc)
+        return []
+    by_url: Dict[str, Dict[str, Any]] = {}
+    # Oldest first, so a pull request two cards name is the first one's.
+    for task_id, payload, created in sorted(rows, key=lambda r: (r[2] or 0, r[0])):
+        try:
+            data = json.loads(payload) if isinstance(payload, str) else payload
+        except ValueError:
+            continue
+        url = data.get("url") if isinstance(data, dict) else None
+        parsed = CARD_WRITE_PR_URL_RE.match(url) if isinstance(url, str) else None
+        if parsed is None or url in by_url:
+            continue
+        by_url[url] = {
+            "kind": CARD_WRITE_KIND_PULL_REQUEST,
+            "verb": CARD_WRITE_VERB_OPENED,
+            "url": url,
+            "number": int(parsed.group(1)),
+            "card": task_id,
+            "at": created or 0,
+        }
+    return sorted(by_url.values(), key=lambda w: (w["at"], w["url"]))[:CARD_STOP_MAX_WRITES]
 
 
 def _card_stop_sleep(seconds: float) -> None:
@@ -9097,8 +9169,8 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     at the deadline, `unresolved` for a card archived mid-claim whose worker
     pid never appeared (a worker may still spawn for it), `errors` for a board
     error after the first pass, how many re-scans ran, `truncated` when the set
-    was larger than one pass, and `deadline` when the budget ran out. Answers
-    within CARD_STOP_WORST_CASE_S. Calling it again stops nothing new, since
+    was larger than one pass, `deadline` when the budget ran out, and
+    `writes`, the pull requests those cards opened (`_card_writes`). Answers within CARD_STOP_WORST_CASE_S. Calling it again stops nothing new, since
     an archived card is not open.
     """
     context_id = str(request_data.get("context_id") or "").strip()
@@ -9125,6 +9197,7 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
         "rounds": 0,
         "truncated": False,
         "deadline": False,
+        "writes": [],
     }
     board = _kanban_db_path()
     if not os.path.isfile(board):
@@ -9141,6 +9214,7 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     pending: Dict[str, Dict[str, Any]] = {}
     attempts: Dict[str, int] = {}  # archives that raised, per card; each is retried once
     watch: Dict[str, str] = {}  # archived mid-claim with no worker pid yet: id -> title
+    seen: Dict[str, Dict[str, Any]] = {}  # every card a collection found: id -> its row
     # Every archive runs here, and the route never waits on this pool past the
     # deadline; `shutdown(wait=False)` below leaves a straggler to finish.
     pool = ThreadPoolExecutor(max_workers=CARD_STOP_PARALLEL)
@@ -9169,6 +9243,7 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     def stop(tree: _CardTree) -> bool:
         """Archive the tree's open cards in phases 1 and 2. True when any of them
         had not failed before, which is what earns another re-scan."""
+        seen.update(tree.cards)
         for task_id, card in tree.cards.items():
             if card["status"] == "done":
                 record(task_id, "settled", {"id": task_id, "title": card["title"], "status": "done"}, card)
@@ -9298,6 +9373,8 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     result["pending"] = list(pending.values())
     result["unresolved"] = [{"id": task_id, "title": title} for task_id, title in watch.items()]
     result["deadline"] = budget.hit
+    unfinished = [*stopped, *failed, *pending, *watch]
+    result["writes"] = _card_writes(board, [*unfinished, *_latest_ask(settled, seen, unfinished)])
     logger.info(
         "card stop for %s: stopped %d, settled %d, failed %d, pending %d, unresolved %d, %d re-scans%s%s",
         session_id,

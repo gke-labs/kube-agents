@@ -462,7 +462,10 @@ func SteerNoticeOf(parts []Part) (SteerNotice, bool) {
 // be open; deadline that the stop ran out of time. listsCut says only that
 // the executor cut stopped, settled or notStopped to fit the part, each at
 // CardStopListMax, so the list that was cut is one at that length: the
-// cards themselves are as the counts say. A stop that found nothing open answers empty lists.
+// cards themselves are as the counts say. writes, absent when empty or from
+// an older executor, names the pull requests the conversation's cards had
+// opened before the stop, at most CardStopWritesMax: a record of what was
+// seen, so no writes never means nothing changed. A stop that found nothing open answers empty lists.
 // A stop that failed answers no part: its terminal is failed, and the
 // reason says why.
 type CardStop struct {
@@ -490,7 +493,30 @@ type CardStopResult struct {
 	// order, cut at CardStopListMax (ListsCut covers it too). Absent from an
 	// older executor's result, which reads as none named.
 	NotStopped []CardStopCard `json:"notStopped,omitempty"`
+	// Writes names the pull requests the conversation's cards had opened,
+	// oldest first (CardStop). Absent from an older executor's result, which
+	// reads as none recorded.
+	Writes []CardStopWrite `json:"writes,omitempty"`
 }
+
+// CardStopWrite is one write a stopped conversation's card made: today
+// always a pull request or GitLab merge request (Kind
+// CardStopWritePullRequest) it opened (Verb CardStopWriteOpened), at URL, as
+// Number.
+type CardStopWrite struct {
+	Kind   string `json:"kind"`
+	Verb   string `json:"verb"`
+	URL    string `json:"url"`
+	Number int    `json:"number"`
+}
+
+// The CardStopWrite vocabulary.
+const (
+	CardStopWritePullRequest = "pull_request"
+	CardStopWriteOpened      = "opened"
+	// CardStopWritesMax is the most writes a result carries.
+	CardStopWritesMax = 20
+)
 
 // CardStopCard is one card a result names. PriorStatus is set on a stopped
 // card only: the status it had before the stop archived it.

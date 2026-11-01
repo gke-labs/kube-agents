@@ -38,9 +38,11 @@ const (
 
 // The Slack Stop's replies, the maintainer's approved wording, one per stop.
 // The approved pull request line ("Stopped. I'd already opened a pull request
-// before you stopped me: #412.") waits for a card-stop result that names the
-// pull requests the stopped cards opened; none does yet.
+// before you stopped me: #412.") is slackStopWritesFormat after any of them.
 const (
+	// slackStopWritesFormat takes the noun ("a pull request", "pull
+	// requests") and the links (cardStopPRLinks).
+	slackStopWritesFormat = "I'd already opened %s before you stopped me: %s."
 	slackStopStoppedReply = "Stopped."
 	// slackStopExceptReplyFormat takes the one card that did not stop.
 	slackStopExceptReplyFormat = "Stopped, except one task that didn't respond: %s."
@@ -123,21 +125,38 @@ func (run CardStopRun) unconfirmedFinal() string {
 // Anything the stop could not promise is the couldn't-stop reply, except
 // exactly one card that did not stop beside work that did, which is named.
 // Titles are cleaned as the card stop's are (cardStopTitle), so a title can
-// mention no one and link nowhere.
+// mention no one and link nowhere. Whatever the line, a pull request the
+// thread's cards had opened is named after it (slackStopWritesLine).
 func slackStopReply(r *lib.CardStopResult, turnCancelled, newerTurnRunning bool) string {
 	unpromised := r.Failed + r.Pending + r.Unresolved
 	stoppedSome := turnCancelled || len(r.Stopped) > 0
+	reply := slackStopStoppedReply
 	switch {
 	case unpromised == 1 && len(r.NotStopped) == 1 && stoppedSome && !r.Deadline && !r.Truncated:
-		return fmt.Sprintf(slackStopExceptReplyFormat, cardStopTitle(r.NotStopped[0].Title))
+		reply = fmt.Sprintf(slackStopExceptReplyFormat, cardStopTitle(r.NotStopped[0].Title))
 	case unpromised > 0 || r.Deadline || r.Truncated:
-		return slackStopCouldntReply
+		reply = slackStopCouldntReply
 	case !stoppedSome && newerTurnRunning:
-		return slackStopNewerTurnReply
+		reply = slackStopNewerTurnReply
 	case !stoppedSome:
-		return slackStopNothingReply
+		reply = slackStopNothingReply
 	}
-	return slackStopStoppedReply
+	if line := slackStopWritesLine(r); line != "" {
+		reply += " " + line
+	}
+	return reply
+}
+
+// slackStopWritesLine is the sentence that names the pull requests the
+// thread's cards had opened before the stop, or "" for none: "I'd already
+// opened a pull request before you stopped me: #412." (the maintainer's
+// approved line).
+func slackStopWritesLine(r *lib.CardStopResult) string {
+	opened := cardStopWrites(r)
+	if len(opened) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(slackStopWritesFormat, cardStopPRNoun(opened), cardStopPRLinks(opened))
 }
 
 // slackPresser is one cached workspace answer for a Stop presser.
