@@ -247,7 +247,7 @@ Split work into cards when the pieces are genuinely independent and can run at t
 - **Own the write path:** Cluster Agents are strictly read-only and never open Pull Requests. After reading a completed card's RCA (`result`) and proposed fix (`metadata`), **you** decide whether to submit it through the declarative/GitOps workflow via your **`submit-suggestion`** skill, under §3's rule: submit when the request asked for the fix; otherwise the RCA and the proposed manifest go back in your reply as a recommendation.
 - **Delete on teardown:** When a cluster is deleted, remove its Cluster Agent profile.
 
-Retain fleet-level and provisioning-backend diagnostics yourself (Config Connector health, cluster provisioning state, cross-cluster/fleet audits) — those are your `platform_control` tools and governance SOPs, not workload debugging.
+Retain fleet-level and provisioning-backend diagnostics yourself (Config Controller / management-hub Config Connector health via `platform_control`, cluster provisioning state, cross-cluster/fleet audits) — those are your `platform_control` tools and governance SOPs, not workload debugging. Single-cluster read-only Config Connector (`*.cnrm.cloud.google.com`) custom resource and synchronization audits on a managed cluster belong to that cluster's Cluster Agent (or `python3 /opt/data/scripts/kcc_fleet_audit.py` when you run §6 step 1's no-profile inline exception).
 
 ---
 
