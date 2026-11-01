@@ -14,6 +14,20 @@
 #
 # Sourced, not executed: this file defines functions and runs nothing.
 
+# A failed uninstall.sh is run again after a wait before either caller reads
+# its status. Every teardown failure on record has been a Google API answering
+# 5xx for seconds to minutes: a credentials 503 while lifecycle.sh read the
+# state, a GKE API server 503 during the Helm uninstall, a cluster delete that
+# GKE reported failed. uninstall.sh is safe to run again, because lifecycle.sh
+# destroy resumes a destroy that stopped partway. Exit 0 and 3 return at once.
+# Both knobs are environment overrides so a test runs with no wait; the job
+# timeouts in deploy-environment.yml and teardown-environment.yml hold the
+# extra attempt.
+readonly TEARDOWN_DEFAULT_ATTEMPTS=2
+readonly TEARDOWN_DEFAULT_RETRY_WAIT_SECONDS=60
+# uninstall.sh's EXIT_NOTHING_TO_TEAR_DOWN: no state, so nothing to retry.
+readonly TEARDOWN_EXIT_NOTHING_TO_TEAR_DOWN=3
+
 # TEARDOWN_STRICT is the name, and both `rc` and `nightly` define it, so that is
 # what deploy-environment.yml forwards and what CI reads. RC_TEARDOWN_STRICT is
 # the pre-rename spelling, read as a fallback and losing to the new name where
@@ -72,6 +86,25 @@ canonical_bool() {
 }
 
 
+# Refuses, with a GitHub Actions error, any named variable that is not a plain
+# decimal: a word makes a `[ -ge ]` comparison exit 2, which an if reads as
+# false; a value past six digits is "not an integer" to `[`; and a leading
+# zero is octal to shell arithmetic (09 is an error, 0600 reads as 384), which
+# provision_environment.sh's stockout loop does on its knobs. The teardown
+# knobs only reach `[` and `sleep`, which read a leading zero as decimal, and
+# are held to the same shape so every knob of the pipeline reads one way.
+teardown_require_plain_decimal() {
+  local knob
+  for knob in "$@"; do
+    case "${!knob}" in
+      "" | *[!0-9]* | 0?* | ???????*)
+        echo "::error title=${knob} is not a plain decimal::${knob}='${!knob}' must be a whole number of at most six digits with no leading zero." >&2
+        exit 1
+        ;;
+    esac
+  done
+}
+
 # Expands the three coordinates into TEARDOWN_TARGET so that a `set -u`
 # abort on a missing one happens at the top of a script, before it has created
 # a temp file or reached GCP.
@@ -83,10 +116,25 @@ canonical_bool() {
 teardown_require_inputs() {
   # shellcheck disable=SC2034  # read by the sourcing script, not by this file
   TEARDOWN_TARGET="${GCP_PROJECT_ID}/${GKE_CLUSTER_NAME} (${GCP_REGION})"
+
+  # The retry knobs, checked here for the same reason: before anything is
+  # destroyed. A count of 0 is refused because the loop below runs
+  # uninstall.sh once whatever the count says, and a setting that reads as
+  # "never" while the script runs anyway would lie.
+  TEARDOWN_ATTEMPTS="${TEARDOWN_ATTEMPTS:-$TEARDOWN_DEFAULT_ATTEMPTS}"
+  TEARDOWN_RETRY_WAIT_SECONDS="${TEARDOWN_RETRY_WAIT_SECONDS:-$TEARDOWN_DEFAULT_RETRY_WAIT_SECONDS}"
+  teardown_require_plain_decimal TEARDOWN_ATTEMPTS TEARDOWN_RETRY_WAIT_SECONDS
+  if [ "${TEARDOWN_ATTEMPTS}" -lt 1 ]; then
+    echo "::error title=TEARDOWN_ATTEMPTS is not at least 1::TEARDOWN_ATTEMPTS='${TEARDOWN_ATTEMPTS}' is refused; the first run of uninstall.sh always happens." >&2
+    exit 1
+  fi
 }
 
 # Runs uninstall.sh against the resolved coordinates, teeing its output to $1, and
-# returns uninstall.sh's own status.
+# returns uninstall.sh's own status. A failure is run again, up to
+# TEARDOWN_ATTEMPTS runs in all with TEARDOWN_RETRY_WAIT_SECONDS between them
+# (see the top of this file); $1 then holds every run's output, each after the
+# first behind a marker line.
 #
 # Call it as `teardown_run "$log" || status=$?`. The arguments are expanded
 # in this function body rather than inside the pipeline because a function runs
@@ -106,16 +154,35 @@ teardown_run() {
     args+=(--agent-namespace="${NAMESPACE}")
   fi
 
-  local status
-  # errexit is lifted around the pipeline rather than the shorter `|| true`:
-  # `||` runs `true` on failure and PIPESTATUS then describes `true` instead of
-  # uninstall.sh. tee always succeeds, so a bare `$?` would report every
-  # teardown as clean.
-  set +e
-  ./uninstall.sh "${args[@]}" 2>&1 | tee "${log_file}"
-  status="${PIPESTATUS[0]}"
-  set -e
-  return "$status"
+  local status attempt=1
+  while :; do
+    # errexit is lifted around the pipeline rather than the shorter `|| true`:
+    # `||` runs `true` on failure and PIPESTATUS then describes `true` instead
+    # of uninstall.sh. tee always succeeds, so a bare `$?` would report every
+    # teardown as clean.
+    # The first run truncates the log and a later one appends behind a
+    # marker line, so the log holds every run and a first run that ended
+    # without a newline does not join the second. The job summary renders
+    # the log's last 40 lines, so after two long failures it shows the
+    # second run's tail; the first run's exit status is in the warning
+    # annotation below, and its output in the job log.
+    set +e
+    if [ "$attempt" -eq 1 ]; then
+      ./uninstall.sh "${args[@]}" 2>&1 | tee "${log_file}"
+    else
+      printf '\n--- uninstall.sh run %s of %s ---\n' "$attempt" "${TEARDOWN_ATTEMPTS}" | tee -a "${log_file}"
+      ./uninstall.sh "${args[@]}" 2>&1 | tee -a "${log_file}"
+    fi
+    status="${PIPESTATUS[0]}"
+    set -e
+    if [ "$status" -eq 0 ] || [ "$status" -eq "$TEARDOWN_EXIT_NOTHING_TO_TEAR_DOWN" ] ||
+      [ "$attempt" -ge "${TEARDOWN_ATTEMPTS}" ]; then
+      return "$status"
+    fi
+    attempt=$((attempt + 1))
+    echo "::warning title=Environment teardown failed; running it again::uninstall.sh exited ${status}; waiting ${TEARDOWN_RETRY_WAIT_SECONDS}s, then running it again (attempt ${attempt} of ${TEARDOWN_ATTEMPTS})." >&2
+    sleep "${TEARDOWN_RETRY_WAIT_SECONDS}"
+  done
 }
 
 # Surfaces a failed teardown on the run's annotations and in the job summary,
