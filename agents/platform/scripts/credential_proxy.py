@@ -3531,10 +3531,15 @@ AGENT_API_SESSION_HEADERS = ("X-Hermes-Session-Id", "X-Hermes-Session-Key")
 # Session ids the A2A bridge owns start with this (`a2a-<contextId>`). A request
 # naming one is refused on the prefix alone; a child of one is found in state.db.
 AGENT_API_BRIDGE_SESSION_PREFIX = "a2a-"
-# How long one read-only state.db open waits on a writer's lock before the
-# lookup skips that file. Hermes holds short write transactions; two seconds
-# outlasts them without stalling a request behind a stuck one.
+# How long one statement against a state.db waits on a writer's lock before it
+# fails. The first such failure ends that file's visit, so a request pays this
+# at most once per locked file, not once per candidate id. Hermes holds short
+# write transactions; two seconds outlasts them without stalling a request
+# behind a stuck one.
 AGENT_API_STATE_DB_BUSY_TIMEOUT_SECONDS = 2.0
+# How many parent links the child walk follows before it stops. A chain this
+# long is a cycle the `seen` set missed or a corrupt file, not a real lineage.
+AGENT_API_SESSION_PARENT_WALK_LIMIT = 256
 
 
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
@@ -3788,6 +3793,12 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         and nothing stays open when this returns. Holding all of them for the
         request's lifetime ran the broker out of file descriptors at a few
         hundred profiles, because the upstream turn can stream for minutes.
+
+        A file that cannot be read (locked past the busy timeout, no sessions
+        table, not a database) is skipped on its first error rather than once
+        per id, so a stuck writer costs a request one timeout per such file.
+        Skipping is the answer an unopenable file has always had here; whether
+        it should refuse instead is the door owner's call, not this function's.
         """
         if not session_ids:
             return False
@@ -3796,8 +3807,11 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             if conn is None:
                 continue
             with contextlib.closing(conn):
-                if any(cls._descends_from_bridge_session(conn, sid) for sid in session_ids):
-                    return True
+                try:
+                    if any(cls._descends_from_bridge_session(conn, sid) for sid in session_ids):
+                        return True
+                except Exception as exc:
+                    LOGGER.debug("could not inspect %s for bridge sessions: %s", db_path, exc)
         return False
 
     @classmethod
@@ -3828,23 +3842,25 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _descends_from_bridge_session(conn: sqlite3.Connection, sid: str) -> bool:
+        """Walk `sid`'s parent chain in one state.db; True when it reaches an `a2a-*` session.
+
+        A database error propagates: it is the file's condition, not this id's,
+        and _names_bridge_session_child answers it once for the file.
+        """
         cur = sid
         seen = {cur}
-        try:
-            for _ in range(256):
-                row = conn.execute(
-                    "SELECT parent_session_id FROM sessions WHERE id = ?",
-                    (cur,),
-                ).fetchone()
-                parent = str(row[0] or "").strip() if row else ""
-                if not parent or parent in seen:
-                    return False
-                if parent.lower().startswith("a2a-"):
-                    return True
-                seen.add(parent)
-                cur = parent
-        except Exception as exc:
-            LOGGER.debug("could not inspect a state.db for session %s: %s", sid, exc)
+        for _ in range(AGENT_API_SESSION_PARENT_WALK_LIMIT):
+            row = conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = ?",
+                (cur,),
+            ).fetchone()
+            parent = str(row[0] or "").strip() if row else ""
+            if not parent or parent in seen:
+                return False
+            if parent.lower().startswith(AGENT_API_BRIDGE_SESSION_PREFIX):
+                return True
+            seen.add(parent)
+            cur = parent
         return False
 
     @staticmethod
