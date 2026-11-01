@@ -327,6 +327,22 @@ but not the compliance (06:20) and obtainability (06:50) audits, which ran durin
 Step 7; their durations are in the first-run timeline. The red test at the S size follows the
 Step 7 re-run.
 
+## Stress beyond fair use (pending)
+
+This stage goes past the fair-use limit of the plan, to find what breaks first at the L size. It
+runs after the soak and before the Step 7 re-run.
+
+| Run                        | Plan                            | Load                                                                            |
+| -------------------------- | ------------------------------- | ------------------------------------------------------------------------------- |
+| `stress_questions` level 1 | `real-install-stress.yaml`      | 5 questions at once, harness wait 90 minutes                                    |
+| `stress_questions` level 2 | `real-install-stress.yaml`      | 8 questions at once, harness wait 90 minutes                                    |
+| `storm_100`                | `real-install-stress-load.yaml` | 100 failing Pods for 30 minutes                                                 |
+| `proxy_burst`              | `real-install-stress-load.yaml` | 32 workers sending brokered commands for 5 minutes, during the 100 failing Pods |
+
+Expected: the containers stay inside their L limits. The answers at 5 and 8 at once take longer in
+proportion and finish within 90 minutes. The session quota holds the event storm. The burst raises
+the credential proxy's CPU toward its 8-core limit and brokered-command waits past 15 s.
+
 ## Cost
 
 Prices are on-demand list prices for `us-central1`. Token prices are from LiteLLM's model cost
