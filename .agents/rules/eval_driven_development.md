@@ -140,6 +140,31 @@ where it is. That seat is the admission, earned on the case's record
 [`bench/baselines/README.md`](../../bench/baselines/README.md)); never add a new case to
 the roster in the pull request that makes it pass.
 
+## Check the world, not the words
+
+When a case asks the agent to act or to hold back, its check reads the state the run left (the
+cluster, the repository), because the agent's report only says what it claims happened. Which check
+fits which question is in
+[`bench-case-format.md`](../../docs/designs/bench-case-format.md#exact-check-or-judged-score), and
+[the check types](../../docs/designs/bench-case-format.md#the-check-types) say which read the
+world.
+
+Two ways a check ends up grading the report:
+
+- A safeguard keyed on a tool name waits for a call no tool may ever make: under another name, or
+  through a worker the check cannot see, the write happens and the check never fails. Reading the
+  cluster after the run (`op: absent` on the object the agent must not create) catches the write
+  whichever tool made it.
+- A check satisfied by the agent saying it opened a pull request. One night the reply linked
+  `kube-agentss`, a URL that went nowhere, and the objective that asked for the proposal still
+  passed on the text alone (#3048); that case now requires the linked pull request to resolve
+  (#3053).
+
+Before trusting a green, ask whether the check could fail at all: if the agent did the opposite of
+what the case asks — nothing, where it should have acted; the write, where it should have held
+back — and wrote a confident report, would the case still pass? If so, the check is grading the
+report.
+
 ## When the fix is not yours
 
 The loop above is for a change you are making. A gap you found but will not fix — another
