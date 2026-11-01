@@ -798,7 +798,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
     result = run(
         [
             "gcloud", "container", "clusters", "list", "--project", project,
-            "--format", "json(name,location,locations,status,currentMasterVersion,autopilot.enabled,autoscaling.enableNodeAutoprovisioning,autoscaling.autoprovisioningLocations)",
+            "--format", "json(name,location,locations,status,currentMasterVersion,autopilot.enabled,autoscaling.enableNodeAutoprovisioning,autoscaling.autoprovisioningLocations,addonsConfig.configConnectorConfig.enabled)",
         ]
     )
     if result.rc != 0:
@@ -834,6 +834,8 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
             # The zones auto-created node pools land in -- see `cluster_zone_span`.
             "locations": c.get("locations") or [],
             "autoprovisioning_locations": (c.get("autoscaling") or {}).get("autoprovisioningLocations") or [],
+            # Read first by the Config Connector read after the sweep.
+            kcc_health.ADDON_FIELD: kcc_health.addon_enabled(c),
         }
         for c in clusters
         if c.get("status") in AUDITABLE_STATUSES
@@ -2363,6 +2365,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         "commands": [{"check": slug, **record} for slug, record in commands.items()],
         "candidates": candidates,
     }
+    if cluster.get(kcc_health.ADDON_FIELD):
+        # Read first by the Config Connector read after the sweep.
+        entry[kcc_health.ADDON_FIELD] = True
     if not_applicable:
         entry["checks_not_applicable"] = not_applicable
     if unevaluated:

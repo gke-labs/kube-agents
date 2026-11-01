@@ -2191,6 +2191,9 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
             # reason `_master_version` is: the fact is fleet-wide and this
             # worker only ever sees one project.
             "_notification_topic": notification_topic(c),
+            # GKE's status, kept for the Config Connector read after the sweep
+            # (`_status` above is removed before the manifest prints).
+            kcc_health.CLUSTER_STATUS_FIELD: c.get("status") or "",
         }
         if kcc_health.addon_enabled(c):
             # Read first by the Config Connector read after the sweep.

@@ -1399,6 +1399,16 @@ class CollectFleetTest(unittest.TestCase):
 
         return run
 
+    def test_a_collected_entry_keeps_the_cluster_status_for_the_config_connector_read(self):
+        """`_status` is removed before the manifest prints; the Config
+        Connector read still needs the status to skip a cluster that is not
+        running."""
+        run = self.discovering(clusters={"base": run_of(0, json.dumps([cluster(name="base-c", status="RECONCILING")]))})
+        manifest = pr.collect_fleet(run=run, now=NOW, max_workers=1)
+        [entry] = [e for e in manifest["clusters"] if e["outcome"] == "collected"]
+        self.assertEqual(entry[pr.kcc_health.CLUSTER_STATUS_FIELD], "RECONCILING")
+        self.assertNotIn("_status", entry)
+
     def test_a_project_with_the_api_disabled_reads_as_empty(self):
         """A project whose Kubernetes Engine API is off cannot hold a cluster;
         treating its failed listing as a lost project makes every non-GKE

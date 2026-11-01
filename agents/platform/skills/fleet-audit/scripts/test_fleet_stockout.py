@@ -180,6 +180,23 @@ class EnumerateClustersTest(unittest.TestCase):
         self.assertEqual([c["name"] for c in clusters], ["ka-today"])
         self.assertEqual(not_running, [])
 
+    def test_a_cluster_with_the_config_connector_add_on_is_marked_and_read_first(self):
+        """Stockout has the least time left of the three, so its add-on
+        clusters are read first, as drift and patch readiness mark theirs."""
+        listing = [
+            {"name": "hub", "location": "us-central1", "status": "RUNNING", "addonsConfig": {"configConnectorConfig": {"enabled": True}}},
+            {"name": "edge", "location": "us-central1", "status": "RUNNING"},
+        ]
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            return run_of(0, json.dumps(listing))
+
+        clusters, _ = fs.enumerate_clusters("acme", run=run)
+        self.assertIn("addonsConfig.configConnectorConfig.enabled", issued[0][-1])
+        self.assertEqual({c["name"]: c.get(fs.kcc_health.ADDON_FIELD) for c in clusters}, {"hub": True, "edge": False})
+
     def test_reads_the_control_plane_version(self):
         clusters_json = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "currentMasterVersion": "1.35.3-gke.1200"}])
         issued = []
@@ -1631,6 +1648,12 @@ class CollectClusterTest(unittest.TestCase):
         entry = self.run_with(dump_items=[cc])
         self.assertEqual(entry["outcome"], "collected")
         self.assertEqual(entry["candidates"], [])
+
+    def test_a_collected_add_on_cluster_carries_the_marker(self):
+        entry = self.run_with(cluster={**self.CLUSTER, fs.kcc_health.ADDON_FIELD: True})
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertIs(entry[fs.kcc_health.ADDON_FIELD], True)
+        self.assertNotIn(fs.kcc_health.ADDON_FIELD, self.run_with())
 
     def test_get_credentials_failure_is_unreachable(self):
         def run(argv, **kwargs):
