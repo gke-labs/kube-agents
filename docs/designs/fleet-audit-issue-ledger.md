@@ -826,9 +826,12 @@ instance in `config-control`), or the file sets no namespace and more than one o
 other cases are by project. The collector records the project each object manages as `project`: the
 object's `cnrm.cloud.google.com/project-id` annotation, else that annotation on its namespace, else
 the namespace's name, as Config Connector decides it. A
-known `project` must equal the file object's project annotation, or the finding's project when the
-file has none, also with one host, because one management cluster can hold an object of the same
-name for each project.
+known `project` must equal the project the file gives (the object's annotation, else the annotation
+of its Namespace when the file declares that Namespace), also with one host, because one management
+cluster can hold an object of the same name for each project. When the file gives none, a `Cluster/`
+or `NodePool/` finding uses its own project, because it is about the managed cluster; a finding of
+another Config Connector kind is on the cluster that runs Config Connector, so its project stays
+unknown.
 
 A ready object is not in the list, so with more than one possible host the same name can be ready
 on one host and not ready on another. Then the `project` must also be known. A possible host is an

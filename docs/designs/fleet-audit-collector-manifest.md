@@ -142,21 +142,23 @@ their notes can name. A discovery that serves no wanted kind means no Config Con
 that collector. A failed discovery, or a kind that does not list, makes the entry `kcc_unread`,
 unless the kind's CustomResourceDefinition went away after the discovery.
 
-The compliance collector always writes the keys, from the read its own `kcc-object-wedged` check
-makes ([`compliance_audit_sop.md`](../../agents/platform/governance/compliance_audit_sop.md) §2.12),
-and takes the namespace annotations from its NetworkPolicy read. The drift, patch readiness and
-stockout collectors, whose fixes can edit a `ContainerCluster` or `ContainerNodePool` declaration,
-read each collected cluster once after their sweep, in a new worker pool of the sweep's size, but
-only with `--config-connector`: the SOP command passes it whenever the audit runs by its SOP,
-scheduled or on demand, and a chat fleet question, which runs the same collectors with no `finish`,
-does not. The drift and patch readiness collectors mark a
-cluster whose `clusters list` record shows the Config Connector add-on enabled with
-`config_connector_addon`, and those clusters are read first. Drift and patch readiness fetch
-credentials for the read; stockout uses the kubeconfig its sweep fetched. When an unready object has
-no project annotation, one `kubectl get namespaces` on that cluster gives the namespace annotations;
-when it fails, the project stays unknown. These reads end `kcc_health.RUN_DEADLINE_S` (540 s) after
-the collector starts, so the manifest prints inside the 600 s terminal call; an entry whose read
-cannot start in time gets `kcc_unread`.
+The compliance collector writes the keys on each cluster it reads that serves a Config Connector
+kind, from the read its own `kcc-object-wedged` check makes
+([`compliance_audit_sop.md`](../../agents/platform/governance/compliance_audit_sop.md) §2.12), and
+takes the namespace annotations from its NetworkPolicy read. Its `kcc-object-wedged` record names
+`kubectl get gcp -A -o json`, a command a reader can run that returns the same objects, and carries
+no `output_sha256`, because no single command produced the parallel read's output. The drift, patch
+readiness and stockout collectors, whose fixes can edit a `ContainerCluster` or `ContainerNodePool`
+declaration, read each collected cluster once after their sweep, in a new worker pool of the sweep's
+size, but only with `--config-connector`: the SOP command passes it whenever the audit runs by its
+SOP, scheduled or on demand, and a chat fleet question, which runs the same collectors with no
+`finish`, does not. All three mark a cluster whose `clusters list` record shows the Config Connector
+add-on enabled with `config_connector_addon`, and those clusters are read first. Drift and patch
+readiness fetch credentials for the read; stockout uses the kubeconfig its sweep fetched. When an
+unready object has no project annotation, one `kubectl get namespaces` on that cluster gives the
+namespace annotations; when it fails, the project stays unknown. These reads end
+`kcc_health.RUN_DEADLINE_S` (540 s) after the collector starts, so the manifest prints inside the
+600 s terminal call; an entry whose read cannot start in time gets `kcc_unread`.
 
 Some entries are not read and get neither key: an entry with no project or no location, a
 `project/<id>` entry at location `global`, and an entry whose `cluster_status` is not `RUNNING` or
