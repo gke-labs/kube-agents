@@ -132,16 +132,24 @@ func TestShellSandboxOverrideLeavesTheInitContainerAlone(t *testing.T) {
 }
 
 // TestShellSandboxOverrideDoesNotAliasTheCR: the resolver deep-copies, so a
-// later writer of the rendered list cannot mutate the CR's quantities.
+// later writer of the rendered list cannot mutate the CR's quantities. The
+// override's limit is held in decimal form: a Quantity parsed to int64 is
+// copied whole by a map read, so Add on the copy could never reach the CR
+// and the test would pass without the DeepCopy; in decimal form the value
+// sits behind a pointer a struct copy shares and only DeepCopy separates.
 func TestShellSandboxOverrideDoesNotAliasTheCR(t *testing.T) {
-	override := &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")}}
+	decimalLimit := resource.MustParse("4Gi")
+	decimalLimit.ToDec()
+	override := &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: decimalLimit}}
 	resolved := resolveShellSandboxResources(sandboxAgentWithResources(override))
 	m := resolved.Limits[corev1.ResourceMemory]
 	m.Add(resource.MustParse("1Gi"))
 	resolved.Limits[corev1.ResourceMemory] = m
 	crLimit := override.Limits[corev1.ResourceMemory]
 	if crLimit.Cmp(resource.MustParse("4Gi")) != 0 {
-		t.Errorf("the CR's limit changed to %s; the resolver aliased it", crLimit.String())
+		// Value(), not String(): the CR's struct keeps the string it was parsed
+		// from, so after an aliased write it would still print 4Gi.
+		t.Errorf("the CR's limit changed to %d bytes; the resolver aliased it", crLimit.Value())
 	}
 }
 
