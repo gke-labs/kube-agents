@@ -234,6 +234,7 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `busMigration.retries[].failedIn` | `string` | yes |  |  | FailedIn is the phase the retried attempt failed in. |
 | `busMigration.retries[].cause` | `string` | no |  |  | Cause is why the retried attempt failed. |
 | `busMigration.givenUp` | `boolean` | no |  |  | GivenUp is set when a person gave a Failed run up: its freeze is lifted, and streams it did not put back are recreated empty. |
+| `busMigration.cleared` | `[]string` | no |  |  | Cleared lists the provisioned streams the current Clearing phase has deleted, ahead of the conversion or the rollback. A restore starts only once it names every one. |
 | `busMigration.freezeConfirmed` | `boolean` | no |  |  | FreezeConfirmed is set once every callout replica serves the write freeze's identity map, and only then does the bus render without its static application users and restart into the freeze. |
 | `busMigration.warnings` | `[]string` | no |  |  | Warnings are what the restore found and restored anyway: a stream lacking a subject a fresh install has, or a field outside the restore's policy that differs from a fresh install. Together they are reported once, in one Warning Event. At most 4 KiB of them; the last says how many more there were. |
 | `busMigration.observedGeneration` | `integer` | yes |  |  | ObservedGeneration is the PlatformAgent generation that started this migration. A migration that ended without converting is not started again until the spec changes. |

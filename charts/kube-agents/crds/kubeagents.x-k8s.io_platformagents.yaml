@@ -11629,6 +11629,14 @@ spec:
                         it was still running at Deadline. Set at the first failure and kept
                         until a retry, which moves it into Retries.
                       type: string
+                    cleared:
+                      description: |-
+                        Cleared lists the provisioned streams the current Clearing phase has
+                        deleted, ahead of the conversion or the rollback. A restore starts
+                        only once it names every one.
+                      items:
+                        type: string
+                      type: array
                     deadline:
                       description: |-
                         Deadline is the deadline of the stretch the run is on: when an

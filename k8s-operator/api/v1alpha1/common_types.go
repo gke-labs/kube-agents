@@ -2469,6 +2469,12 @@ type BusMigrationStatus struct {
 	// +optional
 	GivenUp bool `json:"givenUp,omitempty"`
 
+	// Cleared lists the provisioned streams the current Clearing phase has
+	// deleted, ahead of the conversion or the rollback. A restore starts
+	// only once it names every one.
+	// +optional
+	Cleared []string `json:"cleared,omitempty"`
+
 	// FreezeConfirmed is set once every callout replica serves the write
 	// freeze's identity map, and only then does the bus render without its
 	// static application users and restart into the freeze.

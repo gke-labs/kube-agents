@@ -59,11 +59,11 @@ another `busReplicas` change while one runs.
 - **One to three**, by copy: writes are frozen (no workload but the migration reaches the bus; console
   and web logins drop, and the gateway and bridge cannot publish), the operator's pods
   snapshot every stream to a one-pod staging volume, a pod with no bus identity digests the
-  snapshots, the bus renders three servers, and the operator's restore pod restores each
+  snapshots, the operator deletes the single server's streams (the snapshot holds them), the bus renders three servers, and the operator's restore pod restores each
   stream, checked against the operator's policy for it before and after, and raises it to
   three replicas.
 - **A failure** turns the run back: before the shrink, the pinned streams go back to three
-  replicas; after the conversion, the bus renders one server again and the same snapshot is
+  replicas; after the conversion, the cluster's partial copies are deleted, the bus renders one server again and the same snapshot is
   restored into it. A failed undo stops for a person, as does a failure with no way back (after the shrink, or in the release), and the condition names the step.
   A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
   it up with an annotation on the PlatformAgent that names the run; an unrelated spec change

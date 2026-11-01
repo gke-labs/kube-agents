@@ -17,6 +17,7 @@ import (
 const (
 	migrationFixturePath        = "testdata/rendered-identity-map-migration.json"
 	migrationRestoreFixturePath = "testdata/rendered-identity-map-migration-restore.json"
+	migrationClearFixturePath   = "testdata/rendered-identity-map-migration-clear.json"
 	renderedMigrationSA         = "system:serviceaccount:kubeagents-system:agent-bus-stream-3-1"
 	renderedMigrationUser       = "migrate-stream-3-1"
 	tokenMigrationSnapshot      = "token-for-the-rendered-migration-stream-serviceaccount-padded"
@@ -81,6 +82,16 @@ func TestTheRenderedStreamIdentityReachesItsPhasesWorkAndNothingNear(t *testing.
 			"$JS.SNAPSHOT.RESTORE.TASKS.abc": true,
 			"$JS.API.STREAM.UPDATE.TASKS":    true,
 			"$JS.API.STREAM.DELETE.TASKS":    true,
+		}},
+		"Clearing": {migrationClearFixturePath, map[string]bool{
+			"$JS.API.STREAM.INFO.TASKS":      false,
+			"$JS.API.STREAM.DELETE.TASKS":    false,
+			"$JS.API.STREAM.DELETE.KV_cap":   false,
+			"$JS.API.STREAM.SNAPSHOT.TASKS":  true,
+			"$JS.SNAPSHOT.ACK.TASKS.abc":     true,
+			"$JS.API.STREAM.RESTORE.TASKS":   true,
+			"$JS.SNAPSHOT.RESTORE.TASKS.abc": true,
+			"$JS.API.STREAM.UPDATE.TASKS":    true,
 		}},
 		"Restoring": {migrationRestoreFixturePath, map[string]bool{
 			"$JS.API.STREAM.INFO.TASKS":      false,

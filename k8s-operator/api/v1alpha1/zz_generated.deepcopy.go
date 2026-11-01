@@ -698,6 +698,11 @@ func (in *BusMigrationStatus) DeepCopyInto(out *BusMigrationStatus) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.Cleared != nil {
+		in, out := &in.Cleared, &out.Cleared
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Warnings != nil {
 		in, out := &in.Warnings, &out.Warnings
 		*out = make([]string, len(*in))

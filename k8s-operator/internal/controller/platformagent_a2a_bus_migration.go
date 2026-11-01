@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -54,6 +55,7 @@ const (
 	busMigrationFreezing          busMigrationPhase = "Freezing"          // grow: only the migration's principals admitted
 	busMigrationSnapshot          busMigrationPhase = "Snapshotting"      // grow: the snapshot pod stages every stream
 	busMigrationHashing           busMigrationPhase = "Hashing"           // grow: the operator's hashing pod digests the stage
+	busMigrationClearing          busMigrationPhase = "Clearing"          // grow: the streams deleted ahead of the conversion, or of the rollback
 	busMigrationConverting        busMigrationPhase = "Converting"        // grow: three servers rendered, waiting for them
 	busMigrationRestoring         busMigrationPhase = "Restoring"         // grow: the restore pod restores and raises to R3
 	busMigrationRollingBack       busMigrationPhase = "RollingBack"       // grow failed after the conversion: one server rendered again
@@ -130,11 +132,29 @@ func nextBusMigrationPhase(leg busMigrationLeg, phase busMigrationPhase, abandon
 				return busMigrationStep{next: map[busMigrationPhase]busMigrationPhase{
 					busMigrationFreezing: busMigrationSnapshot,
 					busMigrationSnapshot: busMigrationHashing,
-					busMigrationHashing:  busMigrationConverting,
+					busMigrationHashing:  busMigrationClearing,
 				}[phase]}
 			}
 			// Nothing has changed yet: lift the freeze, stay one server.
 			return busMigrationStep{next: busMigrationReleasing, abandoning: true}
+		case busMigrationClearing:
+			// Going forward, the single server's streams are deleted (the
+			// snapshot, pinned by the hash, holds them) so it joins the
+			// cluster with nothing on disk or reserved; on the way back the
+			// cluster's partial copies are, so the server left alone holds
+			// no replica of a stream it cannot recover. A failed clear stops
+			// for a person, with everything it needs kept: a retry clears
+			// again, and streams already gone count as cleared.
+			if ok {
+				if abandoning {
+					return busMigrationStep{next: busMigrationRollingBack, abandoning: true}
+				}
+				return busMigrationStep{next: busMigrationConverting}
+			}
+			if abandoning {
+				return busMigrationStep{next: busMigrationFailed, abandoning: true, manual: "deleting the partial streams on the three servers before the rollback failed; the bus is write-frozen at three servers and the snapshot is kept on the staging volume"}
+			}
+			return busMigrationStep{next: busMigrationFailed, manual: "deleting the single server's streams before the conversion failed; the bus is write-frozen at one server and the snapshot is kept on the staging volume"}
 		case busMigrationConverting, busMigrationRestoring:
 			if ok {
 				if phase == busMigrationConverting {
@@ -142,7 +162,7 @@ func nextBusMigrationPhase(leg busMigrationLeg, phase busMigrationPhase, abandon
 				}
 				return busMigrationStep{next: busMigrationReleasing}
 			}
-			return busMigrationStep{next: busMigrationRollingBack, abandoning: true}
+			return busMigrationStep{next: busMigrationClearing, abandoning: true}
 		case busMigrationRollingBack:
 			if ok {
 				return busMigrationStep{next: busMigrationRollbackRestoring, abandoning: true}
@@ -189,6 +209,17 @@ func busMigrationTerminal(phase busMigrationPhase) bool {
 // converts, and a rollback renders one again. A run that ended keeps the
 // count it ended on: the new one when Done, the old one when Abandoned or
 // when it failed on its way back.
+// busMigrationRunReplicas is the count a run renders: its phase's, and for a
+// Failed run the phase it failed in, so it stays where it stopped (a clear
+// that failed on three servers is not shrunk onto their partial copies).
+func busMigrationRunReplicas(run *agentv1alpha1.BusMigrationStatus) int {
+	leg, phase := busMigrationLeg(run.Leg), busMigrationPhase(run.Phase)
+	if phase == busMigrationFailed && run.FailedIn != "" {
+		phase = busMigrationPhase(run.FailedIn)
+	}
+	return busMigrationReplicas(leg, phase, run.Abandoning)
+}
+
 func busMigrationReplicas(leg busMigrationLeg, phase busMigrationPhase, abandoning bool) int {
 	from, to := 3, 1
 	if leg == busMigrationGrow {
@@ -197,6 +228,13 @@ func busMigrationReplicas(leg busMigrationLeg, phase busMigrationPhase, abandoni
 	switch phase {
 	case busMigrationShrinking, busMigrationConverting, busMigrationRestoring, busMigrationDone:
 		return to
+	case busMigrationClearing:
+		// Before the conversion, one server; before the rollback, the
+		// cluster, still three.
+		if abandoning {
+			return to
+		}
+		return from
 	case busMigrationReleasing:
 		if abandoning {
 			return from
@@ -305,6 +343,18 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 			return foreign(j.Name)
 		}
 		return jobOutcome(j), jobDeadlineExceeded(j), nil
+	}
+	if phase == busMigrationClearing {
+		refused, err := r.busMigrationSnapshotKept(ctx, agent, run)
+		if err != nil {
+			return busMigrationPending, false, err
+		}
+		if refused != "" {
+			if run.Cause == "" {
+				run.Cause = "the snapshot is not intact, so nothing was cleared: " + refused
+			}
+			return busMigrationErred, false, nil
+		}
 	}
 	if work := busMigrationPhaseWorkload(phase); work.name != "" {
 		// The phase's identity must be this PlatformAgent's own: a
@@ -427,6 +477,12 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 			if refused != "" {
 				outcome, run.Cause = busMigrationErred, "the hashing pod's report was refused: "+refused
 			}
+		case phase == busMigrationClearing && observed != busMigrationPending:
+			if failure, err := r.recordClearReport(ctx, agent, run); err != nil {
+				return 0, err
+			} else if failure != "" && outcome == busMigrationErred && run.Cause == "" && !late {
+				run.Cause = "the Clearing phase failed: " + failure
+			}
 		case (phase == busMigrationRestoring || phase == busMigrationRollbackRestoring) && observed != busMigrationPending:
 			if failure, err := r.recordRestoreReport(ctx, agent, run); err != nil {
 				return 0, err
@@ -450,6 +506,9 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 			run.ForwardDeadline = run.Deadline.DeepCopy()
 			run.Deadline = metav1.NewTime(now.Add(busMigrationRunDeadline))
 		}
+		if step.next == busMigrationClearing && busMigrationPhase(run.Phase) != busMigrationClearing {
+			run.Cleared = nil
+		}
 		run.Phase, run.Abandoning = string(step.next), step.abandoning
 		if step.manual != "" {
 			run.Message = step.manual
@@ -463,7 +522,7 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 			}
 		}
 	}
-	return busMigrationReplicas(leg, busMigrationPhase(run.Phase), run.Abandoning), nil
+	return busMigrationRunReplicas(run), nil
 }
 
 // busMigrationCause says why a run turned back: the phase that failed, and
@@ -585,6 +644,9 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		// the snapshot reads, and acks the chunks it receives.
 		step, verbs = busMigrationStreamIdentity, []string{"INFO", "SNAPSHOT"}
 		extra = func(stream string) []string { return []string{"$JS.SNAPSHOT.ACK." + stream + ".>"} }
+	case busMigrationClearing:
+		// The clear reads and deletes, the provisioned names only.
+		step, verbs = busMigrationStreamIdentity, []string{"INFO", "DELETE"}
 	case busMigrationRestoring, busMigrationRollbackRestoring:
 		// The restores create each stream, send its chunks, raise its
 		// replicas, and delete a stream whose restore went wrong.
@@ -777,20 +839,25 @@ func busMigrationRunSecret(agent *agentv1alpha1.PlatformAgent, runID string) str
 // and policies from the run Secret. Each is bounded by the run's deadline
 // less the margin.
 func buildBusStreamPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, kind string, now time.Time) *corev1.Pod {
-	leg := map[string]string{"snapshot": "snapshot", "restore": "restore", "rollback": "restore"}[kind]
+	leg := map[string]string{"snapshot": "snapshot", "restore": "restore", "rollback": "restore", "clear": "clear"}[kind]
 	command := []string{busMigrationBinary, "bus-migrate", leg,
 		"--server", a2aNATSTLSScheme + a2aNATSAddress(agent),
 		"--ca-file", a2aNATSCAFile(),
 		"--user", busMigrationPrincipal(busMigrationStreamIdentity, run.RunID),
 		"--token-file", a2aBusTokenPath + "/" + a2aBusTokenFile,
 		"--streams", strings.Join(a2aProvisionedStreams, ","),
-		"--dir", busMigrationStageMount,
 	}
-	readOnly := kind != "snapshot"
-	volumes := []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), {Name: busMigrationStageVolume, VolumeSource: corev1.VolumeSource{
-		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: busMigrationStageClaim(agent, run.RunID), ReadOnly: readOnly},
-	}}}
-	mounts := []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount(), {Name: busMigrationStageVolume, MountPath: busMigrationStageMount, ReadOnly: readOnly}}
+	volumes := []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent)}
+	mounts := []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount()}
+	if kind != "clear" {
+		// The clear needs no stage: it deletes by name.
+		readOnly := kind != "snapshot"
+		command = append(command, "--dir", busMigrationStageMount)
+		volumes = append(volumes, corev1.Volume{Name: busMigrationStageVolume, VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: busMigrationStageClaim(agent, run.RunID), ReadOnly: readOnly},
+		}})
+		mounts = append(mounts, corev1.VolumeMount{Name: busMigrationStageVolume, MountPath: busMigrationStageMount, ReadOnly: readOnly})
+	}
 	if leg == "restore" {
 		replicas := "3"
 		if kind == "rollback" {
@@ -833,6 +900,8 @@ func busMigrationPhaseWorkload(phase busMigrationPhase) busMigrationWork {
 		return busMigrationWork{name: "snapshot", identity: busMigrationStreamIdentity, pod: true}
 	case busMigrationHashing:
 		return busMigrationWork{name: "hash", identity: "hash", pod: true}
+	case busMigrationClearing:
+		return busMigrationWork{name: "clear", identity: busMigrationStreamIdentity, pod: true}
 	case busMigrationRestoring:
 		return busMigrationWork{name: "restore", identity: busMigrationStreamIdentity, pod: true}
 	case busMigrationRollbackRestoring:
@@ -880,6 +949,20 @@ func (r *PlatformAgentReconciler) ensureBusMigrationWorkloadFor(ctx context.Cont
 	}
 	if err := ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, nil, commonLabels(agent), fieldOwner); err != nil {
 		return err
+	}
+	if work.name == "clear" {
+		if refused, err := r.busMigrationSnapshotKept(ctx, agent, run); err != nil || refused != "" {
+			// Nothing is deleted unless the snapshot that replaces it is
+			// there (observeBusMigration fails the phase on it).
+			return err
+		}
+	}
+	if (work.name == "restore" || work.name == "rollback") && !busMigrationClearedAll(run) {
+		// No restore onto a bus that still holds copies the clear has not
+		// removed: on a converted cluster those are the old server's,
+		// reserving its store twice over, and on the way back the
+		// cluster's partial copies.
+		return nil
 	}
 	var obj client.Object
 	switch {
@@ -1300,6 +1383,8 @@ func busMigrationRetryPhase(failedIn busMigrationPhase) busMigrationPhase {
 		return busMigrationRollingBack
 	case busMigrationUnpinning:
 		return busMigrationUnpinning
+	case busMigrationClearing:
+		return busMigrationClearing
 	}
 	return ""
 }
@@ -1387,4 +1472,79 @@ func busMigrationPodOfRun(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 		}
 	}
 	return false
+}
+
+// busMigrationSnapshotKept checks, before anything is cleared, that what the
+// streams are restored from is there: the run Secret, the PlatformAgent's
+// own, with one well-formed digest pair per provisioned stream, and the
+// staging claim, its own, bound and not being deleted. refused says what is
+// missing.
+func (r *PlatformAgentReconciler) busMigrationSnapshotKept(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (refused string, err error) {
+	secret := &corev1.Secret{}
+	switch err := r.a2aReader().Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationRunSecret(agent, run.RunID)}, secret); {
+	case errors.IsNotFound(err):
+		return "the run Secret is gone", nil
+	case err != nil:
+		return "", err
+	}
+	if !metav1.IsControlledBy(secret, agent) {
+		return "the run Secret is not this PlatformAgent's", nil
+	}
+	var file busmigrate.RunFile
+	if err := json.Unmarshal(secret.Data[busMigrationRunKey], &file); err != nil {
+		return "the run Secret cannot be read", nil
+	}
+	b, _ := json.Marshal(file.Digests)
+	if _, bad := parseBusDigests(string(b)); bad != "" {
+		return "the run Secret's digests: " + bad, nil
+	}
+	pvc := &corev1.PersistentVolumeClaim{}
+	switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationStageClaim(agent, run.RunID)}, pvc); {
+	case errors.IsNotFound(err):
+		return "the staging claim is gone", nil
+	case err != nil:
+		return "", err
+	}
+	if !metav1.IsControlledBy(pvc, agent) || pvc.DeletionTimestamp != nil || pvc.Status.Phase != corev1.ClaimBound {
+		return "the staging claim is not this PlatformAgent's, or is not bound, or is being deleted", nil
+	}
+	return "", nil
+}
+
+// busMigrationClearedAll reports the current Clearing having deleted every
+// provisioned stream.
+func busMigrationClearedAll(run *agentv1alpha1.BusMigrationStatus) bool {
+	for _, name := range a2aProvisionedStreams {
+		if !slices.Contains(run.Cleared, name) {
+			return false
+		}
+	}
+	return true
+}
+
+// recordClearReport reads a finished clear pod's report into the run's
+// status: each stream it deleted, kept across a retry (a stream deleted
+// once stays deleted), and its error, returned for the cause.
+func (r *PlatformAgentReconciler) recordClearReport(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (failure string, err error) {
+	pod, err := r.busMigrationPod(ctx, agent, run, "clear")
+	if goerrors.Is(err, errBusMigrationForeign) {
+		return "the clear pod is not this PlatformAgent's", nil
+	}
+	if err != nil || pod == nil {
+		return "", err
+	}
+	msg := terminationMessage(pod)
+	if msg == "" {
+		return "", nil
+	}
+	var report busmigrate.Report
+	if err := json.Unmarshal([]byte(msg), &report); err != nil {
+		return "its report could not be read", nil
+	}
+	for _, name := range report.Cleared {
+		if slices.Contains(a2aProvisionedStreams, name) && !slices.Contains(run.Cleared, name) {
+			run.Cleared = append(run.Cleared, name)
+		}
+	}
+	return report.Error, nil
 }
