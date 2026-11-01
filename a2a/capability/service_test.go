@@ -131,6 +131,7 @@ func TestTheCallerIdentityComesFromTheSubjectAndNotFromThePayload(t *testing.T) 
 
 	body, err := json.Marshal(map[string]any{
 		"ref": hop, "verb": VerbTaskExecute, "resource": "project/P/cluster/C",
+		"requestId": testRequestID(t),
 		// Fields the wire format does not have. If a future Request grew
 		// a caller field, this test is what notices.
 		"caller": podB, "delegate": podB, "principal": podB, "self": podB,
@@ -157,7 +158,7 @@ func TestTheCallerIdentityComesFromTheSubjectAndNotFromThePayload(t *testing.T) 
 func TestARequestOffTheCallerScopedNamespaceIsRefused(t *testing.T) {
 	s, _, hop := twoHop(t)
 	nc := serveVerifier(t, s)
-	body, _ := json.Marshal(Request{Ref: hop, Verb: VerbTaskExecute, Resource: "project/P/cluster/C"})
+	body, _ := json.Marshal(Request{Ref: hop, Verb: VerbTaskExecute, Resource: "project/P/cluster/C", RequestID: testRequestID(t)})
 
 	// Two ways in, and they fail differently on purpose.
 	//
@@ -203,7 +204,7 @@ func TestARequestOffTheCallerScopedNamespaceIsRefused(t *testing.T) {
 func TestTheVerifierWillNotAnswerIntoAnotherPrincipalsInbox(t *testing.T) {
 	s, _, hop := twoHop(t)
 	nc := serveVerifier(t, s)
-	body, _ := json.Marshal(Request{Ref: hop, Verb: VerbTaskExecute, Resource: "project/P/cluster/C"})
+	body, _ := json.Marshal(Request{Ref: hop, Verb: VerbTaskExecute, Resource: "project/P/cluster/C", RequestID: testRequestID(t)})
 
 	victim, err := nc.SubscribeSync(ReplyPrefix + podB + ".>")
 	if err != nil {
@@ -240,7 +241,7 @@ func TestTheVerdictCarriesNoPartOfTheCapability(t *testing.T) {
 	// them back: no tier, no scope, no delegate, no key.
 	s, _, hop := twoHop(t)
 	nc := serveVerifier(t, s)
-	body, _ := json.Marshal(Request{Ref: hop, Verb: VerbTaskExecute, Resource: "project/P/cluster/C"})
+	body, _ := json.Marshal(Request{Ref: hop, Verb: VerbTaskExecute, Resource: "project/P/cluster/C", RequestID: testRequestID(t)})
 	data := rawAskBytes(t, nc, podB, body)
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {

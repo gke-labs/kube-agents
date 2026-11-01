@@ -2,6 +2,9 @@ package capability
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -135,6 +138,47 @@ type Request struct {
 	// ignored by another.
 	Profile string `json:"profile,omitempty"`
 	Tier    Tier   `json:"tier,omitempty"`
+
+	// RequestID binds a capability decision to the request that asked for
+	// it, so a caller acts only on the answer to its own question. The
+	// client draws a fresh one per check (requestIDBytes of crypto/rand,
+	// hex), the verifier echoes it in its Response, and the client takes no
+	// reply whose id is missing or different. A request without a
+	// well-formed id is not well-formed.
+	RequestID string `json:"requestId"`
+}
+
+// requestIDBytes is the entropy in one request id: 128 bits.
+const requestIDBytes = 16
+
+// newRequestID draws a fresh request id.
+func newRequestID() (string, error) {
+	var b [requestIDBytes]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// validRequestID reports whether id is exactly what newRequestID produces:
+// requestIDBytes of lowercase hex.
+func validRequestID(id string) bool {
+	if len(id) != 2*requestIDBytes {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// sameRequestID compares the id a reply echoes against the one that was sent.
+// An empty echo never matches.
+func sameRequestID(got, want string) bool {
+	return got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 // Response is a verdict and the rule behind it. It deliberately does NOT carry
@@ -144,6 +188,10 @@ type Request struct {
 type Response struct {
 	Allowed bool   `json:"allowed"`
 	Reason  string `json:"reason,omitempty"`
+	// RequestID echoes the request's id, so the caller can tell this answer
+	// is the answer to its own question. Empty when the request did not
+	// carry a well-formed id, and a client takes no answer without one.
+	RequestID string `json:"requestId,omitempty"`
 }
 
 // Service answers verification requests. It holds the only Store in the
@@ -161,9 +209,17 @@ func (s *Service) Answer(ctx context.Context, subject string, data []byte) Respo
 		return Response{Reason: Reason(err)}
 	}
 	var req Request
-	if err := json.Unmarshal(data, &req); err != nil {
+	if err := json.Unmarshal(data, &req); err != nil || !validRequestID(req.RequestID) {
 		return Response{Reason: "the request is not well-formed"}
 	}
+	resp := s.decide(ctx, caller, req)
+	resp.RequestID = req.RequestID
+	return resp
+}
+
+// decide is Answer's verdict on a request that parsed. Answer stamps the
+// request id on whatever it returns, so no branch here can forget it.
+func (s *Service) decide(ctx context.Context, caller string, req Request) Response {
 	// The walk and the verb check are answered differently on purpose, and
 	// the split is the whole anti-oracle argument.
 	//
@@ -417,6 +473,13 @@ func (c *Client) CheckProfileRun(ctx context.Context, ref Ref, profile string, t
 }
 
 func (c *Client) check(ctx context.Context, req Request) error {
+	// One id per check. Every ask of the check is the same question, so the
+	// answer to any of them, late or not, is the answer to this one.
+	id, err := newRequestID()
+	if err != nil {
+		return err
+	}
+	req.RequestID = id
 	b, err := json.Marshal(req)
 	if err != nil {
 		return err
@@ -469,7 +532,7 @@ func (c *Client) check(ctx context.Context, req Request) error {
 		}
 		err := errUnreachable
 		if sub != nil {
-			err = c.ask(reach, timeout, reply, sub, b)
+			err = c.ask(reach, timeout, reply, sub, b, id)
 		}
 		if !errors.Is(err, errUnreachable) {
 			if attempt > 1 && c.Log != nil {
@@ -497,7 +560,12 @@ func (c *Client) check(ctx context.Context, req Request) error {
 // ask is one request and its answer, on the check's reply subscription.
 // errUnreachable means nothing answered; any other error is the verifier's
 // verdict or an answer that did not parse.
-func (c *Client) ask(ctx context.Context, timeout time.Duration, reply string, sub *nats.Subscription, body []byte) error {
+//
+// Only a reply that echoes id is this check's answer. A reply that parses but
+// carries a missing or different id is not an answer at all: the wait goes on
+// until the ask's timeout, which ends as every unanswered ask does, in
+// errUnreachable and, once the window is spent, a refusal.
+func (c *Client) ask(ctx context.Context, timeout time.Duration, reply string, sub *nats.Subscription, body []byte, id string) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if err := c.nc.PublishRequest(c.subject, reply, body); err != nil {
@@ -508,16 +576,21 @@ func (c *Client) ask(ctx context.Context, timeout time.Duration, reply string, s
 	// subscribed to with a 503 status. That is the shape of the gap after
 	// a bus restart, and the reason it was refused at once before the
 	// retry.
-	msg, err := sub.NextMsgWithContext(ctx)
-	if err != nil {
-		return errUnreachable
+	for {
+		msg, err := sub.NextMsgWithContext(ctx)
+		if err != nil {
+			return errUnreachable
+		}
+		var resp Response
+		if err := json.Unmarshal(msg.Data, &resp); err != nil {
+			return refuse(malformedAnswerRule)
+		}
+		if !sameRequestID(resp.RequestID, id) {
+			continue
+		}
+		if !resp.Allowed {
+			return &Refusal{Rule: resp.Reason}
+		}
+		return nil
 	}
-	var resp Response
-	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		return refuse(malformedAnswerRule)
-	}
-	if !resp.Allowed {
-		return &Refusal{Rule: resp.Reason}
-	}
-	return nil
 }

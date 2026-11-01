@@ -108,7 +108,7 @@ func TestTheVerifierAsksProfileRunOnTheCurrentConnection(t *testing.T) {
 		var req capability.Request
 		_ = json.Unmarshal(m.Data, &req)
 		asked.Store(&req)
-		resp := capability.Response{Allowed: req.Ref.Key == "cap-ok"}
+		resp := capability.Response{Allowed: req.Ref.Key == "cap-ok", RequestID: req.RequestID}
 		if !resp.Allowed {
 			resp.Reason = "not this one"
 		}
