@@ -742,6 +742,18 @@ test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus p
 test-bench: ## Run the bench harness tests under pytest.
 	@python3 -m pytest bench/tests/
 
+# The harness-scale measurement (docs/designs/agent-harness-bottlenecks.md). SCALE_CONFIG is a plan
+# file; the target project and clusters come from it and from SCALE_* in the environment
+# (SCALE_PROJECT_ID is required for scale-run). The data file is the plan's target.data_file.
+SCALE_CONFIG ?= bench/scale/phase1.yaml
+
+.PHONY: scale-plan scale-run
+scale-plan: ## Print the harness-scale measurement matrix for SCALE_CONFIG (default bench/scale/phase1.yaml).
+	@cd bench && python3 -m kube_agents_bench.scale.runner plan $(abspath $(SCALE_CONFIG))
+
+scale-run: ## Run the harness-scale measurement in SCALE_CONFIG against the target in SCALE_*, resuming from its data file.
+	@cd bench && python3 -m kube_agents_bench.scale.runner run $(abspath $(SCALE_CONFIG))
+
 # A broken bench case otherwise costs a full presubmit to discover: provision,
 # deploy, run the agent, score, read the log. Most of the ways a task.yaml is
 # broken are static -- an unknown domain slug, a fixture role the seeded fleet

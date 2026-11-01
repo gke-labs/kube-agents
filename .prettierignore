@@ -64,3 +64,7 @@ agents/platform/skills/fleet-audit/scripts/testdata/finish_without_manifest/*.js
 # and never sees JSON; this entry stops a wider local invocation from rewriting
 # them by accident.
 bench/tasks/*/evidence/*/*.json
+
+# Measured results the scale runner writes compact (bench/kube_agents_bench/scale/records.py); a
+# local prettier pass would pretty-print about a million bytes back into the file.
+bench/scale/harness-limits.json
