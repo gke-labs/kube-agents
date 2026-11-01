@@ -136,6 +136,16 @@ func TestARestartMidOfferDispatchesAfresh(t *testing.T) {
 	if l := b.leases(); len(l) != 0 {
 		t.Fatalf("a dispatcher stopped mid-offer left a lease: %v", l)
 	}
+	// The stop waited for the hand-off to return, and the abandon was sent
+	// before it did: the pod drops the offer now, not when its own accept
+	// window lapses.
+	waitFor(t, 2*time.Second, "the stopping dispatcher's abandon", func() bool { return first.abandonCount() == 1 })
+	first.mu.Lock()
+	abandon := first.abandons[0]
+	first.mu.Unlock()
+	if abandon.TaskID != "task-1" || abandon.Reason != abandonStopping {
+		t.Errorf("the first pod's abandon %+v, want task-1's %q", abandon, abandonStopping)
+	}
 
 	second := b.worker("tse", "read", "tse-1", answerAccept, 500*time.Millisecond)
 	ti.update(func(c *lib.DispatchConfig) { c.AcceptTimeoutSeconds = 1 })
