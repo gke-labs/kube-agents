@@ -1,12 +1,13 @@
 # WHAT THIS GRADES: a `/session` agent asked why a workload is crashlooping
 # follows the persona's rule for the access it has (#2855, #2858). The worker
-# image ships a persona as Claude Code's user CLAUDE.md and seven of the
+# image ships a persona as Claude Code's user CLAUDE.md and twelve of the
 # cluster agent's read-only skills under ~/.claude/skills, and the persona
-# sends crash loops and OOMs to gke-workload-troubleshooting. With the
-# session cluster view ON, the session loads a gke- skill, reads the cluster
-# with its read-only kubectl, and answers itself. With the view OFF, it
-# delegates to the platform agent and the answer comes back through the wake.
-# Before the persona, a session answered from general knowledge: no skill
+# sends crash loops and OOMs to pod-crashloop-oom (or to
+# gke-workload-troubleshooting when a workload's symptom is not yet known).
+# With the session cluster view ON, the session loads a shipped skill, reads
+# the cluster with its read-only kubectl, and answers itself. With the view
+# OFF, it delegates to the platform agent and the answer comes back through the
+# wake. Before the persona, a session answered from general knowledge: no skill
 # existed to load.
 #
 # The skill check is the persona signal. Claude Code's Skill, Read, Glob,
@@ -27,8 +28,9 @@
 # means the view was on. Its absence means the view was off OR the session
 # did not use it. The checks branch on that:
 #
-# - A Bash call (view on): the session must have loaded a gke- skill, run
-#   kubectl, not delegated, and answered with both planted nouns.
+# - A Bash call (view on): the session must have loaded a shipped gke- or
+#   workload-symptom skill, run kubectl, not delegated, and answered with both
+#   planted nouns.
 # - No Bash call (view off, or unused): the skill check passes as a skip, and
 #   the grounded check grades the answer alone, which on a delegated run is
 #   the platform agent's finding relayed by the session's wake turn.
@@ -96,7 +98,7 @@ prompt: >-
   you don't.
 expected_output: >-
   With the cluster view on, the session loads its gke-workload-troubleshooting
-  skill, finds the cluster carrying the seeded-debug namespace with its
+  or pod-crashloop-oom skill, finds the cluster carrying the seeded-debug namespace with its
   read-only kubectl and gcloud, and answers itself without delegating. With
   the view off, it delegates to the platform agent and relays its finding.
   Either way the answer says payments-api's container is OOMKilled on every
@@ -144,16 +146,19 @@ verification_spec:
         # shipped gke- skill counts, not only gke-workload-troubleshooting:
         # what this grades is that the persona's skills reach the model and
         # it uses one, and gke-stall-detection first is a fair reading of
-        # "crashlooping". The match is on the name, so a skill Claude Code
-        # bundles (none on main is named gke-*) cannot pass it.
+        # "crashlooping". So do the four symptom skills the persona names
+        # since #3181 split gke-workload-troubleshooting: pod-crashloop-oom
+        # is the direct route for this question. The match is on the name,
+        # so a skill Claude Code bundles (none is named gke-* or one of the
+        # four) cannot pass it.
         - type: tool_called
           tool_names: ["Skill"]
           arguments:
-            skill: ".*gke-[a-z-]+.*"
+            skill: ".*(gke-[a-z-]+|pod-crashloop-oom|pod-pending-scheduling|pod-container-creating|service-connectivity).*"
         - type: tool_called
           tool_names: ["Skill"]
           arguments:
-            command: ".*gke-[a-z-]+.*"
+            command: ".*(gke-[a-z-]+|pod-crashloop-oom|pod-pending-scheduling|pod-container-creating|service-connectivity).*"
 
   - name: the-answer-names-the-oom
     role: objective

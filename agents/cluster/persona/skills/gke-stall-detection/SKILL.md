@@ -5,7 +5,7 @@ description: Read-only detection of controllers that stopped making progress wit
 
 # GKE Stall Detection
 
-Use this skill when a controller has gone quiet rather than red: a Gateway that never programs, a rollout that never finishes, a custom resource whose status stopped following its spec, an HTTPRoute nobody accepted. The symptom-driven skills (`gke-workload-troubleshooting`, `gke-reliability`) start from a failing pod or a bad event; this one starts from the absence of progress, which those states never show. It is read-only: it lists objects, reads their status and events, resolves referenced names, and proposes nothing beyond naming what is missing.
+Use this skill when a controller has gone quiet rather than red: a Gateway that never programs, a rollout that never finishes, a custom resource whose status stopped following its spec, an HTTPRoute nobody accepted. The symptom-driven skills (`workload-triage-scan`, the `pod-*` skills, `gke-reliability`) start from a failing pod or a bad event; this one starts from the absence of progress, which those states never show. It is read-only: it lists objects, reads their status and events, resolves referenced names, and proposes nothing beyond naming what is missing.
 
 ## When to run it
 

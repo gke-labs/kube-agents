@@ -157,4 +157,4 @@ A card that gives a report format wins: format `result` exactly as the card says
 
 What this skill decides is the content, not the shape. The evidence belongs in `Why`, quoted — the revision that carries the declared template, the kubelet's own sentence, the container's command, the consumer that would break — and the conclusion above decides which option is recommended where the card asks for one.
 
-Without a format from the card, follow the shape in `gke-workload-troubleshooting`, with the classification and its evidence in `metadata.root_cause` and `metadata.evidence`.
+Without a format from the card, follow the shape in [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md), with the classification and its evidence in `metadata.root_cause` and `metadata.evidence`.
