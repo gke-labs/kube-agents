@@ -255,6 +255,32 @@ REPAIR_FLEET_APPLY = "apply bench/tf/fleet to {project_id} from a main checkout:
 # composition's; the LiteLLM GSA has a hand repair in the runbook.
 REPAIR_PLATFORM_GSA = "docs/ci-pool-projects.md section 3: the full-install composition creates kubeagents-platform-gsa; re-create it against the project's existing full-install state (not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
 REPAIR_LITELLM_GSA = "the hand repair in docs/ci-pool-projects.md section 3 (gcloud iam service-accounts create kubeagents-litellm-gsa, roles/aiplatform.user, and its Workload Identity binding)"
+# The calendar-mode advice role on a project provisioned before the composition
+# created it: the role, then the binding, as docs/ci-pool-projects.md section 3
+# spells out. Two commands rather than _project_binding's one because the role
+# has to exist before it can be bound, and idempotent like the rest of the
+# repairs: the finding reads the project policy alone, so it fires the same
+# for a role that exists unbound, and a bare `roles create` would then exit
+# non-zero on the existing id. The describe guard skips the create in that
+# case and the binding runs either way.
+# The leading undelete converges the third state, a role soft-deleted and
+# unbound (what turning the switch off on a Terraform-provisioned project
+# leaves for seven days): describe exits 0 on a soft-deleted role, so the
+# guard alone would skip the create and bind a dead role. On a live or absent
+# role the undelete is an error the `;` swallows. The update before the
+# binding sets what the role grants and its stage whatever state it was in: the
+# finding reads only the policy, so an unbound role is never described, and an
+# undeleted or existing role keeps whatever its last update gave it. On a role
+# the create just made it changes nothing.
+REPAIR_CALENDAR_MODE_ROLE = (
+    "gcloud iam roles undelete {role_id} --project={project_id} >/dev/null 2>&1; "
+    "gcloud iam roles describe {role_id} --project={project_id} >/dev/null 2>&1 "
+    "|| gcloud iam roles create {role_id} --project={project_id} "
+    '--title="Calendar Mode Advice (read-only)" --permissions={permission} --stage=GA; '
+    "gcloud iam roles update {role_id} --project={project_id} --stage=GA --permissions={permission} >/dev/null; "
+    'gcloud projects add-iam-policy-binding {project_id} --member="{member}" --role={role} '
+    "# docs/ci-pool-projects.md section 3"
+)
 REPAIR_MINTER = "docs/ci-pool-projects.md section 5.2 (the ci-pool-minter composition owns the key)"
 REPAIR_MINTER_ROTATION = "import the version the chart pins, or bump githubMinter.kms.keyVersion in charts/kube-agents/values.yaml to an ENABLED one (docs/site/src/content/docs/deploy/token-minter.md)"
 # The one version state `kms keys versions enable` takes; a scheduled or done
@@ -390,6 +416,38 @@ FINDING_HOST_OTEL_SCOPE = "gke/host-otel-scope"
 # A missing Compute plant sweeper grant fails the hourly sweep, not a leased
 # run: the sweeper holds nothing an eval run uses.
 FINDING_COMPUTE_SWEEPER_MISSING = "iam/compute-sweeper/missing"
+# The platform GSA's calendar-mode advice role missing (the constants it is
+# built from are beside PLATFORM_GSA_ROLES below). One id for every project,
+# unlike the other platform-gsa/missing ids, which carry the role name: this
+# role's full name embeds the project id, and the pool-state scan groups
+# findings by id to tell "the pool drifted" from "one project is odd".
+FINDING_PLATFORM_CALENDAR_MODE_ROLE = "iam/platform-gsa/missing/calendar-mode-advice-role"
+# The same role held but carrying other permissions than the one it exists
+# for. A predefined role's contents are fixed; a project custom role's are
+# whatever iam.roles.update last made them, and on a registered pool project
+# the role is outside Terraform state, so this read is the only thing that
+# would notice. Not lease-silent: a widened role is the agent under test
+# grading with authority the closed set exists to exclude, like an extra
+# predefined role.
+FINDING_PLATFORM_CALENDAR_MODE_ROLE_PERMISSIONS = "iam/platform-gsa/calendar-mode-advice-role/permissions"
+REPAIR_CALENDAR_MODE_ROLE_PERMISSIONS = (
+    "gcloud iam roles update {role_id} --project={project_id} --permissions={permission} "
+    "# docs/ci-pool-projects.md section 3"
+)
+# A disabled role is bound and grants nothing, like a soft-deleted one. Both
+# repairs re-activate the role with the one permission in the same paste, so
+# a role that was also widened comes back narrow rather than live as it was.
+ROLE_STAGE_DISABLED = "DISABLED"
+ROLE_STAGE_LIVE = "GA"
+REPAIR_CALENDAR_MODE_ROLE_UNDELETE = (
+    "gcloud iam roles undelete {role_id} --project={project_id}; "
+    "gcloud iam roles update {role_id} --project={project_id} --stage=" + ROLE_STAGE_LIVE + " --permissions={permission} "
+    "# docs/ci-pool-projects.md section 3"
+)
+REPAIR_CALENDAR_MODE_ROLE_ENABLE = (
+    "gcloud iam roles update {role_id} --project={project_id} --stage=" + ROLE_STAGE_LIVE + " --permissions={permission} "
+    "# docs/ci-pool-projects.md section 3"
+)
 # Findings a leased run passes with. Every other finding reds the run that
 # leases the project -- a missing grant, API, key or cluster is a 403 or a
 # missing resource in the agent's transcript -- and the health bot's pool-drift
@@ -406,7 +464,19 @@ FINDING_COMPUTE_SWEEPER_MISSING = "iam/compute-sweeper/missing"
 # red of that case on a project with only this finding is the case's record
 # and not a reason to reclassify.
 # A missing Compute plant sweeper grant is here too: it fails only the sweep.
-LEASE_SILENT_FINDINGS = frozenset({FINDING_HOST_OTEL_SCOPE, FINDING_COMPUTE_SWEEPER_MISSING})
+# So is a project without the calendar-mode advice role, which serves the
+# presubmit in full: no case on the blocking roster runs `gcloud beta compute
+# advice calendar-mode`, and the one case that does
+# (obtainability-window-planning-probe) is nightly-only, so the finding is the
+# nightly's to read and not a pull request's. test_verify_ci_pool_project.py
+# trips on a seated case that names the probe by any of its spellings; a case
+# that reaches it through the skill's own trigger without naming it is for
+# whoever seats it to weigh, and moves this finding out of the set.
+LEASE_SILENT_FINDINGS = frozenset({
+    FINDING_HOST_OTEL_SCOPE,
+    FINDING_COMPUTE_SWEEPER_MISSING,
+    FINDING_PLATFORM_CALENDAR_MODE_ROLE,
+})
 
 # ─── The self-managed forges' once-per-project pieces (docs 5.8) ─────────────
 # hack/ci-forge.sh creates a forge VM per run and reads these; it never writes
@@ -981,6 +1051,21 @@ PLATFORM_GSA_ROLES = {
     "roles/mcp.toolUser",
     "roles/serviceusage.serviceUsageConsumer",
 }
+
+# Beside the read-only set, not in it: the project custom role carrying
+# compute.advice.calendarMode alone, which the full-install composition
+# creates under `enable_calendar_mode_advice = true` (the kube-agents-iam
+# module's `calendar_mode_advice_role_id`; PlatformGsaRolesMatchTerraformTest
+# pins the id). The pool turns it on because the nightly's
+# obtainability-window-planning-probe runs `gcloud beta compute advice
+# calendar-mode`, which no viewer role authorizes: without it the agent under
+# test blocks on the permission and the case fails every night on a credential
+# rather than on the agent's reasoning (#1833). A project provisioned before
+# the switch existed reports it missing here, with the hand repair below, since
+# section 8 of docs/ci-pool-projects.md forbids re-running the provisioning.
+PLATFORM_GSA_CALENDAR_MODE_ROLE_ID = "kubeAgentsCalendarModeAdvice"
+PLATFORM_GSA_CALENDAR_MODE_ROLE_TEMPLATE = "projects/{project_id}/roles/" + PLATFORM_GSA_CALENDAR_MODE_ROLE_ID
+PLATFORM_GSA_CALENDAR_MODE_PERMISSION = "compute.advice.calendarMode"
 
 
 class Finding:
@@ -1701,6 +1786,10 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     # organization with no folder between), and a binding whose member is a group
     # holding the GSA. Both make the extra-role check below a floor rather than
     # the closed set it reads as.
+    # Named before the read so the role's own read below can ask whether the
+    # policy held it when the policy read itself failed.
+    calendar_mode_role = PLATFORM_GSA_CALENDAR_MODE_ROLE_TEMPLATE.format(project_id=project_id)
+    platform_held = set()
     rc, out, err = run_cmd(["gcloud", "projects", "get-iam-policy", project_id, "--format=json"])
     if rc != 0:
         if not _record_unreadable(
@@ -1808,21 +1897,46 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     _compute_sweep_repair(project_id),
                 )
 
-            platform_missing = PLATFORM_GSA_ROLES - platform_held
-            platform_extra = platform_held - PLATFORM_GSA_ROLES
+            platform_expected = PLATFORM_GSA_ROLES | {calendar_mode_role}
+            platform_missing = platform_expected - platform_held
+            platform_extra = platform_held - platform_expected
             if platform_missing and not platform_absent:
                 passed = False
-                details.append(
-                    f"The platform agent GSA is missing {len(platform_missing)} role(s) on "
-                    f"{project_id}: {', '.join(sorted(platform_missing))}. The agent under test "
-                    "authenticates as this account, so eval cases on this project fail on a "
-                    "credential the agent lacks rather than on the agent's reasoning"
-                )
+                predefined_missing = platform_missing - {calendar_mode_role}
+                if predefined_missing:
+                    details.append(
+                        f"The platform agent GSA is missing {len(predefined_missing)} role(s) on "
+                        f"{project_id}: {', '.join(sorted(predefined_missing))}. The agent under test "
+                        "authenticates as this account, so eval cases on this project fail on a "
+                        "credential the agent lacks rather than on the agent's reasoning"
+                    )
+                if calendar_mode_role in platform_missing:
+                    # Its own sentence: the role reds one nightly case and no
+                    # presubmit lease (LEASE_SILENT_FINDINGS), so the sentence
+                    # above, written for roles whose absence reds every lease,
+                    # would misattribute it.
+                    details.append(
+                        f"The platform agent GSA is missing {calendar_mode_role} on {project_id}. "
+                        "No presubmit case needs it; the nightly's obtainability-window-planning-probe "
+                        "fails on this project for want of it rather than on the agent's reasoning"
+                    )
                 for role in sorted(platform_missing):
+                    if role == calendar_mode_role:
+                        finding_id = FINDING_PLATFORM_CALENDAR_MODE_ROLE
+                        repair = REPAIR_CALENDAR_MODE_ROLE.format(
+                            role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
+                            project_id=project_id,
+                            permission=PLATFORM_GSA_CALENDAR_MODE_PERMISSION,
+                            member=platform_member,
+                            role=role,
+                        )
+                    else:
+                        finding_id = f"iam/platform-gsa/missing/{role}"
+                        repair = _project_binding(project_id, platform_member, role)
                     findings.append(Finding(
-                        f"iam/platform-gsa/missing/{role}",
+                        finding_id,
                         f"The platform agent GSA is missing {role} on {project_id}",
-                        _project_binding(project_id, platform_member, role),
+                        repair,
                     ))
             if platform_extra:
                 passed = False
@@ -1962,12 +2076,113 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             passed = False
             details.append(f"Failed parsing policy for {fleet_reader_email}: {exc}")
 
+    # The calendar-mode advice role is admitted to the closed set by name, and
+    # a custom role's name says nothing about its contents: read them. Only
+    # when the policy holds it -- absent, the missing finding above already
+    # carries the repair, and a role that does not exist has no permissions to
+    # read.
+    # True while there is nothing to read: the policy was read and did not
+    # hold the role, so the missing finding above is the whole answer. An
+    # unread policy leaves this unchecked too, since nothing is known.
+    calendar_mode_role_checked = roles_checked and calendar_mode_role not in platform_held
+    if roles_checked and calendar_mode_role in platform_held:
+        rc, out, err = run_cmd([
+            "gcloud", "iam", "roles", "describe", PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
+            f"--project={project_id}", "--format=json",
+        ])
+        if rc != 0:
+            # A refused or transient read is a warning naming what went
+            # unchecked, like every other read here; any other exit (a
+            # NOT_FOUND on a role the policy still binds) is the role absent,
+            # which is the missing finding with its create-then-bind repair.
+            if not _record_unreadable(
+                err,
+                f"The platform agent GSA is bound to {calendar_mode_role} on {project_id}, but the role could not be read "
+                f"({err.strip()}), so the binding grants nothing",
+                f"Could not read {calendar_mode_role} on {project_id}, so its permissions were not checked",
+                details,
+                warnings,
+            ):
+                passed = False
+                findings.append(Finding(
+                    FINDING_PLATFORM_CALENDAR_MODE_ROLE,
+                    f"{calendar_mode_role} on {project_id} is bound but cannot be read",
+                    REPAIR_CALENDAR_MODE_ROLE.format(
+                        role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
+                        project_id=project_id,
+                        permission=PLATFORM_GSA_CALENDAR_MODE_PERMISSION,
+                        member=platform_member,
+                        role=calendar_mode_role,
+                    ),
+                ))
+        else:
+            try:
+                role_doc = _load_json(out)
+                calendar_mode_role_checked = True
+                granted = set(role_doc.get("includedPermissions") or [])
+                expected_permissions = {PLATFORM_GSA_CALENDAR_MODE_PERMISSION}
+                # The state (deleted, disabled) and the contents are read
+                # independently: a dead role that is also widened is both
+                # findings, so the paste that revives it does not revive the
+                # extra permissions with it.
+                if role_doc.get("deleted"):
+                    passed = False
+                    details.append(
+                        f"{calendar_mode_role} on {project_id} is soft-deleted, so the binding grants nothing. "
+                        "The nightly's obtainability-window-planning-probe fails on this project for want of it"
+                    )
+                    findings.append(Finding(
+                        FINDING_PLATFORM_CALENDAR_MODE_ROLE,
+                        f"{calendar_mode_role} on {project_id} is soft-deleted",
+                        REPAIR_CALENDAR_MODE_ROLE_UNDELETE.format(
+                            role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
+                            project_id=project_id,
+                            permission=PLATFORM_GSA_CALENDAR_MODE_PERMISSION,
+                        ),
+                    ))
+                elif role_doc.get("stage") == ROLE_STAGE_DISABLED:
+                    passed = False
+                    details.append(
+                        f"{calendar_mode_role} on {project_id} is disabled (stage {ROLE_STAGE_DISABLED}), so the binding grants nothing. "
+                        "The nightly's obtainability-window-planning-probe fails on this project for want of it"
+                    )
+                    findings.append(Finding(
+                        FINDING_PLATFORM_CALENDAR_MODE_ROLE,
+                        f"{calendar_mode_role} on {project_id} is disabled",
+                        REPAIR_CALENDAR_MODE_ROLE_ENABLE.format(
+                            role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
+                            project_id=project_id,
+                            permission=PLATFORM_GSA_CALENDAR_MODE_PERMISSION,
+                        ),
+                    ))
+                if granted != expected_permissions:
+                    passed = False
+                    details.append(
+                        f"{calendar_mode_role} on {project_id} carries {', '.join(sorted(granted)) or 'no permissions'} "
+                        f"instead of {PLATFORM_GSA_CALENDAR_MODE_PERMISSION} alone. The agent under test holds "
+                        "whatever the role carries, and the set is closed for the same reason the predefined roles are"
+                    )
+                    findings.append(Finding(
+                        FINDING_PLATFORM_CALENDAR_MODE_ROLE_PERMISSIONS,
+                        f"{calendar_mode_role} on {project_id} carries {', '.join(sorted(granted)) or 'no permissions'}",
+                        REPAIR_CALENDAR_MODE_ROLE_PERMISSIONS.format(
+                            role_id=PLATFORM_GSA_CALENDAR_MODE_ROLE_ID,
+                            project_id=project_id,
+                            permission=PLATFORM_GSA_CALENDAR_MODE_PERMISSION,
+                        ),
+                    ))
+            except Exception as exc:  # like the sibling reads: a parse failure is a failed check, not a traceback before the report
+                passed = False
+                calendar_mode_role_checked = False
+                details.append(f"Failed parsing {calendar_mode_role} on {project_id}: {exc}")
+
     # The summary must not assert an item a warning above retracts.
     partial = _partial_summary(
         [
             ("the Workload Identity binding", wi_checked),
             ("the LiteLLM gateway's Workload Identity binding", litellm_checked),
             ("the runners' and platform GSA project roles", roles_checked),
+            ("the calendar-mode advice role's permissions", calendar_mode_role_checked),
             ("the fleet reader's token-creator binding", fleet_reader_checked),
         ]
     )

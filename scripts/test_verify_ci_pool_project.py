@@ -22,6 +22,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
+import eval_rosters
 import verify_ci_pool_project as checker
 
 
@@ -435,14 +438,65 @@ class GkeAndCmekTest(unittest.TestCase):
         # effect on a run, made here beside the finding that emits it.
         self.assertEqual(checker.FINDING_HOST_OTEL_SCOPE, "gke/host-otel-scope")
         self.assertEqual(checker.FINDING_COMPUTE_SWEEPER_MISSING, "iam/compute-sweeper/missing")
+        self.assertEqual(checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE, "iam/platform-gsa/missing/calendar-mode-advice-role")
         # The Compute plant sweeper holds nothing a leased run uses, so a
-        # missing grant fails only the hourly sweep.
+        # missing grant fails only the hourly sweep. The calendar-mode advice
+        # role reds only a nightly-only case: the test below pins that no
+        # presubmit case runs the probe.
         self.assertEqual(
             checker.LEASE_SILENT_FINDINGS,
-            frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_COMPUTE_SWEEPER_MISSING, checker.FINDING_DNS_API}) | checker.FORGE_FINDINGS,
+            frozenset({
+                checker.FINDING_HOST_OTEL_SCOPE,
+                checker.FINDING_COMPUTE_SWEEPER_MISSING,
+                checker.FINDING_DNS_API,
+                checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE,
+            }) | checker.FORGE_FINDINGS,
         )
         # The forge pieces serve the self-managed lanes alone (docs 5.8): the two
         # public lanes read none of them, so a leased run passes with any of them.
+
+    def test_the_calendar_mode_role_is_not_on_the_presubmit_roster(self):
+        # What makes its finding lease-silent: the presubmit runs the blocking
+        # roster, and no case there runs `advice calendar-mode`. If one ever
+        # does, the finding reds presubmit leases and leaves the silent set.
+        # The parse the shell uses, so a roster note cannot make the two
+        # disagree; the blocking roster is a subset of the presubmit file by
+        # construction, and both are read so the record shows it.
+        seated = set(eval_rosters.presubmit_cases()) | set(eval_rosters.blocking_roster())
+        self.assertTrue(seated, "no presubmit cases found")
+        # A tripwire for the spellings a case can name the probe by, on the
+        # prompt side (the API's name, the phrase the skill section uses) and
+        # the check side (the gcloud verb, its flags). It pins the condition
+        # as far as text can: a prompt that reaches the probe through the
+        # skill's own trigger without any of these words is an eval-crew
+        # judgment at seating time, not something a grep can see.
+        spellings = ("calendar-mode", "calendarmode", "calendar mode", "future window", "--duration-range", "--start-time-range")
+        # The fields a case reaches the probe through, read as YAML: a comment
+        # is gone and a `#` inside a value stays text (a seated prompt carries
+        # `## ...` headings), and whitespace is collapsed so a folded prompt
+        # that wraps between two words of a spelling still matches.
+        probe_fields = ("prompt", "goal", "input", "expected_output", "verification_spec")
+
+        def strings(node):
+            if isinstance(node, str):
+                yield node
+            elif isinstance(node, dict):
+                for value in node.values():
+                    yield from strings(value)
+            elif isinstance(node, list):
+                for value in node:
+                    yield from strings(value)
+
+        for case_id in sorted(seated):
+            case = checker._ROOT / "bench" / "tasks" / case_id / "task.yaml"
+            self.assertTrue(case.is_file(), case_id)
+            doc = yaml.safe_load(case.read_text()) or {}
+            text = " ".join(" ".join(s.split()) for field in probe_fields for s in strings(doc.get(field))).lower()
+            hits = [s for s in spellings if s in text]
+            self.assertEqual(
+                hits, [], f"{case_id} names the calendar-mode probe in its prompt or checks ({hits}); the finding can no longer be lease-silent"
+            )
+        self.assertNotIn("obtainability-window-planning-probe", seated)
 
     def test_fleet_clusters_are_not_held_to_the_otel_scope(self):
         # Nothing reads the seeded clusters' traces, and bench/tf/fleet does not
@@ -3641,6 +3695,23 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
         self.assertEqual(1, len(sites), sites)
 
 
+
+def _calendar_role(project_id="kube-agents-evals-3", permissions=None, deleted=False, stage="GA"):
+    """`gcloud iam roles describe` of the calendar-mode advice role: the one
+    permission, live, unless a test says otherwise."""
+    doc = {
+        "name": f"projects/{project_id}/roles/{checker.PLATFORM_GSA_CALENDAR_MODE_ROLE_ID}",
+        "title": "Calendar Mode Advice (read-only)",
+        "stage": stage,
+        "includedPermissions": sorted(
+            {checker.PLATFORM_GSA_CALENDAR_MODE_PERMISSION} if permissions is None else permissions
+        ),
+    }
+    if deleted:
+        doc["deleted"] = True
+    return json.dumps(doc)
+
+
 class IamGrantsTest(unittest.TestCase):
     def _wi_policy(self, project_id):
         member = f"serviceAccount:{project_id}.svc.id.goog[kubeagents-system/kubeagents-platform-agent]"
@@ -3678,7 +3749,12 @@ class IamGrantsTest(unittest.TestCase):
         reconciler = checker.FLEET_RECONCILER_ROLES if reconciler_roles is None else reconciler_roles
         prow = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
         nightly = checker.PROW_RUNNER_ROLES if nightly_roles is None else nightly_roles
-        platform = checker.PLATFORM_GSA_ROLES if platform_roles is None else platform_roles
+        if platform_roles is None:
+            platform = checker.PLATFORM_GSA_ROLES | {
+                checker.PLATFORM_GSA_CALENDAR_MODE_ROLE_TEMPLATE.format(project_id=project_id)
+            }
+        else:
+            platform = platform_roles
         litellm = checker.LITELLM_GSA_ROLES if litellm_roles is None else litellm_roles
         bot = checker.POOL_STATE_READER_ROLES if bot_roles is None else bot_roles
         platform_member = checker.PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
@@ -3713,6 +3789,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(reconciler_roles=checker.FLEET_RECONCILER_ROLES - {"roles/container.admin"})),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -3739,6 +3816,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy(project)),
                 _ok(self._project_policy(compute_sweep_role=False)),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role(project)),
             ]
             result = checker.check_iam_and_service_accounts(project, "123456")
         self.assertFalse(result.passed)
@@ -3764,6 +3842,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(compute_sweep_role=False, extra_bindings=(foreign, wide))),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -3830,11 +3909,15 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
         self.assertEqual(result.warnings, [])
-        self.assertEqual(run.call_count, 4, "four reads, all on the project")
+        # Five reads, all on the project: the two Workload Identity policies,
+        # the project policy, the fleet reader's policy, and the calendar-mode
+        # advice role the project policy held.
+        self.assertEqual(run.call_count, 5, "five reads, all on the project")
 
     def test_missing_legacy_cloudbuild_reader_fails(self):
         # This is exactly the drift found on kube-agents-evals-2.
@@ -3862,6 +3945,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -3878,6 +3962,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(json.dumps({"bindings": []})),
                 _ok(self._project_policy()),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -3894,6 +3979,7 @@ class IamGrantsTest(unittest.TestCase):
                       "service account."),
                 _ok(self._project_policy()),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -3912,6 +3998,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(litellm_roles=set())),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -3930,6 +4017,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._project_policy(
                     litellm_roles=checker.LITELLM_GSA_ROLES | {"roles/container.viewer"})),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -3948,6 +4036,7 @@ class IamGrantsTest(unittest.TestCase):
                       "iam.serviceAccounts.getIamPolicy is required to perform this operation"),
                 _ok(self._project_policy("kube-agents-evals-6")),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
         self.assertTrue(result.passed, result.details)
@@ -3961,6 +4050,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-6")),
                 _ok(self._project_policy("kube-agents-evals-6")),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
         self.assertTrue(result.passed, result.details)
@@ -3988,7 +4078,7 @@ class IamGrantsTest(unittest.TestCase):
         self.assertEqual(
             "the Workload Identity binding, the LiteLLM gateway's Workload Identity binding, "
             "the fleet reader's token-creator binding verified; "
-            "the runners' and platform GSA project roles not checked",
+            "the runners' and platform GSA project roles, the calendar-mode advice role's permissions not checked",
             result.message,
         )
 
@@ -4016,6 +4106,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy("kube-agents-evals-3")),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -4031,6 +4122,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-6")),
                 _ok(self._project_policy("kube-agents-evals-6", prow_roles=without_container_admin)),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
         self.assertFalse(result.passed)
@@ -4046,6 +4138,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-10")),
                 _ok(self._project_policy("kube-agents-evals-10", nightly_roles=set())),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-10", "123456")
         self.assertFalse(result.passed)
@@ -4074,6 +4167,7 @@ class IamGrantsTest(unittest.TestCase):
                     )
                 ),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
         self.assertFalse(result.passed)
@@ -4088,6 +4182,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(prow_roles=checker.PROW_RUNNER_ROLES | {"roles/artifactregistry.writer"})),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
@@ -4121,6 +4216,200 @@ class IamGrantsTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertTrue(any("roles/container.admin" in d for d in result.details), result.details)
 
+    def test_platform_gsa_missing_the_calendar_mode_role_fails_with_the_create_then_bind_repair(self):
+        # A project provisioned before enable_calendar_mode_advice existed: the
+        # nine read-only roles are there and the custom role is not. The
+        # repair creates the role before binding it, because add-iam-policy-binding
+        # on a role that does not exist fails.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(platform_roles=set(checker.PLATFORM_GSA_ROLES))),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        role = "projects/kube-agents-evals-3/roles/kubeAgentsCalendarModeAdvice"
+        # One id for every project: the pool-state scan groups by it.
+        finding = next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE)
+        self.assertNotIn("kube-agents-evals-3", finding.id)
+        self.assertIn(role, finding.observed)
+        member = checker.PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id="kube-agents-evals-3")
+        # Idempotent across the three states: a soft-deleted role is undeleted
+        # first, an existing one skips the create, and the binding always runs.
+        self.assertTrue(finding.repair.startswith("gcloud iam roles undelete kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 >/dev/null 2>&1; "), finding.repair)
+        self.assertIn("gcloud iam roles describe kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 >/dev/null 2>&1 || gcloud iam roles create kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3", finding.repair)
+        self.assertIn("--permissions=compute.advice.calendarMode", finding.repair)
+        self.assertIn(f'; gcloud projects add-iam-policy-binding kube-agents-evals-3 --member="{member}" --role={role}', finding.repair)
+        # What the role grants and its stage are set before the binding goes
+        # live, so an undeleted or existing role that was widened or disabled
+        # is bound narrow and live: the finding never described it.
+        update = "gcloud iam roles update kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 --stage=GA --permissions=compute.advice.calendarMode"
+        self.assertIn(update, finding.repair)
+        self.assertLess(finding.repair.index(update), finding.repair.index("gcloud projects add-iam-policy-binding"))
+        self.assertNotIn("&&", finding.repair)
+        self.assertNotIn(checker.REPAIR_CONFIRM_PREFIX, finding.repair)
+        # Pasteable as the pool-drift issue carries it: the runbook pointer is
+        # a shell comment, not a parenthesised tail bash stops on.
+        self.assertTrue(finding.repair.endswith("# docs/ci-pool-projects.md section 3"), finding.repair)
+        self.assertNotIn("(docs/", finding.repair)
+
+    def test_platform_gsa_holding_the_calendar_mode_role_is_not_an_extra(self):
+        # The default policy carries it, so the closed-set check must read it
+        # as expected rather than as a role beyond the read-only set.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse([f for f in result.findings if f.id.startswith("iam/platform-gsa/extra/")], result.findings)
+
+    def test_the_calendar_mode_roles_permissions_are_read_when_it_is_held(self):
+        # Admitted by name, checked by contents: a custom role carries whatever
+        # iam.roles.update last made it, and nothing else on a registered
+        # project reconciles it.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role(permissions={"compute.advice.calendarMode", "compute.reservations.create"})),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        describe = [c for c in run.call_args_list if c.args[0][:3] == ["gcloud", "iam", "roles"]]
+        self.assertEqual(len(describe), 1, run.call_args_list)
+        self.assertEqual(describe[0].args[0][3:], ["describe", "kubeAgentsCalendarModeAdvice", "--project=kube-agents-evals-3", "--format=json"])
+        finding = next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE_PERMISSIONS)
+        self.assertIn("compute.reservations.create", finding.observed)
+        self.assertTrue(finding.repair.startswith("gcloud iam roles update kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 --permissions=compute.advice.calendarMode"), finding.repair)
+        self.assertTrue(finding.repair.endswith("# docs/ci-pool-projects.md section 3"), finding.repair)
+        # Widened, not absent: this is the extra-role kind of drift, so it is
+        # not in the set a leased run passes with.
+        self.assertNotIn(checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE_PERMISSIONS, checker.LEASE_SILENT_FINDINGS)
+
+    def test_a_soft_deleted_calendar_mode_role_is_reported_as_missing_with_undelete(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role(deleted=True)),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        finding = next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE)
+        self.assertIn("soft-deleted", finding.observed)
+        self.assertTrue(finding.repair.startswith("gcloud iam roles undelete kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3; "), finding.repair)
+        self.assertIn("--stage=GA --permissions=compute.advice.calendarMode", finding.repair)
+
+    def test_a_disabled_calendar_mode_role_is_reported_as_missing_with_the_enable(self):
+        # stage DISABLED keeps the permission list and drops the grant: the
+        # third field that decides whether the binding is live.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role(stage="DISABLED")),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        finding = next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE)
+        self.assertIn("disabled", finding.observed)
+        self.assertTrue(finding.repair.startswith("gcloud iam roles update kubeAgentsCalendarModeAdvice --project=kube-agents-evals-3 --stage=GA --permissions=compute.advice.calendarMode"), finding.repair)
+
+    def test_a_disabled_and_widened_calendar_mode_role_is_both_findings(self):
+        # State and contents are independent: the enable repair must not bring
+        # the extra permission back live, and the widened finding must be loud.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role(stage="DISABLED", permissions={"compute.advice.calendarMode", "compute.reservations.create"})),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        ids = {f.id for f in result.findings}
+        self.assertIn(checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE, ids)
+        self.assertIn(checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE_PERMISSIONS, ids)
+        enable = next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE)
+        self.assertIn("--stage=GA --permissions=compute.advice.calendarMode", enable.repair)
+        self.assertIn("compute.reservations.create", next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE_PERMISSIONS).observed)
+
+    def test_a_refused_calendar_mode_role_read_is_unchecked_not_failed(self):
+        # Like every other read: a 403 on the describe names what went
+        # unchecked and the check keeps passing, so the run exits 2.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._fleet_reader_policy()),
+                _fail("ERROR: (gcloud.iam.roles.describe) PERMISSION_DENIED: denied"),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(any("calendar-mode advice role's permissions" in w or "kubeAgentsCalendarModeAdvice" in w for w in result.warnings), result.warnings)
+        self.assertIn("not checked", result.message)
+        self.assertFalse([f for f in result.findings if "calendar-mode" in f.id], result.findings)
+
+    def test_a_bound_calendar_mode_role_that_does_not_exist_is_the_missing_finding(self):
+        # NOT_FOUND on a role the policy still binds: absent, with the
+        # create-then-bind repair, not the generic failed id.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._fleet_reader_policy()),
+                _fail("ERROR: (gcloud.iam.roles.describe) NOT_FOUND: The role named projects/kube-agents-evals-3/roles/kubeAgentsCalendarModeAdvice was not found."),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        finding = next(f for f in result.findings if f.id == checker.FINDING_PLATFORM_CALENDAR_MODE_ROLE)
+        self.assertIn("gcloud iam roles create kubeAgentsCalendarModeAdvice", finding.repair)
+
+    def test_an_empty_calendar_mode_role_read_fails_the_check_without_a_traceback(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._fleet_reader_policy()),
+                _ok(""),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("Failed parsing" in d for d in result.details), result.details)
+
+    def test_the_calendar_mode_role_is_not_read_when_the_policy_lacks_it(self):
+        # Four reads, not five: the missing finding carries the repair, and a
+        # role that is not bound may not exist to describe.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(platform_roles=set(checker.PLATFORM_GSA_ROLES))),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertEqual(run.call_count, 4, run.call_args_list)
+        # And the detail names the one case the gap reds, not every eval case.
+        line = next(d for d in result.details if "kubeAgentsCalendarModeAdvice" in d)
+        self.assertIn("obtainability-window-planning-probe", line)
+        self.assertNotIn("eval cases on this project fail", line)
+
     def test_a_public_binding_fails(self):
         # Neither identity check would see this: both scan for one literal
         # member, and allUsers is not either of them.
@@ -4131,6 +4420,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._project_policy(
                     extra_bindings=[{"role": "roles/storage.objectViewer", "members": ["allUsers"]}])),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -4149,6 +4439,7 @@ class IamGrantsTest(unittest.TestCase):
                     "condition": {"title": "t", "expression": "request.time < timestamp('2030-01-01T00:00:00Z')"},
                 }])),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -4161,6 +4452,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._fleet_reader_policy()),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
@@ -4180,6 +4472,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._fleet_reader_policy(members=[])),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -4201,6 +4494,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._fleet_reader_policy(members=others)),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -4220,6 +4514,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._fleet_reader_policy(members=runners)),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -4241,6 +4536,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._project_policy()),
                 _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown "
                       "service account."),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -4256,6 +4552,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok("Updates are available for some Google Cloud CLI components."),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -4271,6 +4568,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._project_policy()),
                 _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) PERMISSION_DENIED: "
                       "Permission iam.serviceAccounts.getIamPolicy is required"),
+                _ok(_calendar_role()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
@@ -4280,7 +4578,7 @@ class IamGrantsTest(unittest.TestCase):
         )
         self.assertEqual(
             "the Workload Identity binding, the LiteLLM gateway's Workload Identity binding, "
-            "the runners' and platform GSA project roles verified; "
+            "the runners' and platform GSA project roles, the calendar-mode advice role's permissions verified; "
             "the fleet reader's token-creator binding not checked",
             result.message,
         )
@@ -4316,6 +4614,17 @@ class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
             main, r"^[ \t]*read_only_roles[ \t]*=[ \t]*\[(.*?)\]", "local.read_only_roles in full-install/main.tf"
         )
         self.assertEqual(applied, checker.PLATFORM_GSA_ROLES)
+
+    def test_the_calendar_mode_role_id_matches_the_module(self):
+        # The custom role is the module's, keyed on a fixed role_id; the
+        # verifier names a pool project's role by that id.
+        main = (checker._ROOT / "terraform" / "modules" / "kube-agents-iam" / "main.tf").read_text()
+        declared = re.search(r'calendar_mode_advice_role_id\s*=\s*"([^"]+)"', main)
+        self.assertIsNotNone(declared, "could not find calendar_mode_advice_role_id in the module")
+        self.assertEqual(declared.group(1), checker.PLATFORM_GSA_CALENDAR_MODE_ROLE_ID)
+        permissions = re.search(r'permissions\s*=\s*\[([^\]]*)\]', main)
+        self.assertIsNotNone(permissions, "could not find the custom role's permissions")
+        self.assertEqual(re.findall(r'"([^"]+)"', permissions.group(1)), [checker.PLATFORM_GSA_CALENDAR_MODE_PERMISSION])
 
     def test_the_module_default_matches_the_composition(self):
         tf = (checker._ROOT / "terraform" / "modules" / "kube-agents-iam" / "variables.tf").read_text()
@@ -5440,14 +5749,18 @@ class FindingsCarryRepairsTest(unittest.TestCase):
     """The console detail and the report finding are written together: every
     drift a scan can act on names a stable id and the command that closes it."""
 
-    def _iam(self, project_policy):
+    def _iam(self, project_policy, calendar_role=None):
+        reads = [
+            _ok(self._wi_policy("kube-agents-evals-3")),
+            _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+            _ok(project_policy),
+            _ok(self._fleet_reader_policy()),
+        ]
+        # The role's own read happens only when the policy holds it.
+        if checker.PLATFORM_GSA_CALENDAR_MODE_ROLE_ID in project_policy:
+            reads.append(_ok(calendar_role if calendar_role is not None else _calendar_role()))
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [
-                _ok(self._wi_policy("kube-agents-evals-3")),
-                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
-                _ok(project_policy),
-                _ok(self._fleet_reader_policy()),
-            ]
+            run.side_effect = reads
             return checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
 
     def test_a_healthy_project_reads_true_with_no_findings(self):
