@@ -48,11 +48,6 @@ const (
 	// pluginStagingEphemeralRequest is pluginStagingSizeLimit plus emptyDirLogsAllowance.
 	pluginStagingEphemeralRequest = "576Mi"
 
-	// fluent-bit buffers in memory (Mem_Buf_Limit, no storage.path) and keeps
-	// only its tail databases here: 8.0 MiB peak across 214 gateway pods. Its
-	// container already requests 1Gi of ephemeral storage.
-	fluentBitStateSizeLimit = "128Mi"
-
 	// The a2a provision Job's HOME, for the nats CLI's context directory: a few
 	// files of a few KB. The Job runs for minutes on a bus restart or upgrade,
 	// between samples, so it has no measured peak; it takes the small-state floor.

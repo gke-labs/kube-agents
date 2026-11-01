@@ -1008,7 +1008,8 @@ file and never a `.git` it can write into.
 - Every container the operator builds — the credential-cleanup init container,
   the agent, the dashboard, `agent-api-auth`, the log shipper — has a read-only
   root filesystem;
-  writable state uses bounded `emptyDir` volumes. The sandbox and dashboard
+  writable state uses bounded `emptyDir` volumes, bar the log shipper's cursor
+  directory on the `system-metadata` claim, described below. The sandbox and dashboard
   share a 2Gi `/tmp` scratch volume: the entrypoint runs several hermes
   invocations with `HOME=/tmp` before the agent starts, and those two
   containers already share the data PVC, so the shared volume is not a new
@@ -1016,8 +1017,8 @@ file and never a `.git` it can write into.
   container's own writable layer, discarded whenever that container restarted.
   An `emptyDir` is scoped to the Pod, so its contents now survive a container
   crash or restart and are visible to both containers' next boot. The log
-  shipper gets no `/tmp`: it buffers in memory
-  and keeps its tail database on its own volume. Containers supplied through
+  shipper gets no `/tmp`: it buffers in memory, and its one writable path is
+  the directory below. Containers supplied through
   `spec.deployment.sidecars`/`initContainers` are appended to the Pod
   substantially as written; the webhook does not require a read-only root of
   them, so a CR can still add a writable container to this Pod. "As written"
@@ -1028,6 +1029,22 @@ file and never a `.git` it can write into.
   that discards a CR value, `POD_NAMESPACE` as a default a CR value beats.
   Neither edit touches the container's filesystem posture, which is what this
   bullet is about.
+- The log shipper's tail cursors, the two SQLite files that record how far it
+  has read each log, live in a per-agent directory on the namespace's
+  `system-metadata` claim, mounted into the shipper alone at a `subPath` of its
+  own. A cursor on an `emptyDir` died with the Pod, and every replacement
+  shipped each file again from its first line. The agent's data claim was not
+  used for it because the agent and the dashboard mount that claim at its root,
+  and a cursor file rewritten into something SQLite cannot open stops the
+  shipper at every start; the `system-metadata` claim is reached by those two
+  containers only through `subPath: session`, so no container the operator
+  renders for model-authored code can write the cursors. Of the rendered
+  containers the shipper is the only one with a mount under `fluent-bit-state/`;
+  a CR's `spec.deployment.extraVolumeMounts` can still name the claim without a
+  `subPath`, and the operator does not refuse it. The databases use the rollback
+  journal rather than WAL: the claim is the gofer-backed mount under a runtime
+  class, where WAL-mode SQLite corrupts, and a corrupt cursor on a claim
+  outlives the Pod.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
 - The operator reports Ready only when every workload it renders is ready, with
