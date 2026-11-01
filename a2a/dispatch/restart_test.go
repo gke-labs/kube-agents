@@ -152,3 +152,53 @@ func TestAFinishBetweenHoldersIsSettledNotFailed(t *testing.T) {
 		t.Errorf("terminals %+v, want only the worker's completed", ts)
 	}
 }
+
+// A lease record nobody can read still says the task started, so it is
+// re-adopted, not offered. It names neither a deadline nor a confirm time,
+// so the limit counts from the re-adoption, and the restart grace covers it
+// like any other: a worker still renewing keeps it, and its final renewal
+// settles it with no failure terminal.
+func TestAnUnreadableRecordIsReadoptedWithTheRestartGrace(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+	kv, err := b.js.KeyValue(b.ctx, lib.ProfileLeaseBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1")
+	if _, err := kv.Put(b.ctx, key, []byte("{not a lease record")); err != nil {
+		t.Fatal(err)
+	}
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	renewing := make(chan struct{})
+	renewed := make(chan struct{})
+	go func() {
+		defer close(renewed)
+		tick := time.NewTicker(500 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-renewing:
+				return
+			case <-tick.C:
+				w.publish(lib.DispatchLeaseSubject("tse", "read", "tse-0"), lib.LeaseRenewal{TaskID: "task-1"})
+			}
+		}
+	}()
+	b.runDispatcher(testConfig(), oneProfile("tse", 2, "tse-0"), &fakeVerifier{})
+	time.Sleep(4 * time.Second) // past the 2s grace and the 3s lease
+	close(renewing)
+	<-renewed
+	if ts := b.terminalsOf("task-1"); len(ts) != 0 {
+		t.Fatalf("a re-adopted task its worker still renews was ended: %+v", ts)
+	}
+	w.publish(lib.DispatchLeaseSubject("tse", "read", "tse-0"), lib.LeaseRenewal{TaskID: "task-1", Final: true})
+	waitFor(t, 5*time.Second, "the task settled", func() bool { return b.tombstones()[key].Finished() })
+	if ts := b.terminalsOf("task-1"); len(ts) != 0 {
+		t.Errorf("a settled task got a terminal from the dispatcher: %+v", ts)
+	}
+	if n := w.offerCount(); n != 0 {
+		t.Errorf("a task its record says started was offered %d times", n)
+	}
+}

@@ -939,10 +939,15 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	}
 	if rec.Deadline.IsZero() {
 		// A record that doesn't say (unreadable, or not this dispatcher's
-		// shape): the profile's current limit from the confirm.
+		// shape): the profile's current limit from the confirm, or from now
+		// when the record names no time at all, or the first tick would fail
+		// a live task before the restart grace could protect it.
 		started := rec.ConfirmedAt
 		if started.IsZero() {
 			started = rec.RenewedAt
+		}
+		if started.IsZero() {
+			started = d.now()
 		}
 		rec.Deadline = started.Add(seconds(prof.ActiveDeadlineSeconds))
 	}
