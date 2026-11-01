@@ -18,10 +18,11 @@ workspace exists.
 What that workspace contains depends on the install, and `start` tells you which one you have as its
 `mode` field:
 
-- **`content`** — the workspace is an empty directory. The repository lives in the credential broker,
-  which owns the only checkout; you write manifests into the directory and the harness hands the
-  bytes over. Nothing on your side is a git repository, so there is nothing here to read the
-  repository out of: use `list` and `fetch` (below) for that.
+- **`content`** — the workspace is an empty directory. You write manifests into it, and at `finish`
+  the harness copies them into a clone the credential broker sends down, commits there, and has the
+  broker push the branch. The workspace is not a git repository, so there is nothing here to read
+  the repository out of: use `grep`, `list` and `fetch` (below) for that. Every install with a
+  broker configured takes this mode.
 - **`directory`** — the workspace is a clone of the GitOps repository on the shared volume, and the
   harness runs `checkout`, `add`, `commit` and `push` inside it.
 - **`none`** — no forge is configured; see [No forge configured](finish.md#no-forge-configured).
@@ -84,8 +85,8 @@ credential proxy or the broker is the same answer, and you stop there: see the s
 working around a refusal (`SKILL.md`, "Never work around a refusal").
 `--repo` takes the name as the managed list
 gives it: `owner/name` on github.com, `<host>/owner/name` on a GitHub Enterprise Server, and
-`<host>/<path>` for a repository on another forge (`gitlab.com/<group>/<subgroup>/<project>`). In content mode the broker's file workspace clones a repository
-from its own forge, so `fetch`, `list`, `grep`, the remediation step and the declared-intent search
+`<host>/<path>` for a repository on another forge (`gitlab.com/<group>/<subgroup>/<project>`). In content mode the broker reaches a repository
+on its own forge, so `fetch`, `list`, `grep`, the remediation step and the declared-intent search
 work the same way on every forge, and a remediation on GitLab is a merge request. Directory mode
 serves GitHub only: its local clone reaches no other forge, so `start` and `finish` on a repository
 elsewhere stop at the clone, with no ledger written. Run the audit in content mode for those. It
@@ -245,10 +246,14 @@ them, and `fetch` copies the ones you name into the workspace:
 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py fetch --audit <audit-id> --path clusters/prod-us-east/payments-netpol.yaml
 ```
 
-`grep` runs broker-side and answers with matching lines; it is a fixed string unless `--regex`, and
-`--prefix` narrows it. Use it when what you know is what a file says. `list` answers with paths and
-sizes, never content — use it when what you know is where the file lives. The broker caps what each
-returns, so read `truncated` on both and **pass `--prefix`** on a large repository. `fetch` writes
+Each command reads a snapshot of the repository: one revision's files, with no history, which the
+broker sends and the harness deletes once the command is done. `grep` answers with matching lines;
+it is a fixed string unless `--regex` (POSIX extended), and `--prefix` narrows it. Use it when what
+you know is what a file says. `list` answers with paths and sizes, never content — use it when what
+you know is where the file lives. `list` returns at most 256 entries and `grep` at most 200 matches,
+so read `truncated` on both and **pass `--prefix`** on a large repository. With `--prefix`, the
+snapshot holds only that directory, which also keeps a large repository under the snapshot's size
+limit. `fetch` writes
 each file into the workspace at its repo-relative path, which is exactly where a remediation editing
 that file has to end up; fetch it, edit it in place, and name the same path in the finding.
 
@@ -264,7 +269,7 @@ the broker's search, no release kind: it loses only its cluster's tree, if that 
 and no Kustomization an Application names. Either way the declaration rule's own search is the
 answer for what is missing.
 
-All three print `sha`, the commit of the tree the broker answered from. There is no `git` on this
+All three print `sha`, the commit of the snapshot they read. There is no `git` on this
 side to ask, and the declared-intent record ([`declared_intent_searched`](findings-document.md#declared_intent_searched)) names each repository
 as `owner/name@sha`; take the sha from the command whose answer you searched.
 
