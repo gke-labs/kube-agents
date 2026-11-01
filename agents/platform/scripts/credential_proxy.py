@@ -3795,10 +3795,14 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         hundred profiles, because the upstream turn can stream for minutes.
 
         A file that cannot be read (locked past the busy timeout, no sessions
-        table, not a database) is skipped on its first error rather than once
-        per id, so a stuck writer costs a request one timeout per such file.
-        Skipping is the answer an unopenable file has always had here; whether
-        it should refuse instead is the door owner's call, not this function's.
+        table, not a database) is skipped on its first database error rather
+        than once per id, so a stuck writer costs a request one timeout per
+        such file. Only an `sqlite3.Error` is the file's condition: an id that
+        cannot be bound at all is that id's answer (not a child), and the
+        file's other ids are still tested, so one unbindable decoy in a body
+        cannot hide the real child beside it. Skipping is the answer an
+        unopenable file has always had here; whether it should refuse instead
+        is the door owner's call, not this function's.
         """
         if not session_ids:
             return False
@@ -3810,7 +3814,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                 try:
                     if any(cls._descends_from_bridge_session(conn, sid) for sid in session_ids):
                         return True
-                except Exception as exc:
+                except sqlite3.Error as exc:
                     LOGGER.debug("could not inspect %s for bridge sessions: %s", db_path, exc)
         return False
 
@@ -3844,16 +3848,26 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     def _descends_from_bridge_session(conn: sqlite3.Connection, sid: str) -> bool:
         """Walk `sid`'s parent chain in one state.db; True when it reaches an `a2a-*` session.
 
-        A database error propagates: it is the file's condition, not this id's,
-        and _names_bridge_session_child answers it once for the file.
+        An `sqlite3.Error` propagates: it is the file's condition, not this
+        id's, and _names_bridge_session_child answers it once for the file.
+        Any other error binding the id is the id's own (a lone surrogate from
+        a JSON `\\udXXX` escape cannot be encoded, and no stored id equals
+        it): the answer is False for this id and nothing else, so the caller
+        goes on to the next id instead of giving up on the file.
         """
         cur = sid
         seen = {cur}
         for _ in range(AGENT_API_SESSION_PARENT_WALK_LIMIT):
-            row = conn.execute(
-                "SELECT parent_session_id FROM sessions WHERE id = ?",
-                (cur,),
-            ).fetchone()
+            try:
+                row = conn.execute(
+                    "SELECT parent_session_id FROM sessions WHERE id = ?",
+                    (cur,),
+                ).fetchone()
+            except sqlite3.Error:
+                raise
+            except Exception as exc:
+                LOGGER.debug("a candidate session id could not be bound: %s", type(exc).__name__)
+                return False
             parent = str(row[0] or "").strip() if row else ""
             if not parent or parent in seen:
                 return False
