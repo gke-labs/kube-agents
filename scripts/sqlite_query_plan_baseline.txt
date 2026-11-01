@@ -1,0 +1,90 @@
+# What scripts/check_sqlite_query_plans.py knows about and lets through: full
+# table scans on the session server's unbounded tables, and statements on
+# those tables the planner cannot see because their SQL is assembled at
+# runtime.
+#
+# One line per site: the file, a space, the statement with whitespace
+# collapsed to single spaces, under the comment lines that say why it stands
+# and which issue owns the fix. The same line twice covers two sites in that
+# file. The file only shrinks: a line whose statement stops scanning, or whose
+# site is gone, fails the check until it is removed, and a new site of a known
+# statement is a new finding until a line is added for it, under a reason a
+# reviewer can act on.
+
+# --- full scans ---------------------------------------------------------------
+
+# The fold lookup: no index covers (cluster, namespace, object_kind,
+# workload_key), so every admitted event reads the whole ledger. #4331 adds
+# the fold-column index; delete this line with it.
+agents/platform/scripts/session_kv_server.py SELECT id, session_id FROM intercepted_events WHERE cluster = ? AND namespace = ? AND object_kind = ? AND workload_key = ? AND (reason = ? OR id IN (SELECT duplicate_of FROM intercepted_events WHERE reason = ? AND duplicate_of > 0)) AND (? != ? OR severity = ?) AND duplicate_of IS NULL AND (notified != 0 OR delivery_error != '') AND session_id != '' ORDER BY id DESC LIMIT ?
+
+# Retention: session_metadata has no index on updated_at, so the sweep that
+# runs on every POST /sessions reads every session. This is the scan #3567
+# reports; an index on updated_at closes it, and this line goes with it.
+agents/platform/scripts/session_kv_server.py DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)
+
+# The same delete, issued by the chat agent's session-store plugin on every
+# session save against the same database; the same index closes it.
+agents/chat/defaults/plugins/session_store/store.py DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)
+
+# The same sweep over incidents, which has no index on created_at; the table
+# is bounded by the same retention window it is being trimmed to, and the
+# index belongs with the session_metadata one above.
+agents/platform/scripts/session_kv_server.py DELETE FROM incidents WHERE created_at < datetime('now', ?)
+
+# Startup, once per process: stamp rows the previous process admitted and
+# never dispatched. dispatched_at has no index, and the statement runs before
+# the server takes traffic.
+agents/platform/scripts/session_kv_server.py UPDATE intercepted_events SET dispatched_at = created_at WHERE dispatched_at IS NULL
+
+# Startup, once per process: release the fold anchors a dead process left.
+# fold_key has no index, and the statement runs before the server takes
+# traffic.
+agents/platform/scripts/session_kv_server.py UPDATE intercepted_events SET fold_key = '' WHERE fold_key != ''
+
+# Startup, once per process: the plaintext-identity purge reads every
+# session's metadata blob by design, since what it looks for is inside the
+# JSON.
+agents/platform/scripts/session_kv_server.py SELECT session_id, metadata FROM session_metadata
+
+# GET /v1/sessions sorts every session by updated_at for the newest N; the
+# updated_at index above turns this into an index walk.
+agents/platform/scripts/session_kv_server.py SELECT session_id, metadata, updated_at FROM session_metadata ORDER BY updated_at DESC LIMIT ?
+
+# The incident-report lookup joins thread ids held inside the metadata JSON,
+# so it reads every blob in Python; the comment at the call site accepts the
+# scan as bounded by retention.
+agents/platform/scripts/session_kv_server.py SELECT metadata FROM session_metadata
+
+# The ledger's newest-first page: ORDER BY id DESC LIMIT walks the rowid in
+# reverse and stops at the limit, so the planner's SCAN reads at most LIMIT
+# rows. The column list is a local variable, hence the ? projection.
+agents/platform/scripts/session_kv_server.py SELECT ? FROM intercepted_events ORDER BY id DESC LIMIT ?
+
+# The Slack incident patch finds the event alerts posted in a thread by a
+# LIKE on the session id and a LIKE inside the metadata JSON, once per alert
+# click; neither predicate can use an index, and the thread id lives in the
+# JSON. A thread_id column, or the id convention the patch relies on indexed
+# as a prefix, would close it.
+deploy/docker/patches/slack_ux_incident.py SELECT session_id, metadata FROM session_metadata WHERE session_id LIKE ? AND metadata LIKE '%' || ? || '%'
+
+# --- dynamic statements on owned tables ----------------------------------------
+
+# list_findings builds its WHERE from up to five equality filters on the
+# queue and reads the whole queue when none is given; the queue's lifecycle
+# is state, not age, and the listing is an operator read. Nothing here can
+# plan a WHERE that does not exist until the request arrives.
+agents/platform/scripts/findings_queue.py SELECT ? FROM findings?
+
+# The insert of a new finding names its columns from the row dict; an INSERT
+# plans no read.
+agents/platform/scripts/findings_queue.py INSERT INTO findings (?, last_verified) VALUES (?, datetime('now'))
+
+# Updates keyed on the primary key: the SET list is assembled from the patch
+# or the re-registration, and the WHERE is `id = ?`, a primary-key SEARCH
+# whatever the SET list says.
+agents/platform/scripts/findings_queue.py UPDATE findings SET ?, state = 'queued', last_verified = datetime('now'), surface_count = 0, alarmed_at = NULL, first_shown_at = NULL, added_class = NULL, absent_since = NULL WHERE id = ?
+agents/platform/scripts/findings_queue.py UPDATE findings SET ?, last_verified = datetime('now'), absent_since = NULL WHERE id = ?
+agents/platform/scripts/findings_queue.py UPDATE findings SET ? WHERE id = ?
+agents/platform/scripts/findings_queue.py UPDATE findings SET ? WHERE id = ?
+agents/platform/scripts/findings_queue.py UPDATE findings SET ? WHERE id = ?
