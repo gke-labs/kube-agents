@@ -159,6 +159,7 @@ func TestTheBusRendersTheCountItsPhaseCalls(t *testing.T) {
 		{busMigrationGrow, busMigrationDone, false, 3},
 		{busMigrationGrow, busMigrationAbandoned, true, 1},
 		{busMigrationGrow, busMigrationFailed, true, 1},
+		{busMigrationGrow, busMigrationFailed, false, 3},
 	} {
 		if got := busMigrationReplicas(tc.leg, tc.phase, tc.abandoning); got != tc.want {
 			t.Errorf("%s %s (abandoning %v) renders %d, want %d", tc.leg, tc.phase, tc.abandoning, got, tc.want)
@@ -1724,6 +1725,7 @@ func TestARetryRerunsTheWayBack(t *testing.T) {
 // new migration through unrelated spec changes; only the abandon annotation
 // naming the run gives it up, lifting the freeze and the hold.
 func TestOnlyAnAbandonNamingTheRunLiftsAFailedFreeze(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
 	m := failedRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1)
 	frozen := func() bool { return busMigrationFreezeActive(m.agent) && busMigrationHoldsProvision(m.agent) }
 	m.pass(busMigrationFailed, 1)
@@ -1808,5 +1810,50 @@ func TestTheFailedConditionNamesTheWayOut(t *testing.T) {
 	m.agent.Status.BusMigration.GivenUp = true
 	if cond, _ := busMigratingCondition(m.agent); !strings.Contains(cond.Message, "given up") {
 		t.Errorf("given up: %q", cond.Message)
+	}
+}
+
+// A one to three run that fails going forward, in Releasing (the restart out
+// of the freeze never completed), stopped on a converted cluster holding R3
+// streams: it stays at three servers, never rendered back to one over them.
+func TestAOneToThreeRunFailedInReleasingStaysAtThree(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationReleasing, 3, time.Now().Add(-time.Minute))
+	m.pass(busMigrationFailed, 3)
+	if m.agent.Status.BusMigration.FailedIn != string(busMigrationReleasing) {
+		t.Errorf("failed in %q", m.agent.Status.BusMigration.FailedIn)
+	}
+	m.pass(busMigrationFailed, 3)
+}
+
+// A retry runs fresh work: the failed attempt's rollback pod (or unpin Job)
+// is still on the cluster, owned by the CR for its logs, and the retry
+// neither reads it as its own outcome nor collides with its name.
+func TestARetryRunsFreshWorkNotTheFailedAttempts(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := failedRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1)
+	m.finishPod("rollback", corev1.PodFailed, `{"error":"boom"}`, "") // the failed attempt's pod
+	m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: "3-1-1"}
+	m.pass(busMigrationRollingBack, 1)
+	m.rollOut(1)
+	m.pass(busMigrationRollbackRestoring, 1)
+	m.pass(busMigrationRollbackRestoring, 1) // the old Failed pod is not this attempt's outcome
+	retried := busMigrationWorkName(m.agent, m.agent.Status.BusMigration, "rollback")
+	if retried == busMigrationWorkloadName(m.agent, "rollback", "3-1") {
+		t.Fatalf("the retry's pod has the failed attempt's name %s", retried)
+	}
+	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: retried}, &corev1.Pod{}); err != nil {
+		t.Errorf("no fresh rollback pod %s for the retry: %v", retried, err)
+	}
+
+	u := failedRig(t, busMigrationShrink, busMigrationUnpinning, 3)
+	u.finishJob("unpin", batchv1.JobFailed) // the failed attempt's Job, still there
+	u.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: "3-1-1"}
+	u.pass(busMigrationUnpinning, 3)
+	u.pass(busMigrationUnpinning, 3)
+	if _, _, ok := u.workload("unpin"); !ok {
+		t.Error("the failed unpin Job was removed")
+	}
+	if err := u.cl.Get(context.Background(), client.ObjectKey{Namespace: u.agent.Namespace, Name: busMigrationWorkName(u.agent, u.agent.Status.BusMigration, "unpin")}, &batchv1.Job{}); err != nil {
+		t.Errorf("no fresh unpin Job for the retry: %v", err)
 	}
 }

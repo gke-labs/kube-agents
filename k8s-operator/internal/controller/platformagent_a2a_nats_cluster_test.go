@@ -613,6 +613,7 @@ func a2aRoutePeers(t *testing.T, s *natsserver.Server) []string {
 // migration, once, in the direction it asks, and the bus keeps its count
 // until the migration's phases convert it.
 func TestTheBusServerCountIsStickyAndAChangeStartsAMigration(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
 	ctx := context.Background()
 	claim := func(agent *agentv1alpha1.PlatformAgent, ordinal int, labelled bool) *corev1.PersistentVolumeClaim {
 		c := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace}}
@@ -1272,6 +1273,7 @@ func TestAFailedCountChangingPassStillDropsBusProvisionedOnTheRetry(t *testing.T
 // phases convert it, and the field still decides for a bus that does not
 // exist yet.
 func TestAFieldChangeStartsAMigration(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
 	ctx := context.Background()
 	claim := func(agent *agentv1alpha1.PlatformAgent, ordinal int) *corev1.PersistentVolumeClaim {
 		return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
@@ -1325,6 +1327,7 @@ func TestAFieldChangeStartsAMigration(t *testing.T) {
 // A migration under way is not restarted, and one that ended without
 // converting is not started again until the spec changes.
 func TestAMigrationStartsOncePerSpecChange(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
 	agent := a2aTestAgent()
 	agent.Generation = 7
 	now := metav1.Now()
@@ -1487,5 +1490,33 @@ func TestTheRetiredConversionRefusalIsCleared(t *testing.T) {
 	}
 	if c := meta.FindStatusCondition(stored.Status.Conditions, a2aBusConversionRefusedConditionType); c != nil {
 		t.Errorf("the retired condition is still on the CR: %+v", c)
+	}
+}
+
+// Without the operator's own image nothing could run the migration's work,
+// so a busReplicas change starts none: the bus keeps its count and a
+// Warning says why, rather than a run that freezes writes until its
+// deadline.
+func TestNoOperatorImageStartsNoMigration(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "")
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(3)}}
+	sts := buildA2ANATSStatefulSet(agent, "h")
+	sts.Spec.Replicas = ptr.To(int32(1))
+	rec := record.NewFakeRecorder(8)
+	r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(), Scheme: setupScheme(), Recorder: rec}
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration != nil || agent.Status.BusReplicas != 1 {
+		t.Errorf("migration %+v, busReplicas %d; want none and 1", agent.Status.BusMigration, agent.Status.BusReplicas)
+	}
+	select {
+	case e := <-rec.Events:
+		if !strings.Contains(e, reasonA2ABusMigrationUnavailable) || !strings.Contains(e, "OPERATOR_IMAGE") {
+			t.Errorf("event %q", e)
+		}
+	default:
+		t.Error("no Warning saying why the migration did not start")
 	}
 }

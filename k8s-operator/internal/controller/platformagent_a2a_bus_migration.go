@@ -200,11 +200,13 @@ func busMigrationReplicas(leg busMigrationLeg, phase busMigrationPhase, abandoni
 		}
 		return to
 	case busMigrationFailed:
-		if abandoning || leg == busMigrationGrow {
+		// Where it stopped: a run that failed on its way back is at the old
+		// count; one that failed going forward is at the new one, which is
+		// where its streams are (three to one after the shrink: server 0
+		// alone, at R1; one to three in Releasing: a converted cluster at R3).
+		if abandoning {
 			return from
 		}
-		// Three to one failed after the shrink: server 0 alone holds the
-		// streams at R1.
 		return to
 	}
 	return from
@@ -248,6 +250,19 @@ func withDeadline(outcome busMigrationOutcome, deadline, now time.Time) busMigra
 
 // busMigrationStep names the migration's own workloads: the pin, unpin and
 // snapshot Jobs and the hashing pod, each named for the run.
+// busMigrationWorkName names a run's Job or pod for its current attempt: the
+// run's own name until it is retried, then suffixed with the retry, so a
+// retry runs fresh work and is never read off the attempt that failed. Its
+// ServiceAccounts, staging claim and run Secret keep the run's name, which a
+// retry reuses.
+func busMigrationWorkName(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, name string) string {
+	id := run.RunID
+	if n := len(run.Retries); n > 0 {
+		id = fmt.Sprintf("%s-r%d", id, n)
+	}
+	return busMigrationWorkloadName(agent, name, id)
+}
+
 func busMigrationWorkloadName(agent *agentv1alpha1.PlatformAgent, step, runID string) string {
 	return fmt.Sprintf("%s-bus-%s-%s", agent.Name, step, runID)
 }
@@ -268,7 +283,7 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 	leg, phase := busMigrationLeg(run.Leg), busMigrationPhase(run.Phase)
 	job := func(step string) (busMigrationOutcome, bool, error) {
 		j := &batchv1.Job{}
-		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkloadName(agent, step, run.RunID)}, j); {
+		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkName(agent, run, step)}, j); {
 		case errors.IsNotFound(err):
 			return busMigrationPending, false, nil
 		case err != nil:
@@ -326,7 +341,7 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 // busMigrationPod reads one of the run's pods, nil when it is not there.
 func (r *PlatformAgentReconciler) busMigrationPod(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, name string) (*corev1.Pod, error) {
 	pod := &corev1.Pod{}
-	switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkloadName(agent, name, run.RunID)}, pod); {
+	switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkName(agent, run, name)}, pod); {
 	case errors.IsNotFound(err):
 		return nil, nil
 	case err != nil:
@@ -643,7 +658,7 @@ func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 	}
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      busMigrationWorkloadName(agent, step, run.RunID),
+			Name:      busMigrationWorkName(agent, run, step),
 			Namespace: agent.Namespace,
 			Labels:    a2aLabels(agent, "bus-migration"),
 		},
@@ -668,13 +683,17 @@ func buildBusHashPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusM
 		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: busMigrationStageClaim(agent, run.RunID), ReadOnly: true},
 	}}}
 	mounts := []corev1.VolumeMount{{Name: busMigrationStageVolume, MountPath: busMigrationStageMount, ReadOnly: true}}
+	spec := busMigrationPodSpec(agent, run, "hash", "hash", command, volumes, mounts)
+	// Bounded like the rest, so a hung hash never outlives the run holding
+	// the one-pod staging claim.
+	spec.ActiveDeadlineSeconds = ptr.To(busMigrationActiveDeadline(run, time.Now()))
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      busMigrationWorkloadName(agent, "hash", run.RunID),
+			Name:      busMigrationWorkName(agent, run, "hash"),
 			Namespace: agent.Namespace,
 			Labels:    a2aLabels(agent, "bus-migration"),
 		},
-		Spec: busMigrationPodSpec(agent, run, "hash", "hash", command, volumes, mounts),
+		Spec: spec,
 	}
 }
 
@@ -739,7 +758,7 @@ func buildBusStreamPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bu
 	spec.ActiveDeadlineSeconds = ptr.To(busMigrationActiveDeadline(run, now))
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      busMigrationWorkloadName(agent, kind, run.RunID),
+			Name:      busMigrationWorkName(agent, run, kind),
 			Namespace: agent.Namespace,
 			Labels:    a2aLabels(agent, "bus-migration"),
 		},

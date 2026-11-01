@@ -4059,8 +4059,18 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 	}
 	if running != 0 && want != running {
 		// A change between the counts starts a migration; the bus keeps the
-		// count it runs until the migration's phases convert it.
-		startBusMigration(agent, running, want, metav1.Now())
+		// count it runs until the migration's phases convert it. Not
+		// without the operator's own image, which runs the migration's
+		// work: a run without it would freeze writes and do nothing until
+		// its deadline.
+		if busMigrationImage() == "" {
+			if run := agent.Status.BusMigration; run == nil || busMigrationTerminal(busMigrationPhase(run.Phase)) {
+				r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationUnavailable,
+					fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d, but this operator was deployed without OPERATOR_IMAGE, which runs the migration; the bus keeps %d", want, running, running))
+			}
+		} else {
+			startBusMigration(agent, running, want, metav1.Now())
+		}
 	}
 	if run := agent.Status.BusMigration; run != nil && !busMigrationTerminal(busMigrationPhase(run.Phase)) {
 		// A migration under way decides the count, whatever the field and
@@ -4081,6 +4091,10 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 	agent.Status.BusReplicas = int32(running) // #nosec G115 -- 1 or 3
 	return nil
 }
+
+// reasonA2ABusMigrationUnavailable is the Warning when a busReplicas change
+// cannot start a migration because the operator has no image of its own.
+const reasonA2ABusMigrationUnavailable = "A2ABusMigrationUnavailable"
 
 // busMigrationRunDeadline bounds a migration run: a phase still unfinished
 // then counts as failed, and the run's bus credentials stop working.
