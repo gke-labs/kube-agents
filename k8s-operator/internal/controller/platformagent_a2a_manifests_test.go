@@ -26,6 +26,7 @@ import (
 	"net"
 	"path"
 	"reflect"
+	"regexp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"slices"
@@ -8148,5 +8149,117 @@ func TestTheGatewayAlwaysArmsTheConsoleDoor(t *testing.T) {
 				t.Errorf("the render asks for %d replicas, want 1", *dep.Spec.Replicas)
 			}
 		})
+	}
+}
+
+// a2aJetStreamCapMargin is the store room the provisioned caps must leave
+// unreserved (#4476). NATS reserves every stream's and bucket's max_bytes against
+// max_file_store when it creates the stream and refuses a create past it, so
+// this is the room a new stream, a raised cap or a recreate has before
+// provisioning starts failing with "insufficient storage".
+const a2aJetStreamCapMargin = int64(2) << 30
+
+// TestProvisionedJetStreamCapsFitTheStore holds the provision script's byte caps,
+// summed, under the server's max_file_store less a2aJetStreamCapMargin, and the
+// store under the bus's claim (#4476). Every create must carry a cap: one without
+// reserves nothing, and then grows into the room every other stream's reservation
+// counted on. Lines the script only prints (an `echo` naming an edit for an
+// operator) are not commands and are skipped; an executed edit that raises a cap
+// re-reserves, so it counts.
+func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
+	agent := a2aTestAgent()
+	// Comment lines go first: bash doesn't continue a comment that ends in `\`, so
+	// joining before dropping them would fold the next command into the comment.
+	// Then one logical line per command line (the creates wrap with `\`), split at
+	// && || ; and | so each create's flags stop at the next command.
+	var kept []string
+	for _, line := range strings.Split(a2aProvisionScript(agent), "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "#") {
+			kept = append(kept, line)
+		}
+	}
+	script := strings.ReplaceAll(strings.Join(kept, "\n"), "\\\n", " ")
+	separators := regexp.MustCompile(`&&|\|\||;|\|`)
+	var commands []string
+	for _, line := range strings.Split(script, "\n") {
+		commands = append(commands, separators.Split(line, -1)...)
+	}
+
+	// natscli's create spellings, aliases included, and the edits that can raise a cap.
+	creates := regexp.MustCompile(`\b(stream (?:add|create|new)|kv (?:add|new|create))\s+(\S+)(.*)$`)
+	edits := regexp.MustCompile(`\b(stream (?:edit|update))\s+(\S+)(.*)$`)
+	capOf := func(name, flag, rest string) (int64, bool) {
+		for _, f := range strings.Fields(rest) {
+			if v, ok := strings.CutPrefix(f, flag); ok {
+				n, err := strconv.ParseInt(v, 10, 64)
+				if err != nil || n <= 0 {
+					t.Fatalf("%s: %s%s is not a positive byte count", name, flag, v)
+				}
+				return n, true
+			}
+		}
+		return 0, false
+	}
+	caps := map[string]int64{}
+	created := map[string]bool{}
+	for _, line := range commands {
+		if strings.HasPrefix(strings.TrimSpace(line), "echo ") {
+			continue
+		}
+		if m := creates.FindStringSubmatch(line); m != nil {
+			name, flag := m[2], "--max-bytes="
+			if strings.HasPrefix(m[1], "kv ") {
+				name, flag = "KV_"+name, "--max-bucket-size="
+			}
+			if created[name] {
+				t.Fatalf("%s is created twice in the provision script; which cap holds is not a question this test answers", name)
+			}
+			created[name] = true
+			n, found := capOf(name, flag, m[3])
+			if !found {
+				t.Errorf("%s is created without %s: it reserves nothing, and grows into the room the other caps count on", name, flag)
+			}
+			caps[name] = max(caps[name], n)
+		}
+		if m := edits.FindStringSubmatch(line); m != nil {
+			if n, found := capOf(m[2], "--max-bytes=", m[3]); found && n > caps[m[2]] {
+				caps[m[2]] = n
+			}
+		}
+	}
+	// Not vacuous: every provisioned stream and bucket was found and counted.
+	for _, s := range a2aProvisionedStreams {
+		if !created[s] {
+			t.Errorf("no capped create found for %s; the sum below would leave it out", s)
+		}
+	}
+
+	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+	m := regexp.MustCompile(`(?m)^\s*max_file_store:\s*(\d+)\s*$`).FindStringSubmatch(conf)
+	if m == nil {
+		t.Fatal("nats.conf renders no max_file_store")
+	}
+	store, _ := strconv.ParseInt(m[1], 10, 64)
+	// The store has to fit the volume it is on, or the caps' arithmetic is about room
+	// the disk does not have.
+	claim := buildA2ANATSStatefulSet(agent, "").Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]
+	if store > claim.Value() {
+		t.Errorf("max_file_store is %d bytes, more than the bus's %s claim", store, claim.String())
+	}
+
+	var sum int64
+	names := make([]string, 0, len(caps))
+	for name, n := range caps {
+		sum += n
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	if sum > store-a2aJetStreamCapMargin {
+		var b strings.Builder
+		for _, name := range names {
+			fmt.Fprintf(&b, "\n  %-18s %8.3f GiB", name, float64(caps[name])/(1<<30))
+		}
+		t.Errorf("the provisioned caps reserve %.3f GiB of a %.3f GiB store, leaving %.3f GiB, under the %d GiB margin (#4476):%s",
+			float64(sum)/(1<<30), float64(store)/(1<<30), float64(store-sum)/(1<<30), a2aJetStreamCapMargin>>30, b.String())
 	}
 }
