@@ -22,6 +22,7 @@ import (
 	goerrors "errors"
 	"fmt"
 	"net"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -236,6 +237,12 @@ const (
 	// install without one looks healthy while every unprompted post is
 	// dropped (#3320). Written only in that state, like EventWatcher, and it
 	// leaves Ready alone: chat works, and some installs want no posts.
+	// a2aBusConversionRefusedConditionType is retired: the operator that
+	// refused a bus conversion wrote it, and this one migrates instead
+	// (A2ABusMigrating). It is only ever removed, from a CR an earlier
+	// operator wrote it to.
+	a2aBusConversionRefusedConditionType = "A2ABusConversionRefused"
+
 	homeChannelUnsetConditionType = "HomeChannelUnset"
 	homeChannelUnsetReason        = "NoHomeChannel"
 	// homeChannelUnsetMessageFormat takes the backend, the CR field, the
@@ -438,6 +445,13 @@ type PlatformAgentReconciler struct {
 	// next event. Keyed by ObjectKey, value time.Time; cleared by any write
 	// whose echo carries the field, and when the CR is deleted.
 	prunedUsageStatus sync.Map
+	// prunedBusReplicasStatus records, per CR, when a status write was last
+	// seen to come back without status.busReplicas: an operator rolled ahead
+	// of the CRD that adds the field. While a record is fresh the status
+	// writers leave the field out of their unchanged checks, so the write the
+	// API server prunes does not repeat on every pass (busReplicasStatusCurrent).
+	prunedBusReplicasStatus sync.Map
+
 	// prunedNewerFields records, per CR (usagePollKey) and per newer
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
 	// the proposal readings as one (usageNewerFieldReadings),
@@ -1062,6 +1076,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.cleanupA2A(ctx, instance); err != nil {
 			return ctrl.Result{}, err
 		}
+		// No bus, no server count. Telling the writers what the CR carried
+		// lets them write the cleared field once, and then find it current.
+		a2aState.busReplicasPersisted = instance.Status.BusReplicas
+		instance.Status.BusReplicas = 0
 	}
 
 	// The version this pass rendered, for the deferred write at 2d. Empty on
@@ -1155,7 +1173,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// that darkened its gateway, the A2AGateway condition is kept until the
 	// scaled-up replica is ready, and the pass that clears it should not
 	// depend on the Deployment's status event alone.
-	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayWaking) {
+	// a2aBusNeedsRecheck adds a bus server short of the count while a
+	// quorum serves, for the same reason.
+	if a2aNext && r.a2aBusNeedsRecheck(ctx, instance, a2aState) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -1194,6 +1214,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// event — the same pairing rbacDegraded has above. Without this the record
 	// would expire and sit until the fifteen-minute requeue.
 	requeueAfter = min(requeueAfter, r.usageStatusRequeue(instance))
+	// A bus migration's Jobs and pods are not watched, so while one runs the
+	// pass that reads their outcome has to be scheduled.
+	if d := busMigrationRequeue(instance); d > 0 {
+		requeueAfter = min(requeueAfter, d)
+	}
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
@@ -1202,7 +1227,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // record it returns the secret re-read's interval, the ceiling the caller
 // already applies, so the min it feeds leaves the caller's value alone.
 func (r *PlatformAgentReconciler) usageStatusRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
-	if r.usageStatusPruned(agent) {
+	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) {
 		return usageStatusReprobeInterval
 	}
 	return secretEnvReprobeInterval
@@ -1300,23 +1325,29 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			}
 		}
 
-		// The NATS StatefulSet's volumeClaimTemplate PVC has no owner
+		// The NATS StatefulSet's volumeClaimTemplate PVCs have no owner
 		// reference (nothing from a template does), so without this a
-		// deleted next-mode agent leaks its 40Gi JetStream volume. Guarded by
+		// deleted next-mode agent leaks a 40Gi JetStream volume per server.
+		// Every ordinal the bus can have, not just the current replica count:
+		// claims can outlive their servers (a StatefulSet deleted with the
+		// CR's finalizer still pending, or one that predates the retention
+		// policy that deletes them on scale-down), so every ordinal is checked. Guarded by
 		// the instance label the claim template stamps, because a name is not
-		// ownership: a PVC squatting this exact name that this render did not
-		// create is left alone rather than destroyed.
-		a2aPVC := &corev1.PersistentVolumeClaim{}
-		pvcKey := client.ObjectKey{Name: a2aNATSDataClaim + "-" + a2aNATSName(agent) + "-0", Namespace: agent.Namespace}
-		switch err := r.Client.Get(ctx, pvcKey, a2aPVC); {
-		case err == nil:
-			if a2aPVC.Labels[labelInstance] == instanceLabel(agent.Namespace, agent.Name) {
-				if err := client.IgnoreNotFound(r.Delete(ctx, a2aPVC)); err != nil {
-					return ctrl.Result{}, err
+		// ownership: a PVC squatting one of these names that this render did
+		// not create is left alone rather than destroyed.
+		for ordinal := range a2aNATSMaxReplicas {
+			a2aPVC := &corev1.PersistentVolumeClaim{}
+			pvcKey := client.ObjectKey{Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace}
+			switch err := r.Client.Get(ctx, pvcKey, a2aPVC); {
+			case err == nil:
+				if a2aPVC.Labels[labelInstance] == instanceLabel(agent.Namespace, agent.Name) {
+					if err := client.IgnoreNotFound(r.Delete(ctx, a2aPVC)); err != nil {
+						return ctrl.Result{}, err
+					}
 				}
+			case client.IgnoreNotFound(err) != nil:
+				return ctrl.Result{}, err
 			}
-		case client.IgnoreNotFound(err) != nil:
-			return ctrl.Result{}, err
 		}
 
 		// Resource is deleted. Safe to remove finalizer and update.
@@ -3285,6 +3316,9 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 		errs = append(errs, err)
 	}
 	if a2aStackRendering(agent) {
+		// No server count is resolved here: this path does not reconcile the
+		// bus, so it must not write status.busReplicas or announce a
+		// conversion, and the bus fence does not depend on the count.
 		if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 			var pnErr *profileNamespaceError
 			if goerrors.As(err, &pnErr) {
@@ -3944,7 +3978,7 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 			provisioned = 1
 		}
 		workloads = append(workloads,
-			splitWorkloadStatus{name: natsName, kind: "StatefulSet", ready: nats.Status.ReadyReplicas},
+			splitWorkloadStatus{name: natsName, kind: "StatefulSet", ready: a2aNATSServingReplicas(nats)},
 			splitWorkloadStatus{name: calloutName, kind: "Deployment", ready: callout.Status.ReadyReplicas},
 			splitWorkloadStatus{name: jobName, kind: "Job", ready: provisioned},
 		)
@@ -4206,14 +4240,20 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
-		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) {
+		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
+		retiredConversionRefusedAbsent(agent) &&
+		busMigratingConditionCurrent(agent) && busMigrationStatusCurrent(agent, a2a) &&
+		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) {
 		return nil
 	}
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
 			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live)) &&
-			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered)
+			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
+			retiredConversionRefusedAbsent(live) &&
+			reflect.DeepEqual(live.Status.BusMigration, agent.Status.BusMigration) && busMigratingConditionCurrent(live) &&
+			(r.busReplicasStatusPruned(agent) || live.Status.BusReplicas == agent.Status.BusReplicas)
 	}) {
 		return nil
 	}
@@ -4223,7 +4263,47 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
-	return r.Status().Update(ctx, agent)
+	meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusConversionRefusedConditionType)
+	setBusMigratingCondition(agent, now)
+	writtenBusReplicas := agent.Status.BusReplicas
+	if err := r.Status().Update(ctx, agent); err != nil {
+		return err
+	}
+	r.noteBusReplicasEcho(agent, writtenBusReplicas)
+	return nil
+}
+
+// busReplicasStatusCurrent reports whether status.busReplicas needs no write:
+// the CR already carried the count this pass resolved (persisted, read before
+// resolveA2ABusReplicas set the in-memory copy), or the served CRD was seen to
+// prune the field recently, in which case writing it would only be pruned
+// again and wake the next pass through the unfiltered watch.
+func (r *PlatformAgentReconciler) busReplicasStatusCurrent(agent *agentv1alpha1.PlatformAgent, persisted int32) bool {
+	return r.busReplicasStatusPruned(agent) || persisted == agent.Status.BusReplicas
+}
+
+// busReplicasStatusPruned reports a fresh record that the served CRD drops
+// status.busReplicas (noteBusReplicasEcho), reprobed on the status.usage
+// cadence.
+func (r *PlatformAgentReconciler) busReplicasStatusPruned(agent *agentv1alpha1.PlatformAgent) bool {
+	recorded, pruned := r.prunedBusReplicasStatus.Load(client.ObjectKeyFromObject(agent))
+	return pruned && time.Since(recorded.(time.Time)) < usageStatusReprobeInterval
+}
+
+// noteBusReplicasEcho reads the server's copy back after a status write. The
+// response is decoded into agent through a target-zeroing decoder (see
+// noteUsageStatusEcho), so a field the served CRD does not know comes back 0
+// although a count was written. Writing 0 says nothing either way.
+func (r *PlatformAgentReconciler) noteBusReplicasEcho(agent *agentv1alpha1.PlatformAgent, written int32) {
+	if written == 0 {
+		return
+	}
+	key := client.ObjectKeyFromObject(agent)
+	if agent.Status.BusReplicas == written {
+		r.prunedBusReplicasStatus.Delete(key)
+		return
+	}
+	r.prunedBusReplicasStatus.Store(key, time.Now())
 }
 
 // liveAgentSatisfies checks whether the uncached live object already satisfies pred.
@@ -4360,6 +4440,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		condMsg = "Gateway, shell sandbox and credential broker are all ready"
 		if a2aStackRendering(agent) {
 			condMsg = "Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready"
+			// A quorum serves, so Ready stands, but a server short of
+			// the configured count is a bus one failure from an outage
+			// and is said here: the pod scan below does not run on a
+			// Ready pass.
+			if note := r.a2aNATSShortNote(ctx, agent); note != "" {
+				condMsg += ". " + note
+			}
 		}
 	case errWorkload == nil:
 		// The bucket question the scan asks is "has this install ever
@@ -4522,6 +4609,10 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	homeChannelUnsetMsg := homeChannelUnsetMessage(agent)
 	homeChannelUnsetUnchanged := homeChannelUnsetConditionCurrent(agent, homeChannelUnsetMsg)
 
+	// The retired conversion refusal an earlier operator may have left.
+	conversionRefusedUnchanged := retiredConversionRefusedAbsent(agent)
+	busMigratingUnchanged := busMigratingConditionCurrent(agent)
+
 	// The A2AGateway condition, same class as EventWatcher and for the same
 	// reason it needs its own term: on an upgraded install, the way back
 	// from dark can leave the Ready phase and message exactly as they were
@@ -4589,10 +4680,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
 		homeChannelUnsetUnchanged &&
+		conversionRefusedUnchanged &&
+		busMigratingUnchanged && busMigrationStatusCurrent(agent, a2a) &&
 		hostPathDroppedUnchanged &&
 		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
+		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
 		a2aVerifierUnchanged && a2aMCPServerUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
@@ -4665,6 +4759,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	setHomeChannelUnsetCondition(agent, homeChannelUnsetMsg, now)
+	meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusConversionRefusedConditionType)
+	setBusMigratingCondition(agent, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 
@@ -4674,10 +4770,12 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
+	writtenBusReplicas := agent.Status.BusReplicas
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, err
 	}
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
+	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	return newPhase, nil
 }
 
@@ -4761,6 +4859,7 @@ func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agen
 // map does not keep an entry per deleted name for the life of the process.
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.prunedBusReplicasStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedNewerFieldsMu.Lock()
 	delete(r.prunedNewerFields, usagePollKey(agent))
 	r.prunedNewerFieldsMu.Unlock()
@@ -5207,6 +5306,16 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 		selectors = append(selectors, map[string]string{"app": a2aVerifierName(agent)})
 	}
 
+	// The bus's servers. On a multi-server bus the StatefulSet counts toward
+	// Ready once a quorum serves (a2aNATSServingReplicas), so a server stuck
+	// Pending under the hostname spread or failing its image pull can leave
+	// the CR Ready; updateStatusReady's message names it then
+	// (a2aNATSShortNote). While the CR is not Ready, this scan carries the
+	// pod's reason to the status.
+	if a2aStackRendering(agent) {
+		selectors = append(selectors, map[string]string{"app": a2aNATSName(agent)})
+	}
+
 	pods := make([]corev1.Pod, 0)
 	// A read that failed is not a selector that matched nothing, and since
 	// podReader goes to the API server it can fail for a reason outside this
@@ -5359,7 +5468,11 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 			if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse && cond.Reason == "Unschedulable" {
 				phase = degradedPhase
 				reason = "PodUnschedulable"
-				if requested := requestedRuntimeClasses(agent); len(requested) > 0 {
+				// The CR's RuntimeClass explains a pod that asked for one. A
+				// pod that did not (the bus's servers, held Pending by the
+				// hostname spread) is unschedulable for its own reason, which
+				// is the scheduler's message.
+				if requested := requestedRuntimeClasses(agent); len(requested) > 0 && pod.Spec.RuntimeClassName != nil && *pod.Spec.RuntimeClassName != "" {
 					// Plural only when the CR really does name two, which takes
 					// the agent pod and the sandbox having deliberately been
 					// given different runtimes. Every other install reads the

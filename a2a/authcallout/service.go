@@ -446,9 +446,9 @@ type decision struct {
 	perms   *jwt.Permissions
 	user    string
 
-	// task and notAfter are set on a profile worker's task connection
-	// alone: the task its grants are scoped to, and its credential's
-	// expiry, which caps the minted JWT's (see mint).
+	// task is set on a profile worker's task connection alone: the task
+	// its grants are scoped to. notAfter caps the minted JWT's expiry (see
+	// mint): the task credential's expiry there, or the entry's NotAfter.
 	task     string
 	notAfter time.Time
 }
@@ -519,6 +519,14 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 	grants, user := id.Grants, id.User
 	var task string
 	var notAfter time.Time
+	// An entry past its NotAfter authenticates nothing, whatever the map
+	// still says; one before it mints no JWT that outlives it.
+	if id.NotAfter != nil {
+		if !s.now().Before(*id.NotAfter) {
+			return decision{}, fmt.Errorf("%s's entry expired at %s", att.ServiceAccount, id.NotAfter.UTC().Format(time.RFC3339))
+		}
+		notAfter = *id.NotAfter
+	}
 	if id.Narrowing != "" {
 		// A narrowed entry holds no grants; they are built here from what
 		// the cluster attested about this connection specifically. The

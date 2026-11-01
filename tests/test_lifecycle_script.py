@@ -1579,7 +1579,9 @@ exit 0
         proc, _ = self._run_delete(wedged=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         calls = self.kubectl_args.splitlines()
-        self.assertEqual(len(calls), 7, self.kubectl_args)
+        # get, delete, patch, three RBAC deletes, and one JetStream claim
+        # delete per bus server ordinal (0, 1, 2).
+        self.assertEqual(len(calls), 9, self.kubectl_args)
         for call in calls:
             self.assertTrue(call.startswith("--context gke_test-project_us-central1_test-cluster "), call)
 
@@ -1604,10 +1606,12 @@ exit 0
             "delete clusterrole kubeagents:minimal:kubeagents-system:agent kubeagents:tokenreview:kubeagents-system:agent --ignore-not-found",
             self.kubectl_args,
         )
-        self.assertIn(
-            "delete pvc -n kubeagents-system -l app.kubernetes.io/instance=kubeagents-system-agent --field-selector metadata.name=data-agent-a2a-nats-0 --ignore-not-found --wait=false",
-            self.kubectl_args,
-        )
+        # One claim per bus server: a three-server bus has three.
+        for ordinal in (0, 1, 2):
+            self.assertIn(
+                f"delete pvc -n kubeagents-system -l app.kubernetes.io/instance=kubeagents-system-agent --field-selector metadata.name=data-agent-a2a-nats-{ordinal} --ignore-not-found --wait=false",
+                self.kubectl_args,
+            )
 
     def test_wedged_finalizer_truncates_long_instance_label_for_pvc(self):
         # Ensure that instanceLabel (>63 chars) is properly truncated to 63 chars

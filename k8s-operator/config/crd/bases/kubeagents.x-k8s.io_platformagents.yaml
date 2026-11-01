@@ -9667,6 +9667,31 @@ spec:
                         Tuning sets per-persona execution limits. Unset values keep the defaults
                         baked into the agent image.
                       properties:
+                        busReplicas:
+                          description: |-
+                            BusReplicas is how many NATS servers run the A2A bus under mode: next,
+                            and so how many copies JetStream keeps of every stream and bucket: 3
+                            runs a cluster with R3 streams, which keeps the bus up through a node
+                            drain, upgrade or eviction that moves one server; 1 runs a single
+                            server with R1 streams, which is down for as long as its pod restarts.
+                            1 is for a throwaway, single-node or cost-bound install that accepts
+                            that outage; it saves two NATS pods and two 40Gi volumes.
+
+                            Unset, an install keeps the count its bus already runs, so an install
+                            from before the three-server default stays on one server, and a new bus
+                            gets three (status.busReplicas shows which applies).
+
+                            Set, it decides the count of a bus that does not exist yet. On an
+                            existing bus, a change between 1 and 3 starts a migration that keeps
+                            the bus's data (status.busMigration, the A2ABusMigrating condition):
+                            the bus keeps the count it runs until the migration converts it, and
+                            the admission webhook refuses another change while one runs. One server
+                            to three freezes writes for the window, since it copies the streams
+                            (docs/designs/spec-nats-deployment.md).
+                          enum:
+                            - 1
+                            - 3
+                          type: integer
                         cluster:
                           description: |-
                             Cluster applies to every `cluster-*` profile (the Cluster Agents). Delivered as a
@@ -11585,6 +11610,155 @@ spec:
                     Address is the fully qualified domain name (FQDN) of
                     the agent service.
                   type: string
+                busMigration:
+                  description: |-
+                    BusMigration is the A2A bus's server-count migration under spec.mode:
+                    next, while one runs or since the last one ended: setting
+                    spec.harness.tuning.busReplicas to another count on an existing bus
+                    starts one, and it converts the bus without emptying it. Unset when no
+                    migration has run.
+                  properties:
+                    abandoning:
+                      description: |-
+                        Abandoning is set once the migration is on its way back to the old
+                        count.
+                      type: boolean
+                    cause:
+                      description: |-
+                        Cause is why the run turned back: the phase that failed, and whether
+                        it was still running at Deadline. Set at the first failure and kept
+                        until a retry, which moves it into Retries.
+                      type: string
+                    cleared:
+                      description: |-
+                        Cleared lists the provisioned streams the current Clearing phase has
+                        deleted, ahead of the conversion or the rollback. A restore starts
+                        only once it names every one.
+                      items:
+                        type: string
+                      type: array
+                    deadline:
+                      description: |-
+                        Deadline is the deadline of the stretch the run is on: when an
+                        unfinished phase counts as failed, and when the migration's bus
+                        credentials stop working. Its Jobs stop a few minutes before it. A
+                        run that turns back gets one fresh deadline for its way back
+                        (ForwardDeadline keeps the first), and a retry another.
+                      format: date-time
+                      type: string
+                    failedIn:
+                      description: |-
+                        FailedIn is the phase a Failed run failed in. A run that failed inside
+                        the one to three leg's write freeze keeps the freeze, with its
+                        snapshot, until a person retries it or gives it up, each with an
+                        annotation on the PlatformAgent naming this run (the A2ABusMigrating
+                        condition says which). A Failed run blocks any new migration until
+                        then.
+                      type: string
+                    forwardDeadline:
+                      description: |-
+                        ForwardDeadline is the deadline the run went forward under, kept once
+                        it turned back and Deadline became its way back's.
+                      format: date-time
+                      type: string
+                    freezeConfirmed:
+                      description: |-
+                        FreezeConfirmed is set once every callout replica serves the write
+                        freeze's identity map, and only then does the bus render without its
+                        static application users and restart into the freeze.
+                      type: boolean
+                    givenUp:
+                      description: |-
+                        GivenUp is set when a person gave a Failed run up: its freeze is
+                        lifted, and streams it did not put back are recreated empty.
+                      type: boolean
+                    leg:
+                      description: |-
+                        Leg is the direction: OneToThree (snapshot and restore, behind a write
+                        freeze) or ThreeToOne (in place).
+                      enum:
+                        - OneToThree
+                        - ThreeToOne
+                      type: string
+                    message:
+                      description: Message is the manual step a Failed migration names.
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        ObservedGeneration is the PlatformAgent generation that started this
+                        migration. A migration that ended without converting is not started
+                        again until the spec changes.
+                      format: int64
+                      type: integer
+                    phase:
+                      description: |-
+                        Phase is where the migration is. Done converted the bus with its data;
+                        Abandoned left it at its old count with its data; Failed stopped where
+                        a person has to act, and Message says what.
+                      type: string
+                    retries:
+                      description: |-
+                        Retries records each retry of a Failed run, oldest first, at most
+                        three.
+                      items:
+                        description: |-
+                          BusMigrationRetry is one retry of a Failed bus migration run: when it was
+                          asked for, and the failure it retried.
+                        properties:
+                          at:
+                            description: At is when the retry was asked for.
+                            format: date-time
+                            type: string
+                          cause:
+                            description: Cause is why the retried attempt failed.
+                            type: string
+                          failedIn:
+                            description:
+                              FailedIn is the phase the retried attempt failed
+                              in.
+                            type: string
+                        required:
+                          - at
+                          - failedIn
+                        type: object
+                      maxItems: 3
+                      type: array
+                    runID:
+                      description: |-
+                        RunID names this migration's own Jobs, pods, ServiceAccounts and bus
+                        principals.
+                      type: string
+                    startedAt:
+                      description: StartedAt is when the migration began.
+                      format: date-time
+                      type: string
+                    warnings:
+                      description: |-
+                        Warnings are what the restore found and restored anyway: a stream
+                        lacking a subject a fresh install has, or a field outside the
+                        restore's policy that differs from a fresh install. Together they are
+                        reported once, in one Warning Event. At most 4 KiB of them; the last says
+                        how many more there were.
+                      items:
+                        type: string
+                      type: array
+                  required:
+                    - deadline
+                    - leg
+                    - observedGeneration
+                    - phase
+                    - runID
+                    - startedAt
+                  type: object
+                busReplicas:
+                  description: |-
+                    BusReplicas is the A2A bus's NATS server count under spec.mode: next:
+                    the count the bus runs, which only a migration changes (BusMigration);
+                    for a new bus, spec.harness.tuning.busReplicas, or 3. Re-derived from
+                    the cluster on every reconcile, so it is a reading of the bus rather
+                    than a setting.
+                  format: int32
+                  type: integer
                 conditions:
                   description:
                     Conditions represent the latest available observations

@@ -337,6 +337,10 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	allErrs = append(allErrs, storageErrs...)
 	warnings = append(warnings, storageWarnings...)
 
+	// 6. The bus's server count, on an update: an edit asking an existing bus
+	// for another count is refused here as the operator refuses it.
+	allErrs = append(allErrs, validateBusReplicas(oldObj, platformAgent)...)
+
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
 			schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
@@ -346,6 +350,35 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	}
 
 	return warnings, nil
+}
+
+// validateBusReplicas refuses an update that changes
+// spec.harness.tuning.busReplicas while the bus's migration is under way:
+// a run converts to the count it started for, and turning it around mid-way
+// is not a migration it knows how to make. Setting the field to the other
+// count on an existing bus is otherwise how a migration starts (#4225).
+// Best effort: the run is read from the stored object's status.
+func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
+	if oldObj == nil || platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != "next" {
+		return nil
+	}
+	run := oldObj.Status.BusMigration
+	if run == nil || run.Phase == "Done" || run.Phase == "Abandoned" || run.Phase == "Failed" {
+		return nil
+	}
+	previous, asked := busReplicasField(oldObj), busReplicasField(platformAgent)
+	if (previous == nil) == (asked == nil) && (previous == nil || *previous == *asked) {
+		return nil
+	}
+	return field.ErrorList{field.Forbidden(field.NewPath("spec", "harness", "tuning", "busReplicas"),
+		fmt.Sprintf("the A2A bus's %s migration is under way (phase %s); busReplicas can change again once it has ended (status.busMigration)", run.Leg, run.Phase))}
+}
+
+func busReplicasField(pa *agentv1alpha1.PlatformAgent) *int {
+	if pa.Spec.Harness == nil || pa.Spec.Harness.Tuning == nil {
+		return nil
+	}
+	return pa.Spec.Harness.Tuning.BusReplicas
 }
 
 // validateStorageSize refuses a spec.storage.size of zero or less or above

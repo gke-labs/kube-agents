@@ -1022,6 +1022,14 @@ platformAgent:
       # maxSessions caps the A2A session pods a "next" install runs at once;
       # the operator's default applies when it is unset, and "today" ignores it.
       # maxSessions: 10
+      # busReplicas is how many NATS servers run a "next" install's bus: 3 runs a
+      # cluster with R3 streams that rides out a node drain, 1 a single server
+      # that is down for each pod restart. A cluster needs three nodes; set 1 on a
+      # cluster that cannot have them (kind, a one-node Standard pool), before the
+      # first install. Changing it on an existing bus migrates the bus between one
+      # server and three, keeping its data; one to three freezes writes for its
+      # window.
+      # busReplicas: 3
       # profiles sizes AgentProfile work on a "next" install: ceiling is the most
       # profile tasks running at once across every profile (default: maxInProgress,
       # 6 unless set), childReserve the share of it kept for child tasks (default

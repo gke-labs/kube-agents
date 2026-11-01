@@ -1,0 +1,62 @@
+{
+  "version": "23c57ca61fb30be8",
+  "identities": [
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-bus-stream-3-1",
+      "user": "migrate-stream-3-1",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "$JS.API.STREAM.INFO.TASKS",
+          "$JS.API.STREAM.SNAPSHOT.TASKS",
+          "$JS.SNAPSHOT.ACK.TASKS.>",
+          "$JS.API.STREAM.INFO.DIRECTORY",
+          "$JS.API.STREAM.SNAPSHOT.DIRECTORY",
+          "$JS.SNAPSHOT.ACK.DIRECTORY.>",
+          "$JS.API.STREAM.INFO.TOPICS-STATE",
+          "$JS.API.STREAM.SNAPSHOT.TOPICS-STATE",
+          "$JS.SNAPSHOT.ACK.TOPICS-STATE.>",
+          "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+          "$JS.API.STREAM.SNAPSHOT.TOPICS-JOURNAL",
+          "$JS.SNAPSHOT.ACK.TOPICS-JOURNAL.>",
+          "$JS.API.STREAM.INFO.KV_runtime-state",
+          "$JS.API.STREAM.SNAPSHOT.KV_runtime-state",
+          "$JS.SNAPSHOT.ACK.KV_runtime-state.>",
+          "$JS.API.STREAM.INFO.KV_session-state",
+          "$JS.API.STREAM.SNAPSHOT.KV_session-state",
+          "$JS.SNAPSHOT.ACK.KV_session-state.>",
+          "$JS.API.STREAM.INFO.KV_cap",
+          "$JS.API.STREAM.SNAPSHOT.KV_cap",
+          "$JS.SNAPSHOT.ACK.KV_cap.>",
+          "$JS.API.STREAM.INFO.KV_feedback",
+          "$JS.API.STREAM.SNAPSHOT.KV_feedback",
+          "$JS.SNAPSHOT.ACK.KV_feedback.>",
+          "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.SNAPSHOT.KV_PROFILE_LEASES",
+          "$JS.SNAPSHOT.ACK.KV_PROFILE_LEASES.>",
+          "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+          "$JS.API.STREAM.SNAPSHOT.PROFILE_SUBMITS",
+          "$JS.SNAPSHOT.ACK.PROFILE_SUBMITS.>"
+        ],
+        "subscribe": [
+          "_INBOX.migrate-stream-3-1.>"
+        ]
+      },
+      "notAfter": "2099-01-01T00:00:00Z"
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-bus-frozen-3-1",
+      "user": "migrate-frozen-3-1",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "_INBOX.migrate-frozen-3-1.>"
+        ],
+        "subscribe": [
+          "_INBOX.migrate-frozen-3-1.>"
+        ]
+      },
+      "notAfter": "2099-01-01T00:00:00Z"
+    }
+  ]
+}

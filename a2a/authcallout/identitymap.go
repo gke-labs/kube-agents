@@ -21,6 +21,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -108,6 +109,16 @@ type Identity struct {
 	// Optional while an operator from before per-tier identities can still
 	// render the map; when set it must be a known tier.
 	Tier string `json:"tier,omitempty"`
+
+	// NotAfter, when set, is the instant this entry stops authenticating
+	// anything, and every JWT minted from it expires by then: the server
+	// closes a connection when its JWT expires, so a connection made just
+	// before NotAfter does not outlive it. The operator sets it on the bus
+	// migration's per-run principals at the run's deadline, so a run that
+	// overstays it, or an operator that never removes the entry, leaves no
+	// working credential behind. Only on an entry that names its grants: a
+	// narrowed entry's lifetime is its pod's and its task credential's.
+	NotAfter *time.Time `json:"notAfter,omitempty"`
 }
 
 // IdentityMap is what the operator renders and the callout serves. Version is
@@ -219,6 +230,9 @@ func (id Identity) validate() error {
 	// silently ignores is a grant someone believes exists.
 	if id.Narrowing != NarrowingProfile && (id.Profile != "" || id.Topics != nil || id.Tier != "") {
 		return fmt.Errorf("user %q carries profile or topics but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingProfile)
+	}
+	if id.NotAfter != nil && id.Narrowing != "" {
+		return fmt.Errorf("user %q carries notAfter but narrows on %q; only an entry that names its grants expires that way", id.User, id.Narrowing)
 	}
 	switch id.Narrowing {
 	case "":

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -118,6 +119,11 @@ type a2aAuthMapIdentity struct {
 	// Tier is the tier a profile entry's pods run at (#3655): one entry, and
 	// one ServiceAccount, per tier the profile allows. Omitted elsewhere.
 	Tier string `json:"tier,omitempty"`
+
+	// NotAfter is set only on the bus migration's per-run principals, at
+	// the run's deadline: the callout refuses the entry from then on and
+	// caps every JWT it mints for it there. Omitted elsewhere.
+	NotAfter *time.Time `json:"notAfter,omitempty"`
 }
 
 // a2aAuthMapTopics mirrors the callout's TopicGrants.
@@ -146,7 +152,14 @@ type a2aAuthMapDocument struct {
 // left out rather than failing the render (agentProfileMapEntries).
 func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (a2aAuthMapDocument, error) {
 	identities := make([]a2aAuthMapIdentity, 0)
-	for _, id := range calloutIdentities(agent) {
+	ids := calloutIdentities(agent)
+	if busMigrationFreezeActive(agent) {
+		// The write freeze: the migration's principals and the run's
+		// sentinel, and nothing else, so no other workload authenticates
+		// (busMigrationFrozenIdentities). No profiles, no dispatcher.
+		ids, profiles = busMigrationFrozenIdentities(agent), nil
+	}
+	for _, id := range ids {
 		identities = append(identities, a2aAuthMapIdentity{
 			ServiceAccount: id.serviceAccount,
 			User:           id.user,
@@ -156,13 +169,14 @@ func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 				Subscribe: id.subscribe,
 			},
 			Narrowing: id.narrowing,
+			NotAfter:  id.notAfter,
 		})
 	}
 	identities = append(identities, agentProfileMapEntries(agent, profiles)...)
 	// The dispatcher, when this operator has an image for it. Its grants
 	// name each durable the operator creates, so it is built here, from the
 	// same profiles (platformagent_a2a_dispatcher.go).
-	if a2aDispatcherEnabled() {
+	if a2aDispatcherEnabled() && !busMigrationFreezeActive(agent) {
 		names, durables := dispatcherGrantNames(agent, profiles)
 		id := dispatcherIdentity(agent, agent.Namespace, names, durables)
 		identities = append(identities, a2aAuthMapIdentity{
@@ -320,6 +334,9 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 			return fmt.Errorf("identity %d: user %q names account %q, which the callout will not mint into (only %q is mintable)", i, id.User, id.Account, a2aAccountApp)
 		}
 		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
+		if id.NotAfter != nil && id.Narrowing != "" {
+			return fmt.Errorf("identity %d: user %q carries notAfter but narrows on %q; only an entry that names its grants expires that way", i, id.User, id.Narrowing)
+		}
 		if id.Narrowing != a2aNarrowingProfile && (id.Profile != "" || id.Topics != nil) {
 			return fmt.Errorf("identity %d: user %q carries profile or topics but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingProfile)
 		}

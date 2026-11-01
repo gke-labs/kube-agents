@@ -1,4 +1,11 @@
 locals {
+  # A zonal Standard cluster this composition creates: one node in its default
+  # pool (standard_node_count is per zone), too few for a three-server A2A bus.
+  # An adopted cluster's node count is not known here, so it keeps the
+  # operator's default, which holds a running bus at its count. A today install
+  # runs no bus and ignores the field, so the mode does not enter into it.
+  bus_single_server = var.create_cluster && var.cluster_mode == "standard" && can(regex("^[a-z]+-[a-z]+[0-9]+-[a-z]$", var.location))
+
   # iam, monitoring, and logging are here because Terraform must enable every
   # API its own resources call, where gcloud enables them implicitly.
   base_apis = [
@@ -1039,6 +1046,14 @@ resource "helm_release" "kube_agents" {
             subscription = module.drift_pubsub[0].subscription_name
             enabled      = var.enable_drift_detector ? true : null
           }
+        } : {},
+        # A one-server A2A bus where the cluster cannot hold three: the bus's
+        # three NATS servers each need their own node, and a zonal Standard
+        # cluster's default pool is one node, so the second server would wait
+        # Pending and the bus would never form. extra_helm_values can still
+        # set busReplicas (the second document deep-merges over this one).
+        local.bus_single_server ? {
+          tuning = { busReplicas = 1 }
         } : {}
       )
       deployment = merge(
