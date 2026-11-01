@@ -8138,8 +8138,11 @@ class TestComplianceCollectCluster(unittest.TestCase):
         result = self.run_with(kcc_items=[kcc_object("ComputeFirewall", "allow-ssh")])
         self.assertIsNone(self.kcc_reason(result))
         entry = next(c for c in result["commands"] if c["check"] == "kcc-object-wedged")
-        self.assertIn("kubectl api-resources", entry["command"])
-        self.assertIn("kubectl get --raw /apis/<group>/<version>/<plural>", entry["command"])
+        # A command a reader can run, not a description of the parallel read,
+        # and no digest that no single command produced.
+        self.assertTrue(entry["command"].endswith("kubectl get gcp -A -o json"), entry["command"])
+        self.assertEqual(shlex.split(entry["command"])[1:], ["kubectl", "get", "gcp", "-A", "-o", "json"])
+        self.assertNotIn("output_sha256", entry)
         self.assertEqual(entry["rc"], 0)
 
     def test_config_connector_installed_but_declaring_nothing_is_its_own_reason(self):

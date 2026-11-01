@@ -8133,6 +8133,9 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
 # lists each kind in parallel, because `kubectl get gcp -A` lists the ~230 kinds one after
 # another, too slowly through the credential proxy.
 KCC_CATEGORY = "gcp"
+# The command `kcc-object-wedged` records as its evidence: one read a person
+# can run that returns the objects the collector's parallel read returned.
+KCC_REPRODUCER_ARGV = ("kubectl", "get", KCC_CATEGORY, "-A", "-o", "json")
 
 DEFAULT_SERVICE_ACCOUNT = "default"
 
@@ -8454,13 +8457,16 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     elif kcc_reason:
         context.setdefault("not_applicable", {})["kcc-object-wedged"] = kcc_reason
     else:
-        kcc_command = (
-            f"KUBECONFIG={kubeconfig} {shlex.join(kcc_health.discovery_argv())}, then "
-            f"`kubectl get --raw /apis/<group>/<version>/<plural>` for each of its "
-            f"{kcc_read.kinds} Config Connector kind(s)"
-        )
-        listed = Run(kcc_health.discovery_argv(), 0, json.dumps(kcc_read.items, sort_keys=True), "", time.monotonic() - kcc_started)
-        commands["kcc-object-wedged"] = _record(kcc_command, listed)
+        # The record is the finding's `evidence.command`, so it is a command a
+        # reader can run: the category read, which returns the same objects,
+        # though slowly on a hub (the SOP's §2.12 says so). The collector made
+        # the read in parallel steps (`kcc_health.read_objects`), so no single
+        # command produced its output, and the record carries no output digest.
+        commands["kcc-object-wedged"] = {
+            "command": f"KUBECONFIG={kubeconfig} {shlex.join(KCC_REPRODUCER_ARGV)}",
+            "rc": 0,
+            "duration_s": round(time.monotonic() - kcc_started, 2),
+        }
 
     # Config Sync's sync objects, for §2.17. Ungated like the `gcp` read above
     # and for the same reason: most clusters do not run Config Sync, and an
