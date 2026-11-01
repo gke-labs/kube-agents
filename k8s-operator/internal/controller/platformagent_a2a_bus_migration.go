@@ -704,14 +704,14 @@ func buildBusMigrationJob(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      busMigrationWorkName(agent, run, step),
 			Namespace: agent.Namespace,
-			Labels:    a2aLabels(agent, "bus-migration"),
+			Labels:    a2aLabels(agent, busMigrationComponent),
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptr.To(int32(2)),
 			ActiveDeadlineSeconds:   ptr.To(busMigrationActiveDeadline(run, now)),
 			TTLSecondsAfterFinished: ptr.To(int32(86400)),
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: a2aLabels(agent, "bus-migration")},
+				ObjectMeta: metav1.ObjectMeta{Labels: a2aLabels(agent, busMigrationComponent)},
 				Spec:       busMigrationPodSpec(agent, run, step, step, command, volumes, mounts),
 			},
 		},
@@ -735,7 +735,7 @@ func buildBusHashPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusM
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      busMigrationWorkName(agent, run, "hash"),
 			Namespace: agent.Namespace,
-			Labels:    a2aLabels(agent, "bus-migration"),
+			Labels:    a2aLabels(agent, busMigrationComponent),
 		},
 		Spec: spec,
 	}
@@ -747,6 +747,10 @@ func buildBusHashPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusM
 func busMigrationActiveDeadline(run *agentv1alpha1.BusMigrationStatus, now time.Time) int64 {
 	return max(int64(run.Deadline.Add(-busMigrationJobMargin).Sub(now).Seconds()), 1)
 }
+
+// busMigrationComponent labels the migration's Jobs and pods, and admits
+// them to the bus port (buildA2ANATSNetworkPolicy).
+const busMigrationComponent = "bus-migration"
 
 // busMigrationStreamIdentity names the one to three leg's bus identity:
 // its ServiceAccount, its principal, and the pods that hold it.
@@ -804,7 +808,7 @@ func buildBusStreamPod(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bu
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      busMigrationWorkName(agent, run, kind),
 			Namespace: agent.Namespace,
-			Labels:    a2aLabels(agent, "bus-migration"),
+			Labels:    a2aLabels(agent, busMigrationComponent),
 		},
 		Spec: spec,
 	}
@@ -964,7 +968,7 @@ func (r *PlatformAgentReconciler) ensureBusRunSecret(ctx context.Context, agent 
 		return "", err
 	}
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, Labels: a2aLabels(agent, "bus-migration")},
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, Labels: a2aLabels(agent, busMigrationComponent)},
 		Data:       map[string][]byte{busMigrationRunKey: body},
 	}
 	if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
@@ -1067,7 +1071,7 @@ func buildBusStagePVC(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bus
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      busMigrationStageClaim(agent, run.RunID),
 			Namespace: agent.Namespace,
-			Labels:    a2aLabels(agent, "bus-migration"),
+			Labels:    a2aLabels(agent, busMigrationComponent),
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod},

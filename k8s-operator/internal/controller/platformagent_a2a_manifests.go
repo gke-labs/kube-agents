@@ -2957,6 +2957,14 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 						labelPartOf:       a2aPartOf,
 						a2aComponentLabel: "provision",
 					}}},
+					// The bus migration's Jobs and pods
+					// (platformagent_a2a_bus_migration.go). Reaching the port
+					// grants nothing: each authenticates as its run's
+					// identity, and the hashing pod holds no credential.
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						labelPartOf:       a2aPartOf,
+						a2aComponentLabel: busMigrationComponent,
+					}}},
 					// Seed tooling: hand-applied, not a render, but a
 					// legitimate bus client whose re-run must refuse at auth
 					// if anything, not hang at the dial.

@@ -20,6 +20,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8slabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
@@ -2074,5 +2075,36 @@ func TestAnExitedCalloutPodDoesNotBlockTheFreeze(t *testing.T) {
 	m.pass(busMigrationFreezing, 1)
 	if !m.agent.Status.BusMigration.FreezeConfirmed {
 		t.Error("an exited callout pod held the freeze's confirmation back")
+	}
+}
+
+// The migration's pods can reach the bus: every Job and pod it creates
+// carries the component label the bus's NetworkPolicy admits. (Found live:
+// without it the snapshot pod's dial timed out at the fence.)
+func TestTheMigrationsPodsAreAdmittedToTheBus(t *testing.T) {
+	agent := a2aTestAgent()
+	run := &agentv1alpha1.BusMigrationStatus{RunID: "1-1", Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+	admitted := func(labels map[string]string) bool {
+		np := buildA2ANATSNetworkPolicy(agent)
+		for _, peer := range np.Spec.Ingress[0].From {
+			if peer.PodSelector == nil || peer.NamespaceSelector != nil {
+				continue
+			}
+			sel, err := metav1.LabelSelectorAsSelector(peer.PodSelector)
+			if err == nil && sel.Matches(k8slabels.Set(labels)) {
+				return true
+			}
+		}
+		return false
+	}
+	for name, labels := range map[string]map[string]string{
+		"pin Job":      buildBusMigrationJob(agent, run, "pin", time.Now()).Spec.Template.Labels,
+		"snapshot pod": buildBusStreamPod(agent, run, "snapshot", time.Now()).Labels,
+		"restore pod":  buildBusStreamPod(agent, run, "restore", time.Now()).Labels,
+		"rollback pod": buildBusStreamPod(agent, run, "rollback", time.Now()).Labels,
+	} {
+		if !admitted(labels) {
+			t.Errorf("the %s (labels %v) is not admitted to the bus port", name, labels)
+		}
 	}
 }

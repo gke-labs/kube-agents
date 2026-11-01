@@ -1084,6 +1084,7 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		{"app": "test-agent-a2a-dispatcher"},
 		{labelPartOf: a2aPartOf, "app.kubernetes.io/component": "a2a-session"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "provision"},
+		{labelPartOf: a2aPartOf, a2aComponentLabel: "bus-migration"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "seed"},
 	}
 	// After the same-namespace pods, one namespace-crossing peer: every pod
