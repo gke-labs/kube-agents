@@ -11626,7 +11626,8 @@ spec:
                     cause:
                       description: |-
                         Cause is why the run turned back: the phase that failed, and whether
-                        it was still running at Deadline. Set at the first failure and kept.
+                        it was still running at Deadline. Set at the first failure and kept
+                        until a retry, which moves it into Retries.
                       type: string
                     deadline:
                       description: |-
@@ -11697,11 +11698,16 @@ spec:
                           asked for, and the failure it retried.
                         properties:
                           at:
+                            description: At is when the retry was asked for.
                             format: date-time
                             type: string
                           cause:
+                            description: Cause is why the retried attempt failed.
                             type: string
                           failedIn:
+                            description:
+                              FailedIn is the phase the retried attempt failed
+                              in.
                             type: string
                         required:
                           - at
@@ -11722,8 +11728,8 @@ spec:
                       description: |-
                         Warnings are what the restore found and restored anyway: a stream
                         lacking a subject a fresh install has, or a field outside the
-                        restore's policy that differs from a fresh install. Each is also
-                        reported as one Warning Event. At most 4 KiB of them; the last says
+                        restore's policy that differs from a fresh install. Together they are
+                        reported once, in one Warning Event. At most 4 KiB of them; the last says
                         how many more there were.
                       items:
                         type: string
@@ -11739,10 +11745,10 @@ spec:
                 busReplicas:
                   description: |-
                     BusReplicas is the A2A bus's NATS server count under spec.mode: next:
-                    the count the bus already runs, which spec.harness.tuning.busReplicas
-                    does not change; for a new bus, that field, or 3. Re-derived from the
-                    cluster on every reconcile, so it is a reading of the bus rather than a
-                    setting.
+                    the count the bus runs, which only a migration changes (BusMigration);
+                    for a new bus, spec.harness.tuning.busReplicas, or 3. Re-derived from
+                    the cluster on every reconcile, so it is a reading of the bus rather
+                    than a setting.
                   format: int32
                   type: integer
                 conditions:

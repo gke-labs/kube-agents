@@ -217,7 +217,7 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `storageStatus.bound` | `boolean` | no |  |  | Bound indicates if the primary PVC has been successfully provisioned. |
 | `storageStatus.capacityBytes` | `integer` | no |  |  | CapacityBytes is the size of the filesystem on the agent's data volume, as the gateway pod's event watcher last read it. Absent when the watcher is disabled or the operator has no current reading from it. |
 | `storageStatus.freeBytes` | `integer` | no |  |  | FreeBytes is the space left on the agent's data volume for the agent's own non-root user, read with CapacityBytes. The DataVolumeNearlyFull condition is computed from the two. |
-| `busReplicas` | `integer` | no |  |  | BusReplicas is the A2A bus's NATS server count under spec.mode: next: the count the bus already runs, which spec.harness.tuning.busReplicas does not change; for a new bus, that field, or 3. Re-derived from the cluster on every reconcile, so it is a reading of the bus rather than a setting. |
+| `busReplicas` | `integer` | no |  |  | BusReplicas is the A2A bus's NATS server count under spec.mode: next: the count the bus runs, which only a migration changes (BusMigration); for a new bus, spec.harness.tuning.busReplicas, or 3. Re-derived from the cluster on every reconcile, so it is a reading of the bus rather than a setting. |
 | `busMigration` | `object` | no |  |  | BusMigration is the A2A bus's server-count migration under spec.mode: next, while one runs or since the last one ended: setting spec.harness.tuning.busReplicas to another count on an existing bus starts one, and it converts the bus without emptying it. Unset when no migration has run. |
 | `busMigration.leg` | `string` | yes |  | one of `OneToThree`, `ThreeToOne` | Leg is the direction: OneToThree (snapshot and restore, behind a write freeze) or ThreeToOne (in place). |
 | `busMigration.runID` | `string` | yes |  |  | RunID names this migration's own Jobs, pods, ServiceAccounts and bus principals. |
@@ -226,16 +226,16 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `busMigration.startedAt` | `metav1.Time` | yes |  |  | StartedAt is when the migration began. |
 | `busMigration.deadline` | `metav1.Time` | yes |  |  | Deadline is the deadline of the stretch the run is on: when an unfinished phase counts as failed, and when the migration's bus credentials stop working. Its Jobs stop a few minutes before it. A run that turns back gets one fresh deadline for its way back (ForwardDeadline keeps the first), and a retry another. |
 | `busMigration.message` | `string` | no |  |  | Message is the manual step a Failed migration names. |
-| `busMigration.cause` | `string` | no |  |  | Cause is why the run turned back: the phase that failed, and whether it was still running at Deadline. Set at the first failure and kept. |
+| `busMigration.cause` | `string` | no |  |  | Cause is why the run turned back: the phase that failed, and whether it was still running at Deadline. Set at the first failure and kept until a retry, which moves it into Retries. |
 | `busMigration.forwardDeadline` | `metav1.Time` | no |  |  | ForwardDeadline is the deadline the run went forward under, kept once it turned back and Deadline became its way back's. |
 | `busMigration.failedIn` | `string` | no |  |  | FailedIn is the phase a Failed run failed in. A run that failed inside the one to three leg's write freeze keeps the freeze, with its snapshot, until a person retries it or gives it up, each with an annotation on the PlatformAgent naming this run (the A2ABusMigrating condition says which). A Failed run blocks any new migration until then. |
 | `busMigration.retries` | `[]object` | no |  | max items `3` | Retries records each retry of a Failed run, oldest first, at most three. |
-| `busMigration.retries[].at` | `metav1.Time` | yes |  |  |  |
-| `busMigration.retries[].failedIn` | `string` | yes |  |  |  |
-| `busMigration.retries[].cause` | `string` | no |  |  |  |
+| `busMigration.retries[].at` | `metav1.Time` | yes |  |  | At is when the retry was asked for. |
+| `busMigration.retries[].failedIn` | `string` | yes |  |  | FailedIn is the phase the retried attempt failed in. |
+| `busMigration.retries[].cause` | `string` | no |  |  | Cause is why the retried attempt failed. |
 | `busMigration.givenUp` | `boolean` | no |  |  | GivenUp is set when a person gave a Failed run up: its freeze is lifted, and streams it did not put back are recreated empty. |
 | `busMigration.freezeConfirmed` | `boolean` | no |  |  | FreezeConfirmed is set once every callout replica serves the write freeze's identity map, and only then does the bus render without its static application users and restart into the freeze. |
-| `busMigration.warnings` | `[]string` | no |  |  | Warnings are what the restore found and restored anyway: a stream lacking a subject a fresh install has, or a field outside the restore's policy that differs from a fresh install. Each is also reported as one Warning Event. At most 4 KiB of them; the last says how many more there were. |
+| `busMigration.warnings` | `[]string` | no |  |  | Warnings are what the restore found and restored anyway: a stream lacking a subject a fresh install has, or a field outside the restore's policy that differs from a fresh install. Together they are reported once, in one Warning Event. At most 4 KiB of them; the last says how many more there were. |
 | `busMigration.observedGeneration` | `integer` | yes |  |  | ObservedGeneration is the PlatformAgent generation that started this migration. A migration that ended without converting is not started again until the spec changes. |
 | `telemetry` | `object` | no |  |  | Telemetry reports the resolved OpenTelemetry export configuration. |
 | `telemetry.otlpEndpoint` | `string` | no |  |  | OTLPEndpoint is the collector endpoint written into the agent pod. Empty when the source is None, which is the one case where the pod is given no endpoint at all. |

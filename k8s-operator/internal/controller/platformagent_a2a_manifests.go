@@ -3964,8 +3964,8 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 
 // a2aNATSReplicas is the bus's server count: status.busReplicas, which
 // resolveA2ABusReplicas sets at the start of every pass to the count the pass
-// renders (the running bus's, which a set field cannot change: the
-// conversion is refused), otherwise spec.harness.tuning.busReplicas (a bus not
+// renders (the running bus's, which only a migration's phases change),
+// otherwise spec.harness.tuning.busReplicas (a bus not
 // yet resolved), otherwise DefaultBusReplicas. Only 1 and 3 are counts: the
 // CRD admits nothing else, and anything else that reaches here (a CR written
 // past the schema) falls through rather than rendering a two-server cluster,

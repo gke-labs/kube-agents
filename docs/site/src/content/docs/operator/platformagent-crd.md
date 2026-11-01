@@ -61,9 +61,9 @@ The verifier's and the callout's topology spreads are `ScheduleAnyway`, so a sin
 
 ### Changing the bus's server count
 
-On a bus that already runs, changing `busReplicas` between 1 and 3 starts a migration that keeps the bus's data. The operator runs it in phases, shown in `status.busMigration` and reported by the `A2ABusMigrating` condition. The admission webhook refuses another change to `busReplicas` while one runs. A run has two hours; a phase still running then counts as failed.
+On a bus that already runs, changing `busReplicas` between 1 and 3 starts a migration that keeps the bus's data. The operator runs it in phases, shown in `status.busMigration` and reported by the `A2ABusMigrating` condition. The admission webhook refuses another change to `busReplicas` while one runs. A run has two hours going forward; a phase still running then counts as failed, and the way back gets two hours of its own. Objects under a run's names that the PlatformAgent does not own are never used: a phase that finds one fails and names it.
 
-The operator runs the migration's work in pods of its own image, so it needs `OPERATOR_IMAGE` set, as the chart does. Without it no run starts its work, and each run fails at its deadline.
+The operator runs the migration's work in pods of its own image, so it needs `OPERATOR_IMAGE` set, as the chart does. Without it a `busReplicas` change starts no migration: the bus keeps its count, and an `A2ABusMigrationUnavailable` Warning Event says why.
 
 **Three servers to one** happens in place. A Job of the operator's moves each stream's leader to server 0 and scales the stream to one replica while the bus is still a cluster; then the bus renders one server. Writes keep flowing, with brief stalls as leaders move and while server 0 restarts on its own.
 
@@ -75,22 +75,22 @@ The operator runs the migration's work in pods of its own image, so it needs `OP
 4. **The restore.** The operator's restore pod restores each stream, with its consumers, and raises it to three replicas. Before it restores a stream, it checks the snapshot against the operator's digests and against the operator's policy for that stream: its subjects, limits and retention. After, it checks the restored stream against the same policy and deletes one that fails.
 5. **The release.** The bus restarts with its static users and the callout serves the install's identities again.
 
-The freeze lasts as long as the copy, the conversion and the restore together, which is minutes. The staging claim is `ReadWriteOncePod`, on the default StorageClass, sized for every stream full to its cap plus 10% (32Gi today), so the default StorageClass must support that access mode.
+The freeze lasts as long as the copy, the conversion and the restore together, which is expected to be minutes. The staging claim is `ReadWriteOncePod`, on the default StorageClass, sized for every stream full to its cap plus 10% (32Gi today), so the default StorageClass must support that access mode.
 
 A stream the restore put back that differs from a fresh install of it, on a field outside its policy, is listed in `status.busMigration.warnings` and reported once as a `BusMigrationDrift` Warning Event.
 
 #### When a migration fails
 
-A failed phase turns the run back on its own. Three to one, before the bus has gone to one server, raises the streams back to three replicas. One to three, after the conversion, renders one server again and restores the same snapshot into it. Either way the run ends `Abandoned`: the bus runs as before, with its data, and the condition says why.
+Most failures turn the run back on its own. Three to one, before the bus has gone to one server, raises the streams back to three replicas. One to three, after the conversion, renders one server again and restores the same snapshot into it. Either way the run ends `Abandoned`: the bus runs as before, with its data, and the condition says why. To try the same count again, annotate the PlatformAgent `kubeagents.x-k8s.io/bus-migration-start=<run>`, naming the abandoned run. Spec changes to other fields, and syncs that change nothing, do not start a new run.
 
-Only a failed way back stops for a person. The run is then `Failed`, `status.busMigration.failedIn` names where, and the condition names the step to take. A `Failed` run blocks any other migration, and spec changes leave the bus as it is, until a person acts with an annotation on the PlatformAgent that names the run:
+A failed way back stops for a person, and so does a failure with no way back (below). The run is then `Failed`, `status.busMigration.failedIn` names where, and the condition names the step to take. A `Failed` run blocks any other migration, and spec changes leave the bus as it is, until a person acts with an annotation on the PlatformAgent that names the run:
 
 - **Retry:** `kubectl annotate platformagent <name> -n <namespace> kubeagents.x-k8s.io/bus-migration-retry=<run>-<attempt>`, with the value the condition gives. It runs the way back again from its start with a fresh deadline: the rollback (from `RollingBack` or `RollbackRestoring`) or the unpin (from `Unpinning`). A run may be retried three times; each attempt is recorded in `status.busMigration.retries`.
 - **Give up:** `kubectl annotate platformagent <name> -n <namespace> kubeagents.x-k8s.io/bus-migration-abandon=<run>`. For a run that failed during the freeze, this lifts the freeze, deletes the staging claim and its snapshot, and lets the provision Job recreate, empty, every stream the run did not put back.
 
 A rollback that failed keeps the write freeze, the staging claim and the operator's digests until then, so a retry restores the same snapshot. Before retrying, check the `<agent>-a2a-nats-0` pod, and the restore pod's termination message (`kubectl get pod <agent>-bus-rollback-<run> -o jsonpath='{.status.containerStatuses[0].state.terminated.message}'`), which names the stream and the check that failed.
 
-A run that failed in `Shrinking` (server 0 did not come up on its own) or in `Releasing` (the servers did not come back with their static users) has no way back to retry. Fix the `<agent>-a2a-nats` pods, then give the run up to allow the next migration.
+A run that failed in `Shrinking` (server 0 did not come up on its own) or in `Releasing` (the servers did not come back with their static users) has no way back to retry. The bus stays at the count it reached. Fix the `<agent>-a2a-nats` pods, then give the run up to allow the next migration.
 
 Disabling Google Chat afterwards, with no other backend configured, leaves the gateway running on the console door alone. Flipping back to `today` tears that stack down, keeping the generated credentials Secret and the JetStream PVCs. The callout's keys Secret is **not** kept: a stale issuer key would make every answer the callout gives be refused, so it is deleted with the rest. The task-signing key Secret is deleted with it.
 

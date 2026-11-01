@@ -56,7 +56,7 @@ another `busReplicas` change while one runs.
 - **Three to one**, in place: the operator's pin Job moves every stream's leader to server 0
   and scales it to one replica while the bus is still a cluster, then the bus renders one
   server. Writes keep flowing.
-- **One to three**, by copy: writes are frozen (only the migration reaches the bus; console
+- **One to three**, by copy: writes are frozen (no workload but the migration reaches the bus; console
   and web logins drop, and the gateway and bridge cannot publish), the operator's pods
   snapshot every stream to a one-pod staging volume, a pod with no bus identity digests the
   snapshots, the bus renders three servers, and the operator's restore pod restores each
@@ -64,7 +64,7 @@ another `busReplicas` change while one runs.
   three replicas.
 - **A failure** turns the run back: before the shrink, the pinned streams go back to three
   replicas; after the conversion, the bus renders one server again and the same snapshot is
-  restored into it. Only a failed undo stops for a person, and the condition names the step.
+  restored into it. A failed undo stops for a person, as does a failure with no way back (after the shrink, or in the release), and the condition names the step.
   A rollback that failed keeps the write freeze and the snapshot. The person retries it or gives
   it up with an annotation on the PlatformAgent that names the run; an unrelated spec change
   does neither.

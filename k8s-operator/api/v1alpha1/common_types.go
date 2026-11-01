@@ -2341,10 +2341,10 @@ type AgentStatus struct {
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
 
 	// BusReplicas is the A2A bus's NATS server count under spec.mode: next:
-	// the count the bus already runs, which spec.harness.tuning.busReplicas
-	// does not change; for a new bus, that field, or 3. Re-derived from the
-	// cluster on every reconcile, so it is a reading of the bus rather than a
-	// setting.
+	// the count the bus runs, which only a migration changes (BusMigration);
+	// for a new bus, spec.harness.tuning.busReplicas, or 3. Re-derived from
+	// the cluster on every reconcile, so it is a reading of the bus rather
+	// than a setting.
 	// +optional
 	BusReplicas int32 `json:"busReplicas,omitempty"`
 
@@ -2393,8 +2393,11 @@ type AgentStatus struct {
 // BusMigrationRetry is one retry of a Failed bus migration run: when it was
 // asked for, and the failure it retried.
 type BusMigrationRetry struct {
-	At       metav1.Time `json:"at"`
-	FailedIn string      `json:"failedIn"`
+	// At is when the retry was asked for.
+	At metav1.Time `json:"at"`
+	// FailedIn is the phase the retried attempt failed in.
+	FailedIn string `json:"failedIn"`
+	// Cause is why the retried attempt failed.
 	// +optional
 	Cause string `json:"cause,omitempty"`
 }
@@ -2436,7 +2439,8 @@ type BusMigrationStatus struct {
 	Message string `json:"message,omitempty"`
 
 	// Cause is why the run turned back: the phase that failed, and whether
-	// it was still running at Deadline. Set at the first failure and kept.
+	// it was still running at Deadline. Set at the first failure and kept
+	// until a retry, which moves it into Retries.
 	// +optional
 	Cause string `json:"cause,omitempty"`
 
@@ -2473,8 +2477,8 @@ type BusMigrationStatus struct {
 
 	// Warnings are what the restore found and restored anyway: a stream
 	// lacking a subject a fresh install has, or a field outside the
-	// restore's policy that differs from a fresh install. Each is also
-	// reported as one Warning Event. At most 4 KiB of them; the last says
+	// restore's policy that differs from a fresh install. Together they are
+	// reported once, in one Warning Event. At most 4 KiB of them; the last says
 	// how many more there were.
 	// +optional
 	Warnings []string `json:"warnings,omitempty"`

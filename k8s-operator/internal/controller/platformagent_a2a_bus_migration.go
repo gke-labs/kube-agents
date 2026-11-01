@@ -52,7 +52,7 @@ const (
 	busMigrationShrinking         busMigrationPhase = "Shrinking"         // shrink: one server rendered, waiting for it
 	busMigrationUnpinning         busMigrationPhase = "Unpinning"         // shrink failed before the shrink: streams back to R3
 	busMigrationFreezing          busMigrationPhase = "Freezing"          // grow: only the migration's principals admitted
-	busMigrationSnapshot          busMigrationPhase = "Snapshotting"      // grow: the snapshot Job stages every stream
+	busMigrationSnapshot          busMigrationPhase = "Snapshotting"      // grow: the snapshot pod stages every stream
 	busMigrationHashing           busMigrationPhase = "Hashing"           // grow: the operator's hashing pod digests the stage
 	busMigrationConverting        busMigrationPhase = "Converting"        // grow: three servers rendered, waiting for them
 	busMigrationRestoring         busMigrationPhase = "Restoring"         // grow: the restore pod restores and raises to R3
@@ -91,8 +91,10 @@ type busMigrationStep struct {
 //   - One to three, failing after the conversion: one server is rendered
 //     again and the same snapshot restored into it, then the freeze is
 //     lifted (Abandoned).
-//   - Only a failed undo or rollback stops at Failed, frozen for one to
-//     three, with the step a person has to take.
+//   - A failed undo or rollback stops at Failed, frozen for one to three,
+//     with the step a person has to take; so does a failure with no way
+//     back, after the shrink or in Releasing, where the bus stays at the
+//     count it reached.
 //
 // abandoning carries whether the run is already on its way back, which
 // Releasing needs to tell Done from Abandoned.
@@ -114,7 +116,7 @@ func nextBusMigrationPhase(leg busMigrationLeg, phase busMigrationPhase, abandon
 			if ok {
 				return busMigrationStep{next: busMigrationDone}
 			}
-			return busMigrationStep{next: busMigrationFailed, manual: "server 0 did not come up alone after the shrink; its store holds every stream at R1: check the a2a-nats-0 pod, and set busReplicas back to 3 only once it serves"}
+			return busMigrationStep{next: busMigrationFailed, manual: "server 0 did not come up alone after the shrink; its store holds every stream at R1: check the a2a-nats-0 pod, and once it serves, give the run up to allow another migration"}
 		case busMigrationUnpinning:
 			if ok {
 				return busMigrationStep{next: busMigrationAbandoned, abandoning: true}
@@ -158,7 +160,7 @@ func nextBusMigrationPhase(leg busMigrationLeg, phase busMigrationPhase, abandon
 				}
 				return busMigrationStep{next: busMigrationDone}
 			}
-			return busMigrationStep{next: busMigrationFailed, abandoning: abandoning, manual: "the servers did not come back with the static logins after the freeze; the bus serves the migration's principals only: check the a2a-nats pods (docs: bus migration runbook)"}
+			return busMigrationStep{next: busMigrationFailed, abandoning: abandoning, manual: "the servers did not come back with the static logins after the freeze: check the a2a-nats pods (docs: bus migration runbook)"}
 		}
 	}
 	return stay
@@ -229,8 +231,6 @@ func jobOutcome(job *batchv1.Job) busMigrationOutcome {
 	return busMigrationPending
 }
 
-// withDeadline turns a pending outcome into a failure once the run is past
-// its deadline.
 // jobDeadlineExceeded reports a Job the API server stopped at its
 // activeDeadlineSeconds, which the run's deadline sets.
 func jobDeadlineExceeded(job *batchv1.Job) bool {
@@ -242,6 +242,8 @@ func jobDeadlineExceeded(job *batchv1.Job) bool {
 	return false
 }
 
+// withDeadline turns a pending outcome into a failure once the run is past
+// its deadline.
 func withDeadline(outcome busMigrationOutcome, deadline, now time.Time) busMigrationOutcome {
 	if outcome == busMigrationPending && !deadline.IsZero() && now.After(deadline) {
 		return busMigrationErred
@@ -249,8 +251,6 @@ func withDeadline(outcome busMigrationOutcome, deadline, now time.Time) busMigra
 	return outcome
 }
 
-// busMigrationStep names the migration's own workloads: the pin, unpin and
-// snapshot Jobs and the hashing pod, each named for the run.
 // busMigrationWorkName names a run's Job or pod for its current attempt: the
 // run's own name until it is retried, then suffixed with the retry, so a
 // retry runs fresh work and is never read off the attempt that failed. Its
@@ -264,6 +264,8 @@ func busMigrationWorkName(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 	return busMigrationWorkloadName(agent, name, id)
 }
 
+// busMigrationWorkloadName names a run's objects: its Jobs and pods (through
+// busMigrationWorkName), its ServiceAccounts, staging claim and run Secret.
 func busMigrationWorkloadName(agent *agentv1alpha1.PlatformAgent, step, runID string) string {
 	return fmt.Sprintf("%s-bus-%s-%s", agent.Name, step, runID)
 }
@@ -630,7 +632,7 @@ const (
 	// still works, never on an authorization error mid-stream.
 	busMigrationJobMargin = 5 * time.Minute
 	// busMigrationStageMount is where the staging volume is mounted in the
-	// snapshot Job and the hashing pod.
+	// snapshot, hashing and restore pods.
 	busMigrationStageMount = "/stage"
 	// busMigrationStageVolume names that volume in their pod specs.
 	busMigrationStageVolume = "stage"

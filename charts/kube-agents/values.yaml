@@ -1026,8 +1026,9 @@ platformAgent:
       # cluster with R3 streams that rides out a node drain, 1 a single server
       # that is down for each pod restart. A cluster needs three nodes; set 1 on a
       # cluster that cannot have them (kind, a one-node Standard pool), before the
-      # first install: an existing bus keeps its count, and a different value is
-      # refused rather than converting it.
+      # first install. Changing it on an existing bus migrates the bus between one
+      # server and three, keeping its data; one to three freezes writes for its
+      # window.
       # busReplicas: 3
       # profiles sizes AgentProfile work on a "next" install: ceiling is the most
       # profile tasks running at once across every profile (default: maxInProgress,
