@@ -106,10 +106,11 @@ func (s *stubDelivery) AckSync(context.Context) error {
 	return nil
 }
 
-// A settle writes the task's tombstone before it acks, and frees the slot
-// only once the server has confirmed the ack: the submission is never
-// without a record, so one that comes back (an unconfirmed ack, a replay)
-// is never offered again.
+// A settle writes the task's tombstone before it acks, and retries the ack
+// until the server confirms it: the submission is never without a record, so
+// one that comes back (an unconfirmed ack, a replay) is never offered again.
+// The tombstone is what answers it, so the slot is free once it is written,
+// while the ack is still retried.
 func TestASettleWaitsForTheConfirmedAck(t *testing.T) {
 	b := newBus(t)
 	d, err := New(testConfig(), b.connect("dispatcher"), oneProfile("tse", 2).src, NewStaticPool(), &fakeVerifier{}, quietLog())
@@ -129,8 +130,8 @@ func TestASettleWaitsForTheConfirmedAck(t *testing.T) {
 	if _, ok := b.tombstones()[key]; !ok {
 		t.Fatalf("no tombstone while the ack is unconfirmed: %v", b.records())
 	}
-	if d.holder(h.key()) == nil {
-		t.Fatal("the slot was freed before the server confirmed the ack")
+	if d.holder(h.key()) != nil {
+		t.Fatal("the slot is still held with the tombstone written")
 	}
 	<-done
 	if tomb, ok := b.tombstones()[key]; !ok || tomb.TaskID != "task-1" || tomb.Pod != "tse-0" {

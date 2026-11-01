@@ -312,9 +312,14 @@ func TestLeasedPodsReadsTheTombstonesInOnePass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 20000 round trips take about 800ms on an idle laptop's embedded
-	// server, one pass about 30ms; a clustered bus's round trip is longer.
-	ctx, cancel := context.WithTimeout(b.ctx, 300*time.Millisecond)
+	// On an idle laptop's embedded server 20000 round trips take about
+	// 800ms and one pass about 30ms; under the race detector about 3.3s and
+	// 750ms. A clustered bus's round trip is longer still.
+	budget := 300 * time.Millisecond
+	if raceEnabled {
+		budget = 2 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(b.ctx, budget)
 	defer cancel()
 	start := time.Now()
 	pods, err := d.leasedPods(ctx, "tse", "read", 0)
