@@ -269,6 +269,14 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 		warnings = append(warnings, fresh.OutsidePolicyDrift(meta.Config)...)
 		open := func() (io.ReadCloser, error) { return os.Open(filepath.Join(dir, name, SnapshotDataFile)) }
 		for attempt := 1; ; attempt++ {
+			if alreadyRestored(ctx, nc, policy, meta.State) {
+				// Built by an earlier attempt (a finish that timed out
+				// after the server built the stream, or this pod run
+				// again): the server builds a stream only on the final
+				// message, which is sent only for the operator's digest.
+				err = nil
+				break
+			}
 			err = RestoreVerified(ctx, nc, meta.Config, meta.State, open, want.Data, policy)
 			if err == nil || errors.Is(err, ErrDigestMismatch) || errors.Is(err, ErrOutsidePolicy) || attempt == restoreRetries {
 				break
@@ -289,6 +297,17 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 		}
 	}
 	return warnings, nil
+}
+
+// alreadyRestored reports the stream already there as this snapshot built
+// it: inside its policy, with the snapshot's message count and last
+// sequence.
+func alreadyRestored(ctx context.Context, nc *nats.Conn, policy StreamPolicy, state nats.StreamState) bool {
+	info, err := streamInfo(ctx, nc, policy.Name)
+	if err != nil {
+		return false
+	}
+	return len(policy.Check(info.Config)) == 0 && info.State.Msgs == state.Msgs && info.State.LastSeq == state.LastSeq
 }
 
 // HashMain runs `bus-hash --dir D --streams S`: the digests of every staged

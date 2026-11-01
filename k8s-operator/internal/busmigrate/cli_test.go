@@ -256,3 +256,29 @@ func TestTheRestoreReportFitsATerminationMessage(t *testing.T) {
 		t.Errorf("kept %d and counted %d more of %d", len(r.Warnings)-1, n, len(many))
 	}
 }
+
+// A restore pod run a second time over streams it already restored (or one
+// whose finish timed out after the server built the stream) takes them as
+// done, rather than retrying a name that is in use until it fails.
+func TestTheRestoreLegTakesAStreamItAlreadyRestoredAsDone(t *testing.T) {
+	src := startServer(t, "a2a-nats-0", t.TempDir(), 0)
+	seedBus(t, src.ClientURL(), 1)
+	dir, digests, metas := stageAndHash(t, src.ClientURL(), "TASKS")
+	shutdown(src)
+	run := RunFile{Digests: digests, Policies: []StreamPolicy{policyOf(metas["TASKS"].Config)}}
+	dst := startServer(t, "a2a-nats-0", t.TempDir(), 0)
+	defer shutdown(dst)
+	for i := 1; i <= 2; i++ {
+		start := time.Now()
+		log := filepath.Join(t.TempDir(), "log")
+		var e bytes.Buffer
+		code := Main(context.Background(), []string{"restore", "--server", dst.ClientURL(), "--streams", "TASKS", "--dir", dir,
+			"--run-file", writeRunFile(t, run), "--replicas", "1", "--termination-log", log}, &e)
+		if code != 0 {
+			t.Fatalf("run %d exited %d: %s %+v", i, code, e.String(), readReport(t, log))
+		}
+		if took := time.Since(start); took > 5*time.Second {
+			t.Errorf("run %d took %v", i, took)
+		}
+	}
+}

@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -250,12 +251,21 @@ func (m *migrationRig) finishJob(step string, cond batchv1.JobConditionType) {
 	m.t.Helper()
 	j := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, step, "3-1"), Namespace: m.agent.Namespace}}
 	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(j), j); err != nil {
+		m.own(j)
 		if err := m.cl.Create(context.Background(), j); err != nil {
 			m.t.Fatal(err)
 		}
 	}
 	j.Status.Conditions = []batchv1.JobCondition{{Type: cond, Status: corev1.ConditionTrue}}
 	if err := m.cl.Status().Update(context.Background(), j); err != nil {
+		m.t.Fatal(err)
+	}
+}
+
+// own sets the controller reference the operator gives the run's objects.
+func (m *migrationRig) own(obj client.Object) {
+	m.t.Helper()
+	if err := ctrl.SetControllerReference(m.agent, obj, m.r.Scheme); err != nil {
 		m.t.Fatal(err)
 	}
 }
@@ -267,6 +277,7 @@ func (m *migrationRig) finishPod(name string, phase corev1.PodPhase, message, re
 	m.t.Helper()
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, name, "3-1"), Namespace: m.agent.Namespace}}
 	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		m.own(pod)
 		if err := m.cl.Create(context.Background(), pod); err != nil {
 			m.t.Fatal(err)
 		}
@@ -1093,6 +1104,7 @@ func TestATurnedBackRunNamesItsCause(t *testing.T) {
 
 	stopped := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
 	j := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(stopped.agent, "pin", "3-1"), Namespace: stopped.agent.Namespace}}
+	stopped.own(j)
 	if err := stopped.cl.Create(context.Background(), j); err != nil {
 		t.Fatal(err)
 	}
@@ -1949,5 +1961,118 @@ func TestTheWayBackGetsItsOwnDeadline(t *testing.T) {
 	m.pass(busMigrationFailed, 1)
 	if !m.agent.Status.BusMigration.ForwardDeadline.Equal(&forward) || m.agent.Status.BusMigration.Deadline.After(undo.Time) {
 		t.Error("a failure on the way back renewed its deadline")
+	}
+}
+
+// Objects under a run's names that this PlatformAgent does not control are
+// never trusted or adopted: a planted hashing pod's digests are not read, a
+// planted run Secret is not used, a planted ServiceAccount is not taken
+// over; each fails its phase, naming the object.
+func TestARunTrustsOnlyItsOwnObjects(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	ctx := context.Background()
+
+	hash := newMigrationRig(t, busMigrationGrow, busMigrationHashing, 1, time.Now().Add(time.Hour))
+	planted := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(hash.agent, "hash", "3-1"), Namespace: hash.agent.Namespace}}
+	if err := hash.cl.Create(ctx, planted); err != nil {
+		t.Fatal(err)
+	}
+	planted.Status.Phase = corev1.PodSucceeded
+	planted.Status.ContainerStatuses = []corev1.ContainerStatus{{State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: validDigests()}}}}
+	if err := hash.cl.Status().Update(ctx, planted); err != nil {
+		t.Fatal(err)
+	}
+	if err := hash.r.resolveA2ABusReplicas(ctx, hash.agent); err != nil {
+		t.Fatal(err)
+	}
+	if run := hash.agent.Status.BusMigration; !run.Abandoning || !strings.Contains(run.Cause, "is not this PlatformAgent's") {
+		t.Errorf("a planted hashing pod: phase %s cause %q", run.Phase, run.Cause)
+	}
+	if err := hash.cl.Get(ctx, client.ObjectKey{Namespace: hash.agent.Namespace, Name: busMigrationRunSecret(hash.agent, "3-1")}, &corev1.Secret{}); err == nil {
+		t.Error("a run Secret was written from a planted hashing pod")
+	}
+
+	sec := newMigrationRig(t, busMigrationGrow, busMigrationHashing, 1, time.Now().Add(time.Hour))
+	if err := sec.cl.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(sec.agent, "3-1"), Namespace: sec.agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	sec.finishPod("hash", corev1.PodSucceeded, validDigests(), "")
+	if err := sec.r.resolveA2ABusReplicas(ctx, sec.agent); err != nil {
+		t.Fatal(err)
+	}
+	if run := sec.agent.Status.BusMigration; !strings.Contains(run.Cause, "the run Secret exists and is not this PlatformAgent's") {
+		t.Errorf("a planted run Secret: phase %s cause %q", run.Phase, run.Cause)
+	}
+
+	sa := newMigrationRig(t, busMigrationGrow, busMigrationSnapshot, 1, time.Now().Add(time.Hour))
+	theirs := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(sa.agent, busMigrationStreamIdentity, "3-1"), Namespace: sa.agent.Namespace,
+		Annotations: map[string]string{"iam.gke.io/gcp-service-account": "someone@example.iam.gserviceaccount.com"}}}
+	if err := sa.cl.Create(ctx, theirs); err != nil {
+		t.Fatal(err)
+	}
+	before := theirs.ResourceVersion
+	if err := sa.r.resolveA2ABusReplicas(ctx, sa.agent); err != nil {
+		t.Fatal(err)
+	}
+	got := &corev1.ServiceAccount{}
+	if err := sa.cl.Get(ctx, client.ObjectKeyFromObject(theirs), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ResourceVersion != before || len(got.OwnerReferences) != 0 {
+		t.Error("a planted ServiceAccount was adopted")
+	}
+	if run := sa.agent.Status.BusMigration; !strings.Contains(run.Cause, "ServiceAccount") {
+		t.Errorf("a planted ServiceAccount: phase %s cause %q", run.Phase, run.Cause)
+	}
+	if _, _, ok := sa.workload("snapshot"); ok {
+		t.Error("the snapshot pod ran under a planted ServiceAccount")
+	}
+}
+
+// The pass that enters a phase creates its work in the same pass; a
+// ServiceAccount planted under the phase identity's name before then is not
+// adopted there either.
+func TestEnteringAPhaseDoesNotAdoptAPlantedServiceAccount(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	ctx := context.Background()
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	theirs := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, busMigrationStreamIdentity, "3-1"), Namespace: m.agent.Namespace}}
+	if err := m.cl.Create(ctx, theirs); err != nil {
+		t.Fatal(err)
+	}
+	before := theirs.ResourceVersion
+	m.calloutPods(2, true, true)
+	m.pass(busMigrationFreezing, 1)
+	m.rollOut(1)
+	m.pass(busMigrationSnapshot, 1) // enters Snapshotting and would create its work
+	got := &corev1.ServiceAccount{}
+	if err := m.cl.Get(ctx, client.ObjectKeyFromObject(theirs), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ResourceVersion != before || len(got.OwnerReferences) != 0 {
+		t.Error("entering Snapshotting adopted a planted ServiceAccount")
+	}
+	if _, _, ok := m.workload("snapshot"); ok {
+		t.Error("the snapshot pod was created under a planted ServiceAccount")
+	}
+}
+
+// A callout pod that has exited (evicted and left for collection) answers
+// nothing, so it does not hold the freeze's confirmation back.
+func TestAnExitedCalloutPodDoesNotBlockTheFreeze(t *testing.T) {
+	ctx := context.Background()
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	m.calloutPods(2, true, true)
+	evicted := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "callout-evicted", Namespace: m.agent.Namespace, Labels: a2aCalloutPodSelector(m.agent)}}
+	if err := m.cl.Create(ctx, evicted); err != nil {
+		t.Fatal(err)
+	}
+	evicted.Status.Phase, evicted.Status.Reason = corev1.PodFailed, "Evicted"
+	if err := m.cl.Status().Update(ctx, evicted); err != nil {
+		t.Fatal(err)
+	}
+	m.pass(busMigrationFreezing, 1)
+	if !m.agent.Status.BusMigration.FreezeConfirmed {
+		t.Error("an exited callout pod held the freeze's confirmation back")
 	}
 }

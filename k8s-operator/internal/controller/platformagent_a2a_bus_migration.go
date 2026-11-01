@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"math"
 	"os"
@@ -281,6 +282,15 @@ func busNATSRolledOutAt(sts *appsv1.StatefulSet, replicas int32) bool {
 // phase renders. late reports a Job or pod stopped at its deadline.
 func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (busMigrationOutcome, bool, error) {
 	leg, phase := busMigrationLeg(run.Leg), busMigrationPhase(run.Phase)
+	// foreign fails the phase on an object under the run's name that this
+	// PlatformAgent does not control: its outcome, a hashing pod's digests
+	// above all, is never read, and nothing is adopted.
+	foreign := func(name string) (busMigrationOutcome, bool, error) {
+		if run.Cause == "" {
+			run.Cause = fmt.Sprintf("%s exists and is not this PlatformAgent's", name)
+		}
+		return busMigrationErred, false, nil
+	}
 	job := func(step string) (busMigrationOutcome, bool, error) {
 		j := &batchv1.Job{}
 		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkName(agent, run, step)}, j); {
@@ -289,13 +299,28 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 		case err != nil:
 			return busMigrationPending, false, err
 		}
+		if !metav1.IsControlledBy(j, agent) {
+			return foreign(j.Name)
+		}
 		return jobOutcome(j), jobDeadlineExceeded(j), nil
 	}
 	if work := busMigrationPhaseWorkload(phase); work.name != "" {
+		// The phase's identity must be this PlatformAgent's own: a
+		// ServiceAccount someone else made under its name is never adopted.
+		sa := &corev1.ServiceAccount{}
+		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkloadName(agent, work.identity, run.RunID)}, sa); {
+		case err == nil && !metav1.IsControlledBy(sa, agent):
+			return foreign("ServiceAccount " + sa.Name)
+		case err != nil && !errors.IsNotFound(err):
+			return busMigrationPending, false, err
+		}
 		if !work.pod {
 			return job(work.name)
 		}
 		pod, err := r.busMigrationPod(ctx, agent, run, work.name)
+		if goerrors.Is(err, errBusMigrationForeign) {
+			return foreign(busMigrationWorkName(agent, run, work.name))
+		}
 		if pod == nil || err != nil {
 			return busMigrationPending, false, err
 		}
@@ -347,8 +372,15 @@ func (r *PlatformAgentReconciler) busMigrationPod(ctx context.Context, agent *ag
 	case err != nil:
 		return nil, err
 	}
+	if !metav1.IsControlledBy(pod, agent) {
+		return nil, errBusMigrationForeign
+	}
 	return pod, nil
 }
+
+// errBusMigrationForeign is an object under a run's name that the
+// PlatformAgent does not control.
+var errBusMigrationForeign = goerrors.New("not controlled by this PlatformAgent")
 
 // terminationMessage is a pod's first container's termination message.
 func terminationMessage(pod *corev1.Pod) string {
@@ -832,7 +864,15 @@ func (r *PlatformAgentReconciler) ensureBusMigrationWorkloadFor(ctx context.Cont
 			return err
 		}
 	}
-	if err := ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, busMigrationWorkloadName(agent, work.identity, run.RunID), agent.Namespace, nil, commonLabels(agent), fieldOwner); err != nil {
+	saName := busMigrationWorkloadName(agent, work.identity, run.RunID)
+	existing := &corev1.ServiceAccount{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: saName}, existing); err == nil && !metav1.IsControlledBy(existing, agent) {
+		// Never adopted; the phase fails on it (observeBusMigration).
+		return nil
+	} else if err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+	if err := ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, nil, commonLabels(agent), fieldOwner); err != nil {
 		return err
 	}
 	var obj client.Object
@@ -894,12 +934,19 @@ func a2aStreamPolicies(replicas int) []busmigrate.StreamPolicy {
 func (r *PlatformAgentReconciler) ensureBusRunSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (refused string, err error) {
 	key := client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationRunSecret(agent, run.RunID)}
 	// Read uncached: the operator may not list or watch Secrets.
-	if err := r.a2aReader().Get(ctx, key, &corev1.Secret{}); err == nil {
+	existing := &corev1.Secret{}
+	if err := r.a2aReader().Get(ctx, key, existing); err == nil {
+		if !metav1.IsControlledBy(existing, agent) {
+			return "the run Secret exists and is not this PlatformAgent's", nil
+		}
 		return "", nil
 	} else if !errors.IsNotFound(err) {
 		return "", err
 	}
 	pod, err := r.busMigrationPod(ctx, agent, run, "hash")
+	if goerrors.Is(err, errBusMigrationForeign) {
+		return "the hashing pod is not this PlatformAgent's", nil
+	}
 	if err != nil {
 		return "", err
 	}
@@ -962,6 +1009,9 @@ const busMigrationEventLimit = 1024
 // failed, is returned for the run's cause.
 func (r *PlatformAgentReconciler) recordRestoreReport(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) (failure string, err error) {
 	pod, err := r.busMigrationPod(ctx, agent, run, busMigrationPhaseWorkload(busMigrationPhase(run.Phase)).name)
+	if goerrors.Is(err, errBusMigrationForeign) {
+		return "the restore pod is not this PlatformAgent's", nil
+	}
 	if err != nil || pod == nil {
 		return "", err
 	}
@@ -1166,6 +1216,11 @@ func (r *PlatformAgentReconciler) busMigrationCalloutServesTheFreeze(ctx context
 	var serving int32
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			// Exited (an evicted pod left for collection): it answers
+			// nothing, whatever map it had.
+			continue
+		}
 		if pod.Annotations[a2aBusFreezeAnnotation] != run.RunID {
 			return false, nil
 		}
