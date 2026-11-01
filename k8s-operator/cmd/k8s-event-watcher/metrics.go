@@ -95,11 +95,12 @@ type metrics struct {
 	sessionCreates *prometheus.CounterVec
 	// sessionCreatesSuppressed counts the per-incident creates the
 	// dispatcher did not attempt because the session breaker was open
-	// (sessionBreaker in injector.go). Not a sessionCreates outcome: nothing
-	// was POSTed, and the operator's usage poller reads that series as
-	// attempts. Each one is an incident whose alert waits for its next
-	// sighting after the cooldown, so the labels name the workload it
-	// held, where the breaker itself, one per process, cannot.
+	// (sessionBreaker in injector.go). Not a sessionCreates outcome: that
+	// series counts POSTs that were made, by what they got back
+	// (docs/designs/usage-counters-producer.md), and nothing was POSTed.
+	// Each one is an incident whose alert waits for its next sighting after
+	// the cooldown, so the labels name the workload it held, where the
+	// breaker itself, one per process, cannot.
 	sessionCreatesSuppressed *prometheus.CounterVec
 	// triageSessions counts the sessions this process opened whose event the
 	// daemon then delivered: one per injected event in per-incident mode,
@@ -193,12 +194,17 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_session_creates_total",
 			Help: "Total POST /sessions attempts, labeled by outcome.",
 		}, []string{"cluster", "project", "location", "outcome"}),
-		// namespace, kind and workload are the daemon's own incident key.
-		// The series exist only while the breaker is open, and name the
-		// workloads whose alerts it held.
+		// namespace, kind and workload are the daemon's own incident key
+		// (workloadOf folds a Deployment's pod on its Deployment the way the
+		// daemon's _fold_key does), so a hold's rows line up with the
+		// incidents it delayed. The only watcher series with an object name
+		// in its labels: a child is minted the first time a workload is held
+		// and, like any counter child, lives until the process restarts, so
+		// the distinct values are the workloads that failed during a hold
+		// over the process's life, not a snapshot of the current hold.
 		sessionCreatesSuppressed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_session_creates_suppressed_total",
-			Help: "Total per-incident session creates the watcher did not attempt because the daemon had answered POST /sessions with 429 or 5xx three times running and the cooldown breaker was open. No HTTP call was made; the dedup entry is rolled back so the next sighting after the cooldown opens the incident. workload is the controller reference when known, else the object name.",
+			Help: "Total per-incident session creates the watcher did not attempt because the daemon had answered POST /sessions with 429 or 5xx three times running and the cooldown breaker was open. No HTTP call was made; the dedup entry is rolled back so the next sighting after the cooldown opens the incident. workload is the Deployment's name for a Deployment's pod, else the object's own name.",
 		}, []string{"cluster", "project", "location", "namespace", "kind", "workload"}),
 		triageSessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_triage_sessions_total",

@@ -1796,16 +1796,15 @@ func TestDispatcherHoldsSessionCreatesWhileTheBreakerIsOpen(t *testing.T) {
 	}
 	disp := newDisp()
 	ev := TriageEvent{
-		Key:           EventKey{UID: "pod-1", Reason: "CrashLoopBackOff"},
-		Cluster:       "test-cluster",
-		Project:       "proj",
-		Location:      "us-central1",
-		Namespace:     "default",
-		KindOfObject:  "Pod",
-		Name:          "billing-service-7d9f",
-		ControllerRef: "billing-service",
-		LastSeen:      now,
-		Message:       "back-off restarting failed container",
+		Key:          EventKey{UID: "pod-1", Reason: "CrashLoopBackOff"},
+		Cluster:      "test-cluster",
+		Project:      "proj",
+		Location:     "us-central1",
+		Namespace:    "default",
+		KindOfObject: "Pod",
+		Name:         "billing-service-7d9f8b6c4-xk2pq",
+		LastSeen:     now,
+		Message:      "back-off restarting failed container",
 	}
 	suppressed := func(cluster, workload string) float64 {
 		return testutil.ToFloat64(m.sessionCreatesSuppressed.WithLabelValues(cluster, "proj", "us-central1", "default", "Pod", workload))
@@ -1836,6 +1835,11 @@ func TestDispatcherHoldsSessionCreatesWhileTheBreakerIsOpen(t *testing.T) {
 	if disp.dedup.Len() != 0 {
 		t.Errorf("a held dispatch left %d dedup entries; want 0, so the next sighting after the cooldown opens the incident", disp.dedup.Len())
 	}
+	if got := testutil.ToFloat64(m.activeIncidents.WithLabelValues("test-cluster", "proj", "us-central1")); got != 0 {
+		t.Errorf("active_incidents = %v during the hold; want 0, the rolled-back entry re-read", got)
+	}
+	// The label is the Deployment's name, folded from the pod's as the
+	// daemon folds incidents, not the pod name.
 	if got := suppressed("test-cluster", "billing-service"); got != 20 {
 		t.Errorf("session_creates_suppressed_total for the bucket = %v; want 20", got)
 	}
@@ -1845,12 +1849,11 @@ func TestDispatcherHoldsSessionCreatesWhileTheBreakerIsOpen(t *testing.T) {
 
 	// Process-wide: another cluster's dispatcher, built on the same
 	// injector, is held by the same breaker and counted under its own
-	// labels; a pod with no controller reference is named by itself.
+	// labels; a pod whose name does not fold is named by itself.
 	other := newDisp()
 	otherEv := ev
 	otherEv.Cluster = "other-cluster"
 	otherEv.Name = "cron-job-abc"
-	otherEv.ControllerRef = ""
 	other.Dispatch(context.Background(), otherEv)
 	if createCalls != 3 {
 		t.Fatalf("a second cluster POSTed through the open breaker (%d creates); want the hold to be process-wide", createCalls)
@@ -1873,5 +1876,26 @@ func TestDispatcherHoldsSessionCreatesWhileTheBreakerIsOpen(t *testing.T) {
 	}
 	if got := suppressed("test-cluster", "billing-service"); got != 20 {
 		t.Errorf("session_creates_suppressed_total moved to %v after the cooldown; want it at 20", got)
+	}
+}
+
+// TestWorkloadOfFoldsLikeTheDaemon pins the suppressed counter's workload
+// label to the daemon's own fold (_fold_key): a Deployment's pod on its
+// Deployment, every other name on itself.
+func TestWorkloadOfFoldsLikeTheDaemon(t *testing.T) {
+	for _, tc := range []struct {
+		kind, name, want string
+	}{
+		{"Pod", "billing-service-7d9f8b6c4-xk2pq", "billing-service"},
+		{"pod", "api-5b8c7d9f6-abcde", "api"},
+		{"Pod", "web-0", "web-0"},
+		{"Pod", "backup-29312345-k7x2p", "backup-29312345-k7x2p"},
+		{"Pod", "bare", "bare"},
+		{"Deployment", "api-5b8c7d9f6-abcde", "api-5b8c7d9f6-abcde"},
+		{"Node", "gke-pool-1-abc", "gke-pool-1-abc"},
+	} {
+		if got := workloadOf(TriageEvent{KindOfObject: tc.kind, Name: tc.name}); got != tc.want {
+			t.Errorf("workloadOf(%s %s) = %q; want %q", tc.kind, tc.name, got, tc.want)
+		}
 	}
 }

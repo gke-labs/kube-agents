@@ -94,7 +94,10 @@ type sessionBreaker struct {
 	openUntil time.Time
 	// openedBy is the status that tripped the breaker, for the log line.
 	openedBy int
-	now      func() time.Time
+	// held counts the creates SuppressedUntil turned away during the
+	// current hold, for the line logged when it closes.
+	held int
+	now  func() time.Time
 }
 
 func newSessionBreaker() *sessionBreaker {
@@ -104,10 +107,15 @@ func newSessionBreaker() *sessionBreaker {
 // record takes one POST /sessions outcome. A 201 closes the count; a 429 or
 // a 5xx increments it and, at the threshold, opens the breaker for
 // sessionBreakerCooldown or the response's Retry-After when that is longer,
-// capped at sessionBreakerMaxCooldown. Any other status is left alone.
+// capped at sessionBreakerMaxCooldown. Any other status is left alone. An
+// answer that lands while the breaker is open (a POST that was in flight
+// when it opened) changes nothing: the deadline the open line logged stands.
 func (b *sessionBreaker) record(status int, retryAfter string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if !b.openUntil.IsZero() && b.now().Before(b.openUntil) {
+		return
+	}
 	if status == http.StatusCreated {
 		b.failures = 0
 		return
@@ -134,8 +142,11 @@ func (b *sessionBreaker) record(status int, retryAfter string) {
 }
 
 // SuppressedUntil reports whether session creates are held, and until when.
-// The first call past the deadline closes the breaker, resets the count and
-// logs once; the caller then proceeds to POST.
+// A call that is told "held" is a create turned away, and is counted for
+// the close line. The first call past the deadline closes the breaker,
+// resets the count and logs once, with how many creates the hold turned
+// away; the caller then proceeds to POST. There is no timer: on a quiet
+// fleet the line waits for the next event.
 func (b *sessionBreaker) SuppressedUntil() (time.Time, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -143,13 +154,15 @@ func (b *sessionBreaker) SuppressedUntil() (time.Time, bool) {
 		return time.Time{}, false
 	}
 	if b.now().Before(b.openUntil) {
+		b.held++
 		return b.openUntil, true
 	}
-	log.Printf("injector: session creates resume: cooldown opened by status %d ended at %s",
-		b.openedBy, b.openUntil.UTC().Format(time.RFC3339))
+	log.Printf("injector: session creates resume: cooldown opened by status %d ended at %s; %d creates held",
+		b.openedBy, b.openUntil.UTC().Format(time.RFC3339), b.held)
 	b.openUntil = time.Time{}
 	b.openedBy = 0
 	b.failures = 0
+	b.held = 0
 	return time.Time{}, false
 }
 

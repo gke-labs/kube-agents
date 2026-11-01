@@ -354,3 +354,32 @@ func TestSessionBreakerHonoursRetryAfterUpToTheCap(t *testing.T) {
 		})
 	}
 }
+
+// TestSessionBreakerIgnoresAnswersWhileOpen covers a POST that was in flight
+// when the third failure opened the breaker: its answer, whatever it is,
+// neither pushes the deadline out nor re-opens the breaker.
+func TestSessionBreakerIgnoresAnswersWhileOpen(t *testing.T) {
+	inj, bs, now := newBreakerInjector(t)
+	for i := 0; i < sessionBreakerThreshold; i++ {
+		create(t, inj, bs, http.StatusServiceUnavailable)
+	}
+	first, h := inj.SessionCreatesSuppressedUntil()
+	if !h {
+		t.Fatal("breaker closed after three 503s")
+	}
+	*now = now.Add(30 * time.Second)
+	bs.retryAfter = "300"
+	create(t, inj, bs, http.StatusServiceUnavailable)
+	create(t, inj, bs, http.StatusCreated)
+	until, h := inj.SessionCreatesSuppressedUntil()
+	if !h {
+		t.Fatal("breaker closed by answers that landed while it was open")
+	}
+	if !until.Equal(first) {
+		t.Errorf("deadline moved to %s by a 503 that landed while open; want it kept at %s", until, first)
+	}
+	*now = first.Add(time.Second)
+	if held(t, inj) {
+		t.Fatal("breaker still open past its original deadline")
+	}
+}

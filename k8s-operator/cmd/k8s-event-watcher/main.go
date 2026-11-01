@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,8 @@ const (
 	// name, and skipConsequence finishes their "its cluster will NOT be ...".
 	componentName   = "k8s-event-watcher"
 	skipConsequence = "watched"
+	// kindPod is the involved object kind whose name workloadOf folds.
+	kindPod = "Pod"
 	// memoryLimitEnv carries the container's memory limit in bytes. The
 	// operator sets it through the Downward API from the agent-api-auth
 	// container's limits.memory (see buildAgentAPIAuthSidecar), so the watcher
@@ -695,14 +698,37 @@ func (d *dispatcher) RecordScaleUpMark(ev TriageEvent) bool {
 	return true
 }
 
+// podTemplateHashPodPattern is the shape of a Deployment's pod name,
+// `<deployment>-<pod-template-hash>-<5 random>`: the hash is 8 to 10
+// characters of the alphabet Kubernetes' SafeEncodeString uses, and a
+// StatefulSet's `web-0`, a Job's or a CronJob run's pod, or a bare pod does
+// not match. The same expression as the daemon's POD_TEMPLATE_HASH_POD_RE
+// (session_kv_server.py, _fold_key), which is the incident key the
+// suppressed counter's workload label is meant to line up with.
+var podTemplateHashPodPattern = regexp.MustCompile(`^(.*?)-[4-9bcdf]{8,10}-[a-z0-9]{5}$`)
+
 // workloadOf names the workload an event belongs to for the suppressed
-// counter: the controller reference when the event carries one, else the
-// object's own name.
+// counter, folded the way the daemon folds incidents (_fold_key): a
+// Deployment's pod on its Deployment, any other object on its own name.
+// The watcher sets no controller reference on its events (watcher.go), so
+// the pod name is what there is to fold.
 func workloadOf(ev TriageEvent) string {
-	if ev.ControllerRef != "" {
-		return ev.ControllerRef
+	if !strings.EqualFold(ev.KindOfObject, kindPod) {
+		return ev.Name
+	}
+	if m := podTemplateHashPodPattern.FindStringSubmatch(ev.Name); m != nil {
+		return m[1]
 	}
 	return ev.Name
+}
+
+// forgetIncident rolls back the dedup entry Observe wrote for an event the
+// daemon did not accept, or that the watcher did not offer it, and re-reads
+// the gauge Dispatch set after Observe, so a rolled-back entry is not
+// counted as an open incident until the next dispatch. See dedupCache.Forget.
+func (d *dispatcher) forgetIncident(ev TriageEvent) {
+	d.dedup.Forget(ev.Key, ev.Message)
+	d.metrics.activeIncidents.WithLabelValues(ev.Cluster, ev.Project, ev.Location).Set(float64(d.dedup.Len()))
 }
 
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
@@ -805,9 +831,10 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			// failed create below, for the same reason: nobody was
 			// told, so the first sighting after the cooldown must open
 			// the incident. No log line per held event: the breaker
-			// logs once on open and once on close, and the counter
-			// below carries the per-workload record.
-			d.dedup.Forget(ev.Key, ev.Message)
+			// logs once on open and once on close, with the number of
+			// creates it held, and the counter below carries the
+			// per-workload record.
+			d.forgetIncident(ev)
 			d.metrics.sessionCreatesSuppressed.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Namespace, ev.KindOfObject, workloadOf(ev)).Inc()
 			return
 		}
@@ -817,7 +844,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			// about this failure, so the next sighting must be free to
 			// open the incident rather than be suppressed against an
 			// alert that never went out. See dedupCache.Forget.
-			d.dedup.Forget(ev.Key, ev.Message)
+			d.forgetIncident(ev)
 			log.Printf("dispatcher: create session for %s/%s: %v", ev.Namespace, ev.Name, err)
 			d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "error").Inc()
 			d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "session_create").Inc()
@@ -867,7 +894,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		// have been created for this attempt and is now orphaned; it
 		// ages out on the daemon's own TTL, and leaving the failure
 		// permanently unreportable would be the worse trade.
-		d.dedup.Forget(ev.Key, ev.Message)
+		d.forgetIncident(ev)
 		log.Printf("dispatcher: inject for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, sid, err)
 		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "inject").Inc()
 		return
@@ -906,7 +933,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		// second copy of a delivered alert, and nothing was delivered.
 		// The ceiling resets at 00:00 UTC while this entry would
 		// otherwise outlive the reset by most of a day.
-		d.dedup.Forget(ev.Key, ev.Message)
+		d.forgetIncident(ev)
 		d.metrics.eventsQuotaSuppress.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
 		log.Printf("quota-suppressed %s pod=%s/%s (sid=%s) — daemon dropped the alert, incident reopened",
 			ev.Key.Reason, ev.Namespace, ev.Name, sid)
