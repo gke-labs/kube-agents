@@ -112,7 +112,7 @@ the presubmit exports nothing new until it chooses to. The exchange:
    failing to publish it, infrastructure. The prompt is routed like any text, the gateway's
    literal affordances included, `Delegate` among them; the harness sends none as a prompt, and a
    case whose prompt opens with one is the case's defect. The one it sends itself is the `stop`
-   after a stopped ask's opening turn (`bench/kube_agents_bench/stop_hook.py`). The adapter dedupes on the backend message id,
+   during or after a stopped ask's opening turn (`bench/kube_agents_bench/stop_hook.py`). The adapter dedupes on the backend message id,
    bounded the way the Chat adapter bounds its seen set: a repeated `POST` with an id it has
    already accepted gets the answer the first one got, the record's task id or the same refusal,
    and starts nothing. Because the id

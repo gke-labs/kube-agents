@@ -253,3 +253,80 @@ def test_the_case_carries_the_directive_on_its_own_line():
     case = harness.Path(__file__).resolve().parents[1] / "tasks" / "chat-stop-halts-delegated-remediation" / "task.yaml"
     stop = stop_hook.parse(yaml.safe_load(case.read_text(encoding="utf-8"))["prompt"])
     assert stop is not None and "checkout-gateway" in stop.prompt
+
+
+MID_TURN = stop_hook.MID_TURN_DIRECTIVE
+
+
+def test_the_mid_turn_directive_defaults_its_delay():
+    stop = stop_hook.parse(f"{MID_TURN}\nopen a pull request")
+    assert stop == stop_hook.Stop(prompt="open a pull request", observe_seconds=900.0,
+                                  mid_turn_after=stop_hook.DEFAULT_AFTER_SECONDS)
+    assert stop_hook.is_stopped_ask(f"{MID_TURN}\nask")
+
+
+def test_the_mid_turn_delay_and_window_can_be_named_in_either_order():
+    stop = stop_hook.parse(f"{MID_TURN} observe=600 after=5\nask")
+    assert (stop.observe_seconds, stop.mid_turn_after) == (600.0, 5.0)
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        f"{MID_TURN} after=0",
+        f"{MID_TURN} after=999",
+        f"{MID_TURN} after=soon",
+        f"{MID_TURN} after=1 after=2",
+        f"{DIRECTIVE} after=3",
+        f"{MID_TURN}after=3",
+    ],
+)
+def test_a_bad_mid_turn_directive_is_refused(first):
+    with pytest.raises(ValueError):
+        stop_hook.parse(first + "\nask")
+
+
+def _stop_mid_turn(monkeypatch, reads, send=(True, "stopped")):
+    answers = list(reads)
+    monkeypatch.setattr(harness.board, "read_session_cards",
+                        lambda *a, **k: answers.pop(0) if len(answers) > 1 else answers[0])
+    result = AgentResult(output="", trajectory=[])
+    harness.KubeAgentsHarness()._stop_after_first_card(
+        result, "a2a-ctx-1", stop_hook.Stop(prompt="ask", observe_seconds=30.0, mid_turn_after=3.0),
+        send_stop=lambda: send, poll_interval=0.0,
+    )
+    return result
+
+
+def test_a_mid_turn_stop_that_left_no_card_stopped_everything(monkeypatch):
+    result = _stop_mid_turn(monkeypatch, [_cards({})])
+    assert _entry(result)["status"] == "completed"
+    assert _entry(result, stop_hook.CARDS_STOPPED_ENTRY)["status"] == "completed"
+    assert not result.errors
+
+
+def test_a_card_the_stopped_turn_filed_must_end_archived(monkeypatch):
+    # The #3263 shape: the stopped turn filed its card anyway, and it ran.
+    result = _stop_mid_turn(monkeypatch, [_cards({"t_1": "running"})])
+    assert _entry(result, stop_hook.CARDS_STOPPED_ENTRY)["status"] == "error"
+    assert ARCHIVED == ["t_1"]
+    archived = _stop_mid_turn(monkeypatch, [_cards({"t_2": "archived"})])
+    assert _entry(archived, stop_hook.CARDS_STOPPED_ENTRY)["status"] == "completed"
+
+
+def test_a_turn_that_ended_before_the_mid_turn_stop_fails_the_entry_with_why(monkeypatch):
+    result = _stop_mid_turn(monkeypatch, [_cards({})], send=(False, "the opening turn ended first"))
+    assert _entry(result)["status"] == "error"
+    assert _entry(result)["result"] == "the opening turn ended first"
+    assert result.errors == [f"{stop_hook.STOP_ENTRY}: the opening turn ended first"]
+    assert not any(e["name"] == stop_hook.CARDS_STOPPED_ENTRY for e in result.trajectory)
+
+
+def test_every_task_that_names_the_mid_turn_directive_parses():
+    import yaml
+
+    tasks = harness.Path(__file__).resolve().parents[1] / "tasks"
+    for path in sorted(tasks.glob("*/task.yaml")):
+        prompt = str((yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("prompt") or "")
+        if MID_TURN in prompt:
+            assert stop_hook.parse(prompt).mid_turn_after is not None, path

@@ -962,6 +962,13 @@
 # record files under the version key's `next` mode, the inject lane's.
 ./tasks/chat-stop-halts-delegated-remediation/task.yaml
 
+# gke-labs#3263, Slack Stop step 3: a `stop` sent while the opening turn still
+# runs leaves no card running, though the turn had not filed one yet when the
+# stop went. Next lane only (api-lane-exclusions.txt), as above. deployer:
+# noop, the no-pdb-workload fixture, one front-door turn and at most one card,
+# a 600s observation window.
+./tasks/chat-stop-mid-turn-files-no-card/task.yaml
+
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.

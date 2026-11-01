@@ -1743,6 +1743,19 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # turn can still answer.
 # See the module docstring in deploy/docker/patches/kanban_wake_guard.py.
 #
+# api_session_stop: a Stop ends the turn running in Hermes, not only the
+# bridge's wait for it. The bridge POSTs each turn without streaming, and
+# upstream interrupts an agent only when a streaming client disconnects, so a
+# turn the person stopped ran on and could still file a card after the card
+# stop had looked for one (#3263). The chat-completions handler records each
+# turn under its session id, _run_agent carries the record onto the turn's
+# thread and binds the agent to it, and a new route,
+# POST /v1/kube-agents/sessions/{id}/stop, gives every turn running in the
+# session upstream's hard interrupt and process reap and waits for it to end.
+# kanban_create refuses on a stopped turn. Applied AFTER kanban_wake_guard,
+# whose rewritten lines are two of its anchors. See the module docstring in
+# deploy/docker/patches/api_session_stop.py.
+#
 # kanban_link_running_guard: kanban_link refuses to gate a card that has
 # already started. A link makes its child wait for the parent, so a worker that
 # linked its own running fan-out child stranded that run: its completes were
@@ -1849,6 +1862,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_wake_guard.py \
      deploy/docker/patches/apply_kanban_wake_guard.py \
      deploy/docker/patches/verify_kanban_wake_guard.py \
+     deploy/docker/patches/api_session_stop.py \
+     deploy/docker/patches/apply_api_session_stop.py \
+     deploy/docker/patches/verify_api_session_stop.py \
      deploy/docker/patches/kanban_link_running_guard.py \
      deploy/docker/patches/apply_kanban_link_running_guard.py \
      deploy/docker/patches/verify_kanban_link_running_guard.py \
@@ -1934,7 +1950,11 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF '_kanban_refuse_unblock_on_wake()' /opt/hermes/tools/kanban_tools.py && \
     grep -qF 'headers[_KANBAN_WAKE_HEADER]' /opt/hermes/gateway/wake.py && \
     grep -qF '_kanban_wake_marked(OpenAICompatRoutesMixin._handle_chat_completions)' /opt/hermes/gateway/platforms/api_server.py && \
-    grep -qF 'run_in_executor(None, _kanban_wake_carry(_run))' /opt/hermes/gateway/platforms/api_server.py && \
+    cp /tmp/latency-patches/api_session_stop.py /opt/hermes/tools/api_session_stop.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_api_session_stop.py /opt/hermes && \
+    grep -qF 'run_in_executor(None, _kanban_wake_carry(_kube_session_stop.carry(self, _run)))' /opt/hermes/gateway/platforms/api_server.py && \
+    grep -qF '_kube_session_stop.track(OpenAICompatRoutesMixin._handle_chat_completions)' /opt/hermes/gateway/platforms/api_server.py && \
+    grep -qF '_stop_err = _kube_refuse_create_on_stop()' /opt/hermes/tools/kanban_tools.py && \
     cp /tmp/latency-patches/kanban_link_running_guard.py /opt/hermes/tools/kanban_link_running_guard.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_link_running_guard.py /opt/hermes && \
     grep -qF '_link_err = _kanban_refuse_started_child_link(kb, conn, parent_id, child_id)' /opt/hermes/tools/kanban_tools.py && \
@@ -1986,6 +2006,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_audit_ledger.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_guard.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_api_session_stop.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_link_running_guard.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_fanout_reaper.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \

@@ -430,8 +430,9 @@ report, and a later message on the conversation is a new task and is.
 Hermes can also run a wake turn in the session that filed a card: a synthetic message saying how the card ended, with the worker's result. On a conversation with no notify route, Slack included, a finished card (or one sent for review) wakes the session. On Google Chat only a card that failed, timed out or blocked does, because #2734 posts the finished card's report itself. The wake turn's reply isn't delivered anywhere, since the bridge only reads answers to its own task turns, but it stays in the session's history for the next turn. The wake turn can't file a card: in an `a2a-ctx-*` session, or one descended from it such as its compressed continuation, `kanban_create` refuses on a wake turn and says to wait for the person to ask (#2610, `deploy/docker/patches/kanban_wake_guard.py`). So does `kanban_unblock`: a blocked card's question is for the person, and their reply, a turn of its own, can unblock it.
 
 What the `api` executor does not do. A turn the bridge stops waiting
-for, on cancel or the deadline, may keep running in the server, and the next task on the same
+for at the deadline may keep running in the server, and the next task on the same
 session can start beside it; so can a turn Hermes starts on its own, such as a background wake.
+A cancelled turn is stopped in the server too (the turn stop, below).
 Tool calls from either can land in the wrong task's trace. And when Hermes compresses a long
 session it continues it under a new session id, which the hook reports and the trace's key does
 not match, so the trace stops for that conversation while the answers keep arriving.
@@ -614,8 +615,17 @@ had, where a read failure that dropped the task would leave it open with no term
 Under the `api` executor `working` is published when the task's turn starts, and cancel,
 shutdown and the deadline end the HTTP request, the read of the response body included, where
 the `cli` executor kills a process group, with the same terminals: `canceled-by-request`, `bridge-shutdown`, `deadline-exceeded`. Ending
-the request ends the bridge's wait; whether the server abandons the turn it was running is the
-server's. Turns on one session run one at a time; a task still waiting for the previous turn
+the request ends the bridge's wait, and the server interrupts the turn only for a streaming
+client, which the bridge is not. So after a cancel ends a turn's request, and its `canceled`
+terminal is out, the bridge asks the server to stop the turn running in the session (the turn
+stop): `POST /v1/kube-agents/sessions/{id}/stop` on the API server, with its key, a route
+the image's `api_session_stop` patch adds (`deploy/docker/patches/api_session_stop.py`). The
+route gives every turn running in that session upstream's hard interrupt and process reap, the
+pair `/v1/runs/{run_id}/stop` uses, interrupts a turn whose agent did not exist yet as soon as it
+does, and answers once they have ended or after 10 s; the bridge waits up to 15 s and holds the
+session's turn meanwhile. A stopped turn's `kanban_create` is refused. A server without the
+route answers 404, logged, and the turn runs on. A shutdown and the deadline send no stop.
+Turns on one session run one at a time; a task still waiting for the previous turn
 when its deadline passes ends `reason: session-busy - waited <d> for the session's previous
 turn; no request was sent`, and one cancelled while waiting ends `canceled-before-start`. The
 failures name themselves in the status message:
@@ -656,10 +666,12 @@ terminal. No Hermes turn runs. Instead the bridge:
    the stop has started, and the person who typed it sees it acknowledged while the turn they
    stopped winds down. The wait lets the bridge's own request for the turn the gateway just
    cancelled end first, and holds off the next bridge turn in the session while the cards are
-   archived. It does not prove the Hermes run behind that request has stopped: the session turn
-   is released when the bridge's request ends, and whether Hermes abandons the run then is not
-   guaranteed. A card such a run files a little later is caught by session-kv's re-scan only if
-   it lands within that window; one filed after the call has answered is not. Only bridge turns: a
+   archived. The cancelled task holds the session's turn until its turn stop has answered, so
+   the control looks for cards only once the Hermes turn has ended, and archives one it filed
+   before the interrupt reached it. A turn that outlasts the stop's wait still can't file one,
+   since its `kanban_create` is refused. A server without the stop route, or a turn the server
+   had not yet recorded when the stop arrived, can still file a card later; session-kv's
+   re-scan catches it only if it lands within the call. Only bridge turns: a
    wake turn Hermes starts on its own does not take the bridge's turn. Another conversation's
    stop doesn't wait. The wait is not first come, first served: a message sent right after
    `stop` can take the session first, and a turn that keeps it past 20 s ends the control
