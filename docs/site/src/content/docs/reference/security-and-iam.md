@@ -71,7 +71,7 @@ The default **read-only** set binds read roles, with one qualification under the
 
 - `roles/container.clusterViewer`, `roles/container.viewer` — read-only GKE.
 
-  `roles/container.viewer` carries `container.thirdPartyObjects.list` and `.get`, which let the fleet-audit collectors list the Config Connector objects on a cluster. The collectors find the Config Connector kinds through the API server's discovery, which needs no grant. A `custom` set needs those two permissions or a Kubernetes RBAC grant of `list` on the Config Connector kinds. Without that grant the read fails, no fix gets the note about Config Connector, and the `finish` log has a warning that names the clusters it could not read.
+  `roles/container.viewer` carries `container.thirdPartyObjects.list` and `.get`, which let the fleet-audit collectors list the Config Connector objects on a cluster. The collectors find the Config Connector kinds through the API server's discovery, which needs no grant. A `custom` set needs those two permissions or a Kubernetes RBAC grant of `list` on the Config Connector kinds. Without that grant the read fails, no fix gets the note about Config Connector, and the audit's log has a warning that names the clusters it could not read.
 
   A `custom` set also needs `container.namespaces.list` or a Kubernetes RBAC grant of `list` on namespaces. Without it, an object that takes its project from its namespace has no known project, so it matches a fix only when one cluster runs Config Connector, and no warning appears.
 

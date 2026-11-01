@@ -129,11 +129,18 @@ RBAC grant) finds the Config Connector kinds: a group that ends in `.cnrm.cloud.
 `gcp` category, with the `list` verb. Then one `kubectl get --raw /apis/<group>/<version>/<plural>`
 per kind runs, `KIND_READ_WORKERS` at a time per cluster, and every `kubectl` call of the read takes
 one of `PROXY_SLOTS` slots first, so no more than the credential proxy's admitted count are in
-flight in the process across clusters. `kubectl get gcp -A` makes the same list requests one after
-another, which through the credential proxy took longer than the read's limit on a cluster with the
-add-on. A discovery that serves no Config Connector kind means no Config Connector there. A failed
-discovery, or a kind that does not list, makes the entry `kcc_unread`, unless the kind's
-CustomResourceDefinition went away after the discovery.
+flight in the process across clusters. The compliance collector lists every kind, because
+`kcc-object-wedged` needs them all; on a large hub that read can end `kcc_unread`, as `kubectl get
+gcp -A` can. The drift, patch readiness and stockout collectors list only
+`kcc_health.CONTAINER_KINDS` (`ContainerCluster` and `ContainerNodePool`): their findings are on
+`Cluster/` and `NodePool/` objects, a note names only the finding's own object, and from the agent a
+list request through the proxy takes seconds, so all ~230 kinds do not fit the time budget. Their
+entries name the kinds read (`kcc_kinds_read`), and when a `DependencyNotReady` message names an
+object of another kind, the note names it and says its state was not read. For these collectors a
+cluster that serves neither container kind gets neither key and is not a host: it holds no object
+their notes can name. A discovery that serves no wanted kind means no Config Connector there for
+that collector. A failed discovery, or a kind that does not list, makes the entry `kcc_unread`,
+unless the kind's CustomResourceDefinition went away after the discovery.
 
 The compliance collector always writes the keys, from the read its own `kcc-object-wedged` check
 makes ([`compliance_audit_sop.md`](../../agents/platform/governance/compliance_audit_sop.md) §2.12),
@@ -159,8 +166,8 @@ clusters that are not running. An entry with no kubeconfig file gets `kcc_unread
 cluster entry that is read, neither key means that the cluster's discovery serves no Config
 Connector kind in the `gcp` category, so Config Connector does not run there.
 
-`finish` counts the possible Config Connector hosts: the entries with either key, and, in the
-manifest of a collector that reads Config Connector, each cluster entry that it never read
+`finish` counts the possible Config Connector hosts: the entries with either key, and, when any
+entry carries either key, each cluster entry that the collector never read
 (`unreachable` or `gate-failed`) unless its `cluster_status` says it is not running. With more than
 one, `finish` names an object only when its `project` is known and agrees with the fix. With one, a
 known `project` that differs from the fix's is still no match. `finish` adds a note to a `manifest`

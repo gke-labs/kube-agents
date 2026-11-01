@@ -832,8 +832,8 @@ name for each project.
 
 A ready object is not in the list, so with more than one possible host the same name can be ready
 on one host and not ready on another. Then the `project` must also be known. A possible host is an
-entry that carries `kcc_unready` (also empty) or `kcc_unread`, or, in the manifest of a collector
-that reads Config Connector, a cluster entry it never read (`unreachable` or `gate-failed`). An entry
+entry that carries `kcc_unready` (also empty) or `kcc_unread`, or, when any entry carries either key,
+a cluster entry the collector never read (`unreachable` or `gate-failed`). An entry
 whose `cluster_status` says the cluster is not running is not a host: it cannot run the
 controllers. A `Cluster/` or `NodePool/` finding's own object with no recorded project does not
 match when the manifest holds a cluster of the same name in another project. The own object must
@@ -844,7 +844,10 @@ The note is the last paragraph of the remediation note, starts "**Config Connect
 this file.**", and names each matched object and the controller's reason in code spans. When the
 reason is `DependencyNotReady` and the referenced object is not ready on the same host cluster, it
 follows the chain and names only the deepest unready object, the root cause, with a count of the
-ones between. It names at most two objects in the file and counts the rest.
+ones between. When the host's read did not list the referenced object's kind (the drift, patch
+readiness and stockout collectors read only `ContainerCluster` and `ContainerNodePool`), the note
+names that object and says that its state was not read. It names at most two objects in the file and
+counts the rest.
 
 The fix keeps `kind: manifest`: the change belongs in that file, the stall usually clears before
 anyone reads the ledger, and degrading the fix would drop the pull request. The note does not say
