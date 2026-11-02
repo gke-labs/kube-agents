@@ -7,13 +7,9 @@
 #   helm upgrade kube-agents ./charts/kube-agents -n kubeagents-system \
 #     --reset-then-reuse-values -f charts/kube-agents/examples/values-fleet.yaml
 #
-# Before a hand-run `helm upgrade`, apply charts/kube-agents/crds/ first
-# (`kubectl apply --server-side -f charts/kube-agents/crds/`; upgrade.sh in its
-# full and operator modes does, a harness run does not):
-# Helm never updates CRDs on an upgrade, and the chart refuses the render when
-# the installed CRD predates spec.storage, spec.deployment.credentialProxy or
-# spec.deployment.agentAPIAuth rather than letting the API server prune the
-# values silently.
+# On an existing install, apply charts/kube-agents/crds/ before a hand-run
+# `helm upgrade` (`kubectl apply --server-side -f charts/kube-agents/crds/`);
+# the page's "Applying it" says why, and what upgrade.sh does for you.
 #
 # GKE Autopilot without bursting sets every container's limits equal to its
 # requests, so each key below says what it runs at there. Autopilot also admits
@@ -58,10 +54,13 @@ platformAgent:
       maxInProgress: 3
   deployment:
     # The operator copies spec.deployment.env onto the agent container only for
-    # names on its allowlist, and forwards KUBEAGENTS_AUDIT_AUTO_PROMOTE to the
-    # shell sandbox, where the audits run. Both names here are forwarded; a
-    # name that is not (CLOUDSDK_CORE_DISABLE_FILE_LOGGING, MALLOC_ARENA_MAX)
-    # would be dropped silently, so none is set.
+    # names on its allowlist, forwards KUBEAGENTS_AUDIT_AUTO_PROMOTE to the
+    # shell sandbox, where the audits run, and passes every name it does not
+    # reserve to the credential-proxy and agent-api-auth containers. Both names
+    # here reach the container that reads them. CLOUDSDK_CORE_DISABLE_FILE_LOGGING
+    # and MALLOC_ARENA_MAX are not on the agent container's allowlist: set here
+    # they would reach the proxy pod, where gcloud and kubectl run, and not the
+    # agent container. This file leaves them out.
     env:
       # Seconds an admitted workload event folds its later events into the
       # same incident instead of opening another: an hour, against the default
@@ -87,7 +86,11 @@ platformAgent:
       # with thousands of pods does: close to 1 GiB a slot with all eight in
       # use (modeled), where the broker restarted under a 29-cluster fleet at
       # the default. The CPU request is the CPU it runs at on Autopilot without
-      # bursting; on Standard or with bursting it may reach 8 vCPU.
+      # bursting; on Standard or with bursting it may reach 8 vCPU. On
+      # Standard the 4 vCPU request needs a node with more than that
+      # allocatable; the composition's default e2-standard-4 pool has less,
+      # and the proxy Deployment recreates its pod rather than rolling it, so
+      # add a larger pool before passing this file or the proxy stays Pending.
       # ephemeral-storage keeps the operator's 8Gi default, under Autopilot's
       # 10 GiB per-pod ceiling.
       resources:

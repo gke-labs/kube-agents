@@ -844,11 +844,12 @@ exposes for 25 clusters or more: `operator.resources` at 1Gi, `platformAgent.sto
 (`INCIDENT_WORKLOAD_DEDUP_SECONDS`, `KUBEAGENTS_AUDIT_AUTO_PROMOTE`), each commented with its
 reason and what GKE Autopilot without bursting runs it at. It does not size the agent container
 itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
-sandbox, which the operator fixes at 2 CPU and 2Gi. The two env names are ones the operator
-forwards; `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on its allowlist
-and are left out for that reason. Pass it beside your own values with
-`-f charts/kube-agents/examples/values-fleet.yaml`, after applying `crds/` on an existing
-install. The tier thresholds, the per-pod sum and the host-cluster shapes are on the
+sandbox, whose `platformAgent.harness.experimental.shellSandbox.resources` it leaves at the
+operator's 2 CPU and 2Gi defaults. The two env names reach the containers that read them;
+`CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
+allowlist, would reach only the credential-proxy and `agent-api-auth` containers, and are left
+out. Pass it beside your own values with `-f charts/kube-agents/examples/values-fleet.yaml`,
+after applying `crds/` on an existing install ([Notes](#notes)). The tier thresholds, the per-pod sum and the host-cluster shapes are on the
 [fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/).
 
 ### Agent runtime knobs

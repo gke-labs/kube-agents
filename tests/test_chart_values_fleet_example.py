@@ -3,10 +3,12 @@
 The file is what the site's fleet-sizing page tells an operator of 25 or more clusters to
 pass, so four things have to hold: `helm lint` accepts it against the chart's schema; every
 value it sets lands on the `PlatformAgent` CR (or the operator Deployment) under the path the
-operator reads; every `platformAgent.deployment.env` name in it is one the operator forwards,
-because a name outside the allowlist is dropped silently and the file would ship a key that
-changes nothing; and the figures the page's comments rest on hold against the operator's
-rules (the operator memory floor, the Autopilot memory-per-vCPU band, requests under limits).
+operator reads; every `platformAgent.deployment.env` name in it reaches the container that
+reads it (the agent container takes only the operator's allowlist, the credential-proxy and
+`agent-api-auth` containers take every name the operator does not reserve); and the figures the
+page's comments rest on hold against the operator's rules (the Autopilot memory-per-vCPU band,
+requests under limits, the proxy's declared ephemeral limit under Autopilot's per-pod ceiling).
+The operator memory floor is the chart's own check, which the render below runs.
 
 The page's "What each pod needs" table also carries a declared column: what the chart and the
 operator render at the defaults. Those figures live in `files/footprint.yaml` (generated from
@@ -33,8 +35,10 @@ _README = _CHART / "README.md"
 _SITE_PAGE = _REPO_ROOT / "docs" / "site" / "src" / "content" / "docs" / "deploy" / "fleet-sizing.md"
 _PREREQUISITES_PAGE = _REPO_ROOT / "docs" / "site" / "src" / "content" / "docs" / "install" / "prerequisites.md"
 _UPGRADE_PAGE = _REPO_ROOT / "docs" / "site" / "src" / "content" / "docs" / "install" / "upgrade.md"
-_AGENT_MANIFESTS = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
-_SANDBOX_MANIFESTS = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "shell_sandbox_manifests.go"
+_CONTROLLER_DIR = _REPO_ROOT / "k8s-operator" / "internal" / "controller"
+_AGENT_MANIFESTS = _CONTROLLER_DIR / "platformagent_manifests.go"
+_SANDBOX_MANIFESTS = _CONTROLLER_DIR / "shell_sandbox_manifests.go"
+_API_TYPES = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _HELM = shutil.which("helm")
 _REQUIRED = [
     "--set", "platformAgent.harness.clusterName=ci-cluster",
@@ -57,6 +61,12 @@ _ALLOWLIST_RE = re.compile(
 )
 _ALLOWLIST_ENTRY_RE = re.compile(r'^\s*"(?P<name>[A-Z0-9_]+)":\s*\{\}', re.MULTILINE)
 _SANDBOX_FORWARD_RE = re.compile(r'envAuditAutoPromote\s*=\s*"(?P<name>[A-Z0-9_]+)"')
+# The two process tunables the page and the example say are left out. The agent
+# container's allowlist above drops them; the credential-proxy and agent-api-auth
+# containers take spec.deployment.env through mergeCredentialProxyEnv, a denylist
+# of the names the operator itself sets or lists as sensitive, so a name the
+# operator source never spells reaches those two containers.
+_LEFT_OUT_ENV_NAMES = ("CLOUDSDK_CORE_DISABLE_FILE_LOGGING", "MALLOC_ARENA_MAX")
 
 # The page's declared column, derived from the two files the page cites.
 _FOOTPRINT = _CHART / "files" / "footprint.yaml"
@@ -71,13 +81,13 @@ _PAGE_ROW_MINTER = "GitHub token minter"
 _PAGE_ROW_TOTAL = "**Total**"
 _PAGE_HINDSIGHT_BULLET = "**Hindsight memory**"
 _PAGE_FLEET_DATA_CLAIM_GI = 100
+_PAGE_LARGEST_EPHEMERAL = "proxy's {gib} GiB is the largest declared"
+_EXAMPLE_PROXY_EPHEMERAL = "keeps the operator's {gib}Gi default"
 
-# What the operator and Autopilot hold the figures to.
-_OPERATOR_MEMORY_FLOOR_MI = 512
+# What Autopilot holds the figures to.
 _AUTOPILOT_MIN_MIB_PER_VCPU = 1024
 _AUTOPILOT_MAX_MIB_PER_VCPU = 6.5 * 1024
 _AUTOPILOT_EPHEMERAL_CEILING_MI = 10 * 1024
-_PROXY_DEFAULT_EPHEMERAL_MI = 8 * 1024
 
 _QUANTITY_RE = re.compile(r"^(?P<number>\d+(?:\.\d+)?)(?P<suffix>m|Mi|Gi|Ti|)$")
 _MIB_PER_SUFFIX = {"Mi": 1, "Gi": 1024, "Ti": 1024 * 1024}
@@ -159,6 +169,16 @@ def _page_table_rows() -> dict:
     return rows
 
 
+def _footprint() -> dict:
+    return yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
+
+
+def _operator_source() -> str:
+    """Every Go file the operator's controller and API types are built from, tests excepted."""
+    files = [f for f in _CONTROLLER_DIR.glob("*.go") if not f.name.endswith("_test.go")] + [_API_TYPES]
+    return "\n".join(f.read_text() for f in files)
+
+
 def _forwarded_env_names() -> set:
     source = _AGENT_MANIFESTS.read_text()
     block = _ALLOWLIST_RE.search(source)
@@ -203,20 +223,23 @@ class ExampleShapeTest(unittest.TestCase):
                 self.assertNotIn("valueFrom", entry)
 
     def test_the_names_the_maintainers_left_out_stay_out(self):
+        """The page says the two names reach the proxy pod and not the agent container."""
         names = {entry["name"] for entry in self.values["platformAgent"]["deployment"]["env"]}
         forwarded = _forwarded_env_names()
-        for name in ("CLOUDSDK_CORE_DISABLE_FILE_LOGGING", "MALLOC_ARENA_MAX"):
+        source = _operator_source()
+        for name in _LEFT_OUT_ENV_NAMES:
             with self.subTest(name=name):
                 self.assertNotIn(name, names)
-                self.assertNotIn(name, forwarded, f"{name} is forwarded now; the page and the example can carry it")
+                self.assertNotIn(name, forwarded, f"{name} reaches the agent container now; re-read the page's sentence on it")
+                self.assertNotIn(name, source, f"the operator names {name} now; re-read which container it reaches")
 
-    def test_the_operator_memory_limit_meets_the_floor_and_matches_its_request(self):
-        resources = self.values["operator"]["resources"]
-        limit = _mebibytes(resources["limits"]["memory"])
-        self.assertGreaterEqual(limit, _OPERATOR_MEMORY_FLOOR_MI)
+    def test_the_operator_memory_request_matches_its_limit(self):
         # Autopilot without bursting sets limits equal to requests; the file
         # promises the manager 1Gi there, which only an equal request delivers.
-        self.assertEqual(limit, _mebibytes(resources["requests"]["memory"]))
+        # The chart's floor on the limit is its own render-time check, which
+        # ExampleRenderTest runs with this file.
+        resources = self.values["operator"]["resources"]
+        self.assertEqual(_mebibytes(resources["limits"]["memory"]), _mebibytes(resources["requests"]["memory"]))
 
     def test_every_requests_pair_sits_in_the_autopilot_band(self):
         deployment = self.values["platformAgent"]["deployment"]
@@ -248,7 +271,12 @@ class ExampleShapeTest(unittest.TestCase):
         proxy = deployment["credentialProxy"]["resources"]
         for block in ("requests", "limits"):
             self.assertNotIn("ephemeral-storage", proxy[block])
-        self.assertLessEqual(_PROXY_DEFAULT_EPHEMERAL_MI, _AUTOPILOT_EPHEMERAL_CEILING_MI)
+        # The default the file keeps is the operator's, read from the footprint
+        # so a raise there past Autopilot's ceiling, or past the figure the
+        # comment states, fails here.
+        declared = _footprint()["credentialProxy"]["ephemeralStorageBytesLimit"] / (1024 * 1024)
+        self.assertLessEqual(declared, _AUTOPILOT_EPHEMERAL_CEILING_MI)
+        self.assertIn(_EXAMPLE_PROXY_EPHEMERAL.format(gib=_gib(declared)), _EXAMPLE.read_text())
         # The watcher's GOMAXPROCS follows limits.cpu, so the example leaves it alone.
         self.assertNotIn("cpu", deployment["agentAPIAuth"]["resources"]["limits"])
 
@@ -271,7 +299,7 @@ class DeclaredColumnTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.footprint = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
+        cls.footprint = _footprint()
         cls.values = yaml.safe_load(_VALUES.read_text())
         cls.rows = _page_table_rows()
 
@@ -330,6 +358,14 @@ class DeclaredColumnTest(unittest.TestCase):
         self.assertEqual(cells[1], str(pods))
         self.assertEqual(cells[3], f"**{_cell(tuple(total))}**")
         self.assertEqual(cells[5], f"**{_gib(total[4])} GiB**")
+
+    def test_the_autopilot_bullet_names_the_largest_declared_ephemeral_limit(self):
+        declared = self._declared()
+        largest = max(block[4] for block, _, _ in declared.values())
+        self.assertEqual(largest, declared[_PAGE_ROW_PROXY][0][4])
+        self.assertLessEqual(largest, _AUTOPILOT_EPHEMERAL_CEILING_MI)
+        page = " ".join(_SITE_PAGE.read_text().split())
+        self.assertIn(_PAGE_LARGEST_EPHEMERAL.format(gib=_gib(largest)), page)
 
     def test_the_persistent_total_is_the_footprint_claims_and_the_fleet_raise(self):
         storage = self.footprint["storage"]

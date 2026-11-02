@@ -45,15 +45,15 @@ Hindsight off. The default column is declared. The fleet column is what
 CPU is in vCPU, memory in GiB, and each cell reads requests then limits. A test derives the
 declared column from the two files and fails when the page falls behind them.
 
-| Workload                                                     | Pods | Runtime                                                                | Default (declared)                  | Fleet (modeled)                 | Ephemeral (declared)     | Persistent                                               |
-| ------------------------------------------------------------ | ---- | ---------------------------------------------------------------------- | ----------------------------------- | ------------------------------- | ------------------------ | -------------------------------------------------------- |
-| Credential proxy (Envoy and the broker)                      | 1    | standard                                                               | 0.5 / 1 then 1 / 2                  | 4 / 8 then 8 / 8                | 8 GiB, request and limit | none                                                     |
-| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 3 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25      | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
-| Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged: no field raises it   | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
-| Operator                                                     | 1    | standard                                                               | 0.05 / 0.125 then 0.5 / 0.5         | 0.25 / 1 then 0.5 / 1           | none declared            | none                                                     |
-| LiteLLM                                                      | 2    | standard                                                               | 0.1 / 2 then 0.5 / 3, each          | unchanged                       | 1.25 GiB each            | none                                                     |
-| GitHub token minter                                          | 2    | standard                                                               | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                       | none declared            | none                                                     |
-| **Total**                                                    | 8    |                                                                        | **2.556 / 8.75 then 11 / 23.25**    | **6.6 / 22.25 then 18 / 35.75** | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
+| Workload                                                     | Pods | Runtime                                                                | Default (declared)                  | Fleet (modeled)                                | Ephemeral (declared)     | Persistent                                               |
+| ------------------------------------------------------------ | ---- | ---------------------------------------------------------------------- | ----------------------------------- | ---------------------------------------------- | ------------------------ | -------------------------------------------------------- |
+| Credential proxy (Envoy and the broker)                      | 1    | standard                                                               | 0.5 / 1 then 1 / 2                  | 4 / 8 then 8 / 8                               | 8 GiB, request and limit | none                                                     |
+| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 3 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
+| Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged; its own `resources` field raises it | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
+| Operator                                                     | 1    | standard                                                               | 0.05 / 0.125 then 0.5 / 0.5         | 0.25 / 1 then 0.5 / 1                          | none declared            | none                                                     |
+| LiteLLM                                                      | 2    | standard                                                               | 0.1 / 2 then 0.5 / 3, each          | unchanged                                      | 1.25 GiB each            | none                                                     |
+| GitHub token minter                                          | 2    | standard                                                               | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                                      | none declared            | none                                                     |
+| **Total**                                                    | 8    |                                                                        | **2.556 / 8.75 then 11 / 23.25**    | **6.6 / 22.25 then 18 / 35.75**                | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
 
 The gateway pod's fleet row raises two containers. `agent-api-auth` is the example's
 `agentAPIAuth.resources`, 0.5 vCPU and 2 GiB requests with a 4 GiB memory limit. The agent
@@ -64,9 +64,11 @@ set every key you want to keep. Set it on the CR with `kubectl edit`; a later `h
 leaves it alone, because Helm patches only the fields its render changes. The
 [CRD page](/kube-agents/operator/platformagent-crd/#specdeployment) describes the field.
 
-The shell sandbox's 2 vCPU and 2 GiB limit is fixed in the operator. A fleet audit that needs
-more memory in the sandbox is bounded by `maxInProgress`, which the example lowers to 3. The
-sandbox runs on the node's default runtime unless
+The shell sandbox's 2 vCPU and 2 GiB limits are the operator's defaults.
+[`shellSandbox.resources`](/kube-agents/operator/platformagent-crd/#shellsandbox) raises them one
+key at a time; the example leaves them, so a fleet audit that needs more memory in the sandbox is
+bounded by `maxInProgress`, which the example lowers to 3. The sandbox runs on the node's default
+runtime unless
 [`spec.harness.experimental.shellSandbox.runtimeClassName`](/kube-agents/operator/platformagent-crd/#shellsandbox)
 names `gvisor`; the gateway pod's class is the separate `availability.runtimeClassName`, which
 the installer sets.
@@ -110,8 +112,13 @@ including the cluster fee; modeled, so check the pricing calculator against your
 The composition creates a default pool of `e2-standard-4` nodes, one per zone, and with gVisor
 on a `gvisor-pool` of `e2-standard-4`, one per zone, carrying GKE's sandbox taint. Neither
 machine type is an installer setting, and a machine type changed on a managed pool outside
-Terraform shows as drift on the next plan, so add pools beside them for a fleet. A node has to hold the whole gateway pod and most of the
-proxy's limit for either to reach it, which a 4 vCPU node cannot:
+Terraform shows as drift on the next plan, so add pools beside them for a fleet.
+
+Add them before applying the example. An `e2-standard-4` node has under 4 vCPU allocatable once
+the system DaemonSets take theirs, so the example's 4 vCPU proxy request fits on none of them.
+The proxy Deployment recreates its pod rather than rolling it: applied on the default pools, the
+example leaves the new proxy pod `Pending` with the old one gone. Every brokered `gcloud` and
+`kubectl` command, and the Google Chat relay, is then down until a node fits.
 
 | Pool             | Shape (modeled)                                                                            | Carries                                                               |
 | ---------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
@@ -148,21 +155,22 @@ caveat beside it:
   pull requests on their own.
 
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
-its allowlist, and forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` to the shell sandbox, where the
-audits run. Both names in the example are forwarded. Process tunables such as
-`CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the list: a values file
-that sets them renders a CR that carries them and a pod that does not. The
+its allowlist, forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` to the shell sandbox, where the audits
+run, and passes every name it does not reserve to the credential proxy and `agent-api-auth`
+containers. Both names in the example reach the container that reads them. Process tunables such
+as `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
+allowlist: a values file that sets them renders a proxy pod that carries them, where `gcloud` and
+`kubectl` run, and an agent container that does not. The example leaves them out. The
 [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#sizing-for-a-fleet-examplesvalues-fleetyaml)
 has the chart-side detail.
 
 ### Applying it
 
-`upgrade.sh` applies the chart's CRDs before the chart in its `full` and `operator` modes; a
-`harness` run and a hand-run `helm upgrade` do not. The data volume size and the two resource
-blocks need a CRD that knows their field: `spec.storage`, `spec.deployment.credentialProxy` and
-`spec.deployment.agentAPIAuth`. Against an older CRD the
-API server would prune the value while the release record kept it, so the chart looks up the
-installed CRD and refuses the render instead. Apply the CRDs first:
+A hand-run `helm upgrade` applies no CRDs, and `spec.storage`, `spec.deployment.credentialProxy`
+and `spec.deployment.agentAPIAuth` need a CRD that declares them, so apply `crds/` first; the
+[upgrade modes](/kube-agents/install/upgrade/#upgrade-modes) say which `upgrade.sh` runs do that
+for you. On Standard, add a pool that fits the proxy's 4 vCPU request before this
+([Option B](#option-b-gke-standard)).
 
 ```bash
 kubectl apply --server-side -f charts/kube-agents/crds/
@@ -171,11 +179,13 @@ helm upgrade kube-agents ./charts/kube-agents -n kubeagents-system \
   -f charts/kube-agents/examples/values-fleet.yaml
 ```
 
-An install made with `install.sh` keeps its settings in `install.env`, and a full
-[upgrade](/kube-agents/install/upgrade/) re-renders the chart from that file, so a value passed
-only by hand is rendered away on the next run. Put the data volume size in
-`PLATFORM_AGENT_STORAGE_SIZE=100Gi` and the rest in a `TF_VAR_extra_helm_values` line, which the
-composition deep-merges over the values it computes:
+An install made with `install.sh` re-renders the chart from `install.env` on a full
+[upgrade](/kube-agents/install/upgrade/), so a value passed only by hand is rendered away on the
+next run. Put the data volume size in `PLATFORM_AGENT_STORAGE_SIZE=100Gi` and the rest in the
+file's `TF_VAR_extra_helm_values` line, which the
+[quickstart](/kube-agents/install/quickstart-gke/#operator-settings) describes. The file holds one
+such line and a second `platformAgent` key replaces the first, so merge these keys into a line
+that already has one rather than pasting over it:
 
 ```bash
 PLATFORM_AGENT_STORAGE_SIZE=100Gi
