@@ -63,6 +63,7 @@ def test_stated_stops_match():
         "The Config Connector CRDs do not exist on any cluster.",
         "I could not find Config Connector on any of the five clusters.",
         "Neither cluster has Config Connector.",
+        "None of the 5 clusters in kube-agents-evals-38 (platform-agent-host and seeded-a through seeded-d) has Config Connector installed.",
         "No GitOps repository is registered for this install, so nothing was changed.",
         "There is no GitOps repository registered.",
         "Which of the two formats (Terraform or Config Connector) should the pull request use?",
