@@ -10,13 +10,15 @@ module assembles that block from three sources and nothing else:
 * the gateway pod, through one ``kubectl exec`` for each (optional): the session-kv
   task feed on its loopback port, rolled up to counts and durations, and the
   inference gateway's Prometheus text for token, spend and latency figures;
-* ``kubectl version`` and the gateway's ConfigMap for the Kubernetes version and
-  the model name (optional).
+* ``kubectl version`` for the Kubernetes version (optional); the model name is
+  the resource's ``status.inference``, and the gateway's ConfigMap only when an
+  operator from before that field leaves the key absent (optional).
 
 The block carries static enums, version strings, integer counters and durations.
 No cluster name, project id, namespace, task title, summary, result or error text
 reaches it: the task roll-up reads status and timestamps only, and ``main`` refuses
-to print a block in which any identifier read from the resource appears. Every
+to print a block in which any identifier read from the resource appears outside
+the ``model:`` line, which is printed by design. Every
 optional source that fails prints as ``unavailable``; the block never exceeds
 SUMMARY_MAX_LINES so a reader can check all of it before pasting.
 
@@ -163,11 +165,41 @@ COMPLETION_QUANTILES: Tuple[float, float] = (0.5, 0.95)
 PROMETHEUS_LINE = re.compile(r'^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>(?:[^"}]|"(?:[^"\\]|\\.)*")*)\})?\s+(?P<value>\S+)')
 PROMETHEUS_LABEL = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:[^"\\]|\\.)*)"')
 LITELLM_MODEL_LINE = re.compile(r"^\s*model:\s*['\"]?(?P<model>[A-Za-z0-9_./:@+-]+)", re.MULTILINE)
-#: A model given as a resource path (``vertex_ai/projects/<id>/locations/<region>/endpoints/<n>``)
-#: names a project and a region between its first segment and its last; the block
-#: prints the provider and the last segment only, so neither reaches it and the
-#: audit does not refuse a block over a project the spec also names.
+#: The environment lines, in the order the block prints them; the gateway's
+#: usageSummaryEnvironmentKeys verbatim.
+ENVIRONMENT_KEYS: Tuple[str, ...] = ("version", "mode", "model", "kubernetes", "installed", "interfaces")
+#: ``status.inference``: the operator's reading of the install's default model.
+INFERENCE_STATUS_KEY = "inference"
+INFERENCE_PROVIDER_FIELD = "provider"
+INFERENCE_MODEL_FIELD = "model"
+#: The model line's start; the audit runs over the block without this one line.
+MODEL_LINE_PREFIX = "  model: "
+#: The model_list entry whose model is the install's default (the operator's agentModelName).
+LITELLM_DEFAULT_MODEL_ALIAS = "model-default"
+#: The ``model_name: model-default`` line, quoted or bare, at any indent.
+LITELLM_DEFAULT_NAME_LINE = re.compile(
+    rf"^[ \t]*(?:-[ \t]+)?model_name:[ \t]*(?P<q>['\"]?){re.escape(LITELLM_DEFAULT_MODEL_ALIAS)}(?P=q)[ \t]*(?:#[^\n]*)?$",
+    re.MULTILINE,
+)
+#: The same line followed, within its entry (indented lines that open no new
+#: list item), by ``litellm_params:`` and that block's ``model:``, quoted or
+#: bare, captured possibly empty.
+LITELLM_DEFAULT_ENTRY_MODEL = re.compile(
+    LITELLM_DEFAULT_NAME_LINE.pattern + r"\n"
+    r"(?:(?:[ \t]+(?![ \t-])[^\n]*)?\n)*?"
+    r"[ \t]+litellm_params:[ \t]*(?:#[^\n]*)?\n"
+    r"(?:(?:[ \t]+(?![ \t-])(?!model:)[^\n]*)?\n)*?"
+    r"[ \t]+model:[ \t]*(?P<mq>['\"]?)(?P<model>[^'\"\s#]*)(?P=mq)",
+    re.MULTILINE,
+)
+#: A LiteLLM model is ``<provider>/<name>``, split at the first separator.
 MODEL_SEGMENT_SEPARATOR = "/"
+#: A name that starts with this is a Vertex AI endpoint path
+#: (``projects/<id>/locations/<region>/endpoints/<n>``): only its last segment is kept.
+MODEL_RESOURCE_PATH_PREFIX = "projects/"
+#: A name segment that starts with this is a Bedrock ARN: only its resource id is kept.
+MODEL_ARN_PREFIX = "arn:"
+MODEL_ARN_FIELD_SEPARATOR = ":"
 FEEDBACK_TEMPLATE: Tuple[str, ...] = (
     "feedback:",
     "  Rating: [ 👍 / 👎 / 😐 ]",
@@ -322,20 +354,82 @@ def histogram_quantiles(samples: Iterable[Sample], family: str, quantiles: Seque
     return tuple(results)
 
 
-def model_from_litellm_config(config_yaml: Optional[str]) -> Optional[str]:
-    """The first provider-qualified model the gateway routes to, as ``provider/name``.
+def trim_model_name(name: str) -> str:
+    """The name after the provider, with a resource reference cut to its resource id.
 
-    A resource path keeps its provider and its last segment only: the segments
-    between them name a project and a region.
+    A Vertex AI endpoint path keeps the text after its last ``/``. A name with a
+    segment that starts with ``arn:`` keeps the text after its last ``/``, or,
+    when the ARN is the last segment, the text after its last ``:``. So no
+    project id, region or account id is printed. Every other name is kept as typed.
+    """
+    if name.startswith(MODEL_RESOURCE_PATH_PREFIX):
+        return name.rsplit(MODEL_SEGMENT_SEPARATOR, 1)[-1]
+    segments = name.split(MODEL_SEGMENT_SEPARATOR)
+    for index, segment in enumerate(segments):
+        if not segment.startswith(MODEL_ARN_PREFIX):
+            continue
+        if index < len(segments) - 1:
+            return name.rsplit(MODEL_SEGMENT_SEPARATOR, 1)[-1]
+        return segment.rsplit(MODEL_ARN_FIELD_SEPARATOR, 1)[-1]
+    return name
+
+
+def _valid_provider(provider: str) -> bool:
+    """A provider slug: not empty, and not itself a bare ARN or Vertex AI path."""
+    return (
+        bool(provider)
+        and not provider.startswith(MODEL_ARN_PREFIX)
+        and MODEL_ARN_FIELD_SEPARATOR not in provider
+        and provider != MODEL_RESOURCE_PATH_PREFIX.rstrip(MODEL_SEGMENT_SEPARATOR)
+    )
+
+
+def split_model(litellm_model: str) -> Optional[str]:
+    """``provider/name`` with both sides non-empty after trimming, else None (malformed)."""
+    if litellm_model.endswith(MODEL_SEGMENT_SEPARATOR):
+        return None
+    provider, found, name = litellm_model.partition(MODEL_SEGMENT_SEPARATOR)
+    if not found or not _valid_provider(provider):
+        return None
+    name = trim_model_name(name)
+    if not name:
+        return None
+    return f"{provider}{MODEL_SEGMENT_SEPARATOR}{name}"
+
+
+def model_from_litellm_config(config_yaml: Optional[str]) -> Optional[str]:
+    """The install's default model as the gateway's config states it, as ``provider/name``.
+
+    The operator's rule, ported: the entry named ``model-default`` answers when
+    it exists, and a malformed model there is None with no fallback; only when
+    no entry carries that name does the first well-formed provider-qualified
+    ``model:`` line answer.
     """
     if not config_yaml:
         return None
+    if LITELLM_DEFAULT_NAME_LINE.search(config_yaml):
+        entry = LITELLM_DEFAULT_ENTRY_MODEL.search(config_yaml)
+        return split_model(entry.group("model")) if entry else None
     for match in LITELLM_MODEL_LINE.finditer(config_yaml):
-        model = match.group("model")
-        if MODEL_SEGMENT_SEPARATOR in model:
-            provider, _, path = model.partition(MODEL_SEGMENT_SEPARATOR)
-            return f"{provider}{MODEL_SEGMENT_SEPARATOR}{path.rsplit(MODEL_SEGMENT_SEPARATOR, 1)[-1]}"
+        model = split_model(match.group("model"))
+        if model:
+            return model
     return None
+
+
+def model_from_status(status: Mapping[str, Any]) -> Optional[str]:
+    """``provider/model`` from ``status.inference``; UNAVAILABLE when the key is
+    present without both fields (the operator's definite negative); None when the
+    key is absent (an operator or a served CRD from before the field)."""
+    if INFERENCE_STATUS_KEY not in status:
+        return None
+    inference = status.get(INFERENCE_STATUS_KEY)
+    if not isinstance(inference, Mapping):
+        return UNAVAILABLE
+    provider, model = inference.get(INFERENCE_PROVIDER_FIELD), inference.get(INFERENCE_MODEL_FIELD)
+    if isinstance(provider, str) and isinstance(model, str) and provider and model:
+        return f"{provider}{MODEL_SEGMENT_SEPARATOR}{model}"
+    return UNAVAILABLE
 
 
 # --- the roll-up ----------------------------------------------------------------
@@ -410,6 +504,21 @@ def audit(text: str, identifiers: Iterable[str]) -> List[str]:
     return leaked
 
 
+def _without_model_line(text: str) -> str:
+    """The block less its first ``model:`` line, the one line printed by design.
+
+    A deployment name can carry a spec identifier as a segment
+    (``hosted_vllm/acme/llama-8b`` beside an ``org`` of ``acme``); the line is
+    never the reason a block is refused, and every other line stays audited.
+    """
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if line.startswith(MODEL_LINE_PREFIX):
+            del lines[index]
+            break
+    return "\n".join(lines)
+
+
 # --- rendering ------------------------------------------------------------------
 
 def _duration(seconds: float) -> str:
@@ -457,13 +566,19 @@ def render(snapshot: Snapshot) -> str:
     spec, status = cr.get("spec") or {}, cr.get("status") or {}
     usage = status.get("usage") or {}
     lines: List[str] = ["```", f"{SUMMARY_TITLE} ({now.strftime('%Y-%m-%d')})", "environment:"]
-    lines.append(f"  version: {(spec.get('deployment') or {}).get('tag') or UNKNOWN}")
-    lines.append(f"  mode: {spec.get('mode') or DEFAULT_MODE}")
-    lines.append(f"  model: {model_from_litellm_config(snapshot.litellm_config) or UNAVAILABLE}")
-    lines.append(f"  kubernetes: {_server_version(snapshot.server_version)}")
-    lines.append(f"  installed: {_install_age(cr, now)}; ready: {_ready(cr)}")
+    model = model_from_status(status)
+    if model is None:
+        model = model_from_litellm_config(snapshot.litellm_config) or UNAVAILABLE
     interfaces = usage.get("activeInterfaces") or []
-    lines.append(f"  interfaces: {', '.join(sorted(str(i) for i in interfaces)) or NONE}")
+    environment = {
+        "version": (spec.get("deployment") or {}).get("tag") or UNKNOWN,
+        "mode": spec.get("mode") or DEFAULT_MODE,
+        "model": model,
+        "kubernetes": _server_version(snapshot.server_version),
+        "installed": f"{_install_age(cr, now)}; ready: {_ready(cr)}",
+        "interfaces": ", ".join(sorted(str(i) for i in interfaces)) or NONE,
+    }
+    lines.extend(f"  {key}: {environment[key]}" for key in ENVIRONMENT_KEYS)
     lines.append("usage:")
     for counter in USAGE_COUNTERS:
         value = usage.get(counter)
@@ -677,7 +792,7 @@ def main(argv: Optional[Sequence[str]] = None, stdout: TextIO = sys.stdout, stde
     if missing and options.in_pod:
         detail = "; ".join(f"{name}: {snapshot.source_reasons.get(name, REASON_EXEC)}" for name in missing)
         print(f"feedback-summary: could not be read: {detail}", file=stderr)
-    leaked = audit(text, snapshot.identifiers)
+    leaked = audit(_without_model_line(text), snapshot.identifiers)
     if leaked:
         print(f"feedback-summary: refused to print: the block names {', '.join(leaked)}", file=stderr)
         return EXIT_LEAK
