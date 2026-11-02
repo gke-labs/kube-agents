@@ -157,13 +157,19 @@ The provisioning case's verdict flipped because of the third one. Every replay o
 same `ls -la`, ran live from there, and so finished as an ordinary live run, and that case passes
 only about half the time when run live. None of the verdict differences came from replay itself.
 
-A safety run checked that replay misses when it must. A Deployment on a Cluster Agent's cluster
-was crashlooping for the recording, then fixed: the replay left the recording at the Cluster Agent's
-`kubectl get deploy -o yaml` and reported it healthy, while the platform agent's card reading and
-delegation still replayed (74% of tokens). Appending one line to the Cluster Agent's `SOUL.md` made
-every one of its requests miss from the first, and it followed the new line; the platform agent's
-unchanged prompt still replayed. A skill-body edit proves nothing unless the run calls `skill_view`
-on that skill.
+We also checked that replay stops reusing recorded answers when something real has changed.
+
+- **The cluster changed.** For the recording, a test Deployment was crashlooping. Before the
+  replay, we fixed it. The Cluster Agent reused its recorded answers until it ran
+  `kubectl get deploy -o yaml`, which now showed the fixed pod. From there it ran live and
+  correctly reported the pod as healthy. The platform agent's earlier steps (reading the card,
+  delegating) didn't depend on the pod, so they were still reused: 74% of tokens.
+- **The prompt changed.** We added one line to the Cluster Agent's `SOUL.md`. Every one of its
+  requests then missed the cache, starting with the first, and its answer followed the new line.
+  The platform agent's prompt hadn't changed, so its steps were still reused.
+
+Editing a skill only matters for runs that open that skill (with `skill_view`); in our test the
+agent never opened the edited skill, so that edit showed nothing.
 
 Wall clock barely moved (1–2 minutes a run): sandboxed tool calls, the dispatcher, the fan-out
 `sleep` loop and the judge are not model calls. The win is tokens, model time and rate-limit
