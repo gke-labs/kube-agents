@@ -215,9 +215,11 @@ def exec_endpoints() -> tuple[str | None, str | None]:
     """The broker an exec-role call goes to, and the one it falls back on.
 
     The exec tier when the operator set its URL, with the stateful broker as
-    the fallback; else the stateful broker alone, as before the exec tier. A
-    fallback is only taken when no connection to the exec tier could be made
-    (`BrokerUnreachable`): then no request reached a broker, and nothing ran.
+    the fallback; else the stateful broker alone, as before the exec tier.
+    `execute` falls back only when no connection to the exec tier could be
+    made (`BrokerUnreachable`): then no request reached a broker, and nothing
+    ran. `ApiSession` also falls back after a dropped connection, because its
+    relay calls are GETs, which are safe to send again.
     """
     # Spelled out, not BROKER_URL_ENV: tests/conformance/test_C_enforcement.py
     # (C1) pins that the shim reads this name, across the module boundary to
