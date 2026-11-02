@@ -826,8 +826,11 @@ A match that is not certain gives no note. Two cases are by name: the same objec
 more than one host cluster and nothing tells them apart (Config Controller puts the objects of each
 instance in `config-control`), or the file sets no namespace and more than one object fits. The
 other cases are by project. The collector records the project each object manages as `project`: the
-object's `cnrm.cloud.google.com/project-id` annotation, else that annotation on its namespace, else
-the namespace's name, as Config Connector decides it. A
+object's `cnrm.cloud.google.com/project-id` annotation. Without it, a kind with `spec.projectRef`
+takes `projectRef.external` (with no `projects/` prefix), or the `spec.resourceID` (else the name) of
+the `Project` object that `projectRef.name` names when the read listed it; otherwise the project is
+unknown, and `project_ref` names that object. Any other kind takes the annotation on its namespace,
+else the namespace's name. A
 known `project` must equal the project the file gives (the object's annotation, else the annotation
 of its Namespace when the file declares that Namespace), also with one host, because one management
 cluster can hold an object of the same name for each project. When the file gives none, a `Cluster/`
@@ -859,24 +862,29 @@ A `manifest` fix whose file declares the object gets the paragraph above. Any ot
 `gcloud`, a fix degraded to `manual` because the worker did not write its file, or a `manifest` fix
 to another file) gets a paragraph that names the object's declaration. `finish` looks it up in the
 Config Connector declaration index the `gcloud` check reads: the clone, or
-`kcc_declarations_via_broker` in content mode, which also runs when the manifest records a stall and
-searches for an `apiVersion` line in any Config Connector group (`KCC_DECLARATION_GREP`), so every
-kind is indexed. When exactly one file declares the object, the paragraph keeps the first sentence
-"**Config Connector is not applying this file.**" and names that file. When none or more than one
-does, it starts "**Config Connector is not applying the declaration of this object.**" and says so.
-It says that no file declares the object only when the index covered the whole GitOps repository
-(the clone, or a broker scan that ran to an answer and was not truncated); after a truncated or
-failed scan, or in a dry run with no clone, it says the audit could not search the whole repository.
-The index keeps each other file that declares the same object (`KccDeclaration.also`), and it keys
-each declaration by its namespace as well, so two objects of one name in two namespaces are two
-declarations and two files of one object read as ambiguous. A `gcloud` fix's note is its command, so
+`kcc_declarations_via_broker` in content mode, with its own search for an `apiVersion` line in any
+Config Connector group (`KCC_DECLARATION_GREP`), so every kind is indexed. Both read `.yaml`, `.yml`
+and `.json` files. `finish` builds this index only when a finding needs it (`kcc_index_needed`): a
+`Cluster/` or `NodePool/` finding whose own object matches a stall, or a `kcc-object-wedged` finding
+with a stall of its kind and name on its cluster. When exactly one file declares the object, the
+paragraph keeps the first sentence "**Config Connector is not applying this file.**" and names that
+file. Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and
+says that more than one file declares the object, or only that the audit names no declaration file
+for it. It never says that no file declares the object: the index skips a file it cannot parse (a
+template, for example), so no search proves an absence. A paragraph search that stops short or does
+not run is a warning in the `finish` log. The index keys each declaration by its namespace and its
+project annotation as well, so two objects of one name in two namespaces, or for two projects, are
+two declarations. It keeps each other file that declares the same object, whole, in
+`KccDeclaration.also`, and matches each file on its own fields, so two files of one object read as
+ambiguous. A `gcloud` fix's note is its command, so
 its paragraph goes in `kcc_stalled_paragraph` and renders after the command block. The
 strip-and-rewrite pattern covers both first sentences.
 
 The fix keeps `kind: manifest`: the change belongs in that file, the stall usually clears before
 anyone reads the ledger, and degrading the fix would drop the pull request. The note does not say
 that the change is correct, because the reason can reject the change itself (a node pool change
-that sets both `max_node_count` and `total_max_node_count` fails with `UpdateFailed`). It says to
+that sets both `spec.autoscaling.maxNodeCount` and `spec.autoscaling.totalMaxNodeCount` fails with
+`UpdateFailed`). It says to
 correct the declaration if the reason rejects the change, and that otherwise the change takes effect
 when Config Connector applies the object again.
 

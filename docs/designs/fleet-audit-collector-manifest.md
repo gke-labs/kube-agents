@@ -117,9 +117,11 @@ objects on that cluster whose `Ready` condition is `False`; `kcc_unread` says wh
 cluster gave no answer, which is unknown and never healthy. Each `kcc_unready` entry is `{kind,
 namespace, name, why}`, with `resource` (the object's `spec.resourceID`), `cluster` (a
 `ContainerNodePool`'s `clusterRef`), `location` (the object's `spec.location`) and `project` where
-they are set. `project` is the object's `cnrm.cloud.google.com/project-id` annotation, else the same
-annotation on its namespace, else the namespace's name, as Config Connector itself decides it; the
-namespace name counts only when the namespaces read succeeded and returned that namespace. An empty
+they are known. `project` is the object's `cnrm.cloud.google.com/project-id` annotation. Without it,
+a kind with `spec.projectRef` takes the project from that reference, or records it as unknown with
+`project_ref`; any other kind takes the same annotation on its namespace, else the namespace's name
+(the issue-ledger design, §6, has the rule). The namespace counts only when the namespaces read
+succeeded and returned that namespace. An empty
 list means the cluster runs Config Connector and nothing there is unready. An object with no `Ready`
 condition yet is left out, and so is one whose reason is `Updating` or `Deleting`: Config Connector
 sets those while it still applies the object.
