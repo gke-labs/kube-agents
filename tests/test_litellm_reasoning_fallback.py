@@ -176,10 +176,10 @@ litellm:
         """LiteLLM applies retry_after as the floor of its retry pause and then
         clamps the pause to MAX_RETRY_DELAY, 8s unless the environment says
         otherwise; a floor above that needs the ceiling raised with it."""
-        configmap, deployment = self._documents(_VERTEX_VALUES + "  fallback:\n    numRetries: 2\n    retryAfterSeconds: 30\n")
-        self.assertEqual(self._config(configmap)["router_settings"], {"num_retries": 2, "retry_after": 30})
+        configmap, deployment = self._documents(_VERTEX_VALUES + "  fallback:\n    numRetries: 2\n    retryAfterSeconds: 20\n")
+        self.assertEqual(self._config(configmap)["router_settings"], {"num_retries": 2, "retry_after": 20})
         env = {e["name"]: e.get("value") for e in self._container(deployment)["env"]}
-        self.assertEqual(env["MAX_RETRY_DELAY"], "30")
+        self.assertEqual(env["MAX_RETRY_DELAY"], "20")
 
         configmap, deployment = self._documents(_VERTEX_VALUES + "  fallback:\n    numRetries: 2\n    retryAfterSeconds: 5\n")
         self.assertEqual(self._config(configmap)["router_settings"], {"num_retries": 2, "retry_after": 5})
