@@ -901,6 +901,17 @@ resource "helm_release" "kube_agents" {
   wait    = true
   timeout = 600
 
+  # Opt-in (HELM_UPGRADE_INSTALL in install.env). The helm provider can drop a
+  # live release from state when a refresh lookup errors
+  # (hashicorp/terraform-provider-helm#1669), and the next apply then plans a
+  # create that fails with "cannot re-use a name that is still in use" (#4108).
+  # With this on, that create runs as `helm upgrade --install` and adopts the
+  # release. It adopts any release of this name in the namespace, including one
+  # another Terraform state or a manual `helm install` owns, so it is only for
+  # long-lived environments whose own state owns the release. Off, a conflicting
+  # first install fails loudly.
+  upgrade_install = var.helm_upgrade_install
+
   values = [yamlencode({
     # Reaches every image this release pulls, including the two the chart
     # does not render itself — the agent Deployment and the shell sandbox
