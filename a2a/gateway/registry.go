@@ -767,7 +767,7 @@ func (r *Registry) fencedRecord(ctx context.Context, kv jetstream.KeyValue, sess
 		return 0, err
 	}
 	if term > mine {
-		return 0, fmt.Errorf("session %s: term %d: %w", sessionKey, term, ErrFenced)
+		return 0, fmt.Errorf("session %s: term counter %s at %d is past this gateway's term %d: %w", sessionKey, termKey, term, mine, ErrFenced)
 	}
 	if r.afterTermRead != nil {
 		r.afterTermRead()
@@ -876,7 +876,7 @@ func (r *Registry) Create(ctx context.Context, rec *SessionRecord) error {
 			return err
 		}
 		if term > mine {
-			return fmt.Errorf("session %s: term %d: %w", rec.Key, term, ErrFenced)
+			return fmt.Errorf("session %s: term counter %s at %d is past this gateway's term %d: %w", rec.Key, termKey, term, mine, ErrFenced)
 		}
 	}
 	rec.Epoch = mine

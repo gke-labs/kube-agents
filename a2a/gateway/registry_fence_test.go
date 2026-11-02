@@ -560,3 +560,28 @@ func TestANewTermBetweenTheReadsIsNotCalledAReset(t *testing.T) {
 		t.Fatalf("deposed Put across a new term = %v, want ErrFenced without a reset", err)
 	}
 }
+
+// TestACounterPastTheWritersTermNamesTheCounter: a write refused at the
+// counter check names gateway-term and the value read, so a counter bumped
+// by hand points at the key rather than at a phantom second gateway.
+func TestACounterPastTheWritersTermNamesTheCounter(t *testing.T) {
+	ctx := context.Background()
+	r := startRig(t)
+	kv, err := r.client.KV(ctx, lib.SessionStateBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.Put(ctx, termKey, []byte("9")); err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry(r.client)
+	reg.setEpoch(2)
+	for name, err := range map[string]error{
+		"Put":    reg.Put(ctx, &SessionRecord{Key: "slack:T1/C1/bumped", Addressee: "platform"}),
+		"Create": reg.Create(ctx, &SessionRecord{Key: "slack:T1/C1/bumped-new"}),
+	} {
+		if !errors.Is(err, ErrFenced) || !strings.Contains(err.Error(), termKey) || !strings.Contains(err.Error(), "9") {
+			t.Errorf("%s under a counter past its term = %v, want ErrFenced naming %s and 9", name, err, termKey)
+		}
+	}
+}
