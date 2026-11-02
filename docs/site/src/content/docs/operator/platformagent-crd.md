@@ -1708,9 +1708,9 @@ force-syncs either way.
 A `cluster-*` profile's `config.yaml` is never force-synced: it carries the `cluster_identity`
 stamp the cluster reconciler matches the profile to its cluster by, and an overwrite would strip
 it. It is back-filled from the cluster template instead, on the same fill-only terms — keys the
-template declares and the live file has lost are restored at the next start, and `cluster_identity`
+template declares and the live file has lost are restored on a pass, and `cluster_identity`
 and every value the file already holds are left alone, except the retired `memory.provider` key,
-which the entrypoint drops. The persona files and `skills/` beside it still force-sync.
+which the entrypoint drops.
 
 A cluster profile takes these steps, the persona copy, the `skills/` replace, the shared plugin
 refresh, the back-fill and the repairs below, on a pass. A pass runs only when the profile's
