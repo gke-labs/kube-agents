@@ -491,7 +491,7 @@ wait is a fixed 24-hour figure that is not in the run data.
 
 Three Prow jobs keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
-(the GitOps stale-pull-request sweep, every ten minutes) and the seeded-fleet
+(the GitOps stale-pull-request sweep, hourly) and the seeded-fleet
 reconcile, as a postsubmit on every merge that changes the stack and as a
 daily pass over every project. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
@@ -515,9 +515,9 @@ names none.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note, once it is news: the sweep runs
-every ten minutes and this tick reads its latest finished build every fifteen,
-so the unit is the check, not the build (one sweep build in three is never
-read), and one failed check followed by a clean one is a flap. The sweep's note
+hourly and this tick reads its latest finished build every fifteen minutes, so
+every build is read and counted once, and one failed build followed by a clean
+one is a flap. The sweep's note
 waits until two consecutive checks have failed; the reconciles' first failed
 build is the news. Any project's failure fails a sweep run, so a per-project
 threshold could never fire before the run's; the per-project counts name, in
