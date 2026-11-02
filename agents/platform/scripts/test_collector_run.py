@@ -156,7 +156,9 @@ def paged_dump_over(legacy_run=None):
             listed = next(k for k in cr.LIST_KINDS.values() if k.path == path)
             items = []
             for item in parsed["items"]:
-                if isinstance(item, dict) and item.get("kind") == listed.kind:
+                # A fake's item with no `kind` belongs to a single-kind read,
+                # as a raw list's items do.
+                if isinstance(item, dict) and (item.get("kind") == listed.kind or (len(resources) == 1 and "kind" not in item)):
                     item = copy.deepcopy(item)
                     item.pop("kind", None)
                     item.pop("apiVersion", None)
