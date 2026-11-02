@@ -153,9 +153,12 @@ takes the namespace annotations from its NetworkPolicy read. Its `kcc-object-wed
 no `output_sha256`, because no single command produced the parallel read's output. The drift, patch
 readiness and stockout collectors, whose fixes can edit a `ContainerCluster` or `ContainerNodePool`
 declaration, read each collected cluster once after their sweep, in a new worker pool of the sweep's
-size, but only with `--config-connector`: the SOP command passes it whenever the audit runs by its
-SOP, scheduled or on demand, and a chat fleet question, which runs the same collectors with no
-`finish`, does not. All three mark a cluster whose `clusters list` record shows the Config Connector
+size, but only with `--config-connector` or while an audit run of their stream is in flight (the
+in-flight note that `audit_report.py start` writes exists and is inside its TTL;
+`kcc_health.read_reason`). The SOP command passes the flag, so the flag forces the read, and the
+note makes the read independent of the model copying the flag. A chat fleet question with no run in
+flight does not read. The top-level `config_connector_read` field records why the read ran: `flag`,
+`in-flight`, or `false`. All three mark a cluster whose `clusters list` record shows the Config Connector
 add-on enabled with `config_connector_addon`, and those clusters are read first. Drift and patch
 readiness fetch credentials for the read; stockout uses the kubeconfig its sweep fetched. When an
 unready object has no project annotation, one `kubectl get namespaces` on that cluster gives the

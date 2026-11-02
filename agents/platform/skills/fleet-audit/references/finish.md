@@ -45,7 +45,7 @@ keeps the run partial and leaves open every finding that check filed there. `fin
 slug anywhere else.
 
 The compliance collector, and the drift, patch readiness and stockout collectors with
-`--config-connector`, also give `kcc_unready`, the Config Connector objects whose `Ready` condition
+`--config-connector` or while this run is in flight, also give `kcc_unready`, the Config Connector objects whose `Ready` condition
 is `False`, to a cluster that serves a kind they read: any Config Connector kind for compliance,
 `ContainerCluster` or `ContainerNodePool` for the other three. A cluster whose read failed, also at
 the discovery, gets `kcc_unread` with the reason. You copy neither into the document. `finish` reads them: any fix whose
