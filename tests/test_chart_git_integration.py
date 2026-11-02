@@ -575,16 +575,84 @@ class ChartGitIntegrationTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(f"{_P}forges[0].provider", result.stderr)
 
-    def test_a_bitbucket_provider_fails_the_render_until_the_chart_has_its_rules(self):
-        """The chart does not render a Bitbucket forge yet: one is declared on
-        the PlatformAgent resource until the chart learns the providers' rules."""
-        for provider in ("bitbucket", "bitbucket-datacenter"):
-            with self.subTest(provider=provider):
-                result = _render(
-                    _CR_TEMPLATE, *_forge(0, name="bb", provider=provider)
-                )
+    def test_a_bitbucket_cloud_forge_renders_as_the_lists_with_its_identity(self):
+        """Bitbucket Cloud is never the alias: it has a credentialsRef, and an
+        access token's identity has nowhere else to go."""
+        integration = _integration(
+            *_forge(0, name="bb", provider="bitbucket", namespace="acme"),
+            f"{_P}forges[0].credentialsRef.name=bitbucket-forge-token",
+            f"{_P}forges[0].identity=0b3c1f2e-5d6a-4b7c-8d9e-0f1a2b3c4d5e",
+            *_repo(0, forge="bb", repository="infra", role="gitops"),
+        )
+        self.assertNotIn("github", integration)
+        self.assertEqual(
+            integration["forges"],
+            [{
+                "name": "bb",
+                "provider": "bitbucket",
+                "namespace": "acme",
+                "credentialsRef": {"name": "bitbucket-forge-token"},
+                "identity": "0b3c1f2e-5d6a-4b7c-8d9e-0f1a2b3c4d5e",
+            }],
+        )
+
+    def test_a_bitbucket_datacenter_forge_renders_with_its_host_and_ca(self):
+        integration = _integration(
+            *_forge(0, name="bbdc", provider="bitbucket-datacenter",
+                    host="bitbucket.example.com", namespace="INFRA"),
+            f"{_P}forges[0].credentialsRef.name=bitbucket-dc-token",
+            f"{_P}forges[0].caBundleRef.name=bitbucket-dc-ca",
+            *_repo(0, forge="bbdc", repository="infra", role="gitops"),
+        )
+        self.assertEqual(
+            integration["forges"],
+            [{
+                "name": "bbdc",
+                "provider": "bitbucket-datacenter",
+                "host": "bitbucket.example.com",
+                "namespace": "INFRA",
+                "credentialsRef": {"name": "bitbucket-dc-token"},
+                "caBundleRef": {"name": "bitbucket-dc-ca"},
+            }],
+        )
+
+    def test_bitbucket_forges_refuse_what_the_operator_refuses(self):
+        """Each case names the values key the operator's refusal would not."""
+        cloud = ("name=bb", "provider=bitbucket", "credentialsRef.name=t")
+        dc = ("name=bb", "provider=bitbucket-datacenter", "host=bb.example.com", "credentialsRef.name=t")
+        for label, fields, key in (
+            ("cloud at another host", cloud + ("host=bitbucket.example.com",), "host"),
+            ("cloud with a CA", cloud + ("caBundleRef.name=ca",), "caBundleRef"),
+            ("cloud with a port", cloud + ("port=8443",), "port"),
+            ("cloud without a Secret", ("name=bb", "provider=bitbucket"), "forges[0]"),
+            ("cloud with an uppercase workspace", cloud + ("namespace=Acme",), "namespace"),
+            ("cloud with an identity that is not a UUID", cloud + ("identity=svc-bot",), "identity"),
+            ("dc without a host", ("name=bb", "provider=bitbucket-datacenter", "credentialsRef.name=t"), "host"),
+            ("dc at bitbucket.org", ("name=bb", "provider=bitbucket-datacenter", "host=bitbucket.org", "credentialsRef.name=t"), "host"),
+            ("dc at an Atlassian domain", ("name=bb", "provider=bitbucket-datacenter", "host=acme.atlassian.net", "credentialsRef.name=t"), "host"),
+            ("dc with a port", dc + ("port=7990",), "port"),
+            ("dc with plain http", dc + ("scheme=http",), "scheme"),
+            ("dc without a Secret", ("name=bb", "provider=bitbucket-datacenter", "host=bb.example.com"), "credentialsRef"),
+            ("dc with a project key that starts with a digit", dc + ("namespace=1NFRA",), "namespace"),
+            ("an identity on gitlab", ("name=gl", "provider=gitlab", "credentialsRef.name=t", "identity=bot"), "identity"),
+            ("gitea at bitbucket.org", ("name=g", "provider=gitea", "host=bitbucket.org", "credentialsRef.name=t"), "host"),
+            ("gitlab at an Atlassian domain", ("name=g", "provider=gitlab", "host=git.atlassian.com", "credentialsRef.name=t"), "host"),
+        ):
+            with self.subTest(case=label):
+                sets = tuple(f"{_P}forges[0].{f}" for f in fields)
+                result = _render(_CR_TEMPLATE, *sets)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn(f"{_P}forges[0].provider", result.stderr)
+                self.assertIn(f"{_P}forges[0]", result.stderr)
+                self.assertIn(key, result.stderr)
+
+    def test_two_bitbucket_cloud_forges_are_one_credential_too_many(self):
+        result = _render(
+            _CR_TEMPLATE,
+            *_forge(0, name="a", provider="bitbucket"), f"{_P}forges[0].credentialsRef.name=t",
+            *_forge(1, name="b", provider="bitbucket"), f"{_P}forges[1].credentialsRef.name=u",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("bitbucket.org is already served by forges[0]", result.stderr)
 
     def test_a_gitlab_forge_renders_as_the_lists_with_its_secret(self):
         """GitLab is never the alias: the alias has no provider, host or
@@ -1024,10 +1092,11 @@ class ChartGiteaForgeTest(unittest.TestCase):
                 self.assertIn(f"{_P}forges[0].{field}", result.stderr)
 
     def test_an_unknown_provider_names_every_registered_one(self):
-        result = _render(_CR_TEMPLATE, *_forge(0, name="bitbucket", provider="bitbucket"))
+        result = _render(_CR_TEMPLATE, *_forge(0, name="gogs", provider="gogs"))
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn(f'{_P}forges[0].provider is "bitbucket"; must be one of github, gitlab, gitea',
-                      result.stderr)
+        self.assertIn(
+            f'{_P}forges[0].provider is "gogs"; must be one of github, gitlab, gitea, bitbucket, bitbucket-datacenter',
+            result.stderr)
 
 
 if __name__ == "__main__":

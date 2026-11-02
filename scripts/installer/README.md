@@ -349,7 +349,8 @@ which used to replace the Secret and restart every pod holding it.
 
 ### The GitOps forge
 
-`GITOPS_FORGE` is `github` (the default) or `gitlab`. A github.com install records none of the
+`GITOPS_FORGE` is `github` (the default), `gitlab`, `bitbucket` (Bitbucket Cloud) or
+`bitbucket-datacenter`. A github.com install records none of the
 forge keys. A GitHub Enterprise Server install (`--gitops-host` with the github forge) records
 these keys, beside `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID`, which name the repository and
 the App on the instance:
@@ -396,6 +397,24 @@ read token: the installer writes each key with its own server-side-apply field
 manager, so the write-token apply never removes `read-token`. Use a GitLab project or group access
 token with the Reporter role and only the `read_repository` scope, on the GitOps forge's host
 (gitlab.com or self-managed). On GitHub, `install.sh` refuses the key.
+
+A Bitbucket install, Cloud or Data Center, records the same keys as a GitLab install, plus one:
+
+| Key                   | Value                                                                                                                             |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `GITOPS_FORGE`        | `bitbucket` or `bitbucket-datacenter`                                                                                             |
+| `GITOPS_HOST`         | The Data Center instance's hostname; empty for Cloud                                                                              |
+| `GITOPS_REPO`         | `workspace/repo-slug` (Cloud) or `PROJECTKEY/repo-slug` (Data Center)                                                             |
+| `GITLAB_TOKEN_SECRET` | The name of the Secret that holds the token (default `bitbucket-forge-token`). The key keeps its GitLab name for every forge      |
+| `GITOPS_CA_SECRET`    | Data Center only: the name of the Secret that holds a private CA (default `bitbucket-forge-ca`); set only with `--gitops-ca-file` |
+| `GITOPS_IDENTITY`     | The account a Cloud access token acts as (`--gitops-identity`); recorded only when set                                            |
+
+The neutral flags `--gitops-token-file` and `--gitops-token-secret` are the GitLab flags under new
+names, and `GITOPS_TOKEN_FILE`, `GITOPS_TOKEN_SECRET` and `GITOPS_READ_TOKEN_FILE` in the
+environment are aliases of the `GITLAB_*` variables. The generator writes `gitops_forge`,
+`gitops_host`, `gitops_repo_path`, `gitops_token_secret_name`, and, when set,
+`gitops_ca_secret_name` and `gitops_identity` into `terraform.tfvars`. A switch to another forge
+drops a recorded identity, and a default token Secret name becomes the new forge's default.
 
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.

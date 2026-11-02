@@ -291,6 +291,18 @@ When the GitOps repository is on GitLab (gitlab.com or a self-managed instance),
 
 See [GitLab as the GitOps forge](/kube-agents/install/gitlab/) for the installer flags and where the token goes.
 
+## GitOps repo on Bitbucket
+
+When the GitOps repository is on Bitbucket Cloud or on a Bitbucket Data Center instance, you need none of the GitHub items above: a Bitbucket install has no GitHub App, no token minter and no Cloud KMS key. Prepare these:
+
+- **Bitbucket repository:** the GitOps repository, created before the install, with one commit on its default branch. Note its path: `workspace/repo-slug` on Cloud, `PROJECTKEY/repo-slug` on Data Center.
+- **Token:** on Cloud, the API token (with scopes) of an account that exists only for this install, a workspace access token (Premium), or a repository access token for an install with one repository. On Data Center, a project HTTP access token with Repository write.
+- **Identity:** a Cloud workspace, project or repository access token needs the account UUID that it acts as.
+- **Network access:** the credential broker pod must reach `bitbucket.org` and `api.bitbucket.org`, or the Data Center host, over HTTPS on port 443. A Data Center instance must serve at the root path on port 443.
+- **Certificate:** a Data Center instance behind a private CA needs the CA's PEM file.
+
+See [Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/) for the installer flags and where the token goes.
+
 ## GitOps repo on Gitea
 
 When the GitOps repository is on a self-managed Gitea instance (in-cluster or on-premises), you need none of the GitHub items above either. `install.sh` has no Gitea flag: the forge is declared on the `PlatformAgent` CR, or through the chart, after the install. Prepare these:

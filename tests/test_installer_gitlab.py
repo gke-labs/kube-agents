@@ -239,7 +239,7 @@ class GitLabFlagsTest(unittest.TestCase):
 
     def test_validator_refuses(self):
         for case in (
-            {"PARAM_GITOPS_FORGE": "bitbucket"},
+            {"PARAM_GITOPS_FORGE": "gogs"},
             {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_HOST": "gitlab.com", "PARAM_GITOPS_HOST_FROM_FLAG": "true"},
             {"PARAM_GITOPS_FORGE": "github", "PARAM_GITLAB_TOKEN_FILE": "/etc/hostname"},
             self._gitlab(PARAM_GITOPS_HOST="https://gitlab.com"),
@@ -1253,7 +1253,7 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
         self.assertEqual(sorted(names), ["gitlab_ca_secret_name", "gitlab_repo", "gitlab_token_secret_name"])
 
     def test_gitlab_suppresses_the_github_alias(self):
-        self.assertIn("!local.gitops_is_gitlab && !local.gitops_is_ghes && (local.github_org", self.main)
+        self.assertIn("!local.gitops_is_gitlab && !local.gitops_is_bitbucket && !local.gitops_is_ghes && (local.github_org", self.main)
         self.assertIn("credentialsRef = { name = var.gitlab_token_secret_name }", self.main)
         self.assertIn('role = "gitops"', self.main)
 

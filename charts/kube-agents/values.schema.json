@@ -1229,6 +1229,9 @@
                   "namespace": {
                     "type": "string"
                   },
+                  "identity": {
+                    "type": "string"
+                  },
                   "credentialsRef": {
                     "type": "object",
                     "additionalProperties": false,

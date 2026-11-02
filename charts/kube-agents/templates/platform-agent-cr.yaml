@@ -751,6 +751,19 @@ spec:
   {{- if and (has "gitea" (splitList "," $providers)) (not (has "gitea" $enum)) }}
   {{- fail "platformAgent.integration.forges declares a gitea forge, but the installed PlatformAgent CRD does not accept provider gitea, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
+  {{- range (list "bitbucket" "bitbucket-datacenter") }}
+  {{- if and (has . (splitList "," $providers)) (not (has . $enum)) }}
+  {{- fail (printf "platformAgent.integration.forges declares a %s forge, but the installed PlatformAgent CRD does not accept provider %s, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" . .) }}
+  {{- end }}
+  {{- end }}
+  {{- /* The same for identity: a CRD that prunes it leaves a Bitbucket access token unable to name its own pull requests, with nothing to say why. */}}
+  {{- $identified := false }}
+  {{- range $forges }}
+  {{- if .identity }}{{ $identified = true }}{{ end }}
+  {{- end }}
+  {{- if and $identified (not (hasKey (dig "forges" "items" "properties" (dict) $props) "identity")) }}
+  {{- fail "platformAgent.integration.forges[].identity needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- end }}
   {{- /* The same for caBundleRef: a CRD that prunes it leaves the forge's certificate untrusted, with nothing to say why. */}}
   {{- $caBundled := false }}
   {{- range $forges }}
@@ -807,6 +820,9 @@ spec:
         {{- with (.credentialsRef | default dict).name }}
         credentialsRef:
           name: {{ . | quote }}
+        {{- end }}
+        {{- with .identity }}
+        identity: {{ . | toString | quote }}
         {{- end }}
         {{- with (.caBundleRef | default dict) }}
         {{- if .name }}
