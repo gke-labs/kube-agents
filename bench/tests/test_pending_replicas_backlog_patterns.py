@@ -102,6 +102,9 @@ NO_BACKLOG = (
     "The rollout is stuck at 3/3.",
     "An unscheduled node restart drained pinned-inference-pool.",
     "0 unavailable replicas",
+    # A spelled-out zero or "no" before "pending pods".
+    "There are zero pending pods on seeded-a.",
+    "No pending pods on seeded-a.",
 )
 
 

@@ -172,7 +172,7 @@ verification_spec:
       any_of_patterns:
         - '\bunschedulable\b'
         - '(?<!\b0 )\b(?:pods?|replicas?)\b(?:(?!\b(?:not|no|none|never)\b|n''t\b|\b(?:rather|instead)\s+(?:than|of)\b)[^\n.]){0,40}(?<!\b0 )\bpending\b(?!\s*:?\s*0\b)(?!\s+(?:(?:your|the|an?|my|our)\s+)?approval)'
-        - '(?<!\b0 )\bpending\b(?!\s*:?\s*0\b)(?!\s+(?:(?:your|the|an?|my|our)\s+)?approval)[^\n.]{0,20}\b(?:pods?|replicas?)\b(?!\s*:?\s*0\b)'
+        - '(?<!\b0 )(?<!\bzero )(?<!\bno )\bpending\b(?!\s*:?\s*0\b)(?!\s+(?:(?:your|the|an?|my|our)\s+)?approval)[^\n.]{0,20}\b(?:pods?|replicas?)\b(?!\s*:?\s*0\b)'
         - '\b[1-9]\d*\s+pending\b'
         - '(?<!\b0 pods )(?<!\b0 pod )(?<!\b0 replicas )(?<!\b0 replica )\b(?:are|were|still|as|stuck|stay(?:s|ed)?|remain(?:s|ed)?|left|been|sit(?:s|ting)?)\s+pending\b'
         - '\bin\s+(?:a\s+|the\s+)?pending\b'
