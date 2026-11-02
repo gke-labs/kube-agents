@@ -25,7 +25,16 @@ import test_collector_run as _shared_run_tests  # noqa: E402
 # argument, and the adapter feeds the real paging from it
 # (test_collector_run.paged_dump_over). The test that asserts the paged argv
 # itself patches the real `paged_dump` back in.
-_PAGED_DUMP = patch.object(report, "paged_dump", _shared_run_tests.paged_dump_over())
+def paged_dump_adapter():
+    """A patcher joining the report's paging to FakeReadinessCommands' one-shot answers.
+    Every module that drives `report.main` with the fake starts one in its own
+    `setUpModule`: unittest runs this module's hooks for this module alone, so a
+    sibling that imports the fake without the adapter sends the fake a `--raw` read
+    it does not answer."""
+    return patch.object(report, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+_PAGED_DUMP = paged_dump_adapter()
 
 
 def setUpModule():
