@@ -54,6 +54,7 @@ import errno
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -957,13 +958,17 @@ def _paged_run(argv: list[str], *, env: dict | None = None) -> Run:
 
 def _kubectl_get(resources: str, env: dict) -> tuple[list | None, str | None]:
     """(items, error) of one read of `resources` (a kubectl kind list), one kind at a time in
-    pages through `kubectl get --raw`; the read is named by each kind's first page. A page the
-    credential proxy cut at its output cap is an error naming the cap, as a cut list was."""
+    pages through `kubectl get --raw`. An error names the page that failed (its `continue`
+    token included when one was being followed), not every kind's first page: the paged reader
+    hands back the failing page's `Run`, an operator re-running the command named should see
+    the failure, and the one-page text leaves the member's 160-character note room for the
+    reason. A page the credential proxy cut at its output cap is an error naming the cap, as a
+    cut list was."""
     kinds = resources.split(",")
-    text = paged_command_text(kinds)
     parsed, result = paged_dump(kinds, run=_paged_run, env=env)
     if parsed is not None:
         return parsed.get("items") or [], None
+    text = shlex.join(result.argv)
     if PROXY_TRUNCATION_MARKER in result.stderr:
         return None, KUBECTL_OUTPUT_CUT.format(cmd=text)
     if result.rc != 0:

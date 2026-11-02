@@ -1891,7 +1891,10 @@ class ReadinessTest(unittest.TestCase):
         for member in data["members"]:
             errors = member["readiness"]["read_errors"]
             self.assertIsNone(errors["pods"])
-            self.assertEqual(f"{report.paged_command_text(['daemonset', 'cronjob', 'pvc', 'networkpolicy', 'namespace'])} {CUT_AT_CAP}, so the list did not fit in one read", errors["pvc"])
+            # The page that failed is the one named, not the chain of every kind's first page.
+            self.assertEqual(f"{report.paged_command_text(['pvc'])} {CUT_AT_CAP}, so the list did not fit in one read", errors["pvc"])
+            self.assertEqual("kubectl get --raw '/api/v1/persistentvolumeclaims?limit=500' output was cut", errors["pvc"][:len("kubectl get --raw '/api/v1/persistentvolumeclaims?limit=500' output was cut")])
+            self.assertNotIn("daemonsets", errors["pvc"])
             self.assertEqual(errors["pvc"], errors["networkpolicy"])
         self.assertEqual(0, rc)
 
@@ -2008,7 +2011,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(by_name["seeded-a"]["webhook_read_error"].startswith(report.WEBHOOK_READ_SKIPPED))
         # The skipped read is reported as skipped, not failed: one error row, and a note that says why the webhooks are unread.
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
-        self.assertIn(f"- read failed for p1 (us-central1-a) cluster seeded-a: {report.paged_command_text(['pdb', 'deploy', 'statefulset'])} failed (1)", text)
+        self.assertIn(f"- read failed for p1 (us-central1-a) cluster seeded-a: {report.paged_command_text(['pdb'])} failed (1): Unable to connect to the server: dial tcp: i/o timeout", text)
         self.assertEqual([l for l in text.splitlines() if l.startswith("- read failed") and "skipped" in l], [])
         self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the credential proxy unreachable); webhooks not graded", by_name["seeded-a"]["note"])
         self.assertNotIn("webhook read failed", by_name["seeded-a"]["note"])
@@ -2155,7 +2158,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("webhook read failed; webhooks not graded", host["note"])
         row = next(l for l in text.splitlines() if l.startswith("| p1 | robot-host |") and "| blocked |" in l)
         self.assertIn("(2 replicas)) | read failed |", row)
-        self.assertIn(f"{report.paged_command_text(['validatingwebhookconfigurations', 'mutatingwebhookconfigurations', 'services', 'endpointslices', 'namespaces'])} failed (1)", text)
+        self.assertIn(f"{report.paged_command_text(['validatingwebhookconfigurations'])} failed (1): Error from server (Timeout)", text)
 
     def test_the_namespace_read_feeds_the_selector(self):
         # A dead Role gate that exempts kube-system and kube-public by a label the installer
@@ -2336,10 +2339,11 @@ class ReadinessTest(unittest.TestCase):
             self.assertIsNone(a["read_errors"]["node"])
             self.assertIsNone(a["read_errors"]["pv"])
             self.assertEqual([(u["rule"], u["can_block"]) for u in a["unknown"]], [("needs-netpol", True)])
-            self.assertIn(f"the networkpolicy read failed ({report.paged_command_text(['daemonset', 'cronjob', 'pvc', 'networkpolicy', 'namespace'])} failed (1)", a["unknown"][0]["reason"])
+            self.assertIn(f"the networkpolicy read failed ({report.paged_command_text(['daemonset'])} failed (1): Error from server (Forbidden)", a["unknown"][0]["reason"])
             self.assertEqual(a["rules"]["needs-netpol"], {"entry": 0, "can_block": True, "blocking": 0, "risks": 0, "unknown": 1, "notes": 0})
             self.assertEqual(a["rules"]["needs-pods"]["notes"], 1)
-            self.assertIn("daemonset, cronjob, pvc, networkpolicy, namespace not read (kubectl get --raw '/apis/apps/v1/daemonsets?limit=500'", a["note"])
+            # The note's 160-character excerpt reaches the reason once the error names one page.
+            self.assertIn("daemonset, cronjob, pvc, networkpolicy, namespace not read (kubectl get --raw '/apis/apps/v1/daemonsets?limit=500' failed (1): Error from server (Forbidden)", a["note"])
             self.assertIn("; the per-entry rules that need them say so", a["note"])
             self.assertEqual(data["errors"], [])
             self.assertNotIn("read failed for", text)
@@ -2524,6 +2528,21 @@ class ReadinessTest(unittest.TestCase):
             items, error = report._kubectl_get("pods", {})
             self.assertIsNone(items)
             self.assertEqual(f"{report.paged_command_text(['pods'])} returned unparsable JSON", error)
+
+    def test_a_failed_later_page_is_named_with_its_continue_token(self):
+        """The error names the page that failed, continue token included, so the command an
+        operator re-runs is the one that failed, not the kind's clean first page."""
+        def fake(cmd, timeout=None, env=None):
+            path, _, query = cmd[3].partition("?")
+            if "continue=" in query:
+                return 1, "", "Error from server (Expired): The provided continue parameter is too old"
+            return 0, json.dumps({"metadata": {"continue": "more"} if path == "/api/v1/pods" else {}, "items": []}), ""
+
+        with patch.object(report, "run_cmd", fake), patch.object(report, "paged_dump", _shared_run_tests.cr.paged_dump):
+            items, error = report._kubectl_get("daemonset,pods", {})
+        self.assertIsNone(items)
+        self.assertEqual("kubectl get --raw '/api/v1/pods?limit=500&continue=more' failed (1): Error from server (Expired): The provided continue parameter is too old", error)
+        self.assertLessEqual(len(error), report.NOTE_ERROR_CHARS)
 
     def test_the_addon_inventory_is_in_the_json_and_the_table_and_a_ghost_node_blocks(self):
         fluentbit = {"kind": "DaemonSet", "metadata": {"namespace": "kube-system", "name": "fluentbit-gke"}, "spec": {"template": {"spec": {"containers": [{"name": "fluentbit", "image": "gke.gcr.io/fluent-bit:v0.0.422-gke.21@sha256:abc"}, {"name": "exporter", "image": "gke.gcr.io/fluent-bit-gke-exporter:v0.27.17-gke.36"}]}}}}
