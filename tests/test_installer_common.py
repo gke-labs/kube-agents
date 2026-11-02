@@ -3126,6 +3126,23 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("helm_upgrade_install = false\n", dest.read_text())
 
+    def test_tfvars_refuse_a_helm_upgrade_install_spelling_that_is_neither_true_nor_false(self):
+        # Read as off, a typo leaves upgrade_install off on the environment it
+        # was set to rescue, and the apply fails as before naming nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("ture", "enabled", "t", " "):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"HELM_UPGRADE_INSTALL='{value}'", proc.stderr + proc.stdout)
+                    self.assertIn("is neither true nor false", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a misspelt switch")
+
     def test_helm_upgrade_install_reaches_the_kube_agents_release(self):
         """The tfvars key is inert unless main.tf hands it to the release."""
         composition = _REPO_ROOT / "terraform" / "examples" / "full-install"

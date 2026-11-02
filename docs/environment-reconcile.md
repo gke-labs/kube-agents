@@ -215,6 +215,9 @@ neither list recognises is refused before the teardown rather than by
 refused the same way rather than read as `false`: unset means "say nothing about
 this setting", and guessing `false` from whitespace would rebuild the
 environment with the feature off and nothing in the log saying so.
+`HELM_UPGRADE_INSTALL` is checked there the same way, though it is no
+`install.sh` flag: the installer's tfvars generator refuses a spelling it does
+not recognise, and that refusal would otherwise come after the teardown.
 
 Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `GOOGLE_CHAT_MODE`, `GOOGLE_CHAT_HOME_CHANNEL`,
