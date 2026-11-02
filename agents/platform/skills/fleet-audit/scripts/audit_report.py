@@ -18330,6 +18330,11 @@ def disclose_manual_remediation_routes(
         # The note before an earlier pass of this run cut it, when there was one.
         uncut = remediation.pop(ROUTE_UNCUT_NOTE_FIELD, None)
         worker_note = uncut if isinstance(uncut, str) else original.strip()
+        # A Config Connector paragraph that the worker copied from an earlier
+        # ledger is not the worker's text: removed here, before the note is
+        # kept as the uncut note, so no later pass brings it back.
+        # `disclose_stalled_kcc_remediations` writes it again from this run.
+        worker_note = _without_kcc_paragraph(worker_note)
         if ROUTE_NOTE_PATTERN.search(worker_note):
             worker_note = ROUTE_NOTE_SPACED_PATTERN.sub("", worker_note).strip()
         found = evidence.get(derive_finding_id(finding))
@@ -19368,6 +19373,14 @@ def kcc_stalled_objects(
     return KCC_STALLED_SEPARATOR.join(parts) + (KCC_STALLED_MORE.format(rest=rest) if rest > 0 else "")
 
 
+def _without_kcc_paragraph(note: str) -> str:
+    """`note` with either paragraph of `disclose_stalled_kcc_remediations`
+    removed."""
+    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+        return KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
+    return note
+
+
 def _strip_kcc_stalled_note(remediation: object) -> None:
     """Remove either paragraph of `disclose_stalled_kcc_remediations` from a
     remediation note. The pass writes it again from this run's manifest."""
@@ -19375,7 +19388,7 @@ def _strip_kcc_stalled_note(remediation: object) -> None:
         return
     note = str(remediation.get("note") or "")
     if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
-        remediation["note"] = KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
+        remediation["note"] = _without_kcc_paragraph(note)
 
 
 def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:

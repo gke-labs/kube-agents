@@ -23714,6 +23714,31 @@ metadata:
         audit_report.disclose_stalled_kcc_remediations([second], kcc_manifest(), self.root, {})
         self.assertEqual(second["remediation"]["note"], worker)
 
+    def test_a_copied_paragraph_in_a_cut_worker_note_does_not_come_back(self):
+        """Review finding: the route-note pass kept the worker's note, with a
+        Config Connector paragraph copied from an earlier ledger, as the
+        uncut note, and the paragraph pass rebuilt the note from it. The old
+        paragraph, with its old reason, came back beside this run's."""
+        host = "acme/us-central1/prod"
+        candidate = {**_cand("release-channel", host, "Cluster/prod"), "reconciler": "the Argo CD Application `infra`"}
+        manifest = _manifest((host, [candidate]))
+        manifest["clusters"][0].update(outcome="collected", kcc_unready=[
+            {"kind": "ContainerCluster", "namespace": "infra", "name": "prod", "project": "acme", "why": "UpdateFailed: NEW"}])
+        old = (f"{audit_report.KCC_STALLED_OBJECT_MARK} When the audit ran, Config Connector reported `Ready=False` on "
+               "`ContainerCluster infra/prod` (`UpdateFailed: OLD`). The audit names no declaration file for this object.")
+        worker = ("Set the release channel by hand in the console. " * 45).strip()
+        self.assertGreater(len(worker), audit_report.MAX_NOTE_CHARS)
+        finding = _pub("rc", "release-channel", host, "Cluster/prod")
+        finding["remediation"] = {"kind": "manual", "note": old + "\n\n" + worker}
+        audit_report.disclose_manual_remediation_routes([finding], manifest, set())
+        audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, {})
+        note = finding["remediation"]["note"]
+        uncut = finding["remediation"].get(audit_report.ROUTE_UNCUT_NOTE_FIELD, "")
+        self.assertNotIn("OLD", note)
+        self.assertNotIn("OLD", uncut)
+        self.assertIn("UpdateFailed: NEW", note)
+        self.assertEqual(note.count(audit_report.KCC_STALLED_OBJECT_MARK), 1)
+
     def test_a_declaration_of_another_project_or_location_is_not_named(self):
         """A proj-a/us-central1 file is not the declaration of a
         proj-b/europe-west1 stall of the same name."""
