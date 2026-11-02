@@ -4,7 +4,7 @@
   },
   "concepts/chatops.md": {
     "long-paragraph": 33,
-    "long-sentence": 84
+    "long-sentence": 83
   },
   "concepts/cluster-agents.md": {
     "long-paragraph": 4,
@@ -106,9 +106,7 @@
     "long-sentence": 9
   },
   "operator/platformagent-crd.md": {
-    "long-paragraph": 54,
-    "long-table-cell": 4,
-    "long-sentence": 176
+    "long-sentence": 119
   },
   "overview/architecture.mdx": {
     "long-paragraph": 2,

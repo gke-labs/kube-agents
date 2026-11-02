@@ -246,7 +246,7 @@ deployment's ready replicas land in a range). A fourth, `fleet_resource_property
 this repository's `resource_property` against the seeded-fleet cluster that carries a
 fixture role, named by `fixture_role:` rather than by cluster.
 
-Fourteen read what the run produced, from this repository
+The run-reading types come from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns`, `required_patterns` and
@@ -284,7 +284,8 @@ lead), `report_times_in_window` (every date and time on a report line one of its
 `max_clock_skew_sec`, and its minute must be one some tool output in the trajectory shows,
 the workers' included; a report that states none passes), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
-published), `pull_request_opened` (the remediation pull request the run opened,
+published), `forge_issue_state` (the state, labels and in-run comments of the issue the reply
+names, read from the forge), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
 repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `changed_paths_only` fails one whose diff changes any path matching none of its listed globs, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds), `github_writes` (every pull request or branch under the agent's
 prefix written to the case's GitOps repository since the repetition started that
@@ -325,7 +326,7 @@ is not checked, and a missing command is
 `status: "error"` when the capture has gaps, the pod withheld the workers' arguments, or the
 trajectory holds no worker terminal call).
 
-Thirteen read the install under test, nine of them from that file. `bootstrap_fanout` compares the
+The remaining types read the install under test, most of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster

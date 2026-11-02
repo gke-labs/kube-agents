@@ -20,13 +20,13 @@ In the same way, a `rep N timing:` line under each grading line carries the
 repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages show
 ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
-Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
+Chat — only when the state changes, plus one digest a day at 11 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
 ([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
 are refused a project and one when they stop ([below](#a-backed-up-pool)),
 plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
-([below](#the-watched-periodics)). Once a week, from 9 AM Toronto time on
+([below](#the-watched-periodics)). Once a week, from 11 AM Toronto time on
 Monday, `scripts/eval_dashboard/weekly_chat.py` posts the weekly health
 summary to the same space ([below](#the-weekly-health-email)).
 The digest also carries a section on last night's run of the nightly tier
@@ -112,7 +112,7 @@ Every time a person reads — in a Chat message, the gate comment, the issue
 title — is America/Toronto, written `7:30 AM ET` (`Sun 7:30 AM ET` where the
 day matters), DST included. URL parameters, `health.json`, the state files and
 the history feed stay ISO 8601 UTC. The digest hour is a Toronto hour
-(`--digest-hour 9`, `--digest-tz America/Toronto` by default) and "once a day"
+(`post_health.DEFAULT_DIGEST_HOUR`, 11; `--digest-hour` moves only the digest, the weekly post follows the constant; `--digest-tz` defaults to America/Toronto) and "once a day"
 is a Toronto day: the state file's `last_digest_date` is the local date.
 `--digest-tz` moves only the digest's clock; the times written into messages
 and the `ET` label are fixed to Toronto.
@@ -205,7 +205,8 @@ recorded `null` is "no verdict".
 
 **GREEN** — none of the above. No message of its own beyond the recovery that
 announces it; the daily digest carries the last 24 hours' runs, greens,
-PR-caused reds (by rule 4's test, below) and infra reds (setup deaths, lost
+PR-caused reds (by rule 4's test, below, less its storm silence: a two-hour
+storm cannot blank a 24-hour count) and infra reds (setup deaths, lost
 pods and deadline kills that graded nothing are folded into the infra count),
 the typical run length and the typical wait before a run starts,
 and the delegation-ceiling repetitions on a day that had any. `health.json`'s
@@ -218,7 +219,13 @@ moves no state; the message lists it as "PR-caused" when the evidence rules out
 a flake and a moving main: the case passed on another pull request's run built
 on the same main commit, or it failed on two or more of that pull request's
 runs (a retest counts) while passing on another pull request. One red run with
-no same-base pass gets no line.
+no same-base pass gets no line. "Failing" means a record with at least two
+graded repetitions, all failed: one graded repetition beside two infra ones is
+a throttled run, not a collapse the pull request owns. While a storm's
+repetitions are firing, confirmed or not, no collapse the storm's reach covers
+(from three hours before its first hit run finished) is PR-caused: a thin
+record on one pull request is the storm's own symptom. A collapse that
+finished before the storm is named as usual.
 
 Only presubmit runs reach these rules and the digest's numbers. `data.json`
 also carries the nightly periodics' runs (`runs[].tier`, see
@@ -910,7 +917,7 @@ against any `data.json`; `--live` writes.
 
 ## The nightly section
 
-The 9 AM digest's nightly section lists what last night changed, from
+The 11 AM digest's nightly section lists what last night changed, from
 `data.json` and the open `nightly-red` issues, by the rules [Nightly
 bugs](#nightly-bugs) files by: a case's verdict for a night is the bug filer's
 (a part cut off at the deadline, a case with no graded repetition, and a night
@@ -1061,7 +1068,7 @@ later gap. For a domain whose start date is not recorded, a close in the last
 left `domains.yaml` without a roster case covering it is left open, with a
 warning in the job log.
 
-The 9 AM digest carries one line per uncovered domain, after the nightly part:
+The 11 AM digest carries one line per uncovered domain, after the nightly part:
 the domain, days uncovered, "exception expired N days ago" once its record has
 expired, the owner (as text, not a mention), and the best
 candidate with its record and the store's verdict when the store was read
@@ -1167,7 +1174,7 @@ The
 render step writes both (`--chat-out`) only when the page passes, from the
 numbers the page printed, so the two cannot disagree and a refused week posts
 nothing. The next step, `scripts/eval_dashboard/weekly_chat.py`, posts it on
-the first tick at or after 9 AM Toronto time on the Monday after the week ends,
+the first tick at or after 11 AM Toronto time on the Monday after the week ends,
 through the poster's app identity and token, and records the week in
 `weekly-chat-state.json` beside `data.json`, so later ticks and re-runs post
 nothing more for that week. The week is recorded before the post, so it goes
@@ -1286,7 +1293,7 @@ other: one Chat message naming the roles and how many projects, that a red on
 a case depending on them from a run in those projects is the fixture and not
 the code, that a retest waits for the re-apply, and `Tracking
 #NNN`; the gate comment's health box carries the same sentence on a red run
-while the condition lasts; the 9 AM digest always carries one line on the
+while the condition lasts; the 11 AM digest always carries one line on the
 latest scan (`🧭 Seeded fleet: 30 of 30 pool projects checked at 8:00 AM ET,
 every fixture in its designed state`, or how many fixtures are absent on how
 many projects and how many roles it could not read, or the drifted projects and roles, or
@@ -1387,8 +1394,9 @@ or more calls; `reason` says which.
 
 **The identity and the grant.** Every read runs as the bot itself,
 `eval-dashboard-publisher@kube-agents-prow`, which needs `roles/iam.securityReviewer`,
-`roles/container.clusterViewer`, `roles/artifactregistry.reader`, `roles/cloudkms.viewer`
-and `roles/storage.bucketViewer` on each project (`POOL_STATE_READER_ROLES` in the
+`roles/container.clusterViewer`, `roles/artifactregistry.reader`, `roles/cloudkms.viewer`,
+`roles/storage.bucketViewer`, `roles/compute.networkViewer` and `roles/dns.reader` on each
+project (`POOL_STATE_READER_ROLES` in the
 verifier; together they cover every read the scan's checks make, and none writes;
 the one read outside the project, the warm-cache repository's policy in the Prow
 project, is the verifier's `warm_cache` check, which the scan does not run). `bench/tf/fleet`
@@ -1396,21 +1404,23 @@ grants them (`pool_state_readers`), so a project gets them from its fleet apply 
 the verifier fails one that lacks them (`--report` carries the binding). Grant them
 on the project: the check reads the project's own policy, so a grant on a folder or
 the organisation, or through a group, is not seen and reads as missing on every
-project. Projects applied before that default are one loop, run once by a project
-owner:
+project. Projects applied before that default, or before a role joined the list, are one
+loop, run once by a project owner:
 
 ```bash
 BOT=eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com
 for p in $(sed -n '/^gitops_repo_for_project() {/,/^}/p' hack/ci-deploy.sh \
           | sed -n 's/^[[:space:]]*\(kube-agents-evals[-0-9]*\)).*/\1/p'); do
   for role in roles/iam.securityReviewer roles/container.clusterViewer \
-              roles/artifactregistry.reader roles/cloudkms.viewer roles/storage.bucketViewer; do
+              roles/artifactregistry.reader roles/cloudkms.viewer roles/storage.bucketViewer \
+              roles/compute.networkViewer roles/dns.reader; do
     gcloud projects add-iam-policy-binding "$p" --member "serviceAccount:${BOT}" --role "$role" --quiet >/dev/null
   done
 done
 ```
 
-Until then every check on the project records `not_checked` with gcloud's words.
+Until then the checks whose reads the missing roles cover record `not_checked` with
+gcloud's words (every check, on a project with none of the roles).
 
 **The condition.** `health.py`'s `pool_drift` is the fleet scan's rule over this
 document: the same finding on the same project in two consecutive scans, or on

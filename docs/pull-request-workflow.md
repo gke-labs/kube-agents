@@ -787,8 +787,10 @@ a required check blocks on it the same way) for any owner, member or collaborato
 at the start of a later line; the Actions re-run, like `/request-review`, reads the start of the
 comment only, so a `/retest` under a line of explanation re-runs the Prow jobs alone. It re-runs
 only the pull request's own runs: a head commit that is also a commit on `main` or a release line
-carries that line's push runs too, and a red one of those is named and left alone. It reads the best state per check name, so a run a newer success superseded or one cancelled while still queued is
-not re-run: neither blocks anything. GitHub's own re-run button needs Write access, which most
+carries that line's push runs too, and a red one of those is named and left alone. It reads the best state per check name, so a run a newer success superseded is not re-run, except
+under a check name the base branch requires: GitHub still counts that red run and keeps the pull request out
+of the queue, so it is re-run once no run of its workflow on the pull request is still going, one run per workflow per `/retest`. A run cancelled while still queued made no check run and is never
+re-run. GitHub's own re-run button needs Write access, which most
 collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
 was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
 red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot

@@ -31,6 +31,9 @@ const sessionProfile = "chat"
 // surface that carries every message without a mention.
 const sessionKindDM = "dm"
 
+// sessionKindGroup is the other kind: a channel, a space, a group chat.
+const sessionKindGroup = "group"
+
 // topLevelNothingRunningNotice answers a "stop" or a status question typed
 // in a message the adapter marked TopLevel: one that roots a conversation of
 // its own (a top-level Slack DM), so nothing is running in it and the task

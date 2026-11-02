@@ -1076,7 +1076,7 @@ merge-rate data:
   overruns its night cannot overlap the next.
 - **`optional` is a presubmit-only field** and must not appear. It is Tide's "does this gate the
   merge" flag, and a periodic gates nothing. The substantive point is carried by the eval
-  dashboard's Nightly report and the 9 AM ET digest instead (`scripts/eval_dashboard/nightly.py`,
+  dashboard's Nightly report and the 11 AM ET digest instead (`scripts/eval_dashboard/nightly.py`,
   `post_health.py`; the merged job creates no TestGrid test group): a silently failing recorder
   stops the store filling, and an empty store reads as a legitimate green to every presubmit,
   because an unadmitted case cannot fire the quality rungs. Nothing degrades visibly in the gate,
@@ -1087,7 +1087,7 @@ merge-rate data:
   run.
 
 Three numbers in it are priced rather than measured. The repetition count is the script's default 3
-unless the job sets `EVAL_REPETITIONS`. The timeout is `720m`, not the presubmit's `360m`: the
+unless the job sets `EVAL_REPETITIONS`. The timeout is `840m` on the main halves (`720m` before the gemini-4-argon window), not the presubmit's `360m`: the
 twenty-six-task matrix priced at ~532–552 serial minutes at three repetitions, and the presubmit
 realised only ~1.15× on whole-job wall clock against its serial matrix estimate on 2026-09-10 (the
 periodic's timeout comment; the fixed provision-and-deploy term is inside that figure, which is
@@ -1127,7 +1127,7 @@ does — see
 [Two conditions](#two-conditions-that-guard-depends-on).
 
 The shape, with the harness elided (the alert row in the table above is met through the eval
-dashboard's Nightly report and the 9 AM digest rather than a TestGrid tab, so the job creates no test
+dashboard's Nightly report and the 11 AM digest rather than a TestGrid tab, so the job creates no test
 group):
 
 ```yaml
@@ -1531,7 +1531,6 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   invocations instead of 51 and land the job near 61min, which is real money. It is declined
   because it is not verdict-identical to three unconditional repetitions, in four ways, and the
   cheap version of a gate that quietly grades differently is worse than an expensive one:
-
   - **Rung 5 inverts.** It fires on `expected_fail` and _every_ repetition passing. Sample once and
     a single flaky pass flips the marker that three repetitions would have held; the retry never
     triggers, because from the sampler's point of view nothing failed.
@@ -1568,7 +1567,7 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   missing. The absolute rungs (1, 2, 3, 5) and the correctness floor still block, so the failure
   looks like a working gate. Both exports exist since
   [oss-test-infra#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698).
-- The nightly periodic's three numbers — the script's default repetitions, the `720m` timeout and
+- The nightly periodic's three numbers — the script's default repetitions, the `840m` timeout and
   `EVAL_TASK_PARALLELISM=6` — are priced, not measured;
   [The job definition](#the-job-definition) says from what. Confirm them on the first three nights'
   wall clock and record the result on

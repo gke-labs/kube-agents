@@ -143,8 +143,9 @@ type notifyBlocksPoster interface {
 
 // notifyChatPoster is the optional half a backend that lays out a chat
 // message in the home channel adds: one message, the chat message laid out
-// with its text as the fallback. SlackAdapter is the one implementation; a
-// home request with a chat message to any other backend posts its text.
+// with its text as the fallback. SlackAdapter and GoogleChatAdapter
+// implement it; a home request with a chat message to any other backend
+// posts its text.
 type notifyChatPoster interface {
 	PostNotifyMessage(home, thread string, m OutMessage) (message, landed string, err error)
 }

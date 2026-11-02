@@ -35,7 +35,7 @@ Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A s
 
 ## Read-only tokens for context repositories
 
-A repository registered under `context_repos` — a Terraform repository an audit reads for declared intent — gets a read-only grant, not the write one. The operator renders a policy per same-organization context repository carrying the `platform-agent-read-scope` scope alone, which grants `contents: read` and nothing else. The credential broker requests a token from that scope for its own content-mode clone of the repository, presents it to that one `git` process, and installs it nowhere: the agent sandbox never holds it, and the broker's write gate still refuses a `commit` or `push` to a context repository. A repository registered under both keys is managed and keeps its write policy.
+A repository registered under `context_repos` — a Terraform repository an audit reads for declared intent — gets a read-only grant, not the write one. The operator renders a policy per same-organization context repository carrying the `platform-agent-read-scope` scope alone, which grants `contents: read` and nothing else. The credential broker requests a token from that scope for its own content-mode clone of the repository, presents it to that one `git` process, and installs it nowhere: the agent sandbox never holds it, and the broker's write gate still refuses a `commit` or `push` to a context repository. A context policy does not carry `platform-agent-sweep-scope`, which managed policies carry. A repository registered under both keys is managed and keeps its write policy.
 
 The GitHub App must be installed on each context repository, as it must on each managed one; a private repository the App is not installed on fails to clone as before. A cross-organization entry is skipped with an operator log line. A rule ConfigMap whose `default.yaml` predates the read scope renders no context policies — upgrade the chart or the kustomize template to get it.
 
@@ -155,7 +155,8 @@ Names and values baked into the deployment templates ([`k8s-operator/config/inte
 - **Kubernetes Service / Deployment:** `github-token-minter` (namespace `kubeagents-system`), listening on port `8080` with a `/version` health endpoint.
 - **Image:** substituted from `GITHUB_MINTER_IMAGE`, run as `/minty server run`. The upstream reference and pin live in `images.json`; see the [Docker images](docker-images.md) inventory.
 - **Kubernetes SA:** `kubeagents-github-minter`, Workload-Identity-bound to GSA `kubeagents-github-minter-gsa` (which holds `roles/cloudkms.signerVerifier` on the KMS key).
-- **Scopes:** the ConfigMap rule exposes two. `platform-agent-scope` grants `contents: write`, `pull_requests: write`, and `issues: write`, and is what the agent's managed repositories ride. `platform-agent-read-scope` grants `contents: read` alone, and is what the credential broker requests for its clone of a context repository. A request names one in its `scope` field.
+- **Scopes:** the ConfigMap rule exposes three. `platform-agent-scope` grants `contents: write`, `pull_requests: write`, and `issues: write`, and is what the agent's managed repositories ride. `platform-agent-read-scope` grants `contents: read` alone, and is what the credential broker requests for its clone of a context repository. `platform-agent-sweep-scope` grants `contents`, `pull_requests` and `issues` read, and is what the broker requests per managed repository to read the outcome of the agent's own proposals; context repository policies do not carry it. A request names one in its `scope` field.
+- An install from the Kustomize bases re-applies the minter ConfigMap when it upgrades to this release: a rule without `platform-agent-sweep-scope` refuses the broker's sweep mint, and the install has no proposal readings until it carries the scope.
 - The App ID is injected from the `github-app-credentials` Secret, and the KMS key reference (`projects/.../cryptoKeyVersions/<n>`) points at the configured key version (the chart's `githubMinter.kms.keyVersion`), which must be ENABLED — i.e. imported — before the Deployment passes readiness.
 
 ## Manual testing
@@ -184,7 +185,7 @@ curl -i -X POST http://github-token-minter.kubeagents-system.svc.cluster.local:8
   -d '{"org_name":"<org>","repositories":["<repo>"],"scope":"platform-agent-scope"}'
 ```
 
-A 200 response whose body is the short-lived, repository-scoped GitHub installation token means the pipeline works end-to-end. Put `platform-agent-read-scope` in `scope` to check the read-only grant: the token returned can clone the repository and nothing more.
+A 200 response whose body is the short-lived, repository-scoped GitHub installation token means the pipeline works end-to-end. Put `platform-agent-read-scope` in `scope` to check the read-only grant: the token returned can clone the repository and nothing more. Put `platform-agent-sweep-scope` to check the sweep's grant: the token can read the repository's pull requests and issues and write nothing.
 
 ## Where to go next
 
