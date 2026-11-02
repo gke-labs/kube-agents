@@ -803,6 +803,11 @@ VCS_READINGS_READING_LABEL = "reading"
 VCS_READINGS_REASON_LABEL = "reason"
 # The `le` value of the last edge of the per-proposal gauge, its count.
 VCS_READINGS_LE_INF = "+Inf"
+# Set to exactly "false" to keep the readings sweep from starting. For an
+# install that shares its GitHub App installation's quota with many others, as
+# the eval lanes do: each sweep budgets a fifth of the whole installation's
+# hourly quota for itself (vcs_readings.VCS_READINGS_DETAIL_CALLS_PER_HOUR).
+VCS_READINGS_ENABLED_ENV = "KUBEAGENTS_VCS_READINGS_ENABLED"
 # The failure counter's closed `reason` vocabulary; any other word is `other`.
 VCS_READINGS_FAILURE_REASONS = frozenset({
     vcs_readings.REASON_FORGE,
@@ -9998,8 +10003,12 @@ def start_readings_sweep(executor: CommandExecutor, broker) -> None:
     live-reloaded mount, so whether there is anything to read is decided on
     each pass inside the sweep. A pass over an empty or unreadable list makes
     no attempt and counts no failure, and a repository registered later is
-    read on the next interval.
+    read on the next interval. `VCS_READINGS_ENABLED_ENV` set to "false" turns
+    it off, and the readings' series are then never rendered.
     """
+    if os.environ.get(VCS_READINGS_ENABLED_ENV, "").strip().lower() == "false":
+        LOGGER.info("proposal readings sweep off: %s=false", VCS_READINGS_ENABLED_ENV)
+        return
     vcs_readings.ReadingsSweep(
         registry=broker.registry,
         transport_for=lambda forge, repo: sweep_transport_for(executor, forge, repo),

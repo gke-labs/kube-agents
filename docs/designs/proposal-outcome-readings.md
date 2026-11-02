@@ -275,7 +275,10 @@ hourly quota, which the agent's own verbs share. So step 2 is budgeted by the ho
 not in proposals: `VCS_READINGS_DETAIL_CALLS_PER_HOUR` (1000, a fifth of GitHub's five-thousand-call
 installation quota) spread evenly over the sweeps in an hour, about sixty calls a sweep at the
 default TTL, about nine ordinary proposals or fewer long ones, so a refill of a thousand proposals
-takes about seven hours and never starves the agent's own verbs. The details reading is taken only
+takes about seven hours and never starves the agent's own verbs. The fifth is of one
+installation's quota, so installs that share an installation share the remainder too: the eval
+lanes do, a handful of concurrent fresh installs exhausted it (#4611), and they set
+`KUBEAGENTS_VCS_READINGS_ENABLED=false`, which keeps the sweep from starting. The details reading is taken only
 once every listed proposal is current in the cache; until then its series keep their previous
 values, or stay absent after a restart, with `reason="warming"` on the failure counter, while
 the outcomes reading is taken from the first complete listing. The cache's eviction rule is one

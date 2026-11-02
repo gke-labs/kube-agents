@@ -84,6 +84,19 @@ class CiDeployAlertQuotaTest(unittest.TestCase):
                 "and a correctly filtered record look identical from the board.",
             )
 
+    def test_helm_release_keeps_the_readings_sweep_off(self) -> None:
+        # #4611: every eval install shares one GitHub App installation, and each
+        # fresh install's sweep budgets a fifth of its hourly quota, so a few
+        # concurrent lanes exhausted it and the cases' own forge writes failed.
+        text = _CI_DEPLOY.read_text()
+        self.assertIn('--set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_VCS_READINGS_ENABLED"', text)
+        self.assertIn('--set-string "platformAgent.deployment.env[3].value=false"', text)
+        root = _CI_DEPLOY.parent.parent
+        self.assertIn(
+            'VCS_READINGS_ENABLED_ENV = "KUBEAGENTS_VCS_READINGS_ENABLED"',
+            (root / "agents/platform/scripts/credential_proxy.py").read_text(),
+        )
+
     def test_helm_release_folds_a_workloads_repeat_events_briefly(self) -> None:
         # incident-triage-workload-fold goes green only with the window on, and
         # the autoops cases re-plant one workload per repetition, so a window

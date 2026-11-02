@@ -9462,13 +9462,13 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with("banana"))
 
-    def _served_sweep(self, role, managed):
+    def _served_sweep(self, role, managed, extra_env: dict | None = None):
         """The sweep `serve` started in `role`, with `start` stubbed; None if none was."""
         with mock.patch.object(credential_proxy, "resolve_role", return_value=role), \
                 mock.patch.object(credential_proxy, "managed_repositories", managed), \
                 mock.patch.object(credential_proxy, "start_agent_api_proxy", mock.MagicMock()), \
                 mock.patch.object(credential_proxy.vcs_readings.ReadingsSweep, "start", autospec=True) as start:
-            self._serve_with(None)
+            self._serve_with(None, extra_env)
         if not start.called:
             return None
         start.assert_called_once()
@@ -9496,6 +9496,13 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             credential_proxy.serve(types.SimpleNamespace())
         proxy.serve_forever.assert_called_once_with()
         start.assert_not_called()
+
+    def test_the_sweep_stays_off_when_the_env_var_says_false(self):
+        managed = mock.Mock(return_value=frozenset({"github.com/acme/infra"}))
+        for value, started in (("false", False), (" FALSE ", False), ("banana", True), ("", True)):
+            with self.subTest(value=value):
+                env = {credential_proxy.VCS_READINGS_ENABLED_ENV: value}
+                self.assertEqual(started, self._served_sweep("broker", managed, env) is not None)
 
     def test_the_sweep_starts_on_an_empty_list_and_its_pass_makes_no_forge_call(self):
         sweep = self._served_sweep("broker", mock.Mock(return_value=frozenset()))

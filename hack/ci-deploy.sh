@@ -695,8 +695,8 @@ A2A_OPERATOR_ENV_ARGS=()
 MODE_NEXT_ENV_ARGS=()
 if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   MODE_NEXT_ENV_ARGS=(
-    --set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
-    --set-string "platformAgent.deployment.env[3].value=false"
+    --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+    --set-string "platformAgent.deployment.env[4].value=false"
     --set "profiles.tse.enabled=true"
   )
 fi
@@ -1896,6 +1896,12 @@ echo "✓ CRDs applied from ${CHART_CRD_DIR}"
 echo "Kanban board cap for this install: max_in_progress=${EVAL_KANBAN_MAX_IN_PROGRESS} (spec.harness.tuning.maxInProgress)"
 echo "Credential-proxy memory limit for this install: ${EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT} (spec.deployment.credentialProxy.resources.limits.memory)"
 
+# The proposal readings sweep stays off (spec.deployment.env
+# KUBEAGENTS_VCS_READINGS_ENABLED=false, read by credential_proxy.py). Every
+# eval install shares one GitHub App installation, and each fresh install's
+# sweep budgets a fifth of that installation's hourly quota for itself, so a
+# few concurrent lanes exhausted it and the cases' own forge writes were
+# refused (#4611). No case reads the sweep's series.
 HELM_INSTALL_OUT="$(mktemp)"
 HELM_EXIT=0
 for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
@@ -1926,6 +1932,8 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[1].value=${EVAL_ALERT_DAILY_LIMIT_DRIFT}" \
     --set-string "platformAgent.deployment.env[2].name=INCIDENT_WORKLOAD_DEDUP_SECONDS" \
     --set-string "platformAgent.deployment.env[2].value=${EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS}" \
+    --set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_VCS_READINGS_ENABLED" \
+    --set-string "platformAgent.deployment.env[3].value=false" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     --set "plugins.pubsubPlatform.enabled=true" \
