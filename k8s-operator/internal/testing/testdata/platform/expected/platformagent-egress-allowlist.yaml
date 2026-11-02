@@ -2216,17 +2216,6 @@ spec:
             matchLabels:
               app: platformagent-credential-proxy
     - ports:
-        - port: 8443
-          protocol: TCP
-      to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kubeagents-system
-          podSelector:
-            matchLabels:
-              app: platformagent-kube-proxy
-              kubeagents.x-k8s.io/component: kube-proxy
-    - ports:
         - port: 2222
           protocol: TCP
       to:

@@ -130,6 +130,7 @@ class _SandboxEntrypointHarness(unittest.TestCase):
         # A developer shell that happens to export these must not change the mode.
         env.pop("SANDBOX_IMAGE_TREES", None)
         env.pop("SANDBOX_MOUNTINFO", None)
+        env.pop("KUBE_PROXY_URL", None)
         env.update(
             {
                 "PATH": f"{self.bin_dir}{os.pathsep}{env['PATH']}",
@@ -670,6 +671,71 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
         self.assertIn('SANDBOX_AUDIT_AUTO_PROMOTE_FILE="/run/kube-agents-sandbox/audit-auto-promote"', content)
         self.assertRegex(content, r'printf \'%s\\n\' "\$\{KUBEAGENTS_AUDIT_AUTO_PROMOTE:-true\}" >"\$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"')
         self.assertIn('chmod 0644 "$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"', content)
+
+
+class SandboxEntrypointKubeconfigMigrationTest(_SandboxEntrypointHarness):
+    """Legacy gke-gcloud-auth-plugin kubeconfig migration and context character guard."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        stat_stub = self.bin_dir / "stat"
+        stat_stub.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-c" ] && [ "$2" = "%h %U" ]; then\n'
+            '  echo "1 agent"\n'
+            "  exit 0\n"
+            "fi\n"
+            "exec /usr/bin/stat \"$@\"\n"
+        )
+        stat_stub.chmod(0o755)
+
+    def test_legacy_kubeconfig_with_valid_context_is_rewritten(self) -> None:
+        legacy = self.data / "kubeconfig.yaml"
+        legacy.write_text(
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "current-context: gke_my-proj_us-central1-a_cluster-1\n"
+            "users:\n"
+            "- name: gke\n"
+            "  user:\n"
+            "    exec:\n"
+            "      command: gke-gcloud-auth-plugin\n"
+        )
+        self._run(
+            ". profiles/platform",
+            extra_env={
+                "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                "KUBE_CONTEXT_NAME": "gke_my-proj_us-central1-a_default",
+            },
+        )
+        rewritten = legacy.read_text()
+        self.assertIn(
+            "server: https://agent-kube-proxy:8443/clusters/gke_my-proj_us-central1-a_cluster-1",
+            rewritten,
+        )
+        self.assertNotIn("gke-gcloud-auth-plugin", rewritten)
+
+    def test_legacy_kubeconfig_with_unsafe_context_characters_is_skipped(self) -> None:
+        legacy = self.data / "kubeconfig.yaml"
+        original = (
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "current-context: gke_my-proj/../../evil\n"
+            "users:\n"
+            "- name: gke\n"
+            "  user:\n"
+            "    exec:\n"
+            "      command: gke-gcloud-auth-plugin\n"
+        )
+        legacy.write_text(original)
+        self._run(
+            ". profiles/platform",
+            extra_env={
+                "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                "KUBE_CONTEXT_NAME": "gke_my-proj_us-central1-a_default",
+            },
+        )
+        self.assertEqual(original, legacy.read_text())
 
 
 if __name__ == "__main__":

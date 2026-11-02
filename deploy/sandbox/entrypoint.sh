@@ -479,6 +479,68 @@ MARKER
   done
 done
 
+write_kube_proxy_kubeconfig() {
+  local target_file="$1"
+  local ctx="$2"
+  cat >"$target_file" <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- name: ${ctx}
+  cluster:
+    server: ${KUBE_PROXY_URL%/}/clusters/${ctx}
+    certificate-authority: ${ca_file}
+users:
+- name: kube-proxy-caller
+  user:
+    tokenFile: ${token_file}
+contexts:
+- name: ${ctx}
+  context:
+    cluster: ${ctx}
+    user: kube-proxy-caller
+current-context: ${ctx}
+EOF
+  chown agent:agent "$target_file"
+  chmod 0600 "$target_file"
+}
+
+if [ -n "${KUBE_PROXY_URL:-}" ]; then
+  default_ctx="${KUBE_CONTEXT_NAME:-in-cluster}"
+  ca_file="${KUBE_PROXY_CA_FILE:-/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt}"
+  token_file="${CREDENTIAL_PROXY_TOKEN_FILE:-/var/run/secrets/kubeagents/credential-proxy/token}"
+  clear_symlinks_under_data "$DATA/.kubeconfig"
+  displace_if_not_a_regular_file "$DATA/.kubeconfig"
+  write_kube_proxy_kubeconfig "$DATA/.kubeconfig" "$default_ctx"
+  for kc in \
+    "$DATA/kubeconfig.yaml" \
+    "$DATA/.kube/config" \
+    "$DATA"/.kubeconfigs/kubeconfig*.yaml \
+    "$DATA"/profiles/*/kubeconfig.yaml \
+    "$DATA"/profiles/*/.kubeconfigs/kubeconfig*.yaml; do
+    if [ ! -e "$kc" ] && [ ! -L "$kc" ]; then
+      continue
+    fi
+    clear_symlinks_under_data "$kc"
+    if [ ! -f "$kc" ]; then
+      continue
+    fi
+    if [ "$(stat -c '%h %U' "$kc" 2>/dev/null || true)" != "1 agent" ]; then
+      continue
+    fi
+    if grep -q "gke-gcloud-auth-plugin" "$kc" 2>/dev/null; then
+      kc_ctx="$(awk '/^current-context:/{sub(/^current-context:[[:space:]]*/,""); print; exit}' "$kc" 2>/dev/null | tr -d "'\"[:space:]" || true)"
+      if [ -z "$kc_ctx" ]; then
+        kc_ctx="$default_ctx"
+      fi
+      case "$kc_ctx" in
+      *[!A-Za-z0-9._:-]* | "") continue ;;
+      esac
+      write_kube_proxy_kubeconfig "$kc" "$kc_ctx" || log "WARNING: could not rewrite legacy kubeconfig $kc"
+    fi
+  done
+fi
+
 # 2. The agent's public key. Failing loudly here is the point: without it sshd
 #    starts perfectly happily and every connection is refused with "Permission
 #    denied (publickey)", which reads like a key mismatch on the agent side and
@@ -645,72 +707,11 @@ if [ -z "${CREDENTIAL_PROXY_URL:-}" ]; then
   log "broker."
 fi
 
-write_kube_proxy_kubeconfig() {
-  local target_file="$1"
-  local ctx="$2"
-  cat >"$target_file" <<EOF
-apiVersion: v1
-kind: Config
-clusters:
-- name: ${ctx}
-  cluster:
-    server: ${KUBE_PROXY_URL%/}/clusters/${ctx}
-    certificate-authority: ${ca_file}
-users:
-- name: kube-proxy-caller
-  user:
-    tokenFile: ${token_file}
-contexts:
-- name: ${ctx}
-  context:
-    cluster: ${ctx}
-    user: kube-proxy-caller
-current-context: ${ctx}
-EOF
-  chown agent:agent "$target_file"
-  chmod 0600 "$target_file"
-}
-
-if [ -n "${KUBE_PROXY_URL:-}" ]; then
-  default_ctx="${KUBE_CONTEXT_NAME:-in-cluster}"
-  ca_file="${KUBE_PROXY_CA_FILE:-/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt}"
-  token_file="${CREDENTIAL_PROXY_TOKEN_FILE:-/var/run/secrets/kubeagents/credential-proxy/token}"
-  clear_symlinks_under_data "$DATA/.kubeconfig"
-  displace_if_not_a_regular_file "$DATA/.kubeconfig"
-  write_kube_proxy_kubeconfig "$DATA/.kubeconfig" "$default_ctx"
-  for kc in \
-    "$DATA/kubeconfig.yaml" \
-    "$DATA/.kube/config" \
-    "$DATA"/.kubeconfigs/kubeconfig*.yaml \
-    "$DATA"/profiles/*/kubeconfig.yaml \
-    "$DATA"/profiles/*/.kubeconfigs/kubeconfig*.yaml; do
-    if [ ! -e "$kc" ] && [ ! -L "$kc" ]; then
-      continue
-    fi
-    clear_symlinks_under_data "$kc"
-    if [ ! -f "$kc" ]; then
-      continue
-    fi
-    if [ "$(stat -c '%h %U' "$kc" 2>/dev/null || true)" != "1 agent" ]; then
-      continue
-    fi
-    if grep -q "gke-gcloud-auth-plugin" "$kc" 2>/dev/null; then
-      kc_ctx="$(awk '/^current-context:/{sub(/^current-context:[[:space:]]*/,""); print; exit}' "$kc" 2>/dev/null | tr -d "'\"[:space:]" || true)"
-      if [ -z "$kc_ctx" ]; then
-        kc_ctx="$default_ctx"
-      fi
-      case "$kc_ctx" in
-      *[!A-Za-z0-9._:-]* | "") continue ;;
-      esac
-      write_kube_proxy_kubeconfig "$kc" "$kc_ctx" || log "WARNING: could not rewrite legacy kubeconfig $kc"
-    fi
-  done
-  if id -u hermes >/dev/null 2>&1; then
-    install -d -m 0700 -o hermes -g hermes /home/hermes/.kube
-    cp "$DATA/.kubeconfig" /home/hermes/.kube/config
-    chown hermes:hermes /home/hermes/.kube/config
-    chmod 0600 /home/hermes/.kube/config
-  fi
+if [ -n "${KUBE_PROXY_URL:-}" ] && id -u hermes >/dev/null 2>&1; then
+  install -d -m 0700 -o hermes -g hermes /home/hermes/.kube
+  cp "$DATA/.kubeconfig" /home/hermes/.kube/config
+  chown hermes:hermes /home/hermes/.kube/config
+  chmod 0600 /home/hermes/.kube/config
 fi
 
 log "ready; starting $*"

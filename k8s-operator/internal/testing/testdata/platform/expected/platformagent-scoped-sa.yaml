@@ -1439,6 +1439,7 @@ spec:
   template:
     metadata:
       annotations:
+        kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
         kubeagents.x-k8s.io/tls-cert-hash: <SHA256_FOR_TESTS>
       labels:
         app: platformagent-kube-proxy
@@ -1479,6 +1480,10 @@ spec:
               value: "true"
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
+            - name: CREDENTIAL_PROXY_SCOPED_SA_POOL
+              value: "1"
+            - name: CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE
+              value: /etc/credential-proxy/scoped-sa-pool.json
           image: ghcr.io/gke-labs/kube-agents/kube-proxy:latest
           imagePullPolicy: IfNotPresent
           name: kube-proxy
@@ -1518,6 +1523,10 @@ spec:
             - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               name: event-watcher-ksa-token
               readOnly: true
+            - mountPath: /etc/credential-proxy/scoped-sa-pool.json
+              name: credential-proxy-policy
+              readOnly: true
+              subPath: scoped-sa-pool.json
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -1542,6 +1551,9 @@ spec:
                     - key: ca.crt
                       path: ca.crt
                   name: kube-root-ca.crt
+        - configMap:
+            name: platformagent-credential-proxy-policy
+          name: credential-proxy-policy
 status: {}
 ---
 apiVersion: networking.k8s.io/v1

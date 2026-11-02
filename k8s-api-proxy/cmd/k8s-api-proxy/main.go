@@ -82,6 +82,19 @@ func inClusterConfig(apiServer, caFile, tokenFile string) *rest.Config {
 	}
 }
 
+func parseAllowedCallers(raw string) ([]string, error) {
+	var callers []string
+	for _, entry := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(entry); trimmed != "" {
+			callers = append(callers, trimmed)
+		}
+	}
+	if len(callers) == 0 {
+		return nil, errors.New("--allowed-callers (or CREDENTIAL_PROXY_ALLOWED_CALLERS) is required and must name at least one caller ServiceAccount")
+	}
+	return callers, nil
+}
+
 func main() {
 	defaultCluster := envOrDefault("KUBE_PROXY_DEFAULT_CLUSTER", envOrDefault("KUBE_CONTEXT_NAME", k8sapiproxy.InClusterID))
 
@@ -122,14 +135,9 @@ func main() {
 		}()
 	}
 
-	var callers []string
-	for _, entry := range strings.Split(*allowedCallers, ",") {
-		if trimmed := strings.TrimSpace(entry); trimmed != "" {
-			callers = append(callers, trimmed)
-		}
-	}
-	if len(callers) == 0 {
-		log.Fatalf("--allowed-callers (or CREDENTIAL_PROXY_ALLOWED_CALLERS) is required and must name at least one caller ServiceAccount")
+	callers, err := parseAllowedCallers(*allowedCallers)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	inCluster := inClusterConfig(*kubeAPIServer, *kubeCAFile, *kubeTokenFile)
@@ -149,13 +157,26 @@ func main() {
 		WIFTokenFile:      os.Getenv("CREDENTIAL_PROXY_WIF_TOKEN_FILE"),
 	})
 
-	upstreamTransport, err := upstream.New(ctx, upstream.Config{
-		InCluster:     inCluster,
-		HostClusterID: *hostClusterIDF,
-		TokenSource:   gcpTokens,
-	})
-	if err != nil {
-		log.Fatalf("failed to initialize upstream transport: %v", err)
+	var upstreamTransport k8sapiproxy.UpstreamTransport
+	if scopedPoolEnabled(os.Getenv(scopedPoolFlagEnv)) {
+		poolPath := envOrDefault(scopedPoolFileEnv, defaultScopedPoolFile)
+		members, err := loadScopedSAPool(poolPath)
+		if err != nil {
+			log.Fatalf("failed to load scoped service account pool: %v", err)
+		}
+		upstreamTransport, err = newScopedPoolTransport(ctx, members, gcpTokens, "", nil, inCluster, "")
+		if err != nil {
+			log.Fatalf("failed to initialize scoped upstream transport: %v", err)
+		}
+	} else {
+		upstreamTransport, err = upstream.New(ctx, upstream.Config{
+			InCluster:     inCluster,
+			HostClusterID: *hostClusterIDF,
+			TokenSource:   gcpTokens,
+		})
+		if err != nil {
+			log.Fatalf("failed to initialize upstream transport: %v", err)
+		}
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))

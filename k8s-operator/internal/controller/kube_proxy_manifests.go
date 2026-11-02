@@ -149,6 +149,14 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 			kubeProxyTLSHashAnnotation: tlsCertHash,
 		}
 	}
+	if scopedSAPoolEnabled(agent) {
+		if policyHash, err := getConfigMapHash(buildCredentialProxyPolicyConfigMap(agent)); err == nil && policyHash != "" {
+			if podAnnotations == nil {
+				podAnnotations = make(map[string]string)
+			}
+			podAnnotations["kubeagents.x-k8s.io/proxy-policy-hash"] = policyHash
+		}
+	}
 
 	var affinity *corev1.Affinity
 	var nodeSelector map[string]string
@@ -226,6 +234,29 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 			corev1.VolumeMount{Name: credentialProxyWIFTokenVolume, MountPath: credentialProxyWIFTokenPath, ReadOnly: true},
 		)
 		volumes = append(volumes, buildCredentialProxyFederationVolume(agent)...)
+	}
+
+	if scopedSAPoolEnabled(agent) {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL", Value: "1"},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE", Value: scopedSAPoolMountPath},
+		)
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "credential-proxy-policy",
+			MountPath: scopedSAPoolMountPath,
+			SubPath:   scopedSAPoolKey,
+			ReadOnly:  true,
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: "credential-proxy-policy",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: agent.Name + "-credential-proxy-policy",
+					},
+				},
+			},
+		})
 	}
 
 	container := corev1.Container{
@@ -464,6 +495,9 @@ func (r *PlatformAgentReconciler) ensureKubeProxyTLSSecret(ctx context.Context, 
 }
 
 func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) error {
+	if credentialProxySandboxURL(agent) == "" {
+		return nil
+	}
 	tlsHash, err := r.ensureKubeProxyTLSSecret(ctx, agent)
 	if err != nil {
 		return err
