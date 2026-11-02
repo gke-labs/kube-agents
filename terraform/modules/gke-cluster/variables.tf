@@ -199,8 +199,11 @@ variable "standard_disk_type" {
   type        = string
   default     = null
 
+  # "" counts as unset, as coalesce already treats it for the machine types:
+  # a blanked TF_VAR_ line in install.env exports "". Equality tests only, so
+  # Terraform below 1.10, which evaluates both operands, plans at null too.
   validation {
-    condition     = var.standard_disk_type == null ? true : contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced"], var.standard_disk_type)
+    condition     = (var.standard_disk_type == null || var.standard_disk_type == "") ? true : contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced"], var.standard_disk_type)
     error_message = "standard_disk_type must be pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced."
   }
 }
@@ -268,8 +271,11 @@ variable "gvisor_disk_type" {
   type        = string
   default     = null
 
+  # "" counts as unset, as coalesce already treats it for the machine types:
+  # a blanked TF_VAR_ line in install.env exports "". Equality tests only, so
+  # Terraform below 1.10, which evaluates both operands, plans at null too.
   validation {
-    condition     = var.gvisor_disk_type == null ? true : contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced"], var.gvisor_disk_type)
+    condition     = (var.gvisor_disk_type == null || var.gvisor_disk_type == "") ? true : contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced"], var.gvisor_disk_type)
     error_message = "gvisor_disk_type must be pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced."
   }
 }

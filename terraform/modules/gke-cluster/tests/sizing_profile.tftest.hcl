@@ -2,9 +2,10 @@
 # "medium" profile with it, render the shape the module produced before
 # sizing_profile existed, so an existing caller plans no change; "fleet"
 # renders the fleet-tier shapes; an explicit machine type or disk value wins
-# over the profile; and the validations refuse an unknown profile, a disk
-# under GKE's 10 GB floor, an unknown disk type, and an autoscaling floor
-# above the ceiling. Providers mocked, plan only: nothing here reaches a cloud.
+# over the profile; "" on a string input means unset; and the validations
+# refuse an unknown profile, a disk under GKE's 10 GB floor, an unknown disk
+# type, and an autoscaling floor above the ceiling. Providers mocked, plan
+# only: nothing here reaches a cloud.
 
 mock_provider "google" {}
 mock_provider "google-beta" {}
@@ -133,6 +134,32 @@ run "an_explicit_value_beside_fleet_wins_over_the_profile" {
   assert {
     condition     = output.standard_machine_type == "e2-standard-4" && output.standard_disk_size_gb == 50 && output.standard_disk_type == "pd-ssd" && output.gvisor_machine_type == "n2-standard-2" && output.gvisor_disk_size_gb == 100 && output.gvisor_disk_type == "pd-standard"
     error_message = "the resolved-shape outputs must report the explicit values"
+  }
+}
+
+# A blanked `TF_VAR_` line in install.env exports "", and "" means unset on
+# every string input: the disk types fall back to the profile's type the way
+# the machine types already did through coalesce, rather than failing the
+# disk-type validation.
+run "a_blank_string_input_takes_the_profile_s_value" {
+  command = plan
+
+  variables {
+    sizing_profile        = "fleet"
+    standard_machine_type = ""
+    standard_disk_type    = ""
+    gvisor_machine_type   = ""
+    gvisor_disk_type      = ""
+  }
+
+  assert {
+    condition     = google_container_cluster.standard[0].node_config[0].machine_type == "n2-standard-8" && google_container_cluster.standard[0].node_config[0].disk_type == "pd-balanced"
+    error_message = "a blank default-pool machine type or disk type must take the profile's value: ${google_container_cluster.standard[0].node_config[0].machine_type} / ${google_container_cluster.standard[0].node_config[0].disk_type}"
+  }
+
+  assert {
+    condition     = google_container_node_pool.gvisor[0].node_config[0].machine_type == "n2-standard-4" && google_container_node_pool.gvisor[0].node_config[0].disk_type == "pd-balanced"
+    error_message = "a blank gVisor machine type or disk type must take the profile's value: ${google_container_node_pool.gvisor[0].node_config[0].machine_type} / ${google_container_node_pool.gvisor[0].node_config[0].disk_type}"
   }
 }
 
