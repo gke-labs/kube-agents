@@ -23386,12 +23386,12 @@ metadata:
 
     def test_no_declaration_found_gives_the_sibling_sentence(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
-        # An index that covered the whole repository and holds nothing.
-        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, {}, complete=True)
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, {})
         paragraph = finding["remediation"]["note"].split("\n\n")[-1]
         self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_OBJECT_MARK), paragraph[:120])
         self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, paragraph)
-        self.assertIn("found no declaration of this object", paragraph)
+        self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, paragraph)
+        self.assertNotIn("found no declaration", paragraph)
 
     def test_two_declaring_files_are_ambiguous(self):
         self.write(self.PLANTED, self.PLANTED_DECLARATION)
@@ -23452,7 +23452,7 @@ metadata:
         files = {self.PLANTED: self.PLANTED_DECLARATION, "apps/web.yaml": "kind: Deployment\nmetadata:\n  name: web\n"}
         scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker(files), every_kind=True)
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
-        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, scan.declarations, complete=True)
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, scan.declarations)
         self.assertIn(f"The declaration is `{self.PLANTED}`.", finding["remediation"]["note"])
 
     def test_content_mode_indexes_every_config_connector_kind(self):
@@ -23468,7 +23468,7 @@ metadata:
         self.assertEqual([declaration.path for declaration in scan.declarations.values()], ["pubsub/events.yaml"])
         finding = make_finding(fid="t", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="PubSubTopic/events",
                                namespace="infra", remediation={"kind": "manual", "note": "Grant the role."})
-        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(dict(KCC_TOPIC, name="events")), self.root, scan.declarations, complete=True)
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(dict(KCC_TOPIC, name="events")), self.root, scan.declarations)
         self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
 
     def test_the_gcloud_check_keeps_its_container_search_under_many_iam_files(self):
@@ -23496,30 +23496,44 @@ metadata:
         scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker({"t.yaml": topic}), every_kind=True)
         self.assertEqual([key[0] for key in scan.declarations], ["PubSubTopic"])
 
-    def test_a_truncated_paragraph_search_makes_no_absence_claim(self):
-        topic = "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: other\n"
-        scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker({"t.yaml": topic}, truncated=True), every_kind=True)
-        self.assertTrue(scan.truncated)
+    def test_a_templated_declaration_gives_no_absence_claim(self):
+        """Review finding: a file the audit cannot parse (a Helm or Kustomize
+        template) was skipped, and the paragraph then said that no file
+        declares the object. The paragraph only says it names no file."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION.replace('"nodeCount": 1', '"nodeCount": {{ .Values.count }}').replace("{\n", "{{- /* t */ -}}\n{\n", 1))
+        self.write("templated.yaml", "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerNodePool\nmetadata:\n"
+                   "  name: {{ .Values.name }}\n  {{ if .Values.x }}bad: [\n")
+        declarations = audit_report.kcc_declarations(self.root)
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
-        audit_report.disclose_stalled_kcc_remediations(
-            [finding], self.live_manifest(), self.root, scan.declarations, complete=not scan.truncated and not scan.failed
-        )
-        self.assertIn("could not search the whole GitOps repository", finding["remediation"]["note"])
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+        note = finding["remediation"]["note"]
+        self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
+        for claim in ("found no declaration", "no declaration of this object", "could not search"):
+            self.assertNotIn(claim, note)
 
-    def test_an_incomplete_search_never_claims_that_no_file_declares_the_object(self):
-        """A truncated or failed broker scan, or a dry run with no clone, did
-        not search the whole repository."""
-        for label, declarations, complete in (("truncated", {}, False), ("not run", None, None)):
-            with self.subTest(search=label):
+    def test_a_json_declaration_is_indexed(self):
+        """Config Sync applies `.json` files, and the paragraph's broker search
+        matches a JSON `apiVersion` key, so both modes read them."""
+        path = self.PLANTED.replace(".yaml", ".json")
+        self.write(path, self.PLANTED_DECLARATION.replace("  ", "\t"))
+        for label, declarations in (
+            ("clone", audit_report.kcc_declarations(self.root)),
+            ("broker", audit_report.kcc_declarations_via_broker(
+                "acme/fleet", self.broker({path: self.PLANTED_DECLARATION}), every_kind=True).declarations),
+        ):
+            with self.subTest(mode=label):
                 finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
-                audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations, complete)
-                note = finding["remediation"]["note"]
-                self.assertNotIn("found no declaration", note)
-                self.assertIn("could not search the whole GitOps repository", note)
+                audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+                self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
 
-    def test_without_pyyaml_no_search_counts_as_complete(self):
-        """Without PyYAML nothing is parsed: the broker scan is failed and a
-        clone does not count as searched."""
+    def test_the_absence_sentence_is_gone(self):
+        """No text the audit writes says that no file declares an object."""
+        source = Path(audit_report.__file__).read_text(encoding="utf-8")
+        for sentence in ("found no declaration", "could not search the whole GitOps repository"):
+            self.assertNotIn(sentence, source)
+        self.assertFalse(hasattr(audit_report, "_kcc_clone_searched"))
+
+    def test_without_pyyaml_the_broker_scan_is_failed(self):
         real_import = __import__
 
         def no_yaml(name, *args, **kwargs):
@@ -23529,10 +23543,7 @@ metadata:
 
         with mock.patch("builtins.__import__", side_effect=no_yaml):
             scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker({}), every_kind=True)
-            searched = audit_report._kcc_clone_searched([("", self.root)])
         self.assertTrue(scan.failed)
-        self.assertFalse(searched)
-        self.assertTrue(audit_report._kcc_clone_searched([("", self.root)]))
 
     def test_a_failed_broker_scan_is_marked_failed(self):
         class Broken:
@@ -23645,7 +23656,7 @@ metadata:
         )
         finding = self.harness_finding(prefix + block + " Raise the cap.")
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(self.POOL_STALL), self.root, declarations={}, complete=True)
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(self.POOL_STALL), self.root, declarations={})
         note = finding["remediation"]["note"]
         self.assertTrue(note.startswith(prefix), note[:200])
         self.assertIn("- provisioning/pool.yaml", note)
@@ -23717,7 +23728,7 @@ metadata:
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, audit_report.kcc_declarations(self.root))
         note = finding["remediation"]["note"]
         self.assertNotIn("a/prod.yaml", note)
-        self.assertIn("found no declaration", note)
+        self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
         self.write("b/prod.yaml", cluster.format(project="proj-b", location="europe-west1"))
         finding["remediation"]["note"] = "Set the channel."
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, audit_report.kcc_declarations(self.root))
@@ -23787,7 +23798,7 @@ metadata:
         note = finding["remediation"]["note"]
         self.assertTrue(note.startswith("Add a fallback."))
         self.assertIn(audit_report.KCC_STALLED_OBJECT_MARK, note)
-        self.assertIn("found no declaration of this object", note)
+        self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
         comment = audit_report.render_persists_comment(AUDIT, finding, NOW)
         self.assertNotIn("this fix changed", comment)
 
@@ -23952,15 +23963,15 @@ class TestStalledKccInFinish(HarnessTestCase):
         self.assertIn("DRY RUN: ", self.err)
 
     def test_a_dry_run_with_no_clone_claims_no_absence(self):
-        """A content-mode dry run has no clone and opens no broker session, so
-        it did not search the repository: no "found no declaration"."""
+        """A content-mode dry run has no clone and opens no broker session;
+        the paragraph names no file and makes no claim about the repository."""
         finding = make_finding(obj="Cluster/prod-usc1", remediation={"kind": "manual", "note": "Set the release channel."})
         self.patch_attr("kcc_declaration_roots", lambda *args, **kwargs: [])
         rc = self.run_finish(make_doc(findings=[finding]), ["--dry-run", "--manifest-file", self.manifest_file(self.stalled_manifest())])
         self.assertEqual(rc, 0, self.err)
         self.assertIn(audit_report.KCC_STALLED_OBJECT_MARK, self.out)
-        self.assertIn("could not search the whole GitOps repository", self.out)
-        self.assertNotIn("found no declaration", self.out)
+        self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, self.out)
+        self.assertNotIn("could not search", self.out)
 
     def test_a_merged_fix_that_still_reproduces_says_config_connector_is_not_applying_it(self):
         doc = self.doc_and_file()
