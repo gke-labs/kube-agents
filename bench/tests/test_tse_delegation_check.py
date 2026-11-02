@@ -7,7 +7,7 @@ call can name the assignee. The case reads the delegation in two entries.
 ``delegated-to-tse-specialist`` reads the router's ``kanban_create`` by tool
 name alone, which both transports keep; it is trace-blind, so the scorer
 grades it on the inject lane too. ``tse-specialist-completed-the-card`` reads
-the router's card and then the worker's calls, which the harness reads back
+the router's card with its readable ``assignee`` and then the worker's calls, which the harness reads back
 from the pod tagged with the profile; it is worker-blind, graded on the api
 lane and set aside on inject.
 Every fixture runs through the whole entry as the runner grades it, built
@@ -101,9 +101,12 @@ def test_the_router_entry_grades_on_the_inject_lane_and_the_worker_entry_does_no
     assert WORKER_ENTRY in spec.worker_blind_checks
 
 
-def test_the_inject_lanes_shaped_create_passes_both_entries():
+def test_the_inject_lanes_shaped_create_passes_the_router_entry():
     assert _status(ROUTER_ENTRY, [SHAPED_CREATE] + _tse_run()) == "pass"
-    assert _status(WORKER_ENTRY, [SHAPED_CREATE] + _tse_run()) == "pass"
+    # The worker entry keeps the assignee read, which a shaped argument cannot
+    # satisfy; the scorer never grades this entry on an inject record, so the
+    # runner's honest answer there is a fail that nothing tallies.
+    assert _status(WORKER_ENTRY, [SHAPED_CREATE] + _tse_run()) == "fail"
 
 
 def test_the_api_lanes_readable_create_passes_both_entries():
@@ -125,16 +128,24 @@ def test_a_card_filed_and_never_worked_is_unobserved_not_a_pass():
     # No tagged entry at all: the workers scope cannot see the card, so the
     # entry is an error, which coverage blocks, never a pass.
     assert _status(ROUTER_ENTRY, [SHAPED_CREATE]) == "pass"
-    assert _status(WORKER_ENTRY, [SHAPED_CREATE]) == "error"
+    assert _status(WORKER_ENTRY, [READABLE_CREATE]) == "error"
 
 
 def test_another_profile_completing_the_card_fails_the_worker_entry():
-    assert _status(WORKER_ENTRY, [SHAPED_CREATE] + _tse_run(agent="platform")) == "fail"
+    assert _status(WORKER_ENTRY, [READABLE_CREATE] + _tse_run(agent="platform")) == "fail"
     assert _status(WORKER_ENTRY, [READABLE_CREATE] + _tse_run(agent="cluster-seeded-a")) == "fail"
     # The selector is anchored: a profile whose name starts with tse is not tse.
-    assert _status(WORKER_ENTRY, [SHAPED_CREATE] + _tse_run(agent="tse-2")) == "fail"
+    assert _status(WORKER_ENTRY, [READABLE_CREATE] + _tse_run(agent="tse-2")) == "fail"
+
+
+def test_a_card_filed_to_another_profile_fails_the_worker_entry_whoever_completes_it():
+    # The router filed the card to platform; a platform worker fanned a child out
+    # to tse, which completed it. Not the delegation the case asks for.
+    to_platform = {**READABLE_CREATE, "args": {**READABLE_CREATE["args"], "assignee": "platform"}}
+    assert _status(WORKER_ENTRY, [to_platform] + _tse_run()) == "fail"
+    assert _status(ROUTER_ENTRY, [to_platform] + _tse_run()) == "pass"
 
 
 def test_a_tse_card_started_and_not_completed_fails_the_worker_entry():
-    assert _status(WORKER_ENTRY, [SHAPED_CREATE] + _tse_run()[:-1]) == "fail"
-    assert _status(WORKER_ENTRY, [SHAPED_CREATE] + _tse_run(status="error")) == "fail"
+    assert _status(WORKER_ENTRY, [READABLE_CREATE] + _tse_run()[:-1]) == "fail"
+    assert _status(WORKER_ENTRY, [READABLE_CREATE] + _tse_run(status="error")) == "fail"

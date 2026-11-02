@@ -64,7 +64,11 @@ verification_spec:
   # fail-fast `sequence`: with no card at all the workers scope has nothing
   # to read and answers `error`, which blocks the repetition at the coverage
   # rung before any fail is tallied; the router leaf turns that run into a
-  # definite fail on the api lane too. A card filed and never worked still
+  # definite fail on the api lane too. That leaf keeps the `assignee` read:
+  # the api lane, the one lane that grades this entry, records the argument
+  # readable, and a card the Planning Agent filed to another profile, whose
+  # worker fanned a child out to tse, is not the delegation the case asks
+  # for. A card filed and never worked still
   # has no tagged entry and reads as `error`: the run is unobserved, and
   # coverage blocks it. `kanban_complete` rather than any tse call: a card
   # the specialist started and dropped is not a delegation that answered.
@@ -76,6 +80,8 @@ verification_spec:
       checks:
         - type: tool_called
           tool_names: ["kanban_create"]
+          arguments:
+            assignee: "^tse$"
           require_success: true
         - type: tool_called
           scope: workers
