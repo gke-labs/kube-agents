@@ -518,7 +518,16 @@ def is_non_production(name: str, labels: dict | None = None, namespace: str = ""
 
 Run = collector_run.Run
 run_and_gate = collector_run.run_and_gate
+paged_dump = collector_run.paged_dump
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
+
+# The per-cluster reads. ComputeClass is a CRD (`cloud.google.com`) outside the
+# collections a paged read may page, and a cluster holds a handful, so it keeps
+# its one-shot read; the four built-in kinds are paged, one kind at a time, so a
+# cluster of a few hundred nodes no longer meets the credential proxy's output
+# cap in one `-A -o json` dump.
+COMPUTECLASS_KIND = "computeclasses"
+PAGED_DUMP_KINDS = ("deployments", "statefulsets", "storageclasses", "nodes")
 
 
 RunFn = Callable[..., Run]
@@ -1785,17 +1794,25 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         return {"name": target, "project": project, "location": location, **mode, "outcome": UNREACHABLE_OUTCOME, "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
 
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
-    dump_argv = ["kubectl", "get", "computeclasses,deployments,statefulsets,storageclasses,nodes", "-A", "-o", "json"]
-    parsed, result = run_and_gate(dump_argv, run=run, env=env)
-    if parsed is None:
-        return {"name": target, "project": project, "location": location, **mode, "outcome": GATE_FAILED_OUTCOME, "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
+    cc_argv = ["kubectl", "get", COMPUTECLASS_KIND, "-A", "-o", "json"]
+    cc_parsed, cc_result = run_and_gate(cc_argv, run=run, env=env)
+    if cc_parsed is None:
+        return {"name": target, "project": project, "location": location, **mode, "outcome": GATE_FAILED_OUTCOME, "error": f"object dump gate failed (rc={cc_result.rc}): {cc_result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
+    if not isinstance(cc_parsed, dict) or not isinstance(cc_parsed.get("items"), list):
         # Parsed but not a List: read as `items: []` it would be a cluster with
         # nothing on it, audited clean.
         return {"name": target, "project": project, "location": location, **mode, "outcome": GATE_FAILED_OUTCOME, "error": "object dump gate failed: the answer has no `items` list"}
-    dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
+    parsed, result = paged_dump(PAGED_DUMP_KINDS, run=run, env=env)
+    if parsed is None:
+        return {"name": target, "project": project, "location": location, **mode, "outcome": GATE_FAILED_OUTCOME, "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}
+    # One record for the five kinds, as the one dump was: the two reads' command
+    # lines, and a digest over both outputs.
+    dump_record = _record(
+        f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}; {collector_run.paged_command_text(PAGED_DUMP_KINDS)}",
+        Run(result.argv, 0, cc_result.stdout + "\n" + result.stdout, "", cc_result.duration_s + result.duration_s),
+    )
 
-    items = parsed.get("items", [])
+    items = cc_parsed.get("items", []) + parsed.get("items", [])
     all_compute_classes = [i for i in items if i.get("kind") == "ComputeClass"]
     # §2's standard exclusions, applied before any check reads an object. An
     # excluded workload also stops counting as a ComputeClass's inference or

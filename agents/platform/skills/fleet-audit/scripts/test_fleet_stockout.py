@@ -32,6 +32,21 @@ os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 # no test here reaches the network or depends on the host's broker.
 os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
+import test_collector_run as _shared_run_tests  # noqa: E402
+
+# The collector pages its kinds through `kubectl get --raw`; the fakes below
+# still answer the one-shot dump, and the adapter feeds the real paging from
+# it (test_collector_run.paged_dump_over). The tests that assert the paged
+# argv itself pass a `--raw`-aware fake and bypass this by patching it back.
+_PAGED_DUMP = patch.object(fs, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
@@ -1531,6 +1546,51 @@ class CollectClusterTest(unittest.TestCase):
         "ERROR: (gcloud.container.node-pools.list) ResponseError: code=400, "
         "message=Autopilot node pools cannot be accessed or modified."
     )
+
+    def test_the_cluster_is_read_as_one_crd_read_and_four_paged_kinds(self):
+        """The real paging, not the adapter: ComputeClass keeps its one-shot
+        read (a CRD outside the paged collections), the four built-in kinds
+        are paged `kubectl get --raw` reads, and a cut page fails the cluster
+        closed with the shim's marker in the error."""
+        issued = []
+
+        def run(argv, cut=False, **kwargs):
+            issued.append(argv)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:3] == ["kubectl", "get", "computeclasses"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                return run_of(0, json.dumps({"metadata": {}, "items": []}))
+            if argv[:2] == ["kubectl", "get"]:
+                raise AssertionError(f"a one-shot dump was issued: {argv}")
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp, patch.object(fs, "KUBECONFIG_DIR", Path(tmp)), patch.object(fs, "paged_dump", _shared_run_tests.cr.paged_dump):
+            entry = fs.collect_cluster(self.CLUSTER, run=run)
+        self.assertEqual(entry["outcome"], "collected", entry.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(
+            ["/apis/apps/v1/deployments?limit=500", "/apis/apps/v1/statefulsets?limit=500",
+             "/apis/storage.k8s.io/v1/storageclasses?limit=500", "/api/v1/nodes?limit=100"],
+            raw,
+        )
+        self.assertEqual(1, len([a for a in issued if a[:3] == ["kubectl", "get", "computeclasses"]]))
+        command = next(c["command"] for c in entry["commands"] if c["check"] == "dangling-compute-class")
+        self.assertIn("kubectl get computeclasses -A -o json; kubectl get --raw", command)
+
+        def cut_run(argv, **kwargs):
+            if argv[:3] == ["kubectl", "get", "--raw"] and argv[3].startswith("/api/v1/nodes"):
+                return run_of(74, '{"items": [{"metadata": {"name": "n', "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)")
+            return run(argv, **kwargs)
+
+        with TemporaryDirectory() as tmp, patch.object(fs, "KUBECONFIG_DIR", Path(tmp)), patch.object(fs, "paged_dump", _shared_run_tests.cr.paged_dump):
+            entry = fs.collect_cluster(self.CLUSTER, run=cut_run)
+        self.assertEqual(entry["outcome"], fs.GATE_FAILED_OUTCOME)
+        self.assertIn("rc=74", entry["error"])
+        self.assertIn("credential proxy output truncated", entry["error"])
 
     def run_with(
         self,

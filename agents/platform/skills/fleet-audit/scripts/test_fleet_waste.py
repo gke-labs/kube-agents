@@ -28,6 +28,21 @@ os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 # no test here reaches the network or depends on the host's broker.
 os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
+import test_collector_run as _shared_run_tests  # noqa: E402
+
+# The collector pages its kinds through `kubectl get --raw`; the fakes below
+# still answer the one-shot dump, and the adapter feeds the real paging from
+# it (test_collector_run.paged_dump_over). The tests that assert the paged
+# argv itself pass a `--raw`-aware fake and bypass this by patching it back.
+_PAGED_DUMP = patch.object(fw, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
@@ -5339,6 +5354,44 @@ class CollectClusterTest(unittest.TestCase):
                 entry, facts = fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
         self.assertEqual(entry["outcome"], "unreachable")
         self.assertEqual(facts, {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()})
+
+    def test_the_cluster_is_read_one_kind_per_paged_raw_read(self):
+        """The real paging, not the adapter: every kind in CLUSTER_DUMP_KINDS
+        is one `kubectl get --raw` collection read with a page limit, a pod
+        page's continue token is followed, and the manifest records the first
+        page of each kind."""
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                path, _, query = argv[3].partition("?")
+                if path == "/api/v1/pods" and "continue=" not in query:
+                    return run_of(0, json.dumps({"metadata": {"continue": "more"}, "items": [{"metadata": {"name": "p1", "namespace": "ns", "managedFields": [{}]}, "status": {"phase": "Running"}}]}))
+                if path == "/api/v1/pods":
+                    return run_of(0, json.dumps({"metadata": {}, "items": [{"metadata": {"name": "p2", "namespace": "ns"}, "status": {"phase": "Running"}}]}))
+                return run_of(0, json.dumps({"metadata": {}, "items": []}))
+            if argv[:2] == ["kubectl", "get"]:
+                raise AssertionError(f"a one-shot dump was issued: {argv}")
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp, patch.object(fw, "KUBECONFIG_DIR", Path(tmp)), patch.object(fw, "paged_dump", _shared_run_tests.cr.paged_dump):
+            entry, _ = fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
+        self.assertEqual(entry["outcome"], "collected", entry.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(len(fw.CLUSTER_DUMP_KINDS.split(",")) + 1, len(raw))
+        self.assertIn("/api/v1/pods?limit=500", raw)
+        self.assertIn("/api/v1/pods?limit=500&continue=more", raw)
+        self.assertIn("/api/v1/nodes?limit=100", raw)
+        self.assertIn("/apis/networking.k8s.io/v1/ingresses?limit=500", raw)
+        command = next(c["command"] for c in entry["commands"] if c["check"] == "terminal-pods")
+        self.assertIn("kubectl get --raw '/api/v1/nodes?limit=100'", command)
+        self.assertIn("kubectl get --raw '/api/v1/pods?limit=500'", command)
+        self.assertTrue(command.startswith("KUBECONFIG="))
 
     def test_a_dump_with_no_items_list_is_gate_failed_not_empty(self):
         def run(argv, **kwargs):

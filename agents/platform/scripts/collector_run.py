@@ -74,7 +74,7 @@ LIST_KIND = "List"
 LIST_API_VERSION = "v1"
 #: The stderr a paged read fails with when a page is not a list, or the server
 #: keeps handing back the same continue token.
-PAGE_NOT_A_LIST_TEXT = "paged read: the page is not an object list"
+PAGE_NOT_A_LIST_TEXT = "paged read: the page has no `items` list"
 PAGE_LOOP_TEXT = "paged read: the server repeated a continue token"
 PAGE_CEILING_TEXT = f"paged read: more than {MAX_PAGES} pages of one kind"
 #: What a merged read records as its output: the counts and one digest over
