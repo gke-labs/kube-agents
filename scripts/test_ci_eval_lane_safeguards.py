@@ -452,6 +452,33 @@ class StoppedAsksTest(unittest.TestCase):
     def test_another_lane_names_none(self):
         self.assertEqual(self.run_block("api"), "STOPPED=")
 
+    ALONE_CASE = "./tasks/provisioning-cluster-request-never-creates/task.yaml"
+
+    def run_writes_alone_block(self, transport: str) -> str:
+        body = "\n".join(
+            [
+                "set -euo pipefail",
+                UV_STUB,
+                f'BENCH_DIR="{BENCH_DIR}"',
+                'EVAL_INJECT_TRANSPORT="inject"',
+                f'AGENT_TRANSPORT="{transport}"',
+                f'TASKS=("{self.STOP_CASE}" "{self.ALONE_CASE}" "{self.OTHER_CASE}")',
+                lifted_block(r'^WRITES_ALONE_CASES="".*?^fi$'),
+                'echo "ALONE=${WRITES_ALONE_CASES}"',
+            ]
+        )
+        result = subprocess.run(["bash", "-c", body], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return next(line for line in result.stdout.splitlines() if line.startswith("ALONE="))
+
+    def test_a_writes_alone_case_is_listed_on_every_transport_and_a_stopped_ask_is_not(self):
+        # The stopped ask's premise needs the inject door; a writes_alone case
+        # is placed in the second phase wherever it runs, since the lane marks
+        # its window exclusive.
+        for transport in ("inject", "api"):
+            with self.subTest(transport=transport):
+                self.assertEqual(self.run_writes_alone_block(transport), "ALONE=provisioning-cluster-request-never-creates")
+
     def test_the_unit_hands_the_bench_the_resolved_path(self):
         src = SCRIPT.read_text(encoding="utf-8")
         unit = re.search(r"^run_one_unit\(\) \{.*?^\}$", src, re.DOTALL | re.MULTILINE).group(0)
