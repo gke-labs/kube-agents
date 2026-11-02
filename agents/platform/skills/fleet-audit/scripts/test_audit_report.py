@@ -4316,9 +4316,9 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         self.assertFalse(scan.truncated)
         self.assertEqual(
             sorted(scan.declarations),
-            [("ContainerCluster", "a", "a", "", ""), ("ContainerCluster", "b", "b", "", "")],
+            [("ContainerCluster", "a", "a", "", "", ""), ("ContainerCluster", "b", "b", "", "", "")],
         )
-        self.assertEqual(scan.declarations[("ContainerCluster", "b", "b", "", "")].path, "gcp/b.yaml")
+        self.assertEqual(scan.declarations[("ContainerCluster", "b", "b", "", "", "")].path, "gcp/b.yaml")
 
     def test_a_file_the_broker_withholds_marks_the_scan_truncated(self):
         files = {
@@ -4327,7 +4327,7 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         }
         scan = self.broker_scan(files, [[{"path": "gcp/big.yaml", "reason": "tooLarge"}]])
         self.assertTrue(scan.truncated)
-        self.assertEqual(list(scan.declarations), [("ContainerCluster", "a", "a", "", "")])
+        self.assertEqual(list(scan.declarations), [("ContainerCluster", "a", "a", "", "", "")])
 
     def test_a_broker_that_never_relents_stops_and_marks_the_scan_truncated(self):
         files = {"gcp/a.yaml": self.KCC_TEXT.format(name="a")}
@@ -23543,6 +23543,47 @@ metadata:
             scan = audit_report.kcc_declarations_via_broker("acme/fleet", Broken())
         self.assertTrue(scan.failed)
         self.assertEqual(scan.declarations, {})
+
+    @staticmethod
+    def project_cluster(project, extra=""):
+        """`ContainerCluster prod` in us-central1 for `project`, with no namespace."""
+        return (
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
+            f"  name: prod\n  annotations:\n    cnrm.cloud.google.com/project-id: {project}\n"
+            f"spec:\n  location: us-central1\n{extra}"
+        )
+
+    def test_two_projects_with_one_cluster_name_are_two_declarations(self):
+        """Review finding: the index key had no project, so the proj-b file
+        was kept under the proj-a file's fields and the paragraph found none."""
+        self.write("projects/a/cluster.yaml", self.project_cluster("proj-a", "  releaseChannel:\n    channel: STABLE\n"))
+        self.write("projects/b/cluster.yaml", self.project_cluster("proj-b"))
+        declarations = audit_report.kcc_declarations(self.root)
+        finding = make_finding(fid="b", cluster="proj-b/us-central1/prod", obj="Cluster/prod",
+                               remediation={"kind": "manual", "note": "Fix the cluster."})
+        stall = {"kind": "ContainerCluster", "namespace": "cfg", "name": "prod", "why": "UpdateFailed",
+                 "project": "proj-b", "location": "us-central1"}
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, declarations), ["b"]
+        )
+        self.assertIn("The declaration is `projects/b/cluster.yaml`.", finding["remediation"]["note"])
+        # The gcloud check still takes the first declaration of the name, as before.
+        command = make_finding(fid="g", cluster="proj-b/us-central1/prod", obj="Cluster/prod",
+                               remediation={"kind": "gcloud", "note": "gcloud container clusters update prod --release-channel regular"})
+        problem = audit_report.reverted_gcloud_problem(command, declarations)
+        self.assertEqual(problem[0].path, "projects/a/cluster.yaml")
+
+    def test_each_file_of_one_object_is_matched_on_its_own_fields(self):
+        """A file kept in `also` keeps its own `metadata.name` and namespace."""
+        self.write("one/pool.yaml", self.project_cluster("proj-b").replace("  name: prod\n", "  name: other\n") + "  resourceID: prod\n")
+        self.write("two/pool.yaml", self.project_cluster("proj-b"))
+        declarations = audit_report.kcc_declarations(self.root)
+        stall = audit_report.KccStall(
+            kind="ContainerCluster", namespace="cfg", name="prod", why="x", resource="", cluster="", host="h",
+            project="proj-b", location="us-central1",
+        )
+        found = audit_report._declarations_of(stall, declarations)
+        self.assertEqual([declaration.path for _, declaration in found], ["two/pool.yaml"])
 
     def test_a_manifest_fix_of_the_declaring_file_keeps_its_paragraph(self):
         """Regression: a `manifest` fix whose file declares the object keeps

@@ -18375,12 +18375,13 @@ class KccDeclaration(NamedTuple):
     name: str = ""
     namespace: str = ""
     project: str = ""
-    # Other files that declare the same key, as `(repo, path)`: the first
-    # declaration wins, and these say the object is declared more than once.
-    also: tuple[tuple[str, str], ...] = ()
+    # The declarations of the same key in other files, each with its own
+    # fields: the first declaration wins, and these say the object is
+    # declared more than once.
+    also: tuple["KccDeclaration", ...] = ()
 
 
-# `(kind, name, cluster, location, namespace)`: `cluster` is the bare GKE name the resource
+# `(kind, name, cluster, location, namespace, project)`: `cluster` is the bare GKE name the resource
 # belongs to (its own name for a `ContainerCluster`, the `clusterRef` for a
 # `ContainerNodePool`) and `location` is `spec.location`, empty when the spec
 # omits it. A node pool's name alone is not an identity -- every cluster has a
@@ -18389,7 +18390,10 @@ class KccDeclaration(NamedTuple):
 # `namespace` is the file's `metadata.namespace`, empty when the file leaves
 # it to the tool that applies it: two objects of one name in two namespaces
 # are two declarations, not one declared twice.
-KccKey = tuple[str, str, str, str, str]
+# `project` is the file's `cnrm.cloud.google.com/project-id` annotation, empty
+# when the file sets none: `prod` for proj-a and `prod` for proj-b, in one
+# location, are two declarations, and each keeps its own project.
+KccKey = tuple[str, str, str, str, str, str]
 
 
 def kcc_declarations(root: Path, repo: str = "") -> dict[KccKey, KccDeclaration]:
@@ -18485,20 +18489,21 @@ def _index_kcc_text(
             str(meta.get("namespace") or ""),
             str((meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}).get(KCC_PROJECT_ANNOTATION) or ""),
         )
-        _add_kcc_declaration(index, (kind, name, cluster, location, entry.namespace), entry)
+        _add_kcc_declaration(index, (kind, name, cluster, location, entry.namespace, entry.project), entry)
 
 
 def _add_kcc_declaration(index: dict[KccKey, KccDeclaration], key: KccKey, entry: KccDeclaration) -> None:
     """Add `entry` at `key`. The first declaration wins; a declaration of the
-    same key in another file is kept in the first one's `also`, so the
-    Config Connector paragraph can see that the object has two files."""
+    same key in another file is kept, whole, in the first one's `also`, so
+    the Config Connector paragraph can see that the object has two files
+    and match each file on its own fields."""
     first = index.get(key)
     if first is None:
         index[key] = entry
         return
-    others = ((entry.repo, entry.path), *entry.also)
-    known = {(first.repo, first.path), *first.also}
-    added = tuple(other for other in others if other not in known)
+    others = (entry._replace(also=()), *entry.also)
+    known = {(first.repo, first.path), *((other.repo, other.path) for other in first.also)}
+    added = tuple(other for other in others if (other.repo, other.path) not in known)
     if added:
         index[key] = first._replace(also=first.also + added)
 
@@ -18644,7 +18649,8 @@ def _kcc_candidate(finding: dict) -> bool:
 
 
 def _first_declaration(declarations: dict[KccKey, KccDeclaration], key: tuple[str, str, str, str]) -> KccDeclaration | None:
-    """The first declaration whose key starts with `key`, in any namespace."""
+    """The first declaration whose key starts with `key`, in any namespace
+    and for any project."""
     return next((value for full, value in declarations.items() if full[:4] == key), None)
 
 
@@ -19100,7 +19106,7 @@ def _remediation_file_stalls(
     # nothing about the project or the location its object manages: only the
     # declaration can give those.
     about_managed_cluster = str(finding.get("object") or "").partition("/")[0] in _KCC_OBJECT_KINDS
-    for (kind, _, cluster_ref, file_location, _), declaration in index.items():
+    for (kind, _, cluster_ref, file_location, _, _), declaration in index.items():
         # The index keys a node pool on its `clusterRef`, every other kind on
         # its own name.
         file_ref = cluster_ref if kind in _KCC_OBJECT_KINDS["NodePool"] else ""
@@ -19245,21 +19251,26 @@ def _declarations_of(
     sides know them (`_location_agrees`). One per file."""
     found: list[tuple[KccKey, KccDeclaration]] = []
     files: set[tuple[str, str]] = set()
-    for key, declaration in declarations.items():
-        if key[0] != stall.kind or declaration.name != stall.name:
-            continue
-        if declaration.namespace and declaration.namespace != stall.namespace:
+    for key, first in declarations.items():
+        if key[0] != stall.kind:
             continue
         if key[0] in _KCC_OBJECT_KINDS["NodePool"] and stall.cluster and key[2] != stall.cluster:
             continue
         if not _location_agrees(stall, key[3]):
             continue
-        if stall.project and declaration.project and stall.project != declaration.project:
-            continue
-        for where in ((declaration.repo, declaration.path), *declaration.also):
+        # Each file on its own fields: the first declaration's do not stand
+        # in for the files in its `also`.
+        for declaration in (first._replace(also=()), *first.also):
+            if declaration.name != stall.name:
+                continue
+            if declaration.namespace and declaration.namespace != stall.namespace:
+                continue
+            if stall.project and declaration.project and stall.project != declaration.project:
+                continue
+            where = (declaration.repo, declaration.path)
             if where not in files:
                 files.add(where)
-                found.append((key, declaration._replace(repo=where[0], path=where[1])))
+                found.append((key, declaration))
     return found
 
 
