@@ -509,9 +509,9 @@ func TestABrokerRefusalReachesTheJoinAsAStatusError(t *testing.T) {
 }
 
 // TestDescribeClusterThroughTheBroker covers the exported describe a caller
-// makes after discovery: a Discoverer with a Broker and no Describe reaches the
-// broker's GKE route, and the answer's currentNodeCount, which the broker's
-// projection keeps, comes back on the Cluster.
+// that already holds a Broker makes: a Discoverer with a Broker and no Describe
+// reaches the broker's GKE route, and the answer's currentNodeCount, which the
+// broker's projection keeps, comes back on the Cluster.
 func TestDescribeClusterThroughTheBroker(t *testing.T) {
 	fb, broker := newFakeBroker(t)
 	fb.answers["c"] = fakeAnswer{status: http.StatusOK, body: `{"name":"c","currentNodeCount":7}`}
@@ -527,6 +527,58 @@ func TestDescribeClusterThroughTheBroker(t *testing.T) {
 	want := "GET /v1/watcher/gcp/container.googleapis.com/v1/projects/p/locations/l/clusters/c"
 	if len(requests) != 1 || requests[0] != want {
 		t.Errorf("requests = %v; want exactly [%s]", requests, want)
+	}
+}
+
+// TestDescribeClusterFillsTheBrokerFromTheEnvironment covers the describe the
+// shipped watcher makes: its fleet-shape probe binds DescribeCluster on a
+// zero-value Discoverer, with neither Describe nor Broker set, so the broker
+// has to be filled from BrokerURLEnv and BrokerTokenFileEnv the way
+// DiscoverAndBuild fills it. The one GKE request lands on the fake the
+// environment names, bearing the token from the file it names; without the
+// fill the describe would fall through to the GKE API, which newFakeBroker
+// leaves no credential for.
+func TestDescribeClusterFillsTheBrokerFromTheEnvironment(t *testing.T) {
+	fb, envBroker := newFakeBroker(t)
+	fb.answers["c"] = fakeAnswer{status: http.StatusOK, body: `{"name":"c","currentNodeCount":5}`}
+	t.Setenv(BrokerURLEnv, envBroker.URL)
+	t.Setenv(BrokerTokenFileEnv, envBroker.TokenFile)
+	var d Discoverer
+	cluster, err := d.DescribeCluster(context.Background(), Identity{Project: "p", Location: "l", Cluster: "c"})
+	if err != nil {
+		t.Fatalf("DescribeCluster on a zero Discoverer with the broker in the environment: %v", err)
+	}
+	if cluster.CurrentNodeCount != 5 {
+		t.Errorf("CurrentNodeCount = %d; want 5", cluster.CurrentNodeCount)
+	}
+	requests, auths := fb.seen()
+	want := "GET /v1/watcher/gcp/container.googleapis.com/v1/projects/p/locations/l/clusters/c"
+	if len(requests) != 1 || requests[0] != want {
+		t.Errorf("requests = %v; want exactly [%s]", requests, want)
+	}
+	if got := strings.Join(auths, ","); got != "Bearer token-1" {
+		t.Errorf("Authorization headers = %q; want the token from the file the environment names", got)
+	}
+	if d.Broker != nil {
+		t.Error("DescribeCluster wrote the filled broker back onto the caller's value; the fill is per call")
+	}
+}
+
+// TestDescribeClusterRefusesHalfABrokerPair: the fill applies BrokerFromEnv's
+// rule, so one of the two variables without the other is the describe's error
+// rather than a fall back to the GKE API on the pod's own identity.
+func TestDescribeClusterRefusesHalfABrokerPair(t *testing.T) {
+	fb, envBroker := newFakeBroker(t)
+	t.Setenv(BrokerURLEnv, envBroker.URL)
+	t.Setenv(BrokerTokenFileEnv, "")
+	var d Discoverer
+	if _, err := d.DescribeCluster(context.Background(), Identity{Project: "p", Location: "l", Cluster: "c"}); err == nil {
+		t.Fatal("DescribeCluster with only the broker URL set succeeded; want BrokerFromEnv's error")
+	} else if !strings.Contains(err.Error(), BrokerTokenFileEnv) {
+		t.Errorf("error = %v; want it to name %s", err, BrokerTokenFileEnv)
+	}
+	if requests, _ := fb.seen(); len(requests) != 0 {
+		t.Errorf("half a pair still reached the broker: %v", requests)
 	}
 }
 
