@@ -12,8 +12,9 @@ served, and the rollout stages. The gate's ladder and roster stay in
 [`eval-next-transport.md`](../../docs/designs/eval-next-transport.md). The example proxy in this
 directory ([`README.md`](README.md)) is the starting point and is superseded by the design here
 for eval use. The kustomize integration under `k8s-operator/config/integrations/inference-replay/`
-labels its proxy `app: standalone-replay`, which the agents' egress policies do not admit under
-`spec.mode: next` (see "Where the proxy runs"), so it is not a base for this either.
+labels its proxy `app: standalone-replay`, which the worker pods' egress policies (A2A sessions and
+Cluster Agents) do not admit under `spec.mode: next` (see "Where the proxy runs"), so it is not a
+base for this either.
 
 ## The problem
 
@@ -31,6 +32,19 @@ A proxy sits between the agents and LiteLLM. Every `/v1/chat/completions` reques
 and the answer is stored under the hash. On a hit the stored answer is returned without a model
 call.
 
+```mermaid
+flowchart LR
+    agents["Agent pods<br/>platform agent, Cluster Agents, sessions"]
+    proxy["Replay proxy<br/>normalize, then hash"]
+    cache[("Recorded answers")]
+    litellm["LiteLLM"]
+    model["Model"]
+    agents -- "chat request" --> proxy
+    proxy -- "hit: recorded answer,<br/>this run's IDs filled in" --> agents
+    proxy <-- "look up, or store on a miss" --> cache
+    proxy -- "miss" --> litellm --> model
+```
+
 Three properties make this sound for grading:
 
 - **A hit means the model saw the same input.** The key covers the whole request: system prompt,
@@ -47,6 +61,18 @@ Three properties make this sound for grading:
   script's output, or a tool schema changes a request, and the run is graded live from that point.
   A pull request that changes nothing in a case's path replays it.
 
+A run therefore replays up to its first tool result that differs from the recording, and is live
+from the next request on. This is the safety run from "Measurements": the pod was fixed between the
+recording and the replay.
+
+```mermaid
+flowchart LR
+    s1["Read card<br/>(replayed)"] --> s2["Delegate<br/>(replayed)"] --> s3["kubectl get deploy<br/>(runs live, as every tool does)"]
+    s3 --> d{"Same result as<br/>the recording?"}
+    d -- "yes" --> h["Next request hits:<br/>recorded answer"]
+    d -- "no: the pod was fixed" --> l["Next request misses:<br/>live from here on,<br/>reports healthy"]
+```
+
 ## Normalization
 
 Raw requests never repeat. Kanban task IDs, pod name suffixes, UIDs, timestamps, ages, process and
@@ -59,6 +85,21 @@ request (`⟦TASK_1⟧`, `⟦POD_2⟧`, `⟦AGEm_1⟧`), and the mapping works b
 is kept with placeholders; on a hit the placeholders are filled from the current request's
 values, so a replayed `kanban_show` names this run's card, not the recording's. An answer that
 names a placeholder the current request does not bind is not served.
+
+```mermaid
+sequenceDiagram
+    participant A as Recording run
+    participant P as Proxy
+    participant C as Cache
+    participant B as Later run
+    A->>P: work kanban task t_3c176184
+    P->>P: t_3c176184 becomes ⟦TASK_1⟧, then hash
+    P->>C: store answer kanban_show(⟦TASK_1⟧)
+    B->>P: work kanban task t_9a02e1f7
+    P->>P: t_9a02e1f7 becomes ⟦TASK_1⟧, same hash
+    C-->>P: hit: kanban_show(⟦TASK_1⟧)
+    P-->>B: kanban_show(t_9a02e1f7)
+```
 
 The rules that keep this safe:
 
@@ -141,6 +182,16 @@ does not carry. The shared label also enrols the proxy in LiteLLM's PodDisruptio
 counters, or empty) rather than pass it through to a LiteLLM replica, which would count that
 replica twice.
 
+```mermaid
+flowchart LR
+    agents["Agent pods<br/>egress admits app: litellm"]
+    svc["Service inference-gateway<br/>selects app=litellm, replay=proxy"]
+    proxy["Replay proxy pod<br/>app=litellm, replay=proxy"]
+    up["Service inference-gateway-upstream<br/>selects a LiteLLM-only label"]
+    lite["LiteLLM pods<br/>app=litellm + LiteLLM-only label"]
+    agents --> svc --> proxy --> up --> lite
+```
+
 ### One shared cache for the evaluation pool
 
 The cache is shared across the pool's projects, not split per project. A hit requires the full
@@ -160,6 +211,21 @@ rule structurally: the presubmit's identity has read access only. The cache does
 presubmit identity gets object read on the bucket and nothing else; the nightly and a post-merge
 job, which run `main`'s tree, are the only writers. The cost is freshness: after a prompt change
 merges, presubmits miss until the post-merge job has run the affected cases.
+
+```mermaid
+flowchart LR
+    subgraph trusted["Jobs running main's tree"]
+        nightly["Nightly<br/>(records, never replays)"]
+        post["Post-merge job"]
+    end
+    pre["Presubmit<br/>(the pull request's tree)"]
+    cache[("Shared replay cache<br/>eval-only bucket")]
+    shadow[("Shadow bucket<br/>stage 1 only, never served")]
+    nightly -- "write passing runs" --> cache
+    post -- "write passing runs" --> cache
+    cache -- "read only" --> pre
+    pre -. "stage 1: write, log would-hits" .-> shadow
+```
 
 **The key includes what the request does not show.** Agents send the alias `model-default`; LiteLLM
 resolves the real model, `reasoning_effort` and thinking on its side, and rewrites requests through
