@@ -170,6 +170,9 @@ func TestReconcileProfiles_AbsorbsTheDirectClustersProfile(t *testing.T) {
 	if err := fx.set.start(fx.ctx, targetCluster{Name: "host", Profile: directProfile, Client: fake.NewClientset()}); err != nil {
 		t.Fatal(err)
 	}
+	// What the host injected before its profile arrived, under the unlabelled
+	// triple: the restart must not take it out of the pod's sum.
+	fx.set.m.eventsInjected.WithLabelValues("host", "", "", "BackOff", "default").Inc()
 	writeClusterProfile(t, fx.dir, "cluster-host", "proj", "host", "us-central1")
 	fx.set.reconcileProfiles(fx.ctx, fx.dir)
 	if got, want := fx.profiles(), []string{directProfile}; strings.Join(got, ",") != strings.Join(want, ",") {
@@ -177,6 +180,12 @@ func TestReconcileProfiles_AbsorbsTheDirectClustersProfile(t *testing.T) {
 	}
 	if got := fx.set.directIdentity.String(); got != "proj/us-central1/host" {
 		t.Fatalf("directIdentity = %q; want the absorbed profile's", got)
+	}
+	if got := fx.set.directSource; got != "cluster-host" {
+		t.Fatalf("directSource = %q after the restart; want cluster-host", got)
+	}
+	if got := testutil.ToFloat64(fx.set.m.eventsInjected.WithLabelValues("host", "", "", "BackOff", "default")); got != 1 {
+		t.Fatalf("events_injected_total under the unlabelled triple = %v after the restart; want 1 kept, so the pod's summed counter does not fall", got)
 	}
 	// Absorbed as at boot: the direct entry now runs under the profile's
 	// project, location and Autopilot bit, so its payloads and series carry
@@ -317,6 +326,39 @@ func TestReconcileProfiles_ReportsADuplicateProfileWrittenAfterBoot(t *testing.T
 	}
 }
 
+// Boot absorbs the profile Discover let claim the host's identity, which is
+// not always the first in directory order: a lexically earlier copy whose
+// describe was refused on the boot read is skipped there, and the later one
+// is absorbed and carried on the direct entry as its Source. The rescan takes
+// the owner from that, so the copy is reported and the absorbed profile is
+// not; taking the first in directory order would report the wrong one on
+// every tick and send an operator to remove the wrong directory.
+func TestReconcileProfiles_ReportsACopyOfTheBootAbsorbedProfileAgainstBootsChoice(t *testing.T) {
+	fx := newReloadFixture(t, "host")
+	logs := captureLog(t)
+	writeClusterProfile(t, fx.dir, "cluster-host-a", "proj", "host", "us-central1")
+	writeClusterProfile(t, fx.dir, "cluster-host-b", "proj", "host", "us-central1")
+	// The direct entry as buildWatchSet hands it over when cluster-host-a was
+	// refused on the boot read and cluster-host-b was absorbed.
+	direct := targetCluster{Name: "host", ProjectID: "proj", Location: "us-central1", Profile: directProfile, Source: "cluster-host-b", Client: fake.NewClientset()}
+	if err := fx.set.start(fx.ctx, direct); err != nil {
+		t.Fatal(err)
+	}
+	fx.set.reconcileProfiles(fx.ctx, fx.dir)
+	if got, want := fx.profiles(), []string{directProfile}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("running after the rescan = %v; want %v only", got, want)
+	}
+	if got := testutil.ToFloat64(fx.set.m.clusterDiscoveryErrors.WithLabelValues("cluster-host-a")); got != 1 {
+		t.Fatalf("cluster_discovery_errors_total{profile=cluster-host-a} = %v; want 1 (the copy)", got)
+	}
+	if got := testutil.ToFloat64(fx.set.m.clusterDiscoveryErrors.WithLabelValues("cluster-host-b")); got != 0 {
+		t.Fatalf("the profile boot absorbed was counted as a duplicate of itself (%v)", got)
+	}
+	if !strings.Contains(logs.String(), "skipping profile cluster-host-a, its cluster will NOT be watched: cluster proj/us-central1/host is already claimed by profile cluster-host-b, which the direct client watches as host") {
+		t.Errorf("no duplicate line naming cluster-host-b as the owner in:\n%s", logs.String())
+	}
+}
+
 // The order the first reconcile tick can produce on a fresh install: the
 // foreign same-named profile is read first and absorbed on the guess, and the
 // host's own profile arrives after. The guess is undone the same way, so the
@@ -445,13 +487,16 @@ func (d *holdingDispatcher) RecordScaleUpMark(ev TriageEvent) bool {
 	return d.inner.RecordScaleUpMark(ev)
 }
 
-// stop deletes a removed cluster's metric series after the last dispatch
-// that could write one: Run joins its delivery goroutine before returning,
-// and the run's done closes only after Run has. A dispatch held in flight
-// while the cluster is stopped therefore holds stop too, and the write it
-// makes once released lands before the deletion, not after it, so no series
-// of the cluster survives the stop.
-func TestClusterSet_StopDeletesSeriesAfterTheLastDispatch(t *testing.T) {
+// stop deletes a removed cluster's gauge series after the last dispatch that
+// could write one: Run joins its delivery goroutine before returning, and the
+// run's done closes only after Run has. A dispatch held in flight while the
+// cluster is stopped therefore holds stop too, and the gauge it sets once
+// released lands before the deletion, not after it, so no gauge series of the
+// cluster survives the stop. Its counter series do survive, with the held
+// dispatch's increment on them: the operator's usage poller sums the pod's
+// counters and refuses a sum that falls inside one process, so a deleted
+// counter series would lose a poll window of increments.
+func TestClusterSet_StopDeletesGaugesAfterTheLastDispatchAndKeepsTheCounters(t *testing.T) {
 	fx := newReloadFixture(t, "host")
 	hold := &holdingDispatcher{release: make(chan struct{}), entered: make(chan struct{})}
 	fx.set.wrapDispatcher = func(d eventDispatcher) eventDispatcher {
@@ -492,11 +537,17 @@ func TestClusterSet_StopDeletesSeriesAfterTheLastDispatch(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("stop did not return within 10s of the dispatch being released")
 	}
-	if got := testutil.CollectAndCount(fx.set.m.eventsSeen); got != 0 {
-		t.Errorf("events_seen series after the stop = %d; want 0 (the released dispatch wrote one after the deletion)", got)
+	if got := testutil.CollectAndCount(fx.set.m.activeIncidents); got != 0 {
+		t.Errorf("active_incidents series after the stop = %d; want 0 (the released dispatch set one after the deletion)", got)
 	}
 	if got := fx.clusterUpSeries(); got != 0 {
 		t.Errorf("cluster_up series after the stop = %d; want 0", got)
+	}
+	if got := testutil.ToFloat64(fx.set.m.eventsSeen.WithLabelValues("a", "proj", "us-central1", "BackOff")); got != 1 {
+		t.Errorf("events_seen_total{a,proj,us-central1,BackOff} after the stop = %v; want 1 (the counter kept, with the released dispatch's increment)", got)
+	}
+	if got := testutil.ToFloat64(fx.set.m.eventsInjected.WithLabelValues("a", "proj", "us-central1", "BackOff", "default")); got != 1 {
+		t.Errorf("events_injected_total{a,proj,us-central1,BackOff,default} after the stop = %v; want 1 (a deleted counter would make the pod's sum fall)", got)
 	}
 }
 

@@ -57,6 +57,27 @@ func acceptRecordingServer(t *testing.T, tls bool) (*httptest.Server, *atomic.Va
 	return srv, &accept
 }
 
+// The direct client, built by buildKubeClient from a kubeconfig, asks for
+// protobuf first too: its last line is newClusterClient, and this is the one
+// test that reaches it, since the realMain tests point it at a port where
+// nothing listens and nothing records a header. It pins the header, not the
+// call: client-go's Event client asks for the same pair when a config names
+// no content type, so the test fails when a config built here comes to name
+// another, not when the explicit preference alone is removed.
+func TestBuildKubeClient_AsksForProtobuf(t *testing.T) {
+	srv, accept := acceptRecordingServer(t, false)
+	client, err := buildKubeClient(&flags{kubeconfig: writeKubeconfig(t, srv.URL)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CoreV1().Events(metav1.NamespaceAll).List(context.Background(), metav1.ListOptions{}); err != nil {
+		t.Fatalf("list through the direct client: %v", err)
+	}
+	if got := accept.Load(); got != wireAcceptContentTypes {
+		t.Errorf("the direct client's Accept = %q; want %q", got, wireAcceptContentTypes)
+	}
+}
+
 // The header a config built by newClusterClient sends: protobuf first, JSON
 // second, so a control plane serves the compact form and anything in between
 // that cannot (a proxy that strips it, an older server) still gets an answer

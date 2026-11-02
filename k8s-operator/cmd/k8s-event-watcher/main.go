@@ -103,6 +103,10 @@ const (
 	// first, JSON when the server cannot. The initial Event list of a large
 	// cluster is the biggest body this process ever receives, and protobuf
 	// is a fraction of the JSON size on the wire and in the decoder.
+	// client-go's generated Event client asks for the same pair on its own
+	// when a config names no content type (gentype.PrefersProtobuf), so this
+	// is the default made explicit: a config that names one, or a client-go
+	// default that moves, cannot put the list back in JSON unnoticed.
 	wireContentType        = k8sruntime.ContentTypeProtobuf
 	wireAcceptContentTypes = k8sruntime.ContentTypeProtobuf + "," + k8sruntime.ContentTypeJSON
 
@@ -419,7 +423,9 @@ func buildKubeClient(f *flags) (kubernetes.Interface, error) {
 	return newClusterClient(cfg)
 }
 
-// preferProtobuf makes cfg ask for protobuf and fall back to JSON. Done here,
+// preferProtobuf makes cfg ask for protobuf and fall back to JSON, which is
+// what client-go's typed Event client already asks for when cfg names no
+// content type; setting it pins that against a config that does. Done here,
 // in the one binary whose traffic is dominated by the Event list, rather than
 // in clusterprofiles: the drift detector builds a dynamic client from the same
 // configs, and the unstructured types it reads carry no protobuf. The
@@ -455,7 +461,14 @@ type targetCluster struct {
 	// derives it from the whole triple — so it doubles as the per-cluster
 	// filename for dedup snapshots, where the bare name would collide.
 	Profile string
-	Client  kubernetes.Interface
+	// Source is the profile the direct entry was absorbed from, set by
+	// buildWatchSet at boot and by clusterSet.restartDirect on a rescan, and
+	// empty on every other entry. clusterSet records it as the owner of the
+	// direct cluster's identity, so a later copy of that profile is reported
+	// against the one that was absorbed rather than the first in directory
+	// order, which boot need not have chosen (a refused describe skips it).
+	Source string
+	Client kubernetes.Interface
 	// Autopilot says this is a GKE Autopilot cluster, read off the describe
 	// call discovery already makes (clusterprofiles.Cluster.Autopilot). The
 	// FailedScheduling gate is the only reader: an Autopilot cluster with no
@@ -1410,6 +1423,7 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 				// reading as Standard.
 				direct.ProjectID, direct.Location = covered.ProjectID, covered.Location
 				direct.Autopilot = covered.Autopilot
+				direct.Source = covered.Profile
 				log.Printf("k8s-event-watcher: %s is covered by profile %s and by the direct client; watching it once, directly, as %s (the pod's own credential cannot be denied by IAM or by master authorized networks)",
 					f.clusterName, covered.Profile, direct.identity())
 			}

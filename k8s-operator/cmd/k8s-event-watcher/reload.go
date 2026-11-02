@@ -61,10 +61,11 @@ type clusterSet struct {
 	// buildWatchSet absorbed at boot, or one absorbed on a rescan (see
 	// reconcileProfiles). Empty while no profile has named it.
 	directIdentity clusterprofiles.Identity
-	// directSource is the profile directIdentity was read from: the one the
-	// rescan absorbed, or for boot's absorption the first profile naming it in
-	// directory order, which is the one Discover let claim it (see
-	// reportClaimedDuplicates). Empty with directIdentity.
+	// directSource is the profile directIdentity was read from: the one
+	// buildWatchSet absorbed at boot, carried on the direct entry's Source,
+	// or the one a rescan absorbed. Set and cleared with directIdentity, so
+	// reportClaimedDuplicates can name the owner of the direct cluster's
+	// identity without inferring it from the directory.
 	directSource string
 	// wrapDispatcher, when set, wraps each started cluster's dispatcher before
 	// its watcher is built. nil in the binary; a test sets it to hold a
@@ -103,8 +104,9 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 	cctx, cancel := context.WithCancel(ctx)
 	run := &clusterRun{cluster: tc, cache: cache, cancel: cancel, done: make(chan struct{})}
 	// done closes once the watcher and both loops have returned, so a stop
-	// that waits on it deletes the cluster's series after the last goroutine
-	// that could write one. Local to this start, so the group is never reused.
+	// that waits on it deletes the cluster's gauge series after the last
+	// goroutine that could write one. Local to this start, so the group is
+	// never reused.
 	var loops sync.WaitGroup
 	loops.Add(2)
 	go func() {
@@ -129,6 +131,7 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 	s.running[tc.Profile] = run
 	if tc.Profile == directProfile && tc.ProjectID != "" {
 		s.directIdentity = clusterprofiles.Identity{Project: tc.ProjectID, Location: tc.Location, Cluster: tc.Name}
+		s.directSource = tc.Source
 	}
 	s.mu.Unlock()
 
@@ -190,10 +193,10 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 
 // stop ends the watcher started for profile, waits for its goroutine to
 // return, writes the cluster's dedup snapshot (the restore a restart would
-// read, had the profile come back) and deletes every metric series carrying
-// its labels, so a torn-down cluster does not read as a cluster at
-// cluster_up=0 for the life of the process. A profile that is not running is
-// a no-op.
+// read, had the profile come back) and deletes its two gauge series
+// (deleteClusterGauges), so a torn-down cluster does not read as a cluster at
+// cluster_up=0 for the life of the process; its counter series stay, so the
+// pod's summed counters never fall. A profile that is not running is a no-op.
 //
 // Once wait has begun shutting the set down (closed), a stop is a no-op: the
 // run stays in the set, wait joins it and the shutdown snapshot writes it,
@@ -224,7 +227,7 @@ func (s *clusterSet) stop(profile string) {
 	if err := run.cache.Snapshot(); err != nil {
 		log.Printf("k8s-event-watcher: [%s] dedup snapshot on removal: %v", run.cluster.Name, err)
 	}
-	s.m.deleteClusterSeries(run.cluster.Name, run.cluster.ProjectID, run.cluster.Location)
+	s.m.deleteClusterGauges(run.cluster.Name, run.cluster.ProjectID, run.cluster.Location)
 }
 
 // wait blocks until ctx is done and every watcher goroutine has returned.
@@ -472,8 +475,11 @@ func (s *clusterSet) absorbIntoDirect(tc targetCluster) absorption {
 // the watcher has started. The stop snapshots the entry's dedup cache and the
 // start restores it from the same file (the snapshot is named by profile, and
 // the profile is still directProfile), so the relist replays no incident; the
-// series under the unlabelled triple go with the stop and the labelled ones
-// come with the start.
+// gauge series under the unlabelled triple go with the stop and the labelled
+// ones come with the start, and the counter series under the unlabelled
+// triple stay, so the pod's sums do not fall by the host's first minute. The
+// restarted entry carries the absorbed profile as its Source, so start
+// records it as directSource again.
 func (s *clusterSet) restartDirect(ctx context.Context, absorbed targetCluster) {
 	s.mu.Lock()
 	run, ok := s.running[directProfile]
@@ -483,6 +489,7 @@ func (s *clusterSet) restartDirect(ctx context.Context, absorbed targetCluster) 
 	}
 	direct := run.cluster
 	direct.ProjectID, direct.Location, direct.Autopilot = absorbed.ProjectID, absorbed.Location, absorbed.Autopilot
+	direct.Source = absorbed.Profile
 	log.Printf("k8s-event-watcher: restarting the direct watcher as %s, so its payloads and series carry the project and location profile %s names", direct.identity(), absorbed.Profile)
 	s.stop(directProfile)
 	if ctx.Err() != nil {
@@ -508,11 +515,11 @@ func (s *clusterSet) restartDirect(ctx context.Context, absorbed targetCluster) 
 // is left to discovery, which reports it on the same tick.
 //
 // A running profile cluster's identity is owned by its profile. The direct
-// cluster's is owned by directSource; when boot absorbed it the source is not
-// yet known, and the first profile naming it in directory order is taken,
-// which is the one Discover let claim it at boot. A directory named
-// directProfile is left out: discoverClusterProfilesWanting refuses it with a
-// skip of its own.
+// cluster's is owned by directSource, the profile boot or a rescan absorbed,
+// which is not always the first in directory order: a lexically earlier copy
+// whose describe was refused on the boot read is skipped there, and the later
+// one is absorbed. A directory named directProfile is left out:
+// discoverClusterProfilesWanting refuses it with a skip of its own.
 func (s *clusterSet) reportClaimedDuplicates(dir string) {
 	ids, err := clusterprofiles.ReadIdentities(dir, nil)
 	if err != nil {
@@ -533,9 +540,6 @@ func (s *clusterSet) reportClaimedDuplicates(dir string) {
 			continue
 		}
 		if s.directIdentity != (clusterprofiles.Identity{}) && pi.Identity == s.directIdentity {
-			if s.directSource == "" {
-				s.directSource = pi.Profile
-			}
 			if pi.Profile != s.directSource {
 				s.reportSkip(pi.Profile, fmt.Errorf("cluster %s is already claimed by profile %s, which the direct client watches as %s", pi.Identity, s.directSource, s.f.clusterName))
 			}

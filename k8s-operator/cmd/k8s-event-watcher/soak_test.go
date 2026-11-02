@@ -231,9 +231,10 @@ func TestSoak_StartupBurst(t *testing.T) {
 		var client kubernetes.Interface
 		var err error
 		if forceJSON {
-			// Built directly: newClusterClient sets the binary's
-			// protobuf-first pair on every config it is given, which is the
-			// point of it and the opposite of what this run asks for.
+			// Built directly, with JSON named on the config: newClusterClient
+			// sets the binary's protobuf-first pair on every config it is
+			// given, and client-go's Event client defaults to the same pair
+			// on a config that names nothing, so JSON has to be asked for.
 			cfg.ContentType, cfg.AcceptContentTypes = k8sruntime.ContentTypeJSON, k8sruntime.ContentTypeJSON
 			client, err = kubernetes.NewForConfig(cfg)
 		} else {

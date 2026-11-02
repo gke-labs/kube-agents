@@ -307,7 +307,7 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 	// dispatcher in the order the API server handed them over, which the
 	// dedup window and the scale-up marks both rely on.
 	// Run joins it before returning, so a caller that deletes the cluster's
-	// metric series once Run has returned (clusterSet.stop) is behind the
+	// gauge series once Run has returned (clusterSet.stop) is behind the
 	// last dispatch that could write one.
 	delivered := make(chan struct{})
 	defer func() { <-delivered }()
