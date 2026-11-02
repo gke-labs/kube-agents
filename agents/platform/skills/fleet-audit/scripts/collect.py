@@ -7053,8 +7053,12 @@ def check_kcc_object_wedged(context: dict) -> list[dict]:
         ready = _kcc_ready_condition(item)
         # No condition yet means KCC has not reached the object, which is the
         # normal state for seconds after an apply and is not evidence of
-        # anything. Only an explicit `False` is -- the same bar
-        # `kcc_health.unready_objects` sets, for the same reason.
+        # anything. Only an explicit `False` is. This check flags every
+        # `Ready=False`, the transient reasons `Updating` and `Deleting`
+        # included, and its finding does not call them transient;
+        # `kcc_health.unready_objects` leaves those two out of `kcc_unready`,
+        # because the manifest note says that Config Connector is not applying
+        # the object.
         if ready is None or str(ready.get("status")) != "False":
             continue
         meta = item.get("metadata") or {}
