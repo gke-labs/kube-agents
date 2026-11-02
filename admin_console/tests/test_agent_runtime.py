@@ -1183,7 +1183,11 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
         self.pod = "platform-agent-gateway-1"
         self.spawn_lock = threading.Lock()
         self.clock = FakeClock()
-        self.cache = RuntimeDiscoveryCache(clock=self.clock)
+        # Pinned, so the suite's verdict does not depend on a TTL the invoking
+        # shell exported while tuning the knob.
+        self.cache = RuntimeDiscoveryCache(
+            agent_runtime.DEFAULT_RUNTIME_CACHE_TTL_SECONDS, clock=self.clock
+        )
         prepare = patch.object(GKEKubeAccess, "prepare", return_value=None)
         prepare.start()
         self.addCleanup(prepare.stop)
@@ -1258,9 +1262,11 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
         self.assertEqual(self.spawns("platformagents", "pods"), 6)
 
     def test_module_invalidate_reaches_the_shared_cache(self):
-        self.read(cache=agent_runtime._discovery_cache)
-        agent_runtime.invalidate(self.TARGET)
-        self.read(cache=agent_runtime._discovery_cache)
+        # The module cache reads the TTL from the environment per lookup.
+        with patch.dict(os.environ, {RUNTIME_CACHE_TTL_ENV: ""}):
+            self.read(cache=agent_runtime._discovery_cache)
+            agent_runtime.invalidate(self.TARGET)
+            self.read(cache=agent_runtime._discovery_cache)
 
         self.assertEqual(self.spawns("platformagents", "pods"), 4)
 
