@@ -43,8 +43,9 @@ type inferenceModel struct{ Provider, Model string }
 
 // parseLiteLLMDefaultModel reads the default model out of a LiteLLM config file. The
 // entry named agentModelName is the answer when it exists, and a malformed model there
-// (no separator, or an empty side) is a negative with no fallback. Only when no entry
-// carries that name does the first provider-qualified entry answer. ok false is a
+// (no separator, a separator at either end, or a provider side that is itself a
+// resource reference) is a negative with no fallback. Only when no entry carries that
+// name does the first well-formed provider-qualified entry answer. ok false is a
 // definite negative: the config does not state a default model.
 func parseLiteLLMDefaultModel(configYAML string) (inferenceModel, bool) {
 	var config litellmConfig
