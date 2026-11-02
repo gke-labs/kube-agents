@@ -3798,7 +3798,7 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	n := int64(agentReplicas)
 	for _, dep := range []*appsv1.Deployment{
 		buildCredentialProxyDeployment(agent, ""),
-		buildA2ACalloutDeployment(agent),
+		buildA2ACalloutDeployment(agent, ""),
 		buildA2AVerifierDeployment(agent),
 		buildA2AConsoleDeployment(agent),
 		buildA2AGatewayDeployment(agent),
