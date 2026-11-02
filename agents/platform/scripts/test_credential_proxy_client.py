@@ -819,9 +819,23 @@ class TestContextGrammar(unittest.TestCase):
             "gke_Proj_us-central1_cluster",
             "gke__us-central1_cluster",
             "gke_../etc_us-central1_cluster",
+            # One character over the component ceiling, in each position.
+            f"gke_{'p' * 64}_us-central1_cluster",
+            f"gke_proj_{'l' * 64}_cluster",
+            f"gke_proj_us-central1_{'c' * 64}",
         ):
             with self.subTest(context=context):
                 self.assertIsNone(credential_proxy_client.parse_gke_context(context))
+
+    def test_a_component_at_the_ceiling_is_accepted(self):
+        # The ceiling is a DNS label's 63: above every GKE limit (a project ID
+        # is at most 30, a cluster name 40), so a real cluster is never refused
+        # by it, and it is what bounds the keys and filenames built from the name.
+        self.assertEqual(63, credential_proxy_client._GKE_CONTEXT_COMPONENT_MAX_CHARS)
+        at_ceiling = f"gke_proj_us-central1_{'c' * 63}"
+        target = credential_proxy_client.parse_gke_context(at_ceiling)
+        self.assertIsNotNone(target)
+        self.assertEqual(at_ceiling, target.context_name)
 
 
 class StdinGateTest(unittest.TestCase):

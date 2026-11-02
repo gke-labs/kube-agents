@@ -4821,6 +4821,18 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual([executor.kubeconfig_dir / f"{slow}.yaml"], slow_result)
         self.assertTrue(slow_result[0].is_file(), "the slow cluster's kubeconfig was filed once released")
 
+    def test_a_context_name_over_the_component_ceiling_is_refused_before_it_gets_a_lock_entry(self):
+        # The lock map is bounded in entries; what bounds it in bytes is the
+        # name's grammar. A context a caller made long is refused by
+        # `parse_gke_context` before the cold path looks its key up, so no
+        # entry is retained for it.
+        executor = self.fake_gcloud(self.executor())
+        too_long = f"gke_demo-project_us-central1_{'c' * 64}"
+        with self.assertRaises(ValueError) as refused:
+            executor._resolve_kubeconfig(too_long)
+        self.assertIn("not a GKE context name", str(refused.exception))
+        self.assertEqual(0, len(executor._kubeconfig_locks), "the refused name was given a lock entry")
+
     def test_two_cold_reads_of_one_cluster_fetch_once(self):
         # Sharding does not loosen what the single lock gave one cluster: the
         # second cold read waits for the first, finds the file it filed, and

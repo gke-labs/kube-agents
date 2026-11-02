@@ -54,6 +54,14 @@ _VERB_WORD_MAX = 64
 # at the call site says the same thing twice on purpose: whichever a later
 # reader changes, the other still holds.
 _GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
+# The longest any one component can be. A GKE project ID is at most 30
+# characters and a cluster name at most 40, and no location name comes near
+# a DNS label's 63, so one ceiling holds all three. A name longer than this is
+# not a cluster Google would recognise, and bounding it here also bounds every
+# key and filename built from `context_name`: the credential proxy keeps a lock
+# entry per context name it is asked for, so without a length bound the memory
+# that map holds would be the caller's to choose.
+_GKE_CONTEXT_COMPONENT_MAX_CHARS = 63
 
 # Enough for any real kubeconfig; the point is that the file is read into
 # memory before anything is known about it.
@@ -386,14 +394,17 @@ def parse_gke_context(context: str) -> ClusterTarget | None:
     Each component is held to the GKE naming rules, which is also what keeps the
     value safe to use in a filename — no separators, no dots, no traversal, and
     no newline, which `$` would have let through and `context_name` would then
-    have carried into a path and a log record.
+    have carried into a path and a log record — and to a length
+    (`_GKE_CONTEXT_COMPONENT_MAX_CHARS`), so what is built from the name is
+    bounded in bytes as well as in characters.
     """
     parts = context.split("_", 3)
     if len(parts) != 4 or parts[0] != "gke":
         return None
     project, location, cluster = parts[1], parts[2], parts[3]
     if not all(
-        _GKE_CONTEXT_COMPONENT.fullmatch(part) for part in (project, location, cluster)
+        _GKE_CONTEXT_COMPONENT.fullmatch(part) and len(part) <= _GKE_CONTEXT_COMPONENT_MAX_CHARS
+        for part in (project, location, cluster)
     ):
         return None
     return ClusterTarget(project=project, location=location, cluster=cluster)

@@ -236,7 +236,11 @@ SPLICE_DECISION_TIMEOUT_SECONDS = 15
 # The bound on the per-cluster kubeconfig lock map (`_KeyedLockMap`): a lookup
 # that finds this many keys drops the entries no thread holds or is waiting
 # for. A sidecar reaches far fewer clusters than this in its life; the cap is
-# there so a map keyed by what a caller names cannot grow without limit.
+# there so a map keyed by what a caller names cannot grow without limit. The
+# key is a `context_name`, whose components `parse_gke_context` holds to a
+# length (`_GKE_CONTEXT_COMPONENT_MAX_CHARS`), so the cap bounds the map in
+# bytes and not only in entries: a caller cannot pick a long name to make
+# each entry cost more.
 KEYED_LOCK_MAP_MAX_KEYS = 4096
 
 # Bounds on what a command's output costs this process while the command runs.
