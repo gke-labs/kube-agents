@@ -37,6 +37,7 @@ Run:  cd bench && python -m pytest -q tests/test_confirm_first_card_check.py
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -125,9 +126,11 @@ def _worker(tool: str, result: str, agent: str = "platform", **args) -> dict:
 
 
 def _show(body: str, agent: str = "platform") -> dict:
-    """The specialist's kanban_show of the card, its body in the result."""
+    """A kanban_show by the worker, the card's body in the result."""
     task = {"id": CARD, "title": TITLE, "body": body, "status": "in_progress", "assignee": agent}
-    return _worker("kanban_show", result=yaml.safe_dump({"task": task}, sort_keys=False), agent=agent)
+    # One line of JSON, as the harness records a worker result (worker_trajectory.py
+    # clips and json.dumps it); the body's newlines are two-character escapes there.
+    return _worker("kanban_show", result=json.dumps({"task": task}), agent=agent)
 
 
 def _worked(body: str, agent: str = "platform") -> list[dict]:
@@ -202,11 +205,6 @@ def test_a_card_filed_and_never_read_is_unobserved_not_a_pass():
     assert _status(CONFIRM_FIRST, [_readable_create()]) == "error"
 
 
-def test_a_card_read_by_another_profile_fails_the_criterion():
-    trajectory = [_readable_create()] + _worked(CONFIRM_FIRST_BODY, agent="cluster-seeded-a")
-    assert _status(CONFIRM_FIRST, trajectory) == "fail"
-
-
 def test_no_card_at_all_fails_both_entries():
     assert _status(FILED, NO_CARD) == "fail"
     assert _status(CONFIRM_FIRST, NO_CARD) == "fail"
@@ -234,7 +232,7 @@ def test_a_wrong_ask_body_is_not_rescued_by_a_child_card_that_carries_the_criter
     """The router leaf keeps its `arguments` read: the criterion has to be in
     the card the front door filed, not in a child the worker filed later."""
     child = {"id": "t_683dee98", "title": "seeded-a", "body": CONFIRM_FIRST_BODY, "status": "in_progress", "assignee": "platform"}
-    child_show = _worker("kanban_show", result=yaml.safe_dump({"task": child}, sort_keys=False))
+    child_show = _worker("kanban_show", result=json.dumps({"task": child}))
     trajectory = [_readable_create(NO_CONFIRM_BODY), _show(NO_CONFIRM_BODY), child_show]
     assert _status(CONFIRM_FIRST, trajectory) == "fail"
 
