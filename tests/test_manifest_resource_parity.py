@@ -79,6 +79,8 @@ BASELINE = TESTDATA / "baseline.yaml"
 BROKEN_FIXTURE = TESTDATA / "broken-emptydir.yaml"
 # What `test_an_untracked_golden_is_read` writes to a directory git does not track.
 UNTRACKED_GOLDEN_NAME = "platformagent-untracked.yaml"
+# An editor's duplicate, as `test_a_golden_named_with_a_space_keeps_its_key` writes it.
+SPACED_GOLDEN_NAME = "platformagent copy.yaml"
 
 # The operator's allowance for a writing container's logs and writable layer
 # on top of the emptyDir it writes; the Go constant is the source of truth.
@@ -121,12 +123,12 @@ GOLDEN_WORKLOAD_PREFIX = f"{SOURCE_GOLDEN} "
 CHART_WORKLOAD_PREFIX = f"{SOURCE_CHART} "
 
 # The pods and containers rendered when this was written (2026-11-02): the
-# chart's hindsight-api, litellm, controller-manager, hindsight-postgresql and
-# cr-cleanup; each of nine goldens' shell StatefulSet, credential-proxy and
-# gateway Deployments; the kustomize manager, litellm, hindsight api and
-# postgres and inference-replay. A count under the floor means a source has
-# gone blind, not that the tree got smaller.
-MIN_CHART_PODS = 5
+# chart's hindsight-api, litellm, controller-manager, github-token-minter,
+# web-console, hindsight-postgresql and cr-cleanup; each of nine goldens' shell
+# StatefulSet, credential-proxy and gateway Deployments; the kustomize manager,
+# litellm, hindsight api and postgres and inference-replay. A count under the
+# floor means a source has gone blind, not that the tree got smaller.
+MIN_CHART_PODS = 7
 MIN_GOLDEN_PODS = 27
 MIN_KUSTOMIZE_PODS = 5
 MIN_CONTAINERS = 40
@@ -362,16 +364,23 @@ def count_containers(pods: list[Pod]) -> int:
     return sum(len(_all_containers(p.spec)) for p in pods)
 
 
+def split_workload(where: str) -> tuple[str, str]:
+    """(file, `<Kind>/<name>`) from a `workload_pods` label; the file may hold a
+    space (an editor's `platformagent copy.yaml`), a kind or a name cannot."""
+    path, kind_name = where.rsplit(" ", 1)
+    return path, kind_name
+
+
 def rendered_pods() -> list[Pod]:
     """Every pod the three sources render, labelled by source and file."""
     pods = [Pod(w, s, SOURCE_CHART) for w, s in workload_pods(rendered_chart(), SOURCE_CHART)]
     for where, spec in golden_pods():
         # The goldens render the same workloads once per fixture; one key
         # covers them all and the file is kept for the message.
-        path, kind_name = where.split(" ", 1)
+        path, kind_name = split_workload(where)
         pods.append(Pod(f"{GOLDEN_WORKLOAD_PREFIX}{kind_name}", spec, SOURCE_GOLDEN, path))
     for where, spec in kustomize_pods():
-        path, _ = where.split(" ", 1)
+        path, _ = split_workload(where)
         pods.append(Pod(where, spec, SOURCE_KUSTOMIZE, path))
     return pods
 
@@ -490,6 +499,16 @@ class ResourceParityGateTest(unittest.TestCase):
         self.assertEqual(str(golden), path)
         [(workload, spec)] = workload_pods(docs, SOURCE_GOLDEN)
         self.assertIn(RULE_CONTAINER_EMPTYDIR, {f.rule for f in check_pod(workload, spec)})
+
+    def test_a_golden_named_with_a_space_keeps_its_key(self):
+        # The file is read from disk whatever its name; the workload key is still
+        # `golden <Kind>/<name>` and the file is kept whole for the message.
+        with tempfile.TemporaryDirectory() as tmp:
+            golden = Path(tmp) / SPACED_GOLDEN_NAME
+            golden.write_text(BROKEN_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+            [(path, docs)] = golden_docs(Path(tmp))
+        [(where, _)] = workload_pods(docs, path)
+        self.assertEqual((str(golden), "Deployment/broken"), split_workload(where))
 
     def test_baseline_entries_name_a_rule_and_an_issue(self):
         rules = {RULE_DECLARED, RULE_CONTAINER_EMPTYDIR, RULE_POD_EMPTYDIR, RULE_POD_MEMORY_PER_VCPU, RULE_POD_EPHEMERAL_REQUEST}

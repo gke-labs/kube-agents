@@ -5,9 +5,11 @@ than templates: `test_emptydir_size_limits.py` (every emptyDir carries a
 sizeLimit) and `test_manifest_resource_parity.py` (every container declares its
 resources and its scratch volumes fit under them). Three sources:
 
-- the chart, through `helm template` with Hindsight on so its StatefulSet
-  renders (`rendered_chart`; empty when helm is not installed, and the caller
-  decides whether that is a skip);
+- the chart, through `helm template` with every opt-in workload on: Hindsight
+  so its StatefulSet renders, the GitHub token minter and the web console,
+  which `values.yaml` leaves off and which otherwise never reach a reader
+  (`rendered_chart`; empty when helm is not installed, and the caller decides
+  whether that is a skip);
 - the operator goldens, `k8s-operator/internal/testing/testdata/platform/expected/`,
   which are the reconciler's output for one PlatformAgent each, parsed as YAML
   (`golden_docs`). The directory holds nothing but goldens and is read from
@@ -39,11 +41,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 HELM = shutil.which("helm")
 CHART = "charts/kube-agents"
 CHART_RELEASE = "t"
+# The minter's org and repo are required when it is enabled; the console
+# requires `platformAgent.enabled`, which defaults to true.
 CHART_SETS = (
     "platformAgent.harness.clusterName=c",
     "platformAgent.harness.location=us-east4",
     "platformAgent.harness.projectId=p",
     "hindsight.enabled=true",
+    "githubMinter.enabled=true",
+    "githubMinter.org=example-org",
+    "githubMinter.repo=example-repo",
+    "webConsole.enabled=true",
 )
 
 GOLDEN_DIR = "k8s-operator/internal/testing/testdata/platform/expected"

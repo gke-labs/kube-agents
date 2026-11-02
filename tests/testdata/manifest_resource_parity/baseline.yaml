@@ -27,6 +27,26 @@ entries:
     measure: 2
     detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
     issue: 4433
+  # The GitHub token minter and the web console, both off by default and
+  # rendered under the reader's value sets: neither declares ephemeral-storage,
+  # and the console's 32Mi against 50m sits under the 1Gi-per-vCPU floor.
+  - workload: "chart Deployment/github-token-minter"
+    container: token-minter
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  - workload: "chart Deployment/t-web-console"
+    container: web-console
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  - workload: "chart Deployment/t-web-console"
+    rule: pod-memory-per-vcpu
+    measure: 384
+    detail: "32Mi memory per 50m CPU requested = 640Mi per vCPU; Autopilot admits 1Gi to 6656Mi"
+    issue: 4341
   # LiteLLM requests 2Gi of memory against 100m of CPU, 20 GiB per vCPU;
   # Autopilot raises the CPU request into the band.
   - workload: "chart Deployment/litellm"
