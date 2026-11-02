@@ -408,6 +408,80 @@ func TestPeopleSeenOffWritesNothingAndPurges(t *testing.T) {
 	}
 }
 
+// startPeopleOffRigWithoutBucket starts a rig with the count turned off and
+// no people bucket, waits for the start's purge to find nothing, then
+// creates the bucket holding keys n people, and returns the rig and bucket.
+// The test calls purgePeople itself, with its seams set.
+func startPeopleOffRigWithoutBucket(t *testing.T, n int) (*rig, jetstream.KeyValue) {
+	t.Helper()
+	r := startPeopleRig(t, func(c *Config) { c.PeopleSeenOff = true })
+	waitFor(t, "the no-bucket log", func() bool {
+		return strings.Contains(r.logs.String(), "people: nothing to purge: no people bucket")
+	})
+	kv := createPeopleBucket(t, r.url, jetstream.KeyValueConfig{History: 1, TTL: peopleTestTTL})
+	for i := range n {
+		if _, err := kv.PutString(context.Background(), testPeopleKey(t, fmt.Sprintf("test:p%d", i)), time.Now().UTC().Format(time.RFC3339)); err != nil {
+			t.Fatalf("seed put: %v", err)
+		}
+	}
+	r.g.peoplePurgeRetry = time.Millisecond
+	return r, kv
+}
+
+func TestAFailedPurgeIsTriedAgain(t *testing.T) {
+	r, kv := startPeopleOffRigWithoutBucket(t, 2)
+	failed := false
+	r.g.peoplePurgeList = func(ctx context.Context, kv jetstream.KeyValue) ([]string, error) {
+		if !failed {
+			failed = true
+			return nil, fmt.Errorf("list failed")
+		}
+		return listPeopleKeys(ctx, kv)
+	}
+	r.g.purgePeople(context.Background())
+	if keys := peopleKeys(t, kv); len(keys) != 0 {
+		t.Fatalf("keys = %v after the retry, want none", keys)
+	}
+	logs := r.logs.String()
+	if got := strings.Count(logs, "people: a purge attempt failed"); got != 1 {
+		t.Errorf("purge-failed warnings = %d, want 1:\n%s", got, logs)
+	}
+	warn := strings.Index(logs, "people: a purge attempt failed")
+	purged := strings.Index(logs, "people: purged")
+	if purged < warn || !strings.Contains(logs[purged:], "keys=2") {
+		t.Errorf("want the warning, then people: purged with keys=2:\n%s", logs)
+	}
+	if strings.Contains(logs, "no longer trying") {
+		t.Errorf("the purge gave up:\n%s", logs)
+	}
+}
+
+func TestAPurgeThatKeepsFailingGivesUp(t *testing.T) {
+	r, kv := startPeopleOffRigWithoutBucket(t, 2)
+	lists := 0
+	r.g.peoplePurgeList = func(context.Context, jetstream.KeyValue) ([]string, error) {
+		lists++
+		return nil, fmt.Errorf("list failed")
+	}
+	r.g.purgePeople(context.Background())
+	if want := peopleRetries + 1; lists != want {
+		t.Errorf("attempts = %d, want %d", lists, want)
+	}
+	logs := r.logs.String()
+	if got := strings.Count(logs, "people: a purge attempt failed"); got != peopleRetries+1 {
+		t.Errorf("purge-failed warnings = %d, want %d", got, peopleRetries+1)
+	}
+	if !strings.Contains(logs, "people: purge failed; no longer trying") {
+		t.Errorf("log lacks the give-up line:\n%s", logs)
+	}
+	if strings.Contains(logs, "people: purged") {
+		t.Errorf("a failed purge logged people: purged:\n%s", logs)
+	}
+	if keys := peopleKeys(t, kv); len(keys) != 2 {
+		t.Errorf("keys = %d, want both left", len(keys))
+	}
+}
+
 // fakePeopleWatcher is a jetstream.KeyWatcher whose updates the test sends.
 type fakePeopleWatcher struct {
 	updates chan jetstream.KeyValueEntry

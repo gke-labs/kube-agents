@@ -194,6 +194,11 @@ type Gateway struct {
 	// (startPeople); nil notes nobody.
 	peopleKeyer *peopleKeyer
 	people      atomic.Pointer[peopleDesk]
+	// peoplePurgeRetry is how long purgePeople waits between two attempts,
+	// and peoplePurgeList lists the bucket's keys for one attempt
+	// (listPeopleKeys); tests replace both.
+	peoplePurgeRetry time.Duration
+	peoplePurgeList  func(ctx context.Context, kv jetstream.KeyValue) ([]string, error)
 	// consoleResults holds a console chain end's deliverable from
 	// observeTaskDelivered to the observeTaskTerminal that follows it
 	// (consoleFrame).
@@ -509,6 +514,8 @@ func New(o Options) (*Gateway, error) {
 		pm:               pm,
 		ps:               ps,
 		peopleKeyer:      peopleKeys,
+		peoplePurgeRetry: peopleRetryInterval,
+		peoplePurgeList:  listPeopleKeys,
 		log:              log,
 		runCtx:           context.Background(),
 		sessionLocks:     map[string]*sessionLockEntry{},

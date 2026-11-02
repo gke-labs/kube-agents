@@ -41,7 +41,9 @@ const peopleKeyHexLen = 32
 const (
 	// peopleRetryInterval is how often the gateway looks again for a people
 	// bucket it did not find at start, and peopleRetries how many times, as
-	// for the feedback bucket (feedbackRetryInterval, feedbackRetries).
+	// for the feedback bucket (feedbackRetryInterval, feedbackRetries). The
+	// off switch's purge (purgePeople) retries a failed attempt on the same
+	// schedule.
 	peopleRetryInterval = time.Minute
 	peopleRetries       = 30
 	// peopleWatchRetryInterval is how long the desk waits before it watches
@@ -68,8 +70,8 @@ const (
 	peopleBadValueLog      = "people: skipping a key whose value is not an RFC 3339 time"
 	peoplePurgedLog        = "people: purged"
 	peoplePurgeNoBucketLog = "people: nothing to purge: no people bucket"
-	peoplePurgeFailedLog   = "people: purge failed"
-	peopleDeleteFailedLog  = "people: purge could not delete a key"
+	peoplePurgeFailedLog   = "people: a purge attempt failed"
+	peoplePurgeGaveUpLog   = "people: purge failed; no longer trying"
 )
 
 // The people desk's log attribute keys. No log line carries a people key: a
@@ -80,6 +82,7 @@ const (
 	peopleLogKeys       = "keys"
 	peopleLogErr        = "err"
 	peopleLogUnparsable = "unparsable"
+	peopleLogRemaining  = "remaining"
 )
 
 // peopleBackends are the chat backends whose verified senders are people.
@@ -370,32 +373,85 @@ func (d *peopleDesk) count() (short, long int, ok bool) {
 	return short, long, d.loaded
 }
 
-// purgePeople deletes every key in the people bucket, once, for an install
-// that turned the count off.
+// purgePeople deletes every key in the people bucket, for an install that
+// turned the count off. A failed attempt (the bind, the list, or a delete)
+// is tried again after peoplePurgeRetry, at most peopleRetries times, each
+// attempt listing and deleting what remains. A missing bucket has nothing
+// to purge: a bucket created after this start holds no keys, since an off
+// gateway puts none.
 func (g *Gateway) purgePeople(ctx context.Context) {
+	deleted := 0
+	for try := 0; ; try++ {
+		n, remaining, err := g.purgePeopleOnce(ctx)
+		deleted += n
+		if errors.Is(err, jetstream.ErrBucketNotFound) {
+			g.log.Info(peoplePurgeNoBucketLog, peopleLogBucket, lib.PeopleBucket)
+			return
+		}
+		if err == nil {
+			g.log.Info(peoplePurgedLog, peopleLogBucket, lib.PeopleBucket, peopleLogKeys, deleted)
+			return
+		}
+		args := []any{peopleLogBucket, lib.PeopleBucket, peopleLogErr, err}
+		if remaining >= 0 {
+			args = append(args, peopleLogRemaining, remaining)
+		}
+		g.log.Warn(peoplePurgeFailedLog, args...)
+		if try == peopleRetries {
+			g.log.Info(peoplePurgeGaveUpLog, peopleLogBucket, lib.PeopleBucket, peopleLogKeys, deleted)
+			return
+		}
+		timer := time.NewTimer(g.peoplePurgeRetry)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// purgePeopleOnce makes one purge attempt: it lists the bucket's keys and
+// deletes each. It returns how many it deleted, how many of those it listed
+// it did not (-1 when the bind or the list failed), and the first error.
+func (g *Gateway) purgePeopleOnce(ctx context.Context) (deleted, remaining int, err error) {
 	kv, err := g.client.KV(ctx, lib.PeopleBucket)
-	if errors.Is(err, jetstream.ErrBucketNotFound) {
-		g.log.Info(peoplePurgeNoBucketLog, peopleLogBucket, lib.PeopleBucket)
-		return
-	}
 	if err != nil {
-		g.log.Warn(peoplePurgeFailedLog, peopleLogBucket, lib.PeopleBucket, peopleLogErr, err)
-		return
+		return 0, -1, err
 	}
-	lister, err := kv.ListKeys(ctx)
+	keys, err := g.peoplePurgeList(ctx, kv)
 	if err != nil {
-		g.log.Warn(peoplePurgeFailedLog, peopleLogBucket, lib.PeopleBucket, peopleLogErr, err)
-		return
+		return 0, -1, err
 	}
-	n := 0
-	for key := range lister.Keys() {
+	var first error
+	for _, key := range keys {
 		if err := kv.Delete(ctx, key); err != nil {
-			g.log.Warn(peopleDeleteFailedLog, peopleLogBucket, lib.PeopleBucket, peopleLogErr, err)
+			if first == nil {
+				first = err
+			}
 			continue
 		}
-		n++
+		deleted++
 	}
-	g.log.Info(peoplePurgedLog, peopleLogBucket, lib.PeopleBucket, peopleLogKeys, n)
+	return deleted, len(keys) - deleted, first
+}
+
+// listPeopleKeys lists every key in kv. A list cut short by ctx is an
+// error, not a short list.
+func listPeopleKeys(ctx context.Context, kv jetstream.KeyValue) ([]string, error) {
+	lister, err := kv.ListKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = lister.Stop() }()
+	var keys []string
+	for key := range lister.Keys() {
+		keys = append(keys, key)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return keys, nil
 }
 
 // peopleNote notes a verified turn's person when it came from a chat backend
