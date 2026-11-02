@@ -270,7 +270,7 @@ delete_forge_vms() { # <label> [row]: deletes every VM list_forge_vms names
 hosts_entry() { printf '127.0.0.1 %s' "${EVAL_FORGE_HOST}"; }
 
 close_tunnel() {
-  local pid context=()
+  local pid
   if [ -s "${FORGE_TUNNEL_PID_FILE}" ]; then
     read -r pid < "${FORGE_TUNNEL_PID_FILE}"
     # The port-forward the keeper holds is read before the keeper is killed, so
@@ -282,19 +282,24 @@ close_tunnel() {
     [ -z "${children}" ] || kill ${children} 2>/dev/null || true
     rm -f "${FORGE_TUNNEL_PID_FILE}"
   fi
-  [ ! -s "${FORGE_TUNNEL_CONTEXT_FILE}" ] || context=(--context "$(cat "${FORGE_TUNNEL_CONTEXT_FILE}")")
   if [ -w "${FORGE_TUNNEL_HOSTS_FILE}" ] && grep -qxF "$(hosts_entry)" "${FORGE_TUNNEL_HOSTS_FILE}"; then
     # grep -v exits 1 when nothing is left, which is still a removal.
     { grep -vxF "$(hosts_entry)" "${FORGE_TUNNEL_HOSTS_FILE}" || [ $? -eq 1 ]; } > "${FORGE_TUNNEL_HOSTS_FILE}.forge" && cat "${FORGE_TUNNEL_HOSTS_FILE}.forge" > "${FORGE_TUNNEL_HOSTS_FILE}"
     rm -f "${FORGE_TUNNEL_HOSTS_FILE}.forge"
     echo "Forge ${ACTION}: hosts entry for ${EVAL_FORGE_HOST} removed"
   fi
-  # The relay pod: by name, in the context `up` recorded (a task cluster's
-  # get-credentials may have moved the current one); a run that never reached
-  # the cluster has none to delete.
-  kubectl ${context[@]+"${context[@]}"} delete pod "${FORGE_RELAY_POD}" -n "${FORGE_CLUSTER_CHECK_NAMESPACE}" --ignore-not-found --wait=false >/dev/null 2>&1 \
-    && echo "Forge ${ACTION}: relay pod ${FORGE_RELAY_POD} deleted (if it was there)" \
-    || echo "Forge ${ACTION}: no cluster credentials to delete ${FORGE_RELAY_POD} with; the pod, if any, goes with the install's teardown"
+}
+
+# Every relay pod in the host cluster, by the forge label, on every self-managed
+# row: this run's, and one a run that died before its `down` left (whatever
+# row the next run is), in the context a gitlab-ce `up` recorded (a task
+# cluster's get-credentials may have moved the current one), else the current.
+delete_relay_pods() {
+  local context=()
+  [ ! -s "${FORGE_TUNNEL_CONTEXT_FILE}" ] || context=(--context "$(cat "${FORGE_TUNNEL_CONTEXT_FILE}")")
+  kubectl ${context[@]+"${context[@]}"} delete pod -n "${FORGE_CLUSTER_CHECK_NAMESPACE}" -l "${FORGE_VM_LABEL_KEY}" --ignore-not-found --wait=false >/dev/null 2>&1 \
+    && echo "Forge ${ACTION}: relay pods (label ${FORGE_VM_LABEL_KEY}) deleted, if any" \
+    || echo "Forge ${ACTION}: no cluster credentials to delete relay pods with; one left behind stays until a later forge run's down on this project"
 }
 
 # ─── down ─────────────────────────────────────────────────────────────────────
@@ -302,6 +307,7 @@ forge_down() {
   local started=${SECONDS} name zone
   echo "=== [$(stamp)] Forge down: ${FORGE_VM_NAME} (${EVAL_FORGE} at ${EVAL_FORGE_HOST}) in ${PROJECT_ID} ==="
   [ "${EVAL_FORGE_KIND}" != "gitlab" ] || close_tunnel
+  delete_relay_pods
   # This run's VM first, by the record `up` wrote; then any VM of the row by
   # label, so a run that died between create and record still gets swept.
   if [ -s "${FORGE_RECORD_FILE}" ]; then

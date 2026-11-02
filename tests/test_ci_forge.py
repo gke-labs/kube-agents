@@ -504,7 +504,7 @@ class ForgeScriptTest(unittest.TestCase):
                 os.kill(gone, 0)
         self.assertNotIn("gitlab.eval.internal", self.hosts.read_text())
         self.assertIn("127.0.0.1 localhost", self.hosts.read_text(), "the rest of the hosts file is left alone")
-        self.assertTrue(self.calls_of("kubectl --context host-ctx delete pod forge-relay"), "the relay is deleted in the context up recorded")
+        self.assertTrue(self.calls_of("kubectl --context host-ctx delete pod -n default -l kube-agents-forge"), "relay pods are deleted by label, in the context up recorded")
         self.assertTrue(self.calls_of("compute instances delete forge-gitlab-ce --zone=us-central1-a"))
         self.assertFalse(self.state_dir.exists())
 
@@ -563,6 +563,15 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertIn("TCP-LISTEN:8443,fork,reuseaddr", recreated[0])
         self.assertTrue(self.calls_of("kubectl --context host-ctx wait --for=condition=Ready pod/forge-relay"))
         self.assertEqual(self.run_forge("down", forge="gitlab-ce").returncode, 0)
+
+    def test_down_on_ghes_deletes_a_relay_pod_a_dead_gitlab_ce_run_left(self):
+        # The relay has no controller and only the forge rows know it: a GHES run's
+        # down sweeps one a gitlab-ce run left behind, by its label.
+        self.provision()
+        proc = self.run_forge("down", forge="ghes")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.calls_of("kubectl delete pod -n default -l kube-agents-forge"))
+        self.assertFalse(self.calls_of("kubectl delete pod forge-relay"), "no tunnel to close on ghes, only the sweep")
 
     def test_down_on_gitlab_ce_removes_an_entry_that_was_the_hosts_files_only_line(self):
         self.provision()
