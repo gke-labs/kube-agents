@@ -163,6 +163,32 @@ run "a_blank_string_input_takes_the_profile_s_value" {
   }
 }
 
+# A blanked `TF_VAR_sizing_profile=` line exports "" too, and it means the
+# default profile rather than a refused plan, the way INSTALL.md's example
+# line reads when an operator blanks it to go back to the default.
+run "a_blank_profile_takes_the_default" {
+  command = plan
+
+  variables {
+    sizing_profile = ""
+  }
+
+  assert {
+    condition     = google_container_cluster.standard[0].node_config[0].machine_type == "e2-standard-4" && google_container_cluster.standard[0].node_config[0].disk_size_gb == 100
+    error_message = "a blank profile must render the default pool as small does: ${google_container_cluster.standard[0].node_config[0].machine_type} / ${google_container_cluster.standard[0].node_config[0].disk_size_gb}"
+  }
+
+  assert {
+    condition     = google_container_node_pool.gvisor[0].node_config[0].machine_type == "e2-standard-4" && google_container_node_pool.gvisor[0].node_config[0].disk_size_gb == 100
+    error_message = "a blank profile must render the gVisor pool as small does: ${google_container_node_pool.gvisor[0].node_config[0].machine_type} / ${google_container_node_pool.gvisor[0].node_config[0].disk_size_gb}"
+  }
+
+  assert {
+    condition     = output.sizing_profile == "small"
+    error_message = "the sizing_profile output must report the profile a blank resolved to, not the blank: ${output.sizing_profile}"
+  }
+}
+
 run "an_unknown_profile_is_refused" {
   command = plan
 

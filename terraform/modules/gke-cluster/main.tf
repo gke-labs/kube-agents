@@ -36,7 +36,13 @@ locals {
     }
   }
   profile_disk_type = "pd-balanced"
-  sizing_profile    = local.sizing_profiles[var.sizing_profile]
+  # The profile the pools resolve under. "" means the default, as on the
+  # string inputs below: a blanked TF_VAR_sizing_profile= line in install.env
+  # exports "", and coalesce folds "" as it folds null. The variable's own
+  # default is the same literal, which Terraform cannot read from a local.
+  default_sizing_profile = "small"
+  sizing_profile_name    = coalesce(var.sizing_profile, local.default_sizing_profile)
+  sizing_profile         = local.sizing_profiles[local.sizing_profile_name]
 
   # An explicit value always wins over the profile: the variables default to
   # null so that a value written into a tfvars file, even one equal to the

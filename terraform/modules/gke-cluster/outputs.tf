@@ -54,8 +54,8 @@ output "network_policy_enforced" {
 }
 
 output "sizing_profile" {
-  description = "The sizing profile the Standard cluster's node pools were resolved under (small, medium or fleet)."
-  value       = var.sizing_profile
+  description = "The sizing profile the Standard cluster's node pools were resolved under (small, medium or fleet); small when sizing_profile was given as \"\"."
+  value       = local.sizing_profile_name
 }
 
 output "standard_machine_type" {

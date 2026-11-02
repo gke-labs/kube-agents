@@ -157,14 +157,18 @@ variable "sizing_profile" {
     pool to n2-standard-8 with a 200 GB disk and the gVisor pool to
     n2-standard-4 with a 150 GB disk. An explicit standard_* or gvisor_*
     machine type or disk value always wins over the profile. The resolved
-    values are the module's standard_* and gvisor_* outputs. Only used when
-    cluster_mode = "standard".
+    values are the module's standard_* and gvisor_* outputs. "" (what a
+    blanked TF_VAR_ line in install.env exports) and null both mean "small".
+    Only used when cluster_mode = "standard".
   EOT
   type        = string
   default     = "small"
+  nullable    = false
 
+  # "" counts as unset, as it does on the four machine-type and disk-type
+  # inputs; the local that resolves the profile folds it to the default.
   validation {
-    condition     = contains(["small", "medium", "fleet"], var.sizing_profile)
+    condition     = var.sizing_profile == "" || contains(["small", "medium", "fleet"], var.sizing_profile)
     error_message = "sizing_profile must be \"small\", \"medium\" or \"fleet\"."
   }
 }
