@@ -9,8 +9,9 @@ the one host the credential belongs to. The credential is an HTTP access
 token that an administrator stored in a Secret: a project token (recommended),
 a repository token for an install with one repository, or a service account's
 personal token for repositories in more than one project. All of them are sent
-as `Authorization: Bearer` to the API, and to git with the username
-`x-token-auth`. `allowed_paths` narrows the token to project keys before it is
+as `Authorization: Bearer` to the API, and to git as a bearer too
+(`BEARER_GIT_USERNAME`): the instance refuses them as a Basic password with a
+shared username. `allowed_paths` narrows the token to project keys before it is
 spent.
 
 The instance is served at its root path on port 443 only. A context path or a
@@ -40,12 +41,13 @@ where it is absorbed:
 from __future__ import annotations
 
 import re
+import urllib.parse
 from typing import Any, Callable, Iterable, Mapping
 
 import repo_ref
 
 from ..base import Forge, WorkspaceError, listing
-from ..credentials import Credential, NoCredential, StaticFileCredential
+from ..credentials import BEARER_GIT_USERNAME, Credential, NoCredential, StaticFileCredential
 from ..validate import (
     MAX_CONVERSATION_SIZE,
     MAX_PAGE_SIZE,
@@ -68,7 +70,14 @@ REST = "rest/api/latest"
 #: text. Outside the REST API, so the transport is rooted at the host.
 WHOAMI = "plugins/servlet/applinks/whoami"
 
-GIT_USERNAME = "x-token-auth"
+#: A cheap authenticated read, asked for its `X-AUSERNAME` header only.
+WHO_ANSWERS = f"{REST}/application-properties"
+
+#: The response header that names the authenticated caller, lower-cased as
+#: the transport hands headers over.
+USERNAME_HEADER = "x-ausername"
+
+GIT_USERNAME = BEARER_GIT_USERNAME
 TOKEN_HEADER = "Authorization"
 TOKEN_FORMAT = "Bearer {token}"
 
@@ -229,6 +238,19 @@ class BitbucketDataCenterForge(Forge):
         """
         if self.identity:
             return self.identity
+        # Every authenticated answer names its caller in `X-AUSERNAME`,
+        # URL-encoded; a project token's user is `access-token-user/<p>/<t>`,
+        # which the servlet below does not answer (seen live on 8.19).
+        try:
+            _, headers = api("GET", WHO_ANSWERS, with_headers=True)
+        except WorkspaceError as exc:
+            if exc.status not in (401, 403, 404):
+                raise
+            headers = {}
+        lowered = {str(key).lower(): value for key, value in dict(headers or {}).items()}
+        named = urllib.parse.unquote(str(lowered.get(USERNAME_HEADER) or "")).strip()
+        if named and _USERNAME_RE.fullmatch(named):
+            return named
         try:
             text = api("GET", WHOAMI, raw="text/plain")
         except WorkspaceError as exc:
@@ -649,7 +671,7 @@ TALLY_STATES = {"open": "OPEN", "merged": "MERGED", "closed": "DECLINED"}
 #: A username a reading may ask about. It is a query parameter, not part of a
 #: query language, but it is held to one name with no space, colon or
 #: separator, as every forge holds its author.
-_READING_AUTHOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,254}")
+_READING_AUTHOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+/-]{0,254}")
 
 
 def _reading_author(value: Any) -> str:

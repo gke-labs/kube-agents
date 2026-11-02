@@ -1893,8 +1893,9 @@ type ForgeSpec struct {
 	// only for this install; a repository access token reaches one repository,
 	// so it serves an install with one repository only, because the broker
 	// holds one credential per host. On Bitbucket Data Center it is a project
-	// HTTP access token. The broker sends it as `Authorization: Bearer`, and
-	// to git with the username `x-token-auth`.
+	// HTTP access token. The broker sends it as `Authorization: Bearer`. Git
+	// gets it with the username `x-token-auth` on Cloud, and as a bearer on
+	// Data Center.
 	// +optional
 	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
 

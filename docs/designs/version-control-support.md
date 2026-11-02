@@ -2101,7 +2101,7 @@ table is about both:
 | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
 | `workspace/repo` (Cloud); `KEY/repo` (DC); `~user/repo` refused by name         | `parse`, `clone_url` in its own package                                                                                                                         | none                     |
 | pull requests, not MRs; comments are on an `/comments` sub-resource             | `translate.py` in its own package                                                                                                                               | none                     |
-| access tokens and API tokens, all static, all sent as `Authorization: Bearer`   | `StaticFileCredential` with the username `x-token-auth`, as it is                                                                                               | none                     |
+| access tokens and API tokens, all static, all sent as `Authorization: Bearer`   | `StaticFileCredential`; git gets the username `x-token-auth` on Cloud, and the token as a bearer on Data Center                                                   | the token-file git helper |
 | no issue tracker at all                                                         | `verbs` omitting the six issue verbs, `ForgeUnsupported` for free; the ledgers that need issues read the omission — **[below](#not-every-provider-is-a-forge)** | the consumers            |
 | no labels on a pull request                                                     | the `labels` capability, refused by name in the broker; callers use a branch prefix and a body marker                                                           | `base.py`, the consumers |
 | no current-user route for some tokens                                           | `Forge.whoami` and `identity_required`                                                                                                                          | `base.py`, the broker    |
@@ -2888,9 +2888,12 @@ self-managed GitLab does, and it can name a CA bundle for that host.
 ### The Bitbucket credential
 
 Every recommended token is a static string. The broker sends it as
-`Authorization: Bearer <token>` to the REST API, and git sends it with the
-username `x-token-auth`. `StaticFileCredential` takes all of them as it is, so
-Bitbucket adds no credential strategy and no refresh step.
+`Authorization: Bearer <token>` to the REST API. On Cloud, git sends it with the
+username `x-token-auth`. Data Center refuses an HTTP access token as a Basic
+password with any shared username, so git sends it as a bearer too: the
+token-file helper answers with `authtype=Bearer`, which git 2.46 and later
+support. `StaticFileCredential` takes all of them, so Bitbucket adds no
+credential strategy and no refresh step.
 
 | Product | Token                                                    | Use it when                                                               |
 | ------- | -------------------------------------------------------- | ------------------------------------------------------------------------- |

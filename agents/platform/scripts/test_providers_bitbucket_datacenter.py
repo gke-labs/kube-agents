@@ -63,6 +63,7 @@ REST = "rest/api/latest"
 REPO = f"{REST}/projects/ACME/repos/infra"
 PRS = f"{REPO}/pull-requests"
 WHOAMI = "plugins/servlet/applinks/whoami"
+WHO_ANSWERS = f"{REST}/application-properties"
 TOKEN = "mock-datacenter-write-token-0001"
 READ_TOKEN = "mock-datacenter-read-token-0002"
 DIFF = "diff --git a/x b/x\n+one\n"
@@ -105,6 +106,14 @@ class Text:
 
     def __init__(self, text: str) -> None:
         self.text = text
+
+
+class Headed:
+    """A 200 answer with a JSON body and extra response headers."""
+
+    def __init__(self, body, headers: dict[str, str]) -> None:
+        self.body = body
+        self.headers = headers
 
 
 class MockDataCenter:
@@ -158,11 +167,15 @@ class MockDataCenter:
                     answer = answer(record)
                 if isinstance(answer, Text):
                     return self._send(200, "text/plain", answer.text.encode())
+                if isinstance(answer, Headed):
+                    return self._send(200, "application/json", json.dumps(answer.body).encode(), answer.headers)
                 status, body = (answer.status, answer.body) if isinstance(answer, Status) else (200, answer)
                 self._send(status, "application/json", json.dumps(body).encode())
 
-            def _send(self, status: int, kind: str, data: bytes) -> None:
+            def _send(self, status: int, kind: str, data: bytes, extra: dict | None = None) -> None:
                 self.send_response(status)
+                for name, value in (extra or {}).items():
+                    self.send_header(name, value)
                 self.send_header("Content-Type", kind)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -453,11 +466,11 @@ class TrustTest(DataCenterCase):
         self.assertEqual("FORGE_REDIRECTED", error.fields["code"])
         self.assertEqual(1, len(self.mock.requests))
 
-    def test_git_gets_the_token_through_the_helper_with_x_token_auth(self):
+    def test_git_gets_the_token_through_the_helper_as_a_bearer(self):
         built = BitbucketDataCenterForge(HOST, str(self.token), ())
         config = dict(built.credential.git_config("ACME/infra"))
         self.assertEqual("", config["credential.helper"])
-        self.assertEqual([str(self.token), "x-token-auth"], config[f"credential.https://{HOST}.helper"].split()[1:])
+        self.assertEqual([str(self.token), "authtype-bearer"], config[f"credential.https://{HOST}.helper"].split()[1:])
         self.assertFalse([value for value in config.values() if TOKEN in value])
 
 
@@ -472,10 +485,20 @@ class IdentityTest(DataCenterCase):
         self.assertEqual("svc-configured", self.identity(self.broker(identity="svc-configured"))["login"])
         self.assertEqual([], self.mock.requests)
 
+    def test_the_caller_header_names_a_project_token_user(self):
+        # Seen live on 8.19: a project token acts as `access-token-user/<p>/<t>`,
+        # which the instance names, URL-encoded, in every answer's
+        # `X-AUSERNAME`, and which the servlet answers with nothing.
+        self.mock.routes[("GET", WHO_ANSWERS)] = Headed({}, {"X-AUSERNAME": "access-token-user%2F1%2F1"})
+        self.assertEqual("access-token-user/1/1", self.identity()["login"])
+        [request] = self.mock.requests
+        self.assertEqual(f"Bearer {TOKEN}", request["authorization"])
+
     def test_the_servlet_names_the_username_as_plain_text(self):
+        self.mock.routes[("GET", WHO_ANSWERS)] = {}
         self.mock.routes[("GET", WHOAMI)] = Text("svc-kube-agents\n")
         self.assertEqual("svc-kube-agents", self.identity()["login"])
-        [request] = self.mock.requests
+        request = self.mock.requests[-1]
         self.assertEqual("text/plain", request["accept"])
         self.assertEqual(f"Bearer {TOKEN}", request["authorization"])
 
@@ -483,6 +506,7 @@ class IdentityTest(DataCenterCase):
         for answer in (Status(401), Status(403), Status(404), Text(""), Text("two words"),
                        Text("<html><body>Log in</body></html>"), Text("a\nb")):
             with self.subTest(answer=getattr(answer, "status", None) or getattr(answer, "text", None)):
+                self.mock.routes[("GET", WHO_ANSWERS)] = {}
                 self.mock.routes[("GET", WHOAMI)] = answer
                 with self.assertRaises(IdentityUnknown) as caught:
                     self.identity()
@@ -490,6 +514,7 @@ class IdentityTest(DataCenterCase):
                                  (caught.exception.status, caught.exception.fields["code"]))
 
     def test_a_server_failure_is_the_shared_error(self):
+        self.mock.routes[("GET", WHO_ANSWERS)] = {}
         self.mock.routes[("GET", WHOAMI)] = Status(500)
         error = self.refused(self.identity)
         self.assertNotIsInstance(error, IdentityUnknown)
@@ -888,7 +913,7 @@ class ReadCredentialTest(unittest.TestCase):
         self.assertIsInstance(credential, providers.StaticFileCredential)
         self.assertEqual({"Authorization": f"Bearer {READ_TOKEN}"}, credential.headers("ACME/docs"))
         helper = dict(credential.git_config("ACME/docs"))[f"credential.https://{HOST}.helper"].split()
-        self.assertEqual([str(self.read), "x-token-auth"], helper[1:])
+        self.assertEqual([str(self.read), "authtype-bearer"], helper[1:])
         self.assertEqual({"Authorization": f"Bearer {TOKEN}"}, built.credential.headers("ACME/infra"))
 
     def test_a_key_added_later_is_read_with_no_restart(self):
