@@ -30296,6 +30296,35 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
             self.assertEqual(audit_report.degrade_unlisted_kustomize_additions([finding], probe), ["pdb-fix"])
         self.assertIn("does not list it", finding["remediation"]["note"])
 
+    def test_the_paragraph_scan_leaves_planning_its_retry(self):
+        """Review finding: the Config Connector paragraph scan opened the
+        probe twice after a refused open, so planning got no retry. It makes
+        one attempt at most, and it reuses a workspace the probe has open."""
+        self.patch_attr("content_mode", lambda: True)
+        opens = []
+
+        def refused(*_args, **_kwargs):
+            opens.append("open")
+            raise credential_proxy_client.WorkspaceRequestError(403, {"error": "repository not managed"})
+
+        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        with patch.object(credential_proxy_client.Workspace, "open", refused), contextlib.redirect_stderr(io.StringIO()):
+            scan = audit_report._kcc_paragraph_scan("acme/fleet", probe)
+            self.assertEqual(len(opens), 1)
+            self.assertTrue(scan.failed)
+            self.assertIsNone(probe.broker())
+        self.assertEqual(len(opens), 2)
+
+        session = mock.MagicMock()
+        session.__enter__.return_value = TestStalledKccRemediations.broker({})
+        opened = mock.MagicMock(return_value=session)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        with patch.object(credential_proxy_client.Workspace, "open", opened):
+            self.assertIsNotNone(probe.broker())
+            scan = audit_report._kcc_paragraph_scan("acme/fleet", probe)
+        self.assertEqual(opened.call_count, 1)
+        self.assertFalse(scan.failed)
+
     def test_a_broker_that_does_not_answer_the_open_stops_the_command(self):
         """An outage, as at publish: nothing is published or degraded, and
         the worker runs `finish` again."""

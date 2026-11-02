@@ -22842,6 +22842,20 @@ def findings_predate_run(path: str, audit_id: str) -> str | None:
     return str(started_raw)
 
 
+def _kcc_paragraph_scan(repo: str, probe: _RepositoryProbe) -> KccBrokerScan:
+    """The broker search that the Config Connector paragraph names a
+    declaration from, over every kind (`every_kind`).
+
+    It uses the probe's workspace when the probe already opened one. Otherwise
+    it makes one open attempt at most, so planning, which also asks the probe,
+    keeps its retry. A scan with no workspace is failed, and the paragraph
+    then does not say that no file declares the object."""
+    session = probe.broker()
+    if session is None:
+        return KccBrokerScan({}, False, True)
+    return kcc_declarations_via_broker(repo, session, every_kind=True)
+
+
 def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # Only a scheduled run can be silent. The cron prompt passes
     # `--scheduled`; an on-demand run does not, so its `silent_ok` is always
@@ -23106,12 +23120,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     kcc_index: dict[KccKey, KccDeclaration] = {}
     kcc_index_complete = False
     if kcc_stalls and content_mode():
-        session = probe.broker() or probe.broker()
-        paragraph_scan = (
-            kcc_declarations_via_broker(repo, session, every_kind=True)
-            if session is not None
-            else KccBrokerScan({}, False, True)
-        )
+        paragraph_scan = _kcc_paragraph_scan(repo, probe)
         kcc_index = kcc_declaration_index(kcc_roots, paragraph_scan.declarations)
         kcc_index_complete = not paragraph_scan.truncated and not paragraph_scan.failed
     elif kcc_stalls:
