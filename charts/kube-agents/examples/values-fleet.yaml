@@ -52,7 +52,9 @@ platformAgent:
       # have a brokered command in flight in the credential proxy, which admits
       # eight at once; 3 keeps the gateway pod inside its memory limit while 25
       # or more clusters feed event triage. One worker slot is always kept for
-      # a question asked in chat.
+      # a question asked in chat. The cap costs batch time: capping at 2
+      # roughly doubled a fan-out's finish time on a live cluster, so measure
+      # before going lower.
       maxInProgress: 3
   deployment:
     # The operator copies spec.deployment.env onto the agent container only for

@@ -45,15 +45,15 @@ Hindsight off. The default column is declared. The fleet column is what
 CPU is in vCPU, memory in GiB, and each cell reads requests then limits. A test derives the
 declared column from the two files and fails when the page falls behind them.
 
-| Workload                                                     | Pods | Runtime                                               | Default (declared)                  | Fleet (modeled)                 | Ephemeral (declared)     | Persistent                                               |
-| ------------------------------------------------------------ | ---- | ----------------------------------------------------- | ----------------------------------- | ------------------------------- | ------------------------ | -------------------------------------------------------- |
-| Credential proxy (Envoy and the broker)                      | 1    | standard                                              | 0.5 / 1 then 1 / 2                  | 4 / 8 then 8 / 8                | 8 GiB, request and limit | none                                                     |
-| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName` | 1.506 / 3 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25      | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
-| Shell sandbox `<name>-shell-0`                               | 1    | same class as the gateway pod                         | 0.2 / 0.5 then 2 / 2                | unchanged: no field raises it   | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
-| Operator                                                     | 1    | standard                                              | 0.05 / 0.125 then 0.5 / 0.5         | 0.25 / 1 then 0.5 / 1           | none declared            | none                                                     |
-| LiteLLM                                                      | 2    | standard                                              | 0.1 / 2 then 0.5 / 3, each          | unchanged                       | 1.25 GiB each            | none                                                     |
-| GitHub token minter                                          | 2    | standard                                              | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                       | none declared            | none                                                     |
-| **Total**                                                    | 8    |                                                       | **2.556 / 8.75 then 11 / 23.25**    | **6.6 / 22.25 then 18 / 35.75** | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
+| Workload                                                     | Pods | Runtime                                                                | Default (declared)                  | Fleet (modeled)                 | Ephemeral (declared)     | Persistent                                               |
+| ------------------------------------------------------------ | ---- | ---------------------------------------------------------------------- | ----------------------------------- | ------------------------------- | ------------------------ | -------------------------------------------------------- |
+| Credential proxy (Envoy and the broker)                      | 1    | standard                                                               | 0.5 / 1 then 1 / 2                  | 4 / 8 then 8 / 8                | 8 GiB, request and limit | none                                                     |
+| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 3 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25      | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
+| Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged: no field raises it   | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
+| Operator                                                     | 1    | standard                                                               | 0.05 / 0.125 then 0.5 / 0.5         | 0.25 / 1 then 0.5 / 1           | none declared            | none                                                     |
+| LiteLLM                                                      | 2    | standard                                                               | 0.1 / 2 then 0.5 / 3, each          | unchanged                       | 1.25 GiB each            | none                                                     |
+| GitHub token minter                                          | 2    | standard                                                               | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                       | none declared            | none                                                     |
+| **Total**                                                    | 8    |                                                                        | **2.556 / 8.75 then 11 / 23.25**    | **6.6 / 22.25 then 18 / 35.75** | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
 
 The gateway pod's fleet row raises two containers. `agent-api-auth` is the example's
 `agentAPIAuth.resources`, 0.5 vCPU and 2 GiB requests with a 4 GiB memory limit. The agent
@@ -65,7 +65,11 @@ leaves it alone, because Helm patches only the fields its render changes. The
 [CRD page](/kube-agents/operator/platformagent-crd/#specdeployment) describes the field.
 
 The shell sandbox's 2 vCPU and 2 GiB limit is fixed in the operator. A fleet audit that needs
-more memory in the sandbox is bounded by `maxInProgress`, which the example lowers to 3.
+more memory in the sandbox is bounded by `maxInProgress`, which the example lowers to 3. The
+sandbox runs on the node's default runtime unless
+[`spec.harness.experimental.shellSandbox.runtimeClassName`](/kube-agents/operator/platformagent-crd/#shellsandbox)
+names `gvisor`; the gateway pod's class is the separate `availability.runtimeClassName`, which
+the installer sets.
 
 Two optional stacks add to the total:
 
@@ -109,10 +113,10 @@ machine type is an installer setting, and a machine type changed on a managed po
 Terraform shows as drift on the next plan, so add pools beside them for a fleet. A node has to hold the whole gateway pod and most of the
 proxy's limit for either to reach it, which a 4 vCPU node cannot:
 
-| Pool             | Shape (modeled)                                                                            | Carries                                                  |
-| ---------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------- |
-| Default          | 3 × `n2-standard-8` (or `c3-standard-8`), 200 GB `pd-balanced` boot disk, autoscale 2 to 4 | proxy, operator, LiteLLM, minter, the `next` stack       |
-| gVisor (sandbox) | 1 × `n2-standard-4`, 150 GB boot disk, autoscale 1 to 2; `n2-standard-8` for `mode: next`  | gateway pod and shell sandbox, session pods under `next` |
+| Pool             | Shape (modeled)                                                                            | Carries                                                               |
+| ---------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| Default          | 3 × `n2-standard-8` (or `c3-standard-8`), 200 GB `pd-balanced` boot disk, autoscale 2 to 4 | proxy, operator, LiteLLM, minter, the `next` stack                    |
+| gVisor (sandbox) | 1 × `n2-standard-4`, 150 GB boot disk, autoscale 1 to 2; `n2-standard-8` for `mode: next`  | gateway pod; the shell sandbox once its own `runtimeClassName` is set |
 
 Create the gVisor pool with `--sandbox type=gvisor`, so it carries the taint only the sandboxed
 pods tolerate. The boot disk sizes are modeled: the measured fleet's evictions were disk
