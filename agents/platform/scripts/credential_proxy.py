@@ -8560,6 +8560,11 @@ class CommandExecutor:
 
     @property
     def _refresh_failure_cache(self) -> dict[tuple[str, str, str], tuple[float, Exception]]:
+        """The last failed refresh per (provider, host, repository): what a
+        caller queued before that failure is handed instead of a second run
+        of the helper. Keyed by the repository because a refresh mints for
+        the one repository named, so a failure says nothing about the
+        organisation's other repositories."""
         if getattr(self, "_last_forge_refresh_failure", None) is None:
             self._last_forge_refresh_failure = {}
         return self._last_forge_refresh_failure
@@ -8630,12 +8635,14 @@ class CommandExecutor:
             # Nothing to make current: see `_handle_forge_refresh`.
             return
         clean_repo = repository.strip().lower()
-        org = clean_repo.split("/", 1)[0] if "/" in clean_repo else clean_repo
         # Keyed by host as well as provider: the token slot is a forge
         # host's, so a refresh on one host coalesces nothing on another.
+        # The failure memo is the repository's own: the helper mints for the
+        # one repository named, so a failed mint for one repository must not
+        # be handed to a caller queued for another in the same organisation.
         host = forge.hosts[0] if forge.hosts else ""
         cache_key = (provider, host)
-        failure_key = (provider, host, org)
+        failure_key = (provider, host, clean_repo)
         queued_at = time.monotonic()
         # getattr: an executor built without `__init__`, as the lock and caches
         # below allow for, has no budget and nothing reserved.
