@@ -5,20 +5,22 @@ description: Take one failing eval case (or one root cause behind several), diag
 
 # Eval fix loop
 
-## First-day addendum (2026-11-02, six loops)
-
-- Step 0, before anything else: claim the queue row with your session name; read the store state (`expected_fail`, passes and fails per model); search open issues and pull requests by the case name, the check's reason string and the mechanism; a fix in flight ends the loop with a page row note.
-- For a check-only fix, the red is the nightly record and a replay of every recorded answer through the check on `main`; the green is the same replay at the head, with zero recorded passes turned to fails (`.agents/rules/eval_driven_development.md`: a failure the record shows on `main` is red on demand through the record).
-- Before a live run counts as red or green, read its final message and confirm the reply reaches the changed check; a reply that stops on another branch of the check proves nothing.
-- Patterns admit every recorded phrasing and exclude nothing; a narrowing is measured against every recorded answer before it goes in, and an action summary is the lane safeguard's job, not the check's.
-- Pin every wording check through the whole check (`check_passes` in `bench/tests/conftest.py` where present) on the recorded shapes and on the prose that must fail, one parametrized case per fixture.
-- A presubmit grades with `bench/` at the base commit plus the change's `bench/tasks/`: a lane-script change may call only bench entry points and flags that exist on `main`.
-- A case that can stop and may still let a card write a pull request declares `writes_alone: true`, so the lane runs it alone and charges it any write in its window.
-- Report "branch ready, not pushed" with the head, and wait for worker-review's preflight line before the first push; your own adversarial and docs-drift passes are the Self-Review.
-- Ship checklist: your own issue with `Closes`; `Part of #3978` in every certification issue and pull request body (rule 51); the domain owner and the eval crew as reviewers; sentences of at most 25 words and times in EST or EDT; no `Co-Authored-By` trailer; the body ends "Generated with the help of Claude Code."
-- At the first human lgtm the pull request goes to worker-pr-minder with a one-line handoff and the author takes the next row (rule 50); step 8 is then "send the numbers": the replay counts and the run directories to the page keeper.
-
 One root cause per loop. A classified cause with quoted evidence before any code. Never loosen a check to fit a model's wording. Three greens on the final head. Markers flip in the same pull request.
+
+## First-day addendum (2026-11-02)
+
+1. Before anything, take one row from the certification queue file and write your session name in its claims column.
+2. Read the store state first: `expected_fail` on `main`, passes and fails per model, `fail` against `not_applicable`.
+3. Search open issues and open pull requests three ways: the case name, the failing check's reason string, the mechanism. A fix in flight ends the loop with a page row note.
+4. The red is on the record: quote the store rows and two failing run directories, and replay them through the check as it is on `main`.
+5. For a check-only fix the green is the replay of every recorded answer with the new check: all addressed fails pass, zero passes turn to fails. Three live greens are for an agent or product change only.
+6. A wording check admits every phrasing of the fact and excludes nothing; a safeguard grades the action. Narrowing is measured on the record.
+7. Pin every wording check through the whole check with `check_passes` in `bench/tests/conftest.py`, never with a regex alone.
+8. Prefer the case folder. A change under `bench/kube_agents_bench/` must still work when the presubmit grades with the base commit's bench.
+9. A case that can stop declares `writes_alone: true`, so the lane safeguard charges any pull request the reply did not name.
+10. The body keeps every sentence at 25 words or fewer. It says `Closes #<issue>` and names the former owner as reviewer. It carries `Part of #3978` (rule 51), no `Co-Authored-By` trailer, and ends with "Generated with the help of Claude Code."
+11. One session, one PR: mind it to the first human lgtm, then hand it to the minder with a written handoff (rule 50). Post `/review` only if the bot did not review on open.
+12. Step 8 is "send the numbers": fails flipped, passes kept, the PR number and a page row note go to the planner. The store takes the night at the 06:27 EST read.
 
 ## Inputs
 
