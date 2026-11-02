@@ -273,6 +273,11 @@ def max_bundle_bytes() -> int:
 # it back: the kind is a word, then this process's pid, then its counter.
 SCRATCH_NAME_FORMAT = "{kind}-{pid}-{sequence}"
 SCRATCH_NAME_RE = re.compile(r"^(?P<kind>[a-z]+)-(?P<pid>\d+)-(?P<sequence>\d+)$")
+# The bundle a clone writes or a publish reads lives inside the verb's scratch
+# tree, named after it, so the tree's removal, at the verb's end, at start or
+# by the reclaimer, takes the bundle with it; a sibling under the root would
+# outlive a broker killed mid-verb, and nothing lists siblings.
+SCRATCH_BUNDLE_SUFFIX = ".bundle"
 
 
 def _remove_tree(path: Path) -> None:
@@ -752,10 +757,13 @@ class VcsBroker:
             return path in self._live
 
     def _discard_scratch(self, path: Path) -> None:
-        """A request's end: the tree goes and the directory is no longer in flight."""
+        """A request's end: the tree goes, then the directory is no longer in
+        flight. In that order, so `reclaim_orphan_scratch` on the sampler
+        thread never finds entries on disk for a path the live set has let go
+        and removes them as its own."""
+        _remove_tree(path)
         with self._live_lock:
             self._live.discard(path)
-        _remove_tree(path)
 
     def _scratch(self, kind: str) -> Path:
         """A fresh directory under the broker's root.
@@ -905,7 +913,7 @@ class VcsBroker:
         git = bound.git
 
         root = self._scratch("clone")
-        bundle = root.parent / f"{root.name}.bundle"
+        bundle = root / f"{root.name}{SCRATCH_BUNDLE_SUFFIX}"
         try:
             url = bound.forge.clone_url(bound.repo)
             if branch is None and base is not None:
@@ -1327,7 +1335,7 @@ class VcsBroker:
         git = bound.git
 
         root = self._scratch("publish")
-        bundle = root.parent / f"{root.name}.bundle"
+        bundle = root / f"{root.name}{SCRATCH_BUNDLE_SUFFIX}"
         try:
             bundle.write_bytes(blob)
             git(root, "init", "--quiet")

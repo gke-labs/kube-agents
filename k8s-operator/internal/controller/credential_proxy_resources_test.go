@@ -194,13 +194,18 @@ func TestCredentialProxyEmptyDirsFollowARaisedEphemeralStorageLimit(t *testing.T
 
 // TestCredentialProxyVolumeLimitEnvFollowsTheRenderedSizeLimits: the broker's
 // resource watermark gate measures each scratch volume against the byte figure
-// these two variables carry, so each has to equal the figure the kubelet
-// evicts on: the volume's sizeLimit at the default and at a raised
-// ephemeral-storage override, and the container's limit at an override lowered
-// under a volume's cap, since the kubelet sums the volumes into it. Both names
-// are in the managed set a CR cannot override.
+// these two variables carry, so the pair has to be what the kubelet evicts on:
+// each volume's sizeLimit at the default and at a raised ephemeral-storage
+// override, and at an override lowered under the two sizeLimits together,
+// shares of the container's limit that sum to it, since the kubelet sums the
+// volumes into that one limit; capping each at the whole limit would let two
+// half-full volumes read normal while the pair crosses it. Both names are in
+// the managed set a CR cannot override.
 func TestCredentialProxyVolumeLimitEnvFollowsTheRenderedSizeLimits(t *testing.T) {
-	for _, limit := range []string{"", "8Gi", "10Gi", "16Gi", "4Gi", "2Gi", "1Gi"} {
+	// The 2Gi override, the figure a 2Gi-limited install renders: 5/7 and
+	// 2/7 of 2147483648, summing to it.
+	const loweredLimit, loweredState, loweredTmp = "2Gi", "1533916891", "613566757"
+	for _, limit := range []string{"", "8Gi", "10Gi", "16Gi", "7Gi", "4Gi", loweredLimit, "1Gi"} {
 		var override *corev1.ResourceRequirements
 		if limit != "" {
 			override = &corev1.ResourceRequirements{
@@ -213,33 +218,52 @@ func TestCredentialProxyVolumeLimitEnvFollowsTheRenderedSizeLimits(t *testing.T)
 			{Name: credentialProxyTmpLimitEnv, Value: "1"},
 		}
 		ephemeral := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
-		want := map[string]string{}
+		sizeLimits := map[string]int64{}
 		for _, vol := range buildCredentialProxyRuntimeVolumes(agent) {
-			if vol.EmptyDir == nil || vol.EmptyDir.SizeLimit == nil {
-				continue
+			if vol.EmptyDir != nil && vol.EmptyDir.SizeLimit != nil {
+				sizeLimits[vol.Name] = vol.EmptyDir.SizeLimit.Value()
 			}
-			figure := vol.EmptyDir.SizeLimit.Value()
-			if ephemeral.Cmp(*vol.EmptyDir.SizeLimit) < 0 {
-				figure = ephemeral.Value()
-			}
-			want[vol.Name] = strconv.FormatInt(figure, 10)
-		}
-		if limit == "" || limit == "8Gi" {
-			if want[credentialProxyStateVolumeName] != "5368709120" || want[credentialProxyTmpVolumeName] != "2147483648" {
-				t.Fatalf("limit %q: the default figures moved: %v", limit, want)
-			}
-		}
-		if limit == "2Gi" && (want[credentialProxyStateVolumeName] != "2147483648" || want[credentialProxyTmpVolumeName] != "2147483648") {
-			t.Fatalf("limit %q: the lowered limit should cap both figures: %v", limit, want)
 		}
 		env := map[string][]string{}
 		for _, e := range buildCredentialProxyContainer(agent).Env {
 			env[e.Name] = append(env[e.Name], e.Value)
 		}
+		figures := map[string]int64{}
 		for name, volume := range map[string]string{credentialProxyStateLimitEnv: credentialProxyStateVolumeName, credentialProxyTmpLimitEnv: credentialProxyTmpVolumeName} {
-			if got := env[name]; len(got) != 1 || got[0] != want[volume] {
-				t.Errorf("limit %q: %s = %v, want exactly the %s eviction figure %s", limit, name, got, volume, want[volume])
+			if len(env[name]) != 1 {
+				t.Fatalf("limit %q: %s = %v, want exactly one value", limit, name, env[name])
 			}
+			figure, err := strconv.ParseInt(env[name][0], 10, 64)
+			if err != nil || figure <= 0 {
+				t.Fatalf("limit %q: %s = %q, want a positive byte count", limit, name, env[name][0])
+			}
+			if figure > sizeLimits[volume] {
+				t.Errorf("limit %q: %s = %d is above the %s sizeLimit %d the kubelet evicts the volume on", limit, name, figure, volume, sizeLimits[volume])
+			}
+			figures[volume] = figure
+		}
+		state, tmp := figures[credentialProxyStateVolumeName], figures[credentialProxyTmpVolumeName]
+		together := sizeLimits[credentialProxyStateVolumeName] + sizeLimits[credentialProxyTmpVolumeName]
+		switch {
+		case ephemeral.IsZero() || ephemeral.Value() >= together:
+			if state != sizeLimits[credentialProxyStateVolumeName] || tmp != sizeLimits[credentialProxyTmpVolumeName] {
+				t.Errorf("limit %q holds both volumes: state %d and tmp %d, want the sizeLimits %v", limit, state, tmp, sizeLimits)
+			}
+		default:
+			if state+tmp != ephemeral.Value() {
+				t.Errorf("limit %q is under the sizeLimits together: state %d + tmp %d = %d, want the limit %d the kubelet sums the volumes into", limit, state, tmp, state+tmp, ephemeral.Value())
+			}
+			if state <= tmp {
+				t.Errorf("limit %q: state %d should keep the larger share over tmp %d", limit, state, tmp)
+			}
+		}
+		if limit == "" || limit == "8Gi" {
+			if state != 5368709120 || tmp != 2147483648 {
+				t.Fatalf("limit %q: the default figures moved: state %d tmp %d", limit, state, tmp)
+			}
+		}
+		if limit == loweredLimit && (strconv.FormatInt(state, 10) != loweredState || strconv.FormatInt(tmp, 10) != loweredTmp) {
+			t.Fatalf("limit %q: want state %s and tmp %s, got %d and %d", limit, loweredState, loweredTmp, state, tmp)
 		}
 	}
 }

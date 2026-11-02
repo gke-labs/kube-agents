@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"math/big"
 	"slices"
 	"strconv"
 	"strings"
@@ -241,7 +242,9 @@ const (
 	// tree against the figure given here. Plain values rather than a Downward
 	// API field, which has no selector for a volume's sizeLimit; the state
 	// figure follows a raised ephemeral-storage override the way the volume
-	// does (credentialProxyEmptyDirSizeLimit), and /tmp keeps its cap. In the
+	// does (credentialProxyEmptyDirSizeLimit), /tmp keeps its cap, and an
+	// override lowered under the two caps together splits the limit between
+	// them (credentialProxyEvictionBytes). In the
 	// base env list and so reserved in mergeCredentialProxyEnv, because a CR
 	// that could set either would detach the gate from the eviction threshold.
 	credentialProxyStateLimitEnv = "CREDENTIAL_PROXY_STATE_LIMIT_BYTES" // #nosec G101 -- Env var name, not a credential
@@ -886,29 +889,43 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 // credentialProxyVolumeLimitEnv renders the two variables that tell the broker
 // the figure the kubelet evicts each scratch emptyDir on, in bytes: the
 // volume's sizeLimit, from the same arithmetic buildCredentialProxyRuntimeVolumes
-// sizes it with, capped at the container's merged ephemeral-storage limit. The
-// kubelet sums the volumes into that limit, so under an override lowered below
-// a volume's cap the pod goes at the limit, not at the sizeLimit, and a gate
-// measuring against the sizeLimit would read a volume about to evict the pod
-// as normal.
+// sizes it with, or its share of the container's merged ephemeral-storage
+// limit when an override puts that under the two sizeLimits together. The
+// kubelet sums the volumes into that one limit (the pod has one container),
+// so under such an override the pod goes at the limit, not at either
+// sizeLimit, and a gate measuring each volume against its sizeLimit, or each
+// against the whole limit, would read two half-full volumes about to evict
+// the pod as normal.
 func credentialProxyVolumeLimitEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	ephemeralLimit := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
 	state := credentialProxyEmptyDirSizeLimit(credentialProxyStateSizeLimit, credentialProxyEphemeralStorageLimit, ephemeralLimit)
 	tmp := resource.MustParse(credentialProxyTmpSizeLimit)
+	stateBytes, tmpBytes := credentialProxyEvictionBytes(*state, tmp, ephemeralLimit)
 	return []corev1.EnvVar{
-		{Name: credentialProxyStateLimitEnv, Value: strconv.FormatInt(credentialProxyEvictionBytes(*state, ephemeralLimit), 10)},
-		{Name: credentialProxyTmpLimitEnv, Value: strconv.FormatInt(credentialProxyEvictionBytes(tmp, ephemeralLimit), 10)},
+		{Name: credentialProxyStateLimitEnv, Value: strconv.FormatInt(stateBytes, 10)},
+		{Name: credentialProxyTmpLimitEnv, Value: strconv.FormatInt(tmpBytes, 10)},
 	}
 }
 
-// credentialProxyEvictionBytes is the lower of a volume's sizeLimit and the
-// container's ephemeral-storage limit, the first of the two the kubelet acts on.
-// An unset limit (a zero quantity) bounds nothing, so the sizeLimit stands.
-func credentialProxyEvictionBytes(sizeLimit, ephemeralLimit resource.Quantity) int64 {
-	if !ephemeralLimit.IsZero() && ephemeralLimit.Cmp(sizeLimit) < 0 {
-		return ephemeralLimit.Value()
+// credentialProxyEvictionBytes is the figure the kubelet evicts each scratch
+// volume on, state then /tmp: each volume's sizeLimit while the container's
+// ephemeral-storage limit holds both together, else the limit split between
+// them in the sizeLimits' proportion, so the two figures sum to the one
+// threshold the kubelet acts on and neither can read normal while the pair
+// is about to cross it. The writable layer and the logs get no share under
+// such an override: the watermarks are percentages under these figures, and
+// the headroom that remains is the part of the limit the watermarks leave.
+// An unset limit (a zero quantity) bounds nothing, so the sizeLimits stand.
+func credentialProxyEvictionBytes(stateSize, tmpSize, ephemeralLimit resource.Quantity) (int64, int64) {
+	together := stateSize.DeepCopy()
+	together.Add(tmpSize)
+	if ephemeralLimit.IsZero() || ephemeralLimit.Cmp(together) >= 0 {
+		return stateSize.Value(), tmpSize.Value()
 	}
-	return sizeLimit.Value()
+	// big.Int: a limit times a sizeLimit, both in bytes, overflows int64.
+	stateShare := new(big.Int).Mul(big.NewInt(ephemeralLimit.Value()), big.NewInt(stateSize.Value()))
+	stateBytes := stateShare.Div(stateShare, big.NewInt(together.Value())).Int64()
+	return stateBytes, ephemeralLimit.Value() - stateBytes
 }
 
 // credentialProxyEmptyDirSizeLimit is a volume's default sizeLimit plus

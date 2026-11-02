@@ -530,6 +530,30 @@ class ResourceWatermarkGateTest(unittest.TestCase):
         self.assertEqual(2, self.relieved)
         self.assertEqual(["workspaces", "vcs", "workspaces", "vcs"], self.reclaimed)
 
+    def test_an_episode_that_ends_and_begins_on_the_request_path_arms_the_next_tick(self):
+        # The level moves on every request's memory read, not only on the
+        # tick: an episode can end and a new one begin between two ticks,
+        # and the second owes the tick its relief too.
+        gate = self.gate(memory_percent=76)
+        self.assertEqual("soft", gate.tick())
+        self.assertEqual(1, self.relieved)
+        self.set_memory(gate, 50)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            gate.check("shell")
+        self.assertIn("resource watermark soft -> normal", "\n".join(logs.output))
+        self.set_memory(gate, 77)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            with gate.admit("shell"):
+                pass
+        self.assertIn("resource watermark normal -> soft", "\n".join(logs.output))
+        self.assertEqual(1, self.relieved)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            self.assertEqual("soft", gate.tick())
+        self.assertIn("resource watermark relief: reclaimed=2,1 trimmed=True", "\n".join(logs.output))
+        self.assertEqual(2, self.relieved)
+        self.assertEqual("soft", gate.tick())
+        self.assertEqual(2, self.relieved)
+
     def test_at_71_percent_disk_on_either_volume_the_tick_clamps(self):
         gate = self.gate(memory_percent=10)
         self.sizes["tmp"] = _percent(_TMP_LIMIT, 71)
@@ -692,6 +716,61 @@ class ResourceWatermarkGateTest(unittest.TestCase):
             self.assertEqual(2, executor.slots_in_use)
         release.set()
         thread.join(5)
+
+    def test_a_session_takes_a_slot_above_the_commands_admitted_before_the_clamp(self):
+        # The clamp arrives mid-load: the sweep's commands admitted before it
+        # keep their slots. The reserve is one slot above them, bounded by
+        # the configured cap, not a fixed count that would hold the session
+        # until all but one of them had finished.
+        gate = self.gate(memory_percent=50)
+        gate.tick()
+        executor = CommandExecutor(timeout_seconds=5, max_output_bytes=4096, state_dir=str(self.root / "exec"), scoped_pool=None, max_concurrent_commands=4)
+        executor.watermark_gate = gate
+        held = [threading.Event() for _ in range(3)]
+        release = [threading.Event() for _ in range(3)]
+
+        def hold(index):
+            with executor.request_slot():
+                held[index].set()
+                release[index].wait(5)
+
+        threads = [threading.Thread(target=hold, args=(index,), daemon=True) for index in range(3)]
+        for thread in threads:
+            thread.start()
+        for event in held:
+            self.assertTrue(event.wait(5))
+        self.set_memory(gate, 76)
+        self.assertEqual("soft", gate.tick())
+        self.assertEqual(1, executor._effective_cap())
+        self.assertEqual(4, executor._effective_cap(interactive=True))
+        # Admitted at once, in the one slot above the three background holders.
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+            with executor.request_slot(interactive=True):
+                self.assertEqual(4, executor.slots_in_use)
+                # The reserve is one slot: a second session is held, by the
+                # configured cap now and by the reserve once a holder exits.
+                with self.assertRaises(credential_proxy.CommandSlotUnavailable) as second:
+                    with executor.request_slot(interactive=True):
+                        self.fail("a second session ran past the configured cap")
+                self.assertIn("limit of 4 concurrent commands", str(second.exception))
+                release[0].set()
+                threads[0].join(5)
+                self.assertEqual(3, executor.slots_in_use)
+                self.assertEqual(3, executor._effective_cap(interactive=True))
+                with self.assertRaises(credential_proxy.CommandSlotUnavailable) as third:
+                    with executor.request_slot(interactive=True):
+                        self.fail("a second session ran in the one reserved slot")
+                self.assertIn("limit of 3 concurrent commands (clamped under resource pressure)", str(third.exception))
+                with self.assertRaises(credential_proxy.CommandSlotUnavailable):
+                    with executor.request_slot():
+                        self.fail("a background command ran under the clamp")
+            # The session gone, the reserve is free again above the two holders.
+            with executor.request_slot(interactive=True):
+                self.assertEqual(3, executor.slots_in_use)
+        for event in release:
+            event.set()
+        for thread in threads:
+            thread.join(5)
 
     def test_the_sampler_ticks_the_gate(self):
         gate = self.gate(memory_percent=76)
@@ -856,6 +935,30 @@ class ReliefStepTest(unittest.TestCase):
         self.assertTrue(minted[0].exists())
         broker._discard_scratch(minted[0])
         self.assertFalse(minted[0].exists())
+
+    def test_vcs_scratch_stays_in_flight_until_its_tree_is_gone(self):
+        import vcs_broker
+
+        root = self.root / "vcs"
+        root.mkdir()
+        broker = vcs_broker.VcsBroker(root, git_runner=lambda *args, **kwargs: None)
+        live = broker._scratch("clone")
+        (live / "object").write_text("x")
+        in_flight_during_removal: list[bool] = []
+        remove = vcs_broker._remove_tree
+
+        def observing_remove(path):
+            # The reclaimer on the sampler thread asks this while the tree is
+            # still on disk; a path already let go would be removed as an
+            # orphan and counted as relief.
+            in_flight_during_removal.append(broker._in_flight(path))
+            remove(path)
+
+        with mock.patch.object(vcs_broker, "_remove_tree", observing_remove):
+            broker._discard_scratch(live)
+        self.assertEqual([True], in_flight_during_removal)
+        self.assertFalse(live.exists())
+        self.assertFalse(broker._in_flight(live))
 
     def test_release_process_memory_collects_and_trims_where_libc_has_it(self):
         self.assertIsInstance(credential_proxy.release_process_memory(), bool)

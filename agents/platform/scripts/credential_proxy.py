@@ -1352,9 +1352,11 @@ ROLE_SLOT_ATTRIBUTES: dict[str, str] = {
 # is refused first under the hard watermark and told when to come back. Read
 # from the authenticated principal, never from a header the caller sets.
 INTERACTIVE_ROLES = frozenset({CALLER_ROLE_SESSION})
-# The content workspace routes that write the state volume (a clone, a push's
-# fetch) and so take the resource watermark gate's hard check.
-WORKSPACE_WRITING_ROUTES = frozenset({"open", "push"})
+# The content workspace routes that write the state volume, and so take the
+# resource watermark gate's hard check: `open` clones into it, `commit`
+# fetches into it and writes the changed files, and `push` runs a git child
+# against it (content_workspace.py; the push itself fetches nothing).
+WORKSPACE_WRITING_ROUTES = frozenset({"open", "commit", "push"})
 
 
 def executable_permitted(role: str, executable: str) -> bool:
@@ -2863,7 +2865,8 @@ class ResourceWatermarkGate:
       memory is read again so an idle broker still notices, and the first tick
       at or past the soft watermark runs the relief step once per episode:
       the reclaimers it was built with, then a collection and the allocator
-      trim. A tick under soft arms the step again.
+      trim. The level's return to normal arms the step again, whichever
+      reader produced that reading.
     * `clamps_concurrency` is the executor's: true from the soft watermark,
       and `_effective_cap` then admits PRESSURE_CLAMPED_CONCURRENCY at once.
 
@@ -2988,6 +2991,13 @@ class ResourceWatermarkGate:
             log = LOGGER.warning if WATERMARK_LEVELS.index(level) > WATERMARK_LEVELS.index(self._level) else LOGGER.info
             log("resource watermark %s -> %s (%s)", self._level, level, self._describe_locked())
             self._level = level
+            if level == WATERMARK_LEVEL_NORMAL:
+                # The episode ends here, whichever reader read it under:
+                # the tick, or a request's memory read between two ticks.
+                # Owned by the one place the level moves, so an episode that
+                # begins and ends on the request path still arms the next
+                # tick's relief.
+                self._relieved_this_episode = False
         return level
 
     def _describe_locked(self) -> str:
@@ -3020,10 +3030,7 @@ class ResourceWatermarkGate:
             readings[volume.name] = self.read_volume_ratio(volume)
         with self._lock:
             level = self._update(readings)
-            if level == WATERMARK_LEVEL_NORMAL:
-                self._relieved_this_episode = False
-                return level
-            if self._relieved_this_episode:
+            if level == WATERMARK_LEVEL_NORMAL or self._relieved_this_episode:
                 return level
             self._relieved_this_episode = True
         self.relieve()
@@ -7670,6 +7677,9 @@ class CommandExecutor:
         # refused as one that had just arrived.
         self._slot_condition = threading.Condition()
         self._slots_in_use = 0
+        # Of those, the slots interactive requests hold: the reserve under the
+        # pressure clamp is counted above the rest (_effective_cap).
+        self._interactive_slots_in_use = 0
         self._slot_queue: collections.deque[_AdmissionTicket] = collections.deque()
         # The deadline the commands of the request on this thread share; set by
         # `request_slot` for as long as the slot is held, read by `_execute`.
@@ -8059,19 +8069,27 @@ class CommandExecutor:
             )
 
     def _effective_cap(self, interactive: bool = False) -> int:
-        """The slot cap in force now for a request of this class: while the
-        resource watermark gate is at or past its soft watermark,
-        PRESSURE_CLAMPED_CONCURRENCY, plus INTERACTIVE_RESERVED_SLOTS for an
-        interactive request, so the reserve is a slot in this executor and
-        not only an admission at the gate: a session's read runs beside the
-        one long command the clamp lets a sweep keep; else the configured
-        cap. The gauges keep reporting the configured cap; the clamp is a
-        state of the gate, read off its ratio gauge."""
+        """The slot cap in force now for a request of this class, read under
+        `_slot_condition`: the configured cap, or while the resource watermark
+        gate is at or past its soft watermark, PRESSURE_CLAMPED_CONCURRENCY
+        for background work, and for an interactive request
+        INTERACTIVE_RESERVED_SLOTS above the background slots held now (or
+        above the clamp, when nothing holds more), bounded by the configured
+        cap. The reserve is a slot in this executor and not only an admission
+        at the gate: a session's read runs beside the one long command the
+        clamp lets a sweep keep. It sits above what is running rather than at
+        a fixed count because the clamp arrives mid-load, with the sweep's
+        commands admitted before it still in their slots; a fixed count would
+        hold the session until all but one of them had finished. The gauges
+        keep reporting the configured cap; the clamp is a state of the gate,
+        read off its ratio gauge."""
         gate = self.watermark_gate
-        if gate is not None and gate.clamps_concurrency:
-            clamped = PRESSURE_CLAMPED_CONCURRENCY + (INTERACTIVE_RESERVED_SLOTS if interactive else 0)
-            return min(self.max_concurrent_commands, clamped)
-        return self.max_concurrent_commands
+        if gate is None or not gate.clamps_concurrency:
+            return self.max_concurrent_commands
+        if not interactive:
+            return min(self.max_concurrent_commands, PRESSURE_CLAMPED_CONCURRENCY)
+        background_held = self._slots_in_use - self._interactive_slots_in_use
+        return min(self.max_concurrent_commands, max(PRESSURE_CLAMPED_CONCURRENCY, background_held) + INTERACTIVE_RESERVED_SLOTS)
 
     def _held_bound(self, takes_slot: bool, saw_slots_full: bool) -> str:
         """Which bound held a request through its wait: the one rule behind
@@ -8371,6 +8389,8 @@ class CommandExecutor:
                         raise AdmissionYielded("another caller needs to go first", queued_at)
                 if takes_slot:
                     self._slots_in_use += 1
+                    if interactive:
+                        self._interactive_slots_in_use += 1
                 reserved = REQUEST_CHILD_MEMORY_RESERVE_BYTES if self.children_budget_bytes is not None else 0
                 self._reserved_bytes += reserved
             finally:
@@ -8411,6 +8431,8 @@ class CommandExecutor:
             with self._slot_condition:
                 if takes_slot:
                     self._slots_in_use -= 1
+                    if interactive:
+                        self._interactive_slots_in_use -= 1
                 self._reserved_bytes -= reserved
                 self._slot_condition.notify_all()
 
@@ -13353,7 +13375,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         route = self.path[len("/v1/workspace/") :]
         # The verbs that write the state volume take the gate's hard check,
         # as the k8s list does: `open` clones into it, which is the fill the
-        # disk half exists to stop. Reads take nothing, as before.
+        # disk half exists to stop, and `commit` fetches into it. Reads take
+        # nothing, as before.
         gate = getattr(self, "watermark_gate", None)
         if route in WORKSPACE_WRITING_ROUTES and gate is not None:
             try:

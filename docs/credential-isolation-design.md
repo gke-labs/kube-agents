@@ -915,9 +915,10 @@ Consequences:
   kubelet's eviction signal) against `memory.max` on every admission, and the state and
   `/tmp` emptyDirs against the caps the operator passes
   (`CREDENTIAL_PROXY_STATE_LIMIT_BYTES`, `CREDENTIAL_PROXY_TMP_LIMIT_BYTES`: each volume's
-  sizeLimit, or the container's ephemeral-storage limit when an override puts that lower,
-  since the kubelet sums the volumes into it; statvfs when unset) on the memory sampler's
-  30 s tick. From the soft watermark
+  sizeLimit, or, when an override puts the container's ephemeral-storage limit under the
+  two sizeLimits together, shares of that limit in the sizeLimits' proportion, summing to
+  it, since the kubelet sums the volumes into that one limit; statvfs when unset) on the
+  memory sampler's 30 s tick. From the soft watermark
   (`CREDENTIAL_PROXY_MEM_SOFT_PCT` 75, `CREDENTIAL_PROXY_DISK_SOFT_PCT` 70) admitted commands
   run one at a time and the first tick reclaims idle content workspaces and orphaned vcs
   scratch, collects and trims the allocator. From the hard watermark
@@ -927,11 +928,12 @@ Consequences:
   the same envelope plus `retry_after`, with `retry in N s` in the text the shim prints; one
   slot stays open to the session role, which is the one interactive class, up to a ceiling
   of 92% memory or 90% disk, past which it is refused too. Under the clamp that reserve is a
-  slot in the executor as well: a session's command runs beside the one command the clamp
-  lets background work keep, and passes background requests the clamp holds. The class is the authenticated role, never a header. The gate covers
+  slot in the executor as well, one above the background commands running (those admitted
+  before the clamp arrived keep their slots) and bounded by the configured cap: a session's
+  command runs beside them, and passes background requests the clamp holds. The class is the authenticated role, never a header. The gate covers
   `/v1/exec`, `/v1/vcs/*` and the feedback route; a `/v1/k8s` list without `watch=true`
-  and the content workspace's `open` and `push` take the hard check alone, and a watch and
-  the workspace reads pass. A missing or `max` `memory.max` turns the
+  and the content workspace's `open`, `commit` and `push` take the hard check alone, and a
+  watch and the workspace reads pass. A missing or `max` `memory.max` turns the
   memory half off. The refusal counts under `bound="pressure"`, and
   `kubeagents_credential_proxy_resource_watermark_ratio` carries each resource's fill.
   A long-running command holds its slot and reservation for as long as it runs,

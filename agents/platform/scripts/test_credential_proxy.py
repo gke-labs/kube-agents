@@ -2736,7 +2736,7 @@ class ResourcePressureRouteTest(unittest.TestCase):
         handler._watcher_cluster_endpoint = lambda target, request_id: handler.endpoints_asked.append(target) or None
         return handler
 
-    def test_a_workspace_open_at_the_hard_watermark_is_refused_and_a_read_passes(self):
+    def test_a_workspace_write_at_the_hard_watermark_is_refused_and_a_read_passes(self):
         self.as_role(credential_proxy.CALLER_ROLE_SHELL)
         routed = []
         store = types.SimpleNamespace()
@@ -2748,6 +2748,14 @@ class ResourcePressureRouteTest(unittest.TestCase):
             self.assertEqual(429, status)
             self.assertEqual("11", headers["Retry-After"])
             self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", body["code"])
+            self.assertEqual([], routed)
+            # A commit fetches into the state volume and writes the changed
+            # files, so it is refused the same way; a push, which fetches
+            # nothing, still runs a git child and takes the check too.
+            for verb in ("commit", "push"):
+                status, _, body = self.post({"handle": "h", "branch": "fix/it"}, path=f"/v1/workspace/{verb}")
+                self.assertEqual(429, status, verb)
+                self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", body["code"])
             self.assertEqual([], routed)
             status, _, _ = self.post({"handle": "h", "path": "README.md"}, path="/v1/workspace/read")
             self.assertEqual(200, status)
