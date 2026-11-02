@@ -2184,10 +2184,43 @@ KCC_STALLED_NOTE = (
     "If the reason rejects the change in this file, correct the declaration. Otherwise the change takes "
     "effect when Config Connector applies the object again, and this finding comes back on each run until then."
 )
-# An earlier copy of that note, which a worker can copy from the previous
-# ledger. The pass removes it from every note and writes it again when the
-# stall is still there, as the route-note pass does with its notes.
-KCC_STALLED_NOTE_PATTERN = re.compile(r"[ \t]*" + re.escape(KCC_STALLED_NOTE_MARK) + r"[^\n]*")
+# The paragraph for any other fix of a finding whose own object Config
+# Connector does not apply: a `manual` or `gcloud` fix, a fix degraded to
+# `manual`, or a `manifest` fix to another file. When exactly one file in the
+# repository declares the object, the paragraph keeps the first sentence above
+# and names that file; when none or more than one does, it starts with
+# `KCC_STALLED_OBJECT_MARK` and says so.
+KCC_STALLED_DECLARED_NOTE = (
+    KCC_STALLED_NOTE_MARK + " The declaration is {path}. When the audit ran, Config Connector reported {objects}. "
+    "Config Connector does not apply the object until that reason is gone, so a change to the declaration "
+    "does not take effect before then, and this finding comes back on each run until then. "
+    "If the reason rejects the declaration, correct it there."
+)
+KCC_STALLED_OBJECT_MARK = "**Config Connector is not applying the declaration of this object.**"
+KCC_STALLED_UNDECLARED_NOTE = (
+    KCC_STALLED_OBJECT_MARK + " When the audit ran, Config Connector reported {objects}. "
+    "The audit found {found} of this object in the GitOps repository, so it names no file. "
+    "Config Connector does not apply the object until that reason is gone, so a change to the declaration "
+    "does not take effect before then, and this finding comes back on each run until then. "
+    "If the reason rejects the declaration, correct the declaration."
+)
+KCC_DECLARATION_NONE = "no declaration"
+KCC_DECLARATION_MANY = "more than one declaration ({count} files)"
+# How the paragraph names a declaration in a context repository.
+KCC_DECLARATION_IN_REPO = "{path} in the repository {repo}"
+# The first sentences of both paragraphs, which the strip-and-rewrite pattern
+# and the log look for.
+KCC_STALLED_NOTE_MARKS = (KCC_STALLED_NOTE_MARK, KCC_STALLED_OBJECT_MARK)
+# The finding field that holds the paragraph of a `gcloud` fix: its note is
+# the command, which renders in a bash block, so the paragraph renders after
+# the block. Only `finish` writes it: `validate_findings` removes it.
+KCC_STALLED_PARAGRAPH_FIELD = "kcc_stalled_paragraph"
+# An earlier copy of either paragraph, which a worker can copy from the
+# previous ledger. The pass removes it from every note and writes it again
+# when the stall is still there, as the route-note pass does with its notes.
+KCC_STALLED_NOTE_PATTERN = re.compile(
+    r"[ \t]*(?:" + "|".join(re.escape(mark) for mark in KCC_STALLED_NOTE_MARKS) + r")[^\n]*"
+)
 # What the merged-but-persisting line and comment say in place of the two
 # causes they guess at, when the finding's object is one of those objects.
 # They state the fact and the reason only: the merged change itself can be
@@ -2201,7 +2234,7 @@ KCC_STALLED_PERSISTS_LINE = (
     "takes effect when Config Connector applies the object again. The merged {noun} is not reopened."
 )
 KCC_STALLED_PERSISTS_COMMENT = (
-    "Config Connector is not applying the declaration this fix changed: when the audit ran, it "
+    "Config Connector is not applying the declaration of this finding's object: when the audit ran, it "
     "reported {objects}. If that reason rejects the change this fix made, correct the declaration "
     "in a new change. Otherwise the change takes effect when Config Connector applies the object "
     "again. This {noun} is **not** reopened: it merged, and reopening it would misrepresent "
@@ -5656,9 +5689,10 @@ def _validate_findings_document(data: object, audit_id: str) -> dict:
     for i, finding in enumerate(findings):
         if not isinstance(finding, dict):
             raise ValidationError(f"findings[{i}]: expected an object")
-        # Only `finish` writes this field, from the collector's manifest; a
+        # Only `finish` writes these fields, from the collector's manifest; a
         # worker's copy would state a Config Connector stall nobody read.
         finding.pop(KCC_STALLED_FINDING_FIELD, None)
+        finding.pop(KCC_STALLED_PARAGRAPH_FIELD, None)
 
         # Which check produced this. Was implicit in the id's first segment,
         # which meant it was only ever as reliable as the id — and the id was
@@ -7483,7 +7517,7 @@ def _strip_route_notes(remediation: object) -> None:
     # The Config Connector note is stripped and written again the same way
     # (`disclose_stalled_kcc_remediations`), so a carried note never keeps a
     # stall that this run's manifest does not show.
-    if KCC_STALLED_NOTE_MARK in note:
+    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
         note = KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
     if isinstance(uncut, str) or note != remediation.get("note"):
         remediation["note"] = note
@@ -11555,6 +11589,11 @@ def render_finding(
             "bash",
             placeholder="# (no command supplied)",
         )
+        # The Config Connector paragraph of a `gcloud` fix, after the command
+        # block: inside it, prose would break the command.
+        paragraph = str(finding.get(KCC_STALLED_PARAGRAPH_FIELD) or "")
+        if paragraph:
+            lines += ["", clip_text(paragraph, MAX_NOTE_CHARS)]
     else:
         note = clip_text(remediation.get("note", ""), MAX_NOTE_CHARS)
         lines.append(f"- **Remediation (manual):** {note or '_none supplied_'}")
@@ -18301,6 +18340,9 @@ class KccDeclaration(NamedTuple):
     name: str = ""
     namespace: str = ""
     project: str = ""
+    # Other files that declare the same key, as `(repo, path)`: the first
+    # declaration wins, and these say the object is declared more than once.
+    also: tuple[tuple[str, str], ...] = ()
 
 
 # `(kind, name, cluster, location)`: `cluster` is the bare GKE name the resource
@@ -18397,17 +18439,30 @@ def _index_kcc_text(
         if not name or not cluster:
             continue
         location = str(spec.get("location") or "")
-        index.setdefault(
-            (kind, name, cluster, location),
-            KccDeclaration(
-                repo,
-                path,
-                frozenset(str(k) for k in spec),
-                str(meta.get("name") or ""),
-                str(meta.get("namespace") or ""),
-                str((meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}).get(KCC_PROJECT_ANNOTATION) or ""),
-            ),
+        entry = KccDeclaration(
+            repo,
+            path,
+            frozenset(str(k) for k in spec),
+            str(meta.get("name") or ""),
+            str(meta.get("namespace") or ""),
+            str((meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}).get(KCC_PROJECT_ANNOTATION) or ""),
         )
+        _add_kcc_declaration(index, (kind, name, cluster, location), entry)
+
+
+def _add_kcc_declaration(index: dict[KccKey, KccDeclaration], key: KccKey, entry: KccDeclaration) -> None:
+    """Add `entry` at `key`. The first declaration wins; a declaration of the
+    same key in another file is kept in the first one's `also`, so the
+    Config Connector paragraph can see that the object has two files."""
+    first = index.get(key)
+    if first is None:
+        index[key] = entry
+        return
+    others = ((entry.repo, entry.path), *entry.also)
+    known = {(first.repo, first.path), *first.also}
+    added = tuple(other for other in others if other not in known)
+    if added:
+        index[key] = first._replace(also=first.also + added)
 
 
 class KccBrokerScan(NamedTuple):
@@ -18591,6 +18646,19 @@ def reverted_gcloud_problem(
     return None
 
 
+def kcc_declaration_index(
+    roots: list[tuple[str, Path]], prebuilt: dict[KccKey, KccDeclaration] | None = None
+) -> dict[KccKey, KccDeclaration]:
+    """The Config Connector declarations `finish` can see: `prebuilt` (the
+    broker's index, in content mode) first, then each clone in `roots`, the
+    GitOps repository's before the context repositories'. First wins."""
+    declarations: dict[KccKey, KccDeclaration] = dict(prebuilt or {})
+    for repo, tree in roots:
+        for key, entry in kcc_declarations(tree, repo).items():
+            _add_kcc_declaration(declarations, key, entry)
+    return declarations
+
+
 def degrade_reverted_gcloud_remediations(
     findings: list[dict],
     roots: list[tuple[str, Path]],
@@ -18614,10 +18682,7 @@ def degrade_reverted_gcloud_remediations(
         return []
     # The GitOps repository first, so its declaration wins a name both carry;
     # in content mode that is the broker's index, handed in as `prebuilt`.
-    declarations: dict[KccKey, KccDeclaration] = dict(prebuilt or {})
-    for repo, tree in roots:
-        for key, entry in kcc_declarations(tree, repo).items():
-            declarations.setdefault(key, entry)
+    declarations = kcc_declaration_index(roots, prebuilt)
     if not declarations:
         return []
     degraded: list[str] = []
@@ -18997,24 +19062,32 @@ def _object_stalls(
     kcc_hosts: int,
     targets: tuple[str, ...] = (),
     namespaces: frozenset[str] = frozenset(),
+    declarations: "dict[KccKey, KccDeclaration] | None" = None,
 ) -> list[KccStall]:
     """The unready objects that are `finding`'s own object: a `Cluster/` or
     `NodePool/` finding, matched on the name GKE reports (the object's
-    `resourceID`, else its name) and, for a node pool, on its cluster.
+    `resourceID`, else its name) and, for a node pool, on its cluster; or a
+    finding of a Config Connector kind (`<Kind>/<n>`), matched on that kind,
+    that name and the finding's namespace when it names one, which takes its
+    project and location only from the one declaration of that object in
+    `declarations` (`_generic_object_stalls`).
     An object whose project is known must manage the finding's project, and
     with more than one host that runs Config Connector the project must be
     known (`_project_certain`). An object with no recorded project names
     nothing when the manifest holds a cluster of the same name in another
     project (`targets`): its name and `clusterRef` cannot tell the two
     apart. Objects that fit on more than one host cluster name nothing, as
-    in `_remediation_file_stalls`: the match is not certain. A known location
+    in `_remediation_file_stalls`: the match is not certain, and so do
+    objects in more than one namespace (`_one_object`). A known location
     must be the finding's cluster location (`_location_agrees`), and when
     the fix's file sets namespaces (`namespaces`), the object must be in one
     of them."""
     prefix, _, name = str(finding.get("object") or "").partition("/")
     kinds = _KCC_OBJECT_KINDS.get(prefix)
-    if not kinds or not name:
+    if not name:
         return []
+    if not kinds:
+        return _generic_object_stalls(finding, prefix, name, stalled, kcc_hosts, namespaces, declarations or {})
     cluster = str(finding.get("cluster") or "").rpartition("/")[2]
     project = _finding_project(finding)
     pool_kinds = _KCC_OBJECT_KINDS["NodePool"]
@@ -19034,7 +19107,89 @@ def _object_stalls(
         and _project_certain(stall, project, kcc_hosts)
         and (stall.project or not namesakes)
     ]
-    return fits if len({stall.host for stall in fits}) <= 1 else []
+    return fits if _one_object(fits) else []
+
+
+def _generic_object_stalls(
+    finding: dict,
+    kind: str,
+    name: str,
+    stalled: list[KccStall],
+    kcc_hosts: int,
+    namespaces: frozenset[str],
+    declarations: "dict[KccKey, KccDeclaration]",
+) -> list[KccStall]:
+    """The unready objects that are the own object of a `<Kind>/<n>` finding.
+
+    Such a finding is on the cluster that runs Config Connector, so the
+    finding gives no project or location: they come from the one declaration
+    of the object in `declarations`, when there is exactly one. A finding
+    that names a namespace matches only that namespace.
+    """
+    namespace = str(finding.get("namespace") or "")
+    fits = [
+        stall
+        for stall in stalled
+        if stall.kind == kind
+        and stall.name == name
+        and (not namespace or stall.namespace == namespace)
+        and (not namespaces or stall.namespace in namespaces)
+    ]
+    certain: list[KccStall] = []
+    for stall in fits:
+        found = _declarations_of(stall, declarations)
+        project = found[0][1].project if len(found) == 1 else ""
+        location = found[0][0][3] if len(found) == 1 else ""
+        if _project_certain(stall, project, kcc_hosts) and _location_agrees(stall, location):
+            certain.append(stall)
+    return certain if _one_object(certain) else []
+
+
+def _one_object(fits: list[KccStall]) -> bool:
+    """Whether `fits` is one object at most: on one host, in one namespace,
+    of one name. More is not certain, so it names nothing."""
+    return len({(stall.host, stall.namespace, stall.name) for stall in fits}) <= 1
+
+
+def _declarations_of(
+    stall: KccStall, declarations: "dict[KccKey, KccDeclaration]"
+) -> "list[tuple[KccKey, KccDeclaration]]":
+    """The declarations in the repository index that declare `stall`'s object:
+    the same kind and `metadata.name`, the same namespace when the file sets
+    one, and the same `clusterRef` when both name one. One per file."""
+    found: list[tuple[KccKey, KccDeclaration]] = []
+    files: set[tuple[str, str]] = set()
+    for key, declaration in declarations.items():
+        if key[0] != stall.kind or declaration.name != stall.name:
+            continue
+        if declaration.namespace and declaration.namespace != stall.namespace:
+            continue
+        if key[0] in _KCC_OBJECT_KINDS["NodePool"] and stall.cluster and key[2] != stall.cluster:
+            continue
+        for where in ((declaration.repo, declaration.path), *declaration.also):
+            if where not in files:
+                files.add(where)
+                found.append((key, declaration._replace(repo=where[0], path=where[1])))
+    return found
+
+
+def _kcc_declaration_path(declaration: KccDeclaration) -> str:
+    """A declaration's file, in a code span it cannot close."""
+    path = f"`{KCC_NAME_UNSAFE.sub(KCC_NAME_REPLACEMENT, declaration.path)}`"
+    if not declaration.repo:
+        return path
+    return KCC_DECLARATION_IN_REPO.format(path=path, repo=f"`{KCC_NAME_UNSAFE.sub(KCC_NAME_REPLACEMENT, declaration.repo)}`")
+
+
+def kcc_object_paragraph(matched: list[KccStall], objects: str, declarations: "dict[KccKey, KccDeclaration]") -> str:
+    """The paragraph for a fix that is not a `manifest` fix of the object's
+    own file: it names the one declaration of the first matched object, or
+    says that the audit found none or more than one."""
+    found = _declarations_of(matched[0], declarations)
+    if len(found) == 1:
+        return KCC_STALLED_DECLARED_NOTE.format(path=_kcc_declaration_path(found[0][1]), objects=objects)
+    count = KCC_DECLARATION_NONE if not found else KCC_DECLARATION_MANY.format(count=len(found))
+    return KCC_STALLED_UNDECLARED_NOTE.format(found=count, objects=objects)
 
 
 def _kcc_name(stall: KccStall) -> str:
@@ -19079,12 +19234,12 @@ def kcc_stalled_objects(matched: list[KccStall], stalled: list[KccStall]) -> str
 
 
 def _strip_kcc_stalled_note(remediation: object) -> None:
-    """Remove the note of `disclose_stalled_kcc_remediations` from a
+    """Remove either paragraph of `disclose_stalled_kcc_remediations` from a
     remediation note. The pass writes it again from this run's manifest."""
     if not isinstance(remediation, dict):
         return
     note = str(remediation.get("note") or "")
-    if KCC_STALLED_NOTE_MARK in note:
+    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
         remediation["note"] = KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
 
 
@@ -19112,7 +19267,10 @@ def _with_kcc_stalled_note(note: str, stalled_note: str) -> str:
 
 
 def disclose_stalled_kcc_remediations(
-    findings: list[dict], manifest: dict | None, root: Path
+    findings: list[dict],
+    manifest: dict | None,
+    root: Path,
+    declarations: "dict[KccKey, KccDeclaration] | None" = None,
 ) -> list[str]:
     """Say so when a `manifest` fix edits a declaration Config Connector does
     not apply. Returns the ids whose note changed.
@@ -19149,7 +19307,16 @@ def disclose_stalled_kcc_remediations(
     It also writes `KCC_STALLED_FINDING_FIELD` on each finding whose fix file
     or own `Cluster/` or `NodePool/` object (`_object_stalls`) is unready, for
     the merged-but-persisting line and comment, which then state the stall
-    in place of their guess at a cause. When the file declares more than one
+    in place of their guess at a cause.
+
+    The paragraph goes on any fix whose finding's own object is not ready,
+    whatever its kind: a `manifest` fix whose file declares the object gets
+    the paragraph above; any other fix (`manual`, `gcloud`, degraded to
+    `manual`, or a `manifest` fix to another file) gets one that names the
+    one file in `declarations`, the repository's Config Connector index, that
+    declares the object, or says that the audit found none or more than one
+    (`kcc_object_paragraph`). A `gcloud` fix's paragraph goes in
+    `KCC_STALLED_PARAGRAPH_FIELD`, because its note is the command. When the file declares more than one
     Config Connector object, only the finding's own object counts
     (`_fix_declarations`); when none is the finding's own, the fix gets no
     Config Connector text. A `manifest` fix uses its own object
@@ -19166,26 +19333,38 @@ def disclose_stalled_kcc_remediations(
         before = remediation.get("note") if isinstance(remediation, dict) else None
         _strip_kcc_stalled_note(remediation)
         finding.pop(KCC_STALLED_FINDING_FIELD, None)
+        before_paragraph = finding.pop(KCC_STALLED_PARAGRAPH_FIELD, None)
         index = _fix_declarations(finding, _remediation_file_index(finding, root)) if stalled else {}
         in_file = _remediation_file_stalls(finding, index, stalled, health.hosts) if index else []
-        is_manifest = isinstance(remediation, dict) and remediation.get("kind") == MANIFEST_REMEDIATION_KIND
-        object_fallback = bool(stalled) and (bool(index) or not is_manifest)
         namespaces = frozenset(declaration.namespace for declaration in index.values() if declaration.namespace)
         matched = in_file or (
-            _object_stalls(finding, stalled, health.hosts, health.targets, namespaces) if object_fallback else []
+            _object_stalls(finding, stalled, health.hosts, health.targets, namespaces, declarations)
+            if stalled
+            else []
         )
         if matched:
-            finding[KCC_STALLED_FINDING_FIELD] = kcc_stalled_objects(matched, stalled)
-        if in_file and isinstance(remediation, dict):
-            stalled_note = KCC_STALLED_NOTE.format(objects=finding[KCC_STALLED_FINDING_FIELD])
-            remediation["note"] = _with_kcc_stalled_note(str(remediation.get("note") or "").strip(), stalled_note)
-        if isinstance(remediation, dict) and remediation.get("note") != before:
+            objects = kcc_stalled_objects(matched, stalled)
+            finding[KCC_STALLED_FINDING_FIELD] = objects
+            if in_file:
+                paragraph = KCC_STALLED_NOTE.format(objects=objects)
+            else:
+                paragraph = kcc_object_paragraph(matched, objects, declarations or {})
+            if isinstance(remediation, dict) and remediation.get("kind") == "gcloud":
+                finding[KCC_STALLED_PARAGRAPH_FIELD] = paragraph
+            elif isinstance(remediation, dict):
+                remediation["note"] = _with_kcc_stalled_note(str(remediation.get("note") or "").strip(), paragraph)
+        moved = isinstance(remediation, dict) and remediation.get("note") != before
+        if moved or finding.get(KCC_STALLED_PARAGRAPH_FIELD) != before_paragraph:
             changed.append(fid)
     return changed
 
 
 def disclose_stalled_kcc_and_log(
-    findings: list[dict], manifest: dict | None, root: Path, prefix: str = ""
+    findings: list[dict],
+    manifest: dict | None,
+    root: Path,
+    prefix: str = "",
+    declarations: "dict[KccKey, KccDeclaration] | None" = None,
 ) -> None:
     """Add the Config Connector stall notes, and log what changed and what
     the manifest could not tell."""
@@ -19197,10 +19376,10 @@ def disclose_stalled_kcc_and_log(
             "publishes with no note about whether Config Connector applies it."
         )
     by_id = {str(finding.get("id", "")): finding for finding in findings}
-    for fid in disclose_stalled_kcc_remediations(findings, manifest, root):
+    for fid in disclose_stalled_kcc_remediations(findings, manifest, root, declarations):
         note = str((by_id[fid].get("remediation") or {}).get("note") or "")
-        if KCC_STALLED_NOTE_MARK in note:
-            log(f"{prefix}{fid}: its manifest fix edits a declaration Config Connector is not applying; the note says so.")
+        if any(mark in note for mark in KCC_STALLED_NOTE_MARKS) or by_id[fid].get(KCC_STALLED_PARAGRAPH_FIELD):
+            log(f"{prefix}{fid}: Config Connector is not applying the finding's own object; the fix says so.")
         else:
             log(f"{prefix}{fid}: removed a Config Connector note that its remediation copied from an earlier ledger.")
 
@@ -20359,7 +20538,13 @@ def _handle_finish_dry_run(
         else set(),
         prefix="DRY RUN: ",
     )
-    disclose_stalled_kcc_and_log(findings, manifest, root, prefix="DRY RUN: ")
+    disclose_stalled_kcc_and_log(
+        findings,
+        manifest,
+        root,
+        prefix="DRY RUN: ",
+        declarations=kcc_declaration_index(kcc_roots) if kcc_health(manifest).stalled else {},
+    )
     paths = manifest_paths(findings)
 
     gaps = coverage_gaps(data)
@@ -21743,6 +21928,7 @@ def _plan_remediation_files(
     degraded: list[str],
     unlisted: list[str],
     listing_may_refuse: bool = False,
+    kcc_index: dict[KccKey, KccDeclaration] | None = None,
 ) -> _FixPlan:
     """`finish`'s last step before it publishes: refuse an unwritten fix, then write the fixes it derives.
 
@@ -21851,7 +22037,7 @@ def _plan_remediation_files(
     # The same place, for the same reason: a `manifest` fix whose file
     # declares an object Config Connector does not apply says so on both
     # ledgers and in its pull request.
-    disclose_stalled_kcc_and_log(findings, manifest, root)
+    disclose_stalled_kcc_and_log(findings, manifest, root, declarations=kcc_index)
     return _FixPlan(remediation_prs, sweep_on, unlinked_paths, file_url, file_ref, listing_refusal)
 
 
@@ -21880,6 +22066,7 @@ def _finish_store_ledger(
     noun: str,
     timers: Callable[[], dict],
     scheduled: bool = False,
+    kcc_index: dict[KccKey, KccDeclaration] | None = None,
 ) -> None:
     """Keep the ledger in the report store and chat, and open the fixes on the forge.
 
@@ -21921,7 +22108,7 @@ def _finish_store_ledger(
         audit_id, repo, args, data, findings,
         manifest=manifest, record=record, root=root, probe=probe,
         promised=promised, degraded=degraded, unlisted=unlisted,
-        listing_may_refuse=True,
+        listing_may_refuse=True, kcc_index=kcc_index,
     )
     remediation_prs, sweep_on = fix_plan.remediation_prs, fix_plan.sweep_on
     # A refused listing leaves the fixes unknown: this run opens, syncs and
@@ -22695,7 +22882,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # Closed after planning below, and at exit if anything between raises, so
     # a failed `finish` does not hold a broker slot until the idle reclaim.
     atexit.register(probe.close)
-    if content_mode() and any(_kcc_candidate(finding) for finding in findings):
+    # The Config Connector paragraph names the declaration of a stalled
+    # object (`disclose_stalled_kcc_remediations`), so a manifest that
+    # records a stall needs the same index the gcloud check reads.
+    kcc_stalls = bool(kcc_health(manifest).stalled)
+    if content_mode() and (kcc_stalls or any(_kcc_candidate(finding) for finding in findings)):
         # The probe's open is the scan's, and a failed one is retried once on
         # the probe's count: the backstop keeps its retry, and planning, which
         # fails safe without the broker, takes none.
@@ -22717,8 +22908,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 f"{repo}; gcloud fixes against declarations it did not return "
                 "publish as written, so their absence here proves nothing."
             )
+    kcc_roots = kcc_declaration_roots(audit_id, root, record)
+    # The index the Config Connector paragraph names a declaration from: read
+    # only when the manifest records a stall.
+    kcc_index = kcc_declaration_index(kcc_roots, kcc_prebuilt) if kcc_stalls else {}
     for fid in degrade_reverted_gcloud_remediations(
-        findings, kcc_declaration_roots(audit_id, root, record), prebuilt=kcc_prebuilt
+        findings, kcc_roots, prebuilt=kcc_prebuilt
     ):
         log(
             f"WARNING: {fid}'s gcloud remediation changes a field a Config "
@@ -22843,6 +23038,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             noun=noun,
             timers=timer_payload,
             scheduled=scheduled,
+            kcc_index=kcc_index,
         )
         return
     existing_issue, existing_url, existing_body, existing_title = find_existing_issue(
@@ -23154,7 +23350,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     fix_plan = _plan_remediation_files(
         audit_id, repo, args, data, findings,
         manifest=manifest, record=record, root=root, probe=probe,
-        promised=promised, degraded=degraded, unlisted=unlisted,
+        promised=promised, degraded=degraded, unlisted=unlisted, kcc_index=kcc_index,
     )
     remediation_prs, sweep_on = fix_plan.remediation_prs, fix_plan.sweep_on
     unlinked_paths, file_url, file_ref = fix_plan.unlinked_paths, fix_plan.file_url, fix_plan.file_ref
