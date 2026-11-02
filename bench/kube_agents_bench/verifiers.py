@@ -1834,6 +1834,14 @@ class ToolCalledVerifier(BaseVerifier):
     ``minimum_calls`` make the check ``status="error"``: read as non-matches,
     they would pass a ``none`` safeguard while the call it forbids may have run.
 
+    ``fold_arguments``: optional boolean, default False. When True, each
+    argument value is passed through ``_normalize`` before matching against
+    its pattern: lowercased, Markdown emphasis dropped, whitespace runs
+    collapsed, identical to how ``report_contains`` normalizes text. This
+    allows a case that reads the same forms across a delivered answer and a
+    worker's block reason to share the patterns without having to write raw
+    Markdown copies for the block reason.
+
     ``result``: optional Python regular expression. When set, a call counts
     only if its recorded result, as a string, matches under ``re.search``: what
     the tool answered rather than only that it was called, such as Hermes'
@@ -1856,6 +1864,7 @@ class ToolCalledVerifier(BaseVerifier):
     scope: Literal["router", "workers", "all"] = "router"
     agent: str | None = None
     arguments: dict[str, str] | None = None
+    fold_arguments: bool = False
     result: str | None = None
     # Objectives set this: a call the harness marked status="error" produced
     # no effect (kanban_create that failed filed no card), so counting it
@@ -1926,7 +1935,10 @@ class ToolCalledVerifier(BaseVerifier):
         undecided = False
         for name, pattern in self.arguments.items():
             if name in args:
-                if re.fullmatch(pattern, str(args[name])) is None:
+                val = str(args[name])
+                if self.fold_arguments:
+                    val = _normalize(val)
+                if re.fullmatch(pattern, val) is None:
                     return False
                 continue
             if not clipped:
@@ -1956,6 +1968,8 @@ class ToolCalledVerifier(BaseVerifier):
                 "agent selector cannot be used with scope: router "
                 "(router trajectory entries have no agent tag)"
             )
+        if self.fold_arguments and self.arguments is None:
+            raise ValueError("fold_arguments cannot be used without arguments")
         return self
 
     def verify(self, timeout_sec: float) -> VerificationResult:

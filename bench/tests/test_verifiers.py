@@ -2972,6 +2972,85 @@ def test_tool_called_arguments_must_be_patterns():
         ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], arguments={"title": "("})
 
 
+def test_tool_called_fold_arguments_requires_arguments():
+    with pytest.raises(ValueError, match="fold_arguments cannot be used without arguments"):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], fold_arguments=True)
+
+
+def test_tool_called_fold_arguments_normalizes_markdown_emphasis_whitespace_and_case():
+    raw_reason = "No registered repository declares `seeded-a`.\n\n**Stop** now."
+    transcript.set(
+        "done",
+        [
+            {
+                "name": "kanban_block",
+                "args": {"reason": raw_reason},
+                "status": "completed",
+                "agent": "platform",
+            }
+        ],
+    )
+    pattern = r"no registered repository declares seeded-a\. stop now\."
+
+    # Without fold_arguments (default False): raw markdown and newlines cause fullmatch to fail
+    raw_check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+    )
+    assert raw_check.verify(5.0).status == "fail"
+
+    # With fold_arguments=True: _normalize strips markdown backticks and bold, collapses whitespace, and lowercases
+    folded_check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+        fold_arguments=True,
+    )
+    assert folded_check.verify(5.0).status == "pass"
+
+
+def test_tool_called_fold_arguments_works_with_clipped_worker_call():
+    raw_reason = "The manifest `clusters/seeded-a/kcc.yaml` has _no_ Config Connector."
+    # Embedded in a clipped json raw string
+    clipped = json.dumps({"reason": raw_reason, "other": "x" * 100}) + " ...[clipped 900 chars]"
+    transcript.set(
+        "done",
+        [
+            {
+                "name": "kanban_block",
+                "args": {"raw": clipped},
+                "status": "completed",
+                "agent": "platform",
+            }
+        ],
+    )
+    pattern = r"the manifest clusters/seeded-a/kcc\.yaml has no config connector\."
+
+    raw_check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+    )
+    assert raw_check.verify(5.0).status == "fail"
+
+    folded_check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+        fold_arguments=True,
+    )
+    assert folded_check.verify(5.0).status == "pass"
+
+
 def test_tool_called_result_counts_only_the_calls_that_answered_so():
     spilled = "<persisted-output>\nThis tool result was too large (109,963 characters, 107.4 KB)."
     transcript.set(
