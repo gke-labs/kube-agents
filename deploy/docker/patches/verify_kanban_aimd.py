@@ -158,6 +158,9 @@ conn, path = fresh()
 worker = new_card(conn, "Why is web-7 failing?")
 K.recompute_ready(conn)
 K.claim_task(conn, worker)
+# The dispatcher's first tick on a board starts its event cursor at the newest
+# row, so it runs before the worker writes anything.
+KA.effective_max_in_progress(conn, CAP, probe=lambda: None)
 os.environ["HERMES_KANBAN_DB"] = str(path)
 os.environ["HERMES_KANBAN_TASK"] = worker
 
