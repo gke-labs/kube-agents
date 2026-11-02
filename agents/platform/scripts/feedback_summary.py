@@ -40,6 +40,8 @@ import subprocess
 import sys
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO, Tuple
 
+# Independent of the gateway's usageSummaryMaxLines: this block has lines the
+# gateway's lacks.
 SUMMARY_MAX_LINES = 41
 SUMMARY_TITLE = "kube-agents usage & feedback summary"
 TASK_WINDOW_DAYS = 14

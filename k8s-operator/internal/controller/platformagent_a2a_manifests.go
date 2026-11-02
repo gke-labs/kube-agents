@@ -1905,9 +1905,10 @@ func a2aAgentJetStreamGrants() []string {
 //
 //   - KV_people, one hashed key per chat person (a2a/gateway/people.go): the
 //     same four verbs -- STREAM.INFO to bind it and read its max age at
-//     start, DIRECT.GET for a key's read, and the watcher's CONSUMER.CREATE
-//     and CONSUMER.DELETE for the desk's watch and the purge's key list. Put
-//     and Delete are publishes on $KV.people.>.
+//     start, DIRECT.GET held to match feedback's grant set (the desk reads
+//     through its watch, not by key), and the watcher's CONSUMER.CREATE and
+//     CONSUMER.DELETE for the desk's watch and the purge's key list. Put and
+//     Delete are publishes on $KV.people.>.
 //
 // Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
 // provision script creates has allow_direct set: the script says

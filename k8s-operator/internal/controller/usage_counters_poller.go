@@ -1256,6 +1256,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage.BackgroundTasksGaveUpTotal = background
 	usage.NegativeFeedbackTotal = negative
 	usage.SessionsTotal = sessions
+	// Written only while unpruned, so a patch for another counter does not
+	// carry it and refresh a fresh pruning record.
 	if !chatSessionsPruned {
 		usage.ChatSessionsTotal = chatSessions
 	}
@@ -1330,6 +1332,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	if negative > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageCounterNegativeFeedback, agent.Status.Usage.NegativeFeedbackTotal == negative)
 	}
+	// Gated on !chatSessionsPruned as well, unlike the counters above, so a
+	// fresh pruning record is not refreshed by a patch for another field.
 	if !chatSessionsPruned && chatSessions > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageStatusFieldChatSessions, agent.Status.Usage.ChatSessionsTotal == chatSessions)
 	}

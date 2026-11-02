@@ -476,7 +476,7 @@ The gateway's metrics serve two counts, the people seen in the last 7 days and i
 
 To remove one person, whoever holds the gateway's NATS credentials deletes that person's key from the bucket. The count drops at once. The delete leaves a marker that carries the key's name, and the bucket's 30-day limit removes it.
 
-To turn the record off, set `spec.telemetry.peopleSeen: false` in the `PlatformAgent` CR, or the chart's `platformAgent.telemetry.peopleSeen`. On an install made with `install.sh`, put that value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={telemetry={peopleSeen=false}}}'`. The gateway then writes no key and serves no count. At its next start it deletes every key the bucket holds.
+To turn the record off, set `spec.telemetry.peopleSeen: false` in the `PlatformAgent` CR, or the chart's `platformAgent.telemetry.peopleSeen`. On an install made with `install.sh`, put that value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={telemetry={peopleSeen=false}}}'`. The gateway then writes no key and serves no sample. At its next start it deletes every key the bucket holds.
 
 ## How a chat question is answered under `next`
 

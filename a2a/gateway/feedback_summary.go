@@ -31,7 +31,9 @@ import (
 // refuses a block that does.
 
 const (
-	usageSummaryTitle    = "kube-agents usage & feedback summary"
+	usageSummaryTitle = "kube-agents usage & feedback summary"
+	// usageSummaryMaxLines is independent of the script's SUMMARY_MAX_LINES:
+	// the script's block has lines this one lacks.
 	usageSummaryMaxLines = 40
 	hoursPerDay          = 24
 	//: The task roll-up's window, as the script's; the gateway clamps it to

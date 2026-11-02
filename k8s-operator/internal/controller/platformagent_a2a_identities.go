@@ -483,7 +483,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here\n" +
 			"used to destroy every task's history and the five consumers on it -\n" +
 			"no CONSUMER.DELETE on TASKS, and nothing at all on DIRECTORY, the\n" +
-			"topic streams or the other two buckets.",
+			"topic streams or the runtime-state, cap and PROFILE_LEASES buckets.",
 		auth:     a2aAuthStatic,
 		credsKey: a2aGatewayPasswordKey,
 		// $JS.ACK / $JS.FC.> are the delivery path's reply subjects: an
