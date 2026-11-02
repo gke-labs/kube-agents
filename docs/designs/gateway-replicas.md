@@ -96,15 +96,15 @@ Then it releases the lease.
 
 ### What it costs
 
-The crash that's most common, a container restarting in its own pod after a panic or an OOM kill,
-recovers more slowly than it does with one replica. With one replica the restarted container is
-back in seconds. With two, the restarted container is a new holder (the per-process id), so it
-waits out the lease like the standby does, and the standby takes over after the lease expires: 20s
-or more, and up to 30s more before the relay binds. What the second replica buys is everything
-else, where one replica has no gateway at all until a new pod schedules and starts: a rollout or a
-node drain (a graceful handover in a few seconds), and a node or zone loss. On a cluster that
-rolls and drains often, that's the larger share of gateway downtime, but it's a trade, and one
-replica with a fast restart stays a supported setting.
+The relay waits 30s after any start that follows a crash: the dead process's held events come back
+only when their AckWait runs out, and they have to render before newer ones. That holds for a
+standby taking over an expired lease and for a container restarting in its own pod, with one
+replica or two. Chat ingress starts at once either way. A container restarting in its own pod
+re-takes the lease at once, since its identity is the pod name (below), so that crash, the most
+common one, recovers as fast as it does today. What the second replica adds is a gateway during
+the events where one replica has none until a new pod schedules and starts: a rollout or a node
+drain (a graceful handover in a few seconds) and a node or zone loss (the lease's 20s, then the
+relay's 30s).
 
 ### Fencing
 
@@ -116,8 +116,9 @@ client-go's 15s default that leaves about 3s, so the gateway sets `leaseDuration
 about 8s. Ingress and the inbound queue stop at once. The relay's render drain is bounded at 5s
 inside that, and a batch still rendering when it runs out is abandoned and given back. The relay's
 own stop drain (`relayStopDrainTimeout`) is 15s today, sized to the pod's grace period on SIGTERM.
-So step 2 gives the lost-lease path its own 5s bound, and SIGTERM keeps the 15s. That makes two replicas acting at once unlikely, not
-impossible: a paused process, or a clock that jumps, can still overlap the next leader.
+So build step 2 (below) gives the lost-lease path its own 5s bound, and SIGTERM keeps the 15s.
+That makes two replicas acting at once unlikely, not impossible: a paused process, or a clock that
+jumps, can still overlap the next leader.
 
 So writes are fenced by a term number. The term isn't the Lease's `leaseTransitions`: the Lease
 can be deleted and recreated (by hand, or by a reinstall or restore that keeps the bus volume),
@@ -136,11 +137,13 @@ atomic. A write that slips through that gap lands on a record the new leader has
 yet. The new leader's own next write to that record is conditional on its revision, so it
 re-reads the record and carries on from what the deposed leader left.
 
-The election's identity is the pod name plus a per-process id. client-go lets a process whose
-identity matches the current holder renew without waiting, so a container restarting in the same
-pod under the bare pod name would carry on as leader with no acquisition, and so no new term.
-With the per-process id, a restarted container is a new holder: it waits out the lease like any
-other and starts a new term.
+The election's identity is the pod name. client-go lets a process whose identity matches the
+current holder renew without waiting, so a container restarting in its own pod re-takes the lease
+at once. It still starts a new term: a gateway increments the term counter every time it starts
+leading, whether client-go counted a transition or not, so the restarted process writes under a
+term the dead one never had. (Two containers never share a pod's name at once, so the identity
+can't be held twice.) A restarted container that re-takes the lease this way still waits AckWait
+before binding the relay, as any start after a crash does.
 
 The term fences records, not every side effect. A deposed leader in the overlap can still post
 to a chat, publish a task or spawn a pod before it learns it lost. Its record write then usually
@@ -174,8 +177,7 @@ so `kubectl port-forward svc/...` can resolve a pod. With two replicas, that can
 standby. So:
 
 - A standby's door answers every request with 503 and the active pod's name, which it reads from
-  the Lease's `holderIdentity` (the part before the `_` and the per-process id), so a client knows
-  where to port-forward instead.
+  the Lease's `holderIdentity`, so a client knows where to port-forward instead.
 - A client that has to reach the active replica port-forwards to `pod/<holder>`, read from the
   Lease (`kubectl get lease`). The eval harness and the repository's scripts do that.
 
@@ -192,9 +194,9 @@ that from being a trap:
   example `kubectl -n kubeagents-system port-forward pod/<holder> 8099`, so a person who hits the
   standby copies one line.
 - **A one-liner and a helper resolve the holder.**
-  `h=$(kubectl -n <ns> get lease <agent>-a2a-gateway -o jsonpath='{.spec.holderIdentity}'); kubectl -n <ns> port-forward pod/${h%%_*} <port>`
-  does it by hand (a pod name has no `_`), and a small script in `hack/` wraps it, re-resolving when the port-forward drops
-  on a handover.
+  `kubectl -n <ns> port-forward pod/$(kubectl -n <ns> get lease <agent>-a2a-gateway -o jsonpath='{.spec.holderIdentity}') <port>`
+  does it by hand, and a small script in `hack/` wraps it, re-resolving when the port-forward
+  drops on a handover.
 - **Every caller is updated in the same change as the standby's 503:** the bench harness's
   inject transport (`bench/kube_agents_bench/harness.py` and `inject_transport.py`), which
   drives the required smoke gate, resolves the holder and re-resolves on a 503 or a dropped
@@ -240,9 +242,13 @@ ingress gap above.
 - **`RollingUpdate` with `maxSurge: 1`, `maxUnavailable: 0`,** replacing `Recreate`, so the new
   pod comes up as a standby before an old one stops. The operator renders it, and a second
   replica, only once the Lease has had a holder. The operator records that as a condition on the
-  PlatformAgent (`GatewayElected`), set the first time it sees a holder and never cleared, so a
-  deleted Lease, its held-back recreate or a restore doesn't flip the Deployment back to one
-  replica. A gateway from before the election holds no
+  PlatformAgent (`GatewayElected`), set the first time it sees a holder, so a deleted Lease or its
+  held-back recreate doesn't flip the Deployment back to one replica. It's cleared when the mode
+  goes back to today, as `BusProvisioned` is. A status condition doesn't survive most restores, so
+  a restored install starts at one replica and moves to two once a gateway takes the Lease again.
+  While `A2A_GATEWAY_IMAGE` pins the gateway image, the operator holds one replica and `Recreate`
+  whatever the condition says: it can't tell whether a pinned image runs the election. A gateway
+  from before the election holds no
   Lease and would act beside an elected one, and term 0 fences nothing. So an install upgrading
   across the election in one roll keeps one replica and `Recreate` for that roll, and moves to two
   once the elected gateway has taken the Lease. A surge pod needs room under the agent
@@ -279,11 +285,12 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    and within one term the last write still wins, as it does with one active replica today. The
    registry gains the call that starts a term, which the election makes. Until the election
    exists, every write carries term 0, and term 0 fences nothing.
-2. **Leader election in the gateway.** It lands after the relay's ack-after-render change.
-   Acquire (identity: pod name and per-process id), start a term, renew and step down; all of `Run`'s and
+2. **Leader election in the gateway.** Acquire (identity: the pod name), start a term on every
+   acquisition and every start that re-takes its own lease, renew and step down; all of `Run`'s and
    `realMain`'s work gated on the lease; the step-down order and budget above, with the relay's
    drain bounded at 5s on the lost-lease path; the relay's delayed
-   bind after a takeover from an expired lease; release on SIGTERM. Tests on an embedded server
+   bind after any start that follows a crash, a takeover from an expired lease or a same-pod
+   restart; release on SIGTERM. Tests on an embedded server
    with two gateways: one acts, the other doesn't; the lease moves and the work follows; a crash
    takeover renders the dead leader's held events before newer ones.
    Rolling back from this step needs nothing: a gateway without the election writes at term 0,
@@ -293,7 +300,8 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    helper, and the eval harness, the CI scripts and the docs resolving the holder. It lands before
    step 4, so nothing meets a standby it can't route around.
 4. **Operator:** replicas, the readiness probe, the strategy (held at one replica and `Recreate`
-   until the `GatewayElected` condition is set), the PDB, the spread, the Lease (with its owner reference and
+   until the `GatewayElected` condition is set, and while `A2A_GATEWAY_IMAGE` pins the image), the
+   PDB, the spread, the Lease (with its owner reference and
    an `Owns` watch, recreated one `leaseDuration` after a deletion) and its Role. Its tests pin
    each, including the held-back recreate and the first roll across the election.
 5. **The cards-pending mark on the record** (planned separately).
