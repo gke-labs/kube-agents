@@ -63,6 +63,10 @@ class PeopleSeenRenderTest(unittest.TestCase):
     def test_the_default_renders_no_telemetry_block(self):
         self.assertNotIn("telemetry", self._spec_of(self._render()))
 
+    def test_a_null_telemetry_object_renders_no_telemetry_block(self):
+        spec = self._spec_of(self._render("--set-json", "platformAgent.telemetry=null"))
+        self.assertNotIn("telemetry", spec)
+
     def test_true_renders_no_telemetry_block(self):
         spec = self._spec_of(self._render("--set", "platformAgent.telemetry.peopleSeen=true"))
         self.assertNotIn("telemetry", spec)

@@ -650,7 +650,7 @@ spec:
     what leaves the operator free to discover a collector; an explicit "" would look like
     a decision the chart made.
   */}}
-  {{- $peopleSeenOff := eq (toString .Values.platformAgent.telemetry.peopleSeen) "false" }}
+  {{- $peopleSeenOff := eq (toString (.Values.platformAgent.telemetry | default dict).peopleSeen) "false" }}
   {{- if or .Values.telemetry.otlpEndpoint $peopleSeenOff }}
   telemetry:
     {{- with .Values.telemetry.otlpEndpoint }}
