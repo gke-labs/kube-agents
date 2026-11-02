@@ -158,23 +158,18 @@ conflict waits for the next poll. The byte fields are rewritten only when free s
 hundredth of the volume, so a working agent does not wake the reconciler every poll, and they have
 a pruning record of their own for a CRD that predates them.
 
-The same body also carries the fleet's shape, which no status field projects yet: six gauges
-with no cluster label, `k8s_event_watcher_fleet_nodes`, `_fleet_max_cluster_nodes`,
+The same body also carries the fleet's shape, which no status field projects yet: gauges with
+no cluster label, `k8s_event_watcher_fleet_nodes`, `_fleet_max_cluster_nodes`,
 `_fleet_controllers`, `_fleet_pods`, `_fleet_max_cluster_pods` and
-`_fleet_shape_clusters{outcome}`, measured by the watcher every five minutes over its running set
-(`cmd/k8s-event-watcher/fleetshape.go`). They are the producer for the automatic sizing profile,
-whose tier thresholds live in the operator, where the tier is acted on, and nowhere else; the
-watcher publishes the raw figures only. The node counts are each cluster's `currentNodeCount`
-from a GKE describe through the same path discovery uses, which through the broker means the
-field joins the broker's projection of `clusters.get`. The workload counts are one-item
-metadata-only lists (`limit=1`, `Accept` asking for a `PartialObjectMetadataList`) plus the
-server's `remainingItemCount`, the web console's own method, and through the broker they are the
-one list beyond events its Kubernetes route admits, under a rule pinned to five cluster-scoped
-paths, that query and that `Accept`, so no object body crosses on the broker's credential. A
-cluster with any failed read is left out of that probe's totals and counted under
-`outcome="failed"`, so a reader of the totals can tell a small fleet from a half-read one; the
-gauges are readings, not counters, and a poll that projects them will take the largest across
-replicas as it does for the cluster gauges.
+`_fleet_shape_clusters{outcome}`, measured by the watcher every five minutes over its running set.
+They are published for an automatic sizing profile the operator will read; the watcher publishes
+the raw figures only, and the tier thresholds belong with that consumer when it lands. How the
+reading is made, and why a cluster lands under `outcome="failed"`, is the watcher README's
+("The fleet's shape" in `cmd/k8s-event-watcher/README.md`); what matters to a projection is that
+the gauges are readings, not counters, that a `failed` count above zero makes the totals partial,
+and that a poll projecting them takes the largest across replicas as it does for the cluster
+gauges. Through the broker, the node count is `currentNodeCount` in the `clusters.get` projection
+and the workload counts are the one list beyond events the Kubernetes route admits.
 
 `eventsIngestedTotal` counts the events the watcher accepted for triage, past its reason filter
 and its dedup window and not turned away by the daemon, not the events it observed. The observed series,

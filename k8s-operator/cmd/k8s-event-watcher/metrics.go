@@ -127,7 +127,8 @@ type metrics struct {
 	// The fleet's shape, set by the fleet-shape probe (fleetshape.go) every
 	// --fleet-shape-interval and read between probes: plain gauges rather
 	// than per-cluster ones, because what they exist to answer is the size
-	// of the whole fleet (the operator's automatic sizing reads them), and
+	// of the whole fleet (published for an automatic sizing profile the
+	// operator will read; nothing projects them yet), and
 	// per-cluster series would be one more family that grows with the
 	// fleet. fleetShapeClusters{outcome} says how many clusters the totals
 	// hold (counted) and how many they leave out (failed), so a total read
