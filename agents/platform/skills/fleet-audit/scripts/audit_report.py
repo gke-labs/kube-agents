@@ -18796,9 +18796,9 @@ class KccStall(NamedTuple):
     name, and `cluster` a `ContainerNodePool`'s `clusterRef`; both are `""`
     when the collector did not record them. `host` is the manifest entry the
     object was read on: the cluster that runs that Config Connector.
-    `project` is the GCP project the object manages (its
-    `cnrm.cloud.google.com/project-id` annotation, else its namespace's
-    annotation, else the namespace's name), `""` when not known.
+    `project` is the GCP project the object manages, as `kcc_health.py`
+    records it (the annotation, else `spec.projectRef`, else the namespace),
+    `""` when not known.
     `location` is the object's `spec.location`, `""` when it has none.
     `host_kinds` holds the kinds the host's read listed when it listed only
     some (`kcc_kinds_read`), and `read` is False for an object that a

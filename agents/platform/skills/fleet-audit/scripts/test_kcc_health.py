@@ -169,6 +169,33 @@ class UnreadyObjectsTest(unittest.TestCase):
         self.assertEqual(found["prod"]["project"], "pa")
         self.assertNotIn("project", found["other"])
 
+    def test_a_project_ref_gives_the_project_and_the_namespace_does_not(self):
+        """Review finding: a kind with `spec.projectRef` was given its
+        namespace's name as its project. `external` gives the project; `name`
+        gives it only through a `Project` object the read listed."""
+        def topic(name, ref):
+            return kcc_object("PubSubTopic", name, namespace="config-control", status="False", reason="UpdateFailed",
+                              spec={"projectRef": ref})
+
+        listed = {"apiVersion": "resourcemanager.cnrm.cloud.google.com/v1beta1", "kind": "Project",
+                  "metadata": {"name": "app", "namespace": "config-control"}, "spec": {"resourceID": "app-123"}}
+        records = kcc_health.unready_objects([
+            topic("ext", {"external": "projects/proj-x"}),
+            topic("bare", {"external": "proj-y"}),
+            topic("listed", {"name": "app"}),
+            topic("unlisted", {"name": "elsewhere", "namespace": "projects"}),
+            listed,
+        ])
+        found = {record["name"]: record for record in records}
+        self.assertEqual(found["ext"]["project"], "proj-x")
+        self.assertEqual(found["bare"]["project"], "proj-y")
+        self.assertEqual(found["listed"]["project"], "app-123")
+        self.assertNotIn("project", found["unlisted"])
+        namespaces = [{"metadata": {"name": "config-control"}}]
+        kcc_health.fill_namespace_projects(records, namespaces)
+        self.assertNotIn("project", found["unlisted"])
+        self.assertFalse(kcc_health._needs_namespace_projects({"kcc_unready": [found["unlisted"]]}))
+
     def test_a_transient_reason_is_not_unready(self):
         """`Updating` and `Deleting` mean Config Connector still applies the
         object; the note must not say it is not applying."""

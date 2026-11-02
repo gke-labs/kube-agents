@@ -26,10 +26,13 @@ time limit on a cluster with the add-on.
   `{kind, namespace, name, why}`, plus `resource` (the object's
   `spec.resourceID`), `cluster` (a `ContainerNodePool`'s `clusterRef`),
   `location` (the object's `spec.location`) and `project` (the GCP project
-  the object manages: its `cnrm.cloud.google.com/project-id` annotation,
-  else the same annotation on its namespace, else the namespace's name, as
-  Config Connector itself decides it) where they are set. When an unready
-  object has no project annotation, one `kubectl get namespaces` gives the
+  the object manages) where they are known. The project is the object's
+  `cnrm.cloud.google.com/project-id` annotation. Without it, a kind with
+  `spec.projectRef` takes `projectRef.external`, or the `Project` object
+  that `projectRef.name` names when the read listed it, else the project
+  is unknown (`project_ref` names that object); any other kind takes the
+  annotation on its namespace, else the namespace's name. When an unready
+  object needs its namespace, one `kubectl get namespaces` gives the
   namespaces; when that read fails, the project stays unknown. An empty
   list means the cluster runs Config Connector and every object it holds
   is ready, not yet reached, or still updating or deleting.
@@ -83,6 +86,17 @@ TRANSIENT_REASONS = frozenset({"Updating", "Deleting"})
 KCC_NODE_POOL_KIND = "ContainerNodePool"
 # The annotation that names the GCP project a Config Connector object manages.
 KCC_PROJECT_ANNOTATION = "cnrm.cloud.google.com/project-id"
+# A kind that has `spec.projectRef` takes its project from it, not from the
+# namespace: `external` is the project ID, also as `projects/<id>`; `name`
+# names a `Project` object, whose project ID is its `spec.resourceID`, else
+# its name.
+PROJECT_REF_FIELD = "projectRef"
+PROJECT_REF_PREFIX = "projects/"
+KCC_PROJECT_KIND = "Project"
+# The record key that holds the `Project` object a `projectRef.name` names
+# (`<namespace>/<name>`) when the read did not list that object. The project
+# is then unknown, and the namespace does not give it.
+RECORD_PROJECT_REF = "project_ref"
 # The manifest keys this module writes on a cluster entry.
 UNREADY_FIELD = "kcc_unready"
 UNREAD_FIELD = "kcc_unread"
@@ -286,6 +300,7 @@ def unready_objects(items: list) -> list[dict]:
     """Every object in the merged Config Connector lists (`read_objects`)
     whose `Ready` is `False`."""
     found: list[dict] = []
+    projects = _project_ids(items)
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -318,8 +333,49 @@ def unready_objects(items: list) -> list[dict]:
         project = str(annotations.get(KCC_PROJECT_ANNOTATION) or "")
         if project:
             record["project"] = project
+        elif isinstance(spec.get(PROJECT_REF_FIELD), dict):
+            _project_from_ref(record, spec[PROJECT_REF_FIELD], projects)
         found.append(record)
     return sorted(found, key=lambda r: (r["kind"], r["namespace"], r["name"]))
+
+
+def _project_ids(items: list) -> dict[tuple[str, str], str]:
+    """The project ID of each `Project` object in the read, by
+    `(namespace, name)`: its `spec.resourceID`, else its name."""
+    projects: dict[tuple[str, str], str] = {}
+    for item in items:
+        if not isinstance(item, dict) or item.get("kind") != KCC_PROJECT_KIND:
+            continue
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
+        name = str(meta.get("name") or "")
+        if name:
+            projects[(str(meta.get("namespace") or ""), name)] = str(spec.get("resourceID") or "") or name
+    return projects
+
+
+def _project_from_ref(record: dict, ref: dict, projects: dict[tuple[str, str], str]) -> None:
+    """Set `record`'s project from the object's `spec.projectRef`.
+
+    `external` gives the project ID. `name` gives it only when the read
+    listed that `Project` object; otherwise the project stays unknown and
+    `RECORD_PROJECT_REF` says why, so the namespace does not stand in: an
+    unknown project is safe, a wrong one names the wrong declaration."""
+    external = str(ref.get("external") or "").strip()
+    if external:
+        project = external.removeprefix(PROJECT_REF_PREFIX).partition("/")[0]
+        if project:
+            record["project"] = project
+        return
+    name = str(ref.get("name") or "")
+    if not name:
+        return
+    namespace = str(ref.get("namespace") or "") or record["namespace"]
+    project = projects.get((namespace, name), "")
+    if project:
+        record["project"] = project
+    else:
+        record[RECORD_PROJECT_REF] = f"{namespace}/{name}"
 
 
 def fill_namespace_projects(records: list[dict], namespaces: list) -> None:
@@ -340,12 +396,16 @@ def fill_namespace_projects(records: list[dict], namespaces: list) -> None:
         if name:
             projects[name] = str(annotations.get(KCC_PROJECT_ANNOTATION) or "") or name
     for record in records:
+        if record.get(RECORD_PROJECT_REF):
+            continue
         if not record.get("project") and projects.get(record.get("namespace", "")):
             record["project"] = projects[record["namespace"]]
 
 
 def _needs_namespace_projects(fields: dict) -> bool:
-    return any(not record.get("project") for record in fields.get(UNREADY_FIELD) or [])
+    return any(
+        not record.get("project") and not record.get(RECORD_PROJECT_REF) for record in fields.get(UNREADY_FIELD) or []
+    )
 
 
 def read_namespace_projects(fields: dict, kubeconfig: Path, *, run: RunFn, deadline: float, clock: ClockFn = time.monotonic) -> None:
