@@ -112,6 +112,6 @@ safeguards:
           # line, the token mint and the reset's own calls included. 30 s is
           # about three times the widest of those, which are an upper bound
           # on the clocks' disagreement. The second phase settles this long before each
-          # unit; at the default, 120 s, a nightly that runs all six requesting
-          # cases three times would wait 18 settles, 36 minutes.
+          # unit; at the default, 30 s, a nightly that runs all six requesting
+          # cases three times would wait 18 settles, 9 minutes.
           max_clock_skew_sec: 30
