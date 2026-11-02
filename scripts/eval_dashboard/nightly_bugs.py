@@ -72,7 +72,11 @@ cross-checked against the same issues read through GraphQL
 (``listing_doubt``); when GraphQL cannot be read, or names more issues
 than the listing holds, the listings are read again (LISTING_ATTEMPTS),
 and when no read agrees the tick writes nothing and logs why; the next tick
-retries. Comments are read the same way: an issue whose listing counts
+retries. With ``--state``, a live run counts those held ticks in a small JSON
+file (``held_state``); past HELD_TICKS_DIGEST of them in a row the morning
+digest says filing is held (``held_digest_lines``), until the first trusted
+tick clears it. A dry run records nothing held: it files nothing anyway.
+Comments are read the same way: an issue whose listing counts
 more comments than the read returned is not commented on that tick.
 
 All GitHub traffic goes through ``ghcli.Gh``. **Dry run is the default**:
@@ -89,6 +93,7 @@ import functools
 import json
 import pathlib
 import re
+import subprocess
 import sys
 import time
 
@@ -104,10 +109,12 @@ except ImportError:  # scripts/ is not on sys.path yet
     import case_owner
 try:
     from eval_dashboard import classify, gate_issue, ghcli, nightly, nightly_infra
+    from eval_dashboard import post_health
     from eval_dashboard.post_health import NIGHTLY_URL
 except ImportError:  # run as a script: scripts/eval_dashboard/nightly_bugs.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import classify, gate_issue, ghcli, nightly, nightly_infra
+    from eval_dashboard import post_health
     from eval_dashboard.post_health import NIGHTLY_URL
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -154,6 +161,14 @@ LISTING_ATTEMPTS = 4
 # The pause between those reads: the empty answers came in bursts, so reads
 # back to back can all land in one.
 LISTING_RETRY_DELAY_S = 3
+# How many ticks in a row with no trusted listing (15 minutes apart: about
+# two hours) before the digest says filing is held (#3769). Fewer is the
+# REST listing's ordinary bursts, which the next tick rides out.
+HELD_TICKS_DIGEST = 8
+# A state file not rewritten for this long says nothing about filing now:
+# the step stopped running or could not write, and the job log says why.
+HELD_STATE_FRESH = datetime.timedelta(hours=1)
+HELD_DIGEST_LINE = "🚫 Nightly bug filing held since {since}: the nightly-red issue listing is untrusted ({doubt}), so no bugs are filed or commented on."
 GRAPHQL_PATH = "graphql"
 GRAPHQL_FIRST = 100
 LISTING_QUERY = """\
@@ -641,6 +656,31 @@ def read_listings(gh: ghcli.Gh, since: str | None, label: str = LABEL) -> tuple[
     return open_issues, closed_issues, doubt
 
 
+def held_state(prev: dict | None, doubt: str | None, live: bool, now: datetime.datetime) -> dict:
+    """The ``--state`` document after a pass whose listings were read:
+    ``held_ticks`` live passes in a row with no trusted listing, since
+    ``held_since``, last for ``doubt``. A trusted pass, or a dry run, holds
+    nothing."""
+    prev = prev or {}
+    stamp = now.isoformat(timespec="seconds")
+    if not (doubt and live):
+        return {"held_ticks": 0, "held_since": None, "doubt": None, "updated_at": stamp}
+    ticks = prev.get("held_ticks") if isinstance(prev.get("held_ticks"), int) else 0
+    return {"held_ticks": ticks + 1, "held_since": (prev.get("held_since") if ticks else None) or stamp, "doubt": doubt, "updated_at": stamp}
+
+
+def held_digest_lines(state: dict | None, now: datetime.datetime) -> list[str]:
+    """The digest's line while filing has been held HELD_TICKS_DIGEST ticks
+    in a row; none otherwise, or when the state is stale (HELD_STATE_FRESH)."""
+    state = state or {}
+    ticks = state.get("held_ticks")
+    updated = post_health.parse_iso(state.get("updated_at"))
+    if not isinstance(ticks, int) or ticks < HELD_TICKS_DIGEST or not updated or now - updated > HELD_STATE_FRESH:
+        return []
+    since = post_health.parse_iso(state.get("held_since"))
+    return [HELD_DIGEST_LINE.format(since=post_health.clock(since, weekday=True), doubt=state.get("doubt") or "no reason recorded")]
+
+
 class Filer:
     def __init__(self, gh: ghcli.Gh, repo_root: pathlib.Path = REPO_ROOT):
         self.gh = gh
@@ -653,6 +693,9 @@ class Filer:
             log(f"warning: could not read domains.yaml: {exc}")
             self.domain_owners = {}
         self.infra_owner, self.infra_backup = gate_issue.infra_addressees(repo_root / case_owner.DOMAINS_PATH)
+        # The listing's verdict this pass: None until it was read, then the
+        # doubt or "" (trusted). main records it in --state.
+        self.doubt = None
 
     def commented(self, issue: dict, marker: str) -> bool | None:
         """Whether a comment on ``issue`` carries ``marker``; None when the
@@ -683,6 +726,7 @@ class Filer:
         if open_issues is None or closed_issues is None:
             log("warning: could not list the nightly-red issues; nothing filed or commented this pass")
             return result
+        self.doubt = doubt or ""
         if doubt:
             log("warning: no trusted nightly-red issue listing this pass; nothing filed or commented, retried next tick")
             return result
@@ -947,6 +991,7 @@ def parse_args(argv=None):
     parser.add_argument("--data", required=True, type=pathlib.Path, help="data.json the collector wrote")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO)
     parser.add_argument("--repo-root", type=pathlib.Path, default=REPO_ROOT, help="checkout holding bench/tasks and domains.yaml")
+    parser.add_argument("--state", help="held-filing state (held_state): local path or gs:// object; read and rewritten each pass whose listings were read")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", dest="dry_run", action="store_true", default=True, help="print every write instead of sending it (the default)")
     mode.add_argument("--live", dest="dry_run", action="store_false", help="send the writes")
@@ -964,8 +1009,17 @@ def main(argv=None, gh_runner=None) -> int:
         log(f"ERROR: {args.data}: {exc}")
         return 1
     gh = ghcli.Gh(args.repo, gh_runner, dry_run=args.dry_run) if gh_runner else ghcli.Gh(args.repo, dry_run=args.dry_run)
-    result = Filer(gh, args.repo_root).run(data if isinstance(data, dict) else {})
+    filer = Filer(gh, args.repo_root)
+    result = filer.run(data if isinstance(data, dict) else {})
     print(summary(result, args.dry_run))
+    # A pass that could not read the listings at all leaves the count as it
+    # was: it neither trusted nor doubted them.
+    if args.state and filer.doubt is not None:
+        state = held_state(post_health.read_state(args.state), filer.doubt, not args.dry_run, datetime.datetime.now(datetime.timezone.utc))
+        try:
+            post_health.write_state(args.state, state)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            log(f"warning: could not write {args.state}: {exc}; the held-tick count is retried next tick")
     return 0
 
 

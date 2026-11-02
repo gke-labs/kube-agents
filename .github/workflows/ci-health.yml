@@ -120,7 +120,9 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # NIGHTLY_BUGS_LIVE is `true` (a maintainer arms it after reading a few dry
 # runs) and CI_HEALTH_MUTE is not. It runs before the post, so the 11 AM
 # digest's nightly section (scripts/eval_dashboard/nightly_digest.py) reads
-# the issues it filed that tick. The section turns owners' GitHub logins
+# the issues it filed that tick. Armed, it counts the ticks it held for an
+# untrusted issue listing in nightly-bugs-state.json beside health.json, and
+# the digest says so once the hold has lasted about two hours. The section turns owners' GitHub logins
 # into Chat mentions through the CI_HEALTH_CHAT_MENTIONS secret (a JSON
 # object, login -> Chat user id); without it the logins print as text.
 # A fourth, scripts/eval_dashboard/coverage_gaps.py, keeps one
@@ -724,7 +726,9 @@ jobs:
         run: |
           mode=--dry-run
           if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
-          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json "$mode"
+          # --state counts the live ticks held on an untrusted issue listing,
+          # for the digest's held-filing line (post step, --bugs-state).
+          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json --state "$DASHBOARD_BUCKET/nightly-bugs-state.json" "$mode"
 
       # One `presubmit-gate` issue per domain with no blocking roster seat,
       # assigned to the domain owner, kept current, closed when a roster case
@@ -781,6 +785,7 @@ jobs:
             --health work/health.json \
             --data work/data.json \
             "${store_args[@]}" \
+            --bugs-state "$DASHBOARD_BUCKET/nightly-bugs-state.json" \
             --state "$DASHBOARD_BUCKET/health-state.json"
 
       # One comment per pull request whose smoke run went red, or lost its

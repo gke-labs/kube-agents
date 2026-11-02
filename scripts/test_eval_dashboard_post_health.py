@@ -299,10 +299,10 @@ class RunHarness(unittest.TestCase):
         self.coverage = coverage.start()
         self.addCleanup(coverage.stop)
 
-    def tick(self, health_doc, now, environ=None, opener=None, dry_run=False, digest_hour=DIGEST_HOUR, digest_tz=None, gh=None, data=None):
+    def tick(self, health_doc, now, environ=None, opener=None, dry_run=False, digest_hour=DIGEST_HOUR, digest_tz=None, gh=None, data=None, extra=()):
         path = self.dir / "health.json"
         path.write_text(json.dumps(health_doc))
-        argv = ["--health", str(path), "--state", str(self.state), "--now", now.isoformat(), "--digest-hour", str(digest_hour)]
+        argv = ["--health", str(path), "--state", str(self.state), "--now", now.isoformat(), "--digest-hour", str(digest_hour)] + list(extra)
         if data is not None:
             data_path = self.dir / "data.json"
             data_path.write_text(data if isinstance(data, str) else json.dumps(data))
@@ -598,6 +598,20 @@ class Digest(RunHarness):
         self.assertEqual(len(self.opener.requests), 1, "one digest per day")
         self.tick(health(), self.at(DIGEST_UTC, 5, day=5))
         self.assertEqual(len(self.opener.requests), 2, "the next day gets its own")
+
+    def test_the_digest_says_when_bug_filing_has_been_held_for_hours(self):
+        # The nightly bug filer's --state (#3769); no line on a non-digest tick.
+        bugs = self.dir / "nightly-bugs-state.json"
+        now = self.at(DIGEST_UTC, 5)
+        bugs.write_text(json.dumps({"held_ticks": 9, "held_since": "2026-09-04T10:30:00+00:00", "doubt": "the GraphQL cross-check could not be read", "updated_at": now.isoformat()}))
+        self.tick(health(), self.at(DIGEST_UTC - 2, 5), extra=["--bugs-state", str(bugs)])
+        self.assertEqual(self.opener.texts, [])
+        self.tick(health(), now, extra=["--bugs-state", str(bugs)])
+        self.assertIn("🚫 Nightly bug filing held since Fri 6:30 AM ET: the nightly-red issue listing is untrusted (the GraphQL cross-check could not be read)", self.opener.texts[-1])
+        # An unreadable state file costs the line, not the digest.
+        bugs.write_text("not json")
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=5), extra=["--bugs-state", str(bugs)])
+        self.assertNotIn("bug filing held", self.opener.texts[-1])
 
     def test_without_the_flag_the_digest_goes_out_at_the_default_hour(self):
         # The workflow passes no --digest-hour, so DEFAULT_DIGEST_HOUR (11 AM
