@@ -5987,47 +5987,57 @@ _FOOTPRINT_READ_SUBTREES = (
     "platformAgent.harness.experimental.shellSandbox.resources",
 )
 _HCL_TOKEN = re.compile(
-    r'"[^"\\]*(?:\\.[^"\\]*)*"|#[^\n]*|\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)'
+    r'"[^"\\]*(?:\\.[^"\\]*)*"|#[^\n]*|\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?![=>])'
     r"|\bmerge\(|\bvar\.([A-Za-z_][A-Za-z0-9_]*)|[{}()\[\]]"
 )
 
 
-def _composition_chart_vars():
-    """Every (chart key, tfvar) the kube_agents helm_release's first values document assigns.
+def _hcl_chart_vars(src, pos=0):
+    """Every (chart key, tfvar) pair the HCL object opening at src[pos] assigns.
 
-    Walks the HCL with a stack of enclosing keys: `key = {` and `key = merge(` push the
-    key, other brackets push an anonymous frame, and a `var.x` met right after `leaf =`
-    records the path. A `var.x` in a condition (`var.x ? {...} : {}`) has no leaf and is
-    skipped: it decides whether a block renders, and the block's own assignments record
-    what it sets.
+    Walks the object with a stack of enclosing keys: `key = {` and `key = merge(` push the
+    key, `(` and `[` push an anonymous frame, and a `var.x` anywhere in the right-hand side
+    of `leaf =` records the path: right after the `=`, or inside anonymous frames under it
+    (`leaf = try(var.x, false)`, `leaf = [for r in var.x : ...]`), never past a named one.
+    A closer ends the leaves inside and at the frame it closes, and the next `key =` at a
+    depth ends the leaf there, so a `var.x` that follows a block (the condition in
+    `}, var.x ? {} : {`) has no leaf and is skipped: it decides whether a block renders,
+    and the block's own assignments record what it sets.
     """
-    src = _MAIN_TF.read_text()
-    release = src.index('resource "helm_release" "kube_agents"')
-    pos = src.index("values = [yamlencode(", release) + len("values = [yamlencode(")
-    stack, closers, pairs, pending = [], [], set(), None
+    stack, closers, pairs, leaf_at = [], [], set(), {}
     while True:
         m = _HCL_TOKEN.search(src, pos)
         assert m is not None, "unterminated values block"
         tok, pos = m.group(0), m.end()
         if tok.startswith('"') or tok.startswith("#"):
             continue
+        depth = len(stack)
         if m.group(1):
-            pending = m.group(1)
+            leaf_at[depth] = m.group(1)
             continue
         if tok in ("merge(", "{", "(", "["):
-            stack.append(pending if tok in ("merge(", "{") else None)
+            stack.append(leaf_at.get(depth) if tok in ("merge(", "{") else None)
             closers.append("}" if tok == "{" else ")" if tok.endswith("(") else "]")
-            pending = None
             continue
         if tok in "})]":
             closers.pop()
             stack.pop()
             if not closers:
                 return pairs
+            leaf_at = {d: k for d, k in leaf_at.items() if d < len(stack)}
             continue
-        if m.group(2) and pending:
-            pairs.add((".".join(k for k in stack if k) + "." + pending, m.group(2)))
-            pending = None
+        if m.group(2):
+            while depth not in leaf_at and depth > 0 and stack[depth - 1] is None:
+                depth -= 1
+            if depth in leaf_at:
+                pairs.add((".".join([*(k for k in stack[:depth] if k), leaf_at[depth]]), m.group(2)))
+
+
+def _composition_chart_vars():
+    """Every (chart key, tfvar) the kube_agents helm_release's first values document assigns."""
+    src = _MAIN_TF.read_text()
+    release = src.index('resource "helm_release" "kube_agents"')
+    return _hcl_chart_vars(src, src.index("values = [yamlencode(", release) + len("values = [yamlencode("))
 
 
 def _footprint_value_map():
@@ -6062,6 +6072,47 @@ _NOTES_SETS = [
     "--set", "webConsole.enabled=true",
     "--set", "platformAgent.mode=next",
 ]
+
+
+class CompositionChartVarsWalkerTest(unittest.TestCase):
+    """The HCL walker the map-completeness test rests on, over the shapes main.tf uses."""
+
+    def test_a_var_inside_a_function_or_a_for_expression_is_credited_to_its_leaf(self):
+        src = """{
+          a = try(var.x, false)
+          b = coalesce(var.y, "50Gi")
+          c = [for r in var.z.rules : { for k, v in r : k => v if v != null }]
+          d = [{ e = local.n }, var.w]
+        }"""
+        self.assertEqual(
+            _hcl_chart_vars(src), {("a", "x"), ("b", "y"), ("c", "z"), ("d", "w")}
+        )
+
+    def test_a_var_in_a_condition_after_a_block_is_not_credited_to_the_previous_leaf(self):
+        # main.tf's shape: a leaf set from a local, then a merge() argument gated on a var.
+        src = """{
+          root = merge({
+            integration = local.integration
+          }, var.size == local.default_size ? {} : {
+            storage = { size = var.size }
+          }, var.mode == "today" ? {} : {
+            mode = var.mode
+          })
+        }"""
+        self.assertEqual(
+            _hcl_chart_vars(src), {("root.storage.size", "size"), ("root.mode", "mode")}
+        )
+
+    def test_nested_blocks_and_bare_vars_record_the_full_path(self):
+        src = """{
+          a = {
+            b = { c = var.x }
+            d = var.y ? { e = 1 } : {}
+            f = local.g
+          }
+          h = var.z
+        }"""
+        self.assertEqual(_hcl_chart_vars(src), {("a.b.c", "x"), ("a.d", "y"), ("h", "z")})
 
 
 class FootprintSummaryTest(unittest.TestCase):
@@ -6154,6 +6205,8 @@ class FootprintSummaryTest(unittest.TestCase):
         proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM, tfvars=standard)
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("This is a GKE Standard cluster", proc.stdout)
+        # The install creates a gVisor pool only when asked; the sentence claims no pool.
+        self.assertNotIn("gVisor", proc.stdout)
         proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM)
         self.assertNotIn("GKE Standard cluster", proc.stdout)
 
@@ -6165,8 +6218,12 @@ class FootprintSummaryTest(unittest.TestCase):
         proc = self._run("export TF_VAR_extra_helm_values='{litellm={replicaCount=4}}'\n" + script, helm_script=_ECHO_HELM)
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn(caveat, proc.stdout)
-        proc = self._run('touch "$(dirname "$TFVARS")/extra.auto.tfvars"\n' + script, helm_script=_ECHO_HELM)
-        self.assertIn(caveat, proc.stdout)
+        # Every variables file Terraform auto-loads beside the generated terraform.tfvars.
+        for name in ("extra.auto.tfvars", "extra.auto.tfvars.json", "terraform.tfvars.json"):
+            proc = self._run(f'touch "$(dirname "$TFVARS")/{name}"\n' + script, helm_script=_ECHO_HELM)
+            self.assertIn(caveat, proc.stdout, name)
+        proc = self._run('touch "$(dirname "$TFVARS")/notes.json"\n' + script, helm_script=_ECHO_HELM)
+        self.assertNotIn(caveat, proc.stdout)
 
     def test_render_fails_naming_the_cause_when_helm_refuses(self):
         proc = self._run(

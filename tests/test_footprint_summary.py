@@ -200,6 +200,21 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertNotIn("Release footprint", notes)
         self.assertNotIn(_LABEL, notes)
 
+    def test_the_sum_refuses_an_unsizable_input_where_the_preflight_is_inert(self) -> None:
+        # `helm template` has no cluster, so the preflight's lookup finds no quota and the
+        # comparison is inert; the summary still sums, so the sum's refusal of an input it
+        # cannot size reaches this render, from NOTES.txt, and the switch lifts it. This is
+        # the behaviour the chart README and values.yaml document. The chart itself, not
+        # the probe copy, whose requirements probe would refuse first.
+        cmd = [_HELM, "template", "test-release", str(_CHART), *_REQUIRED,
+               "--set", "hindsight.enabled=true", "--set", "hindsight.postgresql.storage="]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout[:400])
+        self.assertIn("NOTES.txt", proc.stderr)
+        self.assertIn("quota preflight: hindsight.postgresql.storage is empty", proc.stderr)
+        proc = subprocess.run(cmd + ["--set", "quotaPreflight.enabled=false"], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
 
 class PinnedPricesTest(unittest.TestCase):
     """The defines hold the pinned figures, and the README names the defines rather than

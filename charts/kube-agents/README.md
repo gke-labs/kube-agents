@@ -1177,7 +1177,11 @@ under `Recreate` at any value, so that surge is an over-count.
 
 **Where it is silent, and where it is not.** The check needs a cluster to query, so it
 does nothing under `helm template` and nothing in a namespace with no ResourceQuota — a
-clean render in either case is not evidence that a quota fits.
+clean render in either case is not evidence that a quota fits. Its sum still runs there: the
+footprint summary below calls the same template on every render while `quotaPreflight.enabled`
+is on, so an input the sum refuses (an empty `hindsight.postgresql.storage`, a quantity it
+cannot parse, a damaged `footprint.yaml`) stops a quota-less render and `helm template` too,
+and `--set quotaPreflight.enabled=false` lifts the summary with the check.
 
 It reads ResourceQuota and nothing else, so a `LimitRange` in the namespace is invisible
 to it. A LimitRange with a per-container `max`, or a `default` that rewrites what the pods
@@ -1222,8 +1226,11 @@ after an install or upgrade, and on `helm install --dry-run` without applying (`
 renders no notes); `install.sh` renders the same template in its pre-flight summary, so the
 installer prints the figures the notes will, for the values its generator writes. It follows
 `quotaPreflight.enabled`, because it shares the preflight's arithmetic and the preflight's
-refusals name that switch as the way round them. Under `spec.mode: next` it says what it
-leaves out: the A2A workloads, NATS's JetStream claim and the session pods, which the
+refusals name that switch as the way round them, but not the preflight's quota gate: it sums
+on every render, a namespace with no ResourceQuota and `helm template` included, so the
+refusals the preflight section lists apply wherever the summary prints. Under
+`spec.mode: next` it says what it leaves out: the A2A workloads, NATS's JetStream claim and
+the session pods, which the
 [install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) list.
 
 #### Upgrade notes: operator memory floor

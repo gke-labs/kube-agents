@@ -1929,7 +1929,12 @@ persistentvolumeclaims and requests.storage. Keys outside that set (services, se
 count/<resource>) are not modelled, and are skipped rather than guessed at.
 
 Inert when lookup returns empty — `helm template` without a cluster, or a namespace with no
-ResourceQuota at all.
+ResourceQuota at all. The comparison is inert there; the sum is not: NOTES.txt prints
+kube-agents.footprintSummary while quotaPreflight.enabled is on, and that calls
+kube-agents.quotaRequirements on every render, so an input the sum refuses (an empty
+hindsight.postgresql.storage, a quantity parseBytes or parseCpuMillis cannot read, a damaged
+footprint.yaml) stops a quota-less render and `helm template` too, with the same
+`quotaPreflight.enabled=false` as the way round it.
 
 It is NOT inert when the installing identity cannot read ResourceQuotas. Helm's `lookup`
 swallows a NotFound and returns nothing; every other API error, a 403 on
@@ -2875,7 +2880,10 @@ Footprint summary: what the release asks of the cluster, and a modeled monthly c
 kube-agents.footprintSummary prints the totals kube-agents.quotaRequirements returns (the
 requests, as the preflight sums them) with a monthly cost modeled from us-central1 GKE
 Autopilot list prices. NOTES.txt prints it on every install and upgrade that leaves
-quotaPreflight.enabled on (a dry run included; `helm template` renders no notes), and
+quotaPreflight.enabled on (a dry run included; `helm template` renders no notes), with no
+quota gate: the preflight sums only when lookup finds a ResourceQuota, this sums on every
+render, so the refusals inside quotaRequirements reach a quota-less namespace and `helm
+template` through it (the doc block above quotaRequirements says which), and
 install.sh's pre-flight summary renders the same template through a throwaway chart holding
 this file and a one-line probe (print_footprint_summary in
 scripts/installer/installer_common.sh), so the installer prints the figures Helm will. The

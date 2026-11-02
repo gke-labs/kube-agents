@@ -121,6 +121,11 @@ readonly FOOTPRINT_PROBE_INDENT=4
 # billed for its node pools instead.
 readonly FOOTPRINT_CLUSTER_MODE_KEY="cluster_mode"
 readonly FOOTPRINT_STANDARD_CLUSTER_MODE="standard"
+# The variables files Terraform loads on its own from the directory holding the
+# generated terraform.tfvars; an extra_helm_values carried in one reaches the
+# apply but not the footprint render. Assigned, then marked readonly (bash 3.2).
+FOOTPRINT_AUTOLOADED_TFVARS_GLOBS=("*.auto.tfvars" "*.auto.tfvars.json" "terraform.tfvars.json")
+readonly FOOTPRINT_AUTOLOADED_TFVARS_GLOBS
 # The footprint-shaping settings, read from the terraform.tfvars the generator
 # wrote (the composition's input) and passed to the chart under the key
 # terraform/examples/full-install/main.tf maps each to: tfvars key=chart value,
@@ -979,17 +984,33 @@ render_footprint_summary() {
 # Two things the render cannot see are said under it when they apply: a
 # Standard cluster, whose bill is its node pools rather than the pod requests
 # the Autopilot rates price, and chart values carried through the
-# composition's extra_helm_values (TF_VAR_extra_helm_values, or a *.auto.tfvars
-# beside the generated file), which reach the apply but not this render.
+# composition's extra_helm_values (TF_VAR_extra_helm_values, or a variables
+# file Terraform auto-loads beside the generated one), which reach the apply
+# but not this render.
+#
+# True when extra_helm_values may reach the apply unseen: TF_VAR_extra_helm_values
+# is set, or a file matching FOOTPRINT_AUTOLOADED_TFVARS_GLOBS sits beside $1.
+footprint_extra_values_may_apply_unseen() {
+  local tfvars_dir glob
+  [ -z "${TF_VAR_extra_helm_values:-}" ] || return 0
+  tfvars_dir="$(dirname "$1")"
+  for glob in "${FOOTPRINT_AUTOLOADED_TFVARS_GLOBS[@]}"; do
+    if compgen -G "${tfvars_dir}/${glob}" >/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 print_footprint_summary() {
   local repo_dir="$1" tfvars_file="$2" summary err_file
   err_file="$(mktemp "${TMPDIR:-/tmp}/kube-agents-footprint-err.XXXXXX")" || return 0
   if summary="$(render_footprint_summary "$repo_dir" "$tfvars_file" 2>"$err_file")"; then
     printf '%s\n' "$summary" | sed 's/^/      /'
     if [ "$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_CLUSTER_MODE_KEY")" = "$FOOTPRINT_STANDARD_CLUSTER_MODE" ]; then
-      print_info "This is a GKE Standard cluster: the modeled cost prices pod requests at Autopilot rates, and a Standard cluster is billed for its node pools (the gVisor pool the install creates among them) whatever the pods request."
+      print_info "This is a GKE Standard cluster: the modeled cost prices pod requests at Autopilot rates, and a Standard cluster is billed for its node pools whatever the pods request."
     fi
-    if [ -n "${TF_VAR_extra_helm_values:-}" ] || compgen -G "$(dirname "$tfvars_file")/*.auto.tfvars" >/dev/null; then
+    if footprint_extra_values_may_apply_unseen "$tfvars_file"; then
       print_info "Chart values set through the composition's extra_helm_values are not in this figure; the chart's install notes after the apply show the release as applied."
     fi
   else
