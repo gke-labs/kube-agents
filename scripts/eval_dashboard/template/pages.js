@@ -2014,15 +2014,15 @@ const scorecardDoc = () => (brief.scorecard && typeof brief.scorecard === "objec
 // One understudy in words: its nightly record and the store's verdict.
 function understudyHtml(u, bar) {
   const record = u.graded ? `${u.passed}/${u.graded} over ${plural(u.nights, "night")}` : "no graded night";
-  const store = u.store && u.store.state ? `store ${u.store.state}${Number.isInteger(u.store.runs) && u.store.runs ? `, ${u.store.passes}/${u.store.runs}` : ""}` : "";
+  const store = u.store && u.store.state === "none" ? "no store record at the current key" : u.store && u.store.state ? `store ${u.store.state}${Number.isInteger(u.store.runs) && u.store.runs ? `, ${u.store.passes}/${u.store.runs}` : ""}` : "";
   const tip = `nightly record over the last ${plural(bar.nights ?? "", "night")}; the bar is ${pct(bar.rate ?? 0)} over at least ${bar.min_runs ?? ""} graded runs${u.meets_bar ? ", met" : ""}`;
-  return `<div><a href="${esc(caseHref(u.case))}">${esc(u.case)}</a>${u.held_out ? ' <span class="mut">(held out)</span>' : ""} <span class="mut"${tipAttr(tip)}>${esc([record, store].filter(Boolean).join(" · "))}</span></div>`;
+  return `<div><a href="${esc(caseHref(u.case))}">${esc(u.case)}</a>${u.held_out ? ' <span class="mut">(held out)</span>' : ""} <span class="mut hint"${tipAttr(tip)}>${esc([record, store].filter(Boolean).join(" · "))}</span></div>`;
 }
 
 function domainRow(d, doc) {
   const seat = d.seats && d.seats.length
     ? `<span class="pill p-pass">yes</span> <span class="mut">${d.seats.map((c) => `<a href="${esc(caseHref(c))}">${esc(c)}</a>`).join(", ")}</span>`
-    : `<span class="pill p-fail">no</span>${d.held_out ? ` <span class="mut"${tipAttr("still runs on the presubmit as a held-out seat, which can red no pull request")}>held out: ${esc(d.held_out)}</span>` : ""}`;
+    : `<span class="pill p-fail">no</span>${d.held_out ? ` <span class="mut hint"${tipAttr("still runs on the presubmit as a held-out seat, which can red no pull request")}>held out: ${esc(d.held_out)}</span>` : ""}`;
   const days = d.seats && d.seats.length ? "—"
     : `${Number.isInteger(d.days_uncovered) ? esc(plural(d.days_uncovered, "day")) : '<span class="mut">start not recorded</span>'}${d.allowlist_issue ? ` · ${issueLink(`#${d.allowlist_issue}`)}` : ""}${Number.isInteger(d.expired_days) ? ` <span class="pill p-fail">exception expired ${esc(plural(d.expired_days, "day"))} ago</span>` : ""}`;
   const red = !d.nightly_red ? '<span class="mut">not read</span>'
@@ -2046,7 +2046,7 @@ function domainsHtml() {
   const generated = parseIso(doc.generated_at);
   return head +
     `<div class="sec"><p><b>${covered}</b> of ${esc(plural(doc.domains.length, "domain"))} have a presubmit seat · <b>${ready}</b> have an understudy ready.</p>` +
-    `<table class="rel"><thead><tr><th>Domain</th><th>Owner</th><th>Presubmit seat</th><th>Days uncovered</th><th>Open nightly-red</th><th>Understudy ready</th><th>Best understudies</th></tr></thead><tbody>${rows}</tbody></table></div>` +
+    `<table class="rel domains"><thead><tr><th>Domain</th><th>Owner</th><th>Presubmit seat</th><th>Days uncovered</th><th>Open nightly-red</th><th>Understudy ready</th><th>Best understudies</th></tr></thead><tbody>${rows}</tbody></table></div>` +
     `<div class="foot block"><p>An understudy is a case of the domain on the nightly matrix with a <code>verification_spec</code>, not <code>expected_fail</code>, off the roster, ranked as the coverage-gap issue ranks it. <b>Ready</b> means the evidence store reads it <code>would-admit</code>: ${esc(pct(bar.rate ?? 0))} over ${esc(bar.min_runs ?? "")} runs at the current version key. The rest of the seat bar (a recorded red, classified misses, a guarded fixture, deterministic checks) is checked when it is admitted — <a href="${PAGE.rosterUrl}">the admission bar</a>.</p>` +
     `<p class="mut">Written by <code>scripts/eval_dashboard/understudies.py</code>${generated != null ? ` at ${esc(et(generated))}` : ""}.</p></div>` + footHtml();
 }

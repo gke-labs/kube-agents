@@ -78,6 +78,10 @@ class ScorecardTest(Harness):
         self.assertEqual(rows["gamma"]["nightly_red"], {"open": 0, "oldest_days": None})
         self.assertIsNone(self.rows()["beta"]["nightly_red"], "not read: null, never zero")
 
+    def test_an_issue_newer_than_now_is_zero_days_old(self):
+        rows = self.rows(red_issues=[red_issue(1, "beta", "2026-10-26T13:00:05Z")])
+        self.assertEqual(rows["beta"]["nightly_red"], {"open": 1, "oldest_days": 0}, "a --now in the past or clock skew never reads -1 days")
+
     def test_no_cases_in_data_json_reads_as_not_read(self):
         doc = data_doc()
         doc["cases"] = []

@@ -2299,7 +2299,7 @@ def scorecard_doc():
                  "understudies": [study("proving-case", 21, 21, "would-admit")], "candidates": 1, "understudy_ready": True},
                 {"slug": "reliability", "name": "Reliability", "owner": "<b>carol</b>", "backup": None, "seats": [], "uncovered_since": "2026-08-30", "days_uncovered": 9,
                  "allowlist_issue": 3120, "held_out": "demoted-case", "expired_days": 2, "nightly_red": {"open": 0, "oldest_days": None},
-                 "understudies": [study("demoted-case", 18, 21, "collecting", held_out=True)], "candidates": 1, "understudy_ready": False},
+                 "understudies": [study("demoted-case", 18, 21, "collecting", held_out=True), study("historical-case", 3, 3, "none")], "candidates": 2, "understudy_ready": False},
                 {"slug": "upgrades", "name": "Upgrades", "owner": None, "backup": None, "seats": [], "uncovered_since": None, "days_uncovered": None,
                  "allowlist_issue": None, "held_out": None, "expired_days": None, "nightly_red": None, "understudies": [], "candidates": 0, "understudy_ready": None},
             ]}
@@ -2331,10 +2331,18 @@ class DomainsPageTest(unittest.TestCase):
         app = dom_text(self.out / "cases.html", fragment="#view=domains")
         self.assertIn('<a href="cases.html#view=domains" class="on">Domain coverage</a></nav><div class="sec head"><h1>Domain coverage</h1>', app)
         self.assertIn("<b>1</b> of 3 domains have a presubmit seat · <b>1</b> have an understudy ready.", app)
-        self.assertIn('<tr><td class="nm">cost</td><td>@alice <span class="mut">backup @bob</span></td><td><span class="pill p-pass">yes</span> <span class="mut"><a href="cases.html#proven-case">proven-case</a></span></td><td class="num">—</td><td class="num">2 <span class="mut">oldest 5 days</span></td><td><span class="pill p-pass">yes</span></td><td><div><a href="cases.html#proving-case">proving-case</a> <span class="mut"', app)
+        self.assertIn('<tr><td class="nm">cost</td><td>@alice <span class="mut">backup @bob</span></td><td><span class="pill p-pass">yes</span> <span class="mut"><a href="cases.html#proven-case">proven-case</a></span></td><td class="num">—</td><td class="num">2 <span class="mut">oldest 5 days</span></td><td><span class="pill p-pass">yes</span></td><td><div><a href="cases.html#proving-case">proving-case</a> <span class="mut hint"', app)
         self.assertIn(">21/21 over 7 nights · store would-admit, 21/21</span></div>", app)
         self.assertIn('<td class="num">9 days · <a href="https://github.com/gke-labs/kube-agents/issues/3120">#3120</a> <span class="pill p-fail">exception expired 2 days ago</span></td><td class="num">0</td><td><span class="pill p-partial">no</span></td>', app)
         self.assertIn("held out: demoted-case", app)
+        self.assertIn(">3/3 over 7 nights · no store record at the current key</span></div>", app, "a read store with no record at the key says so in words")
+        # Hover notes: marked as such, and inside a table the stylesheet's tooltip rule reaches.
+        self.assertIn('<span class="mut hint" data-tip="nightly record over the last 14 nights; the bar is 90% over at least 20 graded runs, met">21/21 over 7 nights', app)
+        self.assertIn('<span class="mut hint" data-tip="still runs on the presubmit as a held-out seat', app)
+        self.assertIn('<table class="rel domains">', app)
+        css = render.PAGE_TEMPLATE.read_text()
+        self.assertIn("table.domains [data-tip]:hover::after", css)
+        self.assertIn("table.rel.domains { overflow:visible; }", css, "the table's rounded clip would cut a note off")
         self.assertIn("@&lt;b&gt;carol&lt;/b&gt;", app, "an owner is escaped")
         self.assertIn('<td class="nm">upgrades</td><td><span class="mut">none on record</span></td>', app)
         self.assertIn('<td class="num"><span class="mut">start not recorded</span></td><td class="num"><span class="mut">not read</span></td><td><span class="mut">store not read</span></td><td><span class="mut">none on the nightly matrix</span></td>', app)

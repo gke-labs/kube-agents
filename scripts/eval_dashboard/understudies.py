@@ -72,7 +72,8 @@ def red_counts(issues: list | None, now: datetime.datetime) -> dict[str, dict] |
         if not isinstance(issue, dict) or issue.get("pull_request"):
             continue
         created = nightly.parse_iso(issue.get("created_at"))
-        age = (now - created).days if created else None
+        # Clamped: an issue newer than `now` (a --now in the past, clock skew) is 0 days old.
+        age = max((now - created).days, 0) if created else None
         for label in issue.get("labels") or []:
             name = label.get("name") if isinstance(label, dict) else label
             if not isinstance(name, str) or not name.startswith(DOMAIN_LABEL_PREFIX):
