@@ -137,35 +137,43 @@ verification_spec:
       type: report_contains
       # The backlog in every phrasing a report uses for it, on the verifier's
       # pattern surface (lowercased, emphasis and backticks dropped, lines
-      # kept): "pending" as a whole word beside pods, replicas, a count, a
-      # state word, a plural "are" or a stuck/remain verb (not "is pending",
-      # which is also "is pending your approval"); the ready-to-wanted ratio ("1 of 5
-      # replicas ready", "stalled at 1/3 replicas", "4 unavailable replicas");
-      # the scheduling-failure forms ("cannot be scheduled", "failing to
-      # schedule", "FailedScheduling", "unschedulable"); and the autoscaler
-      # event only an unschedulable pod carries ("Pod didn't trigger
-      # scale-up"). Never a bare "pending": with no boundary it is a suffix of
+      # kept; a literal space is written `\s+` so a phrase may wrap): "pending"
+      # as a whole word beside pods or replicas with no negation or approval
+      # sense in between, a non-zero count, a state word (either order, so
+      # `Status: Pending` reads), a plural "are" or a stuck/remain verb; the ready-to-wanted ratio only when the two numbers
+      # differ ("1 of 5 replicas ready", "stalled at 1/3"; "5/5 ready" is the
+      # healthy state and must not pass); a non-zero "unavailable" count; the
+      # scheduling-failure forms ("cannot be scheduled", "failing to schedule",
+      # "FailedScheduling", "unschedulable"); and the autoscaler event only an
+      # unschedulable pod carries ("Pod didn't trigger scale-up"), read beside
+      # its pod. Never a bare "pending": with no boundary it is a suffix of
       # depending, impending, spending and suspending, and as a word alone it
-      # is "pending your approval". No count is required, for the reason
-      # above. A first-turn acknowledgement that echoes the prompt ("diagnose
-      # why the replicas are stalled") names no backlog and fails, as it
-      # should. bench/tests/test_pending_replicas_backlog_patterns.py pins the
-      # shapes the nightly reports wrote and the prose that names no backlog.
+      # is "pending your approval"; "is pending" is left out for the same
+      # reason. No count is required, for the reason above. The two-noun gaps
+      # stay on one line by design: a cross-line gap would fuse a negated
+      # bullet into its neighbour. Admitted on purpose, as main's "are
+      # pending" admitted them: "none of the pods is pending" (the negation
+      # sits before the noun) and "still pending" in another sense. A
+      # first-turn acknowledgement that echoes the prompt ("diagnose why the
+      # replicas are stalled") names no backlog and fails, as it should.
+      # bench/tests/test_pending_replicas_backlog_patterns.py pins the recorded
+      # shapes, paraphrases of them, the healthy state, and the prose that
+      # names no backlog.
       any_of_patterns:
         - '\bunschedulable\b'
-        - '\bunscheduled\b'
-        - '\b(?:pods?|replicas?)\b[^\n.]{0,40}\bpending\b'
-        - '\bpending\b[^\n.]{0,20}\b(?:pods?|replicas?)\b'
-        - '\b\d+ pending\b'
-        - '\b(?:are|were|still|as|stuck|stay(?:s|ed)?|remain(?:s|ed)?|left|been|sit(?:s|ting)?) pending\b'
-        - '\bin (?:a |the )?pending\b'
-        - '\bpending (?:state|phase|status)\b'
-        - '\b(?:cannot|can''t|unable to|fail(?:s|ed|ing)? to|not|never) (?:be |been )?schedul(?:e|ed|able)\b'
-        - '\b(?:failedscheduling|scheduling failed)\b'
-        - '\b\d+ ?(?:/|of)(?: the)? ?\d+ (?:replicas? )?(?:(?:is|are) )?(?:ready|available|running)\b'
-        - '\b(?:stalled|stuck) at \d+/\d+\b'
-        - '\b\d+ (?:replicas? (?:is|are) )?unavailable\b'
-        - '\bdid(?:n''t| not) trigger (?:a )?scale[- ]?up\b'
+        - '\b(?:pods?|replicas?)\b(?:(?!\b(?:not|no|none|never)\b)[^\n.]){0,40}(?<!\b0 )\bpending\b(?!\s+(?:your|the|an?|my|our)\s+approval)'
+        - '(?<!\b0 )\bpending\b(?!\s+(?:your|the|an?|my|our)\s+approval)[^\n.]{0,20}\b(?:pods?|replicas?)\b'
+        - '\b[1-9]\d*\s+pending\b'
+        - '\b(?:are|were|still|as|stuck|stay(?:s|ed)?|remain(?:s|ed)?|left|been|sit(?:s|ting)?)\s+pending\b'
+        - '\bin\s+(?:a\s+|the\s+)?pending\b'
+        - '\bpending\s+(?:state|phase|status)\b'
+        - '\b(?:state|phase|status):\s*pending\b'
+        - '\b(?:cannot|can''t|unable\s+to|fail(?:s|ed|ing)?\s+to|never)\s+(?:be\s+|been\s+)?schedul(?:e|ed|able)\b'
+        - '\b(?:failedscheduling|scheduling\s+failed)\b'
+        - '\b(?!(\d+)\s*(?:/|of)(?:\s+the)?\s*\1\b)\d+\s*(?:/|of)(?:\s+the)?\s*\d+\s+(?:replicas?\s+)?(?:(?:is|are)\s+)?(?:ready|available|running)\b'
+        - '\b(?:stalled|stuck)\s+at\s+(?!(\d+)/\1\b)\d+/\d+\b'
+        - '\b[1-9]\d*\s+(?:replicas?\s+(?:is|are)\s+)?unavailable\b'
+        - '\bpods?\b[^\n.]{0,40}\bdid(?:n''t|\s+not)\s+trigger\s+(?:a\s+)?scale[-\s]?up\b'
   - name: the-report-names-the-scheduling-constraint
     role: objective
     mode: assert

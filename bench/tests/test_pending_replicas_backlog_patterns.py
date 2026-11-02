@@ -1,9 +1,11 @@
 """The backlog objective of cluster-agent-pending-replicas-capped-pool, graded as the
 verifier grades it: the whole check, patterns on the pattern surface.
 
-The positive fixtures are the shapes the nightly reports wrote; the negative ones
-name no backlog: a first-turn acknowledgement that echoes the prompt, and prose
-where "pending" is a suffix or means approval.
+Fourteen positive fixtures are sentences the nightly reports wrote; the rest are
+paraphrases of them, one per pattern, so that dropping any pattern turns a
+fixture red. The negative ones name no backlog or the healthy state: a
+first-turn acknowledgement that echoes the prompt, a deployment with every
+replica ready, and prose where "pending" is a suffix or means approval.
 """
 from __future__ import annotations
 
@@ -46,10 +48,15 @@ BACKLOG_NAMED = (
     "4 replicas are unavailable.",
     "Replicas: 1 available, 4 unavailable.",
     "The autoscaler event says the pod did not trigger scale-up.",
-    "They have not been scheduled.",
-    "They are not schedulable.",
     "Scheduling failed: 0/1 nodes are available.",
-    "They remain unscheduled.",
+    # One per pattern that no other admits; a wrapped phrase; the key-value shape.
+    "Four pods, all Pending since Tuesday.",
+    "The Pending inference-server pods wait for CPU.",
+    "Desired 5, ready 1, 4 Pending.",
+    "Four sit in Pending.",
+    "Four show the Pending state.",
+    "The replicas are\npending because the pool cannot grow.",
+    "- **Status**: Pending",
 )
 
 NO_BACKLOG = (
@@ -58,6 +65,20 @@ NO_BACKLOG = (
     "The change is pending your approval; nothing was applied.",
     "The team is spending its budget on a larger machine type.",
     "The impending upgrade will drain the node.",
+    "The pods are placed depending on the node pool's labels.",
+    "Nothing is pending your approval.",
+    # The healthy state, which must not read as a backlog.
+    "inference-server is 1/1 ready on seeded-a; its nodeSelector seeded-role pins it to pinned-inference-pool. Nothing is holding replicas back.",
+    "Replicas: 5 available, 0 unavailable, 0 pending. The nodeSelector seeded-role=pinned-inference is set and the deployment is healthy.",
+    "Utilisation is below target, so the HPA did not trigger a scale-up.",
+    "5/5 ready on seeded-a.",
+    "3 of 3 replicas are available.",
+    "Pods: 5 running, 0 pending.",
+    # A negated or approval-sense "pending" beside a pod noun; an unscheduled window.
+    "The pods are not pending.",
+    "Scaling the replicas is pending your approval.",
+    "Any change to the pods is pending your approval.",
+    "The upgrade was not scheduled.",
 )
 
 
