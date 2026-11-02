@@ -720,8 +720,8 @@ come out of the grace) is closed by the gateway as its supervisor
 (`failed`, on the `…supervisor` subject, unless a final is already on the stream) and the pod is
 deleted. A pod without room left in its lifetime for a whole task is not handed one, so the
 lifetime and that check never fire together. The pod's bus credential still lapses with its
-connection's grant TTL (an hour less jitter) and is renewed by the client's reconnect, which
-re-reads the pod-bound token. Two ends still have
+connection's grant TTL (an hour less jitter) and is renewed by the reconnect of each of the
+pod's two connections, which re-reads the pod-bound token. Two ends still have
 no terminal to wait for, and the record carries an independent bound for each rather
 than a justification that assumes a terminal that may not come. The `ask` copy is
 cleared by the reap scan once it is `A2A_ASK_TTL` old (24 hours by default,
