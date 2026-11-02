@@ -51,6 +51,22 @@ def test_stated_stops_match():
         # The repository stop, subject first.
         "No repository is registered for this install, so nothing was changed.",
         "The GitOps repository is not registered, so nothing was changed.",
+        # A parenthesis beside the subject, a negation split from its
+        # participle, the subject-first repository stop with "GitOps", and a
+        # plural "formats".
+        "KCC (Config Connector) is not installed on the host cluster.",
+        "Config Connector has not been installed on any cluster.",
+        "Config Connector is not yet installed on any cluster.",
+        "Config Connector isn't currently installed on the host cluster.",
+        "Config Connector was never installed on platform-agent-host.",
+        "Config Connector does not appear to be installed on any cluster.",
+        "The Config Connector CRDs do not exist on any cluster.",
+        "I could not find Config Connector on any of the five clusters.",
+        "Neither cluster has Config Connector.",
+        "No GitOps repository is registered for this install, so nothing was changed.",
+        "There is no GitOps repository registered.",
+        "Which of the two formats (Terraform or Config Connector) should the pull request use?",
+        "Which of the supported formats should I use?",
     ):
         assert _matches(report), report
 
@@ -61,5 +77,8 @@ def test_prose_that_names_no_stop_does_not_match():
         "Config Connector is installed and syncing the repository, so the pull request creates the cluster on merge.",
         "The repository is registered and holds the Terraform format the fleet uses; the pull request follows it.",
         "The cluster was created in us-central1 with two nodes and is running.",
+        # The absence word is there, but not as a negation of the subject.
+        "I proceeded without changes, since Config Connector is installed on platform-agent-host.",
+        "Nothing is missing: Config Connector is installed on every cluster.",
     ):
         assert not _matches(report), report

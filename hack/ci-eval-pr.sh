@@ -3051,19 +3051,30 @@ echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: every task in the matrix carries 
 # Read from the prompt, as the harness reads it, not from
 # api-lane-exclusions.txt, which may come to list door-only cases of other
 # kinds.
-# A case that declares `writes_alone: true` at the top of its task.yaml
-# (bench/kube_agents_bench/lane.py, WRITES_ALONE_KEY) is placed the same way
-# on every transport: it requests nothing, but a wrong answer may let a card
-# open a pull request the reply never names, and the lane marks its window
-# exclusive, which is only right when it runs alone.
 STOPPED_ASK_CASES=""
-if ! STOPPED_ASK_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook "${TASKS[@]}" \
-    | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
-  echo "ERROR: could not read which cases are stopped asks or declare writes_alone (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
-  exit 1
+if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
+  if ! STOPPED_ASK_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook "${TASKS[@]}" \
+      | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
+    echo "ERROR: could not read which cases are stopped asks (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
+    exit 1
+  fi
 fi
 if [ -n "${STOPPED_ASK_CASES}" ]; then
-  echo "stopped asks and writes_alone cases, run after every other unit with the cases that request a pull request: ${STOPPED_ASK_CASES}"
+  echo "stopped asks, run after every other unit with the cases that request a pull request: ${STOPPED_ASK_CASES}"
+fi
+# A case that declares `writes_alone: true` at the top of its task.yaml
+# (bench/kube_agents_bench/lane.py, WRITES_ALONE_KEY) runs in the same second
+# phase on every transport: it requests nothing, but a wrong answer may let a
+# card open a pull request the reply never names, and the lane marks its
+# window exclusive, which is only right when it runs alone.
+WRITES_ALONE_CASES=""
+if ! WRITES_ALONE_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook --writes-alone "${TASKS[@]}" \
+    | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
+  echo "ERROR: could not read which cases declare writes_alone (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
+  exit 1
+fi
+if [ -n "${WRITES_ALONE_CASES}" ]; then
+  echo "writes_alone cases, run after every other unit with the cases that request a pull request: ${WRITES_ALONE_CASES}"
 fi
 
 # The task file a unit hands devops-bench: the lane's copy when the step
@@ -3182,7 +3193,7 @@ if [ "${EVAL_TIER}" = "nightly" ]; then
     NIGHTLY_PART_KEPT=()
     for ENTRY in "${TASKS[@]}"; do
       NAME="$(basename "$(dirname "${ENTRY}")")"
-      case ",${INJECT_LANE_REQUESTING},${STOPPED_ASK_CASES:-}," in
+      case ",${INJECT_LANE_REQUESTING},${STOPPED_ASK_CASES:-},${WRITES_ALONE_CASES:-}," in
         *",${NAME},"*) ENTRY_PART="writers" ;;
         *) ENTRY_PART="main" ;;
       esac
@@ -4778,7 +4789,7 @@ unit_phase() { # <task-name> -> 2 for a scope-excluding case, 1 for a case that 
   case ",${SCOPE_EXCLUDE_NAMES:-}," in
     *",$1,"*) echo 2; return ;;
   esac
-  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
+  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-},${WRITES_ALONE_CASES:-}," in
     *",$1,"*) echo 1 ;;
     *) echo 0 ;;
   esac
@@ -4919,7 +4930,7 @@ profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units,
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING:-none}) and the stopped asks and writes_alone cases (${STOPPED_ASK_CASES:-none}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING:-none}) the stopped asks (${STOPPED_ASK_CASES:-none}) and the writes_alone cases (${WRITES_ALONE_CASES:-none}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
   launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"
   wait
 fi
@@ -4937,7 +4948,7 @@ for SCOPE_LINE in ${SCOPE_EXCLUDE_LINES[@]+"${SCOPE_EXCLUDE_LINES[@]}"}; do
   done
   [ -n "${SCOPE_IDX}" ] || continue
   SCOPE_PAUSE="${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
-  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
+  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-},${WRITES_ALONE_CASES:-}," in
     *",${SCOPE_CASE},"*) SCOPE_PAUSE="${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}" ;;
   esac
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${EVAL_REPETITIONS} repetition(s) of ${SCOPE_CASE} alone, with slot(s) $(scope_slots_shown "${SCOPE_SLOTS}") excluded from the install's scope"
