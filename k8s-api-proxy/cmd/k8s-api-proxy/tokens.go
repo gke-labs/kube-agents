@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	cloudPlatformScope       = "https://www.googleapis.com/auth/cloud-platform"
-	defaultSTSURL            = "https://sts.googleapis.com/v1/token"
+	cloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
+	defaultSTSURL      = "https://sts.googleapis.com/v1/token"
+	// #nosec G101 -- public IAM Credentials API URL, not a credential.
 	defaultIAMCredentialsURL = "https://iamcredentials.googleapis.com/v1"
 	tokenHTTPTimeout         = 10 * time.Second
 )

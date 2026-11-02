@@ -833,7 +833,7 @@ class ProfileRouteTest(unittest.TestCase):
         shell = credential_proxy.Principal(workload="system:serviceaccount:ns:shell", role=credential_proxy.CALLER_ROLE_SHELL)
         CredentialProxyHandler.authenticator = _StubAuthenticator(shell)
         self.set_gate(trusted=[DOC["untrusted"]])
-        status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        status, body = self.post({"argv": ["gcloud", "container", "clusters", "list"]})
         self.assertEqual(200, status, body)
         (_, kwargs), = self.executor.calls
         self.assertIsNone(kwargs["kubeconfig_context"])

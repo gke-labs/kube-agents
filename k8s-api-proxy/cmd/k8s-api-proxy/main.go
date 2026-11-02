@@ -51,7 +51,7 @@ func envIntOrDefault(key string, fallback int) int {
 	}
 	v, err := strconv.Atoi(raw)
 	if err != nil {
-		log.Printf("%s: KUBE_PROXY_METRICS_PORT=%q is not an integer", metricsUnavailableAlert, raw)
+		log.Printf("%s: KUBE_PROXY_METRICS_PORT is not an integer", metricsUnavailableAlert)
 		return 0
 	}
 	return v
