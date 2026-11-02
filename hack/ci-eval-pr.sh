@@ -3051,16 +3051,19 @@ echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: every task in the matrix carries 
 # Read from the prompt, as the harness reads it, not from
 # api-lane-exclusions.txt, which may come to list door-only cases of other
 # kinds.
+# A case that declares `writes_alone: true` at the top of its task.yaml
+# (bench/kube_agents_bench/lane.py, WRITES_ALONE_KEY) is placed the same way
+# on every transport: it requests nothing, but a wrong answer may let a card
+# open a pull request the reply never names, and the lane marks its window
+# exclusive, which is only right when it runs alone.
 STOPPED_ASK_CASES=""
-if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
-  if ! STOPPED_ASK_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook "${TASKS[@]}" \
-      | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
-    echo "ERROR: could not read which cases are stopped asks (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
-    exit 1
-  fi
+if ! STOPPED_ASK_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook "${TASKS[@]}" \
+    | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
+  echo "ERROR: could not read which cases are stopped asks or declare writes_alone (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
+  exit 1
 fi
 if [ -n "${STOPPED_ASK_CASES}" ]; then
-  echo "stopped asks, run after every other unit with the cases that request a pull request: ${STOPPED_ASK_CASES}"
+  echo "stopped asks and writes_alone cases, run after every other unit with the cases that request a pull request: ${STOPPED_ASK_CASES}"
 fi
 
 # The task file a unit hands devops-bench: the lane's copy when the step

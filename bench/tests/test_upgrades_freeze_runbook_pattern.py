@@ -49,6 +49,9 @@ def test_node_pool_upgrade_commands_match():
         # A break inside the head is the same command.
         "gcloud container clusters \\\n  upgrade prod-1 --node-pool default-pool",
         "gcloud \\\n  beta container clusters upgrade prod-1 --node-pool=pool-a",
+        # A global flag before the command group, as a runbook that pins the project writes it.
+        "gcloud --project=$PROJECT container clusters upgrade prod-1 --node-pool pool-a",
+        "gcloud --quiet container clusters upgrade prod-1 --location us-central1 --node-pool pool-a",
     ):
         assert _matches(report), report
 

@@ -38,6 +38,16 @@ def test_stated_stops_match():
         "Config Connector is not installed on the host cluster, so a merged manifest would change nothing.",
         # No repository registered.
         "There is no registered GitOps repository to write the cluster definition to.",
+        # A label and a value, a contraction, "not found", the backward forms,
+        # and a path before "format".
+        "- **Config Connector:** not installed on gke_p_us-central1_platform-agent-host.",
+        "Config Connector CRDs: missing on every cluster in reach.",
+        "Config Connector isn't enabled on this cluster, so nothing would apply a merged manifest.",
+        "Config Connector CRDs were not found on any cluster in reach.",
+        "The host cluster does not have Config Connector installed.",
+        "The cluster lacks Config Connector, so a merged manifest would change nothing.",
+        "There is no `provisioning/` format to copy in the repository.",
+        "Which `clusters/*/provisioning/` format should I use for eval-provision-probe?",
     ):
         assert _matches(report), report
 
