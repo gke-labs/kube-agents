@@ -33,8 +33,9 @@ var writeCommandRE = regexp.MustCompile(
 	`\bkubectl\s+(apply|create|delete|patch|edit|replace|scale|autoscale|annotate|label|set|rollout\s+(?:restart|undo|pause|resume)|cordon|uncordon|drain|taint|expose|run|cp|exec|debug|attach)\b` +
 		`|\bgcloud\b[^\n` + "`" + `]*\s(create|delete|update|upgrade|resize|add-iam-policy-binding|remove-iam-policy-binding|set-iam-policy|enable|disable|deploy)\b`)
 
-// otherProgramRE finds a command line that runs a program the worker image
-// does not ship. The build has already rewritten a ./scripts/ path to the
+// otherProgramRE finds a command line that runs a program a session does not
+// run (some, such as jq and python3, are in the worker image for the broker's
+// shim and the cluster persona, but not for a session's skills). The build has already rewritten a ./scripts/ path to the
 // not-shipped placeholder, so a line that starts with the placeholder is a
 // program too; the literal is spelled out rather than taken from
 // shippedFileArg so the check does not move with the constant.
