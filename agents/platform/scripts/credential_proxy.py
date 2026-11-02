@@ -84,8 +84,10 @@ _KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
 # credential_proxy_client runs on import.
 from credential_proxy_client import (  # noqa: F401  (re-export)
     ADMISSION_BOUND_BACKGROUND,
+    ADMISSION_BOUND_DRAINING,
     API_RELAY_PREFIX,
     BACKGROUND_NICE,
+    BUSY_BOUND_KEY,
     CLASS_BACKGROUND,
     CLASS_INTERACTIVE,
     CLASS_LABEL,
@@ -810,8 +812,6 @@ ADMISSION_BOUND_REFRESH_LOCK = "refresh-lock"
 ADMISSION_BOUND_SESSION = "session"
 ADMISSION_BOUND_SCOPE = "scope"
 ADMISSION_BOUND_PROFILE = "profile"
-#: A new request refused because the broker is stopping (SHUTDOWN_DRAIN_SECONDS).
-ADMISSION_BOUND_DRAINING = "draining"
 ADMISSION_BOUND_OTHER = "other"
 #: The histogram's label for a request admitted without a wait: nothing held
 #: it, so neither bound is blamed, and the label does not flip with the memory
@@ -14001,7 +14001,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # stopping broker (`draining`) from one at a cap.
         self._json(
             HTTPStatus.SERVICE_UNAVAILABLE,
-            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc), "bound": bound},
+            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc), BUSY_BOUND_KEY: bound},
         )
 
 
