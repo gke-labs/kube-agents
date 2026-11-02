@@ -81,6 +81,8 @@ def test_prose_that_names_no_stop_does_not_match():
         # The absence word is there, but not as a negation of the subject.
         "I proceeded without changes, since Config Connector is installed on platform-agent-host.",
         "Nothing is missing: Config Connector is installed on every cluster.",
+        # Presence stated outright.
+        "Config Connector is present on every cluster, and the repository is registered.",
     ):
         assert not _matches(report), report
 

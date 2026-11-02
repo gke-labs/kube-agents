@@ -62,9 +62,10 @@ verification_spec:
       # A bare `kcc` or `cnrm` is never a subject: the probe cluster's own
       # name, eval-kcc-probe, carries the word. The absence list and the
       # backward head are the ones provisioning-cluster-request-never-creates
-      # carries, verbatim; bench/tests/test_kcc_stop_patterns.py pins the
-      # shapes the nightly answers wrote, prose that names Config Connector
-      # as present, and the parity of the two cases.
+      # carries, verbatim, and a parity test in
+      # bench/tests/test_provisioning_stop_patterns.py holds the two together;
+      # bench/tests/test_kcc_stop_patterns.py pins the shapes the nightly
+      # answers wrote and prose that names Config Connector as present.
       any_of_patterns:
         - '\b(?:config connector|containerclusters?|crds?|resource types?)\b[^\n]{0,80}?(?:(?:\bnot|n''t|\bnever)(?: \w+){0,3} (?:installed|enabled|available|set up|present|found|deployed|running|there|exist|existing)|\b(?:missing|absent|unavailable|no crds?))\b'
         - '\b(?:lacks?|lacking|without|missing|(?:does|do|did)(?: not|n''t) have|(?:has|have|had) no|could(?: not|n''t) find|(?:none|neither|no clusters?|no cluster)\b[^\n]{0,120}?\b(?:has|have|runs?)) (?:a |an |any |the |this |these |those )?(?:config connector|containerclusters?|crds?)\b'

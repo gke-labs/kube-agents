@@ -352,8 +352,8 @@ Admitted on the record since the split:
   The GitLab nightly passed it 21 of 21 on the seven nights that graded it, 2026-10-19 to 10-26.
   What it costs: like vcs-spent-branch-reuse it requests a pull request, so its three repetitions
   join that case's in the fan-out's second phase, one at a time after every other unit, each after
-  the repository reset and on the inject lane the 120-second GitHub-write settle ([The inject
-  lane](#the-inject-lane)): about 15 minutes more serial tail at the measured median (3 × (120 s +
+  the repository reset and on the inject lane the 30-second GitHub-write settle ([The inject
+  lane](#the-inject-lane)): about 10 minutes more serial tail at the measured median (3 × (30 s +
   172 s)), plus three more resets. The two cases' units alternate there, so a late write from one
   would be charged to the other by the lane's write safeguard; the writers nightly has run them
   interleaved that way on the inject lane, with six other requesting cases, on all three next-mode
@@ -379,9 +379,9 @@ Admitted on the record since the split:
   demoted the upgrades and consistency probes. What it costs: it was the presubmit's one case
   that requests a pull request (until pdb-remediation-pr's return on 2026-10-26), so its three
   repetitions run in the fan-out's second phase, one at a time after every other unit, each
-  after the repository reset and on the inject lane the 120-second GitHub-write settle
-  ([The inject lane](#the-inject-lane)): about 15 minutes of serial tail at the measured median
-  (3 × (120 s + 173 s)), plus the resets and the drain at the phase boundary. Its seat took
+  after the repository reset and on the inject lane the 30-second GitHub-write settle
+  ([The inject lane](#the-inject-lane)): about 10 minutes of serial tail at the measured median
+  (3 × (30 s + 173 s)), plus the resets and the drain at the phase boundary. Its seat took
   `source-control` off the `docs/designs/domains.yaml` allowlist.
 - **upgrades-lagging-master-probe**, 2026-10-23
   ([#3269](https://github.com/gke-labs/kube-agents/issues/3269)), back from its demotion of
@@ -527,7 +527,7 @@ with "Not a roster admission."
   cases that request nothing, four lanes at a time (`EVAL_TASK_PARALLELISM`), and one case's
   repetitions run one after another on its task lock. Phase two runs the cases that request a
   pull request, the stopped asks and the cases that declare `writes_alone`, one unit at a time, after phase one is done, each after
-  the 120 s write settle, so their time adds straight onto the job. Fifteen minutes of build and deploy go on top.
+  the 30 s write settle, so their time adds straight onto the job. Fifteen minutes of build and deploy go on top.
   Held-out seats count, because they run. Locks shared between cases are not counted, so a
   seat with its own Terraform stack would cost more than the estimate says. The test fails
   when the estimate passes

@@ -75,10 +75,10 @@ verification_spec:
   # hack/eval/inject-lane-safeguards.yaml; `writes_alone` above runs the
   # case in the lane's second phase so that safeguard charges a write the
   # reply does not name. The absence list is the one
-  # provisioning-kcc-cluster-without-crds-stops carries, verbatim; a parity
-  # test in bench/tests/test_kcc_stop_patterns.py holds them together, and
-  # bench/tests/test_provisioning_stop_patterns.py pins the shapes the
-  # nightly answers wrote and the prose that names no stop.
+  # provisioning-kcc-cluster-without-crds-stops carries, verbatim;
+  # bench/tests/test_provisioning_stop_patterns.py holds the two together
+  # with a parity test and pins the shapes the nightly answers wrote and the
+  # prose that names no stop.
   - name: the-reply-is-a-pull-request-or-a-stated-stop
     role: objective
     mode: assert
