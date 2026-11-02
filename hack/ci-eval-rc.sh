@@ -101,7 +101,8 @@ set -euo pipefail
 # pool, and in the week to 2026-09-23 its two runs that finished took 357 and
 # 401 minutes while four were killed at its own 480-minute deadline.
 #
-# The 36-unit matrix does fit, and that is measured rather than derived. The
+# The 36-unit matrix does fit, and that is measured rather than derived (45
+# units since 2026-10-26; `python3 scripts/eval_rosters.py --summary`). The
 # presubmit runs it on the same pool at the same repetition count, so its
 # fan-out is the same work this lane does: three runs that reached a verdict on
 # 2026-09-24 spent 83, 110 and 143 minutes in it. Add the ~20 minutes of lease,
@@ -121,7 +122,16 @@ set -euo pipefail
 # pdb-remediation-pr (#2016; held out until its roster line on 2026-10-14)
 # added three more on its own task lock, a ~62 minute chain at its 1250 s hint
 # and ~96 minutes at its measured maximum, until its demotion to the nightly
-# on 2026-10-17 (#3120) took it out of this lane's matrix. A graded miss on the
+# on 2026-10-17 (#3120) took it out of this lane's matrix. vcs-spent-branch-reuse
+# (roster since 2026-10-23) adds three serial units in the fan-out's second
+# phase, after every other unit and each after the reset and a 120 s settle:
+# ~15 minutes at its 173 s median, ~56 at its 1000 s hint. pdb-remediation-pr,
+# back on the roster since 2026-10-26, adds three more to that phase: ~15
+# minutes at its 172 s median since #3145, ~69 at its 1250 s hint.
+# consistency-drift-outlier (roster since 2026-10-26) adds three units in the
+# first phase, beside the other cases and serialized on its task lock: a ~10
+# minute chain at its 198 s median on the claude-opus-5-5 nightlies, ~30 at
+# its 600 s hint. A graded miss on the
 # canary leaves the verdict alone, since it is not admitted; an erroring check
 # (rungs 1-3) turns the verdict RED like any case's.
 #

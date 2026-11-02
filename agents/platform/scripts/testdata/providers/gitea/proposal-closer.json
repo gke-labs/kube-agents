@@ -1,0 +1,105 @@
+{
+  "payload": {
+    "number": 2
+  },
+  "responses": [
+    [
+      {
+        "type": "comment",
+        "id": 31,
+        "html_url": "https://gitea.example.test/acme/infra/pulls/2#issuecomment-31",
+        "pull_request_url": "https://gitea.example.test/acme/infra/pulls/2",
+        "issue_url": "",
+        "user": {
+          "id": 2,
+          "login": "reviewer",
+          "full_name": "",
+          "email": "rev@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/f852808db5853b1dc466547f294f1560",
+          "html_url": "https://gitea.example.test/reviewer",
+          "is_admin": false
+        },
+        "body": "Not needed after all.",
+        "created_at": "2026-10-04T14:20:50Z",
+        "updated_at": "2026-10-04T14:20:50Z"
+      },
+      {
+        "type": "close",
+        "id": 32,
+        "html_url": "https://gitea.example.test/acme/infra/pulls/2#issuecomment-32",
+        "pull_request_url": "https://gitea.example.test/acme/infra/pulls/2",
+        "issue_url": "",
+        "user": {
+          "id": 2,
+          "login": "reviewer",
+          "full_name": "",
+          "email": "rev@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/f852808db5853b1dc466547f294f1560",
+          "html_url": "https://gitea.example.test/reviewer",
+          "is_admin": false
+        },
+        "body": "",
+        "created_at": "2026-10-04T14:21:00Z",
+        "updated_at": "2026-10-04T14:21:00Z"
+      },
+      {
+        "type": "reopen",
+        "id": 33,
+        "html_url": "https://gitea.example.test/acme/infra/pulls/2#issuecomment-33",
+        "pull_request_url": "https://gitea.example.test/acme/infra/pulls/2",
+        "issue_url": "",
+        "user": {
+          "id": 1,
+          "login": "kube-agents",
+          "full_name": "",
+          "email": "kube-agents@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+          "html_url": "https://gitea.example.test/kube-agents",
+          "is_admin": true
+        },
+        "body": "",
+        "created_at": "2026-10-04T14:22:00Z",
+        "updated_at": "2026-10-04T14:22:00Z"
+      },
+      {
+        "type": "close",
+        "id": 34,
+        "html_url": "https://gitea.example.test/acme/infra/pulls/2#issuecomment-34",
+        "pull_request_url": "https://gitea.example.test/acme/infra/pulls/2",
+        "issue_url": "",
+        "user": {
+          "id": 4,
+          "login": "example-maintainer",
+          "full_name": "",
+          "email": "maintainer@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/0d3e0f4b1c2a5d6e7f8091a2b3c4d5e6",
+          "html_url": "https://gitea.example.test/example-maintainer",
+          "is_admin": false
+        },
+        "body": "",
+        "created_at": "2026-10-04T14:23:00Z",
+        "updated_at": "2026-10-04T14:23:00Z"
+      },
+      {
+        "type": "delete_branch",
+        "id": 35,
+        "html_url": "https://gitea.example.test/acme/infra/pulls/2#issuecomment-35",
+        "pull_request_url": "https://gitea.example.test/acme/infra/pulls/2",
+        "issue_url": "",
+        "user": {
+          "id": 1,
+          "login": "kube-agents",
+          "full_name": "",
+          "email": "kube-agents@example.test",
+          "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+          "html_url": "https://gitea.example.test/kube-agents",
+          "is_admin": true
+        },
+        "body": "",
+        "created_at": "2026-10-04T14:23:05Z",
+        "updated_at": "2026-10-04T14:23:05Z"
+      }
+    ],
+    []
+  ]
+}

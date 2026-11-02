@@ -8,9 +8,11 @@ The design is ``docs/designs/oobe.md``. Each tick runs three stages in order:
    because the scheduler snapshots this job's destination when the run starts.
 2. The inventory scan, ``bootstrap_scan_gate.main``: file the sweep card, then the
    hand-off's cluster and ranking cards.
-3. The first-run audits, below: once the scan has settled, the four fleet audits that
+3. The first-run audits, below: once the scan has settled, the four fleet audits and the upgrade retrospective that
    would otherwise wait for their schedules (the next 06:20 UTC, the next Monday for
-   cost), one after another.
+   cost), one after another, and then the upgrade retrospective, whose schedule is
+   Sunday evening and whose first run is the baseline of every cluster the install
+   manages.
 
 Delivery's stdout is the report, and the scheduler posts whatever this job prints to
 that chat, and a failed run with its stderr. So the other two stages write to
@@ -78,13 +80,16 @@ MARKER_TASK_ID = "task_id"
 # The hand-off's marker (bootstrap_handoff._record): `sweep=`, and `task_id=` its ranking card.
 HANDOFF_SWEEP = "sweep"
 
-# The four audits #1866 names, by their ids in agents/platform/cron/jobs.json, in the
-# order it chains them: cost, security, reliability, capacity.
+# The four audits #1866 names and the upgrade retrospective, by their ids in agents/platform/cron/jobs.json, in the
+# order it chains them: cost, security, reliability, capacity; then the upgrade
+# retrospective, last so the four keep #1866's order and the review of every cluster's
+# last upgrade follows the audits whose findings it cites.
 FIRST_RUN_AUDITS = (
     "fleet-wide-cost-analysis",
     "compliance-audit",
     "obtainability-audit",
     "stockout-prevention",
+    "upgrade-retrospective",
 )
 EXECUTIONS_DB = "executions.db"
 # A run row in either is still going; any other status has ended.
@@ -271,6 +276,14 @@ def scan_settled(data_dir: Path, now: float) -> bool:
     state = bootstrap_handoff.read_board(board, sweep_id)
     if state is None:
         return False
+    # The hand-off's own budget for the clusters past the cap, the live roster included when the
+    # marker pinned nothing (a failed listing at filing still sent the worker to audit them).
+    marker = data_dir / SCAN_FILED_MARKER
+    state["uncarded"] = bootstrap_handoff.uncarded_budget(
+        marker,
+        bootstrap_handoff.sweep_cluster_cards(data_dir, marker),
+        lambda: bootstrap_scan_gate.cluster_agents(capped=False),
+    )
     wait = bootstrap_handoff.deadline(state) + RANKING_ALLOWANCE_SECONDS
     if now - filed_at >= wait:
         _log(
@@ -480,7 +493,7 @@ def advance_chain(data_dir: Path, state: dict, now: float, since: float | None =
 
     busy = audits_in_flight(runs, now)
     if busy:
-        # One of the four has a run going, whatever started it, including the run a mark found
+        # One of the chain's audits has a run going, whatever started it, including the run a mark found
         # already going; the chain waits its turn, as the schedule does.
         return save()
     holds = audit_holds(data_dir)

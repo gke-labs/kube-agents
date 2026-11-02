@@ -7,8 +7,8 @@
 > `collect.py` one each for `obtainability-audit`, `compliance-audit` and `ai-security-audit`,
 > `fleet_waste.py` one for `fleet-wide-cost-analysis`, `fleet_stockout.py` one for
 > `stockout-prevention`, `gce-compute-fleet-audit/scripts/compute_fleet_audit.py` one for
-> `gce-compute-fleet-audit`, and `gcp-networking-fabric-audit/scripts/networking_audit.py` one for
-> `gcp-networking-fabric-audit`;
+> `gce-compute-fleet-audit`, `gcp-networking-fabric-audit/scripts/networking_audit.py` one for
+> `gcp-networking-fabric-audit`, and `upgrade_retrospective.py` one for `upgrade-retrospective`;
 > each of those streams' SOPs runs its collector and passes the flag, and every other stream
 > publishes on the document's own attestation, exactly as it did before the flag existed.
 > `fleet_health.py` emits the same shape for `fleet-health`, a chat-only sweep that no stream and
@@ -104,6 +104,7 @@ is `started_at`: `finish` reads it only to give the `collect_s` timer, and no de
 | `clusters[].checks_unevaluated[]`          | **read**         | `{check, reason}` for a check whose own read failed or whose inputs could not decide it on this target, so it neither ran nor was found inapplicable. The document may list it in neither `checks_run` nor `checks_not_applicable`, and must carry `limitations` on that target, which makes the run partial.                                                                                                                                                                              |
 | `clusters[].clusters_listed`               | **read**         | `0` on a `project/<id>` entry whose `clusters list` completed and came back empty, or was refused by that project's own disabled Kubernetes Engine API. Copied verbatim onto that `scope.clusters` entry, it lifts the gap for enumerating no cluster (§5); absent on a failed, zone-incomplete or unreached list.                                                                                                                                                                         |
 | `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is read only by the `major` sweep (§3.4); the stream's SOP says if the model copies it or re-judges it from fleet context.                                                                                                       |
+| `clusters[].candidates[]` route fields     | **read**         | `declaration`, `release_declaration`, `namespace_directory` and `reconciler`, each optional. `finish` reads them for the route notes on a `manual` remediation (the issue-ledger design, §6). An absent field is no claim.                                                                                                                                                                                                                                                                 |
 | `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                                                                                                                                           |
 | `finished_at`                              | **read**         | When the collector stopped. Compared against the run's `started_at`, which the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted.                                                                                                |
 | `version`, `checks_revision`, `started_at` | carried          | Shape version, digest of the check logic, and the collector's own start. `finish` subtracts `started_at` from `finished_at` to give `collect_s`, a report timer that no decision uses. The other two are reserved for a run-over-run comparison; `finish` does not read them today.                                                                                                                                                                                                        |
@@ -195,7 +196,12 @@ previous run's stored report (`ledger_document` when the previous run held the o
 `evidence` object and the `severity` are the same, the finding keeps the previous run's `title` and
 `impact`. It also keeps the previous `recommendation` and `remediation` together, but not when
 either side is `manifest` or names a path, not when the previous one is `manual` and this run's is
-not, and not when `finish` wrote part of either note. The evidence adoption comes first because it
+not, and not when `finish` wrote part of either note, other than the route notes, which are stripped
+and written again. A carried note loses the route notes of the previous run, which `finish` writes
+again from this run's manifest (the issue-ledger design, §6). When the previous run cut the worker's
+note to give the route notes room, the stored `uncut_note` comes back as the note. So the check for
+text that `finish` wrote reads `uncut_note` as well as the note.
+The evidence adoption comes first because it
 makes the evidence of an unchanged finding the same on each run. The arm-specific `impact` comes
 after, because it is an observation, and it must replace carried words. The carry runs before the
 dry-run split, so a dry run shows the words the real run publishes. Changed evidence or a changed
@@ -332,6 +338,11 @@ release. A hold is released only by a manifest run that no longer emits the id, 
 entry, or the document carrying it. This does not touch the byte-for-byte claim for the
 manifest-less run: a body main wrote lists in its marker exactly what its findings section
 rendered, so the difference is empty and the run is what it was.
+
+The held span can also hold rows under _Not re-checked this run_: previous findings on a target
+that a findings run over a gap did not check ([ledger design §7.4](fleet-audit-issue-ledger.md)).
+Their ids are in the marker and not in the held-id list, so a manifest-less run does not carry
+them; the next run decides again from its own scope.
 
 The rows a manifest-less run carries render under the same heading with their own wording: held
 from a previous run's manifest, this run passed none and cannot release them, and a

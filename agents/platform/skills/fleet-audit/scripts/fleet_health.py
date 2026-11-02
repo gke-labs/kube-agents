@@ -35,18 +35,19 @@ every cluster. It feeds a chat answer only: no ledger stream, no
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import math
 import os
 import re
 import shlex
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Callable
 
 MANIFEST_VERSION = 1
 AUDIT_ID = "fleet-health"
@@ -55,10 +56,9 @@ REVISION_DIGEST_CHARS = 12
 CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:REVISION_DIGEST_CHARS]
 
 DEFAULT_TIMEOUT_S = 60
-TIMEOUT_RC = 124
-# The credential proxy's admitted count at the operator's default limit;
-# collect.py's MAX_WORKERS comment has the reasoning.
-MAX_WORKERS = 4
+# How many clusters a sweep reads at once is broker_admission.sweep_width(),
+# resolved in collect_fleet: what the credential broker admits, less headroom
+# for chat (collect.py's comment above its own collect_fleet has the reasoning).
 # Project reads stop starting this long after the run starts, so a run over a
 # credential that lists many projects still prints its manifest inside the
 # chat route's 600 s terminal timeout. fleet_waste.py's PROJECT_READ_DEADLINE_S
@@ -101,6 +101,8 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 
 declared_scope = fleet_scope_args.DeclaredScope()
 
@@ -294,28 +296,15 @@ def log(msg: str) -> None:
     print(f"[fleet_health] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+TIMEOUT_RC = collector_run.TIMEOUT_RC
+Discovery = collector_run.Discovery
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
 # `query(project, promql) -> (result rows, error or None)`.
 QueryFn = Callable[[str, str], "tuple[list[dict], str | None]"]
-
-
-def default_run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        return Run(argv, TIMEOUT_RC, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
-    except Exception as exc:
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
 
 
 def _record(check: str, argv_str: str, rc: int, duration_s: float, output: str) -> dict:
@@ -371,12 +360,6 @@ def unavailable_query_fn(error: str) -> QueryFn:
         return [], error
 
     return query
-
-
-class Discovery(NamedTuple):
-    projects: list[str]
-    error: str | None
-    partial: str | None = None
 
 
 def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
@@ -671,8 +654,9 @@ def _session_query() -> QueryFn:
 
 
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, query: QueryFn | None = None,
-                  max_workers: int = MAX_WORKERS, project_budget_s: float = PROJECT_READ_DEADLINE_S,
+                  max_workers: int | None = None, project_budget_s: float = PROJECT_READ_DEADLINE_S,
                   run_budget_s: float = RUN_BUDGET_S) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     started_at = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
     deadline = time.monotonic() + project_budget_s
     stop_at = time.monotonic() + run_budget_s

@@ -14,8 +14,9 @@
 
 """The ``oobe_audits_started`` check: did the first-run audits stage start every audit.
 
-``agents/chat/scripts/oobe.py`` starts four Platform Agent audits once the onboarding
-scan settles, by marking each due on that profile's roster. A started audit leaves a
+``agents/chat/scripts/oobe.py`` starts five Platform Agent audits once the onboarding
+scan settles -- the four fleet audits, then the upgrade retrospective -- by marking each
+due on that profile's roster. A started audit leaves a
 row in the profile's ``cron/executions.db``. The case's stack
 (``bench/tf/prebuilt/oobe-first-run-audits``) records when it armed the stage in its
 state file, and the stage records when it marked each audit; this passes when every audit it
@@ -39,8 +40,9 @@ from kube_agents_bench import onboarding
 from kube_agents_bench.verifiers import _OnboardingPollVerifier
 from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERMES_PYTHON
 
-# agents/chat/scripts/oobe.py: FIRST_RUN_AUDITS, in the order the stage chains them.
-FIRST_RUN_AUDITS = ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention")
+# agents/chat/scripts/oobe.py: FIRST_RUN_AUDITS, in the order the stage chains them: the
+# four fleet audits, then the upgrade retrospective. A test holds the copy to the stage's.
+FIRST_RUN_AUDITS = ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention", "upgrade-retrospective")
 # bench/tf/prebuilt/oobe-first-run-audits/arm.py: STATE.
 STATE_FILE = f"{DATA_ROOT}/.bench-oobe.json"
 # agents/chat/scripts/oobe.py: AUDITS_MARKER, with its STATE_FIRED list (what the stage marked

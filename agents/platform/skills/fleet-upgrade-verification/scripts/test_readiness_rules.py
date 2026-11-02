@@ -19,7 +19,7 @@ import readiness_rules as shared  # noqa: E402
 import upgrade_readiness as r  # noqa: E402
 import upgrade_shape_tables as tables  # noqa: E402
 from fleet_upgrade_report import parse_version  # noqa: E402
-from readiness_rules import cluster_status_age, control_plane_upgrade_history, finding, known_issues_matrix, lb_connection_draining, orphan_node_objects, target_patch_valid, zonal_control_plane  # noqa: E402
+from readiness_rules import cluster_status_age, control_plane_upgrade_history, finding, known_issues_matrix, lb_connection_draining, orphan_node_objects, rollout_sequence_precheck, target_patch_valid, zonal_control_plane  # noqa: E402
 
 CATALOGUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), *([os.pardir] * 5), "docs", "designs", "upgrade-failure-catalogue.md")
 CATALOGUE_HEADING_RE = re.compile(r"^### (\d+)\. ", re.MULTILINE)
@@ -119,7 +119,9 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         for module in r.EXTRA_RULES:
             self.assertIsInstance(module.RULE_ID, str, module)
-            self.assertIsInstance(module.ENTRY, int, module.RULE_ID)
+            # A catalogue entry number, or None for a plan-level rule, one that grades the
+            # upgrade plan rather than a catalogue scenario.
+            self.assertTrue(module.ENTRY is None or (isinstance(module.ENTRY, int) and not isinstance(module.ENTRY, bool)), module.RULE_ID)
             self.assertIsInstance(module.CAN_BLOCK, bool, module.RULE_ID)
             self.assertTrue(callable(module.evaluate) and callable(module.describe), module.RULE_ID)
             # The inputs are the ones the contract promises, built as the report builds them: a
@@ -149,9 +151,14 @@ class ContractTest(unittest.TestCase):
         with open(CATALOGUE_PATH, encoding="utf-8") as f:
             catalogue_entries = {int(number) for number in CATALOGUE_HEADING_RE.findall(f.read())}
         self.assertGreaterEqual(len(catalogue_entries), 20)
-        for module in r.EXTRA_RULES:
+        numbered = [m for m in r.EXTRA_RULES if m.ENTRY is not None]
+        for module in numbered:
             self.assertIn(module.ENTRY, catalogue_entries, module.RULE_ID)
-        self.assertEqual([m.ENTRY for m in r.EXTRA_RULES], sorted(m.ENTRY for m in r.EXTRA_RULES))
+        self.assertEqual([m.ENTRY for m in numbered], sorted(m.ENTRY for m in numbered))
+        # The plan-level rules, with no entry, are registered after every numbered one.
+        first_unnumbered = next((i for i, m in enumerate(r.EXTRA_RULES) if m.ENTRY is None), len(r.EXTRA_RULES))
+        self.assertTrue(all(m.ENTRY is None for m in r.EXTRA_RULES[first_unnumbered:]), [m.RULE_ID for m in r.EXTRA_RULES])
+        self.assertEqual([m.RULE_ID for m in r.EXTRA_RULES if m.ENTRY is None], [rollout_sequence_precheck.RULE_ID])
         self.assertEqual(shared.READ_KINDS, ("daemonset", "cronjob", "pvc", "networkpolicy", "namespace", "pods", "node", "storageclass", "pv"))
         self.assertEqual(len(shared.READ_KINDS), len(set(shared.READ_KINDS)))
         self.assertEqual(len(shared.CONTEXT_KEYS), len(set(shared.CONTEXT_KEYS)))
@@ -779,8 +786,8 @@ class SharedReadHelpersTest(unittest.TestCase):
 
 
 class LbConnectionDrainingRuleTest(unittest.TestCase):
-    def planted(self, timeout=3600, region=None, group=None):
-        """A backend service as the fixture plants it: the seeded-b default pool's instance group, draining 3600 s."""
+    def planted(self, timeout=720, region=None, group=None):
+        """A backend service as the fixture plants it: the seeded-b default pool's instance group, draining 720 s."""
         record = seeded_b()
         group = group or record["nodePools"][0]["instanceGroupUrls"][0].replace("instanceGroupManagers", "instanceGroups")
         service = {"name": "drain-timeout-seeded-b", "selfLink": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/global/backendServices/drain-timeout-seeded-b", "connectionDraining": {"drainingTimeoutSec": timeout}, "backends": [{"balancingMode": "UTILIZATION", "group": group}]}
@@ -801,9 +808,9 @@ class LbConnectionDrainingRuleTest(unittest.TestCase):
         result = lb_connection_draining.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=reads))
         self.assertEqual(len(result["blocking"]), 1)
         finding = result["blocking"][0]
-        self.assertEqual((finding["backend_service"], finding["timeout_seconds"], finding["pools"], finding["negs"], finding["scope"]), ("drain-timeout-seeded-b", 3600, ["default-pool"], [], "--global"))
+        self.assertEqual((finding["backend_service"], finding["timeout_seconds"], finding["pools"], finding["negs"], finding["scope"]), ("drain-timeout-seeded-b", 720, ["default-pool"], [], "--global"))
         text = lb_connection_draining.describe(finding)
-        self.assertTrue(text.startswith("BackendService drain-timeout-seeded-b drains for 3600 s on pool(s) default-pool; GKE waits 600 s per node during an upgrade, so each surge node's drain times out"), text)
+        self.assertTrue(text.startswith("BackendService drain-timeout-seeded-b drains for 720 s on pool(s) default-pool; GKE waits 600 s per node during an upgrade, so each surge node's drain times out"), text)
         self.assertIn("`gcloud compute backend-services update drain-timeout-seeded-b --global --connection-draining-timeout=600`", text)
         self.assertEqual(result["notes"], [])
         # A regional service names its region in the command; one at the wait is clean.
@@ -831,7 +838,7 @@ class LbConnectionDrainingRuleTest(unittest.TestCase):
         with_services["webhook_items"] = [neg_service]
         result = lb_connection_draining.evaluate(record, {}, with_services, None, context_for(record, reads=reads))
         self.assertEqual((result["blocking"][0]["negs"], result["blocking"][0]["pools"]), ([{"group": "k8s1-abc-shop-web-80-def", "service": "shop/web"}], []))
-        self.assertIn("drains for 3600 s on NEG k8s1-abc-shop-web-80-def of Service shop/web; GKE waits", lb_connection_draining.describe(result["blocking"][0]))
+        self.assertIn("drains for 720 s on NEG k8s1-abc-shop-web-80-def of Service shop/web; GKE waits", lb_connection_draining.describe(result["blocking"][0]))
         # Services not read: the NEG half is unknown only when a NEG backend was seen.
         unread = seeded_b_read()
         unread["webhook_items"], unread["webhook_error"] = None, "timed out"
@@ -849,7 +856,7 @@ class LbConnectionDrainingRuleTest(unittest.TestCase):
         reads = project_reads(**{shared.PROJECT_READ_BACKEND_SERVICES: [service]})
         result = lb_connection_draining.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=reads))
         self.assertEqual([(f["backend_service"], f["pools"]) for f in result["blocking"]], [("drain-timeout-seeded-b", ["default-pool", "no-surge-pool"])])
-        self.assertIn("drains for 3600 s on pool(s) default-pool, no-surge-pool; GKE waits 600 s", lb_connection_draining.describe(result["blocking"][0]))
+        self.assertIn("drains for 720 s on pool(s) default-pool, no-surge-pool; GKE waits 600 s", lb_connection_draining.describe(result["blocking"][0]))
         # A multi-zone pool: one instance group per zone, both backends of the service, the pool named once; at the wait, one service matched of one.
         regional = copy.deepcopy(record)
         regional["nodePools"][0]["instanceGroupUrls"].append(regional["nodePools"][0]["instanceGroupUrls"][0].replace("us-central1-a", "us-central1-b"))
@@ -1635,7 +1642,7 @@ class KnownIssuesMatrixRuleTest(unittest.TestCase):
 
 class RegistryOrderTest(unittest.TestCase):
     def test_the_incident_rules_are_registered_by_entry(self):
-        self.assertEqual([m.RULE_ID for m in r.EXTRA_RULES], ["surge-capacity", "data-on-the-node", "removed-api-callers", "changed-defaults", "deprecated-api-callers", "client-addon-skew", "zonal-control-plane", "removed-node-label", "container-runtime", "cgroup-v2-runtime", "group-oom-kill", "network-dataplane", "node-image-coupled-agent", "gpu-driver", "in-tree-volumes", "retired-registry", "lb-connection-draining", "orphan-node-objects", "control-plane-upgrade-history", "cluster-status-age", "target-patch-valid", "known-issues-matrix"])
+        self.assertEqual([m.RULE_ID for m in r.EXTRA_RULES], ["surge-capacity", "data-on-the-node", "removed-api-callers", "changed-defaults", "deprecated-api-callers", "client-addon-skew", "zonal-control-plane", "removed-node-label", "container-runtime", "cgroup-v2-runtime", "group-oom-kill", "network-dataplane", "node-image-coupled-agent", "gpu-driver", "in-tree-volumes", "retired-registry", "lb-connection-draining", "orphan-node-objects", "control-plane-upgrade-history", "cluster-status-age", "target-patch-valid", "known-issues-matrix", "rollout-sequence-precheck"])  # the plan-level rule last
         # Every blocking rule says what its mechanism holds; the node-removal rules hold the pool move alone.
         self.assertEqual({m.RULE_ID: m.HOLDS for m in r.EXTRA_RULES if m.CAN_BLOCK and hasattr(m, r.HOLDS_ATTRIBUTE)}, {"cluster-status-age": shared.HOLDS_BOTH, "target-patch-valid": shared.HOLDS_BOTH, "lb-connection-draining": (shared.HOLDS_NODE_POOL,), "orphan-node-objects": (shared.HOLDS_NODE_POOL,)})
 

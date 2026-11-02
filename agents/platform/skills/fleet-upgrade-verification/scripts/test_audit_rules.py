@@ -100,7 +100,7 @@ class ContractTest(unittest.TestCase):
         for module in RULES_C:
             self.assertIn(module, readiness.EXTRA_RULES, module.RULE_ID)
             self.assertTrue(callable(module.evaluate) and callable(module.describe))
-        entries = [m.ENTRY for m in readiness.EXTRA_RULES]
+        entries = [m.ENTRY for m in readiness.EXTRA_RULES if m.ENTRY is not None]  # the plan-level rules, with no entry, come after the numbered ones
         self.assertEqual(entries, sorted(entries))
 
     def test_every_rule_runs_over_two_shared_reads_through_the_fold(self):

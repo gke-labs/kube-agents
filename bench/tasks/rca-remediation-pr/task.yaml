@@ -2,7 +2,8 @@
 # Uncommented in hack/ci-eval-pr.sh TASKS on 2026-08-27, taking
 # `remediation` off the coverage allowlist in docs/designs/domains.yaml
 # (back on it 2026-09-22 to 2026-10-14, until pdb-remediation-pr's roster
-# line, #2016, and again since that case's demotion on 2026-10-17, #3120);
+# line, #2016, and again 2026-10-17 to 2026-10-26, while that case was
+# demoted, #3120);
 # demoted from the blocking
 # roster on 2026-09-02 (#1189) and, when the presubmit became the blocking
 # roster only (#1023), moved to the nightly with the other held-out cases

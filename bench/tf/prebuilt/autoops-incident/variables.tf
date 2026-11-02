@@ -59,7 +59,7 @@ variable "agent_deployment" {
 }
 
 variable "agent_container" {
-  type        = string
+  type = string
   # k8s-event-watcher is not a container of its own: it runs inside the
   # agent-api-auth sidecar of the gateway pod (buildAgentAPIAuthSidecar in
   # k8s-operator/internal/controller/platformagent_manifests.go). It used to
@@ -164,14 +164,49 @@ variable "crash_seconds" {
 # sensible wait); `followup`, the watcher's log line that it sent the quiet
 # follow-up for the namespace, which arrives WATCHER_QUIET_AFTER (15m) after
 # the pod's last event, and which the apply stops waiting for at its bound
-# without failing, so a case can grade the follow-up's absence.
+# without failing, so a case can grade the follow-up's absence; `recurrence`,
+# the incident, then an open agent pull request that changes
+# gitops_manifest_path in the run's GitOps repository, then a replaced pod's
+# event handed to the daemon: the same fault on a new pod, after the fold
+# window, while its fix waits for review.
 variable "wait_for" {
   type        = string
-  description = "What the apply waits for: incident or followup."
+  description = "What the apply waits for: incident, followup or recurrence."
   default     = "incident"
   validation {
-    condition     = contains(["incident", "followup"], var.wait_for)
-    error_message = "wait_for must be incident or followup."
+    condition     = contains(["incident", "followup", "recurrence"], var.wait_for)
+    error_message = "wait_for must be incident, followup or recurrence."
+  }
+}
+
+# The workload's manifest in the run's GitOps repository (BENCH_GITOPS_REPO),
+# which wait_for = "recurrence" waits for an open agent pull request to change.
+# Matched as the end of a changed file's path, so a case need not know the
+# repository's layout above it.
+# The repository has to declare the workload there, or no fix can be opened.
+variable "gitops_manifest_path" {
+  type        = string
+  description = "Path of the planted workload's manifest in the GitOps repository; read only by wait_for = recurrence."
+  default     = ""
+}
+
+# Seconds to sleep after the watcher poll before handing control to the agent
+# turn (same settle pattern as bench/tf/prebuilt/triage-start-burst). The
+# front-door reader (`default` profile) has no `sleep` tool and is not held in
+# `_await_delegated_work` when it files no cards of its own, so a fast burst of
+# `kanban_list`/`kanban_show` reads can exhaust its turn while sequential cards
+# (such as `INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true`'s triage card followed by
+# its parented Pull Request card) are still running. Defaults to 0 so
+# single-card cases keep their existing timing; multi-card cases size this as a
+# wall-clock head start for card execution before the board read starts.
+variable "start_settle_seconds" {
+  type        = number
+  description = "Seconds to wait after the watcher poll before the agent turn so filed incident cards have a head start toward completion before the board read starts."
+  default     = 0
+
+  validation {
+    condition     = var.start_settle_seconds >= 0 && var.start_settle_seconds <= 86400 && floor(var.start_settle_seconds) == var.start_settle_seconds
+    error_message = "start_settle_seconds must be a whole number of seconds between 0 and 86400."
   }
 }
 

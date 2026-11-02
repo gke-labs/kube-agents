@@ -62,7 +62,8 @@ default, which the whole-set precondition in `main.tf` tests the counted set aga
 `exclude.clusters`, with the same caps and patterns the CRD enforces, checked at plan time. Each
 project in `projects` other than `project_id` gets the read allowlist in `scope.tf`
 (`roles/container.clusterViewer`, `roles/container.viewer`, `roles/compute.viewer`,
-`roles/monitoring.viewer`, `roles/logging.viewer`, `roles/iam.securityReviewer`) intersected with
+`roles/monitoring.viewer`, `roles/logging.viewer`, `roles/gkehub.viewer`, `roles/iam.securityReviewer`)
+intersected with
 `project_roles`, never `project_roles` itself, so a `custom` list that carries an admin role at
 home carries none of it elsewhere, and `roles/cloudtrace.user` stays at home with the other
 host-only roles (its Trace-console writes travel with the trace reads, and the helpers that need
@@ -133,4 +134,4 @@ module "kube_agents_iam" {
 }
 ```
 
-See the [Release versioning & promotion guide](../../../docs/site/src/content/docs/deploy/release-versioning.md) for SemVer pinning instructions.
+See the [Release versioning guide](../../../docs/site/src/content/docs/deploy/release-versioning.md) for SemVer pinning instructions.

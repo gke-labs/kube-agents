@@ -41,18 +41,20 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
   failed and the next run will retry. "3 requests processed" is indistinguishable from "3 requests
   silently dropped".
 - Refused — one reply saying why, for a commenter without write access, a `/remediate` naming a
-  finding that is not in the current document (unless it is held by the collector — deferred,
-  below), one naming a non-`manifest` finding, or one naming a posture a repository declaration
+  finding that is not in the current document (unless it is held by the collector or listed under
+  _Not re-checked this run_ — deferred, below), one naming a non-`manifest` finding, or one naming a posture a repository declaration
   covers, the model's entry or the harness's: the reply names the declaring `repo:path`, on the
   findings branch and the clean branch alike, since neither "typo" nor "no longer reproduces" is
   true of it. Removing the declaration brings the finding back, and a new request then opens it.
 - **Deferred**, when the target is a posture this run withheld for want of a declared-intent search
   ([`declared_intent_searched`](findings-document.md#declared_intent_searched)), or an id a collector manifest holds
   that the document does not carry — this run's manifest, or a previous run's when this run passed
-  none and the ledger still carries the row. Two wordings there: an id the ledger's hidden block carries is held until the collector
+  none and the ledger still carries the row, or an id under _Not re-checked this run_ (also one that the held cap left out of that section). Three wordings there: an id the ledger's hidden block carries is held until the collector
   stops emitting it or a `declared` entry covers it, the model's or the harness's; an id the ledger
   never carried is named only on
-  the run's JSON line as an unpublished candidate. Either way there is no finding to open a pull
+  the run's JSON line as an unpublished candidate; and an id under _Not re-checked this run_ is
+  held until a run checks its target, and the reply says the run did not read or did not check
+  that target. An id the collector still flags gets the collector's wording. Either way there is no finding to open a pull
   request from — on the findings branch and on the clean branch alike, since "no longer reproduces"
   would be false there. A run whose report store has no trusted record of the open ledger and that passed no manifest cannot
   know which ids are held, so it answers no `/remediate` at all; the next run with a trusted record answers

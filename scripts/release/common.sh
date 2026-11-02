@@ -75,6 +75,7 @@ export REQUIRED_RELEASE_IMAGES=(
   "a2a-verifier"
   "a2a-console"
   "hermes-bridge"
+  "web-console"
 )
 
 # Declarative registry of release bundle directories, root files, and Helm charts

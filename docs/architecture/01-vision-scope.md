@@ -191,6 +191,9 @@ cluster/cloud write whose actor is an agent identity — and **zero cross-scope 
 on any agent read or `SubjectAccessReview`-allow outside its tier scope. The rest are qualitative
 per-phase acceptance ([07](07-implementation-roadmap.md) §2)._
 
+The user-facing criteria measured per release, with their gap audit, are in
+[`docs/kube-agents-success-criteria.md`](../kube-agents-success-criteria.md).
+
 ## 8. Verification
 
 The §7 success criteria are the top-level acceptance. Each is made concrete and machine-checkable in

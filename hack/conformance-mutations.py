@@ -65,6 +65,35 @@ class Mutation:
 MUTATIONS: list[Mutation] = [
     # ---- A. Authority ---------------------------------------------------
     Mutation(
+        "A3-profile-context-unchecked",
+        "agents/platform/scripts/task_confinement.py",
+        ("    for value in contexts:\n        if value != target.context_name:\n",
+         "    for value in contexts:\n        if False:\n"),
+        "test_A3_a_profile_call_outside_its_tasks_target_is_refused",
+        "trust a profile worker's --context, since the managed kubeconfig only "
+        "holds one context anyway -- until the broker regenerates the one it names",
+    ),
+    Mutation(
+        "A3-profile-no-credential-runs",
+        "agents/platform/scripts/task_confinement.py",
+        ("    if target is None:\n        if not local:\n            raise ConfinementRefusal(\n"
+         "                \"this profile task has no target cluster",
+         "    if target is None:\n        if False:\n            raise ConfinementRefusal(\n"
+         "                \"this profile task has no target cluster"),
+        "test_A3_a_profile_caller_without_a_task_credential_reaches_no_cluster",
+        "let a profile worker with no credential run as a session would, on "
+        "the host cluster, so a task the dispatcher gave no target still works",
+    ),
+    Mutation(
+        "A3-profile-reaches-vcs",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),\n',
+         '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),\n'),
+        "test_A3_the_profile_role_reaches_the_exec_route_alone",
+        "let a profile worker read a proposal the way the MCP pod does -- a "
+        "forge read no task target confines",
+    ),
+    Mutation(
         "A3-inject-auth",
         "agents/platform/scripts/session_kv_server.py",
         ('"/sessions/{session_id}/inject", dependencies=[Depends(verify_api_key)])',
@@ -629,6 +658,46 @@ Mutation(
         "drop the empty STALL_WATCH_EXCLUDE_NAMESPACES pin because the CR does not "
         "set it -- one line in the agent-writable PVC .env then silences the stall "
         "watch for a namespace nobody excluded",
+    ),
+    Mutation(
+        "C1-watcher-reads-a-reconciler-kind-the-agent-cannot",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("configsync.gke.io", "reposyncs"),\n',
+         '        ("configsync.gke.io", "reposyncs"),\n        ("helm.toolkit.fluxcd.io", "helmreleases"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "let the drift join read Flux HelmReleases too, for richer drift context "
+        "-- the broker relays an object, inline values and all, that the agent's "
+        "own role was deliberately never granted",
+    ),
+    Mutation(
+        "C1-watcher-relays-a-custom-kind-outside-the-reconciler-table",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("rbac.authorization.k8s.io", "roles"),\n',
+         '        ("rbac.authorization.k8s.io", "roles"),\n        ("cert-manager.io", "certificates"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "add cert-manager Certificates to the watcher table for drift on TLS "
+        "objects -- straight into WATCHER_NAMED_READS, so the reconciler table "
+        "and the agent's role never hear about it",
+    ),
+    Mutation(
+        "C1-watcher-relays-a-crd-under-a-k8s-io-group",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("rbac.authorization.k8s.io", "roles"),\n',
+         '        ("rbac.authorization.k8s.io", "roles"),\n        ("gateway.networking.k8s.io", "httproutes"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "add Gateway API HTTPRoutes to the watcher table, which look built-in by "
+        "their .k8s.io suffix -- the broker relays a CRD the agent's role was "
+        "never granted, and a suffix rule waves it through",
+    ),
+    Mutation(
+        "C1-agent-role-drops-a-reconciler-kind",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("      - rootsyncs\n      - reposyncs\n",
+         "      - rootsyncs\n"),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "trim RepoSyncs from the agent's role as unused by the Helm skill -- "
+        "the drift join still enriches them, so the two grants no longer say "
+        "the same thing",
     ),
     Mutation(
         "C1-watcher-route-allows-a-list",
@@ -1246,6 +1315,15 @@ Mutation(
         "the one-line edit B3 names: 'unblock apply during upgrade window'",
     ),
     Mutation(
+        "C5-gateway-pod-policy-any-account",
+        "k8s-operator/config/admission/a2a-gateway-pod-policy.yaml",
+        ('    - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == variables.sessionAccount"',
+         '    - expression: "has(object.spec.serviceAccountName)"'),
+        "test_C5_the_gateway_pod_policy_holds_its_pods_to_the_session_account",
+        "widen the identity rule to any ServiceAccount, which reopens the "
+        "gateway's pod create to every identity in its namespace",
+    ),
+    Mutation(
         "C1-broker-colocation-flag-restored",
         "k8s-operator/internal/controller/platformagent_manifests.go",
         ("// buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet\n",
@@ -1843,11 +1921,20 @@ Mutation(
     Mutation(
         "A3-slack-foreign-workspace-admitted",
         "a2a/gateway/slack.go",
-        ("\tif s.foreignSender(m) {\n\t\treturn InboundMessage{}, false\n\t}\n", ""),
+        ("\trefused, author := s.foreignSender(m)\n\tif refused {\n\t\treturn InboundMessage{}, false\n\t}\n",
+         "\t_, author := s.foreignSender(m)\n"),
         "test_A3_another_workspaces_member_is_not_a_turn",
         "drop the workspace check, so under allow-all a Slack Connect guest from "
         "another organisation is admitted as slack:<member id> with the install's "
         "capability",
+    ),
+    Mutation(
+        "A3-slack-guest-admitted-without-an-entry",
+        "a2a/gateway/slack.go",
+        ("\treturn entry, s.guests[entry]", "\treturn entry, true"),
+        "test_A3_another_workspaces_member_is_not_a_turn",
+        "admit every member of another workspace as slack:T…:U…, entry or not, so "
+        "allow-all serves any connected organisation",
     ),
     Mutation(
         "A3-slack-map-asserts-member-prefix",
@@ -2195,8 +2282,8 @@ Mutation(
     Mutation(
         "A3-session-writes-its-own-supervisor-subject",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.TaskSupervisorSubject(addressee, "*"),\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.TaskSupervisorSubject(addressee, "*"),\n\t\t},'),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
         "derive a session a grant on its own supervisor subject -- the "
         "helpful-looking change that lets a worker adapter finalise itself "
@@ -2225,10 +2312,20 @@ Mutation(
         "channel without the agent",
     ),
     Mutation(
+        "A3-bridge-sends-a-console-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.notify.console",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "grant the static bridge publish on the console notify subject, so "
+        "a task the bridge runs can put a report into any console "
+        "conversation whose context it knows, without the agent",
+    ),
+    Mutation(
         "A3-agent-answers-its-own-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)\n",
-         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifyReplySubjects)\n"),
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole, a2aNotifyReplySubjects)\n"),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
         "give the agent publish on the notify reply namespace, the symmetric-"
         "looking grant (it already reads there). The agent can then forge the "
@@ -2237,10 +2334,10 @@ Mutation(
     Mutation(
         "A3-session-sends-a-notify",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
-        "derive a session pod (and, through the shared executorGrants, an "
+        "derive a session pod (and, through the shared executorTaskGrants, an "
         "AgentProfile pod) a publish grant on the notify subject, so a session "
         "can post its result to the home channel itself. The gateway then "
         "posts as the install's bot for whatever runs in that pod",
@@ -2248,8 +2345,8 @@ Mutation(
     Mutation(
         "A3-agent-answers-the-board",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)\n",
-         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aBoardReplySubjects)\n"),
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole, a2aBoardReplySubjects)\n"),
         "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
         "give the agent publish on the board reply namespace, so the agent "
         "container can answer the gateway's board request itself. What it "
@@ -2258,8 +2355,8 @@ Mutation(
     Mutation(
         "A3-session-asks-the-board",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.BoardSubject,\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.BoardSubject,\n\t\t},'),
         "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
         "derive a session pod a publish grant on the board request, so "
         "whatever runs in a session pod can make the bridge read session-kv "
@@ -2268,8 +2365,8 @@ Mutation(
     Mutation(
         "A3-session-per-task-wildcard",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.TaskInSubject(addressee, "*"),\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.TaskInSubject(addressee, "*"),\n\t\t},'),
         "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
         "widen the session's task-plane grant toward the per-task wildcard the "
         "cards sketched, which puts the executor in its own in-subject writer "
@@ -2278,22 +2375,24 @@ Mutation(
     Mutation(
         "A3-profile-pod-writes-its-own-supervisor-subject",
         "a2a/authcallout/profile_narrowing.go",
-        ("\tg := executorGrants(profile, pod)\n",
-         "\tg := executorGrants(profile, pod)\n\tg.Publish = append(g.Publish, lib.TaskSupervisorSubject(profile, \"*\"))\n"),
+        ("\tg := executorTaskGrants(profile, task, stem)\n",
+         "\tg := executorTaskGrants(profile, task, stem)\n\tg.Publish = append(g.Publish, lib.TaskSupervisorSubject(profile, \"*\"))\n"),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
-        "derive an AgentProfile's pods a grant on their profile's supervisor "
-        "subject, the janitor's. A profile pod could then end its own task, or "
-        "a sibling's, and have it read as the janitor declaring it dead",
+        "derive an AgentProfile pod's task connection (profileTaskGrants) a "
+        "grant on its profile's supervisor subject, the janitor's. A profile "
+        "pod could then end its own task, or a sibling's, and have it read as "
+        "the janitor declaring it dead",
     ),
     Mutation(
         "A3-profile-pod-writes-its-own-in-subject",
         "a2a/authcallout/profile_narrowing.go",
-        ("\tg := executorGrants(profile, pod)\n",
-         "\tg := executorGrants(profile, pod)\n\tg.Publish = append(g.Publish, lib.TaskInSubject(profile, \"*\"))\n"),
+        ("\tg := executorTaskGrants(profile, task, stem)\n",
+         "\tg := executorTaskGrants(profile, task, stem)\n\tg.Publish = append(g.Publish, lib.TaskInSubject(profile, \"*\"))\n"),
         "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
-        "derive an AgentProfile's pods a publish grant on their profile's in "
-        "subject. Every pod of the profile could then steer or cancel any of "
-        "the profile's tasks as if from the requester",
+        "derive an AgentProfile pod's task connection (profileTaskGrants) a "
+        "publish grant on its profile's in subject. Every pod of the profile "
+        "could then steer or cancel any of the profile's tasks as if from the "
+        "requester",
     ),
     Mutation(
         "A3-session-gains-publish-on-anothers-in-subject",

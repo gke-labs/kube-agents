@@ -115,12 +115,12 @@ candidate's record and `main`'s are the same record once written — and the
 candidate would then be judged non-inferior to a window it had just moved.
 
 A next-mode run on `main` does append. The main nightly
-(`ci-kube-agents-eval-nightly` and its `-writers` part) is a periodic with no
+(`ci-kube-agents-eval-nightly`, its `-main-b` half and its `-writers` part) is a periodic with no
 `PULL_NUMBER` whose matrix runs through the inject door, which `bench-gate`
 reads as the key's `next` mode, so its lines file under a key of their own and
-never reach today's window. Today's window is appended by
-`ci-kube-agents-eval-nightly-today`, the today-mode nightly kept as the
-rollback check, which grades a fresh `today` install over the agent API. At a
+never reach today's window. No job appends today's window now: the
+rollback check is the today lane, which the fourth condition keeps out, and
+today's lines are the ones already in the store. At a
 `next` key a repetition graded with a check set
 aside as not applicable on the inject transport is recorded, because every
 next-mode run, on `main` or on a pull request, is graded under the same set-aside

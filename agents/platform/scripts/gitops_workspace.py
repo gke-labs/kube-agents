@@ -175,6 +175,9 @@ LOGGER = logging.getLogger(__name__)
 #: there.
 GITHUB_REPO_TYPE = "github"
 
+#: The `type` of a self-managed Gitea forge's `managed_repos` entries.
+GITEA_REPO_TYPE = "gitea"
+
 #: What a forge with no noun of its own calls a change proposal, and what every
 #: name that is not a managed repository on another forge is spoken of as.
 DEFAULT_PROPOSAL_NOUN = "pull request"
@@ -185,7 +188,11 @@ DEFAULT_PROPOSAL_NOUN = "pull request"
 #: broker's dependencies, and an import there would fail every consumer on
 #: every install. Kept in step with the forge classes by
 #: `test_gitops_workspace.TestForgeTable`, which runs where `providers` is.
-FORGE_PROPOSAL_NOUNS = {GITHUB_REPO_TYPE: "pull request", "gitlab": "merge request"}
+FORGE_PROPOSAL_NOUNS = {
+    GITHUB_REPO_TYPE: "pull request",
+    "gitlab": "merge request",
+    GITEA_REPO_TYPE: "pull request",
+}
 
 #: How a host-qualified name's `/` is spelt in its workspace directory name.
 ENCODED_SEPARATOR = "%2F"
@@ -1585,15 +1592,26 @@ def _forge_repo_names(
         if kind not in served:
             LOGGER.warning("Skipping %s repository %r: no provider for type %r.", key, url, kind)
             continue
-        if _names_a_port(url):
+        if _names_a_port(url) and (kind != GITEA_REPO_TYPE or "://" not in str(url)):
             # Before parsing: the parser reads a URL's host without its port
             # and a bare `host:8443/path` as an scp remote, so either would
             # come back named on another endpoint than the one registered.
-            LOGGER.warning(
-                "Skipping %s repository %r: a host with a port is not supported; "
-                "the broker serves a forge on its standard HTTPS port only.",
-                key, url,
-            )
+            # Self-managed Gitea URLs seeded by the operator carry `://` and
+            # an explicit port (`http://gitea:3000/owner/repo`), which the
+            # broker's GiteaForge matches by host and reaches on its
+            # configured port.
+            if kind == GITEA_REPO_TYPE:
+                LOGGER.warning(
+                    "Skipping %s repository %r: write a Gitea repository with a port "
+                    "as a full URL (scheme://host:port/owner/repo), or omit the port.",
+                    key, url,
+                )
+            else:
+                LOGGER.warning(
+                    "Skipping %s repository %r: a host with a port is not supported; "
+                    "the broker serves a forge on its standard HTTPS port only.",
+                    key, url,
+                )
             continue
         ref = repo_ref.try_parse(url)
         if ref is None or not ref.host or not HOSTNAME_RE.fullmatch(ref.host):
@@ -1634,7 +1652,10 @@ def _forge_repo_names(
     return github + others
 
 
-_PORT_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^/@]+@)?[^/:]+:\d+(?:/|$)", re.I)
+_PORT_RE = re.compile(
+    r"^(?:[a-z][a-z0-9+.-]*://(?:[^/@]+@)?[^/:]+:\d+(?:/|$)|[^/@:]+:\d+(?:/|$)|[^/@]+@[^/:]+:\d+/[^/]+/)",
+    re.I,
+)
 
 
 def _names_a_port(url: str) -> bool:

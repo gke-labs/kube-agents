@@ -47,6 +47,22 @@ locals {
   # arithmetic (seeded_d's block below works it for the fourth).
   cluster_labels = merge(local.fleet_labels, {
     "environment" = "seeded"
+    # The rollout family. The upgrade rollout's family gate reads
+    # `resourceLabels.upgrade-family`: the first member of a family to take
+    # an upgrade is the canary whose post-upgrade diff releases or holds the
+    # rest. Three clusters share the regular family; seeded-b, pinned a minor
+    # behind, is a held family of its own (held_cluster_labels below), so the
+    # regular family's rollout never waits on the lag. The KEY is on every
+    # cluster in this stack because fleet_drift's label-keys facet compares
+    # label keys across the cohort: a key on three clusters and not the
+    # fourth would be a drift finding on the fourth.
+    "upgrade-family" = "seeded-regular"
+  })
+
+  # seeded-b's resource labels: the same keys as cluster_labels, with the
+  # held family's value.
+  held_cluster_labels = merge(local.cluster_labels, {
+    "upgrade-family" = "seeded-held"
   })
 }
 
@@ -150,8 +166,9 @@ resource "google_service_account_iam_member" "fleet_reader_token_creators" {
 # read-only checks against every pool project as the bot itself, so it needs
 # project-level read here: the project and its IAM policy, the service
 # accounts' policies, the service listing, the cluster listing, the
-# repository, the key and its policy, the state bucket's metadata. These
-# roles cover every read those checks make on the project; none writes. The
+# repository, the key and its policy, the state bucket's metadata, the forge
+# pieces' zone, records, addresses and firewall rules. These roles cover
+# every read those checks make on the project; none writes. The
 # warm-cache repository's policy in the Prow project stays unread. They live in this
 # stack, beside the reader's token-creator grant, because this is the one
 # stack every pool project applies: a project provisioned after this landed
@@ -166,6 +183,8 @@ locals {
     "roles/artifactregistry.reader",
     "roles/cloudkms.viewer",
     "roles/storage.bucketViewer",
+    "roles/compute.networkViewer",
+    "roles/dns.reader",
   ]
   pool_state_reader_grants = {
     for pair in setproduct(var.pool_state_readers, local.pool_state_reader_roles) :
@@ -272,6 +291,10 @@ resource "google_container_cluster" "seeded_a" {
   # The fleet is standing, but deletion protection stays off: the scheduled
   # re-apply must be able to replace a cluster when a facet change requires
   # it, and the label plus README are the guard against accidental sweeps.
+  # This cluster is the exception: the scaled-zero gateway fixture's
+  # kubernetes_manifest resources (defects-a.tf) cannot plan while its endpoint
+  # is unknown, so creating or replacing seeded-a is the README's two-apply
+  # hand recovery, not a reconcile.
   deletion_protection = false
 
   logging_config {
@@ -504,7 +527,7 @@ resource "google_container_cluster" "seeded_b" {
 
   remove_default_node_pool = true
   initial_node_count       = 1
-  resource_labels          = local.cluster_labels
+  resource_labels          = local.held_cluster_labels
   deletion_protection      = false
 
   # REGULAR's own newest previous-minor patch, or the hold when the running
@@ -848,7 +871,8 @@ resource "google_container_cluster" "seeded_d" {
   remove_default_node_pool = true
   initial_node_count       = 1
 
-  # local.cluster_labels, the same as a, b and c. The runner has no other way to
+  # local.cluster_labels, the same as a and c (seeded-b carries
+  # held_cluster_labels: the same keys). The runner has no other way to
   # find this cluster: hack/fleet-kubeconfigs.sh discovers slots with
   # `resourceLabels.environment=seeded AND resourceLabels.managed-by=...`, so a
   # cluster without the environment label is never listed, never resolves to a

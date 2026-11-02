@@ -17,11 +17,12 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path"
-	"strings"
+	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -83,6 +85,12 @@ const (
 	a2aMCPEnvAgent        = "MCP_AGENT_NAME"
 	a2aMCPEnvNamespace    = "MCP_NAMESPACE"
 	a2aMCPEnvListen       = "MCP_LISTEN"
+	// GOMEMLIMIT, the Go runtime's soft heap limit, set to
+	// a2aMCPGoMemLimitPercent of a2aMCPMemoryLimit (a2aMCPGoMemLimit), so
+	// the collector works harder as the heap nears the container's limit
+	// instead of letting garbage push the pod into an OOM kill.
+	a2aMCPEnvGoMemLimit     = "GOMEMLIMIT"
+	a2aMCPGoMemLimitPercent = 85
 
 	a2aMCPReadinessPeriod  = 5
 	a2aMCPReadinessFailure = 3
@@ -100,8 +108,21 @@ const (
 	a2aMCPMemoryLimit   = "128Mi"
 )
 
-// a2aMCPFenceIndex is the fence's place in a2aMCPObjects.
-const a2aMCPFenceIndex = 2
+// a2aMCPGoMemLimit is the MCP container's GOMEMLIMIT: a2aMCPGoMemLimitPercent
+// of its memory limit, in bytes (114085068 for 128Mi), derived from
+// a2aMCPMemoryLimit so a change to the limit carries over. The MCP server's
+// reads are sized against it (readMaxBytes in a2a/mcp/reader.go).
+func a2aMCPGoMemLimit() string {
+	limit := resource.MustParse(a2aMCPMemoryLimit)
+	return strconv.FormatInt(limit.Value()*a2aMCPGoMemLimitPercent/100, 10)
+}
+
+// a2aMCPFenceIndex and a2aMCPTokenIndex are the fence's and the token's
+// places in a2aMCPObjects.
+const (
+	a2aMCPFenceIndex = 2
+	a2aMCPTokenIndex = 3
+)
 
 // a2aMCPDoorEnabled reports whether the operator was deployed with the MCP
 // flag.
@@ -160,7 +181,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 			Selector: &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
-				Spec: corev1.PodSpec{
+				Spec: withA2AMCPBrokerAccess(agent, corev1.PodSpec{
 					// It never talks to the API server.
 					AutomountServiceAccountToken: ptr.To(false),
 					SecurityContext: &corev1.PodSecurityContext{
@@ -209,6 +230,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 							{Name: a2aMCPEnvListen, Value: fmt.Sprintf(":%d", a2aMCPPort)},
 							{Name: a2aMCPEnvAgent, Value: agent.Name},
 							{Name: a2aMCPEnvNamespace, Value: agent.Namespace},
+							{Name: a2aMCPEnvGoMemLimit, Value: a2aMCPGoMemLimit()},
 						},
 						Ports: []corev1.ContainerPort{{Name: a2aMCPPortName, ContainerPort: a2aMCPPort}},
 						VolumeMounts: []corev1.VolumeMount{
@@ -237,7 +259,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 							SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 						},
 					}},
-				},
+				}),
 			},
 		},
 	}
@@ -280,38 +302,42 @@ func buildA2AMCPNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.
 }
 
 // ensureA2AMCPToken mints the bearer token into its Secret when it is absent
-// or empty, and never rotates one that is there: a person rotates it by
-// editing the Secret, and the server reads it per request. An unowned Secret
-// of that name is refused, as the door token's is.
-func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+// or unusable (a2aMCPTokenUsable), and never rotates one that is there: a
+// person rotates it by editing the Secret, and the server reads it per
+// request. An unowned Secret of that name is not adopted, as the door
+// token's is not; unlike the door token's it is not an error either, for
+// the reason reconcileA2AMCPBrokerIdentity gives for the account (#3871):
+// the return says whether the token is ours and the server may render, and
+// false is reported on the CR with a2aMCPTokenUnownedReason.
+func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
 	name := types.NamespacedName{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace}
 	existing := &corev1.Secret{}
 	err := r.a2aReader().Get(ctx, name, existing)
 	if err == nil {
 		if !metav1.IsControlledBy(existing, agent) {
-			return fmt.Errorf("refusing to adopt unowned Secret %s/%s as the MCP server's token; delete it, or give it a controller reference to this PlatformAgent", name.Namespace, name.Name)
+			logf.FromContext(ctx).Info("not adopting an unowned Secret as the MCP server's token; the MCP server is not rendered",
+				"namespace", name.Namespace, "name", name.Name)
+			return false, nil
 		}
-		// The server trims the token file and refuses an empty one, so a
-		// whitespace-only value is empty here too and is minted over.
-		if strings.TrimSpace(string(existing.Data[a2aMCPAccessKey])) != "" {
-			return nil
+		if a2aMCPTokenUsable(existing.Data[a2aMCPAccessKey]) {
+			return true, nil
 		}
 		token, err := randomA2AInjectToken()
 		if err != nil {
-			return fmt.Errorf("mint the MCP server's token: %w", err)
+			return false, fmt.Errorf("mint the MCP server's token: %w", err)
 		}
 		if existing.Data == nil {
 			existing.Data = map[string][]byte{}
 		}
 		existing.Data[a2aMCPAccessKey] = []byte(token)
-		return r.Update(ctx, existing)
+		return true, r.Update(ctx, existing)
 	}
 	if !errors.IsNotFound(err) {
-		return err
+		return false, err
 	}
 	token, err := randomA2AInjectToken()
 	if err != nil {
-		return fmt.Errorf("mint the MCP server's token: %w", err)
+		return false, fmt.Errorf("mint the MCP server's token: %w", err)
 	}
 	secret := &corev1.Secret{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
@@ -319,30 +345,80 @@ func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *
 		Data:       map[string][]byte{a2aMCPAccessKey: []byte(token)},
 	}
 	if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
-		return err
+		return false, err
 	}
-	return r.Create(ctx, secret)
+	return true, r.Create(ctx, secret)
+}
+
+// a2aMCPTokenUsable reports whether a caller could present v as the token.
+// The server trims the token file and refuses an empty one, so a
+// whitespace-only value is empty here too; and it compares the rest byte for
+// byte with an Authorization header's value, which cannot carry a control
+// byte other than a tab (a CR or LF ends the header line, and Go's server
+// refuses the rest), so a value holding one inside, from a two-line file
+// given to --from-file, is a token nobody can present. Either is minted over.
+func a2aMCPTokenUsable(v []byte) bool {
+	v = bytes.TrimSpace(v)
+	if len(v) == 0 {
+		return false
+	}
+	for _, c := range v {
+		// A tab is the one control byte a header value carries.
+		if (c < 0x20 && c != '\t') || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // reconcileA2AMCP applies the MCP server under its flag and removes it
 // without. Its fence is reconcileA2ANetworkFences's, applied before this
-// runs, so the pod never runs unfenced.
-func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+// runs, so the pod never runs unfenced. The return is the reason the server
+// is not rendered with the flag on (a2aMCPTokenUnownedReason), or "": a
+// token Secret under the reserved name that is not ours is reported, and
+// the server removed, rather than an error (#3871). The fence stays: the
+// fences pass re-applies it every pass while the flag is on, so removing
+// it here would create and delete it on each pass, each an event that
+// wakes the next (NetworkPolicy is an Owns() kind). A fence over nothing
+// denies nothing.
+func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
 	if !a2aMCPDoorEnabled() {
-		return r.removeA2AMCP(ctx, agent)
+		return "", r.removeA2AMCP(ctx, agent)
 	}
-	if err := r.ensureA2AMCPToken(ctx, agent); err != nil {
-		return fmt.Errorf("failed to ensure the MCP server's token: %w", err)
+	tokenOwned, err := r.ensureA2AMCPToken(ctx, agent)
+	if err != nil {
+		return "", fmt.Errorf("failed to ensure the MCP server's token: %w", err)
+	}
+	if !tokenOwned {
+		return a2aMCPTokenUnownedReason, r.removeA2AMCPServer(ctx, agent)
 	}
 	for _, obj := range []client.Object{
 		buildA2AMCPDeployment(agent),
 		buildA2AMCPService(agent),
 	} {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
-			return err
+			return "", err
 		}
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
-			return fmt.Errorf("failed to apply the MCP server's %T: %w", obj, err)
+			return "", fmt.Errorf("failed to apply the MCP server's %T: %w", obj, err)
+		}
+	}
+	return "", nil
+}
+
+// removeA2AMCPServer is removeA2AMCP for a pass that keeps the flag on but
+// may not render the server over an object it does not own: the Deployment
+// and its Service go. The fence stands (see reconcileA2AMCP), and so does a
+// token of ours: removing it would rotate the bearer token every client
+// holds the moment the server renders again, a rotation nobody asked for,
+// and a token with no server behind it is inert.
+func (r *PlatformAgentReconciler) removeA2AMCPServer(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	for i, entry := range r.a2aMCPObjects(agent) {
+		if i == a2aMCPFenceIndex || i == a2aMCPTokenIndex {
+			continue
+		}
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
+			return fmt.Errorf("failed to remove the MCP server's %T: %w", entry.obj, err)
 		}
 	}
 	return nil
@@ -354,49 +430,64 @@ func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *ag
 // Delete returns before the pod exits, so the fence waits for a later pass
 // rather than leaving the terminating pod unfenced, the console fence's
 // reason (a2aBusTeardown); a fence over nothing denies nothing and costs
-// nothing in the meantime. The pod list runs only while a fence stands, so
-// an install that never set the flag pays a cached read for it.
+// nothing in the meantime. The pod list runs only while a fence of ours
+// stands, so an install that never set the flag pays a cached read for it.
+//
+// With the flag off this runs on every next reconcile, so an object under a
+// reserved name that this PlatformAgent does not own, the fence included, is
+// not ours to remove and must not stop the rest of the reconcile: it is
+// skipped. With the flag on, an unowned token or account is reported on the
+// CR and the server is not rendered (ensureA2AMCPToken,
+// reconcileA2AMCPBrokerIdentity).
 func (r *PlatformAgentReconciler) removeA2AMCP(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	objs := r.a2aMCPObjects(agent)
-	fence := objs[a2aMCPFenceIndex]
-	for i, entry := range objs {
+	noPodLeft := func() (bool, error) {
+		pods := &corev1.PodList{}
+		if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace),
+			client.MatchingLabels{"app": a2aMCPName(agent)}); err != nil {
+			return false, fmt.Errorf("failed to list the MCP server's pods: %w", err)
+		}
+		return len(pods.Items) == 0, nil
+	}
+	for i, entry := range r.a2aMCPObjects(agent) {
+		var ready func() (bool, error)
 		if i == a2aMCPFenceIndex {
-			continue
+			ready = noPodLeft
 		}
-		// With the flag off this runs on every next reconcile, so an object
-		// under a reserved name that this PlatformAgent does not own is not
-		// ours to remove and must not stop the rest of the reconcile: it is
-		// skipped. Only the flag's own path refuses it (ensureA2AMCPToken).
-		if err := entry.reader.Get(ctx, client.ObjectKeyFromObject(entry.obj), entry.obj); err == nil && !metav1.IsControlledBy(entry.obj, agent) {
-			continue
-		}
-		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, ready); err != nil {
 			return fmt.Errorf("failed to remove the MCP server's %T: %w", entry.obj, err)
 		}
-	}
-	if err := fence.reader.Get(ctx, client.ObjectKeyFromObject(fence.obj), fence.obj); err != nil {
-		if errors.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-	pods := &corev1.PodList{}
-	if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace),
-		client.MatchingLabels{"app": a2aMCPName(agent)}); err != nil {
-		return fmt.Errorf("failed to list the MCP server's pods: %w", err)
-	}
-	if len(pods.Items) > 0 {
-		return nil
-	}
-	if err := r.deleteOwnedA2AObject(ctx, agent, fence.obj, fence.reader); err != nil {
-		return fmt.Errorf("failed to remove the MCP server's fence: %w", err)
 	}
 	return nil
 }
 
+// deleteA2AObjectIfOwned removes one A2A object this agent owns, for a
+// removal that runs whether or not the object was ever rendered: it reads
+// obj once through reader (the cache for kinds the manager watches, a2aReader
+// for a Secret; see removeA2AInjectBackend), and an object that is absent,
+// or that this agent does not control, is left alone without an error --
+// not ours to delete, and not a reason to stop the reconcile (#3871). ready,
+// when set, is asked only of an object that is ours, and holds the delete
+// for a later pass when it says not yet.
+func (r *PlatformAgentReconciler) deleteA2AObjectIfOwned(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object, reader client.Reader, ready func() (bool, error)) error {
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(obj, agent) {
+		logf.FromContext(ctx).V(1).Info("skipping unowned A2A object under a reserved name",
+			"kind", fmt.Sprintf("%T", obj), "namespace", obj.GetNamespace(), "name", obj.GetName())
+		return nil
+	}
+	if ready != nil {
+		if ok, err := ready(); err != nil || !ok {
+			return err
+		}
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, obj))
+}
+
 // a2aMCPObjects names the MCP server's objects: the server, its Service, its
-// fence (at a2aMCPFenceIndex), then its token, read uncached like every
-// Secret here.
+// fence (at a2aMCPFenceIndex), then its token (at a2aMCPTokenIndex), read
+// uncached like every Secret here.
 func (r *PlatformAgentReconciler) a2aMCPObjects(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
 	ns := agent.Namespace
 	return []a2aTeardownEntry{

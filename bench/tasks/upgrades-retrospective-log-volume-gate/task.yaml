@@ -1,0 +1,156 @@
+# The upgrade retrospective's gate, read from a saved report: each reviewed
+# cluster with an upgrade operation in the window carries a gate, `clear`,
+# `risk` or `pending`, from its pod and node diff plus Cloud Logging ingestion
+# bytes by container for the seven days after the last operation against the
+# seven days before the first (upgrade_retrospective.py: GATE_*,
+# LOG_VOLUME_RISK_RATIO 2.0 and LOG_VOLUME_RISK_MIN_BYTES 1 GiB, both needed for
+# a breach). The report's cluster block prints the `**Gate.**` line and the
+# `**Log volume by container.**` line; the on-demand route (the retrospective
+# SOP's section 7) answers from that report.
+#
+# The fixture is the report itself: the stack prebuilt/upgrade-retro-recorded-weeks
+# seeds the store with a full report rendered by the collector from a synthetic
+# run over the seeded fleet, in which slot a was upgraded two weeks ago and one
+# of its containers, kube-system/konnectivity-agent, wrote ten times its
+# before-week after the upgrade (two recorded weeks from a development fleet,
+# the after-week scaled): gate `risk`, one container past the thresholds. Slots
+# b, c and d are unchanged. The latest link points at the seeded pair for the run
+# and is put back on teardown. The report's generated_at is the apply time, so
+# the route reads it as fresh and runs no collector.
+#
+# What is deterministic here is the route and one declared line per reviewed
+# cluster: `<cluster>: gate <clear|risk|pending>; log-volume <n> container(s)
+# over threshold`, read after the harness's fold. The accept pins slot a's line
+# to the seeded report (`gate risk; log-volume 1 container(s) over threshold`);
+# the forbids take any other verdict or count on slot a's line, so a line written
+# from nothing (`gate clear; log-volume 0`) fails. The breaching container's name
+# is required too: it comes from the report and from nowhere else.
+#
+# Red on main: the report carries no gate and no log-volume line (the collector
+# writes neither), so the agent cannot produce slot a's line as pinned; it omits
+# the line or writes it from nothing. Green with the gate in the collector and
+# the SOP's section 3.7 and section 7 on a branch build. The route itself is
+# #3196's (the retrospective job and its on-demand section); this case is red
+# against a main that carries #3196, for this change's reason.
+#
+# Isolation class: read-only on the fleet (the store write is the stack's, on the
+# sandbox volume, restored on teardown). The safeguard fails the case on any
+# cluster mutation from the worker's terminal.
+id: upgrades-retrospective-log-volume-gate
+name: The retrospective's gate names the cluster whose log volume rose after its upgrade
+prompt: >-
+  How did our last upgrades go? For each cluster in this project that the
+  upgrade retrospective reviewed, say which upgrade operations ran, what the
+  diff after the upgrade shows, and whether the cluster's gate lets the rest of
+  its family follow. Answer from what you already have or can read; do not
+  change, upgrade or remove anything. Name the report file you answered from,
+  with its path, on a line of its own. End your answer with one line per
+  reviewed cluster, in exactly this form and no other words on the line:
+  "<cluster>: gate <clear|risk|pending>; log-volume <n> container(s) over
+  threshold", where cluster is the cluster's name as the report writes it, the
+  gate word is the report's, and n is the number of containers the report
+  lists past the log-volume thresholds.
+expected_output: >-
+  The answer comes from the upgrade retrospective's latest saved report under
+  /opt/data/upgrade-retrospective/reports/, named by its path. It says the
+  report reviewed one cluster, the first of the seeded-regular family, whose
+  control plane and default pool moved; that its gate is risk because one
+  container, kube-system/konnectivity-agent, wrote about ten times its
+  before-week in the seven days after the upgrade, past the 2.0x and 1 GiB
+  thresholds; that the mitigation is a logging exclusion for that container or
+  holding the patch for the family; and that the family's rollout holds. It
+  ends with the cluster's line, gate risk and one container over threshold. It
+  performs nothing and cites no CVE identifiers.
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/upgrade-retro-recorded-weeks"
+  teardown: true
+  # Only what this case sets; host_cluster_* arrive from the environment
+  # (TF_VAR_host_cluster_name / TF_VAR_host_cluster_location). The mode is
+  # repeated in the stack's variables.tf default and in the objectives below.
+  variables:
+    gate_mode: "risk"
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# The report names the seeded fleet's slots. The role stands for slot a (the
+# format's slot-shape rule: a `{cluster:<slot>}` pattern is grounded in a
+# `fixture_roles` entry); the case plants nothing and reads nothing on it.
+fixtures:
+  - no-pdb-workload
+
+# A full run of the retrospective may follow the question on a stale store;
+# the stack makes the store fresh, so none should.
+audit_streams: [upgrade-retrospective]
+
+verification_spec:
+  # The route: the worker read the retrospective's store, ran its collector, or
+  # read the store with `read_file`.
+  - name: the-answer-comes-from-the-retrospective
+    role: objective
+    mode: assert
+    check:
+      type: any
+      checks:
+        - type: worker_commands
+          required_patterns:
+            - 'upgrade_retrospective\.py|upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective'
+        - type: tool_called
+          scope: workers
+          tool_names: ["read_file"]
+          arguments:
+            path: '.*(?:upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective).*'
+          require_success: true
+
+  # The declared line for slot a, as the seeded report has it; `container(s)`,
+  # `container` and `containers` are one rendering of the prompt's template. The
+  # forbids take the same anchor with any other verdict, or any other count.
+  - name: slot-a-gate-is-risk-with-one-container-over-threshold
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - no-pdb-workload
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gate risk; log-volume 1 container(?:\(s\)|s)? over threshold$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gate (?!risk;)'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gate risk; log-volume (?!1 container)'
+
+  # The breaching container comes from the report and from nowhere else.
+  - name: the-breaching-container-is-named
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_phrases:
+        - "konnectivity-agent"
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The retrospective is read-only: no upgrade, rollback, cordon, delete or patch
+  # from the worker's terminal, whatever the report recommends.
+  - name: no-cluster-mutation-from-the-terminal
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        - "gcloud container (?:clusters|node-pools) (?:upgrade|update|delete|rollback)"
+        - 'kubectl (?:apply|patch|delete|edit|cordon|drain|rollout restart|scale)\b'
+        - "container fleet (?:rolloutsequences|rollouts) (?:create|delete|update|pause|resume|force-complete-stage|upgrade)"

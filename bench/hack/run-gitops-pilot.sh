@@ -639,9 +639,11 @@ export TF_VAR_gitops_run_branch="${RUN_BRANCH}" TF_VAR_gitops_token_file="${GITO
 export TF_VAR_agent_host_context="${AGENT_HOST_CONTEXT}" TF_VAR_agent_namespace="${AGENT_NAMESPACE}"
 export TF_VAR_gitops_repo="${GITOPS_REPO}" TF_VAR_gitops_broken_base_sha="${GITOPS_BROKEN_BASE_SHA}"
 export GITOPS_REPO GITOPS_RUN_BRANCH="${RUN_BRANCH}" GITOPS_TOKEN_FILE
-# The harness prefers BENCH_GITHUB_TOKEN or GITHUB_TOKEN over the file; hand it
-# the token the stack uses, so an ambient GITHUB_TOKEN for another account
-# cannot make it poll the private repository as a stranger.
+# The harness reads BENCH_GITHUB_TOKEN_FILE first, then BENCH_GITHUB_TOKEN or
+# GITHUB_TOKEN, then GITOPS_TOKEN_FILE; hand it the token the stack uses and
+# drop an ambient token file, so another account's credential cannot make it
+# poll the private repository as a stranger.
+unset BENCH_GITHUB_TOKEN_FILE
 BENCH_GITHUB_TOKEN="$(tr -d '\r\n' < "${GITOPS_TOKEN_FILE}")"; export BENCH_GITHUB_TOKEN
 # The stack names the Argo Application after the task; the harness looks it up.
 export GITOPS_ARGO_APP="${TASK}"

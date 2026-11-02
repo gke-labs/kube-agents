@@ -58,9 +58,14 @@ const (
 // no chat notify route; identityRouteFor records an identity-only route for
 // doors that still carry speaker or audience context.
 var routePlatforms = map[string]string{
-	"gchat:": lib.NotifyPlatformGchat,
-	"slack:": lib.NotifyPlatformSlack,
+	"gchat:":           lib.NotifyPlatformGchat,
+	"slack:":           lib.NotifyPlatformSlack,
+	consoleRoutePrefix: lib.NotifyPlatformConsole,
 }
+
+// consoleRoutePrefix is the console conversation's key prefix, the one route
+// that carries its task (conversationRoute.TaskID).
+const consoleRoutePrefix = "console:"
 
 // errNoChatConversation is an authority that names no chat conversation the
 // notify route serves; nothing is recorded and nothing is wrong.
@@ -75,11 +80,17 @@ var errRouteDisabled = errors.New("no route store configured")
 // carry the gateway's requester principal (hmac:<32-hex>) and audience kind
 // ("dm" or "group") so the memory provider can isolate personal memory per
 // user and fail closed in shared threads.
+//
+// TaskID, on a console conversation's route only, is the gateway task the
+// turn runs: a card the turn files snapshots it, and its report names it
+// (a2a notify --reply-to), so a console client can join the report to the
+// turn. A chat conversation's route leaves it out.
 type conversationRoute struct {
 	Platform     string `json:"platform"`
 	Conversation string `json:"conversation"`
 	ContextID    string `json:"context_id"`
 	Ask          string `json:"ask,omitempty"`
+	TaskID       string `json:"task_id,omitempty"`
 	UserID       string `json:"user_id,omitempty"`
 	ChatType     string `json:"chat_type,omitempty"`
 }
@@ -116,16 +127,25 @@ func routeFor(env *lib.Envelope) (conversationRoute, error) {
 	}
 	key := strings.TrimSpace(auth.Audience.Conversation)
 	userID := strings.TrimSpace(auth.Requester.Principal)
+	// A console route is recorded so its cards post back, but the console
+	// door's credential is shared, so its principal is not a person.
+	if hasSharedPrincipal(key, auth) {
+		userID = ""
+	}
 	chatType := strings.TrimSpace(auth.Audience.Kind)
 	for prefix, platform := range routePlatforms {
 		if strings.HasPrefix(key, prefix) && len(key) > len(prefix) && env.ContextID != "" {
-			return conversationRoute{
+			route := conversationRoute{
 				Platform:     platform,
 				Conversation: key,
 				ContextID:    env.ContextID,
 				UserID:       userID,
 				ChatType:     chatType,
-			}, nil
+			}
+			if prefix == consoleRoutePrefix {
+				route.TaskID = env.TaskID
+			}
+			return route, nil
 		}
 	}
 	return conversationRoute{}, errNoChatConversation
@@ -207,6 +227,10 @@ func (b *Bridge) recordRoute(ctx context.Context, sessionID string, env *lib.Env
 		// In a group conversation, the requester principal varies by speaker
 		// while personal memory is disabled regardless, so an earlier group
 		// record of the same conversation still holds.
+		// A console route's task is not: a card filed now would report
+		// naming the earlier turn, which its client cannot join to this one,
+		// so a console route differing only in its task is lost, and the
+		// answer says the card's report may not arrive.
 		earlier := b.recordedRoute(sessionID)
 		earlier.Ask = route.Ask
 		if route.ChatType == "group" {

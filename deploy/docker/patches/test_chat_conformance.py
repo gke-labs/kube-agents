@@ -5,8 +5,8 @@ Run: python3 -m pytest deploy/docker/patches/test_chat_conformance.py
 The cases are ``tests/conformance/chat/`` (``agents/platform/scripts/chat_cases.py``
 reads them). A case with one input runs through the composer that lays it out
 (``agents/platform/scripts/chat_message.py``, ``slack_ux_incident.chat_triage``, or the
-fleet-audit and first-inventory cards, ``slack_audit_report.chat_from_issue`` and
-``agents/chat/scripts/inventory_presenter.chat``).
+fleet-audit and first-inventory cards, ``slack_audit_report.chat_from_issue``,
+``agents/chat/scripts/inventory_presenter.chat`` and ``agents/chat/scripts/inventory_card.chat``).
 A case that is a sequence of card events runs through the gateway patches that
 send it, with a stand-in for the chat.notify adapter recording each send:
 ``kanban_progress_lines.deliver`` and ``slack_ux_status`` for the plan (the fold
@@ -42,6 +42,8 @@ sys.path.insert(0, str(CHAT_SCRIPTS))
 
 import chat_cases
 import chat_message
+import findings_queue
+import inventory_card
 import inventory_presenter
 import kanban_notifier
 import kanban_progress_lines
@@ -174,6 +176,17 @@ class SharedCasesTest(unittest.TestCase):
         if "inventory_report" in given:
             built = inventory_presenter.chat(given["inventory_report"])
             return [_out(built and built[0], NOTIFY)]
+        if "first_report" in given:
+            # The first inventory's card from the stage's files, on the conversation chat.notify route.
+            files = given["first_report"]
+            card = inventory_card.build(
+                files["items"],
+                files.get("scores"),
+                findings_queue.PacingLimits(**files["limits"]),
+                files["shown"],
+                frozenset(files.get("suppressed", ())),
+            )
+            return [_out(inventory_card.chat(card)[0], NOTIFY)]
         if "markdown" in given:
             return [_out(chat_message.answer_message(given["markdown"]), RESULT)]
         if "reason" in given:

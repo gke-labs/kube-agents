@@ -8,7 +8,7 @@
 # true and the conclusion drawn from them was still wrong: #1253 ships a `gh`
 # shim in the sandbox that routes to the credential broker, so those calls
 # succeed and the resolver works on `main`. Run against `main-4556bc68` on
-# 2026-09-15 this case PASSED, both checks (`run_20260915_202553_528206`), and
+# 2026-09-15 this case PASSED, both checks it then had (`run_20260915_202553_528206`), and
 # it passes on the branch too (`run_20260916_132438_579519`).
 #
 # It is kept anyway, as a regression guard, and the shim is why it is a good
@@ -31,9 +31,13 @@
 # the seeded fleet, which is the difference between a case that runs in any dev
 # project and one parked behind a fleet-activation step -- see
 # vcs-history-only-fact, parked exactly there. So: `deployer: noop`, no
-# `fixtures:`, no cluster read, and the assertion is on `status:resolved`, a
-# fixed string the skill itself defines and only a completed transition puts in
-# the answer.
+# `fixtures:`, no cluster read, and the procedure is read off the issue the
+# answer links to (the prompt asks for its URL): closed inside this run,
+# labelled `status:resolved`, with the claim and the report posted inside this
+# run. Beyond that URL the answer only has to name the label, a fixed string
+# the skill defines and the prompt asks for verbatim. How the answer words the rest is not graded: a phrase list for
+# "the report was posted" fails a run that did the work and described it
+# another way, and passes one that wrote the words and skipped the work.
 #
 # WHY THE CASE SEEDS ITS OWN ISSUE. The resolver polls for an open issue
 # carrying none of the skip labels. A GitOps repository holds audit ledgers,
@@ -77,13 +81,13 @@ prompt: >-
   the repository, post your triage report to the issue and transition the
   ticket.
 
-  In your final answer give the issue number, the answer you posted, and the
-  exact label you transitioned the ticket to.
+  In your final answer give the issue's URL as the forge shows it, the answer
+  you posted, and the exact label you transitioned the ticket to.
 expected_output: >-
   The resolver's poll returned the seeded issue rather than an error. The agent
   claimed it, read the repository to answer it, posted a triage report to the
   issue and transitioned the ticket to status:resolved. The final answer names
-  the issue number, the file and tag it found, and the transition label
+  the issue URL, the file and tag it found, and the transition label
   verbatim.
 infrastructure:
   deployer: noop
@@ -91,13 +95,11 @@ validated: false
 owner: dshnayder
 
 verification_spec:
-  # Its own named check rather than folded into the one below so that
+  # Its own named check rather than folded into the forge check below so that
   # `verification_report[]` says "the resolver could not reach the forge"
-  # rather than "the report did not mention a label" -- if this case ever goes
-  # red, only the first names the cause. It is not red today and this case is
-  # not this PR's red: the header above says why, and both checks pass on
-  # `main`. The phrases are the skill's own words for the failure: its SKILL.md
-  # ERROR branch mandates that chat line verbatim.
+  # rather than "the issue is not closed" -- if this case ever goes red, only
+  # the first names the cause. The phrases are the skill's own words for the
+  # failure: its SKILL.md ERROR branch mandates that chat line verbatim.
   - name: the-resolver-reached-the-forge
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -112,12 +114,21 @@ verification_spec:
     role: objective
     mode: assert
     check:
+      # Read from the forge, for the issue the answer names. `transition`
+      # posts the report, swaps `status:in-progress` for `status:resolved` and
+      # closes the ticket; `claim` posted one comment before that. A close
+      # inside this run, the label, and two comments inside this run are the
+      # whole procedure -- poll, claim, comment, transition -- and say nothing
+      # about how the answer words it.
+      type: forge_issue_state
+      state: closed
+      labels: ["status:resolved"]
+      min_comments: 2
+  - name: the-answer-names-the-transition-label
+    role: objective
+    mode: assert
+    check:
       type: report_contains
       # A fixed string the skill defines, not a fact about any particular
-      # repository: only a completed `transition` puts this label on a ticket,
-      # and the prompt asks for it verbatim. Nothing short of the full
-      # procedure -- poll, claim, comment, transition -- produces it.
+      # repository, and the prompt asks for it verbatim.
       required_phrases: ["status:resolved"]
-      # That the report was actually posted, in the spellings a correct answer
-      # uses for it.
-      any_of_phrases: ["triage report", "posted", "commented on"]

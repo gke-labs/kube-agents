@@ -1,6 +1,9 @@
 package mcp
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -9,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testToken = "s3cret-test-token"
@@ -38,16 +42,20 @@ func post(h http.Handler, header http.Header, body string) *httptest.ResponseRec
 
 const pingFrame = `{"jsonrpc":"2.0","id":1,"method":"ping"}`
 
-// Every way in, and what it gets. The token is the only credential: there is
-// no first-caller adoption and no fallback when it is missing.
-func TestTheEndpointAuthenticatesEveryRequest(t *testing.T) {
+// authCase is one way in and what it gets.
+type authCase struct {
+	name      string
+	tokenFile func(t *testing.T) string
+	header    http.Header
+	want      int
+}
+
+// authCases are every way in, for every authenticated route. The token is
+// the only credential: there is no first-caller adoption and no fallback
+// when it is missing.
+func authCases() []authCase {
 	bearer := func(v string) http.Header { return http.Header{headerAuthorization: {v}} }
-	cases := []struct {
-		name      string
-		tokenFile func(t *testing.T) string
-		header    http.Header
-		want      int
-	}{
+	return []authCase{
 		{"the right token", func(t *testing.T) string { return writeToken(t, testToken) }, bearer("Bearer " + testToken), http.StatusOK},
 		{"the right token with a trailing newline in the file", func(t *testing.T) string { return writeToken(t, testToken+"\n") }, bearer("Bearer " + testToken), http.StatusOK},
 		{"the scheme in another case", func(t *testing.T) string { return writeToken(t, testToken) }, bearer("bearer " + testToken), http.StatusOK},
@@ -61,7 +69,10 @@ func TestTheEndpointAuthenticatesEveryRequest(t *testing.T) {
 		{"a browser is refused before auth", func(t *testing.T) string { return writeToken(t, testToken) },
 			http.Header{headerAuthorization: {"Bearer " + testToken}, headerOrigin: {"http://localhost:8089"}}, http.StatusForbidden},
 	}
-	for _, tc := range cases {
+}
+
+func TestTheEndpointAuthenticatesEveryRequest(t *testing.T) {
+	for _, tc := range authCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			h := Handler(mustServer(t), tc.tokenFile(t), quietLog())
 			if rec := post(h, tc.header, pingFrame); rec.Code != tc.want {
@@ -139,5 +150,36 @@ func TestReadTokenRefusesNothing(t *testing.T) {
 	}
 	if _, err := ReadToken(filepath.Join(t.TempDir(), "absent")); err == nil {
 		t.Error("a missing token file was accepted")
+	}
+}
+
+// A batch's members share one budget, so two slow calls together still answer
+// inside it, and with it the server's write timeout.
+func TestABatchSharesOneBudget(t *testing.T) {
+	old := requestBudget
+	requestBudget = 200 * time.Millisecond
+	t.Cleanup(func() { requestBudget = old })
+	slow := Tool{
+		Definition: ToolDefinition{Name: "slow", InputSchema: map[string]any{"type": "object"}},
+		Call: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			select {
+			case <-ctx.Done():
+				return "out of budget", nil
+			case <-time.After(5 * time.Second):
+				return "finished", nil
+			}
+		},
+	}
+	h := Handler(mustServer(t, slow), writeToken(t, testToken), quietLog())
+	call := func(id int) string {
+		return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"slow","arguments":{}}}`, id)
+	}
+	start := time.Now()
+	rec := post(h, http.Header{"Authorization": {"Bearer " + testToken}}, "["+call(1)+","+call(2)+"]")
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("a batch of two slow calls took %s, past its %s budget", took, requestBudget)
+	}
+	if rec.Code != http.StatusOK || strings.Count(rec.Body.String(), "out of budget") != 2 {
+		t.Errorf("status %d, body %s", rec.Code, rec.Body)
 	}
 }

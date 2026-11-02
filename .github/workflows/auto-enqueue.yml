@@ -19,9 +19,12 @@ name: Auto Enqueue
 #
 # The auto-merge and dequeue calls use a token minted for a GitHub App
 # (`vars.MERGE_QUEUE_APP_ID`, `secrets.MERGE_QUEUE_APP_PRIVATE_KEY`; the App
-# needs Pull requests, Contents and Workflows write on this repository:
+# needs Pull requests, Contents, Workflows and Issues write on this repository:
 # GitHub refuses auto-merge on a pull request that changes a workflow file
-# unless the token can write workflows).
+# unless the token can write workflows, and a queue merge closes the issues
+# the pull request links with a closing keyword on behalf of the App that
+# turned auto-merge on, which needs Issues write; the token minted below
+# does not ask for it).
 # `GITHUB_TOKEN` cannot do them: an event it causes starts no workflow run, so
 # its queue entries could get no `merge_group` runs. The job's own
 # `GITHUB_TOKEN` reads, posts the gate statuses, and posts one comment on a

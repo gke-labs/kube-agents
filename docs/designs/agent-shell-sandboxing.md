@@ -356,6 +356,19 @@ connection was closed under the command or never opened, and that it may have
 run. A per-environment `ControlPath` would remove the sharing itself and is
 upstream's to make.
 
+The sharing also puts a ceiling on fan-out. Every concurrent command is a session on the
+one master, and `sshd` caps sessions per connection at `MaxSessions`, 10 by default: the
+eleventh concurrent command is refused by the master and the client exits 255 with
+nothing on stderr, the same shape as the teardown above. A sweep that delegates a card
+per cluster hit it on a large fleet. `deploy/sandbox/sshd_config` sets `MaxSessions 128`,
+and raises `MaxStartups` to `64:30:256` for the moment several agent processes open a
+master at once after a sandbox restart; the image's smoke test opens one master and runs
+64 sessions over it. More sessions mean more shells in the one pod, so the container's
+memory is the counterpart: `spec.harness.experimental.shellSandbox.resources` sizes the
+shell container, and the
+[CRD reference](../site/src/content/docs/operator/platformagent-crd.md#shellsandbox) owns
+its defaults, merge rule and refusals.
+
 ### What the credential proxy is for
 
 `kubectl` and `gcloud` are not real binaries in the sandbox. They are symlinks to
@@ -1329,7 +1342,8 @@ the operator's StatefulSet it is a root-owned copy inside a directory the model 
 the model can rename it aside and put its own in its place until the next start.
 `/opt/vcs/libexec/platform` is the second copy, root-owned and mode 0755, and it is the
 one a caller that logs in as `hermes` runs: the pull-request and issue crons forward a
-forge verb into this container rather than holding a forge CLI themselves, and running
+forge verb into this container rather than holding a forge CLI themselves, the Cluster
+Agent reconcile sends its GKE reads to `gke_cluster_reads.py` here, and running
 the data volume's copy over that session would hand the credential to whatever sits at
 that path. The read-only mount narrows that to the fallback, and the second copy stays
 as defence in depth. The whole import closure is staged, because `sys.path[0]` is the
@@ -1799,8 +1813,9 @@ wholesale would put a file named `credential_proxy.py` inside the sandbox, which
 wrong thing for a reviewer to find even though it is inert there. So the image gets an
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
 `github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
-`stall_report.py`, `audit_cluster.sh` and `inventory_findings.py` — the entry points an agent is told to run,
-plus the transitive closure of what they import, and the shared modules the skill-tree collectors import from `/opt/defaults/scripts` (`credential_proxy_client.py`, `fleet_scope_args.py`). `inventory_findings.py extract` and `select`
+`stall_report.py`, `audit_cluster.sh`, the three Cluster Agent domain collectors (`audit_storage.py`, `audit_networking.py`,
+`audit_certificates.py`) and `inventory_findings.py` — the entry points an agent is told to run,
+plus the transitive closure of what they import, and the shared modules the skill-tree collectors import from `/opt/defaults/scripts` (`credential_proxy_client.py`, `fleet_scope_args.py`, `collector_run.py`, `broker_admission.py`). `inventory_findings.py extract` and `select`
 work there, and `select` chooses the report's items from the scores file alone. `register` calls
 the Session KV server on the agent pod's loopback and exits 13 from the sandbox, and the
 prioritization SOP answers that exit by going on to `select` and writing the report.
@@ -2641,8 +2656,9 @@ API server. Every path on the credentialed listener except `/healthz` requires i
 unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
-the same listener, when the next stack takes Google Chat, the A2A gateway's, and, under the
-operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session pods'. The operator grants
+the same listener, when the next stack takes Google Chat, the A2A gateway's, under the
+operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, under `mode: next` with
+an `AgentProfile` bound, each profile tier's ServiceAccount. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
 **The audience is per Pod, and it is what separates the callers.** The sandbox's token is
@@ -2663,14 +2679,45 @@ role, and the legacy event routes it cannot reach; [the chatops gateway
 design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
 apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
-minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits `(shell, session)`, and
-within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. Because a
+minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits the session beside the shell
+(the `profile` and `scope` roles, below, reach it too), and
+within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. One path
+under it is the shell's alone: `/v1/exec/admission`, the read-only report of how many commands
+the broker admits at once, which the shell's fleet sweeps size their pools by
+(`broker_admission.py`); the session, profile and scope roles don't reach it, and a sweep run under
+either falls back to four. Because a
 Pod picks the audience it projects, the role is also bound to the caller:
 `CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
 the session audience, and no other caller may present that audience
-([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
+([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). With the
+A2A MCP server on, a fifth, `mcp`, is the MCP pod's: its token is minted for
+`kubeagents-credential-proxy-mcp`, it reaches `/v1/vcs/` alone, and within it `ROLE_VCS_VERBS`
+admits `proposal-view` only, checked on the normalised verb before the body is read, with that
+verb's managed-repository check still applying. It is bound the same way:
+`CREDENTIAL_PROXY_MCP_CALLERS` names the MCP pod's own ServiceAccount, which may present only
+the mcp audience, and no other caller may present it; with the list empty, nobody holds the
+role. It names the account only while the operator controls it; an account somebody else holds under the name is never named. Under
+`mode: next` with an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
+their token is minted for `kubeagents-credential-proxy-profile`, `/v1/exec` admits it, and
+`ROLE_EXECUTABLES` holds it to `kubectl` and `gcloud` with the session's `kubectl` flag
+allowlist. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
+profile tier's ServiceAccount to its (profile, tier), and that account may present only the
+profile audience. Each call also carries the dispatcher's signed task credential in
+`X-Kube-Agents-Task-Credential`, bound to the caller's pod, and is confined to that
+credential's cluster and project. Profile calls together hold at most
+`CREDENTIAL_PROXY_PROFILE_SLOTS` of the command slots
+([spec-subagent-profiles.md](spec-subagent-profiles.md) owns the detail). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
+
+The scope publisher Job under `mode: next` has a role of its own, `scope`:
+its token is minted for `kubeagents-credential-proxy-scope`, it is bound to its callers through
+`CREDENTIAL_PROXY_SCOPE_CALLERS` as the mcp role is, it reaches `/v1/exec` alone, and
+`ROLE_EXECUTABLES` holds it to `gcloud`. Within that, `scope_policy.py` admits five lookups token
+for token, each on an argument the `scope.json` at `CREDENTIAL_PROXY_SCOPE_FILE` declares or
+that an earlier lookup returned to the role within five hours. That record of returned members is
+memory in the one broker process, so the role stays on the single broker pod
+([credential-proxy-single-pod.md](credential-proxy-single-pod.md#2-state-that-lives-in-the-pod)).
 
 Be precise about what the token buys: it is a **multi-tenancy control** that stops another
 workload in the cluster borrowing the agent's credentials, and not an agent-containment

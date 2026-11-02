@@ -183,7 +183,7 @@ its shape is the one in section 3, kept identical by a test.
   findings (a drain-blocking budget over a single replica, a pool past the skew ceiling and a
   fail-closed webhook in the upgrade's path are critical; a budget over several replicas, a webhook
   refusing only what it matches today and a pool at the ceiling are major; a covering exclusion is
-  minor; a rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13, 16 and 25 and major for every other entry), read the queue
+  minor; a rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13, 16 and 25 and major for every other entry, and minor for the plan-level `rollout-sequence-precheck`), read the queue
   for any decision already recorded, and compose the same shape. Say "live brief, composed now; the
   weekly review has not run" in the headline, use the object's name where the queue would have an
   id, close with the live form of the last line (there is no report file and no id to reply with

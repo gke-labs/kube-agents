@@ -3,8 +3,9 @@
 # One line gathers every open finding with the same check, project and
 # cluster, and the nudge names only its first finding's id. The user replies
 # with that id and a decision, and the decision has to reach the whole line:
-# the update_finding tool's PATCH covers every undecided row of the line
-# (findings_queue.patch_finding) and says so in its docstring, which is what
+# the update_finding tool's PATCH covers every row of the line a message has
+# named (`surfaced`; findings_queue.patch_finding) and says so in its
+# docstring, which is what
 # the model reads. If only the named row changed, the line would stay open
 # and keep holding new findings back.
 #

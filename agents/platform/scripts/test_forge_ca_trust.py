@@ -411,6 +411,64 @@ class GitTrustTest(unittest.TestCase):
         with mock.patch.object(providers, "load_forge_entries", side_effect=ValueError("bad")):
             self.assertEqual((), credential_proxy._configured_forge_entries())
 
+    @unittest.skipUnless(shutil.which("git"), "git is needed to read the layer back")
+    def test_a_ported_gitea_forge_pins_its_ca_and_source_by_host_and_port(self):
+        ported = (
+            {
+                "provider": "gitea",
+                "name": "gitea-corp",
+                "host": "gitea.corp",
+                "port": 8443,
+                "token_path": "/t",
+                "allowed_paths": ("acme",),
+                "ca_file": "/ca/gitea.crt",
+                "ca_source": "the Secret gitea-ca or its key ca.crt",
+            },
+        )
+        entries = credential_proxy._ca_reading_entries(ported)
+        self.assertEqual(
+            (
+                {
+                    "host": "gitea.corp:8443",
+                    "ca_file": "/ca/gitea.crt",
+                    "ca_source": "the Secret gitea-ca or its key ca.crt",
+                },
+            ),
+            entries,
+        )
+        config = credential_proxy.forge_ca_git_config(entries)
+        self.assertEqual(
+            (
+                ("http.https://gitea.corp:8443/.sslCAInfo", "/ca/gitea.crt"),
+                ("http.https://gitea.corp:8443/.followRedirects", "false"),
+            ),
+            config,
+        )
+        sources = credential_proxy.forge_ca_sources(entries)
+        self.assertEqual({"gitea.corp:8443": "the Secret gitea-ca or its key ca.crt"}, sources)
+
+        environment = {
+            **os.environ,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            **credential_proxy._git_forced_config_environment(config),
+        }
+        result = subprocess.run(
+            ["git", "config", "--get-urlmatch", "http.sslCAInfo", "https://gitea.corp:8443/acme/infra.git"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual("/ca/gitea.crt", result.stdout.strip())
+
+        refusal = providers.tls_refusal(
+            "fatal: unable to access 'https://gitea.corp:8443/acme/infra.git/': "
+            "Problem with the SSL CA cert (path? access rights?)",
+            sources,
+        )
+        self.assertIn("the Secret gitea-ca or its key ca.crt is missing", refusal.fields["detail"])
+
 
 @unittest.skipUnless(OPENSSL and shutil.which("git"), "openssl and git are needed")
 class GitLoopbackTrustTest(unittest.TestCase):

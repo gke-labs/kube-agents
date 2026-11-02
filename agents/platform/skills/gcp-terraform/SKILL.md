@@ -31,9 +31,8 @@ the reviewer's or CI's step, because only CI has the state to plan against.
 - **A GKE node pool or cluster change** on a Terraform repository: grow or
   shrink a pool, turn on autoscaling, change a release channel or
   maintenance window, add a new cluster, adopt a cluster the repository
-  does not describe. A new cluster comes here only when `SOUL.md` §3 item 7
-  routes it here; where that item says a Terraform repository is a stop,
-  the stop is the answer.
+  does not describe. A new cluster comes here when `SOUL.md` §3 item 7
+  routes it here, which it does for a Terraform repository.
 - **A Cloud SQL change**: a read replica, a tier, backups, high
   availability.
 - **A VPC firewall rule**: open or close a port, narrow a source range,
@@ -166,8 +165,27 @@ which reads decided the edit.
   protection** line saying that applying it fails until a human sets
   `deletion_protection = false` in a separate change. Anything else that
   needs one of them is a human's pull request: stop and say so.
+- **A new cluster's deletion protection** is on, written the way the
+  repository's existing clusters write it (the resource argument or the
+  module input). With no cluster to copy, it is `deletion_protection = true`,
+  the provider's default since 5.0.0. A sibling that has it `false` is not
+  copied: write `true` and name that sibling in the **Deletion protection**
+  line. Never `false`, for a test, an evaluation or an easier teardown: a
+  cluster that needs it off is a human's pull request.
 - **New resources** go where the repository keeps their siblings, in a file
   named the way the siblings are, using the same module or resource shape.
+  Shape, not contents: a new cluster gets only what exists once per cluster
+  (the cluster, its node pools, its fleet membership). A project- or
+  fleet-wide resource the repository already declares (a
+  `google_gke_hub_feature`, a `google_project_service`, a shared service
+  account) is used by name or left alone, never declared a second time:
+  copying a sibling's file copies those too, and a second declaration fails
+  or fights the first at apply. Name the shared ones the cluster relies on
+  in the PR body. `references/container.md` lists the common ones. Where
+  each cluster is its own root module, its `backend` and provider blocks
+  are copied with this cluster's own state prefix: a copied prefix points
+  the new root at the sibling's state, and CI's plan would then propose
+  destroying the sibling.
 - **No secrets in HCL.** A password, key or token never goes into a `.tf`
   or `.tfvars` file; use the repository's existing reference (a
   `google_secret_manager_secret_version` data source, a variable CI fills)
@@ -210,7 +228,7 @@ header:
 - **Decision:** edit | import | create, and the reads that decided it.
 - **Resource:** `<address>` (<type> `<name>` in project `<project>`, location `<location>`).
 - **Replacement:** none | REPLACES <address>: `<argument>` forces it; applying this PR destroys and recreates <what> (or deletes <what>).
-- **Deletion protection:** unchanged | unchanged; applying this PR fails until a human sets `deletion_protection = false` in a separate change.
+- **Deletion protection:** unchanged | unchanged; applying this PR fails until a human sets `deletion_protection = false` in a separate change. | new cluster: `true`, as `<sibling address>` has | new cluster: `true`, the provider default (no existing cluster to copy) | new cluster: `true`; `<sibling address>` has `false` and was not copied.
 - **Import:** none | `import { to = <address>, id = "<id>" }`; plan must show an import, not a create.
 - **Checked:** `tofu fmt -check` on <path>. Not run here: `terraform init`, `validate` and
   `plan`. Run `plan` in CI before merging; it must show only the changes above.

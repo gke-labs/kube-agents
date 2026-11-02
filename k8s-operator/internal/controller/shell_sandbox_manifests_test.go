@@ -405,7 +405,7 @@ func TestShellSandboxPresentsATokenTheBrokerWillAccept(t *testing.T) {
 		}
 	}
 
-	callers := allowedBrokerCallers(agent)
+	callers := allowedBrokerCallers(agent, true)
 	sandboxCaller := "system:serviceaccount:" + agent.Namespace + ":" + shellSandboxServiceAccountName(agent)
 	if !strings.Contains(callers, sandboxCaller) {
 		t.Errorf("the broker must serve the sandbox's identity %q, got %q", sandboxCaller, callers)
@@ -1752,6 +1752,8 @@ func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
 		// The watchers' broker token: mounted into the agent container it
 		// would hand the model the broker's watcher role.
 		watcherTokenVolume,
+		"vcs-forge-credentials-0",
+		"vcs-forge-ca-0",
 	} {
 		t.Run(name, func(t *testing.T) {
 			agent := federatedTestAgent()
@@ -1768,6 +1770,292 @@ func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
 				t.Errorf("the degraded message must name the offending volume; got %q", msg)
 			}
 		})
+	}
+
+	t.Run("extraVolumes, sidecarVolumes, container mounts, env, or AgentPlugin referencing forge Secrets or reserved names", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			dep     *agentv1alpha1.DeploymentSpec
+			plugins []*agentv1alpha1.AgentPlugin
+			wantSub string
+		}{
+			{
+				name: "extraVolumes secret",
+				dep: &agentv1alpha1.DeploymentSpec{
+					ExtraVolumes: []corev1.Volume{{
+						Name:         "custom-gitea",
+						VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "gitea-token"}},
+					}},
+				},
+				wantSub: "spec.deployment.extraVolumes[0] (custom-gitea -> Secret gitea-token)",
+			},
+			{
+				name: "deployment env secretKeyRef",
+				dep: &agentv1alpha1.DeploymentSpec{
+					Env: []corev1.EnvVar{{
+						Name: "GITEA_TOKEN",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+								Key:                  "token",
+							},
+						},
+					}},
+				},
+				wantSub: "spec.deployment.env[0] (GITEA_TOKEN -> Secret gitea-token)",
+			},
+			{
+				name: "extraVolumes reserved prefix name",
+				dep: &agentv1alpha1.DeploymentSpec{
+					ExtraVolumes: []corev1.Volume{{
+						Name:         "vcs-forge-ca-mine",
+						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+					}},
+				},
+				wantSub: "spec.deployment.extraVolumes[0].name (vcs-forge-ca-mine)",
+			},
+			{
+				name: "sidecar volumeMounts naming a broker volume",
+				dep: &agentv1alpha1.DeploymentSpec{
+					Sidecars: []corev1.Container{{
+						Name:  "helper",
+						Image: "busybox:1.36",
+						VolumeMounts: []corev1.VolumeMount{{
+							Name:      "vcs-forge-credentials-0",
+							MountPath: "/tmp/token",
+						}},
+					}},
+				},
+				wantSub: "spec.deployment.sidecars[0].volumeMounts (helper: vcs-forge-credentials-0 at /tmp/token)",
+			},
+			{
+				name: "sidecarVolumes projected secret",
+				dep: &agentv1alpha1.DeploymentSpec{
+					SidecarVolumes: []corev1.Volume{{
+						Name: "custom-gitea-projected",
+						VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+							Sources: []corev1.VolumeProjection{{Secret: &corev1.SecretProjection{
+								LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+							}}},
+						}},
+					}},
+				},
+				wantSub: "spec.deployment.sidecarVolumes[0] (custom-gitea-projected -> Secret gitea-token)",
+			},
+			{
+				name: "sidecar env secretKeyRef",
+				dep: &agentv1alpha1.DeploymentSpec{
+					Sidecars: []corev1.Container{{
+						Name:  "helper",
+						Image: "busybox:1.36",
+						Env: []corev1.EnvVar{{
+							Name: "GITEA_TOKEN",
+							ValueFrom: &corev1.EnvVarSource{
+								SecretKeyRef: &corev1.SecretKeySelector{
+									LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+									Key:                  "token",
+								},
+							},
+						}},
+					}},
+				},
+				wantSub: "spec.deployment.sidecars[0].env[0] (helper.GITEA_TOKEN -> Secret gitea-token)",
+			},
+			{
+				name: "AgentPlugin spec.env secretKeyRef with nil deployment",
+				dep:  nil,
+				plugins: []*agentv1alpha1.AgentPlugin{{
+					ObjectMeta: metav1.ObjectMeta{Name: "leak-plugin", Namespace: "test-ns"},
+					Spec: agentv1alpha1.AgentPluginSpec{
+						AgentRef: "test-agent",
+						Env: []corev1.EnvVar{{
+							Name: "LEAKED_TOKEN",
+							ValueFrom: &corev1.EnvVarSource{
+								SecretKeyRef: &corev1.SecretKeySelector{
+									LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+									Key:                  "token",
+								},
+							},
+						}},
+					},
+				}},
+				wantSub: "AgentPlugin leak-plugin spec.env[0] (LEAKED_TOKEN -> Secret gitea-token)",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				agent := federatedTestAgent()
+				agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+					IntegrationSpec: agentv1alpha1.IntegrationSpec{
+						Forges: []agentv1alpha1.ForgeSpec{{
+							Name:           "gitea",
+							Provider:       agentv1alpha1.GitProviderGitea,
+							Host:           "gitea.example.com",
+							CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitea-token"},
+							CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gitea-ca"},
+						}},
+					},
+				}
+				agent.Spec.Deployment = tc.dep
+				msg := validateExtraVolumeMounts(agent, tc.plugins...)
+				if msg == "" || !strings.Contains(msg, tc.wantSub) {
+					t.Fatalf("expected validateExtraVolumeMounts to contain %q, got %q", tc.wantSub, msg)
+				}
+				if strings.Contains(msg, "extraVolumeMounts") {
+					t.Errorf("expected non-extraVolumeMounts refusal not to blame extraVolumeMounts, got %q", msg)
+				}
+			})
+		}
+	})
+}
+
+func TestCredentialProxyMountsSelfManagedForgeTokens(t *testing.T) {
+	agent := federatedTestAgent()
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{
+				{
+					Name:      "github",
+					Provider:  agentv1alpha1.GitProviderGitHub,
+					Namespace: "gke-labs",
+				},
+				{
+					Name:           "gitlab",
+					Provider:       agentv1alpha1.GitProviderGitLab,
+					Namespace:      "acme",
+					CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitlab-token"},
+				},
+				{
+					Name:           "gitea",
+					Provider:       agentv1alpha1.GitProviderGitea,
+					Host:           "Gitea.Gitea.svc.cluster.local",
+					Namespace:      "platform-team",
+					Scheme:         agentv1alpha1.ForgeSchemeHTTP,
+					Port:           3000,
+					CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitea-token"},
+				},
+			},
+		},
+	}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{
+			{Name: "VCS_FORGES_CONFIG", Value: "/tmp/evil.json"},
+		},
+	}
+
+	raw := buildCredentialProxyPolicyConfigMap(agent).Data[vcsForgesKey]
+	wantJSON := `{"forges":[{"provider":"github","host":"github.com"},` +
+		`{"provider":"gitlab","host":"gitlab.com","tokenPath":"/var/run/kube-agents/forge-credentials/gitlab/token","readTokenPath":"/var/run/kube-agents/forge-credentials/gitlab/read-token","allowedPaths":["acme"]},` +
+		`{"provider":"gitea","host":"gitea.gitea.svc.cluster.local","scheme":"http","port":3000,"tokenPath":"/var/run/kube-agents/forge-credentials/gitea/token","readTokenPath":"/var/run/kube-agents/forge-credentials/gitea/read-token","allowedPaths":["platform-team"]}]}`
+	if raw != wantJSON {
+		t.Errorf("vcs-forges.json =\n %s\nwant\n %s", raw, wantJSON)
+	}
+
+	container := buildCredentialProxyContainer(agent)
+	var forgesConfig string
+	for _, e := range container.Env {
+		if e.Name == vcsForgesEnv {
+			if forgesConfig != "" {
+				t.Fatalf("duplicate %s env var in broker container", vcsForgesEnv)
+			}
+			forgesConfig = e.Value
+		}
+	}
+	if forgesConfig != vcsForgesMountPath {
+		t.Errorf("VCS_FORGES_CONFIG = %q, want %q", forgesConfig, vcsForgesMountPath)
+	}
+
+	var mount *corev1.VolumeMount
+	for i := range container.VolumeMounts {
+		if container.VolumeMounts[i].Name == "vcs-forge-credentials-2" {
+			mount = &container.VolumeMounts[i]
+		}
+	}
+	if mount == nil || !mount.ReadOnly || mount.MountPath != "/var/run/kube-agents/forge-credentials/gitea" {
+		t.Fatalf("expected read-only mount vcs-forge-credentials-2 at /var/run/kube-agents/forge-credentials/gitea, got %+v", mount)
+	}
+
+	volumes := buildCredentialProxyRuntimeVolumes(agent)
+	var vol *corev1.Volume
+	for i := range volumes {
+		if volumes[i].Name == "vcs-forge-credentials-2" {
+			vol = &volumes[i]
+		}
+	}
+	if vol == nil || vol.Secret == nil {
+		t.Fatalf("expected secret volume vcs-forge-credentials-2, got %+v", vol)
+	}
+	sec := vol.Secret
+	// The same two keys every self-managed forge's Secret projects: `token`,
+	// and the optional `read-token`, which a Gitea forge does not read.
+	if sec.SecretName != "gitea-token" || len(sec.Items) != 2 || sec.Items[0].Key != "token" || sec.Items[0].Path != "token" ||
+		sec.Items[1].Key != agentv1alpha1.ForgeCredentialsReadTokenKey || sec.Items[1].Path != agentv1alpha1.ForgeCredentialsReadTokenKey {
+		t.Errorf("unexpected secret volume source: %+v", sec)
+	}
+
+	// Gateway pod must never mount the forge token volume.
+	gatewayPod := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec
+	for _, v := range gatewayPod.Volumes {
+		if agentv1alpha1.IsForgeCredentialVolumeName(v.Name) {
+			t.Errorf("gateway pod must not carry forge credential volume %q", v.Name)
+		}
+	}
+}
+
+func TestSameManagedRepoMatchesSelfManagedGiteaEntries(t *testing.T) {
+	seeded := agentv1alpha1.ManagedRepoEntry{
+		Type: agentv1alpha1.GitProviderGitea,
+		URL:  "http://gitea.gitea.svc.cluster.local:3000/platform-team/gitops",
+	}
+	for _, match := range []string{
+		"http://gitea.gitea.svc.cluster.local:3000/platform-team/gitops",
+		"http://gitea.gitea.svc.cluster.local:3000/platform-team/gitops.git",
+		"https://gitea.gitea.svc.cluster.local/platform-team/gitops.git",
+		"git@gitea.gitea.svc.cluster.local:platform-team/gitops.git",
+	} {
+		existing := agentv1alpha1.ManagedRepoEntry{Type: agentv1alpha1.GitProviderGitea, URL: match}
+		if !sameManagedRepo(existing, seeded) {
+			t.Errorf("sameManagedRepo(%q, %q) = false, want true", match, seeded.URL)
+		}
+	}
+	for _, different := range []string{
+		"http://other.gitea.svc.cluster.local:3000/platform-team/gitops",
+		"http://gitea.gitea.svc.cluster.local:3000/platform-team/other",
+		"platform-team/gitops",
+		"gitea.gitea.svc.cluster.local/platform-team/gitops",
+	} {
+		existing := agentv1alpha1.ManagedRepoEntry{Type: agentv1alpha1.GitProviderGitea, URL: different}
+		if sameManagedRepo(existing, seeded) {
+			t.Errorf("sameManagedRepo(%q, %q) = true, want false", different, seeded.URL)
+		}
+	}
+
+	gitlabSeeded := agentv1alpha1.ManagedRepoEntry{
+		Type: agentv1alpha1.GitProviderGitLab,
+		URL:  "https://gitlab.corp.internal/group/project",
+	}
+	for _, different := range []string{
+		"group/project",
+		"gitlab.corp.internal/group/project",
+	} {
+		existing := agentv1alpha1.ManagedRepoEntry{Type: agentv1alpha1.GitProviderGitLab, URL: different}
+		if sameManagedRepo(existing, gitlabSeeded) {
+			t.Errorf("sameManagedRepo(%q, %q) = true, want false", different, gitlabSeeded.URL)
+		}
+	}
+
+	// GitHub is self-managed too (GitHub Enterprise Server). The agent skips a
+	// bare owner/name there, so it must not count as the seeded repository.
+	ghesSeeded := agentv1alpha1.ManagedRepoEntry{
+		Type: agentv1alpha1.GitProviderGitHub,
+		URL:  "https://ghe.corp/acme/infra",
+	}
+	bare := agentv1alpha1.ManagedRepoEntry{Type: agentv1alpha1.GitProviderGitHub, URL: "acme/infra"}
+	if sameManagedRepo(bare, ghesSeeded) {
+		t.Errorf("sameManagedRepo(%q, %q) = true, want false", bare.URL, ghesSeeded.URL)
+	}
+	ghesGit := agentv1alpha1.ManagedRepoEntry{Type: agentv1alpha1.GitProviderGitHub, URL: "https://ghe.corp/acme/infra.git"}
+	if !sameManagedRepo(ghesGit, ghesSeeded) {
+		t.Errorf("sameManagedRepo(%q, %q) = false, want true", ghesGit.URL, ghesSeeded.URL)
 	}
 }
 

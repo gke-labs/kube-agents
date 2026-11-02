@@ -418,9 +418,10 @@ func TestChatArmedDropsTheSlackReferences(t *testing.T) {
 // verb on Secrets - the a2a-slack-principal-map Secret is reachable by the
 // kubelet's mount alone. Every Role builder, next stack
 // and legacy, is rendered and read; a wildcard resource counts as reaching
-// them. What this does not bound is the gateway's `create` on pods, which can
-// mount a Secret into a pod it builds; buildA2AGatewayRole's comment records
-// that as the admission policy it owes.
+// them. What this does not bound is the gateway's `create` on pods, which RBAC
+// cannot keep from mounting a Secret into a pod it builds; the admission policy
+// kube-agents-a2a-gateway-pod does, where the chart installs it
+// (buildA2AGatewayRole's comment).
 func TestNoRenderedRoleReachesASecret(t *testing.T) {
 	agent := a2aTestAgent()
 	roles := map[string][]rbacv1.PolicyRule{
@@ -556,6 +557,34 @@ func TestAnArmedGatewayCarriesTheSlackAllowlist(t *testing.T) {
 			}
 			if got := env[a2aSlackAllowAllUsersEnvVar].Value; got != tc.wantAll {
 				t.Errorf("%s = %q, want %q", a2aSlackAllowAllUsersEnvVar, got, tc.wantAll)
+			}
+		})
+	}
+}
+
+// TestAnswerFeedbackOffIsTheOnlyRenderedState: slack.answerFeedback=false
+// reaches the gateway as its off switch, and unset or true renders nothing,
+// so an install that never set the field keeps its gateway pod as it was.
+func TestAnswerFeedbackOffIsTheOnlyRenderedState(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	off, on := false, true
+	for _, tc := range []struct {
+		name    string
+		setting *bool
+		want    string
+		present bool
+	}{
+		{"unset", nil, "", false},
+		{"true", &on, "", false},
+		{"false", &off, "false", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := slackTestAgent("next", true)
+			agent.Spec.Integration.Slack.AnswerFeedback = tc.setting
+			env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+			got, ok := env[a2aSlackAnswerFeedbackEnvVar]
+			if ok != tc.present || got.Value != tc.want {
+				t.Errorf("%s = %q (rendered %v), want %q (rendered %v)", a2aSlackAnswerFeedbackEnvVar, got.Value, ok, tc.want, tc.present)
 			}
 		})
 	}

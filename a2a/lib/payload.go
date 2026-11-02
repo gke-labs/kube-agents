@@ -460,7 +460,7 @@ func SteerNoticeOf(parts []Part) (SteerNotice, bool) {
 // them (the executor's log names each card). truncated says the
 // conversation had more open cards than one stop takes, so some may still
 // be open; deadline that the stop ran out of time. listsCut says only that
-// the executor cut stopped or settled to fit the part, each at
+// the executor cut stopped, settled or notStopped to fit the part, each at
 // CardStopListMax, so the list that was cut is one at that length: the
 // cards themselves are as the counts say. A stop that found nothing open answers empty lists.
 // A stop that failed answers no part: its terminal is failed, and the
@@ -486,6 +486,10 @@ type CardStopResult struct {
 	Truncated  bool           `json:"truncated"`
 	Deadline   bool           `json:"deadline"`
 	ListsCut   bool           `json:"listsCut"`
+	// NotStopped names the cards Failed, Pending and Unresolved count, in that
+	// order, cut at CardStopListMax (ListsCut covers it too). Absent from an
+	// older executor's result, which reads as none named.
+	NotStopped []CardStopCard `json:"notStopped,omitempty"`
 }
 
 // CardStopCard is one card a result names. PriorStatus is set on a stopped
@@ -624,9 +628,34 @@ type ArtifactUpdate struct {
 	LastChunk bool     `json:"lastChunk,omitempty"`
 }
 
-// AgentCard carries only the field validation needs.
+// AgentCard is the directory card on a2a.agents.<name>. Validation needs
+// only Name; the rest is what the gateway routes a profile on (#3655), all
+// optional so a card without them still parses.
 type AgentCard struct {
 	Name string `json:"name"`
+	// Description is the routing blurb, a sentence a router can read.
+	Description string `json:"description,omitempty"`
+	// Tiers are the tiers the profile may run at (its allowedTiers).
+	Tiers []string `json:"tiers,omitempty"`
+	// ClusterRef pins a profile to one cluster; absent on a profile that
+	// takes its target as task parameters.
+	ClusterRef *ClusterRef `json:"clusterRef,omitempty"`
+	// Parameters are the task parameters the profile's persona declares.
+	Parameters []ProfileParameter `json:"parameters,omitempty"`
+}
+
+// ClusterRef names one GKE cluster.
+type ClusterRef struct {
+	ProjectID string `json:"projectId"`
+	Location  string `json:"location"`
+	Cluster   string `json:"cluster"`
+}
+
+// ProfileParameter is one task parameter a profile declares: its name, as
+// TaskParameterNameRE, and whether a submission must carry it.
+type ProfileParameter struct {
+	Name     string `json:"name"`
+	Required bool   `json:"required,omitempty"`
 }
 
 func protocolErrf(format string, args ...any) error {

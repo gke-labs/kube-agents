@@ -90,7 +90,8 @@ After this change, under `next`:
 - The agent material names the docs-site short link only, never a Google Forms URL
   (`tests/test_feedback_reference.py`), so a recreated form needs no agent release.
 - Agent behaviour changes need a case: red against `main`, green three times on the
-  branch, registered in `hack/eval/nightly-cases.txt`.
+  branch, registered in `hack/eval/nightly-cases.txt`, unless one of the exemptions in
+  [`eval_driven_development.md`](../../.agents/rules/eval_driven_development.md) applies.
 
 ## The parts, as decided
 

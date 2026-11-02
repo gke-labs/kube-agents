@@ -1,11 +1,11 @@
 ---
 title: Examples
-description: LLM-inference example stacks shipped in examples/.
+description: The LLM-inference example stacks and the reference GitOps repository layout shipped in examples/.
 sidebar:
   order: 3
 ---
 
-Self-contained example stacks live in [`examples/`](https://github.com/gke-labs/kube-agents/tree/main/examples). Each is a plain Kubernetes manifest bundle you deploy with `kubectl apply -f` (see the `README.md` in each directory) — no framework, no rendering.
+Self-contained examples live in [`examples/`](https://github.com/gke-labs/kube-agents/tree/main/examples). The inference stacks are plain Kubernetes manifest bundles you deploy with `kubectl apply -f` (see the `README.md` in each directory) — no framework, no rendering. `gitops-repo` is a repository layout to fork.
 
 ## `inference-replay`
 
@@ -42,6 +42,14 @@ LiteLLM configured to proxy a personal ChatGPT subscription via OAuth device flo
 vLLM's OpenAI-compatible server (`vllm serve`) serving Gemma 4 26B-A4B (`RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic`) on two L4 GPUs with a 128k-token context, for the `openai_compatible` model provider. Ships the vLLM Deployment, Service, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. The README gives the GPU node-pool command and measured sizing for other Gemma 4 sizes and GPUs.
 
 **When to use:** data-locality, air-gapped, or open-model requirements. Provision a GPU node pool first (or use the `gke-compute-classes` skill to spec one).
+
+## `gitops-repo`
+
+[`examples/gitops-repo/`](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo)
+
+The reference layout for the GitOps repository the agent writes to: per-cluster desired state under `clusters/<cluster>/`, fleet-level policy under `fleet/`, the knowledge base, admission policies, and `.kube-agents/intent.yaml`, where the declaring audits look for declared-intent notes. It is a template to fork as your own repository, separate from the kube-agents source tree; `submit-suggestion` opens pull requests against whichever repository the install names.
+
+**When to use:** setting up the GitOps repository for a new install, or checking where an audit expects a declaration to live.
 
 ## Layering
 

@@ -1,6 +1,6 @@
 ---
 name: submit-suggestion
-description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review, including a request to delete a resource, which its "Deleting a resource" section answers with a pull request that removes the declaring manifest, or a stated stop when the repository does not declare it. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
+description: Open a pull request (a merge request on GitLab) when the request asked for one, committing declarative configuration changes for SRE review; not for a request to "propose a manifest", which is answered in the reply. Covers a request to delete a resource, which its "Deleting a resource" section answers with a pull request that removes the declaring manifest, or a stated stop when the repository does not declare it. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
 ---
 
 # submit-suggestion - Secure GitOps Pull Request Orchestrator
@@ -84,6 +84,13 @@ python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py pre
 _(Example: `--repo "acme/fleet" --branch "platform-agent/provision-mercury-09"` or `--repo "acme/fleet" --branch "platform-agent/upgrade-policy-baseline"`)_
 
 In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3, item 6).
+
+Pass `--repo` as the repository registration names it: `<owner>/<repo>` on
+GitHub, or `<host>/<owner>/<repo>` on another declared forge (such as GitLab or
+Gitea). `prepare` echoes the canonical repository name in `repo`; pass that
+`repo` value to every later `--repo` in this skill and in `version-control`
+calls so installs that serve more than one forge do not have to guess which
+host a bare slug belongs to.
 
 It prints one JSON line. **Keep it — Step 2 works inside its `workspace`.** The
 `workspace` is named for your branch as well as the repository, because
@@ -196,6 +203,17 @@ under review are on this copy's branch. Take the authoring skill's reads,
 writing rules and checks, but not its Step 1 `prepare`, its branch name or
 its submit: edit in this `workspace` and submit from Step 3 here, onto the
 same branch. Starting from its Step 1 would open a second pull request.
+
+**Implement only the chosen option.** When the request comes from a multi-option
+triage or audit report (or a single-fix triage report), implement only the
+option the caller chose (the one marked Recommended when none was named, the
+single proposed fix, or the `Option <X>` the user selected) and edit only the
+file(s) that option calls for; if the repository holds both a GitOps sync source
+path and cluster bootstrap or provisioning copies of the workload, check the
+repository's GitOps sync declaration for the namespace or workload and edit only
+the synced workload manifest(s). Never bundle unchosen options
+or optional hardening into the same pull request, and never touch unrelated
+manifests or infrastructure definitions.
 
 Generate or edit the files **inside the returned `workspace`**.
 

@@ -1,0 +1,99 @@
+{
+  "payload": {
+    "number": 3,
+    "comments": true
+  },
+  "responses": [
+    {
+      "id": 3,
+      "url": "https://gitea.example.test/api/v1/repos/acme/infra/issues/3",
+      "html_url": "https://gitea.example.test/acme/infra/issues/3",
+      "number": 3,
+      "user": {
+        "id": 1,
+        "login": "kube-agents",
+        "full_name": "",
+        "email": "kube-agents@example.test",
+        "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+        "html_url": "https://gitea.example.test/kube-agents",
+        "is_admin": true
+      },
+      "original_author": "",
+      "original_author_id": 0,
+      "title": "Drift in prod",
+      "body": "Something drifted.",
+      "ref": "",
+      "labels": [
+        {
+          "id": 1,
+          "name": "status:triage",
+          "exclusive": false,
+          "is_archived": false,
+          "color": "fbca04",
+          "description": "Needs a closer look.",
+          "url": "https://gitea.example.test/api/v1/repos/acme/infra/labels/1"
+        }
+      ],
+      "milestone": null,
+      "assignee": null,
+      "assignees": null,
+      "state": "open",
+      "is_locked": false,
+      "comments": 2,
+      "created_at": "2026-10-04T14:20:42Z",
+      "updated_at": "2026-10-04T14:20:43Z",
+      "closed_at": null,
+      "due_date": null,
+      "pull_request": null,
+      "repository": {
+        "id": 3,
+        "name": "infra",
+        "owner": "acme",
+        "full_name": "acme/infra"
+      },
+      "pin_order": 0
+    },
+    [
+      {
+        "id": 16,
+        "html_url": "https://gitea.example.test/acme/infra/issues/3#issuecomment-16",
+        "pull_request_url": "",
+        "issue_url": "https://gitea.example.test/acme/infra/issues/3",
+        "user": {
+          "id": 1,
+          "login": "kube-agents",
+          "full_name": "",
+          "email": "kube-agents@noreply.gitea.example.test",
+          "avatar_url": "https://gitea.example.test/avatars/a4278dd55a17b2a7c5c87e52eba6e386",
+          "html_url": "https://gitea.example.test/kube-agents",
+          "is_admin": false
+        },
+        "original_author": "",
+        "original_author_id": 0,
+        "body": "Investigating.",
+        "created_at": "2026-10-04T14:20:43Z",
+        "updated_at": "2026-10-04T14:20:43Z"
+      },
+      {
+        "id": 17,
+        "html_url": "https://gitea.example.test/acme/infra/issues/3#issuecomment-17",
+        "pull_request_url": "",
+        "issue_url": "https://gitea.example.test/acme/infra/issues/3",
+        "user": {
+          "id": 2,
+          "login": "reviewer",
+          "full_name": "",
+          "email": "reviewer@noreply.gitea.example.test",
+          "avatar_url": "https://gitea.example.test/avatars/f852808db5853b1dc466547f294f1560",
+          "html_url": "https://gitea.example.test/reviewer",
+          "is_admin": false
+        },
+        "original_author": "",
+        "original_author_id": 0,
+        "body": "Reviewer adds context.",
+        "created_at": "2026-10-04T14:20:43Z",
+        "updated_at": "2026-10-04T14:20:43Z"
+      }
+    ]
+  ]
+}

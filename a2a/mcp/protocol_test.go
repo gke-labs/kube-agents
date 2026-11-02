@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -273,5 +275,89 @@ func TestABatchIsBounded(t *testing.T) {
 	}
 	if grew := after.TotalAlloc - before.TotalAlloc; grew > 8<<20 {
 		t.Errorf("answering it allocated %d MiB; it must stop at the cap, not hold every member", grew>>20)
+	}
+}
+
+// A batch's answers are bounded in bytes as well as in number: 64 members
+// each answered with a large tool result get one small error, and the
+// answers are not all held before it is given.
+func TestABatchsAnswersAreBoundedInBytes(t *testing.T) {
+	const answerSize = 1 << 20
+	big := strings.Repeat("x", answerSize)
+	s := mustServer(t, Tool{
+		Definition: ToolDefinition{Name: "big"},
+		Call:       func(context.Context, json.RawMessage) (string, error) { return big, nil },
+	})
+	member := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"big"}}`
+	batch := "[" + strings.TrimSuffix(strings.Repeat(member+",", maxBatchFrames), ",") + "]"
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	raw := s.HandleJSONRPC(context.Background(), []byte(batch))
+	runtime.ReadMemStats(&after)
+
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("answer is not one JSON object (%d bytes)", len(raw))
+	}
+	e, _ := out["error"].(map[string]any)
+	if e == nil || e["code"] != float64(rpcErrInvalidRequest) || e["message"] != fmt.Sprintf(msgBatchTooLarge, maxBatchResponseBytes) {
+		t.Errorf("a batch of %d 1 MiB answers = %.200s, want one invalid-request error naming the budget", maxBatchFrames, raw)
+	}
+	if grew, held := after.TotalAlloc-before.TotalAlloc, uint64(maxBatchFrames*answerSize*3); grew > held/3 {
+		t.Errorf("answering it allocated %d MiB; it must stop at the budget, not hold every answer (%d MiB)", grew>>20, held>>20)
+	}
+}
+
+// A batch inside the budget is answered as it always was: the members'
+// answers, in order, as one array, byte for byte.
+func TestABatchInsideTheBudgetIsAnsweredAsBefore(t *testing.T) {
+	s := mustServer(t, echoTool("echo"))
+	members := []string{
+		`{"jsonrpc":"2.0","id":1,"method":"ping"}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":"two","method":"tools/call","params":{"name":"echo","arguments":{"a":"<b>"}}}`,
+		`7`,
+	}
+	var want []json.RawMessage
+	for _, m := range members {
+		if a := s.HandleJSONRPC(context.Background(), []byte(m)); a != nil {
+			want = append(want, a)
+		}
+	}
+	wantRaw, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := s.HandleJSONRPC(context.Background(), []byte("["+strings.Join(members, ",")+"]"))
+	if string(got) != string(wantRaw) {
+		t.Errorf("batch answer =\n  %s\nwant\n  %s", got, wantRaw)
+	}
+	var gotV, wantV any
+	if err := json.Unmarshal(got, &gotV); err != nil {
+		t.Fatalf("batch answer is not JSON: %s", got)
+	}
+	_ = json.Unmarshal(wantRaw, &wantV)
+	if !reflect.DeepEqual(gotV, wantV) {
+		t.Errorf("batch answer = %v, want %v", gotV, wantV)
+	}
+}
+
+// Nothing but whitespace may follow a batch's closing bracket.
+func TestTrailingDataAfterABatchIsAParseError(t *testing.T) {
+	s := mustServer(t)
+	const batch = `[{"jsonrpc":"2.0","id":1,"method":"ping"}]`
+	for _, tail := range []string{"]", "}", "x", "7", `{"jsonrpc":"2.0","id":2,"method":"ping"}`} {
+		out := rpc(t, s, batch+tail)
+		if e, _ := out["error"].(map[string]any); e == nil || e["code"] != float64(rpcErrParseError) {
+			t.Errorf("a batch followed by %q = %v, want a parse error", tail, out)
+		}
+	}
+	for _, tail := range []string{"", " ", "\n\t "} {
+		var answers []map[string]any
+		if err := json.Unmarshal(s.HandleJSONRPC(context.Background(), []byte(batch+tail)), &answers); err != nil || len(answers) != 1 {
+			t.Errorf("a batch followed by %q: %v, err %v; want ping's answer", tail, answers, err)
+		}
 	}
 }

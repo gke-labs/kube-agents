@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
-  "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, confirms every object in the role's `probes` list is present, and only then writes that role's kubeconfig. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own set, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'. One sanctioned exception, which discovers by these same labels and the trailing -<slot> name rule: hack/ci-eval-pr.sh section 3b reuses the slot-c cluster as the gpu-stress-test log-fixture subject -- it mutates nothing in-cluster, writes only project-level Cloud Logging entries that name the cluster, and falls back to a per-run cluster when slot c is absent, not RUNNING, or its default namespace is not empty. hack/fleet-fixture-state.py discovers nothing: it reads the slot's cluster name and location back out of the `.fleet-context` file the runner wrote, for the `cluster` state subjects below.",
+  "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, confirms every object in the role's `probes` list is present, and only then writes that role's kubeconfig. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own set, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'. One sanctioned exception, which discovers by these same labels and the trailing -<slot> name rule: hack/ci-eval-pr.sh section 3b reuses the slot-c cluster as the gpu-stress-test log-fixture subject -- it mutates nothing in-cluster, writes only project-level Cloud Logging entries that name the cluster, and falls back to a per-run cluster when slot c is absent, not RUNNING, or its default namespace is not empty. hack/fleet-fixture-state.py discovers nothing: it reads the slot's cluster name and location back out of the `.fleet-context` file the runner wrote, for the `cluster` state subjects below. kube_agents_bench.scope_exclude reads the same file, for a case that declares `scope_exclude:`, to name a slot's cluster in the install's spec.scope.exclude.clusters for that case's repetitions; it discovers nothing either.",
   "probe_syntax": "Each probe is `<kind>/<name>` or `<kind>?<label-selector>`, read against the role's `namespace` when it has one. A role's namespace is probed implicitly. A probe is the runner's promise that the object was THERE before the agent ran, and it is the only thing that entitles a check to call the same object's later absence a violation rather than an environment that was never ready -- so every subject a task.yaml asserts on must appear here, which bench/tests/test_fleet_verifier.py enforces in both directions. A role with an empty list confirms nothing, and its checks can never blame the run for an absence.",
-  "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]`, `[?(@.key=='value')]` or `[\"quoted.key\"]` steps, the last for a label or selector key the bare form cannot carry (`metadata.labels[\"pod-security.kubernetes.io/enforce-version\"]`); `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default), or `node_cpu_spare_ge` (a `node?<selector>` subject with no path: at least one node matches and every matched node keeps at least `value` millicores of allocatable CPU unrequested by the pods bound to it, counted the way the scheduler counts a pod, the larger of its containers' sum with restartable init containers and its biggest ordinary init container, plus pod overhead, Succeeded and Failed pods excluded; a matched node not yet reporting allocatable leaves the role not checked); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit does not run this pass and never acts on a drift; a scheduled scan of every pool project from the CI health bot is the follow-up on #1550. A role with an empty list asserts nothing beyond presence. A `value` may be an object or an empty object; it is compared whole and structurally (key order does not matter), so an `emptyDir` with no fields is `{}`. One key of a label or selector map is asserted through the quoted step, not by comparing the whole map, so a key another owner adds is not drift.",
+  "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]`, `[?(@.key=='value')]` or `[\"quoted.key\"]` steps, the last for a label or selector key the bare form cannot carry (`metadata.labels[\"pod-security.kubernetes.io/enforce-version\"]`); `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), `age_hours_ge` (an RFC 3339 timestamp at least `value` hours in the past; an unparseable one fails), `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default), `not_ahead_of_channel` (cluster subject only, no value: the version is in the cluster's own release channel's `validVersions` in get-server-config, or that list has a newer patch of the same minor, or a newer version when it carries none of that minor; an unrecognised version string fails), or `node_cpu_spare_ge` (a `node?<selector>` subject with no path: at least one node matches and every matched node keeps at least `value` millicores of allocatable CPU unrequested by the pods bound to it, counted the way the scheduler counts a pod, the larger of its containers' sum with restartable init containers and its biggest ordinary init container, plus pod overhead, Succeeded and Failed pods excluded; a matched node not yet reporting allocatable leaves the role not checked); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit does not run this pass and never acts on a drift; a scheduled scan of every pool project from the CI health bot is the follow-up on #1550. A role with an empty list asserts nothing beyond presence. A `value` may be an object or an empty object; it is compared whole and structurally (key order does not matter), so an `emptyDir` with no fields is `{}`. One key of a label or selector map is asserted through the quoted step, not by comparing the whole map, so a key another owner adds is not drift.",
   "cluster_slots": {
-    "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, and the default pool's own headroom.",
-    "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects.",
-    "c": "The consistency outlier: no master authorized networks.",
-    "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture."
+    "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, and the default pool's own headroom. Labelled `upgrade-family=seeded-regular`, the rollout family it shares with slots c and d.",
+    "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects. Labelled `upgrade-family=seeded-held`: a rollout family of its own, so the regular family's rollout never waits on the lag.",
+    "c": "The consistency outlier: no master authorized networks. Labelled `upgrade-family=seeded-regular`.",
+    "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture. Labelled `upgrade-family=seeded-regular`."
   },
   "roles": {
     "crashloop-workload": {
@@ -174,7 +174,13 @@
           "path": "currentMasterVersion",
           "op": "minor_behind_channel_default",
           "value": 1,
-          "why": "the defect itself. GKE upgrading the master -- reconciles lapsing past the exclusion window, or the held minor reaching end of life -- heals it, and upgrades-lagging-master-probe going red (in the nightly since 2026-10-16, #3269) is otherwise the first anyone hears of it"
+          "why": "the defect itself. GKE upgrading the master -- reconciles lapsing past the exclusion window, or the held minor reaching end of life -- heals it, and upgrades-lagging-master-probe going red is otherwise the first anyone hears of it"
+        },
+        {
+          "subject": "cluster",
+          "path": "currentMasterVersion",
+          "op": "not_ahead_of_channel",
+          "why": "the lag has to be one the channel shows. seeded-b ran 1.34.12-gke.1011000, a RAPID patch newer than both 1.34 patches REGULAR carried, from its creation until 2026-10-16: one minor behind the default until REGULAR rolled on 10-13, so the assertion above passed, and on 10-15 agents compared it with REGULAR's 1.34 patches, called it current or ahead of its channel, and failed upgrades-lagging-master-probe (#3025, #3269). A patch REGULAR has moved past is not this; the upgrades cases that read seeded-b off REGULAR's roster need one. A re-apply does not clear it: seeded_b_pin.py holds an ahead patch, because GKE refuses a minor upgrade from one, until REGULAR ships a newer patch of that minor; sooner, re-create seeded-b (bench/tf/fleet/README.md)"
         },
         {
           "subject": "cluster",
@@ -195,7 +201,7 @@
       "cluster_slot": "c",
       "namespace": null,
       "probes": [],
-      "fixture": "master authorized networks absent where both cohort peers have it on",
+      "fixture": "master authorized networks absent where the cohort peers on slots a, b and d have it on",
       "state": [
         {
           "subject": "cluster",
@@ -203,6 +209,79 @@
           "op": "none_eq",
           "value": true,
           "why": "the outlier facet. Anyone enabling authorized networks on slot c gives the drift cohort a 3/3 agreement and consistency-authorized-networks-probe nothing to find"
+        },
+        {
+          "subject": "cluster",
+          "path": "createTime",
+          "op": "age_hours_ge",
+          "value": 24,
+          "why": "the drift SOP leaves a cluster under 24 hours old out of every cohort (fleet_consistency_drift_sop.md section 1). A replaced seeded-c sits out its own audit for a day, so no finding is filed against it and consistency-drift-outlier fails every repetition until the cluster is a day old. Clears itself; no re-apply helps. A replaced peer on a, b or d does not do this: seeded-c stays outvoted 2/3 by the other two and the finding stands at minor, which is why only this slot's age is asserted"
+        }
+      ]
+    },
+    "drift-peer-a": {
+      "cluster_slot": "a",
+      "namespace": null,
+      "probes": [],
+      "fixture": "not a defect: master authorized networks on with the open-for-eval block, one of the majority drift-outlier is outvoted by",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "masterAuthorizedNetworksConfig.enabled",
+          "op": "eq",
+          "value": true,
+          "why": "the drift SOP reads authorized-networks ON only when this is true and cidrBlocks is non-empty, and builds a baseline only when 2/3 of the cohort agree. With seeded-a OFF the vote is 2/4: no baseline and no finding against seeded-c (on a project without seeded-d the baseline flips to OFF at 2/3, and the collector never flags ON against an OFF majority, so there is no finding anywhere), and consistency-drift-outlier fails every repetition. fleet_reconcile.py's daily re-apply restores the block; this says so the hour it goes"
+        },
+        {
+          "subject": "cluster",
+          "path": "masterAuthorizedNetworksConfig.cidrBlocks[*].displayName",
+          "op": "any_eq",
+          "value": "open-for-eval",
+          "why": "stands in for the other half of the SOP's ON, a non-empty cidrBlocks, by naming the one block bench/tf/fleet/main.tf plants (open-for-eval, 0.0.0.0/0). Without any block the facet reads OFF even with enabled true, with the same 2/4 vote as above. A renamed or replaced block reads as drift here too, though the SOP would still read ON; the re-apply puts it back"
+        }
+      ]
+    },
+    "drift-peer-b": {
+      "cluster_slot": "b",
+      "namespace": null,
+      "probes": [],
+      "fixture": "not a defect: master authorized networks on with the open-for-eval block, one of the majority drift-outlier is outvoted by",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "masterAuthorizedNetworksConfig.enabled",
+          "op": "eq",
+          "value": true,
+          "why": "the drift SOP reads authorized-networks ON only when this is true and cidrBlocks is non-empty, and builds a baseline only when 2/3 of the cohort agree. With seeded-b OFF the vote is 2/4: no baseline and no finding against seeded-c (on a project without seeded-d the baseline flips to OFF at 2/3, and the collector never flags ON against an OFF majority, so there is no finding anywhere), and consistency-drift-outlier fails every repetition. fleet_reconcile.py's daily re-apply restores the block; this says so the hour it goes"
+        },
+        {
+          "subject": "cluster",
+          "path": "masterAuthorizedNetworksConfig.cidrBlocks[*].displayName",
+          "op": "any_eq",
+          "value": "open-for-eval",
+          "why": "stands in for the other half of the SOP's ON, a non-empty cidrBlocks, by naming the one block bench/tf/fleet/main.tf plants (open-for-eval, 0.0.0.0/0). Without any block the facet reads OFF even with enabled true, with the same 2/4 vote as above. A renamed or replaced block reads as drift here too, though the SOP would still read ON; the re-apply puts it back"
+        }
+      ]
+    },
+    "drift-peer-d": {
+      "cluster_slot": "d",
+      "namespace": null,
+      "probes": [],
+      "fixture": "not a defect: master authorized networks on with the open-for-eval block, one of the majority drift-outlier is outvoted by",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "masterAuthorizedNetworksConfig.enabled",
+          "op": "eq",
+          "value": true,
+          "why": "the drift SOP reads authorized-networks ON only when this is true and cidrBlocks is non-empty, and builds a baseline only when 2/3 of the cohort agree. With seeded-d OFF the vote is 2/4: no baseline and no finding against seeded-c, and consistency-drift-outlier fails every repetition. fleet_reconcile.py's daily re-apply restores the block; this says so the hour it goes"
+        },
+        {
+          "subject": "cluster",
+          "path": "masterAuthorizedNetworksConfig.cidrBlocks[*].displayName",
+          "op": "any_eq",
+          "value": "open-for-eval",
+          "why": "stands in for the other half of the SOP's ON, a non-empty cidrBlocks, by naming the one block bench/tf/fleet/main.tf plants (open-for-eval, 0.0.0.0/0). Without any block the facet reads OFF even with enabled true, with the same 2/4 vote as above. A renamed or replaced block reads as drift here too, though the SOP would still read ON; the re-apply puts it back"
         }
       ]
     },
@@ -358,7 +437,7 @@
       "cluster_slot": "b",
       "namespace": null,
       "probes": ["node?cloud.google.com/gke-nodepool=default-pool"],
-      "fixture": "drain-timeout-<prefix>-b backend service on the default pool's instance group with connectionDraining.drainingTimeoutSec 3600, six times GKE's 600-second per-node deregistration wait, behind a TCP health check and no forwarding rule, so it routes nothing. The backend service is a Compute Engine object the probe and state grammars cannot address (kubectl kinds and the cluster record only), so the role probes the pool's node and asserts the pool; the readiness report's lb-connection-draining rule is what reads the service, and its case grades that line",
+      "fixture": "drain-timeout-<prefix>-b backend service on the default pool's instance group with connectionDraining.drainingTimeoutSec 720, a fifth over GKE's 600-second per-node deregistration wait and under the 30 minutes after which GKE fails the node step, behind a TCP health check and no forwarding rule, so it routes nothing. The backend service is a Compute Engine object the probe and state grammars cannot address (kubectl kinds and the cluster record only), so the role probes the pool's node and asserts the pool; the readiness report's lb-connection-draining rule is what reads the service, and its case grades that line",
       "state": [
         {
           "subject": "cluster",
@@ -442,7 +521,10 @@
     "zonal-skew-capacity": {
       "cluster_slot": "d",
       "namespace": "seeded-topology",
-      "probes": ["deployment/capacity-starved-worker"],
+      "probes": [
+        "deployment/capacity-starved-worker",
+        "deployment/first-zone-sponge"
+      ],
       "fixture": "capacity-starved-worker Deployment, four replicas at 120m CPU each against two e2-small nodes, so some pods run and the rest stay Pending with an insufficient-cpu event",
       "state": [
         {
@@ -977,6 +1059,53 @@
           "op": "eq",
           "value": "nvidia-l4",
           "why": "the accelerator selector is what ties the image to a node image's driver; without it the pin is just an image"
+        }
+      ]
+    },
+    "scaled-zero-gateway": {
+      "cluster_slot": "a",
+      "namespace": "seeded-scaled-zero",
+      "probes": [
+        "deployment/storefront",
+        "deployment/envoy-seeded-scaled-zero-storefront-edge",
+        "service/storefront",
+        "gateway/storefront-edge",
+        "httproute/storefront"
+      ],
+      "fixture": "A switched-off environment behind an in-cluster gateway: Deployment storefront and the Gateway's proxy Deployment both at replicas 0, Service storefront, Gateway storefront-edge (GatewayClass seeded-envoy) and HTTPRoute storefront. No controller runs; the class names Envoy Gateway's controller, the proxy carries Envoy Gateway's labels, and the status is the one Envoy Gateway v1.9.2 wrote for this shape (Programmed=False, NoResources), written by gateway_status.py",
+      "state": [
+        {
+          "subject": "deployment/storefront",
+          "path": "spec.replicas",
+          "op": "eq",
+          "value": 0,
+          "why": "the environment is switched off on purpose; a scaled-up backend is a running environment, and the case's silence then proves nothing about a deliberate scale to zero"
+        },
+        {
+          "subject": "deployment/envoy-seeded-scaled-zero-storefront-edge",
+          "path": "spec.replicas",
+          "op": "eq",
+          "value": 0,
+          "why": "the proxy at zero is what makes the Gateway switched off; the stall rule finds it by these labels through the GatewayClass controllerName"
+        },
+        {
+          "subject": "gateway/storefront-edge",
+          "path": "status.conditions[?(@.type=='Programmed')].reason",
+          "op": "any_eq",
+          "value": "NoResources",
+          "why": "the signal main reports as a stale condition; a Gateway with the CRD's default Pending status (re-created, status not rewritten) is a different stall, and the case would grade the wrong thing"
+        },
+        {
+          "subject": "pod?app=storefront",
+          "path": null,
+          "op": "absent",
+          "why": "the backend runs nothing; a storefront pod means the environment was scaled up"
+        },
+        {
+          "subject": "pod?app.kubernetes.io/name=envoy",
+          "path": null,
+          "op": "absent",
+          "why": "the proxy runs nothing; an envoy pod means the gateway was scaled up and its Programmed=False no longer matches the cluster"
         }
       ]
     }

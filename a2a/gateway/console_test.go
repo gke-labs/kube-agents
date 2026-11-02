@@ -278,6 +278,27 @@ func TestConsoleTerminalArrivesAsAResultFrame(t *testing.T) {
 	}
 }
 
+// cardsPending is spelled on the wire only when set.
+func TestConsoleTerminalSpellsCardsPendingOnlyWhenSet(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-9.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	if err := r.adapter.PostTerminal("console:tab-9", ConsoleTerminal{TaskID: "task-4", Addressee: "platform", State: lib.StateCompleted, Text: "ack", CardsPending: true}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := sub.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"messageId":"r-task-4-completed","text":"ack","kind":"result","state":"completed","addressee":"platform","taskId":"task-4","cardsPending":true}`
+	if string(msg.Data) != want {
+		t.Errorf("frame = %s, want %s", msg.Data, want)
+	}
+}
+
 // A terminal past consoleResultTextCap is cut to fit under the server's
 // max_payload, says so, and stays valid UTF-8 where the cut lands inside a
 // multi-byte rune.
@@ -335,6 +356,42 @@ func TestConsoleTerminalFitsUnderMaxPayloadAfterEscaping(t *testing.T) {
 	}
 }
 
+// A notify frame's wire spelling is pinned (the MCP server and the page read
+// it): kind notify, the turn it answers, a minted n- id, and an edit that
+// repeats the id it names.
+func TestConsoleNotifyArrivesAsANotifyFrame(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-8.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	id, err := r.adapter.PostNotifyFrame("console:tab-8", "", "the report", "task-7", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(id, consoleNotifyIDPrefix) {
+		t.Errorf("minted id %q lacks the %q prefix", id, consoleNotifyIDPrefix)
+	}
+	if _, err := r.adapter.PostNotifyFrame("console:tab-8", id, "the report, updated", "task-7", true); err != nil {
+		t.Fatal(err)
+	}
+	var raw []string
+	for len(raw) < 2 {
+		msg, err := sub.NextMsg(5 * time.Second)
+		if err != nil {
+			t.Fatalf("after %d frames: %v", len(raw), err)
+		}
+		raw = append(raw, string(msg.Data))
+	}
+	if want := `{"messageId":"` + id + `","text":"the report","kind":"notify","replyTo":"task-7"}`; raw[0] != want {
+		t.Errorf("notify frame = %s, want %s", raw[0], want)
+	}
+	if want := `{"messageId":"` + id + `","text":"the report, updated","edit":true,"kind":"notify","replyTo":"task-7"}`; raw[1] != want {
+		t.Errorf("edit frame = %s, want %s", raw[1], want)
+	}
+}
+
 // Notice ids carry a per-adapter random component, so a restarted gateway's
 // first notice is not c-1 again and a page holding the last boot's c-1 does
 // not take the new one's edits as its own.
@@ -362,11 +419,10 @@ func TestConsoleNoticeIDsDifferAcrossAdapters(t *testing.T) {
 	}
 }
 
-// TestConsoleRunClosesTheConnectionOnCtxCancellation guards Close's doc
-// comment: Run is documented to close the connection itself once ctx is
-// cancelled, so a caller that trusts that and skips an explicit Close does
-// not leak the connection.
-func TestConsoleRunClosesTheConnectionOnCtxCancellation(t *testing.T) {
+// TestConsoleRunLeavesTheConnectionOpenOnCtxCancellation guards Close's doc
+// comment: a cancelled Run stops ingress and leaves the connection open for
+// the relay's stop drain to post on, and Close is what closes it.
+func TestConsoleRunLeavesTheConnectionOpenOnCtxCancellation(t *testing.T) {
 	s := startServer(t)
 	a, err := NewConsoleAdapter(s.ClientURL(), nil, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
 	if err != nil {
@@ -388,8 +444,15 @@ func TestConsoleRunClosesTheConnectionOnCtxCancellation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after ctx cancellation")
 	}
+	if a.closed() {
+		t.Fatal("Run closed the connection on a stop; the relay's drain could no longer post")
+	}
+	if _, err := a.Post("console:tab-1", "after the stop"); err != nil {
+		t.Errorf("Post after the stop: %v", err)
+	}
+	a.Close()
 	if !a.closed() {
-		t.Error("Run returned without closing the connection")
+		t.Error("Close left the connection open")
 	}
 }
 
@@ -715,5 +778,30 @@ func TestConsoleRunReturnsWhenTheConnectionIsClosedForGood(t *testing.T) {
 	}
 	if got := logs.String(); !strings.Contains(got, "closed for good") {
 		t.Errorf("a terminal close was not logged as terminal:\n%s", got)
+	}
+}
+
+// A notify frame cut to fit says the report was cut, not that the full text
+// is a task's result on the bus: a card's report is not on TASKS.
+func TestAConsoleNotifyFrameCutSaysTheReportWasCut(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-11.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	if _, err := r.adapter.PostNotifyFrame("console:tab-11", "", strings.Repeat("<", consoleResultTextCap), "task-1", false); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := sub.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f ConsoleOutFrame
+	if err := json.Unmarshal(msg.Data, &f); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(f.Text, consoleNotifyCutNote) || strings.HasSuffix(f.Text, consoleResultCutNote) {
+		t.Errorf("cut notify text ends %q, want the notify note", f.Text[len(f.Text)-80:])
 	}
 }

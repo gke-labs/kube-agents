@@ -53,6 +53,22 @@ const (
 	// grants name. Required: see authcallout.ParseReservedAddressees.
 	envReservedAddressees = "A2A_RESERVED_ADDRESSEES"
 
+	// envTaskSigningKeys carries the task-signing public keys, comma
+	// separated, which the operator renders from the task-signing Secret it
+	// generates beside the callout keys. Optional: see
+	// authcallout.ParseTaskSigningKeys.
+	envTaskSigningKeys = "A2A_TASK_SIGNING_PUBLIC_KEYS"
+
+	// envTaskCredentialMaxLifetime is the furthest out a task credential's
+	// expiry may be, as a Go duration. #4121's operator will render it with
+	// time.Duration.String ("6h0m0s" by default, 60s to 21600s) from the
+	// PlatformAgent's spec.harness.tuning.profiles.maxTaskDeadlineSeconds,
+	// the same value it will clamp profile deadlines to; this PR's operator
+	// doesn't set it. Optional; unset means the callout's 6h default, which
+	// matches #4121's. See
+	// authcallout.Config.TaskCredentialMaxLifetime.
+	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+
 	defaultAuthMapKey  = "identities.json"
 	defaultStatusAddr  = ":8080"
 	defaultMapWait     = 60 * time.Second
@@ -139,6 +155,24 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("%s: %w", envReservedAddressees, err)
 	}
 
+	// The task-signing public keys. Unset is not a refusal, unlike the two
+	// above: without a key no task connection is honoured, which narrows a
+	// worker rather than widening anyone. A malformed one is, so a render
+	// bug surfaces here rather than as every task connection refused.
+	taskKeys, err := authcallout.ParseTaskSigningKeys(os.Getenv(envTaskSigningKeys))
+	if err != nil {
+		return fmt.Errorf("%s: %w", envTaskSigningKeys, err)
+	}
+
+	// The task credential lifetime. Unlike the variables above, a bad value
+	// does not stop startup: it refuses every task credential and nothing
+	// else (authcallout.Config.TaskCredentialMaxLifetimeInvalid says why),
+	// so the error is logged and handed on rather than returned.
+	taskMaxLifetime, taskLifetimeErr := authcallout.ParseTaskCredentialMaxLifetime(os.Getenv(envTaskCredentialMaxLifetime))
+	if taskLifetimeErr != nil {
+		log.Error("the task credential lifetime is unusable; task credentials will be refused", "error", taskLifetimeErr)
+	}
+
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)
@@ -169,6 +203,10 @@ func run(log *slog.Logger) error {
 		GrantTTL:           grantTTL,
 		ReservedPrincipals: reserved,
 		ReservedAddressees: reservedAddressees,
+		TaskSigningKeys:    taskKeys,
+
+		TaskCredentialMaxLifetime:        taskMaxLifetime,
+		TaskCredentialMaxLifetimeInvalid: taskLifetimeErr,
 	}, log)
 	if err != nil {
 		return err

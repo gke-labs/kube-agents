@@ -18,7 +18,8 @@
 # 2092638061140643840, project kube-agents-evals-3), every exact check green.
 # The other audit domains are covered by snappy probes instead (a full audit
 # costs 600-1300s each, which six domains cannot spend in one presubmit); the
-# other full audits are recast to the nightly tier. This is why the task
+# other full audits are recast to the nightly tier (consistency's is back on
+# the roster since 2026-10-26, consistency-drift-outlier). This is why the task
 # carries the `fleet-audits` domain rather than `security`: what it uniquely
 # covers in presubmit is the machinery, while the planted over-grant itself is
 # probed by security-overgrant-probe. It was held by A1, A4 and A5

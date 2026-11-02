@@ -95,6 +95,11 @@ func WithSideDoors(primary Adapter, doors []DoorSpec, log *slog.Logger) Adapter 
 	return &sideDoorAdapter{primary: primary, doors: doors, log: log}
 }
 
+// Close closes the chat adapters behind the doors (closeAdapter).
+func (s *sideDoorAdapter) Close() {
+	closeAdapter(s.primary)
+}
+
 // doorFor reports which door a conversation belongs to, or nil. The prefix
 // is the whole test, and it is why every door's keys are qualified: see
 // injectConversationKey and a2aConversationKey.
@@ -395,6 +400,15 @@ func (s *sideDoorAdapter) SetHome(admits HomeAdmits, board BoardReader) {
 	}
 }
 
+// SetBoardActor hands the board-health card's Retry and Drop route to the
+// primary, the half that draws the card; implemented unconditionally for the
+// same reason as SetProbe.
+func (s *sideDoorAdapter) SetBoardActor(actor BoardActor) {
+	if sink, ok := s.primary.(BoardActSink); ok {
+		sink.SetBoardActor(actor)
+	}
+}
+
 // SetSessionLookup hands the gateway's session lookup, and the idle TTL it
 // is bounded by, to the primary, which is the half that wants them (the
 // Slack adapter's session-thread rule; the door keys every conversation
@@ -404,5 +418,13 @@ func (s *sideDoorAdapter) SetHome(admits HomeAdmits, board BoardReader) {
 func (s *sideDoorAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	if sink, ok := s.primary.(SessionLookupSink); ok {
 		sink.SetSessionLookup(lookup, idleTTL)
+	}
+}
+
+// SetFeedbackRecorder hands the answer-feedback recorder to the primary, the
+// chat half that draws rating controls; a door's callers are programs.
+func (s *sideDoorAdapter) SetFeedbackRecorder(r FeedbackRecorder) {
+	if sink, ok := s.primary.(FeedbackSink); ok {
+		sink.SetFeedbackRecorder(r)
 	}
 }

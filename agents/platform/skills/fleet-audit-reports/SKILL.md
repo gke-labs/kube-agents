@@ -23,8 +23,10 @@ to uses `no_forge/local`:
 An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
 `wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_still_open`, `prs_closed`, `silent_ok`,
-`ledger_held_open`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
-`document`, and sometimes `ledger_document`, `silent_floor`, `inspect_s`, `publish_s` and `collect_s`.
+`ledger_held_open`, `scheduled`, `scheduled_coverage_gaps`, `scheduled_published_ids`, `scheduled_reported_under_gap`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
+`document`, and sometimes `ledger_document`, `reported_under_gap`, `silent_floor`, `inspect_s`, `publish_s` and `collect_s`.
+The `scheduled_*` keys record the last scheduled run, not this run: an on-demand run copies them
+forward.
 
 - `document` is this run's whole validated findings document — un-clipped, so it holds findings the
   issue body had no room to print.
@@ -54,7 +56,8 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
   request, so this run's
   `silent_ok` was kept `false` and its counts may be measured against that `finish`.
 - `current_ids` is exactly what the body's hidden block published: the findings the body named, in
-  full or on one line, plus the ids the collector held. Derive this run's full set from `document`.
+  full or on one line, the ids the collector held, and the ids under _Not re-checked this run_
+  (previous findings on a target the run did not check). Derive this run's full set from `document`.
 - `inspect_s`, `publish_s` and `collect_s` are seconds: from `start` to `finish`, for `finish` to
   publish, and for the collector to run. An envelope has only the ones `finish` could measure.
   `show` gives them, with null for the others; `streams` does not carry them.

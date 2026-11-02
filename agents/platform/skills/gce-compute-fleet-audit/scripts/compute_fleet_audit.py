@@ -101,16 +101,17 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import functools
 import hashlib
 import json
 import os
 import re
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Callable
 
 AUDIT_ID = "gce-compute-fleet-audit"
 
@@ -126,18 +127,14 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 ]
 
 DEFAULT_TIMEOUT_S = 60
-# The return code `timeout(1)` uses, recorded for a read that ran out of time.
-TIMEOUT_RC = 124
-# How many projects this audit reads at once. Each is a run of gcloud compute
-# reads through the credential proxy, which admits four requests at once under
-# its child memory budget at the operator's default 1Gi limit
-# (docs/designs/credential-proxy-child-memory-budget.md §2.2). A wider pool only
-# queues the rest at the proxy, where a read still waiting at its 60 s admission
-# bound is refused busy, or hits DEFAULT_TIMEOUT_S here first and reads its
-# project as gate-failed -- the SOP's cue to re-read it by hand through the same
-# proxy. So the pool is the admitted count, as the fleet-audit collectors and
-# stall_watch.py's and cluster_agent_reconcile.py's listing pools are.
-MAX_WORKERS = 4
+# How many projects this audit reads at once: broker_admission.sweep_width(),
+# resolved in collect_fleet. Each project is a run of gcloud compute reads
+# through the credential broker, and a pool wider than the broker admits only
+# queues the rest, where a read still waiting at its 60 s admission bound is
+# refused busy, or hits DEFAULT_TIMEOUT_S here first and reads its project as
+# gate-failed -- the SOP's cue to re-read it by hand through the same broker.
+# The fleet-audit collectors resolve the same width (collect.py has the
+# reasoning).
 # `audit_report.validate_check_command`'s ceiling, restated rather than
 # imported because this script ships standalone. An over-length `command` is
 # not a clipped field: `finish` refuses the whole document, so a project with
@@ -202,6 +199,8 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -489,49 +488,13 @@ def log(msg: str) -> None:
     print(f"[compute_fleet_audit] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    """One subprocess's outcome, in the shape the manifest records it — the
-    same shape `collect.py`'s and `networking_audit.py`'s `Run` use, kept as a
-    separate definition because this script ships standalone."""
-
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+TIMEOUT_RC = collector_run.TIMEOUT_RC
+run_and_gate = collector_run.run_and_gate
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
-
-
-def _text(value: object) -> str:
-    return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value or "")
-
-
-def default_run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        # On Linux the partial buffers come back as bytes whatever `text=` says,
-        # as the fleet-audit collectors' `_text()` helpers note.
-        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
-    except Exception as exc:  # gcloud missing, permission denied on exec, etc.
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
-
-
-def run_and_gate(argv: list[str], *, run: RunFn = default_run) -> tuple[object | None, Run]:
-    """One `gcloud` call behind a fail-closed gate — non-zero exit, empty
-    output, or non-JSON output all gate closed (a truncated result must
-    never read as "nothing here")."""
-    result = run(argv)
-    if result.rc != 0 or not result.stdout.strip():
-        return None, result
-    try:
-        return json.loads(result.stdout), result
-    except json.JSONDecodeError:
-        return None, result
 
 
 class ComputeApiDisabled(Exception):
@@ -1526,8 +1489,9 @@ def collect_fleet(
     project: str | None = None,
     *,
     run: RunFn = default_run,
-    max_workers: int = MAX_WORKERS,
+    max_workers: int | None = None,
 ) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     notes: list[str] = []
     projects = get_target_projects(project, notes, run=run)

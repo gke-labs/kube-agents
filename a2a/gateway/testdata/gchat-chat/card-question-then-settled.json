@@ -1,0 +1,57 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*Which cluster?*",
+    "widgets": [
+      {
+        "buttonList": {
+          "buttons": [
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "seeded-a\n\n(Clicked on the question from card t_e0c1.)"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "0"
+                    }
+                  ]
+                }
+              },
+              "text": "seeded-a"
+            },
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "seeded-b\n\n(Clicked on the question from card t_e0c1.)"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "1"
+                    }
+                  ]
+                }
+              },
+              "text": "seeded-b"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "expected": 1,
+    "carrier": "notify",
+    "text": "*Which cluster?*",
+    "widgets": null
+  }
+]

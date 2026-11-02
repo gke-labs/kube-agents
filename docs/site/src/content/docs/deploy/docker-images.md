@@ -22,7 +22,9 @@ the same registry and tag, so an install at a release pulls them at that release
 install pulls them from the mirror. A `PlatformAgent`'s own `spec.deployment.image` does not move
 them;
 `A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE`, `A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE` and
-`A2A_CONSOLE_IMAGE` on the operator override one at a time. The Hermes bridge sidecar the
+`A2A_CONSOLE_IMAGE` on the operator override one at a time. `A2A_DISPATCHER_IMAGE` is
+different: the AgentProfile dispatcher's image is not in the release set yet, so nothing is
+derived for it, and with it unset the operator renders no dispatcher at all. The Hermes bridge sidecar the
 operator renders into the agent pod under `next` is built from the `platform-agent` image of the
 same commit, so the operator takes its registry and tag from the agent image instead, and
 `A2A_BRIDGE_IMAGE` on the operator overrides it. A `PlatformAgent` that declares its own
@@ -35,7 +37,7 @@ the copies itself, through the operator's environment
 The bases those images are built from are inventory entries too. `golang`, `node` and
 `distroless-static` in the build-time table below carry `a2a/Dockerfile.authcallout`,
 `a2a/Dockerfile.console`, `a2a/Dockerfile.gateway`, `a2a/Dockerfile.verifier`,
-`a2a/Dockerfile.worker` and `a2a/Dockerfile.hermes-bridge` alongside
+`a2a/Dockerfile.worker`, `a2a/Dockerfile.hermes-bridge` and `a2a/Dockerfile.web-console` alongside
 every other builder, so a build in a mirrored environment can resolve them like any other.
 
 Several images keep a second copy of their pin elsewhere in the tree — a chart value, a Dockerfile
@@ -66,6 +68,7 @@ Tagged with the release version; `:latest` on every push to `main`.
 | `a2a-console` | `ghcr.io/gke-labs/kube-agents/a2a-console` | release tag | `A2A_CONSOLE_IMAGE` | The console server Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. |
 | `a2a-verifier` | `ghcr.io/gke-labs/kube-agents/a2a-verifier` | release tag | `A2A_VERIFIER_IMAGE` | The capability verifier Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. It resolves the same way the gateway, the worker and the callout do. |
 | `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | `A2A_BRIDGE_IMAGE` | The hermes-bridge sidecar the operator renders beside the agent container under spec.mode: next, and nothing under spec.mode: today. The operator derives it from the agent image (registry and tag) unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's. |
+| `web-console` | `ghcr.io/gke-labs/kube-agents/web-console` | release tag | — | The web console Deployment the chart renders when webConsole.enabled is true, and nothing on a default install. The chart takes the tag from webConsole.image.tag, else the agent image's tag, else the chart's appVersion. |
 
 ### Pulled by an install, built elsewhere
 
@@ -95,10 +98,10 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | ----- | ------------------ | --- | -------- | --------- |
 | `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
 | `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.1` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
-| `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages. |
+| `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages. |
 | `node` | `docker.io/library/node` | `22-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage. |
 | `python` | `docker.io/library/python` | `3.14-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile. |
-| `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier and a2a/Dockerfile.console runtime stages. |
+| `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console and a2a/Dockerfile.console runtime stages. |
 | `busybox` | `docker.io/library/busybox` | `musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8` | — | agentplugins/*/Dockerfile base images. |
 
 <!-- prettier-ignore-end -->
@@ -106,13 +109,13 @@ Needed only to rebuild the images above from source, not to run an install. Each
 
 ## Published images
 
-Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each push to `main`, and when a merge lands on a `release/<X.Y>` branch whose commit has no images yet, tagged with the pushed commit's SHA; `:latest` follows `main` alone. A push to `main` also publishes `platform-agent`, `credential-proxy`, `replay-proxy`, `agent-sandbox`, `pubsub-platform` and `gke-stockout-investigator` — not `k8s-operator`, and not the four A2A `next`-stack images, which are published to GHCR alone — to a Google Artifact Registry repository through [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml), built there by Cloud Build. Production SemVer release tags (`X.Y.Z`) are promoted from the GHCR commit images without rebuilding — see [Release versioning](/kube-agents/deploy/release-versioning/).
+Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each push to `main`, and when a merge lands on a `release/<X.Y>` branch whose commit has no images yet, tagged with the pushed commit's SHA; `:latest` follows `main` alone. A push to `main` also publishes `platform-agent`, `credential-proxy`, `replay-proxy`, `agent-sandbox`, `pubsub-platform` and `gke-stockout-investigator` — not `k8s-operator`, and not the A2A `next`-stack images, which are published to GHCR alone (the [image inventory](#built-and-published-by-this-repo) above lists every first-party image) — to a Google Artifact Registry repository through [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml), built there by Cloud Build. Production SemVer release tags (`X.Y.Z`) are promoted from the GHCR commit images without rebuilding — see [Release versioning](/kube-agents/deploy/release-versioning/).
 
 ### `platform-agent`
 
 The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus three specialist profile templates: the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint; the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`; and the optional GKE Support Agent at `/opt/tse-template`, scaffolded into the `tse` profile at startup when `KUBE_AGENTS_ENABLED_PROFILES` contains `tse`.
 
-There is no cluster or forge tooling in this image, in any form, and a build guard fails if any reappears. The agent's shell runs in the `agent-sandbox` image. `kubectl` and `gcloud` there are credential-proxy shims — symlinks to a client that forwards a command to the broker holding the credential — and `helm`, `yq` and OpenTofu's `tofu` are native. The agent runs `tofu` for one subcommand, `fmt`: `tofu fmt -check -diff` to check the syntax of Terraform it writes for a pull request, then `tofu fmt` to apply the formatting. Its `git` holds no credential and reaches no forge, and there is no `gh`: repositories are fetched and changed through the version-control skill's verbs, which the broker serves. Agent-pod code that needs one of them reaches the sandbox over SSH through `agents/platform/scripts/sandbox_exec.py`, and the sandbox reaches the broker at the `<name>-credential-proxy` Service.
+There is no cluster or forge tooling in this image, in any form, and a build guard fails if any reappears. The agent's shell runs in the `agent-sandbox` image. `kubectl` and `gcloud` there are credential-proxy shims — symlinks to a client that forwards a command to the broker holding the credential — and `helm`, `yq`, `leeway`, and OpenTofu's `tofu` are native. The agent runs `tofu` for one subcommand, `fmt`: `tofu fmt -check -diff` to check the syntax of Terraform it writes for a pull request, then `tofu fmt` to apply the formatting. Its `git` holds no credential and reaches no forge, and there is no `gh`: repositories are fetched and changed through the version-control skill's verbs, which the broker serves. Agent-pod code that needs one of them reaches the sandbox over SSH through `agents/platform/scripts/sandbox_exec.py`, and the sandbox reaches the broker at the `<name>-credential-proxy` Service.
 
 What is installed is the debugging set the agent's own processes use: `curl`, `jq`, `dnsutils`, `iputils-ping`, `patch`, `wget`, `nano`, `vim`.
 
@@ -231,7 +234,7 @@ one for the images it does not.
 | --------------------------------- | ---------------------- | -------------------------------- | -------------------------- | -------------------- |
 | `install.sh`                      | `--registry-prefix`    | `--third-party-registry-prefix`  | leaves upstream registries | **yes**              |
 | Helm chart                        | `global.imageRegistry` | `global.thirdPartyImageRegistry` | leaves upstream registries | n/a                  |
-| Terraform `examples/full-install` | `image_registry`       | `third_party_image_registry`     | leaves upstream registries | **yes**              |
+| `terraform/examples/full-install` | `image_registry`       | `third_party_image_registry`     | leaves upstream registries | **yes**              |
 
 The rows are one path in three coats: `install.sh` generates the Terraform composition's
 `terraform.tfvars` from its flags, and the composition passes both values to the chart's

@@ -41,14 +41,7 @@ spec:
 
 ### Key Fields
 
-| Field             | Type              | Required | Purpose                                                                                                           |
-| ----------------- | ----------------- | -------- | ----------------------------------------------------------------------------------------------------------------- |
-| `agentRef`        | string            | Yes      | Target `PlatformAgent` instance name. Targeting is strictly opt-in; omitting `agentRef` will not match any agent. |
-| `image`           | string            | Yes      | OCI image reference containing plugin assets (skills, prompts, tools).                                            |
-| `imagePullPolicy` | string            | No       | Image pull policy for the OCI image volume. One of `Always`, `Never`, `IfNotPresent`. Default `IfNotPresent`.     |
-| `env`             | `[]corev1.EnvVar` | No       | Additional environment variables (including secret references) injected into the agent pod spec.                  |
-| `targetProfile`   | string            | No       | Install the plugin into a named Hermes profile (for example `platform`) instead of the default one.               |
-| `config`          | string            | No       | YAML configuration overrides merged into the target profile's Hermes `config.yaml`.                               |
+[AgentPlugin fields](/kube-agents/operator/agentplugin-fields/) lists every `spec` and `status` field with its type, default and constraints, generated from the Go API types. `agentRef` is required and names the one `PlatformAgent` the plugin reaches; a name that matches no `PlatformAgent` in the namespace leaves the plugin applied nowhere, reported as `AgentNotFound` below.
 
 ## Architecture & How It Works
 
@@ -70,6 +63,15 @@ spec:
 
 5. **Config Subtree Allowlisting**:
    `spec.config` overrides are restricted to the top-level subtrees `approvals`, `platforms`, and `platform_toolsets`. Any other key (such as `agent`, `leader_election`, or `logging`) is dropped and logged as an error by the operator. Within an allowlisted subtree, list values are unioned with the operator's own entries rather than replacing them. This is a scoping mechanism, not a sandbox — see the [AgentPlugin trust boundary](/kube-agents/reference/security-and-iam/#change-control--safety) for what it does and does not prevent.
+
+## Shipped plugins
+
+The plugins that ship in the repository live under [`agentplugins/`](https://github.com/gke-labs/kube-agents/tree/main/agentplugins), each a Helm chart that creates an `AgentPlugin` plus the OCI image it mounts:
+
+- [`pubsub-platform`](https://github.com/gke-labs/kube-agents/tree/main/agentplugins/pubsub-platform) — a Pub/Sub ingress adapter that pulls filtered Cloud Logging alerts from a subscription, deduplicates them, and turns what survives into agent work.
+- [`gke-stockout-investigator`](https://github.com/gke-labs/kube-agents/tree/main/agentplugins/gke-stockout-investigator) — a skill, installed into the `platform` profile, that diagnoses GKE scale-up failures and proposes a GitOps remediation pull request. Its alerts arrive through the adapter.
+
+`install.sh --enable-pubsub-platform --enable-stockout-investigator` (`enable_pubsub_platform` and `enable_stockout_investigator` in `terraform.tfvars` on the Terraform + Helm method) has the chart render both resources and Terraform create the Pub/Sub topic, subscription and logging sink. Each plugin's README covers its standalone developer install.
 
 ## Requirements & Compatibility Gating
 

@@ -1,7 +1,7 @@
 # Single-Cluster Inventory Audit (`bootstrap-inventory-cluster-<profile>`)
 
 **Purpose:** The per-cluster half of first-time environment discovery, performed by a Cluster Agent
-on the one cluster it is pinned to. The onboarding gate files this card, one per Cluster Agent, during
+on the one cluster it is pinned to. The onboarding gate files this card, one per Cluster Agent up to the first-run cap (the sweep audits the rest), during
 `bootstrap-inventory-scan`, and collects the results from every card; this SOP covers only what one
 Cluster Agent does with its own cluster.
 

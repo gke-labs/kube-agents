@@ -44,6 +44,7 @@ This is a gate on argv, not the impersonation boundary.
 
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass
 
 
@@ -126,6 +127,13 @@ _GCLOUD_READ_ONLY_MESSAGE = (
     "rather than working around it. "
     + _ACTION_BOUNDARY_NOTICE
 )
+# A refusal of a near-misspelling names the admitted read it resembles: live
+# runs typed `rollout-sequences` for `rolloutsequences` and read the refusal
+# as a missing permission. The hint fires only when the typed path ends in
+# the admitted read's own verb (a write never gets one) and its one
+# misspelt word resembles the read's at least this closely.
+_NEAREST_READ_CUTOFF = 0.75
+_NEAREST_READ_HINT = " The nearest admitted read is `gcloud {command}`."
 
 # Only these two reach a cluster or a cloud project. Everything else the proxy
 # executes is governed elsewhere.
@@ -574,6 +582,18 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # also how a Cluster Agent points itself at its target cluster, so
         # refusing it would break the read path this module is protecting.
         ("container", "clusters", "get-credentials"),
+        # Fleet rollout sequencing, the reads the readiness report's
+        # rollout-sequence precheck (fleet-upgrade-verification's
+        # readiness_rules/rollout_sequence_precheck.py) and the upgrade SOP's
+        # stage check make: a host project's RolloutSequences, one of them, and
+        # the Rollouts under them. Pure reads of the GKE Hub API; the writes
+        # that drive a train -- `rolloutsequences create`, `upgrade` and
+        # `delete`, `rollouts pause`, `resume`, `cancel`,
+        # `force-complete-stage` and `delete` -- stay refused, and the tests
+        # hold that door.
+        ("container", "fleet", "rolloutsequences", "describe"),
+        ("container", "fleet", "rolloutsequences", "list"),
+        ("container", "fleet", "rollouts", "list"),
         ("container", "get-server-config"),
         ("container", "node-pools", "describe"),
         ("container", "node-pools", "list"),
@@ -967,6 +987,58 @@ def _gcloud_is_read_only(words: list[str]) -> bool:
     longest = min(len(words), _LONGEST_GCLOUD_COMMAND)
     return any(tuple(words[:length]) in GCLOUD_READ_COMMANDS
                for length in range(1, longest + 1))
+
+
+def _nearest_gcloud_read(words: list[str]) -> str | None:
+    """The admitted read the typed command path misspells, or None.
+
+    Args:
+        words: The words from _gcloud_words_and_flag(), already found not to be
+            a listed read.
+
+    A candidate ends in the typed path's last word (so `clusters upgrade` is
+    never pointed at `clusters list`) and differs from it by one misspelt word
+    at _NEAREST_READ_CUTOFF or closer, with at most one word added or dropped
+    besides: `container fleet rollout-sequences list` names `container fleet
+    rolloutsequences list`; a read of another group names nothing. A path
+    longer than the longest listed read by more than one word is no
+    misspelling of one, and the bound keeps the scan off the proxy's CPU.
+    """
+    if not words or len(words) > _LONGEST_GCLOUD_COMMAND + 1:
+        return None
+    best: tuple[float, str] | None = None
+    for command in sorted(GCLOUD_READ_COMMANDS):
+        if command[-1] != words[-1]:
+            continue
+        score = _misspelling_score(words, list(command))
+        if score is not None and (best is None or score > best[0]):
+            best = (score, " ".join(command))
+    return None if best is None else best[1]
+
+
+def _without_one_word(sequence: list[str]) -> list[list[str]]:
+    """The sequence with each one word but its last removed."""
+    return [sequence[:index] + sequence[index + 1:] for index in range(len(sequence) - 1)]
+
+
+def _misspelling_score(typed: list[str], command: list[str]) -> float | None:
+    """How closely `typed` misspells `command`: the ratio of the one word that
+    differs (1.0 when the two differ by one added or dropped word alone), or
+    None when they differ by more than that."""
+    pairs = [(typed, command)]
+    pairs += [(shorter, command) for shorter in _without_one_word(typed)]
+    pairs += [(typed, shorter) for shorter in _without_one_word(command)]
+    best: float | None = None
+    for typed_words, command_words in pairs:
+        if len(typed_words) != len(command_words):
+            continue
+        differing = [(a, b) for a, b in zip(typed_words, command_words) if a != b]
+        if len(differing) > 1 or (not differing and typed_words is typed and command_words is command):
+            continue
+        score = 1.0 if not differing else difflib.SequenceMatcher(None, *differing[0]).ratio()
+        if score >= _NEAREST_READ_CUTOFF and (best is None or score > best):
+            best = score
+    return best
 
 
 def _kubectl_verb_and_flag(argv: list[str]) -> tuple[tuple[str, ...] | None, str | None]:
@@ -1613,10 +1685,12 @@ def _evaluate(argv: list[str], readings: bool = True) -> Decision:
             )
 
         if not _gcloud_is_read_only(words):
+            nearest = _nearest_gcloud_read(words)
             return Decision(
                 allowed=False,
                 rule_id="gcp.read-only",
-                message=_GCLOUD_READ_ONLY_MESSAGE,
+                message=_GCLOUD_READ_ONLY_MESSAGE
+                + (_NEAREST_READ_HINT.format(command=nearest) if nearest else ""),
                 verb_tuple=_gcloud_verb_tuple(words),
             )
         return _ALLOWED

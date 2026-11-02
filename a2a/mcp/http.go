@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -39,6 +40,12 @@ const (
 	msgUnsupportedVersion = "unsupported MCP protocol version %q"
 )
 
+// requestBudget bounds one request, every member of a batch together, inside
+// the server's write timeout (MaxTurnWait plus a margin, cmd/mcp). A member
+// that starts with little of it left waits that much: a turn returns its task
+// still running, and one with none left is refused with the context error.
+var requestBudget = MaxTurnWait
+
 // errEmptyToken is a token file that holds nothing, which authenticates no one.
 var errEmptyToken = errors.New("empty token")
 
@@ -57,29 +64,34 @@ func ReadToken(path string) (string, error) {
 	return token, nil
 }
 
+// HandlerOption adds to what Handler serves.
+type HandlerOption func(*handlerConfig)
+
+type handlerConfig struct {
+	swarm *swarmHandler
+}
+
+// WithSwarm serves POST SwarmPath, the workstation bridge's swarm view, from
+// bus and convs.
+func WithSwarm(bus *NATSBus, convs *Conversations) HandlerOption {
+	return func(c *handlerConfig) { c.swarm = &swarmHandler{bus: bus, convs: convs} }
+}
+
 // Handler serves the MCP endpoint and the health probe. The token is read
 // from tokenFile on every request, so a rotated Secret takes effect without a
 // restart, and a file that becomes unreadable or empty refuses every request.
-func Handler(s *Server, tokenFile string, log *slog.Logger) http.Handler {
+func Handler(s *Server, tokenFile string, log *slog.Logger, opts ...HandlerOption) http.Handler {
+	var cfg handlerConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	tl := &tokenLog{log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+HealthPath, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set(headerContentType, contentTypeJSON)
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "name": ServerName, "version": ServerVersion})
 	})
-	mux.HandleFunc("POST "+Path, func(w http.ResponseWriter, r *http.Request) {
-		// MCP clients are programs, not pages, and a browser sends Origin on
-		// every POST ("null" included). The bearer token is what keeps a
-		// DNS-rebinding page out, since a browser never attaches it on its
-		// own; this refuses such a page before it reaches the token check.
-		if r.Header.Get(headerOrigin) != "" {
-			http.Error(w, msgNoBrowsers, http.StatusForbidden)
-			return
-		}
-		if !authorized(r, tokenFile, tl) {
-			http.Error(w, msgUnauthorized, http.StatusUnauthorized)
-			return
-		}
+	mux.Handle("POST "+Path, guarded(tokenFile, tl, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// The transport has clients name their revision on every request
 		// after initialize; an absent header means an older client, and an
 		// unknown revision is refused rather than served in another dialect.
@@ -92,15 +104,42 @@ func Handler(s *Server, tokenFile string, log *slog.Logger) http.Handler {
 			http.Error(w, msgBodyTooLarge, http.StatusRequestEntityTooLarge)
 			return
 		}
-		resp := s.HandleJSONRPC(r.Context(), body)
+		// One budget for the whole request: a batch's members share it, so
+		// the response always lands inside the server's write timeout.
+		ctx, cancel := context.WithTimeout(r.Context(), requestBudget)
+		defer cancel()
+		resp := s.HandleJSONRPC(ctx, body)
 		if len(resp) == 0 {
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
 		w.Header().Set(headerContentType, contentTypeJSON)
 		_, _ = w.Write(resp)
-	})
+	})))
+	if cfg.swarm != nil {
+		mux.Handle("POST "+SwarmPath, guarded(tokenFile, tl, cfg.swarm))
+	}
 	return mux
+}
+
+// guarded refuses a browser, then a request without the server's token,
+// before next sees it. Every authenticated route goes through it.
+func guarded(tokenFile string, tl *tokenLog, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// MCP clients are programs, not pages, and a browser sends Origin on
+		// every POST ("null" included). The bearer token is what keeps a
+		// DNS-rebinding page out, since a browser never attaches it on its
+		// own; this refuses such a page before it reaches the token check.
+		if r.Header.Get(headerOrigin) != "" {
+			http.Error(w, msgNoBrowsers, http.StatusForbidden)
+			return
+		}
+		if !authorized(r, tokenFile, tl) {
+			http.Error(w, msgUnauthorized, http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // authorized reports whether r carries the server's token. The scheme is

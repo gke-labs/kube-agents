@@ -89,6 +89,13 @@ const (
 	// turn (the placeholder, a refusal, a status answer) carries no kind, so
 	// a client waiting on a turn can tell the two apart.
 	consoleFrameKindResult = "result"
+	// consoleFrameKindNotify marks a frame carrying a chat.notify post aimed
+	// at the conversation (a kanban card's report), as distinct from a
+	// notice about a turn and from a task's terminal.
+	consoleFrameKindNotify = "notify"
+	// consoleNotifyIDPrefix starts a notify frame's messageId; the rest is
+	// the adapter's boot id and a counter, as a notice's is.
+	consoleNotifyIDPrefix = "n-"
 	// consoleResultIDPrefix starts a terminal frame's messageId, which is
 	// r-<taskId>-<state>: a redelivered end repeats its id and a client can
 	// drop the repeat, while a different end of the same task (a
@@ -114,8 +121,12 @@ const (
 	// that fits) PostTerminal takes when an encoded frame is still too big.
 	consoleResultShrinkNum = 9
 	consoleResultShrinkDen = 10
-	// consoleResultCutNote ends a cut answer.
+	// consoleResultCutNote ends a cut answer: a terminal frame's text is the
+	// task's result, which TASKS keeps whole.
 	consoleResultCutNote = "\n\n(cut here: the full answer is the task's result on the bus)"
+	// consoleNotifyCutNote ends a cut notify frame. A card's report is not
+	// on TASKS, so it points nowhere else.
+	consoleNotifyCutNote = "\n\n(cut here: the report was longer than a console frame carries)"
 	// consoleQueueFullNotice is posted once per fill when consoleQueueCap
 	// refuses a turn; %d is the cap.
 	consoleQueueFullNotice = "⚠️ %d messages are already waiting in this conversation, so new ones are dropped until it catches up"
@@ -145,14 +156,22 @@ type ConsoleOutFrame struct {
 	State     lib.TaskState `json:"state,omitempty"`
 	Addressee string        `json:"addressee,omitempty"`
 	TaskID    string        `json:"taskId,omitempty"`
+	// ReplyTo, on a notify frame, is the task whose turn filed the work the
+	// post reports on, when its sender knew it.
+	ReplyTo string `json:"replyTo,omitempty"`
+	// CardsPending, on a completed terminal frame, says the task handed
+	// work to kanban cards, whose reports follow as notify frames naming it
+	// (ReplyTo). Absent, no handoff was seen, so a client need not wait.
+	CardsPending bool `json:"cardsPending,omitempty"`
 }
 
 // ConsoleTerminal is one task's end as a console conversation is told it.
 type ConsoleTerminal struct {
-	TaskID    string
-	Addressee string
-	State     lib.TaskState
-	Text      string
+	TaskID       string
+	Addressee    string
+	State        lib.TaskState
+	Text         string
+	CardsPending bool
 }
 
 // consoleResultStash carries a completed task's deliverable from the
@@ -342,10 +361,11 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 	return a, nil
 }
 
-// Close is for an adapter that was never run, or needs closing early: Run
-// closes the connection itself once ctx is cancelled, so a caller that also
-// defers Close (or registers it with t.Cleanup) after cancelling is safe —
-// IsClosed makes this idempotent.
+// Close closes the connection. Run closes it itself only when the connection
+// fails; a cancelled ctx stops ingress and leaves the connection open, because
+// the relay may still be rendering onto it, and Gateway.Run calls Close once
+// the relay's stop drain is done. A caller running the adapter on its own
+// closes it after Run returns. IsClosed makes this idempotent.
 func (a *ConsoleAdapter) Close() {
 	if a.nc != nil && !a.nc.IsClosed() {
 		a.closingFlag.Store(true)
@@ -366,9 +386,10 @@ func (a *ConsoleAdapter) subscribed() bool { return a.subscribedFlag.Load() }
 func (a *ConsoleAdapter) closed() bool { return a.nc != nil && a.nc.IsClosed() }
 
 // Run delivers frames as InboundMessages until ctx is done, or until the
-// connection is closed for good, which it reports as an error. It owns the
-// connection's lifecycle from here: on either exit it unsubscribes and
-// closes the connection, so a caller does not leak it by trusting Run alone.
+// connection is closed for good, which it reports as an error. On either
+// exit it unsubscribes. When ctx ends it leaves the connection open, because
+// the relay may still be rendering onto it, and the caller closes it (Close;
+// Gateway.Run does once its relay drain is done).
 //
 // The subscription is plain core NATS with no queue group, so every gateway
 // process holding the console identity answers every frame rather than one
@@ -413,7 +434,12 @@ func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) 
 		}
 	}
 	_ = sub.Unsubscribe()
-	a.Close()
+	// On a stop the connection stays open: ingress has ended, but the
+	// relay may still be rendering a batch onto it, and the gateway closes
+	// it once that drain is done (Gateway.Run).
+	if runErr != nil {
+		a.Close()
+	}
 	return runErr
 }
 
@@ -486,23 +512,53 @@ func (a *ConsoleAdapter) publishFrame(conversation string, f ConsoleOutFrame) er
 	return a.nc.Publish(consoleOutSubject(token), data)
 }
 
-// PostTerminal publishes one task's terminal frame (TerminalPoster). The
-// text is cut to consoleResultTextCap, and cut again while the encoded frame
-// is still past the server's max_payload: JSON escaping can grow a string up
-// to six times, so the byte cap alone does not bound the frame.
+// PostTerminal publishes one task's terminal frame (TerminalPoster), bounded
+// as publishBounded says.
 func (a *ConsoleAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
 	token, ok := consoleConversationToken(conversation)
 	if !ok {
 		return fmt.Errorf("console adapter: malformed conversation id %q", conversation)
 	}
-	f := ConsoleOutFrame{
-		MessageID: consoleResultIDPrefix + t.TaskID + "-" + string(t.State),
-		Text:      cutConsoleResult(t.Text, consoleResultTextCap),
-		Kind:      consoleFrameKindResult,
-		State:     t.State,
-		Addressee: t.Addressee,
-		TaskID:    t.TaskID,
+	return a.publishBounded(token, consoleResultCutNote, ConsoleOutFrame{
+		MessageID:    consoleResultIDPrefix + t.TaskID + "-" + string(t.State),
+		Text:         t.Text,
+		Kind:         consoleFrameKindResult,
+		State:        t.State,
+		Addressee:    t.Addressee,
+		TaskID:       t.TaskID,
+		CardsPending: t.CardsPending,
+	})
+}
+
+// PostNotifyFrame publishes a chat.notify post aimed at the conversation as
+// a notify frame and returns its id. An empty messageID mints a new one;
+// edit republishes messageID with new text, for a keyed post (Update).
+func (a *ConsoleAdapter) PostNotifyFrame(conversation, messageID, text, replyTo string, edit bool) (string, error) {
+	token, ok := consoleConversationToken(conversation)
+	if !ok {
+		return "", fmt.Errorf("console adapter: malformed conversation id %q", conversation)
 	}
+	if messageID == "" {
+		a.mu.Lock()
+		a.nextID++
+		messageID = fmt.Sprintf("%s%s-%d", consoleNotifyIDPrefix, a.bootID, a.nextID)
+		a.mu.Unlock()
+	}
+	err := a.publishBounded(token, consoleNotifyCutNote, ConsoleOutFrame{
+		MessageID: messageID, Text: text, Edit: edit, Kind: consoleFrameKindNotify, ReplyTo: replyTo,
+	})
+	if err != nil {
+		return "", err
+	}
+	return messageID, nil
+}
+
+// publishBounded publishes a frame whose text may be answer-sized: cut to
+// consoleResultTextCap, and cut again while the encoded frame is still past
+// the server's max_payload, since JSON escaping can grow a string up to six
+// times and the byte cap alone does not bound the frame.
+func (a *ConsoleAdapter) publishBounded(token, note string, f ConsoleOutFrame) error {
+	f.Text = cutConsoleText(f.Text, consoleResultTextCap, note)
 	limit := a.nc.MaxPayload()
 	for {
 		data, err := json.Marshal(f)
@@ -515,20 +571,20 @@ func (a *ConsoleAdapter) PostTerminal(conversation string, t ConsoleTerminal) er
 		// Shrink the text by the share of the frame that is over, and a
 		// tenth more, so the loop ends in a step or two.
 		keep := int(int64(len(f.Text)) * limit / int64(len(data)) * consoleResultShrinkNum / consoleResultShrinkDen)
-		if keep <= len(consoleResultCutNote) {
-			return fmt.Errorf("console adapter: terminal frame for %s does not fit under max_payload %d", t.TaskID, limit)
+		if keep <= len(note) {
+			return fmt.Errorf("console adapter: frame %s does not fit under max_payload %d", f.MessageID, limit)
 		}
-		f.Text = cutConsoleResult(f.Text, keep)
+		f.Text = cutConsoleText(f.Text, keep, note)
 	}
 }
 
-// cutConsoleResult cuts text to at most max bytes, ending with the cut note
+// cutConsoleText cuts text to at most max bytes, ending with note
 // and dropping a rune the cut would split. Text within max is returned as is.
-func cutConsoleResult(text string, max int) string {
+func cutConsoleText(text string, max int, note string) string {
 	if len(text) <= max {
 		return text
 	}
-	return strings.ToValidUTF8(text[:max-len(consoleResultCutNote)], "") + consoleResultCutNote
+	return strings.ToValidUTF8(text[:max-len(note)], "") + note
 }
 
 // Post publishes a new notice frame and returns its id.

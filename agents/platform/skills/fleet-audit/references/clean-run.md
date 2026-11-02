@@ -80,9 +80,9 @@ Two rules follow, and they are the whole rule:
   either; its report is `summary`, with the pull request links (see
   [A forge with no issue tracker](finish.md#a-forge-with-no-issue-tracker)).
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
-  channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
-  kanban card or straight from chat, they are waiting on the answer and
-  `[SILENT]` throws it away. Report the outcome and the ledger URL whatever the flag says.
+  channel want this?". `finish` returns `true` only when it gets `--scheduled`, and only the cron
+  prompt tells you to pass that flag. If someone dispatched this job, from a kanban card or straight
+  from chat, do not pass it: `silent_ok` is then always `false`. Report the outcome and the ledger URL.
 
 A zero-finding run comes back `silent_ok: false` in each of these cases, and all of them matter:
 
@@ -91,15 +91,34 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   swallowing this one would leave the operator hearing only bad news.
 - **`partial: true` with a new or changed gap** — the ledger stayed open because the fleet was not
   fully read. "I found nothing" and "I could not look" must not arrive as the same silence. A gap
-  that is the same as on the stored previous run was said on the run that got it, and is still in
+  that is the same as on the last stored scheduled run was said on the run that got it, and is still in
   the ledger and in `coverage_gaps`; it does not make `silent_ok` false again. With no trusted
-  stored record, every gap counts as new. `finish` cannot tell a scheduled run from an on-demand
-  one, so a gap first seen on an on-demand run is not reported again by the next scheduled run.
+  stored record, every gap counts as new. A scheduled run compares its gaps with the last
+  scheduled run, so a gap first seen on an on-demand run is still reported by the next scheduled run.
+- **A scheduled run whose findings are not those of the last scheduled run** — an on-demand run saw
+  a new or resolved finding first, so `new` and `resolved` can be 0. The channel has not heard it.
+  The JSON line then has `since_last_scheduled`: `{"new": [ids], "resolved": [ids]}`, the change
+  since the last scheduled run. Report the issue URL and those counts, for example "changed since
+  the last scheduled run: 1 new". Leave out a count of zero. This includes the first scheduled run after an
+  on-demand run or a person closed the ledger (say that the stream is clean). When no stored record shows the
+  last scheduled run's findings, `since_last_scheduled` is `null`: say that the change since the
+  last scheduled run is not known. This occurs on the first run after an upgrade, after the
+  report store is rebuilt from the ledger, or after a change of the finding id scheme. The key is
+  absent when the last stored run was a scheduled run on the open ledger, because `new` and
+  `resolved` then say the change. A clean run that left the ledger body as it was keeps the
+  findings that the body lists as the last scheduled run's findings, so when coverage comes back
+  with the same findings, nothing changed. A finding that left under a coverage gap is not resolved, so the
+  key is also absent when every finding that moved left under a gap. A finding that an on-demand
+  run resolved with full coverage is resolved, also when this run has a gap.
 - **`unreported_under_gap` on the JSON line** — a finding that the stored run listed is not in what
-  this run published, and a gap holds `resolved` at 0. The gaps may be the same as before; the run
+  this run published, and a gap holds `resolved` at 0. On a scheduled run, the list also has the
+  findings of the last scheduled run that an on-demand run dropped under a gap; a finding that an
+  on-demand run resolved with full coverage is not in it. After a person closed the ledger, it also has
+  the findings that the last stored run listed and that this run does not publish. The gaps may be the same as before; the run
   still speaks. Say in your one line that this many findings are no longer reported while a
   coverage gap stays, with the issue URL. Do not call them resolved. Each id is listed once; a later
-  run with the same gap does not list it again.
+  run with the same gap does not list it again. A finding under _Not re-checked this run_ is
+  published, so it is not listed.
 - **`status: "HELD"`** — the ledger stayed open because the run did not account for findings it was
   carrying, or because it could not read the issue's comments, where a `/remediate` may be waiting
   for an answer. "I found nothing" and "I did not write it down" must not arrive as the same

@@ -52,6 +52,11 @@ RESOURCE_ACTION_RE = re.compile(
     r"^\s*# (\S+) (?:is tainted, so )?(?:will be|must be) (.+?)\s*$",
     re.MULTILINE)
 
+# Terraform colours its plan whether or not a terminal is attached, and the
+# plan this reads is run without `-no-color`, so every line of the log opens
+# with an escape sequence; the anchored patterns above never match it.
+TERMINAL_COLOUR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
 # A destroy in a plan against a long-lived environment is the dangerous case and
 # the one #1060 was about, so it is called out rather than left for the reader
 # to spot in a list.
@@ -68,6 +73,7 @@ def run(args, check=True):
 
 def summarise(plan_text):
     """(totals line, [(address, action)], destructive?) from a plan's text."""
+    plan_text = TERMINAL_COLOUR_RE.sub("", plan_text)
     totals = PLAN_TOTALS_RE.findall(plan_text)
     actions = RESOURCE_ACTION_RE.findall(plan_text)
     destructive = any(any(word in action for word in DESTRUCTIVE)

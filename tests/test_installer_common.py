@@ -146,13 +146,15 @@ def _autopilot_describe_stub(version="1.31.5-gke.1023000"):
     """A `clusters describe` stub for an Autopilot cluster.
 
     The generator asks twice on this path — autopilot.enabled first, then
-    currentMasterVersion for the gVisor floor — so the stub answers on the
-    --format it is given. An empty `version` stands for a version that
-    could not be read.
+    currentMasterVersion for the gVisor floor (plus the NetworkPolicy probe
+    when WEB_CONSOLE_ENABLED and ACCEPT_NO_NETWORK_POLICY are both set) — so
+    the stub answers on the --format it is given. An empty `version` stands
+    for a version that could not be read.
     """
     return (
         'case "$*" in\n'
         f"  *currentMasterVersion*) printf '{version}\\n' ;;\n"
+        '  *datapathProvider*) printf "RUNNING,ADVANCED_DATAPATH,False\\n" ;;\n'
         "  *) printf 'True\\n' ;;\n"
         "esac\n"
         "exit 0"
@@ -256,6 +258,8 @@ class InstallerCommonTest(unittest.TestCase):
                     "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
                     # And the mode, refused on a value outside the CRD's enum.
                     "PLATFORM_AGENT_MODE": "",
+                    "WEB_CONSOLE_ENABLED": "",
+                    "ACCEPT_NO_NETWORK_POLICY": "",
                     # And the data volume size, refused when malformed.
                     "PLATFORM_AGENT_STORAGE_SIZE": "",
                     **(env or {}),
@@ -541,6 +545,115 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("enable_drift_pubsub   = true", content)
             self.assertIn("enable_drift_detector = true", content)
             self.assertNotIn("exported-project", content)
+
+    # ── the web console switch ───────────────────────────────────────────────
+
+    def test_tfvars_carries_the_web_console_switch(self):
+        # Off unless asked for, and on when install.env or the flag says so;
+        # main.tf maps web_console_enabled to the chart's webConsole.enabled.
+        for exported, want in ((None, "false"), ("true", "true"), ("false", "false")):
+            with self.subTest(WEB_CONSOLE_ENABLED=exported), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                env = {"API_SERVER_KEY": "k"}
+                if exported is not None:
+                    env["WEB_CONSOLE_ENABLED"] = exported
+                proc = self._run(
+                    f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                    env=env,
+                    describe_stub=_autopilot_describe_stub(),
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn(f"web_console_enabled      = {want}", dest.read_text())
+
+    def test_tfvars_refuses_web_console_when_accept_no_network_policy_is_set(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "WEB_CONSOLE_ENABLED": "true",
+                    "ACCEPT_NO_NETWORK_POLICY": "true",
+                },
+                describe_stub=(
+                    'case "$*" in\n'
+                    '  *datapathProvider*) printf "RUNNING,,False\\n" ;;\n'
+                    '  *) printf "False\\n" ;;\n'
+                    'esac\n'
+                    'exit 0'
+                ),
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn(
+                "WEB_CONSOLE_ENABLED=true cannot be combined with ACCEPT_NO_NETWORK_POLICY=true",
+                proc.stdout + proc.stderr,
+            )
+            self.assertFalse(dest.exists())
+
+    def test_tfvars_reports_unreadable_cluster_when_probing_web_console_network_policy(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "WEB_CONSOLE_ENABLED": "true",
+                    "ACCEPT_NO_NETWORK_POLICY": "true",
+                },
+                describe_stub=(
+                    'case "$*" in\n'
+                    '  *datapathProvider*) exit 1 ;;\n'
+                    '  *) printf "False\\n" ;;\n'
+                    'esac\n'
+                    'exit 0'
+                ),
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn(
+                "Could not query NetworkPolicy configuration for existing cluster",
+                proc.stdout + proc.stderr,
+            )
+            self.assertFalse(dest.exists())
+
+    def test_tfvars_allows_web_console_when_adopted_standard_cluster_now_enforces_network_policy(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "WEB_CONSOLE_ENABLED": "true",
+                    "ACCEPT_NO_NETWORK_POLICY": "true",
+                },
+                describe_stub=(
+                    'case "$*" in\n'
+                    '  *datapathProvider*) printf "RUNNING,ADVANCED_DATAPATH,False\\n" ;;\n'
+                    '  *) printf "False\\n" ;;\n'
+                    'esac\n'
+                    'exit 0'
+                ),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("web_console_enabled      = true", dest.read_text())
+
+    def test_tfvars_allows_web_console_with_stale_accept_on_autopilot_or_created_cluster(self):
+        for label, describe_stub in (
+            ("adopted_autopilot", _autopilot_describe_stub()),
+            ("created_cluster", 'echo "NOT_FOUND" >&2; exit 1'),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env={
+                        "API_SERVER_KEY": "k",
+                        "WEB_CONSOLE_ENABLED": "true",
+                        "ACCEPT_NO_NETWORK_POLICY": "true",
+                    },
+                    describe_stub=describe_stub,
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn("web_console_enabled      = true", dest.read_text())
 
     # ── the cert-manager probe: a Deployment alone cannot say whose it is ────
 
@@ -1245,6 +1358,31 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertIn(expected, content)
                     if absent:
                         self.assertNotIn(absent, content)
+
+    def test_tfvars_refuse_a_misspelt_vertex_manage_serving_project(self):
+        # Read as off, a typo would revoke the gateway's grant on the serving
+        # project, so the generator names the key and writes nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("ture", "flase", "managed"):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "VERTEX_MANAGE_SERVING_PROJECT": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"VERTEX_MANAGE_SERVING_PROJECT='{value}'", proc.stderr + proc.stdout)
+                    self.assertIn("is neither true nor false", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a misspelt switch")
+            for value, expected in (("False", "false"), ("yes", "true")):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", "VERTEX_MANAGE_SERVING_PROJECT": value},
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(f"vertex_manage_serving_project = {expected}", dest.read_text())
 
     def test_tfvars_refuse_scoped_sa_pool_values_terraform_cannot_take(self):
         # upgrade.sh regenerates from install.env without install.sh's checks,
@@ -3113,9 +3251,9 @@ class InstallDefaultsFileTest(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "autopilot")
 
     def test_the_chart_carries_the_same_per_provider_models(self):
-        """charts/kube-agents/templates/litellm.yaml keeps its own copy of the
-        per-provider default models for a hand-driven Helm install, because a
-        chart cannot source this file. The copy is allowed only while it is
+        """charts/kube-agents/templates/_helpers.tpl (kube-agents.litellmModel)
+        keeps its own copy of the per-provider default models for a
+        hand-driven Helm install, because a chart cannot source this file. The copy is allowed only while it is
         equal, and this is what makes that true."""
         proc = subprocess.run(
             ["bash", "-c",
@@ -3126,9 +3264,9 @@ class InstallDefaultsFileTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         defaults = dict(line.split("=", 1) for line in proc.stdout.split())
-        chart = (_REPO_ROOT / "charts" / "kube-agents" / "templates" / "litellm.yaml").read_text()
+        chart = (_REPO_ROOT / "charts" / "kube-agents" / "templates" / "_helpers.tpl").read_text()
         table = re.search(r'\$defaultModels := dict (.*?) \}\}', chart)
-        self.assertIsNotNone(table, "litellm.yaml no longer declares $defaultModels")
+        self.assertIsNotNone(table, "_helpers.tpl no longer declares $defaultModels")
         chart_models = dict(re.findall(r'"(\w+)" "([^"]+)"', table.group(1)))
         self.assertEqual(chart_models, defaults)
 
@@ -5580,7 +5718,7 @@ class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
         self.assertIsNotNone(regex, "SLACK_HOME_CHANNEL_ID_RE not found")
         gateway = self._rule("a2a/gateway/slack.go", "slackIsHomeChannelID", "id", "slackMinChannelIDLen")
         operator = self._rule("k8s-operator/internal/controller/platformagent_a2a_manifests.go",
-                              "a2aSlackHomeChannel", "home", "a2aSlackMinChannelIDLen")
+                              "slackChannelID", "home", "a2aSlackMinChannelIDLen")
         self.assertEqual(gateway, operator, "the gateway's and the operator's rules differ")
         letters, min_len = gateway
         self.assertEqual(regex.group(1), f"^[{letters}][A-Z0-9]{{{min_len - 1},}}$")
@@ -5735,6 +5873,65 @@ class SourcedFromAFunctionTest(unittest.TestCase):
                                       env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertIn("n=25 [C0HOME] [D0DM]", proc.stdout, proc.stderr)
+
+
+class SlackHomeChannelPolicyTest(unittest.TestCase):
+    """SLACK_HOME_CHANNEL_POLICY renders spec.integration.slack.homeChannelPolicy,
+    whose CRD enum is exact (auto, manual; absent reads as auto). The generator
+    refuses any other spelling before a file is written, so every route to
+    Terraform (install.sh's run, --dry-run, the Day-2 menu, upgrade.sh --plan and
+    apply) stops with the key named rather than inside `terraform plan`."""
+
+    _run = InstallerCommonTest._run
+
+    def _check(self, value, flags=""):
+        return self._run(f'require_slack_home_channel_policy {shlex.quote(value)} {flags}; echo "rc=$?"')
+
+    def test_the_three_accepted_values_pass_silently(self):
+        for value in ("", "auto", "manual"):
+            with self.subTest(value=value):
+                proc = self._check(value)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertNotIn("SLACK_HOME_CHANNEL_POLICY", proc.stdout + proc.stderr)
+
+    def test_any_other_spelling_is_refused_as_the_crd_would(self):
+        # Exact, as the API server is: no trim, no case folding.
+        for value in ("Auto", " auto", "manual ", "MANUAL", "sometimes"):
+            with self.subTest(value=value):
+                proc = self._check(value)
+                out = proc.stdout + proc.stderr
+                self.assertIn("rc=1", proc.stdout, out)
+                self.assertIn(f"SLACK_HOME_CHANNEL_POLICY is '{value}', which is not auto or manual (empty means auto)", out)
+                self.assertIn("spec.integration.slack.homeChannelPolicy", out)
+                self.assertIn("Set it in install.env and run again", out)
+                self.assertNotIn("--slack-home-channel-policy", out)
+
+    def test_the_remedy_names_the_flag_when_install_sh_can_set_it(self):
+        proc = self._check("sometimes", "flags")
+        self.assertIn("Set it in install.env or --slack-home-channel-policy and run again", proc.stdout + proc.stderr)
+
+    def _tfvars(self, env):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", **env},
+                describe_stub=_autopilot_describe_stub(),
+            )
+            return proc, (dest.read_text() if dest.exists() else None)
+
+    def test_the_generator_renders_the_policy_beside_the_other_slack_keys(self):
+        for value in ("", "auto", "manual"):
+            with self.subTest(value=value):
+                proc, content = self._tfvars({"SLACK_HOME_CHANNEL_POLICY": value})
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn(f'slack_home_channel_name = ""\nslack_home_channel_policy = "{value}"\n', content)
+
+    def test_the_generator_refuses_a_policy_outside_the_enum_with_no_file_written(self):
+        proc, content = self._tfvars({"SLACK_HOME_CHANNEL_POLICY": "sometimes"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("SLACK_HOME_CHANNEL_POLICY is 'sometimes'", proc.stdout + proc.stderr)
+        self.assertIsNone(content, "the file must be left untouched")
 
 if __name__ == "__main__":
     unittest.main()

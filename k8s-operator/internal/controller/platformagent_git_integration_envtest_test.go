@@ -106,6 +106,17 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Host: "SSH.GitHub.com", Namespace: "gke-labs",
 				CABundleRef: &agentv1alpha1.ForgeCABundleRef{Name: "gh-ca"}}},
 		}, "caBundleRef is for a self-managed host"},
+		"gitea-http-external": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gitea", Provider: "gitea", Host: "gitea.example.com",
+				Scheme:         "http",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitea-token"}}},
+		}, "scheme http sends the forge token unencrypted"},
+		"gitea-http-ca": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gitea", Provider: "gitea", Host: "gitea.gitea.svc.cluster.local",
+				Scheme:         "http",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitea-token"},
+				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gitea-ca"}}},
+		}, "caBundleRef cannot be set when scheme is http"},
 		"gitlab-com-ca": {agentv1alpha1.IntegrationSpec{
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme",
 				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},

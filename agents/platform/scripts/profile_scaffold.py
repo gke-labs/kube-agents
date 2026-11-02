@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 try:
     import fcntl
@@ -54,16 +55,18 @@ _jobs_lock_state = threading.local()
 
 
 @contextlib.contextmanager
-def cron_jobs_lock(cron_dir: Path, timeout: float | None = None):
+def cron_jobs_lock(cron_dir: Path, timeout: float | None = None, *, warn: Callable[[str], None] | None = None):
     """Serialize reads and writes to jobs.json against Hermes' own cron calls.
 
     Hermes (cron/jobs.py) protects load_jobs -> modify -> save_jobs with a
     cross-process advisory lock on <cron_dir>/.jobs.lock. Taking the same
     flock around the startup merge prevents racing with an in-pod `hermes cron`
-    command (such as `hermes cron pause` on restart).
+    command (such as `hermes cron pause` on restart). `warn` is where the
+    fail-open messages go; a caller in another script passes its own logger.
     """
     if timeout is None:
         timeout = DEFAULT_JOBS_LOCK_TIMEOUT_SECONDS
+    emit = warn or log
     held = getattr(_jobs_lock_state, "held", None)
     if held is None:
         held = {}
@@ -85,7 +88,7 @@ def cron_jobs_lock(cron_dir: Path, timeout: float | None = None):
     try:
         lock_fd = open(lock_path, "a+", encoding="utf-8-sig")
     except OSError as exc:
-        log(f"WARN: could not open cron jobs lock {lock_path} ({exc}); proceeding without lock")
+        emit(f"WARN: could not open cron jobs lock {lock_path} ({exc}); proceeding without lock")
         yield
         return
 
@@ -100,11 +103,11 @@ def cron_jobs_lock(cron_dir: Path, timeout: float | None = None):
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        log(f"WARN: timed out after {timeout}s waiting for {lock_path}; proceeding without lock")
+                        emit(f"WARN: timed out after {timeout}s waiting for {lock_path}; proceeding without lock")
                         break
                     time.sleep(0.05)
                 except OSError as exc:
-                    log(f"WARN: could not acquire cron jobs lock {lock_path} ({exc}); proceeding without lock")
+                    emit(f"WARN: could not acquire cron jobs lock {lock_path} ({exc}); proceeding without lock")
                     break
         else:
             acquired = True

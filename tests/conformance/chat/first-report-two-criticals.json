@@ -1,0 +1,320 @@
+{
+  "name": "first-report-two-criticals",
+  "source": "agents/chat/scripts/test_inventory_card.py::CasesTest.test_the_shared_cases_are_these_fixtures",
+  "notes": "inventory_card.chat: the first inventory's card from the stage's files. Two of four critical items are rows with the scored risk and action under them; the queue line counts the rest; the checks fold.",
+  "input": {
+    "first_report": {
+      "items": {
+        "items": [
+          {
+            "check": "static-sa-key",
+            "project": "onboarding-criticals-prod",
+            "cluster": "prod-central",
+            "object": "invoice-worker",
+            "title": "invoice-worker mounts a static project-editor service account key from the Secret invoice-gcp-key",
+            "namespace": "billing",
+            "detail": "Move invoice-worker to Workload Identity and delete the key: anyone who can read the Secret holds editor on the project",
+            "severity_hint": "high",
+            "line": 57,
+            "id": "f001"
+          },
+          {
+            "check": "image-pull-backoff",
+            "project": "onboarding-criticals-prod",
+            "cluster": "prod-central",
+            "object": "log-shipper",
+            "title": "log-shipper DaemonSet has 0 of 4 pods running: every pod is in ImagePullBackOff on a tag that no longer exists",
+            "namespace": "logging",
+            "detail": "Point log-shipper at a published image tag; until then no node ships its logs",
+            "severity_hint": "high",
+            "line": 58,
+            "id": "f002"
+          },
+          {
+            "check": "crashloop-backoff",
+            "project": "onboarding-criticals-prod",
+            "cluster": "prod-central",
+            "object": "quote-api",
+            "title": "quote-api, the only replica of a serving Deployment, is in CrashLoopBackOff, OOMKilled at its 256Mi limit after 47 restarts",
+            "namespace": "shop",
+            "detail": "Raise the memory limit or fix the leak; the Service has no ready endpoint",
+            "severity_hint": "high",
+            "line": 59,
+            "id": "f003"
+          },
+          {
+            "check": "create-container-config-error",
+            "project": "onboarding-criticals-prod",
+            "cluster": "prod-central",
+            "object": "pricing-engine",
+            "title": "pricing-engine has 0 of 2 replicas running: both pods are stuck in CreateContainerConfigError on the missing ConfigMap pricing-rules",
+            "namespace": "shop",
+            "detail": "Restore the ConfigMap pricing-rules; the Service has no ready endpoint",
+            "severity_hint": "high",
+            "line": 60,
+            "id": "f004"
+          },
+          {
+            "check": "readonly-root-fs",
+            "project": "onboarding-criticals-prod",
+            "cluster": "prod-central",
+            "object": "gift-cards",
+            "title": "gift-cards runs with a writable root filesystem",
+            "namespace": "shop",
+            "detail": "Set readOnlyRootFilesystem: true and mount an emptyDir for the paths it writes",
+            "severity_hint": "medium",
+            "line": 61,
+            "id": "f005"
+          },
+          {
+            "check": "no-resourcequota",
+            "project": "onboarding-criticals-prod",
+            "cluster": "prod-central",
+            "object": "ledger",
+            "title": "Namespace ledger has no ResourceQuota or LimitRange",
+            "namespace": "ledger",
+            "detail": "Add a ResourceQuota and a LimitRange to ledger so one workload cannot take the namespace's share",
+            "severity_hint": "medium",
+            "line": 62,
+            "id": "f006"
+          },
+          {
+            "check": "managed-prometheus",
+            "project": "onboarding-criticals-prod",
+            "cluster": "prod-central",
+            "object": "prod-central",
+            "title": "Managed Service for Prometheus is not enabled on prod-central",
+            "detail": "Enable Managed Service for Prometheus so workload metrics are collected",
+            "severity_hint": "low",
+            "line": 63,
+            "id": "f007"
+          }
+        ]
+      },
+      "scores": {
+        "scores": {
+          "f001": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Move it to Workload Identity.",
+              "rationale": "why",
+              "risk": "Anyone who reads the Secret holds editor on the project."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f002": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Point log-shipper at a published tag.",
+              "rationale": "why",
+              "risk": "No node ships its logs."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f003": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Raise the 256Mi memory limit or fix the leak.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f004": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Restore the ConfigMap pricing-rules.",
+              "rationale": "why",
+              "risk": "pricing-engine serves nothing."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f005": {
+            "rubric": {
+              "B": 3,
+              "L": 4,
+              "detect": 2,
+              "recover": 2,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Set readOnlyRootFilesystem: true.",
+              "rationale": "why",
+              "risk": "A compromised container can rewrite its own binaries."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f006": {
+            "rubric": {
+              "B": 2,
+              "L": 2,
+              "detect": 1,
+              "recover": 2,
+              "C": 0.9
+            },
+            "recommendation": {
+              "action": "Add a ResourceQuota and a LimitRange.",
+              "rationale": "why",
+              "risk": "One workload can take the namespace's share."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f007": {
+            "rubric": {
+              "B": 2,
+              "L": 2,
+              "detect": 1,
+              "recover": 2,
+              "C": 0.9
+            },
+            "recommendation": {
+              "action": "Enable Managed Service for Prometheus.",
+              "rationale": "why",
+              "risk": "No workload metrics are collected."
+            },
+            "remediation": {
+              "kind": "gcloud",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          }
+        },
+        "complete_clusters": ["onboarding-criticals-prod/prod-central"]
+      },
+      "limits": {
+        "first_report_criticals": 2
+      },
+      "shown": {
+        "items": [
+          {
+            "class": "critical",
+            "ids": [
+              "static-sa-key.onboarding-criticals-prod.prod-central.billing.invoice-worker"
+            ]
+          },
+          {
+            "class": "critical",
+            "ids": [
+              "image-pull-backoff.onboarding-criticals-prod.prod-central.logging.log-shipper"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "First look at your fleet: two things to fix first",
+        "detail": "1 cluster scanned in full \u00b7 9 configuration checks",
+        "rows": [
+          {
+            "text": "invoice-worker mounts a static project-editor service account key from the Secret invoice-gcp-key",
+            "severity": "critical",
+            "detail": "Anyone who reads the Secret holds editor on the project. Move it to Workload Identity."
+          },
+          {
+            "text": "log-shipper DaemonSet has 0 of 4 pods running: every pod is in ImagePullBackOff on a tag that no longer exists",
+            "severity": "critical",
+            "detail": "No node ships its logs. Point log-shipper at a published tag."
+          }
+        ],
+        "after": [
+          "5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day."
+        ],
+        "fold": {
+          "title": "What the scan checked",
+          "text": "startup probes\nResourceQuota and LimitRange\nread-only root filesystems\nShielded Nodes\nDataplane V2\nManaged Service for Prometheus\nnode auto-upgrade\nstatic Google Cloud keys in pods\nadded capabilities"
+        },
+        "choices": [
+          {
+            "text": "Fix the first one",
+            "reply": "Fix the first one: invoice-worker mounts a static project-editor service account key from the Secret invoice-gcp-key",
+            "primary": true
+          },
+          {
+            "text": "See all 7 items"
+          }
+        ]
+      }
+    }
+  ]
+}
