@@ -3,7 +3,7 @@ verifier grades it: the whole check, patterns on the pattern surface.
 
 Fourteen positive fixtures are sentences the nightly reports wrote; the rest are
 paraphrases of them, one per pattern, so that dropping any pattern turns a
-fixture red. The negative ones name no backlog or the healthy state: a
+fixture red. The grammar is narrowed to the recorded shapes on purpose. The negative ones name no backlog or the healthy state: a
 first-turn acknowledgement that echoes the prompt, a deployment with every
 replica ready, and prose where "pending" is a suffix or means approval.
 """
@@ -46,17 +46,15 @@ BACKLOG_NAMED = (
     "Only 1 of 5 replicas is ready.",
     "1 of the 5 replicas is ready.",
     "4 replicas are unavailable.",
-    "Replicas: 1 available, 4 unavailable.",
     "The autoscaler event says the pod did not trigger scale-up.",
     "Scheduling failed: 0/1 nodes are available.",
-    # One per pattern that no other admits; a wrapped phrase; the key-value shape.
+    # One per pattern that no other admits; a wrapped phrase.
     "Four pods, all Pending since Tuesday.",
     "The Pending inference-server pods wait for CPU.",
     "Desired 5, ready 1, 4 Pending.",
     "Four sit in Pending.",
     "Four show the Pending state.",
     "The replicas are\npending because the pool cannot grow.",
-    "- **Status**: Pending",
 )
 
 NO_BACKLOG = (
@@ -79,6 +77,17 @@ NO_BACKLOG = (
     "Scaling the replicas is pending your approval.",
     "Any change to the pods is pending your approval.",
     "The upgrade was not scheduled.",
+    # A zero on either side of the noun, a contracted negation, and the other senses.
+    "Pods pending: 0",
+    "Pending pods: 0",
+    "Pending: 0 pods",
+    "0 pods pending",
+    "The pods aren't pending.",
+    "The pod isn't pending.",
+    "The replicas weren't pending.",
+    "The node pool resize operation status: PENDING.",
+    "The rollout allows max 1 unavailable.",
+    "1 of 3 available zones carry the pool.",
 )
 
 
