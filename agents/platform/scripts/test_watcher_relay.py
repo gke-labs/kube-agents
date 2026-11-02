@@ -159,8 +159,10 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         elif attribute in CredentialProxyHandler.__dict__:
             delattr(CredentialProxyHandler, attribute)
 
-    def _request(self, method, path, token="watcher-token", body=None):
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+    def _request(self, method, path, token="watcher-token", body=None, headers=None):
+        headers = dict(headers or {})
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         if body is not None:
             headers["Content-Type"] = "application/json"
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
@@ -268,6 +270,32 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
                 status, _ = self._request(method, path, body=b"{}" if method == "POST" else None)
                 self.assertEqual(status, 403)
         self.assertEqual(self.k8s_requests, [])
+
+    def test_a_count_list_reaches_the_api_server_only_with_the_metadata_accept_it_forwards(self):
+        metadata = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
+        status, body = self._request(
+            "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/apis/apps/v1/deployments?limit=1", headers={"Accept": metadata}
+        )
+        self.assertEqual(status, 200, body)
+        [(path, headers)] = self.k8s_requests
+        self.assertEqual(path, "/apis/apps/v1/deployments?limit=1")
+        self.assertEqual(headers["Accept"], metadata)
+        # The policy reads the Accept the broker forwards, so an Accept the
+        # forwarding shape drops (too long) is evaluated as absent: refused,
+        # not relayed as a list whose one item comes back whole.
+        for accept in (None, "application/json", metadata + ",application/json", metadata + ";" + "x" * 300):
+            with self.subTest(accept=accept):
+                status, body = self._request(
+                    "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/apis/apps/v1/deployments?limit=1",
+                    headers={"Accept": accept} if accept else None,
+                )
+                self.assertEqual(status, 403, body)
+                self.assertIn(watcher_policy.RULE_K8S_ACCEPT, json.loads(body)["message"])
+        status, _ = self._request(
+            "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/apis/apps/v1/deployments?limit=2", headers={"Accept": metadata}
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(len(self.k8s_requests), 1)
 
     def test_a_refusal_is_a_kubernetes_status_naming_the_rule(self):
         # client-go turns this into a StatusError with the message verbatim, so

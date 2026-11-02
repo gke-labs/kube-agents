@@ -21,10 +21,15 @@ half of the first:
   AgentPlugin configs. The gateway pod holds no Google credential of its own,
   so this is the adapter's only way to a subscription. `evaluate_pubsub`.
 - `/v1/k8s/<project>/<location>/<cluster>/<path>`: GET only. List and watch of
-  core/v1 events across the cluster (the event watcher), and a GET of one named
+  core/v1 events across the cluster (the event watcher), a GET of one named
   object of a kind in `WATCHER_NAMED_READS` (the drift detector's join reads the
-  object an audit record names). No other list, no watch of anything else (the
-  deprecated `watch/<resource>` paths included), no subresource, never a Secret.
+  object an audit record names), and a count list: one of the five
+  cluster-scoped lists in `COUNT_LIST_PATHS`, with `limit=1` as its whole query
+  and an `Accept` every range of which asks for a `PartialObjectMetadataList`
+  (the event watcher's fleet-shape probe reads one item's metadata plus the
+  server's `remainingItemCount`, never an object body). No other list, no watch
+  of anything else (the deprecated `watch/<resource>` paths included), no
+  subresource, never a Secret.
 
 Standard library only, like `api_policy`. `Decision` is reused from
 `command_policy`. No refusal message repeats caller text.
@@ -68,6 +73,11 @@ RULE_K8S_SECRETS = "kubernetes.watcher.secrets"
 RULE_K8S_KIND = "kubernetes.watcher.kind"
 RULE_K8S_LEGACY = "kubernetes.watcher.legacy-path"
 RULE_K8S_QUERY = "kubernetes.watcher.query"
+RULE_K8S_ACCEPT = "kubernetes.watcher.accept"
+# The rule ids an allowed Kubernetes call is answered with.
+RULE_K8S_EVENTS = "kubernetes.watcher.events"
+RULE_K8S_NAMED_GET = "kubernetes.watcher.named-get"
+RULE_K8S_COUNT_LIST = "kubernetes.watcher.count-list"
 
 # Google's project id grammar, and GKE's location and cluster name grammars:
 # lower-case, digits and hyphens, so no segment can smuggle a slash or a dot.
@@ -196,6 +206,30 @@ EVENTS_QUERY_KEYS = frozenset(
 )
 # A named GET may only ask for a resource version.
 NAMED_QUERY_KEYS = frozenset({"resourceVersion"})
+# The count lists: the five cluster-scoped lists the event watcher's fleet-shape
+# probe counts (k8s-operator/cmd/k8s-event-watcher/fleetshape.go), each as the
+# exact path. Cluster-scoped only, so a namespaced form of the same plural is a
+# path the route does not know; no `secrets`, no `nodes`, no `configmaps`: a
+# count is of workloads, and the rule is widened by PR, as the tables above are.
+COUNT_LIST_PATHS = frozenset(
+    {
+        "api/v1/pods",
+        "apis/apps/v1/deployments",
+        "apis/apps/v1/statefulsets",
+        "apis/apps/v1/daemonsets",
+        "apis/batch/v1/cronjobs",
+    }
+)
+# The whole of a count list's query: one item. Anything else -- a larger limit,
+# a selector, a continue token, a watch -- is a list, not a count.
+COUNT_LIST_QUERY = {"limit": ["1"]}
+# The Accept parameter that makes the API server answer with each item's
+# ObjectMeta and nothing of its spec or status. Required on every media range
+# the caller offers: with one plain range beside it the server may pick the
+# plain one and the one item comes back whole. Matched on the exact token the
+# Go client sends, so a spelling the server might also take (quoted, cased) is
+# refused rather than guessed at.
+COUNT_LIST_ACCEPT_PARAM = "as=PartialObjectMetadataList"
 
 
 def _validate_named_reads(table: frozenset[tuple[str, str]]) -> None:
@@ -213,12 +247,15 @@ _validate_named_reads(WATCHER_NAMED_READS)
 
 
 # What of a GKE `Cluster` the watchers are relayed: the fields the Go side reads
-# (clusterprofiles.ClientConfigForIdentity and Discover) and nothing else. The
+# (clusterprofiles.ClientConfigForIdentity and Discover, and the event watcher's
+# fleet-shape probe, which reads `currentNodeCount`) and nothing else. The
 # rest of `clusters.get` is not theirs, and `masterAuth` is the sharp part: on a
 # cluster with client certificate issuance on, it carries `clientCertificate`
 # and `clientKey`, a credential for that cluster's API server far wider than the
 # GET-only route the watcher role is held to. Only its CA, which is public, is kept.
-CLUSTER_FIELDS = frozenset({"name", "location", "status", "endpoint", "controlPlaneEndpointsConfig", "autopilot"})
+CLUSTER_FIELDS = frozenset(
+    {"name", "location", "status", "endpoint", "controlPlaneEndpointsConfig", "autopilot", "currentNodeCount"}
+)
 CLUSTER_MASTER_AUTH_FIELDS = frozenset({"clusterCaCertificate"})
 
 
@@ -362,8 +399,30 @@ def split_k8s_target(rest: str) -> tuple[dict[str, str], str] | None:
     return match.groupdict(), parts[3]
 
 
-def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]]) -> Decision:
-    """Allow or refuse one `/v1/k8s/` call. `rest` is the path after the prefix."""
+def accepts_metadata_only(accept: str) -> bool:
+    """True when every media range in `accept` asks for a PartialObjectMetadataList.
+
+    The range's parameters are compared as tokens: `COUNT_LIST_ACCEPT_PARAM`
+    has to be one of them, as written. An empty or blank `Accept` offers no
+    range and is False.
+    """
+    ranges = [media_range.strip() for media_range in accept.split(",")]
+    if not all(ranges):
+        return False
+    for media_range in ranges:
+        params = [param.strip() for param in media_range.split(";")[1:]]
+        if COUNT_LIST_ACCEPT_PARAM not in params:
+            return False
+    return True
+
+
+def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]], accept: str = "") -> Decision:
+    """Allow or refuse one `/v1/k8s/` call.
+
+    `rest` is the path after the prefix; `accept` is the `Accept` header the
+    broker will forward, or empty when it forwards none. Only the count-list
+    rule reads it.
+    """
     if method != METHOD_GET:
         return _refuse(RULE_K8S_METHOD, "The watcher's Kubernetes route is read-only: GET only.")
     split = split_k8s_target(rest)
@@ -373,13 +432,19 @@ def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]]) -> Decisio
     if _EVENTS_LIST.fullmatch(path):
         if not set(query) <= EVENTS_QUERY_KEYS:
             return _refuse(RULE_K8S_QUERY, "An events list or watch carries a query key this route does not forward.")
-        return Decision(allowed=True, rule_id="kubernetes.watcher.events", message="")
+        return Decision(allowed=True, rule_id=RULE_K8S_EVENTS, message="")
+    if path in COUNT_LIST_PATHS:
+        if query != COUNT_LIST_QUERY:
+            return _refuse(RULE_K8S_QUERY, "A count list carries limit=1 and no other query key.")
+        if not accepts_metadata_only(accept):
+            return _refuse(RULE_K8S_ACCEPT, "A count list asks for a PartialObjectMetadataList on every Accept range.")
+        return Decision(allowed=True, rule_id=RULE_K8S_COUNT_LIST, message="")
     match = _NAMED_CORE.fullmatch(path) or _NAMED_GROUP.fullmatch(path)
     if match is None:
         return _refuse(
             RULE_K8S_PATH,
-            "The watcher's Kubernetes route lists and watches events, and reads one named object; "
-            "this path is neither.",
+            "The watcher's Kubernetes route lists and watches events, counts five workload kinds, "
+            "and reads one named object; this path is none of those.",
         )
     if match.group("resource") in REFUSED_PATH_SEGMENTS or match.group("name") in DOT_SEGMENTS:
         return _refuse(
@@ -397,7 +462,7 @@ def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]]) -> Decisio
         )
     if not set(query) <= NAMED_QUERY_KEYS:
         return _refuse(RULE_K8S_QUERY, "A named read carries a query key this route does not forward.")
-    return Decision(allowed=True, rule_id="kubernetes.watcher.named-get", message="")
+    return Decision(allowed=True, rule_id=RULE_K8S_NAMED_GET, message="")
 
 
 # The values the API server reads `watch` as false. It decodes ListOptions with

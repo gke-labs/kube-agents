@@ -283,6 +283,43 @@ class C1IsolationIsStructural(unittest.TestCase):
             decision = policy.evaluate_k8s("GET", target + path, {})
             self.assertEqual(decision.rule_id, policy.RULE_K8S_SECRETS, f"GET {path} is not refused as a Secret")
 
+    def test_C1_the_watcher_count_list_is_five_cluster_scoped_kinds_one_item_metadata_only(self) -> None:
+        """The watcher's fleet-shape probe counts workloads through the broker
+        as one-item lists plus the server's remainingItemCount. The rule that
+        admits them is held to three things at once: five cluster-scoped paths
+        and no other (no namespaced form, no Secret, no Node), a query that is
+        exactly limit=1 (a larger limit or a selector is a list, not a count),
+        and an Accept every range of which asks for a PartialObjectMetadataList
+        (one plain range beside it and the server may answer with the item's
+        whole body: a pod's environment, a CronJob's template)."""
+        policy = h.watcher_policy
+        target = "kagents-dev/us-east4/fleet-a/"
+        metadata = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
+        one = {"limit": ["1"]}
+        five = {"api/v1/pods", "apis/apps/v1/deployments", "apis/apps/v1/statefulsets",
+                "apis/apps/v1/daemonsets", "apis/batch/v1/cronjobs"}
+        self.assertEqual(set(policy.COUNT_LIST_PATHS), five, "the count-list rule admits a path this test does not know")
+        for path in sorted(five):
+            decision = policy.evaluate_k8s("GET", target + path, one, metadata)
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_COUNT_LIST, f"GET {path}?limit=1 is not a count list")
+        for path in (
+            "api/v1/namespaces/default/pods",
+            "apis/apps/v1/namespaces/default/deployments",
+            "api/v1/secrets",
+            "api/v1/nodes",
+            "api/v1/configmaps",
+            "apis/batch/v1/jobs",
+            "apis/example.com/v1/deployments",
+        ):
+            decision = policy.evaluate_k8s("GET", target + path, one, metadata)
+            self.assertFalse(decision.allowed, f"GET {path}?limit=1 is relayed as a count list")
+        for query in ({}, {"limit": ["2"]}, {"limit": ["1"], "labelSelector": ["app=web"]}, {"limit": ["1"], "watch": ["true"]}):
+            decision = policy.evaluate_k8s("GET", target + "api/v1/pods", query, metadata)
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_QUERY, f"GET api/v1/pods with {query} is relayed")
+        for accept in ("", "application/json", "application/vnd.kubernetes.protobuf,application/json", metadata + ",application/json"):
+            decision = policy.evaluate_k8s("GET", target + "api/v1/pods", one, accept)
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_ACCEPT, f"GET api/v1/pods?limit=1 with Accept {accept!r} is relayed whole")
+
     def test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription(self) -> None:
         policy = h.watcher_policy
         configured = "projects/kagents-dev/subscriptions/platform-agent-drift-audit-sub"

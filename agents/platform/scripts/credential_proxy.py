@@ -12754,11 +12754,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _handle_watcher_k8s(self) -> None:
         """`GET /v1/k8s/<project>/<location>/<cluster>/<path>`: a fleet API server read.
 
-        The event watcher's list and watch of events, and the drift detector's
-        read of one named object, on the broker's credential.
-        `watcher_policy.evaluate_k8s` is the table. A watch is streamed through
-        as the API server sends it; everything else is streamed too, with the
-        Cloud API relay's deadline on each read.
+        The event watcher's list and watch of events and its one-item
+        metadata-only count lists, and the drift detector's read of one named
+        object, on the broker's credential. `watcher_policy.evaluate_k8s` is
+        the table. A watch is streamed through as the API server sends it;
+        everything else is streamed too, with the Cloud API relay's deadline
+        on each read.
         """
         request_id = str(uuid.uuid4())
         if self.command != watcher_policy.METHOD_GET:
@@ -12776,7 +12777,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
-        decision = watcher_policy.evaluate_k8s(self.command, rest, query)
+        # The Accept the upstream will see, decided once: the policy's
+        # count-list rule reads it, so what it reads has to be what is put on
+        # the request, and a value the shape drops is evaluated as absent.
+        accept = self.headers.get("Accept") or ""
+        if not WATCHER_K8S_ACCEPT_SHAPE.match(accept):
+            accept = ""
+        decision = watcher_policy.evaluate_k8s(self.command, rest, query, accept)
         if not decision.allowed:
             LOGGER.warning("watcher k8s blocked request_id=%s rule=%s", request_id, decision.rule_id)
             # A metav1.Status, which client-go decodes into a StatusError carrying
@@ -12820,8 +12827,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             target_path = f"/{k8s_path}?{parts.query}" if parts.query else f"/{k8s_path}"
             connection.putrequest(watcher_policy.METHOD_GET, target_path, skip_accept_encoding=True)
             connection.putheader("Authorization", authorization)
-            accept = self.headers.get("Accept")
-            if accept and WATCHER_K8S_ACCEPT_SHAPE.match(accept):
+            if accept:
                 connection.putheader("Accept", accept)
             connection.endheaders()
             response = connection.getresponse()

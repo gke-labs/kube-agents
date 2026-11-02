@@ -749,6 +749,26 @@ Mutation(
         "table may one day list, and the import check leans on it",
     ),
     Mutation(
+        "C1-watcher-count-list-accepts-a-full-body",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if not accepts_metadata_only(accept):\n',
+         '        if accept and not accepts_metadata_only(accept):\n'),
+        "test_C1_the_watcher_count_list_is_five_cluster_scoped_kinds_one_item_metadata_only",
+        "let a count list through when the caller sends no Accept at all, for an "
+        "older watcher -- the one item then comes back as the whole object, a "
+        "pod's environment included, on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-count-list-widened-to-secrets",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        "apis/batch/v1/cronjobs",\n    }\n)\n',
+         '        "apis/batch/v1/cronjobs",\n        "api/v1/secrets",\n    }\n)\n'),
+        "test_C1_the_watcher_count_list_is_five_cluster_scoped_kinds_one_item_metadata_only",
+        "count Secrets too, for a sizing figure -- a metadata-only list of every "
+        "Secret in the fleet, names and namespaces, becomes readable on the "
+        "broker's credential",
+    ),
+    Mutation(
         "C1-watcher-subscription-unpinned",
         "agents/platform/scripts/watcher_policy.py",
         ('    if match.group("sub") not in subscriptions:\n',
