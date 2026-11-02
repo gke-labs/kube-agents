@@ -228,6 +228,11 @@ REFETCH_FAILURE_LOG_CHARS = 200
 # so each is held well under a kubectl's 60 s; a describe that cannot answer
 # in this time leaves the fetch to run as given, marked provisional.
 SPLICE_DECISION_TIMEOUT_SECONDS = 15
+# The bound on the per-cluster kubeconfig lock map (`_KeyedLockMap`): a lookup
+# that finds this many keys drops the entries no thread holds or is waiting
+# for. A sidecar reaches far fewer clusters than this in its life; the cap is
+# there so a map keyed by what a caller names cannot grow without limit.
+KEYED_LOCK_MAP_MAX_KEYS = 4096
 
 # Bounds on what a command's output costs this process while the command runs.
 # Output is read as it streams and only the first `--max-output-bytes` of each
@@ -5072,6 +5077,72 @@ def _flags_of(decision) -> list[str]:
     return list(decision.flags) if decision is not None else []
 
 
+class _KeyedLockEntry:
+    """One key's lock and the number of threads between lookup and release."""
+
+    __slots__ = ("lock", "holders")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.holders = 0
+
+
+class _KeyedLockMap:
+    """A lock per key, so a caller waiting on one key never queues another.
+
+    `held(key)` finds or creates the key's entry under the map lock, which is
+    held only for that dict access, then acquires the key's own lock with the
+    map lock released. Two callers of one key serialise; callers of different
+    keys do not.
+
+    The map is bounded by `max_keys`: a lookup that finds the map full drops
+    the entries nobody holds. What "holds" means is the holder count, not the
+    lock's state: a thread counts from its lookup until its release, so a
+    thread that has found an entry and is still waiting to acquire it keeps
+    the entry in the map, and a later arrival for the same key finds that
+    entry rather than being handed a fresh lock. A try-acquire test would miss
+    that window and let two threads run one key's critical section at once.
+    Entries are kept once released, so a key seen again finds its lock without
+    making one; only a full map drops them. Under more concurrent holders than
+    `max_keys` the map grows past the cap rather than splitting a key.
+    """
+
+    def __init__(self, max_keys: int = KEYED_LOCK_MAP_MAX_KEYS) -> None:
+        self._map_lock = threading.Lock()
+        self._entries: dict[str, _KeyedLockEntry] = {}
+        self._max_keys = max_keys
+
+    def __len__(self) -> int:
+        with self._map_lock:
+            return len(self._entries)
+
+    def _enter(self, key: str) -> _KeyedLockEntry:
+        """Find or create the key's entry and count the caller a holder of it."""
+        with self._map_lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                if len(self._entries) >= self._max_keys:
+                    for stale in [k for k, e in self._entries.items() if e.holders == 0]:
+                        del self._entries[stale]
+                entry = self._entries[key] = _KeyedLockEntry()
+            entry.holders += 1
+            return entry
+
+    def _leave(self, entry: _KeyedLockEntry) -> None:
+        with self._map_lock:
+            entry.holders -= 1
+
+    @contextlib.contextmanager
+    def held(self, key: str) -> Iterator[None]:
+        """Hold the key's lock for the block; the map lock only around the lookup."""
+        entry = self._enter(key)
+        try:
+            with entry.lock:
+                yield
+        finally:
+            self._leave(entry)
+
+
 def _get_credentials_target(argv: list[str]) -> ClusterTarget | None:
     """The (project, cluster, location) a `get-credentials` argv names, or None.
 
@@ -7279,14 +7350,16 @@ class CommandExecutor:
             self.git_hooks_dir.chmod(0o500)
         except OSError:
             LOGGER.warning("could not restrict %s", self.git_hooks_dir)
-        # Serialises the `get-credentials` that fills a cache miss. Generation is
-        # rare and the server is threaded, so a single lock is cheaper than the
-        # bookkeeping needed to make it per-cluster.
-        self._kubeconfig_lock = threading.Lock()
+        # Serialises the `get-credentials` that fills a cache miss, per cluster:
+        # the cold path holds a cluster's lock across the endpoint describe and
+        # the fetch, so under one lock for every cluster a fetch that stalls on
+        # cluster A would queue the first command to every other cluster
+        # behind it. The map is bounded (`KEYED_LOCK_MAP_MAX_KEYS`).
+        self._kubeconfig_locks = _KeyedLockMap()
         # Serialises only the two filesystem steps that file a managed
         # kubeconfig and its provisional mark (`_file_managed_kubeconfig`), so
         # a caller's fetch never waits behind a cold read's gcloud runs, which
-        # `_kubeconfig_lock` covers.
+        # the cluster's `_kubeconfig_locks` entry covers.
         self._marker_lock = threading.Lock()
         # Set once `_endpoint_decision` finds gke_endpoint unimportable; that
         # None is settled, unlike the None of a describe that failed.
@@ -9388,11 +9461,12 @@ class CommandExecutor:
         so a crash between the two leaves an unmarked file only when it was
         settled; and it comes off after the file when it was settled. The two
         steps run under `_marker_lock`, so a settled fetch and a provisional
-        one cannot interleave them, whether or not the caller also holds
-        `_kubeconfig_lock`. A provisional result never replaces an unmarked
-        file that is newer than the snapshot: a caller's fetch files outside
-        `_kubeconfig_lock`, so a settled answer can land during a cold or
-        window-expired broker fetch, and it outranks the undecided one.
+        one cannot interleave them, whether or not the caller also holds the
+        cluster's `_kubeconfig_locks` entry. A provisional result never
+        replaces an unmarked file that is newer than the snapshot: a caller's
+        fetch files outside `_kubeconfig_locks`, so a settled answer can land
+        during a cold or window-expired broker fetch, and it outranks the
+        undecided one.
         """
         marker = self._provisional_marker(target)
         managed = self._managed_kubeconfig(target)
@@ -9420,10 +9494,16 @@ class CommandExecutor:
         `_execute_get_credentials` files the result here. This is the cold path —
         a restart, since the state dir is an emptyDir, or a kubeconfig that was
         pinned by some earlier process.
+
+        The lock is the cluster's own (`_kubeconfig_locks`): two cold reads of
+        one cluster serialise, and the second finds the file the first filed
+        and runs no fetch, while a cold read of another cluster waits for
+        nothing here. It is taken after admission, inside the request's slot
+        and reservation, as the single lock before it was.
         """
         managed = self._managed_kubeconfig(target)
         marker = self._provisional_marker(target)
-        with self._kubeconfig_lock:
+        with self._kubeconfig_locks.held(target.context_name):
             if managed.is_file() and managed.stat().st_size > 0 and (
                 not marker.exists() or self._provisional_window_open(marker)
             ):
@@ -9471,7 +9551,7 @@ class CommandExecutor:
                         )
                         # Only an existing mark is pushed out: a caller may
                         # have filed a settled kubeconfig for this cluster
-                        # outside `_kubeconfig_lock` since the miss above, and
+                        # outside `_kubeconfig_locks` since the miss above, and
                         # marking that file would send it back here a minute
                         # later for an undecided refetch to overwrite.
                         with self._marker_lock:
@@ -9559,7 +9639,7 @@ class CommandExecutor:
                 context = read_current_context(generated)
                 target = parse_gke_context(context) if context else None
                 if target is not None:
-                    # Outside `_kubeconfig_lock`, as before: a scaffold never
+                    # Outside `_kubeconfig_locks`, as before: a scaffold never
                     # waits behind a cold read's gcloud runs. The filing step
                     # takes `_marker_lock` by itself, so the file and its
                     # provisional mark cannot interleave with the broker's own
@@ -9646,7 +9726,7 @@ class CommandExecutor:
         already holds one: a slot and a child memory reservation are a
         request's, held by the route from admission until the response is
         written (`request_slot`), so every command a request runs -- the
-        kubeconfig cache-fill made under `_kubeconfig_lock` included -- is
+        kubeconfig cache-fill made under `_kubeconfig_locks` included -- is
         covered by the one its request holds, and no lock is held while waiting
         for admission. The one exception is the refresh route, which holds
         `_refresh_lock` across its budget wait and yields it to a vcs verb that
