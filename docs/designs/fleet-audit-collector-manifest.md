@@ -142,8 +142,9 @@ their notes can name. A discovery that serves no wanted kind means no Config Con
 that collector. A failed discovery, or a kind that does not list, makes the entry `kcc_unread`,
 unless the kind's CustomResourceDefinition went away after the discovery.
 
-The compliance collector writes the keys on each cluster it reads that serves a Config Connector
-kind, from the read its own `kcc-object-wedged` check makes
+The compliance collector writes `kcc_unready` on each cluster it reads that serves a Config
+Connector kind, and `kcc_unread` on each cluster whose read fails, also when the discovery fails,
+from the read its own `kcc-object-wedged` check makes
 ([`compliance_audit_sop.md`](../../agents/platform/governance/compliance_audit_sop.md) §2.12), and
 takes the namespace annotations from its NetworkPolicy read. Its `kcc-object-wedged` record names
 `kubectl get gcp -A -o json`, a command a reader can run that returns the same objects, and carries
@@ -170,13 +171,12 @@ that is read, neither key means that the cluster's discovery serves none of the 
 collector reads: for compliance, no Config Connector kind in the `gcp` category; for drift, patch
 readiness and stockout, neither container kind.
 
-`finish` counts the possible Config Connector hosts: the entries with either key, and, when any
-entry carries either key, each cluster entry that the collector never read
-(`unreachable` or `gate-failed`) unless its `cluster_status` says it is not running. With more than
-one, `finish` names an object only when its `project` is known and agrees with the fix. With one, a
-known `project` that differs from the fix's is still no match. `finish` adds a paragraph to any fix
-whose finding's own object is not ready, and states the stall on a merged fix that still reproduces
-(the issue-ledger design, §6).
+`finish` adds a paragraph to any fix whose finding's own object is not ready, and states the stall
+on a merged fix that still reproduces. The possible Config Connector hosts are the entries with
+either key and, when any entry has one, each cluster entry the collector never read or a project
+whose cluster list failed, but not a cluster that is not running. The rules for the hosts and for a
+certain match are in the issue-ledger design
+([`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md) §6).
 
 Rules for a collector: every enumerated target appears with an `outcome`; a gate failure (zero-byte
 or truncated read) is `outcome: "gate-failed"`, never a shorter candidate list; a candidate is

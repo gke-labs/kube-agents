@@ -814,7 +814,8 @@ for a cluster or a node pool, the location of the finding's cluster.
 Only the finding's own object in the file counts, also when the file declares one Config Connector
 object: for `NodePool/<n>`, the `ContainerNodePool` `<n>` on the finding's cluster; for
 `Cluster/<n>`, the `ContainerCluster` `<n>`; for `<Kind>/<n>` of a Config Connector kind, the object
-of that kind and that name. A finding of another kind (a `Deployment`, a `HorizontalPodAutoscaler`)
+of that kind and that name. This last rule applies only to a `kcc-object-wedged` finding, which is
+about a Config Connector object, and only to an object on the finding's cluster. A finding of another kind (a `Deployment`, a `HorizontalPodAutoscaler`)
 has no Config Connector object of its own, even when the file declares one of the same name: a
 `Deployment` fix in a file that also declares an `IAMServiceAccount` did not change that account, so
 a stall of the account gives it no note. A file with no object of the finding gives no in-file
@@ -837,7 +838,8 @@ unknown.
 A ready object is not in the list, so with more than one possible host the same name can be ready
 on one host and not ready on another. Then the `project` must also be known. A possible host is an
 entry that carries `kcc_unready` (also empty) or `kcc_unread`, or, when any entry carries either key,
-a cluster entry the collector never read (`unreachable` or `gate-failed`). An entry
+a cluster entry the collector never read (`unreachable` or `gate-failed`), or a project whose
+cluster list failed (a `gate-failed` `project/<id>` entry). An entry
 whose `cluster_status` says the cluster is not running is not a host: it cannot run the
 controllers. A `Cluster/` or `NodePool/` finding's own object with no recorded project does not
 match when the manifest holds a cluster of the same name in another project. The own object must
