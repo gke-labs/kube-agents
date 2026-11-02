@@ -1696,7 +1696,8 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         # Re-stamp this Cluster Agent's Target Cluster Identity from its preserved
         # $d/config.yaml via cluster_agent_profile.py so existing cluster-* profiles
         # keep their identity in SOUL.md. A SOUL.md this container cannot write is
-        # skipped as before, and keeps the home off the stamp.
+        # skipped as before, and keeps the home off the stamp; so does a config.yaml
+        # with no readable identity, which the script exits non-zero for.
         if [ -f "$d/SOUL.md" ] && [ -f "$d/config.yaml" ] && [ -f "$CLUSTER_PROFILE_SCRIPT" ]; then
             if [ -w "$d/SOUL.md" ]; then
                 "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_PROFILE_SCRIPT" stamp-soul --profile-dir "$d" \
@@ -1736,6 +1737,18 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
                 _cluster_clean=0
             fi
         done
+        # The four config.yaml repairs below and the cron back-fill each step over a
+        # file this container cannot write, as they always did. With the stamp a step
+        # stepped over in silence would read as done, so the file is named here and
+        # the home stays off the stamp until it can be written.
+        if [ ! -w "$d/config.yaml" ]; then
+            echo "WARN: $d/config.yaml is not writable; its config repairs were skipped" >&2
+            _cluster_clean=0
+        fi
+        if [ -f "$d/cron/jobs.json" ] && [ ! -w "$d/cron/jobs.json" ]; then
+            echo "WARN: $d/cron/jobs.json is not writable; its risk tier back-fill was skipped" >&2
+            _cluster_clean=0
+        fi
         # Targeted self-heal: drop `memory.provider` from cluster configs already
         # on the PVC. The template no longer sets it (per-user memory scopes by
         # gateway user identity, which a dispatcher-spawned worker never has), but
@@ -1790,7 +1803,8 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
                 || { echo "WARN: failed to repair the remote MCP entries in $d/config.yaml; this cluster agent keeps the header and server URLs it was scaffolded with, and if the back-fill added MCP_REMOTE_BEARER_FILE beside a Google URL its gke and developer_knowledge calls fail until the repair succeeds" >&2; _cluster_clean=0; }
         fi
         # Backfill default legacy risk onto any unannotated jobs in this cluster profile's
-        # cron store if one exists on the PVC.
+        # cron store if one exists on the PVC. The script exits non-zero for a store it
+        # could not read or rewrite, which is what keeps such a home off the stamp.
         if [ -f "$d/cron/jobs.json" ] && [ -w "$d/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
             HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
                 "$SCAFFOLD" --backfill-cron "$d/cron/jobs.json" \

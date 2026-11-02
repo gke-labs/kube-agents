@@ -1339,6 +1339,79 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             self.assertEqual((profile / "SOUL.md").read_text(encoding="utf-8"), "old persona\n")
             self.assertFalse((profile / ".scaffold-stamp").exists(), "a home the pass could not refresh was stamped")
 
+    def test_a_cron_store_the_back_fill_cannot_read_is_not_stamped(self):
+        """The shipped back-fill, not a stand-in: a store it cannot parse fails the step.
+
+        `profile_scaffold.py --backfill-cron` used to exit zero whatever it could do;
+        with the stamp that read a malformed `jobs.json` as back-filled. The step now
+        exits non-zero for a store it could not read or rewrite, the loop's WARN names
+        it, and the home is refreshed again next start.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (profile / "cron").mkdir()
+            (profile / "cron" / "jobs.json").write_text("{not json", encoding="utf-8")
+            proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("WARN: could not read cron store", proc.stderr)
+            self.assertIn("WARN: failed to backfill risk tier", proc.stderr)
+            self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a store the back-fill could not read was stamped")
+            self.assertEqual((profile / "cron" / "jobs.json").read_text(encoding="utf-8"), "{not json")
+
+    def test_a_profile_whose_config_has_no_identity_is_not_stamped(self):
+        """The persona copy blanks SOUL.md; a profile the stamp cannot re-identify must not read as current.
+
+        `stamp-soul` used to return quietly when `config.yaml` carried no readable
+        `cluster_identity`, leaving the blank template in place. It exits non-zero now,
+        the loop says so, and the home stays off the stamp until the identity is back.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            config = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+            del config["cluster_identity"]
+            (profile / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+            proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("no readable cluster_identity", proc.stderr)
+            self.assertIn("WARN: failed to stamp cluster identity", proc.stderr)
+            self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertNotIn("## Target Cluster Identity", (profile / "SOUL.md").read_text(encoding="utf-8"))
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a profile with no identity was stamped")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores the read-only fixture")
+    def test_read_only_config_and_cron_files_inside_a_writable_home_are_not_stamped(self):
+        """A repair stepped over is said, not stamped.
+
+        The config repairs and the cron back-fill are each gated on the file being
+        writable and used to skip it in silence; the persona copy beside them still
+        succeeds, so without a word the pass would look clean. Both files are named,
+        the rest of the pass runs, and no stamp is written.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (profile / "cron").mkdir()
+            (profile / "cron" / "jobs.json").write_text(json.dumps({"jobs": [{"id": "job1"}]}), encoding="utf-8")
+            before = (profile / "config.yaml").read_text(encoding="utf-8")
+            (profile / "config.yaml").chmod(0o444)
+            (profile / "cron" / "jobs.json").chmod(0o444)
+            try:
+                proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            finally:
+                (profile / "config.yaml").chmod(0o644)
+                (profile / "cron" / "jobs.json").chmod(0o644)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("config.yaml is not writable; its config repairs were skipped", proc.stderr)
+            self.assertIn("cron/jobs.json is not writable; its risk tier back-fill was skipped", proc.stderr)
+            self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertIn("## Target Cluster Identity", (profile / "SOUL.md").read_text(encoding="utf-8"),
+                          "the skipped repairs stopped the rest of the pass")
+            self.assertEqual((profile / "config.yaml").read_text(encoding="utf-8"), before)
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a home with a repair skipped was stamped")
+
     def test_without_the_stamp_script_every_home_is_refreshed_and_none_is_stamped(self):
         """The fallback is the loop as it always ran: no digest, no skip, no stamp."""
         with tempfile.TemporaryDirectory() as tmp:

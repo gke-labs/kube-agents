@@ -421,15 +421,21 @@ def backfill_cron_store(store: object) -> object:
     return {**store, "jobs": out}
 
 
-def backfill_cron_file(path: Path) -> bool:
+def backfill_cron_file(path: Path) -> bool | None:
     """Backfill DEFAULT_LEGACY_CRON_RISK into a cron/jobs.json file if present.
 
     Atomic rewrite using a .tmp sibling and os.replace, matching _merge_after_overlay.
-    Returns True if the file was modified, False otherwise.
+    Returns True if the file was modified, False if it needed nothing, and None when
+    the store could not be read or rewritten: the entrypoint runs this on a pass it
+    stamps as finished only when every step finished, so "nothing to do" and "could
+    not" have to be told apart.
     """
     with cron_jobs_lock(path.parent):
         data = read_json(path)
         if data is None:
+            if path.exists():
+                log(f"WARN: could not read cron store {path}; its jobs were not backfilled")
+                return None
             return False
         backfilled = backfill_cron_store(data)
         if backfilled == data:
@@ -441,7 +447,7 @@ def backfill_cron_file(path: Path) -> bool:
             return True
         except OSError as exc:
             log(f"WARN: could not backfill cron store {path}: {exc}")
-            return False
+            return None
 
 
 def retire_cron_jobs(store: object, retire_ids: tuple[str, ...]) -> object:
@@ -655,7 +661,8 @@ def main() -> None:
         target = Path(args.backfill_cron)
         if not target.is_file():
             raise SystemExit(f"ERROR: --backfill-cron target not found: {target}")
-        backfill_cron_file(target)
+        if backfill_cron_file(target) is None:
+            raise SystemExit(f"ERROR: --backfill-cron could not read or rewrite {target}")
         return
 
     if not args.template:
