@@ -99,8 +99,8 @@ EXCLUSIVE_WINDOW_FIELD = "exclusive_window"
 #: (`writes_alone: true` at the top of its task.yaml): a case that requests
 #: nothing and whose reply may still let a card write, so the safeguard has
 #: to charge a write the reply does not name. The script reads the same key
-#: through ``kube_agents_bench.stop_hook --writes-alone`` to place the case,
-#: on every transport; a stopped ask is placed on the inject lane only.
+#: itself, with a plain YAML load, to place the case on every transport; a
+#: stopped ask is placed on the inject lane only.
 WRITES_ALONE_KEY = "writes_alone"
 #: What a task file names its checks under, and the file the copy is written as.
 SPEC_KEY = "verification_spec"

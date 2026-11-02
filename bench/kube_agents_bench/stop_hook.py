@@ -108,28 +108,15 @@ def parse(prompt: str) -> Stop | None:
     return Stop(prompt=ask, observe_seconds=observe)
 
 
-#: The flag that lists the ``writes_alone`` cases instead of the stopped asks.
-WRITES_ALONE_FLAG = "--writes-alone"
-
-
 def main(argv: list[str] | None = None) -> int:
     """Print the case id (its directory) of every task file given whose
     prompt is a stopped ask, one per line: the list hack/ci-eval-pr.sh runs
-    in its second phase on the inject lane. With ``--writes-alone`` first,
-    print instead the cases that declare ``writes_alone: true``, which the
-    script runs in that phase on every transport
-    (:func:`kube_agents_bench.lane.declares_writes_alone`). An unreadable
-    task file is an error."""
-    from kube_agents_bench import lane  # local: lane imports this module
-
-    args = list(sys.argv[1:] if argv is None else argv)
-    writes_alone = bool(args) and args[0] == WRITES_ALONE_FLAG
-    if writes_alone:
-        args = args[1:]
-    for task in args:
+    in its second phase on the inject lane. An unreadable task file is an
+    error. (The script reads the ``writes_alone`` cases itself, with a plain
+    YAML load, since a presubmit grades with the base commit's bench.)"""
+    for task in sys.argv[1:] if argv is None else argv:
         doc = yaml.safe_load(Path(task).read_text(encoding="utf-8")) or {}
-        listed = lane.declares_writes_alone(doc) if writes_alone else is_stopped_ask(str(doc.get("prompt") or ""))
-        if listed:
+        if is_stopped_ask(str(doc.get("prompt") or "")):
             print(Path(task).parent.name)
     return 0
 
