@@ -31,7 +31,7 @@ console's Harness limits page reads `harness-limits.json`.
   `real-install-stress.yaml` and `real-install-stress-load.yaml` (stress beyond fair use),
   `real-install-scaling.yaml` (token cost at 80 and 20 clusters). Run each
   with `--only-factor combined`. [`real-install-results.md`](real-install-results.md) holds the
-  results.
+  results, and [`real-install-evidence.md`](real-install-evidence.md) the data behind them.
 - `harness-limits.json`: every measured run. A run merges its records in and replaces only a record with the same key; a record leaves the file only by hand, as Phase 1's runs spoiled by an outside IAM change did before their re-runs.
 - `harness-limits.sample.json`: a small fake data set the console page and its tests use when
   `harness-limits.json` does not exist.

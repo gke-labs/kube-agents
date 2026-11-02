@@ -62,6 +62,10 @@ Model tokens are the largest running cost. In steady operation, on this fleet, t
 $16.6 of tokens per hour, about $400 per day. One install on GKE costs about $0.40 per hour. The
 40-cluster test fleet costs about $15 per hour.
 
+[`real-install-evidence.md`](real-install-evidence.md) has the data behind these results: memory by
+container and process, agent tasks, what the tokens pay for, credential proxy requests, cost and its
+proof, and what grows with the fleet.
+
 ## Expected conclusions
 
 Each prediction comes from the first-run data above and the Phase 1 to 4 forecast. After the test,
