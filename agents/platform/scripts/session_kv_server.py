@@ -2601,21 +2601,17 @@ def _data_volume_usage(path: str) -> Optional[tuple[int, int]]:
 
 
 def _data_volume_warned() -> bool:
-    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
         row = conn.execute("SELECT warned FROM data_volume_warning WHERE id = 1").fetchone()
     return bool(row and row[0])
 
 
-def _set_data_volume_warned(warned: bool) -> bool:
-    """Move the flag to `warned`. True only for the caller that changed it."""
-    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+def _set_data_volume_warned(warned: bool) -> None:
+    """Set the flag to `warned`."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
         with conn:
             conn.execute("INSERT OR IGNORE INTO data_volume_warning (id, warned) VALUES (1, 0)")
-            cur = conn.execute(
-                "UPDATE data_volume_warning SET warned = ? WHERE id = 1 AND warned != ?",
-                (int(warned), int(warned)),
-            )
-            return cur.rowcount == 1
+            conn.execute("UPDATE data_volume_warning SET warned = ? WHERE id = 1", (int(warned),))
 
 
 def _post_data_volume_warning(message: str) -> bool:
