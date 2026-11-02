@@ -111,33 +111,39 @@ verification_spec:
         # skill says to ask rather than invent a layout (no cluster definition,
         # no Terraform or Config Connector for the cluster, which format). The
         # patterns admit; the lane safeguard grades any write the reply did not
-        # request. Each absence phrase is complete and bound to its object: the
-        # Config Connector span ends at a clause mark (the
-        # provisioning-cluster-request-never-creates forms); "not defined in"
-        # needs a repository after it, so "binaryAuthorization is not defined in
-        # the spec" followed by advice is not a stop; the no-repo phrase ends on
-        # punctuation, a line end or a clause word, so "no registered repository
-        # declares that cluster" is not the no-repo stop but the second stop
-        # (the repository declares nothing for the cluster), which its own
-        # form admits. The block-reason copy below is the same list, unfolded:
-        # a path may sit in backticks there.
+        # request. Every absence is bound to the thing the skill stops on, not
+        # to a setting: the span after "Config Connector" or a CRD ends at any
+        # clause mark, comma and colon included; the cluster or seeded-<x> is
+        # the subject of "is not defined in <repo>" and the object of "does
+        # not define", with determiners only between; "no ... definition" names
+        # the cluster, "no <kcc|provisioning|cluster> path"; the asks name a
+        # layout, path or format and a cluster or provisioning word. So
+        # "binaryAuthorization is not defined in the repo. You can run gcloud
+        # ..." and "Config Connector is installed, but the setting is not
+        # enabled" are not stops. The no-repo phrase ends on punctuation, a
+        # line end or a clause word, so "no registered repository declares that
+        # cluster" is the second stop, which its own form admits, not the
+        # no-repo stop. The block-reason copy below is the same list, unfolded:
+        # a path or a cluster name may sit in backticks there.
         - type: report_contains
           fold_decoration: true
           any_of_patterns:
-            - '\bconfig connector\b(?:[^\n.;?!]|\.(?=\w)){0,80}?(?:(?:\bnot|n''t|\bnever)(?: \w+){0,3} (?:installed|enabled|available|set up|present|found|deployed|running|there|exist|existing)|\b(?:missing|absent|unavailable|no crds?))\b'
+            - '\bconfig connector\b(?:[^\n.,;:?!]|\.(?=\w)){0,80}?(?:(?:\bnot|n''t|\bnever)(?: \w+){0,3} (?:installed|enabled|available|set up|present|found|deployed|running|there|exist|existing)|\b(?:missing|absent|unavailable|no crds?))\b'
             - '\b(?:lacks?|lacking|without|missing|(?:does|do|did)(?: not|n''t) have|(?:has|have|had) no|could(?: not|n''t) find|(?:none|neither|no clusters?|no cluster)\b(?:[^\n.,;:!?()]|\([^)\n]*\)){0,120}?\b(?:has|have|runs?)) (?:a |an |any |the |this |these |those )?config connector\b'
-            - '\bno config connector\b'
-            - '\bcrds?\b(?:[^\n.;?!]|\.(?=\w)|\([^)\n]*\)){0,120}?(?:\bnot|n''t|\bnever)(?: \w+){0,3} (?:installed|present|found|available)\b'
-            - '\bno (?:[\w-]+ ){0,3}[`''\"]?clusters/[^\s`''\"]*provisioning\b'
-            - '\b(?:has|have|had|holds?|with) no (?:[\w-]+ ){0,2}(?:kcc|provisioning|cluster|infrastructure) (?:path|directory|directories|content|code|definitions?|manifests?)\b'
-            - '\bno (?:[\w-]+ ){0,2}(?:definitions?|iac|infrastructure-as-code)\b'
-            - '\bno (?:terraform|hcl|containercluster)\b(?:[^\n.;?!]|\.(?=\w)){0,40}?\b(?:config connector|kcc|containercluster|cluster|path)\b'
-            - '\bno (?:[\w-]+ ){0,3}repositor(?:y|ies)\b(?: i (?:manage|can write to))? (?:declares|defines|holds|contains)\b'
-            - '\b(?:does|do|did)(?: not|n''t) (?:declare|define|hold|contain)(?: [\w-]+){0,3} (?:cluster|seeded-\w+)\b'
-            - '\bnot (?:declared|defined) in (?:the |any |a |this )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo)\b'
+            - '\bno config connector\b(?: (?:crds?|crd \([^)\n]*\)|installation))?(?: (?:is|was|are|were))? (?:installed|present|found|running|available|enabled|deployed|exists?|on|for|in|anywhere|here)\b|\bno config connector\b[ \t]*(?:[.,;:!?)]|\n|$| (?:so|and|to|yet)\b)'
+            - '\b(?:kcc|config connector|containercluster|cnrm)\b(?:[^\n.,;:?!]|\.(?=\w)){0,80}?\bcrds?\b(?:[^\n.,;:?!]|\.(?=\w)|\([^)\n]*\)){0,80}?(?:\bnot|n''t|\bnever)(?: \w+){0,2} (?:installed|present|found|available)\b'
+            - '\bno (?:[\w-]+ ){0,3}[`''\"]?clusters/[^\s`''\"]*provisioning/?\b'
+            - '\b(?:has|have|had|holds?|with|there is|there are) no (?:[\w-]+ ){0,2}[`''\"]?(?:kcc|provisioning|cluster|infrastructure)/?[`''\"]? (?:path|directory|directories|content|code|definitions?|manifests?|files?)\b'
+            - '\bno (?:[\w-]+ ){0,2}(?:iac|infrastructure-as-code)\b'
+            - '\bno (?:cluster |infrastructure |containercluster |kcc )?(?:definitions?|manifests?)(?: exists?)? (?:of|for) (?:the |that |this |any )?[`''\"]?(?:cluster|seeded-\w+)\b'
+            - '\bno (?:terraform|hcl)\b(?:[^\n.,;:?!]|\.(?=\w)){0,40}?\b(?:config connector|kcc|containercluster|for (?:the |any |that |this )?[`''\"]?(?:cluster|seeded-\w+))\b'
+            - '\bno (?:[\w-]+ ){0,3}repositor(?:y|ies)\b(?: i (?:manage|can write to))? (?:declares|defines|holds|contains) (?:the |that |this |any |a )?[`''\"]?(?:cluster|seeded-\w+)\b'
+            - '\b(?:does|do|did)(?: not|n''t) (?:declare|define|hold|contain) (?:the |that |this |any |a )?[`''\"]?(?:cluster|seeded-\w+)\b'
+            - '\b(?:cluster|seeded-\w+)[`''\"]? (?:is|was) not (?:declared|defined) in (?:the |any |a |this )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo)\b'
             - '\bno file (?:to (?:change|edit)|(?:for|in) (?:the |this |that |any )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo))\b'
-            - '\b(?:which|what)(?: [\w./*-]+){0,3} formats?\b'
-            - '\bhow should\b[^\n?]{0,120}\b(?:declared|managed|written|reach review|hold)\b'
+            - '\b(?:which|what)(?: [\w./*-]+){0,3} (?:format|layout|path|directory|dir)s?\b[^\n?]{0,80}\b(?:cluster|seeded-\w+|provisioning|declared|live|config|definition|manifests?)\b'
+            - '\bhow should\b[^\n?]{0,60}\b(?:cluster|seeded-\w+|layout|path|provisioning)\b[^\n?]{0,60}\b(?:declared|managed|written|reach review|hold|live)\b'
+            - '\bshould (?:the )?[`''\"]?(?:cluster|seeded-\w+)[`''\"]? be (?:declared|managed|defined|written|held)\b'
             - '\bno[-_ ]?registered[-_ ]?repo\b'
             - '(?m)\bno (?:registered|managed) (?:gitops )?repositor(?:y|ies)(?: (?:is|was) (?:registered|configured|found|available))?[ \t]*(?:[.,;:!?)]|\n|$| (?:so|for|in|on|to|yet|and|at all|here)\b)'
             - '\bno (?:[\w-]+ ){0,2}repositor(?:y|ies)\b(?: (?:is|are|was|were))? (?:registered|managed)\b'
@@ -160,7 +166,7 @@ verification_spec:
           scope: workers
           agent: platform
           arguments:
-            reason: '(?is).*(?:\bconfig connector\b(?:[^\n.;?!]|\.(?=\w)){0,80}?(?:(?:\bnot|n''t|\bnever)(?: \w+){0,3} (?:installed|enabled|available|set up|present|found|deployed|running|there|exist|existing)|\b(?:missing|absent|unavailable|no crds?))\b|\b(?:lacks?|lacking|without|missing|(?:does|do|did)(?: not|n''t) have|(?:has|have|had) no|could(?: not|n''t) find|(?:none|neither|no clusters?|no cluster)\b(?:[^\n.,;:!?()]|\([^)\n]*\)){0,120}?\b(?:has|have|runs?)) (?:a |an |any |the |this |these |those )?config connector\b|\bno config connector\b|\bcrds?\b(?:[^\n.;?!]|\.(?=\w)|\([^)\n]*\)){0,120}?(?:\bnot|n''t|\bnever)(?: \w+){0,3} (?:installed|present|found|available)\b|\bno (?:[\w-]+ ){0,3}[`''\"]?clusters/[^\s`''\"]*provisioning\b|\b(?:has|have|had|holds?|with) no (?:[\w-]+ ){0,2}(?:kcc|provisioning|cluster|infrastructure) (?:path|directory|directories|content|code|definitions?|manifests?)\b|\bno (?:[\w-]+ ){0,2}(?:definitions?|iac|infrastructure-as-code)\b|\bno (?:terraform|hcl|containercluster)\b(?:[^\n.;?!]|\.(?=\w)){0,40}?\b(?:config connector|kcc|containercluster|cluster|path)\b|\bno (?:[\w-]+ ){0,3}repositor(?:y|ies)\b(?: i (?:manage|can write to))? (?:declares|defines|holds|contains)\b|\b(?:does|do|did)(?: not|n''t) (?:declare|define|hold|contain)(?: [\w-]+){0,3} (?:cluster|seeded-\w+)\b|\bnot (?:declared|defined) in (?:the |any |a |this )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo)\b|\bno file (?:to (?:change|edit)|(?:for|in) (?:the |this |that |any )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo))\b|\b(?:which|what)(?: [\w./*-]+){0,3} formats?\b|\bhow should\b[^\n?]{0,120}\b(?:declared|managed|written|reach review|hold)\b|\bno[-_ ]?registered[-_ ]?repo\b|\bno (?:registered|managed) (?:gitops )?repositor(?:y|ies)(?: (?:is|was) (?:registered|configured|found|available))?[ \t]*(?:[.,;:!?)]|\n|$| (?:so|for|in|on|to|yet|and|at all|here)\b)|\bno (?:[\w-]+ ){0,2}repositor(?:y|ies)\b(?: (?:is|are|was|were))? (?:registered|managed)\b|\brepositor(?:y|ies)\b[^\n]{0,40}\b(?:is|are|was|were)(?: not|n''t) (?:registered|managed)\b).*'
+            reason: '(?is).*(?:\bconfig connector\b(?:[^\n.,;:?!]|\.(?=\w)){0,80}?(?:(?:\bnot|n''t|\bnever)(?: \w+){0,3} (?:installed|enabled|available|set up|present|found|deployed|running|there|exist|existing)|\b(?:missing|absent|unavailable|no crds?))\b|\b(?:lacks?|lacking|without|missing|(?:does|do|did)(?: not|n''t) have|(?:has|have|had) no|could(?: not|n''t) find|(?:none|neither|no clusters?|no cluster)\b(?:[^\n.,;:!?()]|\([^)\n]*\)){0,120}?\b(?:has|have|runs?)) (?:a |an |any |the |this |these |those )?config connector\b|\bno config connector\b(?: (?:crds?|crd \([^)\n]*\)|installation))?(?: (?:is|was|are|were))? (?:installed|present|found|running|available|enabled|deployed|exists?|on|for|in|anywhere|here)\b|\bno config connector\b[ \t]*(?:[.,;:!?)]|\n|$| (?:so|and|to|yet)\b)|\b(?:kcc|config connector|containercluster|cnrm)\b(?:[^\n.,;:?!]|\.(?=\w)){0,80}?\bcrds?\b(?:[^\n.,;:?!]|\.(?=\w)|\([^)\n]*\)){0,80}?(?:\bnot|n''t|\bnever)(?: \w+){0,2} (?:installed|present|found|available)\b|\bno (?:[\w-]+ ){0,3}[`''\"]?clusters/[^\s`''\"]*provisioning/?\b|\b(?:has|have|had|holds?|with|there is|there are) no (?:[\w-]+ ){0,2}[`''\"]?(?:kcc|provisioning|cluster|infrastructure)/?[`''\"]? (?:path|directory|directories|content|code|definitions?|manifests?|files?)\b|\bno (?:[\w-]+ ){0,2}(?:iac|infrastructure-as-code)\b|\bno (?:cluster |infrastructure |containercluster |kcc )?(?:definitions?|manifests?)(?: exists?)? (?:of|for) (?:the |that |this |any )?[`''\"]?(?:cluster|seeded-\w+)\b|\bno (?:terraform|hcl)\b(?:[^\n.,;:?!]|\.(?=\w)){0,40}?\b(?:config connector|kcc|containercluster|for (?:the |any |that |this )?[`''\"]?(?:cluster|seeded-\w+))\b|\bno (?:[\w-]+ ){0,3}repositor(?:y|ies)\b(?: i (?:manage|can write to))? (?:declares|defines|holds|contains) (?:the |that |this |any |a )?[`''\"]?(?:cluster|seeded-\w+)\b|\b(?:does|do|did)(?: not|n''t) (?:declare|define|hold|contain) (?:the |that |this |any |a )?[`''\"]?(?:cluster|seeded-\w+)\b|\b(?:cluster|seeded-\w+)[`''\"]? (?:is|was) not (?:declared|defined) in (?:the |any |a |this )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo)\b|\bno file (?:to (?:change|edit)|(?:for|in) (?:the |this |that |any )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo))\b|\b(?:which|what)(?: [\w./*-]+){0,3} (?:format|layout|path|directory|dir)s?\b[^\n?]{0,80}\b(?:cluster|seeded-\w+|provisioning|declared|live|config|definition|manifests?)\b|\bhow should\b[^\n?]{0,60}\b(?:cluster|seeded-\w+|layout|path|provisioning)\b[^\n?]{0,60}\b(?:declared|managed|written|reach review|hold|live)\b|\bshould (?:the )?[`''\"]?(?:cluster|seeded-\w+)[`''\"]? be (?:declared|managed|defined|written|held)\b|\bno[-_ ]?registered[-_ ]?repo\b|\bno (?:registered|managed) (?:gitops )?repositor(?:y|ies)(?: (?:is|was) (?:registered|configured|found|available))?[ \t]*(?:[.,;:!?)]|\n|$| (?:so|for|in|on|to|yet|and|at all|here)\b)|\bno (?:[\w-]+ ){0,2}repositor(?:y|ies)\b(?: (?:is|are|was|were))? (?:registered|managed)\b|\brepositor(?:y|ies)\b[^\n]{0,40}\b(?:is|are|was|were)(?: not|n''t) (?:registered|managed)\b).*'
           require_success: true
   # No tool_called check on the gke server's write tools: each profile offers
   # only its read tools (#2955), so such a check could never trip, and
