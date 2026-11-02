@@ -294,6 +294,23 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 	}
 }
 
+// A CR cannot give the exec pod another role: spec.deployment.env does not
+// reach the broker's role, and the exec pod sets its own once.
+func TestTheExecTierRoleCannotBeSetFromTheCR(t *testing.T) {
+	agent := execTierTestAgent(ptr.To(int32(2)))
+	agent.Spec.Deployment.Env = []corev1.EnvVar{{Name: credentialProxyRoleEnv, Value: "api-proxy"}}
+	dep := buildCredentialProxyExecTierDeployment(agent, buildCredentialProxyDeployment(agent, "hash"))
+	var roles []string
+	for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == credentialProxyRoleEnv {
+			roles = append(roles, e.Value)
+		}
+	}
+	if len(roles) != 1 || roles[0] != credentialProxyExecRole {
+		t.Errorf("exec pod roles %v, want exactly [exec]", roles)
+	}
+}
+
 // The forge credentials and configuration stay on the stateful broker.
 func TestTheExecTierMountsNoForgeCredentials(t *testing.T) {
 	agent := gitlabAgent("gitlab-token")
