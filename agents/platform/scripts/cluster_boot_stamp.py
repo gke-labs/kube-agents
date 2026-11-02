@@ -113,10 +113,17 @@ def _feed_tree(h: "hashlib._Hash", root: Path) -> None:
             # descend into it (followlinks=False); it is already hashed as a link.
 
 
-def digest(inputs: list[str]) -> str:
-    """The digest of *inputs* in order: ``<version>-<sha256 hex>``."""
+def digest(inputs: list[str], salt: str = "") -> str:
+    """The digest of *inputs* in order, and of *salt*: ``<version>-<sha256 hex>``.
+
+    The salt is the image version: the loop's scripts import helpers the input
+    list does not name, so a tagged image bump moves the digest whatever changed
+    in it, while the trees still catch a rebuild under the same tag.
+    """
     h = hashlib.sha256()
     h.update(DIGEST_VERSION.encode("ascii"))
+    h.update(_SEP)
+    h.update(salt.encode("utf-8", "surrogateescape"))
     h.update(_SEP)
     for index, raw in enumerate(inputs):
         # The ordinal rather than the path: the paths are fixed image paths, and
@@ -160,6 +167,8 @@ def main(argv: list[str] | None = None) -> int:
     p_digest = sub.add_parser("digest", help="print the digest of the inputs, in order")
     p_digest.add_argument("--input", action="append", default=[], metavar="PATH",
                           help="a file or tree the cluster loop reads; repeatable, order matters")
+    p_digest.add_argument("--salt", default="", metavar="TEXT",
+                          help="text hashed with the inputs, the image version; empty by default")
     p_stale = sub.add_parser("stale", help="print the cluster-* homes whose stamp is not the digest")
     p_stale.add_argument("--profiles-dir", required=True, type=Path)
     p_stale.add_argument("--digest", required=True)
@@ -167,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "digest":
         if not args.input:
             parser.error("digest needs at least one --input")
-        print(digest(args.input))
+        print(digest(args.input, args.salt))
         return EXIT_OK
     try:
         names = stale_profiles(args.profiles_dir, args.digest)

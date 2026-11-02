@@ -190,16 +190,14 @@ def expected_entries(profile: str) -> dict[str, str]:
 DISPLACED_MARK = ".displaced-"
 DISPLACED_STAMP = re.compile(r"\d{8}T\d{6}")
 
-# Lists a directory's entries as name, mtime, size and type, NUL terminated so
-# a name with a newline or a tab in it can't forge a second row.  By absolute
-# path for the same reason as `REMOTE_LS`.  The escapes are find's own: an
-# argv can't carry a NUL byte, so `-printf` gets the backslash sequences as
-# text and expands them in the sandbox.
+# Lists a tree's entries as path relative to the starting point, mtime, size
+# and type, NUL terminated so a name with a newline or a tab in it can't forge
+# a second row.  By absolute path for the same reason as `REMOTE_LS`.  The
+# escapes are find's own: an argv can't carry a NUL byte, so `-printf` gets the
+# backslash sequences as text and expands them in the sandbox.  Each sweep
+# reads a whole profiles root in one find: a home's entry arrives as
+# `<home>/<entry>`, a cron run as `<home>/cron/runs/<run>`.
 REMOTE_FIND = "/usr/bin/find"
-FIND_FORMAT = r"%f\t%T@\t%s\t%y\0"
-# The same record with the path relative to the starting point in place of the
-# name, for the listings that read a whole profiles root in one find: a home's
-# entry arrives as `<home>/<entry>`, a cron run as `<home>/cron/runs/<run>`.
 TREE_FIND_FORMAT = r"%P\t%T@\t%s\t%y\0"
 # How deep that find reads under the profiles root for the inventory and the
 # override sweep: the homes and their top-level entries.
@@ -456,13 +454,8 @@ class _SandboxGone(Exception):
     """Stop the inventory: every further listing would fail the same way."""
 
 
-def _parse_records(output: str, nested: bool) -> list[Row]:
-    """Every well-formed record, the name possibly holding tabs; sorted.
-
-    *nested* says whether the first field is a path relative to the listing's
-    root (`TREE_FIND_FORMAT`) or one name (`FIND_FORMAT`), in which case a
-    record with a slash in it is malformed and dropped.
-    """
+def _parse_tree_listing(output: str) -> list[Row]:
+    """Every well-formed `TREE_FIND_FORMAT` record, the path possibly holding tabs; sorted."""
     rows = []
     for record in output.split("\0"):
         parts = record.split("\t")
@@ -470,23 +463,13 @@ def _parse_records(output: str, nested: bool) -> list[Row]:
             continue
         name = "\t".join(parts[:-3])
         mtime, size, kind = parts[-3:]
-        if not name or (not nested and "/" in name):
+        if not name:
             continue
         try:
             rows.append((name, float(mtime), int(size), kind))
         except ValueError:
             continue
     return sorted(rows)
-
-
-def _parse_listing(output: str) -> list[Row]:
-    """Every well-formed `FIND_FORMAT` record, the name possibly holding tabs."""
-    return _parse_records(output, nested=False)
-
-
-def _parse_tree_listing(output: str) -> list[Row]:
-    """Every well-formed `TREE_FIND_FORMAT` record, keyed by path relative to the root."""
-    return _parse_records(output, nested=True)
 
 
 def _glob_escape(text: str) -> str:

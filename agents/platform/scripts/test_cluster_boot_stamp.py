@@ -134,6 +134,13 @@ class DigestTest(_Fixture):
         moved = [p.replace(str(self.root), str(copy), 1) for p in self.inputs]
         self.assertEqual(stamp.digest(self.inputs), stamp.digest(moved))
 
+    def test_the_salt_counts_and_defaults_to_nothing(self):
+        # The entrypoint passes the image version: a tagged bump moves every stamp even
+        # when none of the listed trees changed.
+        self.assertEqual(stamp.digest(self.inputs), stamp.digest(self.inputs, ""))
+        self.assertNotEqual(stamp.digest(self.inputs, "v1.2.3"), stamp.digest(self.inputs, "v1.2.4"))
+        self.assertNotEqual(stamp.digest(self.inputs, "v1.2.3"), stamp.digest(self.inputs))
+
     def test_the_digest_carries_its_version(self):
         self.assertTrue(self.digest().startswith(stamp.DIGEST_VERSION + "-"))
 
@@ -203,6 +210,9 @@ class CliTest(_Fixture):
         code, out, _ = self.run_main("digest", *sum((["--input", p] for p in self.inputs), []))
         self.assertEqual(code, 0)
         self.assertEqual(out, self.digest() + "\n")
+        code, salted, _ = self.run_main("digest", *sum((["--input", p] for p in self.inputs), []), "--salt", "v9")
+        self.assertEqual(code, 0)
+        self.assertEqual(salted, stamp.digest(self.inputs, "v9") + "\n")
 
     def test_stale_prints_one_name_per_line(self):
         self.make_profiles(2)

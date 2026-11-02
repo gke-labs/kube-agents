@@ -1647,13 +1647,18 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         # In a command substitution so the `set --` that builds the argument list
         # is local to it: the script's own positional parameters are the command
         # `exec "$@"` runs at the end. $0 is this file, the entrypoint.
+        # The image version goes in as a salt beside the trees: the scripts the loop
+        # runs import helpers this list does not name, so a tagged image bump reaches
+        # every home whatever changed in it, and the trees still catch a rebuild
+        # under the same tag.
         CLUSTER_BOOT_DIGEST="$(
             set -- --input "$CLUSTER_TEMPLATE"
             for _plugin in $CLUSTER_IMAGE_PLUGINS; do
                 set -- "$@" --input "$CLUSTER_SHARED_PLUGINS/$_plugin"
             done
             exec "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_BOOT_STAMP_SCRIPT" digest "$@" \
-                --input "$CLUSTER_PROFILE_SCRIPT" --input "$SCAFFOLD" --input "$0"
+                --input "$CLUSTER_PROFILE_SCRIPT" --input "$SCAFFOLD" --input "$0" \
+                --salt "${KUBE_AGENTS_VERSION:-}"
         )" || CLUSTER_BOOT_DIGEST=""
     fi
     if [ -n "$CLUSTER_BOOT_DIGEST" ]; then
@@ -1679,17 +1684,27 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         # Cleared by any step below that warns: a pass that left something undone is
         # not stamped, so the next start runs it again for this home.
         _cluster_clean=1
+        # A persona copy that fails used to be silent and retried next start; with the
+        # stamp it has to say so, or the home would read as current with the old persona.
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
-            [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
+            [ -f "$CLUSTER_TEMPLATE/$f" ] || continue
+            cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null \
+                || { echo "WARN: could not copy $f from the image into $d; the profile keeps its previous copy" >&2; _cluster_clean=0; }
         done
         # The cp -f above replaces each cluster-* profile's SOUL.md with the blank
         # image template (/opt/cluster-template/SOUL.md) on every gateway restart.
         # Re-stamp this Cluster Agent's Target Cluster Identity from its preserved
         # $d/config.yaml via cluster_agent_profile.py so existing cluster-* profiles
-        # keep their identity in SOUL.md.
-        if [ -f "$d/SOUL.md" ] && [ -w "$d/SOUL.md" ] && [ -f "$d/config.yaml" ] && [ -f "$CLUSTER_PROFILE_SCRIPT" ]; then
-            "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_PROFILE_SCRIPT" stamp-soul --profile-dir "$d" \
-                || { echo "WARN: failed to stamp cluster identity into $d/SOUL.md" >&2; _cluster_clean=0; }
+        # keep their identity in SOUL.md. A SOUL.md this container cannot write is
+        # skipped as before, and keeps the home off the stamp.
+        if [ -f "$d/SOUL.md" ] && [ -f "$d/config.yaml" ] && [ -f "$CLUSTER_PROFILE_SCRIPT" ]; then
+            if [ -w "$d/SOUL.md" ]; then
+                "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_PROFILE_SCRIPT" stamp-soul --profile-dir "$d" \
+                    || { echo "WARN: failed to stamp cluster identity into $d/SOUL.md" >&2; _cluster_clean=0; }
+            else
+                echo "WARN: $d/SOUL.md is not writable; its cluster identity was not stamped" >&2
+                _cluster_clean=0
+            fi
         fi
         # The skills sync never returns non-zero and says what it could not do on
         # stderr, so its stderr is read back: anything there is a warning, replayed

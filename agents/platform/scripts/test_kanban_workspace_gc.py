@@ -358,7 +358,7 @@ class PrincipalTest(unittest.TestCase):
 
 
 def _find_output(*rows):
-    """`FIND_FORMAT` or `TREE_FIND_FORMAT` output for (name-or-path, mtime, size, type) rows."""
+    """`TREE_FIND_FORMAT` output for (path, mtime, size, type) rows."""
     return "".join(f"{n}\t{m}\t{sz}\t{k}\0" for n, m, sz, k in rows)
 
 
@@ -501,7 +501,7 @@ class HomeInventoryTest(_HomeFixture):
         for _, kwargs in fake.calls:
             self.assertEqual(kwargs.get("errors"), "surrogateescape")
         raw = b"x\xff\t1.0\t1\tf\0dummy-gitops-state\t1.0\t88\tf\0".decode("utf-8", "surrogateescape")
-        names = [r[0] for r in gc._parse_listing(raw)]
+        names = [r[0] for r in gc._parse_tree_listing(raw)]
         self.assertEqual(names, ["dummy-gitops-state", "x\udcff"])
         inv = gc.Inventory()
         inv.unexpected["/h"] = [(names[1], 1.0, 1, "f")]
@@ -518,11 +518,11 @@ class HomeInventoryTest(_HomeFixture):
         # A newline or a tab inside a name stays inside its NUL-terminated
         # record and is reported whole; neither becomes an expected entry.
         out = _find_output(("evil\nskills", "1.0", "1", "f"), ("evil\tskills", "1.0", "1", "f"))
-        self.assertEqual([r[0] for r in gc._parse_listing(out)], ["evil\tskills", "evil\nskills"])
+        self.assertEqual([r[0] for r in gc._parse_tree_listing(out)], ["evil\tskills", "evil\nskills"])
 
     def test_malformed_records_are_skipped(self):
-        out = "garbage\0" + _find_output(("x", "notatime", "1", "f"), ("a/b", "1.0", "1", "f"), ("kept", "1.0", "1", "f"))
-        self.assertEqual([r[0] for r in gc._parse_listing(out)], ["kept"])
+        out = "garbage\0" + _find_output(("x", "notatime", "1", "f"), ("", "1.0", "1", "f"), ("kept", "1.0", "1", "f"))
+        self.assertEqual([r[0] for r in gc._parse_tree_listing(out)], ["kept"])
 
     def test_only_the_mirrors_displaced_names_are_expected(self):
         def expected(name):

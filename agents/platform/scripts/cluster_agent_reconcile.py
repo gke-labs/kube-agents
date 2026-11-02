@@ -209,14 +209,18 @@ PRUNE_SECONDS_PER_DESCRIBE = 3
 # container can resolve to thousands of projects, a chat message has a size ceiling, and
 # a message the platform drops for its size takes the created/pruned summary with it.
 NOTIFY_UNLISTED_LIMIT = 8
-# The most profiles one run creates (attempts count, a failed create included); the rest
-# are deferred to the next run and listed under `create_deferred`. The bootstrap gate runs
-# this script under a ceiling (RECONCILE_TIMEOUT_SECONDS there), and a fleet whose missing
-# profiles cannot all be scaffolded inside it would otherwise be killed mid-run on every
-# tick, leaving half-built homes and no progress; under `--require-create-pass` a run that
-# deferred exits EXIT_CREATES_DEFERRED so the gate asks again next tick. The hourly producer
-# takes the same cap, so a scope widening onboards that many clusters an hour. Read from the
-# agent container's environment; anything but a positive integer reads as the default.
+# The most profiles one run creates; the rest are deferred to the next run and listed under
+# `create_deferred`. The bootstrap gate runs this script under a ceiling
+# (RECONCILE_TIMEOUT_SECONDS there), and a fleet whose missing profiles cannot all be
+# scaffolded inside it would otherwise be killed mid-run on every tick, leaving half-built
+# homes and no progress; under `--require-create-pass` a run that deferred exits
+# EXIT_CREATES_DEFERRED so the gate asks again next tick. Only a create that succeeded
+# counts: a failed one costs the run its time but not a place in the batch, so a cluster
+# sorted behind a hundred failing ones is still attempted, as every cluster was before the
+# cap, and a deferral always means the run made its cap's worth of progress. The hourly
+# producer takes the same cap, so a scope widening onboards that many clusters an hour. Read
+# from the agent container's environment (`spec.deployment.env` carries it); anything but a
+# positive integer reads as the default.
 MAX_CREATES_PER_RUN_ENV = "BOOTSTRAP_MAX_CREATES_PER_TICK"
 MAX_CREATES_PER_RUN_DEFAULT = 100
 try:
@@ -1893,8 +1897,8 @@ def reconcile(dry_run: bool = False) -> dict:
                 continue
             # The per-run cap, before the describe a container member costs: a cluster
             # past it is left for the next run, which finds it still without a profile.
-            # Attempts count, so a run of failing creates is bounded the same way.
-            if len(report["created"]) + len(report["create_failed"]) >= MAX_CREATES_PER_RUN:
+            # Failed creates do not count (see MAX_CREATES_PER_RUN).
+            if len(report["created"]) >= MAX_CREATES_PER_RUN:
                 if not report["create_deferred"]:
                     log(f"create cap reached ({MAX_CREATES_PER_RUN} per run, {MAX_CREATES_PER_RUN_ENV}); "
                         "every further cluster without a profile is deferred to the next run.")
@@ -2547,8 +2551,9 @@ def main() -> None:
     if args.require_create_pass and unreconciled:
         log(f"{unreconciled}; the roster is not reconciled.")
         raise SystemExit(EXIT_CREATE_PASS_SKIPPED)
-    # After the failure exit: a run whose every attempt failed is a failed attempt for the
-    # gate however many it deferred, or a permanent failure would retry forever at no cost.
+    # A deferral means the run created its cap's worth, so this is progress, never a
+    # failure: the gate retries without spending an attempt, and the next run's listing
+    # finds the deferred clusters still without a profile.
     if args.require_create_pass and report.get("create_deferred"):
         log(f"{len(report['create_deferred'])} cluster(s) deferred to the next run by the cap of "
             f"{MAX_CREATES_PER_RUN}; the roster is not reconciled yet.")

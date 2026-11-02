@@ -3571,18 +3571,40 @@ class CreateCapTest(unittest.TestCase):
         self.assertEqual(len(report["created"]), self.CAP)
         self.assertEqual(report["create_deferred"], [])
 
-    def test_failed_attempts_count_against_the_cap(self):
-        # A run of failing creates is bounded the same way: attempts cost the time the
-        # cap exists to bound, whether or not they succeed.
+    def test_failed_creates_do_not_take_a_place_in_the_batch(self):
+        # Every create fails: all 250 are attempted, as they were before the cap, none is
+        # deferred, and the exit is the failed-roster one, which the gate counts as an
+        # attempt and can give up on.
         def failing(pr, c, l):
             raise SystemExit("ERROR: failed to fetch credentials")
 
         code, report = self._run(create=failing)
-        self.assertEqual(len(report["create_failed"]), self.CAP)
-        self.assertEqual(len(report["create_deferred"]), 150)
-        # Every attempt failed and nothing is in place: that is the failed-roster exit, not
-        # the deferral one, so the gate counts the attempt and can give up on a permanent cause.
+        self.assertEqual(len(report["create_failed"]), 250)
+        self.assertEqual(report["create_deferred"], [])
         self.assertEqual(code, rec.EXIT_CREATE_PASS_SKIPPED)
+
+    def test_a_failing_batch_beside_a_kept_profile_does_not_starve_the_rest(self):
+        # The starvation shape: one profile already on the roster, the first hundred clusters
+        # in listing order fail for good, and the rest can be made. The failures must not
+        # fill the batch, or the rest would be deferred on every run, each run exiting 5,
+        # and the gate would wait forever without spending an attempt.
+        self.created.append("cluster-kept")
+        self.clusters = [("p", "kept", "us-central1")] + self.clusters[:150]
+        scaffolded: list[str] = []
+
+        def failing_first_hundred(pr, c, l):
+            if int(c[1:]) < 100:
+                raise SystemExit("ERROR: failed to fetch credentials")
+            name = f"cluster-{c}"
+            self.created.append(name)
+            scaffolded.append(name)
+            return name
+
+        code, report = self._run(create=failing_first_hundred)
+        self.assertEqual(len(report["create_failed"]), 100)
+        self.assertEqual(len(scaffolded), 50, "the clusters behind the failing ones were never tried")
+        self.assertEqual(report["create_deferred"], [])
+        self.assertIsNone(code, "a partial failure beside a scaffolded roster reconciles, as before the cap")
 
     def test_the_cron_path_exits_zero_and_defers_the_same(self):
         code, report = self._run(argv=("x",))

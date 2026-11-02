@@ -1201,7 +1201,6 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         # container, and must not choose where the audit plugin code comes from.
         self.assertEqual(shipped["CLUSTER_SHARED_PLUGINS"], f'CLUSTER_SHARED_PLUGINS="{default}"')
 
-    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores the read-only fixture")
     def _cluster_loop_fixture(self, root):
         """A cluster template, the scripts the loop runs, one scaffolded profile, and the loop's script.
 
@@ -1314,6 +1313,32 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             self.assertIn("## Target Cluster Identity", (profile / "SOUL.md").read_text(encoding="utf-8"),
                           "the failed step stopped the rest of the pass")
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores the read-only fixture")
+    def test_a_home_the_loop_cannot_write_into_warns_and_is_not_stamped(self):
+        """The persona copy used to fail silently; with the stamp, silence would mean current.
+
+        A read-only SOUL.md in a directory this user cannot write into (`cp -f` can
+        neither truncate it nor replace it) fails the first step of the pass and leaves
+        the identity stamp nothing to write into. Both have to be said and have to keep
+        the home off the stamp, or the home would not be revisited until the image changed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (profile / "SOUL.md").write_text("old persona\n", encoding="utf-8")
+            (profile / "SOUL.md").chmod(0o444)
+            profile.chmod(0o555)
+            try:
+                proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            finally:
+                profile.chmod(0o755)
+                (profile / "SOUL.md").chmod(0o644)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("WARN: could not copy SOUL.md from the image", proc.stderr)
+            self.assertIn("SOUL.md is not writable; its cluster identity was not stamped", proc.stderr)
+            self.assertEqual((profile / "SOUL.md").read_text(encoding="utf-8"), "old persona\n")
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a home the pass could not refresh was stamped")
+
     def test_without_the_stamp_script_every_home_is_refreshed_and_none_is_stamped(self):
         """The fallback is the loop as it always ran: no digest, no skip, no stamp."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1327,6 +1352,7 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
                 self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
             self.assertFalse((profile / ".scaffold-stamp").exists())
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores the read-only fixture")
     def test_a_failed_plugin_refresh_leaves_the_old_file_whole(self):
         """A copy that cannot finish keeps the profile's old module intact, and says so.
 
