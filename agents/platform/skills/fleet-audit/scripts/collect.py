@@ -164,9 +164,10 @@ DEFAULT_TIMEOUT_S = 60
 # where a check still waiting at its 60 s admission bound is refused busy, or
 # hits DEFAULT_TIMEOUT_S here first and reads its cluster as unreachable. So the
 # width is read from the broker (GET /v1/exec/admission): its interactive cap
-# (admitted - 1) less the session cap's headroom for chat when it admits six or
-# more, and at most four or the interactive cap below that; four when the broker
-# can't say (broker_admission.width_for). The procedural collectors beside this
+# (admitted - 1) less the session cap's headroom for chat, never below four,
+# from six admitted up (the headroom is whole from seven), and at most four or the
+# interactive cap below that; four when the broker can't say
+# (broker_admission.width_for). The procedural collectors beside this
 # file resolve the same width. stall_watch.py's and cluster_agent_reconcile.py's
 # background listing pools stay at four: they share the broker with kanban
 # workers, and their own comments say why.

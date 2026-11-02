@@ -3124,6 +3124,7 @@ class ClassAdmissionTest(unittest.TestCase):
         executor = self.executor()
         self.hold(executor, self.B, 6)
         late = self.queue(executor, self.B)
+        self.wait_queued(executor, 1)  # held by the background share before the reserve fills
         self.hold(executor, self.I, 2)  # the reserve, admitted at once
         late.thread.join(5)
         self.assertIsNotNone(late.refused)

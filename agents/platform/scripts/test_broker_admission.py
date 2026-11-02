@@ -34,6 +34,9 @@ class WidthForTest(unittest.TestCase):
             with self.subTest(admitted=admitted, interactive_cap=interactive_cap):
                 self.assertEqual(width, broker_admission.width_for(admitted, 2, interactive_cap))
                 self.assertLessEqual(width, interactive_cap)
+                if admitted >= 7:
+                    # From seven up the session cap stays free inside the interactive cap.
+                    self.assertGreaterEqual(interactive_cap - width, 2)
 
     def test_a_broker_without_the_interactive_cap_keeps_todays_width(self):
         for admitted, width in ((4, 4), (6, 4), (8, 6), (16, 14)):
@@ -151,7 +154,7 @@ class SweepWidthTest(unittest.TestCase):
         self.assertEqual(4, broker_admission.FALLBACK_WIDTH)
 
     def test_it_asks_once_per_process(self):
-        with mock.patch.object(broker_admission, "read_report", return_value=(8, 2)) as read:
+        with mock.patch.object(broker_admission, "read_report", return_value=(8, 2, 7)) as read:
             broker_admission.sweep_width()
             broker_admission.sweep_width()
         self.assertEqual(1, read.call_count)
