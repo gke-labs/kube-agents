@@ -425,7 +425,7 @@ is checkable rather than asserted:
 The stack also grants `var.pool_state_readers` (default: the bot) the roles in
 `local.pool_state_reader_roles` for its hourly pool-state scan
 ([`docs/ci-health.md`](../../../docs/ci-health.md), "The pool-state scan"); a project
-applied before that default scans as "not checked".
+applied before that default, or before a role joined the list, scans as "not checked".
 
 Three things about this are worth stating rather than assuming:
 
