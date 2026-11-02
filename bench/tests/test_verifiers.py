@@ -3064,8 +3064,9 @@ def test_tool_called_fold_arguments_rewrites_inner_underscores_to_hyphens():
             }
         ],
     )
-    # A pattern matching the token with hyphens (as folded) or with [-_]
-    pattern = r"(?is).*(?:no[-_]?registered[-_]?repo|\bno (?:registered|managed) (?:gitops )?repositor(?:y|ies)\b).*"
+    # Spells the hyphen the fold produces: with the inner-underscore rewrite
+    # gone the token collapses to `noregisteredrepo` and this must fail.
+    pattern = r"(?is).*(?:no-registered-repo|\bno (?:registered|managed) (?:gitops )?repositor(?:y|ies)\b).*"
     check = ToolCalledVerifier(
         type="tool_called",
         tool_names=["kanban_block"],
