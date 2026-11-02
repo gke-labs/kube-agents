@@ -44,7 +44,9 @@ locals {
   # That 10,000 is the query's row cap, not the window's true total, so daily
   # figures do not come from it. They come from a separate untruncated count of
   # the surviving stream: 623 non-lease calls per 15 minutes, about 60k/day,
-  # against roughly 1.35M/day unfiltered.
+  # against roughly 1.35M/day unfiltered. Both were measured with the suffix
+  # below narrowed to "\.iam\.gserviceaccount\.com$"; the whole-domain suffix
+  # delivers less.
   #
   # The exclusion is scoped by principal rather than dropping leases outright,
   # so that a person running `kubectl patch lease` still reaches the detector.
@@ -54,23 +56,25 @@ locals {
   # Both principal clauses are load-bearing. "^system:" alone leaves the GKE
   # service agent behind: in the same sample container-engine-robot accounted
   # for 287 lease writes, which would have inflated the surviving stream by 65%.
-  # Matching any *.iam.gserviceaccount.com covers it and every future service
-  # agent that carries the "iam" label. It does not cover the Google-managed
-  # accounts, which do not: the Compute Engine default is
-  # "<number>-compute@developer.gserviceaccount.com", and Cloud Build, App
-  # Engine and the cloudservices agent use "@cloudbuild.", "@appspot." and
-  # "@cloudservices." respectively. Their lease writes therefore survive this
-  # exclusion and reach the topic. That costs volume and nothing else -- the
-  # detector's own classifier matches the whole ".gserviceaccount.com" domain
-  # (gcpServiceAccountSuffix in k8s-operator/cmd/drift-detector/classify.go)
-  # and drops them as automation. Widening the suffix here would cut delivered
-  # volume; it is left alone deliberately, because changing a sink filter
-  # changes what a deployed install receives and belongs in its own change.
+  # Matching the whole *.gserviceaccount.com domain covers it, every future
+  # service agent under "iam", and the Google-managed accounts that carry no
+  # "iam" label: the Compute Engine default,
+  # "<number>-compute@developer.gserviceaccount.com", whose node heartbeats
+  # are most of what a node pool writes, and Cloud Build, App Engine and the
+  # cloudservices agent at "@cloudbuild.", "@appspot." and "@cloudservices.".
+  # The suffix used to be "\.iam\.gserviceaccount\.com$", which let those
+  # through to the topic; the detector dropped them as automation (its
+  # classifier matches the whole domain, gcpServiceAccountSuffix in
+  # k8s-operator/cmd/drift-detector/classify.go) but only after pulling them,
+  # and a 100-message pull of them serialized past the credential broker's
+  # relay cap and was redelivered unacked at every ack deadline. The same
+  # suffix as the detector's keeps the two halves of the carve-out in step: no
+  # Lease write the sink now drops would have reached the join.
   #
   # Kept to a single line on purpose: Cloud Logging treats a newline as an
   # implicit AND, which would break the OR grouping if this were wrapped.
   machine_lease_exclusion = <<-EOT
-    NOT (protoPayload.methodName=~"coordination\.v1\.leases" AND (protoPayload.authenticationInfo.principalEmail=~"^system:" OR protoPayload.authenticationInfo.principalEmail=~"\.iam\.gserviceaccount\.com$"))
+    NOT (protoPayload.methodName=~"coordination\.v1\.leases" AND (protoPayload.authenticationInfo.principalEmail=~"^system:" OR protoPayload.authenticationInfo.principalEmail=~"\.gserviceaccount\.com$"))
   EOT
 
   lease_filter = var.exclude_machine_lease_heartbeats ? trimspace(local.machine_lease_exclusion) : ""

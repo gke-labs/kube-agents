@@ -44,10 +44,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import audit_report  # noqa: E402
-import content_workspace  # noqa: E402
-import credential_proxy  # noqa: E402
 import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+import providers  # noqa: E402
+import vcs_broker  # noqa: E402
 import vcs_client  # noqa: E402
 import workspace_paths  # noqa: E402
 
@@ -492,6 +492,140 @@ THREE_SEVERITIES = [
     make_finding(fid="major-one", severity="major", title="Major one"),
     make_finding(fid="crit-two", severity="critical", title="Crit two"),
 ]
+
+
+# The revision `use_snapshot`'s snapshots report.
+SNAPSHOT_TEST_REVISION = "a" * 40
+# The forge verbs `ContentModeTestCase` sends to its real broker, not the Recorder.
+BROKER_BRANCH_VERBS = ("branch-view", "branch-delete")
+# The client's own `forge`, before any test patches it.
+_REAL_VCS_FORGE = vcs_client.forge
+# The identity and the empty config files the broker's git runs with in tests:
+# a developer whose global config sets `commit.gpgsign`, or nothing at all,
+# would otherwise get a different answer from CI.
+BROKER_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "Test",
+    "GIT_AUTHOR_EMAIL": "test@example.com",
+    "GIT_COMMITTER_NAME": "Test",
+    "GIT_COMMITTER_EMAIL": "test@example.com",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_SYSTEM": os.devnull,
+}
+
+
+def _broker_git(argv, cwd, check=True, config=(), *, allow_http=False, stop=None):
+    """The broker's git runner, as `test_vcs_broker.git_runner` presents it."""
+    del allow_http, stop
+    flags = [flag for key, value in config for flag in ("-c", f"{key}={value}")]
+    return subprocess.run(
+        [argv[0], *flags, *argv[1:]],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=check,
+        env={**os.environ, **BROKER_GIT_ENV},
+    )
+
+
+class _DirectoryForge(providers.Forge):
+    """A forge whose repositories are directories under `root`.
+
+    `clone`, `publish` and `snapshot` contain no forge, so pointing
+    `clone_url` at a bare repository on disk runs them for real. The same
+    seam `test_vcs_broker.LocalForge` uses.
+    """
+
+    name = "local"
+    hosts = ("local.test",)
+
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = Path(root)
+        self.credential = providers.NoCredential()
+
+    @classmethod
+    def for_config(cls, config):
+        return ()
+
+    def parse(self, url: str) -> str:
+        return "/".join(providers.repo_segments(url, self.hosts))
+
+    def clone_url(self, repo: str) -> str:
+        return str(self.root / repo)
+
+
+def broker_refusal(status: int, message: str = "refused") -> "vcs_client.VcsError":
+    """The `VcsError` the client raises for an HTTP `status` from the broker."""
+    try:
+        raise credential_proxy_client.WorkspaceRequestError(status, {"error": message})
+    except credential_proxy_client.WorkspaceRequestError as cause:
+        error = vcs_client.VcsError(message)
+        error.__cause__ = cause
+        return error
+
+
+def use_snapshot(case, files=None, *, error=None, calls=None, unreadable=(), read_error=None):
+    """Make `audit_report.RepositorySnapshot` unpack `files` rather than ask the broker.
+
+    `error`, when set, is what taking the snapshot raises; a list gives one
+    entry per snapshot taken, None for one that is taken. `calls` collects the
+    `(repo, ref, paths)` of each snapshot taken. A path in `unreadable` raises
+    `read_error` (by default naming the path) when read. The reads run for
+    real on a temporary tree, `grep` with the developer's `git`.
+    """
+    errors = list(error) if isinstance(error, list) else None
+    scratch = Path(tempfile.mkdtemp(prefix="snapshots-"))
+    case.addCleanup(shutil.rmtree, scratch, True)
+
+    class Snapshot(audit_report.RepositorySnapshot):
+        def __init__(self, repo, ref=None, paths=None):
+            if calls is not None:
+                calls.append((repo, ref, paths))
+            raised = errors.pop(0) if errors is not None else error
+            if raised is not None:
+                raise raised
+            self._scratch = Path(tempfile.mkdtemp(dir=str(scratch)))
+            self.tree = self._scratch / "tree"
+            self.tree.mkdir()
+            for path, text in (files or {}).items():
+                target = self.tree / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            self.revision = SNAPSHOT_TEST_REVISION
+
+        def read_bytes(self, path):
+            if path in unreadable:
+                raise read_error or RuntimeError(f"cannot read {path}")
+            return super().read_bytes(path)
+
+    for target, name, value in (
+        (audit_report, "RepositorySnapshot", Snapshot),
+        (vcs_client, "LOCAL_GIT", shutil.which("git")),
+        (vcs_client, "ROOT", scratch / "vcs"),
+    ):
+        patcher = patch.object(target, name, value)
+        patcher.start()
+        case.addCleanup(patcher.stop)
+    return Snapshot
+
+
+class _HistoryDirectoryForge(_DirectoryForge):
+    """`_DirectoryForge` with a proposal history per branch, as
+    `test_vcs_broker.HistoryLocalForge`: what the broker's `branch-delete`
+    reads to decide a branch is spent."""
+
+    verbs = ("proposal-list",)
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.history: dict[str, list[dict]] = {}
+
+    def proposal_list(self, api, repo, payload):
+        found = [] if payload.get("target") is not None else list(self.history.get(payload.get("source"), []))
+        if payload.get("state") == "open":
+            found = [item for item in found if item.get("state") == "open"]
+        limit = int(payload.get("limit") or 100)
+        return providers.listing(found[:limit], limit, "proposals")
 
 
 class Recorder:
@@ -4258,67 +4392,45 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         body = self.harness.bodies_for("issue-create")[0]
         self.assertIn("in the GitOps repository at `gcp/drift-peer-std-4.yaml`", body)
 
-    def broker_scan(self, files, rounds):
-        """`kcc_declarations_via_broker` against a broker answering `rounds` in turn.
+    class FakeSnapshot:
+        """The two reads `kcc_declarations_via_broker` makes of a snapshot."""
 
-        Each round is the `skipped` list one `read_many` returns; every path
-        not skipped in that round comes back.
-        """
-        answers = iter(rounds)
+        def __init__(self, files, unreadable=()):
+            self.files_by_path, self.unreadable = files, set(unreadable)
 
-        class FakeWorkspace:
-            def grep(self, pattern, **_):
-                return {
-                    "matches": [{"path": path, "line": 1, "text": pattern} for path in files],
-                    "total": len(files),
-                    "truncated": False,
-                }
+        def files(self, prefix=None):
+            return sorted(self.files_by_path)
 
-            def read_many(self, paths):
-                skipped = next(answers)
-                held = {entry["path"] for entry in skipped}
-                return {p: files[p].encode() for p in paths if p not in held}, skipped
-
-        @contextlib.contextmanager
-        def opened(*_, **__):
-            yield FakeWorkspace()
-
-        with patch.object(credential_proxy_client.Workspace, "open", opened):
-            return audit_report.kcc_declarations_via_broker("acme/fleet")
+        def read_bytes(self, path):
+            if path in self.unreadable:
+                raise OSError(f"cannot read {path}")
+            return self.files_by_path[path].encode()
 
     KCC_TEXT = (
         "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\n"
         "metadata:\n  name: {name}\nspec:\n  loggingService: none\n"
     )
 
-    def test_a_request_budget_skip_is_asked_for_again(self):
+    def test_the_scan_indexes_every_declaration_in_the_snapshot(self):
         files = {
             "gcp/a.yaml": self.KCC_TEXT.format(name="a"),
-            "gcp/b.yaml": self.KCC_TEXT.format(name="b"),
+            "gcp/b.yml": self.KCC_TEXT.format(name="b"),
+            "gcp/notes.md": self.KCC_TEXT.format(name="c"),
+            "apps/web.yaml": "kind: Deployment\nmetadata:\n  name: web\n",
         }
-        scan = self.broker_scan(files, [[{"path": "gcp/b.yaml", "reason": "requestBudget"}], []])
-        self.assertFalse(scan.truncated)
+        index = audit_report.kcc_declarations_via_broker("acme/fleet", self.FakeSnapshot(files))
         self.assertEqual(
-            sorted(scan.declarations),
+            sorted(index),
             [("ContainerCluster", "a", "a", ""), ("ContainerCluster", "b", "b", "")],
         )
-        self.assertEqual(scan.declarations[("ContainerCluster", "b", "b", "")].path, "gcp/b.yaml")
+        self.assertEqual(index[("ContainerCluster", "b", "b", "")].path, "gcp/b.yml")
 
-    def test_a_file_the_broker_withholds_marks_the_scan_truncated(self):
-        files = {
-            "gcp/a.yaml": self.KCC_TEXT.format(name="a"),
-            "gcp/big.yaml": self.KCC_TEXT.format(name="big"),
-        }
-        scan = self.broker_scan(files, [[{"path": "gcp/big.yaml", "reason": "tooLarge"}]])
-        self.assertTrue(scan.truncated)
-        self.assertEqual(list(scan.declarations), [("ContainerCluster", "a", "a", "")])
-
-    def test_a_broker_that_never_relents_stops_and_marks_the_scan_truncated(self):
+    def test_a_snapshot_that_cannot_be_read_disables_the_check(self):
         files = {"gcp/a.yaml": self.KCC_TEXT.format(name="a")}
-        stuck = [{"path": "gcp/a.yaml", "reason": "requestBudget"}]
-        scan = self.broker_scan(files, [stuck, stuck, stuck])
-        self.assertTrue(scan.truncated)
-        self.assertEqual(scan.declarations, {})
+        snap = self.FakeSnapshot(files, unreadable={"gcp/a.yaml"})
+        with patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(audit_report.kcc_declarations_via_broker("acme/fleet", snap), {})
+        self.assertIn("could not read acme/fleet through the broker", err.getvalue())
 
     def test_the_dry_run_previews_the_degraded_fix(self):
         self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
@@ -8573,7 +8685,7 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         self.assertIn("WARNING: acme/fleet: no commit sha for the checkout; not searched", self.err)
 
     def test_content_mode_clones_the_gitops_repository_through_the_sibling_script(self):
-        self.patch_attr("detect_content_mode", lambda: True)
+        self.patch_attr("proxy_endpoint", lambda: "http://127.0.0.1:8765")
         copy = self.tmp_path / "copy"
         self.write(copy, "knowledge/checkout.md", note([declaration()]))
         self.harness.replies["--repo acme/fleet"] = self.copy_reply(copy)
@@ -8609,7 +8721,7 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         # `--ref` would read, and credit as `acme/fleet@<sha>`, a branch the
         # run does not publish against. The pin is dropped: no `--ref` on
         # either step, the repository owed and read once, its source unpinned.
-        self.patch_attr("detect_content_mode", lambda: True)
+        self.patch_attr("proxy_endpoint", lambda: "http://127.0.0.1:8765")
         self.context("acme/fleet", ref="release-2026")
         copy = self.tmp_path / "copy"
         self.write(copy, "knowledge/checkout.md", note([declaration()]))
@@ -16525,7 +16637,7 @@ class TestDeclarationsAcrossSpellings(BaseTestCase):
 
 
 class TestContentWorkspaceReachesEveryForge(unittest.TestCase):
-    """Content mode's file workspace clones a repository from its own forge."""
+    """Content mode reaches a repository on its own forge."""
 
     def setUp(self):
         audit_report.set_content_mode(True)
@@ -16549,26 +16661,27 @@ class TestContentWorkspaceReachesEveryForge(unittest.TestCase):
         })
         self.assertIn("repositories not searched: gitlab.com/acme/infra, acme/fleet", gap)
 
-    def test_a_remediation_opens_the_workspace_with_the_name_its_forge_resolves(self):
-        opened = []
-        client = type(sys)("credential_proxy_client")
+    def test_a_remediation_hands_the_broker_the_repository_as_named(self):
+        # The vcs client sends a name the install registered as GitHub as its
+        # registration spells it (`vcs_client._on_the_wire`), so the landing
+        # passes the repository through unchanged, whichever forge it is on.
+        asked = []
 
-        class Workspace:
-            @staticmethod
-            def open(endpoint, repo, branch=None):
-                opened.append(repo)
-                raise RuntimeError("stop after the open")
+        def branch_view(verb, repo, payload):
+            asked.append((verb, repo))
+            raise audit_report.ForgeError("stop after the first call")
 
-        client.Workspace = Workspace
-        for repo, expected in (("gitlab.com/acme/infra", "gitlab.com/acme/infra"), ("github.com/acme/fleet", "acme/fleet")):
-            with self.subTest(repo=repo), patch.dict(sys.modules, {"credential_proxy_client": client}), \
-                    patch.object(audit_report, "proxy_endpoint", return_value="http://broker"), \
-                    patch.object(audit_report, "_proposal_noun", lambda repo: "merge request"):
-                with self.assertRaises(RuntimeError):
+        for repo in ("gitlab.com/acme/infra", "github.com/acme/fleet", "acme/fleet"):
+            with self.subTest(repo=repo), patch.object(audit_report, "forge", branch_view):
+                with self.assertRaises(audit_report.ForgeError):
                     audit_report._land_group_via_broker(
                         repo, "compliance-audit", [], "audit/x", ["a.yaml"], {"a.yaml": b""}
                     )
-        self.assertEqual(["gitlab.com/acme/infra", "acme/fleet"], opened)
+        self.assertEqual(
+            [("branch-view", "gitlab.com/acme/infra"), ("branch-view", "github.com/acme/fleet"),
+             ("branch-view", "acme/fleet")],
+            asked,
+        )
 
     def test_content_mode_refuses_only_a_host_no_managed_entry_names(self):
         managed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
@@ -16582,31 +16695,12 @@ class TestContentWorkspaceReachesEveryForge(unittest.TestCase):
 
 class TestWorkspaceGetsGitHubsBareSlug(unittest.TestCase):
     """Review: an install with a second forge spells GitHub's repositories
-    `github.com/owner/name`, and the workspace refused that spelling."""
+    `github.com/owner/name`, and the declared-intent clone refused that spelling."""
 
     def test_the_door_puts_github_back_to_the_slug(self):
         self.assertEqual("acme/fleet", audit_report.content_workspace_repo("github.com/acme/fleet"))
         self.assertEqual("acme/fleet", audit_report.content_workspace_repo("acme/fleet"))
         self.assertEqual("gitlab.com/a/b", audit_report.content_workspace_repo("gitlab.com/a/b"))
-
-    def test_a_remediation_opens_the_workspace_with_the_slug(self):
-        client = type(sys)("credential_proxy_client")
-        opened = []
-
-        class Workspace:
-            @staticmethod
-            def open(endpoint, repo, **kwargs):
-                opened.append(repo)
-                raise RuntimeError("stop here")
-
-        client.Workspace = Workspace
-        with patch.dict(sys.modules, {"credential_proxy_client": client}), \
-                patch.object(audit_report, "proxy_endpoint", lambda: "http://proxy"):
-            with self.assertRaises(RuntimeError):
-                audit_report._land_group_via_broker(
-                    "github.com/acme/fleet", "compliance-audit", [], "audit/x", ["a.yaml"], {"a.yaml": b""}
-                )
-        self.assertEqual(["acme/fleet"], opened)
 
 
 class TestRemediateReplyNamesTheRefusal(unittest.TestCase):
@@ -16672,7 +16766,7 @@ class TestRemediateRefusesWhereNoProposalCanLand(unittest.TestCase):
                 )
                 reached = RuntimeError("reached planning")
                 with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}), \
-                        patch.object(credential_proxy_client, "workspaces_available", side_effect=down), \
+                        patch.object(credential_proxy_client, "vcs_call", side_effect=down), \
                         patch.object(audit_report, "load_findings", return_value={"findings": []}), \
                         patch.object(audit_report, "resolve_repo", return_value="gitlab.com/acme/infra"), \
                         patch.object(audit_report, "_dry_run_repo", return_value="gitlab.com/acme/infra"), \
@@ -18785,18 +18879,21 @@ _REAL_REFRESH_CREDENTIALS = audit_report.refresh_credentials
 
 
 class ContentModeTestCase(BaseTestCase):
-    """The same commands with the broker armed, against a real broker-side store.
+    """The same commands with a broker configured, against a real `VcsBroker`.
 
-    `ContentWorkspaceStore` runs for real rather than as a recording. The
-    properties this class exists to hold — that no path and no `git` leaves this
-    container, that a second run does not obliterate the first — are properties
-    of what git does with the bytes, and a stubbed store would only prove that
-    the test agrees with itself. What is stubbed is the HTTP hop, at
-    `_workspace_call`, which raises the same exception type the real transport
-    raises for the same conditions.
+    The broker's `clone`, `publish`, `snapshot` and `branch-view` run for real
+    against a bare repository on disk, through a forge whose repositories are
+    directories (`_DirectoryForge`). The properties this class exists to hold
+    -- that no remote and no credential reach this container, that a second
+    run adds to the first -- are properties of what git does with the bytes,
+    and a stubbed broker would only prove that the test agrees with itself.
+    What is stubbed is the HTTP hop, at `credential_proxy_client.vcs_call`,
+    which raises the same exception type the real transport raises for a
+    refusal.
 
-    `run_cmd` is still the Recorder, so every forge call is captured and any
-    `git` the run tries to issue is visible. There should not be one.
+    `run_cmd` is still the Recorder, so every other forge call is captured and
+    any `git` the run tries to issue through it is visible. There should not
+    be one.
     """
 
     def setUp(self):
@@ -18814,109 +18911,78 @@ class ContentModeTestCase(BaseTestCase):
             lambda audit_id=None, repo=None, workspace=None: "acme/fleet",
         )
 
-        # The broker's write gate reads this list before `commit` and `push`,
-        # and the real reader shells out to kubectl. The cache is cleared as
-        # well as stubbed: it is a module global with a five-minute TTL, so a
-        # value another test warmed would decide the gate here instead.
-        credential_proxy._managed_repository_cache = None
-        self.addCleanup(
-            setattr, credential_proxy, "_managed_repository_cache", None
-        )
-        managed = patch.object(
-            gitops_workspace,
-            "get_managed_repos",
-            return_value=["acme/fleet"],
-        )
-        managed.start()
-        self.addCleanup(managed.stop)
-        # The broker's gate reads the host-keyed list.
-        keyed = patch.object(
-            gitops_workspace,
-            "get_managed_repo_keys",
-            return_value=["github:github.com/acme/fleet"],
-        )
-        keyed.start()
-        self.addCleanup(keyed.stop)
+        # The sandbox side: the vcs client's copies root, and its local git,
+        # which on a developer machine is the `git` on PATH.
+        self.vcs_root = self.tmp_path / "vcs"
+        for name, value in (
+            ("ROOT", self.vcs_root),
+            ("SESSIONS", self.vcs_root / ".sessions"),
+            ("LOCAL_GIT", shutil.which("git")),
+        ):
+            patcher = patch.object(vcs_client, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
-        # `open` composes https://github.com/<owner>/<name>.git itself and takes
-        # no caller-supplied URL, by design — so the redirect to the local bare
-        # repo goes in at the runner, below the code under test.
-        url = "https://github.com/acme/fleet.git"
-        origin = self.origin
-
-        # The identity and the empty config files are the test's, not the
-        # broker's: the broker inherits whatever the container gives it, and a
-        # developer whose global config sets `commit.gpgsign` or nothing at all
-        # would otherwise get a different answer from CI.
-        env = dict(
-            os.environ,
-            GIT_AUTHOR_NAME="Test",
-            GIT_AUTHOR_EMAIL="test@example.com",
-            GIT_COMMITTER_NAME="Test",
-            GIT_COMMITTER_EMAIL="test@example.com",
-            GIT_CONFIG_GLOBAL=os.devnull,
-            GIT_CONFIG_SYSTEM=os.devnull,
-        )
-
-        def runner(argv, cwd):
-            argv = [str(origin) if token == url else token for token in argv]
-            completed = subprocess.run(
-                argv,
-                cwd=str(cwd),
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-            return GitResult(
-                completed.returncode, completed.stdout, completed.stderr
-            )
-
-        # The second argument is the agent's volume, and it is the real one:
-        # `assert_disjoint_roots` is the construction-time check that the
-        # broker's trees do not sit inside it, and handing it a placeholder
-        # would assert that against a directory nothing uses.
-        self.store = content_workspace.ContentWorkspaceStore(
-            self.tmp_path / "broker" / "trees",
-            self.gitops_root,
-            runner,
-        )
+        # The broker side, with the one forge whose repositories are directories.
+        self.broker = vcs_broker.VcsBroker(self.tmp_path / "broker", git_runner=_broker_git)
+        forge = _DirectoryForge(self.tmp_path / "forges")
+        self.broker.registry.forges = [forge]
+        self.broker.registry.hosts = {host: forge for host in forge.hosts}
+        self.broker.registry.default = forge
+        routes = vcs_broker.route_table(self.broker)
         self.verbs = []
-
-        # Through the broker's own router rather than straight at the store, so
-        # the payload-to-argument translation the real endpoint performs is the
-        # one under test here too. Only the socket is stubbed.
-        route = credential_proxy.CredentialProxyHandler._workspace_route
-        store = self.store
-
-        class Router:
-            workspaces = store
+        # (verb, payload) for every request the HTTP hop carried.
+        self.requests: list[tuple[str, dict]] = []
+        # verb -> the exception the HTTP hop raises for it instead of answering.
+        self.vcs_failures: dict[str, BaseException] = {}
 
         def call(endpoint, verb, payload):
             self.verbs.append(verb)
+            self.requests.append((verb, dict(payload)))
+            if verb in self.vcs_failures:
+                raise self.vcs_failures[verb]
             try:
-                body = route(Router(), verb, payload)
-            except content_workspace.ContentWorkspaceError as exc:
+                return routes[verb](dict(payload))
+            except workspace_paths.WorkspaceError as exc:
+                # The body the broker's handler answers a refusal with.
                 raise credential_proxy_client.WorkspaceRequestError(
-                    exc.status,
-                    {"status": "blocked", "code": exc.code, "message": str(exc)},
+                    exc.status, {"status": "blocked", "error": str(exc), **exc.fields}
                 ) from exc
-            if body is None:
-                raise credential_proxy_client.WorkspaceRequestError(
-                    404, {"status": "not_found"}
-                )
-            return body
 
-        patcher = patch.object(credential_proxy_client, "_workspace_call", call)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # `branch-view` and `branch-delete` are forge verbs on the client and
+        # broker verbs here: they read the bare repository. Every other forge
+        # verb goes to the Recorder, as in every other test.
+        def forge(verb, payload, repository=None):
+            if verb in BROKER_BRANCH_VERBS:
+                # Recorded as the Recorder records a forge call, so its lists stay aligned.
+                self.harness.calls.append(["forge", verb])
+                self.harness.cwds.append(None)
+                self.harness.payloads.append({**payload, "repository": repository})
+                return _REAL_VCS_FORGE(verb, payload, repository=repository)
+            return self.forge_through_recorder(verb, payload, repository=repository)
+
+        for target, name, value in (
+            (credential_proxy_client, "vcs_call", call),
+            (vcs_client, "forge", forge),
+        ):
+            patcher = patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         endpoint = patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}
         )
         endpoint.start()
         self.addCleanup(endpoint.stop)
 
+    def copies_left(self) -> list[str]:
+        """What the run left under the vcs client's copies root, bookkeeping aside."""
+        if not self.vcs_root.exists():
+            return []
+        return sorted(p.name for p in self.vcs_root.iterdir() if not p.name.startswith("."))
+
     def seed_origin(self) -> Path:
-        origin = self.tmp_path / "origin.git"
+        origin = self.tmp_path / "forges" / "acme" / "fleet"
+        origin.parent.mkdir(parents=True)
         seed = self.tmp_path / "seed"
         seed.mkdir()
         for cmd in (
@@ -18988,7 +19054,10 @@ class ContentModeTestCase(BaseTestCase):
         # code-execution routes through the credential container to work.
         self.assertFalse((self.workspace / ".git").exists())
 
-    def test_no_git_command_is_issued_from_this_container(self):
+    def test_no_git_command_goes_through_run_cmd(self):
+        # The landing commits with the vcs client's local git, which never holds
+        # a remote; what must not happen is a `git` through the harness's own
+        # runner, the directory-mode path that pushes from this container.
         self.start()
         self.write_manifest(
             "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
@@ -19027,10 +19096,10 @@ class ContentModeTestCase(BaseTestCase):
         self.assertEqual(self.stdout_json()["prs_opened"], [
             "https://github.com/acme/fleet/pull/8"
         ])
-        self.assertIn("commit", self.verbs)
-        self.assertIn("push", self.verbs)
-        # A workspace the broker still holds is a clone nothing will collect.
-        self.assertEqual(self.store._workspaces, {})
+        self.assertIn("clone", self.verbs)
+        self.assertIn("publish", self.verbs)
+        # A copy left under the copies root is one nothing will collect.
+        self.assertEqual(self.copies_left(), [])
 
     def test_the_manifest_survives_the_run_that_published_it(self):
         # Directory mode force-switches branches and restores the file
@@ -19071,38 +19140,246 @@ class ContentModeTestCase(BaseTestCase):
         self.assertEqual(self.stdout_json()["prs_opened"], [])
         self.assertFalse(self.harness.forge_calls("proposal-create"))
 
-    def test_a_second_run_adds_to_the_branch_rather_than_replacing_it(self):
-        # The clone path recuts the branch from the base every run, which
-        # discards anything a reviewer pushed to it. The broker continues the
-        # branch, and the branch name is a digest of the path set, so there is
-        # no stale-file risk in doing so.
+    def publish_once(self, text: str = "kind: NetworkPolicy\n") -> str:
+        """One `start` and `finish` that land the fix; the branch it landed on."""
         self.start()
-        self.write_manifest(
-            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
-        )
+        self.write_manifest("clusters/prod-us-east/payments-netpol.yaml", text)
         self.harness.replies = {
             "issue-list": {"issues": []},
             "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
             "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
-        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        return self.branch_for(make_doc())
 
-        branch = self.branch_for(make_doc())
+    def test_a_second_run_adds_to_the_branch_of_its_open_pull_request(self):
+        # The clone path recuts the branch from the base every run, which
+        # discards anything a reviewer pushed to it. The broker path adds to
+        # the branch of this install's open pull request instead.
+        branch = self.publish_once()
         first = self.origin_git(["rev-parse", branch]).strip()
-
-        # A second run starts again; a second `finish` after one `start` is
-        # the same run, and opens no pull request of its own.
         self.start()
         self.write_manifest(
-            "clusters/prod-us-east/payments-netpol.yaml",
-            "kind: NetworkPolicy\nspec: {}\n",
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\nspec: {}\n"
         )
-        self.assertEqual(self.run_finish(make_doc()), 0)
-
+        group = audit_report.remediation_groups(
+            audit_report.validate_findings(copy.deepcopy(make_doc()), AUDIT)["findings"]
+        )[0]
+        landed = audit_report._land_group_via_broker(
+            "acme/fleet",
+            AUDIT,
+            group,
+            branch,
+            ["clusters/prod-us-east/payments-netpol.yaml"],
+            {"clusters/prod-us-east/payments-netpol.yaml": b"kind: NetworkPolicy\nspec: {}\n"},
+            existing={"state": "OPEN", "baseRefName": "main"},
+        )
+        self.assertEqual(landed, audit_report._GroupPush("main", True))
         history = self.origin_git(["rev-list", branch]).split()
         self.assertIn(first, history)
-        self.assertEqual(history[0], self.origin_git(["rev-parse", branch]).strip())
         self.assertNotEqual(history[0], first)
+        self.assertEqual(self.copies_left(), [])
+
+    def push_to_origin(self, path: str, data: bytes) -> None:
+        """Commit `data` at `path` onto the origin's main, as a person would."""
+        seed = self.tmp_path / "seed"
+        target = seed / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        for argv in (["add", "-f", path], ["commit", "--quiet", "-m", f"add {path}"], ["push", "--quiet", "origin", "main"]):
+            subprocess.run(["git", *argv], cwd=str(seed), check=True, capture_output=True)
+
+    def land(self, data: bytes, existing=None, path="clusters/prod-us-east/payments-netpol.yaml"):
+        group = audit_report.remediation_groups(
+            audit_report.validate_findings(copy.deepcopy(make_doc()), AUDIT)["findings"]
+        )[0]
+        return audit_report._land_group_via_broker(
+            "acme/fleet", AUDIT, group, self.branch_for(make_doc()), [path], {path: data}, existing=existing
+        )
+
+    def test_an_open_pull_request_whose_branch_already_carries_the_fix_is_not_pushed(self):
+        branch = self.publish_once()
+        first = self.origin_git(["rev-parse", branch]).strip()
+        before = len(self.verbs)
+        landed = self.land(b"kind: NetworkPolicy\n", existing={"state": "OPEN", "baseRefName": "main"})
+        self.assertEqual(landed, audit_report._GroupPush("main", True))
+        self.assertEqual(self.origin_git(["rev-parse", branch]).strip(), first)
+        self.assertNotIn("publish", self.verbs[before:])
+
+    def test_an_unlabelled_open_pull_request_of_this_install_is_added_to(self):
+        # An earlier run opened it and failed to label it, so the listing that
+        # feeds `existing` missed it. The landing finds it and adds to it.
+        branch = self.publish_once()
+        first = self.origin_git(["rev-parse", branch]).strip()
+        adopted = {"state": "OPEN", "baseRefName": "main"}
+        self.patch_attr("open_proposal_on", lambda repo, name: adopted)
+        self.assertEqual(self.land(b"kind: NetworkPolicy\nspec: {}\n"), audit_report._GroupPush("main", True, adopted))
+        history = self.origin_git(["rev-list", branch]).split()
+        self.assertIn(first, history)
+        self.assertNotEqual(history[0], first)
+
+    def test_a_branch_missing_one_of_the_paths_does_not_carry_the_fix(self):
+        branch = self.publish_once()
+        carries = audit_report._branch_carries(
+            "acme/fleet", branch, ["clusters/prod-us-east/payments-netpol.yaml", "clusters/other.yaml"],
+            {"clusters/prod-us-east/payments-netpol.yaml": b"kind: NetworkPolicy\n", "clusters/other.yaml": b"x\n"},
+        )
+        self.assertFalse(carries)
+
+    def test_a_new_file_the_repository_ignores_is_refused_not_called_applied(self):
+        self.push_to_origin(".gitignore", b"gen/\n")
+        self.start()
+        with self.assertRaises(audit_report.ForgeError) as raised:
+            self.land(b"kind: PodDisruptionBudget\n", path="gen/pdb.yaml")
+        self.assertIn("nothing was staged", str(raised.exception))
+        self.assertEqual(self.copies_left(), [])
+
+    def test_a_prefix_that_names_nothing_lists_nothing_at_the_base(self):
+        self.start()
+        head = self.origin_git(["rev-parse", "main"]).strip()
+        self.assertEqual(self.run_main(["list", "--audit", AUDIT, "--prefix", "clusters/none"]), 0)
+        listed = json.loads(self.out.strip())
+        self.assertEqual((listed["entries"], listed["total"], listed["sha"]), ([], 0, head))
+        self.assertEqual(
+            self.run_main(["grep", "--audit", AUDIT, "--pattern", "seed", "--prefix", "clusters/none"]), 0
+        )
+        self.assertEqual(json.loads(self.out.strip())["matches"], [])
+
+    def test_a_prefix_narrows_the_snapshot_list_and_grep_take(self):
+        self.publish_once()
+        branch = self.branch_for(make_doc())
+        for argv in (
+            ["list", "--audit", AUDIT, "--branch", branch, "--prefix", "clusters"],
+            ["grep", "--audit", AUDIT, "--branch", branch, "--pattern", "kind", "--prefix", "clusters"],
+        ):
+            with self.subTest(argv[0]):
+                before = len(self.requests)
+                self.assertEqual(self.run_main(argv), 0)
+                snapshots = [p for v, p in self.requests[before:] if v == "snapshot"]
+                self.assertEqual([p.get("paths") for p in snapshots], [["clusters"]])
+                self.assertTrue(json.loads(self.out.strip())["total"] >= 1)
+
+    def test_a_too_large_snapshot_names_the_prefix_option(self):
+        self.start()
+        self.vcs_failures["snapshot"] = credential_proxy_client.WorkspaceRequestError(
+            413, {"code": "SNAPSHOT_TOO_LARGE", "error": "over the ceiling. Name `paths` to take part of the tree."}
+        )
+        self.assertEqual(self.run_main(["list", "--audit", AUDIT]), 2)
+        self.assertIn("read a smaller directory with --prefix", self.err)
+        self.assertEqual(self.run_main(["fetch", "--audit", AUDIT, "--path", "README.md"]), 2)
+        self.assertIn("fetch fewer at a time", self.err)
+
+    def test_a_lone_carriage_return_in_a_match_is_one_match(self):
+        self.push_to_origin("legacy/app.yaml", b"namespace: payments\rlabels: {}\n")
+        self.start()
+        self.assertEqual(self.run_main(["grep", "--audit", AUDIT, "--pattern", "namespace"]), 0)
+        found = json.loads(self.out.strip())
+        self.assertEqual(found["total"], 1)
+        self.assertEqual([m["path"] for m in found["matches"]], ["legacy/app.yaml"])
+
+    def test_an_adopted_pull_request_is_refreshed_without_a_second_lookup(self):
+        branch = self.publish_once()
+        lookups = []
+
+        def adopt(repo, name):
+            lookups.append(name)
+            return {"number": 8, "state": "OPEN", "baseRefName": "main",
+                    "url": "https://github.com/acme/fleet/pull/8", "headRefName": name}
+
+        self.patch_attr("open_proposal_on", adopt)
+        creates = len(self.harness.forge_calls("proposal-create"))
+        self.start()
+        self.write_manifest("clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\nspec: {}\n")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertEqual(lookups, [branch])
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), creates)
+        self.assertTrue(self.harness.forge_calls("proposal-update"))
+
+    def test_a_file_name_holding_a_newline_is_one_match(self):
+        self.push_to_origin("clus\nters/x.yaml", b"kind: Namespace\n")
+        self.start()
+        self.assertEqual(self.run_main(["grep", "--audit", AUDIT, "--pattern", "Namespace"]), 0)
+        found = json.loads(self.out.strip())
+        self.assertEqual((found["total"], [m["path"] for m in found["matches"]]), (1, ["clus\nters/x.yaml"]))
+
+    def test_a_fetch_naming_a_missing_file_lists_the_paths(self):
+        self.start()
+        self.assertEqual(
+            self.run_main(["fetch", "--audit", AUDIT, "--path", "README.md", "--path", "gone.yaml"]), 2
+        )
+        self.assertIn("one of the --path values names no file in acme/fleet", self.err)
+        self.assertIn("README.md, gone.yaml", self.err)
+        self.assertFalse((self.workspace / "README.md").exists())
+
+    def test_grep_over_a_file_that_is_not_utf8_names_the_cause(self):
+        self.push_to_origin("legacy/app.yaml", "namespace: caf\u00e9\n".encode("latin-1"))
+        self.start()
+        self.assertEqual(self.run_main(["grep", "--audit", AUDIT, "--pattern", "namespace"]), 2)
+        self.assertIn("not UTF-8 text", self.err)
+
+    def test_new_content_on_a_branch_with_no_pull_request_is_refused_by_name(self):
+        # The branch is there and no pull request of this install is open on
+        # it. The broker deletes such a branch only when it is the tip of a
+        # closed or merged pull request of this install; this forge lists no
+        # proposals, so it refuses, and the group is refused rather than
+        # written over somebody's commits.
+        branch = self.publish_once()
+        first = self.origin_git(["rev-parse", branch]).strip()
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\nspec: {}\n"
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertIn("the broker would not delete it", self.err)
+        self.assertIn("could not publish the fix", self.err)
+        self.assertEqual(self.origin_git(["rev-parse", branch]).strip(), first)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+
+    def history_forge(self) -> "_HistoryDirectoryForge":
+        """Swap the broker's forge for one with a proposal history, so `branch-delete` runs its gates."""
+        forge = _HistoryDirectoryForge(self.tmp_path / "forges")
+        self.broker.registry.forges = [forge]
+        self.broker.registry.hosts = {host: forge for host in forge.hosts}
+        self.broker.registry.default = forge
+        return forge
+
+    def spent(self, branch: str, revision: str) -> dict:
+        return {"number": 8, "state": "closed", "source": branch, "sourceRevision": revision,
+                "sourceRepo": "acme/fleet", "author": "", "url": "https://github.com/acme/fleet/pull/8"}
+
+    def test_a_spent_branch_the_broker_deletes_is_cut_again_from_the_base(self):
+        # The tip of a closed pull request of this install: the broker's own
+        # gates read the landing's `branch-delete` payload, delete the branch,
+        # and the fix is cut again from the base and proposed anew.
+        branch = self.publish_once()
+        first = self.origin_git(["rev-parse", branch]).strip()
+        self.history_forge().history[branch] = [self.spent(branch, first)]
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\nspec: {}\n"
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        history = self.origin_git(["rev-list", branch]).split()
+        self.assertNotIn(first, history)
+        self.assertEqual(
+            self.origin_git(["show", f"{branch}:clusters/prod-us-east/payments-netpol.yaml"]),
+            "kind: NetworkPolicy\nspec: {}\n",
+        )
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 2)
+
+    def test_a_branch_that_moved_past_its_closed_pull_request_is_not_deleted(self):
+        # The closed pull request carried an older revision than the tip, so
+        # the broker refuses with NOT_SPENT and the branch is left as it is.
+        branch = self.publish_once()
+        first = self.origin_git(["rev-parse", branch]).strip()
+        self.history_forge().history[branch] = [self.spent(branch, "0" * 40)]
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\nspec: {}\n"
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertIn("NOT_SPENT", self.err)
+        self.assertEqual(self.origin_git(["rev-parse", branch]).strip(), first)
 
     def test_an_unchanged_second_run_still_reports_the_pull_request(self):
         # EMPTY_COMMIT on a branch that already exists is "nothing to push",
@@ -19250,6 +19527,50 @@ class ContentModeTestCase(BaseTestCase):
         self.assertEqual(self.run_main(["list", "--audit", AUDIT, "--branch", branch]), 0)
         self.assertEqual(json.loads(self.out.strip())["sha"], branch_head)
 
+    def test_a_read_of_a_branch_the_remote_lacks_reads_the_base(self):
+        # A first round names its remediation branch before any run pushed it.
+        self.start()
+        head = self.origin_git(["rev-parse", "main"]).strip()
+        self.assertEqual(
+            self.run_main(["list", "--audit", AUDIT, "--branch", "platform-agent/fix-not-yet"]), 0
+        )
+        self.assertEqual(json.loads(self.out.strip())["sha"], head)
+
+    def test_list_and_grep_stop_at_their_caps_and_say_so(self):
+        self.publish_once()
+        branch = self.branch_for(make_doc())
+        self.patch_attr("LIST_MAX_ENTRIES", 1)
+        self.patch_attr("GREP_MAX_MATCHES", 1)
+        self.assertEqual(self.run_main(["list", "--audit", AUDIT, "--branch", branch]), 0)
+        listed = json.loads(self.out.strip())
+        self.assertEqual((len(listed["entries"]), listed["total"], listed["truncated"]), (1, 2, True))
+        self.assertEqual(
+            self.run_main(["grep", "--audit", AUDIT, "--branch", branch, "--pattern", "e"]), 0
+        )
+        found = json.loads(self.out.strip())
+        self.assertEqual((len(found["matches"]), found["total"], found["truncated"]), (1, 2, True))
+
+    def test_a_read_leaves_no_snapshot_behind(self):
+        self.start()
+        self.assertEqual(self.run_main(["grep", "--audit", AUDIT, "--pattern", "seed"]), 0)
+        self.assertEqual(self.copies_left(), [])
+
+    def test_a_snapshot_a_killed_run_left_is_removed_once_it_is_stale(self):
+        ttl = patch.object(vcs_client, "COPY_TTL_HOURS", 24.0)
+        ttl.start()
+        self.addCleanup(ttl.stop)
+        self.vcs_root.mkdir(parents=True, exist_ok=True)
+        stale = self.vcs_root / f"{audit_report.SNAPSHOT_DIR_PREFIX}old"
+        fresh = self.vcs_root / f"{audit_report.SNAPSHOT_DIR_PREFIX}new"
+        other = self.vcs_root / "someone-elses-copy"
+        for path in (stale, fresh, other):
+            path.mkdir()
+        old = time.time() - (vcs_client.COPY_TTL_HOURS + 1) * audit_report.SECONDS_PER_HOUR
+        os.utime(stale, (old, old))
+        os.utime(other, (old, old))
+        audit_report.remove_stale_snapshots()
+        self.assertEqual(sorted(p.name for p in self.vcs_root.iterdir()), sorted([fresh.name, other.name]))
+
     def test_grep_that_matches_nothing_is_not_an_error(self):
         self.start()
         self.assertEqual(
@@ -19279,11 +19600,9 @@ class ContentModeTestCase(BaseTestCase):
             2,
         )
         self.assertFalse((self.tmp_path / "etc").exists())
-        # Refused before anything was read. The only verb either command sent
-        # is the availability probe, which is an `open` with no repository in
-        # it; a `read` here would mean the path was resolved after the fetch
-        # rather than before it.
-        self.assertEqual(set(self.verbs), {"open"})
+        # Refused before anything was read: a `snapshot` here would mean the
+        # path was resolved after the fetch rather than before it.
+        self.assertEqual(self.verbs, [])
 
     def test_the_pull_request_body_reaches_proposal_create(self):
         self.start()
@@ -19300,30 +19619,12 @@ class ContentModeTestCase(BaseTestCase):
         self.assertEqual(len(bodies), 1)
         self.assertIn("clusters/prod-us-east/payments-netpol.yaml", bodies[0])
 
-    def test_an_unarmed_broker_refuses_start_instead_of_cloning(self):
-        # The leased clone cannot publish from the sandbox any more: its `git`
-        # has no transport and no credential. A broker that does not answer yes
-        # stops the run here, naming the broker, rather than failing later on
-        # a `git` transport error.
-        def unavailable(endpoint, verb, payload):
-            raise credential_proxy_client.WorkspaceUnavailable("not enabled")
-
-        # The broker is up and pins nothing: the directory-mode reset asks it
-        # for this repository's base before falling back to origin/HEAD.
-        def capabilities(endpoint, verb, payload):
-            return {"forge": "github", "repo": payload["repository"], "baseBranch": None}
-
-        for patcher in (
-            patch.object(credential_proxy_client, "_workspace_call", unavailable),
-            patch.object(credential_proxy_client, "vcs_call", capabilities),
-        ):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-
-        self.harness.replies = {"issue-list": {"issues": []}}
-        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
-        self.assertIn("http://127.0.0.1:8765", self.err)
-        self.assertIn("BROKER UNAVAILABLE:", self.err)
+    def test_start_asks_the_broker_nothing_to_choose_the_mode(self):
+        # With a broker configured, content mode is the only mode: the
+        # sandbox's `git` has no transport and no credential. So `start` does
+        # not probe the broker for it, and clones nothing.
+        self.assertEqual(self.start()["mode"], "content")
+        self.assertEqual(self.verbs, [])
         self.assertEqual(
             [c for c in self.harness.calls if c[:2] == ["git", "clone"]], []
         )
@@ -19454,9 +19755,9 @@ class ContentModeTestCase(BaseTestCase):
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
         self.assertIn("START REFUSED:", self.err)
 
-    def test_a_broker_lost_under_the_content_workspace_is_the_same_refusal(self):
-        # The workspace talks to the broker itself, so its transport failure
-        # arrives unwrapped rather than as a forge error.
+    def test_a_broker_lost_under_the_landing_is_the_same_refusal(self):
+        # The landing's clone talks to the broker itself, so its transport
+        # failure arrives as the client raises it rather than as a forge error.
         import urllib.error
 
         self.start()
@@ -19468,18 +19769,15 @@ class ContentModeTestCase(BaseTestCase):
             "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
 
-        def closed(*_args, **_kwargs):
-            raise urllib.error.URLError("[Errno 111] Connection refused")
-
-        with patch.object(credential_proxy_client.Workspace, "open", closed):
-            self.assertEqual(self.run_finish(make_doc()), 2)
+        self.vcs_failures["clone"] = urllib.error.URLError("[Errno 111] Connection refused")
+        self.assertEqual(self.run_finish(make_doc()), 2)
         self.assertIn("BROKER UNAVAILABLE:", self.err)
         self.assertNotIn("FATAL", self.err)
 
     def test_a_busy_broker_at_the_kustomize_check_is_the_same_refusal(self):
-        """A 503 at the probe's open is an outage: `finish` exits 2 with the
-        outage line and opens nothing, so the worker runs it again, and no fix
-        is degraded because the broker was busy."""
+        """A 503 at the probe's snapshot is an outage: `finish` exits 2 with
+        the outage line and opens nothing, so the worker runs it again, and no
+        fix is degraded because the broker was busy."""
         self.start()
         self.write_manifest(
             "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
@@ -19489,17 +19787,16 @@ class ContentModeTestCase(BaseTestCase):
             "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
         }
 
-        def busy(*_args, **_kwargs):
-            raise credential_proxy_client.WorkspaceRequestError(503, {"error": "busy"})
-
-        with patch.object(credential_proxy_client.Workspace, "open", busy):
-            self.assertEqual(self.run_finish(make_doc()), 2)
+        self.vcs_failures["snapshot"] = credential_proxy_client.WorkspaceRequestError(
+            503, {"error": "busy"}
+        )
+        self.assertEqual(self.run_finish(make_doc()), 2)
         self.assertIn("BROKER UNAVAILABLE:", self.err)
         self.assertIn("checking whether a kustomization lists", self.err)
         self.assertEqual(self.harness.forge_calls("proposal-create"), [])
         self.assertEqual(self.harness.forge_calls("issue-create"), [])
 
-    def test_a_broker_dropped_mid_answer_under_the_workspace_is_the_same_refusal(self):
+    def test_a_broker_dropped_mid_answer_under_the_landing_is_the_same_refusal(self):
         """Review finding: a broker evicted after taking the request surfaces
         from the response read, raw and not as a `URLError`, and exited 1."""
         import http.client
@@ -19519,23 +19816,20 @@ class ContentModeTestCase(BaseTestCase):
             TimeoutError("timed out"),
         ):
             with self.subTest(type(raised).__name__):
-                def dropped(*_args, raised=raised, **_kwargs):
-                    raise raised
-
-                with patch.object(credential_proxy_client.Workspace, "open", dropped):
-                    self.assertEqual(self.run_finish(make_doc()), 2)
+                self.vcs_failures["clone"] = raised
+                self.assertEqual(self.run_finish(make_doc()), 2)
                 self.assertIn("BROKER UNAVAILABLE:", self.err)
                 self.assertNotIn("FATAL", self.err)
 
     def test_a_broker_lost_under_a_read_command_is_the_same_refusal(self):
-        """Review finding: `fetch`, `list` and `grep` open the workspace
+        """Review finding: `fetch`, `list` and `grep` call the broker
         themselves, so a lost broker there exited 1 `FATAL`."""
         import http.client
 
         self.start()
-
-        def dropped(*_args, **_kwargs):
-            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+        self.vcs_failures["snapshot"] = http.client.RemoteDisconnected(
+            "Remote end closed connection without response"
+        )
 
         for argv in (
             ["fetch", "--audit", AUDIT, "--path", "README.md"],
@@ -19543,8 +19837,7 @@ class ContentModeTestCase(BaseTestCase):
             ["grep", "--audit", AUDIT, "--pattern", "seed"],
         ):
             with self.subTest(argv[0]):
-                with patch.object(credential_proxy_client.Workspace, "open", dropped):
-                    self.assertEqual(self.run_main(argv), 2)
+                self.assertEqual(self.run_main(argv), 2)
                 self.assertIn("BROKER UNAVAILABLE: the broker at", self.err)
                 self.assertNotIn("FATAL", self.err)
 
@@ -19626,7 +19919,7 @@ class ContentModeTestCase(BaseTestCase):
         # Named exactly as directory mode names it.
         self.assertIn("in the GitOps repository at `gcp/drift-peer-std-4.yaml`", body)
         self.assertIn("Config Connector declaration holds", self.err)
-        self.assertIn("grep", self.verbs)
+        self.assertIn("snapshot", self.verbs)
         # Read, not copied: nothing lands in the tree `finish` publishes, and
         # no git ran here to read it.
         self.assertFalse((self.workspace / "gcp").exists())
@@ -19643,41 +19936,21 @@ class ContentModeTestCase(BaseTestCase):
             "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
             "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
+        scan = mock.Mock(return_value={})
+        self.patch_attr("kcc_declarations_via_broker", scan)
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
-        self.assertNotIn("grep", self.verbs)
-
-    def test_a_truncated_scan_degrades_what_it_found_and_says_so(self):
-        # Two declarations against a one-match ceiling: the broker answers
-        # with the first and `truncated`. The fix it found still degrades;
-        # the run says the index was incomplete rather than implying the rest
-        # of the repository declares nothing.
-        self.seed_kcc("gcp/a-drift-peer-std-4.yaml", "drift-peer-std-4")
-        self.seed_kcc("gcp/b-other.yaml", "other")
-        cap = patch.dict(os.environ, {"CREDENTIAL_PROXY_MAX_MATCHES": "1"})
-        cap.start()
-        self.addCleanup(cap.stop)
-        self.start()
-        body = self.finish_kcc()
-        self.assertIn("`gcp/a-drift-peer-std-4.yaml`", body)
-        self.assertIn("truncated the Config Connector scan", self.err)
+        scan.assert_not_called()
 
     def test_a_broker_error_leaves_the_gcloud_fix_and_the_run_alone(self):
         self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
         self.start()
-        live = credential_proxy_client._workspace_call
-
-        def failing_grep(endpoint, verb, payload):
-            if verb == "grep":
-                raise credential_proxy_client.WorkspaceRequestError(500, {"status": "error"})
-            return live(endpoint, verb, payload)
-
-        patcher = patch.object(credential_proxy_client, "_workspace_call", failing_grep)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.vcs_failures["snapshot"] = credential_proxy_client.WorkspaceRequestError(
+            500, {"status": "error"}
+        )
         body = self.finish_kcc()
         self.assertNotIn("Config Connector holds that field", body)
         self.assertIn(self.KCC_FIX, body)
-        self.assertIn("could not read acme/fleet through the broker", self.err)
+        self.assertIn("could not take a snapshot of acme/fleet through the broker", self.err)
 
 
 # --------------------------------------------------------------------------- #
@@ -21306,27 +21579,22 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertEqual(self.answered, {"a"})
 
     def test_a_namespace_collision_is_not_blamed_on_the_broker(self):
-        module = mock.MagicMock()
-        module.Workspace.open.side_effect = RuntimeError("store full")
+        use_snapshot(self, error=RuntimeError("store full"))
         self.patch_attr("content_mode", lambda: True)
-        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
-            self.generate(namespace_pdbs=["a-pdb"], prime=True)
+        self.generate(namespace_pdbs=["a-pdb"], prime=True)
         self.assertIn("the namespace already has a PodDisruptionBudget named a-pdb", self.generate_err)
         self.assertNotIn("could not be checked", self.generate_err)
 
-    def test_the_broker_is_asked_about_one_path_once(self):
-        inner = mock.MagicMock()
-        inner.list.return_value = []
-        session = mock.MagicMock()
-        session.__enter__.return_value = inner
-        module = mock.MagicMock()
-        module.Workspace.open.return_value = session
+    def test_one_snapshot_answers_every_question_of_the_run(self):
+        calls = []
+        use_snapshot(self, {"clusters/c1/kustomization.yaml": "resources: []\n"}, calls=calls)
         self.patch_attr("content_mode", lambda: True)
         probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
-        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
-            for _ in range(3):
-                self.assertFalse(probe.has_path("clusters/kustomization.yaml"))
-        self.assertEqual(inner.list.call_count, 1)
+        for _ in range(3):
+            self.assertFalse(probe.has_path("clusters/kustomization.yaml"))
+            self.assertTrue(probe.has_path("clusters/c1/kustomization.yaml"))
+        self.assertEqual(calls, [("acme/fleet", None, None)])
+        probe.close()
 
     def test_a_promised_path_the_containment_check_refuses_is_not_refused_again(self):
         """Writing at it is what the check stops, so the run publishes it
@@ -21575,30 +21843,23 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             )
         self.assertIn("Kustomize root", notes["a"])
 
-    def test_a_listing_that_failed_or_stopped_short_is_named_not_called_a_collision(self):
-        class Listing(list):
-            truncated = False
+    def test_a_default_yes_taken_without_a_snapshot_is_not_kept_after_a_retry(self):
+        use_snapshot(self, {"clusters/c1/kustomization.yaml": "resources: []\n"}, error=[RuntimeError("down"), None])
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(probe.has_path("clusters/new.yaml"))  # no snapshot: a default yes
+            self.assertFalse(probe.has_path("clusters/new.yaml"))  # the retry's snapshot answers
+        self.assertFalse(probe.known_absent("clusters/other.yaml"))
+        self.assertTrue(probe.known_absent("clusters/new.yaml"))
+        probe.close()
 
-        for name, error, truncated, said in (
-            ("error", RuntimeError("down"), False, "listing apps/a/a-pdb.yaml: RuntimeError: down"),
-            ("truncated", None, True, "listing apps/a/a-pdb.yaml was truncated"),
-        ):
-            with self.subTest(name):
-                inner = mock.MagicMock()
-                listing = Listing([])
-                listing.truncated = truncated
-                inner.list.side_effect = error
-                inner.list.return_value = listing
-                inner.grep.return_value = {"total": 0}
-                session = mock.MagicMock()
-                session.__enter__.return_value = inner
-                module = mock.MagicMock()
-                module.Workspace.open.return_value = session
-                self.patch_attr("content_mode", lambda: True)
-                with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
-                    self.generate()
-                self.assertIn(f"could not be checked ({said})", self.generate_err)
-                self.assertNotIn("already exists", self.generate_err)
+    def test_a_snapshot_that_failed_is_named_not_called_a_collision(self):
+        use_snapshot(self, error=RuntimeError("down"))
+        self.patch_attr("content_mode", lambda: True)
+        self.generate()
+        self.assertIn("could not be checked (RuntimeError: down)", self.generate_err)
+        self.assertNotIn("already exists", self.generate_err)
 
     def test_its_own_open_pull_request_is_planned_again_for_the_sweep_to_find(self):
         """The next run's clone no longer holds the file; refusing there would
@@ -21611,36 +21872,21 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertEqual(written, ["a"])
         self.assertEqual(self.answered, set())
 
-    def test_in_content_mode_a_path_the_broker_lists_or_cannot_answer_is_not_written(self):
-        class Listing(list):
-            truncated = False
-
-        def broker(entries=(), error=None, truncated=False):
-            inner = mock.MagicMock()
-            listing = Listing(entries)
-            listing.truncated = truncated
-            inner.list.side_effect = error
-            inner.list.return_value = listing
-            inner.grep.return_value = {"total": 0}
-            session = mock.MagicMock()
-            session.__enter__.return_value = inner
-            module = mock.MagicMock()
-            module.Workspace.open.return_value = session
-            return module
-
+    def test_in_content_mode_a_path_the_snapshot_holds_or_cannot_answer_is_not_written(self):
         self.patch_attr("content_mode", lambda: True)
-        for name, module, expected in (
-            ("listed", broker([{"path": "apps/a/a-pdb.yaml", "size": 1}]), []),
-            ("error", broker(error=RuntimeError("down")), []),
-            ("truncated", broker(truncated=True), []),
-            ("absent", broker([]), ["a"]),
+        for name, files, error, expected in (
+            ("held", {"apps/a/a-pdb.yaml": "x\n"}, None, []),
+            ("error", None, RuntimeError("down"), []),
+            ("absent", {}, None, ["a"]),
         ):
-            with self.subTest(name), mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
+            with self.subTest(name):
+                calls = []
+                use_snapshot(self, files, error=error, calls=calls)
                 target = self.workspace / "apps/a/a-pdb.yaml"
                 if target.exists():
                     target.unlink()
                 self.assertEqual(self.generate()[0], expected)
-                self.assertEqual(module.Workspace.open.call_count, 1)
+                self.assertEqual(len(calls), 1)
 
     def test_two_clusters_each_get_their_own_budget_of_one_name(self):
         """A PodDisruptionBudget's name is unique per namespace per cluster, and
@@ -21705,29 +21951,23 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             self.assertTrue(probe.mentions("a-pdb"))
         self.assertTrue(probe.mentions("b-pdb"))
 
-    def test_the_broker_is_asked_for_a_cluster_tree_without_a_trailing_slash(self):
-        """`validate_path` refuses an empty segment, and a refused search
-        reads as a collision."""
-        inner = mock.MagicMock()
-        inner.grep.return_value = {"total": 0}
-        session = mock.MagicMock()
-        session.__enter__.return_value = inner
-        module = mock.MagicMock()
-        module.Workspace.open.return_value = session
+    def test_the_name_search_in_content_mode_stays_in_its_cluster_tree(self):
+        use_snapshot(self, {"clusters/c2/web/pdb.yaml": "metadata:\n  name: a-pdb\n"})
         self.patch_attr("content_mode", lambda: True)
         probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
-        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
-            self.assertFalse(probe.mentions("a-pdb", "clusters/c1/"))
-        self.assertEqual(inner.grep.call_args.kwargs["prefix"], "clusters/c1")
+        self.assertFalse(probe.mentions("a-pdb", "clusters/c1/"))
+        self.assertTrue(probe.mentions("a-pdb", "clusters/c2/"))
+        probe.close()
 
-    def test_the_config_connector_scan_reuses_the_probes_broker_session(self):
-        session = mock.MagicMock()
-        session.grep.return_value = {"matches": [], "total": 0, "truncated": False}
-        module = mock.MagicMock()
-        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
-            audit_report.kcc_declarations_via_broker("acme/fleet", session)
-        module.Workspace.open.assert_not_called()
-        session.grep.assert_called_once()
+    def test_the_config_connector_scan_reuses_the_probes_snapshot(self):
+        calls = []
+        use_snapshot(self, {"gcp/a.yaml": "kind: Other\n"}, calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        snap = probe.broker()
+        self.assertEqual(audit_report.kcc_declarations_via_broker("acme/fleet", snap), {})
+        self.assertEqual(len(calls), 1)
+        probe.close()
 
     def test_two_fixes_never_take_one_file_or_one_name(self):
         manifest = {"clusters": [_ran("c1", "no-pdb", candidates=[])]}
@@ -21774,11 +22014,9 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertIn("the name api-pdb", err.getvalue())
 
     def test_a_broker_that_cannot_be_asked_says_so(self):
-        module = mock.MagicMock()
-        module.Workspace.open.side_effect = RuntimeError("store full")
+        use_snapshot(self, error=RuntimeError("store full"))
         self.patch_attr("content_mode", lambda: True)
-        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
-            written, _ = self.generate()
+        written, _ = self.generate()
         self.assertEqual(written, [])
         self.assertIn("could not be checked (RuntimeError: store full)", self.generate_err)
         self.assertNotIn("already exists", self.generate_err)
@@ -28568,63 +28806,35 @@ class TestLostRecordWayOut(unittest.TestCase):
         self.assertNotIn("could not see the whole fleet", answer)
 
 
-class TestDetectContentMode(BaseTestCase):
-    """With a broker configured, an unclear probe refuses `start`.
+class TestContentModeChoice(BaseTestCase):
+    """Content mode is "a broker is configured", read from the endpoint alone.
 
-    The sandbox's `git` has no transport and no credential, so the leased
-    clone the old fallback chose would fail on its first remote command, later
-    and naming nothing. Only an install with no broker at all reaches it.
+    The sandbox's `git` has no transport and no credential, so with a broker
+    configured there is no other mode to fall back to, and nothing to ask the
+    broker. Only an install with no broker at all takes directory mode.
     """
 
-    ENDPOINT = "http://127.0.0.1:8765"
-
-    def probe(self, answer):
-        import credential_proxy_client
-
-        def workspaces_available(endpoint):
-            self.assertEqual(endpoint, self.ENDPOINT)
-            if isinstance(answer, Exception):
-                raise answer
-            return answer
-
-        patcher = patch.object(credential_proxy_client, "workspaces_available", workspaces_available)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        env = patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": self.ENDPOINT})
-        env.start()
-        self.addCleanup(env.stop)
+    def choose(self, endpoint: str) -> bool:
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
+        self.patch_attr("run_cmd", Recorder())
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": endpoint}), \
+                patch.object(credential_proxy_client, "vcs_call", side_effect=AssertionError("asked")), \
+                patch.object(gitops_workspace, "ensure_workspace", return_value=self.tmp_path):
+            audit_report.ensure_workspace("acme/fleet", AUDIT)
+        return audit_report.content_mode()
 
     def test_no_broker_configured_is_directory_mode(self):
-        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}):
-            self.assertFalse(audit_report.detect_content_mode())
+        self.assertFalse(self.choose(""))
 
-    def test_an_armed_broker_is_content_mode(self):
-        self.probe(True)
-        self.assertTrue(audit_report.detect_content_mode())
+    def test_a_configured_broker_is_content_mode_without_a_probe(self):
+        self.assertTrue(self.choose("http://127.0.0.1:8765"))
 
-    def test_a_broker_that_does_not_say_yes_refuses_the_run(self):
-        self.probe(False)
-        with self.assertRaises(audit_report.BrokerUnavailable) as raised:
-            audit_report.detect_content_mode()
-        self.assertIn(self.ENDPOINT, str(raised.exception))
-        self.assertIn("re-run this command", str(raised.exception))
-
-    def test_a_probe_that_raises_refuses_the_run_and_says_why(self):
-        self.probe(OSError("connection reset"))
-        with self.assertRaises(audit_report.BrokerUnavailable) as raised:
-            audit_report.detect_content_mode()
-        self.assertIn("connection reset", str(raised.exception))
-
-    def test_the_skill_tells_this_refusal_from_the_in_flight_guard(self):
-        """Review findings: this refusal printed `START REFUSED` like the
+    def test_the_skill_tells_a_broker_outage_from_the_in_flight_guard(self):
+        """Review findings: an outage printed `START REFUSED` like the
         in-flight guard, and then the skill said it meant nothing was in
-        flight -- false after `finish`, which keeps its note. It now has its
-        own label, and the skill says which command to re-run."""
-        self.probe(False)
-        with self.assertRaises(audit_report.BrokerUnavailable) as raised:
-            audit_report.detect_content_mode()
-        self.assertNotIsInstance(raised.exception, audit_report.StartRefused)
-        self.assertIn("the broker at", str(raised.exception))
+        flight -- false after `finish`, which keeps its note. It has its own
+        label, and the skill says which command to re-run."""
+        self.assertFalse(issubclass(audit_report.BrokerUnavailable, audit_report.StartRefused))
         text = skill_text()
         on_demand = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
         exit_codes = " ".join(
@@ -28803,28 +29013,6 @@ def kustomize_fix(path, fid="pdb-fix"):
     )
 
 
-class FakeBrokerWorkspace:
-    """The broker's view of the base: `list` and `read_text` over `files`.
-
-    `fail` names the paths whose read raises, and `list_fails` the prefixes
-    whose listing raises, as a broker that does not answer would."""
-
-    def __init__(self, files, fail=(), list_fails=()):
-        self.files = dict(files)
-        self.fail = set(fail)
-        self.list_fails = set(list_fails)
-
-    def list(self, prefix=None):
-        if prefix in self.list_fails:
-            raise RuntimeError("listing failed")
-        return [{"path": path} for path in self.files if prefix is None or path.startswith(prefix)]
-
-    def read_text(self, path):
-        if path in self.fail or path not in self.files:
-            raise RuntimeError(f"cannot read {path}")
-        return self.files[path]
-
-
 class TestUnlistedKustomizeAdditions(BaseTestCase):
     """`degrade_unlisted_kustomize_additions` makes a `manifest` fix `manual`
     when it adds a file that its Kustomize root does not list."""
@@ -28963,111 +29151,72 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         target.parent.mkdir(parents=True)
         target.write_text("kind: PodDisruptionBudget\n", encoding="utf-8")
         finding = kustomize_fix(self.PDB)
-        workspace = FakeBrokerWorkspace(self.overlay())
-        workspace.read_text = mock.MagicMock(side_effect=RuntimeError("e" * 2500))
-        self.assertEqual(self.degrade_via_workspace(workspace, [finding]), ["pdb-fix"])
+        use_snapshot(
+            self, self.overlay(), unreadable={self.KUSTOMIZATION}, read_error=RuntimeError("e" * 2500)
+        )
+        self.assertEqual(self.degrade_in_content_mode([finding]), ["pdb-fix"])
         note = finding["remediation"]["note"]
         self.assertIn(f"could not read `{self.KUSTOMIZATION}`", note)
         self.assertNotIn("```", note)
         self.assert_fence_survives_the_clip(note)
 
-    def degrade_with_open(self, opened):
-        self.patch_attr("content_mode", lambda: True)
-        self.patch_attr("git", mock.MagicMock(side_effect=AssertionError("git in content mode")))
-        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+    def degrade_with_snapshot(self, error):
+        use_snapshot(self, self.overlay(), error=error)
         finding = kustomize_fix(self.PDB)
-        with patch.object(credential_proxy_client.Workspace, "open", opened), contextlib.redirect_stderr(io.StringIO()):
-            return audit_report.degrade_unlisted_kustomize_additions([finding], probe), finding
+        return self.degrade_in_content_mode([finding]), finding
 
-    def test_a_broker_that_refuses_the_open_degrades_and_says_so(self):
+    def test_a_broker_that_refuses_the_snapshot_degrades_and_says_so(self):
         """`has_path` takes a yes and records only `unavailable`; the pass
         still reads that as no answer, also for a file that may exist."""
-
-        def refused(*_args, **_kwargs):
-            raise credential_proxy_client.WorkspaceRequestError(403, {"error": "repository not managed"})
-
-        degraded, finding = self.degrade_with_open(refused)
+        degraded, finding = self.degrade_with_snapshot(broker_refusal(403, "repository not managed"))
         self.assertEqual(degraded, ["pdb-fix"])
         self.assertIn("could not check", finding["remediation"]["note"])
-        self.assertIn("WorkspaceRequestError", finding["remediation"]["note"])
+        self.assertIn("VcsError", finding["remediation"]["note"])
 
     def test_no_answer_in_a_repository_without_kustomize_names_no_kustomization(self):
         """The probe takes a yes it did not see; the note must not state a
         kustomization path as fact."""
-
-        def refused(*_args, **_kwargs):
-            raise credential_proxy_client.WorkspaceRequestError(403, {"error": "repository not managed"})
-
         path = "clusters/prod/apps/web/web-pdb.yaml"
-        self.patch_attr("content_mode", lambda: True)
-        self.patch_attr("git", mock.MagicMock(side_effect=AssertionError("git in content mode")))
-        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        use_snapshot(self, error=broker_refusal(403, "repository not managed"))
         finding = kustomize_fix(path)
-        with patch.object(credential_proxy_client.Workspace, "open", refused), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(audit_report.degrade_unlisted_kustomize_additions([finding], probe), ["pdb-fix"])
+        self.assertEqual(self.degrade_in_content_mode([finding]), ["pdb-fix"])
         note = finding["remediation"]["note"]
         self.assertIn(f"could not check whether the directory of `{path}` is under a kustomization", note)
-        self.assertIn("WorkspaceRequestError", note)
+        self.assertIn("VcsError", note)
         self.assertNotIn("kustomization.yaml", note)
         self.assertNotIn("Kustomization`", note)
 
-    def test_a_server_error_at_the_open_stops_the_command(self):
+    def test_a_server_error_at_the_snapshot_stops_the_command(self):
         """A 503 or 429 says "try again", so it is an outage, not a refusal."""
         for status in (503, 429):
             with self.subTest(status=status):
-
-                def busy(*_args, **_kwargs):
-                    raise credential_proxy_client.WorkspaceRequestError(status, {"error": "busy"})
-
                 with self.assertRaises(audit_report.BrokerUnavailable):
-                    self.degrade_with_open(busy)
+                    self.degrade_with_snapshot(broker_refusal(status, "busy"))
 
-    def test_a_lost_broker_after_a_good_open_stops_the_command(self):
+    def test_a_retried_snapshot_that_succeeds_clears_the_outage(self):
+        """The Config Connector scan takes the probe's snapshot twice when the
+        first fails; a second one that is taken answers for the first."""
         import urllib.error
 
-        class Lost(FakeBrokerWorkspace):
-            def list(self, prefix=None):
-                raise urllib.error.URLError("[Errno 111] Connection refused")
-
-        session = mock.MagicMock()
-        session.__enter__.return_value = Lost(self.overlay())
-        with self.assertRaises(audit_report.BrokerUnavailable):
-            self.degrade_with_open(lambda *_a, **_k: session)
-
-    def test_a_retried_open_that_succeeds_clears_the_outage(self):
-        """The Config Connector scan opens the probe twice when the first open
-        fails; a second open that succeeds answers for the first."""
-        import urllib.error
-
-        session = mock.MagicMock()
-        session.__enter__.return_value = FakeBrokerWorkspace(self.overlay())
-        attempts = iter([urllib.error.URLError("[Errno 111] Connection refused"), session])
-
-        def flapping(*_args, **_kwargs):
-            answer = next(attempts)
-            if isinstance(answer, BaseException):
-                raise answer
-            return answer
-
+        use_snapshot(
+            self, self.overlay(), error=[urllib.error.URLError("[Errno 111] Connection refused"), None]
+        )
         self.patch_attr("content_mode", lambda: True)
         self.patch_attr("git", mock.MagicMock(side_effect=AssertionError("git in content mode")))
         probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
         finding = kustomize_fix(self.PDB)
-        with patch.object(credential_proxy_client.Workspace, "open", flapping), contextlib.redirect_stderr(io.StringIO()):
+        with contextlib.redirect_stderr(io.StringIO()):
             self.assertIsNotNone(probe.broker() or probe.broker())
             self.assertEqual(audit_report.degrade_unlisted_kustomize_additions([finding], probe), ["pdb-fix"])
         self.assertIn("does not list it", finding["remediation"]["note"])
 
-    def test_a_broker_that_does_not_answer_the_open_stops_the_command(self):
+    def test_a_broker_that_does_not_answer_the_snapshot_stops_the_command(self):
         """An outage, as at publish: nothing is published or degraded, and
         the worker runs `finish` again."""
         import urllib.error
 
-        def lost(*_args, **_kwargs):
-            raise urllib.error.URLError("[Errno 111] Connection refused")
-
         with self.assertRaises(audit_report.BrokerUnavailable):
-            self.degrade_with_open(lost)
+            self.degrade_with_snapshot(urllib.error.URLError("[Errno 111] Connection refused"))
 
     def test_a_file_that_cannot_be_read_leaves_the_note_without_a_block(self):
         root = self.clone(self.overlay())
@@ -29245,22 +29394,22 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         self.assertEqual(self.degrade(root, [finding]), [])
         self.assertEqual(finding["remediation"], {"kind": "manual", "note": "by hand"})
 
-    # --- content mode: the broker holds the base ---------------------------- #
+    # --- content mode: a snapshot holds the base ---------------------------- #
 
-    def degrade_via_broker(self, files, findings, **failures):
-        return self.degrade_via_workspace(FakeBrokerWorkspace(files, **failures), findings)
+    def degrade_via_broker(self, files, findings, fail=()):
+        use_snapshot(self, files, unreadable=fail)
+        return self.degrade_in_content_mode(findings)
 
-    def degrade_via_workspace(self, workspace, findings):
-        session = mock.MagicMock()
-        session.__enter__.return_value = workspace
-        module = mock.MagicMock()
-        module.Workspace.open.return_value = session
+    def degrade_in_content_mode(self, findings):
         self.patch_attr("content_mode", lambda: True)
         # Content mode runs no git; a call here would be a bug.
         self.patch_attr("git", mock.MagicMock(side_effect=AssertionError("git in content mode")))
         probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
-        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}), contextlib.redirect_stderr(io.StringIO()):
-            return audit_report.degrade_unlisted_kustomize_additions(findings, probe, "merge request")
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                return audit_report.degrade_unlisted_kustomize_additions(findings, probe, "merge request")
+        finally:
+            probe.close()
 
     def test_content_mode_degrades_an_unlisted_new_file(self):
         finding = kustomize_fix(self.PDB)
@@ -29305,19 +29454,6 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         note = finding["remediation"]["note"]
         self.assertIn(f"could not read `{self.KUSTOMIZATION}`", note)
         self.assertIn(f"cannot read {self.KUSTOMIZATION}", note)
-
-    def test_content_mode_degrades_when_the_listing_of_the_file_fails(self):
-        """The broker could not say if the file is new; the overlay does not
-        list it, so the fix degrades with the reason."""
-        finding = kustomize_fix(self.PDB)
-        self.assertEqual(self.degrade_via_broker(self.overlay(), [finding], list_fails={self.PDB}), ["pdb-fix"])
-        note = finding["remediation"]["note"]
-        self.assertIn("listing failed", note)
-        # The kustomization was read; only whether the file is new is open,
-        # and the note says so rather than that the kustomization was unread.
-        self.assertIn(f"could not check whether `{self.PDB}` is already in the repository", note)
-        self.assertIn(f"`{self.KUSTOMIZATION}` does not list it.", note)
-        self.assertNotIn("could not read", note)
 
     def test_content_mode_keeps_a_file_outside_any_root(self):
         finding = kustomize_fix("clusters/prod/apps/web/web-pdb.yaml")
@@ -29628,7 +29764,7 @@ class TestManifestRemediationLinks(HarnessTestCase):
         data = {"declared_intent_searched": [f"acme/fleet@{model_sha}"]}
         record = {"searched": [f"acme/fleet@{record_sha}"]}
         probe = audit_report._RepositoryProbe("acme/fleet", Path("/tmp"))
-        probe._workspace = type("W", (), {"base_sha": probe_sha})()
+        probe._snapshot = type("S", (), {"revision": probe_sha})()
         self.assertEqual(
             audit_report._repo_file_ref("acme/fleet", None, data, record, probe),
             record_sha,
@@ -29637,7 +29773,7 @@ class TestManifestRemediationLinks(HarnessTestCase):
             audit_report._repo_file_ref("acme/fleet", None, data, None, probe),
             probe_sha,
         )
-        # An unopened probe never opens a broker workspace just to read `base_sha`.
+        # A probe with no snapshot never takes one just to read `base_sha`.
         unopened = audit_report._RepositoryProbe("acme/fleet", Path("/tmp"))
         self.assertEqual(
             audit_report._repo_file_ref("acme/fleet", None, data, None, unopened),

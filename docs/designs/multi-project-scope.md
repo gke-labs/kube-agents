@@ -198,8 +198,17 @@ Rules:
 
 Resolution turns the declared scope into a set of `(project, cluster, location)` tuples, plus a
 per-project outcome. It runs inside the existing reconcile job under the agent's identity, through
-the credential broker, because that is the only process in the install that talks to GCP on a
-schedule and the operator deliberately holds no GCP credential.
+the credential broker, because the operator deliberately holds no GCP credential. Outside
+`spec.mode: next`, the reconcile is the only process in the install that talks to GCP on a
+schedule.
+
+Under `spec.mode: next` there is a second scheduled caller, the scope publisher. The operator
+starts it as a Job every 15 minutes, and soon after the membership fields of `spec.scope` change,
+while the scope declares a folder, organisation, Shared VPC host or Metrics Scope. It resolves the
+same members through the broker's `scope` role, under a ServiceAccount of its own, and writes them
+to the `<name>-resolved-scope` ConfigMap, which the A2A gateway reads before it admits a target
+that `spec.scope.projects` does not list. The broker confers that role only where the chart
+renders the gateway pod admission policy. The operator still holds no GCP credential.
 
 **Explicit projects** are listed once per project. Since #3703 this is the GKE API's
 `projects.locations.clusters` list (`v1/projects/<P>/locations/-/clusters`), read through the

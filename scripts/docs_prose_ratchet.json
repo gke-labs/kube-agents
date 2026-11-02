@@ -106,7 +106,7 @@
     "banned-word": 1,
     "antithesis": 1,
     "long-paragraph": 16,
-    "long-sentence": 42
+    "long-sentence": 41
   },
   "reference/cron-jobs.md": {
     "banned-word": 1,
