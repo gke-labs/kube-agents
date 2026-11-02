@@ -121,7 +121,7 @@ The flow coordinates state through flag files under the agent pod's `/opt/data/`
 
 ## 3. Operational Cases
 
-Both cases converge on the same delivery path: the `no_agent` delivery job posts `INVENTORY.md` (as written, or reshaped for Slack with `KAGE_SLACK_UX` on, followed by the audits note) once the ranked report is on disk, a human is present and the greeting is on its way (the hold below). The only difference is timing. The cases and diagrams below show the chat-platform path; under `spec.mode: next` the binding and the post differ as Rule 5 describes, and the timing is the same.
+Both cases converge on the same delivery path: the `no_agent` delivery job posts `INVENTORY.md` (as the card where one goes, Slack and, under `spec.mode: next`, Google Chat, with `KAGE_SLACK_UX` on; else as written, or reshaped for Slack; followed by the audits note) once the ranked report is on disk, a human is present and the greeting is on its way (the hold below). The only difference is timing. The cases and diagrams below show the chat-platform path; under `spec.mode: next` the binding and the post differ as Rule 5 describes, and the timing is the same.
 
 ### Case A: User engages before the scan completes (mid-scan)
 
@@ -136,7 +136,7 @@ Both cases converge on the same delivery path: the `no_agent` delivery job posts
 
 2. **Delivery job (each tick):** `INVENTORY.md` is still absent → the script emits nothing → silent run.
 3. **Scan completes:** the gate files the per-Cluster-Agent audit cards, up to the first-run cap, and the `platform` worker lists the fleet, audits the clusters past the cap, and completes; once the per-cluster cards settle, the scan job's hand-off writes `/opt/data/INVENTORY.raw.md` and files the prioritization card (or, if no cluster was audited, writes `INVENTORY.md` itself). That worker ranks the findings and writes `/opt/data/INVENTORY.md`. The scan job has not filed again this whole time, on `.bootstrap_scan_filed`.
-4. **Next delivery tick:** both `INVENTORY.md` and `.user_aligned` exist and `.bootstrap_completed` is absent → the script reads the report, registers the sweep's findings in the findings queue, claims delivery by creating `.bootstrap_completed` with `O_EXCL`, marks the report's items shown in the findings queue, posts the card built from the files beside the report (through the Slack relay, or through the gateway under `spec.mode: next`) and prints the audits note, or prints the report as text (reshaped for Slack with `KAGE_SLACK_UX` on) when there is no card, and the scheduler delivers what was printed to the bound origin chat. `_cleanup` then archives the report as `INVENTORY.delivered.md`. The first delivery tick at least `RETIRE_AFTER_SECONDS` later finds `.bootstrap_completed`, posts nothing, and removes the two disabled onboarding entries (`_retire_jobs`); `oobe` removes itself once its audits stage is done.
+4. **Next delivery tick:** both `INVENTORY.md` and `.user_aligned` exist and `.bootstrap_completed` is absent → the script reads the report, registers the sweep's findings in the findings queue, claims delivery by creating `.bootstrap_completed` with `O_EXCL`, marks the report's items shown in the findings queue, posts the card built from the files beside the report (through the Slack relay, or through the gateway under `spec.mode: next`, on Slack and on Google Chat) and prints the audits note, or prints the report as text (reshaped for Slack with `KAGE_SLACK_UX` on) when there is no card, and the scheduler delivers what was printed to the bound origin chat. `_cleanup` then archives the report as `INVENTORY.delivered.md`. The first delivery tick at least `RETIRE_AFTER_SECONDS` later finds `.bootstrap_completed`, posts nothing, and removes the two disabled onboarding entries (`_retire_jobs`); `oobe` removes itself once its audits stage is done.
 
 ```mermaid
 sequenceDiagram
@@ -423,7 +423,7 @@ Unit tests cover the deterministic pieces of the flow (they mock the Hermes
   path and into the recorded conversation under `spec.mode: next`, the done
   card for a clean fleet, the limits file's limit, a dismissed row left off,
   and every reason the text goes instead with its `logs/oobe.log` line (the
-  flag, a non-Slack chat, no ranking card, a missing or unusable file, a shown
+  flag, a chat the card does not go to, no ranking card, a missing or unusable file, a shown
   file that differs, a door that did not post).
 - `../../../scripts/test_bootstrap_handoff.py` — the hand-off: it waits while a
   card is unsettled, writes a raw file whose findings block the ranking stage's
