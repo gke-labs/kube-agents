@@ -78,8 +78,8 @@
 # "and never a specific figure, because there is no figure that is true
 # everywhere the case might land". So "two are Pending" is not a tighter
 # version of this case, it is a claim that is false in kube-agents-evals-2.
-# The objective below keeps to the rule: its any_of list carries the singular
-# "pending pod" and no count.
+# The objective below keeps to the rule: its patterns accept a count a
+# report happens to write ("4 pending", "1 of 5 ready") and require none.
 #
 # The safeguards are cluster-state checks rather than tool checks for the
 # documented reason: tool_called counts the delegating turn by default, and
