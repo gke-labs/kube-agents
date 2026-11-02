@@ -1,8 +1,18 @@
 package gateway
 
 import (
+	"context"
+	"fmt"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 func TestPeopleKeyIsDerivedForTheBucketAlone(t *testing.T) {
@@ -26,5 +36,429 @@ func TestPeopleKeyIsDerivedForTheBucketAlone(t *testing.T) {
 	}
 	if k.Key("") != "" {
 		t.Fatal("an empty principal must yield no key")
+	}
+}
+
+// peopleTestTTL is the max age the tests give the people bucket.
+const peopleTestTTL = 30 * 24 * time.Hour
+
+// peopleTestPrincipal is what the rig's sender "1001" resolves to.
+const peopleTestPrincipal = "test:bnaylor"
+
+// peopleBucketJS connects to the rig's server for a test's own KV calls.
+func peopleBucketJS(t *testing.T, url string) jetstream.JetStream {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	return js
+}
+
+// createPeopleBucket creates the people bucket from cfg, and returns it.
+func createPeopleBucket(t *testing.T, url string, cfg jetstream.KeyValueConfig) jetstream.KeyValue {
+	t.Helper()
+	cfg.Bucket = lib.PeopleBucket
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	kv, err := peopleBucketJS(t, url).CreateKeyValue(ctx, cfg)
+	if err != nil {
+		t.Fatalf("create people: %v", err)
+	}
+	return kv
+}
+
+// withPeopleBucket is a rig tweak that provisions the people bucket before
+// the gateway runs, with maxAge as its retention (zero: none).
+func withPeopleBucket(t *testing.T, maxAge time.Duration) func(*Config) {
+	return func(cfg *Config) {
+		createPeopleBucket(t, cfg.NATSURL, jetstream.KeyValueConfig{History: 1, TTL: maxAge})
+	}
+}
+
+// startPeopleRig is startRigWith with the gateway's log captured in r.logs
+// and written nowhere else.
+func startPeopleRig(t *testing.T, tweak func(*Config)) *rig {
+	t.Helper()
+	logs := &lockedBuffer{}
+	r := startRigWithLogger(t, tweak, slog.New(slog.NewTextHandler(logs, nil)))
+	r.logs = logs
+	return r
+}
+
+// peopleTestClock pins a peopleDesk's clock to a value the test moves by
+// hand.
+type peopleTestClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *peopleTestClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *peopleTestClock) advance(d time.Duration) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+	return c.t
+}
+
+// fixPeopleClock waits for the rig's people desk and pins its clock.
+func fixPeopleClock(t *testing.T, r *rig) *peopleTestClock {
+	t.Helper()
+	waitFor(t, "people on", func() bool { return r.g.people.Load() != nil })
+	clock := &peopleTestClock{t: time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)}
+	desk := r.g.people.Load()
+	desk.mu.Lock()
+	desk.now = clock.now
+	desk.mu.Unlock()
+	return clock
+}
+
+// waitPeopleLoaded waits until the desk has read the bucket's initial values.
+func waitPeopleLoaded(t *testing.T, r *rig) *peopleDesk {
+	t.Helper()
+	waitFor(t, "the people map to load", func() bool {
+		d := r.g.people.Load()
+		if d == nil {
+			return false
+		}
+		_, _, ok := d.count(time.Now())
+		return ok
+	})
+	return r.g.people.Load()
+}
+
+// seenAt is the desk's in-memory time for key, if it has one.
+func (d *peopleDesk) seenAt(key string) (time.Time, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	at, ok := d.seen[key]
+	return at, ok
+}
+
+func (d *peopleDesk) seenLen() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.seen)
+}
+
+// peopleKeys lists the bucket's live keys.
+func peopleKeys(t *testing.T, kv jetstream.KeyValue) []string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lister, err := kv.ListKeys(ctx)
+	if err != nil {
+		t.Fatalf("list keys: %v", err)
+	}
+	var keys []string
+	for k := range lister.Keys() {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// peopleKV binds the rig's people bucket.
+func peopleKV(t *testing.T, r *rig) jetstream.KeyValue {
+	t.Helper()
+	kv, err := r.client.KV(context.Background(), lib.PeopleBucket)
+	if err != nil {
+		t.Fatalf("bind people: %v", err)
+	}
+	return kv
+}
+
+// testPeopleKey is the people key the rig's salt gives principal.
+func testPeopleKey(t *testing.T, principal string) string {
+	t.Helper()
+	k, err := newPeopleKeyer([]byte("test-salt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k.Key(principal)
+}
+
+// peopleTurn sends one turn from the rig's verified sender in conv.
+func peopleTurn(r *rig, conv, messageID string) {
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: messageID, Text: "why is it crashing?"}
+}
+
+// awaitSubmissions waits until n tasks have been submitted to platform.
+func awaitSubmissions(t *testing.T, r *rig, n int) {
+	t.Helper()
+	waitFor(t, fmt.Sprintf("%d submissions", n), func() bool {
+		got := 0
+		for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+			if e.Kind == lib.KindMessage {
+				got++
+			}
+		}
+		return got >= n
+	})
+}
+
+func TestNoPeopleBucketCountsNobody(t *testing.T) {
+	r := startPeopleRig(t, nil) // provision() creates no people bucket
+	waitFor(t, "no bucket log", func() bool {
+		return strings.Contains(r.logs.String(), "people count is off: no people bucket")
+	})
+	peopleTurn(r, "discord:g1/pn1", "d-1")
+	awaitSubmissions(t, r, 1)
+	if r.g.people.Load() != nil {
+		t.Fatal("a desk exists without a bucket")
+	}
+}
+
+func TestAPeopleBucketWithoutAMaxAgeIsLeftAlone(t *testing.T) {
+	r := startPeopleRig(t, withPeopleBucket(t, 0))
+	waitFor(t, "no max age log", func() bool {
+		return strings.Contains(r.logs.String(), "the people bucket has no max age")
+	})
+	if r.g.people.Load() != nil {
+		t.Fatal("a desk exists on a bucket without a max age")
+	}
+}
+
+func TestAChatTurnWritesItsPersonOnceAnHour(t *testing.T) {
+	r := startPeopleRig(t, withPeopleBucket(t, peopleTestTTL))
+	clock := fixPeopleClock(t, r)
+	waitPeopleLoaded(t, r)
+	if !strings.Contains(r.logs.String(), "people count is on") {
+		t.Errorf("log lacks the on line:\n%s", r.logs.String())
+	}
+	kv := peopleKV(t, r)
+	key := r.g.people.Load().keyer.Key(peopleTestPrincipal)
+	if key != testPeopleKey(t, peopleTestPrincipal) {
+		t.Fatalf("desk key %q is not the keyer's for the test salt", key)
+	}
+	get := func() jetstream.KeyValueEntry {
+		entry, err := kv.Get(context.Background(), key)
+		if err != nil {
+			return nil
+		}
+		return entry
+	}
+
+	peopleTurn(r, "discord:g1/ph1", "d-1")
+	first := clock.now().UTC().Format(time.RFC3339)
+	waitFor(t, "the first put", func() bool { return get() != nil })
+	if e := get(); e.Revision() != 1 || string(e.Value()) != first {
+		t.Fatalf("after turn 1: revision %d value %q, want 1 %q", e.Revision(), e.Value(), first)
+	}
+
+	peopleTurn(r, "discord:g1/ph2", "d-2")
+	awaitSubmissions(t, r, 2)
+
+	later := clock.advance(61 * time.Minute).UTC().Format(time.RFC3339)
+	peopleTurn(r, "discord:g1/ph3", "d-3")
+	waitFor(t, "the second put", func() bool { e := get(); return e != nil && e.Revision() > 1 })
+	// A put for turn 2 would have made turn 3's revision 3.
+	if e := get(); e.Revision() != 2 || string(e.Value()) != later {
+		t.Fatalf("after turn 3: revision %d value %q, want 2 %q", e.Revision(), e.Value(), later)
+	}
+	if keys := peopleKeys(t, kv); len(keys) != 1 {
+		t.Fatalf("keys = %v, want one per person", keys)
+	}
+}
+
+func TestTheHourlyBoundSurvivesARestart(t *testing.T) {
+	key := testPeopleKey(t, peopleTestPrincipal)
+	before := time.Now().Add(-10 * time.Minute).UTC().Truncate(time.Second)
+	r := startPeopleRig(t, func(c *Config) {
+		kv := createPeopleBucket(t, c.NATSURL, jetstream.KeyValueConfig{History: 1, TTL: peopleTestTTL})
+		if _, err := kv.PutString(context.Background(), key, before.Format(time.RFC3339)); err != nil {
+			t.Fatalf("seed put: %v", err)
+		}
+	})
+	desk := waitPeopleLoaded(t, r)
+	if at, ok := desk.seenAt(key); !ok || !at.Equal(before) {
+		t.Fatalf("seen[key] = %v, %v; want the seeded %v", at, ok, before)
+	}
+	peopleTurn(r, "discord:g1/pr1", "d-1")
+	awaitSubmissions(t, r, 1)
+	// note runs before the turn is routed, so a put would already show here.
+	if at, _ := desk.seenAt(key); !at.Equal(before) {
+		t.Fatalf("seen[key] = %v after the turn, want the seeded %v kept", at, before)
+	}
+	entry, err := peopleKV(t, r).Get(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Revision() != 1 {
+		t.Fatalf("revision = %d, want 1 (no second put inside the hour)", entry.Revision())
+	}
+}
+
+func TestDoorAndConsoleTurnsAreNotPeople(t *testing.T) {
+	t.Run("inject door", func(t *testing.T) {
+		r := startInjectRigWith(t, withPeopleBucket(t, peopleTestTTL))
+		waitFor(t, "people on", func() bool { return r.g.people.Load() != nil })
+		reply := r.inject(t, "people-door", injectTestAuthor, "how is the fleet?")
+		if !reply.Accepted || reply.TaskID == "" {
+			t.Fatalf("the door turn was not accepted: %+v", reply)
+		}
+		if n := r.g.people.Load().seenLen(); n != 0 {
+			t.Fatalf("the desk noted %d people from a door turn", n)
+		}
+		kv, err := r.g.client.KV(context.Background(), lib.PeopleBucket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if keys := peopleKeys(t, kv); len(keys) != 0 {
+			t.Fatalf("keys = %v, want none from a door turn", keys)
+		}
+	})
+	t.Run("console", func(t *testing.T) {
+		r := startPeopleRig(t, withPeopleBucket(t, peopleTestTTL))
+		waitFor(t, "people on", func() bool { return r.g.people.Load() != nil })
+		r.adapter.roster = []string{consoleAuthor}
+		r.adapter.inbox <- InboundMessage{
+			Conversation: "console:people-tab", Kind: "dm", Backend: consoleBackend,
+			AuthorID: consoleAuthor, MessageID: "m1", Text: "console hello",
+		}
+		awaitSubmissions(t, r, 1)
+		if n := r.g.people.Load().seenLen(); n != 0 {
+			t.Fatalf("the desk noted %d people from a console turn", n)
+		}
+		if keys := peopleKeys(t, peopleKV(t, r)); len(keys) != 0 {
+			t.Fatalf("keys = %v, want none from a console turn", keys)
+		}
+	})
+}
+
+func TestAFailedPutLeavesTheTurnAlone(t *testing.T) {
+	r := startPeopleRig(t, func(c *Config) {
+		createPeopleBucket(t, c.NATSURL, jetstream.KeyValueConfig{History: 1, TTL: peopleTestTTL, MaxBytes: 1})
+	})
+	desk := waitPeopleLoaded(t, r)
+	peopleTurn(r, "discord:g1/pf1", "d-1")
+	r.awaitTask(t, "platform")
+	waitFor(t, "the put failure log", func() bool { return strings.Contains(r.logs.String(), "people: put failed") })
+	// The failed put's optimistic entry is rolled back, so the next turn tries again.
+	waitFor(t, "the rollback", func() bool { return desk.seenLen() == 0 })
+}
+
+func TestPeopleSeenOffWritesNothingAndPurges(t *testing.T) {
+	var kv jetstream.KeyValue
+	r := startPeopleRig(t, func(c *Config) {
+		kv = createPeopleBucket(t, c.NATSURL, jetstream.KeyValueConfig{History: 1, TTL: peopleTestTTL})
+		for _, p := range []string{"test:a", "test:b"} {
+			if _, err := kv.PutString(context.Background(), testPeopleKey(t, p), time.Now().UTC().Format(time.RFC3339)); err != nil {
+				t.Fatalf("seed put: %v", err)
+			}
+		}
+		c.PeopleSeenOff = true
+	})
+	waitFor(t, "the purge", func() bool { return len(peopleKeys(t, kv)) == 0 })
+	waitFor(t, "the purge log", func() bool { return strings.Contains(r.logs.String(), "people: purged") })
+	if !strings.Contains(r.logs.String(), "keys=2") {
+		t.Errorf("purge log lacks keys=2:\n%s", r.logs.String())
+	}
+	if !strings.Contains(r.logs.String(), "people count is off: turned off on this install (telemetry.peopleSeen)") {
+		t.Errorf("log lacks the off line:\n%s", r.logs.String())
+	}
+	peopleTurn(r, "discord:g1/po1", "d-1")
+	awaitSubmissions(t, r, 1)
+	if keys := peopleKeys(t, kv); len(keys) != 0 {
+		t.Fatalf("keys = %v after a turn, want none", keys)
+	}
+	if r.g.people.Load() != nil {
+		t.Fatal("a desk exists with the count turned off")
+	}
+}
+
+func TestAClosedWatchUnloadsTheMapUntilItIsRebuilt(t *testing.T) {
+	now := time.Now()
+	d := &peopleDesk{now: time.Now, loaded: true, seen: map[string]time.Time{"people.x": now}}
+	if short, long, ok := d.count(now); !ok || short != 1 || long != 1 {
+		t.Fatalf("before reset: count = %d, %d, %v; want 1, 1, true", short, long, ok)
+	}
+	d.reset()
+	if _, _, ok := d.count(now); ok {
+		t.Fatal("count is ok after the watch closed")
+	}
+	if d.seenLen() != 0 {
+		t.Fatalf("seen holds %d entries after reset, want none", d.seenLen())
+	}
+}
+
+func TestPeopleCountWindows(t *testing.T) {
+	now := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+	d := &peopleDesk{now: time.Now, loaded: true, seen: map[string]time.Time{
+		"people.today":   now.Add(-time.Hour),
+		"people.week":    now.Add(-peopleWindowShort),
+		"people.month":   now.Add(-20 * 24 * time.Hour),
+		"people.expired": now.Add(-peopleWindowLong - time.Second),
+	}}
+	short, long, ok := d.count(now)
+	if !ok || short != 2 || long != 3 {
+		t.Fatalf("count = %d, %d, %v; want 2, 3, true", short, long, ok)
+	}
+	if _, kept := d.seenAt("people.expired"); kept {
+		t.Fatal("an entry older than the long window was kept")
+	}
+}
+
+func TestADeletedOrPurgedPersonLeavesTheMap(t *testing.T) {
+	r := startPeopleRig(t, withPeopleBucket(t, peopleTestTTL))
+	desk := waitPeopleLoaded(t, r)
+	kv := peopleKV(t, r)
+	ctx := context.Background()
+	stamp := time.Now().UTC().Format(time.RFC3339)
+	for _, k := range []string{"people.deleted", "people.purged"} {
+		if _, err := kv.PutString(ctx, k, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, "both entries in the map", func() bool { return desk.seenLen() == 2 })
+	if err := kv.Delete(ctx, "people.deleted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := kv.Purge(ctx, "people.purged"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "both entries gone from the map", func() bool { return desk.seenLen() == 0 })
+}
+
+func TestThePutHappensAfterVerificationAndBeforeTheSessionLock(t *testing.T) {
+	r := startPeopleRig(t, func(c *Config) {
+		withPeopleBucket(t, peopleTestTTL)(c)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := peopleBucketJS(t, c.NATSURL).UpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.SessionStateBucket, MaxBytes: 1}); err != nil {
+			t.Fatalf("cap session-state: %v", err)
+		}
+	})
+	desk := waitPeopleLoaded(t, r)
+	kv := peopleKV(t, r)
+
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/pv1", Kind: "group", AuthorID: "9999", MessageID: "d-1", Text: "hello"}
+	waitFor(t, "the unverified drop", func() bool {
+		return strings.Contains(r.logs.String(), "dropping message from unverified sender")
+	})
+	if n := desk.seenLen(); n != 0 {
+		t.Fatalf("the desk noted %d people from an unverified sender", n)
+	}
+
+	peopleTurn(r, "discord:g1/pv2", "d-2")
+	key := testPeopleKey(t, peopleTestPrincipal)
+	waitFor(t, "the verified sender's key", func() bool {
+		_, err := kv.Get(context.Background(), key)
+		return err == nil
+	})
+	waitFor(t, "the session mint failure", func() bool {
+		return strings.Contains(r.logs.String(), "session mint failed: session-state bucket is full (max bytes reached)")
+	})
+	if keys := peopleKeys(t, kv); len(keys) != 1 || keys[0] != key {
+		t.Fatalf("keys = %v, want only the verified sender's %s", keys, key)
 	}
 }
