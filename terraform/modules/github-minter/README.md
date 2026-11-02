@@ -15,11 +15,18 @@ The keyring follows `var.location`, which the full-install composition passes st
 When changing regions, the GitHub App private key must be re-imported into the new region's KMS key (either automatically via `install.sh --github-pem-path` or Ahead-Of-Time following the [upstream guide](https://github.com/abcxyz/github-token-minter#readme)).
 
 > **KMS resources cannot be deleted.** Cloud KMS key rings and keys are never actually
-> destroyed — `terraform destroy` only removes them from state, and a subsequent apply
-> with the same names fails with a 409. Recover by importing the existing resources
-> back into state
-> (`terraform import module.<name>.google_kms_key_ring.minter ...`) or by choosing new
-> `kms_keyring_name`/`kms_key_name` values.
+> deleted, and a raw `terraform destroy` does not leave the key usable: destroying the
+> crypto key schedules every version of it for destruction, so the imported GitHub App
+> key can no longer sign. Run `terraform state rm` on the key ring and key before a raw
+> destroy. A later apply with the same names fails with a 409 until you import the
+> existing resources back into state
+> (`terraform import module.<name>.google_kms_key_ring.minter ...`) or choose new
+> `kms_keyring_name`/`kms_key_name` values. In the full-install composition,
+> `lifecycle.sh destroy` forgets the keys first. After a raw destroy, `lifecycle.sh apply`
+> stops while the key has no enabled version: run `lifecycle.sh adopt-kms`, which imports
+> the keys back and restores any version a raw destroy scheduled, as long as its
+> destruction time has not passed. See
+> [Full teardown](../../../docs/site/src/content/docs/install/uninstall.md#full-teardown).
 
 ## Relationship to the install
 

@@ -1113,8 +1113,17 @@ project that use the same key need that grant, so a raw destroy must
 > you did not create here.
 
 > [!NOTE]
-> Cloud KMS key rings and crypto keys (for GKE CMEK and optional GitHub minter)
-> cannot be deleted from GCP — `terraform destroy` only removes them from state,
-> and they stay in the project forever. `make tf-apply` imports them back
-> automatically. Applying with bare `terraform apply` after a destroy fails with
-> a 409 until you either import them yourself or choose new key/keyring names.
+> Cloud KMS key rings and crypto keys (for GKE CMEK and the optional GitHub
+> minter) cannot be deleted from GCP, and they stay in the project forever. A
+> raw `terraform destroy` does more than forget them: destroying a crypto key
+> schedules every version of it for destruction, so the key can no longer
+> encrypt and a cluster that uses it cannot read its etcd. `make tf-destroy`
+> (`lifecycle.sh destroy`, which `uninstall.sh` runs) forgets the keys from
+> state first, so they stay usable; a raw destroy needs the `terraform state rm`
+> in the paragraph above. `make tf-apply` imports them back automatically, and
+> restores any cluster key version a raw destroy scheduled, as long as its
+> destruction time has not passed. A minter key with no enabled version stops
+> `make tf-apply` before that step: run `./lifecycle.sh adopt-kms` first, which
+> imports and restores both keys. Applying with bare `terraform apply` after a destroy fails with a 409 until
+> you either import them yourself or choose new key/keyring names. See
+> [Full teardown](../../../docs/site/src/content/docs/install/uninstall.md#full-teardown).
