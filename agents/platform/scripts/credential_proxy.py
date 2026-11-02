@@ -725,6 +725,14 @@ DRAIN_OPEN_ROUTES = frozenset({
     ("POST", "/v1/chat/teams/events/ack"),
     ("POST", "/v1/chat/teams/events/nack"),
 })
+# The Chat reply routes keep serving too, so the gateway's answers to events it
+# already took land: its relay clients do not resend a 503. Unlike a pull, a
+# reply is short, so it stays counted in flight and the drain waits for it.
+DRAIN_OPEN_REPLY_ROUTES = frozenset({
+    ("POST", "/v1/chat/api"),
+    ("POST", "/v1/chat/slack/api"),
+    ("POST", "/v1/chat/teams/api"),
+})
 # The Pub/Sub verbs relayed under the watcher's and the platform's Google
 # prefixes (WATCHER_GCP_PREFIX, PLATFORM_PUBSUB_PREFIX), by the suffix of the
 # path. A settle stays open while the broker drains, as a Chat relay's does: its
@@ -13821,6 +13829,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         Runs after authentication, so an unknown caller still reads 401, and
         before any route, so a request already past it never sees the drain.
+        The Chat reply routes (DRAIN_OPEN_REPLY_ROUTES) stay open and counted.
         The routes that stay open (DRAIN_OPEN_ROUTES, and the relayed Pub/Sub
         settles) and the long polls (a relayed Pub/Sub pull, the watcher's
         Kubernetes watch) leave the in-flight count here: a long poll holds its
@@ -13840,7 +13849,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         )
         if open_route or long_poll:
             self._leave_in_flight()
-        if open_route or not self.draining.is_set():
+        if open_route or (method, parts.path) in DRAIN_OPEN_REPLY_ROUTES or not self.draining.is_set():
             return False
         if method == "POST":
             # Read first, so the refusal is not lost to a connection reset.

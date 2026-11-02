@@ -9323,7 +9323,7 @@ class GracefulDrainTest(unittest.TestCase):
 
     def test_the_open_routes_still_serve_while_draining(self):
         CredentialProxyHandler.draining.set()
-        for method, path in sorted(credential_proxy.DRAIN_OPEN_ROUTES):
+        for method, path in sorted(credential_proxy.DRAIN_OPEN_ROUTES | credential_proxy.DRAIN_OPEN_REPLY_ROUTES):
             with self.subTest(method=method, path=path):
                 handler, captured = self._handler(path)
                 self.assertFalse(handler._refused_while_draining(method))
@@ -9365,6 +9365,10 @@ class GracefulDrainTest(unittest.TestCase):
             ("POST", credential_proxy.watcher_policy.PLATFORM_PUBSUB_PREFIX + self.PUBSUB + ":pull", False),
             ("POST", credential_proxy.watcher_policy.WATCHER_GCP_PREFIX + self.PUBSUB + ":pull", False),
             ("POST", "/v1/exec", True),
+            # A Chat reply stays open, and the drain waits for it.
+            ("POST", "/v1/chat/api", True),
+            ("POST", "/v1/chat/slack/api", True),
+            ("POST", "/v1/chat/teams/api", True),
         ):
             with self.subTest(method=method, path=path):
                 handler, _ = self._handler(path)

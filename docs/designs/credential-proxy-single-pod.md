@@ -64,8 +64,8 @@ What one pod costs is a gap on every eviction, drain and rollout, and the gap is
 than removed. On SIGTERM the broker refuses new Chat event pulls, keeps the settle routes open for a few
 seconds so the gateway's acks for pulls already answered land, hands any receipt still unsettled
 back to Pub/Sub, and exits; without that the message waits out its 60 s ack deadline on the
-replacement. The standalone broker also drains: it keeps the health probe, the event pulls and the
-settle routes open for the whole drain, answers every other new request `503` with the `draining`
+replacement. The standalone broker also drains: it keeps the health probe, the event pulls, the
+settle routes and the Chat reply routes open for the whole drain, answers every other new request `503` with the `draining`
 bound, stops taking Slack events, and gives the requests in flight up to 30 s to finish.
 It then ends the commands still running, which answer exit 143 with a line that says why, waits a
 few seconds for those answers, and stops. Its pod's `terminationGracePeriodSeconds` of 45 s holds
