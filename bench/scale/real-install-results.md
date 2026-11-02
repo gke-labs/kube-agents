@@ -1,24 +1,23 @@
 # Real-install test results: one install at the L container size
 
-Status on 2026-11-02: Steps 1 to 8 and the stress stage are complete. One stress run, 5 questions
-at once, is being re-run.
+Status on 2026-11-02: complete. Steps 1 to 8 and the stress stage have run.
 
 ## High level summary
 
 One install at the L container size handles a fleet of 40 to 42 clusters safely, at fair use and
 beyond it. An install is one kube-agents deployment. The L size gives the agent 8 CPU and 16 GB,
 the credential proxy 8 CPU and 8 GB, and the event watcher 2 CPU and 4 GB. The test ran for about
-40 hours. In that time no container was killed for memory, no brokered command was refused, and
-no prompt failed. A brokered command is a `kubectl` or `gcloud` command that the credential proxy
-runs for the agent. The credential proxy restarted once, at 8 questions at once, for a reason that
-is not known. No container that the L size sets used more than half of its limit.
+40 hours. In that time no container was killed for memory, and at fair use no brokered command was
+refused and no prompt failed. A brokered command is a `kubectl` or `gcloud` command that the
+credential proxy runs for the agent. Beyond fair use, at 5 questions at once, the credential proxy
+refused 2 commands. At 8 questions at once it restarted once, for a reason that is not known. No container that the L size sets used more than half of its limit.
 
 The first-run flow finished in 63 minutes. The first-run flow is the onboarding that a new install
 does by itself. About 30 of the 63 minutes came from a fault in the test environment: an external
 IAM process removed the install's permissions. Without the fault, the flow takes about 35 minutes.
 
-A heavy question takes 10 to 25 minutes when it runs alone. Eight questions at once all finished
-in 71 minutes. The time of a question does not grow with the cluster count. A question about 10
+A heavy question takes 10 to 25 minutes when it runs alone. Five questions at once took 78 minutes
+and eight took 71 minutes. The time of a question does not grow with the cluster count. A question about 10
 named clusters took longer than one about the whole fleet, because the upgrade script reads the
 whole fleet.
 
@@ -367,20 +366,21 @@ restart, an OOMKill or a refused command.
 
 ## Stress beyond fair use
 
-| Run                                                        | Window (UTC)     | Result                                                                                                                                                                                                                                        |
-| ---------------------------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 5 questions at once                                        | 2026-11-01 19:46 | Not measured yet. One delegated task stopped at its 150-step budget ("Iteration budget exhausted (150/150)"); then a credential outage on the test machine ended the run. The re-run is in progress.                                          |
-| 8 questions at once                                        | 00:31 to 01:42   | All 8 answers finished in 71 minutes. Sandbox shell memory 2.02 GB of its fixed 2.15 GB (94%). The credential proxy restarted once (not an OOMKill). The longest command wait reached 60 s. Agent memory 3.77 GB. 37 model 429s, all retried. |
-| 100 failing Pods, 30 minutes                               | 01:59 to 02:31   | Safe. 725 events per minute; the quota suppressed 5,302 of 5,498 session starts. Agent memory 3.21 GB.                                                                                                                                        |
-| 32 command workers, 5 minutes, during the 100 failing Pods | 02:31 to 02:37   | 551 commands, 0 errors, 1.76 per second. Each command took 18 s at the median and 23 s at most. Credential proxy CPU 3.0 of 8 cores.                                                                                                          |
+| Run                                                        | Window (UTC)              | Result                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ---------------------------------------------------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 5 questions at once                                        | 2026-11-02 07:32 to 08:50 | 5 answers in 78 minutes; 3 complete. The other 2 report denied model calls: an IAM strip removed the install's roles during the run (re-added at 08:47 to 08:48). Sandbox shell memory 2.00 GB of 2.15 GB (93%). The credential proxy refused 2 commands, the only refusals in the whole test; the record does not show whether the load or the IAM strip caused them. Longest command wait 60 s. Agent memory 4.04 GB. An earlier try on 2026-11-01 lost one task at its 150-step budget before a credential outage on the test machine ended it. |
+| 8 questions at once                                        | 00:31 to 01:42            | All 8 answers finished in 71 minutes. Sandbox shell memory 2.02 GB of its fixed 2.15 GB (94%). The credential proxy restarted once (not an OOMKill). The longest command wait reached 60 s. Agent memory 3.77 GB. 37 model 429s, all retried.                                                                                                                                                                                                                                                                                                      |
+| 100 failing Pods, 30 minutes                               | 01:59 to 02:31            | Safe. 725 events per minute; the quota suppressed 5,302 of 5,498 session starts. Agent memory 3.21 GB.                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| 32 command workers, 5 minutes, during the 100 failing Pods | 02:31 to 02:37            | 551 commands, 0 errors, 1.76 per second. Each command took 18 s at the median and 23 s at most. Credential proxy CPU 3.0 of 8 cores.                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 The 8 questions ran while about 130 triage tasks waited in the queue. The event watcher created
 about 120 of them in 10 minutes at 00:21, right after model access came back from an IAM strip.
 
 ### Findings
 
-11. **The first limit beyond fair use is the sandbox shell.** At 8 questions at once its memory
-    reached 94% of its fixed 2 GiB, and brokered commands waited up to 60 s. The containers that
+11. **The first limit beyond fair use is the sandbox shell.** At 5 and 8 questions at once its
+    memory reached 93% and 94% of its fixed 2 GiB, and brokered commands waited up to 60 s. At 5 at
+    once the credential proxy refused 2 commands. The containers that
     the L size sets stayed below half of their limits.
 12. **The command path is not CPU-bound.** 32 workers drove the credential proxy to 3 of its 8
     cores, and each command still took 18 s.
