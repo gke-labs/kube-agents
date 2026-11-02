@@ -10,7 +10,7 @@ The measurements cover fleets of 2 to 40 small clusters. A bottleneck is the par
 
 More resources do not remove some bottlenecks. The agent runs at most 10 requests at once. The sandbox shell is the container where the agent's commands start. It passes at most about 1.5 commands per second. A question that checks the fleet takes a median of more than 2 minutes at every fleet size. An HPA (HorizontalPodAutoscaler) is an object that changes the number of Pods of a workload. A fleet with many Pods and HPAs makes the event watcher open thousands of sessions an hour, even with nothing failing.
 
-An install is one kube-agents deployment with its own Platform Agent. One install cannot hold a fleet of 2,500 clusters, the largest example fleet. With raised agent and proxy limits, one install held 40 clusters of its daily work, and the sandbox shell used 79% of its fixed CPU. A fleet of 2,500 clusters needs about 63 to 105 installs of 24 to 40 clusters each. That is about 190 to 320 nodes of type e2-standard-4. At 40 clusters per install, a question takes about 2 to 6 minutes, and Stall Watch reads each cluster about once an hour. The model's daily audits use about 1.5 to 5 billion input tokens a day across the fleet. That cost is the largest open question.
+An install is one kube-agents deployment with its own Platform Agent. One install cannot hold a fleet of 2,500 clusters, the largest example fleet. With raised agent and proxy limits, one install held 40 clusters of its daily work, and the sandbox shell used 79% of its fixed CPU. A fleet of 2,500 clusters needs about 63 to 105 installs of 24 to 40 clusters each. That is about 190 to 320 nodes of type e2-standard-4. At 40 clusters per install, a question takes about 2 to 6 minutes on small test clusters. A real-install test at the L container size on 40 to 42 clusters of about 40 namespaces each found no container limit, but Stall Watch read each cluster only about once every 5 hours, because its cost follows the namespace count. The model's daily audits use about 1.5 to 5 billion input tokens a day across the fleet. That cost is the largest open question.
 
 # Context
 
@@ -460,6 +460,17 @@ The 2-hour Phase 2 window at 22 clusters, with the audits one after another, sho
 - **Runs that shared the broker are left out of the resource fits.** Stall Watch reads every cluster through the broker at :00 and :30, so the 13 short prompt runs and 8 boot-burst windows that started inside one of its reads or held a tick are left out, as are the proxy load runs that had commands from outside the load. The length of a Stall Watch read (2 minutes plus 30 seconds per cluster) is set from the short runs on either side of a tick, not measured directly.
 - **A CPU line leaves out runs at the limit,** so where only low runs stay in, it can predict too little. The proxy's CPU answer uses the raised-limit runs for that reason.
 - **The raised-limit runs met model quota limits:** 54 provider 429s in the 16-cluster onboarding window.
+
+# Checked on a real install
+
+A new install at the L container size (agent 8 CPU and 16 GB, credential proxy 8 CPU and 8 GB, event watcher 2 CPU and 4 GB) ran on 40 to 42 test clusters of about 6 nodes, 435 Pods and 42 namespaces each for about 40 hours: the first-run flow, heavy questions alone and up to 8 at once, a gateway restart, 20 and 100 failing Pods, Pod churn up to 800 per minute, a 12-hour soak, and a red test at the S size. [`bench/scale/real-install-results.md`](../../bench/scale/real-install-results.md) has the results; [`bench/scale/real-install-test-plan.md`](../../bench/scale/real-install-test-plan.md) is the plan. What it changes here:
+
+- **The L size has room at 40 clusters.** No container that the L size sets passed half of its limit, and no container was killed for memory. At fair use no command was refused; at 5 questions at once the credential proxy refused 2.
+- **Stall Watch is the limit, and its cost follows namespaces.** Each run stops at its 25-minute budget (`TICK_BUDGET_SECONDS` in `agents/platform/scripts/stall_watch.py`). A run with no other load read 4 of 42 clusters and 70 namespaces, about 21 seconds per namespace, so a full pass of 1,683 namespaces took about 5 hours. The Phase 4 rate of 52 to 60 seconds per cluster holds only for clusters with few namespaces.
+- **The sandbox shell is the next limit.** Its memory reached 93 to 94% of its fixed 2 GiB at 5 and 8 questions at once.
+- **The S size slows down instead of crashing.** The first-run flow finished in 56 minutes, but brokered commands waited up to 60 seconds and the audits took up to 3.6 times as long.
+- **Model tokens cost about $400 a day** for one install at 42 clusters in steady operation, at the list price of `gemini-3.5-flash`.
+- **The event watcher watches only the clusters registered before it starts.** On a new install that is none, until the gateway restarts, so the first-run measurements in this document and in the real-install test hold none of the event watcher's load.
 
 # Data to collect next
 
