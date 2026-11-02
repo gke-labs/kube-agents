@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -27,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -39,10 +41,11 @@ import (
 // each asserts its object is STILL over the limit and fails, naming the fix
 // issue, the moment a change brings it under. The fix pull request drops the
 // issue from the requireConfigMapSizeGate call in the same diff, which turns
-// it into the forward check, and that is how the gate records the regression on main without
-// holding every other pull request red, and how the fix proves itself. A
-// forward check that goes red on main would be turned off; an inverted one
-// turns itself into the forward check at the moment the fix lands.
+// it into the forward check, and that is how the gate records the regression
+// on main without holding every other pull request red, and how the fix
+// proves itself. A forward check that goes red on main would be turned off;
+// an inverted one turns itself into the forward check at the moment the fix
+// lands.
 //
 // The renderers are called directly rather than through a full reconcile:
 // 2,500 profiles through the reconciler mean thousands of ServiceAccounts and
@@ -65,56 +68,26 @@ const (
 	// fleetScaleOrg is the one GitHub organisation every fixture repository
 	// belongs to, so the minter claims every one of them.
 	fleetScaleOrg = "fleet-org"
-	// fleetScaleRepoURLFormat and fleetScaleProfileNameFormat name the fixtures;
-	// four digits keep the names sorted the way they are numbered.
-	fleetScaleRepoURLFormat     = "https://github.com/" + fleetScaleOrg + "/repo-%04d"
-	fleetScaleProfileNameFormat = "cluster-%04d"
+	// fleetScaleRepoURLFormat names the fixture repositories; four digits
+	// keep them sorted the way they are numbered.
+	fleetScaleRepoURLFormat = "https://github.com/" + fleetScaleOrg + "/repo-%04d"
+	// A fixture profile is named the way the Platform Agent scaffolds a
+	// Cluster Agent's, cluster-<project>-<cluster>-<location>
+	// (agents/platform/scripts/cluster_agent_profile.py, profile_name), and
+	// the roster half of this gate (agents/chat/scripts/test_agent_roster.py)
+	// builds its fleet from the same project and location. The name is in
+	// every identity-map entry three times and in every dispatch block
+	// twice, so a short stand-in would measure a smaller object than an
+	// install renders. At 46 characters it is under agentProfileNameMax.
+	fleetScaleProject           = "fleet-project"
+	fleetScaleLocation          = "us-central1"
+	fleetScaleProfileNameFormat = "cluster-" + fleetScaleProject + "-cluster-%04d-" + fleetScaleLocation
 	// The fix issues the inverted checks name: the minter policy, the identity
 	// map and the dispatch config shrink under #4431.
 	minterConfigMapFixIssue   = "#4431"
 	identityMapFixIssue       = "#4431"
 	dispatchConfigMapFixIssue = "#4431"
-	// fleetScaleBaseTemplate is default.yaml as the chart renders it
-	// (charts/kube-agents/templates/github-minter.yaml): three scopes, each
-	// with a repository list the sync rewrites to the full managed set.
-	fleetScaleBaseTemplate = `version: 'minty.abcxyz.dev/v2'
-rule:
-  if: "assertion.iss == 'https://accounts.google.com'"
-scope:
-  platform-agent-scope:
-    rule:
-      if: "assertion.email in ['kubeagents-platform-gsa@fleet-project.iam.gserviceaccount.com']"
-    repositories:
-      - 'fleet-gitops'
-    permissions:
-      contents: 'write'
-      pull_requests: 'write'
-      issues: 'write'
-  platform-agent-read-scope:
-    rule:
-      if: "assertion.email in ['kubeagents-platform-gsa@fleet-project.iam.gserviceaccount.com']"
-    repositories:
-      - 'fleet-gitops'
-    permissions:
-      contents: 'read'
-  platform-agent-sweep-scope:
-    rule:
-      if: "assertion.email in ['kubeagents-platform-gsa@fleet-project.iam.gserviceaccount.com']"
-    repositories:
-      - 'fleet-gitops'
-    permissions:
-      contents: 'read'
-      pull_requests: 'read'
-      issues: 'read'
-`
 )
-
-// fleetScaleSubscribeTopics are the subscribe topics the chart's shipped
-// profile carries (charts/kube-agents/values.yaml, agentProfiles.tse.bus), so
-// the identity map is measured at the entry shape an install renders. The
-// verdict depends on it: with no topics the map at N=2,500 measures under the
-// limit, so a change to this fixture is a change to what the check says.
-var fleetScaleSubscribeTopics = []string{"shared.blueprint", "agent.platform.upgrade-readiness"}
 
 // configMapDataSize is what the API server measures a ConfigMap by: the sum of
 // its data values. The serialized object is larger by its metadata and keys,
@@ -140,32 +113,50 @@ func serializedConfigMapSize(t *testing.T, cm *corev1.ConfigMap) int {
 	return len(body)
 }
 
-// requireConfigMapSizeGate is the gate on one rendered object. With fixIssue
-// empty it is the forward check: the object fits under the limit, and a
-// warning is logged once it passes the headroom threshold. With fixIssue set
-// it is inverted: the object is over the limit on main today, that issue owns
-// the fix, and a render that fits is the fix landing without flipping the
-// check. The fix pull request drops the issue from the call in the same diff.
+// configMapSizeVerdict is the gate's judgement on one data size, kept apart
+// from the test plumbing so the boundary on each side is itself tested
+// (TestTheConfigMapSizeVerdictAtItsBoundaries). fatal is non-empty when the
+// gate fails; warning is non-empty when the forward check logs headroom.
+//
+// With fixIssue empty it is the forward check: the object fits under the
+// limit, and a warning is raised once it passes the headroom threshold. With
+// fixIssue set it is inverted: the object is over the limit on main today,
+// that issue owns the fix, and a render that fits is the fix landing without
+// flipping the check. The fix pull request drops the issue from the call in
+// the same diff.
+func configMapSizeVerdict(size int, fixIssue string) (fatal, warning string) {
+	if fixIssue != "" {
+		if size <= configMapSizeLimit {
+			return fmt.Sprintf("%d bytes of data, under the %d-byte ConfigMap limit. This check is inverted because the render was over the limit on main and %s owns the fix: "+
+				"the change that brought it under passes an empty fixIssue to requireConfigMapSizeGate in the same pull request, so the gate holds the object under the limit from here on.",
+				size, configMapSizeLimit, fixIssue), ""
+		}
+		return "", ""
+	}
+	if size > configMapSizeLimit {
+		return fmt.Sprintf("%d bytes of data, over the %d-byte ConfigMap limit: the API server refuses the write and the reconcile cannot land it",
+			size, configMapSizeLimit), ""
+	}
+	if size > configMapSizeWarning {
+		return "", fmt.Sprintf("%d bytes of data, past the %d-byte headroom threshold and within %d bytes of the limit",
+			size, configMapSizeWarning, configMapSizeLimit-size)
+	}
+	return "", ""
+}
+
+// requireConfigMapSizeGate applies configMapSizeVerdict to one rendered
+// object, logging its size on every run.
 func requireConfigMapSizeGate(t *testing.T, cm *corev1.ConfigMap, fixture, fixIssue string) {
 	t.Helper()
 	size := configMapDataSize(cm)
 	t.Logf("%s at %s: %d bytes of data, %d bytes serialized (limit %d, warning above %d)",
 		cm.Name, fixture, size, serializedConfigMapSize(t, cm), configMapSizeLimit, configMapSizeWarning)
-	if fixIssue != "" {
-		if size <= configMapSizeLimit {
-			t.Fatalf("%s at %s is %d bytes of data, under the %d-byte ConfigMap limit. This check is inverted because the render was over the limit on main and %s owns the fix: "+
-				"the change that brought it under passes an empty fixIssue to requireConfigMapSizeGate in the same pull request, so the gate holds the object under the limit from here on.",
-				cm.Name, fixture, size, configMapSizeLimit, fixIssue)
-		}
-		return
+	fatal, warning := configMapSizeVerdict(size, fixIssue)
+	if fatal != "" {
+		t.Fatalf("%s at %s is %s", cm.Name, fixture, fatal)
 	}
-	if size > configMapSizeLimit {
-		t.Fatalf("%s at %s is %d bytes of data, over the %d-byte ConfigMap limit: the API server refuses the write and the reconcile cannot land it",
-			cm.Name, fixture, size, configMapSizeLimit)
-	}
-	if size > configMapSizeWarning {
-		t.Logf("WARNING: %s at %s is %d bytes of data, past the %d-byte headroom threshold and within %d bytes of the limit",
-			cm.Name, fixture, size, configMapSizeWarning, configMapSizeLimit-size)
+	if warning != "" {
+		t.Logf("WARNING: %s at %s is %s", cm.Name, fixture, warning)
 	}
 }
 
@@ -187,16 +178,77 @@ func fleetScaleManagedRepos(t *testing.T) string {
 	return string(body)
 }
 
-// fleetScaleProfileFixtures builds N bound profiles at the shipped shape: the read
-// tier alone (AllowedTiers unset) and the chart's subscribe topics.
-func fleetScaleProfileFixtures(namespace string) []agentv1alpha1.AgentProfile {
+// shippedProfileSubscribeTopics are the subscribe topics the shipped profile
+// carries, read from the example the chart's values mirror
+// (k8s-operator/examples/agentprofile-tse.yaml; TestTheTSEProfileExampleIsAStrictAgentProfile
+// holds it to the type) rather than copied, so the fixture follows the shipped
+// shape. The identity-map verdict depends on them: with no topics the map at
+// N=2,500 measures under the limit, so a shipped profile with none is a
+// broken fixture here, not a smaller fleet.
+func shippedProfileSubscribeTopics(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(tseProfileExamplePath)
+	if err != nil {
+		t.Fatalf("reading the shipped profile: %v", err)
+	}
+	var p agentv1alpha1.AgentProfile
+	if err := yaml.UnmarshalStrict(raw, &p); err != nil {
+		t.Fatalf("the shipped profile is not a strict AgentProfile: %v", err)
+	}
+	if len(p.Spec.Bus.SubscribeTopics) == 0 {
+		t.Fatalf("the shipped profile %s carries no subscribe topics; the identity-map gate measures entries with the shipped topics, so decide the fixture's topics before measuring", tseProfileExamplePath)
+	}
+	return append([]string(nil), p.Spec.Bus.SubscribeTopics...)
+}
+
+// fleetScaleProfileFixtures builds N bound profiles at the shipped shape: the
+// read tier alone (AllowedTiers unset) and the shipped subscribe topics.
+func fleetScaleProfileFixtures(t *testing.T, namespace string) []agentv1alpha1.AgentProfile {
+	t.Helper()
+	topics := shippedProfileSubscribeTopics(t)
 	profiles := make([]agentv1alpha1.AgentProfile, 0, fleetScaleProfiles)
 	for i := 1; i <= fleetScaleProfiles; i++ {
 		profiles = append(profiles, testAgentProfile(namespace, fmt.Sprintf(fleetScaleProfileNameFormat, i), func(p *agentv1alpha1.AgentProfile) {
-			p.Spec.Bus.SubscribeTopics = append([]string(nil), fleetScaleSubscribeTopics...)
+			p.Spec.Bus.SubscribeTopics = append([]string(nil), topics...)
 		}))
 	}
 	return profiles
+}
+
+// The judgement on each side of each threshold, in both modes, so the forward
+// branch is tested before the day the fix flips a call onto it.
+func TestTheConfigMapSizeVerdictAtItsBoundaries(t *testing.T) {
+	cases := []struct {
+		name          string
+		size          int
+		fixIssue      string
+		fatal, warned bool
+	}{
+		{"forward, well under", configMapSizeWarning - 1, "", false, false},
+		{"forward, at the warning threshold", configMapSizeWarning, "", false, false},
+		{"forward, past the warning threshold", configMapSizeWarning + 1, "", false, true},
+		{"forward, one under the limit", configMapSizeLimit - 1, "", false, true},
+		{"forward, at the limit", configMapSizeLimit, "", false, true},
+		{"forward, one over the limit", configMapSizeLimit + 1, "", true, false},
+		{"inverted, well under", configMapSizeWarning - 1, "#0", true, false},
+		{"inverted, one under the limit", configMapSizeLimit - 1, "#0", true, false},
+		{"inverted, at the limit", configMapSizeLimit, "#0", true, false},
+		{"inverted, one over the limit", configMapSizeLimit + 1, "#0", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fatal, warning := configMapSizeVerdict(tc.size, tc.fixIssue)
+			if (fatal != "") != tc.fatal {
+				t.Errorf("size %d, fixIssue %q: fatal = %q, want fatal %v", tc.size, tc.fixIssue, fatal, tc.fatal)
+			}
+			if (warning != "") != tc.warned {
+				t.Errorf("size %d, fixIssue %q: warning = %q, want warning %v", tc.size, tc.fixIssue, warning, tc.warned)
+			}
+			if tc.fixIssue != "" && fatal != "" && !strings.Contains(fatal, tc.fixIssue) {
+				t.Errorf("the inverted failure %q does not name the fix issue %s", fatal, tc.fixIssue)
+			}
+		})
+	}
 }
 
 // The minter policy ConfigMap at R=500: the sync writes one policy key per
@@ -214,9 +266,11 @@ func TestTheMinterPolicyConfigMapAtFleetScale(t *testing.T) {
 			},
 		},
 	}
+	// The chart's three-scope default.yaml, as the read-only policy tests
+	// already hold it (minterTemplateWithReadScope).
 	minterCM := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: minterConfigMapName, Namespace: agent.Namespace},
-		Data:       map[string]string{minterBaseTemplateKey: fleetScaleBaseTemplate},
+		Data:       map[string]string{minterBaseTemplateKey: minterTemplateWithReadScope},
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
@@ -229,7 +283,8 @@ func TestTheMinterPolicyConfigMapAtFleetScale(t *testing.T) {
 	if err := cl.Get(ctx, client.ObjectKey{Name: minterConfigMapName, Namespace: agent.Namespace}, synced); err != nil {
 		t.Fatalf("reading the synced ConfigMap: %v", err)
 	}
-	// The fixture did what it says: a policy per repository, each naming them all.
+	// The fixture did what it says: a policy per repository, each naming
+	// them all under every scope.
 	policies := 0
 	for key, content := range synced.Data {
 		if key == minterBaseTemplateKey {
@@ -237,7 +292,7 @@ func TestTheMinterPolicyConfigMapAtFleetScale(t *testing.T) {
 		}
 		policies++
 		if n := strings.Count(content, "- 'repo-"); n < fleetScaleRepositories {
-			t.Fatalf("policy %s names %d repositories, want every one of the %d: the fixture is not the shape the gate measures", key, n, fleetScaleRepositories)
+			t.Fatalf("policy %s lists %d repository lines, fewer than the %d repositories every scope should name: the fixture is not the shape the gate measures", key, n, fleetScaleRepositories)
 		}
 	}
 	if policies != fleetScaleRepositories {
@@ -254,7 +309,7 @@ func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 	// its identity would add every durable's name to the map on top.
 	t.Setenv(a2aDispatcherImageEnvVar, "")
 	agent := a2aTestAgent()
-	profiles := fleetScaleProfileFixtures(agent.Namespace)
+	profiles := fleetScaleProfileFixtures(t, agent.Namespace)
 
 	cm, _, err := buildA2AAuthMapConfigMap(agent, profiles)
 	if err != nil {
@@ -285,7 +340,7 @@ func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	withDispatcher(t)
 	agent := a2aTestAgent()
-	profiles := fleetScaleProfileFixtures(agent.Namespace)
+	profiles := fleetScaleProfileFixtures(t, agent.Namespace)
 
 	cm, err := buildA2ADispatchConfigMap(agent, profiles)
 	if err != nil {
