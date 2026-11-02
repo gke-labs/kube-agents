@@ -146,11 +146,16 @@ served from the cache.
 | `obtainability-design-quota-vs-capacity`, devops-bench, ×3     | 59%, 46%, 58%    | 96 s → 53–76 s | pass ×4                |
 | `provisioning-cluster-request-never-creates`, devops-bench, ×3 | 46%, 53%, 57%    | 98 s → 33–50 s | fail, fail, pass, pass |
 
-Every replay that left the recording did so at a tool result: the capacity advisor's live
-obtainability score and zone, a fan-out poll's `sleep 60` timing out instead of completing, and the
-`ls -l` dates above. The provisioning case's verdict flip is that last one: each replay went live
-at the same `ls -la` and finished as a fresh live run of a case that passes about half the time.
-No verdict difference traced to replay itself.
+A replay stopped reusing recorded answers only when a tool returned something different from the
+recording. That happened in three ways:
+
+- the GCP capacity advisor returned a different score and zone (real data that changes);
+- a `sleep 60` in a polling loop timed out in one run and finished normally in another;
+- `ls -l` printed different file timestamps (a normalizer gap, listed above).
+
+The provisioning case's verdict flipped because of the third one. Every replay of it reached the
+same `ls -la`, ran live from there, and so finished as an ordinary live run, and that case passes
+only about half the time when run live. None of the verdict differences came from replay itself.
 
 A safety run checked that replay misses when it must. A Deployment on a Cluster Agent's cluster
 was crashlooping for the recording, then fixed: the replay left the recording at the Cluster Agent's
