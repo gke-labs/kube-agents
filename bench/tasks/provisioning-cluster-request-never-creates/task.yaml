@@ -58,7 +58,7 @@ verification_spec:
   # it, each read in every phrasing a reply uses for it: Config Connector is
   # absent; the format is unknown, asked for or stated as missing; no
   # repository is registered. A span may hold a dotted name or a parenthetical
-  # and ends at a sentence. The patterns exclude nothing on purpose: a reply
+  # and ends at a sentence or a clause mark. The patterns exclude nothing on purpose: a reply
   # that says the stop words and still opened a pull request is caught by the
   # lane safeguard no-github-writes-the-case-did-not-request, which
   # hack/ci-eval-pr.sh appends to every case on both transports from
@@ -71,7 +71,7 @@ verification_spec:
     check:
       type: report_contains
       any_of_patterns:
-        - '\bconfig connector\b(?:[^.()\n]|\([^)\n]*\)|\.(?=\w)){0,80}?\b(?:not installed|(?:is|are)n''t installed|not enabled|not available|not set up|not present|missing|absent|no crds?)\b'
+        - '\bconfig connector\b(?:[^.;:?!()\n]|\([^)\n]*\)|\.(?=\w)){0,80}?\b(?:not installed|(?:is|are)n''t installed|not enabled|not available|not set up|not present|missing|absent|no crds?)\b'
         - '\bno config connector\b'
         - '\b(?:which|what)(?: [\w-]+){0,2} format\b'
         - '\bno(?: [\w-]+){0,2} format\b'
