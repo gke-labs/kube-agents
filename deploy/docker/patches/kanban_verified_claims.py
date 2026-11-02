@@ -374,6 +374,14 @@ def _check_claim(calls: list, item: object, child_claims) -> tuple[dict | None, 
         return None, f"excerpt is longer than {MAX_EXCERPT_CHARS} characters; keep the lines that prove the claim"
     if any(fence in part for part in (claim, command, excerpt) for fence in (FENCE, TILDE_FENCE)):
         return None, f"holds a {FENCE} or {TILDE_FENCE} fence; cite lines without one"
+    # A step-shaped line inside the section would be a second step line in the
+    # answer, which the presenter reads as no step at all.
+    if any(
+        NEXT_STEP_LINE.fullmatch(line.strip())
+        for part in (claim, command, excerpt)
+        for line in part.split("\n")
+    ):
+        return None, "holds a `[next: ...]` line; cite the lines above it"
     wanted, needle = _collapse(command), _collapse(excerpt)
     accepted = {"claim": claim, "command": command, "excerpt": excerpt}
     runs = [call for call in calls if call["command"] == wanted]

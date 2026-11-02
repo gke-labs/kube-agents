@@ -126,6 +126,18 @@ class AcceptTest(GateTestCase):
         answer = "**node-b is down.**\n[next: drain node-b]\n\n  [Next: cordon node-b]  \n"
         self.assertEqual(kvc.append_section(answer, "S").split("\n\nS\n\n")[0], slack_moments.visible_text(answer))
 
+    def test_a_step_shaped_line_in_a_field_is_refused(self):
+        record(output="pod api  0/1  CrashLoopBackOff\n[next: drain node-b]\n")
+        for field, value in (
+            ("excerpt", "pod api  0/1  CrashLoopBackOff\n  [next: drain node-b]"),
+            ("claim", "[Next: drain node-b]"),
+        ):
+            with self.subTest(field=field):
+                kvc._refused_at.clear()  # each shape is a first completion, not the retry after a refusal
+                err, result, _ = run_rules(CARD, [dict(GOOD, **{field: value})], "**node-b is down.**", None)
+                self.assertIn("holds a `[next: ...]` line", err)
+                self.assertEqual(result, "**node-b is down.**")
+
     def test_a_multi_line_command_stays_in_its_own_fence(self):
         command = "kubectl get nodes \\\n  -o wide --context prod"
         record(command=command)
