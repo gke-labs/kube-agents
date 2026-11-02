@@ -597,6 +597,10 @@ EVAL_GRADING_LOG_FILE="eval-grading.log"; EVAL_GRADING_LOG="${ARTIFACT_DIR}/${EV
         self.assertIn('sed "s/^/Ledger reset (${label}): /" >> "${EVAL_GRADING_LOG}"', lifted("reset_audit_ledgers"))
         self.assertIn('expires ${minted##* }" >> "${EVAL_GRADING_LOG}"', lifted("mint_ledger_token"))
         self.assertEqual(src.count("uv run bench-gate case"), 1, "grade_case is the one caller; both of its call sites redirect")
+        # The table pointer is printed only when the table exists; a suite
+        # that died before writing it says so instead.
+        self.assertIn('if [ -f "${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE}" ]; then', src)
+        self.assertIn('WARNING: bench-gate suite exited ${SUITE_STATUS} without writing', src)
         # The two sides of the artifact's name: the script writes it, the
         # collector reads it; a rename on one side records every build with
         # no tasks, and nothing else pins the pair.

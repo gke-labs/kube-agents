@@ -1795,6 +1795,7 @@ def runs_from_index(
     unfinished: set[str] | None = None,
     tier: str = tiers.TIER_PRESUBMIT,
     unlisted_is_note: bool = False,
+    empty_is_note: bool = False,
 ) -> list[dict]:
     """Discover builds through Prow's per-job directory index, then read them.
 
@@ -1803,12 +1804,13 @@ def runs_from_index(
     per-build reads as the glob path. A failed listing is a warning and an
     empty result -- the refresh workflow greps for that warning and refuses
     to publish, so a stall never republishes old runs as fresh -- unless
-    `unlisted_is_note` and the listing is the kind _unlisted_is_note allows.
+    `unlisted_is_note` and the listing is the kind _unlisted_is_note allows,
+    or `empty_is_note` and it matched no objects.
     """
     prefix = index_prefix.rstrip("/") + "/"
     listing, stderr = _gcloud_storage_call(["ls", prefix], gcloud)
     if listing is None:
-        if _unlisted_is_note(unlisted_is_note, after_build, stderr):
+        if _unlisted_is_note(unlisted_is_note, after_build, stderr) or (empty_is_note and _NO_OBJECTS.search(stderr or "")):
             print(f"note: directory index {prefix} did not list (no builds yet, or moved); nothing from it this scan", file=sys.stderr)
         else:
             print(f"warning: gcloud storage ls failed for {prefix}; nothing new this scan", file=sys.stderr)
@@ -1843,6 +1845,7 @@ def runs_from_gcs(
     unfinished: set[str] | None = None,
     tier: str = tiers.TIER_PRESUBMIT,
     unlisted_is_note: bool = False,
+    empty_is_note: bool = False,
 ) -> list[dict]:
     """Discover builds by listing the build-directory glob(s), then read them.
 
@@ -1850,13 +1853,14 @@ def runs_from_gcs(
     ~1700 builds, so this is the cold-sweep path; an incremental scan goes
     through runs_from_index. A glob that does not list is the `warning:
     gcloud storage ls ... failed` line the refresh workflow refuses on, unless
-    `unlisted_is_note` and the listing is the kind _unlisted_is_note allows.
+    `unlisted_is_note` and the listing is the kind _unlisted_is_note allows,
+    or `empty_is_note` and it matched no objects.
     """
     runs = []
     for glob in pr_globs:
         listing, stderr = _gcloud_storage_call(["ls", glob], gcloud)
         if listing is None:
-            if _unlisted_is_note(unlisted_is_note, after_build, stderr):
+            if _unlisted_is_note(unlisted_is_note, after_build, stderr) or (empty_is_note and _NO_OBJECTS.search(stderr or "")):
                 print(f"note: glob {glob} did not list (no builds yet, or unreadable); nothing from it this scan", file=sys.stderr)
             else:
                 print(f"warning: gcloud storage ls failed for {glob}; skipping", file=sys.stderr)
@@ -2361,11 +2365,11 @@ def collect(
     # The presubmit's retries are its own pending builds; a GitLab or nightly
     # one is retried by its source, which knows where it lives.
     presubmit_retry = frozenset(b for b in retry if b not in gitlab_pending and b not in nightly_pending)
-    # An index that matched no objects is a note here, as on the lanes'
-    # other sources: the lanes moved buckets, so the new index holds nothing
-    # until their first run lands and the old one may be purged later, and
-    # neither is the bucket or the grant failing (the warning the refresh
-    # workflow refuses to publish on).
+    # An index that matched no objects is a note here: the lanes moved
+    # buckets, so the new index holds nothing until their first run lands and
+    # the old one may be purged later. Any other failure keeps the warning the
+    # refresh workflow refuses to publish on (`empty_is_note`, not the lane
+    # rule `unlisted_is_note`, which on a cold sweep would note every failure).
     for prefix in indexes:
         fresh.extend(
             runs_from_index(
@@ -2375,9 +2379,11 @@ def collect(
                 since_cutoff=since_cutoff,
                 retry_builds=presubmit_retry,
                 unfinished=unfinished,
-                unlisted_is_note=True,
+                empty_is_note=True,
             )
         )
+    # The cold sweep (no watermark) lists the globs; a glob that matched no
+    # objects is the same note as the index above, for the same reason.
     if glob_only:
         fresh.extend(
             runs_from_gcs(
@@ -2387,6 +2393,7 @@ def collect(
                 since_cutoff=since_cutoff,
                 retry_builds=presubmit_retry,
                 unfinished=unfinished,
+                empty_is_note=True,
             )
         )
     # The GitLab lane: pull-request builds of its own job, read through the

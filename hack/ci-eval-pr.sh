@@ -5328,7 +5328,11 @@ EVAL_SUITE_REACHED=1
   "${CASE_RESULTS[@]}" \
   --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \
   --json-out "${ARTIFACT_DIR}/eval-verdict.json") >> "${EVAL_GRADING_LOG}" || SUITE_STATUS=$?
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verdict table written to ${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE} ==="
+if [ -f "${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE}" ]; then
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verdict table written to ${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE} ==="
+else
+  echo "WARNING: bench-gate suite exited ${SUITE_STATUS} without writing ${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE}; its output is in ${EVAL_GRADING_LOG_FILE}"
+fi
 run_rollback_roundtrip || true
 announce_suite_verdict "${SUITE_STATUS}" "${ARTIFACT_DIR}/eval-verdict.json" \
   "${ARTIFACT_DIR}/eval-verdict.md" "${TOTAL_DURATION}" || exit $?

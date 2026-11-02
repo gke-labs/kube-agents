@@ -1007,6 +1007,18 @@ class TestIndexDiscovery(_MergeBase):
         self.assertIsNone(collect.read_retrying(collect._gcs_reader(base, str(failing)), "build-log.txt"))
         self.assertEqual(len(pathlib.Path(str(failing) + ".log").read_text().splitlines()), 2, "a denial is not cached; the retry is real")
 
+    def test_a_cold_sweep_glob_that_matched_no_objects_is_a_note_too(self):
+        """The hand seed and the in-job publish take the cold path; an empty
+        glob under the new bucket must be the same note there, not the
+        warning the refresh workflow refuses to publish on."""
+        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
+        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        empty_glob = FAKE_BUCKET + "pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-moved/*"
+        merged, err = self.quiet_collect(pr_globs=[empty_glob, FAKE_GLOB], gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX, now=now)
+        self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_FULL])
+        self.assertIn(f"note: glob {empty_glob} did not list", err)
+        self.assertNotIn("warning: gcloud storage ls failed", err)
+
     def test_merge_with_alone_still_touches_no_bucket(self):
         """--merge-with without --pr-glob recomputes; the index is how a
         glob scan discovers builds, not a scan of its own."""
@@ -2854,8 +2866,16 @@ class TestGitLabLane(_MergeBase):
         self.assertEqual([r["build_id"] for r in data["runs"]], [BUILD_998_FULL])
         self.assertIn(f"note: glob {FAKE_GITLAB_GLOB} did not list", stderr)
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
-        # The presubmit's own glob keeps the warning: the gate's listing failing is a stall.
-        data, stderr = self.quiet_collect(pr_globs=[FAKE_BUCKET + "pull/gke-labs_kube-agents/1/nowhere/*"], gcloud=gcloud)
+        # The presubmit's own glob keeps the warning when the listing fails (a
+        # denial here): the gate's listing failing is a stall. A glob that
+        # merely matched no objects is a note on both lanes since the smoke
+        # lanes moved buckets (its own tests).
+        denied = FAKE_BUCKET + "pull/gke-labs_kube-agents/1/nowhere/*"
+        os.environ["FAKE_GCLOUD_DENY"] = denied
+        try:
+            data, stderr = self.quiet_collect(pr_globs=[denied], gcloud=gcloud)
+        finally:
+            os.environ.pop("FAKE_GCLOUD_DENY", None)
         self.assertIn("warning: gcloud storage ls failed for", stderr)
 
     def test_the_cold_path_lists_the_lanes_index_not_the_archive_wide_glob(self):
