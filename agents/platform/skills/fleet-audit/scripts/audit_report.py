@@ -2173,13 +2173,12 @@ KCC_PROJECT_ANNOTATION = "cnrm.cloud.google.com/project-id"
 KCC_NAMESPACE_KIND = "Namespace"
 # How many segments a `project/location/name` cluster target has.
 CLUSTER_TARGET_SEGMENTS = 3
-# What a cluster entry of a collector that reads Config Connector needs to
-# be a possible host it never read: an outcome other than these (an
-# `unreachable` or `gate-failed` cluster), a cluster target, and a GKE
-# status in which the cluster can run the controllers, when the entry
+# What an entry of a collector that reads Config Connector needs to be a
+# possible host it never read: an outcome other than these (an
+# `unreachable` or `gate-failed` cluster or `project/<id>` target), and a
+# GKE status in which the cluster can run the controllers, when the entry
 # records one. `kcc_health.py` holds the same status field and statuses.
 KCC_READ_OR_EXCLUDED_OUTCOMES = frozenset({"collected", "out-of-scope"})
-KCC_PROJECT_TARGET_PREFIX = "project/"
 KCC_CLUSTER_STATUS_FIELD = "cluster_status"
 KCC_READABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
 KCC_DEPENDENCY_PATTERN = re.compile(
@@ -18883,15 +18882,15 @@ def kcc_health(manifest: dict | None) -> KccHealth:
 
 
 def _kcc_never_read(entry: dict) -> bool:
-    """Whether `entry` is a cluster the collector never read that can run
-    Config Connector: an `unreachable` or `gate-failed` cluster target that
-    is running, when the entry records its status. Unknown is never "no
-    Config Connector here"."""
+    """Whether `entry` stands for clusters the collector never read that can
+    run Config Connector: an `unreachable` or `gate-failed` cluster target
+    that is running, when the entry records its status, or an `unreachable`
+    or `gate-failed` `project/<id>` target, whose clusters list failed, so
+    its clusters are not known. Unknown is never "no Config Connector
+    here"."""
     status = str(entry.get(KCC_CLUSTER_STATUS_FIELD) or "")
-    return (
-        str(entry.get("outcome") or "") not in KCC_READ_OR_EXCLUDED_OUTCOMES
-        and not str(entry.get("name") or "").startswith(KCC_PROJECT_TARGET_PREFIX)
-        and (not status or status in KCC_READABLE_STATUSES)
+    return str(entry.get("outcome") or "") not in KCC_READ_OR_EXCLUDED_OUTCOMES and (
+        not status or status in KCC_READABLE_STATUSES
     )
 
 

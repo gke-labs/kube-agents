@@ -23119,6 +23119,25 @@ metadata:
                 manifest["clusters"][1].update(hub2)
                 self.assertEqual(self.disclose([finding], manifest), expected)
 
+    def test_a_project_whose_clusters_list_failed_counts_as_a_possible_host(self):
+        """A `gate-failed` `project/<id>` entry hides clusters that may run
+        Config Connector, so the match needs a known project."""
+        self.write(
+            "topics/events.yaml",
+            "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n",
+        )
+        topic = dict(KCC_TOPIC, name="events")
+        for entry, expected in (
+            ({"name": "project/other", "outcome": "gate-failed", "error": "clusters list rc=1"}, []),
+            ({"name": "project/other", "outcome": "collected", "location": "global"}, ["t"]),
+        ):
+            with self.subTest(outcome=entry["outcome"]):
+                finding = make_finding(fid="t", check="kcc-object-wedged", cluster="acme/us-central1/hub-1", obj="PubSubTopic/events",
+                                       namespace="infra", remediation={"kind": "manifest", "path": "topics/events.yaml", "note": "x"})
+                manifest = kcc_manifest(topic)
+                manifest["clusters"].append(entry)
+                self.assertEqual(self.disclose([finding], manifest), expected)
+
     def test_the_namespace_project_brings_the_note_back(self):
         """With an unreachable hub-2, the object's recorded project (from its
         namespace) agrees with the project the file declares through its
@@ -23673,7 +23692,6 @@ metadata:
         self.assertEqual(audit_report.KCC_KINDS_READ_FIELD, kcc_health.KINDS_READ_FIELD)
         self.assertEqual(audit_report.KCC_CLUSTER_STATUS_FIELD, kcc_health.CLUSTER_STATUS_FIELD)
         self.assertEqual(audit_report.KCC_READABLE_STATUSES, kcc_health.READABLE_STATUSES)
-        self.assertEqual(audit_report.KCC_PROJECT_TARGET_PREFIX, kcc_health.PROJECT_TARGET_PREFIX)
 
     def test_a_fix_to_a_file_with_no_config_connector_object_names_the_object_instead(self):
         """The finding's node pool is unready, but the fix edits a
