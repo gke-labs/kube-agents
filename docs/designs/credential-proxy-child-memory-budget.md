@@ -156,7 +156,7 @@ Where each route reserves, and why there:
   it holds its reservation.
 
 - The cold path reserves nothing of its own: it runs under its `kubectl` request's reservation,
-  so nothing waits for admission under `_kubeconfig_lock`.
+  so nothing waits for admission under the cluster's `_kubeconfig_locks` entry.
 
 Besides the store's (§2.1), two spawns stay outside the budget on purpose: the one-off bootstrap command at startup, which
 runs before the broker serves, and the `git config` read of a repository alias, which is a few
