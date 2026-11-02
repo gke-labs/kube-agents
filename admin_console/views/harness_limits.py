@@ -45,6 +45,11 @@ STORY = (
     "cannot hold it, how many installs it needs and what each one needs. Part 2 shows the "
     "measurements behind every number."
 )
+NO_AXIS_WARNING = (
+    "These records measured one fleet point and vary no input, so the forecast below has nothing to "
+    "grow from. Choose a commit with factor runs under *Measurement data*; Part 2 shows these records "
+    "as evidence."
+)
 SPLIT_NONE = "One install holds all {clusters:,.0f} clusters."
 SPLIT_NEEDED = (
     "One install holds about {held:.0f} clusters ({source}), so {clusters:,.0f} clusters need "
@@ -188,9 +193,11 @@ if not dataset.records:
 
 with st.expander("Measurement data"):
     commit_column, mode_column = st.columns(SELECTOR_WIDTHS)
+    available_commits = hl.commits(dataset.records)
     commit = commit_column.selectbox(
         "Commit",
-        hl.commits(dataset.records),
+        available_commits,
+        index=hl.default_commit_index(dataset.records, available_commits),
         format_func=lambda item: hl.commit_label(dataset.records, item),
         key=f"{KEY_PREFIX}:commit",
     )
@@ -203,6 +210,8 @@ with st.expander("Measurement data"):
         key=f"{KEY_PREFIX}:mode:{commit}",
     )
 records = hl.select(dataset.records, commit, mode)
+if not hl.factors(records):
+    st.warning(NO_AXIS_WARNING)
 scope = f"{commit}:{mode}"
 containers = hl.containers(records)
 colors = hl.container_colors(containers, PALETTE.series_colors, PALETTE.neutral)

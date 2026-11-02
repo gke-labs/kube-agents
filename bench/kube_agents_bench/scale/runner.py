@@ -624,6 +624,10 @@ class Runner:
         pending = []
         for spec in specs:
             key = records.record_key(commit, mode, spec.factor, spec.level, spec.operation.name, spec.run)
+            if key in done and not self.same_point(done[key], spec) and phases[key] != self.plan.phase:
+                # Another plan's point under the same key: running would replace its record in the file.
+                raise SystemExit(f"{key} holds {phases[key]}'s record of another point; give this plan's "
+                                 "combined point a new level, or run with --force to replace it")
             if key not in done or not self.same_point(done[key], spec):
                 pending.append(spec)
             elif phases[key] != self.plan.phase:

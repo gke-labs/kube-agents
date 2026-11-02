@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
@@ -398,6 +399,35 @@ class FitTest(unittest.TestCase):
         self.assertTrue(marked.excluded(hl.RESPONSE))
         self.assertFalse(marked.excluded(hl.MEMORY_PEAK))
         self.assertFalse(unrelated.excluded(hl.RESPONSE))
+
+
+class StallWatchRateTest(unittest.TestCase):
+    def test_the_pass_time_is_the_median_of_an_even_count(self):
+        records = parse(
+            *(
+                record(
+                    "clusters",
+                    clusters,
+                    operation=hl.STALL_WATCH_OPERATION,
+                    metrics=((hl.JOB_SECONDS, None, seconds),),
+                    totals={"clusters": clusters},
+                )
+                for clusters, seconds in ((2, 120.0), (8, 400.0))
+            )
+        )
+
+        self.assertAlmostEqual(hl.stall_watch_seconds_per_cluster(records), 55.0)
+
+
+class DefaultCommitTest(unittest.TestCase):
+    def test_a_newer_commit_with_one_fleet_point_is_not_the_default(self):
+        records = clusters_line() + parse(
+            record("combined", 1, operation="first_run", commit="b" * 40, started="2026-11-01T00:00:00Z"),
+        )
+        available = hl.commits(records)
+
+        self.assertEqual(available[0], "b" * 40)
+        self.assertEqual(available[hl.default_commit_index(records, available)], "a" * 40)
 
 
 class PredictionTest(unittest.TestCase):
@@ -922,7 +952,8 @@ class PlanTest(unittest.TestCase):
 class MetricContractTest(unittest.TestCase):
     def readme_metrics(self) -> set[str]:
         """The metric names in bench/scale/README.md, the runner's documented output."""
-        section = SCALE_README.read_text().split("Metric names:", 1)[1]
+        # The list ends at the first blank line, so a later paragraph's identifiers are not read as metrics.
+        section = SCALE_README.read_text().split("Metric names:", 1)[1].strip().split("\n\n", 1)[0]
         return set(re.findall(r"`([a-z0-9_]+)`", section))
 
     def test_every_metric_the_runner_writes_has_a_spec_and_no_other(self):
@@ -1008,6 +1039,20 @@ class ChartTest(unittest.TestCase):
         self.assertIn("agent-api-auth limit", names)
         self.assertIn("this fleet", names)
         self.assertEqual(figure.data[0].marker.color, "#000001")
+
+    def test_a_series_with_every_run_excluded_still_has_a_legend_entry(self):
+        chart = self.memory_chart()
+        first = chart.series[0]
+        excluded = dataclasses.replace(
+            first, points=tuple(dataclasses.replace(point, excluded=True) for point in first.points)
+        )
+        chart = dataclasses.replace(chart, series=(excluded, *chart.series[1:]))
+        colors = hl.container_colors(self.containers, ("#000001", "#000002"), "#999999")
+
+        figure = harness_limit_chart(chart, colors)
+
+        shown = [trace for trace in figure.data if trace.legendgroup == first.name and trace.showlegend]
+        self.assertEqual(len(shown), 1)
 
     def test_colours_follow_the_container_not_the_selection(self):
         palette = ("#000001", "#000002")

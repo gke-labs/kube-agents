@@ -721,6 +721,23 @@ def test_a_stored_combined_run_of_another_point_is_pending(monkeypatch, tmp_path
     assert [s.run for s in run.pending(specs)] == [2, 3]
 
 
+def test_a_combined_point_that_would_replace_another_plan_s_record_is_refused(monkeypatch, tmp_path):
+    plan = load_plan(PHASE2, environ=ENV)
+    path = tmp_path / "data.json"
+    commit = "eeb8a95ceb0a9efd66434161f87820b35b65360c"
+    records.merge(path, [records.Record(
+        commit=commit, mode="next", phase="phase4", factor="combined", level=1, operation="fan_out", run=1,
+        started="2026-10-27T00:00:00Z", ended="2026-10-27T00:10:00Z",
+        values={**plan.base, "clusters": 40.0, "objects": 100.0})])
+    run = runner.Runner(plan, path)
+    run.install = type("Install", (), {"image": lambda self: f"x:{commit}", "mode": lambda self: "next",
+                                       "context": "ctx", "namespace": "ns"})()
+    monkeypatch.setattr(runner.operations, "wait_gateway_ready", lambda *a, **k: None)
+    specs = [s for s in plan.matrix() if s.factor == "combined" and s.operation.name == "fan_out"]
+    with pytest.raises(SystemExit, match="holds phase4's record of another point"):
+        run.pending(specs)
+
+
 def test_a_proxy_load_needs_a_list_command(tmp_path):
     text = PHASE2.read_text().replace(
         "    command:\n      - kubectl\n      - --kubeconfig\n      - \"{kubeconfig}\"\n      - get\n      - pods\n"

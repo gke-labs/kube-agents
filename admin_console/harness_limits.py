@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -979,6 +980,18 @@ def default_mode_index(available: Sequence[str]) -> int:
     return available.index(DEFAULT_MODE) if DEFAULT_MODE in available else 0
 
 
+def default_commit_index(records: Sequence[Record], available: Sequence[str]) -> int:
+    """The newest commit whose runs in its default mode have a factor axis, so a forecast can be drawn.
+
+    A commit that measured one fleet point (the real-install test) is evidence, not a forecast's input.
+    """
+    for index, commit in enumerate(available):
+        found = modes(records, commit)
+        if found and factors(select(records, commit, found[default_mode_index(found)])):
+            return index
+    return 0
+
+
 def select(records: Iterable[Record], commit: str, mode: str) -> tuple[Record, ...]:
     return tuple(
         record for record in records if record.commit == commit and record.mode == mode
@@ -1838,7 +1851,7 @@ def stall_watch_seconds_per_cluster(records: Iterable[Record]) -> float | None:
         and record.totals.get(CLUSTERS)
         and (seconds := record.value(JOB_SECONDS)) is not None
     )
-    return rates[len(rates) // 2] if rates else None
+    return statistics.median(rates) if rates else None
 
 
 @dataclass(frozen=True)
