@@ -8718,7 +8718,9 @@ main() {
     "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "$region")" "$project_id")"
   if grep -q '^enable_github_minter = true$' "$tfvars_file" 2>/dev/null && [ -z "$minter_enabled_version" ]; then
     print_error "The GitHub minter is enabled in the generated configuration, but its KMS signing key still has no ENABLED version — the apply would wait on a minter that can never become ready."
-    print_info "Fix the App key import (see the messages above) and re-run, or unset GITHUB_APP_ID to install without the minter."
+    print_minter_restore_advice "${KMS_KEY:-$DEFAULT_KMS_KEY}" "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" \
+      "$(derive_kms_location "$region")" "$project_id" ||
+      print_info "Fix the App key import (see the messages above) and re-run, or unset GITHUB_APP_ID to install without the minter."
     exit 1
   fi
 

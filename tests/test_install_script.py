@@ -1356,6 +1356,71 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             combined = proc.stdout + proc.stderr
             self.assertIn("not a regular file", combined)
 
+    def test_print_minter_restore_advice_names_the_restore_for_scheduled_versions(self):
+        """A minter key whose versions a destroy scheduled needs a restore, not a
+        re-import: the helper names both of lifecycle.sh's branches and returns 0."""
+        cmd = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            "kms_key_scheduled_version() { echo 3; }; "
+            'KUBE_AGENTS_STATE_BUCKET=b1 KUBE_AGENTS_STATE_PREFIX=kube-agents/c1; '
+            'if print_minter_restore_advice "minter-key" "minter-ring" "us-central1" "p1"; then echo rc=0; else echo rc=1; fi'
+        )
+        proc = self._run_install_func(cmd)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=0", proc.stdout, out)
+        self.assertIn("Its versions are scheduled for destruction, as a destroy of the key leaves them.", out)
+        # adopt-kms by hand needs this install's state backend, named in the command.
+        self.assertIn(
+            'cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET="b1" KUBE_AGENTS_STATE_PREFIX="kube-agents/c1" ./lifecycle.sh adopt-kms',
+            out,
+        )
+        self.assertIn(
+            "gcloud kms keys versions restore <version> --key minter-key --keyring minter-ring --location us-central1 --project p1",
+            out,
+        )
+
+    def test_print_minter_restore_advice_is_silent_with_nothing_scheduled(self):
+        """A key never imported, or a failed query, has nothing to restore: the
+        helper prints nothing and returns 1, so the caller's import advice stands."""
+        cmd = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            'kms_key_scheduled_version() { echo ""; }; '
+            'if print_minter_restore_advice "minter-key" "minter-ring" "us-central1" "p1"; then echo rc=0; else echo rc=1; fi'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("scheduled for destruction", proc.stdout + proc.stderr)
+
+    def test_kms_key_scheduled_version_asks_for_destroy_scheduled_versions(self):
+        """The query filters on DESTROY_SCHEDULED, and a failing gcloud reads as none."""
+        asks = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            'gcloud() { case "$*" in *"state=DESTROY_SCHEDULED"*) echo 3 ;; *) echo wrong ;; esac; }; '
+            'echo "v=[$(kms_key_scheduled_version minter-key minter-ring us-central1 p1)]"'
+        )
+        self.assertIn("v=[3]", self._run_install_func(asks).stdout)
+        fails = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            "gcloud() { return 1; }; "
+            'echo "v=[$(kms_key_scheduled_version minter-key minter-ring us-central1 p1)]"'
+        )
+        self.assertIn("v=[]", self._run_install_func(fails).stdout)
+
+    def test_both_installers_name_the_restore_before_their_import_advice(self):
+        """install.sh and upgrade.sh refuse a minter key with no ENABLED version; the
+        restore advice comes first, and their own import advice only when it returns 1."""
+        for script, advice in (
+            (_INSTALL_SH, 'print_info "Fix the App key import'),
+            (_REPO_ROOT / "upgrade.sh", 'print_info "Import the App key with install.sh'),
+        ):
+            with self.subTest(script=script.name):
+                text = script.read_text()
+                call = text.index("print_minter_restore_advice ")
+                self.assertLess(call, text.index(advice))
+                self.assertIn(" ||\n", text[call : text.index(advice)])
+        # upgrade.sh sources the target tree's helpers, which may predate this one.
+        self.assertIn("declare -F print_minter_restore_advice", (_REPO_ROOT / "upgrade.sh").read_text())
+
     def test_validate_non_interactive_minter_config(self):
         """validate_non_interactive_minter_config enforces intent-driven validation."""
         # 1. No App ID and no PEM path -> succeeds (optional feature omitted)

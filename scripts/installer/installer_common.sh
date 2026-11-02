@@ -2240,6 +2240,39 @@ kms_key_enabled_version() {
       --filter='state=ENABLED' --format='value(name.basename())' 2>/dev/null || true; } | head -1
 }
 
+# The basename of the first DESTROY_SCHEDULED version of a Cloud KMS key, or
+# nothing: what any destroy of the key leaves (a raw `terraform destroy`, or an
+# apply with enable_github_minter = false), and what a restore can still undo
+# until the destruction time. Every failure reads as "none".
+kms_key_scheduled_version() {
+  local key="$1" keyring="$2" location="$3" project="$4"
+  { gcloud kms keys versions list --key "$key" --keyring "$keyring" \
+      --location "$location" --project "$project" \
+      --filter='state=DESTROY_SCHEDULED' --format='value(name.basename())' 2>/dev/null || true; } | head -1
+}
+
+# For a minter key with no ENABLED version: when its versions are scheduled for
+# destruction, prints how to restore them and returns 0; otherwise prints
+# nothing and returns 1, so the caller's import advice stands. The advice
+# follows guard_minter_key in terraform/examples/full-install/lifecycle.sh,
+# which picks one branch by reading Terraform state. install.sh and upgrade.sh
+# read no state at this point, so both branches are named, each with its
+# condition, and adopt-kms is named with this install's state backend, which a
+# hand-run lifecycle.sh does not otherwise find.
+print_minter_restore_advice() {
+  local key="$1" keyring="$2" location="$3" project="$4"
+  [ -n "$(kms_key_scheduled_version "$key" "$keyring" "$location" "$project")" ] || return 1
+  print_info "Its versions are scheduled for destruction, as a destroy of the key leaves them."
+  print_info "Restore them rather than re-importing the key; a restore works only until their destruction time."
+  print_info "If the key is out of Terraform state (after a raw terraform destroy, or an apply with enable_github_minter = false),"
+  print_info "run adopt-kms from a checkout that holds this install's terraform.tfvars; it imports the key back and restores and re-enables those versions, then re-run:"
+  print_info "  cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=\"${KUBE_AGENTS_STATE_BUCKET:-<state bucket>}\" KUBE_AGENTS_STATE_PREFIX=\"${KUBE_AGENTS_STATE_PREFIX:-<state prefix>}\" ./lifecycle.sh adopt-kms"
+  print_info "If the key is still in Terraform state, restore each version with gcloud, then re-run:"
+  print_info "  gcloud kms keys versions restore <version> --key $key --keyring $keyring --location $location --project $project"
+  print_info "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
+  return 0
+}
+
 # ─── terraform.tfvars Generation ──────────────────────────────────────────────
 # HCL string literal with backslashes and double quotes escaped.
 hcl_str() {
