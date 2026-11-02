@@ -857,12 +857,16 @@ A `manifest` fix whose file declares the object gets the paragraph above. Any ot
 `gcloud`, a fix degraded to `manual` because the worker did not write its file, or a `manifest` fix
 to another file) gets a paragraph that names the object's declaration. `finish` looks it up in the
 Config Connector declaration index the `gcloud` check reads: the clone, or
-`kcc_declarations_via_broker` in content mode, which also runs when the manifest records a stall.
-When exactly one file declares the object, the paragraph keeps the first sentence "**Config
-Connector is not applying this file.**" and names that file. When none or more than one does, it
-starts "**Config Connector is not applying the declaration of this object.**" and says so. The index
-keeps each other file that declares the same object (`KccDeclaration.also`), and it keys each
-declaration by its namespace as well, so two objects of one name in two namespaces are two
+`kcc_declarations_via_broker` in content mode, which also runs when the manifest records a stall and
+searches for an `apiVersion` line in any Config Connector group (`KCC_DECLARATION_GREP`), so every
+kind is indexed. When exactly one file declares the object, the paragraph keeps the first sentence
+"**Config Connector is not applying this file.**" and names that file. When none or more than one
+does, it starts "**Config Connector is not applying the declaration of this object.**" and says so.
+It says that no file declares the object only when the index covered the whole GitOps repository
+(the clone, or a broker scan that ran to an answer and was not truncated); after a truncated or
+failed scan, or in a dry run with no clone, it says the audit could not search the whole repository.
+The index keeps each other file that declares the same object (`KccDeclaration.also`), and it keys
+each declaration by its namespace as well, so two objects of one name in two namespaces are two
 declarations and two files of one object read as ambiguous. A `gcloud` fix's note is its command, so
 its paragraph goes in `kcc_stalled_paragraph` and renders after the command block. The
 strip-and-rewrite pattern covers both first sentences.
