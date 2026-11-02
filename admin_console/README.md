@@ -57,8 +57,9 @@ and the Connection check, and lasts the window. Either copy is dropped when a
 discovery fails, and lookups queued behind a failed discovery get its error
 rather than each asking in turn. A read, or the LLM Gateway page's verification
 call, that the cluster fails against the held pod discovers again and retries
-once if the pod has moved; a timeout, or a failure before kubectl ran, is
-reported as it is, since neither says the pod moved. The data read itself is
+once if the pod has moved; a timeout, a failure before kubectl ran, or a
+failure whose rediscovery fails too is reported as the read's own error, since
+none of them says the pod moved. The data read itself is
 never held. The API server also keeps one runtime provider and one chat backend
 per target, so the settlement poll does not rebuild them every two seconds. To
 change the window, set `ADMIN_CONSOLE_RUNTIME_CACHE_TTL_SECONDS` in seconds; `0`

@@ -1238,14 +1238,21 @@ class AgentRuntimeProvider:
         the call, so the target is discovered again and, only when the answer
         moved, `run` is repeated on the new pod. A failure against a pod that
         is still current is returned as it is, and so is a timeout or a
-        preparation failure, which say nothing about the pod. Returns the
-        endpoint the returned result ran against.
+        preparation failure, which say nothing about the pod. A kubectl exit
+        that was answered by nothing (a refused connection, an expired token)
+        looks like a cluster answer and fails the rediscovery the same way;
+        the call's own result is then returned rather than the discovery
+        error, so the failure is reported as the failure of what was asked.
+        Returns the endpoint the returned result ran against.
         """
         endpoint = self.gateway_endpoint(agent)
         result = run(endpoint)
         if result.returncode != 0 and answered_by_cluster(result):
             self._cache.invalidate(self.target)
-            current = self.gateway_endpoint(agent)
+            try:
+                current = self.gateway_endpoint(agent)
+            except AgentRuntimeError:
+                return endpoint, result
             if current != endpoint:
                 endpoint = current
                 result = run(current)

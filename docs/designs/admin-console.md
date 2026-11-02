@@ -242,7 +242,8 @@ console process for `ADMIN_CONSOLE_RUNTIME_CACHE_TTL_SECONDS` (default 30 s) and
 dropped after a chat action, an LLM gateway change or a failed discovery, whose
 error is shared with the lookups queued behind it. A read or verification call
 that the cluster fails against the held pod discovers again and retries once if
-the pod has moved; a timeout is reported as it is. The read behind each page is
+the pod has moved; a timeout, or a failure whose rediscovery fails too, is
+reported as the call's own error. The read behind each page is
 never held.
 
 The public interaction and session resources retain `agentId` for stable stored

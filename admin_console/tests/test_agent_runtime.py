@@ -1347,6 +1347,24 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
         self.assertEqual(self.spawns("pods"), 1)
         self.assertEqual(self.spawns("exec"), 2)
 
+    def test_fast_failing_read_on_an_unreachable_cluster_reports_the_read_error(self):
+        self.read()
+        # A refused connection or an expired token fails kubectl at once with a
+        # non-zero exit, which the access layer cannot tell from a cluster
+        # answer; the rediscovery then fails the same way.
+        self.failing = {"exec", "pods"}
+        with self.assertRaisesRegex(AgentRuntimeError, "Agent runtime read failed"):
+            self.read()
+        self.failing = set()
+
+        self.read()
+
+        # The read's own error was reported, not the rediscovery's; nothing was
+        # held through the failure, so the next read discovered again.
+        self.assertEqual(self.spawns("platformagents"), 2)
+        self.assertEqual(self.spawns("pods"), 3)
+        self.assertEqual(self.spawns("exec"), 3)
+
     def test_concurrent_lookups_share_one_failed_attempt(self):
         attempts: list[int] = []
         first_started = threading.Event()

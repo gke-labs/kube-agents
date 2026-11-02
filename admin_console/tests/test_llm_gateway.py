@@ -198,6 +198,25 @@ class LlmGatewayServiceTest(unittest.TestCase):
             ["gateway-1", "gateway-2"],
         )
 
+    def test_fast_failing_verify_on_an_unreachable_cluster_keeps_its_own_evidence(self):
+        refused = "Unable to connect to the server: dial tcp: connection refused"
+        kube = FakeKube(
+            [
+                KubeCommandResult(0, json.dumps(platform_agents())),
+                KubeCommandResult(0, json.dumps(gateway_pods("gateway-1"))),
+                KubeCommandResult(1, stderr=refused),
+                KubeCommandResult(1, stderr=refused),
+            ]
+        )
+        service = LlmGatewayService(TARGET, kube=kube)
+
+        evidence = service.verify()["evidence"]
+
+        self.assertEqual(evidence["returncode"], 1)
+        self.assertEqual(evidence["stderr"], refused)
+        self.assertIn("gateway-1", evidence["command"])
+        self.assertEqual(len(kube.calls), 4)
+
     def test_timed_out_verify_is_reported_without_rediscovery(self):
         kube = FakeKube(
             [
