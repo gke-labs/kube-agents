@@ -101,7 +101,9 @@ LOGGER = logging.getLogger("credential-proxy")
 # its read-only token. Named in the log when a context clone presents none.
 FORGE_READ_TOKEN_KEY = vcs_broker.FORGE_READ_TOKEN_KEY
 # The process roles `resolve_role` accepts (CREDENTIAL_PROXY_ROLE), and the
-# ones that run the credential broker and so the readings sweep.
+# ones that run the credential broker and so the readings sweep. It also
+# accepts EXEC_ROLE, the exec tier's role from credential_proxy_client: a
+# broker with N replicas, so it runs no sweep and is not in BROKER_ROLES.
 ROLE_COMBINED = "combined"
 ROLE_BROKER = "broker"
 ROLE_API_PROXY = "api-proxy"
@@ -11239,9 +11241,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _exec_pod_refuses(self, method: str, principal: Principal | None) -> bool:
         """On an exec pod, answer a request it does not serve and return True.
 
-        After authentication, so an exec pod answers an unknown route as the
-        stateful broker does: 401 to a caller it cannot identify, then the same
-        404 body. The scope role's commands are refused with the role refusal's
+        After authentication and the route's role check, so an exec pod answers
+        an unknown route as the stateful broker does: 401 to a caller it cannot
+        identify, 403 to a caller whose role the route does not admit, then the
+        same 404 body. The scope role's commands are refused with the role refusal's
         shape, because the member window they read is on the stateful pod.
         """
         if self.broker_role != EXEC_ROLE:
@@ -13815,7 +13818,7 @@ def resolve_role() -> str:
     are on the same loopback. Splitting the broker into its own Pod splits
     those two roles across two containers in two Pods. ``exec`` is the exec
     tier's pod (docs/designs/credential-broker-exec-tier.md §12): the broker
-    with no relays, serving the command routes only (exec_pod_serves).
+    with no relays, serving the exec routes only (exec_pod_serves).
     """
     role = os.getenv("CREDENTIAL_PROXY_ROLE", ROLE_COMBINED).strip().lower() or ROLE_COMBINED
     if role not in {ROLE_COMBINED, ROLE_BROKER, ROLE_API_PROXY, EXEC_ROLE}:
@@ -14015,16 +14018,20 @@ def serve(args: argparse.Namespace) -> None:
     )
     for (host, path), branch in CredentialProxyHandler.pinned_bases.items():
         LOGGER.info("pinned base repository=https://%s/%s branch=%s", host, path, branch)
-    CredentialProxyHandler.workspaces = build_workspace_store(
-        executor,
-        base_branch=CredentialProxyHandler.base_branch,
-        pinned_bases=CredentialProxyHandler.pinned_bases,
-    )
-    CredentialProxyHandler.vcs = build_vcs_broker(
-        executor,
-        base_branch=CredentialProxyHandler.base_branch,
-        pinned_bases=CredentialProxyHandler.pinned_bases,
-    )
+    # An exec pod answers 404 on /v1/workspace/* and /v1/vcs/* (exec_pod_serves),
+    # so it builds neither: no workspace sweep, and no forge asked at each
+    # replica's start what a credential reaches.
+    if role != EXEC_ROLE:
+        CredentialProxyHandler.workspaces = build_workspace_store(
+            executor,
+            base_branch=CredentialProxyHandler.base_branch,
+            pinned_bases=CredentialProxyHandler.pinned_bases,
+        )
+        CredentialProxyHandler.vcs = build_vcs_broker(
+            executor,
+            base_branch=CredentialProxyHandler.base_branch,
+            pinned_bases=CredentialProxyHandler.pinned_bases,
+        )
     if role in BROKER_ROLES:
         start_readings_sweep(executor, CredentialProxyHandler.vcs)
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
@@ -14033,9 +14040,9 @@ def serve(args: argparse.Namespace) -> None:
     CredentialProxyHandler.api_relay = GoogleApiRelay()
     LOGGER.info("Cloud API relay enabled routes=%d", len(api_policy.API_READ_ROUTES))
     # An exec pod serves commands and Cloud API reads and nothing else (§12 of
-    # credential-broker-exec-tier.md), so it starts none of the relays: no
-    # Pub/Sub, Google Chat, Slack or Teams consumer competes with the stateful
-    # broker for their subscriptions and sockets.
+    # credential-broker-exec-tier.md), so it starts none of the event relays:
+    # no Pub/Sub, Google Chat, Slack or Teams consumer competes with the
+    # stateful broker for their subscriptions and sockets.
     if role != EXEC_ROLE:
         CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
         CredentialProxyHandler.platform_pubsub_subscriptions = platform_pubsub_subscriptions()

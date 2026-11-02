@@ -17728,7 +17728,7 @@ class ExecPodRefusesTest(unittest.TestCase):
 
 
 class ExecPodRouteGateTest(unittest.TestCase):
-    """Every route over HTTP on an exec pod: the exec routes are served and the rest answer 404.
+    """Routes over HTTP on an exec pod: the exec routes are served and the rest answer 404.
 
     Each route handler is replaced by one that answers 200 and names itself,
     so a 404 here is the gate's and not a handler's. The same requests on a
@@ -17819,6 +17819,36 @@ class ExecPodRouteGateTest(unittest.TestCase):
         status, body = self._request("POST", "/v1/exec", exec_role)
         self.assertEqual(HTTPStatus.BAD_REQUEST, status)
         self.assertIn("argv", json.loads(body)["error"])
+        status, body = self._request("GET", credential_proxy.ADMISSION_PATH, exec_role)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertIn("admitted", json.loads(body))
+
+    def test_an_unknown_caller_gets_401_before_the_gate(self):
+        class Refuses:
+            authenticates = True
+
+            def authenticate(self, headers):
+                raise credential_proxy.AuthenticationError("no token")
+
+        with mock.patch.object(CredentialProxyHandler, "authenticator", Refuses()):
+            for method, path in (("POST", "/v1/workspace/open"), ("GET", "/v1/chat/events")):
+                with self.subTest(method=method, path=path):
+                    status, _ = self._request(method, path, credential_proxy_client.EXEC_ROLE)
+                    self.assertEqual(HTTPStatus.UNAUTHORIZED, status)
+
+    def test_a_scope_token_is_refused_on_an_exec_pod_and_served_on_the_broker(self):
+        class Scope:
+            authenticates = True
+
+            def authenticate(self, headers):
+                return credential_proxy.Principal(workload="scope-publisher", role=credential_proxy.CALLER_ROLE_SCOPE)
+
+        with mock.patch.object(CredentialProxyHandler, "authenticator", Scope()):
+            status, body = self._request("POST", "/v1/exec", credential_proxy_client.EXEC_ROLE)
+            self.assertEqual(HTTPStatus.FORBIDDEN, status)
+            self.assertEqual("CALLER_ROLE_FORBIDDEN", json.loads(body)["code"])
+            status, _ = self._request("POST", "/v1/exec", "broker")
+            self.assertNotEqual(HTTPStatus.FORBIDDEN, status)
 
 
 class BusyReplyNamesItsBoundTest(unittest.TestCase):
@@ -17873,6 +17903,7 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
         self.policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
         for name, value in (
             ("broker_role", "combined"), ("api_relay", None), ("chat_relay", None),
+            ("workspaces", None), ("vcs", None),
             ("a2a_chat_relay", None), ("slack_relay", None), ("teams_relay", None),
             ("watcher_subscription", ""), ("platform_pubsub_subscriptions", frozenset()),
         ):
@@ -17950,6 +17981,10 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
         self.assertIsNotNone(CredentialProxyHandler.api_relay)
         self.assertEqual(credential_proxy_client.EXEC_ROLE, CredentialProxyHandler.broker_role)
         metrics_listener.assert_called_once_with("127.0.0.1", 9466)
+        # No workspace store and no VCS broker, so no forge is asked at start what a credential reaches.
+        self.assertIsNone(CredentialProxyHandler.workspaces)
+        self.assertIsNone(CredentialProxyHandler.vcs)
+        self.assertNotIn("<lambda>", thread_targets)
 
     def test_the_stateful_broker_starts_them(self):
         relays, pubsub, metrics_listener, thread_targets = self._serve("broker")
@@ -17958,6 +17993,7 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
         pubsub.assert_called_once()
         self.assertIn("initialize_slack_relay", thread_targets)
         self.assertEqual("projects/p/subscriptions/drift", CredentialProxyHandler.watcher_subscription)
+        self.assertIsNotNone(CredentialProxyHandler.vcs)
         self.assertEqual("broker", CredentialProxyHandler.broker_role)
         metrics_listener.assert_called_once_with("127.0.0.1", 9466)
 
