@@ -28,7 +28,7 @@
  *   run.html#build=<prow build id>
  *   grid.html#since=<ISO>&until=<ISO>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]
  *   cases.html#<case>, or cases.html#sort=worst|domain|name&show=all|blocking|held, or cases.html#view=scenarios[&domain=<domain slug>]
- *   trend.html#cases=a,b | trend.html#domain=<domain> [&metric=<judged metric>][&since=<ISO>[&until=<ISO>]]
+ *   trend.html#cases=a,b | trend.html#domain=<domain> [&metric=<judged metric>][&mode=next|today][&since=<ISO>[&until=<ISO>]]
  * The older query form (`?cases=a,b&since=<ISO>&until=<ISO>` before a bare
  * `#gate` or `#agent`; `?build=<id>` on run.html; the same on the Grid and
  * the Cases page) is still read, so a link already posted opens the same
@@ -369,7 +369,7 @@ function linkCaseIds(values) {
 // `#agent`, the old anchors, still selects that view; a bare case id on
 // the Cases page names its row.
 function linkState() {
-  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, view: "", caseHash: null, sort: null, show: null, window: null, rows: null, domain: null, metric: null, casesView: null };
+  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, view: "", caseHash: null, sort: null, show: null, window: null, rows: null, domain: null, metric: null, mode: null, casesView: null };
   let query, fragment;
   try {
     query = new URLSearchParams(location.search);
@@ -404,6 +404,7 @@ function linkState() {
   out.casesView = param("view") === PAGE.casesViews.scenarios ? PAGE.casesViews.scenarios : null;
   const metric = param("metric").trim();
   if (PAGE.metricRe.test(metric)) out.metric = metric;
+  out.mode = pick("mode", TREND_MODES);
   const view = param("view") || location.hash.slice(1);
   out.view = Object.values(PAGE.views).includes(view) ? view : "";
   // A bare fragment that is a case id (`cases.html#<case>`) names the row to
@@ -438,16 +439,17 @@ const caseHref = (name) => `${PAGE.pages.cases}#${enc(name)}`;
 const trendHref = (cases, sinceMs = null, untilMs = null) => `${PAGE.pages.trend}#${scopeParams({ cases, sinceMs, untilMs }).join("&")}`;
 const trendDomainHref = (domain) => `${PAGE.pages.trend}#domain=${enc(domain)}`;
 // The Trend page's own state as a link: the current link with `patch`
-// applied (`cases`, `domain`, `metric`, `sinceMs`, `untilMs`). The page's
+// applied (`cases`, `domain`, `metric`, `mode`, `sinceMs`, `untilMs`). The page's
 // chips write this into the fragment rather than into `ui`: its domain and
 // case titles are same-document navigations, and a chip state that
 // outlived them pinned the view while the URL moved on. One source of
 // truth, and a chip's choice is in a link that can be pasted.
 function trendStateHref(link, patch) {
-  const state = { cases: [...link.cases], domain: link.domain, metric: link.metric, sinceMs: link.sinceMs, untilMs: link.untilMs, ...patch };
+  const state = { cases: [...link.cases], domain: link.domain, metric: link.metric, mode: link.mode, sinceMs: link.sinceMs, untilMs: link.untilMs, ...patch };
   const params = scopeParams({ cases: state.cases, sinceMs: state.sinceMs, untilMs: state.untilMs });
   if (!state.cases.length && state.domain) params.push(`domain=${enc(state.domain)}`);
   if (state.metric) params.push(`metric=${enc(state.metric)}`);
+  if (state.mode) params.push(`mode=${enc(state.mode)}`);
   return `${PAGE.pages.trend}#${params.join("&")}`;
 }
 const runHref = (run) => `${PAGE.pages.run}#build=${enc(run.build)}`;
@@ -2007,6 +2009,19 @@ function scenariosHtml(link) {
 /* ---- the Trend page (SCHEMA.md: brief.json's trend block; trend.py) ---- */
 
 const trendDoc = () => (brief.trend && typeof brief.trend === "object" && !Array.isArray(brief.trend) ? brief.trend : null);
+// The series the page draws (trend.py, one series per mode): next, the main
+// nightly's, unless the link asks for today or the store holds no next
+// record. Today's records are the retired rollback nightly's, drawn while
+// they last in the window. The read's own fields and the latency row stay
+// the document's; `has` says which series hold records, for the chips.
+const TREND_MODES = ["next", "today"];
+const TREND_SERIES_FIELDS = { records: 0, metrics: [], default_metric: null, keys: {}, nights: [], cases: {}, domains: {} };
+function trendSeries(full, link) {
+  const nxt = full.next && typeof full.next === "object" && !Array.isArray(full.next) ? full.next : null;
+  const has = { next: !!(nxt && nxt.records), today: !!full.records };
+  const mode = link.mode && has[link.mode] ? link.mode : has.next || !has.today ? "next" : "today";
+  return { mode, has, t: mode === "today" ? full : { ...full, ...TREND_SERIES_FIELDS, ...(nxt || {}) } };
+}
 const trendCases = (t) => (t && t.cases && typeof t.cases === "object" && !Array.isArray(t.cases) ? t.cases : {});
 const trendDomains = (t) => (t && t.domains && typeof t.domains === "object" && !Array.isArray(t.domains) ? t.domains : {});
 const trendNights = (t) => (t && Array.isArray(t.nights) ? t.nights.filter((n) => n && typeof n === "object" && typeof n.id === "string") : []);
@@ -2361,11 +2376,13 @@ function trendStatusHtml(t) {
 }
 
 function trendHtml(link) {
-  const t = trendDoc();
+  const full = trendDoc();
+  const series = full ? trendSeries(full, link) : { mode: "next", has: {}, t: null };
+  const t = series.t;
   const lede = `Every night the nightly tier runs each case against <code>main</code> three times and appends one record per case to the evidence store; this page reads those records back, each night dated by when its record was written. <b>Pass rate is the gate's number</b>: passes over scored repetitions, with the trailing window computed admission reads drawn beside each night. <b>Judged quality is advisory</b> and is never shown as one point: the store carries a mean and its n per night, so the band is the range of nightly means over the last ${esc(t && t.spread_nights || 7)} nights at one version key (a domain's band is the range across its cases). A vertical marker is a night the version key changed, so a step has its explanation next to it. <b>Latency is advisory too</b>: under each card (and over every case above the domain cards), the opening chat turn and the agent run by night, p50 and ${esc(slowName(t, "turn1"))} for the turn, p50 and ${esc(slowName(t, "agent"))} for the run, over the scope's repetitions not lost to infra, from the nightly runs on record (the store carries no timing), beside the ${esc(latencyTarget(t))} s chat-turn target. <a href="${PAGE.scoreDocUrl}">What a score is</a> is written once, in the eval-scorer design.`;
   const head = (title) => `<div class="sec head"><h1>${title}</h1><div class="lede">${lede}</div></div>`;
   if (!t || (!t.source && !t.read_at) || !t.records) {
-    const why = t && t.source ? `<p class="mut">The store <code>${esc(t.source)}</code> was read ${esc(et(parseIso(t.read_at)))} and holds no today-mode record inside its ${esc(t.window_days || "")}-day window yet${t.next && t.next.records ? ` (it holds ${esc(t.next.records)} next-mode record(s), which this page does not draw yet)` : ""}. The first night that records today-mode evidence fills this page.</p>` : "";
+    const why = t && t.source ? `<p class="mut">The store <code>${esc(t.source)}</code> was read ${esc(et(parseIso(t.read_at)))} and holds no next-mode record inside its ${esc(t.window_days || "")}-day window yet. The first night the main nightly records fills this page.</p>` : "";
     return head("Scores over time on main") + trendStatusHtml(t) + why + footHtml();
   }
   const metric = trendMetric(t, link);
@@ -2374,9 +2391,10 @@ function trendHtml(link) {
   const metrics = Array.isArray(t.metrics) ? t.metrics.filter((m) => typeof m === "string") : [];
   const domainNames = Object.keys(domains).sort();
   const ctl = `<div class="ctl">scope ${chip("scope", "", "all domains", !!scope.all)}${domainNames.map((d) => chip("scope", d, domainWords(d), scope.domain === d, domainTooltip(d))).join("")}` +
-    (metrics.length > 1 ? `<span class="sep">·</span>judged metric ${metrics.map((m) => chip("metric", m, m, m === metric)).join("")}` : "") + `</div>`;
+    (metrics.length > 1 ? `<span class="sep">·</span>judged metric ${metrics.map((m) => chip("metric", m, m, m === metric)).join("")}` : "") +
+    (series.has.next && series.has.today ? `<span class="sep">·</span>series ${chip("mode", "next", "next", series.mode === "next", "The main nightly's records")}${chip("mode", "today", "today · retired", series.mode === "today", "The full-catalog rollback nightly's records. That nightly no longer runs, so this series ends at its last night and leaves the window after it.")}` : "") + `</div>`;
   const read = parseIso(t.read_at);
-  const readLine = `<p class="mut small">Store <code>${esc(t.source)}</code> read ${esc(read != null ? et(read) : "at an unknown time")} · ${plural(t.records, "record")} over ${plural(trendNights(t).length, "night")} inside the last ${esc(t.window_days)} days · nightly records only (a pull request's run never writes the store).</p>`;
+  const readLine = `<p class="mut small">Store <code>${esc(t.source)}</code> read ${esc(read != null ? et(read) : "at an unknown time")} · ${plural(t.records, `${series.mode}-mode record`)} over ${plural(trendNights(t).length, "night")} inside the last ${esc(t.window_days)} days · nightly records only (a pull request's run never writes the store).</p>`;
   let body = "";
   if (scope.cases) {
     const found = scope.cases.filter((name) => cases[name]);
@@ -2443,7 +2461,7 @@ function onToggle(event) {
 /* ---- clicks on the Grid and the Cases page ---- */
 
 function onClick(event) {
-  const target = event.target.closest("button[data-sort],button[data-show],button[data-window],button[data-rows],button[data-domain],button[data-marker],button[data-toggle],button[data-build],button[data-scope],button[data-metric]");
+  const target = event.target.closest("button[data-sort],button[data-show],button[data-window],button[data-rows],button[data-domain],button[data-marker],button[data-toggle],button[data-build],button[data-scope],button[data-metric],button[data-mode]");
   if (!target) return;
   const d = target.dataset;
   if (d.sort) ui.sort = d.sort;
@@ -2463,10 +2481,10 @@ function onClick(event) {
   else if (d.toggle === "retired") ui.showRetired = true;
   else if (d.toggle === "close") ui.selected = null;
   else if (d.build && d.case) ui.selected = { build: d.build, case: d.case };
-  else if (d.scope != null || d.metric) {
+  else if (d.scope != null || d.metric || d.mode) {
     // The Trend page's chips navigate (trendStateHref); the hashchange
     // re-renders, and a chip that names the current state changes nothing.
-    const href = d.metric ? trendStateHref(linkState(), { metric: d.metric }) : trendStateHref(linkState(), { cases: [], domain: d.scope || null });
+    const href = d.metric ? trendStateHref(linkState(), { metric: d.metric }) : d.mode ? trendStateHref(linkState(), { mode: d.mode }) : trendStateHref(linkState(), { cases: [], domain: d.scope || null });
     location.hash = href.slice(href.indexOf("#"));
     return;
   }

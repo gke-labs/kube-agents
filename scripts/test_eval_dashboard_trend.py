@@ -183,6 +183,12 @@ class ModeSeriesTest(unittest.TestCase):
         self.assertEqual(point["judged"]["OutcomeValidity"]["mean"], 0.5)
         self.assertEqual([n["build"] for n in nxt["nights"]], ["9001"])
 
+    def test_a_next_night_dates_its_latency_like_its_bar(self):
+        nxt = [dict(r, key=dict(r["key"], mode="next")) for r in night_one_records()]
+        doc = trend.trend_document(store_doc(nxt), data_with_nightly(LATENCY_DOMAINS, TIMED_RUNS))
+        self.assertEqual(doc["latency"]["nights"][-1], {"id": f"build:{NIGHT_1_BUILD}", "at": "2026-09-17T05:54:31Z", "build": NIGHT_1_BUILD},
+                         "the store's stamp for the night, from the next series")
+
     def test_the_key_path_carries_the_mode_as_the_writer_files_it(self):
         key = {"setup_id": "s", "scoring_version": "v1", "judge_model": "j", "fleet": 1, "verifiers": 1}
         self.assertEqual(trend.key_path(key), "s/j/v1-f1-v1")
@@ -559,6 +565,12 @@ class TrendPageTest(unittest.TestCase):
             dense.append(hostile)
             (root / "dense.json").write_text(json.dumps(store_doc(dense, read_at="2026-10-01T14:09:02Z", lead_days=14, older={"sparse-case": {KEY_1: 3}})))
             cls.dense = render_to(root / "dense", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "dense.json")])
+            # Night one at today, then two later nights at next.
+            modes = list(base)
+            for day in (18, 19):
+                modes += later_night(base, day, f"21007{day}0000000000000", key={"mode": "next"})
+            (root / "modes.json").write_text(json.dumps(store_doc(modes)))
+            cls.modes = render_to(root / "modes", data, health=health_doc("GREEN"), extra_args=["--store", str(root / "modes.json")])
         cls.page = cls.out / "trend.html"
 
     @classmethod
@@ -571,10 +583,11 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn("Pass rate is the gate's number", app)
         self.assertIn("Judged quality is advisory", app)
         self.assertIn('href="https://github.com/gke-labs/kube-agents/blob/main/docs/designs/eval-scorer.md#what-a-score-is"', app)
-        self.assertIn("Store <code>gs://kube-agents-evals-bench/evidence</code> read Thu 10:09 AM ET · 32 records over 8 nights inside the last 90 days", app)
+        self.assertIn("Store <code>gs://kube-agents-evals-bench/evidence</code> read Thu 10:09 AM ET · 32 today-mode records over 8 nights inside the last 90 days", app)
         self.assertIn('<button type="button" data-scope="" class="on">all domains</button>', app)
         self.assertIn('<button type="button" data-scope="remediation">remediation</button>', app)
         self.assertIn('<button type="button" data-metric="OutcomeValidity" class="on">OutcomeValidity</button>', app)
+        self.assertNotIn('data-mode=', app, "a store with one series offers no series chip")
         self.assertEqual(app.count('class="tcard"'), 4, "one card per domain")
         self.assertEqual(app.count('<svg class="tchart"'), 8, "two charts per card")
         self.assertIn('<a href="trend.html#domain=remediation">remediation</a><small>1 case pooled per night</small>', app)
@@ -778,8 +791,27 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn("this page shows the last good read, Thu 10:09 AM ET", stale)
         self.assertEqual(stale.count('class="tcard"'), 4, "the last good read is still drawn")
         empty = dom_text(self.empty / "trend.html")
-        self.assertIn("holds no today-mode record inside its 90-day window yet", empty)
+        self.assertIn("holds no next-mode record inside its 90-day window yet", empty)
         self.assertNotIn('class="tcard"', empty)
+
+    def test_the_next_series_is_the_default_and_today_is_a_chip_away(self):
+        page = self.modes / "trend.html"
+        app = dom_text(page)
+        self.assertIn("· 8 next-mode records over 2 nights inside the last 90 days", app)
+        self.assertIn('<button type="button" data-mode="next" class="on" title="The main nightly\'s records">next</button>', app)
+        self.assertIn('data-mode="today" title="The full-catalog rollback nightly', app)
+        today = dom_text(page, fragment="#mode=today")
+        self.assertIn("· 4 today-mode records over 1 night inside the last 90 days", today)
+        self.assertIn('data-mode="today" class="on"', today)
+        # The chip writes the fragment, and a scope chip keeps the series.
+        script = ('document.querySelector(\'button[data-mode="today"]\').click();'
+                  'window.addEventListener("hashchange", () => { document.getElementById("app").insertAdjacentHTML("afterend", `<p id="where">${location.hash}</p>`); }, { once: true });')
+        self.assertIn('<p id="where">#mode=today</p>', dom_text(scripted_page(page, script)))
+        script = ('document.querySelector(\'button[data-scope="upgrades"]\').click();'
+                  'window.addEventListener("hashchange", () => { document.getElementById("app").insertAdjacentHTML("afterend", `<p id="where">${location.hash}</p>`); }, { once: true });')
+        self.assertIn('<p id="where">#domain=upgrades&amp;mode=today</p>', dom_text(scripted_page(page, script), fragment="#mode=today"))
+        # A link that names a series the store holds no record for draws the other.
+        self.assertIn("· 32 today-mode records", dom_text(self.page, fragment="#mode=next"), "no next record: today, whatever the link says")
 
     def test_the_page_carries_its_data_inline_and_the_nav_tab(self):
         page = self.page.read_text()
