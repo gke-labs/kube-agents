@@ -54,7 +54,6 @@ import errno
 import json
 import os
 import re
-import shlex
 import stat
 import subprocess
 import sys
@@ -119,6 +118,7 @@ import collector_run  # noqa: E402
 Run = collector_run.Run
 paged_dump = collector_run.paged_dump
 paged_command_text = collector_run.paged_command_text
+failed_page_text = collector_run.failed_page_text
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -958,24 +958,24 @@ def _paged_run(argv: list[str], *, env: dict | None = None) -> Run:
 
 def _kubectl_get(resources: str, env: dict) -> tuple[list | None, str | None]:
     """(items, error) of one read of `resources` (a kubectl kind list), one kind at a time in
-    pages through `kubectl get --raw`. An error names the page that failed (its `continue`
-    token included when one was being followed), not every kind's first page: the paged reader
-    hands back the failing page's `Run`, an operator re-running the command named should see
-    the failure, and the one-page text leaves the member's 160-character note room for the
-    reason. A page the credential proxy cut at its output cap is an error naming the cap, as a
-    cut list was."""
+    pages through `kubectl get --raw`. An error names the page that failed, not every kind's
+    first page: the paged reader hands back the failing page's `Run`, and the one-page text
+    leaves the member's 160-character note room for the reason. A later page's `continue`
+    token is elided from that text (`collector_run.failed_page_text`): the token alone is
+    longer than the note and names a list that has moved on. The reason is the page's exit
+    code and stderr, or, for a page that exited 0, the reader's own text for what was wrong
+    with it (empty, not JSON, not a list, a repeated token). A page the credential proxy cut
+    at its output cap is an error naming the cap, as a cut list was."""
     kinds = resources.split(",")
     parsed, result = paged_dump(kinds, run=_paged_run, env=env)
     if parsed is not None:
         return parsed.get("items") or [], None
-    text = shlex.join(result.argv)
+    text = failed_page_text(result.argv)
     if PROXY_TRUNCATION_MARKER in result.stderr:
         return None, KUBECTL_OUTPUT_CUT.format(cmd=text)
     if result.rc != 0:
         return None, f"{text} failed ({result.rc}): {result.stderr.strip()}"
-    if result.stderr.strip():
-        return None, f"{text} returned no items list: {result.stderr.strip()}"
-    return None, f"{text} returned unparsable JSON"
+    return None, f"{text} failed: {result.stderr.strip()}"
 
 
 def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:

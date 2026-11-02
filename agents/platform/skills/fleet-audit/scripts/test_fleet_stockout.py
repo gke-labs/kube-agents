@@ -3744,9 +3744,6 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class RecordedChainUnderTheCommandCapTest(unittest.TestCase):
     def test_the_recorded_chain_stays_under_the_published_command_cap(self):
@@ -3759,3 +3756,6 @@ class RecordedChainUnderTheCommandCapTest(unittest.TestCase):
         self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
         self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "dangling-compute-class"))
 
+
+if __name__ == "__main__":
+    unittest.main()

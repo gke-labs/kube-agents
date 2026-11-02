@@ -2,6 +2,7 @@
 check that no collector grows a copy of it back."""
 
 import ast
+import base64
 import copy
 import functools
 import hashlib
@@ -9,6 +10,7 @@ import json
 import os
 import pathlib
 import random
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -255,20 +257,39 @@ class PagedReadTest(unittest.TestCase):
         self.assertEqual(3, len(calls))
 
     def test_a_cut_page_from_an_older_shim_closes_the_dump_too(self):
-        # rc 0 with a partial payload: the JSON gate, not the exit code, catches it.
-        run, _ = self.scripted({("/api/v1/pods", ""): '{"items": [{"metadata": {"name": "a'})
-        parsed, result = cr.paged_dump(["pods"], run=run)
-        self.assertIsNone(parsed)
-        self.assertEqual(0, result.rc)
+        # rc 0 with a partial payload: the JSON gate, not the exit code, catches it, and the
+        # failing page's stderr says so after whatever the page printed there (the marker).
+        marker = "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 0)"
+        partial = '{"items": [{"metadata": {"name": "a'
+        for stderr in ("", marker):
+            with self.subTest(stderr=stderr):
+                argv = cr.list_argv("pods")
+                run, _ = self.scripted({("/api/v1/pods", ""): cr.Run(argv, 0, partial, stderr, 0.01)})
+                parsed, result = cr.paged_dump(["pods"], run=run)
+                self.assertIsNone(parsed)
+                self.assertEqual(0, result.rc)
+                self.assertEqual(f"{stderr}\n{cr.PAGE_NOT_JSON_TEXT}".strip(), result.stderr)
 
-    def test_a_page_that_is_not_a_list_closes_the_dump(self):
+    def test_a_page_that_is_not_a_list_or_empty_closes_the_dump_and_says_which(self):
         for body in ('{"kind": "Status", "code": 403}', "[]", '"x"', "", "   "):
             with self.subTest(body=body):
                 run, _ = self.scripted({("/api/v1/pods", ""): body})
                 parsed, result = cr.paged_dump(["pods"], run=run)
                 self.assertIsNone(parsed)
-                if body.strip():
-                    self.assertIn(cr.PAGE_NOT_A_LIST_TEXT, result.stderr)
+                self.assertEqual(cr.PAGE_NOT_A_LIST_TEXT if body.strip() else cr.PAGE_EMPTY_TEXT, result.stderr)
+
+    def test_a_failed_pages_text_elides_the_continue_token_and_keeps_the_rest(self):
+        """The server's token is base64 of a cursor, a hundred or more characters: named whole,
+        the page's command alone passes a 160-character note. The first page's text is the
+        command as run; a later page keeps its path and query and loses the token's value."""
+        token = base64.urlsafe_b64encode(json.dumps({"v": "meta.k8s.io/v1", "rv": 123456789, "start": "shop/web-7d9f8c6b5-abcde\u0000"}).encode()).decode()
+        self.assertGreaterEqual(len(token), 100, token)
+        query = {"fieldSelector": "status.phase=Running"}
+        first, later = cr.list_argv("pods", query=query), cr.list_argv("pods", continue_token=token, query=query)
+        self.assertEqual(shlex.join(first), cr.failed_page_text(first))
+        self.assertGreater(len(shlex.join(later)), 160)
+        self.assertEqual(f"kubectl get --raw '/api/v1/pods?limit=500&fieldSelector=status.phase%3DRunning&continue={cr.CONTINUE_ELIDED}'", cr.failed_page_text(later))
+        self.assertEqual("kubectl get node -o json", cr.failed_page_text(["kubectl", "get", "node", "-o", "json"]))
 
     def test_a_repeated_continue_token_ends_the_read_closed(self):
         run, calls = self.scripted({

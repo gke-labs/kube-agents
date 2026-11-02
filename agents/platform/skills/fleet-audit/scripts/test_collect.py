@@ -13236,10 +13236,6 @@ class DefaultRunFailureTest(unittest.TestCase):
         self.assertIn("No such file or directory", discovery.error)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RecordedChainsUnderTheCommandCapTest(unittest.TestCase):
     """Every paged chain `collect.py` records is copied verbatim into `checks_run` and into
     `evidence.command`; `finish` refuses the first over `MAX_COMMAND_CHARS` and clips the
@@ -13256,3 +13252,6 @@ class RecordedChainsUnderTheCommandCapTest(unittest.TestCase):
                 self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "privileged-container"))
                 self.assertEqual(text, audit_report.trim_command(text))
 
+
+if __name__ == "__main__":
+    unittest.main()

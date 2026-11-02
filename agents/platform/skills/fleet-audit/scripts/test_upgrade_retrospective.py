@@ -410,6 +410,17 @@ class OperationsTest(unittest.TestCase):
         self.assertEqual(ops, [])
         self.assertIn("rc=1", error)
 
+    def test_paged_json_words_a_failed_page_with_its_rc_or_the_readers_reason(self):
+        """A page that exited non-zero is worded as `run_json` words it; one that exited 0 and
+        still failed quotes the paged reader's own text for what was wrong with it."""
+        cr = ur.collector_run
+        items, error = ur.paged_json("events", None, run=lambda argv, **kw: run_of(1, "", "denied"), timeout=5, env=None)
+        self.assertEqual((items, error), (None, "kubectl get events rc=1: denied"))
+        for stdout, reason in (("{not json", cr.PAGE_NOT_JSON_TEXT), ("", cr.PAGE_EMPTY_TEXT), ('{"kind": "Status"}', cr.PAGE_NOT_A_LIST_TEXT)):
+            with self.subTest(stdout=stdout):
+                items, error = ur.paged_json("events", None, run=lambda argv, **kw: run_of(0, stdout, ""), timeout=5, env=None)
+                self.assertEqual((items, error), (None, f"kubectl get events failed: {reason}"))
+
 
 def symptoms_of(name, reads=None, ops=None, window=SINCE):
     cluster = cluster_doc(name)
@@ -6634,10 +6645,6 @@ class ReadsTellTheShimTheirDeadlineTest(unittest.TestCase):
         self.assertEqual("0", expected, "the cap admits no retry")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RecordedReadsUnderTheCommandCapTest(unittest.TestCase):
     def test_every_recorded_read_passes_the_validator_at_the_longest_path(self):
         """`draft` copies each read's recorded command into `checks_run`, which `finish` refuses
@@ -6651,3 +6658,6 @@ class RecordedReadsUnderTheCommandCapTest(unittest.TestCase):
                 self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
                 self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", ur.CHECK_NODE_BROKEN))
 
+
+if __name__ == "__main__":
+    unittest.main()

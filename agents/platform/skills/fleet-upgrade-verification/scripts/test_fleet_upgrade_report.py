@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Unit tests for fleet_upgrade_report.py, with gcloud replaced by canned JSON."""
 
+import base64
 import errno
 import io
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 import tempfile
@@ -2515,34 +2517,44 @@ class ReadinessTest(unittest.TestCase):
         self.assertIsNone(nodes)
         self.assertEqual(error, report.KUBECTL_OUTPUT_CUT.format(cmd="kubectl get node"))
 
-    def test_a_paged_read_that_is_not_a_list_or_not_json_says_which(self):
-        def fake(cmd, timeout=None, env=None):
-            if cmd[3].startswith("/apis/apps/v1/deployments"):
-                return 0, '{"kind": "Status", "code": 403}', ""
-            return 0, "{not json", ""
+    def test_a_page_that_exited_0_and_failed_is_worded_with_the_readers_reason(self):
+        """A non-list, non-JSON or empty page is named by the paged reader's own text for
+        it, not by a class the report infers from the `Run`'s shape."""
+        cr = _shared_run_tests.cr
+        pages = {"/apis/apps/v1/deployments": '{"kind": "Status", "code": 403}', "/api/v1/pods": "{not json", "/api/v1/namespaces": ""}
 
-        with patch.object(report, "run_cmd", fake), patch.object(report, "paged_dump", _shared_run_tests.cr.paged_dump):
-            items, error = report._kubectl_get("deploy", {})
-            self.assertIsNone(items)
-            self.assertEqual(f"{report.paged_command_text(['deploy'])} returned no items list: paged read: the page has no `items` list", error)
-            items, error = report._kubectl_get("pods", {})
-            self.assertIsNone(items)
-            self.assertEqual(f"{report.paged_command_text(['pods'])} returned unparsable JSON", error)
-
-    def test_a_failed_later_page_is_named_with_its_continue_token(self):
-        """The error names the page that failed, continue token included, so the command an
-        operator re-runs is the one that failed, not the kind's clean first page."""
         def fake(cmd, timeout=None, env=None):
+            return 0, pages[cmd[3].partition("?")[0]], "Warning: a kubectl notice on stderr"
+
+        with patch.object(report, "run_cmd", fake), patch.object(report, "paged_dump", cr.paged_dump):
+            for kind, reason in (("deploy", cr.PAGE_NOT_A_LIST_TEXT), ("pods", cr.PAGE_NOT_JSON_TEXT), ("namespaces", cr.PAGE_EMPTY_TEXT)):
+                with self.subTest(kind=kind):
+                    items, error = report._kubectl_get(kind, {})
+                    self.assertIsNone(items)
+                    self.assertEqual(f"{report.paged_command_text([kind])} failed: Warning: a kubectl notice on stderr\n{reason}", error)
+
+    def test_a_failed_later_page_is_named_with_its_continue_token_elided(self):
+        """The error names the page that failed, not the kind's clean first page, and elides
+        the `continue` token's value: a real token is base64 of the server's cursor, a hundred
+        or more characters, so named whole the command alone would overrun the member note
+        and the reason would never reach it."""
+        token = base64.urlsafe_b64encode(json.dumps({"v": "meta.k8s.io/v1", "rv": 123456789, "start": "shop/web-7d9f8c6b5-abcde\u0000"}).encode()).decode()
+        seen = []
+
+        def fake(cmd, timeout=None, env=None):
+            seen.append(cmd)
             path, _, query = cmd[3].partition("?")
             if "continue=" in query:
                 return 1, "", "Error from server (Expired): The provided continue parameter is too old"
-            return 0, json.dumps({"metadata": {"continue": "more"} if path == "/api/v1/pods" else {}, "items": []}), ""
+            return 0, json.dumps({"metadata": {"continue": token} if path == "/api/v1/pods" else {}, "items": []}), ""
 
         with patch.object(report, "run_cmd", fake), patch.object(report, "paged_dump", _shared_run_tests.cr.paged_dump):
             items, error = report._kubectl_get("daemonset,pods", {})
         self.assertIsNone(items)
-        self.assertEqual("kubectl get --raw '/api/v1/pods?limit=500&continue=more' failed (1): Error from server (Expired): The provided continue parameter is too old", error)
+        self.assertGreater(len(shlex.join(seen[-1])), report.NOTE_ERROR_CHARS)  # the page as run would not fit
+        self.assertEqual(f"kubectl get --raw '/api/v1/pods?limit=500&continue={_shared_run_tests.cr.CONTINUE_ELIDED}' failed (1): Error from server (Expired): The provided continue parameter is too old", error)
         self.assertLessEqual(len(error), report.NOTE_ERROR_CHARS)
+        self.assertNotIn(token[:12], error)
 
     def test_the_addon_inventory_is_in_the_json_and_the_table_and_a_ghost_node_blocks(self):
         fluentbit = {"kind": "DaemonSet", "metadata": {"namespace": "kube-system", "name": "fluentbit-gke"}, "spec": {"template": {"spec": {"containers": [{"name": "fluentbit", "image": "gke.gcr.io/fluent-bit:v0.0.422-gke.21@sha256:abc"}, {"name": "exporter", "image": "gke.gcr.io/fluent-bit-gke-exporter:v0.27.17-gke.36"}]}}}}

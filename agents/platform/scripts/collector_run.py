@@ -72,11 +72,25 @@ API_VERSION_KEY = "apiVersion"
 #: shape every collector's gate and parser already reads.
 LIST_KIND = "List"
 LIST_API_VERSION = "v1"
-#: The stderr a paged read fails with when a page is not a list, or the server
-#: keeps handing back the same continue token.
+#: The stderr a paged read fails with when a page exited 0 and still failed:
+#: printed nothing, is not JSON, is not a list, or the server keeps handing
+#: back the same continue token. Every such class names itself, so a caller
+#: reports the reader's reason rather than guessing one from the `Run`'s shape.
+PAGE_EMPTY_TEXT = "paged read: the page was empty"
+PAGE_NOT_JSON_TEXT = "paged read: the page is not JSON"
 PAGE_NOT_A_LIST_TEXT = "paged read: the page has no `items` list"
 PAGE_LOOP_TEXT = "paged read: the server repeated a continue token"
 PAGE_CEILING_TEXT = f"paged read: more than {MAX_PAGES} pages of one kind"
+#: The query string's syntax in a page's `--raw` path.
+QUERY_MARK = "?"
+QUERY_PAIR_JOIN = "&"
+QUERY_ASSIGN = "="
+#: What stands in for a `continue` token's value when a failed page's command
+#: is named in an error. The token is the server's cursor, base64 of a
+#: resourceVersion and a start key: a hundred or more characters, so the
+#: command alone would overrun a 160-character note, and bound to a list that
+#: has moved on, so a reader could not re-run it.
+CONTINUE_ELIDED = "…"
 #: What a merged read records as its output: the counts and one digest over
 #: every page as it arrived, so the manifest's `output_sha256` still changes
 #: when the content does, without the merged text being kept to digest.
@@ -259,7 +273,24 @@ def list_argv(
     params.update(query or {})
     if continue_token:
         params[CONTINUE_KEY] = continue_token
-    return ["kubectl", "get", KUBECTL_RAW_FLAG, f"{LIST_KINDS[canonical].path}?{urllib.parse.urlencode(params)}"]
+    return ["kubectl", "get", KUBECTL_RAW_FLAG, f"{LIST_KINDS[canonical].path}{QUERY_MARK}{urllib.parse.urlencode(params)}"]
+
+
+def failed_page_text(argv: list[str]) -> str:
+    """The shell text of one page's argv, for an error that names the page that
+    failed: `shlex.join` of the argv, with the value of a `continue` token in
+    the `--raw` path replaced by `CONTINUE_ELIDED`. A first page's text is
+    unchanged; a later page keeps its path and query and loses the token, which
+    a reader could neither fit in a note nor re-run."""
+    shown = list(argv)
+    at = shown.index(KUBECTL_RAW_FLAG) + 1 if KUBECTL_RAW_FLAG in shown else len(shown)
+    if at < len(shown):
+        path, mark, query = shown[at].partition(QUERY_MARK)
+        if mark:
+            token_prefix = f"{CONTINUE_KEY}{QUERY_ASSIGN}"
+            pairs = [f"{token_prefix}{CONTINUE_ELIDED}" if pair.startswith(token_prefix) else pair for pair in query.split(QUERY_PAIR_JOIN)]
+            shown[at] = f"{path}{mark}{QUERY_PAIR_JOIN.join(pairs)}"
+    return shlex.join(shown)
 
 
 def paged_command_text(resources: Iterable[str], *, query: dict[str, str] | None = None, kubeconfig=None) -> str:
@@ -310,9 +341,13 @@ def paged_list(
     `metadata.managedFields` dropped as it is decoded and each item stamped
     with its kind. `(items, run, pages)` on success; `(None, run, pages)` with
     the failing page's `Run` when any page failed, printed nothing, printed
-    something that is not a list, or the server looped on a token: a partial
-    kind is never returned as a shorter one. `run_kwargs` (`env`, `timeout`)
-    reach every page's `run` as the caller's `run_and_gate` passes them."""
+    something that is not JSON or not a list, or the server looped on a token:
+    a partial kind is never returned as a shorter one. A page that failed with
+    an exit code is handed back as it ran; one that exited 0 carries the
+    `PAGE_*_TEXT` naming its class at the end of its stderr, so a caller's error
+    reports the reason rather than inferring one. `run_kwargs` (`env`,
+    `timeout`) reach every page's `run` as the caller's `run_and_gate` passes
+    them."""
     listed = LIST_KINDS[canonical_resource(resource)]
     items: list = []
     token = ""
@@ -326,12 +361,14 @@ def paged_list(
         result = run(argv, **run_kwargs)
         elapsed += result.duration_s
         pages += 1
-        if result.rc != 0 or not result.stdout.strip():
+        if result.rc != 0:
             return None, result._replace(duration_s=elapsed), pages
+        if not result.stdout.strip():
+            return None, _failed(result._replace(duration_s=elapsed), PAGE_EMPTY_TEXT), pages
         try:
             page = json.loads(result.stdout)
         except json.JSONDecodeError:
-            return None, result._replace(duration_s=elapsed), pages
+            return None, _failed(result._replace(duration_s=elapsed), PAGE_NOT_JSON_TEXT), pages
         if not isinstance(page, dict) or not isinstance(page.get(ITEMS_KEY), list):
             return None, _failed(result._replace(duration_s=elapsed), PAGE_NOT_A_LIST_TEXT), pages
         if digest is not None:
