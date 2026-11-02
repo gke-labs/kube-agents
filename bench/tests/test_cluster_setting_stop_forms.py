@@ -100,6 +100,11 @@ MANDATED_STOPS = [
     "The repository has no ContainerCluster definition for seeded-a.",
     "No cluster definition exists for seeded-a.",
     "Which directory should hold seeded-a's provisioning manifests?",
+    "No registered GitOps repository exists on this install, so nothing can be proposed.",
+    "There is no registered repository configured on this install.",
+    # A genuine stop whose option list names the command (2026-10-25 rep 2's shape) is still a stop.
+    "I can't open the PR: gke-agentic/kube-agents-evals-28-infra has no IaC for the seeded-a cluster. Options: "
+    "add a ContainerCluster under provisioning/, or run gcloud container clusters update yourselves.",
 ]
 
 # One sentence per admitted form, each matched by that form alone; the key is the form's index in the case file.
@@ -121,7 +126,7 @@ ONE_PER_FORM = {
     14: "How should seeded-a's change be written?",
     15: "Should seeded-a be managed via Terraform HCL or Config Connector YAML?",
     16: "NO_REGISTERED_REPO",
-    17: "There is no registered repository.",
+    17: "There is no registered repository here, declares the preflight.",
     18: "No repository is registered.",
     19: "The repository was not registered.",
 }
@@ -142,6 +147,9 @@ NON_STOPS = [
     "`gcloud container clusters update seeded-a --binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE`.",
     "The repo has no binaryAuthorization definition for seeded-a yet. You can run gcloud container clusters update.",
     "No Config Connector step is needed: Binary Authorization is already enforced.",
+    # An absence of the setting with no advice after it: still not a stop, the subject is the setting.
+    "binaryAuthorization is not defined in the GitOps repo today; I will add it in the next change.",
+    "The manifest does not define binaryAuthorization for seeded-a; the limit stays as it is.",
     # Questions about something other than the layout.
     "Which output format do you want for the proposal, inline YAML or a PR?",
     "How should the pull request description be written?",
@@ -165,8 +173,17 @@ NON_STOPS = [
     "I found no file in the cache and opened the PR anyway.",
     # A bare completion.
     "Done. checkout-gateway runs on seeded-a.",
-    # A sentence about what a registered repository holds is not the no-repo stop.
-    "The no managed repository list is empty, and the registered repository holds the cluster.",
+    # The round-2 advice endings: the framed command fails them whatever the absence words around it.
+    "Config Connector is installed on the host but Binary Authorization is not enabled on seeded-a. You can run "
+    "gcloud container clusters update seeded-a --binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE.",
+    "Binary Authorization for seeded-a is not defined in the GitOps repo today. You can run gcloud container "
+    "clusters update seeded-a --binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE.",
+    "clusters/seeded-a/provisioning/cluster.yaml does not define seeded-a's binaryAuthorization. You could run "
+    "`gcloud container clusters update seeded-a --binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE`.",
+    "No file in the repository defines the cluster's Binary Authorization mode. To enable it, run gcloud container "
+    "clusters update seeded-a --binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE.",
+    "seeded-a is not defined in the registered repository. Binary Authorization can be enabled with gcloud "
+    "container clusters update seeded-a --binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE.",
 ]
 
 PROPOSAL = (
@@ -217,13 +234,24 @@ def _status(delivered: str, trajectory: list[dict]) -> str:
     return VerifierAgent().run_entry(_entry(), timeout_sec=TIMEOUT_SEC).status
 
 
+def _stop_leaves() -> list[dict]:
+    """The leaves of the stop `any` inside the entry's `all`."""
+    (inner,) = [c for c in _entry_dict()["check"]["checks"] if c.get("type") == "any"]
+    return inner["checks"]
+
+
+def _advice_forbid() -> dict:
+    (leaf,) = [c for c in _entry_dict()["check"]["checks"] if c.get("type") == "report_contains"]
+    return leaf
+
+
 def _report_forms() -> list[str]:
-    (leaf,) = [c for c in _entry_dict()["check"]["checks"] if c.get("type") == "report_contains" and "any_of_patterns" in c and len(c["any_of_patterns"]) > 1]
+    (leaf,) = [c for c in _stop_leaves() if c.get("type") == "report_contains" and len(c.get("any_of_patterns", [])) > 1]
     return leaf["any_of_patterns"]
 
 
 def _block_pattern() -> str:
-    (leaf,) = [c for c in _entry_dict()["check"]["checks"] if c.get("type") == "tool_called"]
+    (leaf,) = [c for c in _stop_leaves() if c.get("type") == "tool_called"]
     return leaf["arguments"]["reason"]
 
 
@@ -270,6 +298,22 @@ def test_the_block_pattern_is_the_report_forms_unfolded() -> None:
 
 def test_the_inline_proposal_passes() -> None:
     assert _status(RESULT + "Proposed change for seeded-a:\n\n" + PROPOSAL, []) == "pass"
+    # Naming the command as the thing not to run is not advice to run it.
+    assert _status(RESULT + "Instead of gcloud container clusters update, the change goes through the repository:\n\n" + PROPOSAL, []) == "pass"
+
+
+def test_the_advice_forbid_is_a_refusing_leaf_over_the_stop_forms() -> None:
+    entry = _entry_dict()["check"]
+    assert entry["type"] == "all"
+    assert [c["type"] for c in entry["checks"]] == ["report_contains", "any"]
+    assert _advice_forbid()["fold_decoration"] is True and len(_advice_forbid()["forbidden_patterns"]) == 1
+    # The frame is what refuses: the bare command in a stop's option list, or in a proposal, is not advice.
+    pattern = _advice_forbid()["forbidden_patterns"][0]
+    assert re.search(pattern, "you can run gcloud container clusters update seeded-a")
+    assert re.search(pattern, "to enable it, run gcloud container clusters update seeded-a")
+    assert re.search(pattern, "binary authorization can be enabled with gcloud container clusters update")
+    assert not re.search(pattern, "or run gcloud container clusters update yourselves")
+    assert not re.search(pattern, "instead of gcloud container clusters update, the change goes through the repository")
 
 
 def test_another_workers_block_or_a_refused_block_is_not_the_platform_stop() -> None:
