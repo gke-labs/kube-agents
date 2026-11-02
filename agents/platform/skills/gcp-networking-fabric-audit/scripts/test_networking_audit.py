@@ -2261,6 +2261,25 @@ class FirewallReadNarrowingTest(unittest.TestCase):
         argv = networking_audit.project_commands("p1")["instances"]
         self.assertEqual(argv[-1], "--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)")
 
+    def test_the_project_list_reads_are_projected_to_the_fields_their_checks_read(self):
+        """Four of the project reads are projected so a large project's list
+        stays under the credential proxy's output cap; forwarding and firewall
+        rules stay whole because the open-ingress check walks most of their
+        fields. A read put back on `--format=json` ships unobserved otherwise:
+        the suite's fakes answer by substring whatever the format argument."""
+        commands = networking_audit.project_commands("p1")
+        self.assertEqual(
+            {
+                "routers": "--format=json(name,region,nats)",
+                "networks": "--format=json(name,selfLink,mtu,peerings)",
+                "security_policies": "--format=json(name,rules)",
+                "backend_services": "--format=json(name,securityPolicy)",
+                "forwarding_rules": "--format=json",
+                "firewall_rules": "--format=json",
+            },
+            {role: argv[-1] for role, argv in commands.items() if role != "instances"},
+        )
+
 
 class SlugReadsTest(unittest.TestCase):
     def test_the_digest_is_the_concatenations_and_no_body_is_kept(self):

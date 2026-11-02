@@ -419,6 +419,39 @@ class CollectProjectTest(unittest.TestCase):
         entry = cf.collect_project("proj-1", run=self.fake_run(self.clean()))
         self.assertNotIn("autopilot", entry)
 
+    def test_every_list_read_issues_its_projection_and_descends_lists_with_brackets(self):
+        """The five list reads go out with their `--format=json(...)`
+        projections (a read back on the whole resource meets the credential
+        proxy's output cap on a project with thousands of instances), and the
+        instance read spells `metadata.items[].key`: in a `json()` projection
+        a plain dotted component applied to a list projects nothing, so
+        `metadata.items.key` would drop `metadata` from every item and §2.1
+        would read no console wherever the project's common metadata sets no
+        startup script. The fakes answer by substring, so only the argv says."""
+        issued = []
+        inner = self.fake_run(self.clean())
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            return inner(argv, **kwargs)
+
+        cf.collect_project("proj-1", run=run)
+        formats = {" ".join(argv[1:argv.index("list") + 1]): argv[-1] for argv in issued if argv[0] == "gcloud" and "list" in argv}
+        self.assertEqual(
+            {
+                "compute instances list": cf.INSTANCES_FORMAT,
+                "compute instance-groups managed list": cf.MIGS_FORMAT,
+                "compute sole-tenancy node-groups list": cf.NODE_GROUPS_FORMAT,
+                "compute disks list": cf.DISKS_FORMAT,
+                "compute snapshots list": cf.SNAPSHOTS_FORMAT,
+            },
+            formats,
+        )
+        for fmt in formats.values():
+            self.assertRegex(fmt, r"^--format=json\([^()]+\)$", fmt)
+        self.assertEqual(cf.INSTANCES_FORMAT, "--format=json(name,status,zone,metadata.items[].key)")
+        self.assertNotIn("items.key", cf.INSTANCES_FORMAT.replace("items[].key", ""))
+
     def test_every_commands_entry_is_an_object_with_a_string_check_and_int_rc(self):
         """`cross_check_manifest` reads `entry.get("check")` with no isinstance
         guard and compares `rc == 0` as an integer: a bare string in the list

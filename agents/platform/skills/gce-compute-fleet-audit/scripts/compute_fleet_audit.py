@@ -269,7 +269,13 @@ SOLE_TENANT_UTILISATION_PCT = 90
 # config) is tens of times the four fields §2.1 reads, and a project with
 # thousands of instances took the list past the credential proxy's output cap;
 # the projection keeps the reply and this process at a few fields per object.
-INSTANCES_FORMAT = "--format=json(name,status,zone,metadata.items.key)"
+# A field under a list is spelled through it with `[]`: in a `json()`
+# projection a plain dotted component applied to a list projects nothing (the
+# implicit map over a list is `--filter`'s and `value()`'s, not the JSON
+# printer's), and `metadata.items.key` would drop `metadata` from every item,
+# so §2.1 would read no console on any project whose common metadata sets no
+# startup script.
+INSTANCES_FORMAT = "--format=json(name,status,zone,metadata.items[].key)"
 MIGS_FORMAT = "--format=json(name,size,targetSize,status,currentActions,zone,region)"
 NODE_GROUPS_FORMAT = "--format=json(name,size,zone,region,autoscalingPolicy)"
 DISKS_FORMAT = "--format=json(name,selfLink)"
