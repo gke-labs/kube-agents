@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -99,9 +100,16 @@ const (
 	schedulerName         = "default-scheduler"
 	podTemplateHashLength = 10
 	podSuffixLength       = 5
+	// podSuffixValueBits bounds what a Pod suffix encodes: the index folded
+	// with a per-cluster salt by XOR, both under 2^25, stays under 36^5, so
+	// five base-36 characters hold it and no two Pods of a cluster share one.
+	podSuffixValueBits    = 25
+	podSuffixMask         = 1<<podSuffixValueBits - 1
+	podSuffixPad          = "0"
 	uidFormat             = "%08x-%04x-4%03x-%04x-%012x"
 	hashFieldUID          = "uid"
 	hashFieldName         = "name"
+	hashFieldSalt         = "salt"
 	hashFieldShape        = "shape"
 	hashFieldCount        = "count"
 	hashFieldTemplate     = "template"
@@ -273,9 +281,16 @@ func (g *Generator) nodePool(i int) string {
 	return fmt.Sprintf(nodePoolFormat, i%nodePoolCount)
 }
 
-// NodeName is the name of the i-th Node.
+// salt is a per-cluster constant for kind, folded into the per-object part
+// of a name so it differs between seeds while staying a function of the
+// index, which is what keeps the names of one cluster distinct.
+func (g *Generator) salt(kind string) uint64 { return g.hash(kind, 0, hashFieldSalt) }
+
+// NodeName is the name of the i-th Node: its pool, the pool's instance-group
+// hash, and the index folded with the cluster's salt, distinct for every
+// Node of a cluster under 65,536.
 func (g *Generator) NodeName(i int) string {
-	return fmt.Sprintf(nodeNameFormat, g.nodePool(i), uint32(g.hash(hashKindNode, i%nodePoolCount, hashFieldName)), uint16(g.hash(hashKindNode, i, hashFieldName)))
+	return fmt.Sprintf(nodeNameFormat, g.nodePool(i), uint32(g.hash(hashKindNode, i%nodePoolCount, hashFieldName)), uint16(i)^uint16(g.salt(hashKindNode)))
 }
 
 func (g *Generator) namespace(i int) string {
@@ -295,13 +310,13 @@ func (g *Generator) replicaSet(i int) (name string, uid types.UID) {
 	return fmt.Sprintf(replicaSetFormat, g.workload(i), hash), g.uid(hashKindReplicaSet, index)
 }
 
-// PodName is the name of the i-th Pod, and its namespace.
+// PodName is the name of the i-th Pod, and its namespace. The suffix is the
+// index folded with the cluster's salt in base 36, five characters like a
+// ReplicaSet's, distinct for every Pod of a cluster under 2^25.
 func (g *Generator) PodName(i int) (name, namespace string) {
 	rs, _ := g.replicaSet(i)
-	suffix := strconv.FormatUint(g.hash(hashKindPod, i, hashFieldName), hashBase)
-	if len(suffix) > podSuffixLength {
-		suffix = suffix[:podSuffixLength]
-	}
+	suffix := strconv.FormatUint((uint64(i)^g.salt(hashKindPod))&podSuffixMask, hashBase)
+	suffix = strings.Repeat(podSuffixPad, podSuffixLength-len(suffix)) + suffix
 	return fmt.Sprintf(podNameFormat, rs, suffix), g.namespace(i)
 }
 

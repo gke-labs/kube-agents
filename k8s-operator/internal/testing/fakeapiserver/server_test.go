@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -582,8 +583,21 @@ func TestRefusalsAreStatuses(t *testing.T) {
 			_, err := events.List(ctx, metav1.ListOptions{Continue: "not-a-token"})
 			return err
 		}(),
+		"continue token past the end": func() error {
+			token := encodeContinue(continueToken{Version: continueTokenVersion, ResourceVersion: currentVersion(t, s), Start: 1000})
+			_, err := events.List(ctx, metav1.ListOptions{Continue: token})
+			return err
+		}(),
 		"bad resourceVersion": func() error {
 			_, err := events.List(ctx, metav1.ListOptions{ResourceVersion: "latest"})
+			return err
+		}(),
+		"list resourceVersion above int64": func() error {
+			_, err := events.List(ctx, metav1.ListOptions{ResourceVersion: "18446744073709551615"})
+			return err
+		}(),
+		"watch resourceVersion above int64": func() error {
+			_, err := events.Watch(ctx, metav1.ListOptions{ResourceVersion: "9223372036854775808"})
 			return err
 		}(),
 		"negative timeout": func() error {
@@ -594,6 +608,9 @@ func TestRefusalsAreStatuses(t *testing.T) {
 		if !apierrors.IsBadRequest(err) {
 			t.Errorf("%s: %v, want 400", name, err)
 		}
+	}
+	if s.Counts().Expired != 0 || s.Counts().Lists != 0 {
+		t.Errorf("counts after the refusals: %+v, want no 410 and no list served", s.Counts())
 	}
 	_, err := client.CoreV1().Events("team-0").Create(ctx, &corev1.Event{ObjectMeta: metav1.ObjectMeta{Name: "x"}}, metav1.CreateOptions{})
 	if !apierrors.IsNotFound(err) {
@@ -623,6 +640,106 @@ func TestRefusalsAreStatuses(t *testing.T) {
 		if resp.StatusCode != wantCode {
 			t.Errorf("%s: status %d, want %d", name, resp.StatusCode, wantCode)
 		}
+	}
+}
+
+// currentVersion is the server's resource version as the number a continue
+// token carries.
+func currentVersion(t *testing.T, s *Server) int64 {
+	t.Helper()
+	rv, err := strconv.ParseInt(s.ResourceVersion(), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rv
+}
+
+// A continuation page asked for with the largest limit there is serves the
+// rest of the list: the page arithmetic does not wrap.
+func TestList_ContinueWithLargestLimit(t *testing.T) {
+	s := startSmall(t, 1)
+	events := clientFor(t, s, k8sruntime.ContentTypeJSON).CoreV1().Events(metav1.NamespaceAll)
+	first, err := events.List(context.Background(), metav1.ListOptions{Limit: 10})
+	if err != nil || first.Continue == "" {
+		t.Fatalf("first page: %d items, continue %q, %v", len(first.Items), first.Continue, err)
+	}
+	rest, err := events.List(context.Background(), metav1.ListOptions{Limit: math.MaxInt64, Continue: first.Continue})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest.Items) != small.Events-10 || rest.Continue != "" {
+		t.Fatalf("continuation page: %d items, continue %q", len(rest.Items), rest.Continue)
+	}
+}
+
+// The server's backlog count is down by the time the bookmark ending a
+// watch-list's initial events reaches the client, which is when the
+// watcher's gate releases the slot: a fleet test reading both never counts a
+// slot twice.
+func TestWatchList_BacklogReleasedBeforeBookmark(t *testing.T) {
+	var inFlight, peak atomic.Int64
+	s := Start(Options{Seed: 3, Sizes: small, OnBacklog: func(started bool) {
+		if !started {
+			inFlight.Add(-1)
+			return
+		}
+		if now := inFlight.Add(1); now > peak.Load() {
+			peak.Store(now)
+		}
+	}})
+	t.Cleanup(s.Close)
+	w, err := clientFor(t, s, k8sruntime.ContentTypeProtobuf).CoreV1().Events(metav1.NamespaceAll).Watch(context.Background(), metav1.ListOptions{
+		SendInitialEvents: ptr.To(true), AllowWatchBookmarks: true, ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+	for i := 0; i < small.Events; i++ {
+		receive(t, w, 5*time.Second)
+	}
+	if ev := receive(t, w, 5*time.Second); ev.Type != watch.Bookmark {
+		t.Fatalf("after the initial events: %s", ev.Type)
+	}
+	if got := inFlight.Load(); got != 0 {
+		t.Errorf("%d backlog in flight when the bookmark arrived; want the count released before it", got)
+	}
+	if peak.Load() != 1 {
+		t.Errorf("peak backlogs %d, want the stream counted once", peak.Load())
+	}
+}
+
+// Every Node and every Pod of a fleet-scale cluster has its own name: the
+// per-object suffix is a function of the index, so a consumer keyed by name
+// sees as many objects as the sizes say.
+func TestGenerator_NamesAreUnique(t *testing.T) {
+	fleetScale := Sizes{Nodes: 1_500, Pods: 20_000}
+	for seed := int64(0); seed < 3; seed++ {
+		gen := NewGenerator(seed, fleetScale)
+		nodes := map[string]int{}
+		for i := 0; i < fleetScale.Nodes; i++ {
+			name := gen.NodeName(i)
+			if j, dup := nodes[name]; dup {
+				t.Fatalf("seed %d: nodes %d and %d are both %q", seed, j, i, name)
+			}
+			nodes[name] = i
+		}
+		pods := map[string]int{}
+		for i := 0; i < fleetScale.Pods; i++ {
+			name, namespace := gen.PodName(i)
+			key := namespace + "/" + name
+			if j, dup := pods[key]; dup {
+				t.Fatalf("seed %d: pods %d and %d are both %q", seed, j, i, key)
+			}
+			pods[key] = i
+			if suffix := name[len(name)-podSuffixLength-1:]; suffix[0] != '-' || len(suffix) != podSuffixLength+1 {
+				t.Fatalf("seed %d: pod %d is %q, not a %d-character suffix", seed, i, name, podSuffixLength)
+			}
+		}
+	}
+	a, b := NewGenerator(1, fleetScale), NewGenerator(2, fleetScale)
+	if a.NodeName(0) == b.NodeName(0) {
+		t.Errorf("node 0 is %q under two seeds", a.NodeName(0))
 	}
 }
 

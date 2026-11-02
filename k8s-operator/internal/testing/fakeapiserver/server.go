@@ -91,7 +91,8 @@ const (
 	expiredMessageFormat         = "too old resource version: %d (%d)"
 	continueWithVersionMessage   = "specifying resource version is not allowed when using continue"
 	invalidContinueMessage       = "The provided continue parameter is too old to display a consistent list result"
-	invalidResourceVersionFormat = "resourceVersion: Invalid value: %q: strconv.ParseUint: parsing %q: invalid syntax"
+	invalidResourceVersionFormat = "resourceVersion: Invalid value: %q: %v"
+	resourceVersionParseFunc     = "ParseUint"
 	invalidLimitFormat           = "limit: Invalid value: %q: must be a non-negative integer"
 	invalidTimeoutFormat         = "timeoutSeconds: Invalid value: %q: must be a non-negative integer"
 	initialEventsBookmarkMessage = "sendInitialEvents requires watch bookmarks"
@@ -110,9 +111,11 @@ type Options struct {
 	Sizes Sizes
 	// OnBacklog, when set, is called with true as a request starts handing
 	// out a backlog (a list page's body, or a watch-list stream's initial
-	// events) and with false when that transfer has been written, so a test
-	// of a fleet can measure how many backlogs the servers had in flight at
-	// once. Called from request goroutines; it must not block.
+	// events) and with false when that transfer has been written: after a
+	// page's body, and before the bookmark that ends a stream's initial
+	// events, since a client releases its gate slot on the bookmark. A test
+	// of a fleet can so measure how many backlogs the servers had in flight
+	// at once. Called from request goroutines; it must not block.
 	OnBacklog func(inFlight bool)
 }
 
@@ -417,14 +420,20 @@ func (s *Server) serveAccessReview(format wireFormat, w http.ResponseWriter, r *
 }
 
 // parseResourceVersion reads a resourceVersion parameter: 0 for "" and "0",
-// the number otherwise.
+// the number otherwise. A value above the signed 64-bit range the versions
+// are compared in is refused as out of range rather than cast negative,
+// where it would read as below the floor.
 func parseResourceVersion(raw string) (int64, error) {
 	if raw == "" {
 		return 0, nil
 	}
 	rv, err := strconv.ParseUint(raw, resourceVersionBase, resourceVersionBits)
 	if err != nil {
-		return 0, apierrors.NewBadRequest(fmt.Sprintf(invalidResourceVersionFormat, raw, raw))
+		return 0, apierrors.NewBadRequest(fmt.Sprintf(invalidResourceVersionFormat, raw, err))
+	}
+	if rv > math.MaxInt64 {
+		err := &strconv.NumError{Func: resourceVersionParseFunc, Num: raw, Err: strconv.ErrRange}
+		return 0, apierrors.NewBadRequest(fmt.Sprintf(invalidResourceVersionFormat, raw, err))
 	}
 	return int64(rv), nil
 }
@@ -533,10 +542,16 @@ func (s *Server) serveList(res *kind, format wireFormat, w http.ResponseWriter, 
 	}
 	snap := s.snapshotLocked(res, version)
 	s.mu.Unlock()
+	if start > snap.total() {
+		// A token past the snapshot it names, which the fake never minted:
+		// the API server refuses one it cannot serve the same way.
+		format.writeStatus(w, &apierrors.NewBadRequest(invalidContinueMessage).ErrStatus)
+		return
+	}
 
 	s.lists.Add(1)
 	end := snap.total()
-	if limit > 0 && start+limit < end {
+	if limit > 0 && limit < end-start {
 		end = start + limit
 	}
 	items := make([]runtime.Object, 0, end-start)
@@ -659,6 +674,11 @@ func (s *Server) serveWatch(res *kind, format wireFormat, w http.ResponseWriter,
 				ww.flush()
 			}
 		}
+		// Released before the bookmark goes out: the client's gate frees its
+		// slot on the bookmark and the next watcher's request can reach a
+		// server before this goroutine runs another statement, so a count
+		// still up here would read one backlog more than the gate allows.
+		s.backlog(false)
 		if sendInitial {
 			bookmark := res.newEmpty()
 			accessor, err := meta.Accessor(bookmark)
@@ -668,13 +688,11 @@ func (s *Server) serveWatch(res *kind, format wireFormat, w http.ResponseWriter,
 			accessor.SetResourceVersion(strconv.FormatInt(snap.version, resourceVersionBase))
 			accessor.SetAnnotations(map[string]string{metav1.InitialEventsAnnotationKey: initialEventsEndValue})
 			if err := ww.send(watch.Bookmark, bookmark); err != nil {
-				s.backlog(false)
 				return
 			}
 			s.watchLists.Add(1)
 		}
 		ww.flush()
-		s.backlog(false)
 	}
 
 	for {
